@@ -1,0 +1,11 @@
+[package]
+name = "mai-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mai-mcp = { path = "../mai-mcp" }
+mai-protocol = { path = "../mai-protocol" }
+serde.workspace = true
+serde_json.workspace = true

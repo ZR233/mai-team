@@ -1,0 +1,16 @@
+[package]
+name = "mai-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mai-docker = { path = "../mai-docker" }
+mai-protocol = { path = "../mai-protocol" }
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
