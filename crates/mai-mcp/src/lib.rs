@@ -3,7 +3,6 @@ use mai_protocol::McpServerConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
@@ -19,8 +18,6 @@ pub enum McpError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("toml error: {0}")]
-    Toml(#[from] toml::de::Error),
     #[error("mcp server `{0}` failed: {1}")]
     Server(String, String),
     #[error("mcp tool `{0}` not found")]
@@ -30,34 +27,6 @@ pub enum McpError {
 }
 
 pub type Result<T> = std::result::Result<T, McpError>;
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct McpFileConfig {
-    #[serde(default)]
-    pub mcp_servers: BTreeMap<String, McpServerConfig>,
-}
-
-impl McpFileConfig {
-    pub fn load_default() -> Result<Self> {
-        let Some(home) = dirs::home_dir() else {
-            return Ok(Self {
-                mcp_servers: BTreeMap::new(),
-            });
-        };
-        let path = home.join(".mai-team").join("config.toml");
-        Self::load_path(path)
-    }
-
-    pub fn load_path(path: PathBuf) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self {
-                mcp_servers: BTreeMap::new(),
-            });
-        }
-        let text = std::fs::read_to_string(path)?;
-        Ok(toml::from_str(&text)?)
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct McpTool {

@@ -85,6 +85,8 @@ pub struct AgentSummary {
     pub name: String,
     pub status: AgentStatus,
     pub container_id: Option<String>,
+    pub provider_id: String,
+    pub provider_name: String,
     pub model: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -104,6 +106,7 @@ pub struct AgentDetail {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateAgentRequest {
     pub name: Option<String>,
+    pub provider_id: Option<String>,
     pub model: Option<String>,
     pub parent_id: Option<AgentId>,
     pub system_prompt: Option<String>,
@@ -141,6 +144,54 @@ pub struct FileUploadResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderConfig {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
+    pub default_model: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderSummary {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub models: Vec<String>,
+    pub default_model: String,
+    pub enabled: bool,
+    pub has_api_key: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvidersResponse {
+    pub providers: Vec<ProviderSummary>,
+    pub default_provider_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvidersConfigRequest {
+    pub providers: Vec<ProviderConfig>,
+    pub default_provider_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderSecret {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub models: Vec<String>,
+    pub default_model: String,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,7 +359,7 @@ pub struct McpServerConfig {
     pub enabled: bool,
 }
 
-fn default_true() -> bool {
+pub fn default_true() -> bool {
     true
 }
 

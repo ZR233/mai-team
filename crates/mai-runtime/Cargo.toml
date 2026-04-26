@@ -12,6 +12,7 @@ mai-mcp = { path = "../mai-mcp" }
 mai-model = { path = "../mai-model" }
 mai-protocol = { path = "../mai-protocol" }
 mai-skills = { path = "../mai-skills" }
+mai-store = { path = "../mai-store" }
 mai-tools = { path = "../mai-tools" }
 serde_json.workspace = true
 tempfile.workspace = true

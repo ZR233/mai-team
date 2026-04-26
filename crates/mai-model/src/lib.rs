@@ -17,16 +17,8 @@ pub enum ModelError {
 pub type Result<T> = std::result::Result<T, ModelError>;
 
 #[derive(Debug, Clone)]
-pub struct ModelConfig {
-    pub api_key: String,
-    pub base_url: String,
-    pub model: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct ResponsesClient {
     http: reqwest::Client,
-    config: ModelConfig,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,35 +32,22 @@ struct ResponsesRequest<'a> {
 }
 
 impl ResponsesClient {
-    pub fn new(config: ModelConfig) -> Self {
+    pub fn new() -> Self {
         Self {
             http: reqwest::Client::new(),
-            config,
         }
-    }
-
-    pub fn model(&self) -> &str {
-        &self.config.model
     }
 
     pub async fn create_response(
         &self,
-        instructions: &str,
-        input: &[ModelInputItem],
-        tools: &[ToolDefinition],
-    ) -> Result<ModelResponse> {
-        self.create_response_with_model(&self.config.model, instructions, input, tools)
-            .await
-    }
-
-    pub async fn create_response_with_model(
-        &self,
+        base_url: &str,
+        api_key: &str,
         model: &str,
         instructions: &str,
         input: &[ModelInputItem],
         tools: &[ToolDefinition],
     ) -> Result<ModelResponse> {
-        let endpoint = format!("{}/responses", self.config.base_url.trim_end_matches('/'));
+        let endpoint = format!("{}/responses", base_url.trim_end_matches('/'));
         let request = ResponsesRequest {
             model,
             instructions,
@@ -80,7 +59,7 @@ impl ResponsesClient {
         let response = self
             .http
             .post(endpoint)
-            .bearer_auth(&self.config.api_key)
+            .bearer_auth(api_key)
             .json(&request)
             .send()
             .await?;

@@ -2,7 +2,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::Utc;
 use mai_docker::{ContainerHandle, DockerClient};
-use mai_mcp::{McpAgentManager, McpFileConfig};
+use mai_mcp::McpAgentManager;
 use mai_model::ResponsesClient;
 use mai_protocol::{
     AgentDetail, AgentId, AgentMessage, AgentStatus, AgentSummary, CreateAgentRequest, MessageRole,
@@ -10,6 +10,7 @@ use mai_protocol::{
     TurnStatus, now, preview,
 };
 use mai_skills::SkillsManager;
+use mai_store::ConfigStore;
 use mai_tools::{RoutedTool, build_tool_definitions, route_tool};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -39,6 +40,8 @@ pub enum RuntimeError {
     Model(#[from] mai_model::ModelError),
     #[error("mcp error: {0}")]
     Mcp(#[from] mai_mcp::McpError),
+    #[error("store error: {0}")]
+    Store(#[from] mai_store::StoreError),
     #[error("skill error: {0}")]
     Skill(#[from] mai_skills::SkillError),
     #[error("invalid input: {0}")]
@@ -57,8 +60,8 @@ pub struct RuntimeConfig {
 pub struct AgentRuntime {
     docker: DockerClient,
     model: ResponsesClient,
+    store: Arc<ConfigStore>,
     skills: SkillsManager,
-    mcp_config: McpFileConfig,
     agents: RwLock<HashMap<AgentId, Arc<AgentRecord>>>,
     event_tx: broadcast::Sender<ServiceEvent>,
     sequence: AtomicU64,
@@ -86,18 +89,16 @@ impl AgentRuntime {
     pub fn new(
         docker: DockerClient,
         model: ResponsesClient,
+        store: Arc<ConfigStore>,
         config: RuntimeConfig,
     ) -> Result<Arc<Self>> {
         let skills = SkillsManager::new(&config.repo_root);
-        let mcp_config = McpFileConfig::load_default().map_err(|err| {
-            RuntimeError::InvalidInput(format!("failed to load MCP config: {err}"))
-        })?;
         let (event_tx, _) = broadcast::channel(1024);
         Ok(Arc::new(Self {
             docker,
             model,
+            store,
             skills,
-            mcp_config,
             agents: RwLock::new(HashMap::new()),
             event_tx,
             sequence: AtomicU64::new(1),
@@ -118,16 +119,18 @@ impl AgentRuntime {
         let name = request
             .name
             .unwrap_or_else(|| format!("agent-{}", short_id(id)));
-        let model = request
-            .model
-            .unwrap_or_else(|| self.model.model().to_string());
+        let provider_selection = self
+            .store
+            .resolve_provider(request.provider_id.as_deref(), request.model.as_deref())?;
         let summary = AgentSummary {
             id,
             parent_id: request.parent_id,
             name,
             status: AgentStatus::Created,
             container_id: None,
-            model,
+            provider_id: provider_selection.provider.id.clone(),
+            provider_name: provider_selection.provider.name.clone(),
+            model: provider_selection.model.clone(),
             created_at,
             updated_at: created_at,
             current_turn: None,
@@ -165,7 +168,7 @@ impl AgentRuntime {
                 let mcp = McpAgentManager::start(
                     self.docker.clone(),
                     container.id,
-                    self.mcp_config.mcp_servers.clone(),
+                    self.store.list_mcp_servers()?,
                 )
                 .await;
                 *agent.mcp.write().await = Some(Arc::new(mcp));
@@ -406,10 +409,21 @@ impl AgentRuntime {
                 .build_instructions(&agent, &loaded_skills, &mcp_tools)
                 .await?;
             let model_name = agent.summary.read().await.model.clone();
+            let provider_id = agent.summary.read().await.provider_id.clone();
+            let provider_selection = self
+                .store
+                .resolve_provider(Some(&provider_id), Some(&model_name))?;
             let history = agent.history.lock().await.clone();
             let response = self
                 .model
-                .create_response_with_model(&model_name, &instructions, &history, &tools)
+                .create_response(
+                    &provider_selection.provider.base_url,
+                    &provider_selection.provider.api_key,
+                    &provider_selection.model,
+                    &instructions,
+                    &history,
+                    &tools,
+                )
                 .await?;
 
             if let Some(usage) = response.usage {
@@ -580,10 +594,13 @@ impl AgentRuntime {
             RoutedTool::SpawnAgent => {
                 let name = optional_string(&arguments, "name");
                 let message = optional_string(&arguments, "message");
+                let parent_summary = agent.summary.read().await.clone();
                 let created = self
                     .create_agent(CreateAgentRequest {
                         name,
-                        model: Some(agent.summary.read().await.model.clone()),
+                        provider_id: optional_string(&arguments, "provider_id")
+                            .or(Some(parent_summary.provider_id)),
+                        model: optional_string(&arguments, "model").or(Some(parent_summary.model)),
                         parent_id: Some(agent_id),
                         system_prompt: None,
                     })

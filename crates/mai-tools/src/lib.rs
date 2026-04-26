@@ -90,6 +90,8 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             object_schema(vec![
                 ("name", json!({ "type": "string" }), false),
                 ("message", json!({ "type": "string" }), false),
+                ("provider_id", json!({ "type": "string" }), false),
+                ("model", json!({ "type": "string" }), false),
             ]),
         ),
         ToolDefinition::function(
