@@ -16,7 +16,7 @@ pub enum ModelError {
 
 pub type Result<T> = std::result::Result<T, ModelError>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ResponsesClient {
     http: reqwest::Client,
 }
@@ -33,9 +33,7 @@ struct ResponsesRequest<'a> {
 
 impl ResponsesClient {
     pub fn new() -> Self {
-        Self {
-            http: reqwest::Client::new(),
-        }
+        Self::default()
     }
 
     pub async fn create_response(

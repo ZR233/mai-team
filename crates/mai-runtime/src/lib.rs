@@ -196,7 +196,7 @@ impl AgentRuntime {
         for agent in agents.values() {
             summaries.push(agent.summary.read().await.clone());
         }
-        summaries.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        summaries.sort_by_key(|s| s.created_at);
         summaries
     }
 
@@ -329,33 +329,33 @@ impl AgentRuntime {
         let result = self
             .run_turn_inner(agent_id, turn_id, message, skill_mentions)
             .await;
-        if let Err(err) = result {
-            if let Ok(agent) = self.agent(agent_id).await {
-                {
-                    let mut summary = agent.summary.write().await;
-                    summary.status = AgentStatus::Failed;
-                    summary.current_turn = None;
-                    summary.updated_at = now();
-                    summary.last_error = Some(err.to_string());
-                }
-                self.publish(ServiceEventKind::Error {
-                    agent_id: Some(agent_id),
-                    turn_id: Some(turn_id),
-                    message: err.to_string(),
-                })
-                .await;
-                self.publish(ServiceEventKind::TurnCompleted {
-                    agent_id,
-                    turn_id,
-                    status: TurnStatus::Failed,
-                })
-                .await;
-                self.publish(ServiceEventKind::AgentStatusChanged {
-                    agent_id,
-                    status: AgentStatus::Failed,
-                })
-                .await;
+        if let Err(err) = result
+            && let Ok(agent) = self.agent(agent_id).await
+        {
+            {
+                let mut summary = agent.summary.write().await;
+                summary.status = AgentStatus::Failed;
+                summary.current_turn = None;
+                summary.updated_at = now();
+                summary.last_error = Some(err.to_string());
             }
+            self.publish(ServiceEventKind::Error {
+                agent_id: Some(agent_id),
+                turn_id: Some(turn_id),
+                message: err.to_string(),
+            })
+            .await;
+            self.publish(ServiceEventKind::TurnCompleted {
+                agent_id,
+                turn_id,
+                status: TurnStatus::Failed,
+            })
+            .await;
+            self.publish(ServiceEventKind::AgentStatusChanged {
+                agent_id,
+                status: AgentStatus::Failed,
+            })
+            .await;
         }
     }
 
