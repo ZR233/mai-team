@@ -13,9 +13,15 @@
         <button :class="{ active: activeTab === 'providers' }" @click="activeTab = 'providers'">Providers</button>
       </nav>
       <div class="topbar-actions">
-        <span class="connection" :class="connectionState">{{ connectionLabel }}</span>
+        <span class="connection" :class="connectionState">
+          <span class="connection-dot" />
+          {{ connectionLabel }}
+        </span>
         <button class="ghost-button" @click="openTokenDialog('Bearer Token')">Token</button>
-        <button class="primary-button" @click="refreshAll">Refresh</button>
+        <button class="primary-button" :disabled="isLoading" @click="refreshAll">
+          <span v-if="isLoading" class="spinner-sm"></span>
+          <template v-else>Refresh</template>
+        </button>
       </div>
     </header>
 
@@ -73,7 +79,7 @@
             </div>
             <div class="agent-actions">
               <button class="ghost-button" @click="cancelAgent(selectedDetail.id)">Cancel</button>
-              <button class="danger-button" @click="deleteAgent(selectedDetail.id)">Delete</button>
+              <button class="danger-button" @click="confirmDeleteAgent(selectedDetail.id, selectedDetail.name)">Delete</button>
             </div>
           </div>
 
@@ -101,35 +107,51 @@
           </div>
 
           <div class="agent-body">
-            <section class="conversation">
-              <div v-if="!selectedDetail.messages?.length" class="quiet-empty">
+            <section class="conversation" ref="conversationRef">
+              <div v-if="isDetailLoading" class="loading-center">
+                <div class="spinner"></div>
+                <span>Loading messages...</span>
+              </div>
+              <div v-else-if="!selectedDetail.messages?.length" class="quiet-empty">
                 <strong>No messages yet</strong>
                 <span>Send the first instruction to start a turn.</span>
               </div>
-              <article
-                v-for="message in selectedDetail.messages || []"
-                :key="`${message.created_at}-${message.role}-${message.content}`"
-                class="message"
-                :class="messageClass(message.role)"
-              >
-                <div class="message-avatar">{{ roleInitial(message.role) }}</div>
-                <div class="message-content">
-                  <span>{{ roleLabel(message.role) }}</span>
-                  <p>{{ message.content }}</p>
-                </div>
-              </article>
+              <template v-else>
+                <article
+                  v-for="(message, index) in selectedDetail.messages"
+                  :key="`${message.created_at}-${message.role}-${index}`"
+                  class="message"
+                  :class="messageClass(message.role)"
+                >
+                  <div class="message-avatar">{{ roleInitial(message.role) }}</div>
+                  <div class="message-content">
+                    <span>{{ roleLabel(message.role) }}</span>
+                    <div v-if="message.role === 'tool'" class="tool-content">
+                      <p>{{ message.content }}</p>
+                    </div>
+                    <div v-else class="markdown-body" v-html="renderMarkdown(message.content)"></div>
+                  </div>
+                </article>
+              </template>
             </section>
 
             <aside class="event-panel">
               <div class="panel-head">
                 <h3>Recent Events</h3>
-                <span>{{ eventFeed.length }}</span>
+                <span class="event-count">{{ eventFeed.length }}</span>
               </div>
               <div class="event-list">
-                <div v-for="event in eventFeed" :key="event.sequence" class="event-row">
-                  <span class="event-type">{{ event.type || 'event' }}</span>
+                <div
+                  v-for="event in eventFeed"
+                  :key="event.sequence"
+                  class="event-row"
+                  :class="`event-${event.type || 'unknown'}`"
+                >
+                  <div class="event-row-head">
+                    <span class="event-type">{{ formatEventType(event.type) }}</span>
+                    <time>{{ formatTime(event.timestamp) }}</time>
+                  </div>
                   <p>{{ eventSummary(event) }}</p>
-                  <time>{{ formatTime(event.timestamp) }}</time>
                 </div>
                 <div v-if="!eventFeed.length" class="quiet-empty compact">
                   <strong>No events yet</strong>
@@ -143,10 +165,13 @@
             <textarea
               v-model="messageDraft"
               rows="2"
-              placeholder="Send a command or message..."
-              @keydown.enter.exact.prevent="sendMessage"
+              placeholder="Send a command or message... (Enter to send, Shift+Enter for new line)"
+              @keydown.enter.exact="handleEnterKey"
             />
-            <button class="primary-button" type="submit" :disabled="!messageDraft.trim()">Send</button>
+            <button class="primary-button" type="submit" :disabled="!messageDraft.trim() || isSending">
+              <span v-if="isSending" class="spinner-sm"></span>
+              <template v-else>Send</template>
+            </button>
           </form>
         </template>
       </section>
@@ -201,7 +226,7 @@
             </div>
             <div class="provider-actions">
               <button class="ghost-button" @click="openProviderDialog(index)">Edit</button>
-              <button class="danger-button" @click="removeProvider(index)">Delete</button>
+              <button class="danger-button" @click="confirmDeleteProvider(index, provider.name)">Delete</button>
             </div>
           </article>
         </div>
@@ -215,7 +240,8 @@
       </section>
     </main>
 
-    <div v-if="tokenDialog.open" class="modal-backdrop">
+    <!-- Token Dialog -->
+    <div v-if="tokenDialog.open" class="modal-backdrop" @mousedown.self="onBackdropDown" @mouseup.self="onBackdropUp($event, () => tokenDialog.open = false)">
       <form class="modal" @submit.prevent="saveToken">
         <h2>{{ tokenDialog.title }}</h2>
         <label>
@@ -223,12 +249,14 @@
           <input v-model="tokenDialog.value" autocomplete="off" placeholder="Paste token printed by server" />
         </label>
         <div class="modal-actions">
+          <button class="ghost-button" type="button" @click="tokenDialog.open = false">Cancel</button>
           <button class="primary-button" type="submit">Save Token</button>
         </div>
       </form>
     </div>
 
-    <div v-if="providerDialog.open" class="modal-backdrop">
+    <!-- Provider Dialog -->
+    <div v-if="providerDialog.open" class="modal-backdrop" @mousedown.self="onBackdropDown" @mouseup.self="onBackdropUp($event, closeProviderDialog)">
       <form class="modal wide" @submit.prevent="saveProviderDialog">
         <div class="modal-title-row">
           <h2>{{ providerDialog.index === null ? 'Add Provider' : 'Edit Provider' }}</h2>
@@ -286,7 +314,8 @@
       </form>
     </div>
 
-    <div v-if="agentDialog.open" class="modal-backdrop">
+    <!-- Agent Dialog -->
+    <div v-if="agentDialog.open" class="modal-backdrop" @mousedown.self="onBackdropDown" @mouseup.self="onBackdropUp($event, () => agentDialog.open = false)">
       <form class="modal" @submit.prevent="createAgent">
         <div class="modal-title-row">
           <h2>Create Agent</h2>
@@ -318,12 +347,30 @@
       </form>
     </div>
 
-    <div v-if="toast" class="toast">{{ toast }}</div>
+    <!-- Confirm Dialog -->
+    <div v-if="confirmDialog.open" class="modal-backdrop">
+      <div class="modal confirm-modal">
+        <h2>{{ confirmDialog.title }}</h2>
+        <p class="confirm-message">{{ confirmDialog.message }}</p>
+        <div class="modal-actions">
+          <button class="ghost-button" @click="confirmDialog.open = false">Cancel</button>
+          <button class="danger-button" @click="confirmDialog.onConfirm">Confirm</button>
+        </div>
+      </div>
+    </div>
+
+    <Transition name="toast">
+      <div v-if="toast" class="toast">{{ toast }}</div>
+    </Transition>
   </div>
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { marked } from 'marked'
+import hljs from 'highlight.js'
+
+marked.setOptions({ breaks: true, gfm: true })
 
 const activeTab = ref('agents')
 const agents = ref([])
@@ -333,6 +380,11 @@ const messageDraft = ref('')
 const eventFeed = ref([])
 const toast = ref('')
 const connectionState = ref('offline')
+const isLoading = ref(false)
+const isSending = ref(false)
+const isDetailLoading = ref(false)
+const conversationRef = ref(null)
+
 const providersState = reactive({
   providers: [],
   default_provider_id: null
@@ -341,6 +393,17 @@ const providersState = reactive({
 let eventSource = null
 let token = localStorage.getItem('maiToken') || new URLSearchParams(window.location.search).get('token') || ''
 let tokenResolver = null
+let sseRetryCount = 0
+const SSE_MAX_RETRIES = 5
+let sseRetryTimer = null
+let backdropDown = false
+
+const confirmDialog = reactive({
+  open: false,
+  title: '',
+  message: '',
+  onConfirm: () => {}
+})
 
 const tokenDialog = reactive({
   open: false,
@@ -364,9 +427,9 @@ const agentDialog = reactive({
 })
 
 const connectionLabel = computed(() => {
-  if (connectionState.value === 'online') return 'Events connected'
-  if (connectionState.value === 'connecting') return 'Connecting events'
-  return 'Events offline'
+  if (connectionState.value === 'online') return 'Connected'
+  if (connectionState.value === 'connecting') return 'Connecting'
+  return 'Offline'
 })
 
 const selectedProviderModels = computed(() => {
@@ -382,10 +445,57 @@ watch(
   }
 )
 
+watch(
+  () => selectedDetail.value?.messages?.length,
+  async () => {
+    await nextTick()
+    highlightCodeBlocks()
+    scrollToBottom()
+  }
+)
+
 onMounted(async () => {
   connectEvents()
   await refreshAll()
 })
+
+onUnmounted(() => {
+  if (eventSource) eventSource.close()
+  if (sseRetryTimer) clearTimeout(sseRetryTimer)
+})
+
+function renderMarkdown(content) {
+  if (!content) return ''
+  return marked.parse(String(content))
+}
+
+function onBackdropDown() {
+  backdropDown = true
+}
+
+function onBackdropUp(event, callback) {
+  if (backdropDown) {
+    backdropDown = false
+    callback()
+  }
+}
+
+function highlightCodeBlocks() {
+  if (!conversationRef.value) return
+  conversationRef.value.querySelectorAll('pre code').forEach((block) => {
+    if (!block.dataset.highlighted) {
+      hljs.highlightElement(block)
+      block.dataset.highlighted = 'true'
+    }
+  })
+}
+
+async function scrollToBottom() {
+  await nextTick()
+  if (conversationRef.value) {
+    conversationRef.value.scrollTop = conversationRef.value.scrollHeight
+  }
+}
 
 async function api(path, init = {}, retry = true) {
   if (!token) {
@@ -418,6 +528,7 @@ function readError(text) {
 }
 
 async function refreshAll() {
+  isLoading.value = true
   try {
     await Promise.all([loadProviders(), refreshAgents()])
     if (selectedAgentId.value) {
@@ -425,6 +536,8 @@ async function refreshAll() {
     }
   } catch (error) {
     showToast(error.message)
+  } finally {
+    isLoading.value = false
   }
 }
 
@@ -445,10 +558,15 @@ async function refreshAgents() {
 
 async function refreshDetail() {
   if (!selectedAgentId.value) return
-  selectedDetail.value = await api(`/agents/${selectedAgentId.value}`)
-  await nextTick()
-  const conversation = document.querySelector('.conversation')
-  if (conversation) conversation.scrollTop = conversation.scrollHeight
+  isDetailLoading.value = true
+  try {
+    selectedDetail.value = await api(`/agents/${selectedAgentId.value}`)
+    await nextTick()
+    highlightCodeBlocks()
+    scrollToBottom()
+  } finally {
+    isDetailLoading.value = false
+  }
 }
 
 async function selectAgent(id) {
@@ -497,6 +615,7 @@ async function createAgent() {
 async function sendMessage() {
   const message = messageDraft.value.trim()
   if (!selectedAgentId.value || !message) return
+  isSending.value = true
   try {
     await api(`/agents/${selectedAgentId.value}/messages`, {
       method: 'POST',
@@ -506,6 +625,15 @@ async function sendMessage() {
     await refreshDetail()
   } catch (error) {
     showToast(error.message)
+  } finally {
+    isSending.value = false
+  }
+}
+
+function handleEnterKey(event) {
+  if (!event.shiftKey) {
+    event.preventDefault()
+    sendMessage()
   }
 }
 
@@ -518,17 +646,33 @@ async function cancelAgent(id) {
   }
 }
 
-async function deleteAgent(id) {
-  try {
-    await api(`/agents/${id}`, { method: 'DELETE' })
-    if (selectedAgentId.value === id) {
-      selectedAgentId.value = null
-      selectedDetail.value = null
+function confirmDeleteAgent(id, name) {
+  confirmDialog.title = 'Delete Agent'
+  confirmDialog.message = `Are you sure you want to delete "${name || id}"? This action cannot be undone.`
+  confirmDialog.onConfirm = async () => {
+    confirmDialog.open = false
+    try {
+      await api(`/agents/${id}`, { method: 'DELETE' })
+      if (selectedAgentId.value === id) {
+        selectedAgentId.value = null
+        selectedDetail.value = null
+      }
+      await refreshAgents()
+    } catch (error) {
+      showToast(error.message)
     }
-    await refreshAgents()
-  } catch (error) {
-    showToast(error.message)
   }
+  confirmDialog.open = true
+}
+
+function confirmDeleteProvider(index, name) {
+  confirmDialog.title = 'Delete Provider'
+  confirmDialog.message = `Are you sure you want to delete "${name}"? Agents using this provider may stop working.`
+  confirmDialog.onConfirm = async () => {
+    confirmDialog.open = false
+    await removeProvider(index)
+  }
+  confirmDialog.open = true
 }
 
 function openProviderDialog(index) {
@@ -650,6 +794,7 @@ function saveToken() {
   tokenDialog.open = false
   if (tokenResolver) tokenResolver()
   tokenResolver = null
+  sseRetryCount = 0
   connectEvents()
 }
 
@@ -657,6 +802,10 @@ function connectEvents() {
   if (eventSource) {
     eventSource.close()
     eventSource = null
+  }
+  if (sseRetryTimer) {
+    clearTimeout(sseRetryTimer)
+    sseRetryTimer = null
   }
   if (!token) {
     connectionState.value = 'offline'
@@ -666,13 +815,19 @@ function connectEvents() {
   eventSource = new EventSource(`/events?token=${encodeURIComponent(token)}`)
   eventSource.onopen = () => {
     connectionState.value = 'online'
+    sseRetryCount = 0
   }
-  eventSource.onerror = async () => {
+  eventSource.onerror = () => {
     connectionState.value = 'offline'
     eventSource?.close()
     eventSource = null
-    await openTokenDialog('Token expired or invalid')
-    connectEvents()
+    if (sseRetryCount < SSE_MAX_RETRIES) {
+      sseRetryCount++
+      const delay = Math.min(1000 * Math.pow(2, sseRetryCount - 1), 30000)
+      sseRetryTimer = setTimeout(() => connectEvents(), delay)
+    } else {
+      openTokenDialog('Connection lost. Verify token or check server.')
+    }
   }
   const names = [
     'agent_created',
@@ -693,9 +848,12 @@ function connectEvents() {
 async function handleEvent(event) {
   try {
     const parsed = JSON.parse(event.data)
-    eventFeed.value = [parsed, ...eventFeed.value].slice(0, 80)
+    eventFeed.value = [parsed, ...eventFeed.value].slice(0, 150)
   } catch {
-    eventFeed.value = [{ sequence: Date.now(), type: 'event', timestamp: new Date().toISOString(), message: event.data }, ...eventFeed.value].slice(0, 80)
+    eventFeed.value = [
+      { sequence: Date.now(), type: 'event', timestamp: new Date().toISOString(), message: event.data },
+      ...eventFeed.value
+    ].slice(0, 150)
   }
   await refreshAgents()
   if (selectedAgentId.value) await refreshDetail()
@@ -750,6 +908,12 @@ function formatTime(value) {
   return new Date(value).toLocaleTimeString()
 }
 
+function formatEventType(type) {
+  return String(type || 'event')
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (l) => l.toUpperCase())
+}
+
 function totalTokens(agent) {
   return Number(agent.token_usage?.total_tokens || 0).toLocaleString()
 }
@@ -791,7 +955,10 @@ function eventSummary(event) {
   if (event.type === 'turn_completed') return `Turn completed with ${formatStatus(event.status)}`
   if (event.type === 'tool_started') return `Tool started: ${event.tool_name}`
   if (event.type === 'tool_completed') return `Tool completed: ${event.tool_name}`
-  if (event.type === 'agent_message') return `${roleLabel(event.role)}: ${event.content || ''}`
+  if (event.type === 'agent_message') {
+    const content = event.content || ''
+    return `${roleLabel(event.role)}: ${content.length > 120 ? content.slice(0, 120) + '...' : content}`
+  }
   return JSON.stringify(event)
 }
 
