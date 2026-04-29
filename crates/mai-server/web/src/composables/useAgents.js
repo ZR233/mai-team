@@ -29,18 +29,21 @@ export function useAgents() {
       selectedDetail.value = await api(`/agents/${selectedAgentId.value}`)
       await nextTick()
       highlightCodeBlocks(conversationRef.value)
-      scrollToBottom()
+      await scrollConversationToBottom()
     } finally {
       isDetailLoading.value = false
     }
   }
 
-  async function scrollToBottom() {
+  async function scrollConversationToBottom() {
     await nextTick()
+    await nextFrame()
     if (conversationRef.value) {
       conversationRef.value.scrollTop = conversationRef.value.scrollHeight
     }
   }
+
+  const scrollToBottom = scrollConversationToBottom
 
   async function selectAgent(id) {
     selectedAgentId.value = id
@@ -116,6 +119,11 @@ export function useAgents() {
     cancelAgent,
     deleteAgent,
     scrollToBottom,
+    scrollConversationToBottom,
     showToast
   }
+}
+
+function nextFrame() {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()))
 }

@@ -27,58 +27,89 @@
     </div>
 
     <div class="agent-body">
-      <section class="conversation" ref="conversationRef">
+      <section class="conversation chat-timeline" ref="conversationRef">
         <div v-if="loading" class="loading-center">
           <div class="spinner"></div>
           <span>Loading messages...</span>
         </div>
-        <div v-else-if="!detail.messages?.length" class="quiet-empty">
+        <div v-else-if="!timelineItems.length" class="quiet-empty">
           <strong>No messages yet</strong>
           <span>Send the first instruction to start a turn.</span>
         </div>
         <template v-else>
           <article
-            v-for="(message, index) in detail.messages"
-            :key="`${message.created_at}-${message.role}-${index}`"
-            class="message"
-            :class="messageClass(message.role)"
+            v-for="item in timelineItems"
+            :key="item.key"
+            class="timeline-item"
+            :class="`timeline-${item.type}`"
           >
-            <div class="message-avatar">{{ roleInitial(message.role) }}</div>
-            <div class="message-content">
-              <span>{{ roleLabel(message.role) }}</span>
-              <div v-if="message.role === 'tool'" class="tool-content">
-                <p>{{ message.content }}</p>
+            <template v-if="item.type === 'message'">
+              <div class="timeline-message" :class="messageClass(item.role)">
+                <div class="message-avatar">{{ roleInitial(item.role) }}</div>
+                <div class="message-content">
+                  <span>{{ roleLabel(item.role) }}</span>
+                  <div class="markdown-body" v-html="renderMarkdown(item.content)"></div>
+                </div>
               </div>
-              <div v-else class="markdown-body" v-html="renderMarkdown(message.content)"></div>
+            </template>
+
+            <div v-else-if="item.type === 'tool'" class="tool-card" :class="`tool-${item.status}`">
+              <button class="tool-card-toggle" type="button" @click="toggleTool(item)">
+                <span class="tool-chevron" :class="{ open: isToolExpanded(item) }">›</span>
+                <span class="tool-state-dot"></span>
+                <span class="tool-title">
+                  <span>{{ item.status === 'running' ? 'Calling tool' : 'Used tool' }}</span>
+                  <strong>{{ item.toolName }}</strong>
+                </span>
+                <span class="tool-meta">
+                  {{ toolStatusLabel(item.status) }}
+                  <template v-if="formatDuration(item.durationMs)"> · {{ formatDuration(item.durationMs) }}</template>
+                </span>
+              </button>
+              <div class="tool-preview-grid">
+                <div v-if="item.argumentsPreview" class="trace-preview">
+                  <span>Arguments</span>
+                  <pre>{{ item.argumentsPreview }}</pre>
+                </div>
+                <div v-if="item.outputPreview" class="trace-preview">
+                  <span>Output</span>
+                  <pre>{{ item.outputPreview }}</pre>
+                </div>
+              </div>
+              <div v-if="isToolExpanded(item)" class="tool-trace">
+                <div v-if="traceState(item).loading" class="trace-loading">
+                  <span class="spinner-sm"></span>
+                  Loading full trace...
+                </div>
+                <p v-else-if="traceState(item).error" class="trace-error">
+                  {{ traceState(item).error }}
+                </p>
+                <template v-else-if="traceState(item).detail">
+                  <div class="trace-block">
+                    <span>Full arguments</span>
+                    <pre>{{ formatTraceValue(traceState(item).detail.arguments) }}</pre>
+                  </div>
+                  <div class="trace-block">
+                    <span>Full output</span>
+                    <pre>{{ formatTraceValue(traceState(item).detail.output) }}</pre>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <div v-else-if="item.type === 'error'" class="timeline-error-card">
+              <strong>Error</strong>
+              <p>{{ item.message }}</p>
+            </div>
+
+            <div v-else class="process-row" :class="`process-${item.tone}`">
+              <span class="process-dot"></span>
+              <span class="process-label">{{ item.label }}</span>
+              <span v-if="item.detail" class="process-detail">{{ item.detail }}</span>
             </div>
           </article>
         </template>
       </section>
-
-      <aside class="event-panel">
-        <div class="panel-head">
-          <h3>Recent Events</h3>
-          <span class="event-count">{{ events.length }}</span>
-        </div>
-        <div class="event-list">
-          <div
-            v-for="event in events"
-            :key="event.sequence"
-            class="event-row"
-            :class="`event-${event.type || 'unknown'}`"
-          >
-            <div class="event-row-head">
-              <span class="event-type">{{ formatEventType(event.type) }}</span>
-              <time>{{ formatTime(event.timestamp) }}</time>
-            </div>
-            <p>{{ eventSummary(event, formatStatus, roleLabel) }}</p>
-          </div>
-          <div v-if="!events.length" class="quiet-empty compact">
-            <strong>No events yet</strong>
-            <span>Lifecycle and tool events appear here.</span>
-          </div>
-        </div>
-      </aside>
     </div>
 
     <form class="composer" @submit.prevent="send">
@@ -98,12 +129,20 @@
 </template>
 
 <script setup>
+import { computed, nextTick, reactive, watch } from 'vue'
 import {
-  formatStatus, formatDate, formatTime, formatEventType,
+  formatStatus, formatDate,
   totalTokens, shortContainer, initial, roleInitial, roleLabel,
-  statusTone, messageClass, eventSummary
+  statusTone, messageClass
 } from '../utils/format'
 import { renderMarkdown } from '../utils/markdown'
+import { useApi } from '../composables/useApi'
+import {
+  buildAgentTimeline,
+  formatDuration,
+  formatTraceValue,
+  toolStatusLabel
+} from '../utils/timeline'
 
 const props = defineProps({
   detail: { type: Object, default: null },
@@ -114,8 +153,21 @@ const props = defineProps({
 })
 
 const conversationRef = defineModel('conversationRef', { default: null })
-
 const emit = defineEmits(['cancel', 'delete', 'send', 'update:draft'])
+const { api, showToast } = useApi()
+const expandedTools = reactive({})
+const traces = reactive({})
+const emptyTrace = { loading: false, error: '', detail: null }
+
+const timelineItems = computed(() => buildAgentTimeline(props.detail, props.events))
+
+watch(
+  () => props.detail?.id,
+  () => {
+    for (const key of Object.keys(expandedTools)) delete expandedTools[key]
+    for (const key of Object.keys(traces)) delete traces[key]
+  }
+)
 
 function handleEnter(event) {
   if (!event.shiftKey) {
@@ -126,5 +178,55 @@ function handleEnter(event) {
 
 function send() {
   if (props.draft.trim()) emit('send', props.draft.trim())
+}
+
+function isToolExpanded(item) {
+  return Boolean(expandedTools[item.callId])
+}
+
+function traceState(item) {
+  return traces[item.callId] || emptyTrace
+}
+
+function ensureTraceState(item) {
+  if (!traces[item.callId]) traces[item.callId] = { loading: false, error: '', detail: null }
+  return traces[item.callId]
+}
+
+async function toggleTool(item) {
+  const shouldStayPinned = isNearTimelineBottom()
+  expandedTools[item.callId] = !expandedTools[item.callId]
+  if (!expandedTools[item.callId]) return
+
+  const state = ensureTraceState(item)
+  if (state.detail || state.loading) {
+    if (shouldStayPinned) await scrollTimelineToBottom()
+    return
+  }
+  state.loading = true
+  state.error = ''
+  try {
+    state.detail = await api(`/agents/${props.detail.id}/tool-calls/${encodeURIComponent(item.callId)}`)
+  } catch (error) {
+    state.error = error.message
+    showToast(error.message)
+  } finally {
+    state.loading = false
+    if (shouldStayPinned) await scrollTimelineToBottom()
+  }
+}
+
+function isNearTimelineBottom() {
+  const element = conversationRef.value
+  if (!element) return true
+  return element.scrollHeight - element.scrollTop - element.clientHeight < 120
+}
+
+async function scrollTimelineToBottom() {
+  await nextTick()
+  await new Promise((resolve) => requestAnimationFrame(() => resolve()))
+  if (conversationRef.value) {
+    conversationRef.value.scrollTop = conversationRef.value.scrollHeight
+  }
 }
 </script>

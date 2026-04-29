@@ -132,7 +132,8 @@ const { eventFeed, connectionState, connectEvents, disconnect, resetRetryCount }
 const {
   agents, selectedAgentId, selectedDetail, isLoading, isSending, isDetailLoading,
   conversationRef, agentDialog,
-  refreshAgents, refreshDetail, selectAgent, createAgent, sendMessage, cancelAgent, deleteAgent
+  refreshAgents, refreshDetail, selectAgent, createAgent, sendMessage, cancelAgent, deleteAgent,
+  scrollConversationToBottom
 } = useAgents()
 const {
   providersState, providerDialog,
@@ -174,13 +175,15 @@ const selectedProviderModels = computed(() => {
 })
 
 watch(
-  () => selectedDetail.value?.messages?.length,
+  () => [
+    selectedDetail.value?.messages?.length,
+    selectedDetail.value?.recent_events?.length,
+    eventFeed.value.length
+  ],
   async () => {
     await nextTick()
     highlightCodeBlocks(conversationRef.value)
-    if (conversationRef.value) {
-      conversationRef.value.scrollTop = conversationRef.value.scrollHeight
-    }
+    await scrollConversationToBottom()
   }
 )
 

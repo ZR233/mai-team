@@ -12,7 +12,7 @@ use mai_model::ResponsesClient;
 use mai_protocol::{
     AgentId, CreateAgentRequest, CreateAgentResponse, ErrorResponse, FileUploadRequest,
     FileUploadResponse, ProvidersConfigRequest, ProvidersResponse, SendMessageRequest,
-    SendMessageResponse, ServiceEvent,
+    SendMessageResponse, ServiceEvent, ToolTraceDetail,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
 use mai_store::ConfigStore;
@@ -59,6 +59,7 @@ impl From<RuntimeError> for ApiError {
     fn from(value: RuntimeError) -> Self {
         let status = match value {
             RuntimeError::AgentNotFound(_) => StatusCode::NOT_FOUND,
+            RuntimeError::ToolTraceNotFound { .. } => StatusCode::NOT_FOUND,
             RuntimeError::AgentBusy(_) => StatusCode::CONFLICT,
             RuntimeError::InvalidInput(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -172,6 +173,7 @@ async fn main() -> Result<()> {
             get(get_agent).delete(delete_agent).post(cancel_agent_colon),
         )
         .route("/agents/{id}/messages", post(send_message))
+        .route("/agents/{id}/tool-calls/{call_id}", get(get_tool_trace))
         .route("/agents/{id}/files:upload", post(upload_file))
         .route("/agents/{id}/files:download", get(download_file))
         .route("/agents/{id}/cancel", post(cancel_agent))
@@ -288,6 +290,15 @@ async fn send_message(
         .send_message(id, request.message, request.skill_mentions)
         .await?;
     Ok(Json(SendMessageResponse { turn_id }))
+}
+
+async fn get_tool_trace(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((id, call_id)): Path<(AgentId, String)>,
+) -> std::result::Result<Json<ToolTraceDetail>, ApiError> {
+    authorize(&state, &headers, None)?;
+    Ok(Json(state.runtime.tool_trace(id, call_id).await?))
 }
 
 async fn upload_file(

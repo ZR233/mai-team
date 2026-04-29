@@ -130,6 +130,16 @@ pub struct SendMessageResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolTraceDetail {
+    pub call_id: String,
+    pub tool_name: String,
+    pub arguments: Value,
+    pub output: String,
+    pub success: bool,
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileUploadRequest {
     pub path: String,
     pub content_base64: String,
@@ -229,6 +239,10 @@ pub enum ServiceEventKind {
         turn_id: TurnId,
         call_id: String,
         tool_name: String,
+        #[serde(default)]
+        arguments_preview: Option<String>,
+        #[serde(default)]
+        arguments: Option<Value>,
     },
     ToolCompleted {
         agent_id: AgentId,
@@ -237,6 +251,8 @@ pub enum ServiceEventKind {
         tool_name: String,
         success: bool,
         output_preview: String,
+        #[serde(default)]
+        duration_ms: Option<u64>,
     },
     AgentMessage {
         agent_id: AgentId,
@@ -374,4 +390,57 @@ pub fn preview(value: &str, max: usize) -> String {
         out.push_str("...");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tool_events_accept_legacy_json_without_new_fields() {
+        let agent_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let started = json!({
+            "sequence": 1,
+            "timestamp": Utc::now(),
+            "type": "tool_started",
+            "agent_id": agent_id,
+            "turn_id": turn_id,
+            "call_id": "call_1",
+            "tool_name": "container_exec"
+        });
+        let completed = json!({
+            "sequence": 2,
+            "timestamp": Utc::now(),
+            "type": "tool_completed",
+            "agent_id": agent_id,
+            "turn_id": turn_id,
+            "call_id": "call_1",
+            "tool_name": "container_exec",
+            "success": true,
+            "output_preview": "ok"
+        });
+
+        let started: ServiceEvent = serde_json::from_value(started).expect("started event");
+        let completed: ServiceEvent = serde_json::from_value(completed).expect("completed event");
+
+        match started.kind {
+            ServiceEventKind::ToolStarted {
+                arguments,
+                arguments_preview,
+                ..
+            } => {
+                assert!(arguments.is_none());
+                assert!(arguments_preview.is_none());
+            }
+            _ => panic!("expected tool_started"),
+        }
+        match completed.kind {
+            ServiceEventKind::ToolCompleted { duration_ms, .. } => {
+                assert_eq!(duration_ms, None);
+            }
+            _ => panic!("expected tool_completed"),
+        }
+    }
 }

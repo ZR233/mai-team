@@ -6,8 +6,8 @@ use mai_mcp::McpAgentManager;
 use mai_model::ResponsesClient;
 use mai_protocol::{
     AgentDetail, AgentId, AgentMessage, AgentStatus, AgentSummary, CreateAgentRequest, MessageRole,
-    ModelInputItem, ModelOutputItem, ServiceEvent, ServiceEventKind, TokenUsage, TurnId,
-    TurnStatus, now, preview,
+    ModelInputItem, ModelOutputItem, ServiceEvent, ServiceEventKind, TokenUsage, ToolTraceDetail,
+    TurnId, TurnStatus, now, preview,
 };
 use mai_skills::SkillsManager;
 use mai_store::ConfigStore;
@@ -34,6 +34,8 @@ pub enum RuntimeError {
     AgentBusy(AgentId),
     #[error("agent has no container: {0}")]
     MissingContainer(AgentId),
+    #[error("tool trace not found: {agent_id}/{call_id}")]
+    ToolTraceNotFound { agent_id: AgentId, call_id: String },
     #[error("docker error: {0}")]
     Docker(#[from] mai_docker::DockerError),
     #[error("model error: {0}")]
@@ -229,6 +231,49 @@ impl AgentRuntime {
             summary,
             messages,
             recent_events,
+        })
+    }
+
+    pub async fn tool_trace(&self, agent_id: AgentId, call_id: String) -> Result<ToolTraceDetail> {
+        let agent = self.agent(agent_id).await?;
+        let history = agent.history.lock().await.clone();
+        let mut tool_name = None;
+        let mut arguments = None;
+        let mut output = None;
+
+        for item in history {
+            match item {
+                ModelInputItem::FunctionCall {
+                    call_id: item_call_id,
+                    name,
+                    arguments: raw_arguments,
+                } if item_call_id == call_id => {
+                    tool_name = Some(name);
+                    arguments = Some(parse_tool_arguments(&raw_arguments));
+                }
+                ModelInputItem::FunctionCallOutput {
+                    call_id: item_call_id,
+                    output: item_output,
+                } if item_call_id == call_id => {
+                    output = Some(item_output);
+                }
+                _ => {}
+            }
+        }
+
+        let tool_name = tool_name.ok_or_else(|| RuntimeError::ToolTraceNotFound {
+            agent_id,
+            call_id: call_id.clone(),
+        })?;
+        let output = output.unwrap_or_default();
+        let (event_success, duration_ms) = self.tool_event_metadata(agent_id, &call_id).await;
+        Ok(ToolTraceDetail {
+            call_id,
+            tool_name,
+            arguments: arguments.unwrap_or_else(|| json!({})),
+            success: event_success.unwrap_or(!output.is_empty()),
+            output,
+            duration_ms,
         })
     }
 
@@ -523,16 +568,22 @@ impl AgentRuntime {
             self.set_status(&agent, AgentStatus::WaitingTool, None)
                 .await?;
             for (call_id, name, arguments) in tool_calls {
+                let arguments_preview = trace_preview_value(&arguments, 500);
+                let inline_arguments = inline_event_arguments(&arguments);
                 self.publish(ServiceEventKind::ToolStarted {
                     agent_id,
                     turn_id,
                     call_id: call_id.clone(),
                     tool_name: name.clone(),
+                    arguments_preview: Some(arguments_preview),
+                    arguments: inline_arguments,
                 })
                 .await;
+                let started_at = Instant::now();
                 let output = self
                     .execute_tool(&agent, agent_id, turn_id, &name, arguments)
                     .await;
+                let duration_ms = u128_to_u64(started_at.elapsed().as_millis());
                 let execution = match output {
                     Ok(execution) => execution,
                     Err(err) => ToolExecution {
@@ -555,7 +606,8 @@ impl AgentRuntime {
                     call_id,
                     tool_name: name,
                     success: execution.success,
-                    output_preview: preview(&execution.output, 500),
+                    output_preview: trace_preview_output(&execution.output, 500),
+                    duration_ms: Some(duration_ms),
                 })
                 .await;
             }
@@ -960,6 +1012,30 @@ impl AgentRuntime {
         manager.tools().await
     }
 
+    async fn tool_event_metadata(
+        &self,
+        agent_id: AgentId,
+        call_id: &str,
+    ) -> (Option<bool>, Option<u64>) {
+        let events = self.recent_events.lock().await;
+        events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                ServiceEventKind::ToolCompleted {
+                    agent_id: event_agent_id,
+                    call_id: event_call_id,
+                    success,
+                    duration_ms,
+                    ..
+                } if *event_agent_id == agent_id && event_call_id == call_id => {
+                    Some((Some(*success), *duration_ms))
+                }
+                _ => None,
+            })
+            .unwrap_or((None, None))
+    }
+
     async fn publish(&self, kind: ServiceEventKind) {
         let event = ServiceEvent {
             sequence: self.sequence.fetch_add(1, Ordering::SeqCst),
@@ -998,6 +1074,91 @@ fn optional_string(arguments: &Value, field: &str) -> Option<String> {
 fn parse_agent_id(value: &str) -> Result<AgentId> {
     Uuid::parse_str(value)
         .map_err(|err| RuntimeError::InvalidInput(format!("invalid agent_id `{value}`: {err}")))
+}
+
+fn parse_tool_arguments(raw_arguments: &str) -> Value {
+    serde_json::from_str(raw_arguments).unwrap_or_else(|_| json!({ "raw": raw_arguments }))
+}
+
+fn trace_preview_value(value: &Value, max: usize) -> String {
+    let redacted = redacted_preview_value(value);
+    let serialized =
+        serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| redacted.to_string());
+    preview(&serialized, max)
+}
+
+fn trace_preview_output(output: &str, max: usize) -> String {
+    serde_json::from_str::<Value>(output)
+        .map(|value| trace_preview_value(&value, max))
+        .unwrap_or_else(|_| preview(&redact_preview_string(output), max))
+}
+
+fn inline_event_arguments(value: &Value) -> Option<Value> {
+    let redacted = redacted_preview_value(value);
+    let serialized = serde_json::to_string(&redacted).ok()?;
+    (serialized.len() <= 2_000).then_some(redacted)
+}
+
+fn redacted_preview_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in map {
+                if is_sensitive_key(key) {
+                    out.insert(key.clone(), Value::String("<redacted>".to_string()));
+                } else {
+                    out.insert(key.clone(), redacted_preview_value(value));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .take(20)
+                .map(redacted_preview_value)
+                .chain(
+                    (items.len() > 20)
+                        .then(|| Value::String(format!("<{} more items>", items.len() - 20))),
+                )
+                .collect(),
+        ),
+        Value::String(value) => Value::String(redact_preview_string(value)),
+        _ => value.clone(),
+    }
+}
+
+fn redact_preview_string(value: &str) -> String {
+    if value.len() > 240 && looks_like_base64(value) {
+        return format!("<base64 elided: {} chars>", value.len());
+    }
+    if value.len() > 800 {
+        return format!("{}...", value.chars().take(800).collect::<String>());
+    }
+    value.to_string()
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("token")
+        || key.contains("secret")
+        || key.contains("password")
+        || key.contains("authorization")
+        || key.contains("api_key")
+        || key.ends_with("_key")
+        || key.contains("base64")
+}
+
+fn looks_like_base64(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.len() > 240
+        && trimmed.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'\n' | b'\r')
+        })
+}
+
+fn u128_to_u64(value: u128) -> u64 {
+    value.min(u64::MAX as u128) as u64
 }
 
 fn recovered_summary(mut summary: AgentSummary) -> (AgentSummary, bool) {
@@ -1174,5 +1335,108 @@ mod tests {
             .await;
         let events = runtime.recent_events.lock().await;
         assert_eq!(events.back().expect("event").sequence, 42);
+    }
+
+    #[tokio::test]
+    async fn tool_trace_returns_full_history_with_event_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime.sqlite3");
+        let store = ConfigStore::open(&db_path).await.expect("open store");
+        let agent_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let timestamp = now();
+        let summary = AgentSummary {
+            id: agent_id,
+            parent_id: None,
+            name: "trace".to_string(),
+            status: AgentStatus::Completed,
+            container_id: None,
+            provider_id: "openai".to_string(),
+            provider_name: "OpenAI".to_string(),
+            model: "gpt-5.2".to_string(),
+            created_at: timestamp,
+            updated_at: timestamp,
+            current_turn: None,
+            last_error: None,
+            token_usage: TokenUsage::default(),
+        };
+        store.save_agent(&summary, None).await.expect("save agent");
+        store
+            .append_agent_history_item(
+                agent_id,
+                0,
+                &ModelInputItem::FunctionCall {
+                    call_id: "call_1".to_string(),
+                    name: "container_exec".to_string(),
+                    arguments: r#"{"command":"printf hello","cwd":"/workspace"}"#.to_string(),
+                },
+            )
+            .await
+            .expect("save call");
+        store
+            .append_agent_history_item(
+                agent_id,
+                1,
+                &ModelInputItem::FunctionCallOutput {
+                    call_id: "call_1".to_string(),
+                    output: r#"{"status":0,"stdout":"hello","stderr":""}"#.to_string(),
+                },
+            )
+            .await
+            .expect("save output");
+        store
+            .append_service_event(&ServiceEvent {
+                sequence: 9,
+                timestamp,
+                kind: ServiceEventKind::ToolCompleted {
+                    agent_id,
+                    turn_id,
+                    call_id: "call_1".to_string(),
+                    tool_name: "container_exec".to_string(),
+                    success: true,
+                    output_preview: "hello".to_string(),
+                    duration_ms: Some(27),
+                },
+            })
+            .await
+            .expect("save event");
+        drop(store);
+
+        let runtime = AgentRuntime::new(
+            DockerClient::new("unused"),
+            ResponsesClient::new(),
+            Arc::new(ConfigStore::open(&db_path).await.expect("reopen store")),
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+            },
+        )
+        .await
+        .expect("runtime");
+
+        let trace = runtime
+            .tool_trace(agent_id, "call_1".to_string())
+            .await
+            .expect("trace");
+        assert_eq!(trace.tool_name, "container_exec");
+        assert_eq!(trace.arguments["command"], "printf hello");
+        assert_eq!(trace.output, r#"{"status":0,"stdout":"hello","stderr":""}"#);
+        assert!(trace.success);
+        assert_eq!(trace.duration_ms, Some(27));
+    }
+
+    #[test]
+    fn tool_event_preview_redacts_sensitive_and_large_values() {
+        let value = json!({
+            "command": "echo ok",
+            "api_key": "secret",
+            "content_base64": "a".repeat(320),
+        });
+
+        let preview = trace_preview_value(&value, 1_000);
+
+        assert!(preview.contains("echo ok"));
+        assert!(preview.contains("<redacted>"));
+        assert!(!preview.contains("secret"));
+        assert!(!preview.contains(&"a".repeat(120)));
     }
 }
