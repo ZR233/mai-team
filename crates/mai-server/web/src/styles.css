@@ -570,6 +570,28 @@ p {
   gap: 8px;
 }
 
+.agent-model-editor {
+  flex-shrink: 0;
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(220px, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+  padding: 14px 24px;
+  border-bottom: 1px solid #d8e0ea;
+  background: #f8fafc;
+}
+
+.agent-model-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.agent-model-editor .dialog-error {
+  grid-column: 1 / -1;
+}
+
 .detail-strip {
   flex-shrink: 0;
   display: grid;
@@ -1589,6 +1611,18 @@ select:focus {
   }
 
   .agent-actions button {
+    flex: 1;
+  }
+
+  .agent-model-editor {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-model-actions {
+    justify-content: stretch;
+  }
+
+  .agent-model-actions button {
     flex: 1;
   }
 

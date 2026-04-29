@@ -20,7 +20,9 @@
       <label>
         <span>Model</span>
         <select v-model="dialog.model">
-          <option v-for="model in models" :key="model" :value="model">{{ model }}</option>
+          <option v-for="model in models" :key="model.id" :value="model.id">
+            {{ model.name || model.id }}
+          </option>
         </select>
       </label>
       <p v-if="dialog.error" class="dialog-error">{{ dialog.error }}</p>

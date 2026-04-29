@@ -7,6 +7,13 @@
       </div>
       <div class="form-grid">
         <label>
+          <span>Model Provider</span>
+          <select v-model="dialog.form.kind" @change="$emit('kind-changed', dialog.form.kind)">
+            <option value="openai">OpenAI</option>
+            <option value="deepseek">DeepSeek</option>
+          </select>
+        </label>
+        <label>
           <span>Provider ID</span>
           <input v-model.trim="dialog.form.id" placeholder="openai" />
         </label>
@@ -15,7 +22,7 @@
           <input v-model.trim="dialog.form.name" placeholder="OpenAI" />
         </label>
         <label class="span-2">
-          <span>OpenAI Base URL</span>
+          <span>Base URL</span>
           <input v-model.trim="dialog.form.base_url" placeholder="https://api.openai.com/v1" />
         </label>
         <label>
@@ -27,12 +34,20 @@
           />
         </label>
         <label>
+          <span>API Key Env</span>
+          <input v-model.trim="dialog.form.api_key_env" placeholder="OPENAI_API_KEY" />
+        </label>
+        <label>
           <span>Default Model</span>
           <input v-model.trim="dialog.form.default_model" placeholder="gpt-5.2" />
         </label>
         <label class="span-2">
-          <span>Models</span>
-          <textarea v-model="dialog.form.modelsText" rows="5" placeholder="One model per line" />
+          <span>Models JSON</span>
+          <textarea
+            v-model="dialog.form.modelsText"
+            rows="10"
+            placeholder='[{"id":"gpt-5.5","context_tokens":400000,"output_tokens":128000}]'
+          />
         </label>
         <label>
           <span>Enabled</span>
@@ -76,5 +91,5 @@ defineProps({
   dialog: { type: Object, required: true }
 })
 
-defineEmits(['close', 'save'])
+defineEmits(['close', 'save', 'kind-changed'])
 </script>

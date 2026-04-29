@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 pub type AgentId = Uuid;
@@ -118,6 +119,17 @@ pub struct CreateAgentResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateAgentRequest {
+    pub provider_id: Option<String>,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateAgentResponse {
+    pub agent: AgentSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageRequest {
     pub message: String,
     #[serde(default)]
@@ -156,50 +168,119 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    Openai,
+    Deepseek,
+}
+
+impl Default for ProviderKind {
+    fn default() -> Self {
+        Self::Openai
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelConfig {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub context_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default = "default_true")]
+    pub supports_tools: bool,
+    #[serde(default)]
+    pub supports_reasoning: bool,
+    #[serde(default)]
+    pub reasoning_efforts: Vec<ReasoningEffort>,
+    #[serde(default)]
+    pub default_reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub options: Value,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderConfig {
     pub id: String,
+    #[serde(default)]
+    pub kind: ProviderKind,
     pub name: String,
     pub base_url: String,
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
-    pub models: Vec<String>,
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub models: Vec<ModelConfig>,
     pub default_model: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderSummary {
     pub id: String,
+    pub kind: ProviderKind,
     pub name: String,
     pub base_url: String,
-    pub models: Vec<String>,
+    pub api_key_env: Option<String>,
+    pub models: Vec<ModelConfig>,
     pub default_model: String,
     pub enabled: bool,
     pub has_api_key: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProvidersResponse {
     pub providers: Vec<ProviderSummary>,
     pub default_provider_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProvidersConfigRequest {
     pub providers: Vec<ProviderConfig>,
     pub default_provider_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderPreset {
+    pub id: String,
+    pub kind: ProviderKind,
+    pub name: String,
+    pub base_url: String,
+    pub default_model: String,
+    pub models: Vec<ModelConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderPresetsResponse {
+    pub providers: Vec<ProviderPreset>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderSecret {
     pub id: String,
+    pub kind: ProviderKind,
     pub name: String,
     pub base_url: String,
     pub api_key: String,
-    pub models: Vec<String>,
+    pub api_key_env: Option<String>,
+    pub models: Vec<ModelConfig>,
     pub default_model: String,
     pub enabled: bool,
 }
@@ -221,6 +302,9 @@ pub enum ServiceEventKind {
     AgentStatusChanged {
         agent_id: AgentId,
         status: AgentStatus,
+    },
+    AgentUpdated {
+        agent: AgentSummary,
     },
     AgentDeleted {
         agent_id: AgentId,

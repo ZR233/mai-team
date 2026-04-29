@@ -3,7 +3,7 @@
     <div class="stage-title">
       <div>
         <h2>Providers</h2>
-        <p>Configure OpenAI-compatible endpoints and the model list offered to new agents.</p>
+        <p>Configure built-in provider presets and custom model metadata for new agents.</p>
       </div>
       <button class="primary-button" @click="$emit('add')">Add Provider</button>
     </div>
@@ -25,7 +25,7 @@
                 {{ provider.enabled ? 'Enabled' : 'Disabled' }}
               </span>
             </div>
-            <p class="mono">{{ provider.id }}</p>
+            <p class="mono">{{ provider.id }} · {{ provider.kind }}</p>
           </div>
         </div>
         <div class="provider-url">{{ provider.base_url }}</div>
@@ -33,17 +33,18 @@
           <span :class="provider.has_api_key ? 'good' : 'bad'">
             {{ provider.has_api_key ? 'API key set' : 'No API key' }}
           </span>
+          <span v-if="provider.api_key_env">Env: {{ provider.api_key_env }}</span>
           <span>{{ provider.models.length }} model{{ provider.models.length === 1 ? '' : 's' }}</span>
           <span>Default model: {{ provider.default_model }}</span>
         </div>
         <div class="model-chips">
           <span
             v-for="model in provider.models"
-            :key="model"
+            :key="model.id"
             class="model-chip"
-            :class="{ default: model === provider.default_model }"
+            :class="{ default: model.id === provider.default_model }"
           >
-            {{ model }}
+            {{ model.name || model.id }}
           </span>
           <span v-if="!provider.models.length" class="model-chip muted">No models</span>
         </div>

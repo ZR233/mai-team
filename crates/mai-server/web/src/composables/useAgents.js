@@ -66,6 +66,23 @@ export function useAgents() {
     return response.agent
   }
 
+  async function updateAgent(id, providerId, model) {
+    const response = await api(`/agents/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        provider_id: providerId || null,
+        model: model || null
+      })
+    })
+    selectedDetail.value = {
+      ...(selectedDetail.value || {}),
+      ...response.agent
+    }
+    await refreshAgents()
+    await refreshDetail()
+    return response.agent
+  }
+
   async function sendMessage(message) {
     if (!selectedAgentId.value || !message) return
     isSending.value = true
@@ -115,6 +132,7 @@ export function useAgents() {
     refreshDetail,
     selectAgent,
     createAgent,
+    updateAgent,
     sendMessage,
     cancelAgent,
     deleteAgent,

@@ -11,8 +11,9 @@ use mai_docker::DockerClient;
 use mai_model::ResponsesClient;
 use mai_protocol::{
     AgentId, CreateAgentRequest, CreateAgentResponse, ErrorResponse, FileUploadRequest,
-    FileUploadResponse, ProvidersConfigRequest, ProvidersResponse, SendMessageRequest,
-    SendMessageResponse, ServiceEvent, ToolTraceDetail,
+    FileUploadResponse, ProviderPresetsResponse, ProvidersConfigRequest, ProvidersResponse,
+    SendMessageRequest, SendMessageResponse, ServiceEvent, ToolTraceDetail, UpdateAgentRequest,
+    UpdateAgentResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
 use mai_store::ConfigStore;
@@ -103,10 +104,13 @@ async fn main() -> Result<()> {
     let api_key = env::var("OPENAI_API_KEY").ok();
     let base_url =
         env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5.2".to_string());
+    let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
     let db_path = env::var("MAI_DB_PATH")
         .map(PathBuf::from)
         .unwrap_or(ConfigStore::default_path()?);
+    let config_path = env::var("MAI_CONFIG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or(ConfigStore::default_config_path()?);
     let image = env::var("MAI_AGENT_BASE_IMAGE").unwrap_or_else(|_| "ubuntu:24.04".to_string());
     let bind = env::var("MAI_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let addr: SocketAddr = bind.parse().context("invalid MAI_BIND_ADDR")?;
@@ -115,16 +119,10 @@ async fn main() -> Result<()> {
     let docker_version = docker.check_available().await?;
     info!("docker available: {docker_version}");
 
-    let store = Arc::new(ConfigStore::open(db_path).await?);
+    let store = Arc::new(ConfigStore::open_with_config_path(db_path, config_path).await?);
     store
         .seed_default_provider_from_env(api_key, base_url, model)
         .await?;
-    if let Some(home) = dirs::home_dir() {
-        let legacy_path = home.join(".mai-team").join("config.toml");
-        if store.import_legacy_toml_once(legacy_path).await? {
-            info!("imported legacy MCP config into SQLite");
-        }
-    }
 
     let model = ResponsesClient::new();
     let runtime = AgentRuntime::new(
@@ -149,11 +147,15 @@ async fn main() -> Result<()> {
         .route("/", get(index))
         .route("/health", get(health))
         .route("/providers", get(get_providers).put(save_providers))
+        .route("/provider-presets", get(get_provider_presets))
         .route("/events", get(events))
         .route("/agents", get(list_agents).post(create_agent))
         .route(
             "/agents/{id}",
-            get(get_agent).delete(delete_agent).post(cancel_agent_colon),
+            get(get_agent)
+                .delete(delete_agent)
+                .patch(update_agent)
+                .post(cancel_agent_colon),
         )
         .route("/agents/{id}/messages", post(send_message))
         .route("/agents/{id}/tool-calls/{call_id}", get(get_tool_trace))
@@ -225,6 +227,12 @@ async fn save_providers(
     Ok(Json(state.store.providers_response().await?))
 }
 
+async fn get_provider_presets(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<ProviderPresetsResponse>, ApiError> {
+    Ok(Json(state.store.provider_presets_response()))
+}
+
 async fn list_agents(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<Vec<mai_protocol::AgentSummary>>, ApiError> {
@@ -244,6 +252,15 @@ async fn get_agent(
     Path(id): Path<AgentId>,
 ) -> std::result::Result<Json<mai_protocol::AgentDetail>, ApiError> {
     Ok(Json(state.runtime.get_agent(id).await?))
+}
+
+async fn update_agent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<AgentId>,
+    Json(request): Json<UpdateAgentRequest>,
+) -> std::result::Result<Json<UpdateAgentResponse>, ApiError> {
+    let agent = state.runtime.update_agent(id, request).await?;
+    Ok(Json(UpdateAgentResponse { agent }))
 }
 
 async fn send_message(
@@ -349,6 +366,7 @@ fn event_name(event: &ServiceEvent) -> &'static str {
     match &event.kind {
         mai_protocol::ServiceEventKind::AgentCreated { .. } => "agent_created",
         mai_protocol::ServiceEventKind::AgentStatusChanged { .. } => "agent_status_changed",
+        mai_protocol::ServiceEventKind::AgentUpdated { .. } => "agent_updated",
         mai_protocol::ServiceEventKind::AgentDeleted { .. } => "agent_deleted",
         mai_protocol::ServiceEventKind::TurnStarted { .. } => "turn_started",
         mai_protocol::ServiceEventKind::TurnCompleted { .. } => "turn_completed",

@@ -3,16 +3,21 @@ import { useApi } from './useApi'
 
 const providersState = reactive({
   providers: [],
-  default_provider_id: null
+  default_provider_id: null,
+  presets: []
 })
 
 export function useProviders() {
   const { api, showToast } = useApi()
 
   async function loadProviders() {
-    const response = await api('/providers')
-    providersState.providers = response.providers || []
-    providersState.default_provider_id = response.default_provider_id || null
+    const [providersResponse, presetsResponse] = await Promise.all([
+      api('/providers'),
+      api('/provider-presets')
+    ])
+    providersState.providers = providersResponse.providers || []
+    providersState.default_provider_id = providersResponse.default_provider_id || null
+    providersState.presets = presetsResponse.providers || []
   }
 
   async function saveProviders(providers, defaultProviderId) {
@@ -45,9 +50,11 @@ export function useProviders() {
   function emptyProviderForm() {
     return {
       id: '',
+      kind: 'openai',
       name: '',
       base_url: '',
       api_key: '',
+      api_key_env: '',
       default_model: '',
       modelsText: '',
       enabled: true,
@@ -56,38 +63,48 @@ export function useProviders() {
     }
   }
 
-  function nextProviderId() {
-    let index = providersState.providers.length + 1
-    let id = `provider-${index}`
-    while (providersState.providers.some((p) => p.id === id)) {
-      index += 1
-      id = `provider-${index}`
-    }
-    return id
+  function presetFor(kind) {
+    return providersState.presets.find((preset) => preset.kind === kind) || providersState.presets[0]
+  }
+
+  function fillFromPreset(kind) {
+    const preset = presetFor(kind)
+    if (!preset) return
+    providerDialog.form.kind = preset.kind
+    providerDialog.form.id = preset.id
+    providerDialog.form.name = preset.name
+    providerDialog.form.base_url = preset.base_url
+    providerDialog.form.api_key_env = preset.kind === 'openai' ? 'OPENAI_API_KEY' : 'DEEPSEEK_API_KEY'
+    providerDialog.form.default_model = preset.default_model
+    providerDialog.form.modelsText = JSON.stringify(preset.models || [], null, 2)
   }
 
   function openProviderDialog(index) {
     providerDialog.index = index
     providerDialog.error = ''
+    const preset = presetFor('openai')
     const provider =
       index === null
-        ? {
-            id: nextProviderId(),
-            name: 'New Provider',
+        ? preset || {
+            id: 'openai',
+            kind: 'openai',
+            name: 'OpenAI',
             base_url: 'https://api.openai.com/v1',
-            default_model: 'gpt-5.2',
-            models: ['gpt-5.2'],
+            default_model: 'gpt-5.5',
+            models: [],
             enabled: true,
             has_api_key: false
           }
         : providersState.providers[index]
     providerDialog.form = {
       id: provider.id || '',
+      kind: provider.kind || 'openai',
       name: provider.name || '',
       base_url: provider.base_url || '',
       api_key: '',
+      api_key_env: provider.api_key_env || (provider.kind === 'deepseek' ? 'DEEPSEEK_API_KEY' : 'OPENAI_API_KEY'),
       default_model: provider.default_model || '',
-      modelsText: (provider.models || []).join('\n'),
+      modelsText: JSON.stringify(provider.models || [], null, 2),
       enabled: provider.enabled !== false,
       default_provider: providersState.default_provider_id === provider.id,
       has_api_key: provider.has_api_key
@@ -102,22 +119,48 @@ export function useProviders() {
   async function saveProviderDialog() {
     providerDialog.error = ''
     const form = providerDialog.form
-    const models = form.modelsText
-      .split(/\n|,/)
-      .map((value) => value.trim())
-      .filter(Boolean)
+    let models = []
+    try {
+      models = JSON.parse(form.modelsText || '[]')
+    } catch {
+      providerDialog.error = 'Models must be valid JSON.'
+      return
+    }
+    if (!Array.isArray(models)) {
+      providerDialog.error = 'Models must be a JSON array.'
+      return
+    }
+    models = models.map((model) => ({
+      ...model,
+      id: String(model.id || '').trim(),
+      context_tokens: Number(model.context_tokens || 0),
+      output_tokens: Number(model.output_tokens || 0),
+      supports_tools: model.supports_tools !== false,
+      supports_reasoning: Boolean(model.supports_reasoning),
+      reasoning_efforts: Array.isArray(model.reasoning_efforts) ? model.reasoning_efforts : [],
+      default_reasoning_effort: model.default_reasoning_effort || null,
+      options: model.options || null,
+      headers: model.headers || {}
+    }))
     if (!form.id || !form.name || !form.base_url || !form.default_model) {
       providerDialog.error = 'Provider ID, display name, base URL, and default model are required.'
       return
     }
-    if (!models.includes(form.default_model)) {
-      models.unshift(form.default_model)
+    if (!models.length || models.some((model) => !model.id || !model.context_tokens || !model.output_tokens)) {
+      providerDialog.error = 'Every model needs id, context_tokens, and output_tokens.'
+      return
+    }
+    if (!models.some((model) => model.id === form.default_model)) {
+      providerDialog.error = 'Default model must exist in the model list.'
+      return
     }
     const provider = {
       id: form.id,
+      kind: form.kind,
       name: form.name,
       base_url: form.base_url,
       api_key: form.api_key,
+      api_key_env: form.api_key_env,
       default_model: form.default_model,
       models,
       enabled: form.enabled
@@ -138,8 +181,12 @@ export function useProviders() {
       : providersState.default_provider_id && nextProviders.some((item) => item.id === providersState.default_provider_id)
         ? providersState.default_provider_id
         : nextProviders[0]?.id || null
-    await saveProviders(nextProviders, defaultProviderId)
-    providerDialog.open = false
+    try {
+      await saveProviders(nextProviders, defaultProviderId)
+      providerDialog.open = false
+    } catch (error) {
+      providerDialog.error = error.message
+    }
   }
 
   return {
@@ -150,6 +197,7 @@ export function useProviders() {
     openProviderDialog,
     closeProviderDialog,
     saveProviderDialog,
+    fillFromPreset,
     showToast
   }
 }

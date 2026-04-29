@@ -48,10 +48,12 @@
           :draft="messageDraft"
           :loading="isDetailLoading"
           :sending="isSending"
+          :providers="providersState.providers"
           v-model:conversation-ref="conversationRef"
           @cancel="cancelAgent"
           @delete="confirmDeleteAgent"
           @send="onSendMessage"
+          @update-model="onUpdateAgentModel"
           @update:draft="messageDraft = $event"
         />
       </section>
@@ -70,6 +72,7 @@
       :dialog="providerDialog"
       @close="closeProviderDialog"
       @save="saveProviderDialog"
+      @kind-changed="fillFromPreset"
     />
 
     <AgentDialog
@@ -117,11 +120,12 @@ const {
   agents, selectedAgentId, selectedDetail, isLoading, isSending, isDetailLoading,
   conversationRef, agentDialog,
   refreshAgents, refreshDetail, selectAgent, createAgent, sendMessage, cancelAgent, deleteAgent,
-  scrollConversationToBottom
+  updateAgent, scrollConversationToBottom
 } = useAgents()
 const {
   providersState, providerDialog,
-  loadProviders, removeProvider, openProviderDialog, closeProviderDialog, saveProviderDialog
+  loadProviders, removeProvider, openProviderDialog, closeProviderDialog, saveProviderDialog,
+  fillFromPreset
 } = useProviders()
 
 const activeTab = ref('agents')
@@ -195,13 +199,13 @@ function openCreateAgentDialog() {
   agentDialog.open = true
   agentDialog.name = ''
   agentDialog.provider_id = defaultProvider?.id || ''
-  agentDialog.model = defaultProvider?.default_model || defaultProvider?.models?.[0] || ''
+  agentDialog.model = defaultProvider?.default_model || defaultProvider?.models?.[0]?.id || ''
   agentDialog.error = ''
 }
 
 function onAgentProviderChanged() {
   const provider = providersState.providers.find((p) => p.id === agentDialog.provider_id)
-  agentDialog.model = provider?.default_model || provider?.models?.[0] || ''
+  agentDialog.model = provider?.default_model || provider?.models?.[0]?.id || ''
 }
 
 async function onCreateAgent() {
@@ -219,6 +223,15 @@ async function onSendMessage(message) {
   try {
     messageDraft.value = ''
     await sendMessage(message)
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onUpdateAgentModel(payload) {
+  try {
+    await updateAgent(selectedDetail.value.id, payload.provider_id, payload.model)
+    showToast('Agent model updated.')
   } catch (error) {
     showToast(error.message)
   }

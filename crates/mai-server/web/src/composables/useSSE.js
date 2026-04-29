@@ -28,6 +28,7 @@ export function useSSE() {
     }
     const names = [
       'agent_created',
+      'agent_updated',
       'agent_status_changed',
       'agent_deleted',
       'turn_started',

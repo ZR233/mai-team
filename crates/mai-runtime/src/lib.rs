@@ -7,7 +7,7 @@ use mai_model::ResponsesClient;
 use mai_protocol::{
     AgentDetail, AgentId, AgentMessage, AgentStatus, AgentSummary, CreateAgentRequest, MessageRole,
     ModelInputItem, ModelOutputItem, ServiceEvent, ServiceEventKind, TokenUsage, ToolTraceDetail,
-    TurnId, TurnStatus, now, preview,
+    TurnId, TurnStatus, UpdateAgentRequest, now, preview,
 };
 use mai_skills::SkillsManager;
 use mai_store::ConfigStore;
@@ -156,7 +156,7 @@ impl AgentRuntime {
             container_id: None,
             provider_id: provider_selection.provider.id.clone(),
             provider_name: provider_selection.provider.name.clone(),
-            model: provider_selection.model.clone(),
+            model: provider_selection.model.id.clone(),
             created_at,
             updated_at: created_at,
             current_turn: None,
@@ -213,6 +213,41 @@ impl AgentRuntime {
         }
         summaries.sort_by_key(|s| s.created_at);
         summaries
+    }
+
+    pub async fn update_agent(
+        &self,
+        agent_id: AgentId,
+        request: UpdateAgentRequest,
+    ) -> Result<AgentSummary> {
+        let agent = self.agent(agent_id).await?;
+        {
+            let summary = agent.summary.read().await;
+            if !summary.status.can_start_turn() || summary.current_turn.is_some() {
+                return Err(RuntimeError::AgentBusy(agent_id));
+            }
+        }
+        let current = agent.summary.read().await.clone();
+        let provider_id = request
+            .provider_id
+            .as_deref()
+            .or(Some(&current.provider_id));
+        let model = request.model.as_deref().or(Some(&current.model));
+        let provider_selection = self.store.resolve_provider(provider_id, model).await?;
+        let updated = {
+            let mut summary = agent.summary.write().await;
+            summary.provider_id = provider_selection.provider.id.clone();
+            summary.provider_name = provider_selection.provider.name.clone();
+            summary.model = provider_selection.model.id.clone();
+            summary.updated_at = now();
+            summary.clone()
+        };
+        self.persist_agent(&agent).await?;
+        self.publish(ServiceEventKind::AgentUpdated {
+            agent: updated.clone(),
+        })
+        .await;
+        Ok(updated)
     }
 
     pub async fn cleanup_orphaned_containers(&self) -> Result<Vec<String>> {
@@ -512,8 +547,7 @@ impl AgentRuntime {
             let response = self
                 .model
                 .create_response(
-                    &provider_selection.provider.base_url,
-                    &provider_selection.provider.api_key,
+                    &provider_selection.provider,
                     &provider_selection.model,
                     &instructions,
                     &history,
@@ -1233,7 +1267,9 @@ fn extract_skill_mentions(text: &str) -> Vec<String> {
 
 fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
     match &event.kind {
-        ServiceEventKind::AgentCreated { agent } => Some(agent.id),
+        ServiceEventKind::AgentCreated { agent } | ServiceEventKind::AgentUpdated { agent } => {
+            Some(agent.id)
+        }
         ServiceEventKind::AgentStatusChanged { agent_id, .. }
         | ServiceEventKind::AgentDeleted { agent_id }
         | ServiceEventKind::TurnStarted { agent_id, .. }
@@ -1261,7 +1297,44 @@ General rules:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mai_protocol::{
+        ModelConfig, ProviderConfig, ProviderKind, ProvidersConfigRequest, ReasoningEffort,
+    };
     use tempfile::tempdir;
+
+    fn test_model(id: &str) -> ModelConfig {
+        ModelConfig {
+            id: id.to_string(),
+            name: Some(id.to_string()),
+            context_tokens: 400_000,
+            output_tokens: 128_000,
+            supports_tools: true,
+            supports_reasoning: true,
+            reasoning_efforts: vec![
+                ReasoningEffort::Minimal,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ],
+            default_reasoning_effort: Some(ReasoningEffort::Medium),
+            options: serde_json::Value::Null,
+            headers: Default::default(),
+        }
+    }
+
+    fn test_provider() -> ProviderConfig {
+        ProviderConfig {
+            id: "openai".to_string(),
+            kind: ProviderKind::Openai,
+            name: "OpenAI".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: Some("secret".to_string()),
+            api_key_env: Some("OPENAI_API_KEY".to_string()),
+            models: vec![test_model("gpt-5.5"), test_model("gpt-5.4")],
+            default_model: "gpt-5.5".to_string(),
+            enabled: true,
+        }
+    }
 
     #[test]
     fn extracts_skill_mentions() {
@@ -1281,7 +1354,10 @@ mod tests {
     async fn restores_persisted_agents_and_continues_event_sequence() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("runtime.sqlite3");
-        let store = ConfigStore::open(&db_path).await.expect("open store");
+        let config_path = dir.path().join("config.toml");
+        let store = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("open store");
         let agent_id = Uuid::new_v4();
         let turn_id = Uuid::new_v4();
         let timestamp = now();
@@ -1332,7 +1408,11 @@ mod tests {
             .expect("save event");
         drop(store);
 
-        let store = Arc::new(ConfigStore::open(&db_path).await.expect("reopen store"));
+        let store = Arc::new(
+            ConfigStore::open_with_config_path(&db_path, &config_path)
+                .await
+                .expect("reopen store"),
+        );
         let runtime = AgentRuntime::new(
             DockerClient::new("unused"),
             ResponsesClient::new(),
@@ -1372,7 +1452,10 @@ mod tests {
     async fn tool_trace_returns_full_history_with_event_metadata() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("runtime.sqlite3");
-        let store = ConfigStore::open(&db_path).await.expect("open store");
+        let config_path = dir.path().join("config.toml");
+        let store = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("open store");
         let agent_id = Uuid::new_v4();
         let turn_id = Uuid::new_v4();
         let timestamp = now();
@@ -1436,7 +1519,11 @@ mod tests {
         let runtime = AgentRuntime::new(
             DockerClient::new("unused"),
             ResponsesClient::new(),
-            Arc::new(ConfigStore::open(&db_path).await.expect("reopen store")),
+            Arc::new(
+                ConfigStore::open_with_config_path(&db_path, &config_path)
+                    .await
+                    .expect("reopen store"),
+            ),
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
             },
@@ -1453,6 +1540,149 @@ mod tests {
         assert_eq!(trace.output, r#"{"status":0,"stdout":"hello","stderr":""}"#);
         assert!(trace.success);
         assert_eq!(trace.duration_ms, Some(27));
+    }
+
+    #[tokio::test]
+    async fn update_agent_changes_model_persists_and_publishes() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = Arc::new(
+            ConfigStore::open_with_config_path(&db_path, &config_path)
+                .await
+                .expect("open store"),
+        );
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let agent_id = Uuid::new_v4();
+        let timestamp = now();
+        let summary = AgentSummary {
+            id: agent_id,
+            parent_id: None,
+            name: "model-switch".to_string(),
+            status: AgentStatus::Idle,
+            container_id: None,
+            provider_id: "openai".to_string(),
+            provider_name: "OpenAI".to_string(),
+            model: "gpt-5.5".to_string(),
+            created_at: timestamp,
+            updated_at: timestamp,
+            current_turn: None,
+            last_error: None,
+            token_usage: TokenUsage::default(),
+        };
+        store.save_agent(&summary, None).await.expect("save agent");
+        let runtime = AgentRuntime::new(
+            DockerClient::new("unused"),
+            ResponsesClient::new(),
+            Arc::clone(&store),
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+            },
+        )
+        .await
+        .expect("runtime");
+        let mut events = runtime.subscribe();
+
+        let updated = runtime
+            .update_agent(
+                agent_id,
+                UpdateAgentRequest {
+                    provider_id: None,
+                    model: Some("gpt-5.4".to_string()),
+                },
+            )
+            .await
+            .expect("update");
+
+        assert_eq!(updated.model, "gpt-5.4");
+        let event = events.recv().await.expect("event");
+        assert!(matches!(
+            event.kind,
+            ServiceEventKind::AgentUpdated { agent } if agent.id == agent_id && agent.model == "gpt-5.4"
+        ));
+        let snapshot = store.load_runtime_snapshot(10).await.expect("snapshot");
+        assert_eq!(snapshot.agents[0].summary.model, "gpt-5.4");
+    }
+
+    #[tokio::test]
+    async fn update_agent_rejects_busy_and_unknown_model() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = Arc::new(
+            ConfigStore::open_with_config_path(&db_path, &config_path)
+                .await
+                .expect("open store"),
+        );
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let agent_id = Uuid::new_v4();
+        let timestamp = now();
+        let summary = AgentSummary {
+            id: agent_id,
+            parent_id: None,
+            name: "busy".to_string(),
+            status: AgentStatus::Idle,
+            container_id: None,
+            provider_id: "openai".to_string(),
+            provider_name: "OpenAI".to_string(),
+            model: "gpt-5.5".to_string(),
+            created_at: timestamp,
+            updated_at: timestamp,
+            current_turn: None,
+            last_error: None,
+            token_usage: TokenUsage::default(),
+        };
+        store.save_agent(&summary, None).await.expect("save agent");
+        let runtime = AgentRuntime::new(
+            DockerClient::new("unused"),
+            ResponsesClient::new(),
+            store,
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+            },
+        )
+        .await
+        .expect("runtime");
+
+        let unknown = runtime
+            .update_agent(
+                agent_id,
+                UpdateAgentRequest {
+                    provider_id: None,
+                    model: Some("missing".to_string()),
+                },
+            )
+            .await;
+        assert!(matches!(unknown, Err(RuntimeError::Store(_))));
+
+        let agent = runtime.agent(agent_id).await.expect("agent");
+        {
+            let mut summary = agent.summary.write().await;
+            summary.status = AgentStatus::RunningTurn;
+            summary.current_turn = Some(Uuid::new_v4());
+        }
+        let busy = runtime
+            .update_agent(
+                agent_id,
+                UpdateAgentRequest {
+                    provider_id: None,
+                    model: Some("gpt-5.4".to_string()),
+                },
+            )
+            .await;
+        assert!(matches!(busy, Err(RuntimeError::AgentBusy(id)) if id == agent_id));
     }
 
     #[test]

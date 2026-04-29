@@ -13,9 +13,38 @@
         <p v-if="detail.last_error" class="error-text">{{ detail.last_error }}</p>
       </div>
       <div class="agent-actions">
+        <button class="ghost-button" :disabled="!providers.length || isModelChangeBusy" @click="openModelEditor">
+          Change Model
+        </button>
         <button class="ghost-button" @click="$emit('cancel', detail.id)">Cancel</button>
         <button class="danger-button" @click="$emit('delete', detail.id, detail.name)">Delete</button>
       </div>
+    </div>
+
+    <div v-if="modelEditor.open" class="agent-model-editor">
+      <label>
+        <span>Provider</span>
+        <select v-model="modelEditor.provider_id" @change="onModelProviderChanged">
+          <option v-for="provider in providers" :key="provider.id" :value="provider.id">
+            {{ provider.name }}
+          </option>
+        </select>
+      </label>
+      <label>
+        <span>Model</span>
+        <select v-model="modelEditor.model">
+          <option v-for="model in editorModels" :key="model.id" :value="model.id">
+            {{ model.name || model.id }}
+          </option>
+        </select>
+      </label>
+      <div class="agent-model-actions">
+        <button class="ghost-button" type="button" @click="modelEditor.open = false">Cancel</button>
+        <button class="primary-button" type="button" :disabled="!modelEditor.model" @click="saveModelEdit">
+          Save
+        </button>
+      </div>
+      <p v-if="modelEditor.error" class="dialog-error">{{ modelEditor.error }}</p>
     </div>
 
     <div class="detail-strip">
@@ -149,23 +178,37 @@ const props = defineProps({
   events: { type: Array, required: true },
   draft: { type: String, default: '' },
   loading: { type: Boolean, default: false },
-  sending: { type: Boolean, default: false }
+  sending: { type: Boolean, default: false },
+  providers: { type: Array, default: () => [] }
 })
 
 const conversationRef = defineModel('conversationRef', { default: null })
-const emit = defineEmits(['cancel', 'delete', 'send', 'update:draft'])
+const emit = defineEmits(['cancel', 'delete', 'send', 'update:draft', 'update-model'])
 const { api, showToast } = useApi()
 const expandedTools = reactive({})
 const traces = reactive({})
 const emptyTrace = { loading: false, error: '', detail: null }
+const modelEditor = reactive({
+  open: false,
+  provider_id: '',
+  model: '',
+  error: ''
+})
 
 const timelineItems = computed(() => buildAgentTimeline(props.detail, props.events))
+const editorProvider = computed(() => props.providers.find((provider) => provider.id === modelEditor.provider_id))
+const editorModels = computed(() => editorProvider.value?.models || [])
+const isModelChangeBusy = computed(() => {
+  const status = props.detail?.status
+  return status === 'running_turn' || status === 'waiting_tool' || status === 'starting_container'
+})
 
 watch(
   () => props.detail?.id,
   () => {
     for (const key of Object.keys(expandedTools)) delete expandedTools[key]
     for (const key of Object.keys(traces)) delete traces[key]
+    modelEditor.open = false
   }
 )
 
@@ -178,6 +221,29 @@ function handleEnter(event) {
 
 function send() {
   if (props.draft.trim()) emit('send', props.draft.trim())
+}
+
+function openModelEditor() {
+  modelEditor.open = true
+  modelEditor.provider_id = props.detail?.provider_id || props.providers[0]?.id || ''
+  modelEditor.model = props.detail?.model || editorProvider.value?.default_model || editorModels.value[0]?.id || ''
+  modelEditor.error = ''
+}
+
+function onModelProviderChanged() {
+  modelEditor.model = editorProvider.value?.default_model || editorModels.value[0]?.id || ''
+}
+
+function saveModelEdit() {
+  if (!modelEditor.provider_id || !modelEditor.model) {
+    modelEditor.error = 'Provider and model are required.'
+    return
+  }
+  emit('update-model', {
+    provider_id: modelEditor.provider_id,
+    model: modelEditor.model
+  })
+  modelEditor.open = false
 }
 
 function isToolExpanded(item) {

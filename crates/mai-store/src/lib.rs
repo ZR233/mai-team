@@ -1,11 +1,12 @@
 use chrono::{DateTime, Utc};
 use mai_protocol::{
-    AgentId, AgentMessage, AgentStatus, AgentSummary, McpServerConfig, MessageRole, ModelInputItem,
-    ProviderConfig, ProviderSecret, ProviderSummary, ProvidersConfigRequest, ProvidersResponse,
-    ServiceEvent, ServiceEventKind, TokenUsage, TurnId,
+    AgentId, AgentMessage, AgentStatus, AgentSummary, McpServerConfig, MessageRole, ModelConfig,
+    ModelInputItem, ProviderConfig, ProviderKind, ProviderPreset, ProviderPresetsResponse,
+    ProviderSecret, ProviderSummary, ProvidersConfigRequest, ProvidersResponse, ReasoningEffort,
+    ServiceEvent, ServiceEventKind, TokenUsage, TurnId, default_true,
 };
-use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use toasty::Db;
@@ -29,6 +30,8 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("toml error: {0}")]
     Toml(#[from] toml::de::Error),
+    #[error("toml serialize error: {0}")]
+    TomlSer(#[from] toml::ser::Error),
     #[error("time parse error: {0}")]
     Time(#[from] chrono::ParseError),
     #[error("invalid config: {0}")]
@@ -39,13 +42,14 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 
 pub struct ConfigStore {
     path: PathBuf,
+    config_path: PathBuf,
     db: Db,
 }
 
 #[derive(Debug, Clone)]
 pub struct ProviderSelection {
     pub provider: ProviderSecret,
-    pub model: String,
+    pub model: ModelConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +71,53 @@ pub struct RuntimeSnapshot {
 struct LegacyMcpFileConfig {
     #[serde(default)]
     mcp_servers: BTreeMap<String, McpServerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ProvidersToml {
+    #[serde(default)]
+    default_provider_id: Option<String>,
+    #[serde(default)]
+    providers: BTreeMap<String, ProviderToml>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderToml {
+    kind: ProviderKind,
+    name: String,
+    base_url: String,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    default_model: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    models: BTreeMap<String, ModelToml>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelToml {
+    #[serde(default)]
+    name: Option<String>,
+    context_tokens: u64,
+    output_tokens: u64,
+    #[serde(default = "default_true")]
+    supports_tools: bool,
+    #[serde(default)]
+    supports_reasoning: bool,
+    #[serde(default)]
+    reasoning_efforts: Vec<ReasoningEffort>,
+    #[serde(default)]
+    default_reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "is_null")]
+    options: serde_json::Value,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    headers: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, toasty::Model)]
@@ -182,8 +233,19 @@ struct ServiceEventRecord {
 
 impl ConfigStore {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_config_path(path, Self::default_config_path()?).await
+    }
+
+    pub async fn open_with_config_path(
+        path: impl AsRef<Path>,
+        config_path: impl AsRef<Path>,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let config_path = config_path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
@@ -212,7 +274,13 @@ impl ConfigStore {
             set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
         }
 
-        Ok(Self { path, db })
+        let store = Self {
+            path,
+            config_path,
+            db,
+        };
+        store.clear_legacy_provider_storage().await?;
+        Ok(store)
     }
 
     pub fn default_path() -> Result<PathBuf> {
@@ -221,8 +289,21 @@ impl ConfigStore {
         Ok(home.join(".mai-team").join("mai-team.sqlite3"))
     }
 
+    pub fn default_config_path() -> Result<PathBuf> {
+        if let Ok(path) = std::env::var("MAI_CONFIG_PATH") {
+            return Ok(PathBuf::from(path));
+        }
+        let home = dirs::home_dir()
+            .ok_or_else(|| StoreError::InvalidConfig("home directory not found".to_string()))?;
+        Ok(home.join(".mai-team").join("config.toml"))
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
     }
 
     pub async fn migrate(&self) -> Result<()> {
@@ -241,109 +322,100 @@ impl ConfigStore {
         let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) else {
             return Ok(());
         };
+        let mut provider = builtin_provider(ProviderKind::Openai);
+        provider.base_url = base_url;
+        provider.api_key = Some(api_key);
+        if provider.models.iter().all(|item| item.id != model) {
+            provider.models.insert(0, fallback_model(&model));
+        }
+        provider.default_model = model;
         self.save_providers(ProvidersConfigRequest {
             default_provider_id: Some("openai".to_string()),
-            providers: vec![ProviderConfig {
-                id: "openai".to_string(),
-                name: "OpenAI".to_string(),
-                base_url,
-                api_key: Some(api_key),
-                models: vec![model.clone()],
-                default_model: model,
-                enabled: true,
-            }],
+            providers: vec![provider],
         })
         .await
     }
 
     pub async fn provider_count(&self) -> Result<usize> {
-        let mut db = self.db.clone();
-        let count = Query::<List<ProviderRecord>>::all()
-            .count()
-            .exec(&mut db)
-            .await?;
-        Ok(count as usize)
+        Ok(self.load_providers_toml()?.providers.len())
+    }
+
+    pub fn provider_presets_response(&self) -> ProviderPresetsResponse {
+        ProviderPresetsResponse {
+            providers: vec![
+                provider_preset(ProviderKind::Openai),
+                provider_preset(ProviderKind::Deepseek),
+            ],
+        }
     }
 
     pub async fn providers_response(&self) -> Result<ProvidersResponse> {
         let providers = self.list_provider_secrets().await?;
-        let default_provider_id = self.get_setting(SETTING_DEFAULT_PROVIDER_ID).await?;
+        let file = self.load_providers_toml()?;
         Ok(ProvidersResponse {
             providers: providers
                 .into_iter()
                 .map(|provider| ProviderSummary {
                     id: provider.id,
+                    kind: provider.kind,
                     name: provider.name,
                     base_url: provider.base_url,
+                    api_key_env: provider.api_key_env,
                     models: provider.models,
                     default_model: provider.default_model,
                     enabled: provider.enabled,
                     has_api_key: !provider.api_key.is_empty(),
                 })
                 .collect(),
-            default_provider_id,
+            default_provider_id: file.default_provider_id,
         })
     }
 
     pub async fn save_providers(&self, request: ProvidersConfigRequest) -> Result<()> {
         validate_provider_request(&request)?;
-        let existing_keys = self.existing_provider_keys().await?;
-        let mut db = self.db.clone();
-        let mut tx = db.transaction().await?;
-
-        Query::<List<ProviderModelRecord>>::all()
-            .delete()
-            .exec(&mut tx)
-            .await?;
-        Query::<List<ProviderRecord>>::all()
-            .delete()
-            .exec(&mut tx)
-            .await?;
-
-        for (index, provider) in request.providers.iter().enumerate() {
-            let provider_id = provider.id.trim().to_string();
+        let existing = self
+            .load_providers_toml()
+            .unwrap_or_else(|_| ProvidersToml::default());
+        let mut file = ProvidersToml::default();
+        for provider in &request.providers {
+            let provider_id = normalized_id(&provider.id);
+            let existing_provider = existing.providers.get(&provider_id);
             let api_key = provider
                 .api_key
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
                 .map(str::to_string)
-                .or_else(|| existing_keys.get(&provider_id).cloned())
-                .unwrap_or_default();
-            let models = normalized_models(provider);
-            let default_model = normalized_default_model(provider, &models);
-            toasty::create!(ProviderRecord {
-                id: provider_id.clone(),
-                name: provider.name.trim().to_string(),
-                base_url: provider.base_url.trim().to_string(),
-                api_key,
-                default_model,
-                enabled: provider.enabled,
-                sort_order: index as i64,
-            })
-            .exec(&mut tx)
-            .await?;
-
-            for (model_index, model) in models.iter().enumerate() {
-                toasty::create!(ProviderModelRecord {
-                    id: child_id(&provider_id, model),
-                    provider_id: provider_id.clone(),
-                    model: model.clone(),
-                    sort_order: model_index as i64,
-                })
-                .exec(&mut tx)
-                .await?;
+                .or_else(|| existing_provider.and_then(|item| item.api_key.clone()));
+            let mut models = BTreeMap::new();
+            for model in normalized_models(provider) {
+                models.insert(model.id.clone(), ModelToml::from_model(model));
             }
+            file.providers.insert(
+                provider_id,
+                ProviderToml {
+                    kind: provider.kind,
+                    name: provider.name.trim().to_string(),
+                    base_url: provider.base_url.trim().to_string(),
+                    api_key,
+                    api_key_env: provider
+                        .api_key_env
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                        .map(str::to_string),
+                    default_model: provider.default_model.trim().to_string(),
+                    enabled: provider.enabled,
+                    models,
+                },
+            );
         }
 
         if let Some(default_provider_id) = request.default_provider_id.as_deref() {
-            set_setting_in_tx(&mut tx, SETTING_DEFAULT_PROVIDER_ID, default_provider_id).await?;
+            file.default_provider_id = Some(default_provider_id.trim().to_string());
         } else if let Some(first) = request.providers.first() {
-            set_setting_in_tx(&mut tx, SETTING_DEFAULT_PROVIDER_ID, first.id.trim()).await?;
-        } else {
-            delete_setting_in_tx(&mut tx, SETTING_DEFAULT_PROVIDER_ID).await?;
+            file.default_provider_id = Some(first.id.trim().to_string());
         }
 
-        tx.commit().await?;
+        self.write_providers_toml(&file)?;
         Ok(())
     }
 
@@ -375,14 +447,24 @@ impl ConfigStore {
                 provider.id
             )));
         }
-        let selected_model = model
+        let selected_model_id = model
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| provider.default_model.clone());
-        if !provider.models.is_empty() && !provider.models.contains(&selected_model) {
+        let selected_model = provider
+            .models
+            .iter()
+            .find(|item| item.id == selected_model_id)
+            .cloned()
+            .ok_or_else(|| {
+                StoreError::InvalidConfig(format!(
+                    "model `{selected_model_id}` is not configured for provider `{}`",
+                    provider.id
+                ))
+            })?;
+        if selected_model.context_tokens == 0 || selected_model.output_tokens == 0 {
             return Err(StoreError::InvalidConfig(format!(
-                "model `{selected_model}` is not configured for provider `{}`",
-                provider.id
+                "model `{selected_model_id}` must configure context_tokens and output_tokens"
             )));
         }
         Ok(ProviderSelection {
@@ -401,7 +483,7 @@ impl ConfigStore {
         if providers.is_empty() {
             return Ok(None);
         }
-        if let Some(default_provider_id) = self.get_setting(SETTING_DEFAULT_PROVIDER_ID).await?
+        if let Some(default_provider_id) = self.load_providers_toml()?.default_provider_id
             && let Some(provider) = providers
                 .iter()
                 .find(|provider| provider.id == default_provider_id && provider.enabled)
@@ -412,27 +494,71 @@ impl ConfigStore {
     }
 
     pub async fn list_provider_secrets(&self) -> Result<Vec<ProviderSecret>> {
-        let mut db = self.db.clone();
-        let mut providers = Query::<List<ProviderRecord>>::all().exec(&mut db).await?;
-        providers.sort_by(|left, right| {
-            left.sort_order
-                .cmp(&right.sort_order)
-                .then_with(|| left.name.cmp(&right.name))
-        });
-
-        let mut out = Vec::with_capacity(providers.len());
-        for provider in providers {
+        let file = self.load_providers_toml()?;
+        let mut out = Vec::with_capacity(file.providers.len());
+        for (id, provider) in file.providers {
             out.push(ProviderSecret {
-                models: self.load_models(&provider.id).await?,
-                id: provider.id,
+                models: provider
+                    .models
+                    .into_iter()
+                    .map(|(id, model)| model.into_model(id))
+                    .collect(),
+                id,
+                kind: provider.kind,
                 name: provider.name,
                 base_url: provider.base_url,
-                api_key: provider.api_key,
+                api_key: resolve_api_key(provider.api_key, provider.api_key_env.as_deref()),
+                api_key_env: provider.api_key_env,
                 default_model: provider.default_model,
                 enabled: provider.enabled,
             });
         }
         Ok(out)
+    }
+
+    fn load_providers_toml(&self) -> Result<ProvidersToml> {
+        if !self.config_path.exists() {
+            return Ok(ProvidersToml::default());
+        }
+        let text = match std::fs::read_to_string(&self.config_path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ProvidersToml::default());
+            }
+            Err(err) => return Err(err.into()),
+        };
+        match toml::from_str::<ProvidersToml>(&text) {
+            Ok(file) => Ok(file),
+            Err(_) => {
+                let _ = std::fs::remove_file(&self.config_path);
+                Ok(ProvidersToml::default())
+            }
+        }
+    }
+
+    fn write_providers_toml(&self, file: &ProvidersToml) -> Result<()> {
+        if let Some(parent) = self.config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = toml::to_string_pretty(file)?;
+        std::fs::write(&self.config_path, text)?;
+        Ok(())
+    }
+
+    async fn clear_legacy_provider_storage(&self) -> Result<()> {
+        let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
+        Query::<List<ProviderModelRecord>>::all()
+            .delete()
+            .exec(&mut tx)
+            .await?;
+        Query::<List<ProviderRecord>>::all()
+            .delete()
+            .exec(&mut tx)
+            .await?;
+        delete_setting_in_tx(&mut tx, SETTING_DEFAULT_PROVIDER_ID).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn list_mcp_servers(&self) -> Result<BTreeMap<String, McpServerConfig>> {
@@ -696,31 +822,6 @@ impl ConfigStore {
         })
     }
 
-    async fn existing_provider_keys(&self) -> Result<HashMap<String, String>> {
-        let providers = self.list_provider_secrets().await?;
-        Ok(providers
-            .into_iter()
-            .map(|provider| (provider.id, provider.api_key))
-            .collect())
-    }
-
-    async fn load_models(&self, provider_id: &str) -> Result<Vec<String>> {
-        let mut db = self.db.clone();
-        let mut models = Query::<List<ProviderModelRecord>>::filter(
-            ProviderModelRecord::fields()
-                .provider_id()
-                .eq(provider_id.to_string()),
-        )
-        .exec(&mut db)
-        .await?;
-        models.sort_by(|left, right| {
-            left.sort_order
-                .cmp(&right.sort_order)
-                .then_with(|| left.model.cmp(&right.model))
-        });
-        Ok(models.into_iter().map(|row| row.model).collect())
-    }
-
     async fn load_mcp_env(&self, server_name: &str) -> Result<BTreeMap<String, String>> {
         let mut db = self.db.clone();
         let mut env = Query::<List<McpServerEnvRecord>>::filter(
@@ -870,6 +971,181 @@ async fn delete_agent_row_in_tx(tx: &mut toasty::Transaction<'_>, agent_id: Agen
     Ok(())
 }
 
+impl ModelToml {
+    fn from_model(model: ModelConfig) -> Self {
+        Self {
+            name: model.name,
+            context_tokens: model.context_tokens,
+            output_tokens: model.output_tokens,
+            supports_tools: model.supports_tools,
+            supports_reasoning: model.supports_reasoning,
+            reasoning_efforts: model.reasoning_efforts,
+            default_reasoning_effort: model.default_reasoning_effort,
+            options: model.options,
+            headers: model.headers,
+        }
+    }
+
+    fn into_model(self, id: String) -> ModelConfig {
+        ModelConfig {
+            id,
+            name: self.name,
+            context_tokens: self.context_tokens,
+            output_tokens: self.output_tokens,
+            supports_tools: self.supports_tools,
+            supports_reasoning: self.supports_reasoning,
+            reasoning_efforts: self.reasoning_efforts,
+            default_reasoning_effort: self.default_reasoning_effort,
+            options: self.options,
+            headers: self.headers,
+        }
+    }
+}
+
+fn provider_preset(kind: ProviderKind) -> ProviderPreset {
+    let provider = builtin_provider(kind);
+    ProviderPreset {
+        id: provider.id,
+        kind: provider.kind,
+        name: provider.name,
+        base_url: provider.base_url,
+        default_model: provider.default_model,
+        models: provider.models,
+    }
+}
+
+fn builtin_provider(kind: ProviderKind) -> ProviderConfig {
+    match kind {
+        ProviderKind::Openai => ProviderConfig {
+            id: "openai".to_string(),
+            kind,
+            name: "OpenAI".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: None,
+            api_key_env: Some("OPENAI_API_KEY".to_string()),
+            default_model: "gpt-5.5".to_string(),
+            enabled: true,
+            models: vec![
+                openai_reasoning_model("gpt-5.5", 400_000, 128_000),
+                openai_reasoning_model("gpt-5.4", 400_000, 128_000),
+                openai_reasoning_model("gpt-5.4-mini", 400_000, 128_000),
+                openai_reasoning_model("gpt-5.4-nano", 400_000, 128_000),
+                openai_reasoning_model("gpt-5", 400_000, 128_000),
+                ModelConfig {
+                    id: "gpt-4.1".to_string(),
+                    name: Some("GPT-4.1".to_string()),
+                    context_tokens: 1_047_576,
+                    output_tokens: 32_768,
+                    supports_tools: true,
+                    supports_reasoning: false,
+                    reasoning_efforts: Vec::new(),
+                    default_reasoning_effort: None,
+                    options: serde_json::Value::Null,
+                    headers: BTreeMap::new(),
+                },
+            ],
+        },
+        ProviderKind::Deepseek => ProviderConfig {
+            id: "deepseek".to_string(),
+            kind,
+            name: "DeepSeek".to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            api_key: None,
+            api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
+            default_model: "deepseek-v4-flash".to_string(),
+            enabled: true,
+            models: vec![
+                deepseek_model("deepseek-v4-flash", false),
+                deepseek_model("deepseek-v4-pro", false),
+                deepseek_model("deepseek-chat", false),
+                deepseek_model("deepseek-reasoner", true),
+            ],
+        },
+    }
+}
+
+fn openai_reasoning_model(id: &str, context_tokens: u64, output_tokens: u64) -> ModelConfig {
+    let mut efforts = vec![
+        ReasoningEffort::Minimal,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+    ];
+    if id.contains("5.4") || id.contains("5.5") {
+        efforts.push(ReasoningEffort::Xhigh);
+    }
+    ModelConfig {
+        id: id.to_string(),
+        name: Some(id.to_string()),
+        context_tokens,
+        output_tokens,
+        supports_tools: true,
+        supports_reasoning: true,
+        reasoning_efforts: efforts,
+        default_reasoning_effort: Some(ReasoningEffort::Medium),
+        options: serde_json::Value::Null,
+        headers: BTreeMap::new(),
+    }
+}
+
+fn deepseek_model(id: &str, supports_reasoning: bool) -> ModelConfig {
+    ModelConfig {
+        id: id.to_string(),
+        name: Some(id.to_string()),
+        context_tokens: 128_000,
+        output_tokens: 8_192,
+        supports_tools: true,
+        supports_reasoning,
+        reasoning_efforts: supports_reasoning
+            .then(|| {
+                vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                ]
+            })
+            .unwrap_or_default(),
+        default_reasoning_effort: supports_reasoning.then_some(ReasoningEffort::Medium),
+        options: serde_json::Value::Null,
+        headers: BTreeMap::new(),
+    }
+}
+
+fn fallback_model(id: &str) -> ModelConfig {
+    ModelConfig {
+        id: id.to_string(),
+        name: Some(id.to_string()),
+        context_tokens: 128_000,
+        output_tokens: 8_192,
+        supports_tools: true,
+        supports_reasoning: false,
+        reasoning_efforts: Vec::new(),
+        default_reasoning_effort: None,
+        options: serde_json::Value::Null,
+        headers: BTreeMap::new(),
+    }
+}
+
+fn resolve_api_key(api_key: Option<String>, api_key_env: Option<&str>) -> String {
+    api_key
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            api_key_env
+                .filter(|name| !name.trim().is_empty())
+                .and_then(|name| std::env::var(name).ok())
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_default()
+}
+
+fn normalized_id(value: &str) -> String {
+    value.trim().to_string()
+}
+
+fn is_null(value: &serde_json::Value) -> bool {
+    value.is_null()
+}
+
 fn validate_provider_request(request: &ProvidersConfigRequest) -> Result<()> {
     let mut ids = BTreeSet::new();
     for provider in &request.providers {
@@ -891,12 +1167,42 @@ fn validate_provider_request(request: &ProvidersConfigRequest) -> Result<()> {
             )));
         }
         let models = normalized_models(provider);
-        let default_model = normalized_default_model(provider, &models);
+        let default_model = provider.default_model.trim();
         if default_model.is_empty() {
             return Err(StoreError::InvalidConfig(format!(
                 "provider `{}` default_model is required",
                 provider.id
             )));
+        }
+        if !models.iter().any(|model| model.id == default_model) {
+            return Err(StoreError::InvalidConfig(format!(
+                "provider `{}` default_model `{default_model}` is not in models",
+                provider.id
+            )));
+        }
+        for model in &models {
+            if model.context_tokens == 0 || model.output_tokens == 0 {
+                return Err(StoreError::InvalidConfig(format!(
+                    "model `{}` must configure context_tokens and output_tokens",
+                    model.id
+                )));
+            }
+            if model.supports_reasoning {
+                if model.reasoning_efforts.is_empty() {
+                    return Err(StoreError::InvalidConfig(format!(
+                        "reasoning model `{}` must configure reasoning_efforts",
+                        model.id
+                    )));
+                }
+                if let Some(default_effort) = model.default_reasoning_effort
+                    && !model.reasoning_efforts.contains(&default_effort)
+                {
+                    return Err(StoreError::InvalidConfig(format!(
+                        "model `{}` default_reasoning_effort is not in reasoning_efforts",
+                        model.id
+                    )));
+                }
+            }
         }
         if !ids.insert(provider.id.trim().to_string()) {
             return Err(StoreError::InvalidConfig(format!(
@@ -916,28 +1222,16 @@ fn validate_provider_request(request: &ProvidersConfigRequest) -> Result<()> {
     Ok(())
 }
 
-fn normalized_models(provider: &ProviderConfig) -> Vec<String> {
+fn normalized_models(provider: &ProviderConfig) -> Vec<ModelConfig> {
     let mut seen = BTreeSet::new();
     let mut models = Vec::new();
-    for model in &provider.models {
-        let model = model.trim();
-        if !model.is_empty() && seen.insert(model.to_string()) {
-            models.push(model.to_string());
+    for model in provider.models.iter().cloned() {
+        let id = model.id.trim().to_string();
+        if !id.is_empty() && seen.insert(id.clone()) {
+            models.push(ModelConfig { id, ..model });
         }
     }
-    let default_model = provider.default_model.trim();
-    if !default_model.is_empty() && seen.insert(default_model.to_string()) {
-        models.insert(0, default_model.to_string());
-    }
     models
-}
-
-fn normalized_default_model(provider: &ProviderConfig, models: &[String]) -> String {
-    if !provider.default_model.trim().is_empty() {
-        provider.default_model.trim().to_string()
-    } else {
-        models.first().cloned().unwrap_or_default()
-    }
 }
 
 fn child_id(parent: &str, child: &str) -> String {
@@ -1022,7 +1316,9 @@ fn i64_to_u64(value: i64) -> u64 {
 
 fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
     match &event.kind {
-        ServiceEventKind::AgentCreated { agent } => Some(agent.id),
+        ServiceEventKind::AgentCreated { agent } | ServiceEventKind::AgentUpdated { agent } => {
+            Some(agent.id)
+        }
         ServiceEventKind::AgentStatusChanged { agent_id, .. }
         | ServiceEventKind::AgentDeleted { agent_id }
         | ServiceEventKind::TurnStarted { agent_id, .. }
@@ -1038,25 +1334,51 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
 mod tests {
     use super::*;
     use mai_protocol::{AgentStatus, MessageRole, ModelContentItem, ServiceEventKind};
+    use serde_json::json;
     use tempfile::{TempDir, tempdir};
 
     async fn store() -> (TempDir, ConfigStore) {
         let dir = tempdir().expect("tempdir");
-        let store = ConfigStore::open(dir.path().join("config.sqlite3"))
-            .await
-            .expect("open store");
+        let store = ConfigStore::open_with_config_path(
+            dir.path().join("config.sqlite3"),
+            dir.path().join("config.toml"),
+        )
+        .await
+        .expect("open store");
         (dir, store)
     }
 
     fn provider(api_key: Option<&str>) -> ProviderConfig {
         ProviderConfig {
             id: "openai".to_string(),
+            kind: ProviderKind::Openai,
             name: "OpenAI".to_string(),
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: api_key.map(str::to_string),
-            models: vec!["gpt-5.2".to_string(), "gpt-5.1".to_string()],
-            default_model: "gpt-5.2".to_string(),
+            api_key_env: Some("OPENAI_API_KEY".to_string()),
+            models: vec![test_model("gpt-5.5"), test_model("gpt-5.4")],
+            default_model: "gpt-5.5".to_string(),
             enabled: true,
+        }
+    }
+
+    fn test_model(id: &str) -> ModelConfig {
+        ModelConfig {
+            id: id.to_string(),
+            name: Some(id.to_string()),
+            context_tokens: 400_000,
+            output_tokens: 128_000,
+            supports_tools: true,
+            supports_reasoning: true,
+            reasoning_efforts: vec![
+                ReasoningEffort::Minimal,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ],
+            default_reasoning_effort: Some(ReasoningEffort::Medium),
+            options: serde_json::Value::Null,
+            headers: BTreeMap::new(),
         }
     }
 
@@ -1065,9 +1387,12 @@ mod tests {
         let (dir, store) = store().await;
         store.migrate().await.expect("migrate twice");
         drop(store);
-        ConfigStore::open(dir.path().join("config.sqlite3"))
-            .await
-            .expect("reopen existing store");
+        ConfigStore::open_with_config_path(
+            dir.path().join("config.sqlite3"),
+            dir.path().join("config.toml"),
+        )
+        .await
+        .expect("reopen existing store");
     }
 
     #[tokio::test]
@@ -1091,11 +1416,11 @@ mod tests {
         let response = store.providers_response().await.expect("providers");
         assert!(response.providers[0].has_api_key);
         let resolved = store
-            .resolve_provider(Some("openai"), Some("gpt-5.1"))
+            .resolve_provider(Some("openai"), Some("gpt-5.4"))
             .await
             .expect("resolve");
         assert_eq!(resolved.provider.api_key, "secret");
-        assert_eq!(resolved.model, "gpt-5.1");
+        assert_eq!(resolved.model.id, "gpt-5.4");
     }
 
     #[tokio::test]
@@ -1117,6 +1442,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_presets_include_builtin_metadata() {
+        let (_dir, store) = store().await;
+        let presets = store.provider_presets_response();
+        let openai = presets
+            .providers
+            .iter()
+            .find(|provider| provider.kind == ProviderKind::Openai)
+            .expect("openai preset");
+        let deepseek = presets
+            .providers
+            .iter()
+            .find(|provider| provider.kind == ProviderKind::Deepseek)
+            .expect("deepseek preset");
+        assert_eq!(openai.default_model, "gpt-5.5");
+        assert!(openai.models.iter().any(|model| model.id == "gpt-5.4-mini"));
+        assert_eq!(deepseek.default_model, "deepseek-v4-flash");
+        assert!(
+            deepseek
+                .models
+                .iter()
+                .any(|model| model.id == "deepseek-reasoner")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_toml_preserves_custom_model_metadata() {
+        let (_dir, store) = store().await;
+        let mut provider = provider(Some("secret"));
+        let mut custom = test_model("custom-chat");
+        custom.context_tokens = 123_456;
+        custom.output_tokens = 4_096;
+        custom.supports_tools = false;
+        custom.supports_reasoning = false;
+        custom.reasoning_efforts = Vec::new();
+        custom.default_reasoning_effort = None;
+        custom.options = json!({ "temperature": 0.2 });
+        custom
+            .headers
+            .insert("X-Test-Model".to_string(), "custom".to_string());
+        provider.models.push(custom);
+        provider.default_model = "custom-chat".to_string();
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![provider],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save");
+
+        let response = store.providers_response().await.expect("providers");
+        let model = response.providers[0]
+            .models
+            .iter()
+            .find(|model| model.id == "custom-chat")
+            .expect("custom model");
+        assert_eq!(model.context_tokens, 123_456);
+        assert!(!model.supports_tools);
+        assert_eq!(model.options["temperature"], json!(0.2));
+        assert_eq!(model.headers["X-Test-Model"], "custom");
+    }
+
+    #[tokio::test]
+    async fn old_provider_toml_schema_is_cleaned() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+                [mcp_servers.demo]
+                command = "demo-mcp"
+            "#,
+        )
+        .expect("write old config");
+        let store =
+            ConfigStore::open_with_config_path(dir.path().join("config.sqlite3"), &config_path)
+                .await
+                .expect("open");
+
+        assert_eq!(store.provider_count().await.expect("count"), 0);
+        assert!(!config_path.exists());
+    }
+
+    #[tokio::test]
     async fn imports_legacy_mcp_config_once() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
@@ -1133,9 +1541,12 @@ mod tests {
             "#,
         )
         .expect("write legacy");
-        let store = ConfigStore::open(dir.path().join("config.sqlite3"))
-            .await
-            .expect("open");
+        let store = ConfigStore::open_with_config_path(
+            dir.path().join("config.sqlite3"),
+            dir.path().join("providers.toml"),
+        )
+        .await
+        .expect("open");
         assert!(store.import_legacy_toml_once(&path).await.expect("import"));
         assert!(!store.import_legacy_toml_once(&path).await.expect("skip"));
         let servers = store.list_mcp_servers().await.expect("servers");
@@ -1147,7 +1558,9 @@ mod tests {
     async fn runtime_snapshot_survives_reopen() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("config.sqlite3");
-        let store = ConfigStore::open(&db_path).await.expect("open");
+        let store = ConfigStore::open_with_config_path(&db_path, dir.path().join("config.toml"))
+            .await
+            .expect("open");
         let agent_id = Uuid::new_v4();
         let turn_id = Uuid::new_v4();
         let now = Utc::now();
@@ -1207,7 +1620,9 @@ mod tests {
         store.append_service_event(&event).await.expect("event");
         drop(store);
 
-        let reopened = ConfigStore::open(&db_path).await.expect("reopen");
+        let reopened = ConfigStore::open_with_config_path(&db_path, dir.path().join("config.toml"))
+            .await
+            .expect("reopen");
         let snapshot = reopened.load_runtime_snapshot(500).await.expect("snapshot");
         assert_eq!(snapshot.next_sequence, 8);
         assert_eq!(snapshot.agents.len(), 1);
@@ -1223,7 +1638,9 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.sqlite3");
         std::fs::write(&path, b"not sqlite").expect("write invalid old db");
-        let store = ConfigStore::open(&path).await.expect("rebuild");
+        let store = ConfigStore::open_with_config_path(&path, dir.path().join("config.toml"))
+            .await
+            .expect("rebuild");
         assert_eq!(store.provider_count().await.expect("count"), 0);
     }
 }
