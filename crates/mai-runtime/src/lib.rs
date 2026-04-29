@@ -86,7 +86,7 @@ struct ToolExecution {
 }
 
 impl AgentRuntime {
-    pub fn new(
+    pub async fn new(
         docker: DockerClient,
         model: ResponsesClient,
         store: Arc<ConfigStore>,
@@ -94,15 +94,37 @@ impl AgentRuntime {
     ) -> Result<Arc<Self>> {
         let skills = SkillsManager::new(&config.repo_root);
         let (event_tx, _) = broadcast::channel(1024);
+        let snapshot = store.load_runtime_snapshot(RECENT_EVENT_LIMIT).await?;
+        let mut agents = HashMap::new();
+        for persisted in snapshot.agents {
+            let (summary, changed) = recovered_summary(persisted.summary);
+            let agent = Arc::new(AgentRecord {
+                summary: RwLock::new(summary.clone()),
+                messages: Mutex::new(persisted.messages),
+                history: Mutex::new(persisted.history),
+                container: RwLock::new(None),
+                mcp: RwLock::new(None),
+                system_prompt: persisted.system_prompt,
+                turn_lock: Mutex::new(()),
+                cancel_requested: AtomicBool::new(false),
+            });
+            if changed {
+                store
+                    .save_agent(&summary, agent.system_prompt.as_deref())
+                    .await?;
+            }
+            agents.insert(summary.id, agent);
+        }
+
         Ok(Arc::new(Self {
             docker,
             model,
             store,
             skills,
-            agents: RwLock::new(HashMap::new()),
+            agents: RwLock::new(agents),
             event_tx,
-            sequence: AtomicU64::new(1),
-            recent_events: Mutex::new(VecDeque::with_capacity(RECENT_EVENT_LIMIT)),
+            sequence: AtomicU64::new(snapshot.next_sequence),
+            recent_events: Mutex::new(snapshot.recent_events.into_iter().collect()),
         }))
     }
 
@@ -121,7 +143,9 @@ impl AgentRuntime {
             .unwrap_or_else(|| format!("agent-{}", short_id(id)));
         let provider_selection = self
             .store
-            .resolve_provider(request.provider_id.as_deref(), request.model.as_deref())?;
+            .resolve_provider(request.provider_id.as_deref(), request.model.as_deref())
+            .await?;
+        let system_prompt = request.system_prompt;
         let summary = AgentSummary {
             id,
             parent_id: request.parent_id,
@@ -137,6 +161,9 @@ impl AgentRuntime {
             last_error: None,
             token_usage: TokenUsage::default(),
         };
+        self.store
+            .save_agent(&summary, system_prompt.as_deref())
+            .await?;
 
         let agent = Arc::new(AgentRecord {
             summary: RwLock::new(summary.clone()),
@@ -144,7 +171,7 @@ impl AgentRuntime {
             history: Mutex::new(Vec::new()),
             container: RwLock::new(None),
             mcp: RwLock::new(None),
-            system_prompt: request.system_prompt,
+            system_prompt,
             turn_lock: Mutex::new(()),
             cancel_requested: AtomicBool::new(false),
         });
@@ -154,31 +181,17 @@ impl AgentRuntime {
             agent: summary.clone(),
         })
         .await;
-        self.set_status(&agent, AgentStatus::StartingContainer, None)
-            .await;
 
-        match self.docker.create_agent_container(&id.to_string()).await {
-            Ok(container) => {
-                {
-                    let mut summary = agent.summary.write().await;
-                    summary.container_id = Some(container.id.clone());
-                    summary.updated_at = now();
-                }
-                *agent.container.write().await = Some(container.clone());
-                let mcp = McpAgentManager::start(
-                    self.docker.clone(),
-                    container.id,
-                    self.store.list_mcp_servers()?,
-                )
-                .await;
-                *agent.mcp.write().await = Some(Arc::new(mcp));
-                self.set_status(&agent, AgentStatus::Idle, None).await;
-                Ok(agent.summary.read().await.clone())
-            }
+        match self.ensure_agent_container(&agent, AgentStatus::Idle).await {
+            Ok(_) => Ok(agent.summary.read().await.clone()),
             Err(err) => {
                 let message = err.to_string();
-                self.set_status(&agent, AgentStatus::Failed, Some(message.clone()))
-                    .await;
+                if let Err(store_err) = self
+                    .set_status(&agent, AgentStatus::Failed, Some(message.clone()))
+                    .await
+                {
+                    tracing::warn!("failed to persist agent failure: {store_err}");
+                }
                 self.publish(ServiceEventKind::Error {
                     agent_id: Some(id),
                     turn_id: None,
@@ -249,6 +262,7 @@ impl AgentRuntime {
         if !should_start {
             return Err(RuntimeError::AgentBusy(agent_id));
         }
+        self.persist_agent(&agent).await?;
         self.publish(ServiceEventKind::AgentStatusChanged {
             agent_id,
             status: AgentStatus::RunningTurn,
@@ -275,18 +289,20 @@ impl AgentRuntime {
     pub async fn cancel_agent(&self, agent_id: AgentId) -> Result<()> {
         let agent = self.agent(agent_id).await?;
         agent.cancel_requested.store(true, Ordering::SeqCst);
-        self.set_status(&agent, AgentStatus::Cancelled, None).await;
+        self.set_status(&agent, AgentStatus::Cancelled, None)
+            .await?;
         Ok(())
     }
 
     pub async fn delete_agent(&self, agent_id: AgentId) -> Result<()> {
         let agent = self.agent(agent_id).await?;
         self.set_status(&agent, AgentStatus::DeletingContainer, None)
-            .await;
+            .await?;
         if let Some(container) = agent.container.write().await.take() {
             self.docker.delete_container(&container.id).await?;
         }
-        self.set_status(&agent, AgentStatus::Deleted, None).await;
+        self.set_status(&agent, AgentStatus::Deleted, None).await?;
+        self.store.delete_agent(agent_id).await?;
         self.agents.write().await.remove(&agent_id);
         self.publish(ServiceEventKind::AgentDeleted { agent_id })
             .await;
@@ -339,6 +355,9 @@ impl AgentRuntime {
                 summary.updated_at = now();
                 summary.last_error = Some(err.to_string());
             }
+            if let Err(store_err) = self.persist_agent(&agent).await {
+                tracing::warn!("failed to persist failed turn state: {store_err}");
+            }
             self.publish(ServiceEventKind::Error {
                 agent_id: Some(agent_id),
                 turn_id: Some(turn_id),
@@ -368,17 +387,16 @@ impl AgentRuntime {
     ) -> Result<()> {
         let agent = self.agent(agent_id).await?;
         let _turn_guard = agent.turn_lock.lock().await;
+        self.ensure_agent_container(&agent, AgentStatus::RunningTurn)
+            .await?;
         self.publish(ServiceEventKind::TurnStarted { agent_id, turn_id })
             .await;
 
         skill_mentions.extend(extract_skill_mentions(&message));
-        self.record_message(&agent, MessageRole::User, message.clone())
-            .await;
-        agent
-            .history
-            .lock()
-            .await
-            .push(ModelInputItem::user_text(message.clone()));
+        self.record_message(&agent, agent_id, MessageRole::User, message.clone())
+            .await?;
+        self.record_history_item(&agent, agent_id, ModelInputItem::user_text(message.clone()))
+            .await?;
         self.publish(ServiceEventKind::AgentMessage {
             agent_id,
             turn_id: Some(turn_id),
@@ -397,12 +415,12 @@ impl AgentRuntime {
                     TurnStatus::Cancelled,
                     AgentStatus::Cancelled,
                 )
-                .await;
+                .await?;
                 return Ok(());
             }
 
             self.set_status(&agent, AgentStatus::RunningTurn, None)
-                .await;
+                .await?;
             let mcp_tools = self.agent_mcp_tools(&agent).await;
             let tools = build_tool_definitions(&mcp_tools);
             let instructions = self
@@ -412,7 +430,8 @@ impl AgentRuntime {
             let provider_id = agent.summary.read().await.provider_id.clone();
             let provider_selection = self
                 .store
-                .resolve_provider(Some(&provider_id), Some(&model_name))?;
+                .resolve_provider(Some(&provider_id), Some(&model_name))
+                .await?;
             let history = agent.history.lock().await.clone();
             let response = self
                 .model
@@ -427,9 +446,12 @@ impl AgentRuntime {
                 .await?;
 
             if let Some(usage) = response.usage {
-                let mut summary = agent.summary.write().await;
-                summary.token_usage.add(&usage);
-                summary.updated_at = now();
+                {
+                    let mut summary = agent.summary.write().await;
+                    summary.token_usage.add(&usage);
+                    summary.updated_at = now();
+                }
+                self.persist_agent(&agent).await?;
             }
 
             let mut tool_calls = Vec::new();
@@ -437,13 +459,19 @@ impl AgentRuntime {
                 match item {
                     ModelOutputItem::Message { text } => {
                         if !text.trim().is_empty() {
-                            self.record_message(&agent, MessageRole::Assistant, text.clone())
-                                .await;
-                            agent
-                                .history
-                                .lock()
-                                .await
-                                .push(ModelInputItem::assistant_text(text.clone()));
+                            self.record_message(
+                                &agent,
+                                agent_id,
+                                MessageRole::Assistant,
+                                text.clone(),
+                            )
+                            .await?;
+                            self.record_history_item(
+                                &agent,
+                                agent_id,
+                                ModelInputItem::assistant_text(text.clone()),
+                            )
+                            .await?;
                             self.publish(ServiceEventKind::AgentMessage {
                                 agent_id,
                                 turn_id: Some(turn_id),
@@ -464,15 +492,16 @@ impl AgentRuntime {
                         } else {
                             call_id
                         };
-                        agent
-                            .history
-                            .lock()
-                            .await
-                            .push(ModelInputItem::FunctionCall {
+                        self.record_history_item(
+                            &agent,
+                            agent_id,
+                            ModelInputItem::FunctionCall {
                                 call_id: call_id.clone(),
                                 name: name.clone(),
                                 arguments: raw_arguments,
-                            });
+                            },
+                        )
+                        .await?;
                         tool_calls.push((call_id, name, arguments));
                     }
                     ModelOutputItem::Other { .. } => {}
@@ -487,12 +516,12 @@ impl AgentRuntime {
                     TurnStatus::Completed,
                     AgentStatus::Completed,
                 )
-                .await;
+                .await?;
                 return Ok(());
             }
 
             self.set_status(&agent, AgentStatus::WaitingTool, None)
-                .await;
+                .await?;
             for (call_id, name, arguments) in tool_calls {
                 self.publish(ServiceEventKind::ToolStarted {
                     agent_id,
@@ -511,14 +540,15 @@ impl AgentRuntime {
                         output: err.to_string(),
                     },
                 };
-                agent
-                    .history
-                    .lock()
-                    .await
-                    .push(ModelInputItem::FunctionCallOutput {
+                self.record_history_item(
+                    &agent,
+                    agent_id,
+                    ModelInputItem::FunctionCallOutput {
                         call_id: call_id.clone(),
                         output: execution.output.clone(),
-                    });
+                    },
+                )
+                .await?;
                 self.publish(ServiceEventKind::ToolCompleted {
                     agent_id,
                     turn_id,
@@ -740,13 +770,14 @@ impl AgentRuntime {
         turn_id: TurnId,
         turn_status: TurnStatus,
         agent_status: AgentStatus,
-    ) {
+    ) -> Result<()> {
         {
             let mut summary = agent.summary.write().await;
             summary.status = agent_status.clone();
             summary.current_turn = None;
             summary.updated_at = now();
         }
+        self.persist_agent(agent).await?;
         self.publish(ServiceEventKind::TurnCompleted {
             agent_id,
             turn_id,
@@ -758,6 +789,7 @@ impl AgentRuntime {
             status: agent_status,
         })
         .await;
+        Ok(())
     }
 
     async fn set_status(
@@ -765,7 +797,7 @@ impl AgentRuntime {
         agent: &Arc<AgentRecord>,
         status: AgentStatus,
         error: Option<String>,
-    ) {
+    ) -> Result<()> {
         let agent_id = {
             let mut summary = agent.summary.write().await;
             summary.status = status.clone();
@@ -775,16 +807,126 @@ impl AgentRuntime {
             }
             summary.id
         };
+        self.persist_agent(agent).await?;
         self.publish(ServiceEventKind::AgentStatusChanged { agent_id, status })
             .await;
+        Ok(())
     }
 
-    async fn record_message(&self, agent: &AgentRecord, role: MessageRole, content: String) {
-        agent.messages.lock().await.push(AgentMessage {
+    async fn record_message(
+        &self,
+        agent: &AgentRecord,
+        agent_id: AgentId,
+        role: MessageRole,
+        content: String,
+    ) -> Result<()> {
+        let message = AgentMessage {
             role,
             content,
             created_at: now(),
-        });
+        };
+        let position = {
+            let mut messages = agent.messages.lock().await;
+            let position = messages.len();
+            messages.push(message.clone());
+            position
+        };
+        self.store
+            .append_agent_message(agent_id, position, &message)
+            .await?;
+        Ok(())
+    }
+
+    async fn record_history_item(
+        &self,
+        agent: &AgentRecord,
+        agent_id: AgentId,
+        item: ModelInputItem,
+    ) -> Result<()> {
+        let position = {
+            let mut history = agent.history.lock().await;
+            let position = history.len();
+            history.push(item.clone());
+            position
+        };
+        self.store
+            .append_agent_history_item(agent_id, position, &item)
+            .await?;
+        Ok(())
+    }
+
+    async fn persist_agent(&self, agent: &AgentRecord) -> Result<()> {
+        let summary = agent.summary.read().await.clone();
+        self.store
+            .save_agent(&summary, agent.system_prompt.as_deref())
+            .await?;
+        Ok(())
+    }
+
+    async fn ensure_agent_container(
+        &self,
+        agent: &Arc<AgentRecord>,
+        ready_status: AgentStatus,
+    ) -> Result<String> {
+        if let Some(container_id) = agent
+            .container
+            .read()
+            .await
+            .as_ref()
+            .map(|container| container.id.clone())
+        {
+            return Ok(container_id);
+        }
+
+        let agent_id = agent.summary.read().await.id;
+        let mut container_guard = agent.container.write().await;
+        if let Some(container_id) = container_guard
+            .as_ref()
+            .map(|container| container.id.clone())
+        {
+            return Ok(container_id);
+        }
+
+        self.set_status(agent, AgentStatus::StartingContainer, None)
+            .await?;
+        let container = match self
+            .docker
+            .create_agent_container(&agent_id.to_string())
+            .await
+        {
+            Ok(container) => container,
+            Err(err) => {
+                let message = err.to_string();
+                drop(container_guard);
+                if let Err(store_err) = self
+                    .set_status(agent, AgentStatus::Failed, Some(message))
+                    .await
+                {
+                    tracing::warn!("failed to persist container startup failure: {store_err}");
+                }
+                return Err(err.into());
+            }
+        };
+
+        let container_id = container.id.clone();
+        {
+            let mut summary = agent.summary.write().await;
+            summary.container_id = Some(container_id.clone());
+            summary.updated_at = now();
+        }
+        self.persist_agent(agent).await?;
+        *container_guard = Some(container.clone());
+        drop(container_guard);
+
+        let mcp = McpAgentManager::start(
+            self.docker.clone(),
+            container.id,
+            self.store.list_mcp_servers().await?,
+        )
+        .await;
+        *agent.mcp.write().await = Some(Arc::new(mcp));
+        self.set_status(agent, ready_status, None).await?;
+        Ok(container_id)
     }
 
     async fn agent(&self, agent_id: AgentId) -> Result<Arc<AgentRecord>> {
@@ -798,13 +940,17 @@ impl AgentRuntime {
 
     async fn container_id(&self, agent_id: AgentId) -> Result<String> {
         let agent = self.agent(agent_id).await?;
-        agent
+        if let Some(container_id) = agent
             .container
             .read()
             .await
             .as_ref()
             .map(|container| container.id.clone())
-            .ok_or(RuntimeError::MissingContainer(agent_id))
+        {
+            return Ok(container_id);
+        }
+        let ready_status = agent.summary.read().await.status.clone();
+        self.ensure_agent_container(&agent, ready_status).await
     }
 
     async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<mai_mcp::McpTool> {
@@ -820,6 +966,9 @@ impl AgentRuntime {
             timestamp: now(),
             kind,
         };
+        if let Err(err) = self.store.append_service_event(&event).await {
+            tracing::warn!("failed to persist service event: {err}");
+        }
         {
             let mut recent = self.recent_events.lock().await;
             if recent.len() >= RECENT_EVENT_LIMIT {
@@ -849,6 +998,30 @@ fn optional_string(arguments: &Value, field: &str) -> Option<String> {
 fn parse_agent_id(value: &str) -> Result<AgentId> {
     Uuid::parse_str(value)
         .map_err(|err| RuntimeError::InvalidInput(format!("invalid agent_id `{value}`: {err}")))
+}
+
+fn recovered_summary(mut summary: AgentSummary) -> (AgentSummary, bool) {
+    let mut changed = false;
+    if summary.container_id.take().is_some() {
+        changed = true;
+    }
+    if summary.current_turn.take().is_some() {
+        changed = true;
+    }
+    if matches!(
+        summary.status,
+        AgentStatus::Created
+            | AgentStatus::StartingContainer
+            | AgentStatus::RunningTurn
+            | AgentStatus::WaitingTool
+            | AgentStatus::DeletingContainer
+    ) {
+        summary.status = AgentStatus::Failed;
+        summary.last_error = Some("interrupted by server restart".to_string());
+        summary.updated_at = now();
+        changed = true;
+    }
+    (summary, changed)
 }
 
 fn short_id(id: AgentId) -> String {
@@ -896,6 +1069,7 @@ General rules:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn extracts_skill_mentions() {
@@ -909,5 +1083,96 @@ mod tests {
     fn agent_status_allows_new_turn_after_completion() {
         assert!(AgentStatus::Completed.can_start_turn());
         assert!(!AgentStatus::RunningTurn.can_start_turn());
+    }
+
+    #[tokio::test]
+    async fn restores_persisted_agents_and_continues_event_sequence() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime.sqlite3");
+        let store = ConfigStore::open(&db_path).await.expect("open store");
+        let agent_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let timestamp = now();
+        let summary = AgentSummary {
+            id: agent_id,
+            parent_id: None,
+            name: "restored".to_string(),
+            status: AgentStatus::RunningTurn,
+            container_id: Some("old-container".to_string()),
+            provider_id: "openai".to_string(),
+            provider_name: "OpenAI".to_string(),
+            model: "gpt-5.2".to_string(),
+            created_at: timestamp,
+            updated_at: timestamp,
+            current_turn: Some(turn_id),
+            last_error: None,
+            token_usage: TokenUsage::default(),
+        };
+        let message = AgentMessage {
+            role: MessageRole::User,
+            content: "hello".to_string(),
+            created_at: timestamp,
+        };
+        store
+            .save_agent(&summary, Some("system"))
+            .await
+            .expect("save agent");
+        store
+            .append_agent_message(agent_id, 0, &message)
+            .await
+            .expect("save message");
+        store
+            .append_agent_history_item(agent_id, 0, &ModelInputItem::user_text("hello"))
+            .await
+            .expect("save history");
+        store
+            .append_service_event(&ServiceEvent {
+                sequence: 41,
+                timestamp,
+                kind: ServiceEventKind::AgentMessage {
+                    agent_id,
+                    turn_id: Some(turn_id),
+                    role: MessageRole::User,
+                    content: "hello".to_string(),
+                },
+            })
+            .await
+            .expect("save event");
+        drop(store);
+
+        let store = Arc::new(ConfigStore::open(&db_path).await.expect("reopen store"));
+        let runtime = AgentRuntime::new(
+            DockerClient::new("unused"),
+            ResponsesClient::new(),
+            store,
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+            },
+        )
+        .await
+        .expect("runtime");
+
+        let agents = runtime.list_agents().await;
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].status, AgentStatus::Failed);
+        assert_eq!(agents[0].container_id, None);
+        assert_eq!(agents[0].current_turn, None);
+        assert_eq!(
+            agents[0].last_error.as_deref(),
+            Some("interrupted by server restart")
+        );
+
+        let detail = runtime.get_agent(agent_id).await.expect("detail");
+        assert_eq!(detail.messages.len(), 1);
+        assert_eq!(detail.messages[0].content, "hello");
+
+        runtime
+            .publish(ServiceEventKind::AgentStatusChanged {
+                agent_id,
+                status: AgentStatus::Failed,
+            })
+            .await;
+        let events = runtime.recent_events.lock().await;
+        assert_eq!(events.back().expect("event").sequence, 42);
     }
 }

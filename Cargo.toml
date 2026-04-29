@@ -28,7 +28,6 @@ futures = "0.3"
 http = "1"
 mime_guess = "2"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-rusqlite = { version = "0.37", features = ["bundled"] }
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -37,6 +36,8 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 toml = "1"
+toasty = { version = "0.5.0", features = ["sqlite"] }
+toasty-driver-sqlite = "0.5.0"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

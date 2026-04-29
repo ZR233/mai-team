@@ -134,11 +134,13 @@ async fn main() -> Result<()> {
         info!(count = cleaned.len(), "removed stale mai-team containers");
     }
 
-    let store = Arc::new(ConfigStore::open(db_path)?);
-    store.seed_default_provider_from_env(api_key, base_url, model)?;
+    let store = Arc::new(ConfigStore::open(db_path).await?);
+    store
+        .seed_default_provider_from_env(api_key, base_url, model)
+        .await?;
     if let Some(home) = dirs::home_dir() {
         let legacy_path = home.join(".mai-team").join("config.toml");
-        if store.import_legacy_toml_once(legacy_path)? {
+        if store.import_legacy_toml_once(legacy_path).await? {
             info!("imported legacy MCP config into SQLite");
         }
     }
@@ -151,7 +153,8 @@ async fn main() -> Result<()> {
         RuntimeConfig {
             repo_root: env::current_dir()?,
         },
-    )?;
+    )
+    .await?;
     let state = Arc::new(AppState {
         runtime,
         store,
@@ -233,7 +236,7 @@ async fn get_providers(
     headers: HeaderMap,
 ) -> std::result::Result<Json<ProvidersResponse>, ApiError> {
     authorize(&state, &headers, None)?;
-    Ok(Json(state.store.providers_response()?))
+    Ok(Json(state.store.providers_response().await?))
 }
 
 async fn save_providers(
@@ -242,8 +245,8 @@ async fn save_providers(
     Json(request): Json<ProvidersConfigRequest>,
 ) -> std::result::Result<Json<ProvidersResponse>, ApiError> {
     authorize(&state, &headers, None)?;
-    state.store.save_providers(request)?;
-    Ok(Json(state.store.providers_response()?))
+    state.store.save_providers(request).await?;
+    Ok(Json(state.store.providers_response().await?))
 }
 
 async fn list_agents(
