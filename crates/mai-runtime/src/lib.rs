@@ -13,7 +13,7 @@ use mai_skills::SkillsManager;
 use mai_store::ConfigStore;
 use mai_tools::{RoutedTool, build_tool_definitions, route_tool};
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -215,6 +215,20 @@ impl AgentRuntime {
         summaries
     }
 
+    pub async fn cleanup_orphaned_containers(&self) -> Result<Vec<String>> {
+        let active_agent_ids = {
+            let agents = self.agents.read().await;
+            agents
+                .keys()
+                .map(ToString::to_string)
+                .collect::<HashSet<_>>()
+        };
+        Ok(self
+            .docker
+            .cleanup_orphaned_agent_containers(&active_agent_ids)
+            .await?)
+    }
+
     pub async fn get_agent(&self, agent_id: AgentId) -> Result<AgentDetail> {
         let agent = self.agent(agent_id).await?;
         let summary = agent.summary.read().await.clone();
@@ -343,8 +357,25 @@ impl AgentRuntime {
         let agent = self.agent(agent_id).await?;
         self.set_status(&agent, AgentStatus::DeletingContainer, None)
             .await?;
-        if let Some(container) = agent.container.write().await.take() {
-            self.docker.delete_container(&container.id).await?;
+        *agent.mcp.write().await = None;
+        let in_memory_container_id = agent
+            .container
+            .write()
+            .await
+            .take()
+            .map(|container| container.id);
+        let persisted_container_id = agent.summary.read().await.container_id.clone();
+        let preferred_container_id = in_memory_container_id.or(persisted_container_id);
+        let deleted = self
+            .docker
+            .delete_agent_containers(&agent_id.to_string(), preferred_container_id.as_deref())
+            .await?;
+        if !deleted.is_empty() {
+            tracing::info!(
+                agent_id = %agent_id,
+                count = deleted.len(),
+                "removed agent containers"
+            );
         }
         self.set_status(&agent, AgentStatus::Deleted, None).await?;
         self.store.delete_agent(agent_id).await?;
@@ -930,7 +961,10 @@ impl AgentRuntime {
             return Ok(container_id);
         }
 
-        let agent_id = agent.summary.read().await.id;
+        let (agent_id, preferred_container_id) = {
+            let summary = agent.summary.read().await;
+            (summary.id, summary.container_id.clone())
+        };
         let mut container_guard = agent.container.write().await;
         if let Some(container_id) = container_guard
             .as_ref()
@@ -943,7 +977,7 @@ impl AgentRuntime {
             .await?;
         let container = match self
             .docker
-            .create_agent_container(&agent_id.to_string())
+            .ensure_agent_container(&agent_id.to_string(), preferred_container_id.as_deref())
             .await
         {
             Ok(container) => container,
@@ -1163,9 +1197,6 @@ fn u128_to_u64(value: u128) -> u64 {
 
 fn recovered_summary(mut summary: AgentSummary) -> (AgentSummary, bool) {
     let mut changed = false;
-    if summary.container_id.take().is_some() {
-        changed = true;
-    }
     if summary.current_turn.take().is_some() {
         changed = true;
     }
@@ -1316,7 +1347,7 @@ mod tests {
         let agents = runtime.list_agents().await;
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].status, AgentStatus::Failed);
-        assert_eq!(agents[0].container_id, None);
+        assert_eq!(agents[0].container_id.as_deref(), Some("old-container"));
         assert_eq!(agents[0].current_turn, None);
         assert_eq!(
             agents[0].last_error.as_deref(),

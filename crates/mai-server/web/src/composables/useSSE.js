@@ -8,14 +8,10 @@ let sseRetryTimer = null
 const SSE_MAX_RETRIES = 5
 
 export function useSSE() {
-  function connectEvents(token, onEvent) {
+  function connectEvents(onEvent) {
     disconnect()
-    if (!token) {
-      connectionState.value = 'offline'
-      return
-    }
     connectionState.value = 'connecting'
-    eventSource = new EventSource(`/events?token=${encodeURIComponent(token)}`)
+    eventSource = new EventSource('/events')
     eventSource.onopen = () => {
       connectionState.value = 'online'
       sseRetryCount = 0
@@ -27,9 +23,7 @@ export function useSSE() {
       if (sseRetryCount < SSE_MAX_RETRIES) {
         sseRetryCount++
         const delay = Math.min(1000 * Math.pow(2, sseRetryCount - 1), 30000)
-        sseRetryTimer = setTimeout(() => connectEvents(token, onEvent), delay)
-      } else if (onEvent) {
-        onEvent({ type: 'sse_auth_required' })
+        sseRetryTimer = setTimeout(() => connectEvents(onEvent), delay)
       }
     }
     const names = [
@@ -68,15 +62,10 @@ export function useSSE() {
     }
   }
 
-  function resetRetryCount() {
-    sseRetryCount = 0
-  }
-
   return {
     eventFeed,
     connectionState,
     connectEvents,
-    disconnect,
-    resetRetryCount
+    disconnect
   }
 }

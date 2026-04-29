@@ -929,6 +929,7 @@ name = "mai-docker"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",
@@ -996,7 +997,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "base64",
  "dirs",
  "futures",
  "http",
@@ -1014,7 +1014,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

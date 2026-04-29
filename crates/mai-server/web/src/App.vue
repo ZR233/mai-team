@@ -17,7 +17,6 @@
           <span class="connection-dot" />
           {{ connectionLabel }}
         </span>
-        <button class="ghost-button" @click="openTokenDialog('Bearer Token')">Token</button>
         <button class="primary-button" :disabled="isLoading" @click="refreshAll">
           <span v-if="isLoading" class="spinner-sm"></span>
           <template v-else>Refresh</template>
@@ -67,21 +66,6 @@
       />
     </main>
 
-    <!-- Token Dialog -->
-    <div v-if="tokenDialogOpen" class="modal-backdrop" @mousedown.self="onBackdropDown" @mouseup.self="onBackdropUp($event, () => tokenDialogOpen = false)">
-      <form class="modal" @submit.prevent="saveToken">
-        <h2>{{ tokenDialogTitle }}</h2>
-        <label>
-          <span>Bearer Token</span>
-          <input v-model="tokenDialogValue" autocomplete="off" placeholder="Paste token printed by server" />
-        </label>
-        <div class="modal-actions">
-          <button class="ghost-button" type="button" @click="tokenDialogOpen = false">Cancel</button>
-          <button class="primary-button" type="submit">Save Token</button>
-        </div>
-      </form>
-    </div>
-
     <ProviderDialog
       :dialog="providerDialog"
       @close="closeProviderDialog"
@@ -127,8 +111,8 @@ import { useSSE } from './composables/useSSE'
 import { useAgents } from './composables/useAgents'
 import { useProviders } from './composables/useProviders'
 
-const { api, toast, getToken, setToken, showToast } = useApi()
-const { eventFeed, connectionState, connectEvents, disconnect, resetRetryCount } = useSSE()
+const { toast, showToast } = useApi()
+const { eventFeed, connectionState, connectEvents, disconnect } = useSSE()
 const {
   agents, selectedAgentId, selectedDetail, isLoading, isSending, isDetailLoading,
   conversationRef, agentDialog,
@@ -143,11 +127,6 @@ const {
 const activeTab = ref('agents')
 const messageDraft = ref('')
 
-// Token dialog
-const tokenDialogOpen = ref(false)
-const tokenDialogTitle = ref('Bearer Token')
-const tokenDialogValue = ref('')
-
 // Confirm dialog
 const confirmDialog = reactive({
   open: false,
@@ -155,13 +134,6 @@ const confirmDialog = reactive({
   message: '',
   onConfirm: () => {}
 })
-
-// Backdrop tracking
-let backdropDown = false
-function onBackdropDown() { backdropDown = true }
-function onBackdropUp(_event, callback) {
-  if (backdropDown) { backdropDown = false; callback() }
-}
 
 const connectionLabel = computed(() => {
   if (connectionState.value === 'online') return 'Connected'
@@ -188,24 +160,11 @@ watch(
 )
 
 onMounted(async () => {
-  connectEvents(getToken(), handleSSEEvent)
+  connectEvents(handleSSEEvent)
   await refreshAll()
 })
 
 onUnmounted(() => disconnect())
-
-function openTokenDialog(title) {
-  tokenDialogTitle.value = title
-  tokenDialogValue.value = getToken()
-  tokenDialogOpen.value = true
-}
-
-function saveToken() {
-  setToken(tokenDialogValue.value.trim())
-  tokenDialogOpen.value = false
-  resetRetryCount()
-  connectEvents(getToken(), handleSSEEvent)
-}
 
 async function refreshAll() {
   isLoading.value = true
@@ -219,11 +178,7 @@ async function refreshAll() {
   }
 }
 
-async function handleSSEEvent(event) {
-  if (event?.type === 'sse_auth_required') {
-    openTokenDialog('Connection lost. Verify token or check server.')
-    return
-  }
+async function handleSSEEvent() {
   await refreshAgents()
   if (selectedAgentId.value) await refreshDetail()
 }

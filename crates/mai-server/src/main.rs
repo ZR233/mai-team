@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::http::{StatusCode, Uri, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -33,7 +33,6 @@ use tracing::info;
 struct AppState {
     runtime: Arc<AgentRuntime>,
     store: Arc<ConfigStore>,
-    token: String,
 }
 
 #[derive(RustEmbed)]
@@ -44,15 +43,6 @@ struct StaticAssets;
 struct ApiError {
     status: StatusCode,
     message: String,
-}
-
-impl ApiError {
-    fn unauthorized() -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            message: "missing or invalid bearer token".to_string(),
-        }
-    }
 }
 
 impl From<RuntimeError> for ApiError {
@@ -101,11 +91,6 @@ struct DownloadQuery {
     path: String,
 }
 
-#[derive(Debug, Deserialize, Default)]
-struct EventQuery {
-    token: Option<String>,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -115,7 +100,6 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let (token, generated_token) = load_or_generate_token();
     let api_key = env::var("OPENAI_API_KEY").ok();
     let base_url =
         env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
@@ -130,10 +114,6 @@ async fn main() -> Result<()> {
     let docker = DockerClient::new(image);
     let docker_version = docker.check_available().await?;
     info!("docker available: {docker_version}");
-    let cleaned = docker.cleanup_stale_containers().await?;
-    if !cleaned.is_empty() {
-        info!(count = cleaned.len(), "removed stale mai-team containers");
-    }
 
     let store = Arc::new(ConfigStore::open(db_path).await?);
     store
@@ -156,11 +136,14 @@ async fn main() -> Result<()> {
         },
     )
     .await?;
-    let state = Arc::new(AppState {
-        runtime,
-        store,
-        token: token.clone(),
-    });
+    let cleaned = runtime.cleanup_orphaned_containers().await?;
+    if !cleaned.is_empty() {
+        info!(
+            count = cleaned.len(),
+            "removed orphaned mai-team containers"
+        );
+    }
+    let state = Arc::new(AppState { runtime, store });
 
     let app = Router::new()
         .route("/", get(index))
@@ -182,12 +165,7 @@ async fn main() -> Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    if generated_token {
-        println!("Mai Team generated token: {token}");
-    } else {
-        println!("Mai Team token: {token}");
-    }
-    println!("Open http://{addr}/?token={token}");
+    println!("Open http://{addr}/");
     info!("mai-team listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -235,56 +213,44 @@ async fn health() -> Json<serde_json::Value> {
 
 async fn get_providers(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<ProvidersResponse>, ApiError> {
-    authorize(&state, &headers, None)?;
     Ok(Json(state.store.providers_response().await?))
 }
 
 async fn save_providers(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(request): Json<ProvidersConfigRequest>,
 ) -> std::result::Result<Json<ProvidersResponse>, ApiError> {
-    authorize(&state, &headers, None)?;
     state.store.save_providers(request).await?;
     Ok(Json(state.store.providers_response().await?))
 }
 
 async fn list_agents(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
 ) -> std::result::Result<Json<Vec<mai_protocol::AgentSummary>>, ApiError> {
-    authorize(&state, &headers, None)?;
     Ok(Json(state.runtime.list_agents().await))
 }
 
 async fn create_agent(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(request): Json<CreateAgentRequest>,
 ) -> std::result::Result<Json<CreateAgentResponse>, ApiError> {
-    authorize(&state, &headers, None)?;
     let agent = state.runtime.create_agent(request).await?;
     Ok(Json(CreateAgentResponse { agent }))
 }
 
 async fn get_agent(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path(id): Path<AgentId>,
 ) -> std::result::Result<Json<mai_protocol::AgentDetail>, ApiError> {
-    authorize(&state, &headers, None)?;
     Ok(Json(state.runtime.get_agent(id).await?))
 }
 
 async fn send_message(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path(id): Path<AgentId>,
     Json(request): Json<SendMessageRequest>,
 ) -> std::result::Result<Json<SendMessageResponse>, ApiError> {
-    authorize(&state, &headers, None)?;
     let turn_id = state
         .runtime
         .send_message(id, request.message, request.skill_mentions)
@@ -294,20 +260,16 @@ async fn send_message(
 
 async fn get_tool_trace(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path((id, call_id)): Path<(AgentId, String)>,
 ) -> std::result::Result<Json<ToolTraceDetail>, ApiError> {
-    authorize(&state, &headers, None)?;
     Ok(Json(state.runtime.tool_trace(id, call_id).await?))
 }
 
 async fn upload_file(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path(id): Path<AgentId>,
     Json(request): Json<FileUploadRequest>,
 ) -> std::result::Result<Json<FileUploadResponse>, ApiError> {
-    authorize(&state, &headers, None)?;
     let bytes = state
         .runtime
         .upload_file(id, request.path.clone(), request.content_base64)
@@ -320,11 +282,9 @@ async fn upload_file(
 
 async fn download_file(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path(id): Path<AgentId>,
     Query(query): Query<DownloadQuery>,
 ) -> std::result::Result<Response, ApiError> {
-    authorize(&state, &headers, None)?;
     let bytes = state.runtime.download_file_tar(id, query.path).await?;
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -335,20 +295,16 @@ async fn download_file(
 
 async fn cancel_agent(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path(id): Path<AgentId>,
 ) -> std::result::Result<StatusCode, ApiError> {
-    authorize(&state, &headers, None)?;
     state.runtime.cancel_agent(id).await?;
     Ok(StatusCode::ACCEPTED)
 }
 
 async fn cancel_agent_colon(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> std::result::Result<StatusCode, ApiError> {
-    authorize(&state, &headers, None)?;
     let id = id.strip_suffix(":cancel").unwrap_or(&id);
     let id = id.parse::<AgentId>().map_err(|err| ApiError {
         status: StatusCode::BAD_REQUEST,
@@ -360,23 +316,18 @@ async fn cancel_agent_colon(
 
 async fn delete_agent(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path(id): Path<AgentId>,
 ) -> std::result::Result<StatusCode, ApiError> {
-    authorize(&state, &headers, None)?;
     state.runtime.delete_agent(id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn events(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(query): Query<EventQuery>,
 ) -> std::result::Result<
     Sse<impl futures::Stream<Item = std::result::Result<Event, Infallible>>>,
     ApiError,
 > {
-    authorize(&state, &headers, query.token.as_deref())?;
     let stream = BroadcastStream::new(state.runtime.subscribe()).filter_map(|event| async move {
         match event {
             Ok(event) => Some(Ok(sse_event(event))),
@@ -384,30 +335,6 @@ async fn events(
         }
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
-}
-
-fn authorize(
-    state: &AppState,
-    headers: &HeaderMap,
-    query_token: Option<&str>,
-) -> std::result::Result<(), ApiError> {
-    if query_token.is_some_and(|token| token == state.token) {
-        return Ok(());
-    }
-    let Some(value) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return Err(ApiError::unauthorized());
-    };
-    let Some(token) = value.strip_prefix("Bearer ") else {
-        return Err(ApiError::unauthorized());
-    };
-    if token == state.token {
-        Ok(())
-    } else {
-        Err(ApiError::unauthorized())
-    }
 }
 
 fn sse_event(event: ServiceEvent) -> Event {
@@ -429,19 +356,5 @@ fn event_name(event: &ServiceEvent) -> &'static str {
         mai_protocol::ServiceEventKind::ToolCompleted { .. } => "tool_completed",
         mai_protocol::ServiceEventKind::AgentMessage { .. } => "agent_message",
         mai_protocol::ServiceEventKind::Error { .. } => "error",
-    }
-}
-
-fn load_or_generate_token() -> (String, bool) {
-    match env::var("MAI_TEAM_TOKEN") {
-        Ok(token) if !token.trim().is_empty() => (token, false),
-        _ => (
-            format!(
-                "{}{}",
-                uuid::Uuid::new_v4().simple(),
-                uuid::Uuid::new_v4().simple()
-            ),
-            true,
-        ),
     }
 }
