@@ -4,6 +4,7 @@ export function buildAgentTimeline(detail, liveEvents = []) {
   if (!detail) return []
   const events = mergeEvents([...(detail.recent_events || []), ...(liveEvents || [])])
     .filter((event) => eventAgentId(event) === detail.id)
+    .filter((event) => eventSessionId(event) === detail.selected_session_id || !eventSessionId(event))
     .sort(compareTimelineItems)
 
   const agentMessageEvents = events.filter((event) => event.type === 'agent_message')
@@ -180,6 +181,10 @@ function mergeEvents(events) {
 function eventAgentId(event) {
   if (event.type === 'agent_created') return event.agent?.id
   return event.agent_id || null
+}
+
+function eventSessionId(event) {
+  return event.session_id || null
 }
 
 function baseTool(event) {

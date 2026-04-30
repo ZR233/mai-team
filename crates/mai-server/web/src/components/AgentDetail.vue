@@ -55,6 +55,23 @@
       <div><span>Created</span><strong>{{ formatDate(detail.created_at) }}</strong></div>
     </div>
 
+    <div class="session-strip">
+      <div class="session-tabs">
+        <button
+          v-for="session in detail.sessions || []"
+          :key="session.id"
+          type="button"
+          class="session-tab"
+          :class="{ active: session.id === detail.selected_session_id }"
+          @click="$emit('select-session', session.id)"
+        >
+          <span>{{ session.title }}</span>
+          <small>{{ session.message_count }}</small>
+        </button>
+      </div>
+      <button class="small-button" type="button" @click="$emit('create-session')">New Chat</button>
+    </div>
+
     <div class="agent-body">
       <section class="conversation chat-timeline" ref="conversationRef">
         <div v-if="loading" class="loading-center">
@@ -183,7 +200,15 @@ const props = defineProps({
 })
 
 const conversationRef = defineModel('conversationRef', { default: null })
-const emit = defineEmits(['cancel', 'delete', 'send', 'update:draft', 'update-model'])
+const emit = defineEmits([
+  'cancel',
+  'delete',
+  'send',
+  'update:draft',
+  'update-model',
+  'create-session',
+  'select-session'
+])
 const { api, showToast } = useApi()
 const expandedTools = reactive({})
 const traces = reactive({})
@@ -209,6 +234,14 @@ watch(
     for (const key of Object.keys(expandedTools)) delete expandedTools[key]
     for (const key of Object.keys(traces)) delete traces[key]
     modelEditor.open = false
+  }
+)
+
+watch(
+  () => props.detail?.selected_session_id,
+  () => {
+    for (const key of Object.keys(expandedTools)) delete expandedTools[key]
+    for (const key of Object.keys(traces)) delete traces[key]
   }
 )
 
@@ -272,7 +305,9 @@ async function toggleTool(item) {
   state.loading = true
   state.error = ''
   try {
-    state.detail = await api(`/agents/${props.detail.id}/tool-calls/${encodeURIComponent(item.callId)}`)
+    state.detail = await api(
+      `/agents/${props.detail.id}/sessions/${props.detail.selected_session_id}/tool-calls/${encodeURIComponent(item.callId)}`
+    )
   } catch (error) {
     state.error = error.message
     showToast(error.message)

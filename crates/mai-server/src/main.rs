@@ -10,10 +10,10 @@ use futures::StreamExt;
 use mai_docker::DockerClient;
 use mai_model::ResponsesClient;
 use mai_protocol::{
-    AgentId, CreateAgentRequest, CreateAgentResponse, ErrorResponse, FileUploadRequest,
-    FileUploadResponse, ProviderPresetsResponse, ProvidersConfigRequest, ProvidersResponse,
-    SendMessageRequest, SendMessageResponse, ServiceEvent, ToolTraceDetail, UpdateAgentRequest,
-    UpdateAgentResponse,
+    AgentId, CreateAgentRequest, CreateAgentResponse, CreateSessionResponse, ErrorResponse,
+    FileUploadRequest, FileUploadResponse, ProviderPresetsResponse, ProvidersConfigRequest,
+    ProvidersResponse, SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId,
+    ToolTraceDetail, UpdateAgentRequest, UpdateAgentResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
 use mai_store::ConfigStore;
@@ -50,6 +50,7 @@ impl From<RuntimeError> for ApiError {
     fn from(value: RuntimeError) -> Self {
         let status = match value {
             RuntimeError::AgentNotFound(_) => StatusCode::NOT_FOUND,
+            RuntimeError::SessionNotFound { .. } => StatusCode::NOT_FOUND,
             RuntimeError::ToolTraceNotFound { .. } => StatusCode::NOT_FOUND,
             RuntimeError::AgentBusy(_) => StatusCode::CONFLICT,
             RuntimeError::InvalidInput(_) => StatusCode::BAD_REQUEST,
@@ -90,6 +91,11 @@ impl IntoResponse for ApiError {
 #[derive(Debug, Deserialize)]
 struct DownloadQuery {
     path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentDetailQuery {
+    session_id: Option<SessionId>,
 }
 
 #[tokio::main]
@@ -158,6 +164,15 @@ async fn main() -> Result<()> {
                 .post(cancel_agent_colon),
         )
         .route("/agents/{id}/messages", post(send_message))
+        .route("/agents/{id}/sessions", post(create_session))
+        .route(
+            "/agents/{id}/sessions/{session_id}/messages",
+            post(send_session_message),
+        )
+        .route(
+            "/agents/{id}/sessions/{session_id}/tool-calls/{call_id}",
+            get(get_session_tool_trace),
+        )
         .route("/agents/{id}/tool-calls/{call_id}", get(get_tool_trace))
         .route("/agents/{id}/files:upload", post(upload_file))
         .route("/agents/{id}/files:download", get(download_file))
@@ -250,8 +265,9 @@ async fn create_agent(
 async fn get_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<AgentId>,
+    Query(query): Query<AgentDetailQuery>,
 ) -> std::result::Result<Json<mai_protocol::AgentDetail>, ApiError> {
-    Ok(Json(state.runtime.get_agent(id).await?))
+    Ok(Json(state.runtime.get_agent(id, query.session_id).await?))
 }
 
 async fn update_agent(
@@ -270,7 +286,32 @@ async fn send_message(
 ) -> std::result::Result<Json<SendMessageResponse>, ApiError> {
     let turn_id = state
         .runtime
-        .send_message(id, request.message, request.skill_mentions)
+        .send_message(id, None, request.message, request.skill_mentions)
+        .await?;
+    Ok(Json(SendMessageResponse { turn_id }))
+}
+
+async fn create_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<AgentId>,
+) -> std::result::Result<Json<CreateSessionResponse>, ApiError> {
+    let session = state.runtime.create_session(id).await?;
+    Ok(Json(CreateSessionResponse { session }))
+}
+
+async fn send_session_message(
+    State(state): State<Arc<AppState>>,
+    Path((id, session_id)): Path<(AgentId, SessionId)>,
+    Json(request): Json<SendMessageRequest>,
+) -> std::result::Result<Json<SendMessageResponse>, ApiError> {
+    let turn_id = state
+        .runtime
+        .send_message(
+            id,
+            Some(session_id),
+            request.message,
+            request.skill_mentions,
+        )
         .await?;
     Ok(Json(SendMessageResponse { turn_id }))
 }
@@ -279,7 +320,19 @@ async fn get_tool_trace(
     State(state): State<Arc<AppState>>,
     Path((id, call_id)): Path<(AgentId, String)>,
 ) -> std::result::Result<Json<ToolTraceDetail>, ApiError> {
-    Ok(Json(state.runtime.tool_trace(id, call_id).await?))
+    Ok(Json(state.runtime.tool_trace(id, None, call_id).await?))
+}
+
+async fn get_session_tool_trace(
+    State(state): State<Arc<AppState>>,
+    Path((id, session_id, call_id)): Path<(AgentId, SessionId, String)>,
+) -> std::result::Result<Json<ToolTraceDetail>, ApiError> {
+    Ok(Json(
+        state
+            .runtime
+            .tool_trace(id, Some(session_id), call_id)
+            .await?,
+    ))
 }
 
 async fn upload_file(

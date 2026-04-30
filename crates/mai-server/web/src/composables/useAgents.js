@@ -5,6 +5,7 @@ import { highlightCodeBlocks } from '../utils/markdown'
 const agents = ref([])
 const selectedAgentId = ref(null)
 const selectedDetail = ref(null)
+const selectedSessionId = ref(null)
 const isLoading = ref(false)
 const isSending = ref(false)
 const isDetailLoading = ref(false)
@@ -26,7 +27,9 @@ export function useAgents() {
     if (!selectedAgentId.value) return
     isDetailLoading.value = true
     try {
-      selectedDetail.value = await api(`/agents/${selectedAgentId.value}`)
+      const query = selectedSessionId.value ? `?session_id=${encodeURIComponent(selectedSessionId.value)}` : ''
+      selectedDetail.value = await api(`/agents/${selectedAgentId.value}${query}`)
+      selectedSessionId.value = selectedDetail.value?.selected_session_id || null
       await nextTick()
       highlightCodeBlocks(conversationRef.value)
       await scrollConversationToBottom()
@@ -47,7 +50,14 @@ export function useAgents() {
 
   async function selectAgent(id) {
     selectedAgentId.value = id
+    selectedSessionId.value = null
     await refreshAgents()
+    await refreshDetail()
+  }
+
+  async function selectSession(sessionId) {
+    if (!selectedAgentId.value || !sessionId) return
+    selectedSessionId.value = sessionId
     await refreshDetail()
   }
 
@@ -61,9 +71,18 @@ export function useAgents() {
       })
     })
     selectedAgentId.value = response.agent.id
+    selectedSessionId.value = null
     await refreshAgents()
     await refreshDetail()
     return response.agent
+  }
+
+  async function createSession() {
+    if (!selectedAgentId.value) return null
+    const response = await api(`/agents/${selectedAgentId.value}/sessions`, { method: 'POST' })
+    selectedSessionId.value = response.session.id
+    await refreshDetail()
+    return response.session
   }
 
   async function updateAgent(id, providerId, model) {
@@ -84,10 +103,10 @@ export function useAgents() {
   }
 
   async function sendMessage(message) {
-    if (!selectedAgentId.value || !message) return
+    if (!selectedAgentId.value || !selectedSessionId.value || !message) return
     isSending.value = true
     try {
-      await api(`/agents/${selectedAgentId.value}/messages`, {
+      await api(`/agents/${selectedAgentId.value}/sessions/${selectedSessionId.value}/messages`, {
         method: 'POST',
         body: JSON.stringify({ message })
       })
@@ -107,6 +126,7 @@ export function useAgents() {
     if (selectedAgentId.value === id) {
       selectedAgentId.value = null
       selectedDetail.value = null
+      selectedSessionId.value = null
     }
     await refreshAgents()
   }
@@ -122,6 +142,7 @@ export function useAgents() {
   return {
     agents,
     selectedAgentId,
+    selectedSessionId,
     selectedDetail,
     isLoading,
     isSending,
@@ -131,7 +152,9 @@ export function useAgents() {
     refreshAgents,
     refreshDetail,
     selectAgent,
+    selectSession,
     createAgent,
+    createSession,
     updateAgent,
     sendMessage,
     cancelAgent,

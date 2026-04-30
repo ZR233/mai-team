@@ -99,6 +99,7 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             "Send a task message to an existing agent.",
             object_schema(vec![
                 ("agent_id", json!({ "type": "string" }), true),
+                ("session_id", json!({ "type": "string" }), false),
                 ("message", json!({ "type": "string" }), true),
             ]),
         ),

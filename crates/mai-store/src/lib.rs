@@ -1,9 +1,10 @@
 use chrono::{DateTime, Utc};
 use mai_protocol::{
-    AgentId, AgentMessage, AgentStatus, AgentSummary, McpServerConfig, MessageRole, ModelConfig,
-    ModelInputItem, ProviderConfig, ProviderKind, ProviderPreset, ProviderPresetsResponse,
-    ProviderSecret, ProviderSummary, ProvidersConfigRequest, ProvidersResponse, ReasoningEffort,
-    ServiceEvent, ServiceEventKind, TokenUsage, TurnId, default_true,
+    AgentId, AgentMessage, AgentSessionSummary, AgentStatus, AgentSummary, McpServerConfig,
+    MessageRole, ModelConfig, ModelInputItem, ProviderConfig, ProviderKind, ProviderPreset,
+    ProviderPresetsResponse, ProviderSecret, ProviderSummary, ProvidersConfigRequest,
+    ProvidersResponse, ReasoningEffort, ServiceEvent, ServiceEventKind, SessionId, TokenUsage,
+    TurnId, default_true,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,7 +18,7 @@ use uuid::Uuid;
 const SETTING_DEFAULT_PROVIDER_ID: &str = "default_provider_id";
 const SETTING_LEGACY_TOML_IMPORTED: &str = "legacy_toml_imported";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-const SCHEMA_VERSION: &str = "1";
+const SCHEMA_VERSION: &str = "2";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 
 #[derive(Debug, Error)]
@@ -55,9 +56,14 @@ pub struct ProviderSelection {
 #[derive(Debug, Clone)]
 pub struct PersistedAgent {
     pub summary: AgentSummary,
-    pub messages: Vec<AgentMessage>,
-    pub history: Vec<ModelInputItem>,
+    pub sessions: Vec<PersistedAgentSession>,
     pub system_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersistedAgentSession {
+    pub summary: AgentSessionSummary,
+    pub history: Vec<ModelInputItem>,
 }
 
 #[derive(Debug, Clone)]
@@ -198,12 +204,26 @@ struct AgentRecordRow {
 }
 
 #[derive(Debug, Clone, toasty::Model)]
+#[table = "agent_sessions"]
+struct AgentSessionRecord {
+    #[key]
+    id: String,
+    #[index]
+    agent_id: String,
+    title: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
 #[table = "agent_messages"]
 struct AgentMessageRecord {
     #[key]
     id: String,
     #[index]
     agent_id: String,
+    #[index]
+    session_id: String,
     position: i64,
     role: String,
     content: String,
@@ -217,6 +237,8 @@ struct AgentHistoryRecord {
     id: String,
     #[index]
     agent_id: String,
+    #[index]
+    session_id: String,
     position: i64,
     item_json: String,
 }
@@ -228,6 +250,7 @@ struct ServiceEventRecord {
     sequence: i64,
     timestamp: String,
     agent_id: Option<String>,
+    session_id: Option<String>,
     event_json: String,
 }
 
@@ -699,6 +722,14 @@ impl ConfigStore {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         delete_agent_row_in_tx(&mut tx, agent_id).await?;
+        Query::<List<AgentSessionRecord>>::filter(
+            AgentSessionRecord::fields()
+                .agent_id()
+                .eq(agent_id.to_string()),
+        )
+        .delete()
+        .exec(&mut tx)
+        .await?;
         Query::<List<AgentMessageRecord>>::filter(
             AgentMessageRecord::fields()
                 .agent_id()
@@ -719,9 +750,34 @@ impl ConfigStore {
         Ok(())
     }
 
+    pub async fn save_agent_session(
+        &self,
+        agent_id: AgentId,
+        session: &AgentSessionSummary,
+    ) -> Result<()> {
+        let mut db = self.db.clone();
+        Query::<List<AgentSessionRecord>>::filter(
+            AgentSessionRecord::fields().id().eq(session.id.to_string()),
+        )
+        .delete()
+        .exec(&mut db)
+        .await?;
+        toasty::create!(AgentSessionRecord {
+            id: session.id.to_string(),
+            agent_id: agent_id.to_string(),
+            title: session.title.clone(),
+            created_at: session.created_at.to_rfc3339(),
+            updated_at: session.updated_at.to_rfc3339(),
+        })
+        .exec(&mut db)
+        .await?;
+        Ok(())
+    }
+
     pub async fn append_agent_message(
         &self,
         agent_id: AgentId,
+        session_id: SessionId,
         position: usize,
         message: &AgentMessage,
     ) -> Result<()> {
@@ -729,6 +785,7 @@ impl ConfigStore {
         toasty::create!(AgentMessageRecord {
             id: Uuid::new_v4().to_string(),
             agent_id: agent_id.to_string(),
+            session_id: session_id.to_string(),
             position: position as i64,
             role: message_role_to_str(&message.role).to_string(),
             content: message.content.clone(),
@@ -742,6 +799,7 @@ impl ConfigStore {
     pub async fn append_agent_history_item(
         &self,
         agent_id: AgentId,
+        session_id: SessionId,
         position: usize,
         item: &ModelInputItem,
     ) -> Result<()> {
@@ -749,6 +807,7 @@ impl ConfigStore {
         toasty::create!(AgentHistoryRecord {
             id: Uuid::new_v4().to_string(),
             agent_id: agent_id.to_string(),
+            session_id: session_id.to_string(),
             position: position as i64,
             item_json: serde_json::to_string(item)?,
         })
@@ -771,6 +830,7 @@ impl ConfigStore {
             sequence: u64_to_i64(event.sequence),
             timestamp: event.timestamp.to_rfc3339(),
             agent_id: event_agent_id(event).map(|id| id.to_string()),
+            session_id: event_session_id(event).map(|id| id.to_string()),
             event_json: serde_json::to_string(event)?,
         })
         .exec(&mut db)
@@ -789,13 +849,11 @@ impl ConfigStore {
         let mut agents = Vec::with_capacity(agent_rows.len());
         for row in agent_rows {
             let agent_id = parse_agent_id(&row.id)?;
-            let messages = self.load_agent_messages(agent_id).await?;
-            let history = self.load_agent_history(agent_id).await?;
+            let sessions = self.load_agent_sessions(agent_id).await?;
             let system_prompt = row.system_prompt.clone();
             agents.push(PersistedAgent {
                 summary: row.into_summary()?,
-                messages,
-                history,
+                sessions,
                 system_prompt,
             });
         }
@@ -835,7 +893,45 @@ impl ConfigStore {
         Ok(env.into_iter().map(|row| (row.key, row.value)).collect())
     }
 
-    async fn load_agent_messages(&self, agent_id: AgentId) -> Result<Vec<AgentMessage>> {
+    async fn load_agent_sessions(&self, agent_id: AgentId) -> Result<Vec<PersistedAgentSession>> {
+        let mut db = self.db.clone();
+        let mut rows = Query::<List<AgentSessionRecord>>::filter(
+            AgentSessionRecord::fields()
+                .agent_id()
+                .eq(agent_id.to_string()),
+        )
+        .exec(&mut db)
+        .await?;
+        rows.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let mut sessions = Vec::with_capacity(rows.len());
+        for row in rows {
+            let session_id = parse_session_id(&row.id)?;
+            let messages = self.load_agent_messages(agent_id, session_id).await?;
+            let history = self.load_agent_history(agent_id, session_id).await?;
+            sessions.push(PersistedAgentSession {
+                summary: AgentSessionSummary {
+                    id: session_id,
+                    title: row.title,
+                    created_at: parse_utc(&row.created_at)?,
+                    updated_at: parse_utc(&row.updated_at)?,
+                    message_count: messages.len(),
+                },
+                history,
+            });
+        }
+        Ok(sessions)
+    }
+
+    pub async fn load_agent_messages(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> Result<Vec<AgentMessage>> {
         let mut db = self.db.clone();
         let mut rows = Query::<List<AgentMessageRecord>>::filter(
             AgentMessageRecord::fields()
@@ -844,13 +940,18 @@ impl ConfigStore {
         )
         .exec(&mut db)
         .await?;
+        rows.retain(|row| row.session_id == session_id.to_string());
         rows.sort_by_key(|row| row.position);
         rows.into_iter()
             .map(AgentMessageRecord::into_message)
             .collect()
     }
 
-    async fn load_agent_history(&self, agent_id: AgentId) -> Result<Vec<ModelInputItem>> {
+    async fn load_agent_history(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> Result<Vec<ModelInputItem>> {
         let mut db = self.db.clone();
         let mut rows = Query::<List<AgentHistoryRecord>>::filter(
             AgentHistoryRecord::fields()
@@ -859,6 +960,7 @@ impl ConfigStore {
         )
         .exec(&mut db)
         .await?;
+        rows.retain(|row| row.session_id == session_id.to_string());
         rows.sort_by_key(|row| row.position);
         rows.into_iter()
             .map(|row| serde_json::from_str::<ModelInputItem>(&row.item_json).map_err(Into::into))
@@ -913,6 +1015,7 @@ async fn build_db(path: &Path) -> Result<Db> {
         McpServerEnvRecord,
         SettingRecord,
         AgentRecordRow,
+        AgentSessionRecord,
         AgentMessageRecord,
         AgentHistoryRecord,
         ServiceEventRecord,
@@ -1243,6 +1346,11 @@ fn parse_agent_id(value: &str) -> Result<AgentId> {
         .map_err(|err| StoreError::InvalidConfig(format!("invalid agent id `{value}`: {err}")))
 }
 
+fn parse_session_id(value: &str) -> Result<SessionId> {
+    Uuid::parse_str(value)
+        .map_err(|err| StoreError::InvalidConfig(format!("invalid session id `{value}`: {err}")))
+}
+
 fn parse_turn_id(value: &str) -> Result<TurnId> {
     Uuid::parse_str(value)
         .map_err(|err| StoreError::InvalidConfig(format!("invalid turn id `{value}`: {err}")))
@@ -1330,10 +1438,24 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
     }
 }
 
+fn event_session_id(event: &ServiceEvent) -> Option<SessionId> {
+    match &event.kind {
+        ServiceEventKind::TurnStarted { session_id, .. }
+        | ServiceEventKind::TurnCompleted { session_id, .. }
+        | ServiceEventKind::ToolStarted { session_id, .. }
+        | ServiceEventKind::ToolCompleted { session_id, .. }
+        | ServiceEventKind::AgentMessage { session_id, .. } => *session_id,
+        ServiceEventKind::Error { session_id, .. } => *session_id,
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mai_protocol::{AgentStatus, MessageRole, ModelContentItem, ServiceEventKind};
+    use mai_protocol::{
+        AgentStatus, MessageRole, ModelContentItem, ModelToolCall, ServiceEventKind,
+    };
     use serde_json::json;
     use tempfile::{TempDir, tempdir};
 
@@ -1562,6 +1684,7 @@ mod tests {
             .await
             .expect("open");
         let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let turn_id = Uuid::new_v4();
         let now = Utc::now();
         let summary = AgentSummary {
@@ -1583,22 +1706,41 @@ mod tests {
                 total_tokens: 3,
             },
         };
+        let session = AgentSessionSummary {
+            id: session_id,
+            title: "Chat 1".to_string(),
+            created_at: now,
+            updated_at: now,
+            message_count: 0,
+        };
         let message = AgentMessage {
             role: MessageRole::User,
             content: "hello".to_string(),
             created_at: now,
         };
-        let history = ModelInputItem::Message {
-            role: "user".to_string(),
-            content: vec![ModelContentItem::InputText {
-                text: "hello".to_string(),
-            }],
-        };
+        let history = vec![
+            ModelInputItem::Message {
+                role: "user".to_string(),
+                content: vec![ModelContentItem::InputText {
+                    text: "hello".to_string(),
+                }],
+            },
+            ModelInputItem::AssistantTurn {
+                content: None,
+                reasoning_content: Some("thinking".to_string()),
+                tool_calls: vec![ModelToolCall {
+                    call_id: "call_1".to_string(),
+                    name: "container_exec".to_string(),
+                    arguments: "{\"command\":\"pwd\"}".to_string(),
+                }],
+            },
+        ];
         let event = ServiceEvent {
             sequence: 7,
             timestamp: now,
             kind: ServiceEventKind::AgentMessage {
                 agent_id,
+                session_id: Some(session_id),
                 turn_id: Some(turn_id),
                 role: MessageRole::User,
                 content: "hello".to_string(),
@@ -1610,11 +1752,19 @@ mod tests {
             .await
             .expect("save agent");
         store
-            .append_agent_message(agent_id, 0, &message)
+            .save_agent_session(agent_id, &session)
+            .await
+            .expect("save session");
+        store
+            .append_agent_message(agent_id, session_id, 0, &message)
             .await
             .expect("message");
         store
-            .append_agent_history_item(agent_id, 0, &history)
+            .append_agent_history_item(agent_id, session_id, 0, &history[0])
+            .await
+            .expect("history");
+        store
+            .append_agent_history_item(agent_id, session_id, 1, &history[1])
             .await
             .expect("history");
         store.append_service_event(&event).await.expect("event");
@@ -1628,9 +1778,50 @@ mod tests {
         assert_eq!(snapshot.agents.len(), 1);
         assert_eq!(snapshot.agents[0].summary.name, "agent-test");
         assert_eq!(snapshot.agents[0].system_prompt.as_deref(), Some("system"));
-        assert_eq!(snapshot.agents[0].messages[0].content, "hello");
-        assert_eq!(snapshot.agents[0].history.len(), 1);
+        assert_eq!(snapshot.agents[0].sessions.len(), 1);
+        assert_eq!(snapshot.agents[0].sessions[0].summary.title, "Chat 1");
+        assert_eq!(snapshot.agents[0].sessions[0].summary.message_count, 1);
+        assert_eq!(snapshot.agents[0].sessions[0].history.len(), 2);
+        assert!(matches!(
+            &snapshot.agents[0].sessions[0].history[1],
+            ModelInputItem::AssistantTurn {
+                reasoning_content: Some(reasoning),
+                tool_calls,
+                ..
+            } if reasoning == "thinking"
+                && tool_calls.len() == 1
+                && tool_calls[0].call_id == "call_1"
+        ));
         assert_eq!(snapshot.recent_events.len(), 1);
+        assert_eq!(
+            event_session_id(&snapshot.recent_events[0]),
+            Some(session_id)
+        );
+
+        reopened.delete_agent(agent_id).await.expect("delete agent");
+        let snapshot = reopened.load_runtime_snapshot(500).await.expect("snapshot");
+        assert!(snapshot.agents.is_empty());
+        assert!(
+            reopened
+                .load_agent_sessions(agent_id)
+                .await
+                .expect("sessions")
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .load_agent_messages(agent_id, session_id)
+                .await
+                .expect("messages")
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .load_agent_history(agent_id, session_id)
+                .await
+                .expect("history")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

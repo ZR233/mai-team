@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 pub type AgentId = Uuid;
+pub type SessionId = Uuid;
 pub type TurnId = Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +65,15 @@ pub struct AgentMessage {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSessionSummary {
+    pub id: SessionId,
+    pub title: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub message_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TokenUsage {
     pub input_tokens: u64,
@@ -100,6 +110,8 @@ pub struct AgentSummary {
 pub struct AgentDetail {
     #[serde(flatten)]
     pub summary: AgentSummary,
+    pub sessions: Vec<AgentSessionSummary>,
+    pub selected_session_id: SessionId,
     pub messages: Vec<AgentMessage>,
     pub recent_events: Vec<ServiceEvent>,
 }
@@ -139,6 +151,11 @@ pub struct SendMessageRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageResponse {
     pub turn_id: TurnId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSessionResponse {
+    pub session: AgentSessionSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -311,15 +328,21 @@ pub enum ServiceEventKind {
     },
     TurnStarted {
         agent_id: AgentId,
+        #[serde(default)]
+        session_id: Option<SessionId>,
         turn_id: TurnId,
     },
     TurnCompleted {
         agent_id: AgentId,
+        #[serde(default)]
+        session_id: Option<SessionId>,
         turn_id: TurnId,
         status: TurnStatus,
     },
     ToolStarted {
         agent_id: AgentId,
+        #[serde(default)]
+        session_id: Option<SessionId>,
         turn_id: TurnId,
         call_id: String,
         tool_name: String,
@@ -330,6 +353,8 @@ pub enum ServiceEventKind {
     },
     ToolCompleted {
         agent_id: AgentId,
+        #[serde(default)]
+        session_id: Option<SessionId>,
         turn_id: TurnId,
         call_id: String,
         tool_name: String,
@@ -340,12 +365,16 @@ pub enum ServiceEventKind {
     },
     AgentMessage {
         agent_id: AgentId,
+        #[serde(default)]
+        session_id: Option<SessionId>,
         turn_id: Option<TurnId>,
         role: MessageRole,
         content: String,
     },
     Error {
         agent_id: Option<AgentId>,
+        #[serde(default)]
+        session_id: Option<SessionId>,
         turn_id: Option<TurnId>,
         message: String,
     },
@@ -357,6 +386,14 @@ pub enum ModelInputItem {
     Message {
         role: String,
         content: Vec<ModelContentItem>,
+    },
+    AssistantTurn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tool_calls: Vec<ModelToolCall>,
     },
     FunctionCall {
         call_id: String,
@@ -392,6 +429,13 @@ pub enum ModelContentItem {
     OutputText { text: String },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     #[serde(rename = "type")]
@@ -422,6 +466,12 @@ pub enum ModelOutputItem {
     Message {
         text: String,
     },
+    AssistantTurn {
+        content: Option<String>,
+        reasoning_content: Option<String>,
+        #[serde(default)]
+        tool_calls: Vec<ModelOutputToolCall>,
+    },
     FunctionCall {
         call_id: String,
         name: String,
@@ -431,6 +481,14 @@ pub enum ModelOutputItem {
     Other {
         raw: Value,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelOutputToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: Value,
+    pub raw_arguments: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -513,10 +571,12 @@ mod tests {
             ServiceEventKind::ToolStarted {
                 arguments,
                 arguments_preview,
+                session_id,
                 ..
             } => {
                 assert!(arguments.is_none());
                 assert!(arguments_preview.is_none());
+                assert!(session_id.is_none());
             }
             _ => panic!("expected tool_started"),
         }

@@ -5,7 +5,7 @@
         <h2>Agents</h2>
         <p>{{ agents.length }} active session{{ agents.length === 1 ? '' : 's' }}</p>
       </div>
-      <button class="small-button" @click="$emit('create')">New</button>
+      <button class="small-button" @click="$emit('create')">New Agent</button>
     </div>
     <div class="agent-list">
       <button

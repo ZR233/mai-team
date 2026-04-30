@@ -625,6 +625,68 @@ p {
   white-space: nowrap;
 }
 
+.session-strip {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 24px;
+  border-bottom: 1px solid #d8e0ea;
+  background: #fff;
+}
+
+.session-tabs {
+  display: flex;
+  flex: 1;
+  gap: 8px;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.session-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 88px;
+  max-width: 180px;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  color: #41516a;
+  background: #f8fafc;
+}
+
+.session-tab span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-tab small {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  color: #5f6f86;
+  background: #e8eef6;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.session-tab.active {
+  border-color: #1f6feb;
+  color: #174ea6;
+  background: #e7f0ff;
+}
+
+.session-tab.active small {
+  color: #fff;
+  background: #1f6feb;
+}
+
 .agent-body {
   display: flex;
   flex: 1;
@@ -1628,6 +1690,16 @@ select:focus {
 
   .detail-strip {
     grid-template-columns: repeat(5, minmax(150px, 1fr));
+  }
+
+  .session-strip {
+    align-items: stretch;
+    flex-direction: column;
+    padding: 10px 12px;
+  }
+
+  .session-strip > .small-button {
+    width: 100%;
   }
 
   .message {

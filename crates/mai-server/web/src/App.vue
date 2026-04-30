@@ -51,7 +51,9 @@
           :providers="providersState.providers"
           v-model:conversation-ref="conversationRef"
           @cancel="cancelAgent"
+          @create-session="onCreateSession"
           @delete="confirmDeleteAgent"
+          @select-session="onSelectSession"
           @send="onSendMessage"
           @update-model="onUpdateAgentModel"
           @update:draft="messageDraft = $event"
@@ -119,7 +121,8 @@ const { eventFeed, connectionState, connectEvents, disconnect } = useSSE()
 const {
   agents, selectedAgentId, selectedDetail, isLoading, isSending, isDetailLoading,
   conversationRef, agentDialog,
-  refreshAgents, refreshDetail, selectAgent, createAgent, sendMessage, cancelAgent, deleteAgent,
+  refreshAgents, refreshDetail, selectAgent, selectSession, createAgent, createSession,
+  sendMessage, cancelAgent, deleteAgent,
   updateAgent, scrollConversationToBottom
 } = useAgents()
 const {
@@ -223,6 +226,24 @@ async function onSendMessage(message) {
   try {
     messageDraft.value = ''
     await sendMessage(message)
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onCreateSession() {
+  try {
+    messageDraft.value = ''
+    await createSession()
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onSelectSession(sessionId) {
+  try {
+    messageDraft.value = ''
+    await selectSession(sessionId)
   } catch (error) {
     showToast(error.message)
   }
