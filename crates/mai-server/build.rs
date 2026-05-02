@@ -2,7 +2,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -68,9 +68,51 @@ fn watch_dir(path: &Path) {
 
 fn ensure_npm(web_dir: &Path) {
     run_npm(web_dir, ["--version"]);
-    if !web_dir.join("node_modules").exists() {
-        run_npm(web_dir, ["ci"]);
+    if frontend_dependencies_missing(web_dir) {
+        println!(
+            "cargo:warning=frontend npm dependencies are missing or incomplete; installing them"
+        );
+        install_frontend_dependencies(web_dir);
     }
+}
+
+fn frontend_dependencies_missing(web_dir: &Path) -> bool {
+    !web_dir.join("node_modules").is_dir()
+        || !local_npm_bin_exists(web_dir, "vite")
+        || !npm_command_succeeds(web_dir, ["ls", "--depth=0", "--silent"])
+}
+
+fn local_npm_bin_exists(web_dir: &Path, name: &str) -> bool {
+    let bin_dir = web_dir.join("node_modules").join(".bin");
+    if cfg!(windows) {
+        bin_dir.join(format!("{name}.cmd")).exists()
+    } else {
+        bin_dir.join(name).exists()
+    }
+}
+
+fn install_frontend_dependencies(web_dir: &Path) {
+    if web_dir.join("package-lock.json").exists() {
+        run_npm(web_dir, ["ci"]);
+    } else {
+        run_npm(web_dir, ["install"]);
+    }
+}
+
+fn npm_command_succeeds<const N: usize>(web_dir: &Path, args: [&str; N]) -> bool {
+    Command::new("npm")
+        .args(args)
+        .current_dir(web_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to execute npm in {}; install Node.js/npm first: {err}",
+                web_dir.display()
+            )
+        })
+        .success()
 }
 
 fn run_npm<const N: usize>(web_dir: &Path, args: [&str; N]) {
