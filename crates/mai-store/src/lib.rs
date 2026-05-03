@@ -19,7 +19,7 @@ const SETTING_DEFAULT_PROVIDER_ID: &str = "default_provider_id";
 const SETTING_AGENT_CONFIG: &str = "agent_config";
 const SETTING_LEGACY_TOML_IMPORTED: &str = "legacy_toml_imported";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-const SCHEMA_VERSION: &str = "3";
+const SCHEMA_VERSION: &str = "4";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const DEEPSEEK_V4_CONTEXT_TOKENS: u64 = 1_000_000;
 const DEEPSEEK_V4_OUTPUT_TOKENS: u64 = 384_000;
@@ -194,6 +194,7 @@ struct AgentRecordRow {
     name: String,
     status: String,
     container_id: Option<String>,
+    docker_image: String,
     provider_id: String,
     provider_name: String,
     model: String,
@@ -720,6 +721,7 @@ impl ConfigStore {
             name: summary.name.clone(),
             status: agent_status_to_str(&summary.status).to_string(),
             container_id: summary.container_id.clone(),
+            docker_image: summary.docker_image.clone(),
             provider_id: summary.provider_id.clone(),
             provider_name: summary.provider_name.clone(),
             model: summary.model.clone(),
@@ -1079,6 +1081,7 @@ impl AgentRecordRow {
             name: self.name,
             status: parse_agent_status(&self.status)?,
             container_id: self.container_id,
+            docker_image: self.docker_image,
             provider_id: self.provider_id,
             provider_name: self.provider_name,
             model: self.model,
@@ -1992,6 +1995,7 @@ mod tests {
             name: "agent-test".to_string(),
             status: AgentStatus::Completed,
             container_id: Some("container".to_string()),
+            docker_image: "ghcr.io/rcore-os/tgoskits-container:latest".to_string(),
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.2".to_string(),
@@ -2077,6 +2081,10 @@ mod tests {
         assert_eq!(snapshot.next_sequence, 8);
         assert_eq!(snapshot.agents.len(), 1);
         assert_eq!(snapshot.agents[0].summary.name, "agent-test");
+        assert_eq!(
+            snapshot.agents[0].summary.docker_image,
+            "ghcr.io/rcore-os/tgoskits-container:latest"
+        );
         assert_eq!(snapshot.agents[0].system_prompt.as_deref(), Some("system"));
         assert_eq!(snapshot.agents[0].sessions.len(), 1);
         assert_eq!(snapshot.agents[0].sessions[0].summary.title, "Chat 1");
@@ -2142,6 +2150,7 @@ mod tests {
             name: "agent-test".to_string(),
             status: AgentStatus::Completed,
             container_id: None,
+            docker_image: "ubuntu:latest".to_string(),
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.2".to_string(),
@@ -2234,6 +2243,7 @@ mod tests {
                     name: "agent-test".to_string(),
                     status: AgentStatus::Completed,
                     container_id: None,
+                    docker_image: "ubuntu:latest".to_string(),
                     provider_id: "openai".to_string(),
                     provider_name: "OpenAI".to_string(),
                     model: "gpt-5.2".to_string(),

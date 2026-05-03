@@ -118,7 +118,10 @@ struct ToolExecution {
 #[derive(Debug, Clone)]
 enum ContainerSource {
     FreshImage,
-    CloneFrom { parent_container_id: String },
+    CloneFrom {
+        parent_container_id: String,
+        docker_image: String,
+    },
 }
 
 struct ResolvedAgentModel {
@@ -246,6 +249,7 @@ impl AgentRuntime {
             request.reasoning_effort,
             true,
         )?;
+        let docker_image = self.resolve_docker_image(request.docker_image.as_deref());
         let system_prompt = request.system_prompt;
         let summary = AgentSummary {
             id,
@@ -253,6 +257,7 @@ impl AgentRuntime {
             name,
             status: AgentStatus::Created,
             container_id: None,
+            docker_image,
             provider_id: provider_selection.provider.id.clone(),
             provider_name: provider_selection.provider.name.clone(),
             model: provider_selection.model.id.clone(),
@@ -1089,7 +1094,11 @@ impl AgentRuntime {
                 let name = optional_string(&arguments, "name");
                 let message = optional_string(&arguments, "message");
                 let child_model = self.resolve_research_agent_model().await?;
-                let parent_container_id = self.container_id(agent_id).await?;
+                let parent = self.agent(agent_id).await?;
+                let parent_status = parent.summary.read().await.status.clone();
+                let parent_container_id =
+                    self.ensure_agent_container(&parent, parent_status).await?;
+                let parent_docker_image = parent.summary.read().await.docker_image.clone();
                 let created = self
                     .create_agent_with_container_source(
                         CreateAgentRequest {
@@ -1097,11 +1106,13 @@ impl AgentRuntime {
                             provider_id: Some(child_model.preference.provider_id),
                             model: Some(child_model.preference.model),
                             reasoning_effort: child_model.preference.reasoning_effort,
+                            docker_image: Some(parent_docker_image.clone()),
                             parent_id: Some(agent_id),
                             system_prompt: None,
                         },
                         ContainerSource::CloneFrom {
                             parent_container_id,
+                            docker_image: parent_docker_image,
                         },
                     )
                     .await?;
@@ -1599,9 +1610,13 @@ impl AgentRuntime {
             return Ok(container_id);
         }
 
-        let (agent_id, preferred_container_id) = {
+        let (agent_id, preferred_container_id, docker_image) = {
             let summary = agent.summary.read().await;
-            (summary.id, summary.container_id.clone())
+            (
+                summary.id,
+                summary.container_id.clone(),
+                summary.docker_image.clone(),
+            )
         };
         let mut container_guard = agent.container.write().await;
         if let Some(container_id) = container_guard
@@ -1616,20 +1631,23 @@ impl AgentRuntime {
         let container_result = match container_source {
             ContainerSource::FreshImage => {
                 self.docker
-                    .ensure_agent_container(
+                    .ensure_agent_container_from_image(
                         &agent_id.to_string(),
                         preferred_container_id.as_deref(),
+                        &docker_image,
                     )
                     .await
             }
             ContainerSource::CloneFrom {
                 parent_container_id,
+                docker_image,
             } => {
                 if preferred_container_id.is_some() {
                     self.docker
-                        .ensure_agent_container(
+                        .ensure_agent_container_from_image(
                             &agent_id.to_string(),
                             preferred_container_id.as_deref(),
+                            docker_image,
                         )
                         .await
                 } else {
@@ -1700,6 +1718,14 @@ impl AgentRuntime {
         }
         let ready_status = agent.summary.read().await.status.clone();
         self.ensure_agent_container(&agent, ready_status).await
+    }
+
+    fn resolve_docker_image(&self, requested: Option<&str>) -> String {
+        requested
+            .map(str::trim)
+            .filter(|image| !image.is_empty())
+            .unwrap_or_else(|| self.docker.image())
+            .to_string()
     }
 
     async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<mai_mcp::McpTool> {
@@ -2408,6 +2434,7 @@ mod tests {
             name: "compact-agent".to_string(),
             status: AgentStatus::Idle,
             container_id: container_id.map(ToOwned::to_owned),
+            docker_image: "ubuntu:latest".to_string(),
             provider_id: "mock".to_string(),
             provider_name: "Mock".to_string(),
             model: "mock-model".to_string(),
@@ -2764,6 +2791,7 @@ esac
             name: "restored".to_string(),
             status: AgentStatus::RunningTurn,
             container_id: Some("old-container".to_string()),
+            docker_image: "ghcr.io/rcore-os/tgoskits-container:latest".to_string(),
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.2".to_string(),
@@ -2883,6 +2911,7 @@ esac
             name: "trace".to_string(),
             status: AgentStatus::Completed,
             container_id: None,
+            docker_image: "ubuntu:latest".to_string(),
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.2".to_string(),
@@ -2994,6 +3023,7 @@ esac
             name: "assistant-turn-trace".to_string(),
             status: AgentStatus::Completed,
             container_id: None,
+            docker_image: "ubuntu:latest".to_string(),
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.2".to_string(),
@@ -3420,6 +3450,7 @@ esac
                 provider_id: Some("openai".to_string()),
                 model: Some("gpt-5.5".to_string()),
                 reasoning_effort: Some(ReasoningEffort::High),
+                docker_image: None,
                 parent_id: None,
                 system_prompt: None,
             })
@@ -3430,6 +3461,7 @@ esac
         );
         let agent = runtime.list_agents().await[0].clone();
         assert_eq!(agent.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(agent.docker_image, "unused");
         let first = runtime
             .get_agent(agent.id, None)
             .await
@@ -3496,6 +3528,7 @@ esac
                     name: "deepseek-context".to_string(),
                     status: AgentStatus::Idle,
                     container_id: None,
+                    docker_image: "ubuntu:latest".to_string(),
                     provider_id: "deepseek".to_string(),
                     provider_name: "DeepSeek".to_string(),
                     model: "deepseek-v4-pro".to_string(),
@@ -3638,6 +3671,7 @@ esac
                     name: "parent".to_string(),
                     status: AgentStatus::Idle,
                     container_id: None,
+                    docker_image: "ghcr.io/rcore-os/tgoskits-container:latest".to_string(),
                     provider_id: "openai".to_string(),
                     provider_name: "OpenAI".to_string(),
                     model: "gpt-5.4".to_string(),
@@ -3694,6 +3728,10 @@ esac
         assert_eq!(child.provider_id, "alt");
         assert_eq!(child.model, "alt-default");
         assert_eq!(child.reasoning_effort, Some(ReasoningEffort::Medium));
+        assert_eq!(
+            child.docker_image,
+            "ghcr.io/rcore-os/tgoskits-container:latest"
+        );
         let docker_log = fake_docker_log(&dir);
         assert!(docker_log.contains("commit parent-container mai-team-snapshot-"));
         assert!(docker_log.contains(&format!("create --name mai-team-{}", child.id)));
@@ -3737,6 +3775,7 @@ esac
                     name: "parent".to_string(),
                     status: AgentStatus::Idle,
                     container_id: None,
+                    docker_image: "ghcr.io/rcore-os/tgoskits-container:latest".to_string(),
                     provider_id: "openai".to_string(),
                     provider_name: "OpenAI".to_string(),
                     model: "gpt-5.5".to_string(),
@@ -3793,6 +3832,58 @@ esac
         assert_eq!(child.provider_id, "alt");
         assert_eq!(child.model, "alt-research");
         assert_eq!(child.reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(
+            child.docker_image,
+            "ghcr.io/rcore-os/tgoskits-container:latest"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_agent_persists_and_uses_explicit_docker_image() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = Arc::new(
+            ConfigStore::open_with_config_path(&db_path, &config_path)
+                .await
+                .expect("open store"),
+        );
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let runtime = AgentRuntime::new(
+            DockerClient::new_with_binary("ubuntu:latest", fake_docker_path(&dir)),
+            ResponsesClient::new(),
+            Arc::clone(&store),
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+            },
+        )
+        .await
+        .expect("runtime");
+
+        let image = "ghcr.io/rcore-os/tgoskits-container:latest";
+        let agent = runtime
+            .create_agent(CreateAgentRequest {
+                name: Some("custom-image".to_string()),
+                provider_id: Some("openai".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                reasoning_effort: None,
+                docker_image: Some(format!("  {image}  ")),
+                parent_id: None,
+                system_prompt: None,
+            })
+            .await
+            .expect("create agent");
+
+        assert_eq!(agent.docker_image, image);
+        assert!(fake_docker_log(&dir).contains(image));
+        let snapshot = store.load_runtime_snapshot(10).await.expect("snapshot");
+        assert_eq!(snapshot.agents[0].summary.docker_image, image);
     }
 
     #[tokio::test]
@@ -3820,6 +3911,7 @@ esac
             name: "model-switch".to_string(),
             status: AgentStatus::Idle,
             container_id: None,
+            docker_image: "ubuntu:latest".to_string(),
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.5".to_string(),
@@ -3897,6 +3989,7 @@ esac
             name: "reasoning-switch".to_string(),
             status: AgentStatus::Idle,
             container_id: None,
+            docker_image: "ubuntu:latest".to_string(),
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.5".to_string(),
@@ -3971,6 +4064,7 @@ esac
             name: "busy".to_string(),
             status: AgentStatus::Idle,
             container_id: None,
+            docker_image: "ubuntu:latest".to_string(),
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.5".to_string(),

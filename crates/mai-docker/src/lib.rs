@@ -21,6 +21,8 @@ pub enum DockerError {
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid docker image: {0}")]
+    InvalidImage(String),
 }
 
 pub type Result<T> = std::result::Result<T, DockerError>;
@@ -140,6 +142,17 @@ impl DockerClient {
         agent_id: &str,
         preferred_container_id: Option<&str>,
     ) -> Result<ContainerHandle> {
+        self.ensure_agent_container_from_image(agent_id, preferred_container_id, &self.image)
+            .await
+    }
+
+    pub async fn ensure_agent_container_from_image(
+        &self,
+        agent_id: &str,
+        preferred_container_id: Option<&str>,
+        image: &str,
+    ) -> Result<ContainerHandle> {
+        let image = validate_image(image)?;
         if let Some(container) = self
             .reusable_agent_container(agent_id, preferred_container_id)
             .await?
@@ -147,7 +160,8 @@ impl DockerClient {
             return self.prepare_existing_container(container).await;
         }
 
-        self.create_agent_container(agent_id).await
+        self.create_agent_container_from_image(agent_id, image)
+            .await
     }
 
     pub async fn create_agent_container(&self, agent_id: &str) -> Result<ContainerHandle> {
@@ -183,6 +197,7 @@ impl DockerClient {
         agent_id: &str,
         image: &str,
     ) -> Result<ContainerHandle> {
+        let image = validate_image(image)?;
         let name = agent_container_name(agent_id);
         let label = agent_label(agent_id);
         let args = create_agent_container_args(&name, &label, image);
@@ -519,6 +534,30 @@ fn create_agent_container_args(name: &str, agent_label: &str, image: &str) -> Ve
     .collect()
 }
 
+fn validate_image(image: &str) -> Result<&str> {
+    if image.trim().is_empty() {
+        return Err(DockerError::InvalidImage(
+            "image name cannot be empty".to_string(),
+        ));
+    }
+    if image.trim() != image {
+        return Err(DockerError::InvalidImage(
+            "image name cannot include leading or trailing whitespace".to_string(),
+        ));
+    }
+    if image.chars().any(char::is_whitespace) {
+        return Err(DockerError::InvalidImage(
+            "image name cannot include whitespace".to_string(),
+        ));
+    }
+    if image.chars().any(char::is_control) {
+        return Err(DockerError::InvalidImage(
+            "image name cannot include control characters".to_string(),
+        ));
+    }
+    Ok(image)
+}
+
 fn snapshot_image_name(agent_id: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -625,7 +664,7 @@ mod tests {
                     "Id": "abc123",
                     "Name": "/mai-team-agent-1",
                     "Config": {
-                        "Image": "ubuntu:24.04",
+                        "Image": "ubuntu:latest",
                         "Labels": {
                             "mai.team.managed": "true",
                             "mai.team.agent": "agent-1"
@@ -637,7 +676,7 @@ mod tests {
                     "Id": "def456",
                     "Name": "/mai-team-unlabeled",
                     "Config": {
-                        "Image": "ubuntu:24.04",
+                        "Image": "ubuntu:latest",
                         "Labels": {
                             "mai.team.managed": "true"
                         }
@@ -652,7 +691,7 @@ mod tests {
         assert_eq!(containers.len(), 2);
         assert_eq!(containers[0].id, "abc123");
         assert_eq!(containers[0].name, "mai-team-agent-1");
-        assert_eq!(containers[0].image, "ubuntu:24.04");
+        assert_eq!(containers[0].image, "ubuntu:latest");
         assert_eq!(containers[0].state, "exited");
         assert_eq!(containers[0].agent_id.as_deref(), Some("agent-1"));
         assert_eq!(containers[1].agent_id, None);
@@ -719,11 +758,8 @@ mod tests {
 
     #[test]
     fn create_agent_container_args_include_labels_workspace_and_image() {
-        let args = create_agent_container_args(
-            "mai-team-child",
-            "mai.team.agent=child",
-            "mai-team-snapshot-child-1",
-        );
+        let image = "ghcr.io/rcore-os/tgoskits-container:latest";
+        let args = create_agent_container_args("mai-team-child", "mai.team.agent=child", image);
 
         assert_eq!(args[0], "create");
         assert!(
@@ -741,8 +777,32 @@ mod tests {
         assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
         assert!(
             args.windows(3)
-                .any(|window| { window == ["mai-team-snapshot-child-1", "sleep", "infinity"] })
+                .any(|window| { window == [image, "sleep", "infinity"] })
         );
+    }
+
+    #[test]
+    fn validate_image_rejects_empty_whitespace_and_control_characters() {
+        assert_eq!(
+            validate_image("ubuntu:latest").expect("valid"),
+            "ubuntu:latest"
+        );
+        assert!(matches!(
+            validate_image(""),
+            Err(DockerError::InvalidImage(_))
+        ));
+        assert!(matches!(
+            validate_image(" ubuntu:latest"),
+            Err(DockerError::InvalidImage(_))
+        ));
+        assert!(matches!(
+            validate_image("ubuntu latest"),
+            Err(DockerError::InvalidImage(_))
+        ));
+        assert!(matches!(
+            validate_image("ubuntu:\nlatest"),
+            Err(DockerError::InvalidImage(_))
+        ));
     }
 
     #[test]
@@ -756,7 +816,7 @@ mod tests {
         ManagedContainer {
             id: id.to_string(),
             name: format!("mai-team-{id}"),
-            image: "ubuntu:24.04".to_string(),
+            image: "ubuntu:latest".to_string(),
             state: "running".to_string(),
             agent_id: agent_id.map(str::to_string),
         }

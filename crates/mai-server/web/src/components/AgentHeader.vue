@@ -14,6 +14,11 @@
           <span>/</span>
           <span class="mono">{{ detail.model }}</span>
         </p>
+        <p v-if="detail.docker_image">
+          <span>Docker</span>
+          <span>/</span>
+          <span class="mono">{{ detail.docker_image }}</span>
+        </p>
         <p v-if="detail.last_error" class="error-text">{{ detail.last_error }}</p>
       </div>
     </div>

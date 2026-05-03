@@ -215,6 +215,7 @@ function openCreateAgentDialog() {
   agentDialog.name = ''
   agentDialog.provider_id = defaultProvider?.id || ''
   agentDialog.model = defaultProvider?.default_model || defaultProvider?.models?.[0]?.id || ''
+  agentDialog.docker_image = ''
   resetAgentReasoningEffort()
   agentDialog.error = ''
 }
@@ -228,7 +229,13 @@ function resetAgentReasoningEffort() {
 async function onCreateAgent() {
   agentDialog.error = ''
   try {
-    await createAgent(agentDialog.name, agentDialog.provider_id, agentDialog.model, agentDialog.reasoning_effort)
+    await createAgent(
+      agentDialog.name,
+      agentDialog.provider_id,
+      agentDialog.model,
+      agentDialog.reasoning_effort,
+      agentDialog.docker_image
+    )
     agentDialog.open = false
     activeTab.value = 'agents'
   } catch (error) {

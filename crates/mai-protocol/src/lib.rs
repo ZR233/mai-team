@@ -103,6 +103,8 @@ pub struct AgentSummary {
     pub name: String,
     pub status: AgentStatus,
     pub container_id: Option<String>,
+    #[serde(default)]
+    pub docker_image: String,
     pub provider_id: String,
     pub provider_name: String,
     pub model: String,
@@ -134,6 +136,8 @@ pub struct CreateAgentRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub docker_image: Option<String>,
     pub parent_id: Option<AgentId>,
     pub system_prompt: Option<String>,
 }
@@ -641,5 +645,17 @@ mod tests {
             }
             _ => panic!("expected tool_completed"),
         }
+    }
+
+    #[test]
+    fn create_agent_request_accepts_missing_docker_image() {
+        let request: CreateAgentRequest = serde_json::from_value(json!({
+            "name": "agent",
+            "provider_id": "openai",
+            "model": "gpt-5.5"
+        }))
+        .expect("request");
+
+        assert_eq!(request.docker_image, None);
     }
 }

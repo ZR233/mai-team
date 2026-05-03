@@ -9,6 +9,13 @@
         <span>Agent Name</span>
         <input v-model.trim="dialog.name" placeholder="Research Agent" />
       </label>
+      <label>
+        <span>Docker Image</span>
+        <input
+          v-model.trim="dialog.docker_image"
+          placeholder="ghcr.io/rcore-os/tgoskits-container:latest"
+        />
+      </label>
       <ModelSelector
         v-model:provider-id="dialog.provider_id"
         v-model:model="dialog.model"

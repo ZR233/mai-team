@@ -61,14 +61,15 @@ export function useAgents() {
     await refreshDetail()
   }
 
-  async function createAgent(name, providerId, model, reasoningEffort) {
+  async function createAgent(name, providerId, model, reasoningEffort, dockerImage) {
     const response = await api('/agents', {
       method: 'POST',
       body: JSON.stringify({
         name: name || null,
         provider_id: providerId || null,
         model: model || null,
-        reasoning_effort: reasoningEffort || null
+        reasoning_effort: reasoningEffort || null,
+        docker_image: dockerImage || null
       })
     })
     selectedAgentId.value = response.agent.id
@@ -141,6 +142,7 @@ export function useAgents() {
     provider_id: '',
     model: '',
     reasoning_effort: '',
+    docker_image: '',
     error: ''
   })
 
