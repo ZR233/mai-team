@@ -85,6 +85,16 @@ export function buildAgentTimeline(detail, liveEvents = []) {
         timestamp: event.timestamp,
         sequence: event.sequence || 0
       })
+    } else if (event.type === 'context_compacted') {
+      items.push({
+        type: 'process',
+        key: `context-compacted-${event.turn_id}-${event.sequence || event.timestamp}`,
+        tone: 'done',
+        label: '已自动压缩上下文',
+        detail: event.tokens_before ? `${event.tokens_before} tokens` : '历史已整理',
+        timestamp: event.timestamp,
+        sequence: event.sequence || 0
+      })
     } else if (event.type === 'agent_status_changed') {
       const row = statusProcessRow(event)
       if (row) items.push(row)

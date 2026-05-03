@@ -425,6 +425,7 @@ fn event_name(event: &ServiceEvent) -> &'static str {
         mai_protocol::ServiceEventKind::TurnCompleted { .. } => "turn_completed",
         mai_protocol::ServiceEventKind::ToolStarted { .. } => "tool_started",
         mai_protocol::ServiceEventKind::ToolCompleted { .. } => "tool_completed",
+        mai_protocol::ServiceEventKind::ContextCompacted { .. } => "context_compacted",
         mai_protocol::ServiceEventKind::AgentMessage { .. } => "agent_message",
         mai_protocol::ServiceEventKind::Error { .. } => "error",
     }

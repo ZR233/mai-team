@@ -64,6 +64,7 @@ pub struct PersistedAgent {
 pub struct PersistedAgentSession {
     pub summary: AgentSessionSummary,
     pub history: Vec<ModelInputItem>,
+    pub last_context_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -824,6 +825,70 @@ impl ConfigStore {
         Ok(())
     }
 
+    pub async fn replace_agent_history(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        items: &[ModelInputItem],
+    ) -> Result<()> {
+        let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
+        Query::<List<AgentHistoryRecord>>::filter(
+            AgentHistoryRecord::fields()
+                .agent_id()
+                .eq(agent_id.to_string())
+                .and(
+                    AgentHistoryRecord::fields()
+                        .session_id()
+                        .eq(session_id.to_string()),
+                ),
+        )
+        .delete()
+        .exec(&mut tx)
+        .await?;
+
+        for (position, item) in items.iter().enumerate() {
+            toasty::create!(AgentHistoryRecord {
+                id: Uuid::new_v4().to_string(),
+                agent_id: agent_id.to_string(),
+                session_id: session_id.to_string(),
+                position: position as i64,
+                item_json: serde_json::to_string(item)?,
+            })
+            .exec(&mut tx)
+            .await?;
+        }
+        delete_setting_in_tx(&mut tx, &session_context_tokens_key(agent_id, session_id)).await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn save_session_context_tokens(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        tokens: u64,
+    ) -> Result<()> {
+        self.set_setting(
+            &session_context_tokens_key(agent_id, session_id),
+            &tokens.to_string(),
+        )
+        .await
+    }
+
+    pub async fn clear_session_context_tokens(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> Result<()> {
+        let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
+        delete_setting_in_tx(&mut tx, &session_context_tokens_key(agent_id, session_id)).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn append_service_event(&self, event: &ServiceEvent) -> Result<()> {
         let mut db = self.db.clone();
         Query::<List<ServiceEventRecord>>::filter(
@@ -921,6 +986,9 @@ impl ConfigStore {
             let session_id = parse_session_id(&row.id)?;
             let messages = self.load_agent_messages(agent_id, session_id).await?;
             let history = self.load_agent_history(agent_id, session_id).await?;
+            let last_context_tokens = self
+                .load_session_context_tokens(agent_id, session_id)
+                .await?;
             sessions.push(PersistedAgentSession {
                 summary: AgentSessionSummary {
                     id: session_id,
@@ -930,6 +998,7 @@ impl ConfigStore {
                     message_count: messages.len(),
                 },
                 history,
+                last_context_tokens,
             });
         }
         Ok(sessions)
@@ -973,6 +1042,17 @@ impl ConfigStore {
         rows.into_iter()
             .map(|row| serde_json::from_str::<ModelInputItem>(&row.item_json).map_err(Into::into))
             .collect()
+    }
+
+    async fn load_session_context_tokens(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> Result<Option<u64>> {
+        Ok(self
+            .get_setting(&session_context_tokens_key(agent_id, session_id))
+            .await?
+            .and_then(|value| value.parse::<u64>().ok()))
     }
 }
 
@@ -1365,6 +1445,10 @@ fn child_id(parent: &str, child: &str) -> String {
     format!("{parent}\u{1f}{child}")
 }
 
+fn session_context_tokens_key(agent_id: AgentId, session_id: SessionId) -> String {
+    format!("session_context_tokens:{agent_id}:{session_id}")
+}
+
 fn parse_agent_id(value: &str) -> Result<AgentId> {
     Uuid::parse_str(value)
         .map_err(|err| StoreError::InvalidConfig(format!("invalid agent id `{value}`: {err}")))
@@ -1484,6 +1568,7 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         | ServiceEventKind::TurnCompleted { agent_id, .. }
         | ServiceEventKind::ToolStarted { agent_id, .. }
         | ServiceEventKind::ToolCompleted { agent_id, .. }
+        | ServiceEventKind::ContextCompacted { agent_id, .. }
         | ServiceEventKind::AgentMessage { agent_id, .. } => Some(*agent_id),
         ServiceEventKind::Error { agent_id, .. } => *agent_id,
     }
@@ -1496,6 +1581,7 @@ fn event_session_id(event: &ServiceEvent) -> Option<SessionId> {
         | ServiceEventKind::ToolStarted { session_id, .. }
         | ServiceEventKind::ToolCompleted { session_id, .. }
         | ServiceEventKind::AgentMessage { session_id, .. } => *session_id,
+        ServiceEventKind::ContextCompacted { session_id, .. } => Some(*session_id),
         ServiceEventKind::Error { session_id, .. } => *session_id,
         _ => None,
     }
@@ -1692,10 +1778,7 @@ mod tests {
             model.reasoning_efforts,
             vec![ReasoningEffort::High, ReasoningEffort::Max]
         );
-        assert_eq!(
-            model.default_reasoning_effort,
-            Some(ReasoningEffort::High)
-        );
+        assert_eq!(model.default_reasoning_effort, Some(ReasoningEffort::High));
     }
 
     #[tokio::test]
@@ -1893,6 +1976,7 @@ mod tests {
         assert_eq!(snapshot.agents[0].sessions[0].summary.title, "Chat 1");
         assert_eq!(snapshot.agents[0].sessions[0].summary.message_count, 1);
         assert_eq!(snapshot.agents[0].sessions[0].history.len(), 2);
+        assert_eq!(snapshot.agents[0].sessions[0].last_context_tokens, None);
         assert!(matches!(
             &snapshot.agents[0].sessions[0].history[1],
             ModelInputItem::AssistantTurn {
@@ -1933,6 +2017,164 @@ mod tests {
                 .expect("history")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn replace_agent_history_only_replaces_target_session() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("config.sqlite3");
+        let store = ConfigStore::open_with_config_path(&db_path, dir.path().join("config.toml"))
+            .await
+            .expect("open");
+        let agent_id = Uuid::new_v4();
+        let first_session_id = Uuid::new_v4();
+        let second_session_id = Uuid::new_v4();
+        let now = Utc::now();
+        let summary = AgentSummary {
+            id: agent_id,
+            parent_id: None,
+            name: "agent-test".to_string(),
+            status: AgentStatus::Completed,
+            container_id: None,
+            provider_id: "openai".to_string(),
+            provider_name: "OpenAI".to_string(),
+            model: "gpt-5.2".to_string(),
+            reasoning_effort: None,
+            created_at: now,
+            updated_at: now,
+            current_turn: None,
+            last_error: None,
+            token_usage: TokenUsage::default(),
+        };
+        store.save_agent(&summary, None).await.expect("save agent");
+        for session_id in [first_session_id, second_session_id] {
+            store
+                .save_agent_session(
+                    agent_id,
+                    &AgentSessionSummary {
+                        id: session_id,
+                        title: "Chat".to_string(),
+                        created_at: now,
+                        updated_at: now,
+                        message_count: 0,
+                    },
+                )
+                .await
+                .expect("save session");
+        }
+        store
+            .append_agent_history_item(
+                agent_id,
+                first_session_id,
+                0,
+                &ModelInputItem::user_text("old first"),
+            )
+            .await
+            .expect("first history");
+        store
+            .append_agent_history_item(
+                agent_id,
+                second_session_id,
+                0,
+                &ModelInputItem::user_text("old second"),
+            )
+            .await
+            .expect("second history");
+
+        store
+            .replace_agent_history(
+                agent_id,
+                first_session_id,
+                &[ModelInputItem::user_text("new")],
+            )
+            .await
+            .expect("replace");
+        let first = store
+            .load_agent_history(agent_id, first_session_id)
+            .await
+            .expect("first");
+        let second = store
+            .load_agent_history(agent_id, second_session_id)
+            .await
+            .expect("second");
+        assert!(matches!(
+            &first[0],
+            ModelInputItem::Message { content, .. }
+                if matches!(&content[0], ModelContentItem::InputText { text } if text == "new")
+        ));
+        assert!(matches!(
+            &second[0],
+            ModelInputItem::Message { content, .. }
+                if matches!(&content[0], ModelContentItem::InputText { text } if text == "old second")
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_context_tokens_survive_reopen_and_clear() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("config.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("open");
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let now = Utc::now();
+        store
+            .save_agent(
+                &AgentSummary {
+                    id: agent_id,
+                    parent_id: None,
+                    name: "agent-test".to_string(),
+                    status: AgentStatus::Completed,
+                    container_id: None,
+                    provider_id: "openai".to_string(),
+                    provider_name: "OpenAI".to_string(),
+                    model: "gpt-5.2".to_string(),
+                    reasoning_effort: None,
+                    created_at: now,
+                    updated_at: now,
+                    current_turn: None,
+                    last_error: None,
+                    token_usage: TokenUsage::default(),
+                },
+                None,
+            )
+            .await
+            .expect("save agent");
+        store
+            .save_agent_session(
+                agent_id,
+                &AgentSessionSummary {
+                    id: session_id,
+                    title: "Chat".to_string(),
+                    created_at: now,
+                    updated_at: now,
+                    message_count: 0,
+                },
+            )
+            .await
+            .expect("save session");
+        store
+            .save_session_context_tokens(agent_id, session_id, 1234)
+            .await
+            .expect("save tokens");
+        drop(store);
+
+        let reopened = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("reopen");
+        let snapshot = reopened.load_runtime_snapshot(10).await.expect("snapshot");
+        assert_eq!(
+            snapshot.agents[0].sessions[0].last_context_tokens,
+            Some(1234)
+        );
+        reopened
+            .clear_session_context_tokens(agent_id, session_id)
+            .await
+            .expect("clear");
+        let snapshot = reopened.load_runtime_snapshot(10).await.expect("snapshot");
+        assert_eq!(snapshot.agents[0].sessions[0].last_context_tokens, None);
     }
 
     #[tokio::test]

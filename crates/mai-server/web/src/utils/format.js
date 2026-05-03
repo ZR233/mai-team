@@ -70,6 +70,7 @@ export function eventSummary(event, formatStatusFn, roleLabelFn) {
   if (event.type === 'turn_completed') return `Turn completed with ${formatStatusFn(event.status)}`
   if (event.type === 'tool_started') return `Tool started: ${event.tool_name}`
   if (event.type === 'tool_completed') return `Tool completed: ${event.tool_name}`
+  if (event.type === 'context_compacted') return `Context compacted after ${event.tokens_before || 0} tokens`
   if (event.type === 'agent_message') {
     const content = event.content || ''
     return `${roleLabelFn(event.role)}: ${content.length > 120 ? content.slice(0, 120) + '...' : content}`

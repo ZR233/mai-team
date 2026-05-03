@@ -35,6 +35,7 @@ export function useSSE() {
       'turn_completed',
       'tool_started',
       'tool_completed',
+      'context_compacted',
       'agent_message',
       'error'
     ]

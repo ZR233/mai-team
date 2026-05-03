@@ -369,6 +369,13 @@ pub enum ServiceEventKind {
         #[serde(default)]
         duration_ms: Option<u64>,
     },
+    ContextCompacted {
+        agent_id: AgentId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        tokens_before: u64,
+        summary_preview: String,
+    },
     AgentMessage {
         agent_id: AgentId,
         #[serde(default)]
