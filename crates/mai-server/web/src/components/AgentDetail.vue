@@ -1,47 +1,17 @@
 <template>
   <template v-if="detail">
-    <div class="agent-header">
-      <div class="large-avatar">{{ initial(detail.name) }}</div>
-      <div class="agent-title">
-        <div class="title-row">
-          <h2>{{ detail.name }}</h2>
-          <span class="status-pill" :class="statusTone(detail.status)">
-            {{ formatStatus(detail.status) }}
-          </span>
-        </div>
-        <p>{{ detail.provider_name }} / {{ detail.model }}</p>
-        <p v-if="detail.last_error" class="error-text">{{ detail.last_error }}</p>
-      </div>
-      <div class="thinking-depth-control" :class="{ disabled: !currentReasoningOptions.length }">
-        <label for="thinking-depth-select">
-          <span>思考深度</span>
-          <select
-            id="thinking-depth-select"
-            v-model="currentReasoningEffort"
-            :disabled="!currentReasoningOptions.length || isModelChangeBusy || updatingModel"
-            @change="saveReasoningEffort"
-          >
-            <option v-if="!currentReasoningOptions.length" value="">
-              当前模型不支持
-            </option>
-            <option v-for="option in currentReasoningOptions" :key="option.value" :value="option.value">
-              {{ option.label }}
-            </option>
-          </select>
-        </label>
-        <small v-if="currentReasoningOptions.length">
-          {{ updatingModel ? '保存中...' : '应用到下一轮对话' }}
-        </small>
-        <small v-else>换到支持思考的模型后可选</small>
-      </div>
-      <div class="agent-actions">
-        <button class="ghost-button" :disabled="!providers.length || isModelChangeBusy || updatingModel" @click="openModelEditor">
-          Change Model
-        </button>
-        <button class="ghost-button" @click="$emit('cancel', detail.id)">Cancel</button>
-        <button class="danger-button" @click="$emit('delete', detail.id, detail.name)">Delete</button>
-      </div>
-    </div>
+    <AgentHeader
+      :detail="detail"
+      :reasoning-effort="currentReasoningEffort"
+      :reasoning-options="currentReasoningOptions"
+      :providers-count="providers.length"
+      :model-change-busy="isModelChangeBusy"
+      :updating-model="updatingModel"
+      @change-reasoning-effort="saveReasoningEffort"
+      @open-model="openModelEditor"
+      @cancel="$emit('cancel', $event)"
+      @delete="(...args) => $emit('delete', ...args)"
+    />
 
     <div v-if="modelEditor.open" class="agent-model-editor">
       <label>
@@ -77,163 +47,50 @@
       <p v-if="modelEditor.error" class="dialog-error">{{ modelEditor.error }}</p>
     </div>
 
-    <div class="detail-strip">
-      <div><span>Status</span><strong>{{ formatStatus(detail.status) }}</strong></div>
-      <div><span>Container</span><strong>{{ shortContainer(detail.container_id) }}</strong></div>
-      <div><span>Provider</span><strong>{{ detail.provider_id }}</strong></div>
-      <div v-if="detail.reasoning_effort"><span>Reasoning</span><strong>{{ reasoningLabel(detail.reasoning_effort) }}</strong></div>
-      <div><span>Tokens</span><strong>{{ totalTokens(detail) }}</strong></div>
-      <div><span>Created</span><strong>{{ formatDate(detail.created_at) }}</strong></div>
-    </div>
-
-    <div class="session-strip">
-      <div class="session-tabs">
-        <button
-          v-for="session in detail.sessions || []"
-          :key="session.id"
-          type="button"
-          class="session-tab"
-          :class="{ active: session.id === detail.selected_session_id }"
-          @click="$emit('select-session', session.id)"
-        >
-          <span>{{ session.title }}</span>
-          <small>{{ session.message_count }}</small>
-        </button>
-      </div>
-      <button class="small-button" type="button" @click="$emit('create-session')">New Chat</button>
-    </div>
-
-    <div v-if="contextCapacity.visible" class="context-capacity" :class="contextCapacity.tone">
-      <div class="context-capacity-header">
-        <span>上下文容量</span>
-        <strong>{{ contextCapacity.label }}</strong>
-      </div>
-      <div class="context-capacity-track" :style="{ '--compact-threshold': `${contextCapacity.threshold}%` }">
-        <div class="context-capacity-fill" :style="{ width: `${contextCapacity.percent}%` }"></div>
-      </div>
-      <div class="context-capacity-meta">
-        <span>{{ contextCapacity.used }} / {{ contextCapacity.total }} tokens</span>
-        <span>{{ contextCapacity.threshold }}% 自动压缩</span>
-      </div>
-    </div>
+    <SessionTabs
+      :sessions="detail.sessions || []"
+      :selected-session-id="detail.selected_session_id"
+      @select-session="$emit('select-session', $event)"
+      @create-session="$emit('create-session')"
+    />
 
     <div class="agent-body">
-      <section class="conversation chat-timeline" ref="conversationRef">
-        <div v-if="loading" class="loading-center">
-          <div class="spinner"></div>
-          <span>Loading messages...</span>
-        </div>
-        <div v-else-if="!timelineItems.length" class="quiet-empty">
-          <strong>No messages yet</strong>
-          <span>Send the first instruction to start a turn.</span>
-        </div>
-        <template v-else>
-          <article
-            v-for="item in timelineItems"
-            :key="item.key"
-            class="timeline-item"
-            :class="`timeline-${item.type}`"
-          >
-            <template v-if="item.type === 'message'">
-              <div class="timeline-message" :class="messageClass(item.role)">
-                <div class="message-avatar">{{ roleInitial(item.role) }}</div>
-                <div class="message-content">
-                  <span>{{ roleLabel(item.role) }}</span>
-                  <div class="markdown-body" v-html="renderMarkdown(item.content)"></div>
-                </div>
-              </div>
-            </template>
-
-            <div v-else-if="item.type === 'tool'" class="tool-card" :class="`tool-${item.status}`">
-              <button class="tool-card-toggle" type="button" @click="toggleTool(item)">
-                <span class="tool-chevron" :class="{ open: isToolExpanded(item) }">›</span>
-                <span class="tool-state-dot"></span>
-                <span class="tool-title">
-                  <span>{{ item.status === 'running' ? 'Calling tool' : 'Used tool' }}</span>
-                  <strong>{{ item.toolName }}</strong>
-                </span>
-                <span class="tool-meta">
-                  {{ toolStatusLabel(item.status) }}
-                  <template v-if="formatDuration(item.durationMs)"> · {{ formatDuration(item.durationMs) }}</template>
-                </span>
-              </button>
-              <div class="tool-preview-grid">
-                <div v-if="item.argumentsPreview" class="trace-preview">
-                  <span>Arguments</span>
-                  <div class="trace-surface" v-html="renderToolTrace({ toolName: item.toolName, kind: 'arguments', value: item.argumentsPreview })"></div>
-                </div>
-                <div v-if="item.outputPreview" class="trace-preview">
-                  <span>Output</span>
-                  <div class="trace-surface" v-html="renderToolTrace({ toolName: item.toolName, kind: 'output', value: item.outputPreview })"></div>
-                </div>
-              </div>
-              <div v-if="isToolExpanded(item)" class="tool-trace">
-                <div v-if="traceState(item).loading" class="trace-loading">
-                  <span class="spinner-sm"></span>
-                  Loading full trace...
-                </div>
-                <p v-else-if="traceState(item).error" class="trace-error">
-                  {{ traceState(item).error }}
-                </p>
-                <template v-else-if="traceState(item).detail">
-                  <div class="trace-block">
-                    <span>Full arguments</span>
-                    <div class="trace-surface" v-html="renderToolTrace({ toolName: item.toolName, kind: 'arguments', value: traceState(item).detail.arguments })"></div>
-                  </div>
-                  <div class="trace-block">
-                    <span>Full output</span>
-                    <div class="trace-surface" v-html="renderToolTrace({ toolName: item.toolName, kind: 'output', value: traceState(item).detail.output })"></div>
-                  </div>
-                </template>
-              </div>
-            </div>
-
-            <div v-else-if="item.type === 'error'" class="timeline-error-card">
-              <strong>Error</strong>
-              <p>{{ item.message }}</p>
-            </div>
-
-            <div v-else class="process-row" :class="`process-${item.tone}`">
-              <span class="process-dot"></span>
-              <span class="process-label">{{ item.label }}</span>
-              <span v-if="item.detail" class="process-detail">{{ item.detail }}</span>
-            </div>
-          </article>
-        </template>
-      </section>
+      <ChatTimeline
+        v-model:conversation-ref="conversationRef"
+        :timeline-items="timelineItems"
+        :loading="loading"
+        :is-tool-expanded="isToolExpanded"
+        :trace-state="traceState"
+        @toggle-tool="toggleTool"
+      />
     </div>
 
-    <form class="composer" @submit.prevent="send">
-      <textarea
-        :value="draft"
-        rows="2"
-        placeholder="Send a command or message... (Enter to send, Shift+Enter for new line)"
-        @input="$emit('update:draft', $event.target.value)"
-        @keydown.enter.exact="handleEnter"
-      />
-      <button class="primary-button" type="submit" :disabled="!draft.trim() || sending">
-        <span v-if="sending" class="spinner-sm"></span>
-        <template v-else>Send</template>
-      </button>
-    </form>
+    <ContextStatusLine
+      :detail="detail"
+      :context-capacity="contextCapacity"
+      :activity="latestActivity"
+    />
+
+    <ComposerBar
+      :draft="draft"
+      :sending="sending"
+      @send="$emit('send', $event)"
+      @update:draft="$emit('update:draft', $event)"
+    />
   </template>
 </template>
 
 <script setup>
 import { computed, nextTick, reactive, ref, watch } from 'vue'
-import {
-  formatStatus, formatDate,
-  totalTokens, shortContainer, initial, roleInitial, roleLabel,
-  statusTone, messageClass
-} from '../utils/format'
-import { defaultReasoningEffort, reasoningLabel, reasoningOptionsFor } from '../utils/reasoning'
-import { renderMarkdown } from '../utils/markdown'
+import AgentHeader from './AgentHeader.vue'
+import ChatTimeline from './ChatTimeline.vue'
+import ComposerBar from './ComposerBar.vue'
+import ContextStatusLine from './ContextStatusLine.vue'
+import SessionTabs from './SessionTabs.vue'
+import { defaultReasoningEffort, reasoningOptionsFor } from '../utils/reasoning'
 import { useApi } from '../composables/useApi'
 import {
-  buildAgentTimeline,
-  formatDuration,
-  renderToolTrace,
-  toolStatusLabel
+  buildAgentTimeline
 } from '../utils/timeline'
 
 const props = defineProps({
@@ -277,6 +134,13 @@ const editorReasoningOptions = computed(() => reasoningOptionsFor(editorProvider
 const currentProvider = computed(() => props.providers.find((provider) => provider.id === props.detail?.provider_id))
 const currentModel = computed(() => currentProvider.value?.models?.find((model) => model.id === props.detail?.model))
 const currentReasoningOptions = computed(() => reasoningOptionsFor(currentProvider.value, currentModel.value))
+const latestActivity = computed(() => {
+  const activeTool = [...timelineItems.value].reverse().find((item) => item.type === 'tool' && item.status === 'running')
+  if (activeTool) return `${activeTool.toolActionLabel || 'Running'} ${activeTool.toolName}`
+  const activeProcess = [...timelineItems.value].reverse().find((item) => item.type === 'process' && item.tone === 'active')
+  if (activeProcess) return [activeProcess.label, activeProcess.detail].filter(Boolean).join(' · ')
+  return ''
+})
 const contextCapacity = computed(() => {
   const usage = props.detail?.context_usage
   const total = Number(usage?.context_tokens || currentModel.value?.context_tokens || 0)
@@ -334,17 +198,6 @@ watch(
   }
 )
 
-function handleEnter(event) {
-  if (!event.shiftKey) {
-    event.preventDefault()
-    send()
-  }
-}
-
-function send() {
-  if (props.draft.trim()) emit('send', props.draft.trim())
-}
-
 function syncCurrentReasoningEffort() {
   const activeValue = props.detail?.reasoning_effort || ''
   currentReasoningEffort.value = currentReasoningOptions.value.some((option) => option.value === activeValue)
@@ -352,12 +205,13 @@ function syncCurrentReasoningEffort() {
     : defaultReasoningEffort(currentProvider.value, currentModel.value)
 }
 
-function saveReasoningEffort() {
+function saveReasoningEffort(value = currentReasoningEffort.value) {
   if (!props.detail || !currentReasoningOptions.value.length) return
+  currentReasoningEffort.value = value
   emit('update-model', {
     provider_id: props.detail.provider_id,
     model: props.detail.model,
-    reasoning_effort: currentReasoningEffort.value
+    reasoning_effort: value
   })
 }
 

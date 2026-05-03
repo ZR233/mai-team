@@ -132,6 +132,7 @@ export function buildAgentTimeline(detail, liveEvents = []) {
   }
 
   for (const tool of tools.values()) {
+    const summary = summarizeTool(tool)
     items.push({
       type: 'tool',
       key: `tool-${tool.callId}`,
@@ -142,6 +143,10 @@ export function buildAgentTimeline(detail, liveEvents = []) {
       success: tool.success,
       argumentsPreview: tool.argumentsPreview,
       outputPreview: tool.outputPreview,
+      toolActionLabel: summary.actionLabel,
+      toolPrimary: summary.primary,
+      toolSecondary: summary.secondary,
+      toolPreviewLines: summary.previewLines,
       durationMs: tool.durationMs,
       timestamp: tool.timestamp,
       sequence: tool.sequence
@@ -456,6 +461,65 @@ function baseTool(event) {
     timestamp: event.timestamp,
     sequence: event.sequence || 0
   }
+}
+
+function summarizeTool(tool) {
+  const toolName = normalizeToolName(tool.toolName)
+  const args = parseTraceValue(tool.arguments || tool.argumentsPreview).value
+  const output = parseTraceValue(tool.outputPreview).value
+
+  if (toolName === 'container_exec' && isPlainObject(args)) {
+    return {
+      actionLabel: tool.status === 'running' ? 'Running' : tool.status === 'failed' ? 'Failed' : 'Ran',
+      primary: cleanOneLine(args.command || tool.toolName),
+      secondary: args.cwd ? `cwd ${cleanOneLine(args.cwd)}` : '',
+      previewLines: previewOutputLines(output)
+    }
+  }
+
+  return {
+    actionLabel: tool.status === 'running' ? 'Calling' : tool.status === 'failed' ? 'Failed' : 'Called',
+    primary: tool.toolName,
+    secondary: summarizeToolArgs(args),
+    previewLines: previewOutputLines(output)
+  }
+}
+
+function summarizeToolArgs(value) {
+  if (!isPlainObject(value)) return cleanOneLine(formatTraceValue(value)).slice(0, 120)
+  const preferredKeys = ['path', 'agent_id', 'session_id', 'name', 'provider_id', 'model', 'timeout_secs']
+  const entries = preferredKeys
+    .filter((key) => value[key] !== null && value[key] !== undefined && value[key] !== '')
+    .map((key) => `${key.replace(/_id$/, '')} ${cleanOneLine(String(value[key]))}`)
+  if (entries.length) return entries.slice(0, 2).join(' · ')
+  const keys = Object.keys(value)
+  if (!keys.length) return ''
+  return keys.slice(0, 3).join(', ')
+}
+
+function previewOutputLines(value) {
+  const text = outputText(value)
+  if (!text) return []
+  const lines = text.split('\n').map((line) => line.trimEnd()).filter(Boolean)
+  return lines.slice(-4).map((line) => (line.length > 180 ? `${line.slice(0, 177)}...` : line))
+}
+
+function outputText(value) {
+  if (value === null || value === undefined || value === '') return ''
+  if (typeof value === 'string') return cleanTerminalText(value)
+  if (isPlainObject(value)) {
+    const parts = []
+    if (value.stdout) parts.push(String(value.stdout))
+    if (value.stderr) parts.push(String(value.stderr))
+    if (parts.length) return cleanTerminalText(parts.join('\n'))
+    if (value.message) return cleanTerminalText(String(value.message))
+    if (value.error) return cleanTerminalText(String(value.error))
+  }
+  return cleanTerminalText(formatTraceValue(value))
+}
+
+function cleanOneLine(value) {
+  return cleanTerminalText(String(value || '')).replace(/\s+/g, ' ').trim()
 }
 
 function statusProcessRow(event) {
