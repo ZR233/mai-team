@@ -513,6 +513,45 @@ p {
   gap: 4px;
 }
 
+.thinking-depth-control {
+  display: grid;
+  width: min(210px, 24vw);
+  min-width: 170px;
+  gap: 4px;
+}
+
+.thinking-depth-control label {
+  gap: 5px;
+}
+
+.thinking-depth-control span {
+  color: #66758a;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0;
+}
+
+.thinking-depth-control select {
+  min-height: 36px;
+  padding: 7px 10px;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.thinking-depth-control small {
+  overflow: hidden;
+  color: #738198;
+  font-size: 11px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thinking-depth-control.disabled select {
+  color: #738198;
+  background: #f1f5f9;
+}
+
 .title-row,
 .provider-name-line,
 .modal-title-row {
@@ -1802,6 +1841,10 @@ select:focus {
   .stage-title {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .thinking-depth-control {
+    width: 100%;
   }
 
   .agent-actions {

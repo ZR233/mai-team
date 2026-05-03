@@ -26,7 +26,7 @@
         </select>
       </label>
       <label v-if="reasoningOptions.length">
-        <span>Reasoning Effort</span>
+        <span>思考深度</span>
         <select v-model="dialog.reasoning_effort">
           <option v-for="option in reasoningOptions" :key="option.value" :value="option.value">
             {{ option.label }}

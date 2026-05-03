@@ -552,7 +552,10 @@ impl ConfigStore {
             Err(err) => return Err(err.into()),
         };
         match toml::from_str::<ProvidersToml>(&text) {
-            Ok(file) => Ok(file),
+            Ok(mut file) => {
+                normalize_provider_file(&mut file);
+                Ok(file)
+            }
             Err(_) => {
                 let _ = std::fs::remove_file(&self.config_path);
                 Ok(ProvidersToml::default())
@@ -1169,7 +1172,7 @@ fn builtin_provider(kind: ProviderKind) -> ProviderConfig {
             enabled: true,
             models: vec![
                 deepseek_model("deepseek-v4-flash", false),
-                deepseek_model("deepseek-v4-pro", false),
+                deepseek_model("deepseek-v4-pro", true),
                 deepseek_model("deepseek-chat", false),
                 deepseek_model("deepseek-reasoner", true),
             ],
@@ -1215,6 +1218,23 @@ fn deepseek_model(id: &str, supports_reasoning: bool) -> ModelConfig {
         default_reasoning_effort: supports_reasoning.then_some(ReasoningEffort::High),
         options: serde_json::Value::Null,
         headers: BTreeMap::new(),
+    }
+}
+
+fn normalize_provider_file(file: &mut ProvidersToml) {
+    for provider in file.providers.values_mut() {
+        normalize_provider_models(provider);
+    }
+}
+
+fn normalize_provider_models(provider: &mut ProviderToml) {
+    if provider.kind != ProviderKind::Deepseek {
+        return;
+    }
+    if let Some(model) = provider.models.get_mut("deepseek-v4-pro") {
+        model.supports_reasoning = true;
+        model.reasoning_efforts = vec![ReasoningEffort::High, ReasoningEffort::Max];
+        model.default_reasoning_effort = Some(ReasoningEffort::High);
     }
 }
 
@@ -1611,11 +1631,70 @@ mod tests {
         assert_eq!(openai.default_model, "gpt-5.5");
         assert!(openai.models.iter().any(|model| model.id == "gpt-5.4-mini"));
         assert_eq!(deepseek.default_model, "deepseek-v4-flash");
+        let v4_pro = deepseek
+            .models
+            .iter()
+            .find(|model| model.id == "deepseek-v4-pro")
+            .expect("deepseek v4 pro");
+        assert!(v4_pro.supports_reasoning);
+        assert_eq!(
+            v4_pro.reasoning_efforts,
+            vec![ReasoningEffort::High, ReasoningEffort::Max]
+        );
         assert!(
             deepseek
                 .models
                 .iter()
                 .any(|model| model.id == "deepseek-reasoner")
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_deepseek_v4_pro_metadata_is_upgraded() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+                default_provider_id = "deepseek"
+
+                [providers.deepseek]
+                kind = "deepseek"
+                name = "DeepSeek"
+                base_url = "https://api.deepseek.com"
+                api_key = "secret"
+                default_model = "deepseek-v4-pro"
+                enabled = true
+
+                [providers.deepseek.models.deepseek-v4-pro]
+                name = "deepseek-v4-pro"
+                context_tokens = 128000
+                output_tokens = 8192
+                supports_tools = true
+                supports_reasoning = false
+                reasoning_efforts = []
+            "#,
+        )
+        .expect("write config");
+        let store =
+            ConfigStore::open_with_config_path(dir.path().join("config.sqlite3"), &config_path)
+                .await
+                .expect("open");
+
+        let response = store.providers_response().await.expect("providers");
+        let model = response.providers[0]
+            .models
+            .iter()
+            .find(|model| model.id == "deepseek-v4-pro")
+            .expect("deepseek v4 pro");
+        assert!(model.supports_reasoning);
+        assert_eq!(
+            model.reasoning_efforts,
+            vec![ReasoningEffort::High, ReasoningEffort::Max]
+        );
+        assert_eq!(
+            model.default_reasoning_effort,
+            Some(ReasoningEffort::High)
         );
     }
 

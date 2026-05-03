@@ -12,8 +12,30 @@
         <p>{{ detail.provider_name }} / {{ detail.model }}</p>
         <p v-if="detail.last_error" class="error-text">{{ detail.last_error }}</p>
       </div>
+      <div class="thinking-depth-control" :class="{ disabled: !currentReasoningOptions.length }">
+        <label for="thinking-depth-select">
+          <span>思考深度</span>
+          <select
+            id="thinking-depth-select"
+            v-model="currentReasoningEffort"
+            :disabled="!currentReasoningOptions.length || isModelChangeBusy || updatingModel"
+            @change="saveReasoningEffort"
+          >
+            <option v-if="!currentReasoningOptions.length" value="">
+              当前模型不支持
+            </option>
+            <option v-for="option in currentReasoningOptions" :key="option.value" :value="option.value">
+              {{ option.label }}
+            </option>
+          </select>
+        </label>
+        <small v-if="currentReasoningOptions.length">
+          {{ updatingModel ? '保存中...' : '应用到下一轮对话' }}
+        </small>
+        <small v-else>换到支持思考的模型后可选</small>
+      </div>
       <div class="agent-actions">
-        <button class="ghost-button" :disabled="!providers.length || isModelChangeBusy" @click="openModelEditor">
+        <button class="ghost-button" :disabled="!providers.length || isModelChangeBusy || updatingModel" @click="openModelEditor">
           Change Model
         </button>
         <button class="ghost-button" @click="$emit('cancel', detail.id)">Cancel</button>
@@ -39,7 +61,7 @@
         </select>
       </label>
       <label v-if="editorReasoningOptions.length">
-        <span>Reasoning Effort</span>
+        <span>思考深度</span>
         <select v-model="modelEditor.reasoning_effort">
           <option v-for="option in editorReasoningOptions" :key="option.value" :value="option.value">
             {{ option.label }}
@@ -48,7 +70,7 @@
       </label>
       <div class="agent-model-actions">
         <button class="ghost-button" type="button" @click="modelEditor.open = false">Cancel</button>
-        <button class="primary-button" type="button" :disabled="!modelEditor.model" @click="saveModelEdit">
+        <button class="primary-button" type="button" :disabled="!modelEditor.model || updatingModel" @click="saveModelEdit">
           Save
         </button>
       </div>
@@ -184,7 +206,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, reactive, watch } from 'vue'
+import { computed, nextTick, reactive, ref, watch } from 'vue'
 import {
   formatStatus, formatDate,
   totalTokens, shortContainer, initial, roleInitial, roleLabel,
@@ -206,6 +228,7 @@ const props = defineProps({
   draft: { type: String, default: '' },
   loading: { type: Boolean, default: false },
   sending: { type: Boolean, default: false },
+  updatingModel: { type: Boolean, default: false },
   providers: { type: Array, default: () => [] }
 })
 
@@ -223,6 +246,7 @@ const { api, showToast } = useApi()
 const expandedTools = reactive({})
 const traces = reactive({})
 const emptyTrace = { loading: false, error: '', detail: null }
+const currentReasoningEffort = ref('')
 const modelEditor = reactive({
   open: false,
   provider_id: '',
@@ -236,6 +260,9 @@ const editorProvider = computed(() => props.providers.find((provider) => provide
 const editorModels = computed(() => editorProvider.value?.models || [])
 const editorModel = computed(() => editorModels.value.find((model) => model.id === modelEditor.model))
 const editorReasoningOptions = computed(() => reasoningOptionsFor(editorProvider.value, editorModel.value))
+const currentProvider = computed(() => props.providers.find((provider) => provider.id === props.detail?.provider_id))
+const currentModel = computed(() => currentProvider.value?.models?.find((model) => model.id === props.detail?.model))
+const currentReasoningOptions = computed(() => reasoningOptionsFor(currentProvider.value, currentModel.value))
 const isModelChangeBusy = computed(() => {
   const status = props.detail?.status
   return status === 'running_turn' || status === 'waiting_tool' || status === 'starting_container'
@@ -247,7 +274,14 @@ watch(
     for (const key of Object.keys(expandedTools)) delete expandedTools[key]
     for (const key of Object.keys(traces)) delete traces[key]
     modelEditor.open = false
+    syncCurrentReasoningEffort()
   }
+)
+
+watch(
+  () => [props.detail?.reasoning_effort, currentReasoningOptions.value.map((option) => option.value).join('|')],
+  syncCurrentReasoningEffort,
+  { immediate: true }
 )
 
 watch(
@@ -267,6 +301,22 @@ function handleEnter(event) {
 
 function send() {
   if (props.draft.trim()) emit('send', props.draft.trim())
+}
+
+function syncCurrentReasoningEffort() {
+  const activeValue = props.detail?.reasoning_effort || ''
+  currentReasoningEffort.value = currentReasoningOptions.value.some((option) => option.value === activeValue)
+    ? activeValue
+    : defaultReasoningEffort(currentProvider.value, currentModel.value)
+}
+
+function saveReasoningEffort() {
+  if (!props.detail || !currentReasoningOptions.value.length) return
+  emit('update-model', {
+    provider_id: props.detail.provider_id,
+    model: props.detail.model,
+    reasoning_effort: currentReasoningEffort.value
+  })
 }
 
 function openModelEditor() {

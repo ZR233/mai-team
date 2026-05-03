@@ -49,6 +49,7 @@
           :loading="isDetailLoading"
           :sending="isSending"
           :providers="providersState.providers"
+          :updating-model="isUpdatingAgentModel"
           v-model:conversation-ref="conversationRef"
           @cancel="cancelAgent"
           @create-session="onCreateSession"
@@ -136,6 +137,7 @@ const {
 
 const activeTab = ref('agents')
 const messageDraft = ref('')
+const isUpdatingAgentModel = ref(false)
 
 // Confirm dialog
 const confirmDialog = reactive({
@@ -266,11 +268,14 @@ async function onSelectSession(sessionId) {
 }
 
 async function onUpdateAgentModel(payload) {
+  isUpdatingAgentModel.value = true
   try {
     await updateAgent(selectedDetail.value.id, payload.provider_id, payload.model, payload.reasoning_effort)
     showToast('Agent model updated.')
   } catch (error) {
     showToast(error.message)
+  } finally {
+    isUpdatingAgentModel.value = false
   }
 }
 

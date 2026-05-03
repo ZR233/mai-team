@@ -10,9 +10,10 @@ const EFFORT_LABELS = {
 
 export function reasoningOptionsFor(provider, model) {
   if (!model?.supports_reasoning) return []
-  const efforts = provider?.kind === 'deepseek'
-    ? ['high', 'max']
-    : Array.isArray(model.reasoning_efforts) ? model.reasoning_efforts : []
+  const configuredEfforts = Array.isArray(model.reasoning_efforts) ? model.reasoning_efforts : []
+  const efforts = configuredEfforts.length
+    ? configuredEfforts
+    : provider?.kind === 'deepseek' ? ['high', 'max'] : []
   return efforts
     .filter(Boolean)
     .map((value) => String(value).toLowerCase())
