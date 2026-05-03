@@ -69,6 +69,8 @@ struct ChatRequest {
     max_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<DeepseekThinkingRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
     #[serde(flatten)]
     options: BTreeMap<String, Value>,
 }
@@ -330,8 +332,16 @@ fn reasoning_effort_value(effort: ReasoningEffort) -> Option<&'static str> {
 
 fn deepseek_thinking_type(effort: ReasoningEffort) -> Option<&'static str> {
     match effort {
-        ReasoningEffort::High | ReasoningEffort::Max => Some("enabled"),
-        _ => None,
+        ReasoningEffort::None => None,
+        _ => Some("enabled"),
+    }
+}
+
+fn deepseek_reasoning_effort_value(effort: ReasoningEffort) -> Option<&'static str> {
+    match effort {
+        ReasoningEffort::None => None,
+        ReasoningEffort::Max | ReasoningEffort::Xhigh => Some("max"),
+        _ => Some("high"),
     }
 }
 
@@ -357,12 +367,14 @@ fn deepseek_chat_request(
     tools: Vec<ChatTool>,
     reasoning_effort: Option<ReasoningEffort>,
 ) -> ChatRequest {
-    let thinking = model
+    let effort = model
         .supports_reasoning
         .then_some(reasoning_effort.or(model.default_reasoning_effort))
-        .flatten()
+        .flatten();
+    let thinking = effort
         .and_then(deepseek_thinking_type)
         .map(|kind| DeepseekThinkingRequest { kind });
+    let reasoning_effort = effort.and_then(deepseek_reasoning_effort_value);
     ChatRequest {
         model: model.id.clone(),
         messages: chat_messages(instructions, input),
@@ -371,6 +383,7 @@ fn deepseek_chat_request(
         stream: false,
         max_tokens: deepseek_max_tokens(model.output_tokens),
         thinking,
+        reasoning_effort,
         options: option_map(&model.options),
     }
 }
@@ -409,14 +422,8 @@ fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessag
                 content,
                 reasoning_content,
                 tool_calls,
-            } => messages.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: content.clone(),
-                reasoning_content: last_user_index
-                    .is_none_or(|last_user_index| index > last_user_index)
-                    .then(|| reasoning_content.clone())
-                    .flatten(),
-                tool_calls: tool_calls
+            } => {
+                let tool_calls = tool_calls
                     .iter()
                     .map(|tool_call| ChatToolCall {
                         id: tool_call.call_id.clone(),
@@ -426,16 +433,30 @@ fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessag
                             arguments: tool_call.arguments.clone(),
                         },
                     })
-                    .collect(),
-                tool_call_id: None,
-            }),
+                    .collect::<Vec<_>>();
+                let reasoning_content = last_user_index
+                    .is_none_or(|last_user_index| index > last_user_index)
+                    .then(|| reasoning_content.clone())
+                    .flatten();
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: assistant_chat_content(
+                        content,
+                        &tool_calls,
+                        reasoning_content.as_deref(),
+                    ),
+                    reasoning_content,
+                    tool_calls,
+                    tool_call_id: None,
+                });
+            }
             ModelInputItem::FunctionCall {
                 call_id,
                 name,
                 arguments,
             } => messages.push(ChatMessage {
                 role: "assistant".to_string(),
-                content: None,
+                content: Some(String::new()),
                 reasoning_content: None,
                 tool_calls: vec![ChatToolCall {
                     id: call_id.clone(),
@@ -457,6 +478,16 @@ fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessag
         }
     }
     messages
+}
+
+fn assistant_chat_content(
+    content: &Option<String>,
+    tool_calls: &[ChatToolCall],
+    reasoning_content: Option<&str>,
+) -> Option<String> {
+    content
+        .clone()
+        .or_else(|| (!tool_calls.is_empty() || reasoning_content.is_some()).then(String::new))
 }
 
 fn parse_response(value: Value) -> Result<ModelResponse> {
@@ -759,6 +790,98 @@ mod tests {
         );
 
         assert_eq!(request.max_tokens, 64_000);
+        assert_eq!(
+            request.thinking.as_ref().map(|item| item.kind),
+            Some("enabled")
+        );
+        assert_eq!(request.reasoning_effort, Some("high"));
+    }
+
+    #[test]
+    fn deepseek_reasoning_tool_call_messages_have_content_and_effort() {
+        let model = ModelConfig {
+            id: "deepseek-v4-pro".to_string(),
+            name: Some("DeepSeek V4 Pro".to_string()),
+            context_tokens: 1_000_000,
+            output_tokens: 384_000,
+            supports_tools: true,
+            supports_reasoning: true,
+            reasoning_efforts: vec![ReasoningEffort::High, ReasoningEffort::Max],
+            default_reasoning_effort: Some(ReasoningEffort::High),
+            options: serde_json::Value::Null,
+            headers: BTreeMap::new(),
+        };
+        let request = deepseek_chat_request(
+            &model,
+            "instructions",
+            &[
+                ModelInputItem::user_text("continue"),
+                ModelInputItem::AssistantTurn {
+                    content: None,
+                    reasoning_content: Some("need a tool".to_string()),
+                    tool_calls: vec![mai_protocol::ModelToolCall {
+                        call_id: "call_1".to_string(),
+                        name: "container_exec".to_string(),
+                        arguments: "{\"command\":\"pwd\"}".to_string(),
+                    }],
+                },
+                ModelInputItem::FunctionCallOutput {
+                    call_id: "call_1".to_string(),
+                    output: "{\"status\":0,\"stdout\":\"/workspace\"}".to_string(),
+                },
+            ],
+            vec![ChatTool {
+                kind: "function",
+                function: ChatToolFunction {
+                    name: "container_exec".to_string(),
+                    description: "run a command".to_string(),
+                    parameters: json!({ "type": "object" }),
+                },
+            }],
+            Some(ReasoningEffort::Max),
+        );
+
+        assert_eq!(request.reasoning_effort, Some("max"));
+        assert_eq!(
+            request.thinking.as_ref().map(|item| item.kind),
+            Some("enabled")
+        );
+        assert_eq!(request.messages[2].role, "assistant");
+        assert_eq!(request.messages[2].content.as_deref(), Some(""));
+        assert_eq!(
+            request.messages[2].reasoning_content.as_deref(),
+            Some("need a tool")
+        );
+        assert_eq!(request.messages[2].tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn deepseek_medium_reasoning_maps_to_high_effort() {
+        let model = ModelConfig {
+            id: "deepseek-reasoner".to_string(),
+            name: Some("DeepSeek Reasoner".to_string()),
+            context_tokens: 128_000,
+            output_tokens: 8_192,
+            supports_tools: true,
+            supports_reasoning: true,
+            reasoning_efforts: vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ],
+            default_reasoning_effort: Some(ReasoningEffort::Medium),
+            options: serde_json::Value::Null,
+            headers: BTreeMap::new(),
+        };
+        let request = deepseek_chat_request(
+            &model,
+            "instructions",
+            &[ModelInputItem::user_text("hello")],
+            Vec::new(),
+            Some(ReasoningEffort::Medium),
+        );
+
+        assert_eq!(request.reasoning_effort, Some("high"));
         assert_eq!(
             request.thinking.as_ref().map(|item| item.kind),
             Some("enabled")

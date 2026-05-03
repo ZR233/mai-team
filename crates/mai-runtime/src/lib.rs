@@ -1878,7 +1878,12 @@ fn supported_reasoning_efforts(
         return Vec::new();
     }
     match provider_kind {
-        ProviderKind::Deepseek => vec![ReasoningEffort::High, ReasoningEffort::Max],
+        ProviderKind::Deepseek => vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ],
         ProviderKind::Openai => model.reasoning_efforts.clone(),
     }
 }
