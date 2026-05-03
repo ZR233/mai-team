@@ -81,6 +81,7 @@ export function buildAgentTimeline(detail, liveEvents = []) {
       items.push({
         type: 'error',
         key: `error-${event.sequence || event.timestamp}`,
+        title: errorTitle(event.message),
         message: event.message || 'Unknown error',
         timestamp: event.timestamp,
         sequence: event.sequence || 0
@@ -122,8 +123,8 @@ export function buildAgentTimeline(detail, liveEvents = []) {
       items.push({
         type: 'process',
         key: `reading-${event.call_id}-${event.sequence || event.timestamp}`,
-        tone: event.success ? 'active' : 'error',
-        label: event.success ? 'Reading output' : 'Tool returned an error',
+        tone: event.success ? 'active' : 'warning',
+        label: event.success ? 'Reading output' : 'Command exited with an error',
         detail: event.tool_name || 'tool',
         timestamp: offsetTimestamp(event.timestamp, 1),
         sequence: (event.sequence || 0) + 0.1
@@ -575,6 +576,14 @@ function formatTurnStatus(status) {
   if (status === 'cancelled') return 'Cancelled'
   if (status === 'failed') return 'Failed'
   return 'Turn completed'
+}
+
+function errorTitle(message) {
+  const text = String(message || '').toLowerCase()
+  if (text.includes('model error') || text.includes('/chat/completions') || text.includes('/responses')) {
+    return 'Model request failed'
+  }
+  return 'Error'
 }
 
 function hashText(value) {

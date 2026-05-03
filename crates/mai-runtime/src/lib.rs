@@ -2185,6 +2185,13 @@ mod tests {
                             "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
                         })
                     });
+                    if response
+                        .get("__close_without_response")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        return;
+                    }
                     write_mock_response(&mut stream, response).await;
                 });
             }
@@ -2950,6 +2957,84 @@ mod tests {
                     }
                 ))
         );
+    }
+
+    #[tokio::test]
+    async fn model_failure_after_tool_keeps_tool_success_event_separate() {
+        let (base_url, _requests) = start_mock_responses(vec![
+            json!({
+                "id": "first",
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "list_agents",
+                    "arguments": "{}"
+                }],
+                "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+            }),
+            json!({ "__close_without_response": true }),
+        ])
+        .await;
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = Arc::new(
+            ConfigStore::open_with_config_path(&db_path, &config_path)
+                .await
+                .expect("open store"),
+        );
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![compact_test_provider(base_url)],
+                default_provider_id: Some("mock".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        store
+            .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
+            .await
+            .expect("save agent");
+        save_test_session(&store, agent_id, session_id).await;
+        let runtime = AgentRuntime::new(
+            DockerClient::new("unused"),
+            ResponsesClient::new(),
+            Arc::clone(&store),
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+            },
+        )
+        .await
+        .expect("runtime");
+        let agent = runtime.agent(agent_id).await.expect("agent");
+        *agent.container.write().await = Some(ContainerHandle {
+            id: "container-1".to_string(),
+            name: "container-1".to_string(),
+            image: "unused".to_string(),
+        });
+
+        let result = runtime
+            .run_turn_inner(
+                agent_id,
+                session_id,
+                Uuid::new_v4(),
+                "please list agents".to_string(),
+                Vec::new(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        let events = runtime.recent_events.lock().await;
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            ServiceEventKind::ToolCompleted {
+                call_id,
+                tool_name,
+                success: true,
+                ..
+            } if call_id == "call_1" && tool_name == "list_agents"
+        )));
     }
 
     #[tokio::test]

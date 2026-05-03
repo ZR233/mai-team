@@ -24,7 +24,7 @@
           @toggle="$emit('toggle-tool', item)"
         />
         <div v-else-if="item.type === 'error'" class="timeline-error-card">
-          <strong>Error</strong>
+          <strong>{{ item.title || 'Error' }}</strong>
           <p>{{ item.message }}</p>
         </div>
         <ProcessRow v-else :item="item" />

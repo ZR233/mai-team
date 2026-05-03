@@ -6,21 +6,30 @@ use reqwest::StatusCode;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ModelError {
-    #[error("model request failed: {0}")]
-    Request(#[from] reqwest::Error),
-    #[error("model returned {status}: {body}")]
-    Api { status: StatusCode, body: String },
+    #[error("request to {endpoint} failed: {source}")]
+    Request {
+        endpoint: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("request to {endpoint} returned {status}: {body}")]
+    Api {
+        endpoint: String,
+        status: StatusCode,
+        body: String,
+    },
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 }
 
 pub type Result<T> = std::result::Result<T, ModelError>;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ResponsesClient {
     http: reqwest::Client,
 }
@@ -59,9 +68,15 @@ struct ChatRequest {
     stream: bool,
     max_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'static str>,
+    thinking: Option<DeepseekThinkingRequest>,
     #[serde(flatten)]
     options: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeepseekThinkingRequest {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -174,16 +189,30 @@ impl ResponsesClient {
         };
         let response = self
             .http
-            .post(endpoint)
+            .post(&endpoint)
             .bearer_auth(&provider.api_key)
             .headers(headers(&provider.headers(&model.headers)))
             .json(&request)
             .send()
-            .await?;
+            .await
+            .map_err(|source| ModelError::Request {
+                endpoint: endpoint.clone(),
+                source,
+            })?;
         let status = response.status();
-        let body = response.text().await?;
+        let body = response
+            .text()
+            .await
+            .map_err(|source| ModelError::Request {
+                endpoint: endpoint.clone(),
+                source,
+            })?;
         if !status.is_success() {
-            return Err(ModelError::Api { status, body });
+            return Err(ModelError::Api {
+                endpoint,
+                status,
+                body,
+            });
         }
 
         parse_response(serde_json::from_str(&body)?)
@@ -207,35 +236,48 @@ impl ResponsesClient {
         } else {
             Vec::new()
         };
-        let request = ChatRequest {
-            model: model.id.clone(),
-            messages: chat_messages(instructions, input),
-            tool_choice: (!active_tools.is_empty()).then_some("auto"),
-            tools: active_tools,
-            stream: false,
-            max_tokens: model.output_tokens,
-            reasoning_effort: model
-                .supports_reasoning
-                .then_some(reasoning_effort.or(model.default_reasoning_effort))
-                .flatten()
-                .and_then(deepseek_reasoning_effort_value),
-            options: option_map(&model.options),
-        };
+        let request =
+            deepseek_chat_request(model, instructions, input, active_tools, reasoning_effort);
         let response = self
             .http
-            .post(endpoint)
+            .post(&endpoint)
             .bearer_auth(&provider.api_key)
             .headers(headers(&provider.headers(&model.headers)))
             .json(&request)
             .send()
-            .await?;
+            .await
+            .map_err(|source| ModelError::Request {
+                endpoint: endpoint.clone(),
+                source,
+            })?;
         let status = response.status();
-        let body = response.text().await?;
+        let body = response
+            .text()
+            .await
+            .map_err(|source| ModelError::Request {
+                endpoint: endpoint.clone(),
+                source,
+            })?;
         if !status.is_success() {
-            return Err(ModelError::Api { status, body });
+            return Err(ModelError::Api {
+                endpoint,
+                status,
+                body,
+            });
         }
 
         parse_chat_response(serde_json::from_str(&body)?)
+    }
+}
+
+impl Default for ResponsesClient {
+    fn default() -> Self {
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(600))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { http }
     }
 }
 
@@ -286,13 +328,15 @@ fn reasoning_effort_value(effort: ReasoningEffort) -> Option<&'static str> {
     }
 }
 
-fn deepseek_reasoning_effort_value(effort: ReasoningEffort) -> Option<&'static str> {
+fn deepseek_thinking_type(effort: ReasoningEffort) -> Option<&'static str> {
     match effort {
-        ReasoningEffort::None => None,
-        ReasoningEffort::Max => Some("max"),
-        ReasoningEffort::High | ReasoningEffort::Xhigh => Some("high"),
-        ReasoningEffort::Minimal | ReasoningEffort::Low | ReasoningEffort::Medium => Some("high"),
+        ReasoningEffort::High | ReasoningEffort::Max => Some("enabled"),
+        _ => None,
     }
+}
+
+fn deepseek_max_tokens(configured: u64) -> u64 {
+    configured.clamp(1, 64_000)
 }
 
 fn chat_tool(tool: &ToolDefinition) -> ChatTool {
@@ -303,6 +347,31 @@ fn chat_tool(tool: &ToolDefinition) -> ChatTool {
             description: tool.description.clone(),
             parameters: tool.parameters.clone(),
         },
+    }
+}
+
+fn deepseek_chat_request(
+    model: &ModelConfig,
+    instructions: &str,
+    input: &[ModelInputItem],
+    tools: Vec<ChatTool>,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> ChatRequest {
+    let thinking = model
+        .supports_reasoning
+        .then_some(reasoning_effort.or(model.default_reasoning_effort))
+        .flatten()
+        .and_then(deepseek_thinking_type)
+        .map(|kind| DeepseekThinkingRequest { kind });
+    ChatRequest {
+        model: model.id.clone(),
+        messages: chat_messages(instructions, input),
+        tool_choice: (!tools.is_empty()).then_some("auto"),
+        tools,
+        stream: false,
+        max_tokens: deepseek_max_tokens(model.output_tokens),
+        thinking,
+        options: option_map(&model.options),
     }
 }
 
@@ -668,14 +737,31 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_reasoning_effort_maps_high_and_max() {
-        assert_eq!(
-            deepseek_reasoning_effort_value(ReasoningEffort::High),
-            Some("high")
+    fn deepseek_request_uses_current_thinking_param_and_clamps_max_tokens() {
+        let model = ModelConfig {
+            id: "deepseek-v4-pro".to_string(),
+            name: Some("DeepSeek V4 Pro".to_string()),
+            context_tokens: 1_000_000,
+            output_tokens: 384_000,
+            supports_tools: true,
+            supports_reasoning: true,
+            reasoning_efforts: vec![ReasoningEffort::High, ReasoningEffort::Max],
+            default_reasoning_effort: Some(ReasoningEffort::High),
+            options: serde_json::Value::Null,
+            headers: BTreeMap::new(),
+        };
+        let request = deepseek_chat_request(
+            &model,
+            "instructions",
+            &[ModelInputItem::user_text("hello")],
+            Vec::new(),
+            Some(ReasoningEffort::High),
         );
+
+        assert_eq!(request.max_tokens, 64_000);
         assert_eq!(
-            deepseek_reasoning_effort_value(ReasoningEffort::Max),
-            Some("max")
+            request.thinking.as_ref().map(|item| item.kind),
+            Some("enabled")
         );
     }
 }
