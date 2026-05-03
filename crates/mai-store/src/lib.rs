@@ -1307,9 +1307,11 @@ fn deepseek_model(id: &str, supports_reasoning: bool) -> ModelConfig {
         output_tokens: deepseek_output_tokens(id),
         supports_tools: true,
         supports_reasoning,
-        reasoning_efforts: supports_reasoning
-            .then(|| vec![ReasoningEffort::High, ReasoningEffort::Max])
-            .unwrap_or_default(),
+        reasoning_efforts: if supports_reasoning {
+            vec![ReasoningEffort::High, ReasoningEffort::Max]
+        } else {
+            Vec::new()
+        },
         default_reasoning_effort: supports_reasoning.then_some(ReasoningEffort::High),
         options: serde_json::Value::Null,
         headers: BTreeMap::new(),
@@ -2016,7 +2018,7 @@ mod tests {
             content: "hello".to_string(),
             created_at: now,
         };
-        let history = vec![
+        let history = [
             ModelInputItem::Message {
                 role: "user".to_string(),
                 content: vec![ModelContentItem::InputText {

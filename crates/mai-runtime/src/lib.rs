@@ -287,7 +287,7 @@ impl AgentRuntime {
                     message,
                 })
                 .await;
-                Err(err.into())
+                Err(err)
             }
         }
     }
@@ -1484,12 +1484,12 @@ impl AgentRuntime {
         &self,
         preference: Option<&AgentModelPreference>,
     ) -> Result<ResolvedAgentModel> {
-        if let Some(preference) = preference {
-            if preference.provider_id.trim().is_empty() || preference.model.trim().is_empty() {
-                return Err(RuntimeError::InvalidInput(
-                    "research agent provider and model are required".to_string(),
-                ));
-            }
+        if let Some(preference) = preference
+            && (preference.provider_id.trim().is_empty() || preference.model.trim().is_empty())
+        {
+            return Err(RuntimeError::InvalidInput(
+                "research agent provider and model are required".to_string(),
+            ));
         }
         let selection = self
             .store
@@ -2751,7 +2751,7 @@ mod tests {
             .await
             .expect("save agent");
         save_test_session(&store, agent_id, session_id).await;
-        let original_history = vec![
+        let original_history = [
             ModelInputItem::user_text("original request"),
             ModelInputItem::assistant_text("original answer"),
         ];

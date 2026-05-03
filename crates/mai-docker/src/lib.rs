@@ -416,13 +416,13 @@ fn find_reusable_agent_container<'a>(
     agent_id: &str,
     preferred_container_id: Option<&str>,
 ) -> Option<&'a ManagedContainer> {
-    if let Some(preferred_container_id) = preferred_container_id {
-        if let Some(container) = containers.iter().find(|container| {
+    if let Some(preferred_container_id) = preferred_container_id
+        && let Some(container) = containers.iter().find(|container| {
             container.agent_id.as_deref() == Some(agent_id)
                 && container.matches_identifier(preferred_container_id)
-        }) {
-            return Some(container);
-        }
+        })
+    {
+        return Some(container);
     }
 
     containers

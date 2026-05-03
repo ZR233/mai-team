@@ -1,4 +1,4 @@
-import hljs from 'highlight.js'
+import hljs from 'highlight.js/lib/common'
 
 const MESSAGE_MATCH_LIMIT_MS = 120_000
 
