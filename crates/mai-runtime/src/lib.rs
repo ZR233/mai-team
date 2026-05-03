@@ -6,9 +6,9 @@ use mai_mcp::McpAgentManager;
 use mai_model::ResponsesClient;
 use mai_protocol::{
     AgentDetail, AgentId, AgentMessage, AgentSessionSummary, AgentStatus, AgentSummary,
-    CreateAgentRequest, MessageRole, ModelInputItem, ModelOutputItem, ModelToolCall, ServiceEvent,
-    ServiceEventKind, SessionId, TokenUsage, ToolTraceDetail, TurnId, TurnStatus,
-    UpdateAgentRequest, now, preview,
+    CreateAgentRequest, MessageRole, ModelConfig, ModelInputItem, ModelOutputItem, ModelToolCall,
+    ProviderKind, ReasoningEffort, ServiceEvent, ServiceEventKind, SessionId, TokenUsage,
+    ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest, now, preview,
 };
 use mai_skills::SkillsManager;
 use mai_store::ConfigStore;
@@ -175,6 +175,12 @@ impl AgentRuntime {
             .store
             .resolve_provider(request.provider_id.as_deref(), request.model.as_deref())
             .await?;
+        let reasoning_effort = normalize_reasoning_effort(
+            provider_selection.provider.kind,
+            &provider_selection.model,
+            request.reasoning_effort,
+            true,
+        )?;
         let system_prompt = request.system_prompt;
         let summary = AgentSummary {
             id,
@@ -185,6 +191,7 @@ impl AgentRuntime {
             provider_id: provider_selection.provider.id.clone(),
             provider_name: provider_selection.provider.name.clone(),
             model: provider_selection.model.id.clone(),
+            reasoning_effort,
             created_at,
             updated_at: created_at,
             current_turn: None,
@@ -264,11 +271,26 @@ impl AgentRuntime {
             .or(Some(&current.provider_id));
         let model = request.model.as_deref().or(Some(&current.model));
         let provider_selection = self.store.resolve_provider(provider_id, model).await?;
+        let requested_reasoning_effort = if request.reasoning_effort.is_some()
+            || provider_selection.model.id != current.model
+            || provider_selection.provider.id != current.provider_id
+        {
+            request.reasoning_effort
+        } else {
+            current.reasoning_effort
+        };
+        let reasoning_effort = normalize_reasoning_effort(
+            provider_selection.provider.kind,
+            &provider_selection.model,
+            requested_reasoning_effort,
+            true,
+        )?;
         let updated = {
             let mut summary = agent.summary.write().await;
             summary.provider_id = provider_selection.provider.id.clone();
             summary.provider_name = provider_selection.provider.name.clone();
             summary.model = provider_selection.model.id.clone();
+            summary.reasoning_effort = reasoning_effort;
             summary.updated_at = now();
             summary.clone()
         };
@@ -654,8 +676,10 @@ impl AgentRuntime {
             let instructions = self
                 .build_instructions(&agent, &loaded_skills, &mcp_tools)
                 .await?;
-            let model_name = agent.summary.read().await.model.clone();
-            let provider_id = agent.summary.read().await.provider_id.clone();
+            let summary = agent.summary.read().await.clone();
+            let model_name = summary.model.clone();
+            let provider_id = summary.provider_id.clone();
+            let reasoning_effort = summary.reasoning_effort;
             let provider_selection = self
                 .store
                 .resolve_provider(Some(&provider_id), Some(&model_name))
@@ -669,6 +693,7 @@ impl AgentRuntime {
                     &instructions,
                     &history,
                     &tools,
+                    reasoning_effort,
                 )
                 .await?;
 
@@ -935,6 +960,7 @@ impl AgentRuntime {
                         provider_id: optional_string(&arguments, "provider_id")
                             .or(Some(parent_summary.provider_id)),
                         model: optional_string(&arguments, "model").or(Some(parent_summary.model)),
+                        reasoning_effort: parent_summary.reasoning_effort,
                         parent_id: Some(agent_id),
                         system_prompt: None,
                     })
@@ -1402,6 +1428,66 @@ fn parse_session_id(value: &str) -> Result<SessionId> {
         .map_err(|err| RuntimeError::InvalidInput(format!("invalid session_id `{value}`: {err}")))
 }
 
+fn normalize_reasoning_effort(
+    provider_kind: ProviderKind,
+    model: &ModelConfig,
+    effort: Option<ReasoningEffort>,
+    default_when_missing: bool,
+) -> Result<Option<ReasoningEffort>> {
+    if !model.supports_reasoning {
+        return Ok(None);
+    }
+    match effort {
+        Some(ReasoningEffort::None) => Ok(None),
+        Some(effort) if supported_reasoning_efforts(provider_kind, model).contains(&effort) => {
+            Ok(Some(effort))
+        }
+        Some(effort) => Err(RuntimeError::InvalidInput(format!(
+            "reasoning effort `{}` is not supported by model `{}`",
+            reasoning_effort_label(effort),
+            model.id
+        ))),
+        None if default_when_missing => Ok(default_reasoning_effort(provider_kind, model)),
+        None => Ok(None),
+    }
+}
+
+fn supported_reasoning_efforts(
+    provider_kind: ProviderKind,
+    model: &ModelConfig,
+) -> Vec<ReasoningEffort> {
+    if !model.supports_reasoning {
+        return Vec::new();
+    }
+    match provider_kind {
+        ProviderKind::Deepseek => vec![ReasoningEffort::High, ReasoningEffort::Max],
+        ProviderKind::Openai => model.reasoning_efforts.clone(),
+    }
+}
+
+fn default_reasoning_effort(
+    provider_kind: ProviderKind,
+    model: &ModelConfig,
+) -> Option<ReasoningEffort> {
+    let supported = supported_reasoning_efforts(provider_kind, model);
+    model
+        .default_reasoning_effort
+        .filter(|effort| supported.contains(effort))
+        .or_else(|| supported.first().copied())
+}
+
+fn reasoning_effort_label(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::None => "none",
+        ReasoningEffort::Minimal => "minimal",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Xhigh => "xhigh",
+        ReasoningEffort::Max => "max",
+    }
+}
+
 fn parse_tool_arguments(raw_arguments: &str) -> Value {
     serde_json::from_str(raw_arguments).unwrap_or_else(|_| json!({ "raw": raw_arguments }))
 }
@@ -1615,6 +1701,15 @@ mod tests {
         }
     }
 
+    fn non_reasoning_model(id: &str) -> ModelConfig {
+        ModelConfig {
+            supports_reasoning: false,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            ..test_model(id)
+        }
+    }
+
     fn test_provider() -> ProviderConfig {
         ProviderConfig {
             id: "openai".to_string(),
@@ -1623,7 +1718,11 @@ mod tests {
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: Some("secret".to_string()),
             api_key_env: Some("OPENAI_API_KEY".to_string()),
-            models: vec![test_model("gpt-5.5"), test_model("gpt-5.4")],
+            models: vec![
+                test_model("gpt-5.5"),
+                test_model("gpt-5.4"),
+                non_reasoning_model("gpt-4.1"),
+            ],
             default_model: "gpt-5.5".to_string(),
             enabled: true,
         }
@@ -1664,6 +1763,7 @@ mod tests {
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.2".to_string(),
+            reasoning_effort: None,
             created_at: timestamp,
             updated_at: timestamp,
             current_turn: Some(turn_id),
@@ -1782,6 +1882,7 @@ mod tests {
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.2".to_string(),
+            reasoning_effort: None,
             created_at: timestamp,
             updated_at: timestamp,
             current_turn: None,
@@ -1905,6 +2006,7 @@ mod tests {
                 name: Some("chat-agent".to_string()),
                 provider_id: Some("openai".to_string()),
                 model: Some("gpt-5.5".to_string()),
+                reasoning_effort: Some(ReasoningEffort::High),
                 parent_id: None,
                 system_prompt: None,
             })
@@ -1914,6 +2016,7 @@ mod tests {
             "unused docker cannot start, but agent is persisted"
         );
         let agent = runtime.list_agents().await[0].clone();
+        assert_eq!(agent.reasoning_effort, Some(ReasoningEffort::High));
         let first = runtime
             .get_agent(agent.id, None)
             .await
@@ -1933,6 +2036,10 @@ mod tests {
 
         let reopened = store.load_runtime_snapshot(10).await.expect("snapshot");
         assert_eq!(reopened.agents[0].sessions.len(), 2);
+        assert_eq!(
+            reopened.agents[0].summary.reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
     }
 
     #[tokio::test]
@@ -1963,6 +2070,7 @@ mod tests {
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.5".to_string(),
+            reasoning_effort: Some(ReasoningEffort::Low),
             created_at: timestamp,
             updated_at: timestamp,
             current_turn: None,
@@ -1988,19 +2096,101 @@ mod tests {
                 UpdateAgentRequest {
                     provider_id: None,
                     model: Some("gpt-5.4".to_string()),
+                    reasoning_effort: Some(ReasoningEffort::High),
                 },
             )
             .await
             .expect("update");
 
         assert_eq!(updated.model, "gpt-5.4");
+        assert_eq!(updated.reasoning_effort, Some(ReasoningEffort::High));
         let event = events.recv().await.expect("event");
         assert!(matches!(
             event.kind,
-            ServiceEventKind::AgentUpdated { agent } if agent.id == agent_id && agent.model == "gpt-5.4"
+            ServiceEventKind::AgentUpdated { agent } if agent.id == agent_id
+                && agent.model == "gpt-5.4"
+                && agent.reasoning_effort == Some(ReasoningEffort::High)
         ));
         let snapshot = store.load_runtime_snapshot(10).await.expect("snapshot");
         assert_eq!(snapshot.agents[0].summary.model, "gpt-5.4");
+        assert_eq!(
+            snapshot.agents[0].summary.reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+    }
+
+    #[tokio::test]
+    async fn update_agent_rejects_invalid_reasoning_and_clears_unsupported_model() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = Arc::new(
+            ConfigStore::open_with_config_path(&db_path, &config_path)
+                .await
+                .expect("open store"),
+        );
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let agent_id = Uuid::new_v4();
+        let timestamp = now();
+        let summary = AgentSummary {
+            id: agent_id,
+            parent_id: None,
+            name: "reasoning-switch".to_string(),
+            status: AgentStatus::Idle,
+            container_id: None,
+            provider_id: "openai".to_string(),
+            provider_name: "OpenAI".to_string(),
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: Some(ReasoningEffort::Medium),
+            created_at: timestamp,
+            updated_at: timestamp,
+            current_turn: None,
+            last_error: None,
+            token_usage: TokenUsage::default(),
+        };
+        store.save_agent(&summary, None).await.expect("save agent");
+        let runtime = AgentRuntime::new(
+            DockerClient::new("unused"),
+            ResponsesClient::new(),
+            Arc::clone(&store),
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+            },
+        )
+        .await
+        .expect("runtime");
+
+        let invalid = runtime
+            .update_agent(
+                agent_id,
+                UpdateAgentRequest {
+                    provider_id: None,
+                    model: Some("gpt-5.4".to_string()),
+                    reasoning_effort: Some(ReasoningEffort::Max),
+                },
+            )
+            .await;
+        assert!(matches!(invalid, Err(RuntimeError::InvalidInput(_))));
+
+        let updated = runtime
+            .update_agent(
+                agent_id,
+                UpdateAgentRequest {
+                    provider_id: None,
+                    model: Some("gpt-4.1".to_string()),
+                    reasoning_effort: Some(ReasoningEffort::High),
+                },
+            )
+            .await
+            .expect("clear unsupported");
+        assert_eq!(updated.model, "gpt-4.1");
+        assert_eq!(updated.reasoning_effort, None);
     }
 
     #[tokio::test]
@@ -2031,6 +2221,7 @@ mod tests {
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.5".to_string(),
+            reasoning_effort: Some(ReasoningEffort::Medium),
             created_at: timestamp,
             updated_at: timestamp,
             current_turn: None,
@@ -2055,6 +2246,7 @@ mod tests {
                 UpdateAgentRequest {
                     provider_id: None,
                     model: Some("missing".to_string()),
+                    reasoning_effort: None,
                 },
             )
             .await;
@@ -2072,6 +2264,7 @@ mod tests {
                 UpdateAgentRequest {
                     provider_id: None,
                     model: Some("gpt-5.4".to_string()),
+                    reasoning_effort: None,
                 },
             )
             .await;

@@ -19,9 +19,17 @@
       </label>
       <label>
         <span>Model</span>
-        <select v-model="dialog.model">
+        <select v-model="dialog.model" @change="$emit('model-changed')">
           <option v-for="model in models" :key="model.id" :value="model.id">
             {{ model.name || model.id }}
+          </option>
+        </select>
+      </label>
+      <label v-if="reasoningOptions.length">
+        <span>Reasoning Effort</span>
+        <select v-model="dialog.reasoning_effort">
+          <option v-for="option in reasoningOptions" :key="option.value" :value="option.value">
+            {{ option.label }}
           </option>
         </select>
       </label>
@@ -51,8 +59,9 @@ function onBackdropUp(_event, callback) {
 defineProps({
   dialog: { type: Object, required: true },
   providers: { type: Array, required: true },
-  models: { type: Array, required: true }
+  models: { type: Array, required: true },
+  reasoningOptions: { type: Array, default: () => [] }
 })
 
-defineEmits(['close', 'create', 'provider-changed'])
+defineEmits(['close', 'create', 'provider-changed', 'model-changed'])
 </script>

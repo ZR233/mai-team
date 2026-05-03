@@ -81,9 +81,11 @@
       :dialog="agentDialog"
       :providers="providersState.providers"
       :models="selectedProviderModels"
+      :reasoning-options="agentReasoningOptions"
       @close="agentDialog.open = false"
       @create="onCreateAgent"
       @provider-changed="onAgentProviderChanged"
+      @model-changed="onAgentModelChanged"
     />
 
     <ConfirmDialog
@@ -115,6 +117,7 @@ import { useApi } from './composables/useApi'
 import { useSSE } from './composables/useSSE'
 import { useAgents } from './composables/useAgents'
 import { useProviders } from './composables/useProviders'
+import { defaultReasoningEffort, reasoningOptionsFor } from './utils/reasoning'
 
 const { toast, showToast } = useApi()
 const { eventFeed, connectionState, connectEvents, disconnect } = useSSE()
@@ -152,6 +155,9 @@ const selectedProviderModels = computed(() => {
   const provider = providersState.providers.find((p) => p.id === agentDialog.provider_id)
   return provider?.models || []
 })
+const selectedAgentProvider = computed(() => providersState.providers.find((p) => p.id === agentDialog.provider_id))
+const selectedAgentModel = computed(() => selectedProviderModels.value.find((model) => model.id === agentDialog.model))
+const agentReasoningOptions = computed(() => reasoningOptionsFor(selectedAgentProvider.value, selectedAgentModel.value))
 
 watch(
   () => [
@@ -203,18 +209,28 @@ function openCreateAgentDialog() {
   agentDialog.name = ''
   agentDialog.provider_id = defaultProvider?.id || ''
   agentDialog.model = defaultProvider?.default_model || defaultProvider?.models?.[0]?.id || ''
+  resetAgentReasoningEffort()
   agentDialog.error = ''
 }
 
 function onAgentProviderChanged() {
   const provider = providersState.providers.find((p) => p.id === agentDialog.provider_id)
   agentDialog.model = provider?.default_model || provider?.models?.[0]?.id || ''
+  resetAgentReasoningEffort()
+}
+
+function onAgentModelChanged() {
+  resetAgentReasoningEffort()
+}
+
+function resetAgentReasoningEffort() {
+  agentDialog.reasoning_effort = defaultReasoningEffort(selectedAgentProvider.value, selectedAgentModel.value)
 }
 
 async function onCreateAgent() {
   agentDialog.error = ''
   try {
-    await createAgent(agentDialog.name, agentDialog.provider_id, agentDialog.model)
+    await createAgent(agentDialog.name, agentDialog.provider_id, agentDialog.model, agentDialog.reasoning_effort)
     agentDialog.open = false
     activeTab.value = 'agents'
   } catch (error) {
@@ -251,7 +267,7 @@ async function onSelectSession(sessionId) {
 
 async function onUpdateAgentModel(payload) {
   try {
-    await updateAgent(selectedDetail.value.id, payload.provider_id, payload.model)
+    await updateAgent(selectedDetail.value.id, payload.provider_id, payload.model, payload.reasoning_effort)
     showToast('Agent model updated.')
   } catch (error) {
     showToast(error.message)

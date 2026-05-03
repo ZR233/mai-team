@@ -32,9 +32,17 @@
       </label>
       <label>
         <span>Model</span>
-        <select v-model="modelEditor.model">
+        <select v-model="modelEditor.model" @change="onModelChanged">
           <option v-for="model in editorModels" :key="model.id" :value="model.id">
             {{ model.name || model.id }}
+          </option>
+        </select>
+      </label>
+      <label v-if="editorReasoningOptions.length">
+        <span>Reasoning Effort</span>
+        <select v-model="modelEditor.reasoning_effort">
+          <option v-for="option in editorReasoningOptions" :key="option.value" :value="option.value">
+            {{ option.label }}
           </option>
         </select>
       </label>
@@ -51,6 +59,7 @@
       <div><span>Status</span><strong>{{ formatStatus(detail.status) }}</strong></div>
       <div><span>Container</span><strong>{{ shortContainer(detail.container_id) }}</strong></div>
       <div><span>Provider</span><strong>{{ detail.provider_id }}</strong></div>
+      <div v-if="detail.reasoning_effort"><span>Reasoning</span><strong>{{ reasoningLabel(detail.reasoning_effort) }}</strong></div>
       <div><span>Tokens</span><strong>{{ totalTokens(detail) }}</strong></div>
       <div><span>Created</span><strong>{{ formatDate(detail.created_at) }}</strong></div>
     </div>
@@ -115,11 +124,11 @@
               <div class="tool-preview-grid">
                 <div v-if="item.argumentsPreview" class="trace-preview">
                   <span>Arguments</span>
-                  <pre>{{ item.argumentsPreview }}</pre>
+                  <div class="trace-surface" v-html="renderToolTrace({ toolName: item.toolName, kind: 'arguments', value: item.argumentsPreview })"></div>
                 </div>
                 <div v-if="item.outputPreview" class="trace-preview">
                   <span>Output</span>
-                  <pre>{{ item.outputPreview }}</pre>
+                  <div class="trace-surface" v-html="renderToolTrace({ toolName: item.toolName, kind: 'output', value: item.outputPreview })"></div>
                 </div>
               </div>
               <div v-if="isToolExpanded(item)" class="tool-trace">
@@ -133,11 +142,11 @@
                 <template v-else-if="traceState(item).detail">
                   <div class="trace-block">
                     <span>Full arguments</span>
-                    <pre>{{ formatTraceValue(traceState(item).detail.arguments) }}</pre>
+                    <div class="trace-surface" v-html="renderToolTrace({ toolName: item.toolName, kind: 'arguments', value: traceState(item).detail.arguments })"></div>
                   </div>
                   <div class="trace-block">
                     <span>Full output</span>
-                    <pre>{{ formatTraceValue(traceState(item).detail.output) }}</pre>
+                    <div class="trace-surface" v-html="renderToolTrace({ toolName: item.toolName, kind: 'output', value: traceState(item).detail.output })"></div>
                   </div>
                 </template>
               </div>
@@ -181,12 +190,13 @@ import {
   totalTokens, shortContainer, initial, roleInitial, roleLabel,
   statusTone, messageClass
 } from '../utils/format'
+import { defaultReasoningEffort, reasoningLabel, reasoningOptionsFor } from '../utils/reasoning'
 import { renderMarkdown } from '../utils/markdown'
 import { useApi } from '../composables/useApi'
 import {
   buildAgentTimeline,
   formatDuration,
-  formatTraceValue,
+  renderToolTrace,
   toolStatusLabel
 } from '../utils/timeline'
 
@@ -217,12 +227,15 @@ const modelEditor = reactive({
   open: false,
   provider_id: '',
   model: '',
+  reasoning_effort: '',
   error: ''
 })
 
 const timelineItems = computed(() => buildAgentTimeline(props.detail, props.events))
 const editorProvider = computed(() => props.providers.find((provider) => provider.id === modelEditor.provider_id))
 const editorModels = computed(() => editorProvider.value?.models || [])
+const editorModel = computed(() => editorModels.value.find((model) => model.id === modelEditor.model))
+const editorReasoningOptions = computed(() => reasoningOptionsFor(editorProvider.value, editorModel.value))
 const isModelChangeBusy = computed(() => {
   const status = props.detail?.status
   return status === 'running_turn' || status === 'waiting_tool' || status === 'starting_container'
@@ -260,11 +273,21 @@ function openModelEditor() {
   modelEditor.open = true
   modelEditor.provider_id = props.detail?.provider_id || props.providers[0]?.id || ''
   modelEditor.model = props.detail?.model || editorProvider.value?.default_model || editorModels.value[0]?.id || ''
+  modelEditor.reasoning_effort = props.detail?.reasoning_effort || defaultReasoningEffort(editorProvider.value, editorModel.value)
   modelEditor.error = ''
 }
 
 function onModelProviderChanged() {
   modelEditor.model = editorProvider.value?.default_model || editorModels.value[0]?.id || ''
+  resetModelEditorReasoningEffort()
+}
+
+function onModelChanged() {
+  resetModelEditorReasoningEffort()
+}
+
+function resetModelEditorReasoningEffort() {
+  modelEditor.reasoning_effort = defaultReasoningEffort(editorProvider.value, editorModel.value)
 }
 
 function saveModelEdit() {
@@ -274,7 +297,8 @@ function saveModelEdit() {
   }
   emit('update-model', {
     provider_id: modelEditor.provider_id,
-    model: modelEditor.model
+    model: modelEditor.model,
+    reasoning_effort: modelEditor.reasoning_effort
   })
   modelEditor.open = false
 }

@@ -61,13 +61,14 @@ export function useAgents() {
     await refreshDetail()
   }
 
-  async function createAgent(name, providerId, model) {
+  async function createAgent(name, providerId, model, reasoningEffort) {
     const response = await api('/agents', {
       method: 'POST',
       body: JSON.stringify({
         name: name || null,
         provider_id: providerId || null,
-        model: model || null
+        model: model || null,
+        reasoning_effort: reasoningEffort || null
       })
     })
     selectedAgentId.value = response.agent.id
@@ -85,12 +86,13 @@ export function useAgents() {
     return response.session
   }
 
-  async function updateAgent(id, providerId, model) {
+  async function updateAgent(id, providerId, model, reasoningEffort) {
     const response = await api(`/agents/${id}`, {
       method: 'PATCH',
       body: JSON.stringify({
         provider_id: providerId || null,
-        model: model || null
+        model: model || null,
+        reasoning_effort: reasoningEffort || null
       })
     })
     selectedDetail.value = {
@@ -136,6 +138,7 @@ export function useAgents() {
     name: '',
     provider_id: '',
     model: '',
+    reasoning_effort: '',
     error: ''
   })
 

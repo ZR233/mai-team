@@ -18,7 +18,7 @@ use uuid::Uuid;
 const SETTING_DEFAULT_PROVIDER_ID: &str = "default_provider_id";
 const SETTING_LEGACY_TOML_IMPORTED: &str = "legacy_toml_imported";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-const SCHEMA_VERSION: &str = "2";
+const SCHEMA_VERSION: &str = "3";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 
 #[derive(Debug, Error)]
@@ -193,6 +193,7 @@ struct AgentRecordRow {
     provider_id: String,
     provider_name: String,
     model: String,
+    reasoning_effort: Option<String>,
     created_at: String,
     updated_at: String,
     current_turn: Option<String>,
@@ -703,6 +704,10 @@ impl ConfigStore {
             provider_id: summary.provider_id.clone(),
             provider_name: summary.provider_name.clone(),
             model: summary.model.clone(),
+            reasoning_effort: summary
+                .reasoning_effort
+                .map(reasoning_effort_to_str)
+                .map(str::to_string),
             created_at: summary.created_at.to_rfc3339(),
             updated_at: summary.updated_at.to_rfc3339(),
             current_turn: summary.current_turn.map(|id| id.to_string()),
@@ -979,6 +984,11 @@ impl AgentRecordRow {
             provider_id: self.provider_id,
             provider_name: self.provider_name,
             model: self.model,
+            reasoning_effort: self
+                .reasoning_effort
+                .as_deref()
+                .map(parse_reasoning_effort)
+                .transpose()?,
             created_at: parse_utc(&self.created_at)?,
             updated_at: parse_utc(&self.updated_at)?,
             current_turn: self
@@ -1200,15 +1210,9 @@ fn deepseek_model(id: &str, supports_reasoning: bool) -> ModelConfig {
         supports_tools: true,
         supports_reasoning,
         reasoning_efforts: supports_reasoning
-            .then(|| {
-                vec![
-                    ReasoningEffort::Low,
-                    ReasoningEffort::Medium,
-                    ReasoningEffort::High,
-                ]
-            })
+            .then(|| vec![ReasoningEffort::High, ReasoningEffort::Max])
             .unwrap_or_default(),
-        default_reasoning_effort: supports_reasoning.then_some(ReasoningEffort::Medium),
+        default_reasoning_effort: supports_reasoning.then_some(ReasoningEffort::High),
         options: serde_json::Value::Null,
         headers: BTreeMap::new(),
     }
@@ -1389,6 +1393,33 @@ fn parse_agent_status(value: &str) -> Result<AgentStatus> {
         "deleted" => Ok(AgentStatus::Deleted),
         other => Err(StoreError::InvalidConfig(format!(
             "invalid agent status `{other}`"
+        ))),
+    }
+}
+
+fn reasoning_effort_to_str(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::None => "none",
+        ReasoningEffort::Minimal => "minimal",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Xhigh => "xhigh",
+        ReasoningEffort::Max => "max",
+    }
+}
+
+fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort> {
+    match value {
+        "none" => Ok(ReasoningEffort::None),
+        "minimal" => Ok(ReasoningEffort::Minimal),
+        "low" => Ok(ReasoningEffort::Low),
+        "medium" => Ok(ReasoningEffort::Medium),
+        "high" => Ok(ReasoningEffort::High),
+        "xhigh" => Ok(ReasoningEffort::Xhigh),
+        "max" => Ok(ReasoningEffort::Max),
+        other => Err(StoreError::InvalidConfig(format!(
+            "invalid reasoning effort `{other}`"
         ))),
     }
 }
@@ -1696,6 +1727,7 @@ mod tests {
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.2".to_string(),
+            reasoning_effort: Some(ReasoningEffort::High),
             created_at: now,
             updated_at: now,
             current_turn: Some(turn_id),

@@ -99,6 +99,8 @@ pub struct AgentSummary {
     pub provider_id: String,
     pub provider_name: String,
     pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub current_turn: Option<TurnId>,
@@ -121,6 +123,8 @@ pub struct CreateAgentRequest {
     pub name: Option<String>,
     pub provider_id: Option<String>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub parent_id: Option<AgentId>,
     pub system_prompt: Option<String>,
 }
@@ -134,6 +138,8 @@ pub struct CreateAgentResponse {
 pub struct UpdateAgentRequest {
     pub provider_id: Option<String>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

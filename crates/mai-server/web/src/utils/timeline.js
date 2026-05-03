@@ -1,3 +1,5 @@
+import hljs from 'highlight.js'
+
 const MESSAGE_MATCH_LIMIT_MS = 120_000
 
 export function buildAgentTimeline(detail, liveEvents = []) {
@@ -157,10 +159,254 @@ export function formatTraceValue(value) {
   return JSON.stringify(value, null, 2)
 }
 
+export function renderTraceValue(value) {
+  const formatted = formatTraceValue(value)
+  if (!formatted) return ''
+
+  if (isJsonTraceValue(value, formatted)) {
+    try {
+      return hljs.highlight(formatted, { language: 'json', ignoreIllegals: true }).value
+    } catch {
+      return escapeHtml(formatted)
+    }
+  }
+
+  return escapeHtml(formatted)
+}
+
+export function renderToolTrace({ toolName, kind, value }) {
+  const normalizedToolName = normalizeToolName(toolName)
+  const parsed = parseTraceValue(value)
+
+  if (kind === 'arguments') {
+    return renderToolArguments(normalizedToolName, parsed.value)
+  }
+
+  if (kind === 'output') {
+    return renderToolOutput(normalizedToolName, parsed.value)
+  }
+
+  return `<pre class="trace-code trace-code-${parsed.type}"><code>${renderTraceValue(value)}</code></pre>`
+}
+
 export function toolStatusLabel(status) {
   if (status === 'running') return 'Running'
   if (status === 'failed') return 'Failed'
   return 'Done'
+}
+
+function renderToolArguments(toolName, value) {
+  if (isPlainObject(value)) {
+    if (toolName === 'container_exec' && typeof value.command === 'string') {
+      const rows = [
+        renderCommandBlock(value.command),
+        value.cwd ? renderMetaLine('cwd', value.cwd) : '',
+        value.timeout_secs ? renderMetaLine('timeout', `${value.timeout_secs}s`) : ''
+      ]
+      return rows.filter(Boolean).join('')
+    }
+
+    if (toolName === 'container_cp_upload') {
+      return [
+        renderMetaLine('path', value.path),
+        renderMetaLine('content', compactBase64(value.content_base64))
+      ].filter(Boolean).join('')
+    }
+
+    if (toolName === 'container_cp_download') {
+      return renderMetaLine('path', value.path)
+    }
+
+    if (toolName === 'send_message') {
+      return [
+        renderMetaLine('agent', value.agent_id),
+        value.session_id ? renderMetaLine('session', value.session_id) : '',
+        renderTextBlock('message', value.message)
+      ].filter(Boolean).join('')
+    }
+
+    if (toolName === 'spawn_agent') {
+      return [
+        renderMetaLine('name', value.name),
+        value.provider_id ? renderMetaLine('provider', value.provider_id) : '',
+        value.model ? renderMetaLine('model', value.model) : '',
+        renderTextBlock('message', value.message)
+      ].filter(Boolean).join('')
+    }
+
+    if (toolName === 'wait_agent' || toolName === 'close_agent') {
+      return [
+        renderMetaLine('agent', value.agent_id),
+        value.timeout_secs ? renderMetaLine('timeout', `${value.timeout_secs}s`) : ''
+      ].filter(Boolean).join('')
+    }
+  }
+
+  return renderPrettyJson(value)
+}
+
+function renderToolOutput(toolName, value) {
+  if (toolName === 'container_exec' && isPlainObject(value) && hasExecOutputShape(value)) {
+    const rows = [
+      renderStatusLine(value.status),
+      renderTextBlock('stdout', value.stdout),
+      renderTextBlock('stderr', value.stderr, 'error')
+    ]
+    return rows.filter(Boolean).join('')
+  }
+
+  if (isPlainObject(value)) {
+    if ('path' in value || 'bytes' in value) {
+      return [
+        renderMetaLine('path', value.path),
+        Number.isFinite(value.bytes) ? renderMetaLine('bytes', formatBytes(value.bytes)) : ''
+      ].filter(Boolean).join('')
+    }
+
+    if ('error' in value || 'message' in value) {
+      return [
+        renderTextBlock('error', value.error, 'error'),
+        renderTextBlock('message', value.message)
+      ].filter(Boolean).join('')
+    }
+  }
+
+  if (typeof value === 'string') {
+    return renderTextBlock('output', decodeEscapedText(value))
+  }
+
+  return renderPrettyJson(value)
+}
+
+function renderCommandBlock(command) {
+  return `
+    <div class="trace-command">
+      <span class="trace-prompt">$</span>
+      <code>${escapeHtml(cleanTerminalText(command))}</code>
+    </div>
+  `
+}
+
+function renderStatusLine(status) {
+  if (status === null || status === undefined || status === '') return ''
+  const numericStatus = Number(status)
+  const ok = numericStatus === 0
+  return `
+    <div class="trace-status-line">
+      <span class="trace-status-pill ${ok ? 'trace-status-ok' : 'trace-status-error'}">
+        exit ${escapeHtml(String(status))}
+      </span>
+    </div>
+  `
+}
+
+function renderMetaLine(label, value) {
+  if (value === null || value === undefined || value === '') return ''
+  return `
+    <div class="trace-meta-line">
+      <span>${escapeHtml(label)}</span>
+      <code>${escapeHtml(cleanTerminalText(String(value)))}</code>
+    </div>
+  `
+}
+
+function renderTextBlock(label, value, tone = '') {
+  if (value === null || value === undefined || value === '') return ''
+  const text = cleanTerminalText(String(value))
+  if (!text) return ''
+  return `
+    <div class="trace-text-block ${tone ? `trace-text-${tone}` : ''}">
+      <span>${escapeHtml(label)}</span>
+      <pre>${escapeHtml(text)}</pre>
+    </div>
+  `
+}
+
+function renderPrettyJson(value) {
+  return `<pre class="trace-code trace-code-json"><code>${renderTraceValue(value)}</code></pre>`
+}
+
+function parseTraceValue(value) {
+  if (value === null || value === undefined || value === '') return { type: 'text', value: '' }
+  if (typeof value !== 'string') return { type: 'json', value }
+
+  const decoded = decodeEscapedText(value)
+  for (const candidate of [value, decoded]) {
+    try {
+      return { type: 'json', value: JSON.parse(candidate) }
+    } catch {}
+  }
+  return { type: 'text', value: decoded }
+}
+
+function decodeEscapedText(value) {
+  const text = String(value || '')
+  if (!/\\[nrt"\\]/.test(text)) return text
+  return text
+    .replace(/\\r\\n/g, '\n')
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t')
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, '\\')
+}
+
+function cleanTerminalText(value) {
+  return decodeEscapedText(value)
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, '')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+}
+
+function normalizeToolName(value) {
+  return String(value || '').replace(/\./g, '_')
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function hasExecOutputShape(value) {
+  return 'status' in value && ('stdout' in value || 'stderr' in value)
+}
+
+function compactBase64(value) {
+  if (!value) return ''
+  const text = String(value)
+  if (text.length <= 36) return text
+  return `${text.slice(0, 18)}...${text.slice(-10)} (${text.length} chars)`
+}
+
+function formatBytes(value) {
+  if (!Number.isFinite(value)) return ''
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  return `${(value / 1024 / 1024).toFixed(1)} MB`
+}
+
+function isJsonTraceValue(original, formatted) {
+  if (original !== null && typeof original === 'object') return true
+  if (typeof original !== 'string') return original !== undefined
+  try {
+    JSON.parse(formatted)
+    return true
+  } catch {
+    return looksLikeJsonText(formatted)
+  }
+}
+
+function looksLikeJsonText(value) {
+  const trimmed = String(value || '').trimStart()
+  return trimmed.startsWith('{') || trimmed.startsWith('[')
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
 }
 
 function mergeEvents(events) {

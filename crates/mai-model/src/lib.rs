@@ -117,15 +117,30 @@ impl ResponsesClient {
         instructions: &str,
         input: &[ModelInputItem],
         tools: &[ToolDefinition],
+        reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<ModelResponse> {
         match provider.kind {
             ProviderKind::Openai => {
-                self.create_openai_response(provider, model, instructions, input, tools)
-                    .await
+                self.create_openai_response(
+                    provider,
+                    model,
+                    instructions,
+                    input,
+                    tools,
+                    reasoning_effort,
+                )
+                .await
             }
             ProviderKind::Deepseek => {
-                self.create_deepseek_chat(provider, model, instructions, input, tools)
-                    .await
+                self.create_deepseek_chat(
+                    provider,
+                    model,
+                    instructions,
+                    input,
+                    tools,
+                    reasoning_effort,
+                )
+                .await
             }
         }
     }
@@ -137,6 +152,7 @@ impl ResponsesClient {
         instructions: &str,
         input: &[ModelInputItem],
         tools: &[ToolDefinition],
+        reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<ModelResponse> {
         let endpoint = format!("{}/responses", provider.base_url.trim_end_matches('/'));
         let active_tools = if model.supports_tools { tools } else { &[] };
@@ -149,7 +165,7 @@ impl ResponsesClient {
             stream: false,
             reasoning: model
                 .supports_reasoning
-                .then_some(model.default_reasoning_effort)
+                .then_some(reasoning_effort.or(model.default_reasoning_effort))
                 .flatten()
                 .and_then(reasoning_effort_value)
                 .map(|effort| ReasoningRequest { effort }),
@@ -180,6 +196,7 @@ impl ResponsesClient {
         instructions: &str,
         input: &[ModelInputItem],
         tools: &[ToolDefinition],
+        reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<ModelResponse> {
         let endpoint = format!(
             "{}/chat/completions",
@@ -199,7 +216,7 @@ impl ResponsesClient {
             max_tokens: model.output_tokens,
             reasoning_effort: model
                 .supports_reasoning
-                .then_some(model.default_reasoning_effort)
+                .then_some(reasoning_effort.or(model.default_reasoning_effort))
                 .flatten()
                 .and_then(deepseek_reasoning_effort_value),
             options: option_map(&model.options),
@@ -272,7 +289,8 @@ fn reasoning_effort_value(effort: ReasoningEffort) -> Option<&'static str> {
 fn deepseek_reasoning_effort_value(effort: ReasoningEffort) -> Option<&'static str> {
     match effort {
         ReasoningEffort::None => None,
-        ReasoningEffort::High | ReasoningEffort::Xhigh | ReasoningEffort::Max => Some("max"),
+        ReasoningEffort::Max => Some("max"),
+        ReasoningEffort::High | ReasoningEffort::Xhigh => Some("high"),
         ReasoningEffort::Minimal | ReasoningEffort::Low | ReasoningEffort::Medium => Some("high"),
     }
 }
@@ -647,5 +665,17 @@ mod tests {
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[2].role, "assistant");
         assert_eq!(messages[2].reasoning_content, None);
+    }
+
+    #[test]
+    fn deepseek_reasoning_effort_maps_high_and_max() {
+        assert_eq!(
+            deepseek_reasoning_effort_value(ReasoningEffort::High),
+            Some("high")
+        );
+        assert_eq!(
+            deepseek_reasoning_effort_value(ReasoningEffort::Max),
+            Some("max")
+        );
     }
 }
