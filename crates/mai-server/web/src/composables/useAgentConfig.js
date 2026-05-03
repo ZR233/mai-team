@@ -2,8 +2,12 @@ import { reactive } from 'vue'
 import { useApi } from './useApi'
 
 const agentConfigState = reactive({
-  research_agent: null,
-  effective_research_agent: null,
+  planner: null,
+  executor: null,
+  reviewer: null,
+  effective_planner: null,
+  effective_executor: null,
+  effective_reviewer: null,
   validation_error: '',
   loading: false,
   saving: false
@@ -22,12 +26,16 @@ export function useAgentConfig() {
     }
   }
 
-  async function saveAgentConfig(researchAgent) {
+  async function saveAgentConfig(config) {
     agentConfigState.saving = true
     try {
       const response = await api('/agent-config', {
         method: 'PUT',
-        body: JSON.stringify({ research_agent: researchAgent || null })
+        body: JSON.stringify({
+          planner: config?.planner || null,
+          executor: config?.executor || null,
+          reviewer: config?.reviewer || null
+        })
       })
       applyAgentConfigResponse(response)
       return response
@@ -44,7 +52,11 @@ export function useAgentConfig() {
 }
 
 function applyAgentConfigResponse(response) {
-  agentConfigState.research_agent = response?.research_agent || null
-  agentConfigState.effective_research_agent = response?.effective_research_agent || null
+  agentConfigState.planner = response?.planner || null
+  agentConfigState.executor = response?.executor || response?.research_agent || null
+  agentConfigState.reviewer = response?.reviewer || null
+  agentConfigState.effective_planner = response?.effective_planner || null
+  agentConfigState.effective_executor = response?.effective_executor || response?.effective_research_agent || null
+  agentConfigState.effective_reviewer = response?.effective_reviewer || null
   agentConfigState.validation_error = response?.validation_error || ''
 }

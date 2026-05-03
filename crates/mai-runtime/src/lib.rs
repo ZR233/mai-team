@@ -6,7 +6,7 @@ use mai_mcp::McpAgentManager;
 use mai_model::ResponsesClient;
 use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentMessage,
-    AgentModelPreference, AgentSessionSummary, AgentStatus, AgentSummary, ContextUsage,
+    AgentModelPreference, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary, ContextUsage,
     CreateAgentRequest, MessageRole, ModelConfig, ModelContentItem, ModelInputItem,
     ModelOutputItem, ModelToolCall, ProviderKind, ReasoningEffort, ResolvedAgentModelPreference,
     ServiceEvent, ServiceEventKind, SessionId, TokenUsage, ToolTraceDetail, TurnId, TurnStatus,
@@ -41,6 +41,7 @@ Include:
 - Any critical data, examples, file paths, command outputs, or references needed to continue
 
 Be concise, structured, and focused on helping the next model seamlessly continue the work."#;
+const AGENT_ROLES: [AgentRole; 3] = [AgentRole::Planner, AgentRole::Executor, AgentRole::Reviewer];
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -195,16 +196,42 @@ impl AgentRuntime {
 
     pub async fn agent_config(&self) -> Result<AgentConfigResponse> {
         let config = self.store.load_agent_config().await?;
-        let (effective_research_agent, validation_error) = match self
-            .resolve_agent_model_preference(config.research_agent.as_ref())
-            .await
-        {
-            Ok(resolved) => (Some(resolved.effective), None),
-            Err(err) => (None, Some(err.to_string())),
-        };
+        let planner = role_preference(&config, AgentRole::Planner).cloned();
+        let executor = role_preference(&config, AgentRole::Executor).cloned();
+        let reviewer = role_preference(&config, AgentRole::Reviewer).cloned();
+        let mut validation_errors = Vec::new();
+        let effective_planner = self
+            .resolve_effective_agent_model(
+                AgentRole::Planner,
+                planner.as_ref(),
+                &mut validation_errors,
+            )
+            .await;
+        let effective_executor = self
+            .resolve_effective_agent_model(
+                AgentRole::Executor,
+                executor.as_ref(),
+                &mut validation_errors,
+            )
+            .await;
+        let effective_reviewer = self
+            .resolve_effective_agent_model(
+                AgentRole::Reviewer,
+                reviewer.as_ref(),
+                &mut validation_errors,
+            )
+            .await;
+        let validation_error =
+            (!validation_errors.is_empty()).then(|| validation_errors.join("; "));
         Ok(AgentConfigResponse {
-            research_agent: config.research_agent,
-            effective_research_agent,
+            planner,
+            executor,
+            reviewer,
+            effective_planner,
+            effective_executor: effective_executor.clone(),
+            effective_reviewer,
+            research_agent: config.research_agent.clone(),
+            effective_research_agent: effective_executor.clone(),
             validation_error,
         })
     }
@@ -213,8 +240,9 @@ impl AgentRuntime {
         &self,
         request: AgentConfigRequest,
     ) -> Result<AgentConfigResponse> {
-        if let Some(preference) = request.research_agent.as_ref() {
-            self.resolve_agent_model_preference(Some(preference))
+        for role in AGENT_ROLES {
+            let preference = role_preference(&request, role);
+            self.resolve_agent_model_preference(role, preference)
                 .await?;
         }
         self.store.save_agent_config(&request).await?;
@@ -1093,7 +1121,12 @@ impl AgentRuntime {
             RoutedTool::SpawnAgent => {
                 let name = optional_string(&arguments, "name");
                 let message = optional_string(&arguments, "message");
-                let child_model = self.resolve_research_agent_model().await?;
+                let role = optional_string(&arguments, "role")
+                    .as_deref()
+                    .map(parse_agent_role)
+                    .transpose()?
+                    .unwrap_or_default();
+                let child_model = self.resolve_role_agent_model(role).await?;
                 let parent = self.agent(agent_id).await?;
                 let parent_status = parent.summary.read().await.status.clone();
                 let parent_container_id =
@@ -1108,7 +1141,7 @@ impl AgentRuntime {
                             reasoning_effort: child_model.preference.reasoning_effort,
                             docker_image: Some(parent_docker_image.clone()),
                             parent_id: Some(agent_id),
-                            system_prompt: None,
+                            system_prompt: Some(role_system_prompt(role).to_string()),
                         },
                         ContainerSource::CloneFrom {
                             parent_container_id,
@@ -1535,22 +1568,39 @@ impl AgentRuntime {
             })
     }
 
-    async fn resolve_research_agent_model(&self) -> Result<ResolvedAgentModel> {
+    async fn resolve_role_agent_model(&self, role: AgentRole) -> Result<ResolvedAgentModel> {
         let config = self.store.load_agent_config().await?;
-        self.resolve_agent_model_preference(config.research_agent.as_ref())
+        self.resolve_agent_model_preference(role, role_preference(&config, role))
             .await
+    }
+
+    async fn resolve_effective_agent_model(
+        &self,
+        role: AgentRole,
+        preference: Option<&AgentModelPreference>,
+        validation_errors: &mut Vec<String>,
+    ) -> Option<ResolvedAgentModelPreference> {
+        match self.resolve_agent_model_preference(role, preference).await {
+            Ok(resolved) => Some(resolved.effective),
+            Err(err) => {
+                validation_errors.push(err.to_string());
+                None
+            }
+        }
     }
 
     async fn resolve_agent_model_preference(
         &self,
+        role: AgentRole,
         preference: Option<&AgentModelPreference>,
     ) -> Result<ResolvedAgentModel> {
         if let Some(preference) = preference
             && (preference.provider_id.trim().is_empty() || preference.model.trim().is_empty())
         {
-            return Err(RuntimeError::InvalidInput(
-                "research agent provider and model are required".to_string(),
-            ));
+            return Err(RuntimeError::InvalidInput(format!(
+                "{} provider and model are required",
+                agent_role_label(role)
+            )));
         }
         let selection = self
             .store
@@ -1799,6 +1849,17 @@ fn optional_string(arguments: &Value, field: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn parse_agent_role(value: &str) -> Result<AgentRole> {
+    match value.trim().to_lowercase().as_str() {
+        "" | "executor" => Ok(AgentRole::Executor),
+        "planner" => Ok(AgentRole::Planner),
+        "reviewer" => Ok(AgentRole::Reviewer),
+        _ => Err(RuntimeError::InvalidInput(format!(
+            "invalid agent role `{value}`; expected planner, executor, or reviewer"
+        ))),
+    }
+}
+
 fn parse_agent_id(value: &str) -> Result<AgentId> {
     Uuid::parse_str(value)
         .map_err(|err| RuntimeError::InvalidInput(format!("invalid agent_id `{value}`: {err}")))
@@ -1837,6 +1898,36 @@ fn resolved_agent_model_preference(
         reasoning_effort,
         context_tokens: selection.model.context_tokens,
         output_tokens: selection.model.output_tokens,
+    }
+}
+
+fn role_preference(config: &AgentConfigRequest, role: AgentRole) -> Option<&AgentModelPreference> {
+    match role {
+        AgentRole::Planner => config.planner.as_ref().or(config.research_agent.as_ref()),
+        AgentRole::Executor => config.executor.as_ref().or(config.research_agent.as_ref()),
+        AgentRole::Reviewer => config.reviewer.as_ref().or(config.research_agent.as_ref()),
+    }
+}
+
+fn agent_role_label(role: AgentRole) -> &'static str {
+    match role {
+        AgentRole::Planner => "planner",
+        AgentRole::Executor => "executor",
+        AgentRole::Reviewer => "reviewer",
+    }
+}
+
+fn role_system_prompt(role: AgentRole) -> &'static str {
+    match role {
+        AgentRole::Planner => {
+            "You are the Planner role for a multi-agent coding task. Break work into clear steps, identify dependencies, risks, and acceptance criteria, and hand off bounded tasks. Do not modify code unless the task explicitly asks the planner to implement."
+        }
+        AgentRole::Executor => {
+            "You are the Executor role for a multi-agent coding task. Implement concrete changes, run the necessary commands, report touched files and verification results, and keep the work scoped to the assigned task."
+        }
+        AgentRole::Reviewer => {
+            "You are the Reviewer role for a multi-agent coding task. Review changes for bugs, regressions, missing tests, and unclear behavior. Lead with findings ordered by severity and include file paths or command evidence when relevant."
+        }
     }
 }
 
@@ -3612,40 +3703,53 @@ esac
 
         let config = runtime.agent_config().await.expect("config");
         assert_eq!(config.research_agent, None);
-        let effective = config.effective_research_agent.expect("effective default");
+        assert_eq!(config.planner, None);
+        assert_eq!(config.executor, None);
+        assert_eq!(config.reviewer, None);
+        let effective = config.effective_executor.expect("effective default");
         assert_eq!(effective.provider_id, "alt");
         assert_eq!(effective.model, "alt-default");
         assert_eq!(effective.reasoning_effort, Some(ReasoningEffort::Medium));
+        assert_eq!(
+            config.effective_planner.expect("planner default").model,
+            "alt-default"
+        );
+        assert_eq!(
+            config.effective_reviewer.expect("reviewer default").model,
+            "alt-default"
+        );
 
         let updated = runtime
             .update_agent_config(AgentConfigRequest {
-                research_agent: Some(AgentModelPreference {
+                executor: Some(AgentModelPreference {
                     provider_id: "openai".to_string(),
                     model: "gpt-5.4".to_string(),
                     reasoning_effort: Some(ReasoningEffort::High),
                 }),
+                ..Default::default()
             })
             .await
             .expect("update");
         assert_eq!(
-            updated.effective_research_agent.expect("effective").model,
+            updated.effective_executor.expect("effective").model,
             "gpt-5.4"
         );
 
         let invalid = runtime
             .update_agent_config(AgentConfigRequest {
-                research_agent: Some(AgentModelPreference {
+                reviewer: Some(AgentModelPreference {
                     provider_id: "openai".to_string(),
                     model: "gpt-5.4".to_string(),
                     reasoning_effort: Some(ReasoningEffort::Max),
                 }),
+                ..Default::default()
             })
             .await;
         assert!(matches!(invalid, Err(RuntimeError::InvalidInput(_))));
     }
 
     #[tokio::test]
-    async fn spawn_agent_uses_global_default_when_research_config_missing() {
+    async fn spawn_agent_uses_executor_default_when_role_omitted() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("runtime.sqlite3");
         let config_path = dir.path().join("config.toml");
@@ -3739,7 +3843,7 @@ esac
     }
 
     #[tokio::test]
-    async fn spawn_agent_uses_research_config_over_parent_and_legacy_args() {
+    async fn spawn_agent_uses_role_config_over_parent_and_legacy_args() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("runtime.sqlite3");
         let config_path = dir.path().join("config.toml");
@@ -3757,11 +3861,22 @@ esac
             .expect("save providers");
         store
             .save_agent_config(&AgentConfigRequest {
-                research_agent: Some(AgentModelPreference {
+                planner: Some(AgentModelPreference {
+                    provider_id: "alt".to_string(),
+                    model: "alt-default".to_string(),
+                    reasoning_effort: Some(ReasoningEffort::Medium),
+                }),
+                executor: Some(AgentModelPreference {
                     provider_id: "alt".to_string(),
                     model: "alt-research".to_string(),
                     reasoning_effort: Some(ReasoningEffort::Low),
                 }),
+                reviewer: Some(AgentModelPreference {
+                    provider_id: "openai".to_string(),
+                    model: "gpt-5.4".to_string(),
+                    reasoning_effort: Some(ReasoningEffort::High),
+                }),
+                research_agent: None,
             })
             .await
             .expect("save config");
@@ -3817,6 +3932,7 @@ esac
                 "spawn_agent",
                 json!({
                     "name": "child",
+                    "role": "reviewer",
                     "provider_id": "openai",
                     "model": "gpt-5.4"
                 }),
@@ -3829,12 +3945,58 @@ esac
             .into_iter()
             .find(|agent| agent.parent_id == Some(parent_id))
             .expect("child");
-        assert_eq!(child.provider_id, "alt");
-        assert_eq!(child.model, "alt-research");
-        assert_eq!(child.reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(child.provider_id, "openai");
+        assert_eq!(child.model, "gpt-5.4");
+        assert_eq!(child.reasoning_effort, Some(ReasoningEffort::High));
         assert_eq!(
             child.docker_image,
             "ghcr.io/rcore-os/tgoskits-container:latest"
+        );
+        let snapshot = store.load_runtime_snapshot(10).await.expect("snapshot");
+        let child_record = snapshot
+            .agents
+            .into_iter()
+            .find(|agent| agent.summary.id == child.id)
+            .expect("child record");
+        assert!(
+            child_record
+                .system_prompt
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Reviewer role")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_research_agent_config_maps_to_roles() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = Arc::new(
+            ConfigStore::open_with_config_path(&db_path, &config_path)
+                .await
+                .expect("open store"),
+        );
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider(), alt_test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        store
+            .set_setting(
+                "agent_config",
+                r#"{"research_agent":{"provider_id":"alt","model":"alt-research","reasoning_effort":"low"}}"#,
+            )
+            .await
+            .expect("save legacy config");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let config = runtime.agent_config().await.expect("config");
+        assert_eq!(config.executor.expect("executor").model, "alt-research");
+        assert_eq!(
+            config.effective_reviewer.expect("reviewer fallback").model,
+            "alt-research"
         );
     }
 

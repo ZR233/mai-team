@@ -88,6 +88,15 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             TOOL_SPAWN_AGENT,
             "Create a child agent with its own Docker container. Optionally send it an initial task.",
             object_schema(vec![
+                (
+                    "role",
+                    json!({
+                        "type": "string",
+                        "enum": ["planner", "executor", "reviewer"],
+                        "description": "Role profile to use for the child agent. Defaults to executor."
+                    }),
+                    false,
+                ),
                 ("name", json!({ "type": "string" }), false),
                 ("message", json!({ "type": "string" }), false),
             ]),
@@ -178,6 +187,7 @@ mod tests {
             .expect("properties");
         assert!(properties.contains_key("name"));
         assert!(properties.contains_key("message"));
+        assert!(properties.contains_key("role"));
         assert!(!properties.contains_key("provider_id"));
         assert!(!properties.contains_key("model"));
     }

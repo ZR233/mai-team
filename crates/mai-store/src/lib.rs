@@ -1770,6 +1770,13 @@ mod tests {
     async fn agent_config_persists_and_reloads() {
         let (dir, store) = store().await;
         let config = AgentConfigRequest {
+            planner: None,
+            executor: Some(mai_protocol::AgentModelPreference {
+                provider_id: "openai".to_string(),
+                model: "gpt-5.4".to_string(),
+                reasoning_effort: Some(ReasoningEffort::High),
+            }),
+            reviewer: None,
             research_agent: Some(mai_protocol::AgentModelPreference {
                 provider_id: "openai".to_string(),
                 model: "gpt-5.4".to_string(),

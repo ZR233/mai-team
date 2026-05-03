@@ -2,8 +2,8 @@
   <section class="settings-stage">
     <div class="stage-title">
       <div>
-        <h2>Agent Config</h2>
-        <p>Choose the model profile used by subagents created with spawn_agent.</p>
+        <h2>Agent Settings</h2>
+        <p>Assign model profiles to planner, executor, and reviewer subagent roles.</p>
       </div>
       <button class="ghost-button" :disabled="loading" @click="$emit('reload')">Reload</button>
     </div>
@@ -11,34 +11,63 @@
     <div v-if="!providers.length" class="empty-stage providers-empty">
       <div class="empty-mark">P</div>
       <h2>No providers configured</h2>
-      <p>Add a provider before configuring Research Agent.</p>
+      <p>Add a provider before configuring agent roles.</p>
       <button class="primary-button" @click="$emit('open-providers')">Open Providers</button>
     </div>
 
-    <form v-else class="settings-panel" @submit.prevent="save">
-      <div class="settings-panel-head">
-        <div>
-          <h3>Research Agent</h3>
-          <p>All child agents use this profile. Leave it on default to use the global provider default model.</p>
+    <form v-else class="settings-console" @submit.prevent="save">
+      <div class="settings-summary">
+        <div class="settings-summary-item">
+          <span>Provider seed</span>
+          <strong>{{ providerSeedLabel }}</strong>
+          <small>Empty roles are prefilled from the first provider.</small>
         </div>
-        <label class="toggle-row">
-          <input v-model="useDefault" type="checkbox" />
-          <span>Use default model</span>
-        </label>
+        <div class="settings-summary-item" :class="canSave ? 'ready' : 'danger'">
+          <span>Configuration</span>
+          <strong>{{ canSave ? 'Ready' : 'Incomplete' }}</strong>
+          <small>{{ configuredCount }} of {{ ROLE_DEFINITIONS.length }} roles saved or staged.</small>
+        </div>
+        <div class="settings-summary-item">
+          <span>Spawn default</span>
+          <strong>Executor</strong>
+          <small>spawn_agent uses executor when role is omitted.</small>
+        </div>
       </div>
 
-      <ModelSelector
-        v-model:provider-id="form.provider_id"
-        v-model:model="form.model"
-        v-model:reasoning-effort="form.reasoning_effort"
-        :providers="providers"
-        :disabled="useDefault || saving"
-      />
+      <div class="role-config-grid">
+        <article
+          v-for="role in ROLE_DEFINITIONS"
+          :key="role.key"
+          class="role-config-card"
+          :class="`role-${role.key}`"
+        >
+          <div class="role-card-head">
+            <div class="role-avatar">{{ role.initial }}</div>
+            <div>
+              <h3>{{ role.title }}</h3>
+              <p>{{ role.description }}</p>
+            </div>
+            <span class="role-status" :class="{ staged: !savedPreference(role.key) }">
+              {{ savedPreference(role.key) ? 'Configured' : 'Prefilled' }}
+            </span>
+          </div>
 
-      <div class="effective-model-line">
-        <span>Effective</span>
-        <strong>{{ effectiveLabel }}</strong>
+          <ModelSelector
+            v-model:provider-id="forms[role.key].provider_id"
+            v-model:model="forms[role.key].model"
+            v-model:reasoning-effort="forms[role.key].reasoning_effort"
+            :providers="providers"
+            :disabled="saving"
+            compact
+          />
+
+          <div class="effective-model-line role-effective-line">
+            <span>Effective</span>
+            <strong>{{ effectiveLabel(role.key) }}</strong>
+          </div>
+        </article>
       </div>
+
       <p v-if="state.validation_error" class="dialog-error">{{ state.validation_error }}</p>
       <p v-if="error" class="dialog-error">{{ error }}</p>
 
@@ -56,7 +85,28 @@
 <script setup>
 import { computed, reactive, ref, watch } from 'vue'
 import ModelSelector from './ModelSelector.vue'
-import { reasoningLabel } from '../utils/reasoning'
+import { defaultReasoningEffort, reasoningLabel } from '../utils/reasoning'
+
+const ROLE_DEFINITIONS = [
+  {
+    key: 'planner',
+    title: 'Planner',
+    initial: 'P',
+    description: 'Decomposes tasks, plans steps, and calls out dependencies.'
+  },
+  {
+    key: 'executor',
+    title: 'Executor',
+    initial: 'E',
+    description: 'Writes code, runs commands, and completes implementation work.'
+  },
+  {
+    key: 'reviewer',
+    title: 'Reviewer',
+    initial: 'R',
+    description: 'Reviews changes, finds regressions, and highlights test gaps.'
+  }
+]
 
 const props = defineProps({
   providers: { type: Array, default: () => [] },
@@ -67,54 +117,138 @@ const props = defineProps({
 
 const emit = defineEmits(['save', 'reload', 'open-providers'])
 
-const useDefault = ref(true)
 const error = ref('')
-const form = reactive({
-  provider_id: '',
-  model: '',
-  reasoning_effort: ''
+const forms = reactive({
+  planner: emptyPreference(),
+  executor: emptyPreference(),
+  reviewer: emptyPreference()
 })
 
-const effectiveLabel = computed(() => {
-  const effective = props.state.effective_research_agent
-  if (!effective) return 'No effective model'
-  return [
-    effective.provider_name || effective.provider_id,
-    effective.model_name || effective.model,
-    reasoningLabel(effective.reasoning_effort)
-  ].filter(Boolean).join(' · ')
+const providerSeedLabel = computed(() => {
+  const provider = props.providers[0]
+  if (!provider) return 'No provider'
+  const model = provider.default_model || provider.models?.[0]?.id || 'No model'
+  return `${provider.name || provider.id} / ${model}`
 })
 
-const canSave = computed(() => useDefault.value || (form.provider_id && form.model))
+const configuredCount = computed(() =>
+  ROLE_DEFINITIONS.filter((role) => savedPreference(role.key)).length
+)
+
+const canSave = computed(() =>
+  ROLE_DEFINITIONS.every((role) => forms[role.key].provider_id && forms[role.key].model)
+)
 
 watch(
-  () => [props.state.research_agent, props.providers],
+  () => [
+    props.state.planner,
+    props.state.executor,
+    props.state.reviewer,
+    props.providers
+  ],
   resetFromState,
   { immediate: true }
 )
 
+function emptyPreference() {
+  return {
+    provider_id: '',
+    model: '',
+    reasoning_effort: ''
+  }
+}
+
+function savedPreference(role) {
+  return props.state?.[role] || null
+}
+
+function effectivePreference(role) {
+  return props.state?.[`effective_${role}`] || null
+}
+
 function resetFromState() {
-  const configured = props.state.research_agent
-  useDefault.value = !configured
-  const provider = configured
-    ? props.providers.find((item) => item.id === configured.provider_id)
-    : props.providers[0]
-  form.provider_id = configured?.provider_id || provider?.id || ''
-  form.model = configured?.model || provider?.default_model || provider?.models?.[0]?.id || ''
-  form.reasoning_effort = configured?.reasoning_effort || ''
+  for (const role of ROLE_DEFINITIONS) {
+    const configured = savedPreference(role.key)
+    const fallback = defaultPreference(configured)
+    forms[role.key].provider_id = configured?.provider_id || fallback.provider_id
+    forms[role.key].model = configured?.model || fallback.model
+    forms[role.key].reasoning_effort = configured?.reasoning_effort || fallback.reasoning_effort
+  }
   error.value = ''
+}
+
+function defaultPreference(configured) {
+  const provider = configured
+    ? props.providers.find((item) => item.id === configured.provider_id) || props.providers[0]
+    : props.providers[0]
+  const modelId = configured?.model || provider?.default_model || provider?.models?.[0]?.id || ''
+  const model = provider?.models?.find((item) => item.id === modelId)
+  return {
+    provider_id: provider?.id || '',
+    model: modelId,
+    reasoning_effort: defaultReasoningEffort(provider, model)
+  }
+}
+
+function effectiveLabel(role) {
+  const staged = forms[role]
+  const effective = effectivePreference(role)
+  if (matchesEffective(staged, effective)) return modelLabel(effective)
+  return stagedLabel(staged)
+}
+
+function matchesEffective(staged, effective) {
+  if (!staged || !effective) return false
+  return staged.provider_id === effective.provider_id &&
+    staged.model === effective.model &&
+    (staged.reasoning_effort || '') === (effective.reasoning_effort || '')
+}
+
+function modelLabel(preference) {
+  if (!preference) return 'Not saved yet'
+  return [
+    preference.provider_name || providerName(preference.provider_id),
+    preference.model_name || modelName(preference.provider_id, preference.model),
+    reasoningLabel(preference.reasoning_effort)
+  ].filter(Boolean).join(' · ')
+}
+
+function stagedLabel(preference) {
+  if (!preference?.provider_id || !preference?.model) return 'Missing provider or model'
+  return [
+    providerName(preference.provider_id),
+    modelName(preference.provider_id, preference.model),
+    reasoningLabel(preference.reasoning_effort)
+  ].filter(Boolean).join(' · ')
+}
+
+function providerName(providerId) {
+  return props.providers.find((item) => item.id === providerId)?.name || providerId
+}
+
+function modelName(providerId, modelId) {
+  const provider = props.providers.find((item) => item.id === providerId)
+  return provider?.models?.find((item) => item.id === modelId)?.name || modelId
 }
 
 function save() {
   error.value = ''
-  if (!useDefault.value && (!form.provider_id || !form.model)) {
-    error.value = 'Provider and model are required.'
+  if (!canSave.value) {
+    error.value = 'Provider and model are required for every role.'
     return
   }
-  emit('save', useDefault.value ? null : {
-    provider_id: form.provider_id,
-    model: form.model,
-    reasoning_effort: form.reasoning_effort || null
+  emit('save', {
+    planner: preferencePayload(forms.planner),
+    executor: preferencePayload(forms.executor),
+    reviewer: preferencePayload(forms.reviewer)
   })
+}
+
+function preferencePayload(preference) {
+  return {
+    provider_id: preference.provider_id,
+    model: preference.model,
+    reasoning_effort: preference.reasoning_effort || null
+  }
 }
 </script>

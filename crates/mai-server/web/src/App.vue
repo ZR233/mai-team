@@ -282,9 +282,9 @@ async function onUpdateAgentModel(payload) {
   }
 }
 
-async function onSaveAgentConfig(researchAgent) {
+async function onSaveAgentConfig(config) {
   try {
-    await saveAgentConfig(researchAgent)
+    await saveAgentConfig(config)
     showToast('Agent config saved.')
   } catch (error) {
     showToast(error.message)

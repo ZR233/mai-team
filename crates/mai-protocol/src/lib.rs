@@ -296,6 +296,15 @@ pub struct AgentModelPreference {
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    Planner,
+    #[default]
+    Executor,
+    Reviewer,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResolvedAgentModelPreference {
     pub provider_id: String,
@@ -313,11 +322,29 @@ pub struct ResolvedAgentModelPreference {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentConfigRequest {
     #[serde(default)]
+    pub planner: Option<AgentModelPreference>,
+    #[serde(default)]
+    pub executor: Option<AgentModelPreference>,
+    #[serde(default)]
+    pub reviewer: Option<AgentModelPreference>,
+    #[serde(default)]
     pub research_agent: Option<AgentModelPreference>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentConfigResponse {
+    #[serde(default)]
+    pub planner: Option<AgentModelPreference>,
+    #[serde(default)]
+    pub executor: Option<AgentModelPreference>,
+    #[serde(default)]
+    pub reviewer: Option<AgentModelPreference>,
+    #[serde(default)]
+    pub effective_planner: Option<ResolvedAgentModelPreference>,
+    #[serde(default)]
+    pub effective_executor: Option<ResolvedAgentModelPreference>,
+    #[serde(default)]
+    pub effective_reviewer: Option<ResolvedAgentModelPreference>,
     #[serde(default)]
     pub research_agent: Option<AgentModelPreference>,
     #[serde(default)]
