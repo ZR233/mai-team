@@ -11,6 +11,7 @@
       <nav class="tabs" aria-label="Views">
         <button :class="{ active: activeTab === 'agents' }" @click="activeTab = 'agents'">Agents</button>
         <button :class="{ active: activeTab === 'providers' }" @click="activeTab = 'providers'">Providers</button>
+        <button :class="{ active: activeTab === 'settings' }" @click="activeTab = 'settings'">Settings</button>
       </nav>
       <div class="topbar-actions">
         <span class="connection" :class="connectionState">
@@ -62,12 +63,23 @@
       </section>
 
       <ProviderGrid
-        v-else
+        v-else-if="activeTab === 'providers'"
         :providers="providersState.providers"
         :default-id="providersState.default_provider_id"
         @add="openProviderDialog(null)"
         @edit="openProviderDialog"
         @delete="confirmDeleteProvider"
+      />
+
+      <ResearchAgentConfigPanel
+        v-else
+        :providers="providersState.providers"
+        :state="agentConfigState"
+        :loading="agentConfigState.loading"
+        :saving="agentConfigState.saving"
+        @reload="loadAgentConfig"
+        @save="onSaveAgentConfig"
+        @open-providers="activeTab = 'providers'"
       />
     </main>
 
@@ -81,12 +93,8 @@
     <AgentDialog
       :dialog="agentDialog"
       :providers="providersState.providers"
-      :models="selectedProviderModels"
-      :reasoning-options="agentReasoningOptions"
       @close="agentDialog.open = false"
       @create="onCreateAgent"
-      @provider-changed="onAgentProviderChanged"
-      @model-changed="onAgentModelChanged"
     />
 
     <ConfirmDialog
@@ -113,12 +121,14 @@ import ProviderGrid from './components/ProviderGrid.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import ProviderDialog from './components/ProviderDialog.vue'
 import AgentDialog from './components/AgentDialog.vue'
+import ResearchAgentConfigPanel from './components/ResearchAgentConfigPanel.vue'
 
 import { useApi } from './composables/useApi'
 import { useSSE } from './composables/useSSE'
 import { useAgents } from './composables/useAgents'
 import { useProviders } from './composables/useProviders'
-import { defaultReasoningEffort, reasoningOptionsFor } from './utils/reasoning'
+import { useAgentConfig } from './composables/useAgentConfig'
+import { defaultReasoningEffort } from './utils/reasoning'
 
 const { toast, showToast } = useApi()
 const { eventFeed, connectionState, connectEvents, disconnect } = useSSE()
@@ -134,6 +144,7 @@ const {
   loadProviders, removeProvider, openProviderDialog, closeProviderDialog, saveProviderDialog,
   fillFromPreset
 } = useProviders()
+const { agentConfigState, loadAgentConfig, saveAgentConfig } = useAgentConfig()
 
 const activeTab = ref('agents')
 const messageDraft = ref('')
@@ -152,14 +163,6 @@ const connectionLabel = computed(() => {
   if (connectionState.value === 'connecting') return 'Connecting'
   return 'Offline'
 })
-
-const selectedProviderModels = computed(() => {
-  const provider = providersState.providers.find((p) => p.id === agentDialog.provider_id)
-  return provider?.models || []
-})
-const selectedAgentProvider = computed(() => providersState.providers.find((p) => p.id === agentDialog.provider_id))
-const selectedAgentModel = computed(() => selectedProviderModels.value.find((model) => model.id === agentDialog.model))
-const agentReasoningOptions = computed(() => reasoningOptionsFor(selectedAgentProvider.value, selectedAgentModel.value))
 
 watch(
   () => [
@@ -184,7 +187,7 @@ onUnmounted(() => disconnect())
 async function refreshAll() {
   isLoading.value = true
   try {
-    await Promise.all([loadProviders(), refreshAgents()])
+    await Promise.all([loadProviders(), loadAgentConfig(), refreshAgents()])
     if (selectedAgentId.value) await refreshDetail()
   } catch (error) {
     showToast(error.message)
@@ -215,18 +218,10 @@ function openCreateAgentDialog() {
   agentDialog.error = ''
 }
 
-function onAgentProviderChanged() {
-  const provider = providersState.providers.find((p) => p.id === agentDialog.provider_id)
-  agentDialog.model = provider?.default_model || provider?.models?.[0]?.id || ''
-  resetAgentReasoningEffort()
-}
-
-function onAgentModelChanged() {
-  resetAgentReasoningEffort()
-}
-
 function resetAgentReasoningEffort() {
-  agentDialog.reasoning_effort = defaultReasoningEffort(selectedAgentProvider.value, selectedAgentModel.value)
+  const provider = providersState.providers.find((p) => p.id === agentDialog.provider_id)
+  const model = provider?.models?.find((item) => item.id === agentDialog.model)
+  agentDialog.reasoning_effort = defaultReasoningEffort(provider, model)
 }
 
 async function onCreateAgent() {
@@ -276,6 +271,15 @@ async function onUpdateAgentModel(payload) {
     showToast(error.message)
   } finally {
     isUpdatingAgentModel.value = false
+  }
+}
+
+async function onSaveAgentConfig(researchAgent) {
+  try {
+    await saveAgentConfig(researchAgent)
+    showToast('Agent config saved.')
+  } catch (error) {
+    showToast(error.message)
   }
 }
 

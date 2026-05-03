@@ -14,30 +14,13 @@
     />
 
     <div v-if="modelEditor.open" class="agent-model-editor">
-      <label>
-        <span>Provider</span>
-        <select v-model="modelEditor.provider_id" @change="onModelProviderChanged">
-          <option v-for="provider in providers" :key="provider.id" :value="provider.id">
-            {{ provider.name }}
-          </option>
-        </select>
-      </label>
-      <label>
-        <span>Model</span>
-        <select v-model="modelEditor.model" @change="onModelChanged">
-          <option v-for="model in editorModels" :key="model.id" :value="model.id">
-            {{ model.name || model.id }}
-          </option>
-        </select>
-      </label>
-      <label v-if="editorReasoningOptions.length">
-        <span>思考深度</span>
-        <select v-model="modelEditor.reasoning_effort">
-          <option v-for="option in editorReasoningOptions" :key="option.value" :value="option.value">
-            {{ option.label }}
-          </option>
-        </select>
-      </label>
+      <ModelSelector
+        v-model:provider-id="modelEditor.provider_id"
+        v-model:model="modelEditor.model"
+        v-model:reasoning-effort="modelEditor.reasoning_effort"
+        :providers="providers"
+        compact
+      />
       <div class="agent-model-actions">
         <button class="ghost-button" type="button" @click="modelEditor.open = false">Cancel</button>
         <button class="primary-button" type="button" :disabled="!modelEditor.model || updatingModel" @click="saveModelEdit">
@@ -86,6 +69,7 @@ import AgentHeader from './AgentHeader.vue'
 import ChatTimeline from './ChatTimeline.vue'
 import ComposerBar from './ComposerBar.vue'
 import ContextStatusLine from './ContextStatusLine.vue'
+import ModelSelector from './ModelSelector.vue'
 import SessionTabs from './SessionTabs.vue'
 import { defaultReasoningEffort, reasoningOptionsFor } from '../utils/reasoning'
 import { useApi } from '../composables/useApi'
@@ -130,7 +114,6 @@ const timelineItems = computed(() => buildAgentTimeline(props.detail, props.even
 const editorProvider = computed(() => props.providers.find((provider) => provider.id === modelEditor.provider_id))
 const editorModels = computed(() => editorProvider.value?.models || [])
 const editorModel = computed(() => editorModels.value.find((model) => model.id === modelEditor.model))
-const editorReasoningOptions = computed(() => reasoningOptionsFor(editorProvider.value, editorModel.value))
 const currentProvider = computed(() => props.providers.find((provider) => provider.id === props.detail?.provider_id))
 const currentModel = computed(() => currentProvider.value?.models?.find((model) => model.id === props.detail?.model))
 const currentReasoningOptions = computed(() => reasoningOptionsFor(currentProvider.value, currentModel.value))
@@ -221,19 +204,6 @@ function openModelEditor() {
   modelEditor.model = props.detail?.model || editorProvider.value?.default_model || editorModels.value[0]?.id || ''
   modelEditor.reasoning_effort = props.detail?.reasoning_effort || defaultReasoningEffort(editorProvider.value, editorModel.value)
   modelEditor.error = ''
-}
-
-function onModelProviderChanged() {
-  modelEditor.model = editorProvider.value?.default_model || editorModels.value[0]?.id || ''
-  resetModelEditorReasoningEffort()
-}
-
-function onModelChanged() {
-  resetModelEditorReasoningEffort()
-}
-
-function resetModelEditorReasoningEffort() {
-  modelEditor.reasoning_effort = defaultReasoningEffort(editorProvider.value, editorModel.value)
 }
 
 function saveModelEdit() {

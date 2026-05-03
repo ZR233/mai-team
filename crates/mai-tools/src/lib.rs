@@ -90,8 +90,6 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             object_schema(vec![
                 ("name", json!({ "type": "string" }), false),
                 ("message", json!({ "type": "string" }), false),
-                ("provider_id", json!({ "type": "string" }), false),
-                ("model", json!({ "type": "string" }), false),
             ]),
         ),
         ToolDefinition::function(
@@ -164,5 +162,23 @@ mod tests {
         let tools = build_tool_definitions(&[]);
         assert!(tools.iter().any(|tool| tool.name == TOOL_SPAWN_AGENT));
         assert!(tools.iter().all(|tool| tool.kind == "function"));
+    }
+
+    #[test]
+    fn spawn_agent_schema_does_not_expose_model_selection() {
+        let tools = build_tool_definitions(&[]);
+        let spawn = tools
+            .iter()
+            .find(|tool| tool.name == TOOL_SPAWN_AGENT)
+            .expect("spawn tool");
+        let properties = spawn
+            .parameters
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("properties");
+        assert!(properties.contains_key("name"));
+        assert!(properties.contains_key("message"));
+        assert!(!properties.contains_key("provider_id"));
+        assert!(!properties.contains_key("model"));
     }
 }

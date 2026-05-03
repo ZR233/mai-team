@@ -1,10 +1,10 @@
 use chrono::{DateTime, Utc};
 use mai_protocol::{
-    AgentId, AgentMessage, AgentSessionSummary, AgentStatus, AgentSummary, McpServerConfig,
-    MessageRole, ModelConfig, ModelInputItem, ProviderConfig, ProviderKind, ProviderPreset,
-    ProviderPresetsResponse, ProviderSecret, ProviderSummary, ProvidersConfigRequest,
-    ProvidersResponse, ReasoningEffort, ServiceEvent, ServiceEventKind, SessionId, TokenUsage,
-    TurnId, default_true,
+    AgentConfigRequest, AgentId, AgentMessage, AgentSessionSummary, AgentStatus, AgentSummary,
+    McpServerConfig, MessageRole, ModelConfig, ModelInputItem, ProviderConfig, ProviderKind,
+    ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
+    ProvidersConfigRequest, ProvidersResponse, ReasoningEffort, ServiceEvent, ServiceEventKind,
+    SessionId, TokenUsage, TurnId, default_true,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,6 +16,7 @@ use toasty_driver_sqlite::Sqlite;
 use uuid::Uuid;
 
 const SETTING_DEFAULT_PROVIDER_ID: &str = "default_provider_id";
+const SETTING_AGENT_CONFIG: &str = "agent_config";
 const SETTING_LEGACY_TOML_IMPORTED: &str = "legacy_toml_imported";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
 const SCHEMA_VERSION: &str = "3";
@@ -691,6 +692,18 @@ impl ConfigStore {
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         let mut db = self.db.clone();
         set_setting_on(&mut db, key, value).await
+    }
+
+    pub async fn load_agent_config(&self) -> Result<AgentConfigRequest> {
+        let Some(value) = self.get_setting(SETTING_AGENT_CONFIG).await? else {
+            return Ok(AgentConfigRequest::default());
+        };
+        Ok(serde_json::from_str(&value).unwrap_or_default())
+    }
+
+    pub async fn save_agent_config(&self, config: &AgentConfigRequest) -> Result<()> {
+        self.set_setting(SETTING_AGENT_CONFIG, &serde_json::to_string(config)?)
+            .await
     }
 
     pub async fn save_agent(
@@ -1728,6 +1741,48 @@ mod tests {
                 .resolve_provider(Some("openai"), Some("unknown"))
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_config_defaults_when_missing_and_survives_invalid_json() {
+        let (_dir, store) = store().await;
+        assert_eq!(
+            store.load_agent_config().await.expect("missing config"),
+            AgentConfigRequest::default()
+        );
+        store
+            .set_setting(SETTING_AGENT_CONFIG, "{not json")
+            .await
+            .expect("write invalid");
+        assert_eq!(
+            store.load_agent_config().await.expect("invalid config"),
+            AgentConfigRequest::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_config_persists_and_reloads() {
+        let (dir, store) = store().await;
+        let config = AgentConfigRequest {
+            research_agent: Some(mai_protocol::AgentModelPreference {
+                provider_id: "openai".to_string(),
+                model: "gpt-5.4".to_string(),
+                reasoning_effort: Some(ReasoningEffort::High),
+            }),
+        };
+        store.save_agent_config(&config).await.expect("save config");
+        drop(store);
+
+        let reopened = ConfigStore::open_with_config_path(
+            dir.path().join("config.sqlite3"),
+            dir.path().join("config.toml"),
+        )
+        .await
+        .expect("reopen");
+        assert_eq!(
+            reopened.load_agent_config().await.expect("load config"),
+            config
         );
     }
 

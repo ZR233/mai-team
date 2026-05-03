@@ -10,10 +10,11 @@ use futures::StreamExt;
 use mai_docker::DockerClient;
 use mai_model::ResponsesClient;
 use mai_protocol::{
-    AgentId, CreateAgentRequest, CreateAgentResponse, CreateSessionResponse, ErrorResponse,
-    FileUploadRequest, FileUploadResponse, ProviderPresetsResponse, ProvidersConfigRequest,
-    ProvidersResponse, SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId,
-    ToolTraceDetail, UpdateAgentRequest, UpdateAgentResponse,
+    AgentConfigRequest, AgentConfigResponse, AgentId, CreateAgentRequest, CreateAgentResponse,
+    CreateSessionResponse, ErrorResponse, FileUploadRequest, FileUploadResponse,
+    ProviderPresetsResponse, ProvidersConfigRequest, ProvidersResponse, SendMessageRequest,
+    SendMessageResponse, ServiceEvent, SessionId, ToolTraceDetail, UpdateAgentRequest,
+    UpdateAgentResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
 use mai_store::ConfigStore;
@@ -154,6 +155,10 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/providers", get(get_providers).put(save_providers))
         .route("/provider-presets", get(get_provider_presets))
+        .route(
+            "/agent-config",
+            get(get_agent_config).put(save_agent_config),
+        )
         .route("/events", get(events))
         .route("/agents", get(list_agents).post(create_agent))
         .route(
@@ -240,6 +245,19 @@ async fn save_providers(
 ) -> std::result::Result<Json<ProvidersResponse>, ApiError> {
     state.store.save_providers(request).await?;
     Ok(Json(state.store.providers_response().await?))
+}
+
+async fn get_agent_config(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<AgentConfigResponse>, ApiError> {
+    Ok(Json(state.runtime.agent_config().await?))
+}
+
+async fn save_agent_config(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<AgentConfigRequest>,
+) -> std::result::Result<Json<AgentConfigResponse>, ApiError> {
+    Ok(Json(state.runtime.update_agent_config(request).await?))
 }
 
 async fn get_provider_presets(

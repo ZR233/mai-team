@@ -9,30 +9,12 @@
         <span>Agent Name</span>
         <input v-model.trim="dialog.name" placeholder="Research Agent" />
       </label>
-      <label>
-        <span>Provider</span>
-        <select v-model="dialog.provider_id" @change="$emit('provider-changed')">
-          <option v-for="provider in providers" :key="provider.id" :value="provider.id">
-            {{ provider.name }}
-          </option>
-        </select>
-      </label>
-      <label>
-        <span>Model</span>
-        <select v-model="dialog.model" @change="$emit('model-changed')">
-          <option v-for="model in models" :key="model.id" :value="model.id">
-            {{ model.name || model.id }}
-          </option>
-        </select>
-      </label>
-      <label v-if="reasoningOptions.length">
-        <span>思考深度</span>
-        <select v-model="dialog.reasoning_effort">
-          <option v-for="option in reasoningOptions" :key="option.value" :value="option.value">
-            {{ option.label }}
-          </option>
-        </select>
-      </label>
+      <ModelSelector
+        v-model:provider-id="dialog.provider_id"
+        v-model:model="dialog.model"
+        v-model:reasoning-effort="dialog.reasoning_effort"
+        :providers="providers"
+      />
       <p v-if="dialog.error" class="dialog-error">{{ dialog.error }}</p>
       <div class="modal-actions">
         <button class="ghost-button" type="button" @click="$emit('close')">Cancel</button>
@@ -43,6 +25,8 @@
 </template>
 
 <script setup>
+import ModelSelector from './ModelSelector.vue'
+
 let backdropDown = false
 
 function onBackdropDown() {
@@ -59,7 +43,7 @@ function onBackdropUp(_event, callback) {
 defineProps({
   dialog: { type: Object, required: true },
   providers: { type: Array, required: true },
-  models: { type: Array, required: true },
+  models: { type: Array, default: () => [] },
   reasoningOptions: { type: Array, default: () => [] }
 })
 

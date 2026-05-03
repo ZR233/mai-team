@@ -5,13 +5,15 @@ use mai_docker::{ContainerHandle, DockerClient};
 use mai_mcp::McpAgentManager;
 use mai_model::ResponsesClient;
 use mai_protocol::{
-    AgentDetail, AgentId, AgentMessage, AgentSessionSummary, AgentStatus, AgentSummary,
-    ContextUsage, CreateAgentRequest, MessageRole, ModelConfig, ModelContentItem, ModelInputItem,
-    ModelOutputItem, ModelToolCall, ProviderKind, ReasoningEffort, ServiceEvent, ServiceEventKind,
-    SessionId, TokenUsage, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest, now, preview,
+    AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentMessage,
+    AgentModelPreference, AgentSessionSummary, AgentStatus, AgentSummary, ContextUsage,
+    CreateAgentRequest, MessageRole, ModelConfig, ModelContentItem, ModelInputItem,
+    ModelOutputItem, ModelToolCall, ProviderKind, ReasoningEffort, ResolvedAgentModelPreference,
+    ServiceEvent, ServiceEventKind, SessionId, TokenUsage, ToolTraceDetail, TurnId, TurnStatus,
+    UpdateAgentRequest, now, preview,
 };
 use mai_skills::SkillsManager;
-use mai_store::ConfigStore;
+use mai_store::{ConfigStore, ProviderSelection};
 use mai_tools::{RoutedTool, build_tool_definitions, route_tool};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -113,6 +115,11 @@ struct ToolExecution {
     output: String,
 }
 
+struct ResolvedAgentModel {
+    preference: AgentModelPreference,
+    effective: ResolvedAgentModelPreference,
+}
+
 impl AgentRuntime {
     pub async fn new(
         docker: DockerClient,
@@ -175,6 +182,34 @@ impl AgentRuntime {
 
     pub fn subscribe(&self) -> broadcast::Receiver<ServiceEvent> {
         self.event_tx.subscribe()
+    }
+
+    pub async fn agent_config(&self) -> Result<AgentConfigResponse> {
+        let config = self.store.load_agent_config().await?;
+        let (effective_research_agent, validation_error) = match self
+            .resolve_agent_model_preference(config.research_agent.as_ref())
+            .await
+        {
+            Ok(resolved) => (Some(resolved.effective), None),
+            Err(err) => (None, Some(err.to_string())),
+        };
+        Ok(AgentConfigResponse {
+            research_agent: config.research_agent,
+            effective_research_agent,
+            validation_error,
+        })
+    }
+
+    pub async fn update_agent_config(
+        &self,
+        request: AgentConfigRequest,
+    ) -> Result<AgentConfigResponse> {
+        if let Some(preference) = request.research_agent.as_ref() {
+            self.resolve_agent_model_preference(Some(preference))
+                .await?;
+        }
+        self.store.save_agent_config(&request).await?;
+        self.agent_config().await
     }
 
     pub async fn create_agent(
@@ -440,6 +475,15 @@ impl AgentRuntime {
                 } if item_call_id == call_id => {
                     tool_name = Some(name);
                     arguments = Some(parse_tool_arguments(&raw_arguments));
+                }
+                ModelInputItem::AssistantTurn { tool_calls, .. } => {
+                    for tool_call in tool_calls {
+                        if tool_call.call_id == call_id {
+                            tool_name = Some(tool_call.name);
+                            arguments = Some(parse_tool_arguments(&tool_call.arguments));
+                            break;
+                        }
+                    }
                 }
                 ModelInputItem::FunctionCallOutput {
                     call_id: item_call_id,
@@ -1000,14 +1044,13 @@ impl AgentRuntime {
             RoutedTool::SpawnAgent => {
                 let name = optional_string(&arguments, "name");
                 let message = optional_string(&arguments, "message");
-                let parent_summary = agent.summary.read().await.clone();
+                let child_model = self.resolve_research_agent_model().await?;
                 let created = self
                     .create_agent(CreateAgentRequest {
                         name,
-                        provider_id: optional_string(&arguments, "provider_id")
-                            .or(Some(parent_summary.provider_id)),
-                        model: optional_string(&arguments, "model").or(Some(parent_summary.model)),
-                        reasoning_effort: parent_summary.reasoning_effort,
+                        provider_id: Some(child_model.preference.provider_id),
+                        model: Some(child_model.preference.model),
+                        reasoning_effort: child_model.preference.reasoning_effort,
                         parent_id: Some(agent_id),
                         system_prompt: None,
                     })
@@ -1082,6 +1125,18 @@ impl AgentRuntime {
                 output: format!("unknown tool: {name}"),
             }),
         }
+    }
+
+    #[cfg(test)]
+    async fn execute_tool_for_test(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        name: &str,
+        arguments: Value,
+    ) -> Result<ToolExecution> {
+        let agent = self.agent(agent_id).await?;
+        self.execute_tool(&agent, agent_id, Uuid::new_v4(), name, arguments)
+            .await
     }
 
     async fn wait_agent(&self, agent_id: AgentId, timeout: Duration) -> Result<AgentSummary> {
@@ -1419,6 +1474,39 @@ impl AgentRuntime {
             })
     }
 
+    async fn resolve_research_agent_model(&self) -> Result<ResolvedAgentModel> {
+        let config = self.store.load_agent_config().await?;
+        self.resolve_agent_model_preference(config.research_agent.as_ref())
+            .await
+    }
+
+    async fn resolve_agent_model_preference(
+        &self,
+        preference: Option<&AgentModelPreference>,
+    ) -> Result<ResolvedAgentModel> {
+        if let Some(preference) = preference {
+            if preference.provider_id.trim().is_empty() || preference.model.trim().is_empty() {
+                return Err(RuntimeError::InvalidInput(
+                    "research agent provider and model are required".to_string(),
+                ));
+            }
+        }
+        let selection = self
+            .store
+            .resolve_provider(
+                preference.map(|item| item.provider_id.as_str()),
+                preference.map(|item| item.model.as_str()),
+            )
+            .await?;
+        let reasoning_effort = normalize_reasoning_effort(
+            selection.provider.kind,
+            &selection.model,
+            preference.and_then(|item| item.reasoning_effort),
+            true,
+        )?;
+        Ok(resolved_agent_model(selection, reasoning_effort))
+    }
+
     async fn session_history(
         &self,
         agent: &AgentRecord,
@@ -1608,6 +1696,37 @@ fn parse_agent_id(value: &str) -> Result<AgentId> {
 fn parse_session_id(value: &str) -> Result<SessionId> {
     Uuid::parse_str(value)
         .map_err(|err| RuntimeError::InvalidInput(format!("invalid session_id `{value}`: {err}")))
+}
+
+fn resolved_agent_model(
+    selection: ProviderSelection,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> ResolvedAgentModel {
+    let effective = resolved_agent_model_preference(selection.clone(), reasoning_effort);
+    ResolvedAgentModel {
+        preference: AgentModelPreference {
+            provider_id: selection.provider.id.clone(),
+            model: selection.model.id.clone(),
+            reasoning_effort,
+        },
+        effective,
+    }
+}
+
+fn resolved_agent_model_preference(
+    selection: ProviderSelection,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> ResolvedAgentModelPreference {
+    ResolvedAgentModelPreference {
+        provider_id: selection.provider.id,
+        provider_name: selection.provider.name,
+        provider_kind: selection.provider.kind,
+        model: selection.model.id,
+        model_name: selection.model.name,
+        reasoning_effort,
+        context_tokens: selection.model.context_tokens,
+        output_tokens: selection.model.output_tokens,
+    }
 }
 
 fn normalize_reasoning_effort(
@@ -1939,6 +2058,7 @@ General rules:
 - Use `container_cp_upload` and `container_cp_download` for file transfer.
 - Use `spawn_agent`, `send_message`, `wait_agent`, `list_agents`, and `close_agent` for multi-agent collaboration.
 - Keep each child agent task concrete and bounded. Multiple agents can run in parallel.
+- Child agent model selection is controlled by Research Agent settings, falling back to the service default model when unset.
 - Use available skills only when explicitly requested by the user or when clearly relevant.
 - MCP tools are exposed as ordinary function tools whose names begin with `mcp__`.
 - Be concise with final answers and include important file paths or command outputs when they matter.
@@ -2021,6 +2141,20 @@ mod tests {
                 headers: Default::default(),
             }],
             default_model: "deepseek-v4-pro".to_string(),
+            enabled: true,
+        }
+    }
+
+    fn alt_test_provider() -> ProviderConfig {
+        ProviderConfig {
+            id: "alt".to_string(),
+            kind: ProviderKind::Openai,
+            name: "Alt".to_string(),
+            base_url: "https://alt.example/v1".to_string(),
+            api_key: Some("secret".to_string()),
+            api_key_env: None,
+            models: vec![test_model("alt-default"), test_model("alt-research")],
+            default_model: "alt-default".to_string(),
             enabled: true,
         }
     }
@@ -2488,6 +2622,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_trace_finds_calls_stored_inside_assistant_turns() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("open store");
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let timestamp = now();
+        let summary = AgentSummary {
+            id: agent_id,
+            parent_id: None,
+            name: "assistant-turn-trace".to_string(),
+            status: AgentStatus::Completed,
+            container_id: None,
+            provider_id: "openai".to_string(),
+            provider_name: "OpenAI".to_string(),
+            model: "gpt-5.2".to_string(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            current_turn: None,
+            last_error: None,
+            token_usage: TokenUsage::default(),
+        };
+        store.save_agent(&summary, None).await.expect("save agent");
+        store
+            .save_agent_session(
+                agent_id,
+                &AgentSessionSummary {
+                    id: session_id,
+                    title: "Chat 1".to_string(),
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    message_count: 0,
+                },
+            )
+            .await
+            .expect("save session");
+        store
+            .append_agent_history_item(
+                agent_id,
+                session_id,
+                0,
+                &ModelInputItem::AssistantTurn {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ModelToolCall {
+                        call_id: "call_nested".to_string(),
+                        name: "container_exec".to_string(),
+                        arguments: r#"{"command":"pwd"}"#.to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("save assistant turn");
+        store
+            .append_agent_history_item(
+                agent_id,
+                session_id,
+                1,
+                &ModelInputItem::FunctionCallOutput {
+                    call_id: "call_nested".to_string(),
+                    output: r#"{"status":0,"stdout":"/workspace\n","stderr":""}"#.to_string(),
+                },
+            )
+            .await
+            .expect("save output");
+        drop(store);
+
+        let runtime = AgentRuntime::new(
+            DockerClient::new("unused"),
+            ResponsesClient::new(),
+            Arc::new(
+                ConfigStore::open_with_config_path(&db_path, &config_path)
+                    .await
+                    .expect("reopen store"),
+            ),
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+            },
+        )
+        .await
+        .expect("runtime");
+
+        let trace = runtime
+            .tool_trace(agent_id, Some(session_id), "call_nested".to_string())
+            .await
+            .expect("trace");
+        assert_eq!(trace.tool_name, "container_exec");
+        assert_eq!(trace.arguments["command"], "pwd");
+        assert_eq!(
+            trace.output,
+            r#"{"status":0,"stdout":"/workspace\n","stderr":""}"#
+        );
+        assert!(trace.success);
+    }
+
+    #[tokio::test]
     async fn auto_compact_failure_keeps_original_history() {
         let (base_url, _requests) = start_mock_responses(vec![json!({
             "id": "compact_empty",
@@ -2879,6 +3113,257 @@ mod tests {
             detail.context_usage.as_ref().map(|usage| usage.used_tokens),
             Some(0)
         );
+    }
+
+    #[tokio::test]
+    async fn agent_config_resolves_effective_default_and_validates_updates() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = Arc::new(
+            ConfigStore::open_with_config_path(&db_path, &config_path)
+                .await
+                .expect("open store"),
+        );
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider(), alt_test_provider()],
+                default_provider_id: Some("alt".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let runtime = AgentRuntime::new(
+            DockerClient::new("unused"),
+            ResponsesClient::new(),
+            Arc::clone(&store),
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+            },
+        )
+        .await
+        .expect("runtime");
+
+        let config = runtime.agent_config().await.expect("config");
+        assert_eq!(config.research_agent, None);
+        let effective = config.effective_research_agent.expect("effective default");
+        assert_eq!(effective.provider_id, "alt");
+        assert_eq!(effective.model, "alt-default");
+        assert_eq!(effective.reasoning_effort, Some(ReasoningEffort::Medium));
+
+        let updated = runtime
+            .update_agent_config(AgentConfigRequest {
+                research_agent: Some(AgentModelPreference {
+                    provider_id: "openai".to_string(),
+                    model: "gpt-5.4".to_string(),
+                    reasoning_effort: Some(ReasoningEffort::High),
+                }),
+            })
+            .await
+            .expect("update");
+        assert_eq!(
+            updated.effective_research_agent.expect("effective").model,
+            "gpt-5.4"
+        );
+
+        let invalid = runtime
+            .update_agent_config(AgentConfigRequest {
+                research_agent: Some(AgentModelPreference {
+                    provider_id: "openai".to_string(),
+                    model: "gpt-5.4".to_string(),
+                    reasoning_effort: Some(ReasoningEffort::Max),
+                }),
+            })
+            .await;
+        assert!(matches!(invalid, Err(RuntimeError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_uses_global_default_when_research_config_missing() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = Arc::new(
+            ConfigStore::open_with_config_path(&db_path, &config_path)
+                .await
+                .expect("open store"),
+        );
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider(), alt_test_provider()],
+                default_provider_id: Some("alt".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let parent_id = Uuid::new_v4();
+        let timestamp = now();
+        store
+            .save_agent(
+                &AgentSummary {
+                    id: parent_id,
+                    parent_id: None,
+                    name: "parent".to_string(),
+                    status: AgentStatus::Idle,
+                    container_id: None,
+                    provider_id: "openai".to_string(),
+                    provider_name: "OpenAI".to_string(),
+                    model: "gpt-5.4".to_string(),
+                    reasoning_effort: Some(ReasoningEffort::High),
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    current_turn: None,
+                    last_error: None,
+                    token_usage: TokenUsage::default(),
+                },
+                None,
+            )
+            .await
+            .expect("save parent");
+        store
+            .save_agent_session(
+                parent_id,
+                &AgentSessionSummary {
+                    id: Uuid::new_v4(),
+                    title: "Chat 1".to_string(),
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    message_count: 0,
+                },
+            )
+            .await
+            .expect("save session");
+        let runtime = AgentRuntime::new(
+            DockerClient::new("unused"),
+            ResponsesClient::new(),
+            Arc::clone(&store),
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+            },
+        )
+        .await
+        .expect("runtime");
+
+        let result = runtime
+            .execute_tool_for_test(
+                parent_id,
+                "spawn_agent",
+                json!({
+                    "name": "child",
+                    "provider_id": "openai",
+                    "model": "gpt-5.4"
+                }),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "unused docker fails container start, but child summary is persisted first"
+        );
+        let child = runtime
+            .list_agents()
+            .await
+            .into_iter()
+            .find(|agent| agent.parent_id == Some(parent_id))
+            .expect("child");
+        assert_eq!(child.provider_id, "alt");
+        assert_eq!(child.model, "alt-default");
+        assert_eq!(child.reasoning_effort, Some(ReasoningEffort::Medium));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_uses_research_config_over_parent_and_legacy_args() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = Arc::new(
+            ConfigStore::open_with_config_path(&db_path, &config_path)
+                .await
+                .expect("open store"),
+        );
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider(), alt_test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        store
+            .save_agent_config(&AgentConfigRequest {
+                research_agent: Some(AgentModelPreference {
+                    provider_id: "alt".to_string(),
+                    model: "alt-research".to_string(),
+                    reasoning_effort: Some(ReasoningEffort::Low),
+                }),
+            })
+            .await
+            .expect("save config");
+        let parent_id = Uuid::new_v4();
+        let timestamp = now();
+        store
+            .save_agent(
+                &AgentSummary {
+                    id: parent_id,
+                    parent_id: None,
+                    name: "parent".to_string(),
+                    status: AgentStatus::Idle,
+                    container_id: None,
+                    provider_id: "openai".to_string(),
+                    provider_name: "OpenAI".to_string(),
+                    model: "gpt-5.5".to_string(),
+                    reasoning_effort: Some(ReasoningEffort::High),
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    current_turn: None,
+                    last_error: None,
+                    token_usage: TokenUsage::default(),
+                },
+                None,
+            )
+            .await
+            .expect("save parent");
+        store
+            .save_agent_session(
+                parent_id,
+                &AgentSessionSummary {
+                    id: Uuid::new_v4(),
+                    title: "Chat 1".to_string(),
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    message_count: 0,
+                },
+            )
+            .await
+            .expect("save session");
+        let runtime = AgentRuntime::new(
+            DockerClient::new("unused"),
+            ResponsesClient::new(),
+            Arc::clone(&store),
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+            },
+        )
+        .await
+        .expect("runtime");
+
+        let result = runtime
+            .execute_tool_for_test(
+                parent_id,
+                "spawn_agent",
+                json!({
+                    "name": "child",
+                    "provider_id": "openai",
+                    "model": "gpt-5.4"
+                }),
+            )
+            .await;
+        assert!(result.is_err());
+        let child = runtime
+            .list_agents()
+            .await
+            .into_iter()
+            .find(|agent| agent.parent_id == Some(parent_id))
+            .expect("child");
+        assert_eq!(child.provider_id, "alt");
+        assert_eq!(child.model, "alt-research");
+        assert_eq!(child.reasoning_effort, Some(ReasoningEffort::Low));
     }
 
     #[tokio::test]

@@ -443,7 +443,8 @@ p {
   overflow: hidden;
 }
 
-.providers-stage {
+.providers-stage,
+.settings-stage {
   grid-column: 1 / -1;
   overflow: auto;
   overscroll-behavior: contain;
@@ -611,12 +612,23 @@ p {
 .agent-model-editor {
   flex-shrink: 0;
   display: grid;
-  grid-template-columns: minmax(150px, 0.8fr) minmax(200px, 1fr) minmax(150px, 0.8fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
   align-items: end;
   padding: 14px 24px;
   border-bottom: 1px solid #d8e0ea;
   background: #f8fafc;
+}
+
+.model-selector {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.8fr) minmax(200px, 1fr) minmax(150px, 0.8fr);
+  gap: 10px;
+  align-items: end;
+}
+
+.model-selector.compact {
+  grid-template-columns: minmax(150px, 0.8fr) minmax(200px, 1fr) minmax(150px, 0.8fr);
 }
 
 .agent-model-actions {
@@ -628,6 +640,80 @@ p {
 
 .agent-model-editor .dialog-error {
   grid-column: 1 / -1;
+}
+
+.settings-stage {
+  padding: 24px;
+}
+
+.settings-panel {
+  display: grid;
+  gap: 18px;
+  width: min(880px, 100%);
+  padding: 22px;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.settings-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.settings-panel-head h3 {
+  font-size: 17px;
+}
+
+.settings-panel-head p {
+  margin-top: 4px;
+  color: #66758a;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  width: auto;
+  min-height: 36px;
+  grid-template-columns: none;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.toggle-row input {
+  width: auto;
+}
+
+.effective-model-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 40px;
+  padding: 9px 11px;
+  border: 1px solid #dbe3ef;
+  border-radius: 7px;
+  color: #66758a;
+  background: #f8fafc;
+  font-size: 13px;
+}
+
+.effective-model-line strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #172033;
+  text-align: right;
+}
+
+.settings-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .session-strip {
@@ -2167,11 +2253,38 @@ select:focus {
     grid-template-columns: 1fr;
   }
 
+  .model-selector,
+  .model-selector.compact {
+    grid-template-columns: 1fr;
+  }
+
   .agent-model-actions {
     justify-content: stretch;
   }
 
   .agent-model-actions button {
+    flex: 1;
+  }
+
+  .settings-stage {
+    padding: 14px;
+  }
+
+  .settings-panel-head,
+  .effective-model-line {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .effective-model-line strong {
+    text-align: left;
+  }
+
+  .settings-actions {
+    justify-content: stretch;
+  }
+
+  .settings-actions button {
     flex: 1;
   }
 

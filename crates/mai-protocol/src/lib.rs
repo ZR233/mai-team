@@ -289,6 +289,44 @@ pub struct ProvidersConfigRequest {
     pub default_provider_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentModelPreference {
+    pub provider_id: String,
+    pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedAgentModelPreference {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub provider_kind: ProviderKind,
+    pub model: String,
+    #[serde(default)]
+    pub model_name: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub context_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentConfigRequest {
+    #[serde(default)]
+    pub research_agent: Option<AgentModelPreference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentConfigResponse {
+    #[serde(default)]
+    pub research_agent: Option<AgentModelPreference>,
+    #[serde(default)]
+    pub effective_research_agent: Option<ResolvedAgentModelPreference>,
+    #[serde(default)]
+    pub validation_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderPreset {
     pub id: String,
