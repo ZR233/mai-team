@@ -2000,6 +2000,31 @@ mod tests {
         }
     }
 
+    fn deepseek_test_provider() -> ProviderConfig {
+        ProviderConfig {
+            id: "deepseek".to_string(),
+            kind: ProviderKind::Deepseek,
+            name: "DeepSeek".to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            api_key: Some("secret".to_string()),
+            api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
+            models: vec![ModelConfig {
+                id: "deepseek-v4-pro".to_string(),
+                name: Some("deepseek-v4-pro".to_string()),
+                context_tokens: 1_000_000,
+                output_tokens: 384_000,
+                supports_tools: true,
+                supports_reasoning: true,
+                reasoning_efforts: vec![ReasoningEffort::High, ReasoningEffort::Max],
+                default_reasoning_effort: Some(ReasoningEffort::High),
+                options: serde_json::Value::Null,
+                headers: Default::default(),
+            }],
+            default_model: "deepseek-v4-pro".to_string(),
+            enabled: true,
+        }
+    }
+
     async fn start_mock_responses(responses: Vec<Value>) -> (String, Arc<Mutex<Vec<Value>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2773,6 +2798,86 @@ mod tests {
         assert_eq!(
             reopened.agents[0].summary.reasoning_effort,
             Some(ReasoningEffort::High)
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_detail_uses_deepseek_v4_context_tokens() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = Arc::new(
+            ConfigStore::open_with_config_path(&db_path, &config_path)
+                .await
+                .expect("open store"),
+        );
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![deepseek_test_provider()],
+                default_provider_id: Some("deepseek".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let agent_id = Uuid::new_v4();
+        let timestamp = now();
+        store
+            .save_agent(
+                &AgentSummary {
+                    id: agent_id,
+                    parent_id: None,
+                    name: "deepseek-context".to_string(),
+                    status: AgentStatus::Idle,
+                    container_id: None,
+                    provider_id: "deepseek".to_string(),
+                    provider_name: "DeepSeek".to_string(),
+                    model: "deepseek-v4-pro".to_string(),
+                    reasoning_effort: Some(ReasoningEffort::High),
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    current_turn: None,
+                    last_error: None,
+                    token_usage: TokenUsage::default(),
+                },
+                None,
+            )
+            .await
+            .expect("save agent");
+        store
+            .save_agent_session(
+                agent_id,
+                &AgentSessionSummary {
+                    id: Uuid::new_v4(),
+                    title: "Chat 1".to_string(),
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    message_count: 0,
+                },
+            )
+            .await
+            .expect("save session");
+        let runtime = AgentRuntime::new(
+            DockerClient::new("unused"),
+            ResponsesClient::new(),
+            store,
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+            },
+        )
+        .await
+        .expect("runtime");
+
+        let detail = runtime.get_agent(agent_id, None).await.expect("detail");
+
+        assert_eq!(
+            detail
+                .context_usage
+                .as_ref()
+                .map(|usage| usage.context_tokens),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            detail.context_usage.as_ref().map(|usage| usage.used_tokens),
+            Some(0)
         );
     }
 

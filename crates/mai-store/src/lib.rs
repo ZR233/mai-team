@@ -20,6 +20,8 @@ const SETTING_LEGACY_TOML_IMPORTED: &str = "legacy_toml_imported";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
 const SCHEMA_VERSION: &str = "3";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
+const DEEPSEEK_V4_CONTEXT_TOKENS: u64 = 1_000_000;
+const DEEPSEEK_V4_OUTPUT_TOKENS: u64 = 384_000;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -1288,8 +1290,8 @@ fn deepseek_model(id: &str, supports_reasoning: bool) -> ModelConfig {
     ModelConfig {
         id: id.to_string(),
         name: Some(id.to_string()),
-        context_tokens: 128_000,
-        output_tokens: 8_192,
+        context_tokens: deepseek_context_tokens(id),
+        output_tokens: deepseek_output_tokens(id),
         supports_tools: true,
         supports_reasoning,
         reasoning_efforts: supports_reasoning
@@ -1301,6 +1303,29 @@ fn deepseek_model(id: &str, supports_reasoning: bool) -> ModelConfig {
     }
 }
 
+fn deepseek_context_tokens(id: &str) -> u64 {
+    if is_deepseek_v4_model(id) {
+        DEEPSEEK_V4_CONTEXT_TOKENS
+    } else {
+        128_000
+    }
+}
+
+fn deepseek_output_tokens(id: &str) -> u64 {
+    if is_deepseek_v4_model(id) {
+        DEEPSEEK_V4_OUTPUT_TOKENS
+    } else {
+        8_192
+    }
+}
+
+fn is_deepseek_v4_model(id: &str) -> bool {
+    matches!(
+        id,
+        "deepseek-v4-flash" | "deepseek-v4-pro" | "deepseek-chat" | "deepseek-reasoner"
+    )
+}
+
 fn normalize_provider_file(file: &mut ProvidersToml) {
     for provider in file.providers.values_mut() {
         normalize_provider_models(provider);
@@ -1310,6 +1335,12 @@ fn normalize_provider_file(file: &mut ProvidersToml) {
 fn normalize_provider_models(provider: &mut ProviderToml) {
     if provider.kind != ProviderKind::Deepseek {
         return;
+    }
+    for (id, model) in provider.models.iter_mut() {
+        if is_deepseek_v4_model(id) {
+            model.context_tokens = DEEPSEEK_V4_CONTEXT_TOKENS;
+            model.output_tokens = DEEPSEEK_V4_OUTPUT_TOKENS;
+        }
     }
     if let Some(model) = provider.models.get_mut("deepseek-v4-pro") {
         model.supports_reasoning = true;
@@ -1722,11 +1753,27 @@ mod tests {
             .iter()
             .find(|model| model.id == "deepseek-v4-pro")
             .expect("deepseek v4 pro");
+        assert_eq!(v4_pro.context_tokens, DEEPSEEK_V4_CONTEXT_TOKENS);
+        assert_eq!(v4_pro.output_tokens, DEEPSEEK_V4_OUTPUT_TOKENS);
         assert!(v4_pro.supports_reasoning);
         assert_eq!(
             v4_pro.reasoning_efforts,
             vec![ReasoningEffort::High, ReasoningEffort::Max]
         );
+        for id in [
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "deepseek-chat",
+            "deepseek-reasoner",
+        ] {
+            let model = deepseek
+                .models
+                .iter()
+                .find(|model| model.id == id)
+                .expect("deepseek v4 model");
+            assert_eq!(model.context_tokens, DEEPSEEK_V4_CONTEXT_TOKENS);
+            assert_eq!(model.output_tokens, DEEPSEEK_V4_OUTPUT_TOKENS);
+        }
         assert!(
             deepseek
                 .models
@@ -1773,6 +1820,8 @@ mod tests {
             .iter()
             .find(|model| model.id == "deepseek-v4-pro")
             .expect("deepseek v4 pro");
+        assert_eq!(model.context_tokens, DEEPSEEK_V4_CONTEXT_TOKENS);
+        assert_eq!(model.output_tokens, DEEPSEEK_V4_OUTPUT_TOKENS);
         assert!(model.supports_reasoning);
         assert_eq!(
             model.reasoning_efforts,
