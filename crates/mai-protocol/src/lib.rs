@@ -89,6 +89,13 @@ impl TokenUsage {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextUsage {
+    pub used_tokens: u64,
+    pub context_tokens: u64,
+    pub threshold_percent: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSummary {
     pub id: AgentId,
@@ -114,6 +121,8 @@ pub struct AgentDetail {
     pub summary: AgentSummary,
     pub sessions: Vec<AgentSessionSummary>,
     pub selected_session_id: SessionId,
+    #[serde(default)]
+    pub context_usage: Option<ContextUsage>,
     pub messages: Vec<AgentMessage>,
     pub recent_events: Vec<ServiceEvent>,
 }

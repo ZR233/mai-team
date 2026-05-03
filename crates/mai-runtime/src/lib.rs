@@ -6,7 +6,7 @@ use mai_mcp::McpAgentManager;
 use mai_model::ResponsesClient;
 use mai_protocol::{
     AgentDetail, AgentId, AgentMessage, AgentSessionSummary, AgentStatus, AgentSummary,
-    CreateAgentRequest, MessageRole, ModelConfig, ModelContentItem, ModelInputItem,
+    ContextUsage, CreateAgentRequest, MessageRole, ModelConfig, ModelContentItem, ModelInputItem,
     ModelOutputItem, ModelToolCall, ProviderKind, ReasoningEffort, ServiceEvent, ServiceEventKind,
     SessionId, TokenUsage, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest, now, preview,
 };
@@ -338,7 +338,7 @@ impl AgentRuntime {
     ) -> Result<AgentDetail> {
         let agent = self.agent(agent_id).await?;
         let summary = agent.summary.read().await.clone();
-        let (sessions, selected_session_id, messages) = {
+        let (sessions, selected_session_id, context_tokens_used, messages) = {
             let sessions = agent.sessions.lock().await;
             let selected_session = selected_session(&sessions, session_id).ok_or_else(|| {
                 RuntimeError::SessionNotFound {
@@ -352,9 +352,20 @@ impl AgentRuntime {
                     .map(|session| session.summary.clone())
                     .collect(),
                 selected_session.summary.id,
+                selected_session.last_context_tokens.unwrap_or_default(),
                 selected_session.messages.clone(),
             )
         };
+        let context_usage = self
+            .store
+            .resolve_provider(Some(&summary.provider_id), Some(&summary.model))
+            .await
+            .ok()
+            .map(|provider_selection| ContextUsage {
+                used_tokens: context_tokens_used,
+                context_tokens: provider_selection.model.context_tokens,
+                threshold_percent: AUTO_COMPACT_THRESHOLD_PERCENT,
+            });
         let recent_events = self
             .recent_events
             .lock()
@@ -367,6 +378,7 @@ impl AgentRuntime {
             summary,
             sessions,
             selected_session_id,
+            context_usage,
             messages,
             recent_events,
         })
@@ -2741,6 +2753,20 @@ mod tests {
         assert_eq!(detail.sessions.len(), 2);
         assert_eq!(detail.selected_session_id, second.id);
         assert!(detail.messages.is_empty());
+        assert_eq!(
+            detail
+                .context_usage
+                .as_ref()
+                .map(|usage| usage.context_tokens),
+            Some(400_000)
+        );
+        assert_eq!(
+            detail
+                .context_usage
+                .as_ref()
+                .map(|usage| usage.threshold_percent),
+            Some(80)
+        );
 
         let reopened = store.load_runtime_snapshot(10).await.expect("snapshot");
         assert_eq!(reopened.agents[0].sessions.len(), 2);

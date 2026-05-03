@@ -726,6 +726,92 @@ p {
   background: #1f6feb;
 }
 
+.context-capacity {
+  flex-shrink: 0;
+  display: grid;
+  gap: 6px;
+  padding: 9px 24px 10px;
+  border-bottom: 1px solid #d8e0ea;
+  background: #fbfcfe;
+}
+
+.context-capacity-header,
+.context-capacity-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-width: 0;
+}
+
+.context-capacity-header span,
+.context-capacity-meta span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.context-capacity-header span {
+  color: #526179;
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.context-capacity-header strong {
+  color: #1f6feb;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.context-capacity-track {
+  position: relative;
+  overflow: hidden;
+  height: 8px;
+  border: 1px solid #dbe4ef;
+  border-radius: 999px;
+  background: #eef3f8;
+}
+
+.context-capacity-track::after {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  left: var(--compact-threshold);
+  width: 2px;
+  border-radius: 999px;
+  background: #7c8ca4;
+  content: '';
+}
+
+.context-capacity-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: #1f6feb;
+  transition: width 180ms ease;
+}
+
+.context-capacity.warm .context-capacity-header strong {
+  color: #b06a00;
+}
+
+.context-capacity.warm .context-capacity-fill {
+  background: #d88a08;
+}
+
+.context-capacity.full .context-capacity-header strong {
+  color: #b42318;
+}
+
+.context-capacity.full .context-capacity-fill {
+  background: #d92d20;
+}
+
+.context-capacity-meta {
+  color: #738198;
+  font-size: 11px;
+}
+
 .agent-body {
   display: flex;
   flex: 1;
@@ -1879,6 +1965,16 @@ select:focus {
 
   .session-strip > .small-button {
     width: 100%;
+  }
+
+  .context-capacity {
+    padding: 10px 12px;
+  }
+
+  .context-capacity-meta {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
   }
 
   .message {

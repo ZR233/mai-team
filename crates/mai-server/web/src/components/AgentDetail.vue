@@ -103,6 +103,20 @@
       <button class="small-button" type="button" @click="$emit('create-session')">New Chat</button>
     </div>
 
+    <div v-if="contextCapacity.visible" class="context-capacity" :class="contextCapacity.tone">
+      <div class="context-capacity-header">
+        <span>上下文容量</span>
+        <strong>{{ contextCapacity.label }}</strong>
+      </div>
+      <div class="context-capacity-track" :style="{ '--compact-threshold': `${contextCapacity.threshold}%` }">
+        <div class="context-capacity-fill" :style="{ width: `${contextCapacity.percent}%` }"></div>
+      </div>
+      <div class="context-capacity-meta">
+        <span>{{ contextCapacity.used }} / {{ contextCapacity.total }} tokens</span>
+        <span>{{ contextCapacity.threshold }}% 自动压缩</span>
+      </div>
+    </div>
+
     <div class="agent-body">
       <section class="conversation chat-timeline" ref="conversationRef">
         <div v-if="loading" class="loading-center">
@@ -263,6 +277,34 @@ const editorReasoningOptions = computed(() => reasoningOptionsFor(editorProvider
 const currentProvider = computed(() => props.providers.find((provider) => provider.id === props.detail?.provider_id))
 const currentModel = computed(() => currentProvider.value?.models?.find((model) => model.id === props.detail?.model))
 const currentReasoningOptions = computed(() => reasoningOptionsFor(currentProvider.value, currentModel.value))
+const contextCapacity = computed(() => {
+  const usage = props.detail?.context_usage
+  const total = Number(usage?.context_tokens || currentModel.value?.context_tokens || 0)
+  if (!total) {
+    return {
+      visible: false,
+      percent: 0,
+      threshold: 80,
+      used: '0',
+      total: '0',
+      label: '0%',
+      tone: 'low'
+    }
+  }
+  const rawUsed = Number(usage?.used_tokens || 0)
+  const rawThreshold = Number(usage?.threshold_percent || 80)
+  const percentValue = Math.max(0, Math.min(100, Math.round((rawUsed / total) * 100)))
+  const threshold = Math.max(1, Math.min(100, Math.round(rawThreshold)))
+  return {
+    visible: true,
+    percent: percentValue,
+    threshold,
+    used: formatCompactNumber(rawUsed),
+    total: formatCompactNumber(total),
+    label: `${percentValue}%`,
+    tone: percentValue >= threshold ? 'full' : percentValue >= Math.max(1, threshold - 15) ? 'warm' : 'low'
+  }
+})
 const isModelChangeBusy = computed(() => {
   const status = props.detail?.status
   return status === 'running_turn' || status === 'waiting_tool' || status === 'starting_container'
@@ -351,6 +393,17 @@ function saveModelEdit() {
     reasoning_effort: modelEditor.reasoning_effort
   })
   modelEditor.open = false
+}
+
+function formatCompactNumber(value) {
+  const number = Number(value || 0)
+  if (number >= 1_000_000) return `${trimNumber(number / 1_000_000)}M`
+  if (number >= 1_000) return `${trimNumber(number / 1_000)}K`
+  return String(Math.round(number))
+}
+
+function trimNumber(value) {
+  return value >= 10 ? String(Math.round(value)) : value.toFixed(1).replace(/\.0$/, '')
 }
 
 function isToolExpanded(item) {
