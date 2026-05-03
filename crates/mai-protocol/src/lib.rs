@@ -300,6 +300,7 @@ pub struct AgentModelPreference {
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
     Planner,
+    Explorer,
     #[default]
     Executor,
     Reviewer,
@@ -324,6 +325,8 @@ pub struct AgentConfigRequest {
     #[serde(default)]
     pub planner: Option<AgentModelPreference>,
     #[serde(default)]
+    pub explorer: Option<AgentModelPreference>,
+    #[serde(default)]
     pub executor: Option<AgentModelPreference>,
     #[serde(default)]
     pub reviewer: Option<AgentModelPreference>,
@@ -336,11 +339,15 @@ pub struct AgentConfigResponse {
     #[serde(default)]
     pub planner: Option<AgentModelPreference>,
     #[serde(default)]
+    pub explorer: Option<AgentModelPreference>,
+    #[serde(default)]
     pub executor: Option<AgentModelPreference>,
     #[serde(default)]
     pub reviewer: Option<AgentModelPreference>,
     #[serde(default)]
     pub effective_planner: Option<ResolvedAgentModelPreference>,
+    #[serde(default)]
+    pub effective_explorer: Option<ResolvedAgentModelPreference>,
     #[serde(default)]
     pub effective_executor: Option<ResolvedAgentModelPreference>,
     #[serde(default)]

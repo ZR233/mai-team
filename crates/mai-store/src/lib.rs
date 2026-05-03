@@ -1771,6 +1771,7 @@ mod tests {
         let (dir, store) = store().await;
         let config = AgentConfigRequest {
             planner: None,
+            explorer: None,
             executor: Some(mai_protocol::AgentModelPreference {
                 provider_id: "openai".to_string(),
                 model: "gpt-5.4".to_string(),

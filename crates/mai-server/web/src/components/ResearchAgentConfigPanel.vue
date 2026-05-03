@@ -3,9 +3,8 @@
     <div class="stage-title">
       <div>
         <h2>Agent Settings</h2>
-        <p>Assign model profiles to planner, executor, and reviewer subagent roles.</p>
+        <p>Assign model profiles to planner, explorer, executor, and reviewer subagent roles.</p>
       </div>
-      <button class="ghost-button" :disabled="loading" @click="$emit('reload')">Reload</button>
     </div>
 
     <div v-if="!providers.length" class="empty-stage providers-empty">
@@ -34,11 +33,11 @@
         </div>
       </div>
 
-      <div class="role-config-grid">
+      <div class="role-config-list">
         <article
           v-for="role in ROLE_DEFINITIONS"
           :key="role.key"
-          class="role-config-card"
+          class="role-config-row"
           :class="`role-${role.key}`"
         >
           <div class="role-card-head">
@@ -58,7 +57,7 @@
             v-model:reasoning-effort="forms[role.key].reasoning_effort"
             :providers="providers"
             :disabled="saving"
-            compact
+            class="role-model-selector"
           />
 
           <div class="effective-model-line role-effective-line">
@@ -68,11 +67,15 @@
         </article>
       </div>
 
-      <p v-if="state.validation_error" class="dialog-error">{{ state.validation_error }}</p>
-      <p v-if="error" class="dialog-error">{{ error }}</p>
-
       <div class="settings-actions">
-        <button class="ghost-button" type="button" :disabled="saving" @click="resetFromState">Reset</button>
+        <div class="settings-actions-left">
+          <button class="ghost-button" type="button" :disabled="saving" @click="resetFromState">Reset</button>
+          <button class="ghost-button" type="button" :disabled="loading" @click="$emit('reload')">Reload</button>
+        </div>
+        <div class="settings-action-errors">
+          <p v-if="state.validation_error" class="dialog-error">{{ state.validation_error }}</p>
+          <p v-if="error" class="dialog-error">{{ error }}</p>
+        </div>
         <button class="primary-button" type="submit" :disabled="saving || !canSave">
           <span v-if="saving" class="spinner-sm"></span>
           <template v-else>Save Config</template>
@@ -93,6 +96,12 @@ const ROLE_DEFINITIONS = [
     title: 'Planner',
     initial: 'P',
     description: 'Decomposes tasks, plans steps, and calls out dependencies.'
+  },
+  {
+    key: 'explorer',
+    title: 'Explorer',
+    initial: 'X',
+    description: 'Explores code, docs, and web context before implementation.'
   },
   {
     key: 'executor',
@@ -120,6 +129,7 @@ const emit = defineEmits(['save', 'reload', 'open-providers'])
 const error = ref('')
 const forms = reactive({
   planner: emptyPreference(),
+  explorer: emptyPreference(),
   executor: emptyPreference(),
   reviewer: emptyPreference()
 })
@@ -142,6 +152,7 @@ const canSave = computed(() =>
 watch(
   () => [
     props.state.planner,
+    props.state.explorer,
     props.state.executor,
     props.state.reviewer,
     props.providers
@@ -239,6 +250,7 @@ function save() {
   }
   emit('save', {
     planner: preferencePayload(forms.planner),
+    explorer: preferencePayload(forms.explorer),
     executor: preferencePayload(forms.executor),
     reviewer: preferencePayload(forms.reviewer)
   })

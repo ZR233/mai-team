@@ -92,7 +92,7 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "role",
                     json!({
                         "type": "string",
-                        "enum": ["planner", "executor", "reviewer"],
+                        "enum": ["planner", "explorer", "executor", "reviewer"],
                         "description": "Role profile to use for the child agent. Defaults to executor."
                     }),
                     false,

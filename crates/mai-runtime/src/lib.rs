@@ -41,7 +41,12 @@ Include:
 - Any critical data, examples, file paths, command outputs, or references needed to continue
 
 Be concise, structured, and focused on helping the next model seamlessly continue the work."#;
-const AGENT_ROLES: [AgentRole; 3] = [AgentRole::Planner, AgentRole::Executor, AgentRole::Reviewer];
+const AGENT_ROLES: [AgentRole; 4] = [
+    AgentRole::Planner,
+    AgentRole::Explorer,
+    AgentRole::Executor,
+    AgentRole::Reviewer,
+];
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -197,6 +202,7 @@ impl AgentRuntime {
     pub async fn agent_config(&self) -> Result<AgentConfigResponse> {
         let config = self.store.load_agent_config().await?;
         let planner = role_preference(&config, AgentRole::Planner).cloned();
+        let explorer = role_preference(&config, AgentRole::Explorer).cloned();
         let executor = role_preference(&config, AgentRole::Executor).cloned();
         let reviewer = role_preference(&config, AgentRole::Reviewer).cloned();
         let mut validation_errors = Vec::new();
@@ -204,6 +210,13 @@ impl AgentRuntime {
             .resolve_effective_agent_model(
                 AgentRole::Planner,
                 planner.as_ref(),
+                &mut validation_errors,
+            )
+            .await;
+        let effective_explorer = self
+            .resolve_effective_agent_model(
+                AgentRole::Explorer,
+                explorer.as_ref(),
                 &mut validation_errors,
             )
             .await;
@@ -225,9 +238,11 @@ impl AgentRuntime {
             (!validation_errors.is_empty()).then(|| validation_errors.join("; "));
         Ok(AgentConfigResponse {
             planner,
+            explorer,
             executor,
             reviewer,
             effective_planner,
+            effective_explorer,
             effective_executor: effective_executor.clone(),
             effective_reviewer,
             research_agent: config.research_agent.clone(),
@@ -1853,9 +1868,10 @@ fn parse_agent_role(value: &str) -> Result<AgentRole> {
     match value.trim().to_lowercase().as_str() {
         "" | "executor" => Ok(AgentRole::Executor),
         "planner" => Ok(AgentRole::Planner),
+        "explorer" => Ok(AgentRole::Explorer),
         "reviewer" => Ok(AgentRole::Reviewer),
         _ => Err(RuntimeError::InvalidInput(format!(
-            "invalid agent role `{value}`; expected planner, executor, or reviewer"
+            "invalid agent role `{value}`; expected planner, explorer, executor, or reviewer"
         ))),
     }
 }
@@ -1904,6 +1920,7 @@ fn resolved_agent_model_preference(
 fn role_preference(config: &AgentConfigRequest, role: AgentRole) -> Option<&AgentModelPreference> {
     match role {
         AgentRole::Planner => config.planner.as_ref().or(config.research_agent.as_ref()),
+        AgentRole::Explorer => config.explorer.as_ref().or(config.research_agent.as_ref()),
         AgentRole::Executor => config.executor.as_ref().or(config.research_agent.as_ref()),
         AgentRole::Reviewer => config.reviewer.as_ref().or(config.research_agent.as_ref()),
     }
@@ -1912,6 +1929,7 @@ fn role_preference(config: &AgentConfigRequest, role: AgentRole) -> Option<&Agen
 fn agent_role_label(role: AgentRole) -> &'static str {
     match role {
         AgentRole::Planner => "planner",
+        AgentRole::Explorer => "explorer",
         AgentRole::Executor => "executor",
         AgentRole::Reviewer => "reviewer",
     }
@@ -1921,6 +1939,9 @@ fn role_system_prompt(role: AgentRole) -> &'static str {
     match role {
         AgentRole::Planner => {
             "You are the Planner role for a multi-agent coding task. Break work into clear steps, identify dependencies, risks, and acceptance criteria, and hand off bounded tasks. Do not modify code unless the task explicitly asks the planner to implement."
+        }
+        AgentRole::Explorer => {
+            "You are the Explorer role for a multi-agent coding task. Investigate the existing codebase, relevant documentation, and web context when useful. Prefer read-only exploration, cite concrete files or sources, and return concise findings that help the team decide what to build next."
         }
         AgentRole::Executor => {
             "You are the Executor role for a multi-agent coding task. Implement concrete changes, run the necessary commands, report touched files and verification results, and keep the work scoped to the assigned task."
@@ -3704,6 +3725,7 @@ esac
         let config = runtime.agent_config().await.expect("config");
         assert_eq!(config.research_agent, None);
         assert_eq!(config.planner, None);
+        assert_eq!(config.explorer, None);
         assert_eq!(config.executor, None);
         assert_eq!(config.reviewer, None);
         let effective = config.effective_executor.expect("effective default");
@@ -3712,6 +3734,10 @@ esac
         assert_eq!(effective.reasoning_effort, Some(ReasoningEffort::Medium));
         assert_eq!(
             config.effective_planner.expect("planner default").model,
+            "alt-default"
+        );
+        assert_eq!(
+            config.effective_explorer.expect("explorer default").model,
             "alt-default"
         );
         assert_eq!(
@@ -3864,6 +3890,11 @@ esac
                 planner: Some(AgentModelPreference {
                     provider_id: "alt".to_string(),
                     model: "alt-default".to_string(),
+                    reasoning_effort: Some(ReasoningEffort::Medium),
+                }),
+                explorer: Some(AgentModelPreference {
+                    provider_id: "openai".to_string(),
+                    model: "gpt-5.5".to_string(),
                     reasoning_effort: Some(ReasoningEffort::Medium),
                 }),
                 executor: Some(AgentModelPreference {

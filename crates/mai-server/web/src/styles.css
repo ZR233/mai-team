@@ -698,14 +698,20 @@ p {
 
 .settings-stage {
   grid-column: 1 / -1;
-  overflow: auto;
-  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .settings-console {
-  display: grid;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
   gap: 22px;
+  min-height: 0;
   padding: 22px;
+  padding-bottom: 0;
 }
 
 .settings-summary {
@@ -762,32 +768,62 @@ p {
   color: #b42318;
 }
 
-.role-config-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(280px, 1fr));
+.role-config-list {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
   gap: 14px;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 8px;
+  padding-bottom: 10px;
+  scrollbar-color: #aeb9c8 transparent;
+  scrollbar-width: thin;
 }
 
-.role-config-card {
+.role-config-list::-webkit-scrollbar {
+  width: 10px;
+}
+
+.role-config-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.role-config-list::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: #aeb9c8;
+  background-clip: padding-box;
+}
+
+.role-config-row {
   --role-accent: #1f6feb;
   --role-accent-soft: #e7f0ff;
   display: grid;
-  gap: 18px;
+  grid-template-columns: minmax(250px, 0.7fr) minmax(430px, 1.15fr) minmax(230px, 0.55fr);
+  gap: 22px;
+  align-items: center;
   min-width: 0;
   border: 1px solid #d8e0ea;
-  border-top: 3px solid var(--role-accent);
+  border-left: 5px solid var(--role-accent);
   border-radius: 8px;
-  padding: 20px;
+  padding: 20px 22px 20px 17px;
   background: #fff;
   box-shadow: 0 10px 22px rgba(22, 32, 51, 0.05);
 }
 
-.role-config-card.role-executor {
+.role-config-row.role-executor {
   --role-accent: #11a683;
   --role-accent-soft: #e6f7ef;
 }
 
-.role-config-card.role-reviewer {
+.role-config-row.role-explorer {
+  --role-accent: #4766df;
+  --role-accent-soft: #edf1ff;
+}
+
+.role-config-row.role-reviewer {
   --role-accent: #e66a0a;
   --role-accent-soft: #fff1df;
 }
@@ -798,6 +834,8 @@ p {
   align-items: start;
   gap: 12px;
   min-width: 0;
+  padding-right: 18px;
+  border-right: 1px solid #e1e7ef;
 }
 
 .role-avatar {
@@ -850,6 +888,10 @@ p {
   background: #fff4cf;
 }
 
+.role-model-selector {
+  grid-template-columns: minmax(130px, 0.85fr) minmax(170px, 1fr) minmax(130px, 0.85fr);
+}
+
 .effective-model-line {
   display: flex;
   align-items: center;
@@ -875,13 +917,40 @@ p {
 
 .role-effective-line {
   margin-top: 2px;
+  min-height: 72px;
+  border-left: 1px solid #e1e7ef;
+  padding-left: 20px;
+  background: #fff;
 }
 
 .settings-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
+  gap: 10px;
+  margin: 0 -22px;
+  padding: 16px 22px;
+  border-top: 1px solid #d8e0ea;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 -12px 28px rgba(22, 32, 51, 0.08);
+  backdrop-filter: blur(14px);
+}
+
+.settings-actions-left {
+  display: flex;
+  gap: 10px;
+}
+
+.settings-action-errors {
+  display: grid;
+  flex: 1;
+  gap: 4px;
+  min-width: 0;
+  margin-right: auto;
+  font-size: 13px;
 }
 
 .session-strip {
@@ -2480,8 +2549,15 @@ select:focus {
     border-left: 0;
   }
 
-  .role-config-grid {
-    grid-template-columns: repeat(2, minmax(280px, 1fr));
+  .role-config-row {
+    grid-template-columns: minmax(220px, 0.7fr) minmax(320px, 1fr);
+  }
+
+  .role-effective-line {
+    grid-column: 1 / -1;
+    min-height: auto;
+    border-left: 0;
+    padding-left: 0;
   }
 }
 
@@ -2555,12 +2631,17 @@ select:focus {
   }
 
   .settings-console {
+    gap: 14px;
     padding: 14px;
+    padding-bottom: 0;
   }
 
-  .settings-summary,
-  .role-config-grid {
+  .settings-summary {
     grid-template-columns: 1fr;
+  }
+
+  .role-config-list {
+    padding-right: 0;
   }
 
   .settings-summary-item {
@@ -2572,10 +2653,23 @@ select:focus {
     border-top: 0;
   }
 
+  .role-config-row,
+  .role-model-selector,
   .role-card-head,
   .effective-model-line {
+    grid-template-columns: 1fr;
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .role-card-head {
+    border-right: 0;
+    padding-right: 0;
+  }
+
+  .role-status {
+    justify-self: start;
+    margin-left: 0;
   }
 
   .effective-model-line strong {
@@ -2583,7 +2677,16 @@ select:focus {
   }
 
   .settings-actions {
+    align-items: stretch;
+    flex-direction: column;
     justify-content: stretch;
+    margin: 0 -14px;
+    padding: 12px 14px;
+  }
+
+  .settings-actions-left {
+    display: flex;
+    width: 100%;
   }
 
   .settings-actions button {
