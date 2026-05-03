@@ -115,6 +115,12 @@ struct ToolExecution {
     output: String,
 }
 
+#[derive(Debug, Clone)]
+enum ContainerSource {
+    FreshImage,
+    CloneFrom { parent_container_id: String },
+}
+
 struct ResolvedAgentModel {
     preference: AgentModelPreference,
     effective: ResolvedAgentModelPreference,
@@ -216,6 +222,15 @@ impl AgentRuntime {
         self: &Arc<Self>,
         request: CreateAgentRequest,
     ) -> Result<AgentSummary> {
+        self.create_agent_with_container_source(request, ContainerSource::FreshImage)
+            .await
+    }
+
+    async fn create_agent_with_container_source(
+        self: &Arc<Self>,
+        request: CreateAgentRequest,
+        container_source: ContainerSource,
+    ) -> Result<AgentSummary> {
         let id = Uuid::new_v4();
         let created_at = Utc::now();
         let name = request
@@ -270,7 +285,10 @@ impl AgentRuntime {
         })
         .await;
 
-        match self.ensure_agent_container(&agent, AgentStatus::Idle).await {
+        match self
+            .ensure_agent_container_with_source(&agent, AgentStatus::Idle, &container_source)
+            .await
+        {
             Ok(_) => Ok(agent.summary.read().await.clone()),
             Err(err) => {
                 let message = err.to_string();
@@ -579,7 +597,16 @@ impl AgentRuntime {
     }
 
     pub async fn delete_agent(&self, agent_id: AgentId) -> Result<()> {
+        let targets = self.descendant_delete_order(agent_id).await?;
+        for target_id in targets {
+            self.delete_agent_record(target_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_agent_record(&self, agent_id: AgentId) -> Result<()> {
         let agent = self.agent(agent_id).await?;
+        agent.cancel_requested.store(true, Ordering::SeqCst);
         self.set_status(&agent, AgentStatus::DeletingContainer, None)
             .await?;
         *agent.mcp.write().await = None;
@@ -602,12 +629,29 @@ impl AgentRuntime {
                 "removed agent containers"
             );
         }
+        let _turn_guard = agent.turn_lock.lock().await;
         self.set_status(&agent, AgentStatus::Deleted, None).await?;
         self.store.delete_agent(agent_id).await?;
         self.agents.write().await.remove(&agent_id);
         self.publish(ServiceEventKind::AgentDeleted { agent_id })
             .await;
         Ok(())
+    }
+
+    async fn descendant_delete_order(&self, root_id: AgentId) -> Result<Vec<AgentId>> {
+        let summaries = {
+            let agents = self.agents.read().await;
+            let mut summaries = Vec::with_capacity(agents.len());
+            for agent in agents.values() {
+                summaries.push(agent.summary.read().await.clone());
+            }
+            summaries
+        };
+        if !summaries.iter().any(|summary| summary.id == root_id) {
+            return Err(RuntimeError::AgentNotFound(root_id));
+        }
+
+        Ok(descendant_delete_order_from_summaries(root_id, &summaries))
     }
 
     pub async fn upload_file(
@@ -1045,15 +1089,21 @@ impl AgentRuntime {
                 let name = optional_string(&arguments, "name");
                 let message = optional_string(&arguments, "message");
                 let child_model = self.resolve_research_agent_model().await?;
+                let parent_container_id = self.container_id(agent_id).await?;
                 let created = self
-                    .create_agent(CreateAgentRequest {
-                        name,
-                        provider_id: Some(child_model.preference.provider_id),
-                        model: Some(child_model.preference.model),
-                        reasoning_effort: child_model.preference.reasoning_effort,
-                        parent_id: Some(agent_id),
-                        system_prompt: None,
-                    })
+                    .create_agent_with_container_source(
+                        CreateAgentRequest {
+                            name,
+                            provider_id: Some(child_model.preference.provider_id),
+                            model: Some(child_model.preference.model),
+                            reasoning_effort: child_model.preference.reasoning_effort,
+                            parent_id: Some(agent_id),
+                            system_prompt: None,
+                        },
+                        ContainerSource::CloneFrom {
+                            parent_container_id,
+                        },
+                    )
                     .await?;
                 let turn_id = if let Some(message) = message {
                     let session_id = self.resolve_session_id(created.id, None).await?;
@@ -1529,6 +1579,16 @@ impl AgentRuntime {
         agent: &Arc<AgentRecord>,
         ready_status: AgentStatus,
     ) -> Result<String> {
+        self.ensure_agent_container_with_source(agent, ready_status, &ContainerSource::FreshImage)
+            .await
+    }
+
+    async fn ensure_agent_container_with_source(
+        &self,
+        agent: &Arc<AgentRecord>,
+        ready_status: AgentStatus,
+        container_source: &ContainerSource,
+    ) -> Result<String> {
         if let Some(container_id) = agent
             .container
             .read()
@@ -1553,11 +1613,36 @@ impl AgentRuntime {
 
         self.set_status(agent, AgentStatus::StartingContainer, None)
             .await?;
-        let container = match self
-            .docker
-            .ensure_agent_container(&agent_id.to_string(), preferred_container_id.as_deref())
-            .await
-        {
+        let container_result = match container_source {
+            ContainerSource::FreshImage => {
+                self.docker
+                    .ensure_agent_container(
+                        &agent_id.to_string(),
+                        preferred_container_id.as_deref(),
+                    )
+                    .await
+            }
+            ContainerSource::CloneFrom {
+                parent_container_id,
+            } => {
+                if preferred_container_id.is_some() {
+                    self.docker
+                        .ensure_agent_container(
+                            &agent_id.to_string(),
+                            preferred_container_id.as_deref(),
+                        )
+                        .await
+                } else {
+                    self.docker
+                        .create_agent_container_from_parent(
+                            &agent_id.to_string(),
+                            parent_container_id,
+                        )
+                        .await
+                }
+            }
+        };
+        let container = match container_result {
             Ok(container) => container,
             Err(err) => {
                 let message = err.to_string();
@@ -1727,6 +1812,38 @@ fn resolved_agent_model_preference(
         context_tokens: selection.model.context_tokens,
         output_tokens: selection.model.output_tokens,
     }
+}
+
+fn descendant_delete_order_from_summaries(
+    root_id: AgentId,
+    summaries: &[AgentSummary],
+) -> Vec<AgentId> {
+    let mut children: HashMap<AgentId, Vec<&AgentSummary>> = HashMap::new();
+    for summary in summaries {
+        if let Some(parent_id) = summary.parent_id {
+            children.entry(parent_id).or_default().push(summary);
+        }
+    }
+    for values in children.values_mut() {
+        values.sort_by_key(|summary| summary.created_at);
+    }
+
+    let mut order = Vec::new();
+    push_delete_order(root_id, &children, &mut order);
+    order
+}
+
+fn push_delete_order(
+    agent_id: AgentId,
+    children: &HashMap<AgentId, Vec<&AgentSummary>>,
+    order: &mut Vec<AgentId>,
+) {
+    if let Some(child_summaries) = children.get(&agent_id) {
+        for child in child_summaries {
+            push_delete_order(child.id, children, order);
+        }
+    }
+    order.push(agent_id);
 }
 
 fn normalize_reasoning_effort(
@@ -2271,10 +2388,18 @@ mod tests {
     }
 
     fn test_agent_summary(agent_id: AgentId, container_id: Option<&str>) -> AgentSummary {
+        test_agent_summary_with_parent(agent_id, None, container_id)
+    }
+
+    fn test_agent_summary_with_parent(
+        agent_id: AgentId,
+        parent_id: Option<AgentId>,
+        container_id: Option<&str>,
+    ) -> AgentSummary {
         let timestamp = now();
         AgentSummary {
             id: agent_id,
-            parent_id: None,
+            parent_id,
             name: "compact-agent".to_string(),
             status: AgentStatus::Idle,
             container_id: container_id.map(ToOwned::to_owned),
@@ -2288,6 +2413,104 @@ mod tests {
             last_error: None,
             token_usage: TokenUsage::default(),
         }
+    }
+
+    fn test_agent_summary_at(
+        agent_id: AgentId,
+        parent_id: Option<AgentId>,
+        created_at: chrono::DateTime<Utc>,
+    ) -> AgentSummary {
+        AgentSummary {
+            created_at,
+            updated_at: created_at,
+            ..test_agent_summary_with_parent(agent_id, parent_id, None)
+        }
+    }
+
+    async fn test_store(dir: &tempfile::TempDir) -> Arc<ConfigStore> {
+        Arc::new(
+            ConfigStore::open_with_config_path(
+                &dir.path().join("runtime.sqlite3"),
+                &dir.path().join("config.toml"),
+            )
+            .await
+            .expect("open store"),
+        )
+    }
+
+    async fn save_agent_with_session(store: &ConfigStore, summary: &AgentSummary) {
+        store.save_agent(summary, None).await.expect("save agent");
+        save_test_session(store, summary.id, Uuid::new_v4()).await;
+    }
+
+    async fn test_runtime(dir: &tempfile::TempDir, store: Arc<ConfigStore>) -> Arc<AgentRuntime> {
+        AgentRuntime::new(
+            DockerClient::new_with_binary("unused", fake_docker_path(dir)),
+            ResponsesClient::new(),
+            store,
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+            },
+        )
+        .await
+        .expect("runtime")
+    }
+
+    fn fake_docker_path(dir: &tempfile::TempDir) -> String {
+        let path = dir.path().join("fake-docker.sh");
+        let log_path = fake_docker_log_path(dir);
+        let script = format!(
+            r#"#!/bin/sh
+LOG={}
+case "$1" in
+  ps)
+    exit 0
+    ;;
+  commit)
+    echo "$*" >> "$LOG"
+    echo "sha256:snapshot"
+    exit 0
+    ;;
+  create)
+    echo "$*" >> "$LOG"
+    echo "created-container"
+    exit 0
+    ;;
+  rm|rmi|start|exec)
+    echo "$*" >> "$LOG"
+    exit 0
+    ;;
+  *)
+    echo "$*" >> "$LOG"
+    exit 0
+    ;;
+esac
+"#,
+            test_shell_quote(&log_path.to_string_lossy())
+        );
+        std::fs::write(&path, script).expect("write fake docker");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path)
+                .expect("fake docker metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).expect("chmod fake docker");
+        }
+        path.to_string_lossy().to_string()
+    }
+
+    fn fake_docker_log_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        dir.path().join("fake-docker.log")
+    }
+
+    fn fake_docker_log(dir: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(fake_docker_log_path(dir)).unwrap_or_default()
+    }
+
+    fn test_shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 
     async fn save_test_session(store: &ConfigStore, agent_id: AgentId, session_id: SessionId) {
@@ -2319,6 +2542,127 @@ mod tests {
     fn agent_status_allows_new_turn_after_completion() {
         assert!(AgentStatus::Completed.can_start_turn());
         assert!(!AgentStatus::RunningTurn.can_start_turn());
+    }
+
+    #[test]
+    fn descendant_delete_order_deletes_children_before_parents() {
+        let parent = Uuid::new_v4();
+        let older_child = Uuid::new_v4();
+        let younger_child = Uuid::new_v4();
+        let grandchild = Uuid::new_v4();
+        let unrelated = Uuid::new_v4();
+        let base = now();
+        let summaries = vec![
+            test_agent_summary_at(parent, None, base),
+            test_agent_summary_at(
+                younger_child,
+                Some(parent),
+                base + chrono::Duration::seconds(2),
+            ),
+            test_agent_summary_at(
+                older_child,
+                Some(parent),
+                base + chrono::Duration::seconds(1),
+            ),
+            test_agent_summary_at(
+                grandchild,
+                Some(older_child),
+                base + chrono::Duration::seconds(3),
+            ),
+            test_agent_summary_at(unrelated, None, base + chrono::Duration::seconds(4)),
+        ];
+
+        assert_eq!(
+            descendant_delete_order_from_summaries(parent, &summaries),
+            vec![grandchild, older_child, younger_child, parent]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_parent_cascades_to_children_and_grandchildren() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let sibling = Uuid::new_v4();
+        let grandchild = Uuid::new_v4();
+        save_agent_with_session(
+            &store,
+            &test_agent_summary(parent, Some("parent-container")),
+        )
+        .await;
+        save_agent_with_session(
+            &store,
+            &test_agent_summary_with_parent(child, Some(parent), Some("child-container")),
+        )
+        .await;
+        save_agent_with_session(
+            &store,
+            &test_agent_summary_with_parent(sibling, Some(parent), Some("sibling-container")),
+        )
+        .await;
+        save_agent_with_session(
+            &store,
+            &test_agent_summary_with_parent(grandchild, Some(child), Some("grandchild-container")),
+        )
+        .await;
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        runtime.delete_agent(parent).await.expect("delete parent");
+
+        assert!(runtime.list_agents().await.is_empty());
+        assert!(
+            store
+                .load_runtime_snapshot(RECENT_EVENT_LIMIT)
+                .await
+                .expect("snapshot")
+                .agents
+                .is_empty()
+        );
+        let events = runtime.recent_events.lock().await;
+        let deleted = events
+            .iter()
+            .filter_map(|event| match event.kind {
+                ServiceEventKind::AgentDeleted { agent_id } => Some(agent_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deleted, vec![grandchild, child, sibling, parent]);
+    }
+
+    #[tokio::test]
+    async fn delete_child_keeps_parent_and_sibling() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let sibling = Uuid::new_v4();
+        save_agent_with_session(
+            &store,
+            &test_agent_summary(parent, Some("parent-container")),
+        )
+        .await;
+        save_agent_with_session(
+            &store,
+            &test_agent_summary_with_parent(child, Some(parent), Some("child-container")),
+        )
+        .await;
+        save_agent_with_session(
+            &store,
+            &test_agent_summary_with_parent(sibling, Some(parent), Some("sibling-container")),
+        )
+        .await;
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        runtime.delete_agent(child).await.expect("delete child");
+
+        let remaining = runtime
+            .list_agents()
+            .await
+            .into_iter()
+            .map(|agent| agent.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(remaining, HashSet::from([parent, sibling]));
     }
 
     #[test]
@@ -3316,16 +3660,13 @@ mod tests {
             )
             .await
             .expect("save session");
-        let runtime = AgentRuntime::new(
-            DockerClient::new("unused"),
-            ResponsesClient::new(),
-            Arc::clone(&store),
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-            },
-        )
-        .await
-        .expect("runtime");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let parent = runtime.agent(parent_id).await.expect("parent");
+        *parent.container.write().await = Some(ContainerHandle {
+            id: "parent-container".to_string(),
+            name: "parent-container".to_string(),
+            image: "unused".to_string(),
+        });
 
         let result = runtime
             .execute_tool_for_test(
@@ -3338,10 +3679,7 @@ mod tests {
                 }),
             )
             .await;
-        assert!(
-            result.is_err(),
-            "unused docker fails container start, but child summary is persisted first"
-        );
+        assert!(result.expect("spawn agent").success);
         let child = runtime
             .list_agents()
             .await
@@ -3351,6 +3689,10 @@ mod tests {
         assert_eq!(child.provider_id, "alt");
         assert_eq!(child.model, "alt-default");
         assert_eq!(child.reasoning_effort, Some(ReasoningEffort::Medium));
+        let docker_log = fake_docker_log(&dir);
+        assert!(docker_log.contains("commit parent-container mai-team-snapshot-"));
+        assert!(docker_log.contains(&format!("create --name mai-team-{}", child.id)));
+        assert!(docker_log.contains("rmi -f mai-team-snapshot-"));
     }
 
     #[tokio::test]
@@ -3417,16 +3759,13 @@ mod tests {
             )
             .await
             .expect("save session");
-        let runtime = AgentRuntime::new(
-            DockerClient::new("unused"),
-            ResponsesClient::new(),
-            Arc::clone(&store),
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-            },
-        )
-        .await
-        .expect("runtime");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let parent = runtime.agent(parent_id).await.expect("parent");
+        *parent.container.write().await = Some(ContainerHandle {
+            id: "parent-container".to_string(),
+            name: "parent-container".to_string(),
+            image: "unused".to_string(),
+        });
 
         let result = runtime
             .execute_tool_for_test(
@@ -3439,7 +3778,7 @@ mod tests {
                 }),
             )
             .await;
-        assert!(result.is_err());
+        assert!(result.expect("spawn agent").success);
         let child = runtime
             .list_agents()
             .await

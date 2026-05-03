@@ -354,6 +354,7 @@ p {
   background: transparent;
   text-align: left;
   transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
+  padding-left: var(--tree-indent, 10px);
 }
 
 .agent-row:hover,
@@ -364,6 +365,23 @@ p {
 
 .agent-row.active {
   box-shadow: inset 3px 0 0 #1f6feb;
+}
+
+.agent-row.orphan {
+  color: #5f6f85;
+}
+
+.tree-guide {
+  width: 12px;
+  height: 36px;
+  border-left: 1px solid transparent;
+  border-bottom: 1px solid transparent;
+  flex: 0 0 12px;
+}
+
+.agent-row.nested .tree-guide {
+  border-color: #cbd5e1;
+  border-bottom-left-radius: 6px;
 }
 
 .avatar {
@@ -390,8 +408,33 @@ p {
 }
 
 .agent-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
   font-size: 14px;
   font-weight: 800;
+}
+
+.agent-name-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-child-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  padding: 0 5px;
+  color: #475569;
+  background: #e8edf4;
+  font-size: 10px;
+  font-weight: 900;
 }
 
 .agent-meta {

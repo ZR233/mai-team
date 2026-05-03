@@ -129,6 +129,7 @@ import { useAgents } from './composables/useAgents'
 import { useProviders } from './composables/useProviders'
 import { useAgentConfig } from './composables/useAgentConfig'
 import { defaultReasoningEffort } from './utils/reasoning'
+import { countAgentDescendants } from './utils/agentTree'
 
 const { toast, showToast } = useApi()
 const { eventFeed, connectionState, connectEvents, disconnect } = useSSE()
@@ -284,8 +285,11 @@ async function onSaveAgentConfig(researchAgent) {
 }
 
 function confirmDeleteAgent(id, name) {
+  const descendants = countAgentDescendants(id, agents.value)
   confirmDialog.title = 'Delete Agent'
-  confirmDialog.message = `Are you sure you want to delete "${name || id}"? This action cannot be undone.`
+  confirmDialog.message = descendants
+    ? `Are you sure you want to delete "${name || id}" and ${descendants} subagent${descendants === 1 ? '' : 's'}? This action cannot be undone.`
+    : `Are you sure you want to delete "${name || id}"? This action cannot be undone.`
   confirmDialog.onConfirm = async () => {
     confirmDialog.open = false
     try {

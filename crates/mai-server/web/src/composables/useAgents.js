@@ -124,8 +124,10 @@ export function useAgents() {
   }
 
   async function deleteAgent(id) {
+    const deletedIds = descendantIds(id, agents.value)
+    deletedIds.add(id)
     await api(`/agents/${id}`, { method: 'DELETE' })
-    if (selectedAgentId.value === id) {
+    if (deletedIds.has(selectedAgentId.value)) {
       selectedAgentId.value = null
       selectedDetail.value = null
       selectedSessionId.value = null
@@ -170,4 +172,23 @@ export function useAgents() {
 
 function nextFrame() {
   return new Promise((resolve) => requestAnimationFrame(() => resolve()))
+}
+
+function descendantIds(id, agents) {
+  const byParent = new Map()
+  for (const agent of agents) {
+    if (!agent.parent_id) continue
+    const children = byParent.get(agent.parent_id) || []
+    children.push(agent)
+    byParent.set(agent.parent_id, children)
+  }
+  const ids = new Set()
+  const visit = (parentId) => {
+    for (const child of byParent.get(parentId) || []) {
+      ids.add(child.id)
+      visit(child.id)
+    }
+  }
+  visit(id)
+  return ids
 }

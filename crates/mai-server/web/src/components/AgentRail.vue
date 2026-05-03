@@ -9,18 +9,26 @@
     </div>
     <div class="agent-list">
       <button
-        v-for="agent in agents"
-        :key="agent.id"
+        v-for="row in treeRows"
+        :key="row.agent.id"
         class="agent-row"
-        :class="{ active: selectedId === agent.id }"
-        @click="$emit('select', agent.id)"
+        :class="{ active: selectedId === row.agent.id, orphan: row.is_orphan, nested: row.depth > 0 }"
+        :style="{ '--tree-indent': `${10 + row.depth * 20}px` }"
+        @click="$emit('select', row.agent.id)"
       >
-        <span class="avatar">{{ initial(agent.name) }}</span>
+        <span class="tree-guide" aria-hidden="true"></span>
+        <span class="avatar">{{ initial(row.agent.name) }}</span>
         <span class="agent-row-main">
-          <span class="agent-name">{{ agent.name }}</span>
-          <span class="agent-meta">{{ agent.provider_name }} / {{ agent.model }}</span>
+          <span class="agent-name">
+            <span class="agent-name-text">{{ row.agent.name }}</span>
+            <span v-if="row.child_count" class="agent-child-count">{{ row.child_count }}</span>
+          </span>
+          <span class="agent-meta">
+            {{ row.agent.provider_name }} / {{ row.agent.model }}
+            <span v-if="row.is_orphan"> (detached)</span>
+          </span>
         </span>
-        <span class="status-dot" :class="statusTone(agent.status)" :title="formatStatus(agent.status)" />
+        <span class="status-dot" :class="statusTone(row.agent.status)" :title="formatStatus(row.agent.status)" />
       </button>
       <div v-if="!agents.length" class="empty-rail">
         <strong>No agents yet</strong>
@@ -31,13 +39,17 @@
 </template>
 
 <script setup>
+import { computed } from 'vue'
 import { initial, statusTone, formatStatus } from '../utils/format'
+import { buildAgentTreeRows } from '../utils/agentTree'
 
-defineProps({
+const props = defineProps({
   agents: { type: Array, required: true },
   selectedId: { type: String, default: null },
   visible: { type: Boolean, default: true }
 })
 
 defineEmits(['select', 'create'])
+
+const treeRows = computed(() => buildAgentTreeRows(props.agents))
 </script>

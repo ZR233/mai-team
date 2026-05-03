@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Stdio;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::process::{Child, Command};
 
@@ -57,6 +58,13 @@ impl DockerClient {
     pub fn new(image: impl Into<String>) -> Self {
         Self {
             binary: "docker".to_string(),
+            image: image.into(),
+        }
+    }
+
+    pub fn new_with_binary(image: impl Into<String>, binary: impl Into<String>) -> Self {
+        Self {
+            binary: binary.into(),
             image: image.into(),
         }
     }
@@ -143,22 +151,43 @@ impl DockerClient {
     }
 
     pub async fn create_agent_container(&self, agent_id: &str) -> Result<ContainerHandle> {
-        let name = format!("mai-team-{agent_id}");
+        self.create_agent_container_from_image(agent_id, &self.image)
+            .await
+    }
+
+    pub async fn create_agent_container_from_parent(
+        &self,
+        agent_id: &str,
+        parent_container_id: &str,
+    ) -> Result<ContainerHandle> {
+        let image = snapshot_image_name(agent_id);
+        let commit = Command::new(&self.binary)
+            .args(["commit", parent_container_id, &image])
+            .output()
+            .await?;
+        if !commit.status.success() {
+            return Err(DockerError::CommandFailed(stderr_or_stdout(&commit)));
+        }
+
+        let result = self
+            .create_agent_container_from_image(agent_id, &image)
+            .await;
+        if let Err(err) = self.delete_image(&image).await {
+            tracing::warn!(image = %image, "failed to remove temporary snapshot image: {err}");
+        }
+        result
+    }
+
+    async fn create_agent_container_from_image(
+        &self,
+        agent_id: &str,
+        image: &str,
+    ) -> Result<ContainerHandle> {
+        let name = agent_container_name(agent_id);
+        let label = agent_label(agent_id);
+        let args = create_agent_container_args(&name, &label, image);
         let create = Command::new(&self.binary)
-            .args([
-                "create",
-                "--name",
-                &name,
-                "--label",
-                MANAGED_LABEL,
-                "--label",
-                &format!("{AGENT_LABEL_KEY}={agent_id}"),
-                "-w",
-                "/workspace",
-                &self.image,
-                "sleep",
-                "infinity",
-            ])
+            .args(args.iter().map(String::as_str))
             .output()
             .await?;
         if !create.status.success() {
@@ -179,7 +208,7 @@ impl DockerClient {
         Ok(ContainerHandle {
             id,
             name,
-            image: self.image.clone(),
+            image: image.to_string(),
         })
     }
 
@@ -204,6 +233,21 @@ impl DockerClient {
         if !output.status.success() {
             let message = stderr_or_stdout(&output);
             if is_missing_container_error(&message) {
+                return Ok(());
+            }
+            return Err(DockerError::CommandFailed(message));
+        }
+        Ok(())
+    }
+
+    async fn delete_image(&self, image: &str) -> Result<()> {
+        let output = Command::new(&self.binary)
+            .args(["rmi", "-f", image])
+            .output()
+            .await?;
+        if !output.status.success() {
+            let message = stderr_or_stdout(&output);
+            if is_missing_image_error(&message) {
                 return Ok(());
             }
             return Err(DockerError::CommandFailed(message));
@@ -442,6 +486,47 @@ fn is_missing_container_error(message: &str) -> bool {
     message.contains("no such container") || message.contains("no such object")
 }
 
+fn is_missing_image_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("no such image") || message.contains("no such object")
+}
+
+fn agent_container_name(agent_id: &str) -> String {
+    format!("mai-team-{agent_id}")
+}
+
+fn agent_label(agent_id: &str) -> String {
+    format!("{AGENT_LABEL_KEY}={agent_id}")
+}
+
+fn create_agent_container_args(name: &str, agent_label: &str, image: &str) -> Vec<String> {
+    [
+        "create",
+        "--name",
+        name,
+        "--label",
+        MANAGED_LABEL,
+        "--label",
+        agent_label,
+        "-w",
+        "/workspace",
+        image,
+        "sleep",
+        "infinity",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn snapshot_image_name(agent_id: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("mai-team-snapshot-{agent_id}-{nanos}")
+}
+
 impl ManagedContainer {
     fn matches_identifier(&self, identifier: &str) -> bool {
         let identifier = identifier.trim().trim_start_matches('/');
@@ -630,6 +715,41 @@ mod tests {
                 .map(|container| container.id.as_str()),
             Some("owned-fallback")
         );
+    }
+
+    #[test]
+    fn create_agent_container_args_include_labels_workspace_and_image() {
+        let args = create_agent_container_args(
+            "mai-team-child",
+            "mai.team.agent=child",
+            "mai-team-snapshot-child-1",
+        );
+
+        assert_eq!(args[0], "create");
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--name", "mai-team-child"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--label", MANAGED_LABEL])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--label", "mai.team.agent=child"])
+        );
+        assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
+        assert!(
+            args.windows(3)
+                .any(|window| { window == ["mai-team-snapshot-child-1", "sleep", "infinity"] })
+        );
+    }
+
+    #[test]
+    fn snapshot_image_name_uses_agent_id_and_snapshot_prefix() {
+        let image = snapshot_image_name("child-agent");
+
+        assert!(image.starts_with("mai-team-snapshot-child-agent-"));
     }
 
     fn managed(id: &str, agent_id: Option<&str>) -> ManagedContainer {
