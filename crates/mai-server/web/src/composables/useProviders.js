@@ -214,20 +214,5 @@ function normalizeReasoning(model) {
       })).filter((variant) => variant.id)
     }
   }
-  const efforts = Array.isArray(model.reasoning_efforts)
-    ? model.reasoning_efforts.map((value) => String(value || '').trim()).filter(Boolean)
-    : []
-  if (!model.supports_reasoning || !efforts.length) return null
-  return {
-    default_variant: model.default_reasoning_effort || efforts[0],
-    variants: efforts.map((id) => ({
-      id,
-      label: null,
-      request: {
-        reasoning: {
-          effort: id
-        }
-      }
-    }))
-  }
+  return null
 }

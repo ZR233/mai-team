@@ -15,11 +15,9 @@ use toasty::stmt::{List, Query};
 use toasty_driver_sqlite::Sqlite;
 use uuid::Uuid;
 
-const SETTING_DEFAULT_PROVIDER_ID: &str = "default_provider_id";
 const SETTING_AGENT_CONFIG: &str = "agent_config";
-const SETTING_LEGACY_TOML_IMPORTED: &str = "legacy_toml_imported";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-const SCHEMA_VERSION: &str = "4";
+const SCHEMA_VERSION: &str = "5";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const DEEPSEEK_V4_CONTEXT_TOKENS: u64 = 1_000_000;
 const DEEPSEEK_V4_OUTPUT_TOKENS: u64 = 384_000;
@@ -77,12 +75,6 @@ pub struct RuntimeSnapshot {
     pub next_sequence: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct LegacyMcpFileConfig {
-    #[serde(default)]
-    mcp_servers: BTreeMap<String, McpServerConfig>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct ProvidersToml {
@@ -120,40 +112,10 @@ struct ModelToml {
     supports_tools: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reasoning: Option<ModelReasoningConfig>,
-    #[serde(default, skip_serializing)]
-    supports_reasoning: bool,
-    #[serde(default, skip_serializing)]
-    reasoning_efforts: Vec<String>,
-    #[serde(default, skip_serializing)]
-    default_reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "is_null")]
     options: serde_json::Value,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     headers: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, toasty::Model)]
-#[table = "providers"]
-struct ProviderRecord {
-    #[key]
-    id: String,
-    name: String,
-    base_url: String,
-    api_key: String,
-    default_model: String,
-    enabled: bool,
-    sort_order: i64,
-}
-
-#[derive(Debug, Clone, toasty::Model)]
-#[table = "provider_models"]
-struct ProviderModelRecord {
-    #[key]
-    id: String,
-    #[index]
-    provider_id: String,
-    model: String,
-    sort_order: i64,
 }
 
 #[derive(Debug, Clone, toasty::Model)]
@@ -310,7 +272,6 @@ impl ConfigStore {
             config_path,
             db,
         };
-        store.clear_legacy_provider_storage().await?;
         Ok(store)
     }
 
@@ -335,10 +296,6 @@ impl ConfigStore {
 
     pub fn config_path(&self) -> &Path {
         &self.config_path
-    }
-
-    pub async fn migrate(&self) -> Result<()> {
-        Ok(())
     }
 
     pub async fn seed_default_provider_from_env(
@@ -532,7 +489,7 @@ impl ConfigStore {
                 models: provider
                     .models
                     .into_iter()
-                    .map(|(id, model)| model.into_model(id, provider.kind))
+                    .map(|(id, model)| model.into_model(id))
                     .collect(),
                 id,
                 kind: provider.kind,
@@ -559,10 +516,13 @@ impl ConfigStore {
             Err(err) => return Err(err.into()),
         };
         match toml::from_str::<ProvidersToml>(&text) {
-            Ok(mut file) => {
-                normalize_provider_file(&mut file);
-                Ok(file)
-            }
+            Ok(file) => match validate_providers_toml(&file) {
+                Ok(()) => Ok(file),
+                Err(_) => {
+                    let _ = std::fs::remove_file(&self.config_path);
+                    Ok(ProvidersToml::default())
+                }
+            },
             Err(_) => {
                 let _ = std::fs::remove_file(&self.config_path);
                 Ok(ProvidersToml::default())
@@ -576,22 +536,6 @@ impl ConfigStore {
         }
         let text = toml::to_string_pretty(file)?;
         std::fs::write(&self.config_path, text)?;
-        Ok(())
-    }
-
-    async fn clear_legacy_provider_storage(&self) -> Result<()> {
-        let mut db = self.db.clone();
-        let mut tx = db.transaction().await?;
-        Query::<List<ProviderModelRecord>>::all()
-            .delete()
-            .exec(&mut tx)
-            .await?;
-        Query::<List<ProviderRecord>>::all()
-            .delete()
-            .exec(&mut tx)
-            .await?;
-        delete_setting_in_tx(&mut tx, SETTING_DEFAULT_PROVIDER_ID).await?;
-        tx.commit().await?;
         Ok(())
     }
 
@@ -664,30 +608,6 @@ impl ConfigStore {
         Ok(())
     }
 
-    pub async fn import_legacy_toml_once(&self, path: impl AsRef<Path>) -> Result<bool> {
-        if self
-            .get_setting(SETTING_LEGACY_TOML_IMPORTED)
-            .await?
-            .as_deref()
-            == Some("1")
-        {
-            return Ok(false);
-        }
-        if !path.as_ref().exists() || !self.list_mcp_servers().await?.is_empty() {
-            self.set_setting(SETTING_LEGACY_TOML_IMPORTED, "1").await?;
-            return Ok(false);
-        }
-        let text = std::fs::read_to_string(path)?;
-        let legacy: LegacyMcpFileConfig = toml::from_str(&text)?;
-        if legacy.mcp_servers.is_empty() {
-            self.set_setting(SETTING_LEGACY_TOML_IMPORTED, "1").await?;
-            return Ok(false);
-        }
-        self.save_mcp_servers(&legacy.mcp_servers).await?;
-        self.set_setting(SETTING_LEGACY_TOML_IMPORTED, "1").await?;
-        Ok(true)
-    }
-
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
         get_setting_on(&self.db, key).await
     }
@@ -701,7 +621,16 @@ impl ConfigStore {
         let Some(value) = self.get_setting(SETTING_AGENT_CONFIG).await? else {
             return Ok(AgentConfigRequest::default());
         };
-        Ok(serde_json::from_str(&value).unwrap_or_default())
+        match serde_json::from_str(&value) {
+            Ok(config) => Ok(config),
+            Err(_) => {
+                let mut db = self.db.clone();
+                let mut tx = db.transaction().await?;
+                delete_setting_in_tx(&mut tx, SETTING_AGENT_CONFIG).await?;
+                tx.commit().await?;
+                Ok(AgentConfigRequest::default())
+            }
+        }
     }
 
     pub async fn save_agent_config(&self, config: &AgentConfigRequest) -> Result<()> {
@@ -1115,8 +1044,6 @@ impl AgentMessageRecord {
 async fn build_db(path: &Path) -> Result<Db> {
     let mut builder = Db::builder();
     builder.models(toasty::models!(
-        ProviderRecord,
-        ProviderModelRecord,
         McpServerRecord,
         McpServerEnvRecord,
         SettingRecord,
@@ -1188,78 +1115,23 @@ impl ModelToml {
             output_tokens: model.output_tokens,
             supports_tools: model.supports_tools,
             reasoning: model.reasoning,
-            supports_reasoning: false,
-            reasoning_efforts: Vec::new(),
-            default_reasoning_effort: None,
             options: model.options,
             headers: model.headers,
         }
     }
 
-    fn into_model(self, id: String, provider_kind: ProviderKind) -> ModelConfig {
-        let reasoning = self.reasoning.or_else(|| {
-            legacy_reasoning_config(
-                provider_kind,
-                self.supports_reasoning,
-                self.reasoning_efforts,
-                self.default_reasoning_effort,
-            )
-        });
+    fn into_model(self, id: String) -> ModelConfig {
         ModelConfig {
             id,
             name: self.name,
             context_tokens: self.context_tokens,
             output_tokens: self.output_tokens,
             supports_tools: self.supports_tools,
-            reasoning,
+            reasoning: self.reasoning,
             options: self.options,
             headers: self.headers,
         }
     }
-}
-
-fn legacy_reasoning_config(
-    provider_kind: ProviderKind,
-    supports_reasoning: bool,
-    reasoning_efforts: Vec<String>,
-    default_reasoning_effort: Option<String>,
-) -> Option<ModelReasoningConfig> {
-    if !supports_reasoning {
-        return None;
-    }
-    let variants = reasoning_efforts
-        .into_iter()
-        .filter_map(|effort| {
-            let id = effort.trim().to_lowercase();
-            (!id.is_empty()).then(|| match provider_kind {
-                ProviderKind::Deepseek => ModelReasoningVariant {
-                    request: serde_json::json!({
-                        "thinking": {
-                            "type": "enabled",
-                        },
-                        "reasoning_effort": id,
-                    }),
-                    id,
-                    label: None,
-                },
-                ProviderKind::Openai => ModelReasoningVariant {
-                    request: serde_json::json!({
-                        "reasoning": {
-                            "effort": id,
-                        },
-                    }),
-                    id,
-                    label: None,
-                },
-            })
-        })
-        .collect::<Vec<_>>();
-    (!variants.is_empty()).then(|| ModelReasoningConfig {
-        default_variant: default_reasoning_effort
-            .map(|value| value.trim().to_lowercase())
-            .filter(|value| !value.is_empty()),
-        variants,
-    })
 }
 
 fn provider_preset(kind: ProviderKind) -> ProviderPreset {
@@ -1339,15 +1211,14 @@ fn openai_reasoning_model(id: &str, context_tokens: u64, output_tokens: u64) -> 
     }
 }
 
-fn deepseek_model(id: &str, supports_reasoning: bool) -> ModelConfig {
+fn deepseek_model(id: &str, with_reasoning: bool) -> ModelConfig {
     ModelConfig {
         id: id.to_string(),
         name: Some(id.to_string()),
         context_tokens: deepseek_context_tokens(id),
         output_tokens: deepseek_output_tokens(id),
         supports_tools: true,
-        reasoning: supports_reasoning
-            .then(|| deepseek_reasoning_config(vec!["high", "max"], "high")),
+        reasoning: with_reasoning.then(|| deepseek_reasoning_config(vec!["high", "max"], "high")),
         options: serde_json::Value::Null,
         headers: BTreeMap::new(),
     }
@@ -1413,30 +1284,6 @@ fn is_deepseek_v4_model(id: &str) -> bool {
     )
 }
 
-fn normalize_provider_file(file: &mut ProvidersToml) {
-    for provider in file.providers.values_mut() {
-        normalize_provider_models(provider);
-    }
-}
-
-fn normalize_provider_models(provider: &mut ProviderToml) {
-    if provider.kind != ProviderKind::Deepseek {
-        return;
-    }
-    for (id, model) in provider.models.iter_mut() {
-        if is_deepseek_v4_model(id) {
-            model.context_tokens = DEEPSEEK_V4_CONTEXT_TOKENS;
-            model.output_tokens = DEEPSEEK_V4_OUTPUT_TOKENS;
-        }
-    }
-    if let Some(model) = provider.models.get_mut("deepseek-v4-pro") {
-        model.reasoning = Some(deepseek_reasoning_config(vec!["high", "max"], "high"));
-        model.supports_reasoning = false;
-        model.reasoning_efforts = Vec::new();
-        model.default_reasoning_effort = None;
-    }
-}
-
 fn fallback_model(id: &str) -> ModelConfig {
     ModelConfig {
         id: id.to_string(),
@@ -1468,6 +1315,32 @@ fn normalized_id(value: &str) -> String {
 
 fn is_null(value: &serde_json::Value) -> bool {
     value.is_null()
+}
+
+fn validate_providers_toml(file: &ProvidersToml) -> Result<()> {
+    let providers = file
+        .providers
+        .iter()
+        .map(|(id, provider)| ProviderConfig {
+            id: id.clone(),
+            kind: provider.kind,
+            name: provider.name.clone(),
+            base_url: provider.base_url.clone(),
+            api_key: provider.api_key.clone(),
+            api_key_env: provider.api_key_env.clone(),
+            default_model: provider.default_model.clone(),
+            enabled: provider.enabled,
+            models: provider
+                .models
+                .iter()
+                .map(|(model_id, model)| model.clone().into_model(model_id.clone()))
+                .collect(),
+        })
+        .collect();
+    validate_provider_request(&ProvidersConfigRequest {
+        default_provider_id: file.default_provider_id.clone(),
+        providers,
+    })
 }
 
 fn validate_provider_request(request: &ProvidersConfigRequest) -> Result<()> {
@@ -1761,19 +1634,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_is_idempotent() {
-        let (dir, store) = store().await;
-        store.migrate().await.expect("migrate twice");
-        drop(store);
-        ConfigStore::open_with_config_path(
-            dir.path().join("config.sqlite3"),
-            dir.path().join("config.toml"),
-        )
-        .await
-        .expect("reopen existing store");
-    }
-
-    #[tokio::test]
     async fn provider_response_is_redacted_and_preserves_empty_key() {
         let (_dir, store) = store().await;
         store
@@ -1820,7 +1680,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_config_defaults_when_missing_and_survives_invalid_json() {
+    async fn agent_config_defaults_when_missing_and_clears_invalid_json() {
         let (_dir, store) = store().await;
         assert_eq!(
             store.load_agent_config().await.expect("missing config"),
@@ -1833,6 +1693,31 @@ mod tests {
         assert_eq!(
             store.load_agent_config().await.expect("invalid config"),
             AgentConfigRequest::default()
+        );
+        assert_eq!(
+            store
+                .get_setting(SETTING_AGENT_CONFIG)
+                .await
+                .expect("setting"),
+            None
+        );
+        store
+            .set_setting(
+                SETTING_AGENT_CONFIG,
+                r#"{"research_agent":{"provider_id":"openai","model":"gpt-5.4"}}"#,
+            )
+            .await
+            .expect("write old config");
+        assert_eq!(
+            store.load_agent_config().await.expect("old config"),
+            AgentConfigRequest::default()
+        );
+        assert_eq!(
+            store
+                .get_setting(SETTING_AGENT_CONFIG)
+                .await
+                .expect("setting"),
+            None
         );
     }
 
@@ -1848,11 +1733,6 @@ mod tests {
                 reasoning_effort: Some("high".to_string()),
             }),
             reviewer: None,
-            research_agent: Some(mai_protocol::AgentModelPreference {
-                provider_id: "openai".to_string(),
-                model: "gpt-5.4".to_string(),
-                reasoning_effort: Some("high".to_string()),
-            }),
         };
         store.save_agent_config(&config).await.expect("save config");
         drop(store);
@@ -1926,60 +1806,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_deepseek_v4_pro_metadata_is_upgraded() {
-        let dir = tempdir().expect("tempdir");
-        let config_path = dir.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-                default_provider_id = "deepseek"
-
-                [providers.deepseek]
-                kind = "deepseek"
-                name = "DeepSeek"
-                base_url = "https://api.deepseek.com"
-                api_key = "secret"
-                default_model = "deepseek-v4-pro"
-                enabled = true
-
-                [providers.deepseek.models.deepseek-v4-pro]
-                name = "deepseek-v4-pro"
-                context_tokens = 128000
-                output_tokens = 8192
-                supports_tools = true
-                supports_reasoning = false
-                reasoning_efforts = []
-            "#,
-        )
-        .expect("write config");
-        let store =
-            ConfigStore::open_with_config_path(dir.path().join("config.sqlite3"), &config_path)
-                .await
-                .expect("open");
-
-        let response = store.providers_response().await.expect("providers");
-        let model = response.providers[0]
-            .models
-            .iter()
-            .find(|model| model.id == "deepseek-v4-pro")
-            .expect("deepseek v4 pro");
-        assert_eq!(model.context_tokens, DEEPSEEK_V4_CONTEXT_TOKENS);
-        assert_eq!(model.output_tokens, DEEPSEEK_V4_OUTPUT_TOKENS);
-        let reasoning = model.reasoning.as_ref().expect("reasoning variants");
-        assert_eq!(reasoning.default_variant.as_deref(), Some("high"));
-        assert_eq!(reasoning.variants.len(), 2);
-        assert_eq!(
-            reasoning.variants[0].request,
-            json!({
-                "thinking": {
-                    "type": "enabled",
-                },
-                "reasoning_effort": "high",
-            })
-        );
-    }
-
-    #[tokio::test]
     async fn provider_toml_preserves_custom_model_metadata() {
         let (_dir, store) = store().await;
         let mut provider = provider(Some("secret"));
@@ -2015,7 +1841,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_provider_toml_schema_is_cleaned() {
+    async fn old_provider_toml_schema_is_rebuilt() {
         let dir = tempdir().expect("tempdir");
         let config_path = dir.path().join("config.toml");
         std::fs::write(
@@ -2036,33 +1862,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn imports_legacy_mcp_config_once() {
+    async fn old_reasoning_toml_schema_is_rebuilt() {
         let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
+        let config_path = dir.path().join("config.toml");
         std::fs::write(
-            &path,
+            &config_path,
             r#"
-                [mcp_servers.demo]
-                command = "demo-mcp"
-                args = ["--stdio"]
+                default_provider_id = "deepseek"
+
+                [providers.deepseek]
+                kind = "deepseek"
+                name = "DeepSeek"
+                base_url = "https://api.deepseek.com"
+                api_key = "secret"
+                default_model = "deepseek-v4-pro"
                 enabled = true
 
-                [mcp_servers.demo.env]
-                TOKEN = "abc"
+                [providers.deepseek.models.deepseek-v4-pro]
+                name = "deepseek-v4-pro"
+                context_tokens = 128000
+                output_tokens = 8192
+                supports_tools = true
+                supports_reasoning = true
+                reasoning_efforts = ["high", "max"]
+                default_reasoning_effort = "high"
             "#,
         )
-        .expect("write legacy");
-        let store = ConfigStore::open_with_config_path(
-            dir.path().join("config.sqlite3"),
-            dir.path().join("providers.toml"),
-        )
-        .await
-        .expect("open");
-        assert!(store.import_legacy_toml_once(&path).await.expect("import"));
-        assert!(!store.import_legacy_toml_once(&path).await.expect("skip"));
-        let servers = store.list_mcp_servers().await.expect("servers");
-        assert_eq!(servers["demo"].command, "demo-mcp");
-        assert_eq!(servers["demo"].env["TOKEN"], "abc");
+        .expect("write old config");
+        let store =
+            ConfigStore::open_with_config_path(dir.path().join("config.sqlite3"), &config_path)
+                .await
+                .expect("open");
+
+        assert_eq!(store.provider_count().await.expect("count"), 0);
+        assert!(!config_path.exists());
     }
 
     #[tokio::test]
@@ -2381,7 +2214,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_schema_without_marker_is_rebuilt() {
+    async fn invalid_sqlite_file_is_rebuilt() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.sqlite3");
         std::fs::write(&path, b"not sqlite").expect("write invalid old db");
@@ -2389,5 +2222,52 @@ mod tests {
             .await
             .expect("rebuild");
         assert_eq!(store.provider_count().await.expect("count"), 0);
+    }
+
+    #[tokio::test]
+    async fn schema_version_mismatch_rebuilds_database() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("config.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("open");
+        store
+            .save_mcp_servers(&BTreeMap::from([(
+                "demo".to_string(),
+                McpServerConfig {
+                    command: "demo-mcp".to_string(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                    cwd: None,
+                    enabled: true,
+                },
+            )]))
+            .await
+            .expect("save server");
+        store
+            .set_setting(SETTING_SCHEMA_VERSION, "4")
+            .await
+            .expect("mark old schema");
+        drop(store);
+
+        let reopened = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("reopen");
+        assert_eq!(
+            reopened
+                .get_setting(SETTING_SCHEMA_VERSION)
+                .await
+                .expect("schema marker")
+                .as_deref(),
+            Some(SCHEMA_VERSION)
+        );
+        assert!(
+            reopened
+                .list_mcp_servers()
+                .await
+                .expect("servers")
+                .is_empty()
+        );
     }
 }

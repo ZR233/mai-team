@@ -19,19 +19,13 @@ export function reasoningOptionsFor(provider, model) {
       }))
       .filter((option, index, items) => items.findIndex((item) => item.value === option.value) === index)
   }
-  const configuredEfforts = Array.isArray(model?.reasoning_efforts) ? model.reasoning_efforts : []
-  if (!model?.supports_reasoning || !configuredEfforts.length) return []
-  return configuredEfforts
-    .filter(Boolean)
-    .map((value) => String(value))
-    .filter((value, index, items) => items.indexOf(value) === index)
-    .map((value) => ({ value, label: reasoningLabel(value) }))
+  return []
 }
 
 export function defaultReasoningEffort(provider, model) {
   const options = reasoningOptionsFor(provider, model)
   if (!options.length) return ''
-  const configured = String(model?.reasoning?.default_variant || model?.default_reasoning_effort || '')
+  const configured = String(model?.reasoning?.default_variant || '')
   return options.some((option) => option.value === configured)
     ? configured
     : options[0].value

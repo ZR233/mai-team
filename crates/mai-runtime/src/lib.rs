@@ -242,10 +242,8 @@ impl AgentRuntime {
             reviewer,
             effective_planner,
             effective_explorer,
-            effective_executor: effective_executor.clone(),
+            effective_executor,
             effective_reviewer,
-            research_agent: config.research_agent.clone(),
-            effective_research_agent: effective_executor.clone(),
             validation_error,
         })
     }
@@ -1915,10 +1913,10 @@ fn resolved_agent_model_preference(
 
 fn role_preference(config: &AgentConfigRequest, role: AgentRole) -> Option<&AgentModelPreference> {
     match role {
-        AgentRole::Planner => config.planner.as_ref().or(config.research_agent.as_ref()),
-        AgentRole::Explorer => config.explorer.as_ref().or(config.research_agent.as_ref()),
-        AgentRole::Executor => config.executor.as_ref().or(config.research_agent.as_ref()),
-        AgentRole::Reviewer => config.reviewer.as_ref().or(config.research_agent.as_ref()),
+        AgentRole::Planner => config.planner.as_ref(),
+        AgentRole::Explorer => config.explorer.as_ref(),
+        AgentRole::Executor => config.executor.as_ref(),
+        AgentRole::Reviewer => config.reviewer.as_ref(),
     }
 }
 
@@ -3720,7 +3718,6 @@ esac
         .expect("runtime");
 
         let config = runtime.agent_config().await.expect("config");
-        assert_eq!(config.research_agent, None);
         assert_eq!(config.planner, None);
         assert_eq!(config.explorer, None);
         assert_eq!(config.executor, None);
@@ -3866,7 +3863,7 @@ esac
     }
 
     #[tokio::test]
-    async fn spawn_agent_uses_role_config_over_parent_and_legacy_args() {
+    async fn spawn_agent_uses_role_config_over_parent_defaults() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("runtime.sqlite3");
         let config_path = dir.path().join("config.toml");
@@ -3904,7 +3901,6 @@ esac
                     model: "gpt-5.4".to_string(),
                     reasoning_effort: Some("high".to_string()),
                 }),
-                research_agent: None,
             })
             .await
             .expect("save config");
@@ -3992,39 +3988,6 @@ esac
                 .as_deref()
                 .unwrap_or_default()
                 .contains("Reviewer role")
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_research_agent_config_maps_to_roles() {
-        let dir = tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime.sqlite3");
-        let config_path = dir.path().join("config.toml");
-        let store = Arc::new(
-            ConfigStore::open_with_config_path(&db_path, &config_path)
-                .await
-                .expect("open store"),
-        );
-        store
-            .save_providers(ProvidersConfigRequest {
-                providers: vec![test_provider(), alt_test_provider()],
-                default_provider_id: Some("openai".to_string()),
-            })
-            .await
-            .expect("save providers");
-        store
-            .set_setting(
-                "agent_config",
-                r#"{"research_agent":{"provider_id":"alt","model":"alt-research","reasoning_effort":"low"}}"#,
-            )
-            .await
-            .expect("save legacy config");
-        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
-        let config = runtime.agent_config().await.expect("config");
-        assert_eq!(config.executor.expect("executor").model, "alt-research");
-        assert_eq!(
-            config.effective_reviewer.expect("reviewer fallback").model,
-            "alt-research"
         );
     }
 

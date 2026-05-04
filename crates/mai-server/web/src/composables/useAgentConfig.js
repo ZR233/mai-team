@@ -57,11 +57,11 @@ export function useAgentConfig() {
 function applyAgentConfigResponse(response) {
   agentConfigState.planner = response?.planner || null
   agentConfigState.explorer = response?.explorer || null
-  agentConfigState.executor = response?.executor || response?.research_agent || null
+  agentConfigState.executor = response?.executor || null
   agentConfigState.reviewer = response?.reviewer || null
   agentConfigState.effective_planner = response?.effective_planner || null
   agentConfigState.effective_explorer = response?.effective_explorer || null
-  agentConfigState.effective_executor = response?.effective_executor || response?.effective_research_agent || null
+  agentConfigState.effective_executor = response?.effective_executor || null
   agentConfigState.effective_reviewer = response?.effective_reviewer || null
   agentConfigState.validation_error = response?.validation_error || ''
 }

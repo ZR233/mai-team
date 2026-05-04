@@ -239,7 +239,6 @@ fn parse_tool(server: &str, value: Value) -> Option<McpTool> {
         .to_string();
     let input_schema = value
         .get("inputSchema")
-        .or_else(|| value.get("input_schema"))
         .cloned()
         .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
     Some(McpTool {
