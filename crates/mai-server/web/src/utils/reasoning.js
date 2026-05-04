@@ -9,22 +9,29 @@ const EFFORT_LABELS = {
 }
 
 export function reasoningOptionsFor(provider, model) {
-  if (!model?.supports_reasoning) return []
-  const configuredEfforts = Array.isArray(model.reasoning_efforts) ? model.reasoning_efforts : []
-  const efforts = configuredEfforts.length
-    ? configuredEfforts
-    : provider?.kind === 'deepseek' ? ['high', 'max'] : []
-  return efforts
+  const variants = Array.isArray(model?.reasoning?.variants) ? model.reasoning.variants : []
+  if (variants.length) {
+    return variants
+      .filter((variant) => variant?.id)
+      .map((variant) => ({
+        value: String(variant.id),
+        label: variant.label || reasoningLabel(variant.id)
+      }))
+      .filter((option, index, items) => items.findIndex((item) => item.value === option.value) === index)
+  }
+  const configuredEfforts = Array.isArray(model?.reasoning_efforts) ? model.reasoning_efforts : []
+  if (!model?.supports_reasoning || !configuredEfforts.length) return []
+  return configuredEfforts
     .filter(Boolean)
-    .map((value) => String(value).toLowerCase())
+    .map((value) => String(value))
     .filter((value, index, items) => items.indexOf(value) === index)
-    .map((value) => ({ value, label: EFFORT_LABELS[value] || value }))
+    .map((value) => ({ value, label: reasoningLabel(value) }))
 }
 
 export function defaultReasoningEffort(provider, model) {
   const options = reasoningOptionsFor(provider, model)
   if (!options.length) return ''
-  const configured = String(model?.default_reasoning_effort || '').toLowerCase()
+  const configured = String(model?.reasoning?.default_variant || model?.default_reasoning_effort || '')
   return options.some((option) => option.value === configured)
     ? configured
     : options[0].value
@@ -32,6 +39,8 @@ export function defaultReasoningEffort(provider, model) {
 
 export function reasoningLabel(value) {
   if (!value) return ''
-  const normalized = String(value).toLowerCase()
-  return EFFORT_LABELS[normalized] || normalized
+  const normalized = String(value)
+  return EFFORT_LABELS[normalized.toLowerCase()] || normalized
+    .replace(/[_-]+/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase())
 }

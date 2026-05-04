@@ -8,9 +8,8 @@ use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentMessage,
     AgentModelPreference, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary, ContextUsage,
     CreateAgentRequest, MessageRole, ModelConfig, ModelContentItem, ModelInputItem,
-    ModelOutputItem, ModelToolCall, ProviderKind, ReasoningEffort, ResolvedAgentModelPreference,
-    ServiceEvent, ServiceEventKind, SessionId, TokenUsage, ToolTraceDetail, TurnId, TurnStatus,
-    UpdateAgentRequest, now, preview,
+    ModelOutputItem, ModelToolCall, ResolvedAgentModelPreference, ServiceEvent, ServiceEventKind,
+    SessionId, TokenUsage, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest, now, preview,
 };
 use mai_skills::SkillsManager;
 use mai_store::{ConfigStore, ProviderSelection};
@@ -287,9 +286,8 @@ impl AgentRuntime {
             .resolve_provider(request.provider_id.as_deref(), request.model.as_deref())
             .await?;
         let reasoning_effort = normalize_reasoning_effort(
-            provider_selection.provider.kind,
             &provider_selection.model,
-            request.reasoning_effort,
+            request.reasoning_effort.as_deref(),
             true,
         )?;
         let docker_image = self.resolve_docker_image(request.docker_image.as_deref());
@@ -396,9 +394,8 @@ impl AgentRuntime {
             current.reasoning_effort
         };
         let reasoning_effort = normalize_reasoning_effort(
-            provider_selection.provider.kind,
             &provider_selection.model,
-            requested_reasoning_effort,
+            requested_reasoning_effort.as_deref(),
             true,
         )?;
         let updated = {
@@ -1625,9 +1622,8 @@ impl AgentRuntime {
             )
             .await?;
         let reasoning_effort = normalize_reasoning_effort(
-            selection.provider.kind,
             &selection.model,
-            preference.and_then(|item| item.reasoning_effort),
+            preference.and_then(|item| item.reasoning_effort.as_deref()),
             true,
         )?;
         Ok(resolved_agent_model(selection, reasoning_effort))
@@ -1888,9 +1884,9 @@ fn parse_session_id(value: &str) -> Result<SessionId> {
 
 fn resolved_agent_model(
     selection: ProviderSelection,
-    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_effort: Option<String>,
 ) -> ResolvedAgentModel {
-    let effective = resolved_agent_model_preference(selection.clone(), reasoning_effort);
+    let effective = resolved_agent_model_preference(selection.clone(), reasoning_effort.clone());
     ResolvedAgentModel {
         preference: AgentModelPreference {
             provider_id: selection.provider.id.clone(),
@@ -1903,7 +1899,7 @@ fn resolved_agent_model(
 
 fn resolved_agent_model_preference(
     selection: ProviderSelection,
-    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_effort: Option<String>,
 ) -> ResolvedAgentModelPreference {
     ResolvedAgentModelPreference {
         provider_id: selection.provider.id,
@@ -1985,68 +1981,40 @@ fn push_delete_order(
 }
 
 fn normalize_reasoning_effort(
-    provider_kind: ProviderKind,
     model: &ModelConfig,
-    effort: Option<ReasoningEffort>,
+    effort: Option<&str>,
     default_when_missing: bool,
-) -> Result<Option<ReasoningEffort>> {
-    if !model.supports_reasoning {
+) -> Result<Option<String>> {
+    let Some(reasoning) = &model.reasoning else {
         return Ok(None);
-    }
+    };
     match effort {
-        Some(ReasoningEffort::None) => Ok(None),
-        Some(effort) if supported_reasoning_efforts(provider_kind, model).contains(&effort) => {
-            Ok(Some(effort))
+        Some(value) if value.trim().is_empty() || value == "none" => Ok(None),
+        Some(value) if reasoning.variants.iter().any(|variant| variant.id == value) => {
+            Ok(Some(value.to_string()))
         }
         Some(effort) => Err(RuntimeError::InvalidInput(format!(
             "reasoning effort `{}` is not supported by model `{}`",
-            reasoning_effort_label(effort),
-            model.id
+            effort, model.id
         ))),
-        None if default_when_missing => Ok(default_reasoning_effort(provider_kind, model)),
+        None if default_when_missing => Ok(default_reasoning_effort(model)),
         None => Ok(None),
     }
 }
 
-fn supported_reasoning_efforts(
-    provider_kind: ProviderKind,
-    model: &ModelConfig,
-) -> Vec<ReasoningEffort> {
-    if !model.supports_reasoning {
-        return Vec::new();
-    }
-    match provider_kind {
-        ProviderKind::Deepseek => vec![
-            ReasoningEffort::Low,
-            ReasoningEffort::Medium,
-            ReasoningEffort::High,
-            ReasoningEffort::Max,
-        ],
-        ProviderKind::Openai => model.reasoning_efforts.clone(),
-    }
-}
-
-fn default_reasoning_effort(
-    provider_kind: ProviderKind,
-    model: &ModelConfig,
-) -> Option<ReasoningEffort> {
-    let supported = supported_reasoning_efforts(provider_kind, model);
-    model
-        .default_reasoning_effort
-        .filter(|effort| supported.contains(effort))
-        .or_else(|| supported.first().copied())
-}
-
-fn reasoning_effort_label(effort: ReasoningEffort) -> &'static str {
-    match effort {
-        ReasoningEffort::None => "none",
-        ReasoningEffort::Minimal => "minimal",
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
-        ReasoningEffort::Xhigh => "xhigh",
-        ReasoningEffort::Max => "max",
-    }
+fn default_reasoning_effort(model: &ModelConfig) -> Option<String> {
+    let reasoning = model.reasoning.as_ref()?;
+    reasoning
+        .default_variant
+        .as_ref()
+        .filter(|variant| {
+            reasoning
+                .variants
+                .iter()
+                .any(|item| item.id == variant.as_str())
+        })
+        .cloned()
+        .or_else(|| reasoning.variants.first().map(|variant| variant.id.clone()))
 }
 
 fn parse_tool_arguments(raw_arguments: &str) -> Value {
@@ -2328,7 +2296,8 @@ General rules:
 mod tests {
     use super::*;
     use mai_protocol::{
-        ModelConfig, ProviderConfig, ProviderKind, ProvidersConfigRequest, ReasoningEffort,
+        ModelConfig, ModelReasoningConfig, ModelReasoningVariant, ProviderConfig, ProviderKind,
+        ProvidersConfigRequest,
     };
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2340,14 +2309,9 @@ mod tests {
             context_tokens: 400_000,
             output_tokens: 128_000,
             supports_tools: true,
-            supports_reasoning: true,
-            reasoning_efforts: vec![
-                ReasoningEffort::Minimal,
-                ReasoningEffort::Low,
-                ReasoningEffort::Medium,
-                ReasoningEffort::High,
-            ],
-            default_reasoning_effort: Some(ReasoningEffort::Medium),
+            reasoning: Some(openai_reasoning_config(&[
+                "minimal", "low", "medium", "high",
+            ])),
             options: serde_json::Value::Null,
             headers: Default::default(),
         }
@@ -2355,9 +2319,7 @@ mod tests {
 
     fn non_reasoning_model(id: &str) -> ModelConfig {
         ModelConfig {
-            supports_reasoning: false,
-            reasoning_efforts: Vec::new(),
-            default_reasoning_effort: None,
+            reasoning: None,
             ..test_model(id)
         }
     }
@@ -2394,14 +2356,49 @@ mod tests {
                 context_tokens: 1_000_000,
                 output_tokens: 384_000,
                 supports_tools: true,
-                supports_reasoning: true,
-                reasoning_efforts: vec![ReasoningEffort::High, ReasoningEffort::Max],
-                default_reasoning_effort: Some(ReasoningEffort::High),
+                reasoning: Some(deepseek_reasoning_config()),
                 options: serde_json::Value::Null,
                 headers: Default::default(),
             }],
             default_model: "deepseek-v4-pro".to_string(),
             enabled: true,
+        }
+    }
+
+    fn openai_reasoning_config(variants: &[&str]) -> ModelReasoningConfig {
+        ModelReasoningConfig {
+            default_variant: Some("medium".to_string()),
+            variants: variants
+                .iter()
+                .map(|id| ModelReasoningVariant {
+                    id: (*id).to_string(),
+                    label: None,
+                    request: json!({
+                        "reasoning": {
+                            "effort": id,
+                        },
+                    }),
+                })
+                .collect(),
+        }
+    }
+
+    fn deepseek_reasoning_config() -> ModelReasoningConfig {
+        ModelReasoningConfig {
+            default_variant: Some("high".to_string()),
+            variants: ["high", "max"]
+                .into_iter()
+                .map(|id| ModelReasoningVariant {
+                    id: id.to_string(),
+                    label: None,
+                    request: json!({
+                        "thinking": {
+                            "type": "enabled",
+                        },
+                        "reasoning_effort": id,
+                    }),
+                })
+                .collect(),
         }
     }
 
@@ -2550,7 +2547,7 @@ mod tests {
             provider_id: "mock".to_string(),
             provider_name: "Mock".to_string(),
             model: "mock-model".to_string(),
-            reasoning_effort: Some(ReasoningEffort::Medium),
+            reasoning_effort: Some("medium".to_string()),
             created_at: timestamp,
             updated_at: timestamp,
             current_turn: None,
@@ -3561,7 +3558,7 @@ esac
                 name: Some("chat-agent".to_string()),
                 provider_id: Some("openai".to_string()),
                 model: Some("gpt-5.5".to_string()),
-                reasoning_effort: Some(ReasoningEffort::High),
+                reasoning_effort: Some("high".to_string()),
                 docker_image: None,
                 parent_id: None,
                 system_prompt: None,
@@ -3572,7 +3569,7 @@ esac
             "unused docker cannot start, but agent is persisted"
         );
         let agent = runtime.list_agents().await[0].clone();
-        assert_eq!(agent.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(agent.reasoning_effort, Some("high".to_string()));
         assert_eq!(agent.docker_image, "unused");
         let first = runtime
             .get_agent(agent.id, None)
@@ -3609,7 +3606,7 @@ esac
         assert_eq!(reopened.agents[0].sessions.len(), 2);
         assert_eq!(
             reopened.agents[0].summary.reasoning_effort,
-            Some(ReasoningEffort::High)
+            Some("high".to_string())
         );
     }
 
@@ -3644,7 +3641,7 @@ esac
                     provider_id: "deepseek".to_string(),
                     provider_name: "DeepSeek".to_string(),
                     model: "deepseek-v4-pro".to_string(),
-                    reasoning_effort: Some(ReasoningEffort::High),
+                    reasoning_effort: Some("high".to_string()),
                     created_at: timestamp,
                     updated_at: timestamp,
                     current_turn: None,
@@ -3731,7 +3728,7 @@ esac
         let effective = config.effective_executor.expect("effective default");
         assert_eq!(effective.provider_id, "alt");
         assert_eq!(effective.model, "alt-default");
-        assert_eq!(effective.reasoning_effort, Some(ReasoningEffort::Medium));
+        assert_eq!(effective.reasoning_effort, Some("medium".to_string()));
         assert_eq!(
             config.effective_planner.expect("planner default").model,
             "alt-default"
@@ -3750,7 +3747,7 @@ esac
                 executor: Some(AgentModelPreference {
                     provider_id: "openai".to_string(),
                     model: "gpt-5.4".to_string(),
-                    reasoning_effort: Some(ReasoningEffort::High),
+                    reasoning_effort: Some("high".to_string()),
                 }),
                 ..Default::default()
             })
@@ -3766,7 +3763,7 @@ esac
                 reviewer: Some(AgentModelPreference {
                     provider_id: "openai".to_string(),
                     model: "gpt-5.4".to_string(),
-                    reasoning_effort: Some(ReasoningEffort::Max),
+                    reasoning_effort: Some("max".to_string()),
                 }),
                 ..Default::default()
             })
@@ -3805,7 +3802,7 @@ esac
                     provider_id: "openai".to_string(),
                     provider_name: "OpenAI".to_string(),
                     model: "gpt-5.4".to_string(),
-                    reasoning_effort: Some(ReasoningEffort::High),
+                    reasoning_effort: Some("high".to_string()),
                     created_at: timestamp,
                     updated_at: timestamp,
                     current_turn: None,
@@ -3857,7 +3854,7 @@ esac
             .expect("child");
         assert_eq!(child.provider_id, "alt");
         assert_eq!(child.model, "alt-default");
-        assert_eq!(child.reasoning_effort, Some(ReasoningEffort::Medium));
+        assert_eq!(child.reasoning_effort, Some("medium".to_string()));
         assert_eq!(
             child.docker_image,
             "ghcr.io/rcore-os/tgoskits-container:latest"
@@ -3890,22 +3887,22 @@ esac
                 planner: Some(AgentModelPreference {
                     provider_id: "alt".to_string(),
                     model: "alt-default".to_string(),
-                    reasoning_effort: Some(ReasoningEffort::Medium),
+                    reasoning_effort: Some("medium".to_string()),
                 }),
                 explorer: Some(AgentModelPreference {
                     provider_id: "openai".to_string(),
                     model: "gpt-5.5".to_string(),
-                    reasoning_effort: Some(ReasoningEffort::Medium),
+                    reasoning_effort: Some("medium".to_string()),
                 }),
                 executor: Some(AgentModelPreference {
                     provider_id: "alt".to_string(),
                     model: "alt-research".to_string(),
-                    reasoning_effort: Some(ReasoningEffort::Low),
+                    reasoning_effort: Some("low".to_string()),
                 }),
                 reviewer: Some(AgentModelPreference {
                     provider_id: "openai".to_string(),
                     model: "gpt-5.4".to_string(),
-                    reasoning_effort: Some(ReasoningEffort::High),
+                    reasoning_effort: Some("high".to_string()),
                 }),
                 research_agent: None,
             })
@@ -3925,7 +3922,7 @@ esac
                     provider_id: "openai".to_string(),
                     provider_name: "OpenAI".to_string(),
                     model: "gpt-5.5".to_string(),
-                    reasoning_effort: Some(ReasoningEffort::High),
+                    reasoning_effort: Some("high".to_string()),
                     created_at: timestamp,
                     updated_at: timestamp,
                     current_turn: None,
@@ -3978,7 +3975,7 @@ esac
             .expect("child");
         assert_eq!(child.provider_id, "openai");
         assert_eq!(child.model, "gpt-5.4");
-        assert_eq!(child.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(child.reasoning_effort, Some("high".to_string()));
         assert_eq!(
             child.docker_image,
             "ghcr.io/rcore-os/tgoskits-container:latest"
@@ -4108,7 +4105,7 @@ esac
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.5".to_string(),
-            reasoning_effort: Some(ReasoningEffort::Low),
+            reasoning_effort: Some("low".to_string()),
             created_at: timestamp,
             updated_at: timestamp,
             current_turn: None,
@@ -4134,26 +4131,26 @@ esac
                 UpdateAgentRequest {
                     provider_id: None,
                     model: Some("gpt-5.4".to_string()),
-                    reasoning_effort: Some(ReasoningEffort::High),
+                    reasoning_effort: Some("high".to_string()),
                 },
             )
             .await
             .expect("update");
 
         assert_eq!(updated.model, "gpt-5.4");
-        assert_eq!(updated.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(updated.reasoning_effort, Some("high".to_string()));
         let event = events.recv().await.expect("event");
         assert!(matches!(
             event.kind,
             ServiceEventKind::AgentUpdated { agent } if agent.id == agent_id
                 && agent.model == "gpt-5.4"
-                && agent.reasoning_effort == Some(ReasoningEffort::High)
+                && agent.reasoning_effort == Some("high".to_string())
         ));
         let snapshot = store.load_runtime_snapshot(10).await.expect("snapshot");
         assert_eq!(snapshot.agents[0].summary.model, "gpt-5.4");
         assert_eq!(
             snapshot.agents[0].summary.reasoning_effort,
-            Some(ReasoningEffort::High)
+            Some("high".to_string())
         );
     }
 
@@ -4186,7 +4183,7 @@ esac
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.5".to_string(),
-            reasoning_effort: Some(ReasoningEffort::Medium),
+            reasoning_effort: Some("medium".to_string()),
             created_at: timestamp,
             updated_at: timestamp,
             current_turn: None,
@@ -4211,7 +4208,7 @@ esac
                 UpdateAgentRequest {
                     provider_id: None,
                     model: Some("gpt-5.4".to_string()),
-                    reasoning_effort: Some(ReasoningEffort::Max),
+                    reasoning_effort: Some("max".to_string()),
                 },
             )
             .await;
@@ -4223,7 +4220,7 @@ esac
                 UpdateAgentRequest {
                     provider_id: None,
                     model: Some("gpt-4.1".to_string()),
-                    reasoning_effort: Some(ReasoningEffort::High),
+                    reasoning_effort: Some("high".to_string()),
                 },
             )
             .await
@@ -4261,7 +4258,7 @@ esac
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.5".to_string(),
-            reasoning_effort: Some(ReasoningEffort::Medium),
+            reasoning_effort: Some("medium".to_string()),
             created_at: timestamp,
             updated_at: timestamp,
             current_turn: None,

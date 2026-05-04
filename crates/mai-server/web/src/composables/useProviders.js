@@ -136,9 +136,7 @@ export function useProviders() {
       context_tokens: Number(model.context_tokens || 0),
       output_tokens: Number(model.output_tokens || 0),
       supports_tools: model.supports_tools !== false,
-      supports_reasoning: Boolean(model.supports_reasoning),
-      reasoning_efforts: Array.isArray(model.reasoning_efforts) ? model.reasoning_efforts : [],
-      default_reasoning_effort: model.default_reasoning_effort || null,
+      reasoning: normalizeReasoning(model),
       options: model.options || null,
       headers: model.headers || {}
     }))
@@ -199,5 +197,37 @@ export function useProviders() {
     saveProviderDialog,
     fillFromPreset,
     showToast
+  }
+}
+
+function normalizeReasoning(model) {
+  if (model.reasoning && Array.isArray(model.reasoning.variants)) {
+    return {
+      default_variant: model.reasoning.default_variant || null,
+      variants: model.reasoning.variants.map((variant) => ({
+        ...variant,
+        id: String(variant.id || '').trim(),
+        label: variant.label || null,
+        request: variant.request && typeof variant.request === 'object' && !Array.isArray(variant.request)
+          ? variant.request
+          : {}
+      })).filter((variant) => variant.id)
+    }
+  }
+  const efforts = Array.isArray(model.reasoning_efforts)
+    ? model.reasoning_efforts.map((value) => String(value || '').trim()).filter(Boolean)
+    : []
+  if (!model.supports_reasoning || !efforts.length) return null
+  return {
+    default_variant: model.default_reasoning_effort || efforts[0],
+    variants: efforts.map((id) => ({
+      id,
+      label: null,
+      request: {
+        reasoning: {
+          effort: id
+        }
+      }
+    }))
   }
 }

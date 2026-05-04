@@ -109,7 +109,7 @@ pub struct AgentSummary {
     pub provider_name: String,
     pub model: String,
     #[serde(default)]
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_effort: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub current_turn: Option<TurnId>,
@@ -135,7 +135,7 @@ pub struct CreateAgentRequest {
     pub provider_id: Option<String>,
     pub model: Option<String>,
     #[serde(default)]
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub docker_image: Option<String>,
     pub parent_id: Option<AgentId>,
@@ -152,7 +152,7 @@ pub struct UpdateAgentRequest {
     pub provider_id: Option<String>,
     pub model: Option<String>,
     #[serde(default)]
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,18 +212,6 @@ pub enum ProviderKind {
     Deepseek,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ReasoningEffort {
-    None,
-    Minimal,
-    Low,
-    Medium,
-    High,
-    Xhigh,
-    Max,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelConfig {
     pub id: String,
@@ -234,15 +222,28 @@ pub struct ModelConfig {
     #[serde(default = "default_true")]
     pub supports_tools: bool,
     #[serde(default)]
-    pub supports_reasoning: bool,
-    #[serde(default)]
-    pub reasoning_efforts: Vec<ReasoningEffort>,
-    #[serde(default)]
-    pub default_reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning: Option<ModelReasoningConfig>,
     #[serde(default)]
     pub options: Value,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelReasoningConfig {
+    #[serde(default)]
+    pub default_variant: Option<String>,
+    #[serde(default)]
+    pub variants: Vec<ModelReasoningVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelReasoningVariant {
+    pub id: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub request: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -293,7 +294,7 @@ pub struct AgentModelPreference {
     pub provider_id: String,
     pub model: String,
     #[serde(default)]
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -315,7 +316,7 @@ pub struct ResolvedAgentModelPreference {
     #[serde(default)]
     pub model_name: Option<String>,
     #[serde(default)]
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_effort: Option<String>,
     pub context_tokens: u64,
     pub output_tokens: u64,
 }

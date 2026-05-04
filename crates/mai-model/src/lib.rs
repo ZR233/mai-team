@@ -1,6 +1,6 @@
 use mai_protocol::{
     ModelConfig, ModelInputItem, ModelOutputItem, ModelOutputToolCall, ModelResponse, ProviderKind,
-    ProviderSecret, ReasoningEffort, TokenUsage, ToolDefinition,
+    ProviderSecret, TokenUsage, ToolDefinition,
 };
 use reqwest::StatusCode;
 use serde::Serialize;
@@ -45,16 +45,9 @@ struct ResponsesRequest<'a> {
     tool_choice: Option<&'a str>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<ReasoningRequest>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     store: Option<bool>,
     #[serde(flatten)]
     options: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct ReasoningRequest {
-    effort: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,18 +60,8 @@ struct ChatRequest {
     tool_choice: Option<&'static str>,
     stream: bool,
     max_tokens: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thinking: Option<DeepseekThinkingRequest>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'static str>,
     #[serde(flatten)]
     options: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct DeepseekThinkingRequest {
-    #[serde(rename = "type")]
-    kind: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -134,7 +117,7 @@ impl ResponsesClient {
         instructions: &str,
         input: &[ModelInputItem],
         tools: &[ToolDefinition],
-        reasoning_effort: Option<ReasoningEffort>,
+        reasoning_effort: Option<String>,
     ) -> Result<ModelResponse> {
         match provider.kind {
             ProviderKind::Openai => {
@@ -169,7 +152,7 @@ impl ResponsesClient {
         instructions: &str,
         input: &[ModelInputItem],
         tools: &[ToolDefinition],
-        reasoning_effort: Option<ReasoningEffort>,
+        reasoning_effort: Option<String>,
     ) -> Result<ModelResponse> {
         let endpoint = format!("{}/responses", provider.base_url.trim_end_matches('/'));
         let active_tools = if model.supports_tools { tools } else { &[] };
@@ -180,14 +163,8 @@ impl ResponsesClient {
             tools: active_tools,
             tool_choice: (!active_tools.is_empty()).then_some("auto"),
             stream: false,
-            reasoning: model
-                .supports_reasoning
-                .then_some(reasoning_effort.or(model.default_reasoning_effort))
-                .flatten()
-                .and_then(reasoning_effort_value)
-                .map(|effort| ReasoningRequest { effort }),
             store: Some(false),
-            options: option_map(&model.options),
+            options: request_options(model, reasoning_effort.as_deref()),
         };
         let response = self
             .http
@@ -227,7 +204,7 @@ impl ResponsesClient {
         instructions: &str,
         input: &[ModelInputItem],
         tools: &[ToolDefinition],
-        reasoning_effort: Option<ReasoningEffort>,
+        reasoning_effort: Option<String>,
     ) -> Result<ModelResponse> {
         let endpoint = format!(
             "{}/chat/completions",
@@ -238,8 +215,13 @@ impl ResponsesClient {
         } else {
             Vec::new()
         };
-        let request =
-            deepseek_chat_request(model, instructions, input, active_tools, reasoning_effort);
+        let request = deepseek_chat_request(
+            model,
+            instructions,
+            input,
+            active_tools,
+            reasoning_effort.as_deref(),
+        );
         let response = self
             .http
             .post(&endpoint)
@@ -318,30 +300,48 @@ fn option_map(value: &Value) -> BTreeMap<String, Value> {
         .unwrap_or_default()
 }
 
-fn reasoning_effort_value(effort: ReasoningEffort) -> Option<&'static str> {
-    match effort {
-        ReasoningEffort::None => None,
-        ReasoningEffort::Minimal => Some("minimal"),
-        ReasoningEffort::Low => Some("low"),
-        ReasoningEffort::Medium => Some("medium"),
-        ReasoningEffort::High => Some("high"),
-        ReasoningEffort::Xhigh => Some("xhigh"),
-        ReasoningEffort::Max => Some("max"),
+fn request_options(model: &ModelConfig, reasoning_effort: Option<&str>) -> BTreeMap<String, Value> {
+    let mut options = model.options.clone();
+    if let Some(request) = reasoning_variant_request(model, reasoning_effort) {
+        merge_json_objects(&mut options, request);
     }
+    option_map(&options)
 }
 
-fn deepseek_thinking_type(effort: ReasoningEffort) -> Option<&'static str> {
-    match effort {
-        ReasoningEffort::None => None,
-        _ => Some("enabled"),
-    }
+fn reasoning_variant_request<'a>(
+    model: &'a ModelConfig,
+    reasoning_effort: Option<&str>,
+) -> Option<&'a Value> {
+    let reasoning = model.reasoning.as_ref()?;
+    let variant_id = reasoning_effort
+        .filter(|value| !value.trim().is_empty())
+        .or(reasoning.default_variant.as_deref())?;
+    reasoning
+        .variants
+        .iter()
+        .find(|variant| variant.id == variant_id)
+        .map(|variant| &variant.request)
 }
 
-fn deepseek_reasoning_effort_value(effort: ReasoningEffort) -> Option<&'static str> {
-    match effort {
-        ReasoningEffort::None => None,
-        ReasoningEffort::Max | ReasoningEffort::Xhigh => Some("max"),
-        _ => Some("high"),
+fn merge_json_objects(base: &mut Value, overlay: &Value) {
+    let Some(overlay) = overlay.as_object() else {
+        return;
+    };
+    if !base.is_object() {
+        *base = json!({});
+    }
+    let Some(base_map) = base.as_object_mut() else {
+        return;
+    };
+    for (key, overlay_value) in overlay {
+        match (base_map.get_mut(key), overlay_value) {
+            (Some(base_value), Value::Object(_)) if base_value.is_object() => {
+                merge_json_objects(base_value, overlay_value);
+            }
+            _ => {
+                base_map.insert(key.clone(), overlay_value.clone());
+            }
+        }
     }
 }
 
@@ -365,16 +365,8 @@ fn deepseek_chat_request(
     instructions: &str,
     input: &[ModelInputItem],
     tools: Vec<ChatTool>,
-    reasoning_effort: Option<ReasoningEffort>,
+    reasoning_effort: Option<&str>,
 ) -> ChatRequest {
-    let effort = model
-        .supports_reasoning
-        .then_some(reasoning_effort.or(model.default_reasoning_effort))
-        .flatten();
-    let thinking = effort
-        .and_then(deepseek_thinking_type)
-        .map(|kind| DeepseekThinkingRequest { kind });
-    let reasoning_effort = effort.and_then(deepseek_reasoning_effort_value);
     ChatRequest {
         model: model.id.clone(),
         messages: chat_messages(instructions, input),
@@ -382,9 +374,7 @@ fn deepseek_chat_request(
         tools,
         stream: false,
         max_tokens: deepseek_max_tokens(model.output_tokens),
-        thinking,
-        reasoning_effort,
-        options: option_map(&model.options),
+        options: request_options(model, reasoning_effort),
     }
 }
 
@@ -657,6 +647,60 @@ fn parse_usage(value: Option<&Value>) -> Option<TokenUsage> {
 mod tests {
     use super::*;
 
+    fn model_with_reasoning(
+        id: &str,
+        variants: &[&str],
+        default_variant: &str,
+        request_for: impl Fn(&str) -> Value,
+    ) -> ModelConfig {
+        ModelConfig {
+            id: id.to_string(),
+            name: Some(id.to_string()),
+            context_tokens: 1_000_000,
+            output_tokens: 384_000,
+            supports_tools: true,
+            reasoning: Some(mai_protocol::ModelReasoningConfig {
+                default_variant: Some(default_variant.to_string()),
+                variants: variants
+                    .iter()
+                    .map(|id| mai_protocol::ModelReasoningVariant {
+                        id: (*id).to_string(),
+                        label: None,
+                        request: request_for(id),
+                    })
+                    .collect(),
+            }),
+            options: serde_json::Value::Null,
+            headers: BTreeMap::new(),
+        }
+    }
+
+    fn deepseek_model() -> ModelConfig {
+        model_with_reasoning("deepseek-v4-pro", &["high", "max"], "high", |id| {
+            json!({
+                "thinking": {
+                    "type": "enabled",
+                },
+                "reasoning_effort": id,
+            })
+        })
+    }
+
+    fn openai_model() -> ModelConfig {
+        model_with_reasoning(
+            "gpt-5.5",
+            &["minimal", "low", "medium", "high", "xhigh"],
+            "medium",
+            |id| {
+                json!({
+                    "reasoning": {
+                        "effort": id,
+                    },
+                })
+            },
+        )
+    }
+
     #[test]
     fn parses_message_and_function_call() {
         let response = parse_response(json!({
@@ -769,48 +813,30 @@ mod tests {
 
     #[test]
     fn deepseek_request_uses_current_thinking_param_and_clamps_max_tokens() {
-        let model = ModelConfig {
-            id: "deepseek-v4-pro".to_string(),
-            name: Some("DeepSeek V4 Pro".to_string()),
-            context_tokens: 1_000_000,
-            output_tokens: 384_000,
-            supports_tools: true,
-            supports_reasoning: true,
-            reasoning_efforts: vec![ReasoningEffort::High, ReasoningEffort::Max],
-            default_reasoning_effort: Some(ReasoningEffort::High),
-            options: serde_json::Value::Null,
-            headers: BTreeMap::new(),
-        };
+        let model = deepseek_model();
         let request = deepseek_chat_request(
             &model,
             "instructions",
             &[ModelInputItem::user_text("hello")],
             Vec::new(),
-            Some(ReasoningEffort::High),
+            Some("high"),
         );
+        let value = serde_json::to_value(&request).expect("request json");
 
         assert_eq!(request.max_tokens, 64_000);
         assert_eq!(
-            request.thinking.as_ref().map(|item| item.kind),
+            value.pointer("/thinking/type").and_then(Value::as_str),
             Some("enabled")
         );
-        assert_eq!(request.reasoning_effort, Some("high"));
+        assert_eq!(
+            value.get("reasoning_effort").and_then(Value::as_str),
+            Some("high")
+        );
     }
 
     #[test]
     fn deepseek_reasoning_tool_call_messages_have_content_and_effort() {
-        let model = ModelConfig {
-            id: "deepseek-v4-pro".to_string(),
-            name: Some("DeepSeek V4 Pro".to_string()),
-            context_tokens: 1_000_000,
-            output_tokens: 384_000,
-            supports_tools: true,
-            supports_reasoning: true,
-            reasoning_efforts: vec![ReasoningEffort::High, ReasoningEffort::Max],
-            default_reasoning_effort: Some(ReasoningEffort::High),
-            options: serde_json::Value::Null,
-            headers: BTreeMap::new(),
-        };
+        let model = deepseek_model();
         let request = deepseek_chat_request(
             &model,
             "instructions",
@@ -838,12 +864,16 @@ mod tests {
                     parameters: json!({ "type": "object" }),
                 },
             }],
-            Some(ReasoningEffort::Max),
+            Some("max"),
         );
+        let value = serde_json::to_value(&request).expect("request json");
 
-        assert_eq!(request.reasoning_effort, Some("max"));
         assert_eq!(
-            request.thinking.as_ref().map(|item| item.kind),
+            value.get("reasoning_effort").and_then(Value::as_str),
+            Some("max")
+        );
+        assert_eq!(
+            value.pointer("/thinking/type").and_then(Value::as_str),
             Some("enabled")
         );
         assert_eq!(request.messages[2].role, "assistant");
@@ -856,35 +886,24 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_medium_reasoning_maps_to_high_effort() {
-        let model = ModelConfig {
-            id: "deepseek-reasoner".to_string(),
-            name: Some("DeepSeek Reasoner".to_string()),
-            context_tokens: 128_000,
-            output_tokens: 8_192,
-            supports_tools: true,
-            supports_reasoning: true,
-            reasoning_efforts: vec![
-                ReasoningEffort::Low,
-                ReasoningEffort::Medium,
-                ReasoningEffort::High,
-            ],
-            default_reasoning_effort: Some(ReasoningEffort::Medium),
-            options: serde_json::Value::Null,
-            headers: BTreeMap::new(),
-        };
-        let request = deepseek_chat_request(
-            &model,
-            "instructions",
-            &[ModelInputItem::user_text("hello")],
-            Vec::new(),
-            Some(ReasoningEffort::Medium),
-        );
+    fn reasoning_variant_request_deep_merges_over_model_options() {
+        let mut model = openai_model();
+        model.options = json!({
+            "temperature": 0.2,
+            "reasoning": {
+                "effort": "low",
+                "summary": "auto"
+            }
+        });
 
-        assert_eq!(request.reasoning_effort, Some("high"));
+        let options = request_options(&model, Some("xhigh"));
         assert_eq!(
-            request.thinking.as_ref().map(|item| item.kind),
-            Some("enabled")
+            options.get("reasoning"),
+            Some(&json!({
+                "effort": "xhigh",
+                "summary": "auto"
+            }))
         );
+        assert_eq!(options.get("temperature"), Some(&json!(0.2)));
     }
 }

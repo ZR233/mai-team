@@ -1,10 +1,10 @@
 use chrono::{DateTime, Utc};
 use mai_protocol::{
     AgentConfigRequest, AgentId, AgentMessage, AgentSessionSummary, AgentStatus, AgentSummary,
-    McpServerConfig, MessageRole, ModelConfig, ModelInputItem, ProviderConfig, ProviderKind,
-    ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
-    ProvidersConfigRequest, ProvidersResponse, ReasoningEffort, ServiceEvent, ServiceEventKind,
-    SessionId, TokenUsage, TurnId, default_true,
+    McpServerConfig, MessageRole, ModelConfig, ModelInputItem, ModelReasoningConfig,
+    ModelReasoningVariant, ProviderConfig, ProviderKind, ProviderPreset, ProviderPresetsResponse,
+    ProviderSecret, ProviderSummary, ProvidersConfigRequest, ProvidersResponse, ServiceEvent,
+    ServiceEventKind, SessionId, TokenUsage, TurnId, default_true,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -118,12 +118,14 @@ struct ModelToml {
     output_tokens: u64,
     #[serde(default = "default_true")]
     supports_tools: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ModelReasoningConfig>,
+    #[serde(default, skip_serializing)]
     supports_reasoning: bool,
-    #[serde(default)]
-    reasoning_efforts: Vec<ReasoningEffort>,
-    #[serde(default)]
-    default_reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default, skip_serializing)]
+    reasoning_efforts: Vec<String>,
+    #[serde(default, skip_serializing)]
+    default_reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "is_null")]
     options: serde_json::Value,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -530,7 +532,7 @@ impl ConfigStore {
                 models: provider
                     .models
                     .into_iter()
-                    .map(|(id, model)| model.into_model(id))
+                    .map(|(id, model)| model.into_model(id, provider.kind))
                     .collect(),
                 id,
                 kind: provider.kind,
@@ -725,10 +727,7 @@ impl ConfigStore {
             provider_id: summary.provider_id.clone(),
             provider_name: summary.provider_name.clone(),
             model: summary.model.clone(),
-            reasoning_effort: summary
-                .reasoning_effort
-                .map(reasoning_effort_to_str)
-                .map(str::to_string),
+            reasoning_effort: summary.reasoning_effort.clone(),
             created_at: summary.created_at.to_rfc3339(),
             updated_at: summary.updated_at.to_rfc3339(),
             current_turn: summary.current_turn.map(|id| id.to_string()),
@@ -1085,11 +1084,7 @@ impl AgentRecordRow {
             provider_id: self.provider_id,
             provider_name: self.provider_name,
             model: self.model,
-            reasoning_effort: self
-                .reasoning_effort
-                .as_deref()
-                .map(parse_reasoning_effort)
-                .transpose()?,
+            reasoning_effort: self.reasoning_effort,
             created_at: parse_utc(&self.created_at)?,
             updated_at: parse_utc(&self.updated_at)?,
             current_turn: self
@@ -1192,28 +1187,79 @@ impl ModelToml {
             context_tokens: model.context_tokens,
             output_tokens: model.output_tokens,
             supports_tools: model.supports_tools,
-            supports_reasoning: model.supports_reasoning,
-            reasoning_efforts: model.reasoning_efforts,
-            default_reasoning_effort: model.default_reasoning_effort,
+            reasoning: model.reasoning,
+            supports_reasoning: false,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
             options: model.options,
             headers: model.headers,
         }
     }
 
-    fn into_model(self, id: String) -> ModelConfig {
+    fn into_model(self, id: String, provider_kind: ProviderKind) -> ModelConfig {
+        let reasoning = self.reasoning.or_else(|| {
+            legacy_reasoning_config(
+                provider_kind,
+                self.supports_reasoning,
+                self.reasoning_efforts,
+                self.default_reasoning_effort,
+            )
+        });
         ModelConfig {
             id,
             name: self.name,
             context_tokens: self.context_tokens,
             output_tokens: self.output_tokens,
             supports_tools: self.supports_tools,
-            supports_reasoning: self.supports_reasoning,
-            reasoning_efforts: self.reasoning_efforts,
-            default_reasoning_effort: self.default_reasoning_effort,
+            reasoning,
             options: self.options,
             headers: self.headers,
         }
     }
+}
+
+fn legacy_reasoning_config(
+    provider_kind: ProviderKind,
+    supports_reasoning: bool,
+    reasoning_efforts: Vec<String>,
+    default_reasoning_effort: Option<String>,
+) -> Option<ModelReasoningConfig> {
+    if !supports_reasoning {
+        return None;
+    }
+    let variants = reasoning_efforts
+        .into_iter()
+        .filter_map(|effort| {
+            let id = effort.trim().to_lowercase();
+            (!id.is_empty()).then(|| match provider_kind {
+                ProviderKind::Deepseek => ModelReasoningVariant {
+                    request: serde_json::json!({
+                        "thinking": {
+                            "type": "enabled",
+                        },
+                        "reasoning_effort": id,
+                    }),
+                    id,
+                    label: None,
+                },
+                ProviderKind::Openai => ModelReasoningVariant {
+                    request: serde_json::json!({
+                        "reasoning": {
+                            "effort": id,
+                        },
+                    }),
+                    id,
+                    label: None,
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    (!variants.is_empty()).then(|| ModelReasoningConfig {
+        default_variant: default_reasoning_effort
+            .map(|value| value.trim().to_lowercase())
+            .filter(|value| !value.is_empty()),
+        variants,
+    })
 }
 
 fn provider_preset(kind: ProviderKind) -> ProviderPreset {
@@ -1251,9 +1297,7 @@ fn builtin_provider(kind: ProviderKind) -> ProviderConfig {
                     context_tokens: 1_047_576,
                     output_tokens: 32_768,
                     supports_tools: true,
-                    supports_reasoning: false,
-                    reasoning_efforts: Vec::new(),
-                    default_reasoning_effort: None,
+                    reasoning: None,
                     options: serde_json::Value::Null,
                     headers: BTreeMap::new(),
                 },
@@ -1279,14 +1323,9 @@ fn builtin_provider(kind: ProviderKind) -> ProviderConfig {
 }
 
 fn openai_reasoning_model(id: &str, context_tokens: u64, output_tokens: u64) -> ModelConfig {
-    let mut efforts = vec![
-        ReasoningEffort::Minimal,
-        ReasoningEffort::Low,
-        ReasoningEffort::Medium,
-        ReasoningEffort::High,
-    ];
+    let mut variants = vec!["minimal", "low", "medium", "high"];
     if id.contains("5.4") || id.contains("5.5") {
-        efforts.push(ReasoningEffort::Xhigh);
+        variants.push("xhigh");
     }
     ModelConfig {
         id: id.to_string(),
@@ -1294,9 +1333,7 @@ fn openai_reasoning_model(id: &str, context_tokens: u64, output_tokens: u64) -> 
         context_tokens,
         output_tokens,
         supports_tools: true,
-        supports_reasoning: true,
-        reasoning_efforts: efforts,
-        default_reasoning_effort: Some(ReasoningEffort::Medium),
+        reasoning: Some(openai_reasoning_config(variants, "medium")),
         options: serde_json::Value::Null,
         headers: BTreeMap::new(),
     }
@@ -1309,15 +1346,47 @@ fn deepseek_model(id: &str, supports_reasoning: bool) -> ModelConfig {
         context_tokens: deepseek_context_tokens(id),
         output_tokens: deepseek_output_tokens(id),
         supports_tools: true,
-        supports_reasoning,
-        reasoning_efforts: if supports_reasoning {
-            vec![ReasoningEffort::High, ReasoningEffort::Max]
-        } else {
-            Vec::new()
-        },
-        default_reasoning_effort: supports_reasoning.then_some(ReasoningEffort::High),
+        reasoning: supports_reasoning
+            .then(|| deepseek_reasoning_config(vec!["high", "max"], "high")),
         options: serde_json::Value::Null,
         headers: BTreeMap::new(),
+    }
+}
+
+fn openai_reasoning_config(variants: Vec<&str>, default_variant: &str) -> ModelReasoningConfig {
+    ModelReasoningConfig {
+        default_variant: Some(default_variant.to_string()),
+        variants: variants
+            .into_iter()
+            .map(|id| ModelReasoningVariant {
+                id: id.to_string(),
+                label: None,
+                request: serde_json::json!({
+                    "reasoning": {
+                        "effort": id,
+                    },
+                }),
+            })
+            .collect(),
+    }
+}
+
+fn deepseek_reasoning_config(variants: Vec<&str>, default_variant: &str) -> ModelReasoningConfig {
+    ModelReasoningConfig {
+        default_variant: Some(default_variant.to_string()),
+        variants: variants
+            .into_iter()
+            .map(|id| ModelReasoningVariant {
+                id: id.to_string(),
+                label: None,
+                request: serde_json::json!({
+                    "thinking": {
+                        "type": "enabled",
+                    },
+                    "reasoning_effort": id,
+                }),
+            })
+            .collect(),
     }
 }
 
@@ -1361,9 +1430,10 @@ fn normalize_provider_models(provider: &mut ProviderToml) {
         }
     }
     if let Some(model) = provider.models.get_mut("deepseek-v4-pro") {
-        model.supports_reasoning = true;
-        model.reasoning_efforts = vec![ReasoningEffort::High, ReasoningEffort::Max];
-        model.default_reasoning_effort = Some(ReasoningEffort::High);
+        model.reasoning = Some(deepseek_reasoning_config(vec!["high", "max"], "high"));
+        model.supports_reasoning = false;
+        model.reasoning_efforts = Vec::new();
+        model.default_reasoning_effort = None;
     }
 }
 
@@ -1374,9 +1444,7 @@ fn fallback_model(id: &str) -> ModelConfig {
         context_tokens: 128_000,
         output_tokens: 8_192,
         supports_tools: true,
-        supports_reasoning: false,
-        reasoning_efforts: Vec::new(),
-        default_reasoning_effort: None,
+        reasoning: None,
         options: serde_json::Value::Null,
         headers: BTreeMap::new(),
     }
@@ -1443,18 +1511,40 @@ fn validate_provider_request(request: &ProvidersConfigRequest) -> Result<()> {
                     model.id
                 )));
             }
-            if model.supports_reasoning {
-                if model.reasoning_efforts.is_empty() {
+            if let Some(reasoning) = &model.reasoning {
+                if reasoning.variants.is_empty() {
                     return Err(StoreError::InvalidConfig(format!(
-                        "reasoning model `{}` must configure reasoning_efforts",
+                        "reasoning model `{}` must configure reasoning variants",
                         model.id
                     )));
                 }
-                if let Some(default_effort) = model.default_reasoning_effort
-                    && !model.reasoning_efforts.contains(&default_effort)
+                let mut variants = BTreeSet::new();
+                for variant in &reasoning.variants {
+                    let id = variant.id.trim();
+                    if id.is_empty() {
+                        return Err(StoreError::InvalidConfig(format!(
+                            "model `{}` reasoning variant id is required",
+                            model.id
+                        )));
+                    }
+                    if !variant.request.is_object() {
+                        return Err(StoreError::InvalidConfig(format!(
+                            "model `{}` reasoning variant `{id}` request must be an object",
+                            model.id
+                        )));
+                    }
+                    if !variants.insert(id.to_string()) {
+                        return Err(StoreError::InvalidConfig(format!(
+                            "model `{}` has duplicate reasoning variant `{id}`",
+                            model.id
+                        )));
+                    }
+                }
+                if let Some(default_variant) = reasoning.default_variant.as_deref()
+                    && !variants.contains(default_variant.trim())
                 {
                     return Err(StoreError::InvalidConfig(format!(
-                        "model `{}` default_reasoning_effort is not in reasoning_efforts",
+                        "model `{}` default reasoning variant is not in reasoning variants",
                         model.id
                     )));
                 }
@@ -1546,33 +1636,6 @@ fn parse_agent_status(value: &str) -> Result<AgentStatus> {
         "deleted" => Ok(AgentStatus::Deleted),
         other => Err(StoreError::InvalidConfig(format!(
             "invalid agent status `{other}`"
-        ))),
-    }
-}
-
-fn reasoning_effort_to_str(effort: ReasoningEffort) -> &'static str {
-    match effort {
-        ReasoningEffort::None => "none",
-        ReasoningEffort::Minimal => "minimal",
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
-        ReasoningEffort::Xhigh => "xhigh",
-        ReasoningEffort::Max => "max",
-    }
-}
-
-fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort> {
-    match value {
-        "none" => Ok(ReasoningEffort::None),
-        "minimal" => Ok(ReasoningEffort::Minimal),
-        "low" => Ok(ReasoningEffort::Low),
-        "medium" => Ok(ReasoningEffort::Medium),
-        "high" => Ok(ReasoningEffort::High),
-        "xhigh" => Ok(ReasoningEffort::Xhigh),
-        "max" => Ok(ReasoningEffort::Max),
-        other => Err(StoreError::InvalidConfig(format!(
-            "invalid reasoning effort `{other}`"
         ))),
     }
 }
@@ -1677,14 +1740,21 @@ mod tests {
             context_tokens: 400_000,
             output_tokens: 128_000,
             supports_tools: true,
-            supports_reasoning: true,
-            reasoning_efforts: vec![
-                ReasoningEffort::Minimal,
-                ReasoningEffort::Low,
-                ReasoningEffort::Medium,
-                ReasoningEffort::High,
-            ],
-            default_reasoning_effort: Some(ReasoningEffort::Medium),
+            reasoning: Some(ModelReasoningConfig {
+                default_variant: Some("medium".to_string()),
+                variants: ["minimal", "low", "medium", "high"]
+                    .into_iter()
+                    .map(|id| ModelReasoningVariant {
+                        id: id.to_string(),
+                        label: None,
+                        request: json!({
+                            "reasoning": {
+                                "effort": id,
+                            },
+                        }),
+                    })
+                    .collect(),
+            }),
             options: serde_json::Value::Null,
             headers: BTreeMap::new(),
         }
@@ -1775,13 +1845,13 @@ mod tests {
             executor: Some(mai_protocol::AgentModelPreference {
                 provider_id: "openai".to_string(),
                 model: "gpt-5.4".to_string(),
-                reasoning_effort: Some(ReasoningEffort::High),
+                reasoning_effort: Some("high".to_string()),
             }),
             reviewer: None,
             research_agent: Some(mai_protocol::AgentModelPreference {
                 provider_id: "openai".to_string(),
                 model: "gpt-5.4".to_string(),
-                reasoning_effort: Some(ReasoningEffort::High),
+                reasoning_effort: Some("high".to_string()),
             }),
         };
         store.save_agent_config(&config).await.expect("save config");
@@ -1823,10 +1893,15 @@ mod tests {
             .expect("deepseek v4 pro");
         assert_eq!(v4_pro.context_tokens, DEEPSEEK_V4_CONTEXT_TOKENS);
         assert_eq!(v4_pro.output_tokens, DEEPSEEK_V4_OUTPUT_TOKENS);
-        assert!(v4_pro.supports_reasoning);
+        let reasoning = v4_pro.reasoning.as_ref().expect("reasoning variants");
+        assert_eq!(reasoning.default_variant.as_deref(), Some("high"));
         assert_eq!(
-            v4_pro.reasoning_efforts,
-            vec![ReasoningEffort::High, ReasoningEffort::Max]
+            reasoning
+                .variants
+                .iter()
+                .map(|variant| variant.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["high", "max"]
         );
         for id in [
             "deepseek-v4-flash",
@@ -1890,12 +1965,18 @@ mod tests {
             .expect("deepseek v4 pro");
         assert_eq!(model.context_tokens, DEEPSEEK_V4_CONTEXT_TOKENS);
         assert_eq!(model.output_tokens, DEEPSEEK_V4_OUTPUT_TOKENS);
-        assert!(model.supports_reasoning);
+        let reasoning = model.reasoning.as_ref().expect("reasoning variants");
+        assert_eq!(reasoning.default_variant.as_deref(), Some("high"));
+        assert_eq!(reasoning.variants.len(), 2);
         assert_eq!(
-            model.reasoning_efforts,
-            vec![ReasoningEffort::High, ReasoningEffort::Max]
+            reasoning.variants[0].request,
+            json!({
+                "thinking": {
+                    "type": "enabled",
+                },
+                "reasoning_effort": "high",
+            })
         );
-        assert_eq!(model.default_reasoning_effort, Some(ReasoningEffort::High));
     }
 
     #[tokio::test]
@@ -1906,9 +1987,7 @@ mod tests {
         custom.context_tokens = 123_456;
         custom.output_tokens = 4_096;
         custom.supports_tools = false;
-        custom.supports_reasoning = false;
-        custom.reasoning_efforts = Vec::new();
-        custom.default_reasoning_effort = None;
+        custom.reasoning = None;
         custom.options = json!({ "temperature": 0.2 });
         custom
             .headers
@@ -2007,7 +2086,7 @@ mod tests {
             provider_id: "openai".to_string(),
             provider_name: "OpenAI".to_string(),
             model: "gpt-5.2".to_string(),
-            reasoning_effort: Some(ReasoningEffort::High),
+            reasoning_effort: Some("high".to_string()),
             created_at: now,
             updated_at: now,
             current_turn: Some(turn_id),
