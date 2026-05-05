@@ -2,12 +2,20 @@
   <div v-if="dialog.open" class="modal-backdrop" @mousedown.self="onBackdropDown" @mouseup.self="onBackdropUp($event, () => $emit('close'))">
     <form class="modal" @submit.prevent="$emit('create')">
       <div class="modal-title-row">
-        <h2>Create Task Agent</h2>
+        <h2>Create Task</h2>
         <button class="icon-button" type="button" @click="$emit('close')">Close</button>
       </div>
       <label>
-        <span>Task Agent Name</span>
-        <input v-model.trim="dialog.name" placeholder="Research Task Agent" />
+        <span>Task Title</span>
+        <input v-model.trim="dialog.title" placeholder="Implement task workflow" />
+      </label>
+      <label>
+        <span>Initial Message</span>
+        <textarea
+          v-model.trim="dialog.message"
+          rows="4"
+          placeholder="Describe the task for the planner..."
+        ></textarea>
       </label>
       <label>
         <span>Docker Image</span>
@@ -16,24 +24,16 @@
           placeholder="ghcr.io/rcore-os/tgoskits-container:latest"
         />
       </label>
-      <ModelSelector
-        v-model:provider-id="dialog.provider_id"
-        v-model:model="dialog.model"
-        v-model:reasoning-effort="dialog.reasoning_effort"
-        :providers="providers"
-      />
       <p v-if="dialog.error" class="dialog-error">{{ dialog.error }}</p>
       <div class="modal-actions">
         <button class="ghost-button" type="button" @click="$emit('close')">Cancel</button>
-        <button class="primary-button" type="submit" :disabled="!providers.length">Create</button>
+        <button class="primary-button" type="submit">Create</button>
       </div>
     </form>
   </div>
 </template>
 
 <script setup>
-import ModelSelector from './ModelSelector.vue'
-
 let backdropDown = false
 
 function onBackdropDown() {
@@ -48,11 +48,8 @@ function onBackdropUp(_event, callback) {
 }
 
 defineProps({
-  dialog: { type: Object, required: true },
-  providers: { type: Array, required: true },
-  models: { type: Array, default: () => [] },
-  reasoningOptions: { type: Array, default: () => [] }
+  dialog: { type: Object, required: true }
 })
 
-defineEmits(['close', 'create', 'provider-changed', 'model-changed'])
+defineEmits(['close', 'create'])
 </script>

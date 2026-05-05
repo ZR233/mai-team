@@ -31,6 +31,7 @@
     </div>
 
     <SessionTabs
+      v-if="showSessions"
       :sessions="detail.sessions || []"
       :selected-session-id="detail.selected_session_id"
       @select-session="$emit('select-session', $event)"
@@ -55,6 +56,7 @@
     />
 
     <ComposerBar
+      v-if="showComposer"
       :draft="draft"
       :sending="sending"
       @send="$emit('send', $event)"
@@ -84,7 +86,9 @@ const props = defineProps({
   loading: { type: Boolean, default: false },
   sending: { type: Boolean, default: false },
   updatingModel: { type: Boolean, default: false },
-  providers: { type: Array, default: () => [] }
+  providers: { type: Array, default: () => [] },
+  showSessions: { type: Boolean, default: true },
+  showComposer: { type: Boolean, default: true }
 })
 
 const conversationRef = defineModel('conversationRef', { default: null })

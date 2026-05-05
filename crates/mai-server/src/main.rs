@@ -10,10 +10,11 @@ use futures::StreamExt;
 use mai_docker::DockerClient;
 use mai_model::ResponsesClient;
 use mai_protocol::{
-    AgentConfigRequest, AgentConfigResponse, AgentId, CreateAgentRequest, CreateAgentResponse,
-    CreateSessionResponse, ErrorResponse, FileUploadRequest, FileUploadResponse,
+    AgentConfigRequest, AgentConfigResponse, AgentId, ApproveTaskPlanResponse, CreateAgentRequest,
+    CreateAgentResponse, CreateSessionResponse, CreateTaskRequest, CreateTaskResponse,
+    ErrorResponse, FileUploadRequest, FileUploadResponse,
     ProviderPresetsResponse, ProvidersConfigRequest, ProvidersResponse, SendMessageRequest,
-    SendMessageResponse, ServiceEvent, SessionId, ToolTraceDetail, UpdateAgentRequest,
+    SendMessageResponse, ServiceEvent, SessionId, TaskId, ToolTraceDetail, UpdateAgentRequest,
     UpdateAgentResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
@@ -50,10 +51,10 @@ struct ApiError {
 impl From<RuntimeError> for ApiError {
     fn from(value: RuntimeError) -> Self {
         let status = match value {
-            RuntimeError::AgentNotFound(_) => StatusCode::NOT_FOUND,
+            RuntimeError::AgentNotFound(_) | RuntimeError::TaskNotFound(_) => StatusCode::NOT_FOUND,
             RuntimeError::SessionNotFound { .. } => StatusCode::NOT_FOUND,
             RuntimeError::ToolTraceNotFound { .. } => StatusCode::NOT_FOUND,
-            RuntimeError::AgentBusy(_) => StatusCode::CONFLICT,
+            RuntimeError::AgentBusy(_) | RuntimeError::TaskBusy(_) => StatusCode::CONFLICT,
             RuntimeError::InvalidInput(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -97,6 +98,11 @@ struct DownloadQuery {
 #[derive(Debug, Deserialize)]
 struct AgentDetailQuery {
     session_id: Option<SessionId>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskDetailQuery {
+    agent_id: Option<AgentId>,
 }
 
 #[tokio::main]
@@ -160,6 +166,15 @@ async fn main() -> Result<()> {
             get(get_agent_config).put(save_agent_config),
         )
         .route("/events", get(events))
+        .route("/tasks", get(list_tasks).post(create_task))
+        .route("/tasks:ensure-default", post(ensure_default_task))
+        .route(
+            "/tasks/{id}",
+            get(get_task).delete(delete_task),
+        )
+        .route("/tasks/{id}/messages", post(send_task_message))
+        .route("/tasks/{id}/plan:approve", post(approve_task_plan))
+        .route("/tasks/{id}/cancel", post(cancel_task))
         .route("/agents", get(list_agents).post(create_agent))
         .route(
             "/agents/{id}",
@@ -270,6 +285,73 @@ async fn list_agents(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<Vec<mai_protocol::AgentSummary>>, ApiError> {
     Ok(Json(state.runtime.list_agents().await))
+}
+
+async fn list_tasks(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<Vec<mai_protocol::TaskSummary>>, ApiError> {
+    Ok(Json(state.runtime.list_tasks().await))
+}
+
+async fn ensure_default_task(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<Option<mai_protocol::TaskSummary>>, ApiError> {
+    Ok(Json(state.runtime.ensure_default_task().await?))
+}
+
+async fn create_task(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CreateTaskRequest>,
+) -> std::result::Result<Json<CreateTaskResponse>, ApiError> {
+    let task = state
+        .runtime
+        .create_task(request.title, request.message, request.docker_image)
+        .await?;
+    Ok(Json(CreateTaskResponse { task }))
+}
+
+async fn get_task(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<TaskId>,
+    Query(query): Query<TaskDetailQuery>,
+) -> std::result::Result<Json<mai_protocol::TaskDetail>, ApiError> {
+    Ok(Json(state.runtime.get_task(id, query.agent_id).await?))
+}
+
+async fn send_task_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<TaskId>,
+    Json(request): Json<SendMessageRequest>,
+) -> std::result::Result<Json<SendMessageResponse>, ApiError> {
+    let turn_id = state
+        .runtime
+        .send_task_message(id, request.message, request.skill_mentions)
+        .await?;
+    Ok(Json(SendMessageResponse { turn_id }))
+}
+
+async fn approve_task_plan(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<TaskId>,
+) -> std::result::Result<Json<ApproveTaskPlanResponse>, ApiError> {
+    let task = state.runtime.approve_task_plan(id).await?;
+    Ok(Json(ApproveTaskPlanResponse { task }))
+}
+
+async fn cancel_task(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<TaskId>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state.runtime.cancel_task(id).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn delete_task(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<TaskId>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state.runtime.delete_task(id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn create_agent(
@@ -439,6 +521,9 @@ fn event_name(event: &ServiceEvent) -> &'static str {
         mai_protocol::ServiceEventKind::AgentStatusChanged { .. } => "agent_status_changed",
         mai_protocol::ServiceEventKind::AgentUpdated { .. } => "agent_updated",
         mai_protocol::ServiceEventKind::AgentDeleted { .. } => "agent_deleted",
+        mai_protocol::ServiceEventKind::TaskCreated { .. } => "task_created",
+        mai_protocol::ServiceEventKind::TaskUpdated { .. } => "task_updated",
+        mai_protocol::ServiceEventKind::TaskDeleted { .. } => "task_deleted",
         mai_protocol::ServiceEventKind::TurnStarted { .. } => "turn_started",
         mai_protocol::ServiceEventKind::TurnCompleted { .. } => "turn_completed",
         mai_protocol::ServiceEventKind::ToolStarted { .. } => "tool_started",

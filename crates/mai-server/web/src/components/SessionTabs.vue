@@ -13,7 +13,7 @@
         <small>{{ session.message_count }}</small>
       </button>
     </div>
-    <button class="small-button" type="button" @click="$emit('create-session')">New Chat</button>
+    <button class="small-button" type="button" @click="$emit('create-session')">New Session</button>
   </div>
 </template>
 

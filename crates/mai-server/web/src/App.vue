@@ -5,11 +5,11 @@
         <div class="brand-mark">M</div>
         <div>
           <h1>Mai Team</h1>
-          <p>Multi-agent runtime console</p>
+          <p>Task-oriented multi-agent console</p>
         </div>
       </div>
       <nav class="tabs" aria-label="Views">
-        <button :class="{ active: activeTab === 'agents' }" @click="activeTab = 'agents'">Agents</button>
+        <button :class="{ active: activeTab === 'tasks' }" @click="activeTab = 'tasks'">Tasks</button>
         <button :class="{ active: activeTab === 'providers' }" @click="activeTab = 'providers'">Providers</button>
         <button :class="{ active: activeTab === 'settings' }" @click="activeTab = 'settings'">Settings</button>
       </nav>
@@ -26,36 +26,41 @@
     </header>
 
     <main class="workspace">
-      <AgentRail
-        :agents="agents"
-        :selected-id="selectedAgentId"
-        :visible="activeTab === 'agents'"
-        @select="selectAgent"
-        @create="openCreateAgentDialog"
+      <TaskRail
+        :tasks="tasks"
+        :detail="selectedTaskDetail"
+        :selected-task-id="selectedTaskId"
+        :selected-agent-id="selectedAgentId"
+        :visible="activeTab === 'tasks'"
+        @select-task="selectTask"
+        @select-agent="selectTaskAgent"
+        @create="openCreateTaskDialog"
       />
 
-      <section v-if="activeTab === 'agents'" class="agent-stage">
-        <div v-if="!selectedDetail" class="empty-stage">
+      <section v-if="activeTab === 'tasks'" class="agent-stage">
+        <div v-if="!selectedTaskDetail" class="empty-stage">
           <div class="empty-mark">+</div>
-          <h2>No agent selected</h2>
-          <p>Create a new agent or choose one from the left rail.</p>
-          <button class="primary-button" @click="openCreateAgentDialog">Create Agent</button>
+          <h2>No task selected</h2>
+          <p>Create a task or choose one from the left rail.</p>
+          <button class="primary-button" @click="openCreateTaskDialog">Create Task</button>
         </div>
 
-        <AgentDetail
+        <TaskDetail
           v-else
-          :detail="selectedDetail"
+          :detail="selectedTaskDetail"
           :events="eventFeed"
           :draft="messageDraft"
           :loading="isDetailLoading"
           :sending="isSending"
+          :approving-plan="isApprovingPlan"
           :providers="providersState.providers"
           :updating-model="isUpdatingAgentModel"
           v-model:conversation-ref="conversationRef"
-          @cancel="cancelAgent"
-          @create-session="onCreateSession"
-          @delete="confirmDeleteAgent"
-          @select-session="onSelectSession"
+          @approve-plan="onApprovePlan"
+          @cancel="confirmCancelTask"
+          @cancel-agent="onCancelSelectedAgent"
+          @delete="confirmDeleteTask"
+          @delete-agent="confirmDeleteTaskAgent"
           @send="onSendMessage"
           @update-model="onUpdateAgentModel"
           @update:draft="messageDraft = $event"
@@ -90,11 +95,10 @@
       @kind-changed="fillFromPreset"
     />
 
-    <AgentDialog
-      :dialog="agentDialog"
-      :providers="providersState.providers"
-      @close="agentDialog.open = false"
-      @create="onCreateAgent"
+    <TaskDialog
+      :dialog="taskDialog"
+      @close="taskDialog.open = false"
+      @create="onCreateTask"
     />
 
     <ConfirmDialog
@@ -115,43 +119,63 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { highlightCodeBlocks } from './utils/markdown'
 
-import AgentRail from './components/AgentRail.vue'
-import AgentDetail from './components/AgentDetail.vue'
+import TaskRail from './components/TaskRail.vue'
+import TaskDetail from './components/TaskDetail.vue'
 import ProviderGrid from './components/ProviderGrid.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import ProviderDialog from './components/ProviderDialog.vue'
-import AgentDialog from './components/AgentDialog.vue'
+import TaskDialog from './components/TaskDialog.vue'
 import ResearchAgentConfigPanel from './components/ResearchAgentConfigPanel.vue'
 
 import { useApi } from './composables/useApi'
 import { useSSE } from './composables/useSSE'
-import { useAgents } from './composables/useAgents'
+import { useTasks } from './composables/useTasks'
 import { useProviders } from './composables/useProviders'
 import { useAgentConfig } from './composables/useAgentConfig'
-import { defaultReasoningEffort } from './utils/reasoning'
-import { countAgentDescendants } from './utils/agentTree'
 
 const { toast, showToast } = useApi()
 const { eventFeed, connectionState, connectEvents, disconnect } = useSSE()
 const {
-  agents, selectedAgentId, selectedDetail, isLoading, isSending, isDetailLoading,
-  conversationRef, agentDialog,
-  refreshAgents, refreshDetail, selectAgent, selectSession, createAgent, createSession,
-  sendMessage, cancelAgent, deleteAgent,
-  updateAgent, scrollConversationToBottom
-} = useAgents()
+  tasks,
+  selectedTaskId,
+  selectedAgentId,
+  selectedTaskDetail,
+  isLoading,
+  isSending,
+  isDetailLoading,
+  isApprovingPlan,
+  conversationRef,
+  taskDialog,
+  refreshTasks,
+  ensureDefaultTask,
+  refreshDetail,
+  selectTask,
+  selectTaskAgent,
+  createTask,
+  sendTaskMessage,
+  approveTaskPlan,
+  cancelTask,
+  cancelTaskAgent,
+  deleteTask,
+  updateAgent,
+  scrollConversationToBottom
+} = useTasks()
 const {
-  providersState, providerDialog,
-  loadProviders, removeProvider, openProviderDialog, closeProviderDialog, saveProviderDialog,
+  providersState,
+  providerDialog,
+  loadProviders,
+  removeProvider,
+  openProviderDialog,
+  closeProviderDialog,
+  saveProviderDialog,
   fillFromPreset
 } = useProviders()
 const { agentConfigState, loadAgentConfig, saveAgentConfig } = useAgentConfig()
 
-const activeTab = ref('agents')
+const activeTab = ref('tasks')
 const messageDraft = ref('')
 const isUpdatingAgentModel = ref(false)
 
-// Confirm dialog
 const confirmDialog = reactive({
   open: false,
   title: '',
@@ -167,8 +191,9 @@ const connectionLabel = computed(() => {
 
 watch(
   () => [
-    selectedDetail.value?.messages?.length,
-    selectedDetail.value?.recent_events?.length,
+    selectedTaskDetail.value?.selected_agent?.messages?.length,
+    selectedTaskDetail.value?.selected_agent?.recent_events?.length,
+    selectedTaskDetail.value?.plan?.version,
     eventFeed.value.length
   ],
   async () => {
@@ -188,8 +213,14 @@ onUnmounted(() => disconnect())
 async function refreshAll() {
   isLoading.value = true
   try {
-    await Promise.all([loadProviders(), loadAgentConfig(), refreshAgents()])
-    if (selectedAgentId.value) await refreshDetail()
+    await Promise.all([loadProviders(), loadAgentConfig(), refreshTasks()])
+    if (providersState.providers.length && !tasks.value.length) {
+      await ensureDefaultTask()
+    } else if (selectedTaskId.value) {
+      await refreshDetail()
+    } else if (tasks.value[0]?.id) {
+      await selectTask(tasks.value[0].id)
+    }
   } catch (error) {
     showToast(error.message)
   } finally {
@@ -198,73 +229,47 @@ async function refreshAll() {
 }
 
 async function handleSSEEvent() {
-  await refreshAgents()
-  if (selectedAgentId.value) await refreshDetail()
+  await refreshTasks()
+  if (selectedTaskId.value) await refreshDetail()
 }
 
-function openCreateAgentDialog() {
+function openCreateTaskDialog() {
   if (!providersState.providers.length) {
     activeTab.value = 'providers'
-    showToast('Add a provider before creating an agent.')
+    showToast('Add a provider before creating a task.')
     return
   }
-  const defaultProvider =
-    providersState.providers.find((p) => p.id === providersState.default_provider_id) ||
-    providersState.providers[0]
-  agentDialog.open = true
-  agentDialog.name = ''
-  agentDialog.provider_id = defaultProvider?.id || ''
-  agentDialog.model = defaultProvider?.default_model || defaultProvider?.models?.[0]?.id || ''
-  agentDialog.docker_image = ''
-  resetAgentReasoningEffort()
-  agentDialog.error = ''
+  taskDialog.open = true
+  taskDialog.title = ''
+  taskDialog.message = ''
+  taskDialog.docker_image = ''
+  taskDialog.error = ''
 }
 
-function resetAgentReasoningEffort() {
-  const provider = providersState.providers.find((p) => p.id === agentDialog.provider_id)
-  const model = provider?.models?.find((item) => item.id === agentDialog.model)
-  agentDialog.reasoning_effort = defaultReasoningEffort(provider, model)
-}
-
-async function onCreateAgent() {
-  agentDialog.error = ''
+async function onCreateTask() {
+  taskDialog.error = ''
   try {
-    await createAgent(
-      agentDialog.name,
-      agentDialog.provider_id,
-      agentDialog.model,
-      agentDialog.reasoning_effort,
-      agentDialog.docker_image
-    )
-    agentDialog.open = false
-    activeTab.value = 'agents'
+    await createTask(taskDialog.title, taskDialog.message, taskDialog.docker_image)
+    taskDialog.open = false
+    activeTab.value = 'tasks'
   } catch (error) {
-    agentDialog.error = error.message
+    taskDialog.error = error.message
   }
 }
 
 async function onSendMessage(message) {
   try {
     messageDraft.value = ''
-    await sendMessage(message)
+    await sendTaskMessage(message)
   } catch (error) {
     showToast(error.message)
   }
 }
 
-async function onCreateSession() {
+async function onApprovePlan() {
   try {
-    messageDraft.value = ''
-    await createSession()
-  } catch (error) {
-    showToast(error.message)
-  }
-}
-
-async function onSelectSession(sessionId) {
-  try {
-    messageDraft.value = ''
-    await selectSession(sessionId)
+    await approveTaskPlan()
+    showToast('Plan approved. Executor and reviewer workflow started.')
   } catch (error) {
     showToast(error.message)
   }
@@ -273,7 +278,7 @@ async function onSelectSession(sessionId) {
 async function onUpdateAgentModel(payload) {
   isUpdatingAgentModel.value = true
   try {
-    await updateAgent(selectedDetail.value.id, payload.provider_id, payload.model, payload.reasoning_effort)
+    await updateAgent(selectedTaskDetail.value.selected_agent.id, payload.provider_id, payload.model, payload.reasoning_effort)
     showToast('Agent model updated.')
   } catch (error) {
     showToast(error.message)
@@ -282,25 +287,30 @@ async function onUpdateAgentModel(payload) {
   }
 }
 
-async function onSaveAgentConfig(config) {
+async function onCancelSelectedAgent(id) {
   try {
-    await saveAgentConfig(config)
-    showToast('Agent config saved.')
+    await cancelTaskAgent(id)
   } catch (error) {
     showToast(error.message)
   }
 }
 
-function confirmDeleteAgent(id, name) {
-  const descendants = countAgentDescendants(id, agents.value)
-  confirmDialog.title = 'Delete Agent'
-  confirmDialog.message = descendants
-    ? `Are you sure you want to delete "${name || id}" and ${descendants} subagent${descendants === 1 ? '' : 's'}? This action cannot be undone.`
-    : `Are you sure you want to delete "${name || id}"? This action cannot be undone.`
+async function onSaveAgentConfig(config) {
+  try {
+    await saveAgentConfig(config)
+    showToast('Role config saved.')
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+function confirmCancelTask(id) {
+  confirmDialog.title = 'Cancel Task'
+  confirmDialog.message = 'Cancel this task and all running task agents?'
   confirmDialog.onConfirm = async () => {
     confirmDialog.open = false
     try {
-      await deleteAgent(id)
+      await cancelTask(id)
     } catch (error) {
       showToast(error.message)
     }
@@ -308,9 +318,27 @@ function confirmDeleteAgent(id, name) {
   confirmDialog.open = true
 }
 
+function confirmDeleteTask(id, title) {
+  confirmDialog.title = 'Delete Task'
+  confirmDialog.message = `Delete "${title || id}" and all task agents? This action cannot be undone.`
+  confirmDialog.onConfirm = async () => {
+    confirmDialog.open = false
+    try {
+      await deleteTask(id)
+    } catch (error) {
+      showToast(error.message)
+    }
+  }
+  confirmDialog.open = true
+}
+
+function confirmDeleteTaskAgent() {
+  showToast('Delete the task to remove task-owned agents.')
+}
+
 function confirmDeleteProvider(index, name) {
   confirmDialog.title = 'Delete Provider'
-  confirmDialog.message = `Are you sure you want to delete "${name}"? Agents using this provider may stop working.`
+  confirmDialog.message = `Are you sure you want to delete "${name}"? Task agents using this provider may stop working.`
   confirmDialog.onConfirm = async () => {
     confirmDialog.open = false
     try {

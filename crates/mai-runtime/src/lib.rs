@@ -8,8 +8,9 @@ use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentMessage,
     AgentModelPreference, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary, ContextUsage,
     CreateAgentRequest, MessageRole, ModelConfig, ModelContentItem, ModelInputItem,
-    ModelOutputItem, ModelToolCall, ResolvedAgentModelPreference, ServiceEvent, ServiceEventKind,
-    SessionId, TokenUsage, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest, now, preview,
+    ModelOutputItem, ModelToolCall, PlanStatus, ResolvedAgentModelPreference, ServiceEvent,
+    ServiceEventKind, SessionId, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus,
+    TaskSummary, TokenUsage, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest, now, preview,
 };
 use mai_skills::SkillsManager;
 use mai_store::{ConfigStore, ProviderSelection};
@@ -28,6 +29,7 @@ use uuid::Uuid;
 const MAX_TOOL_ITERATIONS: usize = 16;
 const RECENT_EVENT_LIMIT: usize = 500;
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
+const REVIEW_ROUND_LIMIT: u64 = 5;
 const COMPACT_USER_MESSAGE_MAX_CHARS: usize = 80_000;
 const COMPACT_SUMMARY_PREVIEW_CHARS: usize = 240;
 const COMPACT_SUMMARY_PREFIX: &str = "Context checkpoint summary from earlier conversation history. This is background for continuity, not a new user request.";
@@ -51,8 +53,12 @@ const AGENT_ROLES: [AgentRole; 4] = [
 pub enum RuntimeError {
     #[error("agent not found: {0}")]
     AgentNotFound(AgentId),
+    #[error("task not found: {0}")]
+    TaskNotFound(TaskId),
     #[error("agent is busy: {0}")]
     AgentBusy(AgentId),
+    #[error("task is busy: {0}")]
+    TaskBusy(TaskId),
     #[error("agent has no container: {0}")]
     MissingContainer(AgentId),
     #[error("session not found: {agent_id}/{session_id}")]
@@ -91,9 +97,17 @@ pub struct AgentRuntime {
     store: Arc<ConfigStore>,
     skills: SkillsManager,
     agents: RwLock<HashMap<AgentId, Arc<AgentRecord>>>,
+    tasks: RwLock<HashMap<TaskId, Arc<TaskRecord>>>,
     event_tx: broadcast::Sender<ServiceEvent>,
     sequence: AtomicU64,
     recent_events: Mutex<VecDeque<ServiceEvent>>,
+}
+
+struct TaskRecord {
+    summary: RwLock<TaskSummary>,
+    plan: RwLock<TaskPlan>,
+    reviews: RwLock<Vec<TaskReview>>,
+    workflow_lock: Mutex<()>,
 }
 
 struct AgentRecord {
@@ -181,6 +195,25 @@ impl AgentRuntime {
             }
             agents.insert(summary.id, agent);
         }
+        let mut tasks = HashMap::new();
+        for persisted in snapshot.tasks {
+            let mut summary = persisted.summary;
+            let mut agent_count = 0;
+            for agent in agents.values() {
+                if agent.summary.read().await.task_id == Some(summary.id) {
+                    agent_count += 1;
+                }
+            }
+            summary.agent_count = agent_count;
+            summary.review_rounds = persisted.reviews.len() as u64;
+            let task = Arc::new(TaskRecord {
+                summary: RwLock::new(summary.clone()),
+                plan: RwLock::new(persisted.plan),
+                reviews: RwLock::new(persisted.reviews),
+                workflow_lock: Mutex::new(()),
+            });
+            tasks.insert(summary.id, task);
+        }
 
         Ok(Arc::new(Self {
             docker,
@@ -188,6 +221,7 @@ impl AgentRuntime {
             store,
             skills,
             agents: RwLock::new(agents),
+            tasks: RwLock::new(tasks),
             event_tx,
             sequence: AtomicU64::new(snapshot.next_sequence),
             recent_events: Mutex::new(snapshot.recent_events.into_iter().collect()),
@@ -261,11 +295,187 @@ impl AgentRuntime {
         self.agent_config().await
     }
 
+    pub async fn list_tasks(&self) -> Vec<TaskSummary> {
+        let task_records = {
+            let tasks = self.tasks.read().await;
+            tasks.values().cloned().collect::<Vec<_>>()
+        };
+        let mut summaries = Vec::with_capacity(task_records.len());
+        for task in task_records {
+            let mut summary = task.summary.read().await.clone();
+            self.refresh_task_summary_counts(&mut summary).await;
+            summaries.push(summary);
+        }
+        summaries.sort_by_key(|summary| summary.created_at);
+        summaries
+    }
+
+    pub async fn ensure_default_task(self: &Arc<Self>) -> Result<Option<TaskSummary>> {
+        let tasks = self.list_tasks().await;
+        if let Some(task) = tasks.first() {
+            return Ok(Some(task.clone()));
+        }
+        match self.create_task(None, None, None).await {
+            Ok(task) => Ok(Some(task)),
+            Err(RuntimeError::Store(mai_store::StoreError::InvalidConfig(_))) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub async fn create_task(
+        self: &Arc<Self>,
+        title: Option<String>,
+        initial_message: Option<String>,
+        docker_image: Option<String>,
+    ) -> Result<TaskSummary> {
+        let task_id = Uuid::new_v4();
+        let title = title
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "New Task".to_string());
+        let planner_model = self.resolve_role_agent_model(AgentRole::Planner).await?;
+        let created_at = now();
+        let planner = self
+            .create_agent_with_container_source(
+                CreateAgentRequest {
+                    name: Some(format!("{title} Planner")),
+                    provider_id: Some(planner_model.preference.provider_id),
+                    model: Some(planner_model.preference.model),
+                    reasoning_effort: planner_model.preference.reasoning_effort,
+                    docker_image,
+                    parent_id: None,
+                    system_prompt: Some(task_role_system_prompt(AgentRole::Planner).to_string()),
+                },
+                ContainerSource::FreshImage,
+                Some(task_id),
+                Some(AgentRole::Planner),
+            )
+            .await?;
+        let plan = TaskPlan::default();
+        let summary = TaskSummary {
+            id: task_id,
+            title,
+            status: TaskStatus::Planning,
+            plan_status: plan.status.clone(),
+            plan_version: plan.version,
+            planner_agent_id: planner.id,
+            current_agent_id: Some(planner.id),
+            agent_count: 1,
+            review_rounds: 0,
+            created_at,
+            updated_at: now(),
+            last_error: None,
+            final_report: None,
+        };
+        self.store.save_task(&summary, &plan).await?;
+        let task = Arc::new(TaskRecord {
+            summary: RwLock::new(summary.clone()),
+            plan: RwLock::new(plan),
+            reviews: RwLock::new(Vec::new()),
+            workflow_lock: Mutex::new(()),
+        });
+        self.tasks.write().await.insert(task_id, task);
+        self.publish(ServiceEventKind::TaskCreated {
+            task: summary.clone(),
+        })
+        .await;
+        if let Some(message) = initial_message.filter(|message| !message.trim().is_empty()) {
+            let _ = self
+                .send_task_message(task_id, message, Vec::new())
+                .await?;
+        }
+        Ok(summary)
+    }
+
+    pub async fn get_task(
+        &self,
+        task_id: TaskId,
+        selected_agent_id: Option<AgentId>,
+    ) -> Result<TaskDetail> {
+        let task = self.task(task_id).await?;
+        let summary = self.task_summary(&task).await;
+        let plan = task.plan.read().await.clone();
+        let reviews = task.reviews.read().await.clone();
+        let agents = self.task_agents(task_id).await;
+        let selected_agent_id = selected_agent_id
+            .filter(|id| agents.iter().any(|agent| agent.id == *id))
+            .or(summary.current_agent_id)
+            .unwrap_or(summary.planner_agent_id);
+        let selected_agent = self.get_agent(selected_agent_id, None).await?;
+        Ok(TaskDetail {
+            summary,
+            plan,
+            reviews,
+            agents,
+            selected_agent_id,
+            selected_agent,
+        })
+    }
+
+    pub async fn send_task_message(
+        self: &Arc<Self>,
+        task_id: TaskId,
+        message: String,
+        skill_mentions: Vec<String>,
+    ) -> Result<TurnId> {
+        let task = self.task(task_id).await?;
+        let planner_agent_id = task.summary.read().await.planner_agent_id;
+        {
+            let mut plan = task.plan.write().await;
+            if plan.status == PlanStatus::Ready {
+                *plan = TaskPlan::default();
+                let mut summary = task.summary.write().await;
+                summary.status = TaskStatus::Planning;
+                summary.plan_status = PlanStatus::Missing;
+                summary.plan_version = 0;
+                summary.updated_at = now();
+                self.store.save_task(&summary, &plan).await?;
+                self.publish(ServiceEventKind::TaskUpdated {
+                    task: summary.clone(),
+                })
+                .await;
+            }
+        }
+        let turn_id = self
+            .send_message(planner_agent_id, None, message, skill_mentions)
+            .await?;
+        self.set_task_current_agent(&task, planner_agent_id, TaskStatus::Planning, None)
+            .await?;
+        Ok(turn_id)
+    }
+
+    pub async fn approve_task_plan(self: &Arc<Self>, task_id: TaskId) -> Result<TaskSummary> {
+        let task = self.task(task_id).await?;
+        {
+            let mut plan = task.plan.write().await;
+            if plan.status != PlanStatus::Ready || plan.markdown.as_deref().unwrap_or("").is_empty()
+            {
+                return Err(RuntimeError::InvalidInput(
+                    "task has no ready plan to approve".to_string(),
+                ));
+            }
+            plan.status = PlanStatus::Approved;
+            plan.approved_at = Some(now());
+            let mut summary = task.summary.write().await;
+            summary.status = TaskStatus::Executing;
+            summary.plan_status = PlanStatus::Approved;
+            summary.plan_version = plan.version;
+            summary.updated_at = now();
+            self.store.save_task(&summary, &plan).await?;
+            self.publish(ServiceEventKind::TaskUpdated {
+                task: summary.clone(),
+            })
+            .await;
+        }
+        self.spawn_task_workflow(task_id);
+        Ok(self.task_summary(&task).await)
+    }
+
     pub async fn create_agent(
         self: &Arc<Self>,
         request: CreateAgentRequest,
     ) -> Result<AgentSummary> {
-        self.create_agent_with_container_source(request, ContainerSource::FreshImage)
+        self.create_agent_with_container_source(request, ContainerSource::FreshImage, None, None)
             .await
     }
 
@@ -273,6 +483,8 @@ impl AgentRuntime {
         self: &Arc<Self>,
         request: CreateAgentRequest,
         container_source: ContainerSource,
+        task_id: Option<TaskId>,
+        role: Option<AgentRole>,
     ) -> Result<AgentSummary> {
         let id = Uuid::new_v4();
         let created_at = Utc::now();
@@ -293,6 +505,8 @@ impl AgentRuntime {
         let summary = AgentSummary {
             id,
             parent_id: request.parent_id,
+            task_id,
+            role,
             name,
             status: AgentStatus::Created,
             container_id: None,
@@ -310,7 +524,11 @@ impl AgentRuntime {
         self.store
             .save_agent(&summary, system_prompt.as_deref())
             .await?;
-        let session = default_session_record();
+        let session = if task_id.is_some() {
+            session_record_with_title("Task")
+        } else {
+            default_session_record()
+        };
         self.store.save_agent_session(id, &session.summary).await?;
 
         let agent = Arc::new(AgentRecord {
@@ -482,6 +700,11 @@ impl AgentRuntime {
 
     pub async fn create_session(&self, agent_id: AgentId) -> Result<AgentSessionSummary> {
         let agent = self.agent(agent_id).await?;
+        if agent.summary.read().await.task_id.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "task-owned agents use a single internal task session".to_string(),
+            ));
+        }
         let session = {
             let mut sessions = agent.sessions.lock().await;
             let session = AgentSessionRecord {
@@ -644,6 +867,38 @@ impl AgentRuntime {
         for target_id in targets {
             self.delete_agent_record(target_id).await?;
         }
+        Ok(())
+    }
+
+    pub async fn cancel_task(&self, task_id: TaskId) -> Result<()> {
+        let task = self.task(task_id).await?;
+        let agents = self.task_agents(task_id).await;
+        for agent in agents {
+            if let Ok(record) = self.agent(agent.id).await {
+                record.cancel_requested.store(true, Ordering::SeqCst);
+                let _ = self.set_status(&record, AgentStatus::Cancelled, None).await;
+            }
+        }
+        self.set_task_status(&task, TaskStatus::Cancelled, None, None)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_task(self: &Arc<Self>, task_id: TaskId) -> Result<()> {
+        let _task = self.task(task_id).await?;
+        let root_agents = self
+            .task_agents(task_id)
+            .await
+            .into_iter()
+            .filter(|agent| agent.parent_id.is_none())
+            .map(|agent| agent.id)
+            .collect::<Vec<_>>();
+        for agent_id in root_agents {
+            let _ = self.delete_agent(agent_id).await;
+        }
+        self.store.delete_task(task_id).await?;
+        self.tasks.write().await.remove(&task_id);
+        self.publish(ServiceEventKind::TaskDeleted { task_id }).await;
         Ok(())
     }
 
@@ -1139,9 +1394,10 @@ impl AgentRuntime {
                 let child_model = self.resolve_role_agent_model(role).await?;
                 let parent = self.agent(agent_id).await?;
                 let parent_status = parent.summary.read().await.status.clone();
+                let parent_summary = parent.summary.read().await.clone();
                 let parent_container_id =
                     self.ensure_agent_container(&parent, parent_status).await?;
-                let parent_docker_image = parent.summary.read().await.docker_image.clone();
+                let parent_docker_image = parent_summary.docker_image.clone();
                 let created = self
                     .create_agent_with_container_source(
                         CreateAgentRequest {
@@ -1151,12 +1407,14 @@ impl AgentRuntime {
                             reasoning_effort: child_model.preference.reasoning_effort,
                             docker_image: Some(parent_docker_image.clone()),
                             parent_id: Some(agent_id),
-                            system_prompt: Some(role_system_prompt(role).to_string()),
+                            system_prompt: Some(task_role_system_prompt(role).to_string()),
                         },
                         ContainerSource::CloneFrom {
                             parent_container_id,
                             docker_image: parent_docker_image,
                         },
+                        parent_summary.task_id,
+                        Some(role),
                     )
                     .await?;
                 let turn_id = if let Some(message) = message {
@@ -1214,6 +1472,30 @@ impl AgentRuntime {
                     output: json!({ "closed": target }).to_string(),
                 })
             }
+            RoutedTool::SaveTaskPlan => {
+                let title = required_string(&arguments, "title")?;
+                let markdown = required_string(&arguments, "markdown")?;
+                let task = self.save_task_plan(agent_id, title, markdown).await?;
+                Ok(ToolExecution {
+                    success: true,
+                    output: serde_json::to_string(&task).unwrap_or_else(|_| "{}".to_string()),
+                })
+            }
+            RoutedTool::SubmitReviewResult => {
+                let passed = arguments
+                    .get("passed")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| RuntimeError::InvalidInput("missing boolean field `passed`".to_string()))?;
+                let findings = required_string(&arguments, "findings")?;
+                let summary = required_string(&arguments, "summary")?;
+                let review = self
+                    .submit_review_result(agent_id, passed, findings, summary)
+                    .await?;
+                Ok(ToolExecution {
+                    success: true,
+                    output: serde_json::to_string(&review).unwrap_or_else(|_| "{}".to_string()),
+                })
+            }
             RoutedTool::Mcp(model_name) => {
                 let manager = agent.mcp.read().await.clone().ok_or_else(|| {
                     RuntimeError::InvalidInput("MCP manager not initialized".to_string())
@@ -1229,6 +1511,270 @@ impl AgentRuntime {
                 output: format!("unknown tool: {name}"),
             }),
         }
+    }
+
+    async fn save_task_plan(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        title: String,
+        markdown: String,
+    ) -> Result<TaskSummary> {
+        let agent = self.agent(agent_id).await?;
+        let summary = agent.summary.read().await.clone();
+        if summary.role != Some(AgentRole::Planner) {
+            return Err(RuntimeError::InvalidInput(
+                "only planner task agents can save task plans".to_string(),
+            ));
+        }
+        let task_id = summary.task_id.ok_or_else(|| {
+            RuntimeError::InvalidInput("agent is not attached to a task".to_string())
+        })?;
+        let task = self.task(task_id).await?;
+        {
+            let mut plan = task.plan.write().await;
+            let version = plan.version.saturating_add(1).max(1);
+            *plan = TaskPlan {
+                status: PlanStatus::Ready,
+                title: Some(title.trim().to_string()),
+                markdown: Some(markdown.trim().to_string()),
+                version,
+                saved_by_agent_id: Some(agent_id),
+                saved_at: Some(now()),
+                approved_at: None,
+            };
+            let mut task_summary = task.summary.write().await;
+            task_summary.status = TaskStatus::AwaitingApproval;
+            task_summary.plan_status = PlanStatus::Ready;
+            task_summary.plan_version = version;
+            task_summary.current_agent_id = Some(agent_id);
+            task_summary.updated_at = now();
+            self.refresh_task_summary_counts(&mut task_summary).await;
+            self.store.save_task(&task_summary, &plan).await?;
+            self.publish(ServiceEventKind::TaskUpdated {
+                task: task_summary.clone(),
+            })
+            .await;
+        }
+        Ok(self.task_summary(&task).await)
+    }
+
+    async fn submit_review_result(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        passed: bool,
+        findings: String,
+        summary: String,
+    ) -> Result<TaskReview> {
+        let agent = self.agent(agent_id).await?;
+        let agent_summary = agent.summary.read().await.clone();
+        if agent_summary.role != Some(AgentRole::Reviewer) {
+            return Err(RuntimeError::InvalidInput(
+                "only reviewer task agents can submit review results".to_string(),
+            ));
+        }
+        let task_id = agent_summary.task_id.ok_or_else(|| {
+            RuntimeError::InvalidInput("agent is not attached to a task".to_string())
+        })?;
+        let task = self.task(task_id).await?;
+        let review = {
+            let mut reviews = task.reviews.write().await;
+            let review = TaskReview {
+                id: Uuid::new_v4(),
+                task_id,
+                reviewer_agent_id: agent_id,
+                round: reviews.len() as u64 + 1,
+                passed,
+                findings,
+                summary,
+                created_at: now(),
+            };
+            self.store.append_task_review(&review).await?;
+            reviews.push(review.clone());
+            review
+        };
+        {
+            let plan = task.plan.read().await.clone();
+            let mut summary = task.summary.write().await;
+            summary.review_rounds = task.reviews.read().await.len() as u64;
+            summary.updated_at = now();
+            self.refresh_task_summary_counts(&mut summary).await;
+            self.store.save_task(&summary, &plan).await?;
+            self.publish(ServiceEventKind::TaskUpdated {
+                task: summary.clone(),
+            })
+            .await;
+        }
+        Ok(review)
+    }
+
+    fn spawn_task_workflow(self: &Arc<Self>, task_id: TaskId) {
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(err) = runtime.clone().run_task_workflow(task_id).await
+                && let Ok(task) = runtime.task(task_id).await
+            {
+                let _ = runtime
+                    .set_task_status(&task, TaskStatus::Failed, None, Some(err.to_string()))
+                    .await;
+            }
+        });
+    }
+
+    async fn run_task_workflow(self: Arc<Self>, task_id: TaskId) -> Result<()> {
+        let task = self.task(task_id).await?;
+        let _workflow_guard = task.workflow_lock.lock().await;
+        let plan_markdown = task
+            .plan
+            .read()
+            .await
+            .markdown
+            .clone()
+            .filter(|plan| !plan.trim().is_empty())
+            .ok_or_else(|| RuntimeError::InvalidInput("approved plan is empty".to_string()))?;
+        let planner_agent_id = task.summary.read().await.planner_agent_id;
+        let executor = self
+            .spawn_task_role_agent(
+                planner_agent_id,
+                AgentRole::Executor,
+                Some("Task Executor".to_string()),
+            )
+            .await?;
+        self.set_task_current_agent(&task, executor.id, TaskStatus::Executing, None)
+            .await?;
+        self.start_agent_turn(
+            executor.id,
+            format!(
+                "Implement the approved task plan below. Keep changes scoped, run verification, and report touched files and test results.\n\n{}",
+                plan_markdown
+            ),
+        )
+        .await?;
+        let mut executor_summary = self
+            .wait_agent(executor.id, Duration::from_secs(3600))
+            .await?;
+        for round in 1..=REVIEW_ROUND_LIMIT {
+            if matches!(executor_summary.status, AgentStatus::Failed | AgentStatus::Cancelled) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "executor ended with status {:?}",
+                    executor_summary.status
+                )));
+            }
+            let reviewer = self
+                .spawn_task_role_agent(
+                    executor.id,
+                    AgentRole::Reviewer,
+                    Some(format!("Task Reviewer {round}")),
+                )
+                .await?;
+            self.set_task_current_agent(&task, reviewer.id, TaskStatus::Reviewing, None)
+                .await?;
+            self.start_agent_turn(
+                reviewer.id,
+                format!(
+                    "Review the executor's changes for the approved task plan. Use submit_review_result with passed=true only when there are no blocking issues. Include concrete findings and a concise summary.\n\nApproved plan:\n{}",
+                    plan_markdown
+                ),
+            )
+            .await?;
+            let reviewer_summary = self
+                .wait_agent(reviewer.id, Duration::from_secs(3600))
+                .await?;
+            if matches!(reviewer_summary.status, AgentStatus::Failed | AgentStatus::Cancelled) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "reviewer ended with status {:?}",
+                    reviewer_summary.status
+                )));
+            }
+            let latest_review = task.reviews.read().await.last().cloned();
+            let Some(review) = latest_review else {
+                return Err(RuntimeError::InvalidInput(
+                    "reviewer did not submit a review result".to_string(),
+                ));
+            };
+            if review.passed {
+                let report = if review.summary.trim().is_empty() {
+                    "Task completed and review passed.".to_string()
+                } else {
+                    review.summary.clone()
+                };
+                self.set_task_status(&task, TaskStatus::Completed, Some(report), None)
+                    .await?;
+                return Ok(());
+            }
+            if round == REVIEW_ROUND_LIMIT {
+                self.set_task_status(
+                    &task,
+                    TaskStatus::Failed,
+                    None,
+                    Some(format!(
+                        "review did not pass after {REVIEW_ROUND_LIMIT} rounds: {}",
+                        review.findings
+                    )),
+                )
+                .await?;
+                return Ok(());
+            }
+            self.set_task_current_agent(&task, executor.id, TaskStatus::Executing, None)
+                .await?;
+            self.start_agent_turn(
+                executor.id,
+                format!(
+                    "The reviewer found issues. Fix them, rerun verification, and report the changes.\n\nReview findings:\n{}\n\nReview summary:\n{}",
+                    review.findings, review.summary
+                ),
+            )
+            .await?;
+            executor_summary = self
+                .wait_agent(executor.id, Duration::from_secs(3600))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn spawn_task_role_agent(
+        self: &Arc<Self>,
+        parent_agent_id: AgentId,
+        role: AgentRole,
+        name: Option<String>,
+    ) -> Result<AgentSummary> {
+        let parent = self.agent(parent_agent_id).await?;
+        let parent_summary = parent.summary.read().await.clone();
+        let task_id = parent_summary.task_id.ok_or_else(|| {
+            RuntimeError::InvalidInput("parent agent is not attached to a task".to_string())
+        })?;
+        let parent_container_id = self
+            .ensure_agent_container(&parent, parent_summary.status.clone())
+            .await?;
+        let model = self.resolve_role_agent_model(role).await?;
+        self.create_agent_with_container_source(
+            CreateAgentRequest {
+                name,
+                provider_id: Some(model.preference.provider_id),
+                model: Some(model.preference.model),
+                reasoning_effort: model.preference.reasoning_effort,
+                docker_image: Some(parent_summary.docker_image.clone()),
+                parent_id: Some(parent_agent_id),
+                system_prompt: Some(task_role_system_prompt(role).to_string()),
+            },
+            ContainerSource::CloneFrom {
+                parent_container_id,
+                docker_image: parent_summary.docker_image,
+            },
+            Some(task_id),
+            Some(role),
+        )
+        .await
+    }
+
+    async fn start_agent_turn(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        message: String,
+    ) -> Result<TurnId> {
+        let session_id = self.resolve_session_id(agent_id, None).await?;
+        let turn_id = self.prepare_turn(agent_id).await?;
+        self.spawn_turn(agent_id, session_id, turn_id, message, Vec::new());
+        Ok(turn_id)
     }
 
     #[cfg(test)]
@@ -1560,6 +2106,99 @@ impl AgentRuntime {
         self.store
             .save_agent(&summary, agent.system_prompt.as_deref())
             .await?;
+        Ok(())
+    }
+
+    async fn task(&self, task_id: TaskId) -> Result<Arc<TaskRecord>> {
+        self.tasks
+            .read()
+            .await
+            .get(&task_id)
+            .cloned()
+            .ok_or(RuntimeError::TaskNotFound(task_id))
+    }
+
+    async fn task_summary(&self, task: &Arc<TaskRecord>) -> TaskSummary {
+        let mut summary = task.summary.read().await.clone();
+        self.refresh_task_summary_counts(&mut summary).await;
+        summary
+    }
+
+    async fn refresh_task_summary_counts(&self, summary: &mut TaskSummary) {
+        summary.agent_count = self.task_agents(summary.id).await.len();
+        let task = {
+            let tasks = self.tasks.read().await;
+            tasks.get(&summary.id).cloned()
+        };
+        if let Some(task) = task {
+            summary.review_rounds = task.reviews.read().await.len() as u64;
+        }
+    }
+
+    async fn task_agents(&self, task_id: TaskId) -> Vec<AgentSummary> {
+        let agents = self.agents.read().await;
+        let mut summaries = Vec::new();
+        for agent in agents.values() {
+            let summary = agent.summary.read().await.clone();
+            if summary.task_id == Some(task_id) {
+                summaries.push(summary);
+            }
+        }
+        summaries.sort_by_key(|summary| summary.created_at);
+        summaries
+    }
+
+    async fn set_task_current_agent(
+        &self,
+        task: &Arc<TaskRecord>,
+        agent_id: AgentId,
+        status: TaskStatus,
+        error: Option<String>,
+    ) -> Result<()> {
+        let plan = task.plan.read().await.clone();
+        let mut summary = task.summary.write().await;
+        summary.current_agent_id = Some(agent_id);
+        summary.status = status;
+        summary.updated_at = now();
+        if let Some(error) = error {
+            summary.last_error = Some(error);
+        }
+        summary.plan_status = plan.status.clone();
+        summary.plan_version = plan.version;
+        self.refresh_task_summary_counts(&mut summary).await;
+        self.store.save_task(&summary, &plan).await?;
+        self.publish(ServiceEventKind::TaskUpdated {
+            task: summary.clone(),
+        })
+        .await;
+        Ok(())
+    }
+
+    async fn set_task_status(
+        &self,
+        task: &Arc<TaskRecord>,
+        status: TaskStatus,
+        final_report: Option<String>,
+        error: Option<String>,
+    ) -> Result<()> {
+        let plan = task.plan.read().await.clone();
+        let mut summary = task.summary.write().await;
+        summary.status = status;
+        summary.updated_at = now();
+        if final_report.is_some() {
+            summary.final_report = final_report;
+        }
+        if error.is_some() {
+            summary.last_error = error;
+        }
+        summary.plan_status = plan.status.clone();
+        summary.plan_version = plan.version;
+        self.refresh_task_summary_counts(&mut summary).await;
+        self.store.save_task(&summary, &plan).await?;
+        self.publish(ServiceEventKind::TaskUpdated {
+            task: summary.clone(),
+        })
+        .await;
         Ok(())
     }
 
@@ -1929,19 +2568,19 @@ fn agent_role_label(role: AgentRole) -> &'static str {
     }
 }
 
-fn role_system_prompt(role: AgentRole) -> &'static str {
+fn task_role_system_prompt(role: AgentRole) -> &'static str {
     match role {
         AgentRole::Planner => {
-            "You are the Planner role for a multi-agent coding task. Break work into clear steps, identify dependencies, risks, and acceptance criteria, and hand off bounded tasks. Do not modify code unless the task explicitly asks the planner to implement."
+            "You are the Planner for a first-class Mai task. Talk with the user to clarify the task, spawn explorer agents when code or documentation research would help, and do not modify code. When the plan is complete, call save_task_plan with a clear title and complete Markdown plan. After saving, wait for user approval rather than executing."
         }
         AgentRole::Explorer => {
-            "You are the Explorer role for a multi-agent coding task. Investigate the existing codebase, relevant documentation, and web context when useful. Prefer read-only exploration, cite concrete files or sources, and return concise findings that help the team decide what to build next."
+            "You are an Explorer subagent for a task. Investigate code, docs, and relevant context using read-only exploration unless explicitly told otherwise. Return concise findings with concrete files, commands, or sources that help the planner decide."
         }
         AgentRole::Executor => {
-            "You are the Executor role for a multi-agent coding task. Implement concrete changes, run the necessary commands, report touched files and verification results, and keep the work scoped to the assigned task."
+            "You are the Executor for an approved task plan. Implement the requested changes in your container, keep scope tight, run verification, and report changed files plus test results. If reviewer feedback arrives, fix the issues and rerun relevant checks."
         }
         AgentRole::Reviewer => {
-            "You are the Reviewer role for a multi-agent coding task. Review changes for bugs, regressions, missing tests, and unclear behavior. Lead with findings ordered by severity and include file paths or command evidence when relevant."
+            "You are the Reviewer for a task workflow. Review executor changes for bugs, regressions, missing tests, and unclear behavior. You must call submit_review_result with passed, findings, and summary before finishing. Set passed=true only when there are no blocking issues."
         }
     }
 }
@@ -2122,11 +2761,15 @@ fn recovered_summary(mut summary: AgentSummary) -> (AgentSummary, bool) {
 }
 
 fn default_session_record() -> AgentSessionRecord {
+    session_record_with_title("Chat 1")
+}
+
+fn session_record_with_title(title: &str) -> AgentSessionRecord {
     let now = now();
     AgentSessionRecord {
         summary: AgentSessionSummary {
             id: Uuid::new_v4(),
-            title: "Chat 1".to_string(),
+            title: title.to_string(),
             created_at: now,
             updated_at: now,
             message_count: 0,
@@ -2272,6 +2915,9 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         | ServiceEventKind::ToolCompleted { agent_id, .. }
         | ServiceEventKind::ContextCompacted { agent_id, .. }
         | ServiceEventKind::AgentMessage { agent_id, .. } => Some(*agent_id),
+        ServiceEventKind::TaskCreated { .. }
+        | ServiceEventKind::TaskUpdated { .. }
+        | ServiceEventKind::TaskDeleted { .. } => None,
         ServiceEventKind::Error { agent_id, .. } => *agent_id,
     }
 }
@@ -2538,6 +3184,8 @@ mod tests {
         AgentSummary {
             id: agent_id,
             parent_id,
+            task_id: None,
+            role: None,
             name: "compact-agent".to_string(),
             status: AgentStatus::Idle,
             container_id: container_id.map(ToOwned::to_owned),
@@ -2681,6 +3329,125 @@ esac
     fn agent_status_allows_new_turn_after_completion() {
         assert!(AgentStatus::Completed.can_start_turn());
         assert!(!AgentStatus::RunningTurn.can_start_turn());
+    }
+
+    #[tokio::test]
+    async fn create_task_persists_planner_metadata_and_rejects_extra_sessions() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        let task = runtime
+            .create_task(Some("Build task UI".to_string()), None, Some("ubuntu:latest".to_string()))
+            .await
+            .expect("create task");
+
+        assert_eq!(task.status, TaskStatus::Planning);
+        assert_eq!(task.plan_status, PlanStatus::Missing);
+        let detail = runtime.get_task(task.id, None).await.expect("task detail");
+        assert_eq!(detail.agents.len(), 1);
+        assert_eq!(detail.selected_agent.summary.role, Some(AgentRole::Planner));
+        assert_eq!(detail.selected_agent.summary.task_id, Some(task.id));
+        assert_eq!(detail.selected_agent.sessions.len(), 1);
+        assert_eq!(detail.selected_agent.sessions[0].title, "Task");
+        assert!(runtime
+            .create_session(detail.selected_agent.summary.id)
+            .await
+            .is_err());
+
+        let snapshot = store.load_runtime_snapshot(20).await.expect("snapshot");
+        assert_eq!(snapshot.tasks.len(), 1);
+        assert_eq!(snapshot.tasks[0].summary.id, task.id);
+        let planner = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.summary.id == task.planner_agent_id)
+            .expect("planner");
+        assert_eq!(planner.summary.task_id, Some(task.id));
+        assert_eq!(planner.summary.role, Some(AgentRole::Planner));
+    }
+
+    #[tokio::test]
+    async fn task_plan_tool_requires_planner_and_updates_task_status() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let task = runtime
+            .create_task(Some("Plan me".to_string()), None, Some("ubuntu:latest".to_string()))
+            .await
+            .expect("create task");
+
+        let output = runtime
+            .execute_tool_for_test(
+                task.planner_agent_id,
+                "save_task_plan",
+                json!({
+                    "title": "Implementation plan",
+                    "markdown": "# Plan\n\nShip it carefully."
+                }),
+            )
+            .await
+            .expect("save plan");
+        assert!(output.success);
+        let detail = runtime.get_task(task.id, None).await.expect("task detail");
+        assert_eq!(detail.summary.status, TaskStatus::AwaitingApproval);
+        assert_eq!(detail.plan.status, PlanStatus::Ready);
+        assert_eq!(detail.plan.version, 1);
+        assert_eq!(detail.plan.title.as_deref(), Some("Implementation plan"));
+
+        let explorer = runtime
+            .spawn_task_role_agent(
+                task.planner_agent_id,
+                AgentRole::Explorer,
+                Some("Explorer".to_string()),
+            )
+            .await
+            .expect("explorer");
+        let rejected = runtime
+            .execute_tool_for_test(
+                explorer.id,
+                "save_task_plan",
+                json!({
+                    "title": "Nope",
+                    "markdown": "Only planner may do this."
+                }),
+            )
+            .await;
+        assert!(rejected.is_err());
+    }
+
+    #[tokio::test]
+    async fn approving_task_without_ready_plan_fails() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let runtime = test_runtime(&dir, store).await;
+        let task = runtime
+            .create_task(Some("Needs plan".to_string()), None, Some("ubuntu:latest".to_string()))
+            .await
+            .expect("create task");
+
+        assert!(runtime.approve_task_plan(task.id).await.is_err());
     }
 
     #[test]
@@ -2895,6 +3662,8 @@ esac
         let summary = AgentSummary {
             id: agent_id,
             parent_id: None,
+            task_id: None,
+            role: None,
             name: "restored".to_string(),
             status: AgentStatus::RunningTurn,
             container_id: Some("old-container".to_string()),
@@ -3015,6 +3784,8 @@ esac
         let summary = AgentSummary {
             id: agent_id,
             parent_id: None,
+            task_id: None,
+            role: None,
             name: "trace".to_string(),
             status: AgentStatus::Completed,
             container_id: None,
@@ -3127,6 +3898,8 @@ esac
         let summary = AgentSummary {
             id: agent_id,
             parent_id: None,
+            task_id: None,
+            role: None,
             name: "assistant-turn-trace".to_string(),
             status: AgentStatus::Completed,
             container_id: None,
@@ -3391,7 +4164,7 @@ esac
         assert_eq!(requests.len(), 3);
         assert_eq!(
             requests[0]["tools"].as_array().expect("first tools").len(),
-            8
+            10
         );
         assert!(
             requests[1].get("tools").is_none(),
@@ -3399,7 +4172,7 @@ esac
         );
         assert_eq!(
             requests[2]["tools"].as_array().expect("second tools").len(),
-            8
+            10
         );
         let compact_input = requests[1]["input"].as_array().expect("compact input");
         assert!(matches!(
@@ -3632,6 +4405,8 @@ esac
                 &AgentSummary {
                     id: agent_id,
                     parent_id: None,
+                    task_id: None,
+                    role: None,
                     name: "deepseek-context".to_string(),
                     status: AgentStatus::Idle,
                     container_id: None,
@@ -3792,6 +4567,8 @@ esac
                 &AgentSummary {
                     id: parent_id,
                     parent_id: None,
+                    task_id: None,
+                    role: None,
                     name: "parent".to_string(),
                     status: AgentStatus::Idle,
                     container_id: None,
@@ -3911,6 +4688,8 @@ esac
                 &AgentSummary {
                     id: parent_id,
                     parent_id: None,
+                    task_id: None,
+                    role: None,
                     name: "parent".to_string(),
                     status: AgentStatus::Idle,
                     container_id: None,
@@ -3987,7 +4766,7 @@ esac
                 .system_prompt
                 .as_deref()
                 .unwrap_or_default()
-                .contains("Reviewer role")
+                .contains("Reviewer")
         );
     }
 
@@ -4061,6 +4840,8 @@ esac
         let summary = AgentSummary {
             id: agent_id,
             parent_id: None,
+            task_id: None,
+            role: None,
             name: "model-switch".to_string(),
             status: AgentStatus::Idle,
             container_id: None,
@@ -4139,6 +4920,8 @@ esac
         let summary = AgentSummary {
             id: agent_id,
             parent_id: None,
+            task_id: None,
+            role: None,
             name: "reasoning-switch".to_string(),
             status: AgentStatus::Idle,
             container_id: None,
@@ -4214,6 +4997,8 @@ esac
         let summary = AgentSummary {
             id: agent_id,
             parent_id: None,
+            task_id: None,
+            role: None,
             name: "busy".to_string(),
             status: AgentStatus::Idle,
             container_id: None,

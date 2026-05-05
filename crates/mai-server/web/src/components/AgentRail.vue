@@ -2,10 +2,10 @@
   <aside class="agent-rail" :class="{ hidden: !visible }">
     <div class="rail-head">
       <div>
-        <h2>Agents</h2>
-        <p>{{ agents.length }} active session{{ agents.length === 1 ? '' : 's' }}</p>
+        <h2>Task Agents</h2>
+        <p>{{ agents.length }} agent{{ agents.length === 1 ? '' : 's' }}</p>
       </div>
-      <button class="small-button" @click="$emit('create')">New Agent</button>
+      <button class="small-button" @click="$emit('create')">New Task Agent</button>
     </div>
     <div class="agent-list">
       <button
@@ -31,8 +31,8 @@
         <span class="status-dot" :class="statusTone(row.agent.status)" :title="formatStatus(row.agent.status)" />
       </button>
       <div v-if="!agents.length" class="empty-rail">
-        <strong>No agents yet</strong>
-        <span>Create one to start a container-backed session.</span>
+        <strong>No task agents yet</strong>
+        <span>Create a task to start the planner.</span>
       </div>
     </div>
   </aside>

@@ -66,6 +66,9 @@ export function eventSummary(event, formatStatusFn, roleLabelFn) {
   if (event.type === 'agent_created') return `Agent created: ${event.agent?.name || event.agent?.id || ''}`
   if (event.type === 'agent_status_changed') return `${event.agent_id} is ${formatStatusFn(event.status)}`
   if (event.type === 'agent_deleted') return `Agent deleted: ${event.agent_id}`
+  if (event.type === 'task_created') return `Task created: ${event.task?.title || event.task?.id || ''}`
+  if (event.type === 'task_updated') return `Task updated: ${event.task?.title || event.task?.id || ''}`
+  if (event.type === 'task_deleted') return `Task deleted: ${event.task_id}`
   if (event.type === 'turn_started') return `Turn started on ${event.agent_id}`
   if (event.type === 'turn_completed') return `Turn completed with ${formatStatusFn(event.status)}`
   if (event.type === 'tool_started') return `Tool started: ${event.tool_name}`

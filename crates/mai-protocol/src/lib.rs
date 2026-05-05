@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 pub type AgentId = Uuid;
 pub type SessionId = Uuid;
+pub type TaskId = Uuid;
 pub type TurnId = Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -21,6 +22,26 @@ pub enum AgentStatus {
     Cancelled,
     DeletingContainer,
     Deleted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Planning,
+    AwaitingApproval,
+    Executing,
+    Reviewing,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Missing,
+    Ready,
+    Approved,
 }
 
 impl AgentStatus {
@@ -100,6 +121,10 @@ pub struct ContextUsage {
 pub struct AgentSummary {
     pub id: AgentId,
     pub parent_id: Option<AgentId>,
+    #[serde(default)]
+    pub task_id: Option<TaskId>,
+    #[serde(default)]
+    pub role: Option<AgentRole>,
     pub name: String,
     pub status: AgentStatus,
     pub container_id: Option<String>,
@@ -130,6 +155,73 @@ pub struct AgentDetail {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskPlan {
+    pub status: PlanStatus,
+    pub title: Option<String>,
+    pub markdown: Option<String>,
+    pub version: u64,
+    pub saved_by_agent_id: Option<AgentId>,
+    pub saved_at: Option<DateTime<Utc>>,
+    pub approved_at: Option<DateTime<Utc>>,
+}
+
+impl Default for TaskPlan {
+    fn default() -> Self {
+        Self {
+            status: PlanStatus::Missing,
+            title: None,
+            markdown: None,
+            version: 0,
+            saved_by_agent_id: None,
+            saved_at: None,
+            approved_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskReview {
+    pub id: Uuid,
+    pub task_id: TaskId,
+    pub reviewer_agent_id: AgentId,
+    pub round: u64,
+    pub passed: bool,
+    pub findings: String,
+    pub summary: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSummary {
+    pub id: TaskId,
+    pub title: String,
+    pub status: TaskStatus,
+    pub plan_status: PlanStatus,
+    pub plan_version: u64,
+    pub planner_agent_id: AgentId,
+    pub current_agent_id: Option<AgentId>,
+    pub agent_count: usize,
+    pub review_rounds: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub final_report: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskDetail {
+    #[serde(flatten)]
+    pub summary: TaskSummary,
+    pub plan: TaskPlan,
+    pub reviews: Vec<TaskReview>,
+    pub agents: Vec<AgentSummary>,
+    pub selected_agent_id: AgentId,
+    pub selected_agent: AgentDetail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateAgentRequest {
     pub name: Option<String>,
     pub provider_id: Option<String>,
@@ -145,6 +237,25 @@ pub struct CreateAgentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateAgentResponse {
     pub agent: AgentSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CreateTaskRequest {
+    pub title: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub docker_image: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateTaskResponse {
+    pub task: TaskSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApproveTaskPlanResponse {
+    pub task: TaskSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,6 +518,15 @@ pub enum ServiceEventKind {
     },
     AgentDeleted {
         agent_id: AgentId,
+    },
+    TaskCreated {
+        task: TaskSummary,
+    },
+    TaskUpdated {
+        task: TaskSummary,
+    },
+    TaskDeleted {
+        task_id: TaskId,
     },
     TurnStarted {
         agent_id: AgentId,

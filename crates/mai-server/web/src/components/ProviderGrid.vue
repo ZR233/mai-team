@@ -3,7 +3,7 @@
     <div class="stage-title">
       <div>
         <h2>Providers</h2>
-        <p>Configure built-in provider presets and custom model metadata for new agents.</p>
+        <p>Configure built-in provider presets and custom model metadata for task agents.</p>
       </div>
       <button class="primary-button" @click="$emit('add')">Add Provider</button>
     </div>
@@ -79,7 +79,7 @@
     <div v-if="!providers.length" class="empty-stage providers-empty">
       <div class="empty-mark">P</div>
       <h2>No providers configured</h2>
-      <p>Add a provider before creating agents.</p>
+      <p>Add a provider before creating tasks.</p>
       <button class="primary-button" @click="$emit('add')">Add Provider</button>
     </div>
   </section>
@@ -116,7 +116,7 @@ function providerKind(kind) {
 function defaultModelLabel(provider) {
   if (!provider.default_model) return 'not selected'
   return (provider.models || []).some((model) => model.id === provider.default_model)
-    ? 'ready for new agents'
+    ? 'ready for task agents'
     : 'not in model list'
 }
 </script>

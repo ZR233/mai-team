@@ -1022,6 +1022,56 @@ p {
   overflow: hidden;
 }
 
+.task-header {
+  justify-content: space-between;
+}
+
+.task-plan-panel {
+  flex-shrink: 0;
+  display: grid;
+  gap: 12px;
+  max-height: min(36vh, 360px);
+  overflow: auto;
+  padding: 16px 24px;
+  border-bottom: 1px solid #d8e0ea;
+  background: #f8fafc;
+}
+
+.task-plan-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.task-plan-head h3 {
+  color: #172033;
+  font-size: 16px;
+  line-height: 1.25;
+}
+
+.task-plan-head p,
+.task-plan-empty {
+  color: #66758a;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.task-plan-body {
+  max-width: none;
+  border-radius: 8px;
+}
+
+.task-row .avatar {
+  color: #fff;
+  background: linear-gradient(135deg, #1f6feb, #11a683);
+}
+
+.subagent-row .avatar {
+  color: #4766df;
+  background: #edf1ff;
+}
+
 /* ─── Conversation ─── */
 .conversation {
   display: flex;

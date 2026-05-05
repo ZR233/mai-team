@@ -1,10 +1,11 @@
 use chrono::{DateTime, Utc};
 use mai_protocol::{
-    AgentConfigRequest, AgentId, AgentMessage, AgentSessionSummary, AgentStatus, AgentSummary,
-    McpServerConfig, MessageRole, ModelConfig, ModelInputItem, ModelReasoningConfig,
-    ModelReasoningVariant, ProviderConfig, ProviderKind, ProviderPreset, ProviderPresetsResponse,
-    ProviderSecret, ProviderSummary, ProvidersConfigRequest, ProvidersResponse, ServiceEvent,
-    ServiceEventKind, SessionId, TokenUsage, TurnId, default_true,
+    AgentConfigRequest, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus,
+    AgentSummary, McpServerConfig, MessageRole, ModelConfig, ModelInputItem,
+    ModelReasoningConfig, ModelReasoningVariant, PlanStatus, ProviderConfig, ProviderKind,
+    ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
+    ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind, SessionId, TaskId,
+    TaskPlan, TaskReview, TaskStatus, TaskSummary, TokenUsage, TurnId, default_true,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,7 +18,7 @@ use uuid::Uuid;
 
 const SETTING_AGENT_CONFIG: &str = "agent_config";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-const SCHEMA_VERSION: &str = "5";
+const SCHEMA_VERSION: &str = "6";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const DEEPSEEK_V4_CONTEXT_TOKENS: u64 = 1_000_000;
 const DEEPSEEK_V4_OUTPUT_TOKENS: u64 = 384_000;
@@ -71,8 +72,16 @@ pub struct PersistedAgentSession {
 #[derive(Debug, Clone)]
 pub struct RuntimeSnapshot {
     pub agents: Vec<PersistedAgent>,
+    pub tasks: Vec<PersistedTask>,
     pub recent_events: Vec<ServiceEvent>,
     pub next_sequence: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersistedTask {
+    pub summary: TaskSummary,
+    pub plan: TaskPlan,
+    pub reviews: Vec<TaskReview>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -155,6 +164,8 @@ struct AgentRecordRow {
     #[key]
     id: String,
     parent_id: Option<String>,
+    task_id: Option<String>,
+    role: Option<String>,
     name: String,
     status: String,
     container_id: Option<String>,
@@ -171,6 +182,43 @@ struct AgentRecordRow {
     output_tokens: i64,
     total_tokens: i64,
     system_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "tasks"]
+struct TaskRecordRow {
+    #[key]
+    id: String,
+    title: String,
+    status: String,
+    planner_agent_id: String,
+    current_agent_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+    last_error: Option<String>,
+    final_report: Option<String>,
+    plan_status: String,
+    plan_title: Option<String>,
+    plan_markdown: Option<String>,
+    plan_version: i64,
+    plan_saved_by_agent_id: Option<String>,
+    plan_saved_at: Option<String>,
+    plan_approved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "task_reviews"]
+struct TaskReviewRecord {
+    #[key]
+    id: String,
+    #[index]
+    task_id: String,
+    reviewer_agent_id: String,
+    round: i64,
+    passed: bool,
+    findings: String,
+    summary: String,
+    created_at: String,
 }
 
 #[derive(Debug, Clone, toasty::Model)]
@@ -649,6 +697,8 @@ impl ConfigStore {
         toasty::create!(AgentRecordRow {
             id: summary.id.to_string(),
             parent_id: summary.parent_id.map(|id| id.to_string()),
+            task_id: summary.task_id.map(|id| id.to_string()),
+            role: summary.role.map(agent_role_to_str).map(str::to_string),
             name: summary.name.clone(),
             status: agent_status_to_str(&summary.status).to_string(),
             container_id: summary.container_id.clone(),
@@ -669,6 +719,77 @@ impl ConfigStore {
         .exec(&mut tx)
         .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn save_task(&self, task: &TaskSummary, plan: &TaskPlan) -> Result<()> {
+        let mut db = self.db.clone();
+        Query::<List<TaskRecordRow>>::filter(TaskRecordRow::fields().id().eq(task.id.to_string()))
+            .delete()
+            .exec(&mut db)
+            .await?;
+        toasty::create!(TaskRecordRow {
+            id: task.id.to_string(),
+            title: task.title.clone(),
+            status: task_status_to_str(&task.status).to_string(),
+            planner_agent_id: task.planner_agent_id.to_string(),
+            current_agent_id: task.current_agent_id.map(|id| id.to_string()),
+            created_at: task.created_at.to_rfc3339(),
+            updated_at: task.updated_at.to_rfc3339(),
+            last_error: task.last_error.clone(),
+            final_report: task.final_report.clone(),
+            plan_status: plan_status_to_str(&plan.status).to_string(),
+            plan_title: plan.title.clone(),
+            plan_markdown: plan.markdown.clone(),
+            plan_version: u64_to_i64(plan.version),
+            plan_saved_by_agent_id: plan.saved_by_agent_id.map(|id| id.to_string()),
+            plan_saved_at: plan.saved_at.map(|time| time.to_rfc3339()),
+            plan_approved_at: plan.approved_at.map(|time| time.to_rfc3339()),
+        })
+        .exec(&mut db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_task(&self, task_id: TaskId) -> Result<()> {
+        let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
+        Query::<List<TaskRecordRow>>::filter(TaskRecordRow::fields().id().eq(task_id.to_string()))
+            .delete()
+            .exec(&mut tx)
+            .await?;
+        Query::<List<TaskReviewRecord>>::filter(
+            TaskReviewRecord::fields()
+                .task_id()
+                .eq(task_id.to_string()),
+        )
+        .delete()
+        .exec(&mut tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn append_task_review(&self, review: &TaskReview) -> Result<()> {
+        let mut db = self.db.clone();
+        Query::<List<TaskReviewRecord>>::filter(
+            TaskReviewRecord::fields().id().eq(review.id.to_string()),
+        )
+        .delete()
+        .exec(&mut db)
+        .await?;
+        toasty::create!(TaskReviewRecord {
+            id: review.id.to_string(),
+            task_id: review.task_id.to_string(),
+            reviewer_agent_id: review.reviewer_agent_id.to_string(),
+            round: u64_to_i64(review.round),
+            passed: review.passed,
+            findings: review.findings.clone(),
+            summary: review.summary.clone(),
+            created_at: review.created_at.to_rfc3339(),
+        })
+        .exec(&mut db)
+        .await?;
         Ok(())
     }
 
@@ -876,6 +997,15 @@ impl ConfigStore {
             });
         }
 
+        let mut task_rows = Query::<List<TaskRecordRow>>::all().exec(&mut db).await?;
+        task_rows.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        let mut tasks = Vec::with_capacity(task_rows.len());
+        for row in task_rows {
+            let task_id = parse_task_id(&row.id)?;
+            let reviews = self.load_task_reviews(task_id).await?;
+            tasks.push(row.into_persisted_task(reviews)?);
+        }
+
         let mut events = Query::<List<ServiceEventRecord>>::all()
             .exec(&mut db)
             .await?;
@@ -893,6 +1023,7 @@ impl ConfigStore {
 
         Ok(RuntimeSnapshot {
             agents,
+            tasks,
             recent_events,
             next_sequence,
         })
@@ -999,6 +1130,23 @@ impl ConfigStore {
             .await?
             .and_then(|value| value.parse::<u64>().ok()))
     }
+
+    pub async fn load_task_reviews(&self, task_id: TaskId) -> Result<Vec<TaskReview>> {
+        let mut db = self.db.clone();
+        let mut rows = Query::<List<TaskReviewRecord>>::filter(
+            TaskReviewRecord::fields()
+                .task_id()
+                .eq(task_id.to_string()),
+        )
+        .exec(&mut db)
+        .await?;
+        rows.sort_by(|left, right| {
+            left.round
+                .cmp(&right.round)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+        });
+        rows.into_iter().map(TaskReviewRecord::into_review).collect()
+    }
 }
 
 impl AgentRecordRow {
@@ -1006,6 +1154,8 @@ impl AgentRecordRow {
         Ok(AgentSummary {
             id: parse_agent_id(&self.id)?,
             parent_id: self.parent_id.as_deref().map(parse_agent_id).transpose()?,
+            task_id: self.task_id.as_deref().map(parse_task_id).transpose()?,
+            role: self.role.as_deref().map(parse_agent_role).transpose()?,
             name: self.name,
             status: parse_agent_status(&self.status)?,
             container_id: self.container_id,
@@ -1031,11 +1181,68 @@ impl AgentRecordRow {
     }
 }
 
+impl TaskRecordRow {
+    fn into_persisted_task(self, reviews: Vec<TaskReview>) -> Result<PersistedTask> {
+        let plan = TaskPlan {
+            status: parse_plan_status(&self.plan_status)?,
+            title: self.plan_title,
+            markdown: self.plan_markdown,
+            version: i64_to_u64(self.plan_version),
+            saved_by_agent_id: self
+                .plan_saved_by_agent_id
+                .as_deref()
+                .map(parse_agent_id)
+                .transpose()?,
+            saved_at: self.plan_saved_at.as_deref().map(parse_utc).transpose()?,
+            approved_at: self.plan_approved_at.as_deref().map(parse_utc).transpose()?,
+        };
+        let summary = TaskSummary {
+            id: parse_task_id(&self.id)?,
+            title: self.title,
+            status: parse_task_status(&self.status)?,
+            plan_status: plan.status.clone(),
+            plan_version: plan.version,
+            planner_agent_id: parse_agent_id(&self.planner_agent_id)?,
+            current_agent_id: self
+                .current_agent_id
+                .as_deref()
+                .map(parse_agent_id)
+                .transpose()?,
+            agent_count: 0,
+            review_rounds: reviews.len() as u64,
+            created_at: parse_utc(&self.created_at)?,
+            updated_at: parse_utc(&self.updated_at)?,
+            last_error: self.last_error,
+            final_report: self.final_report,
+        };
+        Ok(PersistedTask {
+            summary,
+            plan,
+            reviews,
+        })
+    }
+}
+
 impl AgentMessageRecord {
     fn into_message(self) -> Result<AgentMessage> {
         Ok(AgentMessage {
             role: parse_message_role(&self.role)?,
             content: self.content,
+            created_at: parse_utc(&self.created_at)?,
+        })
+    }
+}
+
+impl TaskReviewRecord {
+    fn into_review(self) -> Result<TaskReview> {
+        Ok(TaskReview {
+            id: parse_task_id(&self.id)?,
+            task_id: parse_task_id(&self.task_id)?,
+            reviewer_agent_id: parse_agent_id(&self.reviewer_agent_id)?,
+            round: i64_to_u64(self.round),
+            passed: self.passed,
+            findings: self.findings,
+            summary: self.summary,
             created_at: parse_utc(&self.created_at)?,
         })
     }
@@ -1047,6 +1254,8 @@ async fn build_db(path: &Path) -> Result<Db> {
         McpServerRecord,
         McpServerEnvRecord,
         SettingRecord,
+        TaskRecordRow,
+        TaskReviewRecord,
         AgentRecordRow,
         AgentSessionRecord,
         AgentMessageRecord,
@@ -1466,6 +1675,11 @@ fn parse_agent_id(value: &str) -> Result<AgentId> {
         .map_err(|err| StoreError::InvalidConfig(format!("invalid agent id `{value}`: {err}")))
 }
 
+fn parse_task_id(value: &str) -> Result<TaskId> {
+    Uuid::parse_str(value)
+        .map_err(|err| StoreError::InvalidConfig(format!("invalid task id `{value}`: {err}")))
+}
+
 fn parse_session_id(value: &str) -> Result<SessionId> {
     Uuid::parse_str(value)
         .map_err(|err| StoreError::InvalidConfig(format!("invalid session id `{value}`: {err}")))
@@ -1513,6 +1727,73 @@ fn parse_agent_status(value: &str) -> Result<AgentStatus> {
     }
 }
 
+fn task_status_to_str(status: &TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Planning => "planning",
+        TaskStatus::AwaitingApproval => "awaiting_approval",
+        TaskStatus::Executing => "executing",
+        TaskStatus::Reviewing => "reviewing",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+    }
+}
+
+fn parse_task_status(value: &str) -> Result<TaskStatus> {
+    match value {
+        "planning" => Ok(TaskStatus::Planning),
+        "awaiting_approval" => Ok(TaskStatus::AwaitingApproval),
+        "executing" => Ok(TaskStatus::Executing),
+        "reviewing" => Ok(TaskStatus::Reviewing),
+        "completed" => Ok(TaskStatus::Completed),
+        "failed" => Ok(TaskStatus::Failed),
+        "cancelled" => Ok(TaskStatus::Cancelled),
+        other => Err(StoreError::InvalidConfig(format!(
+            "invalid task status `{other}`"
+        ))),
+    }
+}
+
+fn plan_status_to_str(status: &PlanStatus) -> &'static str {
+    match status {
+        PlanStatus::Missing => "missing",
+        PlanStatus::Ready => "ready",
+        PlanStatus::Approved => "approved",
+    }
+}
+
+fn parse_plan_status(value: &str) -> Result<PlanStatus> {
+    match value {
+        "missing" => Ok(PlanStatus::Missing),
+        "ready" => Ok(PlanStatus::Ready),
+        "approved" => Ok(PlanStatus::Approved),
+        other => Err(StoreError::InvalidConfig(format!(
+            "invalid plan status `{other}`"
+        ))),
+    }
+}
+
+fn agent_role_to_str(role: AgentRole) -> &'static str {
+    match role {
+        AgentRole::Planner => "planner",
+        AgentRole::Explorer => "explorer",
+        AgentRole::Executor => "executor",
+        AgentRole::Reviewer => "reviewer",
+    }
+}
+
+fn parse_agent_role(value: &str) -> Result<AgentRole> {
+    match value {
+        "planner" => Ok(AgentRole::Planner),
+        "explorer" => Ok(AgentRole::Explorer),
+        "executor" => Ok(AgentRole::Executor),
+        "reviewer" => Ok(AgentRole::Reviewer),
+        other => Err(StoreError::InvalidConfig(format!(
+            "invalid agent role `{other}`"
+        ))),
+    }
+}
+
 fn message_role_to_str(role: &MessageRole) -> &'static str {
     match role {
         MessageRole::User => "user",
@@ -1555,6 +1836,9 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         | ServiceEventKind::ToolCompleted { agent_id, .. }
         | ServiceEventKind::ContextCompacted { agent_id, .. }
         | ServiceEventKind::AgentMessage { agent_id, .. } => Some(*agent_id),
+        ServiceEventKind::TaskCreated { .. }
+        | ServiceEventKind::TaskUpdated { .. }
+        | ServiceEventKind::TaskDeleted { .. } => None,
         ServiceEventKind::Error { agent_id, .. } => *agent_id,
     }
 }
@@ -1912,6 +2196,8 @@ mod tests {
         let summary = AgentSummary {
             id: agent_id,
             parent_id: None,
+            task_id: None,
+            role: None,
             name: "agent-test".to_string(),
             status: AgentStatus::Completed,
             container_id: Some("container".to_string()),
@@ -2067,6 +2353,8 @@ mod tests {
         let summary = AgentSummary {
             id: agent_id,
             parent_id: None,
+            task_id: None,
+            role: None,
             name: "agent-test".to_string(),
             status: AgentStatus::Completed,
             container_id: None,
@@ -2160,6 +2448,8 @@ mod tests {
                 &AgentSummary {
                     id: agent_id,
                     parent_id: None,
+                    task_id: None,
+                    role: None,
                     name: "agent-test".to_string(),
                     status: AgentStatus::Completed,
                     container_id: None,

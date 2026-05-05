@@ -10,6 +10,8 @@ pub const TOOL_SEND_MESSAGE: &str = "send_message";
 pub const TOOL_WAIT_AGENT: &str = "wait_agent";
 pub const TOOL_LIST_AGENTS: &str = "list_agents";
 pub const TOOL_CLOSE_AGENT: &str = "close_agent";
+pub const TOOL_SAVE_TASK_PLAN: &str = "save_task_plan";
+pub const TOOL_SUBMIT_REVIEW_RESULT: &str = "submit_review_result";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutedTool {
@@ -21,6 +23,8 @@ pub enum RoutedTool {
     WaitAgent,
     ListAgents,
     CloseAgent,
+    SaveTaskPlan,
+    SubmitReviewResult,
     Mcp(String),
     Unknown(String),
 }
@@ -35,6 +39,8 @@ pub fn route_tool(name: &str) -> RoutedTool {
         TOOL_WAIT_AGENT => RoutedTool::WaitAgent,
         TOOL_LIST_AGENTS => RoutedTool::ListAgents,
         TOOL_CLOSE_AGENT => RoutedTool::CloseAgent,
+        TOOL_SAVE_TASK_PLAN => RoutedTool::SaveTaskPlan,
+        TOOL_SUBMIT_REVIEW_RESULT => RoutedTool::SubmitReviewResult,
         normalized if normalized.starts_with("mcp__") => RoutedTool::Mcp(normalized.to_string()),
         normalized => RoutedTool::Unknown(normalized.to_string()),
     }
@@ -131,6 +137,23 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             TOOL_CLOSE_AGENT,
             "Stop and remove an agent's Docker container.",
             object_schema(vec![("agent_id", json!({ "type": "string" }), true)]),
+        ),
+        ToolDefinition::function(
+            TOOL_SAVE_TASK_PLAN,
+            "Save the latest task plan. Only planner agents attached to a task may call this.",
+            object_schema(vec![
+                ("title", json!({ "type": "string" }), true),
+                ("markdown", json!({ "type": "string" }), true),
+            ]),
+        ),
+        ToolDefinition::function(
+            TOOL_SUBMIT_REVIEW_RESULT,
+            "Submit the structured review result for a task workflow. Only reviewer agents attached to a task may call this.",
+            object_schema(vec![
+                ("passed", json!({ "type": "boolean" }), true),
+                ("findings", json!({ "type": "string" }), true),
+                ("summary", json!({ "type": "string" }), true),
+            ]),
         ),
     ]
 }

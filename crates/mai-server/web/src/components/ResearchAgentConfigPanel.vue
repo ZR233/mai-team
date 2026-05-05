@@ -2,15 +2,15 @@
   <section class="settings-stage">
     <div class="stage-title">
       <div>
-        <h2>Agent Settings</h2>
-        <p>Assign model profiles to planner, explorer, executor, and reviewer subagent roles.</p>
+        <h2>Task Role Settings</h2>
+        <p>Assign model profiles to planner, explorer, executor, and reviewer task-agent roles.</p>
       </div>
     </div>
 
     <div v-if="!providers.length" class="empty-stage providers-empty">
       <div class="empty-mark">P</div>
       <h2>No providers configured</h2>
-      <p>Add a provider before configuring agent roles.</p>
+      <p>Add a provider before configuring task-agent roles.</p>
       <button class="primary-button" @click="$emit('open-providers')">Open Providers</button>
     </div>
 
@@ -29,7 +29,7 @@
         <div class="settings-summary-item">
           <span>Spawn default</span>
           <strong>Executor</strong>
-          <small>spawn_agent uses executor when role is omitted.</small>
+          <small>Task workflows use executor after plan approval.</small>
         </div>
       </div>
 
