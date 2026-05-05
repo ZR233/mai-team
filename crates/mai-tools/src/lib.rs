@@ -118,7 +118,7 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             TOOL_WAIT_AGENT,
-            "Wait for an agent to finish its current turn.",
+            "Wait for an agent to finish its current turn and return its final assistant response.",
             object_schema(vec![
                 ("agent_id", json!({ "type": "string" }), true),
                 (

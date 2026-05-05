@@ -1451,12 +1451,13 @@ impl AgentRuntime {
                     .get("timeout_secs")
                     .and_then(Value::as_u64)
                     .unwrap_or(300);
-                let summary = self
-                    .wait_agent(target, Duration::from_secs(timeout_secs))
+                let output = self
+                    .wait_agent_output(target, Duration::from_secs(timeout_secs))
                     .await?;
+                self.cleanup_finished_explorer_agent(target).await?;
                 Ok(ToolExecution {
                     success: true,
-                    output: serde_json::to_string(&summary).unwrap_or_else(|_| "{}".to_string()),
+                    output: serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string()),
                 })
             }
             RoutedTool::ListAgents => Ok(ToolExecution {
@@ -1811,6 +1812,62 @@ impl AgentRuntime {
             }
             sleep(Duration::from_millis(250)).await;
         }
+    }
+
+    async fn wait_agent_output(&self, agent_id: AgentId, timeout: Duration) -> Result<Value> {
+        let agent = self.wait_agent(agent_id, timeout).await?;
+        let (session_id, recent_messages) = self.agent_recent_messages(agent_id, 12).await?;
+        let final_response = recent_messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+            .map(|message| message.content.clone());
+        Ok(json!({
+            "agent": agent,
+            "session_id": session_id,
+            "final_response": final_response,
+            "recent_messages": recent_messages,
+        }))
+    }
+
+    async fn cleanup_finished_explorer_agent(&self, agent_id: AgentId) -> Result<()> {
+        let agent = self.agent(agent_id).await?;
+        let summary = agent.summary.read().await.clone();
+        if summary.role != Some(AgentRole::Explorer) {
+            return Ok(());
+        }
+        if summary.current_turn.is_some()
+            || matches!(
+                summary.status,
+                AgentStatus::Created
+                    | AgentStatus::StartingContainer
+                    | AgentStatus::RunningTurn
+                    | AgentStatus::WaitingTool
+                    | AgentStatus::DeletingContainer
+            )
+        {
+            return Ok(());
+        }
+        drop(agent);
+        self.delete_agent(agent_id).await
+    }
+
+    async fn agent_recent_messages(
+        &self,
+        agent_id: AgentId,
+        limit: usize,
+    ) -> Result<(Option<SessionId>, Vec<AgentMessage>)> {
+        let agent = self.agent(agent_id).await?;
+        let sessions = agent.sessions.lock().await;
+        let Some(session) = selected_session(&sessions, None) else {
+            return Ok((None, Vec::new()));
+        };
+        let len = session.messages.len();
+        let start = len.saturating_sub(limit);
+        Ok((
+            Some(session.summary.id),
+            session.messages[start..].to_vec(),
+        ))
     }
 
     async fn build_instructions(
@@ -3767,6 +3824,108 @@ esac
             .await;
         let events = runtime.recent_events.lock().await;
         assert_eq!(events.back().expect("event").sequence, 42);
+    }
+
+    #[tokio::test]
+    async fn wait_agent_tool_returns_final_assistant_response() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let parent_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let child_session_id = Uuid::new_v4();
+        let timestamp = now();
+        let parent = test_agent_summary(parent_id, Some("parent-container"));
+        let child = AgentSummary {
+            id: child_id,
+            parent_id: Some(parent_id),
+            task_id: None,
+            role: Some(AgentRole::Explorer),
+            name: "Explorer".to_string(),
+            status: AgentStatus::Completed,
+            container_id: Some("child-container".to_string()),
+            docker_image: "ubuntu:latest".to_string(),
+            provider_id: "mock".to_string(),
+            provider_name: "Mock".to_string(),
+            model: "mock-model".to_string(),
+            reasoning_effort: Some("medium".to_string()),
+            created_at: timestamp,
+            updated_at: timestamp,
+            current_turn: None,
+            last_error: None,
+            token_usage: TokenUsage::default(),
+        };
+        store.save_agent(&parent, None).await.expect("save parent");
+        save_test_session(&store, parent_id, Uuid::new_v4()).await;
+        store.save_agent(&child, None).await.expect("save child");
+        store
+            .save_agent_session(
+                child_id,
+                &AgentSessionSummary {
+                    id: child_session_id,
+                    title: "Task".to_string(),
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    message_count: 0,
+                },
+            )
+            .await
+            .expect("save child session");
+        store
+            .append_agent_message(
+                child_id,
+                child_session_id,
+                0,
+                &AgentMessage {
+                    role: MessageRole::User,
+                    content: "Explore auth code".to_string(),
+                    created_at: timestamp,
+                },
+            )
+            .await
+            .expect("save user message");
+        store
+            .append_agent_message(
+                child_id,
+                child_session_id,
+                1,
+                &AgentMessage {
+                    role: MessageRole::Assistant,
+                    content: "Explorer conclusion: auth lives in crates/auth.".to_string(),
+                    created_at: timestamp,
+                },
+            )
+            .await
+            .expect("save assistant message");
+        let runtime = test_runtime(&dir, store).await;
+
+        let output = runtime
+            .execute_tool_for_test(
+                parent_id,
+                "wait_agent",
+                json!({
+                    "agent_id": child_id.to_string(),
+                    "timeout_secs": 1
+                }),
+            )
+            .await
+            .expect("wait agent");
+        assert!(output.success);
+        let value: Value = serde_json::from_str(&output.output).expect("wait output json");
+        assert_eq!(
+            value["final_response"].as_str(),
+            Some("Explorer conclusion: auth lives in crates/auth.")
+        );
+        assert_eq!(value["recent_messages"].as_array().expect("messages").len(), 2);
+        assert_eq!(value["agent"]["id"].as_str(), Some(child_id.to_string().as_str()));
+        assert!(matches!(
+            runtime.agent(child_id).await,
+            Err(RuntimeError::AgentNotFound(id)) if id == child_id
+        ));
+        assert!(runtime
+            .list_agents()
+            .await
+            .iter()
+            .all(|agent| agent.id != child_id));
     }
 
     #[tokio::test]
