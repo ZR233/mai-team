@@ -23,6 +23,7 @@
           :trace-state="traceState(item)"
           @toggle="$emit('toggle-tool', item)"
         />
+        <TodoListRow v-else-if="item.type === 'todo_list'" :item="item" />
         <div v-else-if="item.type === 'error'" class="timeline-error-card">
           <strong>{{ item.title || 'Error' }}</strong>
           <p>{{ item.message }}</p>
@@ -38,6 +39,7 @@ import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import ChatMessage from './ChatMessage.vue'
 import ProcessRow from './ProcessRow.vue'
 import ToolCallRow from './ToolCallRow.vue'
+import TodoListRow from './TodoListRow.vue'
 
 defineProps({
   timelineItems: { type: Array, default: () => [] },

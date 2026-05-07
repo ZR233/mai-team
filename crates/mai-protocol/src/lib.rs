@@ -79,6 +79,20 @@ pub enum MessageRole {
     Tool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoListStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TodoItem {
+    pub step: String,
+    pub status: TodoListStatus,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentMessage {
     pub role: MessageRole,
@@ -586,6 +600,13 @@ pub enum ServiceEventKind {
         session_id: Option<SessionId>,
         turn_id: Option<TurnId>,
         message: String,
+    },
+    TodoListUpdated {
+        agent_id: AgentId,
+        #[serde(default)]
+        session_id: Option<SessionId>,
+        turn_id: TurnId,
+        items: Vec<TodoItem>,
     },
 }
 

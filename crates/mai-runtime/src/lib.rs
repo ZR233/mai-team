@@ -10,7 +10,7 @@ use mai_protocol::{
     CreateAgentRequest, MessageRole, ModelConfig, ModelContentItem, ModelInputItem,
     ModelOutputItem, ModelToolCall, PlanStatus, ResolvedAgentModelPreference, ServiceEvent,
     ServiceEventKind, SessionId, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus,
-    TaskSummary, TokenUsage, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest, now, preview,
+    TaskSummary, TokenUsage, TodoItem, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest, now, preview,
 };
 use mai_skills::SkillsManager;
 use mai_store::{ConfigStore, ProviderSelection};
@@ -1591,6 +1591,23 @@ impl AgentRuntime {
                     output: serde_json::to_string(&review).unwrap_or_else(|_| "{}".to_string()),
                 })
             }
+            RoutedTool::UpdateTodoList => {
+                let items_arg = arguments.get("items")
+                    .ok_or_else(|| RuntimeError::InvalidInput("missing field `items`".to_string()))?;
+                let items: Vec<TodoItem> = serde_json::from_value(items_arg.clone())
+                    .map_err(|e| RuntimeError::InvalidInput(format!("invalid items: {e}")))?;
+                self.publish(ServiceEventKind::TodoListUpdated {
+                    agent_id,
+                    session_id: None,
+                    turn_id: _turn_id,
+                    items,
+                })
+                .await;
+                Ok(ToolExecution {
+                    success: true,
+                    output: "Todo list updated".to_string(),
+                })
+            }
             RoutedTool::Mcp(model_name) => {
                 let manager = agent.mcp.read().await.clone().ok_or_else(|| {
                     RuntimeError::InvalidInput("MCP manager not initialized".to_string())
@@ -3144,7 +3161,8 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         | ServiceEventKind::ToolStarted { agent_id, .. }
         | ServiceEventKind::ToolCompleted { agent_id, .. }
         | ServiceEventKind::ContextCompacted { agent_id, .. }
-        | ServiceEventKind::AgentMessage { agent_id, .. } => Some(*agent_id),
+        | ServiceEventKind::AgentMessage { agent_id, .. }
+        | ServiceEventKind::TodoListUpdated { agent_id, .. } => Some(*agent_id),
         ServiceEventKind::TaskCreated { .. }
         | ServiceEventKind::TaskUpdated { .. }
         | ServiceEventKind::TaskDeleted { .. } => None,
@@ -4664,7 +4682,7 @@ esac
         assert_eq!(requests.len(), 3);
         assert_eq!(
             requests[0]["tools"].as_array().expect("first tools").len(),
-            10
+            11
         );
         assert!(
             requests[1].get("tools").is_none(),
@@ -4672,7 +4690,7 @@ esac
         );
         assert_eq!(
             requests[2]["tools"].as_array().expect("second tools").len(),
-            10
+            11
         );
         let compact_input = requests[1]["input"].as_array().expect("compact input");
         assert!(matches!(

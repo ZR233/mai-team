@@ -129,6 +129,17 @@ export function buildAgentTimeline(detail, liveEvents = []) {
         timestamp: offsetTimestamp(event.timestamp, 1),
         sequence: (event.sequence || 0) + 0.1
       })
+    } else if (event.type === 'todo_list_updated') {
+      items.push({
+        type: 'todo_list',
+        key: `todo-${event.turn_id}-${event.sequence || event.timestamp}`,
+        items: (event.items || []).map((item) => ({
+          step: item.step || '',
+          status: item.status || 'pending'
+        })),
+        timestamp: event.timestamp,
+        sequence: event.sequence || 0
+      })
     }
   }
 
@@ -350,7 +361,7 @@ function parseTraceValue(value) {
   for (const candidate of [value, decoded]) {
     try {
       return { type: 'json', value: JSON.parse(candidate) }
-    } catch {}
+    } catch { }
   }
   return { type: 'text', value: decoded }
 }

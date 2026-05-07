@@ -1835,7 +1835,8 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         | ServiceEventKind::ToolStarted { agent_id, .. }
         | ServiceEventKind::ToolCompleted { agent_id, .. }
         | ServiceEventKind::ContextCompacted { agent_id, .. }
-        | ServiceEventKind::AgentMessage { agent_id, .. } => Some(*agent_id),
+        | ServiceEventKind::AgentMessage { agent_id, .. }
+        | ServiceEventKind::TodoListUpdated { agent_id, .. } => Some(*agent_id),
         ServiceEventKind::TaskCreated { .. }
         | ServiceEventKind::TaskUpdated { .. }
         | ServiceEventKind::TaskDeleted { .. } => None,

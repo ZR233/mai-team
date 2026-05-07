@@ -531,5 +531,6 @@ fn event_name(event: &ServiceEvent) -> &'static str {
         mai_protocol::ServiceEventKind::ContextCompacted { .. } => "context_compacted",
         mai_protocol::ServiceEventKind::AgentMessage { .. } => "agent_message",
         mai_protocol::ServiceEventKind::Error { .. } => "error",
+        mai_protocol::ServiceEventKind::TodoListUpdated { .. } => "todo_list_updated",
     }
 }

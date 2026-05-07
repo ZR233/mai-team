@@ -12,6 +12,7 @@ pub const TOOL_LIST_AGENTS: &str = "list_agents";
 pub const TOOL_CLOSE_AGENT: &str = "close_agent";
 pub const TOOL_SAVE_TASK_PLAN: &str = "save_task_plan";
 pub const TOOL_SUBMIT_REVIEW_RESULT: &str = "submit_review_result";
+pub const TOOL_UPDATE_TODO_LIST: &str = "update_todo_list";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutedTool {
@@ -25,6 +26,7 @@ pub enum RoutedTool {
     CloseAgent,
     SaveTaskPlan,
     SubmitReviewResult,
+    UpdateTodoList,
     Mcp(String),
     Unknown(String),
 }
@@ -41,6 +43,7 @@ pub fn route_tool(name: &str) -> RoutedTool {
         TOOL_CLOSE_AGENT => RoutedTool::CloseAgent,
         TOOL_SAVE_TASK_PLAN => RoutedTool::SaveTaskPlan,
         TOOL_SUBMIT_REVIEW_RESULT => RoutedTool::SubmitReviewResult,
+        TOOL_UPDATE_TODO_LIST => RoutedTool::UpdateTodoList,
         normalized if normalized.starts_with("mcp__") => RoutedTool::Mcp(normalized.to_string()),
         normalized => RoutedTool::Unknown(normalized.to_string()),
     }
@@ -154,6 +157,37 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 ("findings", json!({ "type": "string" }), true),
                 ("summary", json!({ "type": "string" }), true),
             ]),
+        ),
+        ToolDefinition::function(
+            TOOL_UPDATE_TODO_LIST,
+            "Update your task todo list. Replaces the entire list each call. \
+             Each item has a step description and a status (pending, in_progress, or completed). \
+             At most one item should be in_progress at a time. \
+             Use this to communicate your progress plan to the user.",
+            object_schema(vec![(
+                "items",
+                json!({
+                    "type": "array",
+                    "description": "The complete list of todo items. Replaces any previous list.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": {
+                                "type": "string",
+                                "description": "Description of the task step."
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                                "description": "Status of this step. At most one item should be in_progress."
+                            }
+                        },
+                        "required": ["step", "status"],
+                        "additionalProperties": false
+                    }
+                }),
+                true,
+            )]),
         ),
     ]
 }
