@@ -240,7 +240,6 @@ function openCreateTaskDialog() {
     return
   }
   taskDialog.open = true
-  taskDialog.title = ''
   taskDialog.message = ''
   taskDialog.docker_image = ''
   taskDialog.error = ''
@@ -251,7 +250,7 @@ async function onCreateTask() {
   taskDialog.error = ''
   taskDialog.submitting = true
   try {
-    await createTask(taskDialog.title, taskDialog.message, taskDialog.docker_image)
+    await createTask(taskDialog.message, taskDialog.docker_image)
     taskDialog.open = false
     activeTab.value = 'tasks'
   } catch (error) {

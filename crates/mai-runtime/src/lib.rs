@@ -331,6 +331,10 @@ impl AgentRuntime {
         docker_image: Option<String>,
     ) -> Result<TaskSummary> {
         let task_id = Uuid::new_v4();
+        let user_omitted_title = title
+            .as_ref()
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true);
         let title = title
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
@@ -381,12 +385,88 @@ impl AgentRuntime {
             task: summary.clone(),
         })
         .await;
+        let message_for_title = initial_message
+            .as_ref()
+            .filter(|m| !m.trim().is_empty())
+            .cloned();
         if let Some(message) = initial_message.filter(|message| !message.trim().is_empty()) {
             let _ = self
                 .send_task_message(task_id, message, Vec::new())
                 .await?;
         }
+        if user_omitted_title {
+            if let Some(message_text) = message_for_title {
+                let runtime = Arc::clone(&self);
+                tokio::spawn(async move {
+                    match runtime.generate_task_title(&message_text).await {
+                        Ok(new_title) => {
+                            if let Err(err) = runtime.update_task_title(task_id, new_title).await {
+                                tracing::warn!("failed to update task title: {err}");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!("failed to generate task title: {err}");
+                        }
+                    }
+                });
+            }
+        }
         Ok(summary)
+    }
+
+    async fn generate_task_title(self: &Arc<Self>, message: &str) -> Result<String> {
+        let planner_model = self.resolve_role_agent_model(AgentRole::Planner).await?;
+        let selection = self
+            .store
+            .resolve_provider(
+                Some(&planner_model.preference.provider_id),
+                Some(&planner_model.preference.model),
+            )
+            .await?;
+        let instructions = "Generate a concise task title of 3-8 words that captures the essence of the user's request. Output only the title text, nothing else. Do not use quotes or punctuation at the end.";
+        let input = vec![ModelInputItem::user_text(message)];
+        let response = self
+            .model
+            .create_response(&selection.provider, &selection.model, instructions, &input, &[], None)
+            .await?;
+        let title = response
+            .output
+            .into_iter()
+            .filter_map(|item| match item {
+                ModelOutputItem::Message { text } => Some(text),
+                ModelOutputItem::AssistantTurn { content, .. } => content,
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+            .trim()
+            .to_string();
+        if title.is_empty() {
+            return Ok("New Task".to_string());
+        }
+        let title = if title.len() > 100 {
+            title.chars().take(100).collect()
+        } else {
+            title
+        };
+        Ok(title)
+    }
+
+    async fn update_task_title(self: &Arc<Self>, task_id: TaskId, new_title: String) -> Result<()> {
+        let task = self.task(task_id).await?;
+        let plan = task.plan.read().await.clone();
+        {
+            let mut summary = task.summary.write().await;
+            summary.title = new_title;
+            summary.updated_at = now();
+            self.refresh_task_summary_counts(&mut summary).await;
+            self.store.save_task(&summary, &plan).await?;
+            self.publish(ServiceEventKind::TaskUpdated {
+                task: summary.clone(),
+            })
+            .await;
+        }
+        Ok(())
     }
 
     pub async fn get_task(

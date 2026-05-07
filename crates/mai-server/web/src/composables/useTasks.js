@@ -64,11 +64,10 @@ export function useTasks() {
     await refreshDetail()
   }
 
-  async function createTask(title, message, dockerImage) {
+  async function createTask(message, dockerImage) {
     const response = await api('/tasks', {
       method: 'POST',
       body: JSON.stringify({
-        title: title || null,
         message: message || null,
         docker_image: dockerImage || null
       })
@@ -154,7 +153,6 @@ export function useTasks() {
 
   const taskDialog = reactive({
     open: false,
-    title: '',
     message: '',
     docker_image: '',
     error: '',

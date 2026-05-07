@@ -6,10 +6,6 @@
         <button class="icon-button" type="button" @click="$emit('close')">Close</button>
       </div>
       <label>
-        <span>Task Title</span>
-        <input v-model.trim="dialog.title" placeholder="Implement task workflow" />
-      </label>
-      <label>
         <span>Initial Message</span>
         <textarea
           v-model.trim="dialog.message"
