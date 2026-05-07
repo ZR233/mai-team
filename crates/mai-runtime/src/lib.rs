@@ -126,6 +126,7 @@ struct AgentSessionRecord {
     messages: Vec<AgentMessage>,
     history: Vec<ModelInputItem>,
     last_context_tokens: Option<u64>,
+    last_turn_response: Option<String>,
 }
 
 #[derive(Debug)]
@@ -174,6 +175,7 @@ impl AgentRuntime {
                     messages,
                     history: persisted_session.history,
                     last_context_tokens: persisted_session.last_context_tokens,
+                    last_turn_response: None,
                 });
             }
             if sessions.is_empty() {
@@ -718,6 +720,7 @@ impl AgentRuntime {
                 messages: Vec::new(),
                 history: Vec::new(),
                 last_context_tokens: None,
+                last_turn_response: None,
             };
             sessions.push(session.clone());
             session.summary
@@ -1075,6 +1078,7 @@ impl AgentRuntime {
         .await;
 
         let loaded_skills = self.skills.load_explicit(&skill_mentions)?;
+        let mut last_assistant_text: Option<String> = None;
         for iteration in 0..MAX_TOOL_ITERATIONS {
             if agent.cancel_requested.load(Ordering::SeqCst) {
                 self.finish_turn(
@@ -1084,6 +1088,7 @@ impl AgentRuntime {
                     turn_id,
                     TurnStatus::Cancelled,
                     AgentStatus::Cancelled,
+                    None,
                 )
                 .await?;
                 return Ok(());
@@ -1144,6 +1149,7 @@ impl AgentRuntime {
                 match item {
                     ModelOutputItem::Message { text } => {
                         if !text.trim().is_empty() {
+                            last_assistant_text = Some(text.clone());
                             self.record_message(
                                 &agent,
                                 agent_id,
@@ -1230,13 +1236,16 @@ impl AgentRuntime {
                                 ModelInputItem::AssistantTurn {
                                     content: content.clone().filter(|text| !text.is_empty()),
                                     reasoning_content: reasoning_content
-                                        .filter(|reasoning| !reasoning.trim().is_empty()),
+                                        .as_ref()
+                                        .filter(|reasoning| !reasoning.trim().is_empty())
+                                        .cloned(),
                                     tool_calls: assistant_tool_calls,
                                 },
                             )
                             .await?;
                         }
                         if let Some(text) = content.filter(|text| !text.trim().is_empty()) {
+                            last_assistant_text = Some(text.clone());
                             self.record_message(
                                 &agent,
                                 agent_id,
@@ -1253,6 +1262,10 @@ impl AgentRuntime {
                                 content: text,
                             })
                             .await;
+                        } else if let Some(reasoning) =
+                            reasoning_content.as_ref().filter(|r| !r.trim().is_empty())
+                        {
+                            last_assistant_text = Some(reasoning.clone());
                         }
                     }
                     ModelOutputItem::Other { .. } => {}
@@ -1267,6 +1280,7 @@ impl AgentRuntime {
                     turn_id,
                     TurnStatus::Completed,
                     AgentStatus::Completed,
+                    last_assistant_text,
                 )
                 .await?;
                 return Ok(());
@@ -1817,11 +1831,22 @@ impl AgentRuntime {
     async fn wait_agent_output(&self, agent_id: AgentId, timeout: Duration) -> Result<Value> {
         let agent = self.wait_agent(agent_id, timeout).await?;
         let (session_id, recent_messages) = self.agent_recent_messages(agent_id, 12).await?;
-        let final_response = recent_messages
-            .iter()
-            .rev()
-            .find(|message| message.role == MessageRole::Assistant)
-            .map(|message| message.content.clone());
+        let tracked_response = {
+            let agent_rec = self.agent(agent_id).await?;
+            let sessions = agent_rec.sessions.lock().await;
+            sessions
+                .iter()
+                .filter_map(|s| s.last_turn_response.as_ref())
+                .last()
+                .cloned()
+        };
+        let final_response = tracked_response.or_else(|| {
+            recent_messages
+                .iter()
+                .rev()
+                .find(|message| message.role == MessageRole::Assistant)
+                .map(|message| message.content.clone())
+        });
         Ok(json!({
             "agent": agent,
             "session_id": session_id,
@@ -1916,12 +1941,19 @@ impl AgentRuntime {
         turn_id: TurnId,
         turn_status: TurnStatus,
         agent_status: AgentStatus,
+        final_text: Option<String>,
     ) -> Result<()> {
         {
             let mut summary = agent.summary.write().await;
             summary.status = agent_status.clone();
             summary.current_turn = None;
             summary.updated_at = now();
+        }
+        {
+            let mut sessions = agent.sessions.lock().await;
+            if let Some(session) = sessions.iter_mut().find(|s| s.summary.id == session_id) {
+                session.last_turn_response = final_text;
+            }
         }
         self.persist_agent(agent).await?;
         self.publish(ServiceEventKind::TurnCompleted {
@@ -2330,14 +2362,16 @@ impl AgentRuntime {
         session_id: SessionId,
     ) -> Result<Vec<ModelInputItem>> {
         let sessions = agent.sessions.lock().await;
-        sessions
+        let mut history = sessions
             .iter()
             .find(|session| session.summary.id == session_id)
             .map(|session| session.history.clone())
             .ok_or(RuntimeError::SessionNotFound {
                 agent_id,
                 session_id,
-            })
+            })?;
+        repair_incomplete_tool_history(&mut history);
+        Ok(history)
     }
 
     async fn ensure_agent_container(
@@ -2834,6 +2868,7 @@ fn session_record_with_title(title: &str) -> AgentSessionRecord {
         messages: Vec::new(),
         history: Vec::new(),
         last_context_tokens: None,
+        last_turn_response: None,
     }
 }
 
@@ -2888,11 +2923,69 @@ fn compact_summary_from_output(output: &[ModelOutputItem]) -> Option<String> {
                 content: Some(text),
                 ..
             } => text,
+            ModelOutputItem::AssistantTurn {
+                content: None,
+                reasoning_content: Some(text),
+                ..
+            } => text,
             _ => return None,
         };
         let text = text.trim();
         (!text.is_empty()).then(|| text.to_string())
     })
+}
+
+fn repair_incomplete_tool_history(history: &mut Vec<ModelInputItem>) {
+    use std::collections::HashSet;
+    let mut insertions: Vec<(usize, ModelInputItem)> = Vec::new();
+    let mut i = 0;
+    while i < history.len() {
+        let call_ids: Vec<String> = match &history[i] {
+            ModelInputItem::AssistantTurn { tool_calls, .. } => {
+                tool_calls.iter().map(|tc| tc.call_id.clone()).collect()
+            }
+            ModelInputItem::FunctionCall { call_id, .. } => {
+                vec![call_id.clone()]
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if call_ids.is_empty() {
+            i += 1;
+            continue;
+        }
+        let mut answered = HashSet::new();
+        let mut last_output_pos = i;
+        let mut j = i + 1;
+        while j < history.len() {
+            if let ModelInputItem::FunctionCallOutput { call_id, .. } = &history[j] {
+                if call_ids.iter().any(|id| id == call_id) {
+                    answered.insert(call_id.clone());
+                }
+                last_output_pos = j;
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        for call_id in call_ids {
+            if !answered.contains(&call_id) {
+                insertions.push((
+                    last_output_pos + 1,
+                    ModelInputItem::FunctionCallOutput {
+                        call_id,
+                        output: "error: tool execution interrupted".to_string(),
+                    },
+                ));
+            }
+        }
+        i = j;
+    }
+    for (pos, item) in insertions.into_iter().rev() {
+        history.insert(pos, item);
+    }
 }
 
 fn build_compacted_history(history: &[ModelInputItem], summary: &str) -> Vec<ModelInputItem> {
@@ -3655,6 +3748,174 @@ esac
             Some("second")
         );
         assert_eq!(compact_summary_from_output(&[]), None);
+    }
+
+    #[test]
+    fn repair_adds_missing_tool_outputs_for_assistant_turn() {
+        let mut history = vec![
+            ModelInputItem::user_text("do something"),
+            ModelInputItem::AssistantTurn {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ModelToolCall {
+                    call_id: "call_1".to_string(),
+                    name: "container_exec".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+        ];
+        repair_incomplete_tool_history(&mut history);
+        assert_eq!(history.len(), 3);
+        assert!(matches!(
+            &history[2],
+            ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_1"
+        ));
+    }
+
+    #[test]
+    fn repair_adds_missing_tool_outputs_for_partial_results() {
+        let mut history = vec![
+            ModelInputItem::AssistantTurn {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![
+                    ModelToolCall {
+                        call_id: "call_1".to_string(),
+                        name: "container_exec".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                    ModelToolCall {
+                        call_id: "call_2".to_string(),
+                        name: "wait_agent".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                ],
+            },
+            ModelInputItem::FunctionCallOutput {
+                call_id: "call_1".to_string(),
+                output: "done".to_string(),
+            },
+        ];
+        repair_incomplete_tool_history(&mut history);
+        assert_eq!(history.len(), 3);
+        assert!(matches!(
+            &history[2],
+            ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_2"
+        ));
+    }
+
+    #[test]
+    fn repair_adds_missing_tool_outputs_for_function_call() {
+        let mut history = vec![
+            ModelInputItem::FunctionCall {
+                call_id: "call_a".to_string(),
+                name: "container_exec".to_string(),
+                arguments: "{}".to_string(),
+            },
+        ];
+        repair_incomplete_tool_history(&mut history);
+        assert_eq!(history.len(), 2);
+        assert!(matches!(
+            &history[1],
+            ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_a"
+        ));
+    }
+
+    #[test]
+    fn repair_does_nothing_for_complete_history() {
+        let mut history = vec![
+            ModelInputItem::user_text("run"),
+            ModelInputItem::FunctionCall {
+                call_id: "call_1".to_string(),
+                name: "container_exec".to_string(),
+                arguments: "{}".to_string(),
+            },
+            ModelInputItem::FunctionCallOutput {
+                call_id: "call_1".to_string(),
+                output: "ok".to_string(),
+            },
+            ModelInputItem::Message {
+                role: "assistant".to_string(),
+                content: vec![ModelContentItem::OutputText {
+                    text: "done".to_string(),
+                }],
+            },
+        ];
+        repair_incomplete_tool_history(&mut history);
+        assert_eq!(history.len(), 4);
+    }
+
+    #[test]
+    fn repair_does_nothing_for_empty_history() {
+        let mut history: Vec<ModelInputItem> = vec![];
+        repair_incomplete_tool_history(&mut history);
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn repair_inserts_before_user_message() {
+        let mut history = vec![
+            ModelInputItem::user_text("do something"),
+            ModelInputItem::AssistantTurn {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ModelToolCall {
+                    call_id: "call_1".to_string(),
+                    name: "container_exec".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+            ModelInputItem::user_text("继续"),
+        ];
+        repair_incomplete_tool_history(&mut history);
+        // Should be: user, AssistantTurn, FunctionCallOutput, user("继续")
+        assert_eq!(history.len(), 4);
+        assert!(matches!(
+            &history[2],
+            ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_1"
+        ));
+        assert!(matches!(
+            &history[3],
+            ModelInputItem::Message { role, .. } if role == "user"
+        ));
+    }
+
+    #[test]
+    fn repair_inserts_partial_before_user_message() {
+        let mut history = vec![
+            ModelInputItem::AssistantTurn {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![
+                    ModelToolCall {
+                        call_id: "call_1".to_string(),
+                        name: "exec".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                    ModelToolCall {
+                        call_id: "call_2".to_string(),
+                        name: "read".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                ],
+            },
+            ModelInputItem::FunctionCallOutput {
+                call_id: "call_1".to_string(),
+                output: "ok".to_string(),
+            },
+            ModelInputItem::user_text("继续"),
+        ];
+        repair_incomplete_tool_history(&mut history);
+        // Should be: AssistantTurn, FCO(call_1), FCO(call_2), user("继续")
+        assert_eq!(history.len(), 4);
+        assert!(matches!(
+            &history[2],
+            ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_2"
+        ));
+        assert!(matches!(
+            &history[3],
+            ModelInputItem::Message { role, .. } if role == "user"
+        ));
     }
 
     #[test]

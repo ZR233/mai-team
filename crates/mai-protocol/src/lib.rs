@@ -737,7 +737,13 @@ pub fn now() -> DateTime<Utc> {
 pub fn preview(value: &str, max: usize) -> String {
     let mut out = value.replace('\n', "\\n");
     if out.len() > max {
-        out.truncate(max);
+        let boundary = out
+            .char_indices()
+            .take_while(|(i, c)| i + c.len_utf8() <= max)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        out.truncate(boundary);
         out.push_str("...");
     }
     out
