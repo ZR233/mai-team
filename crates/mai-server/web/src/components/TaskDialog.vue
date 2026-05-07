@@ -27,7 +27,10 @@
       <p v-if="dialog.error" class="dialog-error">{{ dialog.error }}</p>
       <div class="modal-actions">
         <button class="ghost-button" type="button" @click="$emit('close')">Cancel</button>
-        <button class="primary-button" type="submit">Create</button>
+        <button class="primary-button" type="submit" :disabled="dialog.submitting">
+          <span v-if="dialog.submitting" class="spinner-sm"></span>
+          <template v-else>Create</template>
+        </button>
       </div>
     </form>
   </div>

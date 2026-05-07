@@ -37,7 +37,8 @@ export function useTasks() {
 
   async function refreshDetail() {
     if (!selectedTaskId.value) return
-    isDetailLoading.value = true
+    const isFirstLoad = !selectedTaskDetail.value
+    if (isFirstLoad) isDetailLoading.value = true
     try {
       const query = selectedAgentId.value ? `?agent_id=${encodeURIComponent(selectedAgentId.value)}` : ''
       selectedTaskDetail.value = await api(`/tasks/${selectedTaskId.value}${query}`)
@@ -46,7 +47,7 @@ export function useTasks() {
       highlightCodeBlocks(conversationRef.value)
       await scrollConversationToBottom()
     } finally {
-      isDetailLoading.value = false
+      if (isFirstLoad) isDetailLoading.value = false
     }
   }
 
@@ -74,8 +75,8 @@ export function useTasks() {
     })
     selectedTaskId.value = response.task.id
     selectedAgentId.value = response.task.planner_agent_id
-    await refreshTasks()
-    await refreshDetail()
+    refreshTasks()
+    refreshDetail()
     return response.task
   }
 
@@ -156,7 +157,8 @@ export function useTasks() {
     title: '',
     message: '',
     docker_image: '',
-    error: ''
+    error: '',
+    submitting: false
   })
 
   return {
