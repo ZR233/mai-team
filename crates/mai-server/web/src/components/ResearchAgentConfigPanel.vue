@@ -138,6 +138,56 @@
       </div>
     </section>
 
+    <section class="github-settings">
+      <div class="stage-title compact">
+        <div>
+          <h2>GitHub MCP</h2>
+          <p>Connect GitHub via Personal Access Token to enable the GitHub MCP server.</p>
+        </div>
+      </div>
+
+      <div class="settings-summary">
+        <div class="settings-summary-item" :class="githubState.has_token ? 'ready' : ''">
+          <span>Status</span>
+          <strong>{{ githubState.has_token ? 'Token configured' : 'Not connected' }}</strong>
+          <small>Endpoint: https://api.githubcopilot.com/mcp/</small>
+        </div>
+      </div>
+
+      <div class="github-token-form">
+        <label class="github-token-label">
+          <span>Personal Access Token</span>
+          <input
+            v-model="githubTokenInput"
+            type="password"
+            placeholder="ghp_..."
+            autocomplete="off"
+            class="github-token-input"
+          />
+        </label>
+        <div class="github-token-actions">
+          <button
+            class="primary-button"
+            type="button"
+            :disabled="githubSaving || !githubTokenInput.trim()"
+            @click="saveGithubToken"
+          >
+            <span v-if="githubSaving" class="spinner-sm"></span>
+            <template v-else>Save Token</template>
+          </button>
+          <button
+            v-if="githubState.has_token"
+            class="danger-button"
+            type="button"
+            :disabled="githubSaving"
+            @click="clearGithubToken"
+          >
+            Clear Token
+          </button>
+        </div>
+      </div>
+    </section>
+
     <section class="mcp-settings">
       <div class="stage-title compact">
         <div>
@@ -209,10 +259,14 @@ const props = defineProps({
   skillsSaving: { type: Boolean, default: false },
   skillsError: { type: String, default: '' },
   mcpServersState: { type: Object, required: true },
-  mcpSaving: { type: Boolean, default: false }
+  mcpSaving: { type: Boolean, default: false },
+  githubState: { type: Object, default: () => ({ has_token: false, loading: false }) },
+  githubSaving: { type: Boolean, default: false }
 })
 
-const emit = defineEmits(['save', 'reload', 'open-providers', 'reload-skills', 'save-skills', 'reload-mcp', 'open-mcp'])
+const emit = defineEmits(['save', 'reload', 'open-providers', 'reload-skills', 'save-skills', 'reload-mcp', 'open-mcp', 'save-github'])
+
+const githubTokenInput = ref('')
 
 const error = ref('')
 const forms = reactive({
@@ -386,5 +440,16 @@ function saveSkills() {
     enabled: skillEnabled(skill)
   }))
   emit('save-skills', config)
+}
+
+function saveGithubToken() {
+  const token = githubTokenInput.value.trim()
+  if (!token) return
+  emit('save-github', token)
+  githubTokenInput.value = ''
+}
+
+function clearGithubToken() {
+  emit('save-github', null)
 }
 </script>

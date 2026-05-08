@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use mai_protocol::{
     AgentConfigRequest, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus,
-    AgentSummary, ArtifactInfo, McpServerConfig, MessageRole, ModelConfig, ModelInputItem,
+    AgentSummary, ArtifactInfo, GithubSettingsResponse, McpServerConfig, McpServerTransport,
+    MessageRole, ModelConfig, ModelInputItem,
     ModelReasoningConfig, ModelReasoningVariant, PlanHistoryEntry, PlanStatus, ProviderConfig,
     ProviderKind, ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
     ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind, SessionId,
@@ -19,6 +20,9 @@ use uuid::Uuid;
 
 const SETTING_AGENT_CONFIG: &str = "agent_config";
 const SETTING_SKILLS_CONFIG: &str = "skills_config";
+const SETTING_GITHUB_TOKEN: &str = "github_token";
+const GITHUB_MCP_SERVER_NAME: &str = "github";
+const GITHUB_MCP_URL: &str = "https://api.githubcopilot.com/mcp/";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
 const SCHEMA_VERSION: &str = "8";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
@@ -701,6 +705,47 @@ impl ConfigStore {
     pub async fn save_skills_config(&self, config: &SkillsConfigRequest) -> Result<()> {
         self.set_setting(SETTING_SKILLS_CONFIG, &serde_json::to_string(config)?)
             .await
+    }
+
+    pub async fn get_github_settings(&self) -> Result<GithubSettingsResponse> {
+        let has_token = self.get_setting(SETTING_GITHUB_TOKEN).await?.is_some();
+        Ok(GithubSettingsResponse { has_token })
+    }
+
+    pub async fn save_github_token(&self, token: &str) -> Result<GithubSettingsResponse> {
+        self.set_setting(SETTING_GITHUB_TOKEN, token).await?;
+        let mut servers = self.list_mcp_servers().await?;
+        let mut config = servers
+            .remove(GITHUB_MCP_SERVER_NAME)
+            .unwrap_or_default();
+        config.transport = McpServerTransport::StreamableHttp;
+        config.url = Some(GITHUB_MCP_URL.to_string());
+        config.bearer_token = Some(token.to_string());
+        config.enabled = true;
+        // Rebuild map with "github" first, then remaining servers
+        let mut ordered = BTreeMap::new();
+        ordered.insert(GITHUB_MCP_SERVER_NAME.to_string(), config);
+        ordered.extend(servers);
+        self.save_mcp_servers(&ordered).await?;
+        Ok(GithubSettingsResponse { has_token: true })
+    }
+
+    pub async fn clear_github_token(&self) -> Result<GithubSettingsResponse> {
+        let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
+        delete_setting_in_tx(&mut tx, SETTING_GITHUB_TOKEN).await?;
+        tx.commit().await?;
+        // Only remove the MCP entry if the URL still points to the official GitHub MCP
+        let mut servers = self.list_mcp_servers().await?;
+        if servers
+            .get(GITHUB_MCP_SERVER_NAME)
+            .and_then(|c| c.url.as_deref())
+            == Some(GITHUB_MCP_URL)
+        {
+            servers.remove(GITHUB_MCP_SERVER_NAME);
+            self.save_mcp_servers(&servers).await?;
+        }
+        Ok(GithubSettingsResponse { has_token: false })
     }
 
     pub async fn save_agent(

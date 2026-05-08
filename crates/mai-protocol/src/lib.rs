@@ -993,6 +993,16 @@ impl Default for McpServerConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubSettingsResponse {
+    pub has_token: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubSettingsRequest {
+    pub token: Option<String>,
+}
+
 pub fn default_true() -> bool {
     true
 }

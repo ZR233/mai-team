@@ -13,7 +13,8 @@ use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentId, ApproveTaskPlanResponse, ArtifactInfo,
     CreateAgentRequest, CreateAgentResponse, CreateSessionResponse, CreateTaskRequest,
     CreateTaskResponse, ErrorResponse, FileUploadRequest, FileUploadResponse,
-    McpServersConfigRequest, ProviderPresetsResponse, ProvidersConfigRequest, ProvidersResponse,
+    GithubSettingsRequest, GithubSettingsResponse, McpServersConfigRequest,
+    ProviderPresetsResponse, ProvidersConfigRequest, ProvidersResponse,
     RequestPlanRevisionRequest, RequestPlanRevisionResponse, SendMessageRequest,
     SendMessageResponse, ServiceEvent, SessionId, SkillsConfigRequest, SkillsListResponse, TaskId,
     ToolTraceDetail, UpdateAgentRequest, UpdateAgentResponse,
@@ -164,6 +165,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/providers", get(get_providers).put(save_providers))
         .route("/mcp-servers", get(get_mcp_servers).put(save_mcp_servers))
+        .route("/settings/github", get(get_github_settings).put(save_github_settings))
         .route("/provider-presets", get(get_provider_presets))
         .route("/skills", get(list_skills))
         .route("/skills/config", axum::routing::put(save_skills_config))
@@ -287,6 +289,24 @@ async fn save_mcp_servers(
     Ok(Json(McpServersConfigRequest {
         servers: state.store.list_mcp_servers().await?,
     }))
+}
+
+async fn get_github_settings(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<GithubSettingsResponse>, ApiError> {
+    Ok(Json(state.store.get_github_settings().await?))
+}
+
+async fn save_github_settings(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<GithubSettingsRequest>,
+) -> std::result::Result<Json<GithubSettingsResponse>, ApiError> {
+    let token = request.token.as_deref().unwrap_or("").trim().to_string();
+    if token.is_empty() {
+        Ok(Json(state.store.clear_github_token().await?))
+    } else {
+        Ok(Json(state.store.save_github_token(&token).await?))
+    }
 }
 
 async fn list_skills(

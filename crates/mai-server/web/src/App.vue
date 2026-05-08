@@ -94,6 +94,8 @@
         :skills-error="skillsError"
         :mcp-servers-state="mcpServersState"
         :mcp-saving="mcpServersState.saving"
+        :github-state="githubSettingsState"
+        :github-saving="githubSettingsState.saving"
         @reload="loadAgentConfig"
         @save="onSaveAgentConfig"
         @reload-skills="onLoadSkills"
@@ -101,6 +103,7 @@
         @reload-mcp="onLoadMcpServers"
         @open-mcp="mcpDialogOpen = true"
         @open-providers="activeTab = 'providers'"
+        @save-github="onSaveGithubSettings"
       />
     </main>
 
@@ -159,6 +162,7 @@ import { useProviders } from './composables/useProviders'
 import { useAgentConfig } from './composables/useAgentConfig'
 import { useSkills } from './composables/useSkills'
 import { useMcpServers } from './composables/useMcpServers'
+import { useGithubSettings } from './composables/useGithubSettings'
 
 const { toast, showToast } = useApi()
 const { eventFeed, connectionState, connectEvents, disconnect } = useSSE()
@@ -211,6 +215,11 @@ const {
   loadMcpServers,
   saveMcpServers
 } = useMcpServers()
+const {
+  githubSettingsState,
+  loadGithubSettings,
+  saveGithubSettings
+} = useGithubSettings()
 
 const activeTab = ref('tasks')
 const messageDraft = ref('')
@@ -256,7 +265,7 @@ onUnmounted(() => disconnect())
 async function refreshAll() {
   isLoading.value = true
   try {
-    await Promise.all([loadProviders(), loadAgentConfig(), loadSkills(), loadMcpServers(), refreshTasks()])
+    await Promise.all([loadProviders(), loadAgentConfig(), loadSkills(), loadMcpServers(), loadGithubSettings(), refreshTasks()])
     if (providersState.providers.length && !tasks.value.length) {
       await ensureDefaultTask()
     } else if (selectedTaskId.value) {
@@ -397,6 +406,16 @@ async function onSaveMcpServers(servers) {
     await saveMcpServers(servers)
     mcpDialogOpen.value = false
     showToast('MCP config saved.')
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onSaveGithubSettings(token) {
+  try {
+    await saveGithubSettings(token)
+    await loadMcpServers()
+    showToast(token ? 'GitHub token saved.' : 'GitHub token cleared.')
   } catch (error) {
     showToast(error.message)
   }
