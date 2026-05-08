@@ -1,14 +1,16 @@
 use chrono::{DateTime, Utc};
 use mai_protocol::{
     AgentConfigRequest, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus,
-    AgentSummary, ArtifactInfo, GithubSettingsResponse, McpServerConfig, McpServerTransport,
-    MessageRole, ModelConfig, ModelInputItem,
-    ModelReasoningConfig, ModelReasoningVariant, PlanHistoryEntry, PlanStatus, ProviderConfig,
-    ProviderKind, ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
+    AgentSummary, ArtifactInfo, GithubAppSettingsRequest, GithubAppSettingsResponse,
+    GithubSettingsResponse, McpServerConfig, McpServerTransport, MessageRole, ModelConfig,
+    ModelInputItem, ModelReasoningConfig, ModelReasoningVariant, PlanHistoryEntry, PlanStatus,
+    ProjectCloneStatus, ProjectId, ProjectStatus, ProjectSummary, ProviderConfig, ProviderKind,
+    ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
     ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind, SessionId,
     SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary, TokenUsage, TurnId,
     default_true,
 };
+use rusqlite::Connection as SqliteConnection;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -21,10 +23,12 @@ use uuid::Uuid;
 const SETTING_AGENT_CONFIG: &str = "agent_config";
 const SETTING_SKILLS_CONFIG: &str = "skills_config";
 const SETTING_GITHUB_TOKEN: &str = "github_token";
+const SETTING_GITHUB_APP_CONFIG: &str = "github_app_config";
 const GITHUB_MCP_SERVER_NAME: &str = "github";
 const GITHUB_MCP_URL: &str = "https://api.githubcopilot.com/mcp/";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-const SCHEMA_VERSION: &str = "8";
+const SCHEMA_VERSION: &str = "9";
+const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const DEEPSEEK_V4_CONTEXT_TOKENS: u64 = 1_000_000;
 const DEEPSEEK_V4_OUTPUT_TOKENS: u64 = 384_000;
@@ -37,6 +41,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
     #[error("toml error: {0}")]
     Toml(#[from] toml::de::Error),
     #[error("toml serialize error: {0}")]
@@ -79,8 +85,27 @@ pub struct PersistedAgentSession {
 pub struct RuntimeSnapshot {
     pub agents: Vec<PersistedAgent>,
     pub tasks: Vec<PersistedTask>,
+    pub projects: Vec<ProjectSummary>,
     pub recent_events: Vec<ServiceEvent>,
     pub next_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct GithubAppConfig {
+    #[serde(default)]
+    app_id: Option<String>,
+    #[serde(default)]
+    private_key: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    app_slug: Option<String>,
+    #[serde(default)]
+    app_html_url: Option<String>,
+    #[serde(default)]
+    owner_login: Option<String>,
+    #[serde(default)]
+    owner_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +185,7 @@ struct AgentRecordRow {
     id: String,
     parent_id: Option<String>,
     task_id: Option<String>,
+    project_id: Option<String>,
     role: Option<String>,
     name: String,
     status: String,
@@ -177,6 +203,27 @@ struct AgentRecordRow {
     output_tokens: i64,
     total_tokens: i64,
     system_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "projects"]
+struct ProjectRecordRow {
+    #[key]
+    id: String,
+    name: String,
+    status: String,
+    owner: String,
+    repo: String,
+    repository_id: i64,
+    installation_id: i64,
+    installation_account: String,
+    docker_image: String,
+    workspace_path: String,
+    clone_status: String,
+    maintainer_agent_id: String,
+    created_at: String,
+    updated_at: String,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, toasty::Model)]
@@ -314,18 +361,25 @@ impl ConfigStore {
         if was_empty {
             db.push_schema().await?;
             set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
-        } else if get_setting_on(&db, SETTING_SCHEMA_VERSION)
-            .await
-            .ok()
-            .flatten()
-            .as_deref()
-            != Some(SCHEMA_VERSION)
-        {
-            drop(db);
-            let _ = std::fs::remove_file(&path);
-            db = build_db(&path).await?;
-            db.push_schema().await?;
-            set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
+        } else {
+            let current_schema_version = get_setting_on(&db, SETTING_SCHEMA_VERSION)
+                .await
+                .ok()
+                .flatten();
+            if current_schema_version.as_deref() != Some(SCHEMA_VERSION) {
+                if current_schema_version.as_deref() == Some("8") {
+                    drop(db);
+                    migrate_v8_to_v9(&path)?;
+                    db = build_db(&path).await?;
+                    set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
+                } else {
+                    drop(db);
+                    let _ = std::fs::remove_file(&path);
+                    db = build_db(&path).await?;
+                    db.push_schema().await?;
+                    set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
+                }
+            }
         }
 
         let store = Self {
@@ -715,9 +769,7 @@ impl ConfigStore {
     pub async fn save_github_token(&self, token: &str) -> Result<GithubSettingsResponse> {
         self.set_setting(SETTING_GITHUB_TOKEN, token).await?;
         let mut servers = self.list_mcp_servers().await?;
-        let mut config = servers
-            .remove(GITHUB_MCP_SERVER_NAME)
-            .unwrap_or_default();
+        let mut config = servers.remove(GITHUB_MCP_SERVER_NAME).unwrap_or_default();
         config.transport = McpServerTransport::StreamableHttp;
         config.url = Some(GITHUB_MCP_URL.to_string());
         config.bearer_token = Some(token.to_string());
@@ -748,6 +800,87 @@ impl ConfigStore {
         Ok(GithubSettingsResponse { has_token: false })
     }
 
+    pub async fn get_github_app_settings(&self) -> Result<GithubAppSettingsResponse> {
+        let config = self.github_app_config().await?;
+        Ok(GithubAppSettingsResponse {
+            app_id: config.app_id.clone(),
+            base_url: config
+                .base_url
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_GITHUB_API_BASE_URL.to_string()),
+            has_private_key: config
+                .private_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty()),
+            app_slug: config.app_slug.clone(),
+            app_html_url: config.app_html_url.clone(),
+            owner_login: config.owner_login.clone(),
+            owner_type: config.owner_type.clone(),
+            install_url: github_app_install_url(config.app_slug.as_deref()),
+        })
+    }
+
+    pub async fn github_app_secret(&self) -> Result<Option<(String, String, String)>> {
+        let config = self.github_app_config().await?;
+        let app_id = config.app_id.filter(|value| !value.trim().is_empty());
+        let private_key = config.private_key.filter(|value| !value.trim().is_empty());
+        match (app_id, private_key) {
+            (Some(app_id), Some(private_key)) => Ok(Some((
+                app_id,
+                private_key,
+                config
+                    .base_url
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| DEFAULT_GITHUB_API_BASE_URL.to_string()),
+            ))),
+            _ => Ok(None),
+        }
+    }
+
+    pub async fn save_github_app_settings(
+        &self,
+        request: GithubAppSettingsRequest,
+    ) -> Result<GithubAppSettingsResponse> {
+        let mut current = self.github_app_config().await?;
+        if let Some(app_id) = request.app_id {
+            current.app_id = Some(app_id.trim().to_string()).filter(|value| !value.is_empty());
+        }
+        if let Some(private_key) = request.private_key {
+            current.private_key =
+                Some(private_key.trim().to_string()).filter(|value| !value.is_empty());
+        }
+        if let Some(base_url) = request.base_url {
+            current.base_url = Some(base_url.trim().trim_end_matches('/').to_string())
+                .filter(|value| !value.is_empty());
+        }
+        if let Some(app_slug) = request.app_slug {
+            current.app_slug = Some(app_slug.trim().to_string()).filter(|value| !value.is_empty());
+        }
+        if let Some(app_html_url) = request.app_html_url {
+            current.app_html_url =
+                Some(app_html_url.trim().to_string()).filter(|value| !value.is_empty());
+        }
+        if let Some(owner_login) = request.owner_login {
+            current.owner_login =
+                Some(owner_login.trim().to_string()).filter(|value| !value.is_empty());
+        }
+        if let Some(owner_type) = request.owner_type {
+            current.owner_type =
+                Some(owner_type.trim().to_string()).filter(|value| !value.is_empty());
+        }
+        self.set_setting(SETTING_GITHUB_APP_CONFIG, &serde_json::to_string(&current)?)
+            .await?;
+        self.get_github_app_settings().await
+    }
+
+    async fn github_app_config(&self) -> Result<GithubAppConfig> {
+        match self.get_setting(SETTING_GITHUB_APP_CONFIG).await? {
+            Some(value) if !value.trim().is_empty() => Ok(serde_json::from_str(&value)?),
+            _ => Ok(GithubAppConfig::default()),
+        }
+    }
+
     pub async fn save_agent(
         &self,
         summary: &AgentSummary,
@@ -760,6 +893,7 @@ impl ConfigStore {
             id: summary.id.to_string(),
             parent_id: summary.parent_id.map(|id| id.to_string()),
             task_id: summary.task_id.map(|id| id.to_string()),
+            project_id: summary.project_id.map(|id| id.to_string()),
             role: summary.role.map(agent_role_to_str).map(str::to_string),
             name: summary.name.clone(),
             status: agent_status_to_str(&summary.status).to_string(),
@@ -782,6 +916,56 @@ impl ConfigStore {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn save_project(&self, project: &ProjectSummary) -> Result<()> {
+        let mut db = self.db.clone();
+        Query::<List<ProjectRecordRow>>::filter(
+            ProjectRecordRow::fields().id().eq(project.id.to_string()),
+        )
+        .delete()
+        .exec(&mut db)
+        .await?;
+        toasty::create!(ProjectRecordRow {
+            id: project.id.to_string(),
+            name: project.name.clone(),
+            status: project_status_to_str(&project.status).to_string(),
+            owner: project.owner.clone(),
+            repo: project.repo.clone(),
+            repository_id: u64_to_i64(project.repository_id),
+            installation_id: u64_to_i64(project.installation_id),
+            installation_account: project.installation_account.clone(),
+            docker_image: project.docker_image.clone(),
+            workspace_path: project.workspace_path.clone(),
+            clone_status: project_clone_status_to_str(&project.clone_status).to_string(),
+            maintainer_agent_id: project.maintainer_agent_id.to_string(),
+            created_at: project.created_at.to_rfc3339(),
+            updated_at: project.updated_at.to_rfc3339(),
+            last_error: project.last_error.clone(),
+        })
+        .exec(&mut db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_project(&self, project_id: ProjectId) -> Result<()> {
+        let mut db = self.db.clone();
+        Query::<List<ProjectRecordRow>>::filter(
+            ProjectRecordRow::fields().id().eq(project_id.to_string()),
+        )
+        .delete()
+        .exec(&mut db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn load_projects(&self) -> Result<Vec<ProjectSummary>> {
+        let mut db = self.db.clone();
+        let mut rows = Query::<List<ProjectRecordRow>>::all().exec(&mut db).await?;
+        rows.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        rows.into_iter()
+            .map(ProjectRecordRow::into_summary)
+            .collect()
     }
 
     pub async fn save_task(&self, task: &TaskSummary, plan: &TaskPlan) -> Result<()> {
@@ -1189,6 +1373,7 @@ impl ConfigStore {
             let plan_history = self.load_plan_history(task_id).await?;
             tasks.push(row.into_persisted_task(reviews, plan_history)?);
         }
+        let projects = self.load_projects().await?;
 
         let mut events = Query::<List<ServiceEventRecord>>::all()
             .exec(&mut db)
@@ -1208,6 +1393,7 @@ impl ConfigStore {
         Ok(RuntimeSnapshot {
             agents,
             tasks,
+            projects,
             recent_events,
             next_sequence,
         })
@@ -1326,6 +1512,11 @@ impl AgentRecordRow {
             id: parse_agent_id(&self.id)?,
             parent_id: self.parent_id.as_deref().map(parse_agent_id).transpose()?,
             task_id: self.task_id.as_deref().map(parse_task_id).transpose()?,
+            project_id: self
+                .project_id
+                .as_deref()
+                .map(parse_project_id)
+                .transpose()?,
             role: self.role.as_deref().map(parse_agent_role).transpose()?,
             name: self.name,
             status: parse_agent_status(&self.status)?,
@@ -1348,6 +1539,28 @@ impl AgentRecordRow {
                 output_tokens: i64_to_u64(self.output_tokens),
                 total_tokens: i64_to_u64(self.total_tokens),
             },
+        })
+    }
+}
+
+impl ProjectRecordRow {
+    fn into_summary(self) -> Result<ProjectSummary> {
+        Ok(ProjectSummary {
+            id: parse_project_id(&self.id)?,
+            name: self.name,
+            status: parse_project_status(&self.status)?,
+            owner: self.owner,
+            repo: self.repo,
+            repository_id: i64_to_u64(self.repository_id),
+            installation_id: i64_to_u64(self.installation_id),
+            installation_account: self.installation_account,
+            docker_image: self.docker_image,
+            workspace_path: self.workspace_path,
+            clone_status: parse_project_clone_status(&self.clone_status)?,
+            maintainer_agent_id: parse_agent_id(&self.maintainer_agent_id)?,
+            created_at: parse_utc(&self.created_at)?,
+            updated_at: parse_utc(&self.updated_at)?,
+            last_error: self.last_error,
         })
     }
 }
@@ -1440,6 +1653,7 @@ async fn build_db(path: &Path) -> Result<Db> {
     builder.models(toasty::models!(
         McpServerRecord,
         SettingRecord,
+        ProjectRecordRow,
         TaskRecordRow,
         TaskReviewRecord,
         PlanHistoryRecord,
@@ -1451,6 +1665,45 @@ async fn build_db(path: &Path) -> Result<Db> {
     ));
     builder.max_pool_size(1);
     Ok(builder.build(Sqlite::open(path)).await?)
+}
+
+fn migrate_v8_to_v9(path: &Path) -> Result<()> {
+    let conn = SqliteConnection::open(path)?;
+    if !sqlite_column_exists(&conn, "agents", "project_id")? {
+        conn.execute("ALTER TABLE agents ADD COLUMN project_id TEXT", [])?;
+    }
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS projects (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            repository_id BIGINT NOT NULL,
+            installation_id BIGINT NOT NULL,
+            installation_account TEXT NOT NULL,
+            docker_image TEXT NOT NULL,
+            workspace_path TEXT NOT NULL,
+            clone_status TEXT NOT NULL,
+            maintainer_agent_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn sqlite_column_exists(conn: &SqliteConnection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn has_sqlite_header(path: &Path) -> Result<bool> {
@@ -1944,6 +2197,11 @@ fn parse_task_id(value: &str) -> Result<TaskId> {
         .map_err(|err| StoreError::InvalidConfig(format!("invalid task id `{value}`: {err}")))
 }
 
+fn parse_project_id(value: &str) -> Result<ProjectId> {
+    Uuid::parse_str(value)
+        .map_err(|err| StoreError::InvalidConfig(format!("invalid project id `{value}`: {err}")))
+}
+
 fn parse_session_id(value: &str) -> Result<SessionId> {
     Uuid::parse_str(value)
         .map_err(|err| StoreError::InvalidConfig(format!("invalid session id `{value}`: {err}")))
@@ -2014,6 +2272,48 @@ fn parse_task_status(value: &str) -> Result<TaskStatus> {
         "cancelled" => Ok(TaskStatus::Cancelled),
         other => Err(StoreError::InvalidConfig(format!(
             "invalid task status `{other}`"
+        ))),
+    }
+}
+
+fn project_status_to_str(status: &ProjectStatus) -> &'static str {
+    match status {
+        ProjectStatus::Creating => "creating",
+        ProjectStatus::Ready => "ready",
+        ProjectStatus::Failed => "failed",
+        ProjectStatus::Deleting => "deleting",
+    }
+}
+
+fn parse_project_status(value: &str) -> Result<ProjectStatus> {
+    match value {
+        "creating" => Ok(ProjectStatus::Creating),
+        "ready" => Ok(ProjectStatus::Ready),
+        "failed" => Ok(ProjectStatus::Failed),
+        "deleting" => Ok(ProjectStatus::Deleting),
+        other => Err(StoreError::InvalidConfig(format!(
+            "invalid project status `{other}`"
+        ))),
+    }
+}
+
+fn project_clone_status_to_str(status: &ProjectCloneStatus) -> &'static str {
+    match status {
+        ProjectCloneStatus::Pending => "pending",
+        ProjectCloneStatus::Cloning => "cloning",
+        ProjectCloneStatus::Ready => "ready",
+        ProjectCloneStatus::Failed => "failed",
+    }
+}
+
+fn parse_project_clone_status(value: &str) -> Result<ProjectCloneStatus> {
+    match value {
+        "pending" => Ok(ProjectCloneStatus::Pending),
+        "cloning" => Ok(ProjectCloneStatus::Cloning),
+        "ready" => Ok(ProjectCloneStatus::Ready),
+        "failed" => Ok(ProjectCloneStatus::Failed),
+        other => Err(StoreError::InvalidConfig(format!(
+            "invalid project clone status `{other}`"
         ))),
     }
 }
@@ -2108,6 +2408,9 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         ServiceEventKind::TaskCreated { .. }
         | ServiceEventKind::TaskUpdated { .. }
         | ServiceEventKind::TaskDeleted { .. }
+        | ServiceEventKind::ProjectCreated { .. }
+        | ServiceEventKind::ProjectUpdated { .. }
+        | ServiceEventKind::ProjectDeleted { .. }
         | ServiceEventKind::PlanUpdated { .. } => None,
         ServiceEventKind::ArtifactCreated { artifact } => Some(artifact.agent_id),
         ServiceEventKind::Error { agent_id, .. } => *agent_id,
@@ -2126,6 +2429,13 @@ fn event_session_id(event: &ServiceEvent) -> Option<SessionId> {
         ServiceEventKind::Error { session_id, .. } => *session_id,
         _ => None,
     }
+}
+
+fn github_app_install_url(app_slug: Option<&str>) -> Option<String> {
+    app_slug
+        .map(str::trim)
+        .filter(|slug| !slug.is_empty())
+        .map(|slug| format!("https://github.com/apps/{slug}/installations/new"))
 }
 
 #[cfg(test)]
@@ -2505,6 +2815,7 @@ mod tests {
             id: agent_id,
             parent_id: None,
             task_id: None,
+            project_id: None,
             role: None,
             name: "agent-test".to_string(),
             status: AgentStatus::Completed,
@@ -2662,6 +2973,7 @@ mod tests {
             id: agent_id,
             parent_id: None,
             task_id: None,
+            project_id: None,
             role: None,
             name: "agent-test".to_string(),
             status: AgentStatus::Completed,
@@ -2757,6 +3069,7 @@ mod tests {
                     id: agent_id,
                     parent_id: None,
                     task_id: None,
+                    project_id: None,
                     role: None,
                     name: "agent-test".to_string(),
                     status: AgentStatus::Completed,
@@ -2901,6 +3214,51 @@ mod tests {
                 .expect("servers")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn schema_v8_migrates_projects_without_rebuild() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("config.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("open");
+        store
+            .save_mcp_servers(&BTreeMap::from([(
+                "demo".to_string(),
+                McpServerConfig {
+                    command: Some("demo-mcp".to_string()),
+                    ..Default::default()
+                },
+            )]))
+            .await
+            .expect("save server");
+        store
+            .set_setting(SETTING_SCHEMA_VERSION, "8")
+            .await
+            .expect("mark v8 schema");
+        drop(store);
+
+        let reopened = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("reopen");
+        assert_eq!(
+            reopened
+                .get_setting(SETTING_SCHEMA_VERSION)
+                .await
+                .expect("schema marker")
+                .as_deref(),
+            Some(SCHEMA_VERSION)
+        );
+        assert!(
+            reopened
+                .list_mcp_servers()
+                .await
+                .expect("servers")
+                .contains_key("demo")
+        );
+        assert!(reopened.load_projects().await.expect("projects").is_empty());
     }
 
     #[tokio::test]

@@ -1,26 +1,36 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use chrono::Utc;
+use chrono::{DateTime, TimeDelta, Utc};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use mai_docker::{ContainerHandle, DockerClient};
-use mai_mcp::McpAgentManager;
+use mai_mcp::{McpAgentManager, McpTool};
 use mai_model::ResponsesClient;
 use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentMessage,
     AgentModelPreference, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary, ArtifactInfo,
-    ContextUsage, CreateAgentRequest, MessageRole, ModelConfig, ModelContentItem, ModelInputItem,
-    ModelOutputItem, ModelToolCall, PlanHistoryEntry, PlanStatus, ResolvedAgentModelPreference,
-    ServiceEvent, ServiceEventKind, SessionId, SkillsConfigRequest, SkillsListResponse, TaskDetail,
-    TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary, TodoItem, TokenUsage, ToolTraceDetail,
-    TurnId, TurnStatus, UpdateAgentRequest, UserInputOption, UserInputQuestion, now, preview,
+    ContextUsage, CreateAgentRequest, CreateProjectRequest, GithubAppManifestAccountType,
+    GithubAppManifestStartRequest, GithubAppManifestStartResponse, GithubAppSettingsRequest,
+    GithubAppSettingsResponse, GithubInstallationSummary, GithubInstallationsResponse,
+    GithubRepositoriesResponse, GithubRepositorySummary, McpServerConfig, McpServerTransport,
+    MessageRole, ModelConfig, ModelContentItem, ModelInputItem, ModelOutputItem, ModelToolCall,
+    PlanHistoryEntry, PlanStatus, ProjectCloneStatus, ProjectDetail, ProjectId, ProjectStatus,
+    ProjectSummary, ResolvedAgentModelPreference, SendMessageRequest, ServiceEvent,
+    ServiceEventKind, SessionId, SkillsConfigRequest, SkillsListResponse, TaskDetail, TaskId,
+    TaskPlan, TaskReview, TaskStatus, TaskSummary, TodoItem, TokenUsage, ToolTraceDetail, TurnId,
+    TurnStatus, UpdateAgentRequest, UpdateProjectRequest, UserInputOption, UserInputQuestion, now,
+    preview,
 };
 use mai_skills::{SkillInjections, SkillsManager};
 use mai_store::{ConfigStore, ProviderSelection};
 use mai_tools::{RoutedTool, build_tool_definitions, route_tool};
+use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast};
@@ -31,6 +41,13 @@ const MAX_TOOL_ITERATIONS: usize = 16;
 const RECENT_EVENT_LIMIT: usize = 500;
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
 const REVIEW_ROUND_LIMIT: u64 = 5;
+const PROJECT_WORKSPACE_PATH: &str = "/workspace/repo";
+const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
+const DEFAULT_GITHUB_WEB_BASE_URL: &str = "https://github.com";
+const GITHUB_API_VERSION: &str = "2022-11-28";
+const GITHUB_TOKEN_REFRESH_SKEW_SECS: i64 = 120;
+const GITHUB_MANIFEST_STATE_TTL_SECS: u64 = 900;
+const PROJECT_GITHUB_MCP_SERVER: &str = "github";
 const COMPACT_USER_MESSAGE_MAX_CHARS: usize = 80_000;
 const COMPACT_SUMMARY_PREVIEW_CHARS: usize = 240;
 const COMPACT_SUMMARY_PREFIX: &str = "Context checkpoint summary from earlier conversation history. This is background for continuity, not a new user request.";
@@ -49,6 +66,7 @@ const AGENT_ROLES: [AgentRole; 4] = [
     AgentRole::Executor,
     AgentRole::Reviewer,
 ];
+static PROJECT_GITHUB_TOOLS: LazyLock<Vec<McpTool>> = LazyLock::new(project_github_tools);
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -56,6 +74,8 @@ pub enum RuntimeError {
     AgentNotFound(AgentId),
     #[error("task not found: {0}")]
     TaskNotFound(TaskId),
+    #[error("project not found: {0}")]
+    ProjectNotFound(ProjectId),
     #[error("agent is busy: {0}")]
     AgentBusy(AgentId),
     #[error("task is busy: {0}")]
@@ -83,6 +103,10 @@ pub enum RuntimeError {
     InvalidInput(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("http error: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("jwt error: {0}")]
+    Jwt(#[from] jsonwebtoken::errors::Error),
 }
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
@@ -99,10 +123,18 @@ pub struct AgentRuntime {
     skills: SkillsManager,
     agents: RwLock<HashMap<AgentId, Arc<AgentRecord>>>,
     tasks: RwLock<HashMap<TaskId, Arc<TaskRecord>>>,
+    projects: RwLock<HashMap<ProjectId, Arc<ProjectRecord>>>,
+    github_tokens: Mutex<HashMap<String, CachedGithubToken>>,
+    github_manifest_states: Mutex<HashMap<String, GithubManifestState>>,
+    github_http: reqwest::Client,
     event_tx: broadcast::Sender<ServiceEvent>,
     sequence: AtomicU64,
     recent_events: Mutex<VecDeque<ServiceEvent>>,
     repo_root: PathBuf,
+}
+
+struct ProjectRecord {
+    summary: RwLock<ProjectSummary>,
 }
 
 struct TaskRecord {
@@ -156,9 +188,95 @@ enum ContainerSource {
     },
 }
 
+#[derive(Debug, Clone)]
+struct CachedGithubToken {
+    token: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct GithubManifestState {
+    created_at: Instant,
+    account_type: GithubAppManifestAccountType,
+    org: Option<String>,
+}
+
 struct ResolvedAgentModel {
     preference: AgentModelPreference,
     effective: ResolvedAgentModelPreference,
+}
+
+#[derive(Debug, Serialize)]
+struct GithubJwtClaims {
+    iat: usize,
+    exp: usize,
+    iss: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubAccountApi {
+    login: String,
+    #[serde(rename = "type")]
+    account_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubInstallationApi {
+    id: u64,
+    account: GithubAccountApi,
+    repository_selection: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRepositoriesApi {
+    repositories: Vec<GithubRepositoryApi>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRepositoryApi {
+    id: u64,
+    name: String,
+    full_name: String,
+    private: bool,
+    clone_url: String,
+    html_url: String,
+    default_branch: Option<String>,
+    owner: GithubAccountApi,
+}
+
+#[derive(Debug, Serialize)]
+struct GithubAccessTokenRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_ids: Option<Vec<u64>>,
+    permissions: GithubAccessTokenPermissions,
+}
+
+#[derive(Debug, Serialize)]
+struct GithubAccessTokenPermissions {
+    contents: &'static str,
+    pull_requests: &'static str,
+    issues: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubAccessTokenResponse {
+    token: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubManifestConversionResponse {
+    id: u64,
+    slug: String,
+    html_url: String,
+    pem: String,
+    #[serde(default)]
+    owner: Option<GithubAccountApi>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubErrorResponse {
+    message: Option<String>,
 }
 
 impl AgentRuntime {
@@ -231,6 +349,33 @@ impl AgentRuntime {
             });
             tasks.insert(summary.id, task);
         }
+        let mut projects = HashMap::new();
+        for mut summary in snapshot.projects {
+            let project_id = summary.id;
+            let project_agents = agents
+                .values()
+                .filter(|agent| {
+                    agent
+                        .summary
+                        .try_read()
+                        .ok()
+                        .and_then(|summary| summary.project_id)
+                        == Some(project_id)
+                })
+                .count();
+            if project_agents == 0 {
+                summary.status = ProjectStatus::Failed;
+                summary.clone_status = ProjectCloneStatus::Failed;
+                summary.last_error = Some("maintainer agent is missing".to_string());
+                store.save_project(&summary).await?;
+            }
+            projects.insert(
+                summary.id,
+                Arc::new(ProjectRecord {
+                    summary: RwLock::new(summary),
+                }),
+            );
+        }
 
         Ok(Arc::new(Self {
             docker,
@@ -239,6 +384,10 @@ impl AgentRuntime {
             skills,
             agents: RwLock::new(agents),
             tasks: RwLock::new(tasks),
+            projects: RwLock::new(projects),
+            github_tokens: Mutex::new(HashMap::new()),
+            github_manifest_states: Mutex::new(HashMap::new()),
+            github_http: reqwest::Client::new(),
             event_tx,
             sequence: AtomicU64::new(snapshot.next_sequence),
             recent_events: Mutex::new(snapshot.recent_events.into_iter().collect()),
@@ -342,6 +491,208 @@ impl AgentRuntime {
         summaries
     }
 
+    pub async fn list_projects(&self) -> Vec<ProjectSummary> {
+        let project_records = {
+            let projects = self.projects.read().await;
+            projects.values().cloned().collect::<Vec<_>>()
+        };
+        let mut summaries = Vec::with_capacity(project_records.len());
+        for project in project_records {
+            summaries.push(project.summary.read().await.clone());
+        }
+        summaries.sort_by_key(|summary| summary.created_at);
+        summaries
+    }
+
+    pub async fn github_app_settings(&self) -> Result<GithubAppSettingsResponse> {
+        Ok(self.store.get_github_app_settings().await?)
+    }
+
+    pub async fn save_github_app_settings(
+        &self,
+        request: GithubAppSettingsRequest,
+    ) -> Result<GithubAppSettingsResponse> {
+        self.github_tokens.lock().await.clear();
+        Ok(self.store.save_github_app_settings(request).await?)
+    }
+
+    pub async fn start_github_app_manifest(
+        &self,
+        request: GithubAppManifestStartRequest,
+    ) -> Result<GithubAppManifestStartResponse> {
+        let origin = sanitize_origin(&request.origin)?;
+        let org = match request.account_type {
+            GithubAppManifestAccountType::Organization => {
+                let org = request
+                    .org
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidInput("organization is required".to_string())
+                    })?;
+                if !is_valid_github_slug(org) {
+                    return Err(RuntimeError::InvalidInput(
+                        "organization may contain only letters, numbers, or hyphens".to_string(),
+                    ));
+                }
+                Some(org.to_string())
+            }
+            GithubAppManifestAccountType::Personal => None,
+        };
+        let state = Uuid::new_v4().to_string();
+        let redirect_url = format!("{origin}/github/app-manifest/callback");
+        let setup_url = format!("{origin}/github/app-installation/callback");
+        let webhook_url = format!("{origin}/github/webhook-disabled");
+        let manifest = github_app_manifest(&redirect_url, &setup_url, &webhook_url);
+        let action_url = match (&request.account_type, &org) {
+            (GithubAppManifestAccountType::Organization, Some(org)) => {
+                format!(
+                    "{DEFAULT_GITHUB_WEB_BASE_URL}/organizations/{org}/settings/apps/new?state={state}"
+                )
+            }
+            _ => format!("{DEFAULT_GITHUB_WEB_BASE_URL}/settings/apps/new?state={state}"),
+        };
+
+        self.prune_github_manifest_states().await;
+        self.github_manifest_states.lock().await.insert(
+            state.clone(),
+            GithubManifestState {
+                created_at: Instant::now(),
+                account_type: request.account_type,
+                org,
+            },
+        );
+        Ok(GithubAppManifestStartResponse {
+            state,
+            action_url,
+            manifest,
+        })
+    }
+
+    pub async fn complete_github_app_manifest(
+        &self,
+        code: &str,
+        state: &str,
+    ) -> Result<GithubAppSettingsResponse> {
+        if !is_valid_github_manifest_code(code) {
+            return Err(RuntimeError::InvalidInput(
+                "invalid GitHub manifest code".to_string(),
+            ));
+        }
+        let state_record = self.take_github_manifest_state(state).await?;
+        let url = github_api_url(
+            DEFAULT_GITHUB_API_BASE_URL,
+            &format!("/app-manifests/{code}/conversions"),
+        );
+        let response = self
+            .github_http
+            .post(url)
+            .headers(github_headers())
+            .send()
+            .await?;
+        let conversion: GithubManifestConversionResponse =
+            decode_github_response(response, "create app from manifest").await?;
+        let owner_login = conversion
+            .owner
+            .as_ref()
+            .map(|owner| owner.login.clone())
+            .or_else(|| {
+                state_record.org.clone().filter(|_| {
+                    state_record.account_type == GithubAppManifestAccountType::Organization
+                })
+            });
+        let owner_type = conversion
+            .owner
+            .as_ref()
+            .map(|owner| owner.account_type.clone())
+            .or_else(|| match state_record.account_type {
+                GithubAppManifestAccountType::Organization => Some("Organization".to_string()),
+                GithubAppManifestAccountType::Personal => Some("User".to_string()),
+            });
+        self.save_github_app_settings(GithubAppSettingsRequest {
+            app_id: Some(conversion.id.to_string()),
+            private_key: Some(conversion.pem),
+            base_url: Some(DEFAULT_GITHUB_API_BASE_URL.to_string()),
+            app_slug: Some(conversion.slug),
+            app_html_url: Some(conversion.html_url),
+            owner_login,
+            owner_type,
+        })
+        .await
+    }
+
+    pub async fn list_github_installations(&self) -> Result<GithubInstallationsResponse> {
+        let (jwt, base_url) = self.github_app_jwt().await?;
+        let url = github_api_url(&base_url, "/app/installations?per_page=100");
+        let response = self
+            .github_http
+            .get(url)
+            .bearer_auth(jwt)
+            .headers(github_headers())
+            .send()
+            .await?;
+        let installations: Vec<GithubInstallationApi> =
+            decode_github_response(response, "list installations").await?;
+        Ok(GithubInstallationsResponse {
+            installations: installations
+                .into_iter()
+                .map(|installation| GithubInstallationSummary {
+                    id: installation.id,
+                    account_login: installation.account.login,
+                    account_type: installation.account.account_type,
+                    repository_selection: installation.repository_selection,
+                })
+                .collect(),
+        })
+    }
+
+    pub async fn refresh_github_installations(&self) -> Result<GithubInstallationsResponse> {
+        self.github_tokens.lock().await.clear();
+        self.list_github_installations().await
+    }
+
+    pub async fn list_github_repositories(
+        &self,
+        installation_id: u64,
+    ) -> Result<GithubRepositoriesResponse> {
+        if installation_id == 0 {
+            return Err(RuntimeError::InvalidInput(
+                "installation_id is required".to_string(),
+            ));
+        }
+        let token = self
+            .github_installation_token(installation_id, None)
+            .await?;
+        let (_, _, base_url) = self.github_app_secret().await?;
+        let url = github_api_url(&base_url, "/installation/repositories?per_page=100");
+        let response = self
+            .github_http
+            .get(url)
+            .bearer_auth(token)
+            .headers(github_headers())
+            .send()
+            .await?;
+        let response: GithubRepositoriesApi =
+            decode_github_response(response, "list installation repositories").await?;
+        Ok(GithubRepositoriesResponse {
+            repositories: response
+                .repositories
+                .into_iter()
+                .map(|repository| GithubRepositorySummary {
+                    id: repository.id,
+                    owner: repository.owner.login,
+                    name: repository.name,
+                    full_name: repository.full_name,
+                    private: repository.private,
+                    clone_url: repository.clone_url,
+                    html_url: repository.html_url,
+                    default_branch: repository.default_branch,
+                })
+                .collect(),
+        })
+    }
+
     pub async fn ensure_default_task(self: &Arc<Self>) -> Result<Option<TaskSummary>> {
         let tasks = self.list_tasks().await;
         if let Some(task) = tasks.first() {
@@ -381,6 +732,7 @@ impl AgentRuntime {
                 },
                 ContainerSource::FreshImage,
                 Some(task_id),
+                None,
                 Some(AgentRole::Planner),
             )
             .await?;
@@ -531,6 +883,241 @@ impl AgentRuntime {
         })
     }
 
+    pub async fn get_project(
+        &self,
+        project_id: ProjectId,
+        selected_agent_id: Option<AgentId>,
+        session_id: Option<SessionId>,
+    ) -> Result<ProjectDetail> {
+        let project = self.project(project_id).await?;
+        let summary = project.summary.read().await.clone();
+        let agents = self.project_agents(project_id).await;
+        let selected_agent_id = selected_agent_id
+            .filter(|id| agents.iter().any(|agent| agent.id == *id))
+            .unwrap_or(summary.maintainer_agent_id);
+        let maintainer_agent = self.get_agent(selected_agent_id, session_id).await?;
+        let status = if summary.status == ProjectStatus::Ready {
+            "ready"
+        } else {
+            "pending"
+        };
+        Ok(ProjectDetail {
+            summary,
+            maintainer_agent,
+            agents,
+            auth_status: status.to_string(),
+            mcp_status: status.to_string(),
+        })
+    }
+
+    pub async fn create_project(
+        self: &Arc<Self>,
+        request: CreateProjectRequest,
+    ) -> Result<ProjectSummary> {
+        if request.installation_id == 0 {
+            return Err(RuntimeError::InvalidInput(
+                "installation_id is required".to_string(),
+            ));
+        }
+        if request.repository_id == 0 {
+            return Err(RuntimeError::InvalidInput(
+                "repository_id is required".to_string(),
+            ));
+        }
+        let owner = clean_project_field(request.owner, "owner")?;
+        let repo = clean_project_field(request.repo, "repo")?;
+        let name = request.name.trim().to_string();
+        let name = if name.is_empty() {
+            format!("{owner}/{repo}")
+        } else {
+            name
+        };
+        let installation_account = self
+            .github_installation_account(request.installation_id)
+            .await?;
+        let project_id = Uuid::new_v4();
+        let planner_model = self.resolve_role_agent_model(AgentRole::Planner).await?;
+        let system_prompt = project_maintainer_system_prompt(&owner, &repo);
+        let maintainer = self
+            .create_agent_with_container_source(
+                CreateAgentRequest {
+                    name: Some(format!("{name} Maintainer")),
+                    provider_id: Some(planner_model.preference.provider_id),
+                    model: Some(planner_model.preference.model),
+                    reasoning_effort: planner_model.preference.reasoning_effort,
+                    docker_image: request.docker_image.clone(),
+                    parent_id: None,
+                    system_prompt: Some(system_prompt),
+                },
+                ContainerSource::FreshImage,
+                None,
+                Some(project_id),
+                Some(AgentRole::Planner),
+            )
+            .await?;
+        let created_at = now();
+        let project = ProjectSummary {
+            id: project_id,
+            name,
+            status: ProjectStatus::Creating,
+            owner,
+            repo,
+            repository_id: request.repository_id,
+            installation_id: request.installation_id,
+            installation_account,
+            docker_image: maintainer.docker_image.clone(),
+            workspace_path: PROJECT_WORKSPACE_PATH.to_string(),
+            clone_status: ProjectCloneStatus::Cloning,
+            maintainer_agent_id: maintainer.id,
+            created_at,
+            updated_at: created_at,
+            last_error: None,
+        };
+        self.store.save_project(&project).await?;
+        self.projects.write().await.insert(
+            project_id,
+            Arc::new(ProjectRecord {
+                summary: RwLock::new(project.clone()),
+            }),
+        );
+        self.publish(ServiceEventKind::ProjectCreated {
+            project: project.clone(),
+        })
+        .await;
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            let clone_result = runtime
+                .clone_project_repository(project_id, maintainer.id, request.repository_id)
+                .await;
+            let update = match clone_result {
+                Ok(()) => {
+                    runtime
+                        .set_project_clone_result(
+                            project_id,
+                            ProjectStatus::Ready,
+                            ProjectCloneStatus::Ready,
+                            None,
+                        )
+                        .await
+                }
+                Err(err) => {
+                    runtime
+                        .set_project_clone_result(
+                            project_id,
+                            ProjectStatus::Failed,
+                            ProjectCloneStatus::Failed,
+                            Some(err.to_string()),
+                        )
+                        .await
+                }
+            };
+            if let Err(err) = update {
+                tracing::warn!(project_id = %project_id, "failed to update project clone status: {err}");
+            }
+        });
+        Ok(project)
+    }
+
+    pub async fn update_project(
+        &self,
+        project_id: ProjectId,
+        request: UpdateProjectRequest,
+    ) -> Result<ProjectSummary> {
+        let project = self.project(project_id).await?;
+        let updated = {
+            let mut summary = project.summary.write().await;
+            if let Some(name) = request.name {
+                let name = name.trim();
+                if !name.is_empty() {
+                    summary.name = name.to_string();
+                }
+            }
+            if let Some(docker_image) = request.docker_image {
+                let docker_image = docker_image.trim();
+                if !docker_image.is_empty() {
+                    summary.docker_image = docker_image.to_string();
+                }
+            }
+            summary.updated_at = now();
+            summary.clone()
+        };
+        self.store.save_project(&updated).await?;
+        self.publish(ServiceEventKind::ProjectUpdated {
+            project: updated.clone(),
+        })
+        .await;
+        Ok(updated)
+    }
+
+    pub async fn delete_project(self: &Arc<Self>, project_id: ProjectId) -> Result<()> {
+        let project = self.project(project_id).await?;
+        let root_agents = self
+            .project_agents(project_id)
+            .await
+            .into_iter()
+            .filter(|agent| agent.parent_id.is_none())
+            .map(|agent| agent.id)
+            .collect::<Vec<_>>();
+        {
+            let mut summary = project.summary.write().await;
+            summary.status = ProjectStatus::Deleting;
+            summary.updated_at = now();
+            self.store.save_project(&summary).await?;
+            self.publish(ServiceEventKind::ProjectUpdated {
+                project: summary.clone(),
+            })
+            .await;
+        }
+        for agent_id in root_agents {
+            let _ = self.delete_agent(agent_id).await;
+        }
+        self.store.delete_project(project_id).await?;
+        self.projects.write().await.remove(&project_id);
+        self.publish(ServiceEventKind::ProjectDeleted { project_id })
+            .await;
+        Ok(())
+    }
+
+    pub async fn cancel_project(&self, project_id: ProjectId) -> Result<()> {
+        let project = self.project(project_id).await?;
+        let agents = self.project_agents(project_id).await;
+        for agent in agents {
+            if let Ok(record) = self.agent(agent.id).await {
+                record.cancel_requested.store(true, Ordering::SeqCst);
+                let _ = self.set_status(&record, AgentStatus::Cancelled, None).await;
+            }
+        }
+        let updated = {
+            let mut summary = project.summary.write().await;
+            if matches!(summary.status, ProjectStatus::Creating) {
+                summary.status = ProjectStatus::Failed;
+                summary.last_error = Some("cancelled".to_string());
+            }
+            summary.updated_at = now();
+            summary.clone()
+        };
+        self.store.save_project(&updated).await?;
+        self.publish(ServiceEventKind::ProjectUpdated { project: updated })
+            .await;
+        Ok(())
+    }
+
+    pub async fn send_project_message(
+        self: &Arc<Self>,
+        project_id: ProjectId,
+        request: SendMessageRequest,
+    ) -> Result<TurnId> {
+        let project = self.project(project_id).await?;
+        let maintainer_agent_id = project.summary.read().await.maintainer_agent_id;
+        self.send_message(
+            maintainer_agent_id,
+            request.session_id,
+            request.message,
+            request.skill_mentions,
+        )
+        .await
+    }
+
     pub async fn send_task_message(
         self: &Arc<Self>,
         task_id: TaskId,
@@ -668,8 +1255,14 @@ impl AgentRuntime {
         self: &Arc<Self>,
         request: CreateAgentRequest,
     ) -> Result<AgentSummary> {
-        self.create_agent_with_container_source(request, ContainerSource::FreshImage, None, None)
-            .await
+        self.create_agent_with_container_source(
+            request,
+            ContainerSource::FreshImage,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     async fn create_agent_with_container_source(
@@ -677,6 +1270,7 @@ impl AgentRuntime {
         request: CreateAgentRequest,
         container_source: ContainerSource,
         task_id: Option<TaskId>,
+        project_id: Option<ProjectId>,
         role: Option<AgentRole>,
     ) -> Result<AgentSummary> {
         let id = Uuid::new_v4();
@@ -699,6 +1293,7 @@ impl AgentRuntime {
             id,
             parent_id: request.parent_id,
             task_id,
+            project_id,
             role,
             name,
             status: AgentStatus::Created,
@@ -1388,6 +1983,8 @@ impl AgentRuntime {
         let skill_injections = self
             .skills
             .build_injections(&skill_mentions, &skills_config)?;
+        self.inject_project_mcp_tools(&agent, agent_id, session_id)
+            .await?;
         let mut last_assistant_text: Option<String> = None;
         for iteration in 0..MAX_TOOL_ITERATIONS {
             if agent.cancel_requested.load(Ordering::SeqCst) {
@@ -1783,6 +2380,7 @@ impl AgentRuntime {
                             docker_image: parent_docker_image,
                         },
                         parent_summary.task_id,
+                        parent_summary.project_id,
                         Some(role),
                     )
                     .await?;
@@ -2056,6 +2654,11 @@ impl AgentRuntime {
                 })
             }
             RoutedTool::Mcp(model_name) => {
+                if agent.summary.read().await.project_id.is_some() {
+                    return self
+                        .execute_project_mcp_tool(&agent, &model_name, arguments)
+                        .await;
+                }
                 let manager = agent.mcp.read().await.clone().ok_or_else(|| {
                     RuntimeError::InvalidInput("MCP manager not initialized".to_string())
                 })?;
@@ -2348,6 +2951,7 @@ impl AgentRuntime {
                 docker_image: parent_summary.docker_image,
             },
             Some(task_id),
+            parent_summary.project_id,
             Some(role),
         )
         .await
@@ -2916,6 +3520,258 @@ impl AgentRuntime {
             .ok_or(RuntimeError::TaskNotFound(task_id))
     }
 
+    async fn project(&self, project_id: ProjectId) -> Result<Arc<ProjectRecord>> {
+        self.projects
+            .read()
+            .await
+            .get(&project_id)
+            .cloned()
+            .ok_or(RuntimeError::ProjectNotFound(project_id))
+    }
+
+    async fn project_agents(&self, project_id: ProjectId) -> Vec<AgentSummary> {
+        let agents = self.agents.read().await;
+        let mut summaries = Vec::new();
+        for agent in agents.values() {
+            let summary = agent.summary.read().await.clone();
+            if summary.project_id == Some(project_id) {
+                summaries.push(summary);
+            }
+        }
+        summaries.sort_by_key(|summary| summary.created_at);
+        summaries
+    }
+
+    async fn set_project_clone_result(
+        &self,
+        project_id: ProjectId,
+        status: ProjectStatus,
+        clone_status: ProjectCloneStatus,
+        last_error: Option<String>,
+    ) -> Result<ProjectSummary> {
+        let project = self.project(project_id).await?;
+        let updated = {
+            let mut summary = project.summary.write().await;
+            summary.status = status;
+            summary.clone_status = clone_status;
+            summary.last_error = last_error;
+            summary.updated_at = now();
+            summary.clone()
+        };
+        self.store.save_project(&updated).await?;
+        self.publish(ServiceEventKind::ProjectUpdated {
+            project: updated.clone(),
+        })
+        .await;
+        Ok(updated)
+    }
+
+    async fn github_installation_account(&self, installation_id: u64) -> Result<String> {
+        let installations = self.list_github_installations().await?.installations;
+        installations
+            .into_iter()
+            .find(|installation| installation.id == installation_id)
+            .map(|installation| installation.account_login)
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(format!(
+                    "GitHub installation `{installation_id}` was not found"
+                ))
+            })
+    }
+
+    async fn prune_github_manifest_states(&self) {
+        let ttl = Duration::from_secs(GITHUB_MANIFEST_STATE_TTL_SECS);
+        let mut states = self.github_manifest_states.lock().await;
+        states.retain(|_, state| state.created_at.elapsed() < ttl);
+    }
+
+    async fn take_github_manifest_state(&self, state: &str) -> Result<GithubManifestState> {
+        self.prune_github_manifest_states().await;
+        let record = self
+            .github_manifest_states
+            .lock()
+            .await
+            .remove(state)
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "GitHub App setup link expired or state is invalid. Start configuration again."
+                        .to_string(),
+                )
+            })?;
+        Ok(record)
+    }
+
+    async fn github_app_secret(&self) -> Result<(String, String, String)> {
+        self.store.github_app_secret().await?.ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "GitHub App ID and private key must be configured before using Projects"
+                    .to_string(),
+            )
+        })
+    }
+
+    async fn github_app_jwt(&self) -> Result<(String, String)> {
+        let (app_id, private_key, base_url) = self.github_app_secret().await?;
+        let now = Utc::now().timestamp();
+        let claims = GithubJwtClaims {
+            iat: now.saturating_sub(60) as usize,
+            exp: now.saturating_add(540) as usize,
+            iss: app_id,
+        };
+        let token = encode(
+            &Header::new(Algorithm::RS256),
+            &claims,
+            &EncodingKey::from_rsa_pem(private_key.as_bytes())?,
+        )?;
+        Ok((token, base_url))
+    }
+
+    async fn github_installation_token(
+        &self,
+        installation_id: u64,
+        repository_id: Option<u64>,
+    ) -> Result<String> {
+        let cache_key = format!(
+            "{installation_id}:{}",
+            repository_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "all".to_string())
+        );
+        {
+            let tokens = self.github_tokens.lock().await;
+            if let Some(cached) = tokens.get(&cache_key)
+                && cached.expires_at - TimeDelta::seconds(GITHUB_TOKEN_REFRESH_SKEW_SECS)
+                    > Utc::now()
+            {
+                return Ok(cached.token.clone());
+            }
+        }
+
+        let (jwt, base_url) = self.github_app_jwt().await?;
+        let url = github_api_url(
+            &base_url,
+            &format!("/app/installations/{installation_id}/access_tokens"),
+        );
+        let body = GithubAccessTokenRequest {
+            repository_ids: repository_id.map(|id| vec![id]),
+            permissions: GithubAccessTokenPermissions {
+                contents: "write",
+                pull_requests: "write",
+                issues: "write",
+            },
+        };
+        let response = self
+            .github_http
+            .post(url)
+            .bearer_auth(jwt)
+            .headers(github_headers())
+            .json(&body)
+            .send()
+            .await?;
+        let token: GithubAccessTokenResponse =
+            decode_github_response(response, "create installation token").await?;
+        self.github_tokens.lock().await.insert(
+            cache_key,
+            CachedGithubToken {
+                token: token.token.clone(),
+                expires_at: token.expires_at,
+            },
+        );
+        Ok(token.token)
+    }
+
+    async fn project_installation_token_for_agent(
+        &self,
+        agent: &AgentRecord,
+    ) -> Result<Option<String>> {
+        let Some(project_id) = agent.summary.read().await.project_id else {
+            return Ok(None);
+        };
+        let project = self.project(project_id).await?;
+        let summary = project.summary.read().await.clone();
+        Ok(Some(
+            self.github_installation_token(summary.installation_id, Some(summary.repository_id))
+                .await?,
+        ))
+    }
+
+    async fn execute_project_mcp_tool(
+        &self,
+        agent: &AgentRecord,
+        model_name: &str,
+        arguments: Value,
+    ) -> Result<ToolExecution> {
+        let Some(token) = self.project_installation_token_for_agent(agent).await? else {
+            return Err(RuntimeError::InvalidInput(
+                "agent is not attached to a project".to_string(),
+            ));
+        };
+        let mut config = McpServerConfig {
+            transport: McpServerTransport::StreamableHttp,
+            url: Some("https://api.githubcopilot.com/mcp/".to_string()),
+            bearer_token: Some(token),
+            enabled: true,
+            startup_timeout_secs: Some(20),
+            ..McpServerConfig::default()
+        };
+        config.disabled_tools = Vec::new();
+        let mut configs = std::collections::BTreeMap::new();
+        configs.insert(PROJECT_GITHUB_MCP_SERVER.to_string(), config);
+        let manager = McpAgentManager::start(self.docker.clone(), String::new(), configs).await;
+        let output = manager.call_model_tool(model_name, arguments).await;
+        manager.shutdown().await;
+        Ok(ToolExecution {
+            success: true,
+            output: output?.to_string(),
+            ends_turn: false,
+        })
+    }
+
+    async fn clone_project_repository(
+        &self,
+        project_id: ProjectId,
+        maintainer_agent_id: AgentId,
+        repository_id: u64,
+    ) -> Result<()> {
+        let project = self.project(project_id).await?;
+        let summary = project.summary.read().await.clone();
+        let token = self
+            .github_installation_token(summary.installation_id, Some(repository_id))
+            .await?;
+        let container_id = self.container_id(maintainer_agent_id).await?;
+        let repo_url = github_clone_url(&summary.owner, &summary.repo);
+        let command = format!(
+            "set -eu\n\
+             rm -rf {workspace}\n\
+             mkdir -p /workspace\n\
+             git config --global --unset-all credential.helper >/dev/null 2>&1 || true\n\
+             rm -rf \"$HOME/.config/gh\" \"$HOME/.git-credentials\"\n\
+             git -c credential.helper= -c http.https://github.com/.extraheader=\"AUTHORIZATION: bearer $MAI_GITHUB_INSTALLATION_TOKEN\" clone -- {repo_url} {workspace}\n\
+             git config --global --unset-all credential.helper >/dev/null 2>&1 || true\n\
+             rm -rf \"$HOME/.config/gh\" \"$HOME/.git-credentials\"",
+            workspace = shell_quote(PROJECT_WORKSPACE_PATH),
+            repo_url = shell_quote(&repo_url),
+        );
+        let output = self
+            .docker
+            .exec_shell_env(
+                &container_id,
+                &command,
+                Some("/"),
+                Some(600),
+                &[("MAI_GITHUB_INSTALLATION_TOKEN".to_string(), token.clone())],
+            )
+            .await?;
+        if output.status != 0 {
+            let combined = format!("{}\n{}", output.stderr, output.stdout);
+            let message = redact_secret(combined.trim(), &token);
+            return Err(RuntimeError::InvalidInput(format!(
+                "repository clone failed: {message}"
+            )));
+        }
+        Ok(())
+    }
+
     async fn task_summary(&self, task: &Arc<TaskRecord>) -> TaskSummary {
         let mut summary = task.summary.read().await.clone();
         self.refresh_task_summary_counts(&mut summary).await;
@@ -3276,10 +4132,74 @@ impl AgentRuntime {
     }
 
     async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<mai_mcp::McpTool> {
+        if agent.summary.read().await.project_id.is_some()
+            && self
+                .store
+                .github_app_secret()
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            if let Some(manager) = agent.mcp.read().await.clone() {
+                let tools = manager.tools().await;
+                if !tools.is_empty() {
+                    return tools;
+                }
+            }
+            return PROJECT_GITHUB_TOOLS.clone();
+        }
         let Some(manager) = agent.mcp.read().await.clone() else {
             return Vec::new();
         };
         manager.tools().await
+    }
+
+    async fn inject_project_mcp_tools(
+        &self,
+        agent: &AgentRecord,
+        agent_id: AgentId,
+        _session_id: SessionId,
+    ) -> Result<()> {
+        if agent.summary.read().await.project_id.is_none() {
+            return Ok(());
+        }
+        if agent.mcp.read().await.is_some() {
+            return Ok(());
+        }
+        let Some(token) = self.project_installation_token_for_agent(agent).await? else {
+            return Ok(());
+        };
+        let mut config = McpServerConfig {
+            transport: McpServerTransport::StreamableHttp,
+            url: Some("https://api.githubcopilot.com/mcp/".to_string()),
+            bearer_token: Some(token),
+            enabled: true,
+            startup_timeout_secs: Some(20),
+            ..McpServerConfig::default()
+        };
+        config.disabled_tools = Vec::new();
+        let mut configs = std::collections::BTreeMap::new();
+        configs.insert(PROJECT_GITHUB_MCP_SERVER.to_string(), config);
+        self.publish(ServiceEventKind::McpServerStatusChanged {
+            agent_id,
+            server: PROJECT_GITHUB_MCP_SERVER.to_string(),
+            status: mai_protocol::McpStartupStatus::Starting,
+            error: None,
+        })
+        .await;
+        let mcp = McpAgentManager::start(self.docker.clone(), String::new(), configs).await;
+        for status in mcp.statuses().await {
+            self.publish(ServiceEventKind::McpServerStatusChanged {
+                agent_id,
+                server: status.server,
+                status: status.status,
+                error: status.error,
+            })
+            .await;
+        }
+        *agent.mcp.write().await = Some(Arc::new(mcp));
+        Ok(())
     }
 
     async fn tool_event_metadata(
@@ -3493,6 +4413,200 @@ fn agent_role_label(role: AgentRole) -> &'static str {
         AgentRole::Explorer => "explorer",
         AgentRole::Executor => "executor",
         AgentRole::Reviewer => "reviewer",
+    }
+}
+
+fn project_maintainer_system_prompt(owner: &str, repo: &str) -> String {
+    format!(
+        r#"You are the Maintainer agent for the GitHub project `{owner}/{repo}`.
+
+You run inside an isolated Docker container. The repository is cloned at `/workspace/repo`; use that path for local inspection and edits.
+
+Security rules:
+- Do not look for or persist GitHub credentials.
+- Do not configure credential helpers.
+- Do not write `~/.config/gh`, `~/.git-credentials`, long-lived `GH_TOKEN`, or long-lived `GITHUB_TOKEN`.
+- Use MCP/GitHub API tools for GitHub reads and writes such as issues, branches, commits, and pull requests.
+- Treat the deployment as no-webhook/no-public-inbound: refresh or poll state when you need current GitHub information.
+
+Operational focus:
+- Help the user review, plan, and maintain this repository.
+- Prefer small, testable changes.
+- Run relevant checks before reporting completion."#
+    )
+}
+
+fn clean_project_field(value: String, field: &str) -> Result<String> {
+    let value = value.trim().trim_matches('/').to_string();
+    if value.is_empty() {
+        return Err(RuntimeError::InvalidInput(format!("{field} is required")));
+    }
+    if value.contains('/') || value.contains(char::is_whitespace) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "{field} must be a GitHub path segment"
+        )));
+    }
+    Ok(value)
+}
+
+fn github_clone_url(owner: &str, repo: &str) -> String {
+    format!("https://github.com/{owner}/{repo}.git")
+}
+
+fn github_api_url(base_url: &str, path: &str) -> String {
+    let base = base_url
+        .trim()
+        .trim_end_matches('/')
+        .if_empty(DEFAULT_GITHUB_API_BASE_URL);
+    format!("{base}{path}")
+}
+
+fn sanitize_origin(origin: &str) -> Result<String> {
+    let origin = origin.trim().trim_end_matches('/');
+    if origin.is_empty() {
+        return Err(RuntimeError::InvalidInput("origin is required".to_string()));
+    }
+    if !(origin.starts_with("http://") || origin.starts_with("https://")) {
+        return Err(RuntimeError::InvalidInput(
+            "origin must start with http:// or https://".to_string(),
+        ));
+    }
+    if origin.contains('#') || origin.contains('?') || origin.contains(char::is_whitespace) {
+        return Err(RuntimeError::InvalidInput(
+            "origin must be a plain browser origin".to_string(),
+        ));
+    }
+    Ok(origin.to_string())
+}
+
+fn is_valid_github_slug(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= 100
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn is_valid_github_manifest_code(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn github_app_manifest(redirect_url: &str, setup_url: &str, webhook_url: &str) -> Value {
+    json!({
+        "name": format!("Mai Team {}", Uuid::new_v4().to_string().split('-').next().unwrap_or("project")),
+        "url": "https://github.com",
+        "redirect_url": redirect_url,
+        "callback_urls": [redirect_url],
+        "setup_url": setup_url,
+        "public": false,
+        "default_permissions": {
+            "contents": "write",
+            "pull_requests": "write",
+            "issues": "write"
+        },
+        "default_events": [],
+        "hook_attributes": {
+            "url": webhook_url,
+            "active": false
+        }
+    })
+}
+
+fn github_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    headers.insert(USER_AGENT, HeaderValue::from_static("mai-team"));
+    headers.insert(
+        "X-GitHub-Api-Version",
+        HeaderValue::from_static(GITHUB_API_VERSION),
+    );
+    headers
+}
+
+fn project_github_tools() -> Vec<McpTool> {
+    [
+        ("get_me", "Get the authenticated GitHub user."),
+        ("search_repositories", "Search GitHub repositories."),
+        (
+            "get_file_contents",
+            "Read file contents from a GitHub repository.",
+        ),
+        ("create_issue", "Create a GitHub issue."),
+        ("create_pull_request", "Create a GitHub pull request."),
+        ("create_branch", "Create a GitHub branch."),
+        (
+            "create_or_update_file",
+            "Create or update a file in a GitHub repository.",
+        ),
+        ("push_files", "Push multiple files to a GitHub repository."),
+        ("list_issues", "List GitHub issues."),
+        ("list_pull_requests", "List GitHub pull requests."),
+        ("get_pull_request", "Get a GitHub pull request."),
+        ("get_issue", "Get a GitHub issue."),
+    ]
+    .into_iter()
+    .map(|(name, description)| McpTool {
+        server: PROJECT_GITHUB_MCP_SERVER.to_string(),
+        name: name.to_string(),
+        model_name: mai_mcp::model_tool_name(PROJECT_GITHUB_MCP_SERVER, name),
+        description: description.to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true
+        }),
+        output_schema: None,
+    })
+    .collect()
+}
+
+async fn decode_github_response<T: DeserializeOwned>(
+    response: reqwest::Response,
+    action: &str,
+) -> Result<T> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response.json::<T>().await?);
+    }
+    let text = response.text().await.unwrap_or_default();
+    let message = serde_json::from_str::<GithubErrorResponse>(&text)
+        .ok()
+        .and_then(|error| error.message)
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| preview(&text, 300));
+    Err(RuntimeError::InvalidInput(format!(
+        "GitHub {action} failed ({status}): {message}"
+    )))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn redact_secret(value: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return value.to_string();
+    }
+    value.replace(secret, "<redacted>")
+}
+
+trait IfEmpty {
+    fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str;
+}
+
+impl IfEmpty for str {
+    fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str {
+        if self.is_empty() { fallback } else { self }
     }
 }
 
@@ -3955,6 +5069,9 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         ServiceEventKind::TaskCreated { .. }
         | ServiceEventKind::TaskUpdated { .. }
         | ServiceEventKind::TaskDeleted { .. }
+        | ServiceEventKind::ProjectCreated { .. }
+        | ServiceEventKind::ProjectUpdated { .. }
+        | ServiceEventKind::ProjectDeleted { .. }
         | ServiceEventKind::PlanUpdated { .. } => None,
         ServiceEventKind::ArtifactCreated { artifact } => Some(artifact.agent_id),
         ServiceEventKind::Error { agent_id, .. } => *agent_id,
@@ -4225,6 +5342,7 @@ mod tests {
             id: agent_id,
             parent_id,
             task_id: None,
+            project_id: None,
             role: None,
             name: "compact-agent".to_string(),
             status: AgentStatus::Idle,
@@ -4916,6 +6034,7 @@ esac
             id: agent_id,
             parent_id: None,
             task_id: None,
+            project_id: None,
             role: None,
             name: "restored".to_string(),
             status: AgentStatus::RunningTurn,
@@ -5035,6 +6154,7 @@ esac
             id: child_id,
             parent_id: Some(parent_id),
             task_id: None,
+            project_id: None,
             role: Some(AgentRole::Explorer),
             name: "Explorer".to_string(),
             status: AgentStatus::Completed,
@@ -5148,6 +6268,7 @@ esac
             id: agent_id,
             parent_id: None,
             task_id: None,
+            project_id: None,
             role: None,
             name: "trace".to_string(),
             status: AgentStatus::Completed,
@@ -5262,6 +6383,7 @@ esac
             id: agent_id,
             parent_id: None,
             task_id: None,
+            project_id: None,
             role: None,
             name: "assistant-turn-trace".to_string(),
             status: AgentStatus::Completed,
@@ -5917,6 +7039,7 @@ esac
                     id: agent_id,
                     parent_id: None,
                     task_id: None,
+                    project_id: None,
                     role: None,
                     name: "deepseek-context".to_string(),
                     status: AgentStatus::Idle,
@@ -6079,6 +7202,7 @@ esac
                     id: parent_id,
                     parent_id: None,
                     task_id: None,
+                    project_id: None,
                     role: None,
                     name: "parent".to_string(),
                     status: AgentStatus::Idle,
@@ -6200,6 +7324,7 @@ esac
                     id: parent_id,
                     parent_id: None,
                     task_id: None,
+                    project_id: None,
                     role: None,
                     name: "parent".to_string(),
                     status: AgentStatus::Idle,
@@ -6300,6 +7425,7 @@ esac
                     id: parent_id,
                     parent_id: None,
                     task_id: None,
+                    project_id: None,
                     role: None,
                     name: "parent".to_string(),
                     status: AgentStatus::Idle,
@@ -6502,6 +7628,7 @@ esac
             id: agent_id,
             parent_id: None,
             task_id: None,
+            project_id: None,
             role: None,
             name: "model-switch".to_string(),
             status: AgentStatus::Idle,
@@ -6582,6 +7709,7 @@ esac
             id: agent_id,
             parent_id: None,
             task_id: None,
+            project_id: None,
             role: None,
             name: "reasoning-switch".to_string(),
             status: AgentStatus::Idle,
@@ -6659,6 +7787,7 @@ esac
             id: agent_id,
             parent_id: None,
             task_id: None,
+            project_id: None,
             role: None,
             name: "busy".to_string(),
             status: AgentStatus::Idle,
@@ -6715,6 +7844,60 @@ esac
             )
             .await;
         assert!(matches!(busy, Err(RuntimeError::AgentBusy(id)) if id == agent_id));
+    }
+
+    #[tokio::test]
+    async fn github_manifest_start_builds_org_action_and_manifest() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let runtime = test_runtime(&dir, store).await;
+
+        let response = runtime
+            .start_github_app_manifest(GithubAppManifestStartRequest {
+                origin: "http://127.0.0.1:8080/".to_string(),
+                account_type: GithubAppManifestAccountType::Organization,
+                org: Some("mai-org".to_string()),
+            })
+            .await
+            .expect("start manifest");
+
+        assert!(
+            response
+                .action_url
+                .starts_with("https://github.com/organizations/mai-org/settings/apps/new?state=")
+        );
+        assert!(response.action_url.ends_with(&response.state));
+        assert_eq!(
+            response.manifest["redirect_url"],
+            "http://127.0.0.1:8080/github/app-manifest/callback"
+        );
+        assert_eq!(
+            response.manifest["default_permissions"]["contents"],
+            "write"
+        );
+        assert_eq!(
+            response.manifest["default_permissions"]["pull_requests"],
+            "write"
+        );
+        assert_eq!(response.manifest["default_permissions"]["issues"], "write");
+        assert_eq!(response.manifest["hook_attributes"]["active"], false);
+    }
+
+    #[tokio::test]
+    async fn github_manifest_start_rejects_invalid_org() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let runtime = test_runtime(&dir, store).await;
+
+        let result = runtime
+            .start_github_app_manifest(GithubAppManifestStartRequest {
+                origin: "http://127.0.0.1:8080".to_string(),
+                account_type: GithubAppManifestAccountType::Organization,
+                org: Some("-bad-".to_string()),
+            })
+            .await;
+
+        assert!(matches!(result, Err(RuntimeError::InvalidInput(_))));
     }
 
     #[test]

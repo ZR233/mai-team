@@ -486,6 +486,132 @@ p {
   overflow: hidden;
 }
 
+.projects-stage {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: 300px 250px minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.project-rail {
+  min-width: 0;
+}
+
+.project-row {
+  padding-left: 10px;
+}
+
+.project-row .avatar {
+  color: #fff;
+  background: linear-gradient(135deg, #1f6feb, #11a683);
+}
+
+.project-subnav {
+  min-height: 0;
+  overflow: auto;
+  padding: 14px;
+}
+
+.project-content {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.project-panel {
+  display: grid;
+  align-content: start;
+  gap: 16px;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 22px;
+}
+
+.project-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.project-fact {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  padding: 14px;
+  background: #fff;
+  box-shadow: 0 10px 22px rgba(22, 32, 51, 0.05);
+}
+
+.project-fact span {
+  color: #718096;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.project-fact strong {
+  min-width: 0;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  color: #172033;
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.project-fact.danger strong {
+  color: #b42318;
+}
+
+.project-agent-list {
+  display: grid;
+  gap: 8px;
+}
+
+.project-agent-row {
+  border-color: #d8e0ea;
+  background: #fff;
+}
+
+.project-dialog-action {
+  display: flex;
+  align-items: end;
+  min-width: 0;
+}
+
+.project-dialog-action .ghost-button {
+  width: 100%;
+}
+
+.permission-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  padding: 10px;
+  background: #f8fafc;
+}
+
+.permission-summary span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  border-radius: 999px;
+  padding: 0 10px;
+  color: #0b684f;
+  background: #daf4ea;
+  font-size: 11px;
+  font-weight: 900;
+}
+
 .providers-stage,
 .settings-stage {
   grid-column: 1 / -1;
@@ -1391,11 +1517,119 @@ p {
   align-items: end;
 }
 
+.github-app-wizard {
+  display: grid;
+  gap: 12px;
+  border: 1px solid #e1e7ef;
+  border-radius: 8px;
+  padding: 14px;
+  background: #f8fafc;
+}
+
+.segmented-control {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  width: min(360px, 100%);
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  padding: 4px;
+  background: #fff;
+}
+
+.segmented-control button {
+  min-height: 34px;
+  border: 0;
+  border-radius: 6px;
+  color: #526176;
+  background: transparent;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.segmented-control button.active {
+  color: #0f3f86;
+  background: #e8f0ff;
+}
+
+.github-org-field {
+  max-width: 360px;
+}
+
+.github-app-command-row,
+.github-app-links,
+.project-empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.github-app-links a {
+  color: #1b66d2;
+  font-size: 13px;
+  font-weight: 900;
+  text-decoration: none;
+}
+
+.advanced-config {
+  border: 1px solid #e1e7ef;
+  border-radius: 8px;
+  padding: 0;
+  background: #fff;
+}
+
+.advanced-config summary {
+  padding: 12px 14px;
+  color: #405066;
+  font-size: 13px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.advanced-config[open] {
+  padding-bottom: 14px;
+}
+
+.advanced-config[open] .github-app-form {
+  padding: 0 14px;
+}
+
+.github-app-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.github-app-form .span-2 {
+  grid-column: 1 / -1;
+}
+
 .github-token-actions {
   display: flex;
   gap: 8px;
   align-items: center;
   justify-content: flex-end;
+}
+
+.project-github-empty {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #dbe7fb;
+  border-radius: 8px;
+  padding: 14px;
+  background: #f4f8ff;
+}
+
+.project-github-empty strong {
+  color: #172033;
+  font-size: 14px;
+}
+
+.project-github-empty span {
+  color: #526176;
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 .session-strip {
@@ -3575,6 +3809,11 @@ select:focus {
     grid-template-rows: auto minmax(0, 1fr);
   }
 
+  .projects-stage {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+
   .agent-rail {
     max-height: 34vh;
     overflow: hidden;
@@ -3638,6 +3877,12 @@ select:focus {
     scrollbar-width: thin;
   }
 
+  .project-subnav {
+    min-height: auto;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
   .settings-nav-item {
     flex: 0 0 190px;
   }
@@ -3656,7 +3901,8 @@ select:focus {
 
   .skills-overview,
   .mcp-summary-grid,
-  .mcp-server-head {
+  .mcp-server-head,
+  .project-facts {
     grid-template-columns: 1fr;
   }
 
@@ -3677,11 +3923,21 @@ select:focus {
   .role-model-selector,
   .role-card-head,
   .role-models-layout,
+  .github-app-form,
   .github-token-form,
+  .github-app-command-row,
+  .project-dialog-action,
   .effective-model-line {
     grid-template-columns: 1fr;
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .github-app-command-row .primary-button,
+  .github-app-command-row .ghost-button,
+  .project-empty-actions .primary-button,
+  .project-empty-actions .ghost-button {
+    width: 100%;
   }
 
   .role-card-head {

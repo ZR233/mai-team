@@ -10,6 +10,7 @@
       </div>
       <nav class="tabs" aria-label="Views">
         <button :class="{ active: activeTab === 'tasks' }" @click="activeTab = 'tasks'">Tasks</button>
+        <button :class="{ active: activeTab === 'projects' }" @click="activeTab = 'projects'">Projects</button>
         <button :class="{ active: activeTab === 'providers' }" @click="activeTab = 'providers'">Providers</button>
         <button :class="{ active: activeTab === 'settings' }" @click="activeTab = 'settings'">Settings</button>
       </nav>
@@ -37,7 +38,37 @@
         @create="openCreateTaskDialog"
       />
 
-      <section v-if="activeTab === 'tasks'" class="agent-stage">
+      <ProjectWorkspace
+        v-if="activeTab === 'projects'"
+        v-model:conversation-ref="projectConversationRef"
+        :projects="projects"
+        :detail="selectedProjectDetail"
+        :selected-project-id="selectedProjectId"
+        :events="eventFeed"
+        :draft="projectMessageDraft"
+        :loading="isProjectDetailLoading"
+        :sending="isProjectSending"
+        :providers="providersState.providers"
+        :skills="enabledSkills"
+        :selected-skills="selectedProjectSkills"
+        :skills-loading="skillsState.loading"
+        :skills-error="skillsError"
+        :updating-model="isUpdatingProjectAgentModel"
+        @create="openCreateProjectDialog"
+        @select-project="selectProject"
+        @select-agent="selectProjectAgent"
+        @cancel-agent="onCancelProjectAgent"
+        @delete-agent="confirmDeleteProjectAgent"
+        @send="onSendProjectMessage"
+        @update-model="onUpdateProjectAgentModel"
+        @update:draft="projectMessageDraft = $event"
+        @update:selected-skills="selectedProjectSkills = $event"
+        @load-skills="onLoadSkills"
+        @create-session="onCreateProjectSession"
+        @select-session="selectProjectSession"
+      />
+
+      <section v-else-if="activeTab === 'tasks'" class="agent-stage">
         <div v-if="!selectedTaskDetail" class="empty-stage">
           <div class="empty-mark">+</div>
           <h2>No task selected</h2>
@@ -96,6 +127,9 @@
         :mcp-saving="mcpServersState.saving"
         :github-state="githubSettingsState"
         :github-saving="githubSettingsState.saving"
+        :github-app-saving="githubSettingsState.appSaving"
+        :github-app-manifest-starting="githubSettingsState.manifestStarting"
+        :initial-section="settingsInitialSection"
         @reload="loadAgentConfig"
         @save="onSaveAgentConfig"
         @reload-skills="onLoadSkills"
@@ -104,6 +138,9 @@
         @open-mcp="mcpDialogOpen = true"
         @open-providers="activeTab = 'providers'"
         @save-github="onSaveGithubSettings"
+        @save-github-app="onSaveGithubAppSettings"
+        @configure-github-app="onConfigureGithubApp"
+        @refresh-github-installations="onRefreshGithubAppInstallations"
       />
     </main>
 
@@ -118,6 +155,17 @@
       :dialog="taskDialog"
       @close="taskDialog.open = false"
       @create="onCreateTask"
+    />
+
+    <ProjectDialog
+      :dialog="projectDialog"
+      :github-state="githubSettingsState"
+      @close="projectDialog.open = false"
+      @create="onCreateProject"
+      @configure-github-app="openGithubAppSettings"
+      @install-github-app="openGithubAppInstallation"
+      @refresh-installations="onRefreshProjectInstallations"
+      @refresh-repositories="onRefreshProjectRepositories"
     />
 
     <McpServersDialog
@@ -148,16 +196,19 @@ import { highlightCodeBlocks } from './utils/markdown'
 
 import TaskRail from './components/TaskRail.vue'
 import TaskDetail from './components/TaskDetail.vue'
+import ProjectWorkspace from './components/ProjectWorkspace.vue'
 import ProviderGrid from './components/ProviderGrid.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import ProviderDialog from './components/ProviderDialog.vue'
 import TaskDialog from './components/TaskDialog.vue'
+import ProjectDialog from './components/ProjectDialog.vue'
 import ResearchAgentConfigPanel from './components/ResearchAgentConfigPanel.vue'
 import McpServersDialog from './components/McpServersDialog.vue'
 
 import { useApi } from './composables/useApi'
 import { useSSE } from './composables/useSSE'
 import { useTasks } from './composables/useTasks'
+import { useProjects } from './composables/useProjects'
 import { useProviders } from './composables/useProviders'
 import { useAgentConfig } from './composables/useAgentConfig'
 import { useSkills } from './composables/useSkills'
@@ -193,6 +244,30 @@ const {
   scrollConversationToBottom
 } = useTasks()
 const {
+  projects,
+  selectedProjectId,
+  selectedProjectDetail,
+  isProjectsLoading,
+  isProjectSending,
+  isProjectDetailLoading,
+  projectConversationRef,
+  projectDialog,
+  refreshProjects,
+  refreshProjectDetail,
+  selectProject,
+  selectProjectAgent,
+  selectProjectSession,
+  createProject,
+  sendProjectMessage,
+  cancelProjectAgent,
+  createProjectSession,
+  updateProjectAgent,
+  loadGithubInstallations,
+  refreshGithubInstallations,
+  loadGithubRepositories,
+  scrollProjectConversationToBottom
+} = useProjects()
+const {
   providersState,
   providerDialog,
   loadProviders,
@@ -218,15 +293,21 @@ const {
 const {
   githubSettingsState,
   loadGithubSettings,
-  saveGithubSettings
+  saveGithubSettings,
+  saveGithubAppSettings,
+  startGithubAppManifest
 } = useGithubSettings()
 
 const activeTab = ref('tasks')
 const messageDraft = ref('')
+const projectMessageDraft = ref('')
 const selectedSkills = ref([])
+const selectedProjectSkills = ref([])
 const isUpdatingAgentModel = ref(false)
+const isUpdatingProjectAgentModel = ref(false)
 const skillsError = ref('')
 const mcpDialogOpen = ref(false)
+const settingsInitialSection = ref('roles')
 
 const confirmDialog = reactive({
   open: false,
@@ -255,8 +336,23 @@ watch(
   }
 )
 
+watch(
+  () => [
+    selectedProjectDetail.value?.maintainer_agent?.messages?.length,
+    selectedProjectDetail.value?.maintainer_agent?.recent_events?.length,
+    selectedProjectDetail.value?.maintainer_agent?.selected_session_id,
+    eventFeed.value.length
+  ],
+  async () => {
+    await nextTick()
+    highlightCodeBlocks(projectConversationRef.value)
+    await scrollProjectConversationToBottom()
+  }
+)
+
 onMounted(async () => {
   connectEvents(handleSSEEvent)
+  applyStartupHash()
   await refreshAll()
 })
 
@@ -264,8 +360,9 @@ onUnmounted(() => disconnect())
 
 async function refreshAll() {
   isLoading.value = true
+  isProjectsLoading.value = true
   try {
-    await Promise.all([loadProviders(), loadAgentConfig(), loadSkills(), loadMcpServers(), loadGithubSettings(), refreshTasks()])
+    await Promise.all([loadProviders(), loadAgentConfig(), loadSkills(), loadMcpServers(), loadGithubSettings(), refreshTasks(), refreshProjects()])
     if (providersState.providers.length && !tasks.value.length) {
       await ensureDefaultTask()
     } else if (selectedTaskId.value) {
@@ -273,16 +370,44 @@ async function refreshAll() {
     } else if (tasks.value[0]?.id) {
       await selectTask(tasks.value[0].id)
     }
+    if (selectedProjectId.value) {
+      await refreshProjectDetail()
+    } else if (projects.value[0]?.id) {
+      await selectProject(projects.value[0].id)
+    }
   } catch (error) {
     showToast(error.message)
   } finally {
     isLoading.value = false
+    isProjectsLoading.value = false
   }
+}
+
+function applyStartupHash() {
+  const hash = window.location.hash || ''
+  if (!hash.includes('github-app=')) return
+  settingsInitialSection.value = 'integrations'
+  activeTab.value = 'settings'
+  if (hash.includes('configured')) {
+    showToast('GitHub App connected. Install it on repositories before creating a project.')
+  } else if (hash.includes('installed')) {
+    showToast('GitHub App installation updated. Refresh installations to load repositories.')
+  } else if (hash.includes('error')) {
+    showToast('GitHub App setup did not complete.')
+  }
+}
+
+function openGithubAppSettings() {
+  settingsInitialSection.value = 'integrations'
+  activeTab.value = 'settings'
+  projectDialog.open = false
 }
 
 async function handleSSEEvent() {
   await refreshTasks()
+  await refreshProjects()
   if (selectedTaskId.value) await refreshDetail()
+  if (selectedProjectId.value) await refreshProjectDetail()
 }
 
 function openCreateTaskDialog() {
@@ -325,6 +450,27 @@ async function onSendMessage(payload) {
   }
 }
 
+async function onSendProjectMessage(payload) {
+  const message = typeof payload === 'string' ? payload : payload?.message
+  const skillMentions = typeof payload === 'string' ? selectedProjectSkills.value : (payload?.skillMentions || [])
+  try {
+    projectMessageDraft.value = ''
+    await sendProjectMessage(message, skillMentions)
+    selectedProjectSkills.value = []
+    await loadSkills()
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onCreateProjectSession() {
+  try {
+    await createProjectSession()
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
 async function onApprovePlan() {
   try {
     await approveTaskPlan()
@@ -355,11 +501,124 @@ async function onUpdateAgentModel(payload) {
   }
 }
 
+async function onUpdateProjectAgentModel(payload) {
+  const agentId = selectedProjectDetail.value?.maintainer_agent?.id
+  if (!agentId) return
+  isUpdatingProjectAgentModel.value = true
+  try {
+    await updateProjectAgent(agentId, payload.provider_id, payload.model, payload.reasoning_effort)
+    showToast('Agent model updated.')
+  } catch (error) {
+    showToast(error.message)
+  } finally {
+    isUpdatingProjectAgentModel.value = false
+  }
+}
+
 async function onCancelSelectedAgent(id) {
   try {
     await cancelTaskAgent(id)
   } catch (error) {
     showToast(error.message)
+  }
+}
+
+async function onCancelProjectAgent(id) {
+  try {
+    await cancelProjectAgent(id)
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function openCreateProjectDialog() {
+  resetProjectDialog()
+  projectDialog.open = true
+  await loadGithubSettings()
+  if (!githubSettingsState.app_id || !githubSettingsState.has_private_key) {
+    projectDialog.error = 'Configure GitHub App before creating a project.'
+    return
+  }
+  await onRefreshProjectInstallations()
+}
+
+function resetProjectDialog() {
+  projectDialog.form.name = ''
+  projectDialog.form.installation_id = ''
+  projectDialog.form.repository_id = ''
+  projectDialog.form.owner = ''
+  projectDialog.form.repo = ''
+  projectDialog.form.docker_image = ''
+  projectDialog.repositories = []
+  projectDialog.error = ''
+  projectDialog.submitting = false
+}
+
+async function onRefreshProjectInstallations() {
+  projectDialog.loadingInstallations = true
+  projectDialog.error = ''
+  try {
+    await loadGithubSettings()
+    const response = await refreshGithubInstallations()
+    projectDialog.installations = response?.installations || []
+  } catch (error) {
+    projectDialog.error = error.message
+  } finally {
+    projectDialog.loadingInstallations = false
+  }
+}
+
+async function onLoadProjectInstallations() {
+  projectDialog.loadingInstallations = true
+  projectDialog.error = ''
+  try {
+    await loadGithubSettings()
+    const response = await loadGithubInstallations()
+    projectDialog.installations = response?.installations || []
+  } catch (error) {
+    projectDialog.error = error.message
+  } finally {
+    projectDialog.loadingInstallations = false
+  }
+}
+
+async function onRefreshProjectRepositories() {
+  if (!projectDialog.form.installation_id) return
+  projectDialog.loadingRepositories = true
+  projectDialog.error = ''
+  try {
+    const response = await loadGithubRepositories(projectDialog.form.installation_id)
+    projectDialog.repositories = response?.repositories || []
+  } catch (error) {
+    projectDialog.error = error.message
+  } finally {
+    projectDialog.loadingRepositories = false
+  }
+}
+
+async function onCreateProject() {
+  if (projectDialog.submitting) return
+  projectDialog.error = ''
+  if (!projectDialog.form.owner || !projectDialog.form.repo) {
+    projectDialog.error = 'Select a repository before creating the project.'
+    return
+  }
+  projectDialog.submitting = true
+  try {
+    await createProject({
+      name: projectDialog.form.name,
+      installation_id: projectDialog.form.installation_id,
+      repository_id: projectDialog.form.repository_id,
+      owner: projectDialog.form.owner,
+      repo: projectDialog.form.repo,
+      docker_image: projectDialog.form.docker_image || null
+    })
+    projectDialog.open = false
+    activeTab.value = 'projects'
+  } catch (error) {
+    projectDialog.error = error.message
+  } finally {
+    projectDialog.submitting = false
   }
 }
 
@@ -421,6 +680,44 @@ async function onSaveGithubSettings(token) {
   }
 }
 
+async function onSaveGithubAppSettings(payload) {
+  try {
+    await saveGithubAppSettings(payload)
+    showToast('GitHub App settings saved.')
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onConfigureGithubApp(payload) {
+  try {
+    await startGithubAppManifest({
+      ...payload,
+      origin: window.location.origin
+    })
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onRefreshGithubAppInstallations() {
+  try {
+    await refreshGithubInstallations()
+    await loadGithubSettings()
+    showToast('GitHub installations refreshed.')
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+function openGithubAppInstallation() {
+  if (!githubSettingsState.install_url) {
+    showToast('Configure GitHub App before installing it.')
+    return
+  }
+  window.location.href = githubSettingsState.install_url
+}
+
 function confirmCancelTask(id) {
   confirmDialog.title = 'Cancel Task'
   confirmDialog.message = 'Cancel this task and all running task agents?'
@@ -451,6 +748,10 @@ function confirmDeleteTask(id, title) {
 
 function confirmDeleteTaskAgent() {
   showToast('Delete the task to remove task-owned agents.')
+}
+
+function confirmDeleteProjectAgent() {
+  showToast('Delete the project to remove project-owned agents.')
 }
 
 function confirmDeleteProvider(index, name) {

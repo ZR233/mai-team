@@ -11,13 +11,16 @@ use mai_docker::DockerClient;
 use mai_model::ResponsesClient;
 use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentId, ApproveTaskPlanResponse, ArtifactInfo,
-    CreateAgentRequest, CreateAgentResponse, CreateSessionResponse, CreateTaskRequest,
-    CreateTaskResponse, ErrorResponse, FileUploadRequest, FileUploadResponse,
-    GithubSettingsRequest, GithubSettingsResponse, McpServersConfigRequest,
-    ProviderPresetsResponse, ProvidersConfigRequest, ProvidersResponse,
-    RequestPlanRevisionRequest, RequestPlanRevisionResponse, SendMessageRequest,
+    CreateAgentRequest, CreateAgentResponse, CreateProjectRequest, CreateProjectResponse,
+    CreateSessionResponse, CreateTaskRequest, CreateTaskResponse, ErrorResponse, FileUploadRequest,
+    FileUploadResponse, GithubAppManifestStartRequest, GithubAppManifestStartResponse,
+    GithubAppSettingsRequest, GithubAppSettingsResponse, GithubInstallationsResponse,
+    GithubRepositoriesResponse, GithubSettingsRequest, GithubSettingsResponse,
+    McpServersConfigRequest, ProjectId, ProviderPresetsResponse, ProvidersConfigRequest,
+    ProvidersResponse, RequestPlanRevisionRequest, RequestPlanRevisionResponse, SendMessageRequest,
     SendMessageResponse, ServiceEvent, SessionId, SkillsConfigRequest, SkillsListResponse, TaskId,
-    ToolTraceDetail, UpdateAgentRequest, UpdateAgentResponse,
+    ToolTraceDetail, UpdateAgentRequest, UpdateAgentResponse, UpdateProjectRequest,
+    UpdateProjectResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
 use mai_store::ConfigStore;
@@ -54,7 +57,9 @@ struct ApiError {
 impl From<RuntimeError> for ApiError {
     fn from(value: RuntimeError) -> Self {
         let status = match value {
-            RuntimeError::AgentNotFound(_) | RuntimeError::TaskNotFound(_) => StatusCode::NOT_FOUND,
+            RuntimeError::AgentNotFound(_)
+            | RuntimeError::TaskNotFound(_)
+            | RuntimeError::ProjectNotFound(_) => StatusCode::NOT_FOUND,
             RuntimeError::SessionNotFound { .. } => StatusCode::NOT_FOUND,
             RuntimeError::ToolTraceNotFound { .. } => StatusCode::NOT_FOUND,
             RuntimeError::AgentBusy(_) | RuntimeError::TaskBusy(_) => StatusCode::CONFLICT,
@@ -106,6 +111,26 @@ struct AgentDetailQuery {
 #[derive(Debug, Deserialize)]
 struct TaskDetailQuery {
     agent_id: Option<AgentId>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectDetailQuery {
+    agent_id: Option<AgentId>,
+    session_id: Option<SessionId>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubManifestCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubInstallationCallbackQuery {
+    setup_action: Option<String>,
+    installation_id: Option<u64>,
 }
 
 #[tokio::main]
@@ -165,7 +190,35 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/providers", get(get_providers).put(save_providers))
         .route("/mcp-servers", get(get_mcp_servers).put(save_mcp_servers))
-        .route("/settings/github", get(get_github_settings).put(save_github_settings))
+        .route(
+            "/settings/github",
+            get(get_github_settings).put(save_github_settings),
+        )
+        .route(
+            "/settings/github-app",
+            get(get_github_app_settings).put(save_github_app_settings),
+        )
+        .route(
+            "/github/app-manifest/start",
+            post(start_github_app_manifest),
+        )
+        .route(
+            "/github/app-manifest/callback",
+            get(complete_github_app_manifest),
+        )
+        .route(
+            "/github/app-installation/callback",
+            get(github_app_installation_callback),
+        )
+        .route("/github/installations", get(list_github_installations))
+        .route(
+            "/github/installations:refresh",
+            post(refresh_github_installations),
+        )
+        .route(
+            "/github/installations/{id}/repositories",
+            get(list_github_repositories),
+        )
         .route("/provider-presets", get(get_provider_presets))
         .route("/skills", get(list_skills))
         .route("/skills/config", axum::routing::put(save_skills_config))
@@ -184,6 +237,15 @@ async fn main() -> Result<()> {
             post(request_plan_revision),
         )
         .route("/tasks/{id}/cancel", post(cancel_task))
+        .route("/projects", get(list_projects).post(create_project))
+        .route(
+            "/projects/{id}",
+            get(get_project)
+                .patch(update_project)
+                .delete(delete_project),
+        )
+        .route("/projects/{id}/messages", post(send_project_message))
+        .route("/projects/{id}/cancel", post(cancel_project))
         .route("/agents", get(list_agents).post(create_agent))
         .route(
             "/agents/{id}",
@@ -255,6 +317,59 @@ fn embedded_asset_response(path: &str, fallback_index: bool) -> Response {
         .expect("embedded static response")
 }
 
+fn github_callback_page(success: bool, title: &str, message: &str, next: &str) -> Response {
+    let status = if success {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    let accent = if success { "#0b7a53" } else { "#b42318" };
+    let title = html_escape(title);
+    let message = html_escape(message);
+    let next = html_escape(next);
+    let body = format!(
+        r#"<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="2;url={next}">
+    <title>{title}</title>
+    <style>
+      body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f3f6fa; color: #172033; }}
+      main {{ width: min(520px, calc(100vw - 32px)); border: 1px solid #d8e0ea; border-radius: 8px; padding: 28px; background: #fff; box-shadow: 0 16px 36px rgba(22, 32, 51, 0.08); }}
+      .mark {{ width: 42px; height: 42px; display: grid; place-items: center; border-radius: 8px; margin-bottom: 18px; background: color-mix(in srgb, {accent} 12%, white); color: {accent}; font-weight: 900; }}
+      h1 {{ margin: 0 0 8px; font-size: 22px; }}
+      p {{ margin: 0 0 20px; color: #526176; line-height: 1.5; }}
+      a {{ color: #1b66d2; font-weight: 800; }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="mark">{mark}</div>
+      <h1>{title}</h1>
+      <p>{message}</p>
+      <a href="{next}">Return to Mai settings</a>
+    </main>
+  </body>
+</html>"#,
+        mark = if success { "OK" } else { "!" }
+    );
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(body))
+        .expect("callback response")
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
 }
@@ -309,6 +424,99 @@ async fn save_github_settings(
     }
 }
 
+async fn get_github_app_settings(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<GithubAppSettingsResponse>, ApiError> {
+    Ok(Json(state.runtime.github_app_settings().await?))
+}
+
+async fn save_github_app_settings(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<GithubAppSettingsRequest>,
+) -> std::result::Result<Json<GithubAppSettingsResponse>, ApiError> {
+    Ok(Json(state.runtime.save_github_app_settings(request).await?))
+}
+
+async fn start_github_app_manifest(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<GithubAppManifestStartRequest>,
+) -> std::result::Result<Json<GithubAppManifestStartResponse>, ApiError> {
+    Ok(Json(
+        state.runtime.start_github_app_manifest(request).await?,
+    ))
+}
+
+async fn complete_github_app_manifest(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<GithubManifestCallbackQuery>,
+) -> Response {
+    if let Some(error) = query.error {
+        let message = query.error_description.unwrap_or(error);
+        return github_callback_page(
+            false,
+            "GitHub App setup was cancelled",
+            &message,
+            "/#settings=integrations&github-app=error",
+        );
+    }
+    let code = query.code.unwrap_or_default();
+    let state_value = query.state.unwrap_or_default();
+    match state
+        .runtime
+        .complete_github_app_manifest(&code, &state_value)
+        .await
+    {
+        Ok(_) => github_callback_page(
+            true,
+            "GitHub App connected",
+            "Mai saved the GitHub App ID and private key server-side.",
+            "/#settings=integrations&github-app=configured",
+        ),
+        Err(error) => github_callback_page(
+            false,
+            "GitHub App setup failed",
+            &error.to_string(),
+            "/#settings=integrations&github-app=error",
+        ),
+    }
+}
+
+async fn github_app_installation_callback(
+    Query(query): Query<GithubInstallationCallbackQuery>,
+) -> Response {
+    let message = match (query.setup_action.as_deref(), query.installation_id) {
+        (Some(action), Some(id)) => format!("GitHub App installation {action}: {id}"),
+        (Some(action), None) => format!("GitHub App installation {action}."),
+        (None, Some(id)) => format!("GitHub App installation ready: {id}"),
+        (None, None) => "GitHub App installation finished.".to_string(),
+    };
+    github_callback_page(
+        true,
+        "GitHub App installation updated",
+        &message,
+        "/#settings=integrations&github-app=installed",
+    )
+}
+
+async fn list_github_installations(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<GithubInstallationsResponse>, ApiError> {
+    Ok(Json(state.runtime.list_github_installations().await?))
+}
+
+async fn refresh_github_installations(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<GithubInstallationsResponse>, ApiError> {
+    Ok(Json(state.runtime.refresh_github_installations().await?))
+}
+
+async fn list_github_repositories(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+) -> std::result::Result<Json<GithubRepositoriesResponse>, ApiError> {
+    Ok(Json(state.runtime.list_github_repositories(id).await?))
+}
+
 async fn list_skills(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<SkillsListResponse>, ApiError> {
@@ -351,6 +559,12 @@ async fn list_tasks(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<Vec<mai_protocol::TaskSummary>>, ApiError> {
     Ok(Json(state.runtime.list_tasks().await))
+}
+
+async fn list_projects(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<Vec<mai_protocol::ProjectSummary>>, ApiError> {
+    Ok(Json(state.runtime.list_projects().await))
 }
 
 async fn ensure_default_task(
@@ -423,6 +637,61 @@ async fn delete_task(
     Path(id): Path<TaskId>,
 ) -> std::result::Result<StatusCode, ApiError> {
     state.runtime.delete_task(id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn create_project(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CreateProjectRequest>,
+) -> std::result::Result<Json<CreateProjectResponse>, ApiError> {
+    let project = state.runtime.create_project(request).await?;
+    Ok(Json(CreateProjectResponse { project }))
+}
+
+async fn get_project(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<ProjectId>,
+    Query(query): Query<ProjectDetailQuery>,
+) -> std::result::Result<Json<mai_protocol::ProjectDetail>, ApiError> {
+    Ok(Json(
+        state
+            .runtime
+            .get_project(id, query.agent_id, query.session_id)
+            .await?,
+    ))
+}
+
+async fn update_project(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<ProjectId>,
+    Json(request): Json<UpdateProjectRequest>,
+) -> std::result::Result<Json<UpdateProjectResponse>, ApiError> {
+    let project = state.runtime.update_project(id, request).await?;
+    Ok(Json(UpdateProjectResponse { project }))
+}
+
+async fn send_project_message(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<ProjectId>,
+    Json(request): Json<SendMessageRequest>,
+) -> std::result::Result<Json<SendMessageResponse>, ApiError> {
+    let turn_id = state.runtime.send_project_message(id, request).await?;
+    Ok(Json(SendMessageResponse { turn_id }))
+}
+
+async fn cancel_project(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<ProjectId>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state.runtime.cancel_project(id).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn delete_project(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<ProjectId>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state.runtime.delete_project(id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -648,6 +917,9 @@ fn event_name(event: &ServiceEvent) -> &'static str {
         mai_protocol::ServiceEventKind::TaskCreated { .. } => "task_created",
         mai_protocol::ServiceEventKind::TaskUpdated { .. } => "task_updated",
         mai_protocol::ServiceEventKind::TaskDeleted { .. } => "task_deleted",
+        mai_protocol::ServiceEventKind::ProjectCreated { .. } => "project_created",
+        mai_protocol::ServiceEventKind::ProjectUpdated { .. } => "project_updated",
+        mai_protocol::ServiceEventKind::ProjectDeleted { .. } => "project_deleted",
         mai_protocol::ServiceEventKind::TurnStarted { .. } => "turn_started",
         mai_protocol::ServiceEventKind::TurnCompleted { .. } => "turn_completed",
         mai_protocol::ServiceEventKind::ToolStarted { .. } => "tool_started",

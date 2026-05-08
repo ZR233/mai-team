@@ -329,6 +329,18 @@ impl DockerClient {
         cwd: Option<&str>,
         timeout_secs: Option<u64>,
     ) -> Result<ExecOutput> {
+        self.exec_shell_env(container_id, command, cwd, timeout_secs, &[])
+            .await
+    }
+
+    pub async fn exec_shell_env(
+        &self,
+        container_id: &str,
+        command: &str,
+        cwd: Option<&str>,
+        timeout_secs: Option<u64>,
+        env: &[(String, String)],
+    ) -> Result<ExecOutput> {
         let shell_command = match timeout_secs {
             Some(seconds) if seconds > 0 => {
                 format!(
@@ -342,6 +354,9 @@ impl DockerClient {
         cmd.arg("exec");
         if let Some(cwd) = cwd {
             cmd.args(["-w", cwd]);
+        }
+        for (key, value) in env {
+            cmd.args(["-e", &format!("{key}={value}")]);
         }
         cmd.args([container_id, "/bin/sh", "-lc", &shell_command]);
 

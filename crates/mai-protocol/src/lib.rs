@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 pub type AgentId = Uuid;
+pub type ProjectId = Uuid;
 pub type SessionId = Uuid;
 pub type TaskId = Uuid;
 pub type TurnId = Uuid;
@@ -35,6 +36,24 @@ pub enum TaskStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectStatus {
+    Creating,
+    Ready,
+    Failed,
+    Deleting,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectCloneStatus {
+    Pending,
+    Cloning,
+    Ready,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -163,6 +182,8 @@ pub struct AgentSummary {
     #[serde(default)]
     pub task_id: Option<TaskId>,
     #[serde(default)]
+    pub project_id: Option<ProjectId>,
+    #[serde(default)]
     pub role: Option<AgentRole>,
     pub name: String,
     pub status: AgentStatus,
@@ -284,6 +305,38 @@ pub struct TaskDetail {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectSummary {
+    pub id: ProjectId,
+    pub name: String,
+    pub status: ProjectStatus,
+    pub owner: String,
+    pub repo: String,
+    pub repository_id: u64,
+    pub installation_id: u64,
+    pub installation_account: String,
+    pub docker_image: String,
+    pub workspace_path: String,
+    pub clone_status: ProjectCloneStatus,
+    pub maintainer_agent_id: AgentId,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectDetail {
+    #[serde(flatten)]
+    pub summary: ProjectSummary,
+    pub maintainer_agent: AgentDetail,
+    pub agents: Vec<AgentSummary>,
+    #[serde(default)]
+    pub auth_status: String,
+    #[serde(default)]
+    pub mcp_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateAgentRequest {
     pub name: Option<String>,
     pub provider_id: Option<String>,
@@ -313,6 +366,35 @@ pub struct CreateTaskRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTaskResponse {
     pub task: TaskSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CreateProjectRequest {
+    pub name: String,
+    pub installation_id: u64,
+    pub repository_id: u64,
+    pub owner: String,
+    pub repo: String,
+    #[serde(default)]
+    pub docker_image: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UpdateProjectRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub docker_image: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateProjectResponse {
+    pub project: ProjectSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateProjectResponse {
+    pub project: ProjectSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,6 +430,8 @@ pub struct SendMessageRequest {
     pub message: String,
     #[serde(default)]
     pub skill_mentions: Vec<String>,
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -714,6 +798,15 @@ pub enum ServiceEventKind {
     TaskDeleted {
         task_id: TaskId,
     },
+    ProjectCreated {
+        project: ProjectSummary,
+    },
+    ProjectUpdated {
+        project: ProjectSummary,
+    },
+    ProjectDeleted {
+        project_id: ProjectId,
+    },
     TurnStarted {
         agent_id: AgentId,
         #[serde(default)]
@@ -1001,6 +1094,95 @@ pub struct GithubSettingsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GithubSettingsRequest {
     pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GithubAppSettingsResponse {
+    pub app_id: Option<String>,
+    pub base_url: String,
+    pub has_private_key: bool,
+    #[serde(default)]
+    pub app_slug: Option<String>,
+    #[serde(default)]
+    pub app_html_url: Option<String>,
+    #[serde(default)]
+    pub owner_login: Option<String>,
+    #[serde(default)]
+    pub owner_type: Option<String>,
+    #[serde(default)]
+    pub install_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GithubAppSettingsRequest {
+    #[serde(default)]
+    pub app_id: Option<String>,
+    #[serde(default)]
+    pub private_key: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub app_slug: Option<String>,
+    #[serde(default)]
+    pub app_html_url: Option<String>,
+    #[serde(default)]
+    pub owner_login: Option<String>,
+    #[serde(default)]
+    pub owner_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubAppManifestStartRequest {
+    pub origin: String,
+    pub account_type: GithubAppManifestAccountType,
+    #[serde(default)]
+    pub org: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubAppManifestAccountType {
+    Personal,
+    Organization,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubAppManifestStartResponse {
+    pub state: String,
+    pub action_url: String,
+    pub manifest: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubInstallationSummary {
+    pub id: u64,
+    pub account_login: String,
+    pub account_type: String,
+    #[serde(default)]
+    pub repository_selection: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubInstallationsResponse {
+    pub installations: Vec<GithubInstallationSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubRepositorySummary {
+    pub id: u64,
+    pub owner: String,
+    pub name: String,
+    pub full_name: String,
+    pub private: bool,
+    pub clone_url: String,
+    pub html_url: String,
+    #[serde(default)]
+    pub default_branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubRepositoriesResponse {
+    pub repositories: Vec<GithubRepositorySummary>,
 }
 
 pub fn default_true() -> bool {

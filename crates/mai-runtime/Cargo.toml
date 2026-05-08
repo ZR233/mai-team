@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 base64.workspace = true
 chrono.workspace = true
+jsonwebtoken.workspace = true
 mai-docker = { path = "../mai-docker" }
 mai-mcp = { path = "../mai-mcp" }
 mai-model = { path = "../mai-model" }
@@ -14,6 +15,8 @@ mai-protocol = { path = "../mai-protocol" }
 mai-skills = { path = "../mai-skills" }
 mai-store = { path = "../mai-store" }
 mai-tools = { path = "../mai-tools" }
+reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
