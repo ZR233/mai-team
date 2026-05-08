@@ -27,51 +27,17 @@
       </div>
     </header>
 
-    <section class="task-plan-panel">
-      <div class="task-plan-head">
+    <details class="task-plan-panel" :open="!planCollapsed">
+      <summary class="task-plan-head">
         <div>
           <h3>{{ planTitle }}</h3>
           <p>{{ planMeta }}</p>
         </div>
-        <div v-if="canApprove" class="plan-actions">
-          <button
-            class="primary-button"
-            type="button"
-            :disabled="approvingPlan"
-            @click="$emit('approve-plan')"
-          >
-            <span v-if="approvingPlan" class="spinner-sm"></span>
-            <template v-else>Approve and Execute</template>
-          </button>
-          <button class="outline-button" type="button" @click="showRevisionDialog = true">
-            Request Revision
-          </button>
-        </div>
-      </div>
+      </summary>
 
       <div v-if="revisionFeedback" class="plan-feedback-banner">
         <strong>Revision requested:</strong>
         <p>{{ revisionFeedback }}</p>
-      </div>
-
-      <div v-if="showRevisionDialog" class="revision-feedback-panel">
-        <textarea
-          v-model="revisionText"
-          placeholder="Describe what should change in the plan..."
-          rows="3"
-        ></textarea>
-        <div class="revision-actions">
-          <button
-            class="primary-button"
-            type="button"
-            :disabled="!revisionText.trim() || submittingRevision"
-            @click="submitRevision"
-          >
-            <span v-if="submittingRevision" class="spinner-sm"></span>
-            <template v-else>Submit Feedback</template>
-          </button>
-          <button class="ghost-button" type="button" @click="showRevisionDialog = false; revisionText = ''">Cancel</button>
-        </div>
       </div>
 
       <div v-if="planMarkdown" class="markdown-body task-plan-body" v-html="renderMarkdown(planMarkdown)"></div>
@@ -89,7 +55,7 @@
           </div>
         </div>
       </details>
-    </section>
+    </details>
 
     <AgentDetail
       :detail="detail.selected_agent"
@@ -101,18 +67,23 @@
       :updating-model="updatingModel"
       :show-sessions="false"
       :show-composer="canCompose"
+      :plan-approval-pending="canApprove"
+      :approving-plan="approvingPlan"
+      :plan-version="detail.plan?.version || 0"
       v-model:conversation-ref="conversationRef"
       @cancel="$emit('cancel-agent', $event)"
       @delete="(...args) => $emit('delete-agent', ...args)"
       @send="$emit('send', $event)"
       @update-model="$emit('update-model', $event)"
       @update:draft="$emit('update:draft', $event)"
+      @approve-plan="$emit('approve-plan')"
+      @request-plan-revision="$emit('request-plan-revision', $event)"
     />
   </template>
 </template>
 
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import AgentDetail from './AgentDetail.vue'
 import { formatDate, formatStatus, initial, statusTone } from '../utils/format'
 import { renderMarkdown } from '../utils/markdown'
@@ -142,9 +113,7 @@ const emit = defineEmits([
   'update-model'
 ])
 
-const showRevisionDialog = ref(false)
-const revisionText = ref('')
-const submittingRevision = ref(false)
+const planCollapsed = ref(false)
 
 const planTitle = computed(() => props.detail?.plan?.title || 'Task Plan')
 const planMarkdown = computed(() => props.detail?.plan?.markdown || '')
@@ -163,15 +132,11 @@ const planMeta = computed(() => {
   return `v${plan.version} · ${formatStatus(plan.status)} · ${savedAt}${approvedAt}`
 })
 
-async function submitRevision() {
-  if (!revisionText.value.trim()) return
-  submittingRevision.value = true
-  try {
-    emit('request-plan-revision', revisionText.value.trim())
-    revisionText.value = ''
-    showRevisionDialog.value = false
-  } finally {
-    submittingRevision.value = false
+watch(
+  () => props.detail?.plan?.status,
+  (status) => {
+    if (status === 'approved') planCollapsed.value = true
+    else planCollapsed.value = false
   }
-}
+)
 </script>

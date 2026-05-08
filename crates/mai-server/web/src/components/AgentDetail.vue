@@ -55,8 +55,16 @@
       :activity="latestActivity"
     />
 
+    <PlanApprovalBar
+      v-if="planApprovalPending"
+      :plan-version="planVersion"
+      :approving="approvingPlan"
+      :submitting-revision="false"
+      @approve="$emit('approve-plan')"
+      @request-revision="$emit('request-plan-revision', $event)"
+    />
     <QuestionBar
-      v-if="pendingUserInput"
+      v-else-if="pendingUserInput"
       :questions="pendingUserInput.questions"
       :header="pendingUserInput.header"
       :sending="sending"
@@ -78,6 +86,7 @@ import AgentHeader from './AgentHeader.vue'
 import ChatTimeline from './ChatTimeline.vue'
 import ComposerBar from './ComposerBar.vue'
 import QuestionBar from './QuestionBar.vue'
+import PlanApprovalBar from './PlanApprovalBar.vue'
 import ContextStatusLine from './ContextStatusLine.vue'
 import ModelSelector from './ModelSelector.vue'
 import SessionTabs from './SessionTabs.vue'
@@ -96,7 +105,10 @@ const props = defineProps({
   updatingModel: { type: Boolean, default: false },
   providers: { type: Array, default: () => [] },
   showSessions: { type: Boolean, default: true },
-  showComposer: { type: Boolean, default: true }
+  showComposer: { type: Boolean, default: true },
+  planApprovalPending: { type: Boolean, default: false },
+  approvingPlan: { type: Boolean, default: false },
+  planVersion: { type: Number, default: 0 }
 })
 
 const conversationRef = defineModel('conversationRef', { default: null })
@@ -107,7 +119,9 @@ const emit = defineEmits([
   'update:draft',
   'update-model',
   'create-session',
-  'select-session'
+  'select-session',
+  'approve-plan',
+  'request-plan-revision'
 ])
 const { api, showToast } = useApi()
 const expandedTools = reactive({})

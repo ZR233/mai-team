@@ -1037,11 +1037,33 @@ p {
   background: #f8fafc;
 }
 
+.task-plan-panel:not([open]) {
+  max-height: none;
+  overflow: visible;
+}
+
 .task-plan-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 14px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.task-plan-head::-webkit-details-marker {
+  display: none;
+}
+
+.task-plan-head::before {
+  content: '▾';
+  color: #66758a;
+  font-size: 12px;
+  transition: transform 0.15s;
+}
+
+.task-plan-panel:not([open]) .task-plan-head::before {
+  transform: rotate(-90deg);
 }
 
 .task-plan-head h3 {
