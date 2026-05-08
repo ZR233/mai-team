@@ -40,6 +40,13 @@
           <strong>{{ item.title || 'Error' }}</strong>
           <p>{{ item.message }}</p>
         </div>
+        <div v-else-if="item.type === 'artifact'" class="artifact-card">
+          <a :href="`/artifacts/${item.artifact.id}/download`" download class="artifact-download">
+            <span class="artifact-icon">&#8595;</span>
+            <span class="artifact-name">{{ item.artifact.name }}</span>
+            <span class="artifact-size">{{ formatBytes(item.artifact.size_bytes) }}</span>
+          </a>
+        </div>
         <ProcessRow v-else :item="item" />
       </article>
     </template>
@@ -61,6 +68,13 @@ defineProps({
 })
 
 defineEmits(['toggle-tool'])
+
+function formatBytes(value) {
+  if (!value || !Number.isFinite(value)) return ''
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  return `${(value / 1024 / 1024).toFixed(1)} MB`
+}
 
 const conversationRef = defineModel('conversationRef', { default: null })
 const localConversationRef = ref(null)

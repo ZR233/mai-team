@@ -42,7 +42,8 @@ export function useSSE() {
       'agent_message',
       'error',
       'todo_list_updated',
-      'user_input_requested'
+      'user_input_requested',
+      'artifact_created'
     ]
     for (const name of names) {
       eventSource.addEventListener(name, (event) => {

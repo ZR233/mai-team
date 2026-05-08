@@ -156,6 +156,14 @@ export function buildAgentTimeline(detail, liveEvents = []) {
         timestamp: event.timestamp,
         sequence: event.sequence || 0
       })
+    } else if (event.type === 'artifact_created') {
+      items.push({
+        type: 'artifact',
+        key: `artifact-${event.artifact.id}`,
+        artifact: event.artifact,
+        timestamp: event.timestamp,
+        sequence: event.sequence || 0
+      })
     }
   }
 

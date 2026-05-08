@@ -14,6 +14,7 @@ pub const TOOL_SAVE_TASK_PLAN: &str = "save_task_plan";
 pub const TOOL_SUBMIT_REVIEW_RESULT: &str = "submit_review_result";
 pub const TOOL_UPDATE_TODO_LIST: &str = "update_todo_list";
 pub const TOOL_REQUEST_USER_INPUT: &str = "request_user_input";
+pub const TOOL_SAVE_ARTIFACT: &str = "save_artifact";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutedTool {
@@ -29,6 +30,7 @@ pub enum RoutedTool {
     SubmitReviewResult,
     UpdateTodoList,
     RequestUserInput,
+    SaveArtifact,
     Mcp(String),
     Unknown(String),
 }
@@ -47,6 +49,7 @@ pub fn route_tool(name: &str) -> RoutedTool {
         TOOL_SUBMIT_REVIEW_RESULT => RoutedTool::SubmitReviewResult,
         TOOL_UPDATE_TODO_LIST => RoutedTool::UpdateTodoList,
         TOOL_REQUEST_USER_INPUT => RoutedTool::RequestUserInput,
+        TOOL_SAVE_ARTIFACT => RoutedTool::SaveArtifact,
         normalized if normalized.starts_with("mcp__") => RoutedTool::Mcp(normalized.to_string()),
         normalized => RoutedTool::Unknown(normalized.to_string()),
     }
@@ -229,6 +232,16 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                         "additionalProperties": false
                     }
                 }), true),
+            ]),
+        ),
+        ToolDefinition::function(
+            TOOL_SAVE_ARTIFACT,
+            "Register a file as a downloadable artifact for the user. \
+             Use this when you have produced a deliverable file (report, code output, data export, generated document, etc.) \
+             that the user should be able to download from the web interface.",
+            object_schema(vec![
+                ("path", json!({ "type": "string", "description": "Absolute path of the file inside the container." }), true),
+                ("name", json!({ "type": "string", "description": "Display name for the artifact. Defaults to the filename from path." }), false),
             ]),
         ),
     ]

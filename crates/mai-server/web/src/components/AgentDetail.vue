@@ -64,7 +64,7 @@
       @request-revision="$emit('request-plan-revision', $event)"
     />
     <QuestionBar
-      v-else-if="pendingUserInput"
+      v-else-if="inputEnabled && pendingUserInput"
       :questions="pendingUserInput.questions"
       :header="pendingUserInput.header"
       :sending="sending"
@@ -108,7 +108,8 @@ const props = defineProps({
   showComposer: { type: Boolean, default: true },
   planApprovalPending: { type: Boolean, default: false },
   approvingPlan: { type: Boolean, default: false },
-  planVersion: { type: Number, default: 0 }
+  planVersion: { type: Number, default: 0 },
+  inputEnabled: { type: Boolean, default: true }
 })
 
 const conversationRef = defineModel('conversationRef', { default: null })

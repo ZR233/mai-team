@@ -425,6 +425,23 @@ impl DockerClient {
         }
         Ok(output.stdout)
     }
+
+    pub async fn copy_from_container_to_file(
+        &self,
+        container_id: &str,
+        container_path: &str,
+        host_path: &std::path::Path,
+    ) -> Result<()> {
+        let source = format!("{container_id}:{container_path}");
+        let output = Command::new(&self.binary)
+            .args(["cp", &source, &host_path.to_string_lossy()])
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(DockerError::CommandFailed(stderr_or_stdout(&output)));
+        }
+        Ok(())
+    }
 }
 
 fn stderr_or_stdout(output: &std::process::Output) -> String {

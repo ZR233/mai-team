@@ -10,9 +10,9 @@ use futures::StreamExt;
 use mai_docker::DockerClient;
 use mai_model::ResponsesClient;
 use mai_protocol::{
-    AgentConfigRequest, AgentConfigResponse, AgentId, ApproveTaskPlanResponse, CreateAgentRequest,
-    CreateAgentResponse, CreateSessionResponse, CreateTaskRequest, CreateTaskResponse,
-    ErrorResponse, FileUploadRequest, FileUploadResponse,
+    AgentConfigRequest, AgentConfigResponse, AgentId, ArtifactInfo, ApproveTaskPlanResponse,
+    CreateAgentRequest, CreateAgentResponse, CreateSessionResponse, CreateTaskRequest,
+    CreateTaskResponse, ErrorResponse, FileUploadRequest, FileUploadResponse,
     ProviderPresetsResponse, ProvidersConfigRequest, ProvidersResponse, RequestPlanRevisionRequest,
     RequestPlanRevisionResponse, SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId,
     TaskId, ToolTraceDetail, UpdateAgentRequest, UpdateAgentResponse,
@@ -36,6 +36,7 @@ use tracing::info;
 struct AppState {
     runtime: Arc<AgentRuntime>,
     store: Arc<ConfigStore>,
+    runtime_config: RuntimeConfig,
 }
 
 #[derive(RustEmbed)]
@@ -138,13 +139,14 @@ async fn main() -> Result<()> {
         .await?;
 
     let model = ResponsesClient::new();
+    let runtime_config = RuntimeConfig {
+        repo_root: env::current_dir()?,
+    };
     let runtime = AgentRuntime::new(
         docker,
         model,
         Arc::clone(&store),
-        RuntimeConfig {
-            repo_root: env::current_dir()?,
-        },
+        runtime_config.clone(),
     )
     .await?;
     let cleaned = runtime.cleanup_orphaned_containers().await?;
@@ -154,7 +156,7 @@ async fn main() -> Result<()> {
             "removed orphaned mai-team containers"
         );
     }
-    let state = Arc::new(AppState { runtime, store });
+    let state = Arc::new(AppState { runtime, store, runtime_config });
 
     let app = Router::new()
         .route("/", get(index))
@@ -197,6 +199,8 @@ async fn main() -> Result<()> {
         .route("/agents/{id}/tool-calls/{call_id}", get(get_tool_trace))
         .route("/agents/{id}/files:upload", post(upload_file))
         .route("/agents/{id}/files:download", get(download_file))
+        .route("/tasks/{id}/artifacts", get(list_artifacts))
+        .route("/artifacts/{id}/download", get(download_artifact))
         .route("/agents/{id}/cancel", post(cancel_agent))
         .fallback(get(static_fallback))
         .layer(CorsLayer::permissive())
@@ -473,6 +477,58 @@ async fn download_file(
         .expect("response builder"))
 }
 
+async fn list_artifacts(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<TaskId>,
+) -> std::result::Result<Json<Vec<ArtifactInfo>>, ApiError> {
+    let artifacts = state.store.load_artifacts(&id).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: e.to_string(),
+    })?;
+    Ok(Json(artifacts))
+}
+
+async fn download_artifact(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> std::result::Result<Response, ApiError> {
+    let artifacts = state.store.load_all_artifacts().map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: e.to_string(),
+    })?;
+    let artifact = artifacts
+        .into_iter()
+        .find(|a| a.id == id.as_str())
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "Artifact not found".to_string(),
+        })?;
+
+    let file_path = state
+        .runtime_config
+        .repo_root
+        .join("artifacts")
+        .join(artifact.task_id.to_string())
+        .join(&artifact.id)
+        .join(&artifact.name);
+
+    let bytes = tokio::fs::read(&file_path).await.map_err(|e| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: format!("File not found: {e}"),
+    })?;
+
+    let filename = artifact.name.clone();
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(Body::from(bytes))
+        .expect("response builder"))
+}
+
 async fn cancel_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<AgentId>,
@@ -544,5 +600,6 @@ fn event_name(event: &ServiceEvent) -> &'static str {
         mai_protocol::ServiceEventKind::TodoListUpdated { .. } => "todo_list_updated",
         mai_protocol::ServiceEventKind::PlanUpdated { .. } => "plan_updated",
         mai_protocol::ServiceEventKind::UserInputRequested { .. } => "user_input_requested",
+        mai_protocol::ServiceEventKind::ArtifactCreated { .. } => "artifact_created",
     }
 }

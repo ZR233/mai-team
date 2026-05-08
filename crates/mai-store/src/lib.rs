@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use mai_protocol::{
     AgentConfigRequest, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus,
-    AgentSummary, McpServerConfig, MessageRole, ModelConfig, ModelInputItem,
+    AgentSummary, ArtifactInfo, McpServerConfig, MessageRole, ModelConfig, ModelInputItem,
     ModelReasoningConfig, ModelReasoningVariant, PlanHistoryEntry, PlanStatus, ProviderConfig,
     ProviderKind, ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
     ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind, SessionId, TaskId,
@@ -83,6 +83,7 @@ pub struct PersistedTask {
     pub plan: TaskPlan,
     pub plan_history: Vec<PlanHistoryEntry>,
     pub reviews: Vec<TaskReview>,
+    pub artifacts: Vec<ArtifactInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -877,6 +878,57 @@ impl ConfigStore {
             .collect()
     }
 
+    pub fn save_artifact(&self, info: &ArtifactInfo) -> Result<()> {
+        let dir = self.path.join("artifacts");
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join(format!("{}.json", info.id));
+        let data = serde_json::to_string(info)?;
+        std::fs::write(file, data)?;
+        Ok(())
+    }
+
+    pub fn load_artifacts(&self, task_id: &TaskId) -> Result<Vec<ArtifactInfo>> {
+        let dir = self.path.join("artifacts");
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut result = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map_or(true, |ext| ext != "json") {
+                continue;
+            }
+            let data = std::fs::read_to_string(&path)?;
+            let info: ArtifactInfo = serde_json::from_str(&data)?;
+            if info.task_id == *task_id {
+                result.push(info);
+            }
+        }
+        result.sort_by_key(|a| a.created_at);
+        Ok(result)
+    }
+
+    pub fn load_all_artifacts(&self) -> Result<Vec<ArtifactInfo>> {
+        let dir = self.path.join("artifacts");
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut result = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map_or(true, |ext| ext != "json") {
+                continue;
+            }
+            let data = std::fs::read_to_string(&path)?;
+            let info: ArtifactInfo = serde_json::from_str(&data)?;
+            result.push(info);
+        }
+        result.sort_by_key(|a| a.created_at);
+        Ok(result)
+    }
+
     pub async fn delete_agent(&self, agent_id: AgentId) -> Result<()> {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
@@ -1311,6 +1363,7 @@ impl TaskRecordRow {
             plan,
             plan_history,
             reviews,
+            artifacts: Vec::new(),
         })
     }
 }
@@ -1936,7 +1989,8 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         ServiceEventKind::TaskCreated { .. }
         | ServiceEventKind::TaskUpdated { .. }
         | ServiceEventKind::TaskDeleted { .. }
-        | ServiceEventKind::PlanUpdated { .. } => None,
+        | ServiceEventKind::PlanUpdated { .. }
+        | ServiceEventKind::ArtifactCreated { .. } => None,
         ServiceEventKind::Error { agent_id, .. } => *agent_id,
     }
 }

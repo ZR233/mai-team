@@ -70,6 +70,7 @@
       :plan-approval-pending="canApprove"
       :approving-plan="approvingPlan"
       :plan-version="detail.plan?.version || 0"
+      :input-enabled="inputEnabled"
       v-model:conversation-ref="conversationRef"
       @cancel="$emit('cancel-agent', $event)"
       @delete="(...args) => $emit('delete-agent', ...args)"
@@ -119,6 +120,10 @@ const planTitle = computed(() => props.detail?.plan?.title || 'Task Plan')
 const planMarkdown = computed(() => props.detail?.plan?.markdown || '')
 const revisionFeedback = computed(() => props.detail?.plan?.revision_feedback || '')
 const canApprove = computed(() => props.detail?.status === 'awaiting_approval' && props.detail?.plan?.status === 'ready')
+const inputEnabled = computed(() => {
+  const status = props.detail?.status
+  return status === 'planning' || status === 'awaiting_approval'
+})
 const canCompose = computed(() => {
   const status = props.detail?.status
   const selectedRole = props.detail?.selected_agent?.role

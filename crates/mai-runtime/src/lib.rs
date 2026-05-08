@@ -6,8 +6,8 @@ use mai_mcp::McpAgentManager;
 use mai_model::ResponsesClient;
 use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentMessage,
-    AgentModelPreference, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary, ContextUsage,
-    CreateAgentRequest, MessageRole, ModelConfig, ModelContentItem, ModelInputItem,
+    AgentModelPreference, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary, ArtifactInfo,
+    ContextUsage, CreateAgentRequest, MessageRole, ModelConfig, ModelContentItem, ModelInputItem,
     ModelOutputItem, ModelToolCall, PlanHistoryEntry, PlanStatus, ResolvedAgentModelPreference,
     ServiceEvent, ServiceEventKind, SessionId, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus,
     TaskSummary, TokenUsage, TodoItem, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest,
@@ -18,7 +18,7 @@ use mai_store::{ConfigStore, ProviderSelection};
 use mai_tools::{RoutedTool, build_tool_definitions, route_tool};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tempfile::NamedTempFile;
@@ -102,6 +102,7 @@ pub struct AgentRuntime {
     event_tx: broadcast::Sender<ServiceEvent>,
     sequence: AtomicU64,
     recent_events: Mutex<VecDeque<ServiceEvent>>,
+    repo_root: PathBuf,
 }
 
 struct TaskRecord {
@@ -109,6 +110,7 @@ struct TaskRecord {
     plan: RwLock<TaskPlan>,
     plan_history: RwLock<Vec<PlanHistoryEntry>>,
     reviews: RwLock<Vec<TaskReview>>,
+    artifacts: RwLock<Vec<ArtifactInfo>>,
     workflow_lock: Mutex<()>,
 }
 
@@ -135,6 +137,7 @@ struct AgentSessionRecord {
 struct ToolExecution {
     success: bool,
     output: String,
+    ends_turn: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +218,7 @@ impl AgentRuntime {
                 plan: RwLock::new(persisted.plan),
                 plan_history: RwLock::new(persisted.plan_history),
                 reviews: RwLock::new(persisted.reviews),
+                artifacts: RwLock::new(persisted.artifacts),
                 workflow_lock: Mutex::new(()),
             });
             tasks.insert(summary.id, task);
@@ -230,6 +234,7 @@ impl AgentRuntime {
             event_tx,
             sequence: AtomicU64::new(snapshot.next_sequence),
             recent_events: Mutex::new(snapshot.recent_events.into_iter().collect()),
+            repo_root: config.repo_root,
         }))
     }
 
@@ -382,6 +387,7 @@ impl AgentRuntime {
             plan: RwLock::new(plan),
             plan_history: RwLock::new(Vec::new()),
             reviews: RwLock::new(Vec::new()),
+            artifacts: RwLock::new(Vec::new()),
             workflow_lock: Mutex::new(()),
         });
         self.tasks.write().await.insert(task_id, task);
@@ -497,6 +503,7 @@ impl AgentRuntime {
             agents,
             selected_agent_id,
             selected_agent,
+            artifacts: task.artifacts.read().await.clone(),
         })
     }
 
@@ -1138,6 +1145,59 @@ impl AgentRuntime {
             .await?)
     }
 
+    pub async fn save_artifact(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        path: String,
+        display_name: Option<String>,
+    ) -> Result<ArtifactInfo> {
+        let agent = self.agent(agent_id).await?;
+        let task_id = agent.summary.read().await.task_id.ok_or_else(|| {
+            RuntimeError::InvalidInput("Agent has no task".to_string())
+        })?;
+        let container_id = self.container_id(agent_id).await?;
+
+        let name = display_name.unwrap_or_else(|| {
+            Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone())
+        });
+
+        let artifact_id = Uuid::new_v4().to_string();
+        let dir = self.repo_root.join("artifacts").join(task_id.to_string()).join(&artifact_id);
+        std::fs::create_dir_all(&dir)?;
+
+        let dest = dir.join(&name);
+        self.docker
+            .copy_from_container_to_file(&container_id, &path, &dest)
+            .await?;
+
+        let size_bytes = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+
+        let info = ArtifactInfo {
+            id: artifact_id,
+            agent_id,
+            task_id,
+            name,
+            path,
+            size_bytes,
+            created_at: Utc::now(),
+        };
+
+        self.store.save_artifact(&info)?;
+
+        let task = self.task(task_id).await?;
+        task.artifacts.write().await.push(info.clone());
+
+        self.publish(ServiceEventKind::ArtifactCreated {
+            artifact: info.clone(),
+        })
+        .await;
+
+        Ok(info)
+    }
+
     async fn run_turn(
         self: Arc<Self>,
         agent_id: AgentId,
@@ -1445,6 +1505,7 @@ impl AgentRuntime {
 
             self.set_status(&agent, AgentStatus::WaitingTool, None)
                 .await?;
+            let mut should_end_turn = false;
             for (call_id, name, arguments) in tool_calls {
                 let arguments_preview = trace_preview_value(&arguments, 500);
                 let inline_arguments = inline_event_arguments(&arguments);
@@ -1468,8 +1529,12 @@ impl AgentRuntime {
                     Err(err) => ToolExecution {
                         success: false,
                         output: err.to_string(),
+                        ends_turn: false,
                     },
                 };
+                if execution.ends_turn {
+                    should_end_turn = true;
+                }
                 self.record_history_item(
                     &agent,
                     agent_id,
@@ -1491,6 +1556,20 @@ impl AgentRuntime {
                     duration_ms: Some(duration_ms),
                 })
                 .await;
+            }
+
+            if should_end_turn {
+                self.finish_turn(
+                    &agent,
+                    agent_id,
+                    session_id,
+                    turn_id,
+                    TurnStatus::Completed,
+                    AgentStatus::Completed,
+                    last_assistant_text,
+                )
+                .await?;
+                return Ok(());
             }
 
             if iteration + 1 == MAX_TOOL_ITERATIONS {
@@ -1529,6 +1608,7 @@ impl AgentRuntime {
                         "stderr": output.stderr,
                     }))
                     .unwrap_or_else(|_| "{}".to_string()),
+                    ends_turn: false,
                 })
             }
             RoutedTool::ContainerCpUpload => {
@@ -1540,6 +1620,7 @@ impl AgentRuntime {
                 Ok(ToolExecution {
                     success: true,
                     output: json!({ "path": path, "bytes": bytes }).to_string(),
+                    ends_turn: false,
                 })
             }
             RoutedTool::ContainerCpDownload => {
@@ -1552,6 +1633,7 @@ impl AgentRuntime {
                         "tar_base64": BASE64.encode(bytes),
                     })
                     .to_string(),
+                    ends_turn: false,
                 })
             }
             RoutedTool::SpawnAgent => {
@@ -1599,6 +1681,7 @@ impl AgentRuntime {
                 Ok(ToolExecution {
                     success: true,
                     output: json!({ "agent": created, "turn_id": turn_id }).to_string(),
+                    ends_turn: false,
                 })
             }
             RoutedTool::SendMessage => {
@@ -1614,6 +1697,7 @@ impl AgentRuntime {
                 Ok(ToolExecution {
                     success: true,
                     output: json!({ "turn_id": turn_id }).to_string(),
+                    ends_turn: false,
                 })
             }
             RoutedTool::WaitAgent => {
@@ -1629,12 +1713,14 @@ impl AgentRuntime {
                 Ok(ToolExecution {
                     success: true,
                     output: serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string()),
+                    ends_turn: false,
                 })
             }
             RoutedTool::ListAgents => Ok(ToolExecution {
                 success: true,
                 output: serde_json::to_string(&self.list_agents().await)
                     .unwrap_or_else(|_| "[]".to_string()),
+                ends_turn: false,
             }),
             RoutedTool::CloseAgent => {
                 let target = parse_agent_id(&required_string(&arguments, "agent_id")?)?;
@@ -1642,6 +1728,7 @@ impl AgentRuntime {
                 Ok(ToolExecution {
                     success: true,
                     output: json!({ "closed": target }).to_string(),
+                    ends_turn: false,
                 })
             }
             RoutedTool::SaveTaskPlan => {
@@ -1651,6 +1738,7 @@ impl AgentRuntime {
                 Ok(ToolExecution {
                     success: true,
                     output: serde_json::to_string(&task).unwrap_or_else(|_| "{}".to_string()),
+                    ends_turn: false,
                 })
             }
             RoutedTool::SubmitReviewResult => {
@@ -1666,6 +1754,7 @@ impl AgentRuntime {
                 Ok(ToolExecution {
                     success: true,
                     output: serde_json::to_string(&review).unwrap_or_else(|_| "{}".to_string()),
+                    ends_turn: false,
                 })
             }
             RoutedTool::UpdateTodoList => {
@@ -1683,6 +1772,7 @@ impl AgentRuntime {
                 Ok(ToolExecution {
                     success: true,
                     output: "Todo list updated".to_string(),
+                    ends_turn: false,
                 })
             }
             RoutedTool::RequestUserInput => {
@@ -1718,6 +1808,18 @@ impl AgentRuntime {
                 Ok(ToolExecution {
                     success: true,
                     output: "Questions sent to user. Wait for their response in the next message.".to_string(),
+                    ends_turn: true,
+                })
+            }
+            RoutedTool::SaveArtifact => {
+                let path = required_string(&arguments, "path")?;
+                let name = optional_string(&arguments, "name");
+                let artifact = self.save_artifact(agent_id, path, name).await?;
+                Ok(ToolExecution {
+                    success: true,
+                    output: serde_json::to_string(&artifact)
+                        .unwrap_or_else(|_| "{}".to_string()),
+                    ends_turn: false,
                 })
             }
             RoutedTool::Mcp(model_name) => {
@@ -1728,11 +1830,13 @@ impl AgentRuntime {
                 Ok(ToolExecution {
                     success: true,
                     output: output.to_string(),
+                    ends_turn: false,
                 })
             }
             RoutedTool::Unknown(name) => Ok(ToolExecution {
                 success: false,
                 output: format!("unknown tool: {name}"),
+                ends_turn: false,
             }),
         }
     }
@@ -3337,7 +3441,8 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         ServiceEventKind::TaskCreated { .. }
         | ServiceEventKind::TaskUpdated { .. }
         | ServiceEventKind::TaskDeleted { .. }
-        | ServiceEventKind::PlanUpdated { .. } => None,
+        | ServiceEventKind::PlanUpdated { .. }
+        | ServiceEventKind::ArtifactCreated { .. } => None,
         ServiceEventKind::Error { agent_id, .. } => *agent_id,
     }
 }
@@ -4854,7 +4959,7 @@ esac
         assert_eq!(requests.len(), 3);
         assert_eq!(
             requests[0]["tools"].as_array().expect("first tools").len(),
-            12
+            13
         );
         assert!(
             requests[1].get("tools").is_none(),
@@ -4862,7 +4967,7 @@ esac
         );
         assert_eq!(
             requests[2]["tools"].as_array().expect("second tools").len(),
-            12
+            13
         );
         let compact_input = requests[1]["input"].as_array().expect("compact input");
         assert!(matches!(

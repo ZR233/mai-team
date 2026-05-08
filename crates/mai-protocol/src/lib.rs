@@ -269,6 +269,8 @@ pub struct TaskDetail {
     pub agents: Vec<AgentSummary>,
     pub selected_agent_id: AgentId,
     pub selected_agent: AgentDetail,
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,6 +370,17 @@ pub struct FileUploadRequest {
 pub struct FileUploadResponse {
     pub path: String,
     pub bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactInfo {
+    pub id: String,
+    pub agent_id: AgentId,
+    pub task_id: TaskId,
+    pub name: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -665,6 +678,9 @@ pub enum ServiceEventKind {
         turn_id: TurnId,
         header: String,
         questions: Vec<UserInputQuestion>,
+    },
+    ArtifactCreated {
+        artifact: ArtifactInfo,
     },
 }
 

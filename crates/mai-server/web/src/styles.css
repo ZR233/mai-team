@@ -1245,6 +1245,44 @@ p {
   color: #66758a;
 }
 
+/* ─── Artifact Card ─── */
+.artifact-card {
+  border: 1px solid #d0e0f0;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.artifact-download {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: #f0f6ff;
+  color: #1f6feb;
+  text-decoration: none;
+  transition: background 0.15s;
+}
+
+.artifact-download:hover {
+  background: #ddeaff;
+}
+
+.artifact-icon {
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.artifact-name {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.artifact-size {
+  margin-left: auto;
+  font-size: 11px;
+  color: #66758a;
+}
+
 /* ─── Question Bar ─── */
 .question-bar {
   flex-shrink: 0;
