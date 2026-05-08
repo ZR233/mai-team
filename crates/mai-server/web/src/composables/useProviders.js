@@ -63,20 +63,29 @@ export function useProviders() {
     }
   }
 
-  function presetFor(kind) {
-    return providersState.presets.find((preset) => preset.kind === kind) || providersState.presets[0]
+  function presetFor(key) {
+    return (
+      providersState.presets.find((preset) => preset.id === key) ||
+      providersState.presets.find((preset) => preset.kind === key) ||
+      providersState.presets[0]
+    )
   }
 
-  function fillFromPreset(kind) {
-    const preset = presetFor(kind)
+  function fillFromPreset(key) {
+    const preset = presetFor(key)
     if (!preset) return
-    providerDialog.form.kind = preset.kind
     providerDialog.form.id = preset.id
     providerDialog.form.name = preset.name
     providerDialog.form.base_url = preset.base_url
-    providerDialog.form.api_key_env = preset.kind === 'openai' ? 'OPENAI_API_KEY' : 'DEEPSEEK_API_KEY'
     providerDialog.form.default_model = preset.default_model
     providerDialog.form.modelsText = JSON.stringify(preset.models || [], null, 2)
+    providerDialog.form.api_key_env = defaultApiKeyEnv({ id: preset.id, kind: preset.kind })
+  }
+
+  function providerKindFor(form) {
+    const presetKey = form.kind
+    if (presetKey === 'mimo-api' || presetKey === 'mimo-token-plan') return 'mimo'
+    return presetKey
   }
 
   function openProviderDialog(index) {
@@ -98,11 +107,11 @@ export function useProviders() {
         : providersState.providers[index]
     providerDialog.form = {
       id: provider.id || '',
-      kind: provider.kind || 'openai',
+      kind: provider.kind === 'mimo' ? (provider.id || 'mimo-api') : (provider.kind || 'openai'),
       name: provider.name || '',
       base_url: provider.base_url || '',
       api_key: '',
-      api_key_env: provider.api_key_env || (provider.kind === 'deepseek' ? 'DEEPSEEK_API_KEY' : 'OPENAI_API_KEY'),
+      api_key_env: provider.api_key_env || defaultApiKeyEnv(provider),
       default_model: provider.default_model || '',
       modelsText: JSON.stringify(provider.models || [], null, 2),
       enabled: provider.enabled !== false,
@@ -110,6 +119,13 @@ export function useProviders() {
       has_api_key: provider.has_api_key
     }
     providerDialog.open = true
+  }
+
+  function defaultApiKeyEnv(provider) {
+    if (provider.id === 'mimo-token-plan') return 'MIMO_TOKEN_PLAN_API_KEY'
+    if (provider.id === 'mimo-api' || provider.kind === 'mimo') return 'MIMO_API_KEY'
+    if (provider.kind === 'deepseek') return 'DEEPSEEK_API_KEY'
+    return 'OPENAI_API_KEY'
   }
 
   function closeProviderDialog() {
@@ -154,7 +170,7 @@ export function useProviders() {
     }
     const provider = {
       id: form.id,
-      kind: form.kind,
+      kind: providerKindFor(form),
       name: form.name,
       base_url: form.base_url,
       api_key: form.api_key,

@@ -142,6 +142,17 @@ impl ResponsesClient {
                 )
                 .await
             }
+            ProviderKind::Mimo => {
+                self.create_mimo_chat(
+                    provider,
+                    model,
+                    instructions,
+                    input,
+                    tools,
+                    reasoning_effort,
+                )
+                .await
+            }
         }
     }
 
@@ -216,6 +227,62 @@ impl ResponsesClient {
             Vec::new()
         };
         let request = deepseek_chat_request(
+            model,
+            instructions,
+            input,
+            active_tools,
+            reasoning_effort.as_deref(),
+        );
+        let response = self
+            .http
+            .post(&endpoint)
+            .bearer_auth(&provider.api_key)
+            .headers(headers(&provider.headers(&model.headers)))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|source| ModelError::Request {
+                endpoint: endpoint.clone(),
+                source,
+            })?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|source| ModelError::Request {
+                endpoint: endpoint.clone(),
+                source,
+            })?;
+        if !status.is_success() {
+            return Err(ModelError::Api {
+                endpoint,
+                status,
+                body,
+            });
+        }
+
+        parse_chat_response(serde_json::from_str(&body)?)
+    }
+
+    async fn create_mimo_chat(
+        &self,
+        provider: &ProviderSecret,
+        model: &ModelConfig,
+        instructions: &str,
+        input: &[ModelInputItem],
+        tools: &[ToolDefinition],
+        reasoning_effort: Option<String>,
+    ) -> Result<ModelResponse> {
+        let endpoint = format!(
+            "{}/chat/completions",
+            provider.base_url.trim_end_matches('/')
+        );
+        let active_tools = if model.supports_tools {
+            tools.iter().map(chat_tool).collect()
+        } else {
+            Vec::new()
+        };
+        let request = mimo_chat_request(
             model,
             instructions,
             input,
@@ -349,6 +416,10 @@ fn deepseek_max_tokens(configured: u64) -> u64 {
     configured.clamp(1, 64_000)
 }
 
+fn mimo_max_tokens(configured: u64) -> u64 {
+    configured.clamp(1, 131_072)
+}
+
 fn chat_tool(tool: &ToolDefinition) -> ChatTool {
     ChatTool {
         kind: "function",
@@ -374,6 +445,24 @@ fn deepseek_chat_request(
         tools,
         stream: false,
         max_tokens: deepseek_max_tokens(model.output_tokens),
+        options: request_options(model, reasoning_effort),
+    }
+}
+
+fn mimo_chat_request(
+    model: &ModelConfig,
+    instructions: &str,
+    input: &[ModelInputItem],
+    tools: Vec<ChatTool>,
+    reasoning_effort: Option<&str>,
+) -> ChatRequest {
+    ChatRequest {
+        model: model.id.clone(),
+        messages: chat_messages(instructions, input),
+        tool_choice: (!tools.is_empty()).then_some("auto"),
+        tools,
+        stream: false,
+        max_tokens: mimo_max_tokens(model.output_tokens),
         options: request_options(model, reasoning_effort),
     }
 }

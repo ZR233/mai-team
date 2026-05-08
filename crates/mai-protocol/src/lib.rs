@@ -394,6 +394,7 @@ pub enum ProviderKind {
     #[default]
     Openai,
     Deepseek,
+    Mimo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

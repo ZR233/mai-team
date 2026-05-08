@@ -401,6 +401,18 @@ impl ConfigStore {
             providers: vec![
                 provider_preset(ProviderKind::Openai),
                 provider_preset(ProviderKind::Deepseek),
+                provider_preset_from_config(mimo_builtin_provider(
+                    "mimo-api",
+                    "MiMo API",
+                    "https://api.xiaomimimo.com/v1",
+                    "MIMO_API_KEY",
+                )),
+                provider_preset_from_config(mimo_builtin_provider(
+                    "mimo-token-plan",
+                    "MiMo Token Plan",
+                    "https://token-plan-cn.xiaomimimo.com/v1",
+                    "MIMO_TOKEN_PLAN_API_KEY",
+                )),
             ],
         }
     }
@@ -1495,6 +1507,10 @@ impl ModelToml {
 
 fn provider_preset(kind: ProviderKind) -> ProviderPreset {
     let provider = builtin_provider(kind);
+    provider_preset_from_config(provider)
+}
+
+fn provider_preset_from_config(provider: ProviderConfig) -> ProviderPreset {
     ProviderPreset {
         id: provider.id,
         kind: provider.kind,
@@ -1550,6 +1566,27 @@ fn builtin_provider(kind: ProviderKind) -> ProviderConfig {
                 deepseek_model("deepseek-reasoner", true),
             ],
         },
+        ProviderKind::Mimo => mimo_builtin_provider("mimo-api", "MiMo API", "https://api.xiaomimimo.com/v1", "MIMO_API_KEY"),
+    }
+}
+
+fn mimo_builtin_provider(id: &str, name: &str, base_url: &str, api_key_env: &str) -> ProviderConfig {
+    ProviderConfig {
+        id: id.to_string(),
+        kind: ProviderKind::Mimo,
+        name: name.to_string(),
+        base_url: base_url.to_string(),
+        api_key: None,
+        api_key_env: Some(api_key_env.to_string()),
+        default_model: "mimo-v2.5-pro".to_string(),
+        enabled: true,
+        models: vec![
+            mimo_model("mimo-v2.5-pro", true),
+            mimo_model("mimo-v2.5", true),
+            mimo_model("mimo-v2-pro", true),
+            mimo_model("mimo-v2-omni", true),
+            mimo_model("mimo-v2-flash", false),
+        ],
     }
 }
 
@@ -1641,6 +1678,54 @@ fn is_deepseek_v4_model(id: &str) -> bool {
         id,
         "deepseek-v4-flash" | "deepseek-v4-pro" | "deepseek-chat" | "deepseek-reasoner"
     )
+}
+
+fn mimo_model(id: &str, with_reasoning: bool) -> ModelConfig {
+    ModelConfig {
+        id: id.to_string(),
+        name: Some(id.to_string()),
+        context_tokens: mimo_context_tokens(id),
+        output_tokens: mimo_output_tokens(id),
+        supports_tools: true,
+        reasoning: with_reasoning.then(|| mimo_reasoning_config()),
+        options: serde_json::Value::Null,
+        headers: BTreeMap::new(),
+    }
+}
+
+fn mimo_context_tokens(id: &str) -> u64 {
+    match id {
+        "mimo-v2.5-pro" | "mimo-v2-pro" => 256_000,
+        "mimo-v2.5" | "mimo-v2-omni" => 128_000,
+        "mimo-v2-flash" => 128_000,
+        _ => 128_000,
+    }
+}
+
+fn mimo_output_tokens(id: &str) -> u64 {
+    match id {
+        "mimo-v2.5-pro" | "mimo-v2-pro" => 131_072,
+        "mimo-v2.5" | "mimo-v2-omni" => 32_768,
+        "mimo-v2-flash" => 65_536,
+        _ => 32_768,
+    }
+}
+
+fn mimo_reasoning_config() -> ModelReasoningConfig {
+    ModelReasoningConfig {
+        default_variant: Some("high".to_string()),
+        variants: vec![
+            ModelReasoningVariant {
+                id: "high".to_string(),
+                label: None,
+                request: serde_json::json!({
+                    "thinking": {
+                        "type": "enabled",
+                    },
+                }),
+            },
+        ],
+    }
 }
 
 fn fallback_model(id: &str) -> ModelConfig {
@@ -2244,6 +2329,37 @@ mod tests {
                 .iter()
                 .any(|model| model.id == "deepseek-reasoner")
         );
+        let mimo_presets: Vec<_> = presets
+            .providers
+            .iter()
+            .filter(|provider| provider.kind == ProviderKind::Mimo)
+            .collect();
+        assert_eq!(mimo_presets.len(), 2, "expected mimo-api and mimo-token-plan presets");
+        let mimo_api = mimo_presets
+            .iter()
+            .find(|p| p.id == "mimo-api")
+            .expect("mimo-api preset");
+        let mimo_tp = mimo_presets
+            .iter()
+            .find(|p| p.id == "mimo-token-plan")
+            .expect("mimo-token-plan preset");
+        assert_eq!(mimo_api.base_url, "https://api.xiaomimimo.com/v1");
+        assert_eq!(mimo_tp.base_url, "https://token-plan-cn.xiaomimimo.com/v1");
+        assert_eq!(mimo_api.default_model, "mimo-v2.5-pro");
+        let mimo_pro = mimo_api
+            .models
+            .iter()
+            .find(|model| model.id == "mimo-v2.5-pro")
+            .expect("mimo-v2.5-pro");
+        assert_eq!(mimo_pro.output_tokens, 131_072);
+        assert!(mimo_pro.reasoning.is_some());
+        let mimo_flash = mimo_api
+            .models
+            .iter()
+            .find(|model| model.id == "mimo-v2-flash")
+            .expect("mimo-v2-flash");
+        assert_eq!(mimo_flash.output_tokens, 65_536);
+        assert!(mimo_flash.reasoning.is_none());
     }
 
     #[tokio::test]
