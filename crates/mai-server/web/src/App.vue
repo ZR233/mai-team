@@ -57,6 +57,7 @@
           :updating-model="isUpdatingAgentModel"
           v-model:conversation-ref="conversationRef"
           @approve-plan="onApprovePlan"
+          @request-plan-revision="onRequestPlanRevision"
           @cancel="confirmCancelTask"
           @cancel-agent="onCancelSelectedAgent"
           @delete="confirmDeleteTask"
@@ -154,6 +155,7 @@ const {
   createTask,
   sendTaskMessage,
   approveTaskPlan,
+  requestPlanRevision,
   cancelTask,
   cancelTaskAgent,
   deleteTask,
@@ -273,6 +275,15 @@ async function onApprovePlan() {
   try {
     await approveTaskPlan()
     showToast('Plan approved. Executor and reviewer workflow started.')
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onRequestPlanRevision(feedback) {
+  try {
+    await requestPlanRevision(feedback)
+    showToast('Revision requested. The planner will update the plan.')
   } catch (error) {
     showToast(error.message)
   }

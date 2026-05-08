@@ -8,9 +8,10 @@ use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentMessage,
     AgentModelPreference, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary, ContextUsage,
     CreateAgentRequest, MessageRole, ModelConfig, ModelContentItem, ModelInputItem,
-    ModelOutputItem, ModelToolCall, PlanStatus, ResolvedAgentModelPreference, ServiceEvent,
-    ServiceEventKind, SessionId, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus,
-    TaskSummary, TokenUsage, TodoItem, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest, now, preview,
+    ModelOutputItem, ModelToolCall, PlanHistoryEntry, PlanStatus, ResolvedAgentModelPreference,
+    ServiceEvent, ServiceEventKind, SessionId, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus,
+    TaskSummary, TokenUsage, TodoItem, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest,
+    UserInputOption, UserInputQuestion, now, preview,
 };
 use mai_skills::SkillsManager;
 use mai_store::{ConfigStore, ProviderSelection};
@@ -106,6 +107,7 @@ pub struct AgentRuntime {
 struct TaskRecord {
     summary: RwLock<TaskSummary>,
     plan: RwLock<TaskPlan>,
+    plan_history: RwLock<Vec<PlanHistoryEntry>>,
     reviews: RwLock<Vec<TaskReview>>,
     workflow_lock: Mutex<()>,
 }
@@ -211,6 +213,7 @@ impl AgentRuntime {
             let task = Arc::new(TaskRecord {
                 summary: RwLock::new(summary.clone()),
                 plan: RwLock::new(persisted.plan),
+                plan_history: RwLock::new(persisted.plan_history),
                 reviews: RwLock::new(persisted.reviews),
                 workflow_lock: Mutex::new(()),
             });
@@ -377,6 +380,7 @@ impl AgentRuntime {
         let task = Arc::new(TaskRecord {
             summary: RwLock::new(summary.clone()),
             plan: RwLock::new(plan),
+            plan_history: RwLock::new(Vec::new()),
             reviews: RwLock::new(Vec::new()),
             workflow_lock: Mutex::new(()),
         });
@@ -477,6 +481,7 @@ impl AgentRuntime {
         let task = self.task(task_id).await?;
         let summary = self.task_summary(&task).await;
         let plan = task.plan.read().await.clone();
+        let plan_history = task.plan_history.read().await.clone();
         let reviews = task.reviews.read().await.clone();
         let agents = self.task_agents(task_id).await;
         let selected_agent_id = selected_agent_id
@@ -487,6 +492,7 @@ impl AgentRuntime {
         Ok(TaskDetail {
             summary,
             plan,
+            plan_history,
             reviews,
             agents,
             selected_agent_id,
@@ -505,13 +511,30 @@ impl AgentRuntime {
         {
             let mut plan = task.plan.write().await;
             if plan.status == PlanStatus::Ready {
-                *plan = TaskPlan::default();
+                let entry = PlanHistoryEntry {
+                    version: plan.version,
+                    title: plan.title.clone(),
+                    markdown: plan.markdown.clone(),
+                    saved_at: plan.saved_at,
+                    saved_by_agent_id: plan.saved_by_agent_id,
+                    revision_feedback: None,
+                    revision_requested_at: None,
+                };
+                self.store.save_plan_history_entry(task_id, &entry).await?;
+                task.plan_history.write().await.push(entry);
+                plan.status = PlanStatus::NeedsRevision;
+                plan.revision_feedback = None;
+                plan.revision_requested_at = None;
                 let mut summary = task.summary.write().await;
                 summary.status = TaskStatus::Planning;
-                summary.plan_status = PlanStatus::Missing;
-                summary.plan_version = 0;
+                summary.plan_status = PlanStatus::NeedsRevision;
                 summary.updated_at = now();
                 self.store.save_task(&summary, &plan).await?;
+                self.publish(ServiceEventKind::PlanUpdated {
+                    task_id,
+                    plan: plan.clone(),
+                })
+                .await;
                 self.publish(ServiceEventKind::TaskUpdated {
                     task: summary.clone(),
                 })
@@ -550,6 +573,60 @@ impl AgentRuntime {
             .await;
         }
         self.spawn_task_workflow(task_id);
+        Ok(self.task_summary(&task).await)
+    }
+
+    pub async fn request_plan_revision(
+        self: &Arc<Self>,
+        task_id: TaskId,
+        feedback: String,
+    ) -> Result<TaskSummary> {
+        let task = self.task(task_id).await?;
+        {
+            let mut plan = task.plan.write().await;
+            if plan.status != PlanStatus::Ready {
+                return Err(RuntimeError::InvalidInput(
+                    "task plan is not in ready status".to_string(),
+                ));
+            }
+            let entry = PlanHistoryEntry {
+                version: plan.version,
+                title: plan.title.clone(),
+                markdown: plan.markdown.clone(),
+                saved_at: plan.saved_at,
+                saved_by_agent_id: plan.saved_by_agent_id,
+                revision_feedback: Some(feedback.clone()),
+                revision_requested_at: Some(now()),
+            };
+            self.store.save_plan_history_entry(task_id, &entry).await?;
+            task.plan_history.write().await.push(entry);
+            plan.status = PlanStatus::NeedsRevision;
+            plan.revision_feedback = Some(feedback.clone());
+            plan.revision_requested_at = Some(now());
+            let mut summary = task.summary.write().await;
+            summary.status = TaskStatus::Planning;
+            summary.plan_status = PlanStatus::NeedsRevision;
+            summary.updated_at = now();
+            self.store.save_task(&summary, &plan).await?;
+            self.publish(ServiceEventKind::PlanUpdated {
+                task_id,
+                plan: plan.clone(),
+            })
+            .await;
+            self.publish(ServiceEventKind::TaskUpdated {
+                task: summary.clone(),
+            })
+            .await;
+        }
+        let planner_agent_id = task.summary.read().await.planner_agent_id;
+        let feedback_message = format!(
+            "The user requests revision of the plan.\n\nFeedback:\n{feedback}\n\nPlease address the feedback and save an updated plan."
+        );
+        let _ = self
+            .send_message(planner_agent_id, None, feedback_message, Vec::new())
+            .await?;
+        self.set_task_current_agent(&task, planner_agent_id, TaskStatus::Planning, None)
+            .await?;
         Ok(self.task_summary(&task).await)
     }
 
@@ -1608,6 +1685,41 @@ impl AgentRuntime {
                     output: "Todo list updated".to_string(),
                 })
             }
+            RoutedTool::RequestUserInput => {
+                let header = required_string(&arguments, "header")?;
+                let questions_arg = arguments.get("questions")
+                    .ok_or_else(|| RuntimeError::InvalidInput("missing field `questions`".to_string()))?;
+                let raw_questions: Vec<serde_json::Value> = serde_json::from_value(questions_arg.clone())
+                    .map_err(|e| RuntimeError::InvalidInput(format!("invalid questions: {e}")))?;
+                let mut questions = Vec::with_capacity(raw_questions.len());
+                for raw in &raw_questions {
+                    let id = raw.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let question = raw.get("question").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let options_raw = raw.get("options")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut options = Vec::with_capacity(options_raw.len());
+                    for opt in &options_raw {
+                        let label = opt.get("label").and_then(Value::as_str).unwrap_or_default().to_string();
+                        let description = opt.get("description").and_then(Value::as_str).map(str::to_string);
+                        options.push(UserInputOption { label, description });
+                    }
+                    questions.push(UserInputQuestion { id, question, options });
+                }
+                self.publish(ServiceEventKind::UserInputRequested {
+                    agent_id,
+                    session_id: None,
+                    turn_id: _turn_id,
+                    header,
+                    questions,
+                })
+                .await;
+                Ok(ToolExecution {
+                    success: true,
+                    output: "Questions sent to user. Wait for their response in the next message.".to_string(),
+                })
+            }
             RoutedTool::Mcp(model_name) => {
                 let manager = agent.mcp.read().await.clone().ok_or_else(|| {
                     RuntimeError::InvalidInput("MCP manager not initialized".to_string())
@@ -1644,6 +1756,19 @@ impl AgentRuntime {
         let task = self.task(task_id).await?;
         {
             let mut plan = task.plan.write().await;
+            if plan.version > 0 {
+                let entry = PlanHistoryEntry {
+                    version: plan.version,
+                    title: plan.title.clone(),
+                    markdown: plan.markdown.clone(),
+                    saved_at: plan.saved_at,
+                    saved_by_agent_id: plan.saved_by_agent_id,
+                    revision_feedback: plan.revision_feedback.clone(),
+                    revision_requested_at: plan.revision_requested_at,
+                };
+                self.store.save_plan_history_entry(task_id, &entry).await?;
+                task.plan_history.write().await.push(entry);
+            }
             let version = plan.version.saturating_add(1).max(1);
             *plan = TaskPlan {
                 status: PlanStatus::Ready,
@@ -1653,6 +1778,8 @@ impl AgentRuntime {
                 saved_by_agent_id: Some(agent_id),
                 saved_at: Some(now()),
                 approved_at: None,
+                revision_feedback: None,
+                revision_requested_at: None,
             };
             let mut task_summary = task.summary.write().await;
             task_summary.status = TaskStatus::AwaitingApproval;
@@ -1662,6 +1789,11 @@ impl AgentRuntime {
             task_summary.updated_at = now();
             self.refresh_task_summary_counts(&mut task_summary).await;
             self.store.save_task(&task_summary, &plan).await?;
+            self.publish(ServiceEventKind::PlanUpdated {
+                task_id,
+                plan: plan.clone(),
+            })
+            .await;
             self.publish(ServiceEventKind::TaskUpdated {
                 task: task_summary.clone(),
             })
@@ -2756,11 +2888,49 @@ fn agent_role_label(role: AgentRole) -> &'static str {
     }
 }
 
+const PLANNER_SYSTEM_PROMPT: &str = r#"You are the Planner for a Mai task. Your job is to create a decision-complete implementation plan through a structured 3-phase process. A decision-complete plan can be handed to the Executor agent and implemented without any additional design decisions.
+
+## 3-Phase Planning Process
+
+### Phase 1 — Explore (discover facts, eliminate unknowns)
+- Use `spawn_agent` with role `explorer` to investigate code, docs, and relevant context.
+- Run read-only commands to understand the codebase structure, existing patterns, and constraints.
+- Do NOT ask the user questions that can be answered by exploring the code.
+- Only ask clarifying questions about the prompt if there are obvious ambiguities.
+
+### Phase 2 — Intent Chat (clarify what they want)
+- Use `request_user_input` to ask structured questions about: goal + success criteria, scope, constraints, and key preferences/tradeoffs.
+- Each question must materially change the plan, confirm an assumption, or choose between meaningful tradeoffs.
+- Offer 2-4 clear options with a recommended default.
+- Bias toward asking over guessing when high-impact ambiguity remains.
+
+### Phase 3 — Implementation Spec (produce the plan)
+- Create a complete implementation specification covering: approach, interfaces/data flow, edge cases, testing strategy, and assumptions.
+- The plan must be decision-complete — the Executor should not need to make any design decisions.
+
+## Rules
+
+- **No code modification**: Only explore and plan. Never edit files or make changes.
+- **Use `save_task_plan`** to save or update the plan with a clear title and complete Markdown content.
+- **Use `update_todo_list`** to show your planning progress to the user.
+- **Use `request_user_input`** for structured questions during planning.
+- When the user requests revision of the plan, address their feedback fully and save an updated plan.
+
+## Plan Format
+
+The plan should include:
+- A clear title
+- A brief summary
+- Key changes grouped by subsystem or behavior
+- Important API/interface changes
+- Test cases and scenarios
+- Explicit assumptions and defaults chosen
+
+Keep the plan concise and actionable. Prefer behavior-level descriptions over file-by-file inventories. Mention specific files only when needed to disambiguate a non-obvious change."#;
+
 fn task_role_system_prompt(role: AgentRole) -> &'static str {
     match role {
-        AgentRole::Planner => {
-            "You are the Planner for a first-class Mai task. Talk with the user to clarify the task, spawn explorer agents when code or documentation research would help, and do not modify code. When the plan is complete, call save_task_plan with a clear title and complete Markdown plan. After saving, wait for user approval rather than executing."
-        }
+        AgentRole::Planner => PLANNER_SYSTEM_PROMPT,
         AgentRole::Explorer => {
             "You are an Explorer subagent for a task. Investigate code, docs, and relevant context using read-only exploration unless explicitly told otherwise. Return concise findings with concrete files, commands, or sources that help the planner decide."
         }
@@ -3162,10 +3332,12 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         | ServiceEventKind::ToolCompleted { agent_id, .. }
         | ServiceEventKind::ContextCompacted { agent_id, .. }
         | ServiceEventKind::AgentMessage { agent_id, .. }
-        | ServiceEventKind::TodoListUpdated { agent_id, .. } => Some(*agent_id),
+        | ServiceEventKind::TodoListUpdated { agent_id, .. }
+        | ServiceEventKind::UserInputRequested { agent_id, .. } => Some(*agent_id),
         ServiceEventKind::TaskCreated { .. }
         | ServiceEventKind::TaskUpdated { .. }
-        | ServiceEventKind::TaskDeleted { .. } => None,
+        | ServiceEventKind::TaskDeleted { .. }
+        | ServiceEventKind::PlanUpdated { .. } => None,
         ServiceEventKind::Error { agent_id, .. } => *agent_id,
     }
 }
@@ -4682,7 +4854,7 @@ esac
         assert_eq!(requests.len(), 3);
         assert_eq!(
             requests[0]["tools"].as_array().expect("first tools").len(),
-            11
+            12
         );
         assert!(
             requests[1].get("tools").is_none(),
@@ -4690,7 +4862,7 @@ esac
         );
         assert_eq!(
             requests[2]["tools"].as_array().expect("second tools").len(),
-            11
+            12
         );
         let compact_input = requests[1]["input"].as_array().expect("compact input");
         assert!(matches!(

@@ -55,8 +55,15 @@
       :activity="latestActivity"
     />
 
+    <QuestionBar
+      v-if="pendingUserInput"
+      :questions="pendingUserInput.questions"
+      :header="pendingUserInput.header"
+      :sending="sending"
+      @answer="handleQuestionAnswer"
+    />
     <ComposerBar
-      v-if="showComposer"
+      v-else-if="showComposer"
       :draft="draft"
       :sending="sending"
       @send="$emit('send', $event)"
@@ -70,6 +77,7 @@ import { computed, nextTick, reactive, ref, watch } from 'vue'
 import AgentHeader from './AgentHeader.vue'
 import ChatTimeline from './ChatTimeline.vue'
 import ComposerBar from './ComposerBar.vue'
+import QuestionBar from './QuestionBar.vue'
 import ContextStatusLine from './ContextStatusLine.vue'
 import ModelSelector from './ModelSelector.vue'
 import SessionTabs from './SessionTabs.vue'
@@ -104,6 +112,7 @@ const emit = defineEmits([
 const { api, showToast } = useApi()
 const expandedTools = reactive({})
 const traces = reactive({})
+const answeredInputKeys = reactive(new Set())
 const emptyTrace = { loading: false, error: '', detail: null }
 const currentReasoningEffort = ref('')
 const modelEditor = reactive({
@@ -115,6 +124,11 @@ const modelEditor = reactive({
 })
 
 const timelineItems = computed(() => buildAgentTimeline(props.detail, props.events))
+const pendingUserInput = computed(() => {
+  return timelineItems.value.find(
+    (item) => item.type === 'user_input' && !answeredInputKeys.has(item.key)
+  ) || null
+})
 const editorProvider = computed(() => props.providers.find((provider) => provider.id === modelEditor.provider_id))
 const editorModels = computed(() => editorProvider.value?.models || [])
 const editorModel = computed(() => editorModels.value.find((model) => model.id === modelEditor.model))
@@ -166,6 +180,7 @@ watch(
   () => {
     for (const key of Object.keys(expandedTools)) delete expandedTools[key]
     for (const key of Object.keys(traces)) delete traces[key]
+    answeredInputKeys.clear()
     modelEditor.open = false
     syncCurrentReasoningEffort()
   }
@@ -182,6 +197,7 @@ watch(
   () => {
     for (const key of Object.keys(expandedTools)) delete expandedTools[key]
     for (const key of Object.keys(traces)) delete traces[key]
+    answeredInputKeys.clear()
   }
 )
 
@@ -190,6 +206,12 @@ function syncCurrentReasoningEffort() {
   currentReasoningEffort.value = currentReasoningOptions.value.some((option) => option.value === activeValue)
     ? activeValue
     : defaultReasoningEffort(currentProvider.value, currentModel.value)
+}
+
+function handleQuestionAnswer(responseText) {
+  if (!pendingUserInput.value) return
+  answeredInputKeys.add(pendingUserInput.value.key)
+  emit('send', responseText)
 }
 
 function saveReasoningEffort(value = currentReasoningEffort.value) {

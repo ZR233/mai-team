@@ -108,6 +108,22 @@ export function useTasks() {
     }
   }
 
+  async function requestPlanRevision(feedback) {
+    if (!selectedTaskId.value || !feedback) return null
+    isSending.value = true
+    try {
+      const response = await api(`/tasks/${selectedTaskId.value}/plan:request-revision`, {
+        method: 'POST',
+        body: JSON.stringify({ feedback })
+      })
+      await refreshTasks()
+      await refreshDetail()
+      return response.task
+    } finally {
+      isSending.value = false
+    }
+  }
+
   async function cancelTask(id) {
     await api(`/tasks/${id}/cancel`, { method: 'POST' })
     await refreshTasks()
@@ -178,6 +194,7 @@ export function useTasks() {
     createTask,
     sendTaskMessage,
     approveTaskPlan,
+    requestPlanRevision,
     cancelTask,
     cancelTaskAgent,
     deleteTask,

@@ -140,6 +140,22 @@ export function buildAgentTimeline(detail, liveEvents = []) {
         timestamp: event.timestamp,
         sequence: event.sequence || 0
       })
+    } else if (event.type === 'user_input_requested') {
+      items.push({
+        type: 'user_input',
+        key: `user-input-${event.turn_id}-${event.sequence || event.timestamp}`,
+        header: event.header || '',
+        questions: (event.questions || []).map((q) => ({
+          id: q.id || '',
+          question: q.question || '',
+          options: (q.options || []).map((o) => ({
+            label: o.label || '',
+            description: o.description || ''
+          }))
+        })),
+        timestamp: event.timestamp,
+        sequence: event.sequence || 0
+      })
     }
   }
 

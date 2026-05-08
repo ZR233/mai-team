@@ -13,9 +13,9 @@ use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentId, ApproveTaskPlanResponse, CreateAgentRequest,
     CreateAgentResponse, CreateSessionResponse, CreateTaskRequest, CreateTaskResponse,
     ErrorResponse, FileUploadRequest, FileUploadResponse,
-    ProviderPresetsResponse, ProvidersConfigRequest, ProvidersResponse, SendMessageRequest,
-    SendMessageResponse, ServiceEvent, SessionId, TaskId, ToolTraceDetail, UpdateAgentRequest,
-    UpdateAgentResponse,
+    ProviderPresetsResponse, ProvidersConfigRequest, ProvidersResponse, RequestPlanRevisionRequest,
+    RequestPlanRevisionResponse, SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId,
+    TaskId, ToolTraceDetail, UpdateAgentRequest, UpdateAgentResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
 use mai_store::ConfigStore;
@@ -174,6 +174,7 @@ async fn main() -> Result<()> {
         )
         .route("/tasks/{id}/messages", post(send_task_message))
         .route("/tasks/{id}/plan:approve", post(approve_task_plan))
+        .route("/tasks/{id}/plan:request-revision", post(request_plan_revision))
         .route("/tasks/{id}/cancel", post(cancel_task))
         .route("/agents", get(list_agents).post(create_agent))
         .route(
@@ -336,6 +337,15 @@ async fn approve_task_plan(
 ) -> std::result::Result<Json<ApproveTaskPlanResponse>, ApiError> {
     let task = state.runtime.approve_task_plan(id).await?;
     Ok(Json(ApproveTaskPlanResponse { task }))
+}
+
+async fn request_plan_revision(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<TaskId>,
+    Json(request): Json<RequestPlanRevisionRequest>,
+) -> std::result::Result<Json<RequestPlanRevisionResponse>, ApiError> {
+    let task = state.runtime.request_plan_revision(id, request.feedback).await?;
+    Ok(Json(RequestPlanRevisionResponse { task }))
 }
 
 async fn cancel_task(
@@ -532,5 +542,7 @@ fn event_name(event: &ServiceEvent) -> &'static str {
         mai_protocol::ServiceEventKind::AgentMessage { .. } => "agent_message",
         mai_protocol::ServiceEventKind::Error { .. } => "error",
         mai_protocol::ServiceEventKind::TodoListUpdated { .. } => "todo_list_updated",
+        mai_protocol::ServiceEventKind::PlanUpdated { .. } => "plan_updated",
+        mai_protocol::ServiceEventKind::UserInputRequested { .. } => "user_input_requested",
     }
 }

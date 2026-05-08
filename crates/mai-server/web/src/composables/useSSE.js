@@ -40,7 +40,9 @@ export function useSSE() {
       'tool_completed',
       'context_compacted',
       'agent_message',
-      'error'
+      'error',
+      'todo_list_updated',
+      'user_input_requested'
     ]
     for (const name of names) {
       eventSource.addEventListener(name, (event) => {

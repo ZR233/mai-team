@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use mai_protocol::{
     AgentConfigRequest, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus,
     AgentSummary, McpServerConfig, MessageRole, ModelConfig, ModelInputItem,
-    ModelReasoningConfig, ModelReasoningVariant, PlanStatus, ProviderConfig, ProviderKind,
-    ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
+    ModelReasoningConfig, ModelReasoningVariant, PlanHistoryEntry, PlanStatus, ProviderConfig,
+    ProviderKind, ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
     ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind, SessionId, TaskId,
     TaskPlan, TaskReview, TaskStatus, TaskSummary, TokenUsage, TurnId, default_true,
 };
@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 const SETTING_AGENT_CONFIG: &str = "agent_config";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-const SCHEMA_VERSION: &str = "6";
+const SCHEMA_VERSION: &str = "7";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const DEEPSEEK_V4_CONTEXT_TOKENS: u64 = 1_000_000;
 const DEEPSEEK_V4_OUTPUT_TOKENS: u64 = 384_000;
@@ -81,6 +81,7 @@ pub struct RuntimeSnapshot {
 pub struct PersistedTask {
     pub summary: TaskSummary,
     pub plan: TaskPlan,
+    pub plan_history: Vec<PlanHistoryEntry>,
     pub reviews: Vec<TaskReview>,
 }
 
@@ -204,6 +205,8 @@ struct TaskRecordRow {
     plan_saved_by_agent_id: Option<String>,
     plan_saved_at: Option<String>,
     plan_approved_at: Option<String>,
+    plan_revision_feedback: Option<String>,
+    plan_revision_requested_at: Option<String>,
 }
 
 #[derive(Debug, Clone, toasty::Model)]
@@ -219,6 +222,22 @@ struct TaskReviewRecord {
     findings: String,
     summary: String,
     created_at: String,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "plan_history"]
+struct PlanHistoryRecord {
+    #[key]
+    id: String,
+    #[index]
+    task_id: String,
+    version: i64,
+    title: Option<String>,
+    markdown: Option<String>,
+    saved_at: Option<String>,
+    saved_by_agent_id: Option<String>,
+    revision_feedback: Option<String>,
+    revision_requested_at: Option<String>,
 }
 
 #[derive(Debug, Clone, toasty::Model)]
@@ -745,6 +764,8 @@ impl ConfigStore {
             plan_saved_by_agent_id: plan.saved_by_agent_id.map(|id| id.to_string()),
             plan_saved_at: plan.saved_at.map(|time| time.to_rfc3339()),
             plan_approved_at: plan.approved_at.map(|time| time.to_rfc3339()),
+            plan_revision_feedback: plan.revision_feedback.clone(),
+            plan_revision_requested_at: plan.revision_requested_at.map(|time| time.to_rfc3339()),
         })
         .exec(&mut db)
         .await?;
@@ -760,6 +781,14 @@ impl ConfigStore {
             .await?;
         Query::<List<TaskReviewRecord>>::filter(
             TaskReviewRecord::fields()
+                .task_id()
+                .eq(task_id.to_string()),
+        )
+        .delete()
+        .exec(&mut tx)
+        .await?;
+        Query::<List<PlanHistoryRecord>>::filter(
+            PlanHistoryRecord::fields()
                 .task_id()
                 .eq(task_id.to_string()),
         )
@@ -791,6 +820,61 @@ impl ConfigStore {
         .exec(&mut db)
         .await?;
         Ok(())
+    }
+
+    pub async fn save_plan_history_entry(
+        &self,
+        task_id: TaskId,
+        entry: &PlanHistoryEntry,
+    ) -> Result<()> {
+        let mut db = self.db.clone();
+        toasty::create!(PlanHistoryRecord {
+            id: Uuid::new_v4().to_string(),
+            task_id: task_id.to_string(),
+            version: u64_to_i64(entry.version),
+            title: entry.title.clone(),
+            markdown: entry.markdown.clone(),
+            saved_at: entry.saved_at.map(|time| time.to_rfc3339()),
+            saved_by_agent_id: entry.saved_by_agent_id.map(|id| id.to_string()),
+            revision_feedback: entry.revision_feedback.clone(),
+            revision_requested_at: entry.revision_requested_at.map(|time| time.to_rfc3339()),
+        })
+        .exec(&mut db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn load_plan_history(&self, task_id: TaskId) -> Result<Vec<PlanHistoryEntry>> {
+        let mut db = self.db.clone();
+        let mut rows = Query::<List<PlanHistoryRecord>>::filter(
+            PlanHistoryRecord::fields()
+                .task_id()
+                .eq(task_id.to_string()),
+        )
+        .exec(&mut db)
+        .await?;
+        rows.sort_by_key(|row| row.version);
+        rows.into_iter()
+            .map(|row| {
+                Ok(PlanHistoryEntry {
+                    version: i64_to_u64(row.version),
+                    title: row.title,
+                    markdown: row.markdown,
+                    saved_at: row.saved_at.as_deref().map(parse_utc).transpose()?,
+                    saved_by_agent_id: row
+                        .saved_by_agent_id
+                        .as_deref()
+                        .map(parse_agent_id)
+                        .transpose()?,
+                    revision_feedback: row.revision_feedback,
+                    revision_requested_at: row
+                        .revision_requested_at
+                        .as_deref()
+                        .map(parse_utc)
+                        .transpose()?,
+                })
+            })
+            .collect()
     }
 
     pub async fn delete_agent(&self, agent_id: AgentId) -> Result<()> {
@@ -1003,7 +1087,8 @@ impl ConfigStore {
         for row in task_rows {
             let task_id = parse_task_id(&row.id)?;
             let reviews = self.load_task_reviews(task_id).await?;
-            tasks.push(row.into_persisted_task(reviews)?);
+            let plan_history = self.load_plan_history(task_id).await?;
+            tasks.push(row.into_persisted_task(reviews, plan_history)?);
         }
 
         let mut events = Query::<List<ServiceEventRecord>>::all()
@@ -1182,7 +1267,7 @@ impl AgentRecordRow {
 }
 
 impl TaskRecordRow {
-    fn into_persisted_task(self, reviews: Vec<TaskReview>) -> Result<PersistedTask> {
+    fn into_persisted_task(self, reviews: Vec<TaskReview>, plan_history: Vec<PlanHistoryEntry>) -> Result<PersistedTask> {
         let plan = TaskPlan {
             status: parse_plan_status(&self.plan_status)?,
             title: self.plan_title,
@@ -1195,6 +1280,12 @@ impl TaskRecordRow {
                 .transpose()?,
             saved_at: self.plan_saved_at.as_deref().map(parse_utc).transpose()?,
             approved_at: self.plan_approved_at.as_deref().map(parse_utc).transpose()?,
+            revision_feedback: self.plan_revision_feedback,
+            revision_requested_at: self
+                .plan_revision_requested_at
+                .as_deref()
+                .map(parse_utc)
+                .transpose()?,
         };
         let summary = TaskSummary {
             id: parse_task_id(&self.id)?,
@@ -1218,6 +1309,7 @@ impl TaskRecordRow {
         Ok(PersistedTask {
             summary,
             plan,
+            plan_history,
             reviews,
         })
     }
@@ -1256,6 +1348,7 @@ async fn build_db(path: &Path) -> Result<Db> {
         SettingRecord,
         TaskRecordRow,
         TaskReviewRecord,
+        PlanHistoryRecord,
         AgentRecordRow,
         AgentSessionRecord,
         AgentMessageRecord,
@@ -1758,6 +1851,7 @@ fn plan_status_to_str(status: &PlanStatus) -> &'static str {
     match status {
         PlanStatus::Missing => "missing",
         PlanStatus::Ready => "ready",
+        PlanStatus::NeedsRevision => "needs_revision",
         PlanStatus::Approved => "approved",
     }
 }
@@ -1766,6 +1860,7 @@ fn parse_plan_status(value: &str) -> Result<PlanStatus> {
     match value {
         "missing" => Ok(PlanStatus::Missing),
         "ready" => Ok(PlanStatus::Ready),
+        "needs_revision" => Ok(PlanStatus::NeedsRevision),
         "approved" => Ok(PlanStatus::Approved),
         other => Err(StoreError::InvalidConfig(format!(
             "invalid plan status `{other}`"
@@ -1836,10 +1931,12 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         | ServiceEventKind::ToolCompleted { agent_id, .. }
         | ServiceEventKind::ContextCompacted { agent_id, .. }
         | ServiceEventKind::AgentMessage { agent_id, .. }
-        | ServiceEventKind::TodoListUpdated { agent_id, .. } => Some(*agent_id),
+        | ServiceEventKind::TodoListUpdated { agent_id, .. }
+        | ServiceEventKind::UserInputRequested { agent_id, .. } => Some(*agent_id),
         ServiceEventKind::TaskCreated { .. }
         | ServiceEventKind::TaskUpdated { .. }
-        | ServiceEventKind::TaskDeleted { .. } => None,
+        | ServiceEventKind::TaskDeleted { .. }
+        | ServiceEventKind::PlanUpdated { .. } => None,
         ServiceEventKind::Error { agent_id, .. } => *agent_id,
     }
 }
@@ -1850,7 +1947,8 @@ fn event_session_id(event: &ServiceEvent) -> Option<SessionId> {
         | ServiceEventKind::TurnCompleted { session_id, .. }
         | ServiceEventKind::ToolStarted { session_id, .. }
         | ServiceEventKind::ToolCompleted { session_id, .. }
-        | ServiceEventKind::AgentMessage { session_id, .. } => *session_id,
+        | ServiceEventKind::AgentMessage { session_id, .. }
+        | ServiceEventKind::UserInputRequested { session_id, .. } => *session_id,
         ServiceEventKind::ContextCompacted { session_id, .. } => Some(*session_id),
         ServiceEventKind::Error { session_id, .. } => *session_id,
         _ => None,

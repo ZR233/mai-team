@@ -41,6 +41,7 @@ pub enum TaskStatus {
 pub enum PlanStatus {
     Missing,
     Ready,
+    NeedsRevision,
     Approved,
 }
 
@@ -91,6 +92,20 @@ pub enum TodoListStatus {
 pub struct TodoItem {
     pub step: String,
     pub status: TodoListStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserInputOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserInputQuestion {
+    pub id: String,
+    pub question: String,
+    pub options: Vec<UserInputOption>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +192,10 @@ pub struct TaskPlan {
     pub saved_by_agent_id: Option<AgentId>,
     pub saved_at: Option<DateTime<Utc>>,
     pub approved_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub revision_feedback: Option<String>,
+    #[serde(default)]
+    pub revision_requested_at: Option<DateTime<Utc>>,
 }
 
 impl Default for TaskPlan {
@@ -189,8 +208,23 @@ impl Default for TaskPlan {
             saved_by_agent_id: None,
             saved_at: None,
             approved_at: None,
+            revision_feedback: None,
+            revision_requested_at: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanHistoryEntry {
+    pub version: u64,
+    pub title: Option<String>,
+    pub markdown: Option<String>,
+    pub saved_at: Option<DateTime<Utc>>,
+    pub saved_by_agent_id: Option<AgentId>,
+    #[serde(default)]
+    pub revision_feedback: Option<String>,
+    #[serde(default)]
+    pub revision_requested_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +263,8 @@ pub struct TaskDetail {
     #[serde(flatten)]
     pub summary: TaskSummary,
     pub plan: TaskPlan,
+    #[serde(default)]
+    pub plan_history: Vec<PlanHistoryEntry>,
     pub reviews: Vec<TaskReview>,
     pub agents: Vec<AgentSummary>,
     pub selected_agent_id: AgentId,
@@ -269,6 +305,16 @@ pub struct CreateTaskResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApproveTaskPlanResponse {
+    pub task: TaskSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestPlanRevisionRequest {
+    pub feedback: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestPlanRevisionResponse {
     pub task: TaskSummary,
 }
 
@@ -607,6 +653,18 @@ pub enum ServiceEventKind {
         session_id: Option<SessionId>,
         turn_id: TurnId,
         items: Vec<TodoItem>,
+    },
+    PlanUpdated {
+        task_id: TaskId,
+        plan: TaskPlan,
+    },
+    UserInputRequested {
+        agent_id: AgentId,
+        #[serde(default)]
+        session_id: Option<SessionId>,
+        turn_id: TurnId,
+        header: String,
+        questions: Vec<UserInputQuestion>,
     },
 }
 

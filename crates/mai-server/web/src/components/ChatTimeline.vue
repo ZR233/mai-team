@@ -24,6 +24,18 @@
           @toggle="$emit('toggle-tool', item)"
         />
         <TodoListRow v-else-if="item.type === 'todo_list'" :item="item" />
+        <div v-else-if="item.type === 'user_input'" class="user-input-card">
+          <strong v-if="item.header">{{ item.header }}</strong>
+          <div v-for="q in item.questions" :key="q.id" class="user-input-question">
+            <p>{{ q.question }}</p>
+            <div class="user-input-options">
+              <div v-for="opt in q.options" :key="opt.label" class="user-input-option">
+                <span class="option-label">{{ opt.label }}</span>
+                <span v-if="opt.description" class="option-desc">{{ opt.description }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
         <div v-else-if="item.type === 'error'" class="timeline-error-card">
           <strong>{{ item.title || 'Error' }}</strong>
           <p>{{ item.message }}</p>

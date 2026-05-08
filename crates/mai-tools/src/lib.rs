@@ -13,6 +13,7 @@ pub const TOOL_CLOSE_AGENT: &str = "close_agent";
 pub const TOOL_SAVE_TASK_PLAN: &str = "save_task_plan";
 pub const TOOL_SUBMIT_REVIEW_RESULT: &str = "submit_review_result";
 pub const TOOL_UPDATE_TODO_LIST: &str = "update_todo_list";
+pub const TOOL_REQUEST_USER_INPUT: &str = "request_user_input";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutedTool {
@@ -27,6 +28,7 @@ pub enum RoutedTool {
     SaveTaskPlan,
     SubmitReviewResult,
     UpdateTodoList,
+    RequestUserInput,
     Mcp(String),
     Unknown(String),
 }
@@ -44,6 +46,7 @@ pub fn route_tool(name: &str) -> RoutedTool {
         TOOL_SAVE_TASK_PLAN => RoutedTool::SaveTaskPlan,
         TOOL_SUBMIT_REVIEW_RESULT => RoutedTool::SubmitReviewResult,
         TOOL_UPDATE_TODO_LIST => RoutedTool::UpdateTodoList,
+        TOOL_REQUEST_USER_INPUT => RoutedTool::RequestUserInput,
         normalized if normalized.starts_with("mcp__") => RoutedTool::Mcp(normalized.to_string()),
         normalized => RoutedTool::Unknown(normalized.to_string()),
     }
@@ -143,7 +146,9 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             TOOL_SAVE_TASK_PLAN,
-            "Save the latest task plan. Only planner agents attached to a task may call this.",
+            "Save or update the task plan. Each call replaces the previous plan and increments the version. \
+             Plans must be decision-complete: the Executor should not need to make design decisions. \
+             Use request_user_input to resolve any remaining ambiguity before saving.",
             object_schema(vec![
                 ("title", json!({ "type": "string" }), true),
                 ("markdown", json!({ "type": "string" }), true),
@@ -188,6 +193,43 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 }),
                 true,
             )]),
+        ),
+        ToolDefinition::function(
+            TOOL_REQUEST_USER_INPUT,
+            "Ask the user a structured question with multiple-choice options. \
+             Use this during planning to resolve ambiguity, confirm assumptions, or choose between meaningful tradeoffs. \
+             Each question must materially change the plan, confirm an assumption, or choose between tradeoffs.",
+            object_schema(vec![
+                ("header", json!({ "type": "string", "description": "Short section header for the question group." }), true),
+                ("questions", json!({
+                    "type": "array",
+                    "description": "List of questions to ask the user.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string", "description": "Unique identifier for this question." },
+                            "question": { "type": "string", "description": "The question text." },
+                            "options": {
+                                "type": "array",
+                                "description": "Available choices. 2-4 options, each with label and description.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": { "type": "string", "description": "Short option label." },
+                                        "description": { "type": "string", "description": "Explanation of what this option means." }
+                                    },
+                                    "required": ["label", "description"],
+                                    "additionalProperties": false
+                                },
+                                "minItems": 2,
+                                "maxItems": 4
+                            }
+                        },
+                        "required": ["id", "question", "options"],
+                        "additionalProperties": false
+                    }
+                }), true),
+            ]),
         ),
     ]
 }
