@@ -477,6 +477,7 @@ function mergeEvents(events) {
 
 function eventAgentId(event) {
   if (event.type === 'agent_created') return event.agent?.id
+  if (event.type === 'artifact_created') return event.artifact?.agent_id || null
   return event.agent_id || null
 }
 
