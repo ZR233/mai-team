@@ -9,28 +9,33 @@ fn main() {
     let web_dir = manifest_dir.join("web");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let static_dir = out_dir.join("static");
+    let staging_dir = out_dir.join("web-src");
+    let npm_cache_dir = out_dir.join("npm-cache");
 
     watch_frontend(&web_dir);
-    ensure_npm(&web_dir);
-    run_npm(&web_dir, ["run", "build"]);
+    prepare_staging_dir(&web_dir, &staging_dir);
+    ensure_npm(&staging_dir, &npm_cache_dir);
 
-    let dist_dir = web_dir.join("dist");
-    if !dist_dir.join("index.html").exists() {
+    let static_arg = static_dir.to_string_lossy().to_string();
+    run_npm(
+        &staging_dir,
+        &npm_cache_dir,
+        [
+            "run",
+            "build",
+            "--",
+            "--outDir",
+            static_arg.as_str(),
+            "--emptyOutDir",
+        ],
+    );
+
+    if !static_dir.join("index.html").exists() {
         panic!(
-            "frontend build did not produce {}; expected npm run build to create Vite dist",
-            dist_dir.join("index.html").display()
+            "frontend build did not produce {}; expected npm run build to create embedded static output",
+            static_dir.join("index.html").display()
         );
     }
-
-    if static_dir.exists() {
-        fs::remove_dir_all(&static_dir).unwrap_or_else(|err| {
-            panic!(
-                "failed to remove old embedded static dir {}: {err}",
-                static_dir.display()
-            )
-        });
-    }
-    copy_dir(&dist_dir, &static_dir);
 }
 
 fn watch_frontend(web_dir: &Path) {
@@ -66,20 +71,32 @@ fn watch_dir(path: &Path) {
     }
 }
 
-fn ensure_npm(web_dir: &Path) {
-    run_npm(web_dir, ["--version"]);
-    if frontend_dependencies_missing(web_dir) {
+fn prepare_staging_dir(web_dir: &Path, staging_dir: &Path) {
+    if staging_dir.exists() {
+        fs::remove_dir_all(staging_dir).unwrap_or_else(|err| {
+            panic!(
+                "failed to remove old frontend staging dir {}: {err}",
+                staging_dir.display()
+            )
+        });
+    }
+    copy_web_source(web_dir, staging_dir);
+}
+
+fn ensure_npm(web_dir: &Path, npm_cache_dir: &Path) {
+    run_npm(web_dir, npm_cache_dir, ["--version"]);
+    if frontend_dependencies_missing(web_dir, npm_cache_dir) {
         println!(
             "cargo:warning=frontend npm dependencies are missing or incomplete; installing them"
         );
-        install_frontend_dependencies(web_dir);
+        install_frontend_dependencies(web_dir, npm_cache_dir);
     }
 }
 
-fn frontend_dependencies_missing(web_dir: &Path) -> bool {
+fn frontend_dependencies_missing(web_dir: &Path, npm_cache_dir: &Path) -> bool {
     !web_dir.join("node_modules").is_dir()
         || !local_npm_bin_exists(web_dir, "vite")
-        || !npm_command_succeeds(web_dir, ["ls", "--depth=0", "--silent"])
+        || !npm_command_succeeds(web_dir, npm_cache_dir, ["ls", "--depth=0", "--silent"])
 }
 
 fn local_npm_bin_exists(web_dir: &Path, name: &str) -> bool {
@@ -91,18 +108,23 @@ fn local_npm_bin_exists(web_dir: &Path, name: &str) -> bool {
     }
 }
 
-fn install_frontend_dependencies(web_dir: &Path) {
+fn install_frontend_dependencies(web_dir: &Path, npm_cache_dir: &Path) {
     if web_dir.join("package-lock.json").exists() {
-        run_npm(web_dir, ["ci"]);
+        run_npm(web_dir, npm_cache_dir, ["ci"]);
     } else {
-        run_npm(web_dir, ["install"]);
+        run_npm(web_dir, npm_cache_dir, ["install"]);
     }
 }
 
-fn npm_command_succeeds<const N: usize>(web_dir: &Path, args: [&str; N]) -> bool {
+fn npm_command_succeeds<const N: usize>(
+    web_dir: &Path,
+    npm_cache_dir: &Path,
+    args: [&str; N],
+) -> bool {
     Command::new("npm")
         .args(args)
         .current_dir(web_dir)
+        .env("npm_config_cache", npm_cache_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -115,10 +137,11 @@ fn npm_command_succeeds<const N: usize>(web_dir: &Path, args: [&str; N]) -> bool
         .success()
 }
 
-fn run_npm<const N: usize>(web_dir: &Path, args: [&str; N]) {
+fn run_npm<const N: usize>(web_dir: &Path, npm_cache_dir: &Path, args: [&str; N]) {
     let status = Command::new("npm")
         .args(args)
         .current_dir(web_dir)
+        .env("npm_config_cache", npm_cache_dir)
         .status()
         .unwrap_or_else(|err| {
             panic!(
@@ -134,7 +157,7 @@ fn run_npm<const N: usize>(web_dir: &Path, args: [&str; N]) {
     }
 }
 
-fn copy_dir(from: &Path, to: &Path) {
+fn copy_web_source(from: &Path, to: &Path) {
     fs::create_dir_all(to)
         .unwrap_or_else(|err| panic!("failed to create directory {}: {err}", to.display()));
     for entry in fs::read_dir(from)
@@ -142,13 +165,14 @@ fn copy_dir(from: &Path, to: &Path) {
     {
         let entry = entry.unwrap_or_else(|err| panic!("failed to read directory entry: {err}"));
         let source = entry.path();
+        let file_name = entry.file_name();
+        if should_skip_web_source_entry(file_name.as_os_str()) {
+            continue;
+        }
         let target = to.join(entry.file_name());
         if source.is_dir() {
-            copy_dir(&source, &target);
+            copy_web_source(&source, &target);
         } else {
-            if source.file_name() == Some(OsStr::new(".DS_Store")) {
-                continue;
-            }
             fs::copy(&source, &target).unwrap_or_else(|err| {
                 panic!(
                     "failed to copy {} to {}: {err}",
@@ -158,4 +182,11 @@ fn copy_dir(from: &Path, to: &Path) {
             });
         }
     }
+}
+
+fn should_skip_web_source_entry(file_name: &OsStr) -> bool {
+    matches!(
+        file_name.to_str(),
+        Some("node_modules" | "dist" | ".vite" | ".DS_Store")
+    )
 }
