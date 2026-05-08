@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 pub type AgentId = Uuid;
@@ -343,6 +344,102 @@ pub struct SendMessageRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageResponse {
     pub turn_id: TurnId,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillScope {
+    Repo,
+    User,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillInterface {
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub short_description: Option<String>,
+    #[serde(default)]
+    pub icon_small: Option<PathBuf>,
+    #[serde(default)]
+    pub icon_large: Option<PathBuf>,
+    #[serde(default)]
+    pub brand_color: Option<String>,
+    #[serde(default)]
+    pub default_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillToolDependency {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub value: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillDependencies {
+    #[serde(default)]
+    pub tools: Vec<SkillToolDependency>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillPolicy {
+    #[serde(default)]
+    pub allow_implicit_invocation: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillMetadata {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub short_description: Option<String>,
+    pub path: PathBuf,
+    pub scope: SkillScope,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub interface: Option<SkillInterface>,
+    #[serde(default)]
+    pub dependencies: Option<SkillDependencies>,
+    #[serde(default)]
+    pub policy: Option<SkillPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillErrorInfo {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillsListResponse {
+    pub roots: Vec<PathBuf>,
+    pub skills: Vec<SkillMetadata>,
+    pub errors: Vec<SkillErrorInfo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillsConfigRequest {
+    #[serde(default)]
+    pub config: Vec<SkillConfigEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillConfigEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -4,8 +4,9 @@ use mai_protocol::{
     AgentSummary, ArtifactInfo, McpServerConfig, MessageRole, ModelConfig, ModelInputItem,
     ModelReasoningConfig, ModelReasoningVariant, PlanHistoryEntry, PlanStatus, ProviderConfig,
     ProviderKind, ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
-    ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind, SessionId, TaskId,
-    TaskPlan, TaskReview, TaskStatus, TaskSummary, TokenUsage, TurnId, default_true,
+    ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind, SessionId,
+    SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary, TokenUsage, TurnId,
+    default_true,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,6 +18,7 @@ use toasty_driver_sqlite::Sqlite;
 use uuid::Uuid;
 
 const SETTING_AGENT_CONFIG: &str = "agent_config";
+const SETTING_SKILLS_CONFIG: &str = "skills_config";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
 const SCHEMA_VERSION: &str = "7";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
@@ -718,6 +720,27 @@ impl ConfigStore {
             .await
     }
 
+    pub async fn load_skills_config(&self) -> Result<SkillsConfigRequest> {
+        let Some(value) = self.get_setting(SETTING_SKILLS_CONFIG).await? else {
+            return Ok(SkillsConfigRequest::default());
+        };
+        match serde_json::from_str(&value) {
+            Ok(config) => Ok(config),
+            Err(_) => {
+                let mut db = self.db.clone();
+                let mut tx = db.transaction().await?;
+                delete_setting_in_tx(&mut tx, SETTING_SKILLS_CONFIG).await?;
+                tx.commit().await?;
+                Ok(SkillsConfigRequest::default())
+            }
+        }
+    }
+
+    pub async fn save_skills_config(&self, config: &SkillsConfigRequest) -> Result<()> {
+        self.set_setting(SETTING_SKILLS_CONFIG, &serde_json::to_string(config)?)
+            .await
+    }
+
     pub async fn save_agent(
         &self,
         summary: &AgentSummary,
@@ -793,9 +816,7 @@ impl ConfigStore {
             .exec(&mut tx)
             .await?;
         Query::<List<TaskReviewRecord>>::filter(
-            TaskReviewRecord::fields()
-                .task_id()
-                .eq(task_id.to_string()),
+            TaskReviewRecord::fields().task_id().eq(task_id.to_string()),
         )
         .delete()
         .exec(&mut tx)
@@ -891,7 +912,10 @@ impl ConfigStore {
     }
 
     fn artifacts_dir(&self) -> PathBuf {
-        self.path.parent().unwrap_or(Path::new(".")).join("artifacts")
+        self.path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("artifacts")
     }
 
     pub fn save_artifact(&self, info: &ArtifactInfo) -> Result<()> {
@@ -1287,9 +1311,7 @@ impl ConfigStore {
     pub async fn load_task_reviews(&self, task_id: TaskId) -> Result<Vec<TaskReview>> {
         let mut db = self.db.clone();
         let mut rows = Query::<List<TaskReviewRecord>>::filter(
-            TaskReviewRecord::fields()
-                .task_id()
-                .eq(task_id.to_string()),
+            TaskReviewRecord::fields().task_id().eq(task_id.to_string()),
         )
         .exec(&mut db)
         .await?;
@@ -1298,7 +1320,9 @@ impl ConfigStore {
                 .cmp(&right.round)
                 .then_with(|| left.created_at.cmp(&right.created_at))
         });
-        rows.into_iter().map(TaskReviewRecord::into_review).collect()
+        rows.into_iter()
+            .map(TaskReviewRecord::into_review)
+            .collect()
     }
 }
 
@@ -1335,7 +1359,11 @@ impl AgentRecordRow {
 }
 
 impl TaskRecordRow {
-    fn into_persisted_task(self, reviews: Vec<TaskReview>, plan_history: Vec<PlanHistoryEntry>) -> Result<PersistedTask> {
+    fn into_persisted_task(
+        self,
+        reviews: Vec<TaskReview>,
+        plan_history: Vec<PlanHistoryEntry>,
+    ) -> Result<PersistedTask> {
         let plan = TaskPlan {
             status: parse_plan_status(&self.plan_status)?,
             title: self.plan_title,
@@ -1347,7 +1375,11 @@ impl TaskRecordRow {
                 .map(parse_agent_id)
                 .transpose()?,
             saved_at: self.plan_saved_at.as_deref().map(parse_utc).transpose()?,
-            approved_at: self.plan_approved_at.as_deref().map(parse_utc).transpose()?,
+            approved_at: self
+                .plan_approved_at
+                .as_deref()
+                .map(parse_utc)
+                .transpose()?,
             revision_feedback: self.plan_revision_feedback,
             revision_requested_at: self
                 .plan_revision_requested_at
@@ -1566,11 +1598,21 @@ fn builtin_provider(kind: ProviderKind) -> ProviderConfig {
                 deepseek_model("deepseek-reasoner", true),
             ],
         },
-        ProviderKind::Mimo => mimo_builtin_provider("mimo-api", "MiMo API", "https://api.xiaomimimo.com/v1", "MIMO_API_KEY"),
+        ProviderKind::Mimo => mimo_builtin_provider(
+            "mimo-api",
+            "MiMo API",
+            "https://api.xiaomimimo.com/v1",
+            "MIMO_API_KEY",
+        ),
     }
 }
 
-fn mimo_builtin_provider(id: &str, name: &str, base_url: &str, api_key_env: &str) -> ProviderConfig {
+fn mimo_builtin_provider(
+    id: &str,
+    name: &str,
+    base_url: &str,
+    api_key_env: &str,
+) -> ProviderConfig {
     ProviderConfig {
         id: id.to_string(),
         kind: ProviderKind::Mimo,
@@ -1714,17 +1756,15 @@ fn mimo_output_tokens(id: &str) -> u64 {
 fn mimo_reasoning_config() -> ModelReasoningConfig {
     ModelReasoningConfig {
         default_variant: Some("high".to_string()),
-        variants: vec![
-            ModelReasoningVariant {
-                id: "high".to_string(),
-                label: None,
-                request: serde_json::json!({
-                    "thinking": {
-                        "type": "enabled",
-                    },
-                }),
-            },
-        ],
+        variants: vec![ModelReasoningVariant {
+            id: "high".to_string(),
+            label: None,
+            request: serde_json::json!({
+                "thinking": {
+                    "type": "enabled",
+                },
+            }),
+        }],
     }
 }
 
@@ -2334,7 +2374,11 @@ mod tests {
             .iter()
             .filter(|provider| provider.kind == ProviderKind::Mimo)
             .collect();
-        assert_eq!(mimo_presets.len(), 2, "expected mimo-api and mimo-token-plan presets");
+        assert_eq!(
+            mimo_presets.len(),
+            2,
+            "expected mimo-api and mimo-token-plan presets"
+        );
         let mimo_api = mimo_presets
             .iter()
             .find(|p| p.id == "mimo-api")
@@ -2785,6 +2829,43 @@ mod tests {
             .await
             .expect("rebuild");
         assert_eq!(store.provider_count().await.expect("count"), 0);
+    }
+
+    #[tokio::test]
+    async fn skills_config_persists_in_settings() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("config.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("open");
+        let config = SkillsConfigRequest {
+            config: vec![mai_protocol::SkillConfigEntry {
+                name: Some("demo".to_string()),
+                path: None,
+                enabled: false,
+            }],
+        };
+        store
+            .save_skills_config(&config)
+            .await
+            .expect("save skills config");
+        drop(store);
+
+        let reopened = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("reopen");
+        assert_eq!(
+            reopened
+                .load_skills_config()
+                .await
+                .expect("load skills config"),
+            config
+        );
+        assert!(
+            !config_path.exists(),
+            "provider config file should be untouched"
+        );
     }
 
     #[tokio::test]

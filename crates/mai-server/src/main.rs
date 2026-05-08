@@ -10,12 +10,13 @@ use futures::StreamExt;
 use mai_docker::DockerClient;
 use mai_model::ResponsesClient;
 use mai_protocol::{
-    AgentConfigRequest, AgentConfigResponse, AgentId, ArtifactInfo, ApproveTaskPlanResponse,
+    AgentConfigRequest, AgentConfigResponse, AgentId, ApproveTaskPlanResponse, ArtifactInfo,
     CreateAgentRequest, CreateAgentResponse, CreateSessionResponse, CreateTaskRequest,
     CreateTaskResponse, ErrorResponse, FileUploadRequest, FileUploadResponse,
     ProviderPresetsResponse, ProvidersConfigRequest, ProvidersResponse, RequestPlanRevisionRequest,
     RequestPlanRevisionResponse, SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId,
-    TaskId, ToolTraceDetail, UpdateAgentRequest, UpdateAgentResponse,
+    SkillsConfigRequest, SkillsListResponse, TaskId, ToolTraceDetail, UpdateAgentRequest,
+    UpdateAgentResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
 use mai_store::ConfigStore;
@@ -125,7 +126,8 @@ async fn main() -> Result<()> {
     let config_path = env::var("MAI_CONFIG_PATH")
         .map(PathBuf::from)
         .unwrap_or(ConfigStore::default_config_path()?);
-    let image = env::var("MAI_AGENT_BASE_IMAGE").unwrap_or_else(|_| "ghcr.io/zr233/mai-team-agent:latest".to_string());
+    let image = env::var("MAI_AGENT_BASE_IMAGE")
+        .unwrap_or_else(|_| "ghcr.io/zr233/mai-team-agent:latest".to_string());
     let bind = env::var("MAI_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let addr: SocketAddr = bind.parse().context("invalid MAI_BIND_ADDR")?;
 
@@ -142,13 +144,8 @@ async fn main() -> Result<()> {
     let runtime_config = RuntimeConfig {
         repo_root: env::current_dir()?,
     };
-    let runtime = AgentRuntime::new(
-        docker,
-        model,
-        Arc::clone(&store),
-        runtime_config.clone(),
-    )
-    .await?;
+    let runtime =
+        AgentRuntime::new(docker, model, Arc::clone(&store), runtime_config.clone()).await?;
     let cleaned = runtime.cleanup_orphaned_containers().await?;
     if !cleaned.is_empty() {
         info!(
@@ -156,13 +153,19 @@ async fn main() -> Result<()> {
             "removed orphaned mai-team containers"
         );
     }
-    let state = Arc::new(AppState { runtime, store, runtime_config });
+    let state = Arc::new(AppState {
+        runtime,
+        store,
+        runtime_config,
+    });
 
     let app = Router::new()
         .route("/", get(index))
         .route("/health", get(health))
         .route("/providers", get(get_providers).put(save_providers))
         .route("/provider-presets", get(get_provider_presets))
+        .route("/skills", get(list_skills))
+        .route("/skills/config", axum::routing::put(save_skills_config))
         .route(
             "/agent-config",
             get(get_agent_config).put(save_agent_config),
@@ -170,13 +173,13 @@ async fn main() -> Result<()> {
         .route("/events", get(events))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks:ensure-default", post(ensure_default_task))
-        .route(
-            "/tasks/{id}",
-            get(get_task).delete(delete_task),
-        )
+        .route("/tasks/{id}", get(get_task).delete(delete_task))
         .route("/tasks/{id}/messages", post(send_task_message))
         .route("/tasks/{id}/plan:approve", post(approve_task_plan))
-        .route("/tasks/{id}/plan:request-revision", post(request_plan_revision))
+        .route(
+            "/tasks/{id}/plan:request-revision",
+            post(request_plan_revision),
+        )
         .route("/tasks/{id}/cancel", post(cancel_task))
         .route("/agents", get(list_agents).post(create_agent))
         .route(
@@ -267,6 +270,19 @@ async fn save_providers(
     Ok(Json(state.store.providers_response().await?))
 }
 
+async fn list_skills(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<SkillsListResponse>, ApiError> {
+    Ok(Json(state.runtime.list_skills().await?))
+}
+
+async fn save_skills_config(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SkillsConfigRequest>,
+) -> std::result::Result<Json<SkillsListResponse>, ApiError> {
+    Ok(Json(state.runtime.update_skills_config(request).await?))
+}
+
 async fn get_agent_config(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<AgentConfigResponse>, ApiError> {
@@ -348,7 +364,10 @@ async fn request_plan_revision(
     Path(id): Path<TaskId>,
     Json(request): Json<RequestPlanRevisionRequest>,
 ) -> std::result::Result<Json<RequestPlanRevisionResponse>, ApiError> {
-    let task = state.runtime.request_plan_revision(id, request.feedback).await?;
+    let task = state
+        .runtime
+        .request_plan_revision(id, request.feedback)
+        .await?;
     Ok(Json(RequestPlanRevisionResponse { task }))
 }
 

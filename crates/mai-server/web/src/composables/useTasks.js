@@ -79,13 +79,13 @@ export function useTasks() {
     return response.task
   }
 
-  async function sendTaskMessage(message) {
+  async function sendTaskMessage(message, skillMentions = []) {
     if (!selectedTaskId.value || !message) return null
     isSending.value = true
     try {
       const response = await api(`/tasks/${selectedTaskId.value}/messages`, {
         method: 'POST',
-        body: JSON.stringify({ message })
+        body: JSON.stringify({ message, skill_mentions: skillMentions })
       })
       await refreshTasks()
       await refreshDetail()

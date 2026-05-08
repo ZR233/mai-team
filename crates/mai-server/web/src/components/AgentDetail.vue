@@ -74,8 +74,14 @@
       v-else-if="showComposer"
       :draft="draft"
       :sending="sending"
+      :skills="skills"
+      :selected-skills="selectedSkills"
+      :skills-loading="skillsLoading"
+      :skills-error="skillsError"
       @send="$emit('send', $event)"
       @update:draft="$emit('update:draft', $event)"
+      @update:selected-skills="$emit('update:selectedSkills', $event)"
+      @load-skills="$emit('load-skills')"
     />
   </template>
 </template>
@@ -104,6 +110,10 @@ const props = defineProps({
   sending: { type: Boolean, default: false },
   updatingModel: { type: Boolean, default: false },
   providers: { type: Array, default: () => [] },
+  skills: { type: Array, default: () => [] },
+  selectedSkills: { type: Array, default: () => [] },
+  skillsLoading: { type: Boolean, default: false },
+  skillsError: { type: String, default: '' },
   showSessions: { type: Boolean, default: true },
   showComposer: { type: Boolean, default: true },
   planApprovalPending: { type: Boolean, default: false },
@@ -118,6 +128,8 @@ const emit = defineEmits([
   'delete',
   'send',
   'update:draft',
+  'update:selectedSkills',
+  'load-skills',
   'update-model',
   'create-session',
   'select-session',

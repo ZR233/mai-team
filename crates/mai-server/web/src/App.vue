@@ -54,6 +54,10 @@
           :sending="isSending"
           :approving-plan="isApprovingPlan"
           :providers="providersState.providers"
+          :skills="enabledSkills"
+          :selected-skills="selectedSkills"
+          :skills-loading="skillsState.loading"
+          :skills-error="skillsError"
           :updating-model="isUpdatingAgentModel"
           v-model:conversation-ref="conversationRef"
           @approve-plan="onApprovePlan"
@@ -65,6 +69,8 @@
           @send="onSendMessage"
           @update-model="onUpdateAgentModel"
           @update:draft="messageDraft = $event"
+          @update:selected-skills="selectedSkills = $event"
+          @load-skills="onLoadSkills"
         />
       </section>
 
@@ -81,10 +87,15 @@
         v-else
         :providers="providersState.providers"
         :state="agentConfigState"
+        :skills-state="skillsState"
         :loading="agentConfigState.loading"
         :saving="agentConfigState.saving"
+        :skills-saving="skillsState.saving"
+        :skills-error="skillsError"
         @reload="loadAgentConfig"
         @save="onSaveAgentConfig"
+        @reload-skills="onLoadSkills"
+        @save-skills="onSaveSkillsConfig"
         @open-providers="activeTab = 'providers'"
       />
     </main>
@@ -133,6 +144,7 @@ import { useSSE } from './composables/useSSE'
 import { useTasks } from './composables/useTasks'
 import { useProviders } from './composables/useProviders'
 import { useAgentConfig } from './composables/useAgentConfig'
+import { useSkills } from './composables/useSkills'
 
 const { toast, showToast } = useApi()
 const { eventFeed, connectionState, connectEvents, disconnect } = useSSE()
@@ -173,10 +185,19 @@ const {
   fillFromPreset
 } = useProviders()
 const { agentConfigState, loadAgentConfig, saveAgentConfig } = useAgentConfig()
+const {
+  skillsState,
+  enabledSkills,
+  loadSkills,
+  ensureSkillsLoaded,
+  saveSkillsConfig
+} = useSkills()
 
 const activeTab = ref('tasks')
 const messageDraft = ref('')
+const selectedSkills = ref([])
 const isUpdatingAgentModel = ref(false)
+const skillsError = ref('')
 
 const confirmDialog = reactive({
   open: false,
@@ -215,7 +236,7 @@ onUnmounted(() => disconnect())
 async function refreshAll() {
   isLoading.value = true
   try {
-    await Promise.all([loadProviders(), loadAgentConfig(), refreshTasks()])
+    await Promise.all([loadProviders(), loadAgentConfig(), loadSkills(), refreshTasks()])
     if (providersState.providers.length && !tasks.value.length) {
       await ensureDefaultTask()
     } else if (selectedTaskId.value) {
@@ -262,10 +283,14 @@ async function onCreateTask() {
   }
 }
 
-async function onSendMessage(message) {
+async function onSendMessage(payload) {
+  const message = typeof payload === 'string' ? payload : payload?.message
+  const skillMentions = typeof payload === 'string' ? selectedSkills.value : (payload?.skillMentions || [])
   try {
     messageDraft.value = ''
-    await sendTaskMessage(message)
+    await sendTaskMessage(message, skillMentions)
+    selectedSkills.value = []
+    await loadSkills()
   } catch (error) {
     showToast(error.message)
   }
@@ -314,6 +339,27 @@ async function onSaveAgentConfig(config) {
     await saveAgentConfig(config)
     showToast('Role config saved.')
   } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onLoadSkills() {
+  skillsError.value = ''
+  try {
+    await ensureSkillsLoaded()
+  } catch (error) {
+    skillsError.value = error.message
+    showToast(error.message)
+  }
+}
+
+async function onSaveSkillsConfig(config) {
+  skillsError.value = ''
+  try {
+    await saveSkillsConfig(config)
+    showToast('Skills config saved.')
+  } catch (error) {
+    skillsError.value = error.message
     showToast(error.message)
   }
 }

@@ -105,13 +105,13 @@ export function useAgents() {
     return response.agent
   }
 
-  async function sendMessage(message) {
+  async function sendMessage(message, skillMentions = []) {
     if (!selectedAgentId.value || !selectedSessionId.value || !message) return
     isSending.value = true
     try {
       await api(`/agents/${selectedAgentId.value}/sessions/${selectedSessionId.value}/messages`, {
         method: 'POST',
-        body: JSON.stringify({ message })
+        body: JSON.stringify({ message, skill_mentions: skillMentions })
       })
       await refreshDetail()
     } finally {

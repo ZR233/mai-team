@@ -64,6 +64,10 @@
       :loading="loading"
       :sending="sending"
       :providers="providers"
+      :skills="skills"
+      :selected-skills="selectedSkills"
+      :skills-loading="skillsLoading"
+      :skills-error="skillsError"
       :updating-model="updatingModel"
       :show-sessions="false"
       :show-composer="canCompose"
@@ -77,6 +81,8 @@
       @send="$emit('send', $event)"
       @update-model="$emit('update-model', $event)"
       @update:draft="$emit('update:draft', $event)"
+      @update:selected-skills="$emit('update:selectedSkills', $event)"
+      @load-skills="$emit('load-skills')"
       @approve-plan="$emit('approve-plan')"
       @request-plan-revision="$emit('request-plan-revision', $event)"
     />
@@ -97,7 +103,11 @@ const props = defineProps({
   sending: { type: Boolean, default: false },
   approvingPlan: { type: Boolean, default: false },
   updatingModel: { type: Boolean, default: false },
-  providers: { type: Array, default: () => [] }
+  providers: { type: Array, default: () => [] },
+  skills: { type: Array, default: () => [] },
+  selectedSkills: { type: Array, default: () => [] },
+  skillsLoading: { type: Boolean, default: false },
+  skillsError: { type: String, default: '' }
 })
 
 const conversationRef = defineModel('conversationRef', { default: null })
@@ -111,6 +121,8 @@ const emit = defineEmits([
   'delete-agent',
   'send',
   'update:draft',
+  'update:selectedSkills',
+  'load-skills',
   'update-model'
 ])
 

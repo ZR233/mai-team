@@ -82,6 +82,61 @@
         </button>
       </div>
     </form>
+
+    <section class="skills-settings">
+      <div class="stage-title compact">
+        <div>
+          <h2>Skills</h2>
+          <p>Codex-compatible skills discovered from repo and user roots.</p>
+        </div>
+        <button class="ghost-button" type="button" :disabled="skillsState.loading" @click="$emit('reload-skills')">Reload</button>
+      </div>
+
+      <div class="skills-root-list">
+        <span v-for="root in skillsState.roots" :key="root" class="skill-root">{{ root }}</span>
+        <span v-if="!skillsState.roots?.length" class="skill-root muted">No roots loaded</span>
+      </div>
+
+      <div v-if="skillsState.errors?.length" class="skill-errors">
+        <div v-for="item in skillsState.errors" :key="item.path" class="skill-error-row">
+          <strong>{{ item.path }}</strong>
+          <span>{{ item.message }}</span>
+        </div>
+      </div>
+
+      <div class="skills-config-list">
+        <button
+          v-for="skill in skillsState.skills"
+          :key="skill.path"
+          class="skill-config-row"
+          type="button"
+          :class="{ disabled: !skill.enabled }"
+          @click="toggleSkill(skill)"
+        >
+          <span class="skill-toggle" :class="{ on: skill.enabled }">{{ skill.enabled ? 'On' : 'Off' }}</span>
+          <span class="skill-config-main">
+            <strong>{{ skill.name }}</strong>
+            <small>{{ skill.description }}</small>
+            <code>{{ skill.path }}</code>
+          </span>
+          <span class="mini-pill">{{ skill.scope }}</span>
+        </button>
+        <div v-if="!skillsState.loading && !skillsState.skills?.length" class="quiet-empty skills-empty">
+          <strong>No skills found</strong>
+          <span>Add `SKILL.md` files under `.agents/skills` or `~/.agents/skills`.</span>
+        </div>
+      </div>
+
+      <div class="settings-actions skills-actions">
+        <div class="settings-action-errors">
+          <p v-if="skillsError" class="dialog-error">{{ skillsError }}</p>
+        </div>
+        <button class="primary-button" type="button" :disabled="skillsSaving || skillsState.loading" @click="saveSkills">
+          <span v-if="skillsSaving" class="spinner-sm"></span>
+          <template v-else>Save Skills</template>
+        </button>
+      </div>
+    </section>
   </section>
 </template>
 
@@ -120,11 +175,14 @@ const ROLE_DEFINITIONS = [
 const props = defineProps({
   providers: { type: Array, default: () => [] },
   state: { type: Object, required: true },
+  skillsState: { type: Object, required: true },
   loading: { type: Boolean, default: false },
-  saving: { type: Boolean, default: false }
+  saving: { type: Boolean, default: false },
+  skillsSaving: { type: Boolean, default: false },
+  skillsError: { type: String, default: '' }
 })
 
-const emit = defineEmits(['save', 'reload', 'open-providers'])
+const emit = defineEmits(['save', 'reload', 'open-providers', 'reload-skills', 'save-skills'])
 
 const error = ref('')
 const forms = reactive({
@@ -133,6 +191,7 @@ const forms = reactive({
   executor: emptyPreference(),
   reviewer: emptyPreference()
 })
+const skillOverrides = reactive({})
 
 const providerSeedLabel = computed(() => {
   const provider = props.providers[0]
@@ -159,6 +218,13 @@ watch(
   ],
   resetFromState,
   { immediate: true }
+)
+
+watch(
+  () => props.skillsState.skills,
+  () => {
+    for (const key of Object.keys(skillOverrides)) delete skillOverrides[key]
+  }
 )
 
 function emptyPreference() {
@@ -262,5 +328,24 @@ function preferencePayload(preference) {
     model: preference.model,
     reasoning_effort: preference.reasoning_effort || null
   }
+}
+
+function skillEnabled(skill) {
+  return Object.prototype.hasOwnProperty.call(skillOverrides, skill.path)
+    ? skillOverrides[skill.path]
+    : skill.enabled
+}
+
+function toggleSkill(skill) {
+  skillOverrides[skill.path] = !skillEnabled(skill)
+  skill.enabled = skillOverrides[skill.path]
+}
+
+function saveSkills() {
+  const config = props.skillsState.skills.map((skill) => ({
+    path: skill.path,
+    enabled: skillEnabled(skill)
+  }))
+  emit('save-skills', config)
 }
 </script>

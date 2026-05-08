@@ -9,11 +9,11 @@ use mai_protocol::{
     AgentModelPreference, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary, ArtifactInfo,
     ContextUsage, CreateAgentRequest, MessageRole, ModelConfig, ModelContentItem, ModelInputItem,
     ModelOutputItem, ModelToolCall, PlanHistoryEntry, PlanStatus, ResolvedAgentModelPreference,
-    ServiceEvent, ServiceEventKind, SessionId, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus,
-    TaskSummary, TokenUsage, TodoItem, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest,
-    UserInputOption, UserInputQuestion, now, preview,
+    ServiceEvent, ServiceEventKind, SessionId, SkillsConfigRequest, SkillsListResponse, TaskDetail,
+    TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary, TodoItem, TokenUsage, ToolTraceDetail,
+    TurnId, TurnStatus, UpdateAgentRequest, UserInputOption, UserInputQuestion, now, preview,
 };
-use mai_skills::SkillsManager;
+use mai_skills::{SkillInjections, SkillsManager};
 use mai_store::{ConfigStore, ProviderSelection};
 use mai_tools::{RoutedTool, build_tool_definitions, route_tool};
 use serde_json::{Value, json};
@@ -292,6 +292,20 @@ impl AgentRuntime {
         })
     }
 
+    pub async fn list_skills(&self) -> Result<SkillsListResponse> {
+        let config = self.store.load_skills_config().await?;
+        Ok(self.skills.list(&config)?)
+    }
+
+    pub async fn update_skills_config(
+        &self,
+        request: SkillsConfigRequest,
+    ) -> Result<SkillsListResponse> {
+        let normalized = mai_skills::normalize_config(&request)?;
+        self.store.save_skills_config(&normalized).await?;
+        Ok(self.skills.list(&normalized)?)
+    }
+
     pub async fn update_agent_config(
         &self,
         request: AgentConfigRequest,
@@ -339,10 +353,7 @@ impl AgentRuntime {
         docker_image: Option<String>,
     ) -> Result<TaskSummary> {
         let task_id = Uuid::new_v4();
-        let user_omitted_title = title
-            .as_ref()
-            .map(|v| v.trim().is_empty())
-            .unwrap_or(true);
+        let user_omitted_title = title.as_ref().map(|v| v.trim().is_empty()).unwrap_or(true);
         let title = title
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
@@ -400,9 +411,7 @@ impl AgentRuntime {
             .filter(|m| !m.trim().is_empty())
             .cloned();
         if let Some(message) = initial_message.filter(|message| !message.trim().is_empty()) {
-            let _ = self
-                .send_task_message(task_id, message, Vec::new())
-                .await?;
+            let _ = self.send_task_message(task_id, message, Vec::new()).await?;
         }
         if user_omitted_title {
             if let Some(message_text) = message_for_title {
@@ -437,7 +446,14 @@ impl AgentRuntime {
         let input = vec![ModelInputItem::user_text(message)];
         let response = self
             .model
-            .create_response(&selection.provider, &selection.model, instructions, &input, &[], None)
+            .create_response(
+                &selection.provider,
+                &selection.model,
+                instructions,
+                &input,
+                &[],
+                None,
+            )
             .await?;
         let title = response
             .output
@@ -1068,7 +1084,8 @@ impl AgentRuntime {
         }
         self.store.delete_task(task_id).await?;
         self.tasks.write().await.remove(&task_id);
-        self.publish(ServiceEventKind::TaskDeleted { task_id }).await;
+        self.publish(ServiceEventKind::TaskDeleted { task_id })
+            .await;
         Ok(())
     }
 
@@ -1155,9 +1172,12 @@ impl AgentRuntime {
         display_name: Option<String>,
     ) -> Result<ArtifactInfo> {
         let agent = self.agent(agent_id).await?;
-        let task_id = agent.summary.read().await.task_id.ok_or_else(|| {
-            RuntimeError::InvalidInput("Agent has no task".to_string())
-        })?;
+        let task_id = agent
+            .summary
+            .read()
+            .await
+            .task_id
+            .ok_or_else(|| RuntimeError::InvalidInput("Agent has no task".to_string()))?;
         let container_id = self.container_id(agent_id).await?;
 
         let name = display_name.unwrap_or_else(|| {
@@ -1168,7 +1188,11 @@ impl AgentRuntime {
         });
 
         let artifact_id = Uuid::new_v4().to_string();
-        let dir = self.repo_root.join("artifacts").join(task_id.to_string()).join(&artifact_id);
+        let dir = self
+            .repo_root
+            .join("artifacts")
+            .join(task_id.to_string())
+            .join(&artifact_id);
         std::fs::create_dir_all(&dir)?;
 
         let dest = dir.join(&name);
@@ -1297,7 +1321,10 @@ impl AgentRuntime {
         })
         .await;
 
-        let loaded_skills = self.skills.load_explicit(&skill_mentions)?;
+        let skills_config = self.store.load_skills_config().await?;
+        let skill_injections = self
+            .skills
+            .build_injections(&skill_mentions, &skills_config)?;
         let mut last_assistant_text: Option<String> = None;
         for iteration in 0..MAX_TOOL_ITERATIONS {
             if agent.cancel_requested.load(Ordering::SeqCst) {
@@ -1319,7 +1346,7 @@ impl AgentRuntime {
             let mcp_tools = self.agent_mcp_tools(&agent).await;
             let tools = build_tool_definitions(&mcp_tools);
             let instructions = self
-                .build_instructions(&agent, &loaded_skills, &mcp_tools)
+                .build_instructions(&agent, &skill_injections, &skills_config, &mcp_tools)
                 .await?;
             let summary = agent.summary.read().await.clone();
             let model_name = summary.model.clone();
@@ -1335,7 +1362,10 @@ impl AgentRuntime {
             {
                 tracing::warn!("auto context compaction failed before model request: {err}");
             }
-            let history = self.session_history(&agent, agent_id, session_id).await?;
+            let mut history = self.session_history(&agent, agent_id, session_id).await?;
+            if let Some(skill_fragment) = skill_user_fragment(&skill_injections) {
+                history.push(skill_fragment);
+            }
             let response = self
                 .model
                 .create_response(
@@ -1748,7 +1778,9 @@ impl AgentRuntime {
                 let passed = arguments
                     .get("passed")
                     .and_then(Value::as_bool)
-                    .ok_or_else(|| RuntimeError::InvalidInput("missing boolean field `passed`".to_string()))?;
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidInput("missing boolean field `passed`".to_string())
+                    })?;
                 let findings = required_string(&arguments, "findings")?;
                 let summary = required_string(&arguments, "summary")?;
                 let review = self
@@ -1761,8 +1793,9 @@ impl AgentRuntime {
                 })
             }
             RoutedTool::UpdateTodoList => {
-                let items_arg = arguments.get("items")
-                    .ok_or_else(|| RuntimeError::InvalidInput("missing field `items`".to_string()))?;
+                let items_arg = arguments.get("items").ok_or_else(|| {
+                    RuntimeError::InvalidInput("missing field `items`".to_string())
+                })?;
                 let items: Vec<TodoItem> = serde_json::from_value(items_arg.clone())
                     .map_err(|e| RuntimeError::InvalidInput(format!("invalid items: {e}")))?;
                 self.publish(ServiceEventKind::TodoListUpdated {
@@ -1780,25 +1813,48 @@ impl AgentRuntime {
             }
             RoutedTool::RequestUserInput => {
                 let header = required_string(&arguments, "header")?;
-                let questions_arg = arguments.get("questions")
-                    .ok_or_else(|| RuntimeError::InvalidInput("missing field `questions`".to_string()))?;
-                let raw_questions: Vec<serde_json::Value> = serde_json::from_value(questions_arg.clone())
-                    .map_err(|e| RuntimeError::InvalidInput(format!("invalid questions: {e}")))?;
+                let questions_arg = arguments.get("questions").ok_or_else(|| {
+                    RuntimeError::InvalidInput("missing field `questions`".to_string())
+                })?;
+                let raw_questions: Vec<serde_json::Value> =
+                    serde_json::from_value(questions_arg.clone()).map_err(|e| {
+                        RuntimeError::InvalidInput(format!("invalid questions: {e}"))
+                    })?;
                 let mut questions = Vec::with_capacity(raw_questions.len());
                 for raw in &raw_questions {
-                    let id = raw.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
-                    let question = raw.get("question").and_then(Value::as_str).unwrap_or_default().to_string();
-                    let options_raw = raw.get("options")
+                    let id = raw
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let question = raw
+                        .get("question")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let options_raw = raw
+                        .get("options")
                         .and_then(Value::as_array)
                         .cloned()
                         .unwrap_or_default();
                     let mut options = Vec::with_capacity(options_raw.len());
                     for opt in &options_raw {
-                        let label = opt.get("label").and_then(Value::as_str).unwrap_or_default().to_string();
-                        let description = opt.get("description").and_then(Value::as_str).map(str::to_string);
+                        let label = opt
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let description = opt
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
                         options.push(UserInputOption { label, description });
                     }
-                    questions.push(UserInputQuestion { id, question, options });
+                    questions.push(UserInputQuestion {
+                        id,
+                        question,
+                        options,
+                    });
                 }
                 self.publish(ServiceEventKind::UserInputRequested {
                     agent_id,
@@ -1810,7 +1866,8 @@ impl AgentRuntime {
                 .await;
                 Ok(ToolExecution {
                     success: true,
-                    output: "Questions sent to user. Wait for their response in the next message.".to_string(),
+                    output: "Questions sent to user. Wait for their response in the next message."
+                        .to_string(),
                     ends_turn: true,
                 })
             }
@@ -1820,8 +1877,7 @@ impl AgentRuntime {
                 let artifact = self.save_artifact(agent_id, path, name).await?;
                 Ok(ToolExecution {
                     success: true,
-                    output: serde_json::to_string(&artifact)
-                        .unwrap_or_else(|_| "{}".to_string()),
+                    output: serde_json::to_string(&artifact).unwrap_or_else(|_| "{}".to_string()),
                     ends_turn: false,
                 })
             }
@@ -2004,7 +2060,10 @@ impl AgentRuntime {
             .wait_agent(executor.id, Duration::from_secs(3600))
             .await?;
         for round in 1..=REVIEW_ROUND_LIMIT {
-            if matches!(executor_summary.status, AgentStatus::Failed | AgentStatus::Cancelled) {
+            if matches!(
+                executor_summary.status,
+                AgentStatus::Failed | AgentStatus::Cancelled
+            ) {
                 return Err(RuntimeError::InvalidInput(format!(
                     "executor ended with status {:?}",
                     executor_summary.status
@@ -2030,7 +2089,10 @@ impl AgentRuntime {
             let reviewer_summary = self
                 .wait_agent(reviewer.id, Duration::from_secs(3600))
                 .await?;
-            if matches!(reviewer_summary.status, AgentStatus::Failed | AgentStatus::Cancelled) {
+            if matches!(
+                reviewer_summary.status,
+                AgentStatus::Failed | AgentStatus::Cancelled
+            ) {
                 return Err(RuntimeError::InvalidInput(format!(
                     "reviewer ended with status {:?}",
                     reviewer_summary.status
@@ -2225,16 +2287,14 @@ impl AgentRuntime {
         };
         let len = session.messages.len();
         let start = len.saturating_sub(limit);
-        Ok((
-            Some(session.summary.id),
-            session.messages[start..].to_vec(),
-        ))
+        Ok((Some(session.summary.id), session.messages[start..].to_vec()))
     }
 
     async fn build_instructions(
         &self,
         agent: &AgentRecord,
-        loaded_skills: &[mai_skills::LoadedSkill],
+        skill_injections: &SkillInjections,
+        skills_config: &SkillsConfigRequest,
         mcp_tools: &[mai_mcp::McpTool],
     ) -> Result<String> {
         let mut instructions = String::from(BASE_INSTRUCTIONS);
@@ -2243,16 +2303,11 @@ impl AgentRuntime {
             instructions.push_str(system_prompt);
         }
         instructions.push_str("\n\n## Available Skills\n");
-        instructions.push_str(&self.skills.render_available()?);
-        if !loaded_skills.is_empty() {
-            instructions.push_str("\n\n## Loaded Skill Instructions\n");
-            for skill in loaded_skills {
-                instructions.push_str(&format!(
-                    "\n### ${}\nPath: {}\n{}\n",
-                    skill.summary.name,
-                    skill.summary.path.display(),
-                    skill.contents
-                ));
+        instructions.push_str(&self.skills.render_available(skills_config)?);
+        if !skill_injections.warnings.is_empty() {
+            instructions.push_str("\n\n## Skill Warnings\n");
+            for warning in &skill_injections.warnings {
+                instructions.push_str(&format!("\n- {warning}"));
             }
         }
         instructions.push_str("\n\n## MCP Tools\n");
@@ -2470,7 +2525,10 @@ impl AgentRuntime {
         }
         let mut compact_input = history.clone();
         compact_input.push(ModelInputItem::user_text(COMPACT_PROMPT));
-        let instructions = self.build_instructions(agent, &[], &[]).await?;
+        let skills_config = self.store.load_skills_config().await?;
+        let instructions = self
+            .build_instructions(agent, &SkillInjections::default(), &skills_config, &[])
+            .await?;
         let response = self
             .model
             .create_response(
@@ -3271,14 +3329,23 @@ fn short_id(id: AgentId) -> String {
 }
 
 fn extract_skill_mentions(text: &str) -> Vec<String> {
-    text.split(|ch: char| ch.is_whitespace() || ch == ',' || ch == ')' || ch == '(')
-        .filter_map(|part| part.strip_prefix('$'))
-        .map(|part| {
-            part.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_')
-                .to_string()
-        })
-        .filter(|part| !part.is_empty())
-        .collect()
+    mai_skills::extract_skill_mentions(text)
+}
+
+fn skill_user_fragment(skill_injections: &SkillInjections) -> Option<ModelInputItem> {
+    if skill_injections.items.is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    for skill in &skill_injections.items {
+        text.push_str(&format!(
+            "\n<skill>\n<name>{}</name>\n<path>{}</path>\n{}\n</skill>\n",
+            skill.metadata.name,
+            skill.metadata.path.display(),
+            skill.contents
+        ));
+    }
+    Some(ModelInputItem::user_text(text))
 }
 
 fn should_auto_compact(last_context_tokens: u64, context_tokens: u64) -> bool {
@@ -3848,9 +3915,42 @@ esac
     #[test]
     fn extracts_skill_mentions() {
         assert_eq!(
-            extract_skill_mentions("please use $rust-dev, then $doc."),
-            vec!["rust-dev", "doc"]
+            extract_skill_mentions("please use $rust-dev, then $plugin:doc and $PATH."),
+            vec!["rust-dev", "plugin:doc"]
         );
+    }
+
+    #[test]
+    fn skill_user_fragment_wraps_loaded_skill_contents() {
+        let path = std::path::PathBuf::from("/tmp/demo/SKILL.md");
+        let fragment = skill_user_fragment(&SkillInjections {
+            items: vec![mai_skills::LoadedSkill {
+                metadata: mai_protocol::SkillMetadata {
+                    name: "demo".to_string(),
+                    description: "Demo skill".to_string(),
+                    short_description: None,
+                    path: path.clone(),
+                    scope: mai_protocol::SkillScope::Repo,
+                    enabled: true,
+                    interface: None,
+                    dependencies: None,
+                    policy: None,
+                },
+                contents: "skill body".to_string(),
+            }],
+            warnings: Vec::new(),
+        })
+        .expect("fragment");
+        assert!(matches!(
+            fragment,
+            ModelInputItem::Message { role, content }
+                if role == "user"
+                    && matches!(&content[0], ModelContentItem::InputText { text }
+                        if text.contains("<skill>")
+                            && text.contains("<name>demo</name>")
+                            && text.contains(path.to_string_lossy().as_ref())
+                            && text.contains("skill body"))
+        ));
     }
 
     #[test]
@@ -3873,7 +3973,11 @@ esac
         let runtime = test_runtime(&dir, Arc::clone(&store)).await;
 
         let task = runtime
-            .create_task(Some("Build task UI".to_string()), None, Some("ubuntu:latest".to_string()))
+            .create_task(
+                Some("Build task UI".to_string()),
+                None,
+                Some("ubuntu:latest".to_string()),
+            )
             .await
             .expect("create task");
 
@@ -3885,10 +3989,12 @@ esac
         assert_eq!(detail.selected_agent.summary.task_id, Some(task.id));
         assert_eq!(detail.selected_agent.sessions.len(), 1);
         assert_eq!(detail.selected_agent.sessions[0].title, "Task");
-        assert!(runtime
-            .create_session(detail.selected_agent.summary.id)
-            .await
-            .is_err());
+        assert!(
+            runtime
+                .create_session(detail.selected_agent.summary.id)
+                .await
+                .is_err()
+        );
 
         let snapshot = store.load_runtime_snapshot(20).await.expect("snapshot");
         assert_eq!(snapshot.tasks.len(), 1);
@@ -3915,7 +4021,11 @@ esac
             .expect("save providers");
         let runtime = test_runtime(&dir, Arc::clone(&store)).await;
         let task = runtime
-            .create_task(Some("Plan me".to_string()), None, Some("ubuntu:latest".to_string()))
+            .create_task(
+                Some("Plan me".to_string()),
+                None,
+                Some("ubuntu:latest".to_string()),
+            )
             .await
             .expect("create task");
 
@@ -3971,7 +4081,11 @@ esac
             .expect("save providers");
         let runtime = test_runtime(&dir, store).await;
         let task = runtime
-            .create_task(Some("Needs plan".to_string()), None, Some("ubuntu:latest".to_string()))
+            .create_task(
+                Some("Needs plan".to_string()),
+                None,
+                Some("ubuntu:latest".to_string()),
+            )
             .await
             .expect("create task");
 
@@ -4184,13 +4298,11 @@ esac
 
     #[test]
     fn repair_adds_missing_tool_outputs_for_function_call() {
-        let mut history = vec![
-            ModelInputItem::FunctionCall {
-                call_id: "call_a".to_string(),
-                name: "container_exec".to_string(),
-                arguments: "{}".to_string(),
-            },
-        ];
+        let mut history = vec![ModelInputItem::FunctionCall {
+            call_id: "call_a".to_string(),
+            name: "container_exec".to_string(),
+            arguments: "{}".to_string(),
+        }];
         repair_incomplete_tool_history(&mut history);
         assert_eq!(history.len(), 2);
         assert!(matches!(
@@ -4554,17 +4666,25 @@ esac
             value["final_response"].as_str(),
             Some("Explorer conclusion: auth lives in crates/auth.")
         );
-        assert_eq!(value["recent_messages"].as_array().expect("messages").len(), 2);
-        assert_eq!(value["agent"]["id"].as_str(), Some(child_id.to_string().as_str()));
+        assert_eq!(
+            value["recent_messages"].as_array().expect("messages").len(),
+            2
+        );
+        assert_eq!(
+            value["agent"]["id"].as_str(),
+            Some(child_id.to_string().as_str())
+        );
         assert!(matches!(
             runtime.agent(child_id).await,
             Err(RuntimeError::AgentNotFound(id)) if id == child_id
         ));
-        assert!(runtime
-            .list_agents()
-            .await
-            .iter()
-            .all(|agent| agent.id != child_id));
+        assert!(
+            runtime
+                .list_agents()
+                .await
+                .iter()
+                .all(|agent| agent.id != child_id)
+        );
     }
 
     #[tokio::test]
@@ -5014,6 +5134,153 @@ esac
                     }
                 ))
         );
+    }
+
+    #[tokio::test]
+    async fn user_turn_includes_selected_skill_as_user_fragment() {
+        let (base_url, requests) = start_mock_responses(vec![json!({
+            "id": "skill",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "done" }]
+            }],
+            "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+        })])
+        .await;
+        let dir = tempdir().expect("tempdir");
+        let skill_dir = dir.path().join(".agents/skills/demo");
+        std::fs::create_dir_all(&skill_dir).expect("mkdir skill");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo skill.\n---\nUse the demo flow.",
+        )
+        .expect("write skill");
+        let store = Arc::new(
+            ConfigStore::open_with_config_path(
+                dir.path().join("runtime.sqlite3"),
+                dir.path().join("config.toml"),
+            )
+            .await
+            .expect("open store"),
+        );
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![compact_test_provider(base_url)],
+                default_provider_id: Some("mock".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        store
+            .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
+            .await
+            .expect("save agent");
+        save_test_session(&store, agent_id, session_id).await;
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let agent = runtime.agent(agent_id).await.expect("agent");
+        *agent.container.write().await = Some(ContainerHandle {
+            id: "container-1".to_string(),
+            name: "container-1".to_string(),
+            image: "unused".to_string(),
+        });
+
+        runtime
+            .run_turn_inner(
+                agent_id,
+                session_id,
+                Uuid::new_v4(),
+                "please use $demo".to_string(),
+                Vec::new(),
+            )
+            .await
+            .expect("turn");
+
+        let requests = requests.lock().await.clone();
+        let input = requests[0]["input"].as_array().expect("input");
+        assert!(input.iter().any(|item| {
+            item["role"] == "user"
+                && item["content"][0]["text"].as_str().is_some_and(|text| {
+                    text.contains("<skill>")
+                        && text.contains("<name>demo</name>")
+                        && text.contains("Use the demo flow.")
+                })
+        }));
+    }
+
+    #[tokio::test]
+    async fn disabled_skill_is_not_injected() {
+        let (base_url, requests) = start_mock_responses(vec![json!({
+            "id": "skill",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "done" }]
+            }],
+            "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+        })])
+        .await;
+        let dir = tempdir().expect("tempdir");
+        let skill_dir = dir.path().join(".agents/skills/demo");
+        std::fs::create_dir_all(&skill_dir).expect("mkdir skill");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo skill.\n---\nUse the demo flow.",
+        )
+        .expect("write skill");
+        let store = Arc::new(
+            ConfigStore::open_with_config_path(
+                dir.path().join("runtime.sqlite3"),
+                dir.path().join("config.toml"),
+            )
+            .await
+            .expect("open store"),
+        );
+        store
+            .save_skills_config(&SkillsConfigRequest {
+                config: vec![mai_protocol::SkillConfigEntry {
+                    name: Some("demo".to_string()),
+                    path: None,
+                    enabled: false,
+                }],
+            })
+            .await
+            .expect("save skills config");
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![compact_test_provider(base_url)],
+                default_provider_id: Some("mock".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        store
+            .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
+            .await
+            .expect("save agent");
+        save_test_session(&store, agent_id, session_id).await;
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let agent = runtime.agent(agent_id).await.expect("agent");
+        *agent.container.write().await = Some(ContainerHandle {
+            id: "container-1".to_string(),
+            name: "container-1".to_string(),
+            image: "unused".to_string(),
+        });
+
+        runtime
+            .run_turn_inner(
+                agent_id,
+                session_id,
+                Uuid::new_v4(),
+                "please use $demo".to_string(),
+                Vec::new(),
+            )
+            .await
+            .expect("turn");
+
+        let request_text = serde_json::to_string(&requests.lock().await[0]).expect("request json");
+        assert!(!request_text.contains("<skill>"));
+        assert!(!request_text.contains("Use the demo flow."));
     }
 
     #[tokio::test]
