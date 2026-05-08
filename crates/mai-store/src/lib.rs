@@ -878,8 +878,12 @@ impl ConfigStore {
             .collect()
     }
 
+    fn artifacts_dir(&self) -> PathBuf {
+        self.path.parent().unwrap_or(Path::new(".")).join("artifacts")
+    }
+
     pub fn save_artifact(&self, info: &ArtifactInfo) -> Result<()> {
-        let dir = self.path.join("artifacts");
+        let dir = self.artifacts_dir();
         std::fs::create_dir_all(&dir)?;
         let file = dir.join(format!("{}.json", info.id));
         let data = serde_json::to_string(info)?;
@@ -888,7 +892,7 @@ impl ConfigStore {
     }
 
     pub fn load_artifacts(&self, task_id: &TaskId) -> Result<Vec<ArtifactInfo>> {
-        let dir = self.path.join("artifacts");
+        let dir = self.artifacts_dir();
         if !dir.exists() {
             return Ok(Vec::new());
         }
@@ -910,7 +914,7 @@ impl ConfigStore {
     }
 
     pub fn load_all_artifacts(&self) -> Result<Vec<ArtifactInfo>> {
-        let dir = self.path.join("artifacts");
+        let dir = self.artifacts_dir();
         if !dir.exists() {
             return Ok(Vec::new());
         }
@@ -1989,8 +1993,8 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         ServiceEventKind::TaskCreated { .. }
         | ServiceEventKind::TaskUpdated { .. }
         | ServiceEventKind::TaskDeleted { .. }
-        | ServiceEventKind::PlanUpdated { .. }
-        | ServiceEventKind::ArtifactCreated { .. } => None,
+        | ServiceEventKind::PlanUpdated { .. } => None,
+        ServiceEventKind::ArtifactCreated { artifact } => Some(artifact.agent_id),
         ServiceEventKind::Error { agent_id, .. } => *agent_id,
     }
 }

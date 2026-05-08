@@ -1247,9 +1247,11 @@ p {
 
 /* ─── Artifact Card ─── */
 .artifact-card {
-  border: 1px solid #d0e0f0;
-  border-radius: 8px;
+  border: 1px solid #b6d9f0;
+  border-radius: 10px;
   overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+  max-width: 380px;
 }
 
 .artifact-download {
@@ -1257,30 +1259,36 @@ p {
   align-items: center;
   gap: 10px;
   padding: 10px 14px;
-  background: #f0f6ff;
-  color: #1f6feb;
+  background: linear-gradient(135deg, #eef6ff 0%, #f0faff 100%);
+  color: #1a6dd4;
   text-decoration: none;
-  transition: background 0.15s;
+  transition: background 0.15s, box-shadow 0.15s;
+  cursor: pointer;
 }
 
 .artifact-download:hover {
-  background: #ddeaff;
+  background: linear-gradient(135deg, #ddeeff 0%, #dce8f8 100%);
+  box-shadow: 0 2px 8px rgba(26, 109, 212, 0.15);
 }
 
 .artifact-icon {
-  font-size: 16px;
-  font-weight: 700;
+  flex-shrink: 0;
+  opacity: 0.8;
 }
 
 .artifact-name {
   font-weight: 600;
   font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .artifact-size {
   margin-left: auto;
   font-size: 11px;
   color: #66758a;
+  flex-shrink: 0;
 }
 
 /* ─── Question Bar ─── */

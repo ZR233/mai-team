@@ -1,3 +1,4 @@
 /target
 crates/mai-server/web/dist
 crates/mai-server/web/node_modules
+/artifacts

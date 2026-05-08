@@ -141,9 +141,17 @@ const modelEditor = reactive({
 const timelineItems = computed(() => buildAgentTimeline(props.detail, props.events))
 const pendingUserInput = computed(() => {
   if (!props.inputEnabled) return null
-  return timelineItems.value.find(
+  const items = timelineItems.value
+  const input = items.find(
     (item) => item.type === 'user_input' && !answeredInputKeys.has(item.key)
-  ) || null
+  )
+  if (!input) return null
+  // If there's a user message after this input, the question was already answered
+  const inputIdx = items.indexOf(input)
+  const answered = items.some(
+    (item, idx) => idx > inputIdx && item.type === 'message' && item.role === 'user'
+  )
+  return answered ? null : input
 })
 const editorProvider = computed(() => props.providers.find((provider) => provider.id === modelEditor.provider_id))
 const editorModels = computed(() => editorProvider.value?.models || [])

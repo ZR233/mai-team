@@ -41,8 +41,8 @@
           <p>{{ item.message }}</p>
         </div>
         <div v-else-if="item.type === 'artifact'" class="artifact-card">
-          <a :href="`/artifacts/${item.artifact.id}/download`" download class="artifact-download">
-            <span class="artifact-icon">&#8595;</span>
+          <a :href="`/artifacts/${item.artifact.id}/download`" download class="artifact-download" :title="`Download ${item.artifact.name}`">
+            <svg class="artifact-icon" viewBox="0 0 16 16" width="18" height="18" fill="currentColor"><path d="M8 1a.75.75 0 0 1 .75.75v6.69l2.22-2.22a.75.75 0 1 1 1.06 1.06l-3.5 3.5a.75.75 0 0 1-1.06 0l-3.5-3.5a.75.75 0 0 1 1.06-1.06l2.22 2.22V1.75A.75.75 0 0 1 8 1Z"/><path d="M2.5 10.75a.75.75 0 0 1 1.5 0v1.75c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.75a.75.75 0 0 1 1.5 0v1.75A1.75 1.75 0 0 1 11.75 14.5h-7.5A1.75 1.75 0 0 1 2.5 12.75v-1.75Z"/></svg>
             <span class="artifact-name">{{ item.artifact.name }}</span>
             <span class="artifact-size">{{ formatBytes(item.artifact.size_bytes) }}</span>
           </a>
