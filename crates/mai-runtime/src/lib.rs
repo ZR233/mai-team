@@ -122,6 +122,7 @@ struct AgentRecord {
     system_prompt: Option<String>,
     turn_lock: Mutex<()>,
     cancel_requested: AtomicBool,
+    pending_inputs: Mutex<VecDeque<QueuedAgentInput>>,
 }
 
 #[derive(Clone)]
@@ -131,6 +132,12 @@ struct AgentSessionRecord {
     history: Vec<ModelInputItem>,
     last_context_tokens: Option<u64>,
     last_turn_response: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedAgentInput {
+    session_id: Option<SessionId>,
+    message: String,
 }
 
 #[derive(Debug)]
@@ -194,6 +201,7 @@ impl AgentRuntime {
                 system_prompt: persisted.system_prompt,
                 turn_lock: Mutex::new(()),
                 cancel_requested: AtomicBool::new(false),
+                pending_inputs: Mutex::new(VecDeque::new()),
             });
             if changed {
                 store
@@ -724,6 +732,7 @@ impl AgentRuntime {
             system_prompt,
             turn_lock: Mutex::new(()),
             cancel_requested: AtomicBool::new(false),
+            pending_inputs: Mutex::new(VecDeque::new()),
         });
 
         self.agents.write().await.insert(id, Arc::clone(&agent));
@@ -1056,6 +1065,58 @@ impl AgentRuntime {
         Ok(())
     }
 
+    async fn close_agent(&self, agent_id: AgentId) -> Result<AgentStatus> {
+        let agent = self.agent(agent_id).await?;
+        agent.cancel_requested.store(true, Ordering::SeqCst);
+        let previous_status = agent.summary.read().await.status.clone();
+        if let Some(manager) = agent.mcp.write().await.take() {
+            manager.shutdown().await;
+        }
+        let in_memory_container_id = agent
+            .container
+            .write()
+            .await
+            .take()
+            .map(|container| container.id);
+        let persisted_container_id = agent.summary.read().await.container_id.clone();
+        let preferred_container_id = in_memory_container_id.or(persisted_container_id);
+        let _ = self
+            .docker
+            .delete_agent_containers(&agent_id.to_string(), preferred_container_id.as_deref())
+            .await?;
+        {
+            let mut summary = agent.summary.write().await;
+            summary.status = AgentStatus::Deleted;
+            summary.container_id = None;
+            summary.current_turn = None;
+            summary.updated_at = now();
+        }
+        self.persist_agent(&agent).await?;
+        self.publish(ServiceEventKind::AgentStatusChanged {
+            agent_id,
+            status: AgentStatus::Deleted,
+        })
+        .await;
+        Ok(previous_status)
+    }
+
+    async fn resume_agent(&self, agent_id: AgentId) -> Result<AgentSummary> {
+        let agent = self.agent(agent_id).await?;
+        {
+            let mut summary = agent.summary.write().await;
+            if summary.status == AgentStatus::Deleted {
+                summary.status = AgentStatus::Idle;
+                summary.last_error = None;
+                summary.updated_at = now();
+            }
+            summary.container_id = None;
+        }
+        self.persist_agent(&agent).await?;
+        self.ensure_agent_container(&agent, AgentStatus::Idle)
+            .await?;
+        Ok(agent.summary.read().await.clone())
+    }
+
     pub async fn cancel_task(&self, task_id: TaskId) -> Result<()> {
         let task = self.task(task_id).await?;
         let agents = self.task_agents(task_id).await;
@@ -1094,7 +1155,9 @@ impl AgentRuntime {
         agent.cancel_requested.store(true, Ordering::SeqCst);
         self.set_status(&agent, AgentStatus::DeletingContainer, None)
             .await?;
-        *agent.mcp.write().await = None;
+        if let Some(manager) = agent.mcp.write().await.take() {
+            manager.shutdown().await;
+        }
         let in_memory_container_id = agent
             .container
             .write()
@@ -1671,26 +1734,46 @@ impl AgentRuntime {
             }
             RoutedTool::SpawnAgent => {
                 let name = optional_string(&arguments, "name");
-                let message = optional_string(&arguments, "message");
-                let role = optional_string(&arguments, "role")
+                let message = collab_message_from_args(&arguments)?;
+                let legacy_role = optional_string(&arguments, "role")
                     .as_deref()
                     .map(parse_agent_role)
-                    .transpose()?
+                    .transpose()?;
+                let role = legacy_role
+                    .or_else(|| {
+                        optional_string(&arguments, "agent_type")
+                            .and_then(|value| agent_type_role(&value))
+                    })
                     .unwrap_or_default();
-                let child_model = self.resolve_role_agent_model(role).await?;
                 let parent = self.agent(agent_id).await?;
                 let parent_status = parent.summary.read().await.status.clone();
                 let parent_summary = parent.summary.read().await.clone();
                 let parent_container_id =
                     self.ensure_agent_container(&parent, parent_status).await?;
                 let parent_docker_image = parent_summary.docker_image.clone();
+                let (provider_id, model, reasoning_effort) = if legacy_role.is_some() {
+                    let child_model = self.resolve_role_agent_model(role).await?;
+                    (
+                        child_model.preference.provider_id,
+                        child_model.preference.model,
+                        child_model.preference.reasoning_effort,
+                    )
+                } else {
+                    (
+                        parent_summary.provider_id.clone(),
+                        optional_string(&arguments, "model")
+                            .unwrap_or_else(|| parent_summary.model.clone()),
+                        optional_string(&arguments, "reasoning_effort")
+                            .or_else(|| parent_summary.reasoning_effort.clone()),
+                    )
+                };
                 let created = self
                     .create_agent_with_container_source(
                         CreateAgentRequest {
                             name,
-                            provider_id: Some(child_model.preference.provider_id),
-                            model: Some(child_model.preference.model),
-                            reasoning_effort: child_model.preference.reasoning_effort,
+                            provider_id: Some(provider_id),
+                            model: Some(model),
+                            reasoning_effort,
                             docker_image: Some(parent_docker_image.clone()),
                             parent_id: Some(agent_id),
                             system_prompt: Some(task_role_system_prompt(role).to_string()),
@@ -1703,6 +1786,13 @@ impl AgentRuntime {
                         Some(role),
                     )
                     .await?;
+                if arguments
+                    .get("fork_context")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    self.fork_agent_context(agent_id, created.id).await?;
+                }
                 let turn_id = if let Some(message) = message {
                     let session_id = self.resolve_session_id(created.id, None).await?;
                     let turn_id = self.prepare_turn(created.id).await?;
@@ -1717,6 +1807,27 @@ impl AgentRuntime {
                     ends_turn: false,
                 })
             }
+            RoutedTool::SendInput => {
+                let target =
+                    parse_agent_id(&required_any_string(&arguments, &["target", "agent_id"])?)?;
+                let message = collab_message_from_args(&arguments)?.ok_or_else(|| {
+                    RuntimeError::InvalidInput(
+                        "send_input requires message or text items".to_string(),
+                    )
+                })?;
+                let interrupt = arguments
+                    .get("interrupt")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let output = self
+                    .send_input_to_agent(target, None, message, interrupt)
+                    .await?;
+                Ok(ToolExecution {
+                    success: true,
+                    output: output.to_string(),
+                    ends_turn: false,
+                })
+            }
             RoutedTool::SendMessage => {
                 let target = parse_agent_id(&required_string(&arguments, "agent_id")?)?;
                 let session_id = optional_string(&arguments, "session_id")
@@ -1724,25 +1835,30 @@ impl AgentRuntime {
                     .map(parse_session_id)
                     .transpose()?;
                 let message = required_string(&arguments, "message")?;
-                let session_id = self.resolve_session_id(target, session_id).await?;
-                let turn_id = self.prepare_turn(target).await?;
-                self.spawn_turn(target, session_id, turn_id, message, Vec::new());
+                let output = self
+                    .send_input_to_agent(target, session_id, message, false)
+                    .await?;
                 Ok(ToolExecution {
                     success: true,
-                    output: json!({ "turn_id": turn_id }).to_string(),
+                    output: output.to_string(),
                     ends_turn: false,
                 })
             }
             RoutedTool::WaitAgent => {
-                let target = parse_agent_id(&required_string(&arguments, "agent_id")?)?;
-                let timeout_secs = arguments
-                    .get("timeout_secs")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(300);
-                let output = self
-                    .wait_agent_output(target, Duration::from_secs(timeout_secs))
-                    .await?;
-                self.cleanup_finished_explorer_agent(target).await?;
+                let legacy_single_target =
+                    arguments.get("targets").is_none() && arguments.get("agent_id").is_some();
+                let targets = wait_targets(&arguments)?;
+                let timeout = wait_timeout(&arguments);
+                if legacy_single_target && targets.len() == 1 {
+                    let output = self.wait_agent_output(targets[0], timeout).await?;
+                    self.cleanup_finished_explorer_agent(targets[0]).await?;
+                    return Ok(ToolExecution {
+                        success: true,
+                        output: serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string()),
+                        ends_turn: false,
+                    });
+                }
+                let output = self.wait_agents_output(targets, timeout).await?;
                 Ok(ToolExecution {
                     success: true,
                     output: serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string()),
@@ -1756,11 +1872,69 @@ impl AgentRuntime {
                 ends_turn: false,
             }),
             RoutedTool::CloseAgent => {
-                let target = parse_agent_id(&required_string(&arguments, "agent_id")?)?;
-                self.delete_agent(target).await?;
+                let target =
+                    parse_agent_id(&required_any_string(&arguments, &["target", "agent_id"])?)?;
+                let previous = self.close_agent(target).await?;
                 Ok(ToolExecution {
                     success: true,
-                    output: json!({ "closed": target }).to_string(),
+                    output: json!({ "closed": target, "previous_status": previous }).to_string(),
+                    ends_turn: false,
+                })
+            }
+            RoutedTool::ResumeAgent => {
+                let target = parse_agent_id(&required_any_string(
+                    &arguments,
+                    &["id", "agent_id", "target"],
+                )?)?;
+                let resumed = self.resume_agent(target).await?;
+                Ok(ToolExecution {
+                    success: true,
+                    output: json!({ "agent": resumed }).to_string(),
+                    ends_turn: false,
+                })
+            }
+            RoutedTool::ListMcpResources => {
+                let manager = agent.mcp.read().await.clone().ok_or_else(|| {
+                    RuntimeError::InvalidInput("MCP manager not initialized".to_string())
+                })?;
+                let output = manager
+                    .list_resources(
+                        optional_string(&arguments, "server").as_deref(),
+                        optional_string(&arguments, "cursor"),
+                    )
+                    .await?;
+                Ok(ToolExecution {
+                    success: true,
+                    output: output.to_string(),
+                    ends_turn: false,
+                })
+            }
+            RoutedTool::ListMcpResourceTemplates => {
+                let manager = agent.mcp.read().await.clone().ok_or_else(|| {
+                    RuntimeError::InvalidInput("MCP manager not initialized".to_string())
+                })?;
+                let output = manager
+                    .list_resource_templates(
+                        optional_string(&arguments, "server").as_deref(),
+                        optional_string(&arguments, "cursor"),
+                    )
+                    .await?;
+                Ok(ToolExecution {
+                    success: true,
+                    output: output.to_string(),
+                    ends_turn: false,
+                })
+            }
+            RoutedTool::ReadMcpResource => {
+                let manager = agent.mcp.read().await.clone().ok_or_else(|| {
+                    RuntimeError::InvalidInput("MCP manager not initialized".to_string())
+                })?;
+                let server = required_string(&arguments, "server")?;
+                let uri = required_string(&arguments, "uri")?;
+                let output = manager.read_resource(&server, &uri).await?;
+                Ok(ToolExecution {
+                    success: true,
+                    output: output.to_string(),
                     ends_turn: false,
                 })
             }
@@ -2253,6 +2427,144 @@ impl AgentRuntime {
         }))
     }
 
+    async fn wait_agents_output(
+        &self,
+        agent_ids: Vec<AgentId>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut completed = Vec::new();
+            let mut pending = Vec::new();
+            for agent_id in &agent_ids {
+                let summary = self.agent(*agent_id).await?.summary.read().await.clone();
+                if summary.current_turn.is_none()
+                    || matches!(
+                        summary.status,
+                        AgentStatus::Completed
+                            | AgentStatus::Failed
+                            | AgentStatus::Cancelled
+                            | AgentStatus::Deleted
+                            | AgentStatus::Idle
+                    )
+                {
+                    completed.push(*agent_id);
+                } else {
+                    pending.push(*agent_id);
+                }
+            }
+            if !completed.is_empty() || pending.is_empty() || Instant::now() >= deadline {
+                let mut completed_outputs = Vec::new();
+                for agent_id in completed {
+                    completed_outputs.push(
+                        self.wait_agent_output(agent_id, Duration::from_secs(0))
+                            .await?,
+                    );
+                    self.cleanup_finished_explorer_agent(agent_id).await?;
+                }
+                return Ok(json!({
+                    "completed": completed_outputs,
+                    "pending": pending,
+                    "timed_out": !pending.is_empty(),
+                }));
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn send_input_to_agent(
+        self: &Arc<Self>,
+        target: AgentId,
+        session_id: Option<SessionId>,
+        message: String,
+        interrupt: bool,
+    ) -> Result<Value> {
+        let agent = self.agent(target).await?;
+        if interrupt {
+            agent.cancel_requested.store(true, Ordering::SeqCst);
+            {
+                let mut summary = agent.summary.write().await;
+                summary.current_turn = None;
+                summary.status = AgentStatus::Cancelled;
+                summary.updated_at = now();
+            }
+            self.persist_agent(&agent).await?;
+        }
+        match self.prepare_turn(target).await {
+            Ok(turn_id) => {
+                let session_id = self.resolve_session_id(target, session_id).await?;
+                self.spawn_turn(target, session_id, turn_id, message, Vec::new());
+                Ok(json!({ "turn_id": turn_id, "queued": false }))
+            }
+            Err(RuntimeError::AgentBusy(_)) if !interrupt => {
+                agent
+                    .pending_inputs
+                    .lock()
+                    .await
+                    .push_back(QueuedAgentInput {
+                        session_id,
+                        message,
+                    });
+                Ok(json!({ "queued": true }))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn start_next_queued_input(self: &Arc<Self>, agent_id: AgentId) -> Result<()> {
+        let agent = self.agent(agent_id).await?;
+        let Some(input) = agent.pending_inputs.lock().await.pop_front() else {
+            return Ok(());
+        };
+        let session_id = self.resolve_session_id(agent_id, input.session_id).await?;
+        let turn_id = match self.prepare_turn(agent_id).await {
+            Ok(turn_id) => turn_id,
+            Err(RuntimeError::AgentBusy(_)) => {
+                agent.pending_inputs.lock().await.push_front(input);
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
+        self.spawn_turn(agent_id, session_id, turn_id, input.message, Vec::new());
+        Ok(())
+    }
+
+    async fn fork_agent_context(&self, parent_id: AgentId, child_id: AgentId) -> Result<()> {
+        let parent = self.agent(parent_id).await?;
+        let child = self.agent(child_id).await?;
+        let parent_session = {
+            let sessions = parent.sessions.lock().await;
+            selected_session(&sessions, None).cloned()
+        }
+        .ok_or(RuntimeError::AgentNotFound(parent_id))?;
+        let child_session_id = self.resolve_session_id(child_id, None).await?;
+        {
+            let mut child_sessions = child.sessions.lock().await;
+            let child_session = child_sessions
+                .iter_mut()
+                .find(|session| session.summary.id == child_session_id)
+                .ok_or(RuntimeError::SessionNotFound {
+                    agent_id: child_id,
+                    session_id: child_session_id,
+                })?;
+            child_session.messages = parent_session.messages.clone();
+            child_session.history = parent_session.history.clone();
+            child_session.summary.message_count = child_session.messages.len();
+            child_session.summary.updated_at = now();
+            let summary = child_session.summary.clone();
+            self.store.save_agent_session(child_id, &summary).await?;
+        }
+        self.store
+            .replace_agent_history(child_id, child_session_id, &parent_session.history)
+            .await?;
+        for (position, message) in parent_session.messages.iter().enumerate() {
+            self.store
+                .append_agent_message(child_id, child_session_id, position, message)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn cleanup_finished_explorer_agent(&self, agent_id: AgentId) -> Result<()> {
         let agent = self.agent(agent_id).await?;
         let summary = agent.summary.read().await.clone();
@@ -2325,7 +2637,7 @@ impl AgentRuntime {
     }
 
     async fn finish_turn(
-        &self,
+        self: &Arc<Self>,
         agent: &Arc<AgentRecord>,
         agent_id: AgentId,
         session_id: SessionId,
@@ -2359,6 +2671,9 @@ impl AgentRuntime {
             status: agent_status,
         })
         .await;
+        if let Err(err) = self.start_next_queued_input(agent_id).await {
+            tracing::warn!("failed to start queued agent input: {err}");
+        }
         Ok(())
     }
 
@@ -2868,12 +3183,61 @@ impl AgentRuntime {
         *container_guard = Some(container.clone());
         drop(container_guard);
 
-        let mcp = McpAgentManager::start(
-            self.docker.clone(),
-            container.id,
-            self.store.list_mcp_servers().await?,
-        )
-        .await;
+        let mcp_configs = self.store.list_mcp_servers().await?;
+        for server in mcp_configs
+            .iter()
+            .filter_map(|(server, config)| config.enabled.then_some(server))
+        {
+            self.publish(ServiceEventKind::McpServerStatusChanged {
+                agent_id,
+                server: server.clone(),
+                status: mai_protocol::McpStartupStatus::Starting,
+                error: None,
+            })
+            .await;
+        }
+        let mcp = McpAgentManager::start(self.docker.clone(), container.id, mcp_configs).await;
+        for status in mcp.statuses().await {
+            self.publish(ServiceEventKind::McpServerStatusChanged {
+                agent_id,
+                server: status.server,
+                status: status.status,
+                error: status.error,
+            })
+            .await;
+        }
+        let required_failures = mcp.required_failures().await;
+        if !required_failures.is_empty() {
+            let message = required_failures
+                .iter()
+                .map(|status| {
+                    format!(
+                        "{}: {}",
+                        status.server,
+                        status
+                            .error
+                            .as_deref()
+                            .unwrap_or("required MCP server failed")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            mcp.shutdown().await;
+            *agent.container.write().await = None;
+            {
+                let mut summary = agent.summary.write().await;
+                summary.container_id = None;
+            }
+            let _ = self
+                .docker
+                .delete_agent_containers(&agent_id.to_string(), Some(&container_id))
+                .await;
+            self.set_status(agent, AgentStatus::Failed, Some(message.clone()))
+                .await?;
+            return Err(RuntimeError::InvalidInput(format!(
+                "required MCP server startup failed: {message}"
+            )));
+        }
         *agent.mcp.write().await = Some(Arc::new(mcp));
         self.set_status(agent, ready_status, None).await?;
         Ok(container_id)
@@ -2975,11 +3339,90 @@ fn required_string(arguments: &Value, field: &str) -> Result<String> {
         .ok_or_else(|| RuntimeError::InvalidInput(format!("missing string field `{field}`")))
 }
 
+fn required_any_string(arguments: &Value, fields: &[&str]) -> Result<String> {
+    for field in fields {
+        if let Some(value) = optional_string(arguments, field) {
+            return Ok(value);
+        }
+    }
+    Err(RuntimeError::InvalidInput(format!(
+        "missing string field `{}`",
+        fields.join("` or `")
+    )))
+}
+
 fn optional_string(arguments: &Value, field: &str) -> Option<String> {
     arguments
         .get(field)
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn collab_message_from_args(arguments: &Value) -> Result<Option<String>> {
+    if let Some(message) = optional_string(arguments, "message") {
+        return Ok(Some(message));
+    }
+    let Some(items) = arguments.get("items").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let mut parts = Vec::new();
+    for item in items {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("text");
+        if item_type != "text" {
+            return Err(RuntimeError::InvalidInput(format!(
+                "unsupported collab item type `{item_type}`; only text is supported"
+            )));
+        }
+        let text = item.get("text").and_then(Value::as_str).ok_or_else(|| {
+            RuntimeError::InvalidInput("text collab items require `text`".to_string())
+        })?;
+        parts.push(text.to_string());
+    }
+    Ok((!parts.is_empty()).then(|| parts.join("\n")))
+}
+
+fn agent_type_role(value: &str) -> Option<AgentRole> {
+    match value.trim().to_lowercase().as_str() {
+        "explorer" => Some(AgentRole::Explorer),
+        "worker" | "default" | "" => Some(AgentRole::Executor),
+        _ => None,
+    }
+}
+
+fn wait_targets(arguments: &Value) -> Result<Vec<AgentId>> {
+    if let Some(targets) = arguments.get("targets").and_then(Value::as_array) {
+        if targets.is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "targets must be non-empty".to_string(),
+            ));
+        }
+        return targets
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidInput("targets must contain strings".to_string())
+                    })
+                    .and_then(parse_agent_id)
+            })
+            .collect();
+    }
+    Ok(vec![parse_agent_id(&required_string(
+        arguments, "agent_id",
+    )?)?])
+}
+
+fn wait_timeout(arguments: &Value) -> Duration {
+    if let Some(ms) = arguments.get("timeout_ms").and_then(Value::as_u64) {
+        return Duration::from_millis(ms);
+    }
+    Duration::from_secs(
+        arguments
+            .get("timeout_secs")
+            .and_then(Value::as_u64)
+            .unwrap_or(300),
+    )
 }
 
 fn parse_agent_role(value: &str) -> Result<AgentRole> {
@@ -3507,6 +3950,7 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         | ServiceEventKind::ContextCompacted { agent_id, .. }
         | ServiceEventKind::AgentMessage { agent_id, .. }
         | ServiceEventKind::TodoListUpdated { agent_id, .. }
+        | ServiceEventKind::McpServerStatusChanged { agent_id, .. }
         | ServiceEventKind::UserInputRequested { agent_id, .. } => Some(*agent_id),
         ServiceEventKind::TaskCreated { .. }
         | ServiceEventKind::TaskUpdated { .. }
@@ -3523,7 +3967,8 @@ General rules:
 - You execute all local work inside your own Docker container; do not assume access to a host workspace.
 - Use `container_exec` for shell commands inside your container.
 - Use `container_cp_upload` and `container_cp_download` for file transfer.
-- Use `spawn_agent`, `send_message`, `wait_agent`, `list_agents`, and `close_agent` for multi-agent collaboration.
+- Use `spawn_agent`, `send_input`, `wait_agent`, `list_agents`, `close_agent`, and `resume_agent` for multi-agent collaboration.
+- Use `list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource` to inspect MCP resources when available.
 - Keep each child agent task concrete and bounded. Multiple agents can run in parallel.
 - Child agent model selection is controlled by Research Agent settings, falling back to the service default model when unset.
 - Use available skills only when explicitly requested by the user or when clearly relevant.
@@ -5080,9 +5525,10 @@ esac
 
         let requests = requests.lock().await.clone();
         assert_eq!(requests.len(), 3);
+        let expected_tool_count = build_tool_definitions(&[]).len();
         assert_eq!(
             requests[0]["tools"].as_array().expect("first tools").len(),
-            13
+            expected_tool_count
         );
         assert!(
             requests[1].get("tools").is_none(),
@@ -5090,7 +5536,7 @@ esac
         );
         assert_eq!(
             requests[2]["tools"].as_array().expect("second tools").len(),
-            13
+            expected_tool_count
         );
         let compact_input = requests[1]["input"].as_array().expect("compact input");
         assert!(matches!(
@@ -5691,9 +6137,9 @@ esac
             .into_iter()
             .find(|agent| agent.parent_id == Some(parent_id))
             .expect("child");
-        assert_eq!(child.provider_id, "alt");
-        assert_eq!(child.model, "alt-default");
-        assert_eq!(child.reasoning_effort, Some("medium".to_string()));
+        assert_eq!(child.provider_id, "openai");
+        assert_eq!(child.model, "gpt-5.4");
+        assert_eq!(child.reasoning_effort, Some("high".to_string()));
         assert_eq!(
             child.docker_image,
             "ghcr.io/rcore-os/tgoskits-container:latest"
@@ -5833,6 +6279,156 @@ esac
                 .unwrap_or_default()
                 .contains("Reviewer")
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_inherits_parent_and_accepts_codex_overrides() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider(), alt_test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let parent_id = Uuid::new_v4();
+        let timestamp = now();
+        store
+            .save_agent(
+                &AgentSummary {
+                    id: parent_id,
+                    parent_id: None,
+                    task_id: None,
+                    role: None,
+                    name: "parent".to_string(),
+                    status: AgentStatus::Idle,
+                    container_id: None,
+                    docker_image: "ubuntu:latest".to_string(),
+                    provider_id: "openai".to_string(),
+                    provider_name: "OpenAI".to_string(),
+                    model: "gpt-5.5".to_string(),
+                    reasoning_effort: Some("medium".to_string()),
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    current_turn: None,
+                    last_error: None,
+                    token_usage: TokenUsage::default(),
+                },
+                None,
+            )
+            .await
+            .expect("save parent");
+        save_test_session(&store, parent_id, Uuid::new_v4()).await;
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let parent = runtime.agent(parent_id).await.expect("parent");
+        *parent.container.write().await = Some(ContainerHandle {
+            id: "parent-container".to_string(),
+            name: "parent-container".to_string(),
+            image: "unused".to_string(),
+        });
+
+        let result = runtime
+            .execute_tool_for_test(
+                parent_id,
+                "spawn_agent",
+                json!({
+                    "agent_type": "worker",
+                    "model": "gpt-5.4",
+                    "reasoning_effort": "high",
+                    "message": "start"
+                }),
+            )
+            .await
+            .expect("spawn");
+        assert!(result.success);
+        let child = runtime
+            .list_agents()
+            .await
+            .into_iter()
+            .find(|agent| agent.parent_id == Some(parent_id))
+            .expect("child");
+        assert_eq!(child.provider_id, "openai");
+        assert_eq!(child.model, "gpt-5.4");
+        assert_eq!(child.reasoning_effort, Some("high".to_string()));
+        assert_eq!(child.role, Some(AgentRole::Executor));
+    }
+
+    #[tokio::test]
+    async fn wait_agent_accepts_targets_and_send_input_queues_busy_target() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let parent_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let child_session_id = Uuid::new_v4();
+        let timestamp = now();
+        store
+            .save_agent(&test_agent_summary_at(parent_id, None, timestamp), None)
+            .await
+            .expect("save parent");
+        save_test_session(&store, parent_id, Uuid::new_v4()).await;
+        let mut child = test_agent_summary_at(child_id, Some(parent_id), timestamp);
+        child.status = AgentStatus::RunningTurn;
+        child.current_turn = Some(Uuid::new_v4());
+        store.save_agent(&child, None).await.expect("save child");
+        store
+            .save_agent_session(
+                child_id,
+                &AgentSessionSummary {
+                    id: child_session_id,
+                    title: "Task".to_string(),
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    message_count: 0,
+                },
+            )
+            .await
+            .expect("save child session");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let child_record = runtime.agent(child_id).await.expect("child");
+        {
+            let mut summary = child_record.summary.write().await;
+            summary.status = AgentStatus::RunningTurn;
+            summary.current_turn = Some(Uuid::new_v4());
+        }
+
+        let queued = runtime
+            .execute_tool_for_test(
+                parent_id,
+                "send_input",
+                json!({
+                    "target": child_id.to_string(),
+                    "items": [{ "type": "text", "text": "queued hello" }]
+                }),
+            )
+            .await
+            .expect("send input");
+        assert!(queued.success);
+        let value: Value = serde_json::from_str(&queued.output).expect("json");
+        assert_eq!(value["queued"].as_bool(), Some(true));
+
+        let waited = runtime
+            .execute_tool_for_test(
+                parent_id,
+                "wait_agent",
+                json!({
+                    "targets": [child_id.to_string()],
+                    "timeout_ms": 1
+                }),
+            )
+            .await
+            .expect("wait");
+        let value: Value = serde_json::from_str(&waited.output).expect("json");
+        assert!(value["completed"].as_array().expect("completed").is_empty());
+        assert_eq!(value["pending"].as_array().expect("pending").len(), 1);
+        assert_eq!(value["timed_out"].as_bool(), Some(true));
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ use uuid::Uuid;
 const SETTING_AGENT_CONFIG: &str = "agent_config";
 const SETTING_SKILLS_CONFIG: &str = "skills_config";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-const SCHEMA_VERSION: &str = "7";
+const SCHEMA_VERSION: &str = "8";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const DEEPSEEK_V4_CONTEXT_TOKENS: u64 = 1_000_000;
 const DEEPSEEK_V4_OUTPUT_TOKENS: u64 = 384_000;
@@ -136,22 +136,9 @@ struct ModelToml {
 struct McpServerRecord {
     #[key]
     name: String,
-    command: String,
-    args_json: String,
-    cwd: Option<String>,
+    config_json: String,
     enabled: bool,
     sort_order: i64,
-}
-
-#[derive(Debug, Clone, toasty::Model)]
-#[table = "mcp_server_env"]
-struct McpServerEnvRecord {
-    #[key]
-    id: String,
-    #[index]
-    server_name: String,
-    key: String,
-    value: String,
 }
 
 #[derive(Debug, Clone, toasty::Model)]
@@ -632,17 +619,9 @@ impl ConfigStore {
 
         let mut servers = BTreeMap::new();
         for row in rows {
-            let args = serde_json::from_str::<Vec<String>>(&row.args_json).unwrap_or_default();
-            servers.insert(
-                row.name.clone(),
-                McpServerConfig {
-                    command: row.command,
-                    args,
-                    env: self.load_mcp_env(&row.name).await?,
-                    cwd: row.cwd,
-                    enabled: row.enabled,
-                },
-            );
+            let mut config = serde_json::from_str::<McpServerConfig>(&row.config_json)?;
+            config.enabled = row.enabled;
+            servers.insert(row.name.clone(), config);
         }
         Ok(servers)
     }
@@ -653,10 +632,6 @@ impl ConfigStore {
     ) -> Result<()> {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
-        Query::<List<McpServerEnvRecord>>::all()
-            .delete()
-            .exec(&mut tx)
-            .await?;
         Query::<List<McpServerRecord>>::all()
             .delete()
             .exec(&mut tx)
@@ -665,25 +640,12 @@ impl ConfigStore {
         for (index, (name, config)) in servers.iter().enumerate() {
             toasty::create!(McpServerRecord {
                 name: name.clone(),
-                command: config.command.clone(),
-                args_json: serde_json::to_string(&config.args)?,
-                cwd: config.cwd.clone(),
+                config_json: serde_json::to_string(config)?,
                 enabled: config.enabled,
                 sort_order: index as i64,
             })
             .exec(&mut tx)
             .await?;
-
-            for (key, value) in &config.env {
-                toasty::create!(McpServerEnvRecord {
-                    id: child_id(name, key),
-                    server_name: name.clone(),
-                    key: key.clone(),
-                    value: value.clone(),
-                })
-                .exec(&mut tx)
-                .await?;
-            }
         }
 
         tx.commit().await?;
@@ -1206,19 +1168,6 @@ impl ConfigStore {
         })
     }
 
-    async fn load_mcp_env(&self, server_name: &str) -> Result<BTreeMap<String, String>> {
-        let mut db = self.db.clone();
-        let mut env = Query::<List<McpServerEnvRecord>>::filter(
-            McpServerEnvRecord::fields()
-                .server_name()
-                .eq(server_name.to_string()),
-        )
-        .exec(&mut db)
-        .await?;
-        env.sort_by(|left, right| left.key.cmp(&right.key));
-        Ok(env.into_iter().map(|row| (row.key, row.value)).collect())
-    }
-
     async fn load_agent_sessions(&self, agent_id: AgentId) -> Result<Vec<PersistedAgentSession>> {
         let mut db = self.db.clone();
         let mut rows = Query::<List<AgentSessionRecord>>::filter(
@@ -1445,7 +1394,6 @@ async fn build_db(path: &Path) -> Result<Db> {
     let mut builder = Db::builder();
     builder.models(toasty::models!(
         McpServerRecord,
-        McpServerEnvRecord,
         SettingRecord,
         TaskRecordRow,
         TaskReviewRecord,
@@ -1937,10 +1885,6 @@ fn normalized_models(provider: &ProviderConfig) -> Vec<ModelConfig> {
     models
 }
 
-fn child_id(parent: &str, child: &str) -> String {
-    format!("{parent}\u{1f}{child}")
-}
-
 fn session_context_tokens_key(agent_id: AgentId, session_id: SessionId) -> String {
     format!("session_context_tokens:{agent_id}:{session_id}")
 }
@@ -2114,6 +2058,7 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         | ServiceEventKind::ContextCompacted { agent_id, .. }
         | ServiceEventKind::AgentMessage { agent_id, .. }
         | ServiceEventKind::TodoListUpdated { agent_id, .. }
+        | ServiceEventKind::McpServerStatusChanged { agent_id, .. }
         | ServiceEventKind::UserInputRequested { agent_id, .. } => Some(*agent_id),
         ServiceEventKind::TaskCreated { .. }
         | ServiceEventKind::TaskUpdated { .. }
@@ -2142,7 +2087,8 @@ fn event_session_id(event: &ServiceEvent) -> Option<SessionId> {
 mod tests {
     use super::*;
     use mai_protocol::{
-        AgentStatus, MessageRole, ModelContentItem, ModelToolCall, ServiceEventKind,
+        AgentStatus, McpServerTransport, MessageRole, ModelContentItem, ModelToolCall,
+        ServiceEventKind,
     };
     use serde_json::json;
     use tempfile::{TempDir, tempdir};
@@ -2880,11 +2826,8 @@ mod tests {
             .save_mcp_servers(&BTreeMap::from([(
                 "demo".to_string(),
                 McpServerConfig {
-                    command: "demo-mcp".to_string(),
-                    args: Vec::new(),
-                    env: BTreeMap::new(),
-                    cwd: None,
-                    enabled: true,
+                    command: Some("demo-mcp".to_string()),
+                    ..Default::default()
                 },
             )]))
             .await
@@ -2913,5 +2856,43 @@ mod tests {
                 .expect("servers")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_servers_round_trip_json_config() {
+        let (_dir, store) = store().await;
+        let servers = BTreeMap::from([
+            (
+                "stdio".to_string(),
+                McpServerConfig {
+                    command: Some("demo-mcp".to_string()),
+                    args: vec!["--stdio".to_string()],
+                    env: BTreeMap::from([("A".to_string(), "B".to_string())]),
+                    cwd: Some("/workspace".to_string()),
+                    enabled_tools: Some(vec!["echo".to_string()]),
+                    disabled_tools: vec!["danger".to_string()],
+                    startup_timeout_secs: Some(3),
+                    tool_timeout_secs: Some(7),
+                    ..Default::default()
+                },
+            ),
+            (
+                "http".to_string(),
+                McpServerConfig {
+                    transport: McpServerTransport::StreamableHttp,
+                    url: Some("https://example.com/mcp".to_string()),
+                    headers: BTreeMap::from([("X-Test".to_string(), "yes".to_string())]),
+                    bearer_token_env: Some("MCP_TOKEN".to_string()),
+                    enabled: false,
+                    required: true,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        store.save_mcp_servers(&servers).await.expect("save");
+        let loaded = store.list_mcp_servers().await.expect("load");
+
+        assert_eq!(loaded, servers);
     }
 }

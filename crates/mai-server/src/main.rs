@@ -13,10 +13,10 @@ use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentId, ApproveTaskPlanResponse, ArtifactInfo,
     CreateAgentRequest, CreateAgentResponse, CreateSessionResponse, CreateTaskRequest,
     CreateTaskResponse, ErrorResponse, FileUploadRequest, FileUploadResponse,
-    ProviderPresetsResponse, ProvidersConfigRequest, ProvidersResponse, RequestPlanRevisionRequest,
-    RequestPlanRevisionResponse, SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId,
-    SkillsConfigRequest, SkillsListResponse, TaskId, ToolTraceDetail, UpdateAgentRequest,
-    UpdateAgentResponse,
+    McpServersConfigRequest, ProviderPresetsResponse, ProvidersConfigRequest, ProvidersResponse,
+    RequestPlanRevisionRequest, RequestPlanRevisionResponse, SendMessageRequest,
+    SendMessageResponse, ServiceEvent, SessionId, SkillsConfigRequest, SkillsListResponse, TaskId,
+    ToolTraceDetail, UpdateAgentRequest, UpdateAgentResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
 use mai_store::ConfigStore;
@@ -163,6 +163,7 @@ async fn main() -> Result<()> {
         .route("/", get(index))
         .route("/health", get(health))
         .route("/providers", get(get_providers).put(save_providers))
+        .route("/mcp-servers", get(get_mcp_servers).put(save_mcp_servers))
         .route("/provider-presets", get(get_provider_presets))
         .route("/skills", get(list_skills))
         .route("/skills/config", axum::routing::put(save_skills_config))
@@ -268,6 +269,24 @@ async fn save_providers(
 ) -> std::result::Result<Json<ProvidersResponse>, ApiError> {
     state.store.save_providers(request).await?;
     Ok(Json(state.store.providers_response().await?))
+}
+
+async fn get_mcp_servers(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<McpServersConfigRequest>, ApiError> {
+    Ok(Json(McpServersConfigRequest {
+        servers: state.store.list_mcp_servers().await?,
+    }))
+}
+
+async fn save_mcp_servers(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<McpServersConfigRequest>,
+) -> std::result::Result<Json<McpServersConfigRequest>, ApiError> {
+    state.store.save_mcp_servers(&request.servers).await?;
+    Ok(Json(McpServersConfigRequest {
+        servers: state.store.list_mcp_servers().await?,
+    }))
 }
 
 async fn list_skills(
@@ -615,6 +634,9 @@ fn event_name(event: &ServiceEvent) -> &'static str {
         mai_protocol::ServiceEventKind::ToolCompleted { .. } => "tool_completed",
         mai_protocol::ServiceEventKind::ContextCompacted { .. } => "context_compacted",
         mai_protocol::ServiceEventKind::AgentMessage { .. } => "agent_message",
+        mai_protocol::ServiceEventKind::McpServerStatusChanged { .. } => {
+            "mcp_server_status_changed"
+        }
         mai_protocol::ServiceEventKind::Error { .. } => "error",
         mai_protocol::ServiceEventKind::TodoListUpdated { .. } => "todo_list_updated",
         mai_protocol::ServiceEventKind::PlanUpdated { .. } => "plan_updated",

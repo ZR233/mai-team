@@ -137,6 +137,34 @@
         </button>
       </div>
     </section>
+
+    <section class="mcp-settings">
+      <div class="stage-title compact">
+        <div>
+          <h2>MCP Servers</h2>
+          <p>Stdio servers run inside agent containers; Streamable HTTP connects from Mai.</p>
+        </div>
+        <div class="settings-actions-left">
+          <button class="ghost-button" type="button" :disabled="mcpServersState.loading" @click="$emit('reload-mcp')">Reload</button>
+          <button class="primary-button" type="button" :disabled="mcpServersState.loading" @click="$emit('open-mcp')">
+            Configure MCP
+          </button>
+        </div>
+      </div>
+
+      <div class="mcp-summary-grid">
+        <div class="settings-summary-item">
+          <span>Servers</span>
+          <strong>{{ mcpServerCount }}</strong>
+          <small>{{ mcpEnabledCount }} enabled</small>
+        </div>
+        <div class="settings-summary-item">
+          <span>Transports</span>
+          <strong>{{ mcpTransportLabel }}</strong>
+          <small>stdio and Streamable HTTP supported.</small>
+        </div>
+      </div>
+    </section>
   </section>
 </template>
 
@@ -179,10 +207,12 @@ const props = defineProps({
   loading: { type: Boolean, default: false },
   saving: { type: Boolean, default: false },
   skillsSaving: { type: Boolean, default: false },
-  skillsError: { type: String, default: '' }
+  skillsError: { type: String, default: '' },
+  mcpServersState: { type: Object, required: true },
+  mcpSaving: { type: Boolean, default: false }
 })
 
-const emit = defineEmits(['save', 'reload', 'open-providers', 'reload-skills', 'save-skills'])
+const emit = defineEmits(['save', 'reload', 'open-providers', 'reload-skills', 'save-skills', 'reload-mcp', 'open-mcp'])
 
 const error = ref('')
 const forms = reactive({
@@ -207,6 +237,15 @@ const configuredCount = computed(() =>
 const canSave = computed(() =>
   ROLE_DEFINITIONS.every((role) => forms[role.key].provider_id && forms[role.key].model)
 )
+
+const mcpServers = computed(() => Object.values(props.mcpServersState.servers || {}))
+const mcpServerCount = computed(() => mcpServers.value.length)
+const mcpEnabledCount = computed(() => mcpServers.value.filter((server) => server.enabled !== false).length)
+const mcpTransportLabel = computed(() => {
+  const transports = new Set(mcpServers.value.map((server) => server.transport || 'stdio'))
+  if (!transports.size) return 'None'
+  return Array.from(transports).join(' · ')
+})
 
 watch(
   () => [

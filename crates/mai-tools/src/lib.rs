@@ -6,10 +6,15 @@ pub const TOOL_CONTAINER_EXEC: &str = "container_exec";
 pub const TOOL_CONTAINER_CP_UPLOAD: &str = "container_cp_upload";
 pub const TOOL_CONTAINER_CP_DOWNLOAD: &str = "container_cp_download";
 pub const TOOL_SPAWN_AGENT: &str = "spawn_agent";
+pub const TOOL_SEND_INPUT: &str = "send_input";
 pub const TOOL_SEND_MESSAGE: &str = "send_message";
 pub const TOOL_WAIT_AGENT: &str = "wait_agent";
 pub const TOOL_LIST_AGENTS: &str = "list_agents";
 pub const TOOL_CLOSE_AGENT: &str = "close_agent";
+pub const TOOL_RESUME_AGENT: &str = "resume_agent";
+pub const TOOL_LIST_MCP_RESOURCES: &str = "list_mcp_resources";
+pub const TOOL_LIST_MCP_RESOURCE_TEMPLATES: &str = "list_mcp_resource_templates";
+pub const TOOL_READ_MCP_RESOURCE: &str = "read_mcp_resource";
 pub const TOOL_SAVE_TASK_PLAN: &str = "save_task_plan";
 pub const TOOL_SUBMIT_REVIEW_RESULT: &str = "submit_review_result";
 pub const TOOL_UPDATE_TODO_LIST: &str = "update_todo_list";
@@ -22,10 +27,15 @@ pub enum RoutedTool {
     ContainerCpUpload,
     ContainerCpDownload,
     SpawnAgent,
+    SendInput,
     SendMessage,
     WaitAgent,
     ListAgents,
     CloseAgent,
+    ResumeAgent,
+    ListMcpResources,
+    ListMcpResourceTemplates,
+    ReadMcpResource,
     SaveTaskPlan,
     SubmitReviewResult,
     UpdateTodoList,
@@ -41,10 +51,15 @@ pub fn route_tool(name: &str) -> RoutedTool {
         TOOL_CONTAINER_CP_UPLOAD => RoutedTool::ContainerCpUpload,
         TOOL_CONTAINER_CP_DOWNLOAD => RoutedTool::ContainerCpDownload,
         TOOL_SPAWN_AGENT => RoutedTool::SpawnAgent,
+        TOOL_SEND_INPUT => RoutedTool::SendInput,
         TOOL_SEND_MESSAGE => RoutedTool::SendMessage,
         TOOL_WAIT_AGENT => RoutedTool::WaitAgent,
         TOOL_LIST_AGENTS => RoutedTool::ListAgents,
         TOOL_CLOSE_AGENT => RoutedTool::CloseAgent,
+        TOOL_RESUME_AGENT => RoutedTool::ResumeAgent,
+        TOOL_LIST_MCP_RESOURCES => RoutedTool::ListMcpResources,
+        TOOL_LIST_MCP_RESOURCE_TEMPLATES => RoutedTool::ListMcpResourceTemplates,
+        TOOL_READ_MCP_RESOURCE => RoutedTool::ReadMcpResource,
         TOOL_SAVE_TASK_PLAN => RoutedTool::SaveTaskPlan,
         TOOL_SUBMIT_REVIEW_RESULT => RoutedTool::SubmitReviewResult,
         TOOL_UPDATE_TODO_LIST => RoutedTool::UpdateTodoList,
@@ -101,24 +116,47 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             TOOL_SPAWN_AGENT,
-            "Create a child agent with its own Docker container. Optionally send it an initial task.",
+            "Create a child agent with its own Docker container. Spawned agents inherit the parent model by default unless role, model, or reasoning_effort is provided.",
             object_schema(vec![
+                (
+                    "agent_type",
+                    json!({
+                        "type": "string",
+                        "enum": ["default", "explorer", "worker"],
+                        "description": "Codex-compatible agent type. default and worker map to executor; explorer maps to explorer."
+                    }),
+                    false,
+                ),
                 (
                     "role",
                     json!({
                         "type": "string",
                         "enum": ["planner", "explorer", "executor", "reviewer"],
-                        "description": "Role profile to use for the child agent. Defaults to executor."
+                        "description": "Legacy role profile. When set, role model preferences are used."
                     }),
                     false,
                 ),
                 ("name", json!({ "type": "string" }), false),
                 ("message", json!({ "type": "string" }), false),
+                ("items", collab_items_schema(), false),
+                ("fork_context", json!({ "type": "boolean" }), false),
+                ("model", json!({ "type": "string" }), false),
+                ("reasoning_effort", json!({ "type": "string" }), false),
+            ]),
+        ),
+        ToolDefinition::function(
+            TOOL_SEND_INPUT,
+            "Send a message to an existing agent. Use interrupt=true to redirect work immediately; otherwise busy agents queue the input for the next turn.",
+            object_schema(vec![
+                ("target", json!({ "type": "string" }), true),
+                ("message", json!({ "type": "string" }), false),
+                ("items", collab_items_schema(), false),
+                ("interrupt", json!({ "type": "boolean" }), false),
             ]),
         ),
         ToolDefinition::function(
             TOOL_SEND_MESSAGE,
-            "Send a task message to an existing agent.",
+            "Legacy alias for send_input. Send a task message to an existing agent.",
             object_schema(vec![
                 ("agent_id", json!({ "type": "string" }), true),
                 ("session_id", json!({ "type": "string" }), false),
@@ -127,9 +165,19 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             TOOL_WAIT_AGENT,
-            "Wait for an agent to finish its current turn and return its final assistant response.",
+            "Wait for one or more agents to finish their current turns and return final assistant responses.",
             object_schema(vec![
-                ("agent_id", json!({ "type": "string" }), true),
+                (
+                    "targets",
+                    json!({ "type": "array", "items": { "type": "string" } }),
+                    false,
+                ),
+                ("agent_id", json!({ "type": "string" }), false),
+                (
+                    "timeout_ms",
+                    json!({ "type": "integer", "minimum": 100, "maximum": 3600000 }),
+                    false,
+                ),
                 (
                     "timeout_secs",
                     json!({ "type": "integer", "minimum": 1, "maximum": 3600 }),
@@ -144,8 +192,43 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             TOOL_CLOSE_AGENT,
-            "Stop and remove an agent's Docker container.",
-            object_schema(vec![("agent_id", json!({ "type": "string" }), true)]),
+            "Stop and remove an agent's Docker container while keeping the agent record resumable.",
+            object_schema(vec![
+                ("target", json!({ "type": "string" }), false),
+                ("agent_id", json!({ "type": "string" }), false),
+            ]),
+        ),
+        ToolDefinition::function(
+            TOOL_RESUME_AGENT,
+            "Resume a closed agent by recreating or reattaching its Docker container.",
+            object_schema(vec![
+                ("id", json!({ "type": "string" }), false),
+                ("agent_id", json!({ "type": "string" }), false),
+            ]),
+        ),
+        ToolDefinition::function(
+            TOOL_LIST_MCP_RESOURCES,
+            "Lists resources provided by MCP servers.",
+            object_schema(vec![
+                ("server", json!({ "type": "string" }), false),
+                ("cursor", json!({ "type": "string" }), false),
+            ]),
+        ),
+        ToolDefinition::function(
+            TOOL_LIST_MCP_RESOURCE_TEMPLATES,
+            "Lists resource templates provided by MCP servers.",
+            object_schema(vec![
+                ("server", json!({ "type": "string" }), false),
+                ("cursor", json!({ "type": "string" }), false),
+            ]),
+        ),
+        ToolDefinition::function(
+            TOOL_READ_MCP_RESOURCE,
+            "Read a specific resource from an MCP server.",
+            object_schema(vec![
+                ("server", json!({ "type": "string" }), true),
+                ("uri", json!({ "type": "string" }), true),
+            ]),
         ),
         ToolDefinition::function(
             TOOL_SAVE_TASK_PLAN,
@@ -203,35 +286,43 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
              Use this during planning to resolve ambiguity, confirm assumptions, or choose between meaningful tradeoffs. \
              Each question must materially change the plan, confirm an assumption, or choose between tradeoffs.",
             object_schema(vec![
-                ("header", json!({ "type": "string", "description": "Short section header for the question group." }), true),
-                ("questions", json!({
-                    "type": "array",
-                    "description": "List of questions to ask the user.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string", "description": "Unique identifier for this question." },
-                            "question": { "type": "string", "description": "The question text." },
-                            "options": {
-                                "type": "array",
-                                "description": "Available choices. 2-4 options, each with label and description.",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "label": { "type": "string", "description": "Short option label." },
-                                        "description": { "type": "string", "description": "Explanation of what this option means." }
+                (
+                    "header",
+                    json!({ "type": "string", "description": "Short section header for the question group." }),
+                    true,
+                ),
+                (
+                    "questions",
+                    json!({
+                        "type": "array",
+                        "description": "List of questions to ask the user.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "Unique identifier for this question." },
+                                "question": { "type": "string", "description": "The question text." },
+                                "options": {
+                                    "type": "array",
+                                    "description": "Available choices. 2-4 options, each with label and description.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": { "type": "string", "description": "Short option label." },
+                                            "description": { "type": "string", "description": "Explanation of what this option means." }
+                                        },
+                                        "required": ["label", "description"],
+                                        "additionalProperties": false
                                     },
-                                    "required": ["label", "description"],
-                                    "additionalProperties": false
-                                },
-                                "minItems": 2,
-                                "maxItems": 4
-                            }
-                        },
-                        "required": ["id", "question", "options"],
-                        "additionalProperties": false
-                    }
-                }), true),
+                                    "minItems": 2,
+                                    "maxItems": 4
+                                }
+                            },
+                            "required": ["id", "question", "options"],
+                            "additionalProperties": false
+                        }
+                    }),
+                    true,
+                ),
             ]),
         ),
         ToolDefinition::function(
@@ -240,8 +331,16 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
              Use this when you have produced a deliverable file (report, code output, data export, generated document, etc.) \
              that the user should be able to download from the web interface.",
             object_schema(vec![
-                ("path", json!({ "type": "string", "description": "Absolute path of the file inside the container." }), true),
-                ("name", json!({ "type": "string", "description": "Display name for the artifact. Defaults to the filename from path." }), false),
+                (
+                    "path",
+                    json!({ "type": "string", "description": "Absolute path of the file inside the container." }),
+                    true,
+                ),
+                (
+                    "name",
+                    json!({ "type": "string", "description": "Display name for the artifact. Defaults to the filename from path." }),
+                    false,
+                ),
             ]),
         ),
     ]
@@ -261,6 +360,21 @@ fn object_schema(fields: Vec<(&str, Value, bool)>) -> Value {
         "properties": properties,
         "required": required,
         "additionalProperties": false,
+    })
+}
+
+fn collab_items_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "type": { "type": "string", "enum": ["text"] },
+                "text": { "type": "string" }
+            },
+            "required": ["type", "text"],
+            "additionalProperties": false
+        }
     })
 }
 
@@ -300,7 +414,35 @@ mod tests {
         assert!(properties.contains_key("name"));
         assert!(properties.contains_key("message"));
         assert!(properties.contains_key("role"));
+        assert!(properties.contains_key("agent_type"));
+        assert!(properties.contains_key("model"));
         assert!(!properties.contains_key("provider_id"));
-        assert!(!properties.contains_key("model"));
+    }
+
+    #[test]
+    fn codex_compatible_subagent_tools_are_exposed() {
+        let tools = build_tool_definitions(&[]);
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&TOOL_SEND_INPUT));
+        assert!(names.contains(&TOOL_WAIT_AGENT));
+        assert!(names.contains(&TOOL_CLOSE_AGENT));
+        assert!(names.contains(&TOOL_RESUME_AGENT));
+        let wait = tools
+            .iter()
+            .find(|tool| tool.name == TOOL_WAIT_AGENT)
+            .expect("wait_agent");
+        let properties = wait
+            .parameters
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("wait properties");
+        assert!(properties.contains_key("targets"));
+        assert!(properties.contains_key("timeout_ms"));
+        assert!(properties.contains_key("agent_id"));
+        assert_eq!(route_tool("send_input"), RoutedTool::SendInput);
+        assert_eq!(route_tool("resume_agent"), RoutedTool::ResumeAgent);
     }
 }

@@ -938,11 +938,42 @@ p {
   backdrop-filter: blur(14px);
 }
 
-.skills-settings {
+.skills-settings,
+.mcp-settings {
   display: grid;
   gap: 14px;
   padding: 22px;
   padding-top: 0;
+}
+
+.mcp-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  overflow: hidden;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.mcp-server-list {
+  display: grid;
+  gap: 12px;
+}
+
+.mcp-server-row {
+  display: grid;
+  gap: 12px;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  padding: 14px;
+  background: #f8fafc;
+}
+
+.mcp-server-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(150px, 190px) auto;
+  gap: 10px;
+  align-items: end;
 }
 
 .stage-title.compact {
@@ -3303,6 +3334,11 @@ select:focus {
   }
 
   .settings-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .mcp-summary-grid,
+  .mcp-server-head {
     grid-template-columns: 1fr;
   }
 

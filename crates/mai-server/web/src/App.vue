@@ -92,10 +92,14 @@
         :saving="agentConfigState.saving"
         :skills-saving="skillsState.saving"
         :skills-error="skillsError"
+        :mcp-servers-state="mcpServersState"
+        :mcp-saving="mcpServersState.saving"
         @reload="loadAgentConfig"
         @save="onSaveAgentConfig"
         @reload-skills="onLoadSkills"
         @save-skills="onSaveSkillsConfig"
+        @reload-mcp="onLoadMcpServers"
+        @open-mcp="mcpDialogOpen = true"
         @open-providers="activeTab = 'providers'"
       />
     </main>
@@ -111,6 +115,14 @@
       :dialog="taskDialog"
       @close="taskDialog.open = false"
       @create="onCreateTask"
+    />
+
+    <McpServersDialog
+      :open="mcpDialogOpen"
+      :servers-state="mcpServersState"
+      :saving="mcpServersState.saving"
+      @close="mcpDialogOpen = false"
+      @save="onSaveMcpServers"
     />
 
     <ConfirmDialog
@@ -138,6 +150,7 @@ import ConfirmDialog from './components/ConfirmDialog.vue'
 import ProviderDialog from './components/ProviderDialog.vue'
 import TaskDialog from './components/TaskDialog.vue'
 import ResearchAgentConfigPanel from './components/ResearchAgentConfigPanel.vue'
+import McpServersDialog from './components/McpServersDialog.vue'
 
 import { useApi } from './composables/useApi'
 import { useSSE } from './composables/useSSE'
@@ -145,6 +158,7 @@ import { useTasks } from './composables/useTasks'
 import { useProviders } from './composables/useProviders'
 import { useAgentConfig } from './composables/useAgentConfig'
 import { useSkills } from './composables/useSkills'
+import { useMcpServers } from './composables/useMcpServers'
 
 const { toast, showToast } = useApi()
 const { eventFeed, connectionState, connectEvents, disconnect } = useSSE()
@@ -192,12 +206,18 @@ const {
   ensureSkillsLoaded,
   saveSkillsConfig
 } = useSkills()
+const {
+  mcpServersState,
+  loadMcpServers,
+  saveMcpServers
+} = useMcpServers()
 
 const activeTab = ref('tasks')
 const messageDraft = ref('')
 const selectedSkills = ref([])
 const isUpdatingAgentModel = ref(false)
 const skillsError = ref('')
+const mcpDialogOpen = ref(false)
 
 const confirmDialog = reactive({
   open: false,
@@ -236,7 +256,7 @@ onUnmounted(() => disconnect())
 async function refreshAll() {
   isLoading.value = true
   try {
-    await Promise.all([loadProviders(), loadAgentConfig(), loadSkills(), refreshTasks()])
+    await Promise.all([loadProviders(), loadAgentConfig(), loadSkills(), loadMcpServers(), refreshTasks()])
     if (providersState.providers.length && !tasks.value.length) {
       await ensureDefaultTask()
     } else if (selectedTaskId.value) {
@@ -360,6 +380,24 @@ async function onSaveSkillsConfig(config) {
     showToast('Skills config saved.')
   } catch (error) {
     skillsError.value = error.message
+    showToast(error.message)
+  }
+}
+
+async function onLoadMcpServers() {
+  try {
+    await loadMcpServers()
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onSaveMcpServers(servers) {
+  try {
+    await saveMcpServers(servers)
+    mcpDialogOpen.value = false
+    showToast('MCP config saved.')
+  } catch (error) {
     showToast(error.message)
   }
 }

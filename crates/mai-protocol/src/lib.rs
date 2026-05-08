@@ -64,6 +64,15 @@ impl AgentStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum McpStartupStatus {
+    Starting,
+    Ready,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum TurnStatus {
     Running,
     WaitingTool,
@@ -571,6 +580,12 @@ pub struct ProvidersConfigRequest {
     pub default_provider_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct McpServersConfigRequest {
+    #[serde(default)]
+    pub servers: BTreeMap<String, McpServerConfig>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentModelPreference {
     pub provider_id: String,
@@ -780,6 +795,13 @@ pub enum ServiceEventKind {
     ArtifactCreated {
         artifact: ArtifactInfo,
     },
+    McpServerStatusChanged {
+        agent_id: AgentId,
+        server: String,
+        status: McpStartupStatus,
+        #[serde(default)]
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -907,16 +929,68 @@ pub struct ExecResult {
     pub stderr: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerTransport {
+    #[default]
+    Stdio,
+    StreamableHttp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerConfig {
-    pub command: String,
+    #[serde(default)]
+    pub transport: McpServerTransport,
+    #[serde(default)]
+    pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+    #[serde(default)]
+    pub bearer_token_env: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub startup_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub enabled_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            transport: McpServerTransport::Stdio,
+            command: None,
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+            bearer_token: None,
+            bearer_token_env: None,
+            enabled: true,
+            required: false,
+            startup_timeout_secs: None,
+            tool_timeout_secs: None,
+            enabled_tools: None,
+            disabled_tools: Vec::new(),
+        }
+    }
 }
 
 pub fn default_true() -> bool {

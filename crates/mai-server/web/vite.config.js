@@ -10,6 +10,7 @@ export default defineConfig({
       '/agent-config': apiTarget,
       '/agents': apiTarget,
       '/events': apiTarget,
+      '/mcp-servers': apiTarget,
       '/provider-presets': apiTarget,
       '/providers': apiTarget
     }
