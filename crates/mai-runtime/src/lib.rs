@@ -517,7 +517,7 @@ impl AgentRuntime {
         let planner_agent_id = task.summary.read().await.planner_agent_id;
         {
             let mut plan = task.plan.write().await;
-            if plan.status == PlanStatus::Ready {
+            if plan.status == PlanStatus::Ready || plan.status == PlanStatus::Approved {
                 let entry = PlanHistoryEntry {
                     version: plan.version,
                     title: plan.title.clone(),
@@ -532,9 +532,12 @@ impl AgentRuntime {
                 plan.status = PlanStatus::NeedsRevision;
                 plan.revision_feedback = None;
                 plan.revision_requested_at = None;
+                plan.approved_at = None;
                 let mut summary = task.summary.write().await;
                 summary.status = TaskStatus::Planning;
                 summary.plan_status = PlanStatus::NeedsRevision;
+                summary.final_report = None;
+                summary.last_error = None;
                 summary.updated_at = now();
                 self.store.save_task(&summary, &plan).await?;
                 self.publish(ServiceEventKind::PlanUpdated {

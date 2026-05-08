@@ -140,6 +140,7 @@ const modelEditor = reactive({
 
 const timelineItems = computed(() => buildAgentTimeline(props.detail, props.events))
 const pendingUserInput = computed(() => {
+  if (!props.inputEnabled) return null
   return timelineItems.value.find(
     (item) => item.type === 'user_input' && !answeredInputKeys.has(item.key)
   ) || null

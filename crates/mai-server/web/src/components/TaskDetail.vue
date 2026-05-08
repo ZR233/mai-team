@@ -123,11 +123,14 @@ const canApprove = computed(() => props.detail?.status === 'awaiting_approval' &
 const inputEnabled = computed(() => {
   const status = props.detail?.status
   return status === 'planning' || status === 'awaiting_approval'
+      || status === 'completed' || status === 'failed'
 })
 const canCompose = computed(() => {
   const status = props.detail?.status
   const selectedRole = props.detail?.selected_agent?.role
-  return selectedRole === 'planner' && (status === 'planning' || status === 'awaiting_approval')
+  return selectedRole === 'planner'
+      && (status === 'planning' || status === 'awaiting_approval'
+       || status === 'completed' || status === 'failed')
 })
 const planMeta = computed(() => {
   const plan = props.detail?.plan
