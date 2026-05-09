@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, RwLock};
@@ -145,6 +145,88 @@ impl McpAgentManager {
                         )
                         .await;
                     tracing::warn!("failed to initialize MCP server `{server_name}`: {err}");
+                }
+            }
+        }
+
+        manager
+    }
+
+    pub async fn start_sidecars(
+        docker: DockerClient,
+        workspace_volume: String,
+        image: String,
+        configs: BTreeMap<String, McpServerConfig>,
+    ) -> Self {
+        let manager = Self {
+            sessions: RwLock::new(BTreeMap::new()),
+            tools: RwLock::new(BTreeMap::new()),
+            statuses: RwLock::new(BTreeMap::new()),
+        };
+
+        let enabled_configs = configs
+            .into_iter()
+            .filter(|(_, config)| config.enabled)
+            .collect::<Vec<_>>();
+        for (server_name, config) in &enabled_configs {
+            manager
+                .set_status(
+                    server_name,
+                    McpStartupStatus::Starting,
+                    None,
+                    config.required,
+                )
+                .await;
+        }
+
+        let mut startup_tasks = stream::iter(enabled_configs.into_iter().map(
+            |(server_name, config)| {
+                let docker = docker.clone();
+                let workspace_volume = workspace_volume.clone();
+                let image = image.clone();
+                async move {
+                    let required = config.required;
+                    let result = start_sidecar_server_session(
+                        docker,
+                        workspace_volume,
+                        image,
+                        server_name.clone(),
+                        config,
+                    )
+                    .await;
+                    (server_name, required, result)
+                }
+            },
+        ))
+        .buffer_unordered(16);
+
+        while let Some((server_name, required, result)) = startup_tasks.next().await {
+            match result {
+                Ok((session, tools)) => {
+                    manager
+                        .sessions
+                        .write()
+                        .await
+                        .insert(server_name.clone(), Arc::clone(&session));
+                    let mut tool_map = manager.tools.write().await;
+                    for mut tool in tools {
+                        tool.model_name = collision_safe_tool_name(&tool_map, &tool);
+                        tool_map.insert(tool.model_name.clone(), tool);
+                    }
+                    manager
+                        .set_status(&server_name, McpStartupStatus::Ready, None, required)
+                        .await;
+                }
+                Err(err) => {
+                    manager
+                        .set_status(
+                            &server_name,
+                            McpStartupStatus::Failed,
+                            Some(err.to_string()),
+                            required,
+                        )
+                        .await;
+                    tracing::warn!("failed to initialize MCP sidecar `{server_name}`: {err}");
                 }
             }
         }
@@ -289,6 +371,30 @@ async fn start_server_session(
     .map_err(|_| McpError::Timeout(timeout_server, "initialize".to_string()))?
 }
 
+async fn start_sidecar_server_session(
+    docker: DockerClient,
+    workspace_volume: String,
+    image: String,
+    server_name: String,
+    config: McpServerConfig,
+) -> Result<(Arc<McpSession>, Vec<McpTool>)> {
+    let startup_timeout = config
+        .startup_timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
+    let timeout_server = server_name.clone();
+    timeout(startup_timeout, async move {
+        let session = Arc::new(
+            McpSession::start_sidecar(&docker, &workspace_volume, &image, server_name, config)
+                .await?,
+        );
+        let tools = session.list_tools().await?;
+        Ok((session, tools))
+    })
+    .await
+    .map_err(|_| McpError::Timeout(timeout_server, "initialize".to_string()))?
+}
+
 enum McpSession {
     Stdio(StdioMcpSession),
     Http(RmcpSession),
@@ -305,6 +411,32 @@ impl McpSession {
             McpServerTransport::Stdio => Ok(Self::Stdio(
                 StdioMcpSession::start(docker, container_id, server_name, config).await?,
             )),
+            McpServerTransport::StreamableHttp => Ok(Self::Http(
+                RmcpSession::start_http(server_name, config).await?,
+            )),
+        }
+    }
+
+    async fn start_sidecar(
+        docker: &DockerClient,
+        workspace_volume: &str,
+        image: &str,
+        server_name: String,
+        config: McpServerConfig,
+    ) -> Result<Self> {
+        match config.transport {
+            McpServerTransport::Stdio => {
+                Ok(Self::Stdio(
+                    StdioMcpSession::start_sidecar(
+                        docker,
+                        workspace_volume,
+                        image,
+                        server_name,
+                        config,
+                    )
+                    .await?,
+                ))
+            }
             McpServerTransport::StreamableHttp => Ok(Self::Http(
                 RmcpSession::start_http(server_name, config).await?,
             )),
@@ -385,6 +517,52 @@ impl StdioMcpSession {
             &config.args,
             config.cwd.as_deref(),
             &env,
+        )?;
+        let stdin = child.stdin.take().ok_or(McpError::MissingStdio)?;
+        let stdout = child.stdout.take().ok_or(McpError::MissingStdio)?;
+        let service = rmcp::serve_client(client_info(), rmcp_transport(stdout, stdin))
+            .await
+            .map_err(|err| McpError::Server(server_name.clone(), err.to_string()))?;
+        Ok(Self {
+            server_name,
+            config,
+            service: Mutex::new(Some(service)),
+            child: Mutex::new(child),
+        })
+    }
+
+    async fn start_sidecar(
+        docker: &DockerClient,
+        workspace_volume: &str,
+        image: &str,
+        server_name: String,
+        config: McpServerConfig,
+    ) -> Result<Self> {
+        let command = config.command.as_deref().ok_or_else(|| {
+            McpError::InvalidConfig(server_name.clone(), "stdio command is required".to_string())
+        })?;
+        let env = config
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        let name = format!(
+            "mai-team-mcp-{}-{}-{nonce}",
+            sanitize_name(&server_name),
+            std::process::id()
+        );
+        let mut child = docker.spawn_sidecar(
+            &name,
+            image,
+            command,
+            &config.args,
+            config.cwd.as_deref(),
+            &env,
+            Some(workspace_volume),
         )?;
         let stdin = child.stdin.take().ok_or(McpError::MissingStdio)?;
         let stdout = child.stdout.take().ok_or(McpError::MissingStdio)?;

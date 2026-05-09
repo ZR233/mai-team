@@ -119,24 +119,32 @@
             <h2>Repository</h2>
             <p>{{ repositoryName(detail) }}</p>
           </div>
-          <span class="section-status">GitHub App</span>
+          <span class="section-status">Git Account</span>
         </header>
         <div class="project-facts">
           <div class="project-fact">
             <span>Owner / Repo</span>
-            <strong>{{ repositoryName(detail) }}</strong>
+            <strong>{{ detail.repository_full_name || repositoryName(detail) }}</strong>
           </div>
           <div class="project-fact">
-            <span>Installation Account</span>
+            <span>Branch</span>
+            <strong>{{ detail.branch || 'Default branch' }}</strong>
+          </div>
+          <div class="project-fact">
+            <span>Git Account</span>
             <strong>{{ detail.installation_account || 'Unknown' }}</strong>
           </div>
           <div class="project-fact">
-            <span>Installation ID</span>
-            <strong>{{ detail.installation_id || 'Unknown' }}</strong>
+            <span>Account ID</span>
+            <strong>{{ detail.git_account_id || 'Unknown' }}</strong>
           </div>
           <div class="project-fact span-2">
             <span>Workspace Path</span>
             <strong>{{ detail.workspace_path || 'Not cloned yet' }}</strong>
+          </div>
+          <div class="project-fact span-2">
+            <span>Project Path</span>
+            <strong>{{ detail.project_path || '/' }}</strong>
           </div>
           <div class="project-fact span-2">
             <span>Docker Image</span>
@@ -144,11 +152,11 @@
           </div>
           <div class="project-fact">
             <span>Auth Mode</span>
-            <strong>GitHub App</strong>
+            <strong>Git account token</strong>
           </div>
           <div class="project-fact">
-            <span>Webhook</span>
-            <strong>No webhook</strong>
+            <span>Agent Tools</span>
+            <strong>Git MCP + GitHub MCP</strong>
           </div>
           <div class="project-fact">
             <span>MCP Status</span>

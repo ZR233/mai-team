@@ -43,7 +43,8 @@ export function useSSE() {
       'error',
       'todo_list_updated',
       'user_input_requested',
-      'artifact_created'
+      'artifact_created',
+      'mcp_server_status_changed'
     ]
     for (const name of names) {
       eventSource.addEventListener(name, (event) => {

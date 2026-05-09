@@ -8,17 +8,18 @@ use mai_model::ResponsesClient;
 use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentMessage,
     AgentModelPreference, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary, ArtifactInfo,
-    ContextUsage, CreateAgentRequest, CreateProjectRequest, GithubAppManifestAccountType,
-    GithubAppManifestStartRequest, GithubAppManifestStartResponse, GithubAppSettingsRequest,
-    GithubAppSettingsResponse, GithubInstallationSummary, GithubInstallationsResponse,
-    GithubRepositoriesResponse, GithubRepositorySummary, McpServerConfig, McpServerTransport,
-    MessageRole, ModelConfig, ModelContentItem, ModelInputItem, ModelOutputItem, ModelToolCall,
-    PlanHistoryEntry, PlanStatus, ProjectCloneStatus, ProjectDetail, ProjectId, ProjectStatus,
-    ProjectSummary, ResolvedAgentModelPreference, SendMessageRequest, ServiceEvent,
-    ServiceEventKind, SessionId, SkillsConfigRequest, SkillsListResponse, TaskDetail, TaskId,
-    TaskPlan, TaskReview, TaskStatus, TaskSummary, TodoItem, TokenUsage, ToolTraceDetail, TurnId,
-    TurnStatus, UpdateAgentRequest, UpdateProjectRequest, UserInputOption, UserInputQuestion, now,
-    preview,
+    ContextUsage, CreateAgentRequest, CreateProjectRequest, GitAccountRequest,
+    GitAccountResponse, GitAccountStatus, GitAccountSummary, GitAccountsResponse, GitTokenKind,
+    GithubAppManifestAccountType, GithubAppManifestStartRequest, GithubAppManifestStartResponse,
+    GithubAppSettingsRequest, GithubAppSettingsResponse, GithubInstallationSummary,
+    GithubInstallationsResponse, GithubRepositoriesResponse, GithubRepositorySummary,
+    McpServerConfig, McpServerTransport, MessageRole, ModelConfig,
+    ModelContentItem, ModelInputItem, ModelOutputItem, ModelToolCall, PlanHistoryEntry,
+    PlanStatus, ProjectCloneStatus, ProjectDetail, ProjectId, ProjectStatus, ProjectSummary,
+    ResolvedAgentModelPreference, SendMessageRequest, ServiceEvent, ServiceEventKind, SessionId,
+    SkillsConfigRequest, SkillsListResponse, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus,
+    TaskSummary, TodoItem, TokenUsage, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest,
+    UpdateProjectRequest, UserInputOption, UserInputQuestion, now, preview,
 };
 use mai_skills::{SkillInjections, SkillsManager};
 use mai_store::{ConfigStore, ProviderSelection};
@@ -48,6 +49,7 @@ const GITHUB_API_VERSION: &str = "2022-11-28";
 const GITHUB_TOKEN_REFRESH_SKEW_SECS: i64 = 120;
 const GITHUB_MANIFEST_STATE_TTL_SECS: u64 = 900;
 const PROJECT_GITHUB_MCP_SERVER: &str = "github";
+const PROJECT_GIT_MCP_SERVER: &str = "git";
 const COMPACT_USER_MESSAGE_MAX_CHARS: usize = 80_000;
 const COMPACT_SUMMARY_PREVIEW_CHARS: usize = 240;
 const COMPACT_SUMMARY_PREFIX: &str = "Context checkpoint summary from earlier conversation history. This is background for continuity, not a new user request.";
@@ -67,6 +69,7 @@ const AGENT_ROLES: [AgentRole; 4] = [
     AgentRole::Reviewer,
 ];
 static PROJECT_GITHUB_TOOLS: LazyLock<Vec<McpTool>> = LazyLock::new(project_github_tools);
+static PROJECT_GIT_TOOLS: LazyLock<Vec<McpTool>> = LazyLock::new(project_git_tools);
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -221,6 +224,11 @@ struct GithubAccountApi {
 }
 
 #[derive(Debug, Deserialize)]
+struct GithubUserApi {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct GithubInstallationApi {
     id: u64,
     account: GithubAccountApi,
@@ -242,6 +250,15 @@ struct GithubRepositoryApi {
     html_url: String,
     default_branch: Option<String>,
     owner: GithubAccountApi,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedGithubRepository {
+    id: u64,
+    owner: String,
+    name: String,
+    full_name: String,
+    default_branch: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -504,6 +521,84 @@ impl AgentRuntime {
         summaries
     }
 
+    pub async fn list_git_accounts(&self) -> Result<GitAccountsResponse> {
+        Ok(self.store.list_git_accounts().await?)
+    }
+
+    pub async fn save_git_account(&self, request: GitAccountRequest) -> Result<GitAccountResponse> {
+        let account = self.store.upsert_git_account(request).await?;
+        let verified = self.verify_git_account(&account.id).await?;
+        Ok(GitAccountResponse { account: verified })
+    }
+
+    pub async fn verify_git_account(&self, account_id: &str) -> Result<GitAccountSummary> {
+        let token = self.git_account_token(account_id).await?;
+        let response = self
+            .github_http
+            .get(github_api_url(DEFAULT_GITHUB_API_BASE_URL, "/user"))
+            .bearer_auth(&token)
+            .headers(github_headers())
+            .send()
+            .await?;
+        let scopes = github_scopes(response.headers());
+        let token_kind = git_token_kind(&token, &scopes);
+        match decode_github_response::<GithubUserApi>(response, "verify token").await {
+            Ok(user) => Ok(self
+                .store
+                .update_git_account_verification(
+                    account_id,
+                    Some(user.login),
+                    token_kind,
+                    scopes,
+                    GitAccountStatus::Verified,
+                    None,
+                )
+                .await?),
+            Err(err) => Ok(self
+                .store
+                .update_git_account_verification(
+                    account_id,
+                    None,
+                    token_kind,
+                    scopes,
+                    GitAccountStatus::Failed,
+                    Some(redact_secret(&err.to_string(), &token)),
+                )
+                .await?),
+        }
+    }
+
+    pub async fn delete_git_account(&self, account_id: &str) -> Result<GitAccountsResponse> {
+        Ok(self.store.delete_git_account(account_id).await?)
+    }
+
+    pub async fn set_default_git_account(&self, account_id: &str) -> Result<GitAccountsResponse> {
+        Ok(self.store.set_default_git_account(account_id).await?)
+    }
+
+    pub async fn list_git_account_repositories(
+        &self,
+        account_id: &str,
+    ) -> Result<GithubRepositoriesResponse> {
+        let token = self.git_account_token(account_id).await?;
+        let url = github_api_url(
+            DEFAULT_GITHUB_API_BASE_URL,
+            "/user/repos?per_page=100&affiliation=owner,collaborator,organization_member&sort=updated",
+        );
+        let response = self
+            .github_http
+            .get(url)
+            .bearer_auth(&token)
+            .headers(github_headers())
+            .send()
+            .await?;
+        let repositories: Vec<GithubRepositoryApi> =
+            decode_github_response(response, "list repositories").await?;
+        Ok(GithubRepositoriesResponse {
+            repositories: repositories.into_iter().map(github_repository_summary).collect(),
+        })
+    }
+
     pub async fn github_app_settings(&self) -> Result<GithubAppSettingsResponse> {
         Ok(self.store.get_github_app_settings().await?)
     }
@@ -679,16 +774,7 @@ impl AgentRuntime {
             repositories: response
                 .repositories
                 .into_iter()
-                .map(|repository| GithubRepositorySummary {
-                    id: repository.id,
-                    owner: repository.owner.login,
-                    name: repository.name,
-                    full_name: repository.full_name,
-                    private: repository.private,
-                    clone_url: repository.clone_url,
-                    html_url: repository.html_url,
-                    default_branch: repository.default_branch,
-                })
+                .map(github_repository_summary)
                 .collect(),
         })
     }
@@ -914,30 +1000,47 @@ impl AgentRuntime {
         self: &Arc<Self>,
         request: CreateProjectRequest,
     ) -> Result<ProjectSummary> {
-        if request.installation_id == 0 {
-            return Err(RuntimeError::InvalidInput(
-                "installation_id is required".to_string(),
-            ));
-        }
-        if request.repository_id == 0 {
-            return Err(RuntimeError::InvalidInput(
-                "repository_id is required".to_string(),
-            ));
-        }
-        let owner = clean_project_field(request.owner, "owner")?;
-        let repo = clean_project_field(request.repo, "repo")?;
+        let account_id = request
+            .git_account_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| RuntimeError::InvalidInput("git_account_id is required".to_string()))?
+            .to_string();
+        let repository_ref = request
+            .repository_full_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let owner = request.owner.trim();
+                let repo = request.repo.trim();
+                (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
+            })
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput("repository_full_name is required".to_string())
+            })?;
+        let repository = self
+            .verified_git_account_repository(&account_id, &repository_ref)
+            .await?;
+        let owner = repository.owner.clone();
+        let repo = repository.name.clone();
+        let repository_id = repository.id;
+        let branch = normalize_optional_path_segment(request.branch.as_deref(), "branch")?
+            .unwrap_or_else(|| repository.default_branch.clone());
+        let project_path = normalize_project_path(request.project_path.as_deref())?;
         let name = request.name.trim().to_string();
         let name = if name.is_empty() {
             format!("{owner}/{repo}")
         } else {
             name
         };
-        let installation_account = self
-            .github_installation_account(request.installation_id)
-            .await?;
+        let account = self.git_account_summary(&account_id).await?;
+        let installation_account = account.login.unwrap_or_else(|| account.label);
         let project_id = Uuid::new_v4();
         let planner_model = self.resolve_role_agent_model(AgentRole::Planner).await?;
-        let system_prompt = project_maintainer_system_prompt(&owner, &repo);
+        let system_prompt = project_maintainer_system_prompt(&owner, &repo, &branch, &project_path);
         let maintainer = self
             .create_agent_with_container_source(
                 CreateAgentRequest {
@@ -962,9 +1065,13 @@ impl AgentRuntime {
             status: ProjectStatus::Creating,
             owner,
             repo,
-            repository_id: request.repository_id,
-            installation_id: request.installation_id,
+            repository_full_name: repository.full_name,
+            git_account_id: Some(account_id),
+            repository_id,
+            installation_id: 0,
             installation_account,
+            branch,
+            project_path,
             docker_image: maintainer.docker_image.clone(),
             workspace_path: PROJECT_WORKSPACE_PATH.to_string(),
             clone_status: ProjectCloneStatus::Cloning,
@@ -987,7 +1094,7 @@ impl AgentRuntime {
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
             let clone_result = runtime
-                .clone_project_repository(project_id, maintainer.id, request.repository_id)
+                .clone_project_repository(project_id, maintainer.id)
                 .await;
             let update = match clone_result {
                 Ok(()) => {
@@ -3566,19 +3673,6 @@ impl AgentRuntime {
         Ok(updated)
     }
 
-    async fn github_installation_account(&self, installation_id: u64) -> Result<String> {
-        let installations = self.list_github_installations().await?.installations;
-        installations
-            .into_iter()
-            .find(|installation| installation.id == installation_id)
-            .map(|installation| installation.account_login)
-            .ok_or_else(|| {
-                RuntimeError::InvalidInput(format!(
-                    "GitHub installation `{installation_id}` was not found"
-                ))
-            })
-    }
-
     async fn prune_github_manifest_states(&self) {
         let ttl = Duration::from_secs(GITHUB_MANIFEST_STATE_TTL_SECS);
         let mut states = self.github_manifest_states.lock().await;
@@ -3608,6 +3702,59 @@ impl AgentRuntime {
                     .to_string(),
             )
         })
+    }
+
+    async fn verified_git_account_repository(
+        &self,
+        account_id: &str,
+        repository_full_name: &str,
+    ) -> Result<VerifiedGithubRepository> {
+        let token = self.git_account_token(account_id).await?;
+        let repository_full_name = repository_full_name.trim();
+        if !repository_full_name.contains('/') || repository_full_name.contains(char::is_whitespace)
+        {
+            return Err(RuntimeError::InvalidInput(
+                "repository_full_name must look like owner/repo".to_string(),
+            ));
+        }
+        let url = github_api_url(
+            DEFAULT_GITHUB_API_BASE_URL,
+            &format!("/repos/{repository_full_name}"),
+        );
+        let response = self
+            .github_http
+            .get(url)
+            .bearer_auth(&token)
+            .headers(github_headers())
+            .send()
+            .await?;
+        let repository: GithubRepositoryApi =
+            decode_github_response(response, "get repository").await?;
+        Ok(VerifiedGithubRepository {
+            id: repository.id,
+            owner: repository.owner.login,
+            name: repository.name,
+            full_name: repository.full_name,
+            default_branch: repository.default_branch.unwrap_or_else(|| "main".to_string()),
+        })
+    }
+
+    async fn git_account_summary(&self, account_id: &str) -> Result<GitAccountSummary> {
+        self.store
+            .list_git_accounts()
+            .await?
+            .accounts
+            .into_iter()
+            .find(|account| account.id == account_id)
+            .ok_or_else(|| RuntimeError::InvalidInput("git account not found".to_string()))
+    }
+
+    async fn git_account_token(&self, account_id: &str) -> Result<String> {
+        self.store
+            .git_account_token(account_id)
+            .await?
+            .filter(|token| !token.trim().is_empty())
+            .ok_or_else(|| RuntimeError::InvalidInput("git account token not found".to_string()))
     }
 
     async fn github_app_jwt(&self) -> Result<(String, String)> {
@@ -3680,19 +3827,16 @@ impl AgentRuntime {
         Ok(token.token)
     }
 
-    async fn project_installation_token_for_agent(
-        &self,
-        agent: &AgentRecord,
-    ) -> Result<Option<String>> {
+    async fn project_git_token_for_agent(&self, agent: &AgentRecord) -> Result<Option<String>> {
         let Some(project_id) = agent.summary.read().await.project_id else {
             return Ok(None);
         };
         let project = self.project(project_id).await?;
         let summary = project.summary.read().await.clone();
-        Ok(Some(
-            self.github_installation_token(summary.installation_id, Some(summary.repository_id))
-                .await?,
-        ))
+        let Some(account_id) = summary.git_account_id else {
+            return Ok(None);
+        };
+        Ok(Some(self.git_account_token(&account_id).await?))
     }
 
     async fn execute_project_mcp_tool(
@@ -3701,28 +3845,26 @@ impl AgentRuntime {
         model_name: &str,
         arguments: Value,
     ) -> Result<ToolExecution> {
-        let Some(token) = self.project_installation_token_for_agent(agent).await? else {
+        let Some(token) = self.project_git_token_for_agent(agent).await? else {
             return Err(RuntimeError::InvalidInput(
                 "agent is not attached to a project".to_string(),
             ));
         };
-        let mut config = McpServerConfig {
-            transport: McpServerTransport::StreamableHttp,
-            url: Some("https://api.githubcopilot.com/mcp/".to_string()),
-            bearer_token: Some(token),
-            enabled: true,
-            startup_timeout_secs: Some(20),
-            ..McpServerConfig::default()
-        };
-        config.disabled_tools = Vec::new();
-        let mut configs = std::collections::BTreeMap::new();
-        configs.insert(PROJECT_GITHUB_MCP_SERVER.to_string(), config);
-        let manager = McpAgentManager::start(self.docker.clone(), String::new(), configs).await;
+        let summary = agent.summary.read().await.clone();
+        let workspace_volume = DockerClient::workspace_volume_for_agent(&summary.id.to_string());
+        let image = self.docker.image().to_string();
+        let configs = project_mcp_configs(&token);
+        let manager =
+            McpAgentManager::start_sidecars(self.docker.clone(), workspace_volume, image, configs)
+                .await;
         let output = manager.call_model_tool(model_name, arguments).await;
         manager.shutdown().await;
+        let output = output.map_err(|err| {
+            RuntimeError::InvalidInput(redact_secret(&err.to_string(), &token))
+        })?;
         Ok(ToolExecution {
             success: true,
-            output: output?.to_string(),
+            output: redact_secret(&output.to_string(), &token),
             ends_turn: false,
         })
     }
@@ -3731,35 +3873,46 @@ impl AgentRuntime {
         &self,
         project_id: ProjectId,
         maintainer_agent_id: AgentId,
-        repository_id: u64,
     ) -> Result<()> {
         let project = self.project(project_id).await?;
         let summary = project.summary.read().await.clone();
-        let token = self
-            .github_installation_token(summary.installation_id, Some(repository_id))
-            .await?;
-        let container_id = self.container_id(maintainer_agent_id).await?;
+        let account_id = summary.git_account_id.clone().ok_or_else(|| {
+            RuntimeError::InvalidInput("project git account is not configured".to_string())
+        })?;
+        let token = self.git_account_token(&account_id).await?;
         let repo_url = github_clone_url(&summary.owner, &summary.repo);
+        let branch = summary.branch.trim();
+        let branch_arg = if branch.is_empty() {
+            String::new()
+        } else {
+            format!(" --branch {}", shell_quote(branch))
+        };
         let command = format!(
             "set -eu\n\
              rm -rf {workspace}\n\
              mkdir -p /workspace\n\
              git config --global --unset-all credential.helper >/dev/null 2>&1 || true\n\
              rm -rf \"$HOME/.config/gh\" \"$HOME/.git-credentials\"\n\
-             git -c credential.helper= -c http.https://github.com/.extraheader=\"AUTHORIZATION: bearer $MAI_GITHUB_INSTALLATION_TOKEN\" clone -- {repo_url} {workspace}\n\
+             git -c credential.helper= -c http.https://github.com/.extraheader=\"AUTHORIZATION: bearer $MAI_GITHUB_INSTALLATION_TOKEN\" clone{branch_arg} -- {repo_url} {workspace}\n\
              git config --global --unset-all credential.helper >/dev/null 2>&1 || true\n\
              rm -rf \"$HOME/.config/gh\" \"$HOME/.git-credentials\"",
             workspace = shell_quote(PROJECT_WORKSPACE_PATH),
+            branch_arg = branch_arg,
             repo_url = shell_quote(&repo_url),
         );
+        let workspace_volume =
+            DockerClient::workspace_volume_for_agent(&maintainer_agent_id.to_string());
+        let sidecar_name = sidecar_container_name("clone", &maintainer_agent_id.to_string());
         let output = self
             .docker
-            .exec_shell_env(
-                &container_id,
+            .run_sidecar_shell_env(
+                &sidecar_name,
+                self.docker.image(),
                 &command,
                 Some("/"),
                 Some(600),
                 &[("MAI_GITHUB_INSTALLATION_TOKEN".to_string(), token.clone())],
+                Some(&workspace_volume),
             )
             .await?;
         if output.status != 0 {
@@ -4132,22 +4285,14 @@ impl AgentRuntime {
     }
 
     async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<mai_mcp::McpTool> {
-        if agent.summary.read().await.project_id.is_some()
-            && self
-                .store
-                .github_app_secret()
-                .await
-                .ok()
-                .flatten()
-                .is_some()
-        {
+        if agent.summary.read().await.project_id.is_some() {
             if let Some(manager) = agent.mcp.read().await.clone() {
                 let tools = manager.tools().await;
                 if !tools.is_empty() {
                     return tools;
                 }
             }
-            return PROJECT_GITHUB_TOOLS.clone();
+            return project_builtin_tools();
         }
         let Some(manager) = agent.mcp.read().await.clone() else {
             return Vec::new();
@@ -4167,34 +4312,32 @@ impl AgentRuntime {
         if agent.mcp.read().await.is_some() {
             return Ok(());
         }
-        let Some(token) = self.project_installation_token_for_agent(agent).await? else {
+        let Some(token) = self.project_git_token_for_agent(agent).await? else {
             return Ok(());
         };
-        let mut config = McpServerConfig {
-            transport: McpServerTransport::StreamableHttp,
-            url: Some("https://api.githubcopilot.com/mcp/".to_string()),
-            bearer_token: Some(token),
-            enabled: true,
-            startup_timeout_secs: Some(20),
-            ..McpServerConfig::default()
-        };
-        config.disabled_tools = Vec::new();
-        let mut configs = std::collections::BTreeMap::new();
-        configs.insert(PROJECT_GITHUB_MCP_SERVER.to_string(), config);
+        let summary = agent.summary.read().await.clone();
+        let workspace_volume = DockerClient::workspace_volume_for_agent(&summary.id.to_string());
+        let image = self.docker.image().to_string();
+        let configs = project_mcp_configs(&token);
         self.publish(ServiceEventKind::McpServerStatusChanged {
             agent_id,
-            server: PROJECT_GITHUB_MCP_SERVER.to_string(),
+            server: "project".to_string(),
             status: mai_protocol::McpStartupStatus::Starting,
             error: None,
         })
         .await;
-        let mcp = McpAgentManager::start(self.docker.clone(), String::new(), configs).await;
+        let mcp =
+            McpAgentManager::start_sidecars(self.docker.clone(), workspace_volume, image, configs)
+                .await;
         for status in mcp.statuses().await {
+            let error = status
+                .error
+                .map(|error| redact_secret(&error, &token));
             self.publish(ServiceEventKind::McpServerStatusChanged {
                 agent_id,
                 server: status.server,
                 status: status.status,
-                error: status.error,
+                error,
             })
             .await;
         }
@@ -4416,11 +4559,22 @@ fn agent_role_label(role: AgentRole) -> &'static str {
     }
 }
 
-fn project_maintainer_system_prompt(owner: &str, repo: &str) -> String {
+fn project_maintainer_system_prompt(
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    project_path: &str,
+) -> String {
+    let focus_path = if project_path == "/" {
+        PROJECT_WORKSPACE_PATH.to_string()
+    } else {
+        format!("{PROJECT_WORKSPACE_PATH}{project_path}")
+    };
     format!(
         r#"You are the Maintainer agent for the GitHub project `{owner}/{repo}`.
 
 You run inside an isolated Docker container. The repository is cloned at `/workspace/repo`; use that path for local inspection and edits.
+The selected branch is `{branch}`. The project path is `{project_path}`; focus local work in `{focus_path}` unless the user asks otherwise.
 
 Security rules:
 - Do not look for or persist GitHub credentials.
@@ -4436,21 +4590,56 @@ Operational focus:
     )
 }
 
-fn clean_project_field(value: String, field: &str) -> Result<String> {
-    let value = value.trim().trim_matches('/').to_string();
-    if value.is_empty() {
-        return Err(RuntimeError::InvalidInput(format!("{field} is required")));
-    }
-    if value.contains('/') || value.contains(char::is_whitespace) {
+fn normalize_optional_path_segment(value: Option<&str>, field: &str) -> Result<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.contains(char::is_whitespace)
+        || value.starts_with('-')
+        || value.starts_with('/')
+        || value.contains("..")
+        || value.contains('\\')
+    {
         return Err(RuntimeError::InvalidInput(format!(
-            "{field} must be a GitHub path segment"
+            "{field} must be a safe Git ref name"
         )));
     }
-    Ok(value)
+    Ok(Some(value.to_string()))
+}
+
+fn normalize_project_path(value: Option<&str>) -> Result<String> {
+    let value = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("/");
+    if value.contains(char::is_whitespace) || value.contains('\\') || value.contains("..") {
+        return Err(RuntimeError::InvalidInput(
+            "project_path must be a safe repository path".to_string(),
+        ));
+    }
+    let trimmed = value.trim_matches('/');
+    if trimmed.is_empty() {
+        Ok("/".to_string())
+    } else {
+        Ok(format!("/{trimmed}"))
+    }
 }
 
 fn github_clone_url(owner: &str, repo: &str) -> String {
     format!("https://github.com/{owner}/{repo}.git")
+}
+
+fn github_repository_summary(repository: GithubRepositoryApi) -> GithubRepositorySummary {
+    GithubRepositorySummary {
+        id: repository.id,
+        owner: repository.owner.login,
+        name: repository.name,
+        full_name: repository.full_name,
+        private: repository.private,
+        clone_url: repository.clone_url,
+        html_url: repository.html_url,
+        default_branch: repository.default_branch,
+    }
 }
 
 fn github_api_url(base_url: &str, path: &str) -> String {
@@ -4533,6 +4722,67 @@ fn github_headers() -> HeaderMap {
     headers
 }
 
+fn github_scopes(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get("x-oauth-scopes")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn git_token_kind(token: &str, scopes: &[String]) -> GitTokenKind {
+    if token.starts_with("github_pat_") {
+        GitTokenKind::FineGrainedPat
+    } else if token.starts_with("ghp_") || !scopes.is_empty() {
+        GitTokenKind::Classic
+    } else {
+        GitTokenKind::Unknown
+    }
+}
+
+fn project_mcp_configs(token: &str) -> std::collections::BTreeMap<String, McpServerConfig> {
+    let mut configs = std::collections::BTreeMap::new();
+    configs.insert(
+        PROJECT_GITHUB_MCP_SERVER.to_string(),
+        McpServerConfig {
+            transport: McpServerTransport::Stdio,
+            command: Some("github-mcp-server".to_string()),
+            args: vec!["stdio".to_string()],
+            env: std::collections::BTreeMap::from([(
+                "GITHUB_PERSONAL_ACCESS_TOKEN".to_string(),
+                token.to_string(),
+            )]),
+            enabled: true,
+            startup_timeout_secs: Some(20),
+            ..McpServerConfig::default()
+        },
+    );
+    configs.insert(
+        PROJECT_GIT_MCP_SERVER.to_string(),
+        McpServerConfig {
+            transport: McpServerTransport::Stdio,
+            command: Some("uvx".to_string()),
+            args: vec![
+                "mcp-server-git".to_string(),
+                "--repository".to_string(),
+                PROJECT_WORKSPACE_PATH.to_string(),
+            ],
+            env: std::collections::BTreeMap::from([(
+                "GITHUB_TOKEN".to_string(),
+                token.to_string(),
+            )]),
+            enabled: true,
+            startup_timeout_secs: Some(20),
+            ..McpServerConfig::default()
+        },
+    );
+    configs
+}
+
 fn project_github_tools() -> Vec<McpTool> {
     [
         ("get_me", "Get the authenticated GitHub user."),
@@ -4570,6 +4820,34 @@ fn project_github_tools() -> Vec<McpTool> {
     .collect()
 }
 
+fn project_git_tools() -> Vec<McpTool> {
+    [
+        ("git_status", "Show repository working tree status."),
+        ("git_diff", "Show changes in the repository."),
+        ("git_log", "Show recent commit history."),
+        ("git_add", "Stage files."),
+        ("git_commit", "Create a commit."),
+    ]
+    .into_iter()
+    .map(|(name, description)| McpTool {
+        server: PROJECT_GIT_MCP_SERVER.to_string(),
+        name: name.to_string(),
+        model_name: mai_mcp::model_tool_name(PROJECT_GIT_MCP_SERVER, name),
+        description: description.to_string(),
+        input_schema: json!({ "type": "object" }),
+        output_schema: None,
+    })
+    .collect()
+}
+
+fn project_builtin_tools() -> Vec<McpTool> {
+    PROJECT_GITHUB_TOOLS
+        .iter()
+        .cloned()
+        .chain(PROJECT_GIT_TOOLS.iter().cloned())
+        .collect()
+}
+
 async fn decode_github_response<T: DeserializeOwned>(
     response: reqwest::Response,
     action: &str,
@@ -4598,6 +4876,34 @@ fn redact_secret(value: &str, secret: &str) -> String {
         return value.to_string();
     }
     value.replace(secret, "<redacted>")
+}
+
+fn sidecar_container_name(kind: &str, id: &str) -> String {
+    let nanos = Utc::now()
+        .timestamp_nanos_opt()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    format!("mai-team-{kind}-{}-{nanos}", sanitize_docker_name(id))
+}
+
+fn sanitize_docker_name(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if sanitized.is_empty() {
+        "sidecar".to_string()
+    } else {
+        sanitized
+    }
 }
 
 trait IfEmpty {
@@ -6016,6 +6322,27 @@ esac
         ];
 
         assert_eq!(recent_user_messages(&history, 7), vec!["def", "ghij"]);
+    }
+
+    #[test]
+    fn normalize_project_path_defaults_and_trims() {
+        assert_eq!(normalize_project_path(None).expect("default"), "/");
+        assert_eq!(
+            normalize_project_path(Some(" crates/mai-server/web/ ")).expect("path"),
+            "/crates/mai-server/web"
+        );
+    }
+
+    #[test]
+    fn normalize_project_path_rejects_unsafe_values() {
+        assert!(matches!(
+            normalize_project_path(Some("../secret")),
+            Err(RuntimeError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            normalize_project_path(Some("bad path")),
+            Err(RuntimeError::InvalidInput(_))
+        ));
     }
 
     #[tokio::test]

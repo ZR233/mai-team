@@ -3,7 +3,7 @@
     <div class="settings-page-title">
       <div>
         <h2>Settings</h2>
-        <p>Tune role models, skills, and integrations for task agents.</p>
+        <p>Tune role models, skills, and Git accounts for task agents.</p>
       </div>
     </div>
 
@@ -212,204 +212,117 @@
           </div>
         </section>
 
-        <section v-else-if="activeSettingsSection === 'integrations'" class="settings-section-panel github-settings">
+        <section v-else-if="activeSettingsSection === 'git-accounts'" class="settings-section-panel github-settings">
           <div class="settings-section-header">
             <div>
-              <h2>Integrations</h2>
-              <p>Connect GitHub MCP and GitHub App auth for project repositories.</p>
+              <h2>Git Accounts</h2>
+              <p>Manage GitHub tokens used by project agents for repository access.</p>
+            </div>
+            <span class="section-status" :class="gitAccountCount ? 'ready' : ''">
+              {{ gitAccountCount ? `${gitAccountCount} connected` : 'No accounts' }}
+            </span>
+          </div>
+
+          <div class="settings-summary">
+            <div class="settings-summary-item" :class="gitAccountCount ? 'ready' : ''">
+              <span>Connected accounts</span>
+              <strong>{{ gitAccountCount }}</strong>
+              <small>{{ defaultGitAccount ? `Default: ${accountDisplay(defaultGitAccount)}` : 'Add a GitHub account.' }}</small>
+            </div>
+            <div class="settings-summary-item ready">
+              <span>Provider</span>
+              <strong>GitHub</strong>
+              <small>GitLab is reserved for a later version.</small>
+            </div>
+            <div class="settings-summary-item ready">
+              <span>Agent tools</span>
+              <strong>Git MCP + GitHub MCP</strong>
+              <small>Same stored token, server-side only.</small>
             </div>
           </div>
 
-          <div class="integration-card">
-            <div class="integration-card-head">
-              <div>
-                <h3>GitHub App Auth Service</h3>
-                <p>Create a preconfigured GitHub App without webhooks, then install it on project repositories.</p>
-              </div>
-              <span class="section-status" :class="githubAppConfigured ? 'ready' : ''">
-                {{ githubAppConfigured ? 'Configured' : 'Not configured' }}
-              </span>
-            </div>
-
-            <div class="settings-summary">
-              <div class="settings-summary-item" :class="githubState.app_id ? 'ready' : ''">
-                <span>App ID</span>
-                <strong>{{ githubState.app_id || 'Missing' }}</strong>
-                <small>{{ githubState.owner_login ? `${githubState.owner_login} · ${githubState.owner_type || 'GitHub'}` : 'Created through GitHub Manifest Flow.' }}</small>
-              </div>
-              <div class="settings-summary-item" :class="githubState.has_private_key ? 'ready' : ''">
-                <span>Private key</span>
-                <strong>{{ githubState.has_private_key ? 'Stored server-side' : 'Missing' }}</strong>
-                <small>Never sent to agents or containers.</small>
-              </div>
-              <div class="settings-summary-item ready">
-                <span>Mode</span>
-                <strong>No webhook</strong>
-                <small>Manual refresh / polling via outbound HTTPS.</small>
-              </div>
-            </div>
-
-            <div class="github-app-wizard">
-              <div class="segmented-control" role="group" aria-label="GitHub App account type">
-                <button
-                  type="button"
-                  :class="{ active: githubManifestForm.account_type === 'organization' }"
-                  @click="githubManifestForm.account_type = 'organization'"
-                >
-                  Organization
-                </button>
-                <button
-                  type="button"
-                  :class="{ active: githubManifestForm.account_type === 'personal' }"
-                  @click="githubManifestForm.account_type = 'personal'"
-                >
-                  Personal
-                </button>
-              </div>
-
-              <label v-if="githubManifestForm.account_type === 'organization'" class="github-org-field">
-                <span>Organization</span>
-                <input
-                  v-model.trim="githubManifestForm.org"
-                  placeholder="your-org"
-                  autocomplete="off"
-                />
-              </label>
-
-              <div class="github-app-command-row">
-                <button
-                  class="primary-button"
-                  type="button"
-                  :disabled="githubAppManifestStarting || !canConfigureGithubApp"
-                  @click="configureGithubApp"
-                >
-                  <span v-if="githubAppManifestStarting" class="spinner-sm"></span>
-                  <template v-else>Configure on GitHub</template>
-                </button>
-                <button
-                  v-if="githubState.install_url"
-                  class="ghost-button"
-                  type="button"
-                  @click="openGithubInstall"
-                >
-                  Install App
-                </button>
-                <button
-                  class="ghost-button"
-                  type="button"
-                  @click="$emit('refresh-github-installations')"
-                >
-                  Refresh Installations
-                </button>
-              </div>
-            </div>
-
-            <div v-if="githubState.app_slug || githubState.app_html_url" class="github-app-links">
-              <a v-if="githubState.app_html_url" :href="githubState.app_html_url" target="_blank" rel="noreferrer">View GitHub App</a>
-              <a v-if="githubState.install_url" :href="githubState.install_url">Install on repositories</a>
-            </div>
-
-            <details class="advanced-config" :open="advancedGithubAppOpen" @toggle="advancedGithubAppOpen = $event.target.open">
-              <summary>Advanced manual config</summary>
-              <div class="github-app-form">
-                <label>
-                  <span>GitHub App ID</span>
-                  <input
-                    v-model.trim="githubAppForm.app_id"
-                    placeholder="123456"
-                    autocomplete="off"
-                    @input="githubAppDirty = true"
-                  />
-                </label>
-                <label>
-                  <span>Base URL</span>
-                  <input
-                    v-model.trim="githubAppForm.base_url"
-                    placeholder="https://api.github.com"
-                    autocomplete="off"
-                    @input="githubAppDirty = true"
-                  />
-                </label>
-                <label class="span-2">
-                  <span>Private Key</span>
-                  <textarea
-                    v-model="githubAppForm.private_key"
-                    rows="5"
-                    :placeholder="githubState.has_private_key ? 'Leave blank to keep the stored key' : '-----BEGIN RSA PRIVATE KEY-----'"
-                    autocomplete="off"
-                    @input="githubAppDirty = true"
-                  ></textarea>
-                </label>
-              </div>
-            </details>
-
-            <div class="settings-actions">
-              <div class="settings-action-errors">
-                <p v-if="githubAppError" class="dialog-error">{{ githubAppError }}</p>
-              </div>
+          <div class="git-accounts-layout">
+            <div class="git-account-list">
               <button
-                class="primary-button"
+                v-for="account in gitAccounts"
+                :key="account.id"
+                class="git-account-card"
                 type="button"
-                :disabled="githubAppSaving || !advancedGithubAppOpen"
-                @click="saveGithubApp"
+                :class="{ active: selectedGitAccountId === account.id }"
+                @click="selectGitAccount(account)"
               >
-                <span v-if="githubAppSaving" class="spinner-sm"></span>
-                <template v-else>Save Manual Config</template>
+                <span class="git-account-mark">GH</span>
+                <span class="git-account-main">
+                  <strong>{{ account.label || 'GitHub' }}</strong>
+                  <small>{{ accountDisplay(account) }}</small>
+                  <span class="git-account-meta">{{ tokenKindLabel(account.token_kind) }} · {{ account.status || 'unverified' }}</span>
+                </span>
+                <span v-if="account.is_default" class="mini-pill green">Default</span>
               </button>
-            </div>
-          </div>
-
-          <div class="integration-card">
-            <div class="integration-card-head">
-              <div>
-                <h3>GitHub MCP</h3>
-                <p>Connect GitHub workflows, repositories, and pull request context.</p>
-              </div>
-              <span class="section-status" :class="githubState.has_token ? 'ready' : ''">
-                {{ githubState.has_token ? 'Connected' : 'Not connected' }}
-              </span>
-            </div>
-
-            <div class="settings-summary single">
-              <div class="settings-summary-item" :class="githubState.has_token ? 'ready' : ''">
-                <span>Status</span>
-                <strong>{{ githubState.has_token ? 'Token configured' : 'Not connected' }}</strong>
-                <small>Endpoint: https://api.githubcopilot.com/mcp/</small>
+              <div v-if="!gitAccountCount" class="quiet-empty skills-empty">
+                <strong>No Git accounts</strong>
+                <span>Add a GitHub PAT to enable project repositories.</span>
               </div>
             </div>
 
-            <div class="github-token-form">
-              <label class="github-token-label">
-                <span>Personal Access Token</span>
-                <input
-                  v-model="githubTokenInput"
-                  type="password"
-                  placeholder="ghp_..."
-                  autocomplete="off"
-                  class="github-token-input"
-                />
+            <form class="git-account-form" @submit.prevent="saveGitAccountForm">
+              <div class="integration-card-head">
+                <div>
+                  <h3>{{ gitForm.id ? 'Edit Account' : 'Add Account' }}</h3>
+                  <p>Token type is detected after verification.</p>
+                </div>
+                <span class="section-status" :class="selectedGitAccount?.status === 'verified' ? 'ready' : ''">
+                  {{ selectedGitAccount?.status || 'New' }}
+                </span>
+              </div>
+
+              <div class="segmented-control provider-control" role="group" aria-label="Git provider">
+                <button class="active" type="button">GitHub</button>
+                <button class="disabled" type="button" disabled>GitLab</button>
+              </div>
+
+              <label>
+                <span>Account label</span>
+                <input v-model.trim="gitForm.label" placeholder="Personal" autocomplete="off" />
               </label>
-              <div class="github-token-actions">
-                <button
-                  class="primary-button"
-                  type="button"
-                  :disabled="githubSaving || !githubTokenInput.trim()"
-                  @click="saveGithubToken"
-                >
-                  <span v-if="githubSaving" class="spinner-sm"></span>
-                  <template v-else>Save Token</template>
-                </button>
-                <button
-                  v-if="githubState.has_token"
-                  class="danger-button"
-                  type="button"
-                  :disabled="githubSaving"
-                  @click="clearGithubToken"
-                >
-                  Clear Token
+              <label>
+                <span>GitHub username</span>
+                <input v-model.trim="gitForm.login" placeholder="Optional" autocomplete="off" />
+              </label>
+              <label>
+                <span>Token</span>
+                <input v-model="gitForm.token" type="password" placeholder="ghp_ or github_pat_" autocomplete="off" />
+                <small>Leave blank when editing to keep the stored token.</small>
+              </label>
+
+              <div class="detected-token-row">
+                <span>Detected token</span>
+                <strong>{{ selectedGitAccount ? tokenKindLabel(selectedGitAccount.token_kind) : 'After Test connection' }}</strong>
+                <small>{{ selectedGitAccount?.scopes?.length ? selectedGitAccount.scopes.join(', ') : 'Permissions are read from GitHub when available.' }}</small>
+              </div>
+
+              <div class="agent-runtime-strip">
+                <span>Agent runtime</span>
+                <strong>Stored token -> Git MCP + GitHub MCP</strong>
+                <small>Token stays in server-managed MCP processes, not in the agent container.</small>
+              </div>
+
+              <div class="settings-actions">
+                <div class="settings-actions-left">
+                  <button class="ghost-button" type="button" :disabled="gitAccountsState.saving || !gitForm.id" @click="resetGitForm">New</button>
+                  <button class="ghost-button" type="button" :disabled="gitAccountsState.verifying || !gitForm.id" @click="$emit('verify-git-account', gitForm.id)">
+                    <span v-if="gitAccountsState.verifying" class="spinner-sm"></span>
+                    <template v-else>Test connection</template>
+                  </button>
+                </div>
+                <button class="ghost-button" type="button" :disabled="!gitForm.id || selectedGitAccount?.is_default" @click="$emit('set-default-git-account', gitForm.id)">Set Default</button>
+                <button class="primary-button" type="submit" :disabled="gitAccountsState.saving || !canSaveGitAccount">
+                  <span v-if="gitAccountsState.saving" class="spinner-sm"></span>
+                  <template v-else>Save Account</template>
                 </button>
               </div>
-            </div>
+              <button v-if="gitForm.id" class="danger-button git-delete-button" type="button" :disabled="gitAccountsState.deleting" @click="$emit('delete-git-account', gitForm.id)">Delete Account</button>
+            </form>
           </div>
         </section>
 
@@ -480,7 +393,7 @@ const ROLE_DEFINITIONS = [
 const SETTINGS_SECTIONS = [
   { key: 'roles', title: 'Role Models', icon: 'R' },
   { key: 'skills', title: 'Skills', icon: 'S' },
-  { key: 'integrations', title: 'Integrations', icon: 'G' },
+  { key: 'git-accounts', title: 'Git Accounts', icon: 'G' },
   { key: 'mcp', title: 'MCP Servers', icon: 'M' }
 ]
 
@@ -494,10 +407,7 @@ const props = defineProps({
   skillsError: { type: String, default: '' },
   mcpServersState: { type: Object, required: true },
   mcpSaving: { type: Boolean, default: false },
-  githubState: { type: Object, default: () => ({ has_token: false, loading: false }) },
-  githubSaving: { type: Boolean, default: false },
-  githubAppSaving: { type: Boolean, default: false },
-  githubAppManifestStarting: { type: Boolean, default: false },
+  gitAccountsState: { type: Object, default: () => ({ accounts: [] }) },
   initialSection: { type: String, default: 'roles' }
 })
 
@@ -509,26 +419,20 @@ const emit = defineEmits([
   'save-skills',
   'reload-mcp',
   'open-mcp',
-  'save-github',
-  'save-github-app',
-  'configure-github-app',
-  'refresh-github-installations'
+  'save-git-account',
+  'verify-git-account',
+  'delete-git-account',
+  'set-default-git-account'
 ])
 
 const activeSettingsSection = ref('roles')
-const githubTokenInput = ref('')
-const githubManifestForm = reactive({
-  account_type: 'organization',
-  org: ''
+const selectedGitAccountId = ref('')
+const gitForm = reactive({
+  id: '',
+  label: '',
+  login: '',
+  token: ''
 })
-const githubAppForm = reactive({
-  app_id: '',
-  base_url: 'https://api.github.com',
-  private_key: ''
-})
-const githubAppError = ref('')
-const githubAppDirty = ref(false)
-const advancedGithubAppOpen = ref(false)
 
 const error = ref('')
 const forms = reactive({
@@ -578,10 +482,12 @@ const mcpTransportLabel = computed(() => {
   if (!transports.size) return 'None'
   return Array.from(transports).join(' · ')
 })
-const githubAppConfigured = computed(() => Boolean(props.githubState.app_id && props.githubState.has_private_key))
-const canConfigureGithubApp = computed(() => {
-  if (githubManifestForm.account_type === 'personal') return true
-  return isGithubOrgSlug(githubManifestForm.org)
+const gitAccounts = computed(() => props.gitAccountsState.accounts || [])
+const gitAccountCount = computed(() => gitAccounts.value.length)
+const defaultGitAccount = computed(() => gitAccounts.value.find((account) => account.is_default) || null)
+const selectedGitAccount = computed(() => gitAccounts.value.find((account) => account.id === selectedGitAccountId.value) || null)
+const canSaveGitAccount = computed(() => {
+  return Boolean(gitForm.label.trim() && (gitForm.id || gitForm.token.trim()))
 })
 
 watch(
@@ -613,11 +519,7 @@ watch(
   }
 )
 
-watch(
-  () => [props.githubState.app_id, props.githubState.base_url, props.githubState.has_private_key],
-  syncGithubAppForm,
-  { immediate: true }
-)
+watch(gitAccounts, syncSelectedGitAccount, { immediate: true })
 
 function emptyPreference() {
   return {
@@ -725,10 +627,7 @@ function preferencePayload(preference) {
 function sectionStatus(section) {
   if (section === 'roles') return `${configuredCount.value}/${ROLE_DEFINITIONS.length} configured`
   if (section === 'skills') return `${enabledSkillCount.value} enabled`
-  if (section === 'integrations') {
-    if (githubAppConfigured.value) return 'GitHub App ready'
-    return props.githubState.has_token ? 'GitHub MCP connected' : 'Not connected'
-  }
+  if (section === 'git-accounts') return gitAccountCount.value ? `${gitAccountCount.value} connected` : 'No accounts'
   if (section === 'mcp') return `${mcpEnabledCount.value} active`
   return ''
 }
@@ -752,62 +651,47 @@ function saveSkills() {
   emit('save-skills', config)
 }
 
-function saveGithubToken() {
-  const token = githubTokenInput.value.trim()
-  if (!token) return
-  emit('save-github', token)
-  githubTokenInput.value = ''
+function syncSelectedGitAccount() {
+  if (selectedGitAccountId.value && gitAccounts.value.some((account) => account.id === selectedGitAccountId.value)) return
+  const next = defaultGitAccount.value || gitAccounts.value[0]
+  if (next) selectGitAccount(next)
 }
 
-function clearGithubToken() {
-  emit('save-github', null)
+function selectGitAccount(account) {
+  selectedGitAccountId.value = account.id
+  gitForm.id = account.id
+  gitForm.label = account.label || ''
+  gitForm.login = account.login || ''
+  gitForm.token = ''
 }
 
-function syncGithubAppForm() {
-  if (githubAppDirty.value) return
-  githubAppForm.app_id = props.githubState.app_id || ''
-  githubAppForm.base_url = props.githubState.base_url || 'https://api.github.com'
-  githubAppForm.private_key = ''
-  githubAppError.value = ''
+function resetGitForm() {
+  selectedGitAccountId.value = ''
+  gitForm.id = ''
+  gitForm.label = ''
+  gitForm.login = ''
+  gitForm.token = ''
 }
 
-function configureGithubApp() {
-  githubAppError.value = ''
-  if (!canConfigureGithubApp.value) {
-    githubAppError.value = 'Organization may contain only letters, numbers, or hyphens.'
-    return
-  }
-  emit('configure-github-app', {
-    account_type: githubManifestForm.account_type,
-    org: githubManifestForm.account_type === 'organization' ? githubManifestForm.org.trim() : null
+function saveGitAccountForm() {
+  emit('save-git-account', {
+    id: gitForm.id || null,
+    provider: 'github',
+    label: gitForm.label.trim(),
+    login: gitForm.login.trim() || null,
+    token: gitForm.token.trim() || null,
+    is_default: !gitAccountCount.value
   })
+  gitForm.token = ''
 }
 
-function openGithubInstall() {
-  if (props.githubState.install_url) window.location.href = props.githubState.install_url
+function accountDisplay(account) {
+  return account?.login ? `@${account.login}` : (account?.provider || 'github')
 }
 
-function saveGithubApp() {
-  githubAppError.value = ''
-  if (!githubAppForm.app_id.trim()) {
-    githubAppError.value = 'GitHub App ID is required.'
-    return
-  }
-  if (!props.githubState.has_private_key && !githubAppForm.private_key.trim()) {
-    githubAppError.value = 'Private key is required the first time you configure the app.'
-    return
-  }
-  emit('save-github-app', {
-    app_id: githubAppForm.app_id.trim(),
-    base_url: githubAppForm.base_url.trim() || 'https://api.github.com',
-    private_key: githubAppForm.private_key.trim() || null
-  })
-  githubAppDirty.value = false
-  githubAppForm.private_key = ''
-}
-
-function isGithubOrgSlug(value) {
-  const org = value.trim()
-  return Boolean(org) && /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,98}[A-Za-z0-9])?$/.test(org)
+function tokenKindLabel(value) {
+  if (value === 'classic') return 'Classic token'
+  if (value === 'fine_grained_pat') return 'Fine-grained PAT'
+  return 'Token type pending'
 }
 </script>

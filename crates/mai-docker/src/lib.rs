@@ -75,6 +75,10 @@ impl DockerClient {
         &self.image
     }
 
+    pub fn workspace_volume_for_agent(agent_id: &str) -> String {
+        agent_workspace_volume(agent_id)
+    }
+
     pub async fn check_available(&self) -> Result<String> {
         let output = Command::new(&self.binary)
             .args(["version", "--format", "{{.Server.Version}}"])
@@ -200,7 +204,8 @@ impl DockerClient {
         let image = validate_image(image)?;
         let name = agent_container_name(agent_id);
         let label = agent_label(agent_id);
-        let args = create_agent_container_args(&name, &label, image);
+        let workspace_volume = agent_workspace_volume(agent_id);
+        let args = create_agent_container_args(&name, &label, image, &workspace_volume);
         let create = Command::new(&self.binary)
             .args(args.iter().map(String::as_str))
             .output()
@@ -356,9 +361,56 @@ impl DockerClient {
             cmd.args(["-w", cwd]);
         }
         for (key, value) in env {
-            cmd.args(["-e", &format!("{key}={value}")]);
+            cmd.arg("-e").arg(key);
+            cmd.env(key, value);
         }
         cmd.args([container_id, "/bin/sh", "-lc", &shell_command]);
+
+        let output = cmd.output().await?;
+        Ok(ExecOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8(output.stdout)?,
+            stderr: String::from_utf8(output.stderr)?,
+        })
+    }
+
+    pub async fn run_sidecar_shell_env(
+        &self,
+        name: &str,
+        image: &str,
+        command: &str,
+        cwd: Option<&str>,
+        timeout_secs: Option<u64>,
+        env: &[(String, String)],
+        workspace_volume: Option<&str>,
+    ) -> Result<ExecOutput> {
+        let image = validate_image(image)?;
+        let shell_command = match timeout_secs {
+            Some(seconds) if seconds > 0 => {
+                format!(
+                    "timeout --preserve-status {seconds}s /bin/sh -lc {}",
+                    shell_quote(command)
+                )
+            }
+            _ => command.to_string(),
+        };
+        let mut cmd = Command::new(&self.binary);
+        cmd.arg("run")
+            .arg("--rm")
+            .args(["--name", name])
+            .args(["--label", MANAGED_LABEL]);
+        if let Some(volume) = workspace_volume {
+            let mount = format!("{volume}:/workspace");
+            cmd.args(["-v", &mount]);
+        }
+        if let Some(cwd) = cwd {
+            cmd.args(["-w", cwd]);
+        }
+        for (key, value) in env {
+            cmd.arg("-e").arg(key);
+            cmd.env(key, value);
+        }
+        cmd.arg(image).args(["/bin/sh", "-lc", &shell_command]);
 
         let output = cmd.output().await?;
         Ok(ExecOutput {
@@ -382,9 +434,44 @@ impl DockerClient {
             cmd.args(["-w", cwd]);
         }
         for (key, value) in env {
-            cmd.args(["-e", &format!("{key}={value}")]);
+            cmd.arg("-e").arg(key);
+            cmd.env(key, value);
         }
         cmd.arg(container_id).arg(command).args(args);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Ok(cmd.spawn()?)
+    }
+
+    pub fn spawn_sidecar(
+        &self,
+        name: &str,
+        image: &str,
+        command: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+        workspace_volume: Option<&str>,
+    ) -> Result<Child> {
+        let image = validate_image(image)?;
+        let mut cmd = Command::new(&self.binary);
+        cmd.arg("run")
+            .arg("--rm")
+            .arg("-i")
+            .args(["--name", name])
+            .args(["--label", MANAGED_LABEL]);
+        if let Some(volume) = workspace_volume {
+            cmd.args(["-v", &format!("{volume}:/workspace")]);
+        }
+        if let Some(cwd) = cwd {
+            cmd.args(["-w", cwd]);
+        }
+        for (key, value) in env {
+            cmd.arg("-e").arg(key);
+            cmd.env(key, value);
+        }
+        cmd.arg(image).arg(command).args(args);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -546,24 +633,32 @@ fn agent_label(agent_id: &str) -> String {
     format!("{AGENT_LABEL_KEY}={agent_id}")
 }
 
-fn create_agent_container_args(name: &str, agent_label: &str, image: &str) -> Vec<String> {
-    [
-        "create",
-        "--name",
-        name,
-        "--label",
-        MANAGED_LABEL,
-        "--label",
-        agent_label,
-        "-w",
-        "/workspace",
-        image,
-        "sleep",
-        "infinity",
+fn create_agent_container_args(
+    name: &str,
+    agent_label: &str,
+    image: &str,
+    workspace_volume: &str,
+) -> Vec<String> {
+    vec![
+        "create".to_string(),
+        "--name".to_string(),
+        name.to_string(),
+        "--label".to_string(),
+        MANAGED_LABEL.to_string(),
+        "--label".to_string(),
+        agent_label.to_string(),
+        "-v".to_string(),
+        format!("{workspace_volume}:/workspace"),
+        "-w".to_string(),
+        "/workspace".to_string(),
+        image.to_string(),
+        "sleep".to_string(),
+        "infinity".to_string(),
     ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
+}
+
+fn agent_workspace_volume(agent_id: &str) -> String {
+    format!("mai-team-workspace-{agent_id}")
 }
 
 fn validate_image(image: &str) -> Result<&str> {
@@ -791,7 +886,12 @@ mod tests {
     #[test]
     fn create_agent_container_args_include_labels_workspace_and_image() {
         let image = "ghcr.io/rcore-os/tgoskits-container:latest";
-        let args = create_agent_container_args("mai-team-child", "mai.team.agent=child", image);
+        let args = create_agent_container_args(
+            "mai-team-child",
+            "mai.team.agent=child",
+            image,
+            "mai-team-workspace-child",
+        );
 
         assert_eq!(args[0], "create");
         assert!(
@@ -805,6 +905,10 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|window| window == ["--label", "mai.team.agent=child"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-v", "mai-team-workspace-child:/workspace"])
         );
         assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
         assert!(

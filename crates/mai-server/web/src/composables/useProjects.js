@@ -161,17 +161,9 @@ export function useProjects() {
     return response?.agent || response
   }
 
-  async function loadGithubInstallations() {
-    return api('/github/installations')
-  }
-
-  async function refreshGithubInstallations() {
-    return api('/github/installations:refresh', { method: 'POST' })
-  }
-
-  async function loadGithubRepositories(installationId) {
-    if (!installationId) return { repositories: [] }
-    return api(`/github/installations/${encodeURIComponent(installationId)}/repositories`)
+  async function loadGitAccountRepositories(accountId) {
+    if (!accountId) return { repositories: [] }
+    return api(`/git/accounts/${encodeURIComponent(accountId)}/repositories`)
   }
 
   async function scrollProjectConversationToBottom() {
@@ -184,17 +176,23 @@ export function useProjects() {
 
   const projectDialog = reactive({
     open: false,
+    mode: 'git_account',
     form: {
       name: '',
-      installation_id: '',
-      repository_id: '',
-      owner: '',
-      repo: '',
+      git_account_id: '',
+      repository_full_name: '',
+      branch: '',
+      project_path: '/'
+    },
+    repository: {
+      query: ''
+    },
+    runtime: {
       docker_image: ''
     },
-    installations: [],
+    gitAccounts: [],
     repositories: [],
-    loadingInstallations: false,
+    loadingAccounts: false,
     loadingRepositories: false,
     submitting: false,
     error: ''
@@ -224,9 +222,7 @@ export function useProjects() {
     cancelProjectAgent,
     createProjectSession,
     updateProjectAgent,
-    loadGithubInstallations,
-    refreshGithubInstallations,
-    loadGithubRepositories,
+    loadGitAccountRepositories,
     scrollProjectConversationToBottom
   }
 }

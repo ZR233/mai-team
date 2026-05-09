@@ -125,10 +125,7 @@
         :skills-error="skillsError"
         :mcp-servers-state="mcpServersState"
         :mcp-saving="mcpServersState.saving"
-        :github-state="githubSettingsState"
-        :github-saving="githubSettingsState.saving"
-        :github-app-saving="githubSettingsState.appSaving"
-        :github-app-manifest-starting="githubSettingsState.manifestStarting"
+        :git-accounts-state="gitAccountsState"
         :initial-section="settingsInitialSection"
         @reload="loadAgentConfig"
         @save="onSaveAgentConfig"
@@ -137,10 +134,10 @@
         @reload-mcp="onLoadMcpServers"
         @open-mcp="mcpDialogOpen = true"
         @open-providers="activeTab = 'providers'"
-        @save-github="onSaveGithubSettings"
-        @save-github-app="onSaveGithubAppSettings"
-        @configure-github-app="onConfigureGithubApp"
-        @refresh-github-installations="onRefreshGithubAppInstallations"
+        @save-git-account="onSaveGitAccount"
+        @verify-git-account="onVerifyGitAccount"
+        @delete-git-account="onDeleteGitAccount"
+        @set-default-git-account="onSetDefaultGitAccount"
       />
     </main>
 
@@ -159,12 +156,9 @@
 
     <ProjectDialog
       :dialog="projectDialog"
-      :github-state="githubSettingsState"
       @close="projectDialog.open = false"
       @create="onCreateProject"
-      @configure-github-app="openGithubAppSettings"
-      @install-github-app="openGithubAppInstallation"
-      @refresh-installations="onRefreshProjectInstallations"
+      @configure-git-accounts="openGitAccountsSettings"
       @refresh-repositories="onRefreshProjectRepositories"
     />
 
@@ -213,7 +207,7 @@ import { useProviders } from './composables/useProviders'
 import { useAgentConfig } from './composables/useAgentConfig'
 import { useSkills } from './composables/useSkills'
 import { useMcpServers } from './composables/useMcpServers'
-import { useGithubSettings } from './composables/useGithubSettings'
+import { useGitAccounts } from './composables/useGitAccounts'
 
 const { toast, showToast } = useApi()
 const { eventFeed, connectionState, connectEvents, disconnect } = useSSE()
@@ -262,9 +256,7 @@ const {
   cancelProjectAgent,
   createProjectSession,
   updateProjectAgent,
-  loadGithubInstallations,
-  refreshGithubInstallations,
-  loadGithubRepositories,
+  loadGitAccountRepositories,
   scrollProjectConversationToBottom
 } = useProjects()
 const {
@@ -291,12 +283,13 @@ const {
   saveMcpServers
 } = useMcpServers()
 const {
-  githubSettingsState,
-  loadGithubSettings,
-  saveGithubSettings,
-  saveGithubAppSettings,
-  startGithubAppManifest
-} = useGithubSettings()
+  gitAccountsState,
+  loadGitAccounts,
+  saveGitAccount,
+  verifyGitAccount,
+  deleteGitAccount,
+  setDefaultGitAccount
+} = useGitAccounts()
 
 const activeTab = ref('tasks')
 const messageDraft = ref('')
@@ -362,7 +355,7 @@ async function refreshAll() {
   isLoading.value = true
   isProjectsLoading.value = true
   try {
-    await Promise.all([loadProviders(), loadAgentConfig(), loadSkills(), loadMcpServers(), loadGithubSettings(), refreshTasks(), refreshProjects()])
+    await Promise.all([loadProviders(), loadAgentConfig(), loadSkills(), loadMcpServers(), loadGitAccounts(), refreshTasks(), refreshProjects()])
     if (providersState.providers.length && !tasks.value.length) {
       await ensureDefaultTask()
     } else if (selectedTaskId.value) {
@@ -385,20 +378,13 @@ async function refreshAll() {
 
 function applyStartupHash() {
   const hash = window.location.hash || ''
-  if (!hash.includes('github-app=')) return
-  settingsInitialSection.value = 'integrations'
+  if (!hash.includes('settings=git-accounts')) return
+  settingsInitialSection.value = 'git-accounts'
   activeTab.value = 'settings'
-  if (hash.includes('configured')) {
-    showToast('GitHub App connected. Install it on repositories before creating a project.')
-  } else if (hash.includes('installed')) {
-    showToast('GitHub App installation updated. Refresh installations to load repositories.')
-  } else if (hash.includes('error')) {
-    showToast('GitHub App setup did not complete.')
-  }
 }
 
-function openGithubAppSettings() {
-  settingsInitialSection.value = 'integrations'
+function openGitAccountsSettings() {
+  settingsInitialSection.value = 'git-accounts'
   activeTab.value = 'settings'
   projectDialog.open = false
 }
@@ -534,61 +520,53 @@ async function onCancelProjectAgent(id) {
 async function openCreateProjectDialog() {
   resetProjectDialog()
   projectDialog.open = true
-  await loadGithubSettings()
-  if (!githubSettingsState.app_id || !githubSettingsState.has_private_key) {
-    projectDialog.error = 'Configure GitHub App before creating a project.'
+  await loadGitAccounts()
+  projectDialog.gitAccounts = gitAccountsState.accounts || []
+  const defaultAccount = projectDialog.gitAccounts.find((account) => account.is_default) || projectDialog.gitAccounts[0]
+  if (!defaultAccount) {
+    projectDialog.error = 'Add a Git account before creating a project.'
     return
   }
-  await onRefreshProjectInstallations()
+  projectDialog.form.git_account_id = defaultAccount.id
+  await onRefreshProjectRepositories()
 }
 
 function resetProjectDialog() {
+  projectDialog.mode = 'git_account'
   projectDialog.form.name = ''
-  projectDialog.form.installation_id = ''
-  projectDialog.form.repository_id = ''
-  projectDialog.form.owner = ''
-  projectDialog.form.repo = ''
-  projectDialog.form.docker_image = ''
+  projectDialog.form.git_account_id = ''
+  projectDialog.form.repository_full_name = ''
+  projectDialog.form.branch = ''
+  projectDialog.form.project_path = '/'
+  projectDialog.repository.query = ''
+  projectDialog.runtime.docker_image = ''
+  projectDialog.gitAccounts = []
   projectDialog.repositories = []
   projectDialog.error = ''
   projectDialog.submitting = false
 }
 
-async function onRefreshProjectInstallations() {
-  projectDialog.loadingInstallations = true
-  projectDialog.error = ''
-  try {
-    await loadGithubSettings()
-    const response = await refreshGithubInstallations()
-    projectDialog.installations = response?.installations || []
-  } catch (error) {
-    projectDialog.error = error.message
-  } finally {
-    projectDialog.loadingInstallations = false
-  }
-}
-
-async function onLoadProjectInstallations() {
-  projectDialog.loadingInstallations = true
-  projectDialog.error = ''
-  try {
-    await loadGithubSettings()
-    const response = await loadGithubInstallations()
-    projectDialog.installations = response?.installations || []
-  } catch (error) {
-    projectDialog.error = error.message
-  } finally {
-    projectDialog.loadingInstallations = false
-  }
-}
-
 async function onRefreshProjectRepositories() {
-  if (!projectDialog.form.installation_id) return
+  if (!projectDialog.form.git_account_id) return
   projectDialog.loadingRepositories = true
   projectDialog.error = ''
   try {
-    const response = await loadGithubRepositories(projectDialog.form.installation_id)
+    const response = await loadGitAccountRepositories(projectDialog.form.git_account_id)
     projectDialog.repositories = response?.repositories || []
+    if (projectDialog.form.repository_full_name && !projectDialog.repositories.some((repository) => {
+      return repository.full_name === projectDialog.form.repository_full_name
+    })) {
+      projectDialog.form.repository_full_name = ''
+      projectDialog.form.branch = ''
+    }
+    if (!projectDialog.form.repository_full_name && projectDialog.repositories.length === 1) {
+      const repository = projectDialog.repositories[0]
+      projectDialog.form.repository_full_name = repository.full_name
+      projectDialog.form.branch = repository.default_branch || 'main'
+      if (!projectDialog.form.name.trim()) {
+        projectDialog.form.name = repository.full_name || [repository.owner, repository.name].filter(Boolean).join('/')
+      }
+    }
   } catch (error) {
     projectDialog.error = error.message
   } finally {
@@ -599,19 +577,23 @@ async function onRefreshProjectRepositories() {
 async function onCreateProject() {
   if (projectDialog.submitting) return
   projectDialog.error = ''
-  if (!projectDialog.form.owner || !projectDialog.form.repo) {
+  if (!projectDialog.form.repository_full_name) {
     projectDialog.error = 'Select a repository before creating the project.'
+    return
+  }
+  if (!projectDialog.form.git_account_id) {
+    projectDialog.error = 'Select a Git account before creating the project.'
     return
   }
   projectDialog.submitting = true
   try {
     await createProject({
       name: projectDialog.form.name,
-      installation_id: projectDialog.form.installation_id,
-      repository_id: projectDialog.form.repository_id,
-      owner: projectDialog.form.owner,
-      repo: projectDialog.form.repo,
-      docker_image: projectDialog.form.docker_image || null
+      git_account_id: projectDialog.form.git_account_id,
+      repository_full_name: projectDialog.form.repository_full_name,
+      branch: projectDialog.form.branch || null,
+      project_path: projectDialog.form.project_path || '/',
+      docker_image: projectDialog.runtime.docker_image || null
     })
     projectDialog.open = false
     activeTab.value = 'projects'
@@ -670,52 +652,40 @@ async function onSaveMcpServers(servers) {
   }
 }
 
-async function onSaveGithubSettings(token) {
+async function onSaveGitAccount(payload) {
   try {
-    await saveGithubSettings(token)
-    await loadMcpServers()
-    showToast(token ? 'GitHub token saved.' : 'GitHub token cleared.')
+    await saveGitAccount(payload)
+    showToast('Git account saved.')
   } catch (error) {
     showToast(error.message)
   }
 }
 
-async function onSaveGithubAppSettings(payload) {
+async function onVerifyGitAccount(id) {
   try {
-    await saveGithubAppSettings(payload)
-    showToast('GitHub App settings saved.')
+    await verifyGitAccount(id)
+    showToast('Git account verified.')
   } catch (error) {
     showToast(error.message)
   }
 }
 
-async function onConfigureGithubApp(payload) {
+async function onDeleteGitAccount(id) {
   try {
-    await startGithubAppManifest({
-      ...payload,
-      origin: window.location.origin
-    })
+    await deleteGitAccount(id)
+    showToast('Git account deleted.')
   } catch (error) {
     showToast(error.message)
   }
 }
 
-async function onRefreshGithubAppInstallations() {
+async function onSetDefaultGitAccount(id) {
   try {
-    await refreshGithubInstallations()
-    await loadGithubSettings()
-    showToast('GitHub installations refreshed.')
+    await setDefaultGitAccount(id)
+    showToast('Default Git account updated.')
   } catch (error) {
     showToast(error.message)
   }
-}
-
-function openGithubAppInstallation() {
-  if (!githubSettingsState.install_url) {
-    showToast('Configure GitHub App before installing it.')
-    return
-  }
-  window.location.href = githubSettingsState.install_url
 }
 
 function confirmCancelTask(id) {

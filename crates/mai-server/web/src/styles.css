@@ -1612,6 +1612,137 @@ p {
   justify-content: flex-end;
 }
 
+.git-accounts-layout {
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
+  gap: 14px;
+}
+
+.git-account-list,
+.git-account-form {
+  display: grid;
+  gap: 12px;
+}
+
+.git-account-card {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  padding: 12px;
+  color: inherit;
+  background: #fff;
+  text-align: left;
+  cursor: pointer;
+}
+
+.git-account-card.active {
+  border-color: #8fb7f3;
+  background: #f4f8ff;
+}
+
+.git-account-mark {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-radius: 8px;
+  color: #172033;
+  background: #edf2f7;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.git-account-main {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.git-account-main strong,
+.git-account-main small,
+.git-account-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-account-main strong {
+  color: #172033;
+  font-size: 14px;
+}
+
+.git-account-main small,
+.git-account-meta {
+  color: #66758a;
+  font-size: 12px;
+}
+
+.git-account-form {
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  padding: 16px;
+  background: #fff;
+}
+
+.git-account-form label,
+.git-account-form label span {
+  display: grid;
+  gap: 6px;
+}
+
+.git-account-form label > span {
+  color: #405066;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.provider-control {
+  width: min(320px, 100%);
+}
+
+.segmented-control button.disabled {
+  color: #9aa6b5;
+  background: #f4f6f9;
+  cursor: not-allowed;
+}
+
+.detected-token-row,
+.agent-runtime-strip {
+  display: grid;
+  gap: 4px;
+  border: 1px solid #e1e7ef;
+  border-radius: 8px;
+  padding: 12px;
+  background: #f8fafc;
+}
+
+.detected-token-row span,
+.agent-runtime-strip span {
+  color: #718096;
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.detected-token-row strong,
+.agent-runtime-strip strong {
+  color: #172033;
+  font-size: 14px;
+}
+
+.detected-token-row small,
+.agent-runtime-strip small {
+  color: #66758a;
+  font-size: 12px;
+}
+
+.git-delete-button {
+  justify-self: end;
+}
+
 .project-github-empty {
   display: grid;
   gap: 8px;
@@ -1630,6 +1761,285 @@ p {
   color: #526176;
   font-size: 13px;
   line-height: 1.45;
+}
+
+.project-create-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  gap: 0;
+  align-items: start;
+}
+
+.project-create-main,
+.project-create-section,
+.project-create-side {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.project-mode-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.project-mode-card {
+  display: grid;
+  gap: 4px;
+  min-height: 72px;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  padding: 10px;
+  color: #26354a;
+  background: #fff;
+  text-align: left;
+}
+
+.project-mode-card strong {
+  font-size: 13px;
+}
+
+.project-mode-card span {
+  color: #718096;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.project-mode-card.active {
+  border-color: #1f6feb;
+  background: #f4f8ff;
+  box-shadow: inset 3px 0 0 #1f6feb;
+}
+
+.project-mode-card.disabled {
+  color: #7b8798;
+  background: #f5f7fa;
+}
+
+.project-create-section {
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  padding: 14px;
+  background: #fff;
+}
+
+.project-create-form {
+  display: grid;
+  gap: 12px;
+}
+
+.project-field-row {
+  display: grid;
+  grid-template-columns: 140px minmax(0, 1fr);
+  gap: 14px;
+  align-items: center;
+  min-width: 0;
+}
+
+.project-field-row > span {
+  color: #28384e;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.project-field-row.align-start {
+  align-items: start;
+}
+
+.project-field-row.two-col {
+  align-items: start;
+}
+
+.project-two-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+
+.project-control-with-action {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.project-inline-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  border: 1px solid #d8e0ea;
+  border-radius: 7px;
+  padding: 0 11px;
+  color: #42526a;
+  background: #f8fafc;
+  font-size: 13px;
+}
+
+.project-inline-status strong {
+  color: #1f6feb;
+  font-size: 13px;
+}
+
+.project-picker {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.project-picker-list {
+  display: grid;
+  overflow: hidden;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.project-picker-list.compact-list {
+  max-height: 128px;
+}
+
+.project-picker-option {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  min-height: 36px;
+  border: 0;
+  border-bottom: 1px solid #edf1f6;
+  border-radius: 0;
+  padding: 0 11px;
+  color: #243348;
+  background: #fff;
+  text-align: left;
+}
+
+.project-picker-option:last-child {
+  border-bottom: 0;
+}
+
+.project-picker-option:hover,
+.project-picker-option.active {
+  background: #edf5ff;
+}
+
+.project-picker-option span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.project-picker-option strong {
+  color: #1f6feb;
+  font-size: 11px;
+}
+
+.project-picker-empty {
+  padding: 12px;
+  color: #718096;
+  font-size: 13px;
+}
+
+.section-mini-head,
+.project-side-head {
+  display: grid;
+  gap: 3px;
+}
+
+.section-mini-head strong,
+.project-side-head strong {
+  color: #172033;
+  font-size: 13px;
+}
+
+.section-mini-head span,
+.project-side-head span,
+.project-create-note {
+  color: #66758a;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.project-create-side {
+  position: sticky;
+  top: 0;
+  border-left: 1px solid #d8e0ea;
+  padding: 4px 0 4px 22px;
+  background: transparent;
+}
+
+.permission-summary.compact {
+  border: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.project-checklist {
+  position: relative;
+  display: grid;
+  gap: 18px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.project-checklist::before {
+  position: absolute;
+  top: 11px;
+  bottom: 11px;
+  left: 9px;
+  width: 1px;
+  background: #cbd5e1;
+  content: "";
+}
+
+.project-checklist li {
+  position: relative;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+}
+
+.project-checklist li > span {
+  position: relative;
+  z-index: 1;
+  width: 18px;
+  height: 18px;
+  border: 2px solid #cbd5e1;
+  border-radius: 50%;
+  background: #fff;
+}
+
+.project-checklist li.done > span {
+  border-color: #12a87d;
+  background: #12a87d;
+  box-shadow: inset 0 0 0 4px #daf4ea;
+}
+
+.project-checklist div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.project-checklist strong {
+  color: #172033;
+  font-size: 12px;
+}
+
+.project-checklist small {
+  min-width: 0;
+  overflow: hidden;
+  color: #66758a;
+  font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .session-strip {
@@ -3639,6 +4049,19 @@ p {
   width: min(720px, 100%);
 }
 
+.modal.project-create-modal {
+  gap: 16px;
+  width: min(1048px, 100%);
+  padding: 28px 30px 20px;
+}
+
+.project-create-modal .modal-title-row p {
+  margin-top: 4px;
+  color: #66758a;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .modal-title-row {
   justify-content: space-between;
 }
@@ -3923,6 +4346,11 @@ select:focus {
   .role-model-selector,
   .role-card-head,
   .role-models-layout,
+  .project-create-layout,
+  .project-mode-grid,
+  .project-field-row,
+  .project-control-with-action,
+  .project-two-controls,
   .github-app-form,
   .github-token-form,
   .github-app-command-row,
@@ -3931,6 +4359,10 @@ select:focus {
     grid-template-columns: 1fr;
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .project-create-side {
+    position: static;
   }
 
   .github-app-command-row .primary-button,

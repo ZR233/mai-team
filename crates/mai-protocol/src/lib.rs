@@ -311,9 +311,17 @@ pub struct ProjectSummary {
     pub status: ProjectStatus,
     pub owner: String,
     pub repo: String,
+    #[serde(default)]
+    pub repository_full_name: String,
+    #[serde(default)]
+    pub git_account_id: Option<String>,
     pub repository_id: u64,
     pub installation_id: u64,
     pub installation_account: String,
+    #[serde(default)]
+    pub branch: String,
+    #[serde(default)]
+    pub project_path: String,
     pub docker_image: String,
     pub workspace_path: String,
     pub clone_status: ProjectCloneStatus,
@@ -370,11 +378,22 @@ pub struct CreateTaskResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CreateProjectRequest {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
+    pub git_account_id: Option<String>,
     pub installation_id: u64,
     pub repository_id: u64,
+    #[serde(default)]
+    pub repository_full_name: Option<String>,
+    #[serde(default)]
     pub owner: String,
+    #[serde(default)]
     pub repo: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub project_path: Option<String>,
     #[serde(default)]
     pub docker_image: Option<String>,
 }
@@ -1183,6 +1202,103 @@ pub struct GithubRepositorySummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GithubRepositoriesResponse {
     pub repositories: Vec<GithubRepositorySummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GitProvider {
+    Github,
+}
+
+impl Default for GitProvider {
+    fn default() -> Self {
+        Self::Github
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GitTokenKind {
+    Classic,
+    FineGrainedPat,
+    Unknown,
+}
+
+impl Default for GitTokenKind {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GitAccountStatus {
+    Unverified,
+    Verified,
+    Failed,
+}
+
+impl Default for GitAccountStatus {
+    fn default() -> Self {
+        Self::Unverified
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitAccountSummary {
+    pub id: String,
+    #[serde(default)]
+    pub provider: GitProvider,
+    pub label: String,
+    #[serde(default)]
+    pub login: Option<String>,
+    #[serde(default)]
+    pub token_kind: GitTokenKind,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub status: GitAccountStatus,
+    #[serde(default)]
+    pub is_default: bool,
+    pub has_token: bool,
+    #[serde(default)]
+    pub last_verified_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GitAccountsResponse {
+    #[serde(default)]
+    pub accounts: Vec<GitAccountSummary>,
+    #[serde(default)]
+    pub default_account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GitAccountRequest {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub provider: GitProvider,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub login: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitAccountResponse {
+    pub account: GitAccountSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GitAccountDefaultRequest {
+    pub account_id: String,
 }
 
 pub fn default_true() -> bool {

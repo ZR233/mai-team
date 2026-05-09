@@ -10,9 +10,15 @@ export default defineConfig({
       '/agent-config': apiTarget,
       '/agents': apiTarget,
       '/events': apiTarget,
+      '/git': apiTarget,
+      '/github': apiTarget,
       '/mcp-servers': apiTarget,
       '/provider-presets': apiTarget,
-      '/providers': apiTarget
+      '/providers': apiTarget,
+      '/projects': apiTarget,
+      '/settings': apiTarget,
+      '/skills': apiTarget,
+      '/tasks': apiTarget
     }
   },
   build: {

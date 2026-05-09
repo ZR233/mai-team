@@ -13,7 +13,8 @@ use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentId, ApproveTaskPlanResponse, ArtifactInfo,
     CreateAgentRequest, CreateAgentResponse, CreateProjectRequest, CreateProjectResponse,
     CreateSessionResponse, CreateTaskRequest, CreateTaskResponse, ErrorResponse, FileUploadRequest,
-    FileUploadResponse, GithubAppManifestStartRequest, GithubAppManifestStartResponse,
+    FileUploadResponse, GitAccountDefaultRequest, GitAccountRequest, GitAccountResponse,
+    GitAccountsResponse, GithubAppManifestStartRequest, GithubAppManifestStartResponse,
     GithubAppSettingsRequest, GithubAppSettingsResponse, GithubInstallationsResponse,
     GithubRepositoriesResponse, GithubSettingsRequest, GithubSettingsResponse,
     McpServersConfigRequest, ProjectId, ProviderPresetsResponse, ProvidersConfigRequest,
@@ -32,6 +33,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio_stream::once;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -190,6 +192,20 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/providers", get(get_providers).put(save_providers))
         .route("/mcp-servers", get(get_mcp_servers).put(save_mcp_servers))
+        .route("/git/accounts", get(list_git_accounts).post(save_git_account))
+        .route(
+            "/git/accounts/default",
+            axum::routing::put(set_default_git_account),
+        )
+        .route(
+            "/git/accounts/{id}",
+            axum::routing::put(save_git_account_by_id).delete(delete_git_account),
+        )
+        .route("/git/accounts/{id}/verify", post(verify_git_account))
+        .route(
+            "/git/accounts/{id}/repositories",
+            get(list_git_account_repositories),
+        )
         .route(
             "/settings/github",
             get(get_github_settings).put(save_github_settings),
@@ -404,6 +420,63 @@ async fn save_mcp_servers(
     Ok(Json(McpServersConfigRequest {
         servers: state.store.list_mcp_servers().await?,
     }))
+}
+
+async fn list_git_accounts(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<GitAccountsResponse>, ApiError> {
+    Ok(Json(state.runtime.list_git_accounts().await?))
+}
+
+async fn save_git_account(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<GitAccountRequest>,
+) -> std::result::Result<Json<GitAccountResponse>, ApiError> {
+    Ok(Json(state.runtime.save_git_account(request).await?))
+}
+
+async fn save_git_account_by_id(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(mut request): Json<GitAccountRequest>,
+) -> std::result::Result<Json<GitAccountResponse>, ApiError> {
+    request.id = Some(id);
+    Ok(Json(state.runtime.save_git_account(request).await?))
+}
+
+async fn verify_git_account(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<GitAccountResponse>, ApiError> {
+    Ok(Json(GitAccountResponse {
+        account: state.runtime.verify_git_account(&id).await?,
+    }))
+}
+
+async fn delete_git_account(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<GitAccountsResponse>, ApiError> {
+    Ok(Json(state.runtime.delete_git_account(&id).await?))
+}
+
+async fn set_default_git_account(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<GitAccountDefaultRequest>,
+) -> std::result::Result<Json<GitAccountsResponse>, ApiError> {
+    Ok(Json(
+        state
+            .runtime
+            .set_default_git_account(&request.account_id)
+            .await?,
+    ))
+}
+
+async fn list_git_account_repositories(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<GithubRepositoriesResponse>, ApiError> {
+    Ok(Json(state.runtime.list_git_account_repositories(&id).await?))
 }
 
 async fn get_github_settings(
@@ -891,12 +964,14 @@ async fn events(
     Sse<impl futures::Stream<Item = std::result::Result<Event, Infallible>>>,
     ApiError,
 > {
-    let stream = BroadcastStream::new(state.runtime.subscribe()).filter_map(|event| async move {
+    let initial = once(Ok(Event::default().comment("connected")));
+    let events = BroadcastStream::new(state.runtime.subscribe()).filter_map(|event| async move {
         match event {
             Ok(event) => Some(Ok(sse_event(event))),
             Err(_) => None,
         }
     });
+    let stream = initial.chain(events);
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 

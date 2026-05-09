@@ -1,14 +1,15 @@
 use chrono::{DateTime, Utc};
 use mai_protocol::{
     AgentConfigRequest, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus,
-    AgentSummary, ArtifactInfo, GithubAppSettingsRequest, GithubAppSettingsResponse,
-    GithubSettingsResponse, McpServerConfig, McpServerTransport, MessageRole, ModelConfig,
-    ModelInputItem, ModelReasoningConfig, ModelReasoningVariant, PlanHistoryEntry, PlanStatus,
-    ProjectCloneStatus, ProjectId, ProjectStatus, ProjectSummary, ProviderConfig, ProviderKind,
-    ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
-    ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind, SessionId,
-    SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary, TokenUsage, TurnId,
-    default_true,
+    AgentSummary, ArtifactInfo, GitAccountRequest, GitAccountStatus, GitAccountSummary,
+    GitAccountsResponse, GitProvider, GitTokenKind, GithubAppSettingsRequest,
+    GithubAppSettingsResponse, GithubSettingsResponse, McpServerConfig,
+    MessageRole, ModelConfig, ModelInputItem, ModelReasoningConfig, ModelReasoningVariant,
+    PlanHistoryEntry, PlanStatus, ProjectCloneStatus, ProjectId, ProjectStatus, ProjectSummary,
+    ProviderConfig, ProviderKind, ProviderPreset, ProviderPresetsResponse, ProviderSecret,
+    ProviderSummary, ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind,
+    SessionId, SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary,
+    TokenUsage, TurnId, default_true,
 };
 use rusqlite::Connection as SqliteConnection;
 use serde::{Deserialize, Serialize};
@@ -24,10 +25,9 @@ const SETTING_AGENT_CONFIG: &str = "agent_config";
 const SETTING_SKILLS_CONFIG: &str = "skills_config";
 const SETTING_GITHUB_TOKEN: &str = "github_token";
 const SETTING_GITHUB_APP_CONFIG: &str = "github_app_config";
-const GITHUB_MCP_SERVER_NAME: &str = "github";
-const GITHUB_MCP_URL: &str = "https://api.githubcopilot.com/mcp/";
+const SETTING_GIT_ACCOUNTS: &str = "git_accounts";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-const SCHEMA_VERSION: &str = "9";
+const SCHEMA_VERSION: &str = "11";
 const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const DEEPSEEK_V4_CONTEXT_TOKENS: u64 = 1_000_000;
@@ -106,6 +106,37 @@ struct GithubAppConfig {
     owner_login: Option<String>,
     #[serde(default)]
     owner_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct GitAccountsConfig {
+    #[serde(default)]
+    default_account_id: Option<String>,
+    #[serde(default)]
+    accounts: Vec<StoredGitAccount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredGitAccount {
+    id: String,
+    #[serde(default)]
+    provider: GitProvider,
+    label: String,
+    #[serde(default)]
+    login: Option<String>,
+    #[serde(default)]
+    token_kind: GitTokenKind,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    status: GitAccountStatus,
+    #[serde(default)]
+    is_default: bool,
+    token_secret: String,
+    #[serde(default)]
+    last_verified_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -214,9 +245,13 @@ struct ProjectRecordRow {
     status: String,
     owner: String,
     repo: String,
+    repository_full_name: String,
+    git_account_id: Option<String>,
     repository_id: i64,
     installation_id: i64,
     installation_account: String,
+    branch: String,
+    project_path: String,
     docker_image: String,
     workspace_path: String,
     clone_status: String,
@@ -367,11 +402,11 @@ impl ConfigStore {
                 .ok()
                 .flatten();
             if current_schema_version.as_deref() != Some(SCHEMA_VERSION) {
-                if current_schema_version.as_deref() == Some("8") {
-                    drop(db);
-                    migrate_v8_to_v9(&path)?;
-                    db = build_db(&path).await?;
-                    set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
+            if matches!(current_schema_version.as_deref(), Some("8" | "9" | "10")) {
+                drop(db);
+                migrate_to_v11(&path)?;
+                db = build_db(&path).await?;
+                set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
                 } else {
                     drop(db);
                     let _ = std::fs::remove_file(&path);
@@ -768,17 +803,6 @@ impl ConfigStore {
 
     pub async fn save_github_token(&self, token: &str) -> Result<GithubSettingsResponse> {
         self.set_setting(SETTING_GITHUB_TOKEN, token).await?;
-        let mut servers = self.list_mcp_servers().await?;
-        let mut config = servers.remove(GITHUB_MCP_SERVER_NAME).unwrap_or_default();
-        config.transport = McpServerTransport::StreamableHttp;
-        config.url = Some(GITHUB_MCP_URL.to_string());
-        config.bearer_token = Some(token.to_string());
-        config.enabled = true;
-        // Rebuild map with "github" first, then remaining servers
-        let mut ordered = BTreeMap::new();
-        ordered.insert(GITHUB_MCP_SERVER_NAME.to_string(), config);
-        ordered.extend(servers);
-        self.save_mcp_servers(&ordered).await?;
         Ok(GithubSettingsResponse { has_token: true })
     }
 
@@ -787,17 +811,179 @@ impl ConfigStore {
         let mut tx = db.transaction().await?;
         delete_setting_in_tx(&mut tx, SETTING_GITHUB_TOKEN).await?;
         tx.commit().await?;
-        // Only remove the MCP entry if the URL still points to the official GitHub MCP
-        let mut servers = self.list_mcp_servers().await?;
-        if servers
-            .get(GITHUB_MCP_SERVER_NAME)
-            .and_then(|c| c.url.as_deref())
-            == Some(GITHUB_MCP_URL)
-        {
-            servers.remove(GITHUB_MCP_SERVER_NAME);
-            self.save_mcp_servers(&servers).await?;
-        }
         Ok(GithubSettingsResponse { has_token: false })
+    }
+
+    pub async fn list_git_accounts(&self) -> Result<GitAccountsResponse> {
+        let config = self.git_accounts_config().await?;
+        Ok(git_accounts_response(&config))
+    }
+
+    pub async fn upsert_git_account(&self, request: GitAccountRequest) -> Result<GitAccountSummary> {
+        let token = request.token.unwrap_or_default().trim().to_string();
+        let mut config = self.git_accounts_config().await?;
+        let id = request
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let existing = config.accounts.iter().position(|account| account.id == id);
+        let current_token = existing
+            .and_then(|index| config.accounts.get(index))
+            .map(|account| account.token_secret.clone())
+            .unwrap_or_default();
+        let token_secret = if token.is_empty() { current_token } else { token };
+        if token_secret.trim().is_empty() {
+            return Err(StoreError::InvalidConfig(
+                "git account token is required".to_string(),
+            ));
+        }
+        let fallback_label = request
+            .login
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("GitHub");
+        let label = request
+            .label
+            .trim()
+            .to_string()
+            .if_empty(fallback_label)
+            .to_string();
+        let mut account = existing
+            .and_then(|index| config.accounts.get(index).cloned())
+            .unwrap_or_else(|| StoredGitAccount {
+                id: id.clone(),
+                provider: request.provider.clone(),
+                label: label.clone(),
+                login: None,
+                token_kind: GitTokenKind::Unknown,
+                scopes: Vec::new(),
+                status: GitAccountStatus::Unverified,
+                is_default: false,
+                token_secret: token_secret.clone(),
+                last_verified_at: None,
+                last_error: None,
+            });
+        account.provider = request.provider;
+        account.label = label;
+        if let Some(login) = request.login {
+            account.login = Some(login.trim().to_string()).filter(|value| !value.is_empty());
+        }
+        account.token_secret = token_secret;
+        if request.is_default || config.accounts.is_empty() {
+            config.default_account_id = Some(id.clone());
+        }
+        account.is_default = config.default_account_id.as_deref() == Some(id.as_str());
+        if let Some(index) = existing {
+            config.accounts[index] = account;
+        } else {
+            config.accounts.push(account);
+        }
+        normalize_git_account_defaults(&mut config);
+        self.save_git_accounts_config(&config).await?;
+        Ok(config
+            .accounts
+            .iter()
+            .find(|account| account.id == id)
+            .map(|account| account.summary(config.default_account_id.as_deref()))
+            .expect("saved account"))
+    }
+
+    pub async fn update_git_account_verification(
+        &self,
+        account_id: &str,
+        login: Option<String>,
+        token_kind: GitTokenKind,
+        scopes: Vec<String>,
+        status: GitAccountStatus,
+        last_error: Option<String>,
+    ) -> Result<GitAccountSummary> {
+        let mut config = self.git_accounts_config().await?;
+        let default_account_id = config.default_account_id.clone();
+        let account = config
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+            .ok_or_else(|| StoreError::InvalidConfig("git account not found".to_string()))?;
+        account.login = login.or_else(|| account.login.clone());
+        account.token_kind = token_kind;
+        account.scopes = scopes;
+        account.status = status;
+        account.last_verified_at = Some(Utc::now());
+        account.last_error = last_error;
+        let summary = account.summary(default_account_id.as_deref());
+        self.save_git_accounts_config(&config).await?;
+        Ok(summary)
+    }
+
+    pub async fn delete_git_account(&self, account_id: &str) -> Result<GitAccountsResponse> {
+        let mut config = self.git_accounts_config().await?;
+        config.accounts.retain(|account| account.id != account_id);
+        if config.default_account_id.as_deref() == Some(account_id) {
+            config.default_account_id = config.accounts.first().map(|account| account.id.clone());
+        }
+        normalize_git_account_defaults(&mut config);
+        self.save_git_accounts_config(&config).await?;
+        Ok(git_accounts_response(&config))
+    }
+
+    pub async fn set_default_git_account(&self, account_id: &str) -> Result<GitAccountsResponse> {
+        let mut config = self.git_accounts_config().await?;
+        if !config.accounts.iter().any(|account| account.id == account_id) {
+            return Err(StoreError::InvalidConfig("git account not found".to_string()));
+        }
+        config.default_account_id = Some(account_id.to_string());
+        normalize_git_account_defaults(&mut config);
+        self.save_git_accounts_config(&config).await?;
+        Ok(git_accounts_response(&config))
+    }
+
+    pub async fn git_account_token(&self, account_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .git_accounts_config()
+            .await?
+            .accounts
+            .into_iter()
+            .find(|account| account.id == account_id)
+            .map(|account| account.token_secret))
+    }
+
+    async fn git_accounts_config(&self) -> Result<GitAccountsConfig> {
+        let mut config = match self.get_setting(SETTING_GIT_ACCOUNTS).await? {
+            Some(value) if !value.trim().is_empty() => serde_json::from_str(&value)?,
+            _ => GitAccountsConfig::default(),
+        };
+        if config.accounts.is_empty() {
+            if let Some(token) = self.get_setting(SETTING_GITHUB_TOKEN).await? {
+                let token = token.trim().to_string();
+                if !token.is_empty() {
+                    config.accounts.push(StoredGitAccount {
+                        id: "github-default".to_string(),
+                        provider: GitProvider::Github,
+                        label: "GitHub".to_string(),
+                        login: None,
+                        token_kind: GitTokenKind::Unknown,
+                        scopes: Vec::new(),
+                        status: GitAccountStatus::Unverified,
+                        is_default: true,
+                        token_secret: token,
+                        last_verified_at: None,
+                        last_error: None,
+                    });
+                    config.default_account_id = Some("github-default".to_string());
+                }
+            }
+        }
+        normalize_git_account_defaults(&mut config);
+        Ok(config)
+    }
+
+    async fn save_git_accounts_config(&self, config: &GitAccountsConfig) -> Result<()> {
+        self.set_setting(SETTING_GIT_ACCOUNTS, &serde_json::to_string(config)?)
+            .await
     }
 
     pub async fn get_github_app_settings(&self) -> Result<GithubAppSettingsResponse> {
@@ -932,9 +1118,13 @@ impl ConfigStore {
             status: project_status_to_str(&project.status).to_string(),
             owner: project.owner.clone(),
             repo: project.repo.clone(),
+            repository_full_name: project.repository_full_name.clone(),
+            git_account_id: project.git_account_id.clone(),
             repository_id: u64_to_i64(project.repository_id),
             installation_id: u64_to_i64(project.installation_id),
             installation_account: project.installation_account.clone(),
+            branch: project.branch.clone(),
+            project_path: project.project_path.clone(),
             docker_image: project.docker_image.clone(),
             workspace_path: project.workspace_path.clone(),
             clone_status: project_clone_status_to_str(&project.clone_status).to_string(),
@@ -1551,9 +1741,13 @@ impl ProjectRecordRow {
             status: parse_project_status(&self.status)?,
             owner: self.owner,
             repo: self.repo,
+            repository_full_name: self.repository_full_name,
+            git_account_id: self.git_account_id,
             repository_id: i64_to_u64(self.repository_id),
             installation_id: i64_to_u64(self.installation_id),
             installation_account: self.installation_account,
+            branch: self.branch,
+            project_path: self.project_path,
             docker_image: self.docker_image,
             workspace_path: self.workspace_path,
             clone_status: parse_project_clone_status(&self.clone_status)?,
@@ -1562,6 +1756,45 @@ impl ProjectRecordRow {
             updated_at: parse_utc(&self.updated_at)?,
             last_error: self.last_error,
         })
+    }
+}
+
+impl StoredGitAccount {
+    fn summary(&self, default_account_id: Option<&str>) -> GitAccountSummary {
+        GitAccountSummary {
+            id: self.id.clone(),
+            provider: self.provider.clone(),
+            label: self.label.clone(),
+            login: self.login.clone(),
+            token_kind: self.token_kind.clone(),
+            scopes: self.scopes.clone(),
+            status: self.status.clone(),
+            is_default: default_account_id == Some(self.id.as_str()),
+            has_token: !self.token_secret.trim().is_empty(),
+            last_verified_at: self.last_verified_at,
+            last_error: self.last_error.clone(),
+        }
+    }
+}
+
+fn git_accounts_response(config: &GitAccountsConfig) -> GitAccountsResponse {
+    GitAccountsResponse {
+        accounts: config
+            .accounts
+            .iter()
+            .map(|account| account.summary(config.default_account_id.as_deref()))
+            .collect(),
+        default_account_id: config.default_account_id.clone(),
+    }
+}
+
+fn normalize_git_account_defaults(config: &mut GitAccountsConfig) {
+    if config.default_account_id.is_none() {
+        config.default_account_id = config.accounts.first().map(|account| account.id.clone());
+    }
+    let default_account_id = config.default_account_id.clone();
+    for account in &mut config.accounts {
+        account.is_default = default_account_id.as_deref() == Some(account.id.as_str());
     }
 }
 
@@ -1667,7 +1900,7 @@ async fn build_db(path: &Path) -> Result<Db> {
     Ok(builder.build(Sqlite::open(path)).await?)
 }
 
-fn migrate_v8_to_v9(path: &Path) -> Result<()> {
+fn migrate_to_v11(path: &Path) -> Result<()> {
     let conn = SqliteConnection::open(path)?;
     if !sqlite_column_exists(&conn, "agents", "project_id")? {
         conn.execute("ALTER TABLE agents ADD COLUMN project_id TEXT", [])?;
@@ -1679,9 +1912,13 @@ fn migrate_v8_to_v9(path: &Path) -> Result<()> {
             status TEXT NOT NULL,
             owner TEXT NOT NULL,
             repo TEXT NOT NULL,
+            repository_full_name TEXT NOT NULL DEFAULT '',
+            git_account_id TEXT,
             repository_id BIGINT NOT NULL,
             installation_id BIGINT NOT NULL,
             installation_account TEXT NOT NULL,
+            branch TEXT NOT NULL DEFAULT '',
+            project_path TEXT NOT NULL DEFAULT '/',
             docker_image TEXT NOT NULL,
             workspace_path TEXT NOT NULL,
             clone_status TEXT NOT NULL,
@@ -1690,6 +1927,33 @@ fn migrate_v8_to_v9(path: &Path) -> Result<()> {
             updated_at TEXT NOT NULL,
             last_error TEXT
         )",
+        [],
+    )?;
+    if !sqlite_column_exists(&conn, "projects", "repository_full_name")? {
+        conn.execute(
+            "ALTER TABLE projects ADD COLUMN repository_full_name TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !sqlite_column_exists(&conn, "projects", "git_account_id")? {
+        conn.execute("ALTER TABLE projects ADD COLUMN git_account_id TEXT", [])?;
+    }
+    if !sqlite_column_exists(&conn, "projects", "branch")? {
+        conn.execute(
+            "ALTER TABLE projects ADD COLUMN branch TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !sqlite_column_exists(&conn, "projects", "project_path")? {
+        conn.execute(
+            "ALTER TABLE projects ADD COLUMN project_path TEXT NOT NULL DEFAULT '/'",
+            [],
+        )?;
+    }
+    conn.execute(
+        "UPDATE projects
+            SET repository_full_name = owner || '/' || repo
+          WHERE repository_full_name = ''",
         [],
     )?;
     Ok(())
@@ -1704,6 +1968,16 @@ fn sqlite_column_exists(conn: &SqliteConnection, table: &str, column: &str) -> R
         }
     }
     Ok(false)
+}
+
+trait StringDefault {
+    fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str;
+}
+
+impl StringDefault for str {
+    fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str {
+        if self.is_empty() { fallback } else { self }
+    }
 }
 
 fn has_sqlite_header(path: &Path) -> Result<bool> {
@@ -3259,6 +3533,38 @@ mod tests {
                 .contains_key("demo")
         );
         assert!(reopened.load_projects().await.expect("projects").is_empty());
+    }
+
+    #[tokio::test]
+    async fn schema_v9_adds_project_create_fields_without_rebuild() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("config.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("open");
+        store
+            .set_setting(SETTING_SCHEMA_VERSION, "9")
+            .await
+            .expect("mark v9 schema");
+        drop(store);
+
+        let reopened = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("reopen");
+        assert_eq!(
+            reopened
+                .get_setting(SETTING_SCHEMA_VERSION)
+                .await
+                .expect("schema marker")
+                .as_deref(),
+            Some(SCHEMA_VERSION)
+        );
+
+        let conn = SqliteConnection::open(&db_path).expect("sqlite");
+        assert!(sqlite_column_exists(&conn, "projects", "repository_full_name").expect("column"));
+        assert!(sqlite_column_exists(&conn, "projects", "branch").expect("column"));
+        assert!(sqlite_column_exists(&conn, "projects", "project_path").expect("column"));
     }
 
     #[tokio::test]
