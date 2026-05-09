@@ -3,13 +3,13 @@ use mai_protocol::{
     AgentConfigRequest, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus,
     AgentSummary, ArtifactInfo, GitAccountRequest, GitAccountStatus, GitAccountSummary,
     GitAccountsResponse, GitProvider, GitTokenKind, GithubAppSettingsRequest,
-    GithubAppSettingsResponse, GithubSettingsResponse, McpServerConfig,
-    MessageRole, ModelConfig, ModelInputItem, ModelReasoningConfig, ModelReasoningVariant,
-    PlanHistoryEntry, PlanStatus, ProjectCloneStatus, ProjectId, ProjectStatus, ProjectSummary,
-    ProviderConfig, ProviderKind, ProviderPreset, ProviderPresetsResponse, ProviderSecret,
-    ProviderSummary, ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind,
-    SessionId, SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary,
-    TokenUsage, TurnId, default_true,
+    GithubAppSettingsResponse, GithubSettingsResponse, McpServerConfig, MessageRole, ModelConfig,
+    ModelInputItem, ModelReasoningConfig, ModelReasoningVariant, PlanHistoryEntry, PlanStatus,
+    ProjectCloneStatus, ProjectId, ProjectStatus, ProjectSummary, ProviderConfig, ProviderKind,
+    ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
+    ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind, SessionId,
+    SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary, TokenUsage, TurnId,
+    default_true,
 };
 use rusqlite::Connection as SqliteConnection;
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ const SETTING_GITHUB_TOKEN: &str = "github_token";
 const SETTING_GITHUB_APP_CONFIG: &str = "github_app_config";
 const SETTING_GIT_ACCOUNTS: &str = "git_accounts";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-const SCHEMA_VERSION: &str = "11";
+const SCHEMA_VERSION: &str = "12";
 const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const DEEPSEEK_V4_CONTEXT_TOKENS: u64 = 1_000_000;
@@ -251,9 +251,7 @@ struct ProjectRecordRow {
     installation_id: i64,
     installation_account: String,
     branch: String,
-    project_path: String,
     docker_image: String,
-    workspace_path: String,
     clone_status: String,
     maintainer_agent_id: String,
     created_at: String,
@@ -402,11 +400,14 @@ impl ConfigStore {
                 .ok()
                 .flatten();
             if current_schema_version.as_deref() != Some(SCHEMA_VERSION) {
-            if matches!(current_schema_version.as_deref(), Some("8" | "9" | "10")) {
-                drop(db);
-                migrate_to_v11(&path)?;
-                db = build_db(&path).await?;
-                set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
+                if matches!(
+                    current_schema_version.as_deref(),
+                    Some("8" | "9" | "10" | "11")
+                ) {
+                    drop(db);
+                    migrate_to_v12(&path)?;
+                    db = build_db(&path).await?;
+                    set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
                 } else {
                     drop(db);
                     let _ = std::fs::remove_file(&path);
@@ -819,7 +820,10 @@ impl ConfigStore {
         Ok(git_accounts_response(&config))
     }
 
-    pub async fn upsert_git_account(&self, request: GitAccountRequest) -> Result<GitAccountSummary> {
+    pub async fn upsert_git_account(
+        &self,
+        request: GitAccountRequest,
+    ) -> Result<GitAccountSummary> {
         let token = request.token.unwrap_or_default().trim().to_string();
         let mut config = self.git_accounts_config().await?;
         let id = request
@@ -834,7 +838,11 @@ impl ConfigStore {
             .and_then(|index| config.accounts.get(index))
             .map(|account| account.token_secret.clone())
             .unwrap_or_default();
-        let token_secret = if token.is_empty() { current_token } else { token };
+        let token_secret = if token.is_empty() {
+            current_token
+        } else {
+            token
+        };
         if token_secret.trim().is_empty() {
             return Err(StoreError::InvalidConfig(
                 "git account token is required".to_string(),
@@ -932,8 +940,14 @@ impl ConfigStore {
 
     pub async fn set_default_git_account(&self, account_id: &str) -> Result<GitAccountsResponse> {
         let mut config = self.git_accounts_config().await?;
-        if !config.accounts.iter().any(|account| account.id == account_id) {
-            return Err(StoreError::InvalidConfig("git account not found".to_string()));
+        if !config
+            .accounts
+            .iter()
+            .any(|account| account.id == account_id)
+        {
+            return Err(StoreError::InvalidConfig(
+                "git account not found".to_string(),
+            ));
         }
         config.default_account_id = Some(account_id.to_string());
         normalize_git_account_defaults(&mut config);
@@ -1124,9 +1138,7 @@ impl ConfigStore {
             installation_id: u64_to_i64(project.installation_id),
             installation_account: project.installation_account.clone(),
             branch: project.branch.clone(),
-            project_path: project.project_path.clone(),
             docker_image: project.docker_image.clone(),
-            workspace_path: project.workspace_path.clone(),
             clone_status: project_clone_status_to_str(&project.clone_status).to_string(),
             maintainer_agent_id: project.maintainer_agent_id.to_string(),
             created_at: project.created_at.to_rfc3339(),
@@ -1747,9 +1759,7 @@ impl ProjectRecordRow {
             installation_id: i64_to_u64(self.installation_id),
             installation_account: self.installation_account,
             branch: self.branch,
-            project_path: self.project_path,
             docker_image: self.docker_image,
-            workspace_path: self.workspace_path,
             clone_status: parse_project_clone_status(&self.clone_status)?,
             maintainer_agent_id: parse_agent_id(&self.maintainer_agent_id)?,
             created_at: parse_utc(&self.created_at)?,
@@ -1900,7 +1910,7 @@ async fn build_db(path: &Path) -> Result<Db> {
     Ok(builder.build(Sqlite::open(path)).await?)
 }
 
-fn migrate_to_v11(path: &Path) -> Result<()> {
+fn migrate_to_v12(path: &Path) -> Result<()> {
     let conn = SqliteConnection::open(path)?;
     if !sqlite_column_exists(&conn, "agents", "project_id")? {
         conn.execute("ALTER TABLE agents ADD COLUMN project_id TEXT", [])?;
@@ -1918,9 +1928,7 @@ fn migrate_to_v11(path: &Path) -> Result<()> {
             installation_id BIGINT NOT NULL,
             installation_account TEXT NOT NULL,
             branch TEXT NOT NULL DEFAULT '',
-            project_path TEXT NOT NULL DEFAULT '/',
             docker_image TEXT NOT NULL,
-            workspace_path TEXT NOT NULL,
             clone_status TEXT NOT NULL,
             maintainer_agent_id TEXT NOT NULL,
             created_at TEXT NOT NULL,
@@ -1944,18 +1952,87 @@ fn migrate_to_v11(path: &Path) -> Result<()> {
             [],
         )?;
     }
-    if !sqlite_column_exists(&conn, "projects", "project_path")? {
-        conn.execute(
-            "ALTER TABLE projects ADD COLUMN project_path TEXT NOT NULL DEFAULT '/'",
-            [],
-        )?;
-    }
     conn.execute(
         "UPDATE projects
             SET repository_full_name = owner || '/' || repo
           WHERE repository_full_name = ''",
         [],
     )?;
+    drop_project_path_columns(&conn)?;
+    Ok(())
+}
+
+fn drop_project_path_columns(conn: &SqliteConnection) -> Result<()> {
+    if !sqlite_column_exists(conn, "projects", "project_path")?
+        && !sqlite_column_exists(conn, "projects", "workspace_path")?
+    {
+        return Ok(());
+    }
+    conn.execute(
+        "CREATE TABLE projects_v12 (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            repository_full_name TEXT NOT NULL DEFAULT '',
+            git_account_id TEXT,
+            repository_id BIGINT NOT NULL,
+            installation_id BIGINT NOT NULL,
+            installation_account TEXT NOT NULL,
+            branch TEXT NOT NULL DEFAULT '',
+            docker_image TEXT NOT NULL,
+            clone_status TEXT NOT NULL,
+            maintainer_agent_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT
+        )",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO projects_v12 (
+            id,
+            name,
+            status,
+            owner,
+            repo,
+            repository_full_name,
+            git_account_id,
+            repository_id,
+            installation_id,
+            installation_account,
+            branch,
+            docker_image,
+            clone_status,
+            maintainer_agent_id,
+            created_at,
+            updated_at,
+            last_error
+        )
+        SELECT
+            id,
+            name,
+            status,
+            owner,
+            repo,
+            repository_full_name,
+            git_account_id,
+            repository_id,
+            installation_id,
+            installation_account,
+            branch,
+            docker_image,
+            clone_status,
+            maintainer_agent_id,
+            created_at,
+            updated_at,
+            last_error
+        FROM projects",
+        [],
+    )?;
+    conn.execute("DROP TABLE projects", [])?;
+    conn.execute("ALTER TABLE projects_v12 RENAME TO projects", [])?;
     Ok(())
 }
 
@@ -3564,7 +3641,68 @@ mod tests {
         let conn = SqliteConnection::open(&db_path).expect("sqlite");
         assert!(sqlite_column_exists(&conn, "projects", "repository_full_name").expect("column"));
         assert!(sqlite_column_exists(&conn, "projects", "branch").expect("column"));
-        assert!(sqlite_column_exists(&conn, "projects", "project_path").expect("column"));
+        assert!(!sqlite_column_exists(&conn, "projects", "project_path").expect("column"));
+        assert!(!sqlite_column_exists(&conn, "projects", "workspace_path").expect("column"));
+    }
+
+    #[tokio::test]
+    async fn schema_v11_drops_project_path_columns_without_rebuild() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("config.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("open");
+        let project_id = Uuid::new_v4();
+        let maintainer_agent_id = Uuid::new_v4();
+        let timestamp = Utc::now();
+        store
+            .save_project(&ProjectSummary {
+                id: project_id,
+                name: "owner/repo".to_string(),
+                status: ProjectStatus::Ready,
+                owner: "owner".to_string(),
+                repo: "repo".to_string(),
+                repository_full_name: "owner/repo".to_string(),
+                git_account_id: Some("account-1".to_string()),
+                repository_id: 42,
+                installation_id: 0,
+                installation_account: "owner".to_string(),
+                branch: "main".to_string(),
+                docker_image: "ubuntu:latest".to_string(),
+                clone_status: ProjectCloneStatus::Ready,
+                maintainer_agent_id,
+                created_at: timestamp,
+                updated_at: timestamp,
+                last_error: None,
+            })
+            .await
+            .expect("save project");
+        store
+            .set_setting(SETTING_SCHEMA_VERSION, "11")
+            .await
+            .expect("mark v11 schema");
+        drop(store);
+
+        let reopened = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("reopen");
+        assert_eq!(
+            reopened
+                .get_setting(SETTING_SCHEMA_VERSION)
+                .await
+                .expect("schema marker")
+                .as_deref(),
+            Some(SCHEMA_VERSION)
+        );
+        let projects = reopened.load_projects().await.expect("projects");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, project_id);
+        assert_eq!(projects[0].repository_full_name, "owner/repo");
+
+        let conn = SqliteConnection::open(&db_path).expect("sqlite");
+        assert!(!sqlite_column_exists(&conn, "projects", "project_path").expect("column"));
+        assert!(!sqlite_column_exists(&conn, "projects", "workspace_path").expect("column"));
     }
 
     #[tokio::test]

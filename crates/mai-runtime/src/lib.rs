@@ -1217,7 +1217,6 @@ impl AgentRuntime {
         let repository_id = repository.id;
         let branch = normalize_optional_path_segment(request.branch.as_deref(), "branch")?
             .unwrap_or_else(|| repository.default_branch.clone());
-        let project_path = normalize_project_path(request.project_path.as_deref())?;
         let name = request.name.trim().to_string();
         let name = if name.is_empty() {
             format!("{owner}/{repo}")
@@ -1228,7 +1227,8 @@ impl AgentRuntime {
         let installation_account = account.login.unwrap_or_else(|| account.label);
         let project_id = Uuid::new_v4();
         let planner_model = self.resolve_role_agent_model(AgentRole::Planner).await?;
-        let system_prompt = project_maintainer_system_prompt(&owner, &repo, &branch, &project_path);
+        let clone_url = github_clone_url(&owner, &repo);
+        let system_prompt = project_maintainer_system_prompt(&owner, &repo, &clone_url, &branch);
         let maintainer = self
             .create_agent_with_container_source(
                 CreateAgentRequest {
@@ -1259,9 +1259,7 @@ impl AgentRuntime {
             installation_id: 0,
             installation_account,
             branch,
-            project_path,
             docker_image: maintainer.docker_image.clone(),
-            workspace_path: PROJECT_WORKSPACE_PATH.to_string(),
             clone_status: ProjectCloneStatus::Cloning,
             maintainer_agent_id: maintainer.id,
             created_at,
@@ -4829,19 +4827,15 @@ fn agent_role_label(role: AgentRole) -> &'static str {
 fn project_maintainer_system_prompt(
     owner: &str,
     repo: &str,
+    clone_url: &str,
     branch: &str,
-    project_path: &str,
 ) -> String {
-    let focus_path = if project_path == "/" {
-        PROJECT_WORKSPACE_PATH.to_string()
-    } else {
-        format!("{PROJECT_WORKSPACE_PATH}{project_path}")
-    };
     format!(
         r#"You are the Maintainer agent for the GitHub project `{owner}/{repo}`.
 
+The repository clone URL is `{clone_url}`.
 You run inside an isolated Docker container. The repository is cloned at `/workspace/repo`; use that path for local inspection and edits.
-The selected branch is `{branch}`. The project path is `{project_path}`; focus local work in `{focus_path}` unless the user asks otherwise.
+The selected branch is `{branch}`.
 
 Security rules:
 - Do not look for or persist GitHub credentials.
@@ -4872,24 +4866,6 @@ fn normalize_optional_path_segment(value: Option<&str>, field: &str) -> Result<O
         )));
     }
     Ok(Some(value.to_string()))
-}
-
-fn normalize_project_path(value: Option<&str>) -> Result<String> {
-    let value = value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("/");
-    if value.contains(char::is_whitespace) || value.contains('\\') || value.contains("..") {
-        return Err(RuntimeError::InvalidInput(
-            "project_path must be a safe repository path".to_string(),
-        ));
-    }
-    let trimmed = value.trim_matches('/');
-    if trimmed.is_empty() {
-        Ok("/".to_string())
-    } else {
-        Ok(format!("/{trimmed}"))
-    }
 }
 
 fn github_clone_url(owner: &str, repo: &str) -> String {
@@ -6046,9 +6022,7 @@ mod tests {
             installation_id: 0,
             installation_account: "owner".to_string(),
             branch: "main".to_string(),
-            project_path: "/".to_string(),
             docker_image: "unused-agent".to_string(),
-            workspace_path: PROJECT_WORKSPACE_PATH.to_string(),
             clone_status: ProjectCloneStatus::Cloning,
             maintainer_agent_id,
             created_at: timestamp,
@@ -6672,27 +6646,6 @@ esac
         ];
 
         assert_eq!(recent_user_messages(&history, 7), vec!["def", "ghij"]);
-    }
-
-    #[test]
-    fn normalize_project_path_defaults_and_trims() {
-        assert_eq!(normalize_project_path(None).expect("default"), "/");
-        assert_eq!(
-            normalize_project_path(Some(" crates/mai-server/web/ ")).expect("path"),
-            "/crates/mai-server/web"
-        );
-    }
-
-    #[test]
-    fn normalize_project_path_rejects_unsafe_values() {
-        assert!(matches!(
-            normalize_project_path(Some("../secret")),
-            Err(RuntimeError::InvalidInput(_))
-        ));
-        assert!(matches!(
-            normalize_project_path(Some("bad path")),
-            Err(RuntimeError::InvalidInput(_))
-        ));
     }
 
     #[tokio::test]
@@ -8373,6 +8326,19 @@ esac
         ));
     }
 
+    #[test]
+    fn project_maintainer_prompt_includes_clone_url_and_workspace() {
+        let prompt = project_maintainer_system_prompt(
+            "owner",
+            "repo",
+            "https://github.com/owner/repo.git",
+            "main",
+        );
+
+        assert!(prompt.contains("https://github.com/owner/repo.git"));
+        assert!(prompt.contains("/workspace/repo"));
+    }
+
     #[tokio::test]
     async fn project_clone_uses_configured_sidecar_image_and_execs_inside_sidecar() {
         let dir = tempdir().expect("tempdir");
@@ -8420,6 +8386,7 @@ esac
         )));
         assert!(docker_log.contains("ghcr.io/example/mai-team-sidecar:test sleep infinity"));
         assert!(docker_log.contains("exec -w / -e MAI_GITHUB_INSTALLATION_TOKEN"));
+        assert!(docker_log.contains("https://github.com/owner/repo.git"));
         assert!(docker_log.contains("created-container"));
         assert!(!docker_log.contains("unused-agent sleep infinity"));
         assert!(!docker_log.contains("secret-token"));

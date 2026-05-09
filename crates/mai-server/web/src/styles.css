@@ -1847,16 +1847,6 @@ p {
   align-items: start;
 }
 
-.project-field-row.two-col {
-  align-items: start;
-}
-
-.project-two-controls {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 12px;
-}
-
 .project-control-with-action {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
@@ -4366,7 +4356,6 @@ select:focus {
   .project-mode-grid,
   .project-field-row,
   .project-control-with-action,
-  .project-two-controls,
   .github-app-form,
   .github-token-form,
   .github-app-command-row,

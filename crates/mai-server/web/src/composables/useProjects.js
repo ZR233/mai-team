@@ -195,8 +195,7 @@ export function useProjects() {
       name: '',
       git_account_id: '',
       repository_full_name: '',
-      branch: '',
-      project_path: '/'
+      branch: ''
     },
     repository: {
       query: ''

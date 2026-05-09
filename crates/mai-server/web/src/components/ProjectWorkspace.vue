@@ -139,14 +139,6 @@
             <strong>{{ detail.git_account_id || 'Unknown' }}</strong>
           </div>
           <div class="project-fact span-2">
-            <span>Workspace Path</span>
-            <strong>{{ detail.workspace_path || 'Not cloned yet' }}</strong>
-          </div>
-          <div class="project-fact span-2">
-            <span>Project Path</span>
-            <strong>{{ detail.project_path || '/' }}</strong>
-          </div>
-          <div class="project-fact span-2">
             <span>Docker Image</span>
             <strong>{{ detail.docker_image || 'Default image' }}</strong>
           </div>

@@ -320,10 +320,7 @@ pub struct ProjectSummary {
     pub installation_account: String,
     #[serde(default)]
     pub branch: String,
-    #[serde(default)]
-    pub project_path: String,
     pub docker_image: String,
-    pub workspace_path: String,
     pub clone_status: ProjectCloneStatus,
     pub maintainer_agent_id: AgentId,
     pub created_at: DateTime<Utc>,
@@ -382,7 +379,9 @@ pub struct CreateProjectRequest {
     pub name: String,
     #[serde(default)]
     pub git_account_id: Option<String>,
+    #[serde(default)]
     pub installation_id: u64,
+    #[serde(default)]
     pub repository_id: u64,
     #[serde(default)]
     pub repository_full_name: Option<String>,
@@ -392,8 +391,6 @@ pub struct CreateProjectRequest {
     pub repo: String,
     #[serde(default)]
     pub branch: Option<String>,
-    #[serde(default)]
-    pub project_path: Option<String>,
     #[serde(default)]
     pub docker_image: Option<String>,
 }
@@ -1360,5 +1357,21 @@ mod tests {
         .expect("request");
 
         assert_eq!(request.docker_image, None);
+    }
+
+    #[test]
+    fn create_project_request_accepts_git_account_repository_only() {
+        let request: CreateProjectRequest = serde_json::from_value(json!({
+            "name": "Mai Team",
+            "git_account_id": "account-1",
+            "repository_full_name": "owner/repo",
+            "branch": "main",
+            "docker_image": "ubuntu:latest"
+        }))
+        .expect("request");
+
+        assert_eq!(request.installation_id, 0);
+        assert_eq!(request.repository_id, 0);
+        assert_eq!(request.repository_full_name.as_deref(), Some("owner/repo"));
     }
 }

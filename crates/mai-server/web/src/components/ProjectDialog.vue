@@ -91,19 +91,10 @@
               </div>
             </div>
 
-            <div class="project-field-row two-col">
-              <span></span>
-              <div class="project-two-controls">
-                <label>
-                  <span>Branch</span>
-                  <input v-model.trim="dialog.form.branch" :disabled="!selectedRepository" placeholder="main" />
-                </label>
-                <label>
-                  <span>Project Path</span>
-                  <input v-model.trim="dialog.form.project_path" placeholder="/" />
-                </label>
-              </div>
-            </div>
+            <label class="project-field-row">
+              <span>Branch</span>
+              <input v-model.trim="dialog.form.branch" :disabled="!selectedRepository" placeholder="main" />
+            </label>
 
             <div class="project-field-row align-start">
               <span>Docker Image</span>

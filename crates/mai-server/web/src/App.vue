@@ -541,7 +541,6 @@ function resetProjectDialog() {
   projectDialog.form.git_account_id = ''
   projectDialog.form.repository_full_name = ''
   projectDialog.form.branch = ''
-  projectDialog.form.project_path = '/'
   projectDialog.repository.query = ''
   projectDialog.runtime.docker_image = ''
   projectDialog.runtime.default_docker_image = ''
@@ -643,7 +642,6 @@ async function onCreateProject() {
       git_account_id: projectDialog.form.git_account_id,
       repository_full_name: projectDialog.form.repository_full_name,
       branch: projectDialog.form.branch || null,
-      project_path: projectDialog.form.project_path || '/',
       docker_image: projectDialog.runtime.docker_image || null
     })
     projectDialog.open = false
