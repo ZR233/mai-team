@@ -4204,9 +4204,20 @@ impl AgentRuntime {
             "set -eu\n\
              rm -rf {workspace}\n\
              mkdir -p /workspace\n\
+             ASKPASS=$(mktemp)\n\
+             trap 'rm -f \"$ASKPASS\"; git config --global --unset-all credential.helper >/dev/null 2>&1 || true; rm -rf \"$HOME/.config/gh\" \"$HOME/.git-credentials\"' EXIT\n\
+             cat > \"$ASKPASS\" <<'EOF'\n\
+#!/bin/sh\n\
+case \"$1\" in\n\
+  *Username*) printf '%s\\n' x-access-token ;;\n\
+  *Password*) printf '%s\\n' \"$MAI_GITHUB_INSTALLATION_TOKEN\" ;;\n\
+  *) printf '\\n' ;;\n\
+esac\n\
+EOF\n\
+             chmod 700 \"$ASKPASS\"\n\
              git config --global --unset-all credential.helper >/dev/null 2>&1 || true\n\
              rm -rf \"$HOME/.config/gh\" \"$HOME/.git-credentials\"\n\
-             git -c credential.helper= -c http.https://github.com/.extraheader=\"AUTHORIZATION: bearer $MAI_GITHUB_INSTALLATION_TOKEN\" clone{branch_arg} -- {repo_url} {workspace}\n\
+             GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=\"$ASKPASS\" git -c credential.helper= clone{branch_arg} -- {repo_url} {workspace}\n\
              git config --global --unset-all credential.helper >/dev/null 2>&1 || true\n\
              rm -rf \"$HOME/.config/gh\" \"$HOME/.git-credentials\"",
             workspace = shell_quote(PROJECT_WORKSPACE_PATH),
@@ -8465,6 +8476,7 @@ esac
         )));
         assert!(docker_log.contains("ghcr.io/example/mai-team-sidecar:test sleep infinity"));
         assert!(docker_log.contains("exec -w / -e MAI_GITHUB_INSTALLATION_TOKEN"));
+        assert!(docker_log.contains("GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=\"$ASKPASS\""));
         assert!(docker_log.contains("https://github.com/owner/repo.git"));
         assert!(docker_log.contains("created-container"));
         assert!(!docker_log.contains("unused-agent sleep infinity"));
@@ -8522,6 +8534,7 @@ esac
         assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Ready);
         assert_eq!(detail.maintainer_agent.summary.status, AgentStatus::Idle);
         assert!(fake_docker_log(&dir).contains("exec -w / -e MAI_GITHUB_INSTALLATION_TOKEN"));
+        assert!(fake_docker_log(&dir).contains("GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=\"$ASKPASS\""));
 
         let mut saw_cloning = false;
         let mut saw_ready = false;
