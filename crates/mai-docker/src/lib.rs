@@ -8,6 +8,10 @@ use tokio::process::{Child, Command};
 
 const MANAGED_LABEL: &str = "mai.team.managed=true";
 const AGENT_LABEL_KEY: &str = "mai.team.agent";
+const PROJECT_LABEL_KEY: &str = "mai.team.project";
+const SIDECAR_LABEL_KEY: &str = "mai.team.sidecar";
+const SIDECAR_KIND_LABEL_KEY: &str = "mai.team.sidecar.kind";
+const PROJECT_SIDECAR_KIND: &str = "project";
 
 #[derive(Debug, Error)]
 pub enum DockerError {
@@ -47,6 +51,9 @@ pub struct ManagedContainer {
     pub image: String,
     pub state: String,
     pub agent_id: Option<String>,
+    pub project_id: Option<String>,
+    pub sidecar: bool,
+    pub sidecar_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,8 +133,17 @@ impl DockerClient {
         &self,
         active_agent_ids: &HashSet<String>,
     ) -> Result<Vec<String>> {
+        self.cleanup_orphaned_managed_containers(active_agent_ids, &HashSet::new())
+            .await
+    }
+
+    pub async fn cleanup_orphaned_managed_containers(
+        &self,
+        active_agent_ids: &HashSet<String>,
+        active_project_ids: &HashSet<String>,
+    ) -> Result<Vec<String>> {
         let containers = self.list_managed_containers().await?;
-        let ids = orphaned_container_ids(&containers, active_agent_ids);
+        let ids = orphaned_container_ids(&containers, active_agent_ids, active_project_ids);
 
         for id in &ids {
             self.delete_container(id).await?;
@@ -232,6 +248,68 @@ impl DockerClient {
         })
     }
 
+    pub async fn ensure_project_sidecar_container(
+        &self,
+        project_id: &str,
+        agent_id: &str,
+        preferred_container_id: Option<&str>,
+        image: &str,
+        workspace_volume: &str,
+    ) -> Result<ContainerHandle> {
+        let image = validate_image(image)?;
+        if let Some(container) = self
+            .reusable_project_sidecar_container(project_id, preferred_container_id)
+            .await?
+        {
+            return self.prepare_existing_container(container).await;
+        }
+
+        self.create_project_sidecar_container(project_id, agent_id, image, workspace_volume)
+            .await
+    }
+
+    async fn create_project_sidecar_container(
+        &self,
+        project_id: &str,
+        agent_id: &str,
+        image: &str,
+        workspace_volume: &str,
+    ) -> Result<ContainerHandle> {
+        let image = validate_image(image)?;
+        let name = project_sidecar_container_name(project_id);
+        let args = create_project_sidecar_container_args(
+            &name,
+            project_id,
+            agent_id,
+            image,
+            workspace_volume,
+        );
+        let create = Command::new(&self.binary)
+            .args(args.iter().map(String::as_str))
+            .output()
+            .await?;
+        if !create.status.success() {
+            return Err(DockerError::CommandFailed(stderr_or_stdout(&create)));
+        }
+        let id = String::from_utf8(create.stdout)?.trim().to_string();
+
+        if let Err(err) = self.start_container(&id).await {
+            let _ = self.delete_container(&id).await;
+            return Err(err);
+        }
+
+        if let Err(err) = self.ensure_workspace(&id).await {
+            let _ = self.delete_container(&id).await;
+            return Err(err);
+        }
+
+        Ok(ContainerHandle {
+            id,
+            name,
+            image: image.to_string(),
+        })
+    }
+
     pub async fn delete_agent_containers(
         &self,
         agent_id: &str,
@@ -239,6 +317,20 @@ impl DockerClient {
     ) -> Result<Vec<String>> {
         let containers = self.list_managed_containers().await?;
         let ids = agent_container_delete_ids(&containers, agent_id, preferred_container_id);
+        for id in &ids {
+            self.delete_container(id).await?;
+        }
+        Ok(ids)
+    }
+
+    pub async fn delete_project_sidecar_containers(
+        &self,
+        project_id: &str,
+        preferred_container_id: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let containers = self.list_managed_containers().await?;
+        let ids =
+            project_sidecar_container_delete_ids(&containers, project_id, preferred_container_id);
         for id in &ids {
             self.delete_container(id).await?;
         }
@@ -282,6 +374,22 @@ impl DockerClient {
     ) -> Result<Option<ManagedContainer>> {
         let containers = self.list_managed_containers().await?;
         Ok(find_reusable_agent_container(&containers, agent_id, preferred_container_id).cloned())
+    }
+
+    async fn reusable_project_sidecar_container(
+        &self,
+        project_id: &str,
+        preferred_container_id: Option<&str>,
+    ) -> Result<Option<ManagedContainer>> {
+        let containers = self.list_managed_containers().await?;
+        Ok(
+            find_reusable_project_sidecar_container(
+                &containers,
+                project_id,
+                preferred_container_id,
+            )
+            .cloned(),
+        )
     }
 
     async fn prepare_existing_container(
@@ -563,12 +671,20 @@ fn managed_containers_from_inspect(json: &str) -> Result<Vec<ManagedContainer>> 
 fn orphaned_container_ids(
     containers: &[ManagedContainer],
     active_agent_ids: &HashSet<String>,
+    active_project_ids: &HashSet<String>,
 ) -> Vec<String> {
     dedupe_container_ids(containers.iter().filter_map(|container| {
-        let is_orphaned = container
-            .agent_id
-            .as_ref()
-            .is_none_or(|agent_id| !active_agent_ids.contains(agent_id));
+        let is_orphaned = if container.sidecar {
+            container
+                .project_id
+                .as_ref()
+                .is_none_or(|project_id| !active_project_ids.contains(project_id))
+        } else {
+            container
+                .agent_id
+                .as_ref()
+                .is_none_or(|agent_id| !active_agent_ids.contains(agent_id))
+        };
         is_orphaned.then(|| container.id.clone())
     }))
 }
@@ -608,6 +724,48 @@ fn find_reusable_agent_container<'a>(
         .find(|container| container.agent_id.as_deref() == Some(agent_id))
 }
 
+fn project_sidecar_container_delete_ids(
+    containers: &[ManagedContainer],
+    project_id: &str,
+    preferred_container_id: Option<&str>,
+) -> Vec<String> {
+    let preferred = preferred_container_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let labeled = containers
+        .iter()
+        .filter(|container| {
+            container.sidecar
+                && container.sidecar_kind.as_deref() == Some(PROJECT_SIDECAR_KIND)
+                && container.project_id.as_deref() == Some(project_id)
+        })
+        .map(|container| container.id.clone());
+    dedupe_container_ids(preferred.into_iter().chain(labeled))
+}
+
+fn find_reusable_project_sidecar_container<'a>(
+    containers: &'a [ManagedContainer],
+    project_id: &str,
+    preferred_container_id: Option<&str>,
+) -> Option<&'a ManagedContainer> {
+    let matches_project = |container: &&ManagedContainer| {
+        container.sidecar
+            && container.sidecar_kind.as_deref() == Some(PROJECT_SIDECAR_KIND)
+            && container.project_id.as_deref() == Some(project_id)
+    };
+
+    if let Some(preferred_container_id) = preferred_container_id
+        && let Some(container) = containers.iter().find(|container| {
+            matches_project(container) && container.matches_identifier(preferred_container_id)
+        })
+    {
+        return Some(container);
+    }
+
+    containers.iter().find(matches_project)
+}
+
 fn dedupe_container_ids(ids: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut seen = HashSet::new();
     ids.into_iter()
@@ -633,6 +791,10 @@ fn agent_label(agent_id: &str) -> String {
     format!("{AGENT_LABEL_KEY}={agent_id}")
 }
 
+fn project_sidecar_container_name(project_id: &str) -> String {
+    format!("mai-team-project-sidecar-{project_id}")
+}
+
 fn create_agent_container_args(
     name: &str,
     agent_label: &str,
@@ -647,6 +809,37 @@ fn create_agent_container_args(
         MANAGED_LABEL.to_string(),
         "--label".to_string(),
         agent_label.to_string(),
+        "-v".to_string(),
+        format!("{workspace_volume}:/workspace"),
+        "-w".to_string(),
+        "/workspace".to_string(),
+        image.to_string(),
+        "sleep".to_string(),
+        "infinity".to_string(),
+    ]
+}
+
+fn create_project_sidecar_container_args(
+    name: &str,
+    project_id: &str,
+    agent_id: &str,
+    image: &str,
+    workspace_volume: &str,
+) -> Vec<String> {
+    vec![
+        "create".to_string(),
+        "--name".to_string(),
+        name.to_string(),
+        "--label".to_string(),
+        MANAGED_LABEL.to_string(),
+        "--label".to_string(),
+        format!("{SIDECAR_LABEL_KEY}=true"),
+        "--label".to_string(),
+        format!("{SIDECAR_KIND_LABEL_KEY}={PROJECT_SIDECAR_KIND}"),
+        "--label".to_string(),
+        format!("{PROJECT_LABEL_KEY}={project_id}"),
+        "--label".to_string(),
+        agent_label(agent_id),
         "-v".to_string(),
         format!("{workspace_volume}:/workspace"),
         "-w".to_string(),
@@ -736,6 +929,11 @@ impl From<InspectContainer> for ManagedContainer {
             .as_ref()
             .and_then(|config| config.labels.as_ref());
         let agent_id = labels.and_then(|labels| labels.get(AGENT_LABEL_KEY).cloned());
+        let project_id = labels.and_then(|labels| labels.get(PROJECT_LABEL_KEY).cloned());
+        let sidecar = labels
+            .and_then(|labels| labels.get(SIDECAR_LABEL_KEY))
+            .is_some_and(|value| value == "true");
+        let sidecar_kind = labels.and_then(|labels| labels.get(SIDECAR_KIND_LABEL_KEY).cloned());
         let image = value
             .config
             .and_then(|config| config.image)
@@ -751,6 +949,9 @@ impl From<InspectContainer> for ManagedContainer {
             image,
             state,
             agent_id,
+            project_id,
+            sidecar,
+            sidecar_kind,
         }
     }
 }
@@ -794,7 +995,10 @@ mod tests {
                         "Image": "ubuntu:latest",
                         "Labels": {
                             "mai.team.managed": "true",
-                            "mai.team.agent": "agent-1"
+                            "mai.team.agent": "agent-1",
+                            "mai.team.project": "project-1",
+                            "mai.team.sidecar": "true",
+                            "mai.team.sidecar.kind": "project"
                         }
                     },
                     "State": { "Status": "exited" }
@@ -821,7 +1025,11 @@ mod tests {
         assert_eq!(containers[0].image, "ubuntu:latest");
         assert_eq!(containers[0].state, "exited");
         assert_eq!(containers[0].agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(containers[0].project_id.as_deref(), Some("project-1"));
+        assert!(containers[0].sidecar);
+        assert_eq!(containers[0].sidecar_kind.as_deref(), Some("project"));
         assert_eq!(containers[1].agent_id, None);
+        assert!(!containers[1].sidecar);
     }
 
     #[test]
@@ -835,8 +1043,25 @@ mod tests {
         let active_agent_ids = HashSet::from(["agent-1".to_string()]);
 
         assert_eq!(
-            orphaned_container_ids(&containers, &active_agent_ids),
+            orphaned_container_ids(&containers, &active_agent_ids, &HashSet::new()),
             vec!["orphan".to_string(), "missing-label".to_string()]
+        );
+    }
+
+    #[test]
+    fn orphaned_container_ids_keep_active_project_sidecars() {
+        let containers = vec![
+            managed("agent-keep", Some("agent-1")),
+            managed_project_sidecar("sidecar-keep", "project-1", "agent-1"),
+            managed_project_sidecar("sidecar-orphan", "project-2", "agent-2"),
+            managed_project_sidecar("sidecar-orphan", "project-2", "agent-2"),
+        ];
+        let active_agent_ids = HashSet::from(["agent-1".to_string()]);
+        let active_project_ids = HashSet::from(["project-1".to_string()]);
+
+        assert_eq!(
+            orphaned_container_ids(&containers, &active_agent_ids, &active_project_ids),
+            vec!["sidecar-orphan".to_string()]
         );
     }
 
@@ -884,6 +1109,56 @@ mod tests {
     }
 
     #[test]
+    fn project_sidecar_delete_ids_use_preferred_id_and_label_fallback() {
+        let containers = vec![
+            managed_project_sidecar("project-owned-1", "project-1", "agent-1"),
+            managed_project_sidecar("project-owned-2", "project-1", "agent-1"),
+            managed_project_sidecar("other-project", "project-2", "agent-2"),
+        ];
+
+        assert_eq!(
+            project_sidecar_container_delete_ids(&containers, "project-1", Some("persisted")),
+            vec![
+                "persisted".to_string(),
+                "project-owned-1".to_string(),
+                "project-owned-2".to_string()
+            ]
+        );
+        assert_eq!(
+            project_sidecar_container_delete_ids(&containers, "project-1", Some("project-owned-1")),
+            vec!["project-owned-1".to_string(), "project-owned-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn reusable_project_sidecar_prefers_matching_persisted_container() {
+        let containers = vec![
+            managed_project_sidecar("other-project", "project-2", "agent-2"),
+            managed_project_sidecar("project-fallback", "project-1", "agent-1"),
+            managed_project_sidecar("project-preferred", "project-1", "agent-1"),
+        ];
+
+        assert_eq!(
+            find_reusable_project_sidecar_container(
+                &containers,
+                "project-1",
+                Some("project-preferred")
+            )
+            .map(|container| container.id.as_str()),
+            Some("project-preferred")
+        );
+        assert_eq!(
+            find_reusable_project_sidecar_container(
+                &containers,
+                "project-1",
+                Some("other-project")
+            )
+            .map(|container| container.id.as_str()),
+            Some("project-fallback")
+        );
+    }
+
+    #[test]
     fn create_agent_container_args_include_labels_workspace_and_image() {
         let image = "ghcr.io/rcore-os/tgoskits-container:latest";
         let args = create_agent_container_args(
@@ -909,6 +1184,53 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|window| window == ["-v", "mai-team-workspace-child:/workspace"])
+        );
+        assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
+        assert!(
+            args.windows(3)
+                .any(|window| { window == [image, "sleep", "infinity"] })
+        );
+    }
+
+    #[test]
+    fn create_project_sidecar_container_args_include_labels_workspace_and_image() {
+        let image = "ghcr.io/zr233/mai-team-sidecar:latest";
+        let args = create_project_sidecar_container_args(
+            "mai-team-project-sidecar-project-1",
+            "project-1",
+            "agent-1",
+            image,
+            "mai-team-workspace-agent-1",
+        );
+
+        assert_eq!(args[0], "create");
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--name", "mai-team-project-sidecar-project-1"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--label", MANAGED_LABEL])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--label", "mai.team.sidecar=true"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--label", "mai.team.sidecar.kind=project"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--label", "mai.team.project=project-1"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--label", "mai.team.agent=agent-1"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-v", "mai-team-workspace-agent-1:/workspace"])
         );
         assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
         assert!(
@@ -955,6 +1277,22 @@ mod tests {
             image: "ubuntu:latest".to_string(),
             state: "running".to_string(),
             agent_id: agent_id.map(str::to_string),
+            project_id: None,
+            sidecar: false,
+            sidecar_kind: None,
+        }
+    }
+
+    fn managed_project_sidecar(id: &str, project_id: &str, agent_id: &str) -> ManagedContainer {
+        ManagedContainer {
+            id: id.to_string(),
+            name: format!("mai-team-project-sidecar-{project_id}"),
+            image: "ghcr.io/zr233/mai-team-sidecar:latest".to_string(),
+            state: "running".to_string(),
+            agent_id: Some(agent_id.to_string()),
+            project_id: Some(project_id.to_string()),
+            sidecar: true,
+            sidecar_kind: Some(PROJECT_SIDECAR_KIND.to_string()),
         }
     }
 }

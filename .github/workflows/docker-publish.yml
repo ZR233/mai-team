@@ -1,15 +1,16 @@
-name: Build and Push Agent Image
+name: Build and Push Runtime Images
 
 on:
   push:
     branches: [main]
     paths:
       - Dockerfile
+      - Dockerfile.sidecar
+      - .github/workflows/docker-publish.yml
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/mai-team-agent
 
 jobs:
   build-and-push:
@@ -35,23 +36,44 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
+      - name: Extract agent metadata
+        id: agent-meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/mai-team-agent
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=
 
-      - name: Build and push
+      - name: Build and push agent image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ steps.agent-meta.outputs.tags }}
+          labels: ${{ steps.agent-meta.outputs.labels }}
+          cache-from: type=gha,scope=agent
+          cache-to: type=gha,mode=max,scope=agent
+
+      - name: Extract sidecar metadata
+        id: sidecar-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/mai-team-sidecar
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=
+
+      - name: Build and push sidecar image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.sidecar
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.sidecar-meta.outputs.tags }}
+          labels: ${{ steps.sidecar-meta.outputs.labels }}
+          cache-from: type=gha,scope=sidecar
+          cache-to: type=gha,mode=max,scope=sidecar

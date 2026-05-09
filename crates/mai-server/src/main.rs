@@ -156,6 +156,8 @@ async fn main() -> Result<()> {
         .unwrap_or(ConfigStore::default_config_path()?);
     let image = env::var("MAI_AGENT_BASE_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/zr233/mai-team-agent:latest".to_string());
+    let sidecar_image = env::var("MAI_SIDECAR_IMAGE")
+        .unwrap_or_else(|_| "ghcr.io/zr233/mai-team-sidecar:latest".to_string());
     let bind = env::var("MAI_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let addr: SocketAddr = bind.parse().context("invalid MAI_BIND_ADDR")?;
 
@@ -171,6 +173,7 @@ async fn main() -> Result<()> {
     let model = ResponsesClient::new();
     let runtime_config = RuntimeConfig {
         repo_root: env::current_dir()?,
+        sidecar_image,
     };
     let runtime =
         AgentRuntime::new(docker, model, Arc::clone(&store), runtime_config.clone()).await?;

@@ -50,6 +50,7 @@ const GITHUB_TOKEN_REFRESH_SKEW_SECS: i64 = 120;
 const GITHUB_MANIFEST_STATE_TTL_SECS: u64 = 900;
 const PROJECT_GITHUB_MCP_SERVER: &str = "github";
 const PROJECT_GIT_MCP_SERVER: &str = "git";
+const DEFAULT_SIDECAR_IMAGE: &str = "ghcr.io/zr233/mai-team-sidecar:latest";
 const COMPACT_USER_MESSAGE_MAX_CHARS: usize = 80_000;
 const COMPACT_SUMMARY_PREVIEW_CHARS: usize = 240;
 const COMPACT_SUMMARY_PREFIX: &str = "Context checkpoint summary from earlier conversation history. This is background for continuity, not a new user request.";
@@ -117,6 +118,7 @@ pub type Result<T> = std::result::Result<T, RuntimeError>;
 #[derive(Clone)]
 pub struct RuntimeConfig {
     pub repo_root: PathBuf,
+    pub sidecar_image: String,
 }
 
 pub struct AgentRuntime {
@@ -134,10 +136,12 @@ pub struct AgentRuntime {
     sequence: AtomicU64,
     recent_events: Mutex<VecDeque<ServiceEvent>>,
     repo_root: PathBuf,
+    sidecar_image: String,
 }
 
 struct ProjectRecord {
     summary: RwLock<ProjectSummary>,
+    sidecar: RwLock<Option<ContainerHandle>>,
 }
 
 struct TaskRecord {
@@ -390,9 +394,11 @@ impl AgentRuntime {
                 summary.id,
                 Arc::new(ProjectRecord {
                     summary: RwLock::new(summary),
+                    sidecar: RwLock::new(None),
                 }),
             );
         }
+        let sidecar_image = runtime_sidecar_image(config.sidecar_image);
 
         Ok(Arc::new(Self {
             docker,
@@ -409,6 +415,7 @@ impl AgentRuntime {
             sequence: AtomicU64::new(snapshot.next_sequence),
             recent_events: Mutex::new(snapshot.recent_events.into_iter().collect()),
             repo_root: config.repo_root,
+            sidecar_image,
         }))
     }
 
@@ -1085,6 +1092,7 @@ impl AgentRuntime {
             project_id,
             Arc::new(ProjectRecord {
                 summary: RwLock::new(project.clone()),
+                sidecar: RwLock::new(None),
             }),
         );
         self.publish(ServiceEventKind::ProjectCreated {
@@ -1108,6 +1116,7 @@ impl AgentRuntime {
                         .await
                 }
                 Err(err) => {
+                    let _ = runtime.delete_project_sidecar(project_id).await;
                     runtime
                         .set_project_clone_result(
                             project_id,
@@ -1178,6 +1187,7 @@ impl AgentRuntime {
         for agent_id in root_agents {
             let _ = self.delete_agent(agent_id).await;
         }
+        let _ = self.delete_project_sidecar(project_id).await;
         self.store.delete_project(project_id).await?;
         self.projects.write().await.remove(&project_id);
         self.publish(ServiceEventKind::ProjectDeleted { project_id })
@@ -1206,6 +1216,7 @@ impl AgentRuntime {
         self.store.save_project(&updated).await?;
         self.publish(ServiceEventKind::ProjectUpdated { project: updated })
             .await;
+        let _ = self.delete_project_sidecar(project_id).await;
         Ok(())
     }
 
@@ -1528,16 +1539,23 @@ impl AgentRuntime {
     }
 
     pub async fn cleanup_orphaned_containers(&self) -> Result<Vec<String>> {
-        let active_agent_ids = {
+        let (active_agent_ids, active_project_ids) = {
             let agents = self.agents.read().await;
-            agents
-                .keys()
-                .map(ToString::to_string)
-                .collect::<HashSet<_>>()
+            let projects = self.projects.read().await;
+            (
+                agents
+                    .keys()
+                    .map(ToString::to_string)
+                    .collect::<HashSet<_>>(),
+                projects
+                    .keys()
+                    .map(ToString::to_string)
+                    .collect::<HashSet<_>>(),
+            )
         };
         Ok(self
             .docker
-            .cleanup_orphaned_agent_containers(&active_agent_ids)
+            .cleanup_orphaned_managed_containers(&active_agent_ids, &active_project_ids)
             .await?)
     }
 
@@ -1770,9 +1788,15 @@ impl AgentRuntime {
     async fn close_agent(&self, agent_id: AgentId) -> Result<AgentStatus> {
         let agent = self.agent(agent_id).await?;
         agent.cancel_requested.store(true, Ordering::SeqCst);
-        let previous_status = agent.summary.read().await.status.clone();
+        let (previous_status, project_id) = {
+            let summary = agent.summary.read().await;
+            (summary.status.clone(), summary.project_id)
+        };
         if let Some(manager) = agent.mcp.write().await.take() {
             manager.shutdown().await;
+        }
+        if let Some(project_id) = project_id {
+            let _ = self.delete_project_sidecar(project_id).await;
         }
         let in_memory_container_id = agent
             .container
@@ -1857,8 +1881,12 @@ impl AgentRuntime {
         agent.cancel_requested.store(true, Ordering::SeqCst);
         self.set_status(&agent, AgentStatus::DeletingContainer, None)
             .await?;
+        let project_id = agent.summary.read().await.project_id;
         if let Some(manager) = agent.mcp.write().await.take() {
             manager.shutdown().await;
+        }
+        if let Some(project_id) = project_id {
+            let _ = self.delete_project_sidecar(project_id).await;
         }
         let in_memory_container_id = agent
             .container
@@ -3649,6 +3677,65 @@ impl AgentRuntime {
         summaries
     }
 
+    async fn ensure_project_sidecar(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+    ) -> Result<ContainerHandle> {
+        let project = self.project(project_id).await?;
+        if let Some(container) = project.sidecar.read().await.clone() {
+            return Ok(container);
+        }
+
+        let mut sidecar_guard = project.sidecar.write().await;
+        if let Some(container) = sidecar_guard.clone() {
+            return Ok(container);
+        }
+
+        let workspace_volume = DockerClient::workspace_volume_for_agent(&agent_id.to_string());
+        let container = self
+            .docker
+            .ensure_project_sidecar_container(
+                &project_id.to_string(),
+                &agent_id.to_string(),
+                None,
+                &self.sidecar_image,
+                &workspace_volume,
+            )
+            .await?;
+        *sidecar_guard = Some(container.clone());
+        Ok(container)
+    }
+
+    async fn delete_project_sidecar(&self, project_id: ProjectId) -> Result<Vec<String>> {
+        let project = match self.project(project_id).await {
+            Ok(project) => project,
+            Err(RuntimeError::ProjectNotFound(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+        let preferred_container_id = project
+            .sidecar
+            .write()
+            .await
+            .take()
+            .map(|container| container.id);
+        let deleted = self
+            .docker
+            .delete_project_sidecar_containers(
+                &project_id.to_string(),
+                preferred_container_id.as_deref(),
+            )
+            .await?;
+        if !deleted.is_empty() {
+            tracing::info!(
+                project_id = %project_id,
+                count = deleted.len(),
+                "removed project sidecar containers"
+            );
+        }
+        Ok(deleted)
+    }
+
     async fn set_project_clone_result(
         &self,
         project_id: ProjectId,
@@ -3851,17 +3938,18 @@ impl AgentRuntime {
             ));
         };
         let summary = agent.summary.read().await.clone();
-        let workspace_volume = DockerClient::workspace_volume_for_agent(&summary.id.to_string());
-        let image = self.docker.image().to_string();
+        let Some(project_id) = summary.project_id else {
+            return Err(RuntimeError::InvalidInput(
+                "agent is not attached to a project".to_string(),
+            ));
+        };
+        let sidecar = self.ensure_project_sidecar(project_id, summary.id).await?;
         let configs = project_mcp_configs(&token);
-        let manager =
-            McpAgentManager::start_sidecars(self.docker.clone(), workspace_volume, image, configs)
-                .await;
+        let manager = McpAgentManager::start(self.docker.clone(), sidecar.id, configs).await;
         let output = manager.call_model_tool(model_name, arguments).await;
         manager.shutdown().await;
-        let output = output.map_err(|err| {
-            RuntimeError::InvalidInput(redact_secret(&err.to_string(), &token))
-        })?;
+        let output = output
+            .map_err(|err| RuntimeError::InvalidInput(redact_secret(&err.to_string(), &token)))?;
         Ok(ToolExecution {
             success: true,
             output: redact_secret(&output.to_string(), &token),
@@ -3900,19 +3988,17 @@ impl AgentRuntime {
             branch_arg = branch_arg,
             repo_url = shell_quote(&repo_url),
         );
-        let workspace_volume =
-            DockerClient::workspace_volume_for_agent(&maintainer_agent_id.to_string());
-        let sidecar_name = sidecar_container_name("clone", &maintainer_agent_id.to_string());
+        let sidecar = self
+            .ensure_project_sidecar(project_id, maintainer_agent_id)
+            .await?;
         let output = self
             .docker
-            .run_sidecar_shell_env(
-                &sidecar_name,
-                self.docker.image(),
+            .exec_shell_env(
+                &sidecar.id,
                 &command,
                 Some("/"),
                 Some(600),
                 &[("MAI_GITHUB_INSTALLATION_TOKEN".to_string(), token.clone())],
-                Some(&workspace_volume),
             )
             .await?;
         if output.status != 0 {
@@ -4316,8 +4402,10 @@ impl AgentRuntime {
             return Ok(());
         };
         let summary = agent.summary.read().await.clone();
-        let workspace_volume = DockerClient::workspace_volume_for_agent(&summary.id.to_string());
-        let image = self.docker.image().to_string();
+        let Some(project_id) = summary.project_id else {
+            return Ok(());
+        };
+        let sidecar = self.ensure_project_sidecar(project_id, summary.id).await?;
         let configs = project_mcp_configs(&token);
         self.publish(ServiceEventKind::McpServerStatusChanged {
             agent_id,
@@ -4326,13 +4414,9 @@ impl AgentRuntime {
             error: None,
         })
         .await;
-        let mcp =
-            McpAgentManager::start_sidecars(self.docker.clone(), workspace_volume, image, configs)
-                .await;
+        let mcp = McpAgentManager::start(self.docker.clone(), sidecar.id, configs).await;
         for status in mcp.statuses().await {
-            let error = status
-                .error
-                .map(|error| redact_secret(&error, &token));
+            let error = status.error.map(|error| redact_secret(&error, &token));
             self.publish(ServiceEventKind::McpServerStatusChanged {
                 agent_id,
                 server: status.server,
@@ -4878,31 +4962,12 @@ fn redact_secret(value: &str, secret: &str) -> String {
     value.replace(secret, "<redacted>")
 }
 
-fn sidecar_container_name(kind: &str, id: &str) -> String {
-    let nanos = Utc::now()
-        .timestamp_nanos_opt()
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    format!("mai-team-{kind}-{}-{nanos}", sanitize_docker_name(id))
-}
-
-fn sanitize_docker_name(value: &str) -> String {
-    let sanitized = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    if sanitized.is_empty() {
-        "sidecar".to_string()
+fn runtime_sidecar_image(image: String) -> String {
+    let image = image.trim();
+    if image.is_empty() {
+        DEFAULT_SIDECAR_IMAGE.to_string()
     } else {
-        sanitized
+        image.to_string()
     }
 }
 
@@ -5701,10 +5766,58 @@ mod tests {
             store,
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
+                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
             },
         )
         .await
         .expect("runtime")
+    }
+
+    async fn test_runtime_with_sidecar_image(
+        dir: &tempfile::TempDir,
+        store: Arc<ConfigStore>,
+        sidecar_image: &str,
+    ) -> Arc<AgentRuntime> {
+        AgentRuntime::new(
+            DockerClient::new_with_binary("unused-agent", fake_docker_path(dir)),
+            ResponsesClient::new(),
+            store,
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+                sidecar_image: sidecar_image.to_string(),
+            },
+        )
+        .await
+        .expect("runtime")
+    }
+
+    fn test_project_summary(
+        project_id: ProjectId,
+        maintainer_agent_id: AgentId,
+        git_account_id: &str,
+    ) -> ProjectSummary {
+        let timestamp = now();
+        ProjectSummary {
+            id: project_id,
+            name: "owner/repo".to_string(),
+            status: ProjectStatus::Creating,
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            repository_full_name: "owner/repo".to_string(),
+            git_account_id: Some(git_account_id.to_string()),
+            repository_id: 42,
+            installation_id: 0,
+            installation_account: "owner".to_string(),
+            branch: "main".to_string(),
+            project_path: "/".to_string(),
+            docker_image: "unused-agent".to_string(),
+            workspace_path: PROJECT_WORKSPACE_PATH.to_string(),
+            clone_status: ProjectCloneStatus::Cloning,
+            maintainer_agent_id,
+            created_at: timestamp,
+            updated_at: timestamp,
+            last_error: None,
+        }
     }
 
     fn fake_docker_path(dir: &tempfile::TempDir) -> String {
@@ -6434,6 +6547,7 @@ esac
             store,
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
+                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
             },
         )
         .await
@@ -6679,6 +6793,7 @@ esac
             ),
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
+                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
             },
         )
         .await
@@ -6781,6 +6896,7 @@ esac
             ),
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
+                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
             },
         )
         .await
@@ -6849,6 +6965,7 @@ esac
             Arc::clone(&store),
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
+                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
             },
         )
         .await
@@ -6950,6 +7067,7 @@ esac
             Arc::clone(&store),
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
+                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
             },
         )
         .await
@@ -7222,6 +7340,7 @@ esac
             Arc::clone(&store),
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
+                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
             },
         )
         .await
@@ -7279,6 +7398,7 @@ esac
             Arc::clone(&store),
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
+                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
             },
         )
         .await
@@ -7405,6 +7525,7 @@ esac
             store,
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
+                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
             },
         )
         .await
@@ -7448,6 +7569,7 @@ esac
             Arc::clone(&store),
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
+                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
             },
         )
         .await
@@ -7907,6 +8029,7 @@ esac
             Arc::clone(&store),
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
+                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
             },
         )
         .await
@@ -7930,6 +8053,112 @@ esac
         assert!(fake_docker_log(&dir).contains(image));
         let snapshot = store.load_runtime_snapshot(10).await.expect("snapshot");
         assert_eq!(snapshot.agents[0].summary.docker_image, image);
+    }
+
+    #[tokio::test]
+    async fn project_clone_uses_configured_sidecar_image_and_execs_inside_sidecar() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("account-1".to_string()),
+                label: "GitHub".to_string(),
+                token: Some("secret-token".to_string()),
+                is_default: true,
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, None);
+        agent.project_id = Some(project_id);
+        agent.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &agent).await;
+        let project = test_project_summary(project_id, agent_id, "account-1");
+        store.save_project(&project).await.expect("save project");
+        let runtime = test_runtime_with_sidecar_image(
+            &dir,
+            Arc::clone(&store),
+            "ghcr.io/example/mai-team-sidecar:test",
+        )
+        .await;
+
+        runtime
+            .clone_project_repository(project_id, agent_id)
+            .await
+            .expect("clone");
+
+        let docker_log = fake_docker_log(&dir);
+        assert!(docker_log.contains(&format!(
+            "create --name mai-team-project-sidecar-{project_id}"
+        )));
+        assert!(docker_log.contains("ghcr.io/example/mai-team-sidecar:test sleep infinity"));
+        assert!(docker_log.contains("exec -w / -e MAI_GITHUB_INSTALLATION_TOKEN"));
+        assert!(docker_log.contains("created-container"));
+        assert!(!docker_log.contains("unused-agent sleep infinity"));
+        assert!(!docker_log.contains("secret-token"));
+    }
+
+    #[tokio::test]
+    async fn project_sidecar_is_removed_when_project_is_deleted() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("account-1".to_string()),
+                label: "GitHub".to_string(),
+                token: Some("secret-token".to_string()),
+                is_default: true,
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let agent_container_id = format!("mai-team-{agent_id}");
+        let mut agent = test_agent_summary(agent_id, Some(&agent_container_id));
+        agent.project_id = Some(project_id);
+        agent.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &agent).await;
+        let project = test_project_summary(project_id, agent_id, "account-1");
+        store.save_project(&project).await.expect("save project");
+        let runtime = test_runtime_with_sidecar_image(
+            &dir,
+            Arc::clone(&store),
+            "ghcr.io/example/mai-team-sidecar:test",
+        )
+        .await;
+
+        runtime
+            .clone_project_repository(project_id, agent_id)
+            .await
+            .expect("clone");
+        runtime
+            .delete_project(project_id)
+            .await
+            .expect("delete project");
+
+        let docker_log = fake_docker_log(&dir);
+        assert!(docker_log.contains(&format!(
+            "create --name mai-team-project-sidecar-{project_id}"
+        )));
+        assert!(docker_log.contains("rm -f created-container"));
+        assert!(docker_log.contains(&format!("rm -f mai-team-{agent_id}")));
     }
 
     #[tokio::test]
@@ -7978,6 +8207,7 @@ esac
             Arc::clone(&store),
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
+                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
             },
         )
         .await
@@ -8059,6 +8289,7 @@ esac
             Arc::clone(&store),
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
+                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
             },
         )
         .await
@@ -8137,6 +8368,7 @@ esac
             store,
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
+                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
             },
         )
         .await
