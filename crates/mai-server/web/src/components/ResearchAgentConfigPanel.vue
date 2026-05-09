@@ -255,7 +255,7 @@
                 <span class="git-account-main">
                   <strong>{{ account.label || 'GitHub' }}</strong>
                   <small>{{ accountDisplay(account) }}</small>
-                  <span class="git-account-meta">{{ tokenKindLabel(account.token_kind) }} · {{ account.status || 'unverified' }}</span>
+                  <span class="git-account-meta">{{ tokenKindLabel(account.token_kind) }} · {{ gitAccountStatusLabel(account.status) }}</span>
                 </span>
                 <span v-if="account.is_default" class="mini-pill green">Default</span>
               </button>
@@ -271,8 +271,8 @@
                   <h3>{{ gitForm.id ? 'Edit Account' : 'Add Account' }}</h3>
                   <p>Token type is detected after verification.</p>
                 </div>
-                <span class="section-status" :class="selectedGitAccount?.status === 'verified' ? 'ready' : ''">
-                  {{ selectedGitAccount?.status || 'New' }}
+                <span class="section-status" :class="gitAccountStatusClass(selectedGitAccount?.status)">
+                  {{ selectedGitAccount ? gitAccountStatusLabel(selectedGitAccount.status) : 'New' }}
                 </span>
               </div>
 
@@ -296,6 +296,7 @@
                 <strong>{{ selectedGitAccount ? tokenKindLabel(selectedGitAccount.token_kind) : 'After Test connection' }}</strong>
                 <small>{{ selectedGitAccount?.scopes?.length ? selectedGitAccount.scopes.join(', ') : 'Permissions are read from GitHub when available.' }}</small>
               </div>
+              <p v-if="selectedGitAccount?.last_error" class="dialog-error">{{ selectedGitAccount.last_error }}</p>
 
               <div class="agent-runtime-strip">
                 <span>Agent runtime</span>
@@ -686,5 +687,18 @@ function tokenKindLabel(value) {
   if (value === 'classic') return 'Classic token'
   if (value === 'fine_grained_pat') return 'Fine-grained PAT'
   return 'Token type pending'
+}
+
+function gitAccountStatusLabel(value) {
+  if (value === 'verified') return 'Verified'
+  if (value === 'verifying') return 'Verifying'
+  if (value === 'failed') return 'Failed'
+  return 'Unverified'
+}
+
+function gitAccountStatusClass(value) {
+  if (value === 'verified') return 'ready'
+  if (value === 'failed') return 'danger'
+  return ''
 }
 </script>

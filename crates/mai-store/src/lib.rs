@@ -838,6 +838,7 @@ impl ConfigStore {
             .and_then(|index| config.accounts.get(index))
             .map(|account| account.token_secret.clone())
             .unwrap_or_default();
+        let has_new_token = !token.is_empty();
         let token_secret = if token.is_empty() {
             current_token
         } else {
@@ -881,6 +882,11 @@ impl ConfigStore {
             account.login = Some(login.trim().to_string()).filter(|value| !value.is_empty());
         }
         account.token_secret = token_secret;
+        account.status = GitAccountStatus::Verifying;
+        account.last_error = None;
+        if has_new_token {
+            account.last_verified_at = None;
+        }
         if request.is_default || config.accounts.is_empty() {
             config.default_account_id = Some(id.clone());
         }
@@ -922,6 +928,21 @@ impl ConfigStore {
         account.status = status;
         account.last_verified_at = Some(Utc::now());
         account.last_error = last_error;
+        let summary = account.summary(default_account_id.as_deref());
+        self.save_git_accounts_config(&config).await?;
+        Ok(summary)
+    }
+
+    pub async fn mark_git_account_verifying(&self, account_id: &str) -> Result<GitAccountSummary> {
+        let mut config = self.git_accounts_config().await?;
+        let default_account_id = config.default_account_id.clone();
+        let account = config
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+            .ok_or_else(|| StoreError::InvalidConfig("git account not found".to_string()))?;
+        account.status = GitAccountStatus::Verifying;
+        account.last_error = None;
         let summary = account.summary(default_account_id.as_deref());
         self.save_git_accounts_config(&config).await?;
         Ok(summary)
@@ -2877,6 +2898,54 @@ mod tests {
             .expect("resolve");
         assert_eq!(resolved.provider.api_key, "secret");
         assert_eq!(resolved.model.id, "gpt-5.4");
+    }
+
+    #[tokio::test]
+    async fn git_account_save_enters_verifying_and_clears_previous_error() {
+        let (_dir, store) = store().await;
+        let saved = store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("account-1".to_string()),
+                provider: GitProvider::Github,
+                label: "Personal".to_string(),
+                token: Some("secret-token".to_string()),
+                is_default: true,
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        assert_eq!(saved.status, GitAccountStatus::Verifying);
+        assert_eq!(saved.last_error, None);
+        assert_eq!(saved.last_verified_at, None);
+
+        let failed = store
+            .update_git_account_verification(
+                "account-1",
+                None,
+                GitTokenKind::Unknown,
+                Vec::new(),
+                GitAccountStatus::Failed,
+                Some("bad token".to_string()),
+            )
+            .await
+            .expect("mark failed");
+        assert_eq!(failed.status, GitAccountStatus::Failed);
+        assert!(failed.last_verified_at.is_some());
+
+        let resaved = store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("account-1".to_string()),
+                provider: GitProvider::Github,
+                label: "Personal".to_string(),
+                token: Some("new-secret".to_string()),
+                is_default: true,
+                ..Default::default()
+            })
+            .await
+            .expect("resave account");
+        assert_eq!(resaved.status, GitAccountStatus::Verifying);
+        assert_eq!(resaved.last_error, None);
+        assert_eq!(resaved.last_verified_at, None);
     }
 
     #[tokio::test]

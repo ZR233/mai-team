@@ -11,6 +11,9 @@ const gitAccountsState = reactive({
   loaded: false
 })
 
+const GIT_ACCOUNT_VERIFY_POLL_INTERVAL_MS = 1000
+const GIT_ACCOUNT_VERIFY_POLL_ATTEMPTS = 12
+
 export function useGitAccounts() {
   const { api } = useApi()
 
@@ -34,6 +37,10 @@ export function useGitAccounts() {
         body: JSON.stringify(payload)
       })
       await loadGitAccounts()
+      const account = response?.account || response
+      if (account?.id) {
+        pollGitAccountVerification(account.id).catch(() => {})
+      }
       return response
     } finally {
       gitAccountsState.saving = false
@@ -74,6 +81,16 @@ export function useGitAccounts() {
   async function loadGitAccountRepositories(id) {
     if (!id) return { repositories: [] }
     return api(`/git/accounts/${encodeURIComponent(id)}/repositories`)
+  }
+
+  async function pollGitAccountVerification(id) {
+    for (let attempt = 0; attempt < GIT_ACCOUNT_VERIFY_POLL_ATTEMPTS; attempt++) {
+      await new Promise((resolve) => window.setTimeout(resolve, GIT_ACCOUNT_VERIFY_POLL_INTERVAL_MS))
+      const response = await loadGitAccounts()
+      const account = response?.accounts?.find((item) => item.id === id)
+      if (!account || account.status !== 'verifying') return account
+    }
+    return null
   }
 
   return {

@@ -49,6 +49,7 @@ const DEFAULT_GITHUB_WEB_BASE_URL: &str = "https://github.com";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 const GITHUB_TOKEN_REFRESH_SKEW_SECS: i64 = 120;
 const GITHUB_MANIFEST_STATE_TTL_SECS: u64 = 900;
+const GITHUB_HTTP_TIMEOUT_SECS: u64 = 10;
 const PROJECT_GITHUB_MCP_SERVER: &str = "github";
 const PROJECT_GIT_MCP_SERVER: &str = "git";
 const DEFAULT_SIDECAR_IMAGE: &str = "ghcr.io/zr233/mai-team-sidecar:latest";
@@ -120,6 +121,7 @@ pub type Result<T> = std::result::Result<T, RuntimeError>;
 pub struct RuntimeConfig {
     pub repo_root: PathBuf,
     pub sidecar_image: String,
+    pub github_api_base_url: Option<String>,
 }
 
 pub struct AgentRuntime {
@@ -138,6 +140,7 @@ pub struct AgentRuntime {
     recent_events: Mutex<VecDeque<ServiceEvent>>,
     repo_root: PathBuf,
     sidecar_image: String,
+    github_api_base_url: String,
 }
 
 struct ProjectRecord {
@@ -431,6 +434,15 @@ impl AgentRuntime {
             );
         }
         let sidecar_image = runtime_sidecar_image(config.sidecar_image);
+        let github_api_base_url = config
+            .github_api_base_url
+            .as_deref()
+            .unwrap_or(DEFAULT_GITHUB_API_BASE_URL)
+            .to_string();
+
+        let github_http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(GITHUB_HTTP_TIMEOUT_SECS))
+            .build()?;
 
         Ok(Arc::new(Self {
             docker,
@@ -442,12 +454,13 @@ impl AgentRuntime {
             projects: RwLock::new(projects),
             github_tokens: Mutex::new(HashMap::new()),
             github_manifest_states: Mutex::new(HashMap::new()),
-            github_http: reqwest::Client::new(),
+            github_http,
             event_tx,
             sequence: AtomicU64::new(snapshot.next_sequence),
             recent_events: Mutex::new(snapshot.recent_events.into_iter().collect()),
             repo_root: config.repo_root,
             sidecar_image,
+            github_api_base_url,
         }))
     }
 
@@ -564,21 +577,47 @@ impl AgentRuntime {
         Ok(self.store.list_git_accounts().await?)
     }
 
-    pub async fn save_git_account(&self, request: GitAccountRequest) -> Result<GitAccountResponse> {
+    pub async fn save_git_account(
+        self: &Arc<Self>,
+        request: GitAccountRequest,
+    ) -> Result<GitAccountResponse> {
         let account = self.store.upsert_git_account(request).await?;
-        let verified = self.verify_git_account(&account.id).await?;
-        Ok(GitAccountResponse { account: verified })
+        let runtime = Arc::clone(self);
+        let account_id = account.id.clone();
+        tokio::spawn(async move {
+            if let Err(err) = runtime.verify_git_account(&account_id).await {
+                tracing::warn!(account_id = %account_id, "failed to verify git account in background: {err}");
+            }
+        });
+        Ok(GitAccountResponse { account })
     }
 
     pub async fn verify_git_account(&self, account_id: &str) -> Result<GitAccountSummary> {
         let token = self.git_account_token(account_id).await?;
-        let response = self
+        self.store.mark_git_account_verifying(account_id).await?;
+        let response = match self
             .github_http
-            .get(github_api_url(DEFAULT_GITHUB_API_BASE_URL, "/user"))
+            .get(github_api_url(&self.github_api_base_url, "/user"))
             .bearer_auth(&token)
             .headers(github_headers())
             .send()
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                return Ok(self
+                    .store
+                    .update_git_account_verification(
+                        account_id,
+                        None,
+                        GitTokenKind::Unknown,
+                        Vec::new(),
+                        GitAccountStatus::Failed,
+                        Some(redact_secret(&err.to_string(), &token)),
+                    )
+                    .await?);
+            }
+        };
         let scopes = github_scopes(response.headers());
         let token_kind = git_token_kind(&token, &scopes);
         match decode_github_response::<GithubUserApi>(response, "verify token").await {
@@ -621,7 +660,7 @@ impl AgentRuntime {
     ) -> Result<GithubRepositoriesResponse> {
         let token = self.git_account_token(account_id).await?;
         let url = github_api_url(
-            DEFAULT_GITHUB_API_BASE_URL,
+            &self.github_api_base_url,
             "/user/repos?per_page=100&affiliation=owner,collaborator,organization_member&sort=updated",
         );
         let response = self
@@ -710,7 +749,7 @@ impl AgentRuntime {
         owner: &str,
     ) -> std::result::Result<Vec<GithubPackageApi>, reqwest::Error> {
         let org_url = github_api_url(
-            DEFAULT_GITHUB_API_BASE_URL,
+            &self.github_api_base_url,
             &format!(
                 "/orgs/{}/packages?package_type=container&per_page=100",
                 github_path_segment(owner)
@@ -727,7 +766,7 @@ impl AgentRuntime {
             return org_response.error_for_status()?.json().await;
         }
         let user_url = github_api_url(
-            DEFAULT_GITHUB_API_BASE_URL,
+            &self.github_api_base_url,
             &format!(
                 "/users/{}/packages?package_type=container&per_page=100",
                 github_path_segment(owner)
@@ -751,7 +790,7 @@ impl AgentRuntime {
         package_name: &str,
     ) -> std::result::Result<Vec<GithubPackageVersionApi>, reqwest::Error> {
         let org_url = github_api_url(
-            DEFAULT_GITHUB_API_BASE_URL,
+            &self.github_api_base_url,
             &format!(
                 "/orgs/{}/packages/container/{}/versions?per_page=30",
                 github_path_segment(owner),
@@ -769,7 +808,7 @@ impl AgentRuntime {
             return org_response.error_for_status()?.json().await;
         }
         let user_url = github_api_url(
-            DEFAULT_GITHUB_API_BASE_URL,
+            &self.github_api_base_url,
             &format!(
                 "/users/{}/packages/container/{}/versions?per_page=30",
                 github_path_segment(owner),
@@ -4028,7 +4067,7 @@ impl AgentRuntime {
             ));
         }
         let url = github_api_url(
-            DEFAULT_GITHUB_API_BASE_URL,
+            &self.github_api_base_url,
             &format!("/repos/{repository_full_name}"),
         );
         let response = self
@@ -5736,8 +5775,8 @@ General rules:
 mod tests {
     use super::*;
     use mai_protocol::{
-        ModelConfig, ModelReasoningConfig, ModelReasoningVariant, ProviderConfig, ProviderKind,
-        ProvidersConfigRequest,
+        GitProvider, ModelConfig, ModelReasoningConfig, ModelReasoningVariant, ProviderConfig,
+        ProviderKind, ProvidersConfigRequest,
     };
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -5907,21 +5946,44 @@ mod tests {
                 break header_end;
             }
         };
-        let headers = String::from_utf8_lossy(&buffer[..header_end]);
+        let headers = String::from_utf8_lossy(&buffer[..header_end]).to_string();
         let content_length = content_length(&headers);
         while buffer.len() < header_end + content_length {
             let read = stream.read(&mut chunk).await.expect("read request body");
             assert!(read > 0, "mock request closed before body");
             buffer.extend_from_slice(&chunk[..read]);
         }
+        if content_length == 0 {
+            let request_line = headers.lines().next().unwrap_or_default();
+            return json!({ "request_line": request_line });
+        }
         serde_json::from_slice(&buffer[header_end..header_end + content_length])
             .expect("request json")
     }
 
     async fn write_mock_response(stream: &mut tokio::net::TcpStream, response: Value) {
-        let body = serde_json::to_string(&response).expect("response json");
+        let status = response
+            .get("__status")
+            .and_then(Value::as_u64)
+            .unwrap_or(200);
+        let headers = response
+            .get("__headers")
+            .and_then(Value::as_object)
+            .cloned();
+        let mut body_value = response;
+        if let Some(object) = body_value.as_object_mut() {
+            object.remove("__status");
+            object.remove("__headers");
+        }
+        let body = serde_json::to_string(&body_value).expect("response json");
+        let reason = if status == 200 { "OK" } else { "ERROR" };
+        let extra_headers = headers
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(name, value)| value.as_str().map(|value| format!("{name}: {value}\r\n")))
+            .collect::<String>();
         let reply = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n{extra_headers}content-length: {}\r\nconnection: close\r\n\r\n{}",
             body.len(),
             body
         );
@@ -6035,6 +6097,7 @@ mod tests {
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+                github_api_base_url: None,
             },
         )
         .await
@@ -6053,6 +6116,26 @@ mod tests {
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: sidecar_image.to_string(),
+                github_api_base_url: None,
+            },
+        )
+        .await
+        .expect("runtime")
+    }
+
+    async fn test_runtime_with_github_api(
+        dir: &tempfile::TempDir,
+        store: Arc<ConfigStore>,
+        github_api_base_url: String,
+    ) -> Arc<AgentRuntime> {
+        AgentRuntime::new(
+            DockerClient::new_with_binary("unused", fake_docker_path(dir)),
+            ResponsesClient::new(),
+            store,
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+                github_api_base_url: Some(github_api_base_url),
             },
         )
         .await
@@ -6193,6 +6276,107 @@ esac
             )
             .await
             .expect("save session");
+    }
+
+    #[tokio::test]
+    async fn save_git_account_returns_verifying_without_waiting_for_verify() {
+        let (base_url, _requests) = start_mock_responses(vec![json!({
+            "__close_without_response": true
+        })])
+        .await;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let runtime = test_runtime_with_github_api(&dir, Arc::clone(&store), base_url).await;
+
+        let response = runtime
+            .save_git_account(GitAccountRequest {
+                id: Some("account-1".to_string()),
+                provider: GitProvider::Github,
+                label: "Personal".to_string(),
+                token: Some("secret-token".to_string()),
+                is_default: true,
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+
+        assert_eq!(response.account.status, GitAccountStatus::Verifying);
+        assert_eq!(response.account.last_error, None);
+    }
+
+    #[tokio::test]
+    async fn verify_git_account_records_success_metadata() {
+        let (base_url, _requests) = start_mock_responses(vec![json!({
+            "__headers": {
+                "x-oauth-scopes": "repo, read:packages"
+            },
+            "login": "octo"
+        })])
+        .await;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("account-1".to_string()),
+                provider: GitProvider::Github,
+                label: "Personal".to_string(),
+                token: Some("ghp_secret".to_string()),
+                is_default: true,
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        let runtime = test_runtime_with_github_api(&dir, Arc::clone(&store), base_url).await;
+
+        let account = runtime
+            .verify_git_account("account-1")
+            .await
+            .expect("verify account");
+
+        assert_eq!(account.status, GitAccountStatus::Verified);
+        assert_eq!(account.login.as_deref(), Some("octo"));
+        assert_eq!(account.token_kind, GitTokenKind::Classic);
+        assert!(account.scopes.contains(&"repo".to_string()));
+        assert!(account.last_verified_at.is_some());
+        assert_eq!(account.last_error, None);
+    }
+
+    #[tokio::test]
+    async fn verify_git_account_records_failed_http_error() {
+        let (base_url, _requests) = start_mock_responses(vec![json!({
+            "__status": 401,
+            "message": "Bad credentials"
+        })])
+        .await;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("account-1".to_string()),
+                provider: GitProvider::Github,
+                label: "Personal".to_string(),
+                token: Some("secret-token".to_string()),
+                is_default: true,
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        let runtime = test_runtime_with_github_api(&dir, Arc::clone(&store), base_url).await;
+
+        let account = runtime
+            .verify_git_account("account-1")
+            .await
+            .expect("verify account");
+
+        assert_eq!(account.status, GitAccountStatus::Failed);
+        assert!(account.last_verified_at.is_some());
+        assert!(
+            account
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Bad credentials")
+        );
     }
 
     #[test]
@@ -6828,6 +7012,7 @@ esac
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+                github_api_base_url: None,
             },
         )
         .await
@@ -7074,6 +7259,7 @@ esac
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+                github_api_base_url: None,
             },
         )
         .await
@@ -7177,6 +7363,7 @@ esac
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+                github_api_base_url: None,
             },
         )
         .await
@@ -7246,6 +7433,7 @@ esac
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+                github_api_base_url: None,
             },
         )
         .await
@@ -7348,6 +7536,7 @@ esac
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+                github_api_base_url: None,
             },
         )
         .await
@@ -7621,6 +7810,7 @@ esac
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+                github_api_base_url: None,
             },
         )
         .await
@@ -7679,6 +7869,7 @@ esac
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+                github_api_base_url: None,
             },
         )
         .await
@@ -7806,6 +7997,7 @@ esac
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+                github_api_base_url: None,
             },
         )
         .await
@@ -7850,6 +8042,7 @@ esac
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+                github_api_base_url: None,
             },
         )
         .await
@@ -8310,6 +8503,7 @@ esac
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+                github_api_base_url: None,
             },
         )
         .await
@@ -8596,6 +8790,7 @@ esac
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+                github_api_base_url: None,
             },
         )
         .await
@@ -8725,6 +8920,7 @@ esac
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+                github_api_base_url: None,
             },
         )
         .await
@@ -8807,6 +9003,7 @@ esac
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+                github_api_base_url: None,
             },
         )
         .await
@@ -8886,6 +9083,7 @@ esac
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+                github_api_base_url: None,
             },
         )
         .await

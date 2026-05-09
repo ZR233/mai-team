@@ -1252,6 +1252,7 @@ impl Default for GitTokenKind {
 #[serde(rename_all = "snake_case")]
 pub enum GitAccountStatus {
     Unverified,
+    Verifying,
     Verified,
     Failed,
 }
