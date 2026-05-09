@@ -73,17 +73,35 @@ export function useProjects() {
     await refreshProjectDetail()
   }
 
+  function upsertProjectSummary(project) {
+    if (!project?.id) return
+    const index = projects.value.findIndex((item) => item.id === project.id)
+    if (index >= 0) {
+      projects.value.splice(index, 1, { ...projects.value[index], ...project })
+    } else {
+      projects.value = [project, ...projects.value]
+    }
+  }
+
+  function refreshProjectCreationState() {
+    refreshProjects().catch(() => {})
+    if (selectedProjectId.value) {
+      refreshProjectDetail().catch(() => {})
+    }
+  }
+
   async function createProject(payload) {
     const response = await api('/projects', {
       method: 'POST',
       body: JSON.stringify(payload)
     })
     const project = response?.project || response
+    upsertProjectSummary(project)
     selectedProjectId.value = project?.id || null
     selectedProjectAgentId.value = project?.maintainer_agent_id || null
     selectedProjectSessionId.value = null
-    await refreshProjects()
-    if (selectedProjectId.value) await refreshProjectDetail()
+    selectedProjectDetail.value = project || null
+    refreshProjectCreationState()
     return project
   }
 

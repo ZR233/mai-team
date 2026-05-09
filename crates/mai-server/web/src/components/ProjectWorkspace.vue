@@ -21,9 +21,9 @@
             <span class="agent-name">
               <span class="agent-name-text">{{ project.name }}</span>
             </span>
-            <span class="agent-meta">{{ repositoryName(project) }} · {{ formatStatus(project.status) }}</span>
+            <span class="agent-meta">{{ repositoryName(project) }} · {{ projectStageLabel(project) }}</span>
           </span>
-          <span class="status-dot" :class="statusTone(project.status)" :title="formatStatus(project.status)" />
+          <span class="status-dot" :class="statusTone(project.status)" :title="projectStageLabel(project)" />
         </button>
         <div v-if="!projects.length" class="empty-rail">
           <strong>No projects yet</strong>
@@ -56,6 +56,49 @@
         <h2>No project selected</h2>
         <p>Create a project or choose one from the left rail.</p>
         <button class="primary-button" type="button" @click="$emit('create')">New Project</button>
+      </div>
+
+      <div v-else-if="isProjectSettingUp" class="project-panel project-progress-panel">
+        <header class="settings-section-header">
+          <div>
+            <h2>{{ projectStageTitle }}</h2>
+            <p>{{ repositoryName(detail) }}</p>
+          </div>
+          <span class="section-status" :class="statusTone(detail.status)">{{ projectStageLabel(detail) }}</span>
+        </header>
+        <div class="project-progress-bar" :class="{ failed: isProjectFailed }">
+          <span></span>
+        </div>
+        <div class="settings-summary">
+          <div
+            v-for="step in projectSetupSteps"
+            :key="step.id"
+            class="settings-summary-item"
+            :class="{ ready: step.done, danger: step.failed }"
+          >
+            <span>{{ step.label }}</span>
+            <strong>{{ step.value }}</strong>
+            <small>{{ step.help }}</small>
+          </div>
+        </div>
+        <div class="project-facts">
+          <div class="project-fact">
+            <span>Repository</span>
+            <strong>{{ detail.repository_full_name || repositoryName(detail) }}</strong>
+          </div>
+          <div class="project-fact">
+            <span>Branch</span>
+            <strong>{{ detail.branch || 'Default branch' }}</strong>
+          </div>
+          <div class="project-fact span-2">
+            <span>Docker Image</span>
+            <strong>{{ detail.docker_image || 'Default image' }}</strong>
+          </div>
+          <div class="project-fact span-2" :class="{ danger: detail.last_error }">
+            <span>Status</span>
+            <strong>{{ detail.last_error || projectProgressMessage }}</strong>
+          </div>
+        </div>
       </div>
 
       <template v-else-if="activeSection === 'planner'">
@@ -253,6 +296,55 @@ const projectAgents = computed(() => {
   return agents
 })
 
+const isProjectFailed = computed(() => props.detail?.status === 'failed' || props.detail?.clone_status === 'failed')
+const isProjectSettingUp = computed(() => {
+  if (!props.detail) return false
+  if (isProjectFailed.value) return true
+  return props.detail.status === 'creating'
+    || props.detail.clone_status === 'pending'
+    || props.detail.clone_status === 'cloning'
+})
+const projectStageTitle = computed(() => (isProjectFailed.value ? 'Project setup failed' : 'Setting up project'))
+const projectProgressMessage = computed(() => {
+  if (!props.detail) return ''
+  if (isProjectFailed.value) return 'Project setup failed.'
+  if (props.detail.clone_status === 'cloning') return 'Cloning the repository into the project workspace.'
+  if (props.detail.maintainer_agent?.status === 'starting_container') return 'Starting the maintainer workspace container.'
+  return 'Project accepted. Preparing the maintainer workspace.'
+})
+const projectSetupSteps = computed(() => {
+  const detail = props.detail || {}
+  const cloneReady = detail.clone_status === 'ready'
+  const cloning = detail.clone_status === 'cloning'
+  const failed = isProjectFailed.value
+  return [
+    {
+      id: 'accepted',
+      label: 'Accepted',
+      value: 'Project saved',
+      help: 'The server accepted this project.',
+      done: true,
+      failed: false
+    },
+    {
+      id: 'workspace',
+      label: 'Workspace',
+      value: failed ? 'Failed' : (cloning || cloneReady ? 'Started' : 'Starting'),
+      help: detail.maintainer_agent?.status ? formatStatus(detail.maintainer_agent.status) : 'Waiting for maintainer container',
+      done: cloning || cloneReady,
+      failed
+    },
+    {
+      id: 'clone',
+      label: 'Clone',
+      value: failed ? 'Failed' : (cloneReady ? 'Ready' : (cloning ? 'Cloning' : 'Pending')),
+      help: failed ? (detail.last_error || 'Clone did not complete') : 'Repository path: /workspace/repo',
+      done: cloneReady,
+      failed
+    }
+  ]
+})
+
 watch(
   () => props.selectedProjectId,
   () => {
@@ -262,6 +354,15 @@ watch(
 
 function repositoryName(project) {
   return [project?.owner, project?.repo].filter(Boolean).join('/') || 'Repository pending'
+}
+
+function projectStageLabel(project) {
+  if (!project) return 'Pending'
+  if (project.status === 'failed' || project.clone_status === 'failed') return 'Failed'
+  if (project.status === 'ready' || project.clone_status === 'ready') return 'Ready'
+  if (project.clone_status === 'cloning') return 'Cloning repository'
+  if (project.clone_status === 'pending') return 'Starting workspace'
+  return formatStatus(project.status)
 }
 
 function roleInitial(role) {

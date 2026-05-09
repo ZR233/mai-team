@@ -1230,7 +1230,7 @@ impl AgentRuntime {
         let clone_url = github_clone_url(&owner, &repo);
         let system_prompt = project_maintainer_system_prompt(&owner, &repo, &clone_url, &branch);
         let maintainer = self
-            .create_agent_with_container_source(
+            .create_agent_record(
                 CreateAgentRequest {
                     name: Some(format!("{name} Maintainer")),
                     provider_id: Some(planner_model.preference.provider_id),
@@ -1240,12 +1240,12 @@ impl AgentRuntime {
                     parent_id: None,
                     system_prompt: Some(system_prompt),
                 },
-                ContainerSource::FreshImage,
                 None,
                 Some(project_id),
                 Some(AgentRole::Planner),
             )
             .await?;
+        let maintainer_summary = maintainer.summary.read().await.clone();
         let created_at = now();
         let project = ProjectSummary {
             id: project_id,
@@ -1259,9 +1259,9 @@ impl AgentRuntime {
             installation_id: 0,
             installation_account,
             branch,
-            docker_image: maintainer.docker_image.clone(),
-            clone_status: ProjectCloneStatus::Cloning,
-            maintainer_agent_id: maintainer.id,
+            docker_image: maintainer_summary.docker_image.clone(),
+            clone_status: ProjectCloneStatus::Pending,
+            maintainer_agent_id: maintainer_summary.id,
             created_at,
             updated_at: created_at,
             last_error: None,
@@ -1280,34 +1280,11 @@ impl AgentRuntime {
         .await;
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
-            let clone_result = runtime
-                .clone_project_repository(project_id, maintainer.id)
-                .await;
-            let update = match clone_result {
-                Ok(()) => {
-                    runtime
-                        .set_project_clone_result(
-                            project_id,
-                            ProjectStatus::Ready,
-                            ProjectCloneStatus::Ready,
-                            None,
-                        )
-                        .await
-                }
-                Err(err) => {
-                    let _ = runtime.delete_project_sidecar(project_id).await;
-                    runtime
-                        .set_project_clone_result(
-                            project_id,
-                            ProjectStatus::Failed,
-                            ProjectCloneStatus::Failed,
-                            Some(err.to_string()),
-                        )
-                        .await
-                }
-            };
-            if let Err(err) = update {
-                tracing::warn!(project_id = %project_id, "failed to update project clone status: {err}");
+            if let Err(err) = runtime
+                .start_project_workspace(project_id, maintainer_summary.id)
+                .await
+            {
+                tracing::warn!(project_id = %project_id, "failed to finish project workspace setup: {err}");
             }
         });
         Ok(project)
@@ -1570,6 +1547,43 @@ impl AgentRuntime {
         project_id: Option<ProjectId>,
         role: Option<AgentRole>,
     ) -> Result<AgentSummary> {
+        let agent = self
+            .create_agent_record(request, task_id, project_id, role)
+            .await?;
+
+        match self
+            .ensure_agent_container_with_source(&agent, AgentStatus::Idle, &container_source)
+            .await
+        {
+            Ok(_) => Ok(agent.summary.read().await.clone()),
+            Err(err) => {
+                let message = err.to_string();
+                let agent_id = agent.summary.read().await.id;
+                if let Err(store_err) = self
+                    .set_status(&agent, AgentStatus::Failed, Some(message.clone()))
+                    .await
+                {
+                    tracing::warn!("failed to persist agent failure: {store_err}");
+                }
+                self.publish(ServiceEventKind::Error {
+                    agent_id: Some(agent_id),
+                    session_id: None,
+                    turn_id: None,
+                    message,
+                })
+                .await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn create_agent_record(
+        self: &Arc<Self>,
+        request: CreateAgentRequest,
+        task_id: Option<TaskId>,
+        project_id: Option<ProjectId>,
+        role: Option<AgentRole>,
+    ) -> Result<Arc<AgentRecord>> {
         let id = Uuid::new_v4();
         let created_at = Utc::now();
         let name = request
@@ -1632,30 +1646,7 @@ impl AgentRuntime {
             agent: summary.clone(),
         })
         .await;
-
-        match self
-            .ensure_agent_container_with_source(&agent, AgentStatus::Idle, &container_source)
-            .await
-        {
-            Ok(_) => Ok(agent.summary.read().await.clone()),
-            Err(err) => {
-                let message = err.to_string();
-                if let Err(store_err) = self
-                    .set_status(&agent, AgentStatus::Failed, Some(message.clone()))
-                    .await
-                {
-                    tracing::warn!("failed to persist agent failure: {store_err}");
-                }
-                self.publish(ServiceEventKind::Error {
-                    agent_id: Some(id),
-                    session_id: None,
-                    turn_id: None,
-                    message,
-                })
-                .await;
-                Err(err)
-            }
-        }
+        Ok(agent)
     }
 
     pub async fn list_agents(&self) -> Vec<AgentSummary> {
@@ -3939,6 +3930,59 @@ impl AgentRuntime {
         Ok(updated)
     }
 
+    async fn start_project_workspace(
+        self: &Arc<Self>,
+        project_id: ProjectId,
+        maintainer_agent_id: AgentId,
+    ) -> Result<()> {
+        let setup_result = async {
+            let maintainer = self.agent(maintainer_agent_id).await?;
+            self.ensure_agent_container_with_source(
+                &maintainer,
+                AgentStatus::Idle,
+                &ContainerSource::FreshImage,
+            )
+            .await?;
+            self.set_project_clone_result(
+                project_id,
+                ProjectStatus::Creating,
+                ProjectCloneStatus::Cloning,
+                None,
+            )
+            .await?;
+            self.clone_project_repository(project_id, maintainer_agent_id)
+                .await
+        }
+        .await;
+
+        let update = match setup_result {
+            Ok(()) => {
+                self.set_project_clone_result(
+                    project_id,
+                    ProjectStatus::Ready,
+                    ProjectCloneStatus::Ready,
+                    None,
+                )
+                .await
+            }
+            Err(err) => {
+                let _ = self.delete_project_sidecar(project_id).await;
+                self.set_project_clone_result(
+                    project_id,
+                    ProjectStatus::Failed,
+                    ProjectCloneStatus::Failed,
+                    Some(err.to_string()),
+                )
+                .await
+            }
+        };
+        if let Err(err) = update {
+            tracing::warn!(project_id = %project_id, "failed to update project clone status: {err}");
+            return Err(err);
+        }
+        Ok(())
+    }
+
     async fn prune_github_manifest_states(&self) {
         let ttl = Duration::from_secs(GITHUB_MANIFEST_STATE_TTL_SECS);
         let mut states = self.github_manifest_states.lock().await;
@@ -6023,7 +6067,7 @@ mod tests {
             installation_account: "owner".to_string(),
             branch: "main".to_string(),
             docker_image: "unused-agent".to_string(),
-            clone_status: ProjectCloneStatus::Cloning,
+            clone_status: ProjectCloneStatus::Pending,
             maintainer_agent_id,
             created_at: timestamp,
             updated_at: timestamp,
@@ -6072,6 +6116,41 @@ esac
                 .permissions();
             permissions.set_mode(0o755);
             std::fs::set_permissions(&path, permissions).expect("chmod fake docker");
+        }
+        path.to_string_lossy().to_string()
+    }
+
+    fn failing_docker_path(dir: &tempfile::TempDir) -> String {
+        let path = dir.path().join("failing-docker.sh");
+        let log_path = fake_docker_log_path(dir);
+        let script = format!(
+            r#"#!/bin/sh
+LOG={}
+echo "$*" >> "$LOG"
+case "$1" in
+  create)
+    echo "container startup failed" >&2
+    exit 42
+    ;;
+  ps|rm|rmi|start|exec|commit)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#,
+            test_shell_quote(&log_path.to_string_lossy())
+        );
+        std::fs::write(&path, script).expect("write fake docker");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path)
+                .expect("fake docker metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).expect("chmod docker");
         }
         path.to_string_lossy().to_string()
     }
@@ -8390,6 +8469,146 @@ esac
         assert!(docker_log.contains("created-container"));
         assert!(!docker_log.contains("unused-agent sleep infinity"));
         assert!(!docker_log.contains("secret-token"));
+    }
+
+    #[tokio::test]
+    async fn project_workspace_setup_moves_from_pending_to_ready() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("account-1".to_string()),
+                label: "GitHub".to_string(),
+                token: Some("secret-token".to_string()),
+                is_default: true,
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, None);
+        agent.status = AgentStatus::Created;
+        agent.project_id = Some(project_id);
+        agent.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &agent).await;
+        let project = test_project_summary(project_id, agent_id, "account-1");
+        store.save_project(&project).await.expect("save project");
+        let runtime = test_runtime_with_sidecar_image(
+            &dir,
+            Arc::clone(&store),
+            "ghcr.io/example/mai-team-sidecar:test",
+        )
+        .await;
+        let mut events = runtime.subscribe();
+
+        runtime
+            .start_project_workspace(project_id, agent_id)
+            .await
+            .expect("setup");
+
+        let detail = runtime
+            .get_project(project_id, None, None)
+            .await
+            .expect("detail");
+        assert_eq!(detail.summary.status, ProjectStatus::Ready);
+        assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Ready);
+        assert_eq!(detail.maintainer_agent.summary.status, AgentStatus::Idle);
+        assert!(fake_docker_log(&dir).contains("exec -w / -e MAI_GITHUB_INSTALLATION_TOKEN"));
+
+        let mut saw_cloning = false;
+        let mut saw_ready = false;
+        while let Ok(event) = events.try_recv() {
+            match event.kind {
+                ServiceEventKind::ProjectUpdated { project }
+                    if project.id == project_id
+                        && project.clone_status == ProjectCloneStatus::Cloning =>
+                {
+                    saw_cloning = true;
+                }
+                ServiceEventKind::ProjectUpdated { project }
+                    if project.id == project_id
+                        && project.clone_status == ProjectCloneStatus::Ready =>
+                {
+                    saw_ready = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_cloning);
+        assert!(saw_ready);
+    }
+
+    #[tokio::test]
+    async fn project_workspace_setup_failure_marks_project_failed() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("account-1".to_string()),
+                label: "GitHub".to_string(),
+                token: Some("secret-token".to_string()),
+                is_default: true,
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, None);
+        agent.status = AgentStatus::Created;
+        agent.project_id = Some(project_id);
+        agent.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &agent).await;
+        let project = test_project_summary(project_id, agent_id, "account-1");
+        store.save_project(&project).await.expect("save project");
+        let runtime = AgentRuntime::new(
+            DockerClient::new_with_binary("unused-agent", failing_docker_path(&dir)),
+            ResponsesClient::new(),
+            Arc::clone(&store),
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
+            },
+        )
+        .await
+        .expect("runtime");
+
+        runtime
+            .start_project_workspace(project_id, agent_id)
+            .await
+            .expect("setup handles failure");
+
+        let detail = runtime
+            .get_project(project_id, None, None)
+            .await
+            .expect("detail");
+        assert_eq!(detail.summary.status, ProjectStatus::Failed);
+        assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Failed);
+        assert_eq!(detail.maintainer_agent.summary.status, AgentStatus::Failed);
+        assert!(
+            detail
+                .summary
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("container startup failed")
+        );
+        assert!(!fake_docker_log(&dir).contains("exec -w / -e MAI_GITHUB_INSTALLATION_TOKEN"));
     }
 
     #[tokio::test]

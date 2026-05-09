@@ -532,6 +532,45 @@ p {
   padding: 22px;
 }
 
+.project-progress-panel {
+  align-content: start;
+}
+
+.project-progress-bar {
+  position: relative;
+  overflow: hidden;
+  height: 8px;
+  border-radius: 999px;
+  background: #e7edf4;
+}
+
+.project-progress-bar span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 44%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #1f6feb, #11a683);
+  animation: project-progress-slide 1.2s ease-in-out infinite;
+}
+
+.project-progress-bar.failed span {
+  width: 100%;
+  background: #d92d20;
+  animation: none;
+}
+
+@keyframes project-progress-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  50% {
+    transform: translateX(80%);
+  }
+  100% {
+    transform: translateX(230%);
+  }
+}
+
 .project-facts {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
