@@ -4,8 +4,8 @@ on:
   push:
     branches: [main]
     paths:
-      - Dockerfile
-      - Dockerfile.sidecar
+      - docker/agent/Dockerfile
+      - docker/sidecar/Dockerfile
       - .github/workflows/docker-publish.yml
   workflow_dispatch:
 
@@ -13,8 +13,77 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  build-and-push:
+  changed-images:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.changed.outputs.matrix }}
+      should_build: ${{ steps.changed.outputs.should_build }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed image definitions
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          agent=false
+          sidecar=false
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            agent=true
+            sidecar=true
+          else
+            before="${{ github.event.before }}"
+            after="${{ github.sha }}"
+
+            if [[ "$before" == "0000000000000000000000000000000000000000" ]]; then
+              changed_files="$(git show --format= --name-only "$after")"
+            else
+              changed_files="$(git diff --name-only "$before" "$after")"
+            fi
+
+            if grep -Fxq "docker/agent/Dockerfile" <<<"$changed_files"; then
+              agent=true
+            fi
+
+            if grep -Fxq "docker/sidecar/Dockerfile" <<<"$changed_files"; then
+              sidecar=true
+            fi
+          fi
+
+          matrix='{"include":['
+          separator=''
+
+          if [[ "$agent" == "true" ]]; then
+            matrix+='{"name":"agent","image":"mai-team-agent","dockerfile":"./docker/agent/Dockerfile","cache_scope":"agent"}'
+            separator=','
+          fi
+
+          if [[ "$sidecar" == "true" ]]; then
+            matrix+="${separator}"'{"name":"sidecar","image":"mai-team-sidecar","dockerfile":"./docker/sidecar/Dockerfile","cache_scope":"sidecar"}'
+          fi
+
+          matrix+=']}'
+
+          if [[ "$matrix" == '{"include":[]}' ]]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build-and-push:
+    needs: changed-images
+    if: needs.changed-images.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changed-images.outputs.matrix) }}
     permissions:
       contents: read
       packages: write
@@ -36,44 +105,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract agent metadata
-        id: agent-meta
+      - name: Extract image metadata
+        id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/mai-team-agent
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=
 
-      - name: Build and push agent image
+      - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ${{ matrix.dockerfile }}
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.agent-meta.outputs.tags }}
-          labels: ${{ steps.agent-meta.outputs.labels }}
-          cache-from: type=gha,scope=agent
-          cache-to: type=gha,mode=max,scope=agent
-
-      - name: Extract sidecar metadata
-        id: sidecar-meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/mai-team-sidecar
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=
-
-      - name: Build and push sidecar image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile.sidecar
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.sidecar-meta.outputs.tags }}
-          labels: ${{ steps.sidecar-meta.outputs.labels }}
-          cache-from: type=gha,scope=sidecar
-          cache-to: type=gha,mode=max,scope=sidecar
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
