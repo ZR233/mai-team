@@ -18,10 +18,10 @@ use mai_protocol::{
     GithubAppSettingsRequest, GithubAppSettingsResponse, GithubInstallationsResponse,
     GithubRepositoriesResponse, GithubSettingsRequest, GithubSettingsResponse,
     McpServersConfigRequest, ProjectId, ProviderPresetsResponse, ProvidersConfigRequest,
-    ProvidersResponse, RequestPlanRevisionRequest, RequestPlanRevisionResponse, SendMessageRequest,
-    SendMessageResponse, ServiceEvent, SessionId, SkillsConfigRequest, SkillsListResponse, TaskId,
-    ToolTraceDetail, UpdateAgentRequest, UpdateAgentResponse, UpdateProjectRequest,
-    UpdateProjectResponse,
+    ProvidersResponse, RepositoryPackagesResponse, RequestPlanRevisionRequest,
+    RequestPlanRevisionResponse, RuntimeDefaultsResponse, SendMessageRequest, SendMessageResponse,
+    ServiceEvent, SessionId, SkillsConfigRequest, SkillsListResponse, TaskId, ToolTraceDetail,
+    UpdateAgentRequest, UpdateAgentResponse, UpdateProjectRequest, UpdateProjectResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
 use mai_store::ConfigStore;
@@ -195,7 +195,10 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/providers", get(get_providers).put(save_providers))
         .route("/mcp-servers", get(get_mcp_servers).put(save_mcp_servers))
-        .route("/git/accounts", get(list_git_accounts).post(save_git_account))
+        .route(
+            "/git/accounts",
+            get(list_git_accounts).post(save_git_account),
+        )
         .route(
             "/git/accounts/default",
             axum::routing::put(set_default_git_account),
@@ -209,6 +212,11 @@ async fn main() -> Result<()> {
             "/git/accounts/{id}/repositories",
             get(list_git_account_repositories),
         )
+        .route(
+            "/git/accounts/{id}/repositories/{owner}/{repo}/packages",
+            get(list_git_account_repository_packages),
+        )
+        .route("/runtime/defaults", get(get_runtime_defaults))
         .route(
             "/settings/github",
             get(get_github_settings).put(save_github_settings),
@@ -479,7 +487,27 @@ async fn list_git_account_repositories(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> std::result::Result<Json<GithubRepositoriesResponse>, ApiError> {
-    Ok(Json(state.runtime.list_git_account_repositories(&id).await?))
+    Ok(Json(
+        state.runtime.list_git_account_repositories(&id).await?,
+    ))
+}
+
+async fn list_git_account_repository_packages(
+    State(state): State<Arc<AppState>>,
+    Path((id, owner, repo)): Path<(String, String, String)>,
+) -> std::result::Result<Json<RepositoryPackagesResponse>, ApiError> {
+    Ok(Json(
+        state
+            .runtime
+            .list_git_account_repository_packages(&id, &owner, &repo)
+            .await?,
+    ))
+}
+
+async fn get_runtime_defaults(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<RuntimeDefaultsResponse>, ApiError> {
+    Ok(Json(state.runtime.runtime_defaults()))
 }
 
 async fn get_github_settings(

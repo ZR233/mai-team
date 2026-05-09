@@ -107,21 +107,31 @@
 
             <div class="project-field-row align-start">
               <span>Docker Image</span>
-              <div class="project-picker">
-                <input v-model.trim="dialog.runtime.docker_image" placeholder="ghcr.io/rcore-os/tgoskits-container:latest" />
-                <div class="project-picker-list compact-list" aria-label="Docker image suggestions">
-                  <button
-                    v-for="image in dockerImages"
-                    :key="image"
-                    class="project-picker-option"
-                    type="button"
-                    :class="{ active: dialog.runtime.docker_image === image }"
-                    @click="dialog.runtime.docker_image = image"
+              <div class="project-runtime-picker">
+                <input v-model.trim="dialog.runtime.docker_image" :placeholder="runtimePlaceholder" />
+                <div class="project-control-with-action">
+                  <select
+                    v-model="dialog.runtime.package_image"
+                    :disabled="dialog.runtime.loadingPackages || !dialog.runtime.packages.length"
+                    @change="selectPackageImage"
                   >
-                    <span>{{ image }}</span>
-                    <strong v-if="dialog.runtime.docker_image === image">Selected</strong>
+                    <option value="" disabled>{{ packageSelectPlaceholder }}</option>
+                    <option v-for="imagePackage in dialog.runtime.packages" :key="imagePackage.image" :value="imagePackage.image">
+                      {{ imagePackage.image }}
+                    </option>
+                  </select>
+                  <button
+                    class="ghost-button"
+                    type="button"
+                    :disabled="dialog.runtime.loadingPackages || !selectedRepository"
+                    @click="$emit('load-repository-packages')"
+                  >
+                    <span v-if="dialog.runtime.loadingPackages" class="spinner-sm"></span>
+                    <template v-else>Load Images</template>
                   </button>
                 </div>
+                <small v-if="dialog.runtime.packageWarning" class="project-runtime-note danger">{{ dialog.runtime.packageWarning }}</small>
+                <small v-else class="project-runtime-note">{{ runtimeHelpText }}</small>
               </div>
             </div>
           </div>
@@ -189,19 +199,14 @@ const emit = defineEmits([
   'close',
   'create',
   'configure-git-accounts',
-  'refresh-repositories'
+  'refresh-repositories',
+  'load-repository-packages'
 ])
 
 const modes = [
   { id: 'git_account', label: 'Git Account', description: 'Select account and repository' },
   { id: 'local_git', label: 'Local Git', description: 'Coming soon', disabled: true },
   { id: 'upload', label: 'Upload', description: 'Coming soon', disabled: true }
-]
-
-const dockerImages = [
-  'ghcr.io/rcore-os/tgoskits-container:latest',
-  'ghcr.io/rcore-os/tgoskits-container:v1.2.0',
-  'ghcr.io/rcore-os/tgoskits-container:v1.1.0'
 ]
 
 const hasAccounts = computed(() => props.dialog.gitAccounts.length > 0)
@@ -256,6 +261,21 @@ const runtimeLabel = computed(() => {
   return props.dialog.runtime.docker_image.trim() || 'Default image'
 })
 
+const runtimePlaceholder = computed(() => props.dialog.runtime.default_docker_image || 'Docker image')
+
+const packageSelectPlaceholder = computed(() => {
+  if (!selectedRepository.value) return 'Select repository first'
+  if (props.dialog.runtime.loadingPackages) return 'Loading repository images'
+  if (!props.dialog.runtime.packages.length) return 'No repository images'
+  return 'Select repository image'
+})
+
+const runtimeHelpText = computed(() => {
+  if (props.dialog.runtime.packages.length) return 'Choose a repository image or type any Docker image.'
+  if (selectedRepository.value) return 'No repository images loaded. You can still type any Docker image.'
+  return 'Select a repository to load related images, or type any Docker image.'
+})
+
 let backdropDown = false
 
 function onBackdropDown() {
@@ -281,6 +301,13 @@ function selectRepository(repository) {
   props.dialog.form.branch = repository.default_branch || 'main'
   if (!props.dialog.form.name.trim()) {
     props.dialog.form.name = repositoryLabel(repository)
+  }
+  emit('load-repository-packages')
+}
+
+function selectPackageImage() {
+  if (props.dialog.runtime.package_image) {
+    props.dialog.runtime.docker_image = props.dialog.runtime.package_image
   }
 }
 

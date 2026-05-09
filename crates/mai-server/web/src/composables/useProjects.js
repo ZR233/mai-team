@@ -166,6 +166,20 @@ export function useProjects() {
     return api(`/git/accounts/${encodeURIComponent(accountId)}/repositories`)
   }
 
+  async function loadRuntimeDefaults() {
+    return api('/runtime/defaults')
+  }
+
+  async function loadGitAccountRepositoryPackages(accountId, repositoryFullName) {
+    if (!accountId || !repositoryFullName || !repositoryFullName.includes('/')) {
+      return { packages: [], warning: null }
+    }
+    const [owner, ...repoParts] = repositoryFullName.split('/')
+    const repo = repoParts.join('/')
+    if (!owner || !repo) return { packages: [], warning: null }
+    return api(`/git/accounts/${encodeURIComponent(accountId)}/repositories/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/packages`)
+  }
+
   async function scrollProjectConversationToBottom() {
     await nextTick()
     await nextFrame()
@@ -188,7 +202,12 @@ export function useProjects() {
       query: ''
     },
     runtime: {
-      docker_image: ''
+      docker_image: '',
+      default_docker_image: '',
+      packages: [],
+      package_image: '',
+      loadingPackages: false,
+      packageWarning: ''
     },
     gitAccounts: [],
     repositories: [],
@@ -223,6 +242,8 @@ export function useProjects() {
     createProjectSession,
     updateProjectAgent,
     loadGitAccountRepositories,
+    loadRuntimeDefaults,
+    loadGitAccountRepositoryPackages,
     scrollProjectConversationToBottom
   }
 }

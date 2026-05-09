@@ -8,15 +8,16 @@ use mai_model::ResponsesClient;
 use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentMessage,
     AgentModelPreference, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary, ArtifactInfo,
-    ContextUsage, CreateAgentRequest, CreateProjectRequest, GitAccountRequest,
-    GitAccountResponse, GitAccountStatus, GitAccountSummary, GitAccountsResponse, GitTokenKind,
+    ContextUsage, CreateAgentRequest, CreateProjectRequest, GitAccountRequest, GitAccountResponse,
+    GitAccountStatus, GitAccountSummary, GitAccountsResponse, GitTokenKind,
     GithubAppManifestAccountType, GithubAppManifestStartRequest, GithubAppManifestStartResponse,
     GithubAppSettingsRequest, GithubAppSettingsResponse, GithubInstallationSummary,
     GithubInstallationsResponse, GithubRepositoriesResponse, GithubRepositorySummary,
-    McpServerConfig, McpServerTransport, MessageRole, ModelConfig,
-    ModelContentItem, ModelInputItem, ModelOutputItem, ModelToolCall, PlanHistoryEntry,
-    PlanStatus, ProjectCloneStatus, ProjectDetail, ProjectId, ProjectStatus, ProjectSummary,
-    ResolvedAgentModelPreference, SendMessageRequest, ServiceEvent, ServiceEventKind, SessionId,
+    McpServerConfig, McpServerTransport, MessageRole, ModelConfig, ModelContentItem,
+    ModelInputItem, ModelOutputItem, ModelToolCall, PlanHistoryEntry, PlanStatus,
+    ProjectCloneStatus, ProjectDetail, ProjectId, ProjectStatus, ProjectSummary,
+    RepositoryPackageSummary, RepositoryPackagesResponse, ResolvedAgentModelPreference,
+    RuntimeDefaultsResponse, SendMessageRequest, ServiceEvent, ServiceEventKind, SessionId,
     SkillsConfigRequest, SkillsListResponse, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus,
     TaskSummary, TodoItem, TokenUsage, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest,
     UpdateProjectRequest, UserInputOption, UserInputQuestion, now, preview,
@@ -254,6 +255,37 @@ struct GithubRepositoryApi {
     html_url: String,
     default_branch: Option<String>,
     owner: GithubAccountApi,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubPackageApi {
+    name: String,
+    html_url: String,
+    #[serde(default)]
+    repository: Option<GithubPackageRepositoryApi>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubPackageRepositoryApi {
+    full_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubPackageVersionApi {
+    #[serde(default)]
+    metadata: GithubPackageVersionMetadataApi,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct GithubPackageVersionMetadataApi {
+    #[serde(default)]
+    container: GithubPackageContainerMetadataApi,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct GithubPackageContainerMetadataApi {
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -602,8 +634,157 @@ impl AgentRuntime {
         let repositories: Vec<GithubRepositoryApi> =
             decode_github_response(response, "list repositories").await?;
         Ok(GithubRepositoriesResponse {
-            repositories: repositories.into_iter().map(github_repository_summary).collect(),
+            repositories: repositories
+                .into_iter()
+                .map(github_repository_summary)
+                .collect(),
         })
+    }
+
+    pub fn runtime_defaults(&self) -> RuntimeDefaultsResponse {
+        RuntimeDefaultsResponse {
+            default_docker_image: self.docker.image().to_string(),
+        }
+    }
+
+    pub async fn list_git_account_repository_packages(
+        &self,
+        account_id: &str,
+        owner: &str,
+        repo: &str,
+    ) -> Result<RepositoryPackagesResponse> {
+        let token = self.git_account_token(account_id).await?;
+        let repository_ref = format!("{}/{}", owner.trim(), repo.trim());
+        if owner.trim().is_empty() || repo.trim().is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "repository owner and name are required".to_string(),
+            ));
+        }
+        let packages = match self
+            .github_container_packages_for_owner(&token, owner.trim())
+            .await
+        {
+            Ok(packages) => packages,
+            Err(err) if err.status() == Some(reqwest::StatusCode::FORBIDDEN) => {
+                return Ok(RepositoryPackagesResponse {
+                    packages: Vec::new(),
+                    warning: Some("GitHub token cannot read packages for this owner".to_string()),
+                });
+            }
+            Err(err) if err.status() == Some(reqwest::StatusCode::NOT_FOUND) => {
+                return Ok(RepositoryPackagesResponse {
+                    packages: Vec::new(),
+                    warning: Some("No readable GitHub container packages found".to_string()),
+                });
+            }
+            Err(err) => return Err(RuntimeError::Http(err)),
+        };
+        let mut summaries = Vec::new();
+        for package in packages
+            .into_iter()
+            .filter(|package| github_package_belongs_to_repo(package, &repository_ref))
+        {
+            let versions = match self
+                .github_container_package_versions(&token, owner.trim(), &package.name)
+                .await
+            {
+                Ok(versions) => versions,
+                Err(err) if err.status() == Some(reqwest::StatusCode::FORBIDDEN) => continue,
+                Err(err) if err.status() == Some(reqwest::StatusCode::NOT_FOUND) => continue,
+                Err(err) => return Err(RuntimeError::Http(err)),
+            };
+            if let Some(summary) = repository_package_summary(owner.trim(), package, versions) {
+                summaries.push(summary);
+            }
+        }
+        summaries.sort_by(|left, right| left.name.cmp(&right.name).then(left.tag.cmp(&right.tag)));
+        Ok(RepositoryPackagesResponse {
+            packages: summaries,
+            warning: None,
+        })
+    }
+
+    async fn github_container_packages_for_owner(
+        &self,
+        token: &str,
+        owner: &str,
+    ) -> std::result::Result<Vec<GithubPackageApi>, reqwest::Error> {
+        let org_url = github_api_url(
+            DEFAULT_GITHUB_API_BASE_URL,
+            &format!(
+                "/orgs/{}/packages?package_type=container&per_page=100",
+                github_path_segment(owner)
+            ),
+        );
+        let org_response = self
+            .github_http
+            .get(org_url)
+            .bearer_auth(token)
+            .headers(github_headers())
+            .send()
+            .await?;
+        if org_response.status() != reqwest::StatusCode::NOT_FOUND {
+            return org_response.error_for_status()?.json().await;
+        }
+        let user_url = github_api_url(
+            DEFAULT_GITHUB_API_BASE_URL,
+            &format!(
+                "/users/{}/packages?package_type=container&per_page=100",
+                github_path_segment(owner)
+            ),
+        );
+        self.github_http
+            .get(user_url)
+            .bearer_auth(token)
+            .headers(github_headers())
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+    }
+
+    async fn github_container_package_versions(
+        &self,
+        token: &str,
+        owner: &str,
+        package_name: &str,
+    ) -> std::result::Result<Vec<GithubPackageVersionApi>, reqwest::Error> {
+        let org_url = github_api_url(
+            DEFAULT_GITHUB_API_BASE_URL,
+            &format!(
+                "/orgs/{}/packages/container/{}/versions?per_page=30",
+                github_path_segment(owner),
+                github_path_segment(package_name)
+            ),
+        );
+        let org_response = self
+            .github_http
+            .get(org_url)
+            .bearer_auth(token)
+            .headers(github_headers())
+            .send()
+            .await?;
+        if org_response.status() != reqwest::StatusCode::NOT_FOUND {
+            return org_response.error_for_status()?.json().await;
+        }
+        let user_url = github_api_url(
+            DEFAULT_GITHUB_API_BASE_URL,
+            &format!(
+                "/users/{}/packages/container/{}/versions?per_page=30",
+                github_path_segment(owner),
+                github_path_segment(package_name)
+            ),
+        );
+        self.github_http
+            .get(user_url)
+            .bearer_auth(token)
+            .headers(github_headers())
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
     }
 
     pub async fn github_app_settings(&self) -> Result<GithubAppSettingsResponse> {
@@ -3822,7 +4003,9 @@ impl AgentRuntime {
             owner: repository.owner.login,
             name: repository.name,
             full_name: repository.full_name,
-            default_branch: repository.default_branch.unwrap_or_else(|| "main".to_string()),
+            default_branch: repository
+                .default_branch
+                .unwrap_or_else(|| "main".to_string()),
         })
     }
 
@@ -4726,12 +4909,66 @@ fn github_repository_summary(repository: GithubRepositoryApi) -> GithubRepositor
     }
 }
 
+fn github_package_belongs_to_repo(package: &GithubPackageApi, repository_full_name: &str) -> bool {
+    package.repository.as_ref().is_some_and(|repository| {
+        repository
+            .full_name
+            .eq_ignore_ascii_case(repository_full_name)
+    })
+}
+
+fn repository_package_summary(
+    owner: &str,
+    package: GithubPackageApi,
+    versions: Vec<GithubPackageVersionApi>,
+) -> Option<RepositoryPackageSummary> {
+    let tag = preferred_container_tag(&versions)?;
+    let image = format!("ghcr.io/{}/{}:{}", owner, package.name, tag);
+    Some(RepositoryPackageSummary {
+        name: package.name,
+        image,
+        tag,
+        html_url: package.html_url,
+    })
+}
+
+fn preferred_container_tag(versions: &[GithubPackageVersionApi]) -> Option<String> {
+    let mut first_tag = None;
+    for version in versions {
+        for tag in &version.metadata.container.tags {
+            let tag = tag.trim();
+            if tag.is_empty() {
+                continue;
+            }
+            if tag == "latest" {
+                return Some(tag.to_string());
+            }
+            if first_tag.is_none() {
+                first_tag = Some(tag.to_string());
+            }
+        }
+    }
+    first_tag
+}
+
 fn github_api_url(base_url: &str, path: &str) -> String {
     let base = base_url
         .trim()
         .trim_end_matches('/')
         .if_empty(DEFAULT_GITHUB_API_BASE_URL);
     format!("{base}{path}")
+}
+
+fn github_path_segment(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn sanitize_origin(origin: &str) -> Result<String> {
@@ -8053,6 +8290,87 @@ esac
         assert!(fake_docker_log(&dir).contains(image));
         let snapshot = store.load_runtime_snapshot(10).await.expect("snapshot");
         assert_eq!(snapshot.agents[0].summary.docker_image, image);
+    }
+
+    #[test]
+    fn repository_package_summary_prefers_latest_tag() {
+        let package = GithubPackageApi {
+            name: "mai-team-agent".to_string(),
+            html_url: "https://github.com/orgs/example/packages/container/mai-team-agent"
+                .to_string(),
+            repository: Some(GithubPackageRepositoryApi {
+                full_name: "example/mai-team".to_string(),
+            }),
+        };
+        let versions = vec![
+            GithubPackageVersionApi {
+                metadata: GithubPackageVersionMetadataApi {
+                    container: GithubPackageContainerMetadataApi {
+                        tags: vec!["v1.2.0".to_string()],
+                    },
+                },
+            },
+            GithubPackageVersionApi {
+                metadata: GithubPackageVersionMetadataApi {
+                    container: GithubPackageContainerMetadataApi {
+                        tags: vec!["latest".to_string(), "sha-123".to_string()],
+                    },
+                },
+            },
+        ];
+
+        let summary = repository_package_summary("example", package, versions).expect("summary");
+
+        assert_eq!(summary.tag, "latest");
+        assert_eq!(summary.image, "ghcr.io/example/mai-team-agent:latest");
+    }
+
+    #[test]
+    fn repository_package_summary_uses_first_available_tag() {
+        let package = GithubPackageApi {
+            name: "mai-team-sidecar".to_string(),
+            html_url: "https://github.com/orgs/example/packages/container/mai-team-sidecar"
+                .to_string(),
+            repository: Some(GithubPackageRepositoryApi {
+                full_name: "example/mai-team".to_string(),
+            }),
+        };
+        let versions = vec![GithubPackageVersionApi {
+            metadata: GithubPackageVersionMetadataApi {
+                container: GithubPackageContainerMetadataApi {
+                    tags: vec!["v1.2.0".to_string(), "sha-456".to_string()],
+                },
+            },
+        }];
+
+        let summary = repository_package_summary("example", package, versions).expect("summary");
+
+        assert_eq!(summary.tag, "v1.2.0");
+        assert_eq!(summary.image, "ghcr.io/example/mai-team-sidecar:v1.2.0");
+    }
+
+    #[test]
+    fn github_package_match_requires_exact_repository() {
+        let package = GithubPackageApi {
+            name: "mai-team-agent".to_string(),
+            html_url: "https://github.com/orgs/example/packages/container/mai-team-agent"
+                .to_string(),
+            repository: Some(GithubPackageRepositoryApi {
+                full_name: "example/mai-team".to_string(),
+            }),
+        };
+        let missing_repo_package = GithubPackageApi {
+            name: "orphan-image".to_string(),
+            html_url: "https://github.com/orgs/example/packages/container/orphan-image".to_string(),
+            repository: None,
+        };
+
+        assert!(github_package_belongs_to_repo(&package, "example/mai-team"));
+        assert!(!github_package_belongs_to_repo(&package, "example/other"));
+        assert!(!github_package_belongs_to_repo(
+            &missing_repo_package,
+            "example/mai-team"
+        ));
     }
 
     #[tokio::test]

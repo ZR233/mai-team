@@ -1889,6 +1889,22 @@ p {
   min-width: 0;
 }
 
+.project-runtime-picker {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.project-runtime-note {
+  color: #66758a;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.project-runtime-note.danger {
+  color: #b42318;
+}
+
 .project-picker-list {
   display: grid;
   overflow: hidden;

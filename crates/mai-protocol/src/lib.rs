@@ -1204,6 +1204,27 @@ pub struct GithubRepositoriesResponse {
     pub repositories: Vec<GithubRepositorySummary>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeDefaultsResponse {
+    pub default_docker_image: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RepositoryPackagesResponse {
+    #[serde(default)]
+    pub packages: Vec<RepositoryPackageSummary>,
+    #[serde(default)]
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryPackageSummary {
+    pub name: String,
+    pub image: String,
+    pub tag: String,
+    pub html_url: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GitProvider {

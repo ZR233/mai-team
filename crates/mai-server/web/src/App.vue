@@ -160,6 +160,7 @@
       @create="onCreateProject"
       @configure-git-accounts="openGitAccountsSettings"
       @refresh-repositories="onRefreshProjectRepositories"
+      @load-repository-packages="onLoadProjectRepositoryPackages"
     />
 
     <McpServersDialog
@@ -257,6 +258,8 @@ const {
   createProjectSession,
   updateProjectAgent,
   loadGitAccountRepositories,
+  loadRuntimeDefaults,
+  loadGitAccountRepositoryPackages,
   scrollProjectConversationToBottom
 } = useProjects()
 const {
@@ -520,6 +523,7 @@ async function onCancelProjectAgent(id) {
 async function openCreateProjectDialog() {
   resetProjectDialog()
   projectDialog.open = true
+  await loadProjectRuntimeDefaults()
   await loadGitAccounts()
   projectDialog.gitAccounts = gitAccountsState.accounts || []
   const defaultAccount = projectDialog.gitAccounts.find((account) => account.is_default) || projectDialog.gitAccounts[0]
@@ -540,16 +544,32 @@ function resetProjectDialog() {
   projectDialog.form.project_path = '/'
   projectDialog.repository.query = ''
   projectDialog.runtime.docker_image = ''
+  projectDialog.runtime.default_docker_image = ''
+  projectDialog.runtime.packages = []
+  projectDialog.runtime.package_image = ''
+  projectDialog.runtime.loadingPackages = false
+  projectDialog.runtime.packageWarning = ''
   projectDialog.gitAccounts = []
   projectDialog.repositories = []
   projectDialog.error = ''
   projectDialog.submitting = false
 }
 
+async function loadProjectRuntimeDefaults() {
+  try {
+    const defaults = await loadRuntimeDefaults()
+    projectDialog.runtime.default_docker_image = defaults?.default_docker_image || ''
+    projectDialog.runtime.docker_image = projectDialog.runtime.default_docker_image
+  } catch (error) {
+    projectDialog.error = error.message
+  }
+}
+
 async function onRefreshProjectRepositories() {
   if (!projectDialog.form.git_account_id) return
   projectDialog.loadingRepositories = true
   projectDialog.error = ''
+  clearProjectRepositoryPackages()
   try {
     const response = await loadGitAccountRepositories(projectDialog.form.git_account_id)
     projectDialog.repositories = response?.repositories || []
@@ -566,11 +586,42 @@ async function onRefreshProjectRepositories() {
       if (!projectDialog.form.name.trim()) {
         projectDialog.form.name = repository.full_name || [repository.owner, repository.name].filter(Boolean).join('/')
       }
+      await onLoadProjectRepositoryPackages()
     }
   } catch (error) {
     projectDialog.error = error.message
   } finally {
     projectDialog.loadingRepositories = false
+  }
+}
+
+function clearProjectRepositoryPackages() {
+  projectDialog.runtime.packages = []
+  projectDialog.runtime.package_image = ''
+  projectDialog.runtime.packageWarning = ''
+}
+
+async function onLoadProjectRepositoryPackages() {
+  if (!projectDialog.form.git_account_id || !projectDialog.form.repository_full_name) {
+    clearProjectRepositoryPackages()
+    return
+  }
+  projectDialog.runtime.loadingPackages = true
+  projectDialog.runtime.packageWarning = ''
+  try {
+    const response = await loadGitAccountRepositoryPackages(
+      projectDialog.form.git_account_id,
+      projectDialog.form.repository_full_name
+    )
+    projectDialog.runtime.packages = response?.packages || []
+    projectDialog.runtime.package_image = ''
+    projectDialog.runtime.packageWarning = response?.warning || ''
+  } catch (error) {
+    projectDialog.runtime.packages = []
+    projectDialog.runtime.package_image = ''
+    projectDialog.runtime.packageWarning = error.message
+  } finally {
+    projectDialog.runtime.loadingPackages = false
   }
 }
 
