@@ -30,8 +30,10 @@ use serde::Deserialize;
 use serde_json::json;
 use std::convert::Infallible;
 use std::env;
+use std::fs;
+use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 use std::sync::Arc;
 use tokio_stream::once;
 use tokio_stream::wrappers::BroadcastStream;
@@ -49,6 +51,10 @@ struct AppState {
 #[derive(RustEmbed)]
 #[folder = "$OUT_DIR/static"]
 struct StaticAssets;
+
+#[derive(RustEmbed)]
+#[folder = "$OUT_DIR/system-skills"]
+struct EmbeddedSystemSkills;
 
 #[derive(Debug)]
 struct ApiError {
@@ -170,12 +176,20 @@ async fn main() -> Result<()> {
         .seed_default_provider_from_env(api_key, base_url, model)
         .await?;
 
+    let system_skills_root = system_skills_path()?;
+    release_embedded_system_skills(&system_skills_root)?;
+    info!(
+        path = %system_skills_root.display(),
+        "released embedded system skills"
+    );
+
     let model = ResponsesClient::new();
     let runtime_config = RuntimeConfig {
         repo_root: env::current_dir()?,
         sidecar_image,
         github_api_base_url: None,
         git_binary: None,
+        system_skills_root: Some(system_skills_root),
     };
     let runtime =
         AgentRuntime::new(docker, model, Arc::clone(&store), runtime_config.clone()).await?;
@@ -344,6 +358,66 @@ fn embedded_asset_response(path: &str, fallback_index: bool) -> Response {
         .header(header::CONTENT_TYPE, content_type)
         .body(Body::from(asset.data.into_owned()))
         .expect("embedded static response")
+}
+
+fn system_skills_path() -> Result<PathBuf> {
+    env::var("MAI_SYSTEM_SKILLS_PATH")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            dirs::home_dir()
+                .map(|home| home.join(".mai-team").join("system-skills"))
+                .ok_or_else(|| env::VarError::NotPresent)
+        })
+        .context("home directory not found; set MAI_SYSTEM_SKILLS_PATH")
+}
+
+fn release_embedded_system_skills(target_dir: &std::path::Path) -> io::Result<()> {
+    if !safe_system_skills_target(target_dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsafe system skills target: {}", target_dir.display()),
+        ));
+    }
+    if target_dir.exists() {
+        fs::remove_dir_all(target_dir)?;
+    }
+    fs::create_dir_all(target_dir)?;
+    for path in EmbeddedSystemSkills::iter() {
+        let path = path.as_ref();
+        let Some(relative) = safe_embedded_relative_path(path) else {
+            continue;
+        };
+        let target = target_dir.join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if let Some(asset) = EmbeddedSystemSkills::get(path) {
+            fs::write(target, asset.data.as_ref())?;
+        }
+    }
+    Ok(())
+}
+
+fn safe_system_skills_target(path: &std::path::Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+    !matches!(
+        path.components().next_back(),
+        None | Some(Component::RootDir | Component::Prefix(_))
+    )
+}
+
+fn safe_embedded_relative_path(path: &str) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in std::path::Path::new(path).components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!normalized.as_os_str().is_empty()).then_some(normalized)
 }
 
 fn github_callback_page(success: bool, title: &str, message: &str, next: &str) -> Response {
@@ -1042,5 +1116,55 @@ fn event_name(event: &ServiceEvent) -> &'static str {
         mai_protocol::ServiceEventKind::PlanUpdated { .. } => "plan_updated",
         mai_protocol::ServiceEventKind::UserInputRequested { .. } => "user_input_requested",
         mai_protocol::ServiceEventKind::ArtifactCreated { .. } => "artifact_created",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn embedded_system_skills_release_to_target_dir() {
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("system-skills");
+
+        release_embedded_system_skills(&target).expect("release skills");
+
+        let skill_path = target.join("github-pr-review").join("SKILL.md");
+        let contents = fs::read_to_string(skill_path).expect("skill contents");
+        assert!(contents.contains("name: github-pr-review"));
+    }
+
+    #[test]
+    fn embedded_system_skills_release_overwrites_target_dir() {
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("system-skills");
+        fs::create_dir_all(&target).expect("mkdir");
+        fs::write(target.join("stale.txt"), "old").expect("write stale");
+
+        release_embedded_system_skills(&target).expect("release skills");
+
+        assert!(!target.join("stale.txt").exists());
+        assert!(target.join("github-pr-review").join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn safe_embedded_relative_path_rejects_parent_components() {
+        assert_eq!(
+            safe_embedded_relative_path("github-pr-review/SKILL.md"),
+            Some(PathBuf::from("github-pr-review").join("SKILL.md"))
+        );
+        assert_eq!(safe_embedded_relative_path("../SKILL.md"), None);
+        assert_eq!(safe_embedded_relative_path("/tmp/SKILL.md"), None);
+    }
+
+    #[test]
+    fn system_skills_release_rejects_root_target() {
+        assert!(!safe_system_skills_target(std::path::Path::new("")));
+        assert!(!safe_system_skills_target(std::path::Path::new("/")));
+        assert!(safe_system_skills_target(std::path::Path::new(
+            "/tmp/system-skills"
+        )));
     }
 }

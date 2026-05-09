@@ -151,6 +151,18 @@ impl SkillsManager {
         }
     }
 
+    pub fn new_with_system_root(
+        repo_root: impl AsRef<Path>,
+        system_root: Option<impl AsRef<Path>>,
+    ) -> Self {
+        Self {
+            roots: default_roots_with_system(
+                repo_root.as_ref(),
+                system_root.as_ref().map(|path| path.as_ref()),
+            ),
+        }
+    }
+
     pub fn with_roots(roots: Vec<(PathBuf, SkillScope)>) -> Self {
         Self {
             roots: roots
@@ -349,6 +361,10 @@ pub fn normalize_config(config: &SkillsConfigRequest) -> Result<SkillsConfigRequ
 }
 
 fn default_roots(repo_root: &Path) -> Vec<SkillRoot> {
+    default_roots_with_system(repo_root, None)
+}
+
+fn default_roots_with_system(repo_root: &Path, system_root: Option<&Path>) -> Vec<SkillRoot> {
     let mut roots = vec![SkillRoot {
         path: repo_root.join(".agents").join("skills"),
         scope: SkillScope::Repo,
@@ -357,6 +373,12 @@ fn default_roots(repo_root: &Path) -> Vec<SkillRoot> {
         roots.push(SkillRoot {
             path: home.join(".agents").join("skills"),
             scope: SkillScope::User,
+        });
+    }
+    if let Some(system_root) = system_root {
+        roots.push(SkillRoot {
+            path: system_root.to_path_buf(),
+            scope: SkillScope::System,
         });
     }
     roots
@@ -682,6 +704,7 @@ fn scope_rank(scope: SkillScope) -> u8 {
     match scope {
         SkillScope::Repo => 0,
         SkillScope::User => 1,
+        SkillScope::System => 2,
     }
 }
 
@@ -815,7 +838,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let repo = dir.path().join("repo");
         let user = dir.path().join("user");
-        for root in [&repo, &user] {
+        let system = dir.path().join("system");
+        for root in [&repo, &user, &system] {
             let skill_dir = root.join("demo");
             fs::create_dir_all(&skill_dir).expect("mkdir");
             fs::write(
@@ -825,12 +849,40 @@ mod tests {
             .expect("write");
         }
         let manager = SkillsManager::with_roots(vec![
+            (system.clone(), SkillScope::System),
             (user, SkillScope::User),
             (repo.clone(), SkillScope::Repo),
         ]);
         let response = manager.list(&SkillsConfigRequest::default()).expect("list");
         assert_eq!(response.skills[0].scope, SkillScope::Repo);
         assert!(response.skills[0].path.starts_with(repo));
+        assert_eq!(response.skills[1].scope, SkillScope::User);
+        assert_eq!(response.skills[2].scope, SkillScope::System);
+        assert!(response.skills[2].path.starts_with(system));
+    }
+
+    #[test]
+    fn new_with_system_root_discovers_system_skills() {
+        let dir = tempdir().expect("tempdir");
+        let system = dir.path().join("system");
+        let skill_dir = system.join("demo");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join(SKILL_FILE),
+            "---\nname: system-demo\ndescription: System demo.\n---\nbody",
+        )
+        .expect("write");
+
+        let manager = SkillsManager::new_with_system_root(dir.path(), Some(&system));
+        let response = manager.list(&SkillsConfigRequest::default()).expect("list");
+
+        let skill = response
+            .skills
+            .iter()
+            .find(|skill| skill.name == "system-demo")
+            .expect("system skill");
+        assert_eq!(skill.scope, SkillScope::System);
+        assert!(response.roots.iter().any(|root| root == &system));
     }
 
     #[test]
@@ -847,6 +899,40 @@ mod tests {
         }
         let manager = SkillsManager::with_roots(vec![(dir.path().to_path_buf(), SkillScope::Repo)]);
         let one_path = canonicalize_or_clone(dir.path().join("one/SKILL.md"));
+        let response = manager
+            .list(&SkillsConfigRequest {
+                config: vec![
+                    SkillConfigEntry {
+                        name: Some("two".to_string()),
+                        path: None,
+                        enabled: false,
+                    },
+                    SkillConfigEntry {
+                        name: None,
+                        path: Some(one_path),
+                        enabled: false,
+                    },
+                ],
+            })
+            .expect("list");
+        assert!(response.skills.iter().all(|skill| !skill.enabled));
+    }
+
+    #[test]
+    fn config_disables_system_skill_by_name_and_path() {
+        let dir = tempdir().expect("tempdir");
+        let system = dir.path().join("system");
+        for name in ["one", "two"] {
+            let skill_dir = system.join(name);
+            fs::create_dir_all(&skill_dir).expect("mkdir");
+            fs::write(
+                skill_dir.join(SKILL_FILE),
+                format!("---\nname: {name}\ndescription: {name}\n---\nbody"),
+            )
+            .expect("write");
+        }
+        let manager = SkillsManager::with_roots(vec![(system.clone(), SkillScope::System)]);
+        let one_path = canonicalize_or_clone(system.join("one/SKILL.md"));
         let response = manager
             .list(&SkillsConfigRequest {
                 config: vec![

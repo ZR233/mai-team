@@ -460,6 +460,7 @@ pub struct SendMessageResponse {
 pub enum SkillScope {
     Repo,
     User,
+    System,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

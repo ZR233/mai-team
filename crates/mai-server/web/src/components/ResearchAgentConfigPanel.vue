@@ -148,7 +148,7 @@
           <div class="settings-section-header">
             <div>
               <h2>Skills</h2>
-              <p>Codex-compatible skills discovered from repo and user roots.</p>
+              <p>Codex-compatible skills discovered from repo, user, and system roots.</p>
             </div>
             <button class="ghost-button" type="button" :disabled="skillsState.loading" @click="$emit('reload-skills')">Reload</button>
           </div>
@@ -162,7 +162,7 @@
             <div class="settings-summary-item">
               <span>Roots</span>
               <strong>{{ skillsState.roots?.length || 0 }}</strong>
-              <small>Repo and user skill roots.</small>
+              <small>Repo, user, and system skill roots.</small>
             </div>
           </div>
 
@@ -197,7 +197,7 @@
             </button>
             <div v-if="!skillsState.loading && !skillsState.skills?.length" class="quiet-empty skills-empty">
               <strong>No skills found</strong>
-              <span>Add `SKILL.md` files under `.agents/skills` or `~/.agents/skills`.</span>
+              <span>Add `SKILL.md` files under `.agents/skills`, `~/.agents/skills`, or system skills.</span>
             </div>
           </div>
 

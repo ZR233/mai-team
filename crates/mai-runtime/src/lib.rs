@@ -125,6 +125,7 @@ pub struct RuntimeConfig {
     pub sidecar_image: String,
     pub github_api_base_url: Option<String>,
     pub git_binary: Option<String>,
+    pub system_skills_root: Option<PathBuf>,
 }
 
 pub struct AgentRuntime {
@@ -346,7 +347,10 @@ impl AgentRuntime {
         store: Arc<ConfigStore>,
         config: RuntimeConfig,
     ) -> Result<Arc<Self>> {
-        let skills = SkillsManager::new(&config.repo_root);
+        let skills = SkillsManager::new_with_system_root(
+            &config.repo_root,
+            config.system_skills_root.as_ref(),
+        );
         let (event_tx, _) = broadcast::channel(1024);
         let snapshot = store.load_runtime_snapshot(RECENT_EVENT_LIMIT).await?;
         let mut agents = HashMap::new();
@@ -3009,6 +3013,10 @@ impl AgentRuntime {
                     ends_turn: false,
                 })
             }
+            RoutedTool::GithubApiGet => {
+                let path = required_string(&arguments, "path")?;
+                self.execute_project_github_api_get(&agent, &path).await
+            }
             RoutedTool::Mcp(model_name) => {
                 if agent.summary.read().await.project_id.is_some() {
                     return self
@@ -4233,6 +4241,48 @@ impl AgentRuntime {
         })
     }
 
+    async fn execute_project_github_api_get(
+        &self,
+        agent: &AgentRecord,
+        path: &str,
+    ) -> Result<ToolExecution> {
+        let Some(token) = self.project_git_token_for_agent(agent).await? else {
+            return Err(RuntimeError::InvalidInput(
+                "agent is not attached to a project".to_string(),
+            ));
+        };
+        let path = normalize_github_api_get_path(path)?;
+        let url = github_api_url(&self.github_api_base_url, &path);
+        let response = self
+            .github_http
+            .get(url)
+            .bearer_auth(&token)
+            .headers(github_headers())
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        let output = if status.is_success() {
+            serde_json::from_str::<Value>(&text)
+                .unwrap_or_else(|_| json!({ "status": status.as_u16(), "body": text }))
+        } else {
+            let message = serde_json::from_str::<GithubErrorResponse>(&text)
+                .ok()
+                .and_then(|error| error.message)
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or_else(|| preview(&text, 300));
+            json!({
+                "status": status.as_u16(),
+                "error": redact_secret(&message, &token),
+            })
+        };
+        Ok(ToolExecution {
+            success: status.is_success(),
+            output: redact_secret(&output.to_string(), &token),
+            ends_turn: false,
+        })
+    }
+
     async fn clone_project_repository(
         &self,
         project_id: ProjectId,
@@ -5092,6 +5142,20 @@ fn github_api_url(base_url: &str, path: &str) -> String {
     format!("{base}{path}")
 }
 
+fn normalize_github_api_get_path(path: &str) -> Result<String> {
+    let path = path.trim();
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains('#')
+        || path.contains(char::is_whitespace)
+    {
+        return Err(RuntimeError::InvalidInput(
+            "github_api_get path must be a GitHub API path beginning with `/`".to_string(),
+        ));
+    }
+    Ok(path.to_string())
+}
+
 fn github_path_segment(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.as_bytes() {
@@ -5256,6 +5320,10 @@ fn project_github_tools() -> Vec<McpTool> {
         ("list_issues", "List GitHub issues."),
         ("list_pull_requests", "List GitHub pull requests."),
         ("get_pull_request", "Get a GitHub pull request."),
+        ("pull_request_read", "Read pull request details, files, comments, reviews, or status when supported by the GitHub MCP server."),
+        ("pull_request_review_write", "Submit a GitHub pull request review when supported by the GitHub MCP server."),
+        ("create_pull_request_review", "Create a GitHub pull request review."),
+        ("add_issue_comment", "Add a comment to a GitHub issue or pull request."),
         ("get_issue", "Get a GitHub issue."),
     ]
     .into_iter()
@@ -6162,6 +6230,7 @@ mod tests {
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
                 git_binary: None,
+                system_skills_root: None,
             },
         )
         .await
@@ -6182,6 +6251,7 @@ mod tests {
                 sidecar_image: sidecar_image.to_string(),
                 github_api_base_url: None,
                 git_binary: Some(fake_git_path(dir)),
+                system_skills_root: None,
             },
         )
         .await
@@ -6202,6 +6272,7 @@ mod tests {
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: Some(github_api_base_url),
                 git_binary: None,
+                system_skills_root: None,
             },
         )
         .await
@@ -7124,6 +7195,7 @@ esac
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
                 git_binary: None,
+                system_skills_root: None,
             },
         )
         .await
@@ -7372,6 +7444,7 @@ esac
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
                 git_binary: None,
+                system_skills_root: None,
             },
         )
         .await
@@ -7477,6 +7550,7 @@ esac
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
                 git_binary: None,
+                system_skills_root: None,
             },
         )
         .await
@@ -7548,6 +7622,7 @@ esac
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
                 git_binary: None,
+                system_skills_root: None,
             },
         )
         .await
@@ -7652,6 +7727,7 @@ esac
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
                 git_binary: None,
+                system_skills_root: None,
             },
         )
         .await
@@ -7927,6 +8003,7 @@ esac
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
                 git_binary: None,
+                system_skills_root: None,
             },
         )
         .await
@@ -7987,6 +8064,7 @@ esac
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
                 git_binary: None,
+                system_skills_root: None,
             },
         )
         .await
@@ -8116,6 +8194,7 @@ esac
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
                 git_binary: None,
+                system_skills_root: None,
             },
         )
         .await
@@ -8162,6 +8241,7 @@ esac
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
                 git_binary: None,
+                system_skills_root: None,
             },
         )
         .await
@@ -8624,6 +8704,7 @@ esac
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
                 git_binary: None,
+                system_skills_root: None,
             },
         )
         .await
@@ -8923,6 +9004,7 @@ esac
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
                 git_binary: None,
+                system_skills_root: None,
             },
         )
         .await
@@ -9054,6 +9136,7 @@ esac
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
                 git_binary: None,
+                system_skills_root: None,
             },
         )
         .await
@@ -9138,6 +9221,7 @@ esac
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
                 git_binary: None,
+                system_skills_root: None,
             },
         )
         .await
@@ -9219,6 +9303,7 @@ esac
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
                 git_binary: None,
+                system_skills_root: None,
             },
         )
         .await

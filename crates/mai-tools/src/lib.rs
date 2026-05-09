@@ -20,6 +20,7 @@ pub const TOOL_SUBMIT_REVIEW_RESULT: &str = "submit_review_result";
 pub const TOOL_UPDATE_TODO_LIST: &str = "update_todo_list";
 pub const TOOL_REQUEST_USER_INPUT: &str = "request_user_input";
 pub const TOOL_SAVE_ARTIFACT: &str = "save_artifact";
+pub const TOOL_GITHUB_API_GET: &str = "github_api_get";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutedTool {
@@ -41,6 +42,7 @@ pub enum RoutedTool {
     UpdateTodoList,
     RequestUserInput,
     SaveArtifact,
+    GithubApiGet,
     Mcp(String),
     Unknown(String),
 }
@@ -65,6 +67,7 @@ pub fn route_tool(name: &str) -> RoutedTool {
         TOOL_UPDATE_TODO_LIST => RoutedTool::UpdateTodoList,
         TOOL_REQUEST_USER_INPUT => RoutedTool::RequestUserInput,
         TOOL_SAVE_ARTIFACT => RoutedTool::SaveArtifact,
+        TOOL_GITHUB_API_GET => RoutedTool::GithubApiGet,
         normalized if normalized.starts_with("mcp__") => RoutedTool::Mcp(normalized.to_string()),
         normalized => RoutedTool::Unknown(normalized.to_string()),
     }
@@ -343,6 +346,20 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 ),
             ]),
         ),
+        ToolDefinition::function(
+            TOOL_GITHUB_API_GET,
+            "Call the current Mai project's GitHub REST API with a GET request. \
+             Use this only as a read-only fallback when GitHub MCP tools do not expose a needed PR endpoint. \
+             The path must be a GitHub API path such as `/repos/OWNER/REPO/pulls/123/reviews`; credentials are supplied server-side.",
+            object_schema(vec![(
+                "path",
+                json!({
+                    "type": "string",
+                    "description": "GitHub API path beginning with `/`, optionally including a query string."
+                }),
+                true,
+            )]),
+        ),
     ]
 }
 
@@ -444,5 +461,6 @@ mod tests {
         assert!(properties.contains_key("agent_id"));
         assert_eq!(route_tool("send_input"), RoutedTool::SendInput);
         assert_eq!(route_tool("resume_agent"), RoutedTool::ResumeAgent);
+        assert_eq!(route_tool("github_api_get"), RoutedTool::GithubApiGet);
     }
 }

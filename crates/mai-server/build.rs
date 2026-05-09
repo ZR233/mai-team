@@ -7,10 +7,15 @@ use std::process::{Command, Stdio};
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let web_dir = manifest_dir.join("web");
+    let system_skills_dir = manifest_dir.join("system-skills");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let static_dir = out_dir.join("static");
+    let embedded_system_skills_dir = out_dir.join("system-skills");
     let staging_dir = out_dir.join("web-src");
     let npm_cache_dir = out_dir.join("npm-cache");
+
+    watch_dir(&system_skills_dir);
+    prepare_system_skills_dir(&system_skills_dir, &embedded_system_skills_dir);
 
     watch_frontend(&web_dir);
     prepare_staging_dir(&web_dir, &staging_dir);
@@ -35,6 +40,27 @@ fn main() {
             "frontend build did not produce {}; expected npm run build to create embedded static output",
             static_dir.join("index.html").display()
         );
+    }
+}
+
+fn prepare_system_skills_dir(source_dir: &Path, target_dir: &Path) {
+    if target_dir.exists() {
+        fs::remove_dir_all(target_dir).unwrap_or_else(|err| {
+            panic!(
+                "failed to remove old system skills dir {}: {err}",
+                target_dir.display()
+            )
+        });
+    }
+    if source_dir.exists() {
+        copy_dir(source_dir, target_dir, should_skip_system_skill_entry);
+    } else {
+        fs::create_dir_all(target_dir).unwrap_or_else(|err| {
+            panic!(
+                "failed to create empty system skills dir {}: {err}",
+                target_dir.display()
+            )
+        });
     }
 }
 
@@ -158,6 +184,10 @@ fn run_npm<const N: usize>(web_dir: &Path, npm_cache_dir: &Path, args: [&str; N]
 }
 
 fn copy_web_source(from: &Path, to: &Path) {
+    copy_dir(from, to, should_skip_web_source_entry);
+}
+
+fn copy_dir(from: &Path, to: &Path, should_skip: fn(&OsStr) -> bool) {
     fs::create_dir_all(to)
         .unwrap_or_else(|err| panic!("failed to create directory {}: {err}", to.display()));
     for entry in fs::read_dir(from)
@@ -166,12 +196,12 @@ fn copy_web_source(from: &Path, to: &Path) {
         let entry = entry.unwrap_or_else(|err| panic!("failed to read directory entry: {err}"));
         let source = entry.path();
         let file_name = entry.file_name();
-        if should_skip_web_source_entry(file_name.as_os_str()) {
+        if should_skip(file_name.as_os_str()) {
             continue;
         }
         let target = to.join(entry.file_name());
         if source.is_dir() {
-            copy_web_source(&source, &target);
+            copy_dir(&source, &target, should_skip);
         } else {
             fs::copy(&source, &target).unwrap_or_else(|err| {
                 panic!(
@@ -189,4 +219,8 @@ fn should_skip_web_source_entry(file_name: &OsStr) -> bool {
         file_name.to_str(),
         Some("node_modules" | "dist" | ".vite" | ".DS_Store")
     )
+}
+
+fn should_skip_system_skill_entry(file_name: &OsStr) -> bool {
+    matches!(file_name.to_str(), Some(".DS_Store"))
 }
