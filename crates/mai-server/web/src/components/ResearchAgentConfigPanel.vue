@@ -669,14 +669,21 @@ function resetGitForm() {
 }
 
 function saveGitAccountForm() {
-  emit('save-git-account', {
-    id: gitForm.id || null,
-    provider: 'github',
-    label: gitForm.label.trim(),
-    token: gitForm.token.trim() || null,
-    is_default: !gitAccountCount.value
-  })
-  gitForm.token = ''
+  const token = gitForm.token.trim()
+  const clearSavedToken = () => {
+    if (gitForm.token.trim() === token) gitForm.token = ''
+  }
+  emit(
+    'save-git-account',
+    {
+      id: gitForm.id || null,
+      provider: 'github',
+      label: gitForm.label.trim(),
+      token: token || null,
+      is_default: !gitAccountCount.value
+    },
+    clearSavedToken
+  )
 }
 
 function accountDisplay(account) {

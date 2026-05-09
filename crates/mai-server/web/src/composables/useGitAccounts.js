@@ -17,14 +17,15 @@ const GIT_ACCOUNT_VERIFY_POLL_ATTEMPTS = 12
 export function useGitAccounts() {
   const { api } = useApi()
 
-  async function loadGitAccounts() {
-    gitAccountsState.loading = true
+  async function loadGitAccounts(options = {}) {
+    const silent = options?.silent === true
+    if (!silent) gitAccountsState.loading = true
     try {
-      const response = await api('/git/accounts')
+      const response = await api('/git/accounts', { timeoutMs: 15000 })
       applyResponse(response)
       return response
     } finally {
-      gitAccountsState.loading = false
+      if (!silent) gitAccountsState.loading = false
     }
   }
 
@@ -34,11 +35,13 @@ export function useGitAccounts() {
       const endpoint = payload?.id ? `/git/accounts/${encodeURIComponent(payload.id)}` : '/git/accounts'
       const response = await api(endpoint, {
         method: payload?.id ? 'PUT' : 'POST',
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        timeoutMs: 15000
       })
-      await loadGitAccounts()
       const account = response?.account || response
       if (account?.id) {
+        upsertGitAccount(account)
+        loadGitAccounts({ silent: true }).catch(() => {})
         pollGitAccountVerification(account.id).catch(() => {})
       }
       return response
@@ -50,8 +53,13 @@ export function useGitAccounts() {
   async function verifyGitAccount(id) {
     gitAccountsState.verifying = true
     try {
-      const response = await api(`/git/accounts/${encodeURIComponent(id)}/verify`, { method: 'POST' })
-      await loadGitAccounts()
+      const response = await api(`/git/accounts/${encodeURIComponent(id)}/verify`, {
+        method: 'POST',
+        timeoutMs: 15000
+      })
+      const account = response?.account || response
+      if (account?.id) upsertGitAccount(account)
+      loadGitAccounts({ silent: true }).catch(() => {})
       return response
     } finally {
       gitAccountsState.verifying = false
@@ -86,7 +94,7 @@ export function useGitAccounts() {
   async function pollGitAccountVerification(id) {
     for (let attempt = 0; attempt < GIT_ACCOUNT_VERIFY_POLL_ATTEMPTS; attempt++) {
       await new Promise((resolve) => window.setTimeout(resolve, GIT_ACCOUNT_VERIFY_POLL_INTERVAL_MS))
-      const response = await loadGitAccounts()
+      const response = await loadGitAccounts({ silent: true })
       const account = response?.accounts?.find((item) => item.id === id)
       if (!account || account.status !== 'verifying') return account
     }
@@ -107,5 +115,21 @@ export function useGitAccounts() {
 function applyResponse(response) {
   gitAccountsState.accounts = response?.accounts || []
   gitAccountsState.default_account_id = response?.default_account_id || null
+  gitAccountsState.loaded = true
+}
+
+function upsertGitAccount(account) {
+  if (!account?.id) return
+  const index = gitAccountsState.accounts.findIndex((item) => item.id === account.id)
+  if (index >= 0) {
+    gitAccountsState.accounts.splice(index, 1, { ...gitAccountsState.accounts[index], ...account })
+  } else {
+    gitAccountsState.accounts = [account, ...gitAccountsState.accounts]
+  }
+  if (account.is_default) {
+    gitAccountsState.default_account_id = account.id
+  } else if (!gitAccountsState.default_account_id && gitAccountsState.accounts.length === 1) {
+    gitAccountsState.default_account_id = account.id
+  }
   gitAccountsState.loaded = true
 }

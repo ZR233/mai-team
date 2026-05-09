@@ -701,9 +701,10 @@ async function onSaveMcpServers(servers) {
   }
 }
 
-async function onSaveGitAccount(payload) {
+async function onSaveGitAccount(payload, onSaved) {
   try {
     await saveGitAccount(payload)
+    if (typeof onSaved === 'function') onSaved()
     showToast('Git account saved. Verifying connection...')
   } catch (error) {
     showToast(error.message)
