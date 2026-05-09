@@ -31,10 +31,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, tempdir};
 use thiserror::Error;
+use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::time::{Duration, Instant, sleep};
 use uuid::Uuid;
@@ -122,6 +124,7 @@ pub struct RuntimeConfig {
     pub repo_root: PathBuf,
     pub sidecar_image: String,
     pub github_api_base_url: Option<String>,
+    pub git_binary: Option<String>,
 }
 
 pub struct AgentRuntime {
@@ -141,6 +144,7 @@ pub struct AgentRuntime {
     repo_root: PathBuf,
     sidecar_image: String,
     github_api_base_url: String,
+    git_binary: String,
 }
 
 struct ProjectRecord {
@@ -439,6 +443,13 @@ impl AgentRuntime {
             .as_deref()
             .unwrap_or(DEFAULT_GITHUB_API_BASE_URL)
             .to_string();
+        let git_binary = config
+            .git_binary
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("git")
+            .to_string();
 
         let github_http = reqwest::Client::builder()
             .timeout(Duration::from_secs(GITHUB_HTTP_TIMEOUT_SECS))
@@ -461,6 +472,7 @@ impl AgentRuntime {
             repo_root: config.repo_root,
             sidecar_image,
             github_api_base_url,
+            git_binary,
         }))
     }
 
@@ -4233,54 +4245,105 @@ impl AgentRuntime {
         })?;
         let token = self.git_account_token(&account_id).await?;
         let repo_url = github_clone_url(&summary.owner, &summary.repo);
-        let branch = summary.branch.trim();
-        let branch_arg = if branch.is_empty() {
-            String::new()
-        } else {
-            format!(" --branch {}", shell_quote(branch))
-        };
-        let command = format!(
-            "set -eu\n\
-             rm -rf {workspace}\n\
-             mkdir -p /workspace\n\
-             ASKPASS=$(mktemp)\n\
-             trap 'rm -f \"$ASKPASS\"; git config --global --unset-all credential.helper >/dev/null 2>&1 || true; rm -rf \"$HOME/.config/gh\" \"$HOME/.git-credentials\"' EXIT\n\
-             cat > \"$ASKPASS\" <<'EOF'\n\
-#!/bin/sh\n\
-case \"$1\" in\n\
-  *Username*) printf '%s\\n' x-access-token ;;\n\
-  *Password*) printf '%s\\n' \"$MAI_GITHUB_INSTALLATION_TOKEN\" ;;\n\
-  *) printf '\\n' ;;\n\
-esac\n\
-EOF\n\
-             chmod 700 \"$ASKPASS\"\n\
-             git config --global --unset-all credential.helper >/dev/null 2>&1 || true\n\
-             rm -rf \"$HOME/.config/gh\" \"$HOME/.git-credentials\"\n\
-             GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=\"$ASKPASS\" git -c credential.helper= clone{branch_arg} -- {repo_url} {workspace}\n\
-             git config --global --unset-all credential.helper >/dev/null 2>&1 || true\n\
-             rm -rf \"$HOME/.config/gh\" \"$HOME/.git-credentials\"",
-            workspace = shell_quote(PROJECT_WORKSPACE_PATH),
-            branch_arg = branch_arg,
-            repo_url = shell_quote(&repo_url),
-        );
         let sidecar = self
             .ensure_project_sidecar(project_id, maintainer_agent_id)
             .await?;
+        let temp = tempdir()?;
+        let checkout_path = temp.path().join("repo");
+        self.clone_repository_on_host(&repo_url, summary.branch.trim(), &checkout_path, &token)
+            .await?;
         let output = self
             .docker
-            .exec_shell_env(
+            .exec_shell(
                 &sidecar.id,
-                &command,
+                &format!(
+                    "rm -rf {workspace}",
+                    workspace = shell_quote(PROJECT_WORKSPACE_PATH)
+                ),
                 Some("/"),
-                Some(600),
-                &[("MAI_GITHUB_INSTALLATION_TOKEN".to_string(), token.clone())],
+                Some(30),
             )
             .await?;
         if output.status != 0 {
             let combined = format!("{}\n{}", output.stderr, output.stdout);
-            let message = redact_secret(combined.trim(), &token);
+            let message = preview(redact_secret(combined.trim(), &token).trim(), 500);
             return Err(RuntimeError::InvalidInput(format!(
-                "repository clone failed: {message}"
+                "repository workspace cleanup failed: {message}"
+            )));
+        }
+        self.docker
+            .copy_to_container(&sidecar.id, &checkout_path, PROJECT_WORKSPACE_PATH)
+            .await?;
+        self.prepare_copied_project_workspace(&sidecar.id).await?;
+        Ok(())
+    }
+
+    async fn prepare_copied_project_workspace(&self, container_id: &str) -> Result<()> {
+        let command = format!(
+            "set -eu\n\
+             owner=$(id -u):$(id -g)\n\
+             chown -R \"$owner\" {workspace} 2>/dev/null || git config --global --add safe.directory {workspace}",
+            workspace = shell_quote(PROJECT_WORKSPACE_PATH),
+        );
+        let output = self
+            .docker
+            .exec_shell(container_id, &command, Some("/"), Some(60))
+            .await?;
+        if output.status != 0 {
+            let combined = format!("{}\n{}", output.stderr, output.stdout);
+            let message = preview(combined.trim(), 500);
+            return Err(RuntimeError::InvalidInput(format!(
+                "repository workspace ownership setup failed: {message}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn clone_repository_on_host(
+        &self,
+        repo_url: &str,
+        branch: &str,
+        checkout_path: &Path,
+        token: &str,
+    ) -> Result<()> {
+        let askpass = NamedTempFile::new()?;
+        let askpass_script = "#!/bin/sh\n\
+case \"$1\" in\n\
+  *Username*) printf '%s\\n' x-access-token ;;\n\
+  *Password*) printf '%s\\n' \"$MAI_GITHUB_INSTALLATION_TOKEN\" ;;\n\
+  *) printf '\\n' ;;\n\
+esac\n";
+        std::fs::write(askpass.path(), askpass_script)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(askpass.path())?.permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(askpass.path(), permissions)?;
+        }
+
+        let mut command = Command::new(&self.git_binary);
+        command.arg("-c").arg("credential.helper=").arg("clone");
+        if !branch.is_empty() {
+            command.arg("--branch").arg(branch);
+        }
+        command.arg("--").arg(repo_url).arg(checkout_path);
+        command
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", askpass.path())
+            .env("MAI_GITHUB_INSTALLATION_TOKEN", token)
+            .stdin(Stdio::null());
+
+        let output = command.output().await?;
+        if !output.status.success() {
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let message = preview(redact_secret(combined.trim(), token).trim(), 500);
+            return Err(RuntimeError::InvalidInput(format!(
+                "repository clone failed on server host: {message}"
             )));
         }
         Ok(())
@@ -6098,13 +6161,14 @@ mod tests {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
+                git_binary: None,
             },
         )
         .await
         .expect("runtime")
     }
 
-    async fn test_runtime_with_sidecar_image(
+    async fn test_runtime_with_sidecar_image_and_git(
         dir: &tempfile::TempDir,
         store: Arc<ConfigStore>,
         sidecar_image: &str,
@@ -6117,6 +6181,7 @@ mod tests {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: sidecar_image.to_string(),
                 github_api_base_url: None,
+                git_binary: Some(fake_git_path(dir)),
             },
         )
         .await
@@ -6136,6 +6201,7 @@ mod tests {
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: Some(github_api_base_url),
+                git_binary: None,
             },
         )
         .await
@@ -6189,7 +6255,7 @@ case "$1" in
     echo "created-container"
     exit 0
     ;;
-  rm|rmi|start|exec)
+  rm|rmi|start|exec|cp)
     echo "$*" >> "$LOG"
     exit 0
     ;;
@@ -6210,6 +6276,42 @@ esac
                 .permissions();
             permissions.set_mode(0o755);
             std::fs::set_permissions(&path, permissions).expect("chmod fake docker");
+        }
+        path.to_string_lossy().to_string()
+    }
+
+    fn fake_git_path(dir: &tempfile::TempDir) -> String {
+        let path = dir.path().join("fake-git.sh");
+        let log_path = fake_git_log_path(dir);
+        let script = format!(
+            r#"#!/bin/sh
+LOG={}
+echo "$*" >> "$LOG"
+if [ -n "$GIT_ASKPASS" ]; then
+  echo "askpass=$GIT_ASKPASS" >> "$LOG"
+fi
+if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
+  echo "token-present" >> "$LOG"
+fi
+last=""
+for arg in "$@"; do
+  last="$arg"
+done
+mkdir -p "$last"
+printf 'hello\n' > "$last/README.md"
+exit 0
+"#,
+            test_shell_quote(&log_path.to_string_lossy())
+        );
+        std::fs::write(&path, script).expect("write fake git");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path)
+                .expect("fake git metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).expect("chmod fake git");
         }
         path.to_string_lossy().to_string()
     }
@@ -6253,8 +6355,16 @@ esac
         dir.path().join("fake-docker.log")
     }
 
+    fn fake_git_log_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        dir.path().join("fake-git.log")
+    }
+
     fn fake_docker_log(dir: &tempfile::TempDir) -> String {
         std::fs::read_to_string(fake_docker_log_path(dir)).unwrap_or_default()
+    }
+
+    fn fake_git_log(dir: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(fake_git_log_path(dir)).unwrap_or_default()
     }
 
     fn test_shell_quote(value: &str) -> String {
@@ -7013,6 +7123,7 @@ esac
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
+                git_binary: None,
             },
         )
         .await
@@ -7260,6 +7371,7 @@ esac
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
+                git_binary: None,
             },
         )
         .await
@@ -7364,6 +7476,7 @@ esac
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
+                git_binary: None,
             },
         )
         .await
@@ -7434,6 +7547,7 @@ esac
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
+                git_binary: None,
             },
         )
         .await
@@ -7537,6 +7651,7 @@ esac
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
+                git_binary: None,
             },
         )
         .await
@@ -7811,6 +7926,7 @@ esac
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
+                git_binary: None,
             },
         )
         .await
@@ -7870,6 +7986,7 @@ esac
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
+                git_binary: None,
             },
         )
         .await
@@ -7998,6 +8115,7 @@ esac
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
+                git_binary: None,
             },
         )
         .await
@@ -8043,6 +8161,7 @@ esac
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
+                git_binary: None,
             },
         )
         .await
@@ -8504,6 +8623,7 @@ esac
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
+                git_binary: None,
             },
         )
         .await
@@ -8652,7 +8772,7 @@ esac
         save_agent_with_session(&store, &agent).await;
         let project = test_project_summary(project_id, agent_id, "account-1");
         store.save_project(&project).await.expect("save project");
-        let runtime = test_runtime_with_sidecar_image(
+        let runtime = test_runtime_with_sidecar_image_and_git(
             &dir,
             Arc::clone(&store),
             "ghcr.io/example/mai-team-sidecar:test",
@@ -8669,12 +8789,23 @@ esac
             "create --name mai-team-project-sidecar-{project_id}"
         )));
         assert!(docker_log.contains("ghcr.io/example/mai-team-sidecar:test sleep infinity"));
-        assert!(docker_log.contains("exec -w / -e MAI_GITHUB_INSTALLATION_TOKEN"));
-        assert!(docker_log.contains("GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=\"$ASKPASS\""));
-        assert!(docker_log.contains("https://github.com/owner/repo.git"));
+        assert!(docker_log.contains("exec -w / created-container /bin/sh -lc"));
+        assert!(docker_log.contains("rm -rf"));
+        assert!(docker_log.contains("/workspace/repo"));
+        assert!(docker_log.contains("cp "));
+        assert!(docker_log.contains("created-container:/workspace/repo"));
+        assert!(docker_log.contains("chown -R"));
+        assert!(docker_log.contains("safe.directory"));
+        let git_log = fake_git_log(&dir);
+        assert!(git_log.contains(
+            "-c credential.helper= clone --branch main -- https://github.com/owner/repo.git"
+        ));
+        assert!(git_log.contains("askpass="));
+        assert!(git_log.contains("token-present"));
         assert!(docker_log.contains("created-container"));
         assert!(!docker_log.contains("unused-agent sleep infinity"));
         assert!(!docker_log.contains("secret-token"));
+        assert!(!git_log.contains("secret-token"));
     }
 
     #[tokio::test]
@@ -8707,7 +8838,7 @@ esac
         save_agent_with_session(&store, &agent).await;
         let project = test_project_summary(project_id, agent_id, "account-1");
         store.save_project(&project).await.expect("save project");
-        let runtime = test_runtime_with_sidecar_image(
+        let runtime = test_runtime_with_sidecar_image_and_git(
             &dir,
             Arc::clone(&store),
             "ghcr.io/example/mai-team-sidecar:test",
@@ -8727,8 +8858,8 @@ esac
         assert_eq!(detail.summary.status, ProjectStatus::Ready);
         assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Ready);
         assert_eq!(detail.maintainer_agent.summary.status, AgentStatus::Idle);
-        assert!(fake_docker_log(&dir).contains("exec -w / -e MAI_GITHUB_INSTALLATION_TOKEN"));
-        assert!(fake_docker_log(&dir).contains("GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=\"$ASKPASS\""));
+        assert!(fake_docker_log(&dir).contains("created-container:/workspace/repo"));
+        assert!(fake_git_log(&dir).contains("https://github.com/owner/repo.git"));
 
         let mut saw_cloning = false;
         let mut saw_ready = false;
@@ -8791,6 +8922,7 @@ esac
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
+                git_binary: None,
             },
         )
         .await
@@ -8849,7 +8981,7 @@ esac
         save_agent_with_session(&store, &agent).await;
         let project = test_project_summary(project_id, agent_id, "account-1");
         store.save_project(&project).await.expect("save project");
-        let runtime = test_runtime_with_sidecar_image(
+        let runtime = test_runtime_with_sidecar_image_and_git(
             &dir,
             Arc::clone(&store),
             "ghcr.io/example/mai-team-sidecar:test",
@@ -8921,6 +9053,7 @@ esac
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
+                git_binary: None,
             },
         )
         .await
@@ -9004,6 +9137,7 @@ esac
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
+                git_binary: None,
             },
         )
         .await
@@ -9084,6 +9218,7 @@ esac
                 repo_root: dir.path().to_path_buf(),
                 sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: None,
+                git_binary: None,
             },
         )
         .await

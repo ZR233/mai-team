@@ -652,6 +652,7 @@ function syncSelectedGitAccount() {
   if (selectedGitAccountId.value && gitAccounts.value.some((account) => account.id === selectedGitAccountId.value)) return
   const next = defaultGitAccount.value || gitAccounts.value[0]
   if (next) selectGitAccount(next)
+  else resetGitForm()
 }
 
 function selectGitAccount(account) {

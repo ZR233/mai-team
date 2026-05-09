@@ -175,6 +175,7 @@ async fn main() -> Result<()> {
         repo_root: env::current_dir()?,
         sidecar_image,
         github_api_base_url: None,
+        git_binary: None,
     };
     let runtime =
         AgentRuntime::new(docker, model, Arc::clone(&store), runtime_config.clone()).await?;

@@ -19,6 +19,7 @@ use thiserror::Error;
 use toasty::Db;
 use toasty::stmt::{List, Query};
 use toasty_driver_sqlite::Sqlite;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const SETTING_AGENT_CONFIG: &str = "agent_config";
@@ -59,6 +60,7 @@ pub struct ConfigStore {
     path: PathBuf,
     config_path: PathBuf,
     db: Db,
+    git_accounts_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -422,6 +424,7 @@ impl ConfigStore {
             path,
             config_path,
             db,
+            git_accounts_lock: Mutex::new(()),
         };
         Ok(store)
     }
@@ -816,6 +819,7 @@ impl ConfigStore {
     }
 
     pub async fn list_git_accounts(&self) -> Result<GitAccountsResponse> {
+        let _guard = self.git_accounts_lock.lock().await;
         let config = self.git_accounts_config().await?;
         Ok(git_accounts_response(&config))
     }
@@ -824,6 +828,7 @@ impl ConfigStore {
         &self,
         request: GitAccountRequest,
     ) -> Result<GitAccountSummary> {
+        let _guard = self.git_accounts_lock.lock().await;
         let token = request.token.unwrap_or_default().trim().to_string();
         let mut config = self.git_accounts_config().await?;
         let id = request
@@ -915,6 +920,7 @@ impl ConfigStore {
         status: GitAccountStatus,
         last_error: Option<String>,
     ) -> Result<GitAccountSummary> {
+        let _guard = self.git_accounts_lock.lock().await;
         let mut config = self.git_accounts_config().await?;
         let default_account_id = config.default_account_id.clone();
         let account = config
@@ -934,6 +940,7 @@ impl ConfigStore {
     }
 
     pub async fn mark_git_account_verifying(&self, account_id: &str) -> Result<GitAccountSummary> {
+        let _guard = self.git_accounts_lock.lock().await;
         let mut config = self.git_accounts_config().await?;
         let default_account_id = config.default_account_id.clone();
         let account = config
@@ -949,6 +956,7 @@ impl ConfigStore {
     }
 
     pub async fn delete_git_account(&self, account_id: &str) -> Result<GitAccountsResponse> {
+        let _guard = self.git_accounts_lock.lock().await;
         let mut config = self.git_accounts_config().await?;
         config.accounts.retain(|account| account.id != account_id);
         if config.default_account_id.as_deref() == Some(account_id) {
@@ -960,6 +968,7 @@ impl ConfigStore {
     }
 
     pub async fn set_default_git_account(&self, account_id: &str) -> Result<GitAccountsResponse> {
+        let _guard = self.git_accounts_lock.lock().await;
         let mut config = self.git_accounts_config().await?;
         if !config
             .accounts
@@ -977,6 +986,7 @@ impl ConfigStore {
     }
 
     pub async fn git_account_token(&self, account_id: &str) -> Result<Option<String>> {
+        let _guard = self.git_accounts_lock.lock().await;
         Ok(self
             .git_accounts_config()
             .await?
@@ -2946,6 +2956,45 @@ mod tests {
         assert_eq!(resaved.status, GitAccountStatus::Verifying);
         assert_eq!(resaved.last_error, None);
         assert_eq!(resaved.last_verified_at, None);
+    }
+
+    #[tokio::test]
+    async fn git_account_delete_wins_over_late_verification_update() {
+        let (_dir, store) = store().await;
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("account-1".to_string()),
+                provider: GitProvider::Github,
+                label: "Personal".to_string(),
+                token: Some("secret-token".to_string()),
+                is_default: true,
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+
+        let response = store
+            .delete_git_account("account-1")
+            .await
+            .expect("delete account");
+        assert!(response.accounts.is_empty());
+        assert_eq!(response.default_account_id, None);
+
+        let late_update = store
+            .update_git_account_verification(
+                "account-1",
+                Some("octo".to_string()),
+                GitTokenKind::Classic,
+                vec!["repo".to_string()],
+                GitAccountStatus::Verified,
+                None,
+            )
+            .await;
+        assert!(late_update.is_err());
+
+        let response = store.list_git_accounts().await.expect("list accounts");
+        assert!(response.accounts.is_empty());
+        assert_eq!(response.default_account_id, None);
     }
 
     #[tokio::test]
