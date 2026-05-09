@@ -286,10 +286,6 @@
                 <input v-model.trim="gitForm.label" placeholder="Personal" autocomplete="off" />
               </label>
               <label>
-                <span>GitHub username</span>
-                <input v-model.trim="gitForm.login" placeholder="Optional" autocomplete="off" />
-              </label>
-              <label>
                 <span>Token</span>
                 <input v-model="gitForm.token" type="password" placeholder="ghp_ or github_pat_" autocomplete="off" />
                 <small>Leave blank when editing to keep the stored token.</small>
@@ -427,10 +423,10 @@ const emit = defineEmits([
 
 const activeSettingsSection = ref('roles')
 const selectedGitAccountId = ref('')
+const DEFAULT_GIT_ACCOUNT_LABEL = 'Personal'
 const gitForm = reactive({
   id: '',
-  label: '',
-  login: '',
+  label: DEFAULT_GIT_ACCOUNT_LABEL,
   token: ''
 })
 
@@ -661,15 +657,13 @@ function selectGitAccount(account) {
   selectedGitAccountId.value = account.id
   gitForm.id = account.id
   gitForm.label = account.label || ''
-  gitForm.login = account.login || ''
   gitForm.token = ''
 }
 
 function resetGitForm() {
   selectedGitAccountId.value = ''
   gitForm.id = ''
-  gitForm.label = ''
-  gitForm.login = ''
+  gitForm.label = DEFAULT_GIT_ACCOUNT_LABEL
   gitForm.token = ''
 }
 
@@ -678,7 +672,6 @@ function saveGitAccountForm() {
     id: gitForm.id || null,
     provider: 'github',
     label: gitForm.label.trim(),
-    login: gitForm.login.trim() || null,
     token: gitForm.token.trim() || null,
     is_default: !gitAccountCount.value
   })
