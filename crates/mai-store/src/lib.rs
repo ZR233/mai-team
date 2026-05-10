@@ -1,20 +1,19 @@
 use chrono::{DateTime, Utc};
 use mai_protocol::{
-    AgentConfigRequest, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus,
-    AgentSummary, ArtifactInfo, GitAccountRequest, GitAccountStatus, GitAccountSummary,
-    GitAccountsResponse, GitProvider, GitTokenKind, GithubAppSettingsRequest,
-    GithubAppSettingsResponse, GithubSettingsResponse, McpServerConfig, MessageRole, ModelConfig,
-    ModelInputItem, ModelReasoningConfig, ModelReasoningVariant, PlanHistoryEntry, PlanStatus,
-    ProjectCloneStatus, ProjectId, ProjectReviewOutcome, ProjectReviewStatus, ProjectStatus,
-    ProjectSummary, ProviderConfig, ProviderKind, ProviderPreset, ProviderPresetsResponse,
-    ProviderSecret, ProviderSummary, ProvidersConfigRequest, ProvidersResponse, ServiceEvent,
-    ServiceEventKind, SessionId, SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskStatus,
-    TaskSummary, TokenUsage, TurnId, default_true,
+    AgentConfigRequest, AgentId, AgentMessage, AgentSessionSummary, AgentSummary, ArtifactInfo,
+    GitAccountRequest, GitAccountStatus, GitAccountSummary, GitAccountsResponse, GitProvider,
+    GitTokenKind, GithubAppSettingsRequest, GithubAppSettingsResponse, GithubSettingsResponse,
+    McpServerConfig, ModelConfig, ModelInputItem, ModelReasoningConfig, ModelReasoningVariant,
+    PlanHistoryEntry, ProjectId, ProjectSummary, ProviderConfig, ProviderKind, ProviderPreset,
+    ProviderPresetsResponse, ProviderSecret, ProviderSummary, ProvidersConfigRequest,
+    ProvidersResponse, ServiceEvent, ServiceEventKind, SessionId, SkillsConfigRequest, TaskId,
+    TaskPlan, TaskReview, TaskSummary, TokenUsage, TurnId, default_true,
 };
 use rusqlite::Connection as SqliteConnection;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use thiserror::Error;
 use toasty::Db;
 use toasty::stmt::{List, Query};
@@ -28,7 +27,7 @@ const SETTING_GITHUB_TOKEN: &str = "github_token";
 const SETTING_GITHUB_APP_CONFIG: &str = "github_app_config";
 const SETTING_GIT_ACCOUNTS: &str = "git_accounts";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-const SCHEMA_VERSION: &str = "12";
+const SCHEMA_VERSION: &str = "13";
 const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const DEEPSEEK_V4_CONTEXT_TOKENS: u64 = 1_000_000;
@@ -415,10 +414,10 @@ impl ConfigStore {
             if current_schema_version.as_deref() != Some(SCHEMA_VERSION) {
                 if matches!(
                     current_schema_version.as_deref(),
-                    Some("8" | "9" | "10" | "11")
+                    Some("8" | "9" | "10" | "11" | "12")
                 ) {
                     drop(db);
-                    migrate_to_v12(&path)?;
+                    migrate_to_v13(&path)?;
                     db = build_db(&path).await?;
                     set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
                 } else {
@@ -1195,10 +1194,7 @@ impl ConfigStore {
                 .last_review_finished_at
                 .map(|time| time.to_rfc3339()),
             next_review_at: project.next_review_at.map(|time| time.to_rfc3339()),
-            last_review_outcome: project
-                .last_review_outcome
-                .as_ref()
-                .map(|o| o.to_string()),
+            last_review_outcome: project.last_review_outcome.as_ref().map(|o| o.to_string()),
             review_last_error: project.review_last_error.clone(),
         })
         .exec(&mut db)
@@ -1775,9 +1771,9 @@ impl AgentRecordRow {
                 .as_deref()
                 .map(parse_project_id)
                 .transpose()?,
-            role: self.role.as_deref().map(|r| r.parse()).transpose()?,
+            role: self.role.as_deref().map(parse_store_enum).transpose()?,
             name: self.name,
-            status: self.status.parse()?,
+            status: parse_store_enum(&self.status)?,
             container_id: self.container_id,
             docker_image: self.docker_image,
             provider_id: self.provider_id,
@@ -1806,7 +1802,7 @@ impl ProjectRecordRow {
         Ok(ProjectSummary {
             id: parse_project_id(&self.id)?,
             name: self.name,
-            status: self.status.parse()?,
+            status: parse_store_enum(&self.status)?,
             owner: self.owner,
             repo: self.repo,
             repository_full_name: self.repository_full_name,
@@ -1816,14 +1812,14 @@ impl ProjectRecordRow {
             installation_account: self.installation_account,
             branch: self.branch,
             docker_image: self.docker_image,
-            clone_status: self.clone_status.parse()?,
+            clone_status: parse_store_enum(&self.clone_status)?,
             maintainer_agent_id: parse_agent_id(&self.maintainer_agent_id)?,
             created_at: parse_utc(&self.created_at)?,
             updated_at: parse_utc(&self.updated_at)?,
             last_error: self.last_error,
             auto_review_enabled: self.auto_review_enabled,
             reviewer_extra_prompt: self.reviewer_extra_prompt,
-            review_status: self.review_status.parse()?,
+            review_status: parse_store_enum(&self.review_status)?,
             current_reviewer_agent_id: self
                 .current_reviewer_agent_id
                 .as_deref()
@@ -1843,7 +1839,7 @@ impl ProjectRecordRow {
             last_review_outcome: self
                 .last_review_outcome
                 .as_deref()
-                .map(|o| o.parse())
+                .map(parse_store_enum)
                 .transpose()?,
             review_last_error: self.review_last_error,
         })
@@ -1896,7 +1892,7 @@ impl TaskRecordRow {
         plan_history: Vec<PlanHistoryEntry>,
     ) -> Result<PersistedTask> {
         let plan = TaskPlan {
-            status: self.plan_status.parse()?,
+            status: parse_store_enum(&self.plan_status)?,
             title: self.plan_title,
             markdown: self.plan_markdown,
             version: i64_to_u64(self.plan_version),
@@ -1921,7 +1917,7 @@ impl TaskRecordRow {
         let summary = TaskSummary {
             id: parse_task_id(&self.id)?,
             title: self.title,
-            status: self.status.parse()?,
+            status: parse_store_enum(&self.status)?,
             plan_status: plan.status.clone(),
             plan_version: plan.version,
             planner_agent_id: parse_agent_id(&self.planner_agent_id)?,
@@ -1950,7 +1946,7 @@ impl TaskRecordRow {
 impl AgentMessageRecord {
     fn into_message(self) -> Result<AgentMessage> {
         Ok(AgentMessage {
-            role: self.role.parse()?,
+            role: parse_store_enum(&self.role)?,
             content: self.content,
             created_at: parse_utc(&self.created_at)?,
         })
@@ -1991,7 +1987,7 @@ async fn build_db(path: &Path) -> Result<Db> {
     Ok(builder.build(Sqlite::open(path)).await?)
 }
 
-fn migrate_to_v12(path: &Path) -> Result<()> {
+fn migrate_to_v13(path: &Path) -> Result<()> {
     let conn = SqliteConnection::open(path)?;
     if !sqlite_column_exists(&conn, "agents", "project_id")? {
         conn.execute("ALTER TABLE agents ADD COLUMN project_id TEXT", [])?;
@@ -2732,6 +2728,29 @@ fn parse_utc(value: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
 }
 
+fn parse_store_enum<T>(value: &str) -> Result<T>
+where
+    T: FromStr<Err = strum::ParseError>,
+{
+    if let Ok(parsed) = value.parse() {
+        return Ok(parsed);
+    }
+    let mut normalized = String::with_capacity(value.len() + 4);
+    for (index, ch) in value.char_indices() {
+        if ch.is_ascii_uppercase() {
+            if index > 0 && !normalized.ends_with('_') {
+                normalized.push('_');
+            }
+            normalized.push(ch.to_ascii_lowercase());
+        } else if ch == '-' {
+            normalized.push('_');
+        } else {
+            normalized.push(ch);
+        }
+    }
+    Ok(normalized.parse()?)
+}
+
 fn u64_to_i64(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
 }
@@ -2794,10 +2813,10 @@ fn github_app_install_url(app_slug: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mai_protocol::McpServerScope;
     use mai_protocol::{
-        AgentStatus, McpServerTransport, MessageRole, ModelContentItem, ModelToolCall,
-        ServiceEventKind,
+        AgentStatus, McpServerScope, McpServerTransport, MessageRole, ModelContentItem,
+        ModelToolCall, ProjectCloneStatus, ProjectReviewOutcome, ProjectReviewStatus,
+        ProjectStatus, ServiceEventKind,
     };
     use serde_json::json;
     use tempfile::{TempDir, tempdir};
@@ -3812,6 +3831,81 @@ mod tests {
         let conn = SqliteConnection::open(&db_path).expect("sqlite");
         assert!(!sqlite_column_exists(&conn, "projects", "project_path").expect("column"));
         assert!(!sqlite_column_exists(&conn, "projects", "workspace_path").expect("column"));
+    }
+
+    #[tokio::test]
+    async fn schema_v12_adds_project_review_columns_without_rebuild() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("config.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("open");
+        store
+            .set_setting(SETTING_SCHEMA_VERSION, "12")
+            .await
+            .expect("mark v12 schema");
+        drop(store);
+
+        let conn = SqliteConnection::open(&db_path).expect("sqlite");
+        conn.execute("ALTER TABLE projects DROP COLUMN auto_review_enabled", [])
+            .expect("drop auto review column");
+        conn.execute("ALTER TABLE projects DROP COLUMN reviewer_extra_prompt", [])
+            .expect("drop extra prompt column");
+        conn.execute("ALTER TABLE projects DROP COLUMN review_status", [])
+            .expect("drop review status column");
+        conn.execute(
+            "ALTER TABLE projects DROP COLUMN current_reviewer_agent_id",
+            [],
+        )
+        .expect("drop current reviewer column");
+        conn.execute(
+            "ALTER TABLE projects DROP COLUMN last_review_started_at",
+            [],
+        )
+        .expect("drop started column");
+        conn.execute(
+            "ALTER TABLE projects DROP COLUMN last_review_finished_at",
+            [],
+        )
+        .expect("drop finished column");
+        conn.execute("ALTER TABLE projects DROP COLUMN next_review_at", [])
+            .expect("drop next review column");
+        conn.execute("ALTER TABLE projects DROP COLUMN last_review_outcome", [])
+            .expect("drop outcome column");
+        conn.execute("ALTER TABLE projects DROP COLUMN review_last_error", [])
+            .expect("drop last error column");
+        drop(conn);
+
+        let reopened = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("reopen");
+        assert_eq!(
+            reopened
+                .get_setting(SETTING_SCHEMA_VERSION)
+                .await
+                .expect("schema marker")
+                .as_deref(),
+            Some(SCHEMA_VERSION)
+        );
+
+        let conn = SqliteConnection::open(&db_path).expect("sqlite");
+        for column in [
+            "auto_review_enabled",
+            "reviewer_extra_prompt",
+            "review_status",
+            "current_reviewer_agent_id",
+            "last_review_started_at",
+            "last_review_finished_at",
+            "next_review_at",
+            "last_review_outcome",
+            "review_last_error",
+        ] {
+            assert!(
+                sqlite_column_exists(&conn, "projects", column).expect("column check"),
+                "{column} should be added during v12 -> v13 migration"
+            );
+        }
     }
 
     #[tokio::test]
