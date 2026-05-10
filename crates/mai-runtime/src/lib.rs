@@ -5,7 +5,7 @@ use futures::future::{AbortHandle, Abortable};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use mai_docker::{ContainerHandle, DockerClient};
 use mai_mcp::{McpAgentManager, McpTool};
-use mai_model::ResponsesClient;
+use mai_model::{ModelRequest, ResponsesClient};
 use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentMessage,
     AgentModelPreference, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary, ArtifactInfo,
@@ -257,6 +257,14 @@ struct ProjectSkillSourceDir {
     relative: PathBuf,
     cache_name: String,
     container_path: String,
+}
+
+struct TurnResult {
+    turn_id: TurnId,
+    status: TurnStatus,
+    agent_status: AgentStatus,
+    final_text: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2117,7 +2125,7 @@ impl AgentRuntime {
         if current_turn != Some(turn_id)
             && control.as_ref().map(|turn| turn.turn_id) != Some(turn_id)
         {
-            return Err(RuntimeError::TurnNotFound { agent_id, turn_id });
+            return Ok(());
         }
         agent.cancel_requested.store(true, Ordering::SeqCst);
         if let Some(control) = control.filter(|turn| turn.turn_id == turn_id) {
@@ -2135,11 +2143,13 @@ impl AgentRuntime {
         self.complete_turn_if_current(
             &agent,
             agent_id,
-            turn_id,
-            TurnStatus::Cancelled,
-            AgentStatus::Cancelled,
-            None,
-            None,
+            TurnResult {
+                turn_id,
+                status: TurnStatus::Cancelled,
+                agent_status: AgentStatus::Cancelled,
+                final_text: None,
+                error: None,
+            },
         )
         .await?;
         Ok(())
@@ -2424,11 +2434,13 @@ impl AgentRuntime {
                     .complete_turn_if_current(
                         &agent,
                         agent_id,
-                        turn_id,
-                        TurnStatus::Cancelled,
-                        AgentStatus::Cancelled,
-                        None,
-                        None,
+                        TurnResult {
+                            turn_id,
+                            status: TurnStatus::Cancelled,
+                            agent_status: AgentStatus::Cancelled,
+                            final_text: None,
+                            error: None,
+                        },
                     )
                     .await;
                 return;
@@ -2438,11 +2450,13 @@ impl AgentRuntime {
                 .complete_turn_if_current(
                     &agent,
                     agent_id,
-                    turn_id,
-                    TurnStatus::Failed,
-                    AgentStatus::Failed,
-                    None,
-                    Some(message.clone()),
+                    TurnResult {
+                        turn_id,
+                        status: TurnStatus::Failed,
+                        agent_status: AgentStatus::Failed,
+                        final_text: None,
+                        error: Some(message.clone()),
+                    },
                 )
                 .await
                 .unwrap_or(false);
@@ -2586,12 +2600,14 @@ impl AgentRuntime {
             let response = self
                 .model
                 .create_response_with_cancel(
-                    &provider_selection.provider,
-                    &provider_selection.model,
-                    &instructions,
-                    &history,
-                    &tools,
-                    reasoning_effort,
+                    &ModelRequest {
+                        provider: &provider_selection.provider,
+                        model: &provider_selection.model,
+                        instructions: &instructions,
+                        input: &history,
+                        tools: &tools,
+                        reasoning_effort,
+                    },
                     &cancellation_token,
                 )
                 .await
@@ -2752,10 +2768,13 @@ impl AgentRuntime {
                     &agent,
                     agent_id,
                     session_id,
-                    turn_id,
-                    TurnStatus::Completed,
-                    AgentStatus::Completed,
-                    last_assistant_text,
+                    TurnResult {
+                        turn_id,
+                        status: TurnStatus::Completed,
+                        agent_status: AgentStatus::Completed,
+                        final_text: last_assistant_text,
+                        error: None,
+                    },
                 )
                 .await?;
                 return Ok(());
@@ -2840,10 +2859,13 @@ impl AgentRuntime {
                     &agent,
                     agent_id,
                     session_id,
-                    turn_id,
-                    TurnStatus::Completed,
-                    AgentStatus::Completed,
-                    last_assistant_text,
+                    TurnResult {
+                        turn_id,
+                        status: TurnStatus::Completed,
+                        agent_status: AgentStatus::Completed,
+                        final_text: last_assistant_text,
+                        error: None,
+                    },
                 )
                 .await?;
                 return Ok(());
@@ -3907,22 +3929,10 @@ impl AgentRuntime {
         agent: &Arc<AgentRecord>,
         agent_id: AgentId,
         session_id: SessionId,
-        turn_id: TurnId,
-        turn_status: TurnStatus,
-        agent_status: AgentStatus,
-        final_text: Option<String>,
+        result: TurnResult,
     ) -> Result<()> {
         let _ = session_id;
-        self.complete_turn_if_current(
-            agent,
-            agent_id,
-            turn_id,
-            turn_status,
-            agent_status,
-            final_text,
-            None,
-        )
-        .await?;
+        self.complete_turn_if_current(agent, agent_id, result).await?;
         Ok(())
     }
 
@@ -3930,12 +3940,9 @@ impl AgentRuntime {
         self: &Arc<Self>,
         agent: &Arc<AgentRecord>,
         agent_id: AgentId,
-        turn_id: TurnId,
-        turn_status: TurnStatus,
-        agent_status: AgentStatus,
-        final_text: Option<String>,
-        error: Option<String>,
+        result: TurnResult,
     ) -> Result<bool> {
+        let turn_id = result.turn_id;
         let session_id = {
             let mut active_turn = agent.active_turn.lock().expect("active turn lock");
             let active_session_id = active_turn
@@ -3969,17 +3976,17 @@ impl AgentRuntime {
             if summary.current_turn != Some(turn_id) {
                 return Ok(false);
             }
-            summary.status = agent_status.clone();
+            summary.status = result.agent_status.clone();
             summary.current_turn = None;
             summary.updated_at = now();
-            if let Some(error) = error {
+            if let Some(error) = result.error {
                 summary.last_error = Some(error);
             }
         }
         {
             let mut sessions = agent.sessions.lock().await;
             if let Some(session) = sessions.iter_mut().find(|s| s.summary.id == session_id) {
-                session.last_turn_response = final_text;
+                session.last_turn_response = result.final_text;
             }
         }
         self.persist_agent(agent).await?;
@@ -3987,12 +3994,12 @@ impl AgentRuntime {
             agent_id,
             session_id: Some(session_id),
             turn_id,
-            status: turn_status,
+            status: result.status,
         })
         .await;
         self.publish(ServiceEventKind::AgentStatusChanged {
             agent_id,
-            status: agent_status,
+            status: result.agent_status,
         })
         .await;
         if let Err(err) = self.start_next_queued_input(agent_id).await {
@@ -4208,12 +4215,14 @@ impl AgentRuntime {
         let response = self
             .model
             .create_response_with_cancel(
-                &provider_selection.provider,
-                &provider_selection.model,
-                &instructions,
-                &compact_input,
-                &[],
-                summary.reasoning_effort,
+                &ModelRequest {
+                    provider: &provider_selection.provider,
+                    model: &provider_selection.model,
+                    instructions: &instructions,
+                    input: &compact_input,
+                    tools: &[],
+                    reasoning_effort: summary.reasoning_effort,
+                },
                 cancellation_token,
             )
             .await
@@ -8994,11 +9003,13 @@ esac
             .complete_turn_if_current(
                 &agent,
                 agent_id,
-                stale_turn_id,
-                TurnStatus::Cancelled,
-                AgentStatus::Cancelled,
-                None,
-                None,
+                TurnResult {
+                    turn_id: stale_turn_id,
+                    status: TurnStatus::Cancelled,
+                    agent_status: AgentStatus::Cancelled,
+                    final_text: None,
+                    error: None,
+                },
             )
             .await
             .expect("complete stale");

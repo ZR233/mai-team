@@ -108,6 +108,15 @@ struct ChatToolFunction {
     parameters: Value,
 }
 
+pub struct ModelRequest<'a> {
+    pub provider: &'a ProviderSecret,
+    pub model: &'a ModelConfig,
+    pub instructions: &'a str,
+    pub input: &'a [ModelInputItem],
+    pub tools: &'a [ToolDefinition],
+    pub reasoning_effort: Option<String>,
+}
+
 impl ResponsesClient {
     pub fn new() -> Self {
         Self::default()
@@ -161,22 +170,17 @@ impl ResponsesClient {
 
     pub async fn create_response_with_cancel(
         &self,
-        provider: &ProviderSecret,
-        model: &ModelConfig,
-        instructions: &str,
-        input: &[ModelInputItem],
-        tools: &[ToolDefinition],
-        reasoning_effort: Option<String>,
+        req: &ModelRequest<'_>,
         cancellation_token: &CancellationToken,
     ) -> Result<ModelResponse> {
         tokio::select! {
             response = self.create_response(
-                provider,
-                model,
-                instructions,
-                input,
-                tools,
-                reasoning_effort,
+                req.provider,
+                req.model,
+                req.instructions,
+                req.input,
+                req.tools,
+                req.reasoning_effort.clone(),
             ) => response,
             _ = cancellation_token.cancelled() => Err(ModelError::Cancelled),
         }

@@ -1,5 +1,5 @@
 use futures::{StreamExt, stream};
-use mai_docker::{DockerClient, DockerError};
+use mai_docker::{DockerClient, DockerError, SidecarParams};
 use mai_protocol::{McpServerConfig, McpServerTransport, McpStartupStatus};
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::model::{
@@ -558,15 +558,16 @@ impl StdioMcpSession {
             sanitize_name(&server_name),
             std::process::id()
         );
-        let mut child = docker.spawn_sidecar(
-            &name,
+        let mut child = docker.spawn_sidecar(&SidecarParams {
+            name: &name,
             image,
             command,
-            &config.args,
-            config.cwd.as_deref(),
-            &env,
-            Some(workspace_volume),
-        )?;
+            args: &config.args,
+            cwd: config.cwd.as_deref(),
+            env: &env,
+            workspace_volume: Some(workspace_volume),
+            timeout_secs: None,
+        })?;
         let stdin = child.stdin.take().ok_or(McpError::MissingStdio)?;
         let stdout = child.stdout.take().ok_or(McpError::MissingStdio)?;
         let service = rmcp::serve_client(client_info(), rmcp_transport(stdout, stdin))

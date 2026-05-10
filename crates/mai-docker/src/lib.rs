@@ -66,6 +66,18 @@ pub struct ExecOutput {
     pub stderr: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SidecarParams<'a> {
+    pub name: &'a str,
+    pub image: &'a str,
+    pub command: &'a str,
+    pub args: &'a [String],
+    pub cwd: Option<&'a str>,
+    pub env: &'a [(String, String)],
+    pub workspace_volume: Option<&'a str>,
+    pub timeout_secs: Option<u64>,
+}
+
 impl DockerClient {
     pub fn new(image: impl Into<String>) -> Self {
         Self {
@@ -532,43 +544,35 @@ impl DockerClient {
         })
     }
 
-    pub async fn run_sidecar_shell_env(
-        &self,
-        name: &str,
-        image: &str,
-        command: &str,
-        cwd: Option<&str>,
-        timeout_secs: Option<u64>,
-        env: &[(String, String)],
-        workspace_volume: Option<&str>,
-    ) -> Result<ExecOutput> {
-        let image = validate_image(image)?;
-        let shell_command = match timeout_secs {
+    pub async fn run_sidecar_shell_env(&self, params: &SidecarParams<'_>) -> Result<ExecOutput> {
+        let image = validate_image(params.image)?;
+        let shell_command = match params.timeout_secs {
             Some(seconds) if seconds > 0 => {
                 format!(
                     "timeout --preserve-status {seconds}s /bin/sh -lc {}",
-                    shell_quote(command)
+                    shell_quote(params.command)
                 )
             }
-            _ => command.to_string(),
+            _ => params.command.to_string(),
         };
         let mut cmd = Command::new(&self.binary);
         cmd.arg("run")
             .arg("--rm")
-            .args(["--name", name])
+            .args(["--name", params.name])
             .args(["--label", MANAGED_LABEL]);
-        if let Some(volume) = workspace_volume {
+        if let Some(volume) = params.workspace_volume {
             let mount = format!("{volume}:/workspace");
             cmd.args(["-v", &mount]);
         }
-        if let Some(cwd) = cwd {
+        if let Some(cwd) = params.cwd {
             cmd.args(["-w", cwd]);
         }
-        for (key, value) in env {
+        for (key, value) in params.env {
             cmd.arg("-e").arg(key);
             cmd.env(key, value);
         }
-        cmd.arg(image).args(["/bin/sh", "-lc", &shell_command]);
+        cmd.arg(image)
+            .args(["/bin/sh", "-lc", &shell_command]);
 
         let output = cmd.output().await?;
         Ok(ExecOutput {
@@ -602,34 +606,25 @@ impl DockerClient {
         Ok(cmd.spawn()?)
     }
 
-    pub fn spawn_sidecar(
-        &self,
-        name: &str,
-        image: &str,
-        command: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        env: &[(String, String)],
-        workspace_volume: Option<&str>,
-    ) -> Result<Child> {
-        let image = validate_image(image)?;
+    pub fn spawn_sidecar(&self, params: &SidecarParams<'_>) -> Result<Child> {
+        let image = validate_image(params.image)?;
         let mut cmd = Command::new(&self.binary);
         cmd.arg("run")
             .arg("--rm")
             .arg("-i")
-            .args(["--name", name])
+            .args(["--name", params.name])
             .args(["--label", MANAGED_LABEL]);
-        if let Some(volume) = workspace_volume {
+        if let Some(volume) = params.workspace_volume {
             cmd.args(["-v", &format!("{volume}:/workspace")]);
         }
-        if let Some(cwd) = cwd {
+        if let Some(cwd) = params.cwd {
             cmd.args(["-w", cwd]);
         }
-        for (key, value) in env {
+        for (key, value) in params.env {
             cmd.arg("-e").arg(key);
             cmd.env(key, value);
         }
-        cmd.arg(image).arg(command).args(args);
+        cmd.arg(image).arg(params.command).args(params.args);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

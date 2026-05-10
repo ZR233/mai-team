@@ -22,8 +22,10 @@ export function useApi() {
       const text = await response.text()
       throw new Error(readError(text))
     }
-    if (response.status === 204) return null
-    return response.json()
+    if (response.status === 204 || response.status === 205) return null
+    const text = await response.text()
+    if (!text.trim()) return null
+    return JSON.parse(text)
   }
 
   function showToast(message) {
