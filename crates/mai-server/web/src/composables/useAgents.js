@@ -8,6 +8,7 @@ const selectedDetail = ref(null)
 const selectedSessionId = ref(null)
 const isLoading = ref(false)
 const isSending = ref(false)
+const isStopping = ref(false)
 const isDetailLoading = ref(false)
 const conversationRef = ref(null)
 
@@ -124,6 +125,20 @@ export function useAgents() {
     await refreshDetail()
   }
 
+  async function stopAgentTurn(agent = selectedDetail.value) {
+    const agentId = agent?.id || selectedAgentId.value
+    const turnId = agent?.current_turn || selectedDetail.value?.current_turn
+    if (!agentId || !turnId) return null
+    isStopping.value = true
+    try {
+      await api(`/agents/${agentId}/turns/${turnId}/cancel`, { method: 'POST' })
+      await refreshAgents()
+      await refreshDetail()
+    } finally {
+      isStopping.value = false
+    }
+  }
+
   async function deleteAgent(id) {
     const deletedIds = descendantIds(id, agents.value)
     deletedIds.add(id)
@@ -153,6 +168,7 @@ export function useAgents() {
     selectedDetail,
     isLoading,
     isSending,
+    isStopping,
     isDetailLoading,
     conversationRef,
     agentDialog,
@@ -165,6 +181,7 @@ export function useAgents() {
     updateAgent,
     sendMessage,
     cancelAgent,
+    stopAgentTurn,
     deleteAgent,
     scrollToBottom,
     scrollConversationToBottom,

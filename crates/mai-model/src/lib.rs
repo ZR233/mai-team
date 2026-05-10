@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::Duration;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Error)]
 pub enum ModelError {
@@ -25,6 +26,8 @@ pub enum ModelError {
     },
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("request cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, ModelError>;
@@ -153,6 +156,29 @@ impl ResponsesClient {
                 )
                 .await
             }
+        }
+    }
+
+    pub async fn create_response_with_cancel(
+        &self,
+        provider: &ProviderSecret,
+        model: &ModelConfig,
+        instructions: &str,
+        input: &[ModelInputItem],
+        tools: &[ToolDefinition],
+        reasoning_effort: Option<String>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<ModelResponse> {
+        tokio::select! {
+            response = self.create_response(
+                provider,
+                model,
+                instructions,
+                input,
+                tools,
+                reasoning_effort,
+            ) => response,
+            _ = cancellation_token.cancelled() => Err(ModelError::Cancelled),
         }
     }
 

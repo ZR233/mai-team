@@ -10,6 +10,7 @@ const selectedProjectDetail = ref(null)
 const isProjectsLoading = ref(false)
 const isProjectDetailLoading = ref(false)
 const isProjectSending = ref(false)
+const isProjectStopping = ref(false)
 const projectConversationRef = ref(null)
 const projectSkillsState = reactive({
   projectId: null,
@@ -214,6 +215,20 @@ export function useProjects() {
     await refreshProjectDetail()
   }
 
+  async function stopProjectAgentTurn(agent = selectedProjectDetail.value?.maintainer_agent) {
+    const agentId = agent?.id || selectedProjectAgentId.value
+    const turnId = agent?.current_turn || selectedProjectDetail.value?.maintainer_agent?.current_turn
+    if (!agentId || !turnId) return null
+    isProjectStopping.value = true
+    try {
+      await api(`/agents/${agentId}/turns/${turnId}/cancel`, { method: 'POST' })
+      await refreshProjects()
+      await refreshProjectDetail()
+    } finally {
+      isProjectStopping.value = false
+    }
+  }
+
   async function createProjectSession() {
     const agentId = selectedProjectDetail.value?.maintainer_agent?.id || selectedProjectAgentId.value
     if (!agentId) return null
@@ -300,6 +315,7 @@ export function useProjects() {
     isProjectsLoading,
     isProjectDetailLoading,
     isProjectSending,
+    isProjectStopping,
     projectConversationRef,
     projectSkillsState,
     projectDialog,
@@ -317,6 +333,7 @@ export function useProjects() {
     ensureProjectSkillsLoaded,
     cancelProject,
     cancelProjectAgent,
+    stopProjectAgentTurn,
     createProjectSession,
     updateProjectAgent,
     loadGitAccountRepositories,

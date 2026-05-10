@@ -5,6 +5,7 @@ use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::process::{Child, Command};
+use tokio_util::sync::CancellationToken;
 
 const MANAGED_LABEL: &str = "mai.team.managed=true";
 const AGENT_LABEL_KEY: &str = "mai.team.agent";
@@ -27,6 +28,8 @@ pub enum DockerError {
     Json(#[from] serde_json::Error),
     #[error("invalid docker image: {0}")]
     InvalidImage(String),
+    #[error("docker command cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, DockerError>;
@@ -454,6 +457,45 @@ impl DockerClient {
         timeout_secs: Option<u64>,
         env: &[(String, String)],
     ) -> Result<ExecOutput> {
+        self.exec_shell_env_with_cancel(
+            container_id,
+            command,
+            cwd,
+            timeout_secs,
+            env,
+            &CancellationToken::new(),
+        )
+        .await
+    }
+
+    pub async fn exec_shell_with_cancel(
+        &self,
+        container_id: &str,
+        command: &str,
+        cwd: Option<&str>,
+        timeout_secs: Option<u64>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<ExecOutput> {
+        self.exec_shell_env_with_cancel(
+            container_id,
+            command,
+            cwd,
+            timeout_secs,
+            &[],
+            cancellation_token,
+        )
+        .await
+    }
+
+    pub async fn exec_shell_env_with_cancel(
+        &self,
+        container_id: &str,
+        command: &str,
+        cwd: Option<&str>,
+        timeout_secs: Option<u64>,
+        env: &[(String, String)],
+        cancellation_token: &CancellationToken,
+    ) -> Result<ExecOutput> {
         let shell_command = match timeout_secs {
             Some(seconds) if seconds > 0 => {
                 format!(
@@ -474,7 +516,15 @@ impl DockerClient {
         }
         cmd.args([container_id, "/bin/sh", "-lc", &shell_command]);
 
-        let output = cmd.output().await?;
+        cmd.kill_on_drop(true);
+        let output = cmd.output();
+        tokio::pin!(output);
+        let output = tokio::select! {
+            output = &mut output => output?,
+            _ = cancellation_token.cancelled() => {
+                return Err(DockerError::Cancelled);
+            }
+        };
         Ok(ExecOutput {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8(output.stdout)?,

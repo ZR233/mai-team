@@ -39,6 +39,7 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = "0.7"
 toml = "1"
 toasty = { version = "0.5.0", features = ["sqlite"] }
 toasty-driver-sqlite = "0.5.0"

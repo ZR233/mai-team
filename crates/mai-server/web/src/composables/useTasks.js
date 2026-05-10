@@ -8,6 +8,7 @@ const selectedAgentId = ref(null)
 const selectedTaskDetail = ref(null)
 const isLoading = ref(false)
 const isSending = ref(false)
+const isStopping = ref(false)
 const isDetailLoading = ref(false)
 const isApprovingPlan = ref(false)
 const conversationRef = ref(null)
@@ -135,6 +136,20 @@ export function useTasks() {
     await refreshDetail()
   }
 
+  async function stopTaskAgentTurn(agent = selectedTaskDetail.value?.selected_agent) {
+    const agentId = agent?.id || selectedAgentId.value
+    const turnId = agent?.current_turn || selectedTaskDetail.value?.selected_agent?.current_turn
+    if (!agentId || !turnId) return null
+    isStopping.value = true
+    try {
+      await api(`/agents/${agentId}/turns/${turnId}/cancel`, { method: 'POST' })
+      await refreshTasks()
+      await refreshDetail()
+    } finally {
+      isStopping.value = false
+    }
+  }
+
   async function deleteTask(id) {
     await api(`/tasks/${id}`, { method: 'DELETE' })
     if (selectedTaskId.value === id) {
@@ -182,6 +197,7 @@ export function useTasks() {
     selectedTaskDetail,
     isLoading,
     isSending,
+    isStopping,
     isDetailLoading,
     isApprovingPlan,
     conversationRef,
@@ -197,6 +213,7 @@ export function useTasks() {
     requestPlanRevision,
     cancelTask,
     cancelTaskAgent,
+    stopTaskAgentTurn,
     deleteTask,
     updateAgent,
     scrollConversationToBottom,

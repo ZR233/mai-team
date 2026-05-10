@@ -108,6 +108,7 @@
           :draft="draft"
           :loading="loading"
           :sending="sending"
+          :stopping="stopping"
           :providers="providers"
           :skills="skills"
           :selected-skills="selectedSkills"
@@ -120,6 +121,7 @@
           @cancel="$emit('cancel-agent', $event)"
           @delete="(...args) => $emit('delete-agent', ...args)"
           @send="$emit('send', $event)"
+          @stop="$emit('stop', $event)"
           @update-model="$emit('update-model', $event)"
           @update:draft="$emit('update:draft', $event)"
           @update:selected-skills="$emit('update:selectedSkills', $event)"
@@ -328,6 +330,7 @@ const props = defineProps({
   draft: { type: String, default: '' },
   loading: { type: Boolean, default: false },
   sending: { type: Boolean, default: false },
+  stopping: { type: Boolean, default: false },
   updatingModel: { type: Boolean, default: false },
   providers: { type: Array, default: () => [] },
   skills: { type: Array, default: () => [] },
@@ -348,6 +351,7 @@ defineEmits([
   'delete-project',
   'delete-agent',
   'send',
+  'stop',
   'update-model',
   'update:draft',
   'update:selectedSkills',

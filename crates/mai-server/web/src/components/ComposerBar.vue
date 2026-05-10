@@ -62,9 +62,19 @@
           </button>
         </div>
       </div>
-      <button class="primary-button" type="submit" :disabled="!draft.trim() || sending">
+      <button class="primary-button" type="submit" :disabled="!draft.trim() || sending || stoppable">
         <span v-if="sending" class="spinner-sm"></span>
         <template v-else>Send</template>
+      </button>
+      <button
+        v-if="stoppable"
+        class="danger-button"
+        type="button"
+        :disabled="stopping"
+        @click="$emit('stop')"
+      >
+        <span v-if="stopping" class="spinner-sm"></span>
+        <template v-else>Stop</template>
       </button>
     </div>
   </form>
@@ -79,10 +89,12 @@ const props = defineProps({
   skills: { type: Array, default: () => [] },
   selectedSkills: { type: Array, default: () => [] },
   skillsLoading: { type: Boolean, default: false },
-  skillsError: { type: String, default: '' }
+  skillsError: { type: String, default: '' },
+  stoppable: { type: Boolean, default: false },
+  stopping: { type: Boolean, default: false }
 })
 
-const emit = defineEmits(['send', 'update:draft', 'update:selectedSkills', 'load-skills'])
+const emit = defineEmits(['send', 'update:draft', 'update:selectedSkills', 'load-skills', 'stop'])
 
 const pickerOpen = ref(false)
 const query = ref('')

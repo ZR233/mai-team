@@ -48,6 +48,7 @@
         :draft="projectMessageDraft"
         :loading="isProjectDetailLoading"
         :sending="isProjectSending"
+        :stopping="isProjectStopping"
         :providers="providersState.providers"
         :skills="projectComposerSkills"
         :selected-skills="selectedProjectSkills"
@@ -61,6 +62,7 @@
         @cancel-agent="onCancelProjectAgent"
         @delete-agent="confirmDeleteProjectAgent"
         @send="onSendProjectMessage"
+        @stop="onStopProjectAgentTurn"
         @update-model="onUpdateProjectAgentModel"
         @update:draft="projectMessageDraft = $event"
         @update:selected-skills="selectedProjectSkills = $event"
@@ -85,6 +87,7 @@
           :draft="messageDraft"
           :loading="isDetailLoading"
           :sending="isSending"
+          :stopping="isStopping"
           :approving-plan="isApprovingPlan"
           :providers="providersState.providers"
           :skills="enabledSkills"
@@ -100,6 +103,7 @@
           @delete="confirmDeleteTask"
           @delete-agent="confirmDeleteTaskAgent"
           @send="onSendMessage"
+          @stop="onStopTaskAgentTurn"
           @update-model="onUpdateAgentModel"
           @update:draft="messageDraft = $event"
           @update:selected-skills="selectedSkills = $event"
@@ -221,6 +225,7 @@ const {
   selectedTaskDetail,
   isLoading,
   isSending,
+  isStopping,
   isDetailLoading,
   isApprovingPlan,
   conversationRef,
@@ -236,6 +241,7 @@ const {
   requestPlanRevision,
   cancelTask,
   cancelTaskAgent,
+  stopTaskAgentTurn,
   deleteTask,
   updateAgent,
   scrollConversationToBottom
@@ -246,6 +252,7 @@ const {
   selectedProjectDetail,
   isProjectsLoading,
   isProjectSending,
+  isProjectStopping,
   isProjectDetailLoading,
   projectConversationRef,
   projectSkillsState,
@@ -261,6 +268,7 @@ const {
   detectProjectSkills,
   ensureProjectSkillsLoaded,
   cancelProjectAgent,
+  stopProjectAgentTurn,
   createProjectSession,
   updateProjectAgent,
   loadGitAccountRepositories,
@@ -556,9 +564,25 @@ async function onCancelSelectedAgent(id) {
   }
 }
 
+async function onStopTaskAgentTurn(agent) {
+  try {
+    await stopTaskAgentTurn(agent)
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
 async function onCancelProjectAgent(id) {
   try {
     await cancelProjectAgent(id)
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onStopProjectAgentTurn(agent) {
+  try {
+    await stopProjectAgentTurn(agent)
   } catch (error) {
     showToast(error.message)
   }

@@ -1272,6 +1272,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -1300,6 +1301,8 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -1319,6 +1322,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "chrono",
+ "futures",
  "jsonwebtoken",
  "mai-docker",
  "mai-mcp",
@@ -1333,6 +1337,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

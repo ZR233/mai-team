@@ -1,6 +1,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, TimeDelta, Utc};
+use futures::future::{AbortHandle, Abortable};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use mai_docker::{ContainerHandle, DockerClient};
 use mai_mcp::{McpAgentManager, McpTool};
@@ -35,12 +36,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use tempfile::{NamedTempFile, tempdir};
 use thiserror::Error;
 use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::time::{Duration, Instant, sleep};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const MAX_TOOL_ITERATIONS: usize = 16;
@@ -75,6 +77,7 @@ Include:
 - Any critical data, examples, file paths, command outputs, or references needed to continue
 
 Be concise, structured, and focused on helping the next model seamlessly continue the work."#;
+const TURN_CANCEL_GRACE: Duration = Duration::from_millis(500);
 const AGENT_ROLES: [AgentRole; 4] = [
     AgentRole::Planner,
     AgentRole::Explorer,
@@ -105,6 +108,10 @@ pub enum RuntimeError {
     },
     #[error("tool trace not found: {agent_id}/{call_id}")]
     ToolTraceNotFound { agent_id: AgentId, call_id: String },
+    #[error("turn not found: {agent_id}/{turn_id}")]
+    TurnNotFound { agent_id: AgentId, turn_id: TurnId },
+    #[error("turn cancelled")]
+    TurnCancelled,
     #[error("docker error: {0}")]
     Docker(#[from] mai_docker::DockerError),
     #[error("model error: {0}")]
@@ -178,7 +185,22 @@ struct AgentRecord {
     system_prompt: Option<String>,
     turn_lock: Mutex<()>,
     cancel_requested: AtomicBool,
+    active_turn: StdMutex<Option<TurnControl>>,
     pending_inputs: Mutex<VecDeque<QueuedAgentInput>>,
+}
+
+#[derive(Clone)]
+struct TurnControl {
+    turn_id: TurnId,
+    session_id: SessionId,
+    cancellation_token: CancellationToken,
+    abort_handle: Option<AbortHandle>,
+}
+
+#[derive(Clone)]
+struct TurnGuard {
+    turn_id: TurnId,
+    cancellation_token: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -398,6 +420,7 @@ impl AgentRuntime {
                 system_prompt: persisted.system_prompt,
                 turn_lock: Mutex::new(()),
                 cancel_requested: AtomicBool::new(false),
+                active_turn: StdMutex::new(None),
                 pending_inputs: Mutex::new(VecDeque::new()),
             });
             if changed {
@@ -1449,13 +1472,18 @@ impl AgentRuntime {
         Ok(())
     }
 
-    pub async fn cancel_project(&self, project_id: ProjectId) -> Result<()> {
+    pub async fn cancel_project(self: &Arc<Self>, project_id: ProjectId) -> Result<()> {
         let project = self.project(project_id).await?;
         let agents = self.project_agents(project_id).await;
         for agent in agents {
             if let Ok(record) = self.agent(agent.id).await {
-                record.cancel_requested.store(true, Ordering::SeqCst);
-                let _ = self.set_status(&record, AgentStatus::Cancelled, None).await;
+                let current_turn = record.summary.read().await.current_turn;
+                if let Some(turn_id) = current_turn {
+                    let _ = self.cancel_agent_turn(agent.id, turn_id).await;
+                } else {
+                    record.cancel_requested.store(true, Ordering::SeqCst);
+                    let _ = self.set_status(&record, AgentStatus::Cancelled, None).await;
+                }
             }
         }
         let updated = {
@@ -1650,7 +1678,7 @@ impl AgentRuntime {
             .await?;
 
         match self
-            .ensure_agent_container_with_source(&agent, AgentStatus::Idle, &container_source)
+            .ensure_agent_container_with_source(&agent, AgentStatus::Idle, &container_source, None)
             .await
         {
             Ok(_) => Ok(agent.summary.read().await.clone()),
@@ -1736,6 +1764,7 @@ impl AgentRuntime {
             system_prompt,
             turn_lock: Mutex::new(()),
             cancel_requested: AtomicBool::new(false),
+            active_turn: StdMutex::new(None),
             pending_inputs: Mutex::new(VecDeque::new()),
         });
 
@@ -1988,12 +2017,19 @@ impl AgentRuntime {
         skill_mentions: Vec<String>,
     ) -> Result<TurnId> {
         let session_id = self.resolve_session_id(agent_id, session_id).await?;
-        let turn_id = self.prepare_turn(agent_id).await?;
-        self.spawn_turn(agent_id, session_id, turn_id, message, skill_mentions);
+        let (agent, turn_id) = self.prepare_turn(agent_id).await?;
+        self.spawn_turn(
+            &agent,
+            agent_id,
+            session_id,
+            turn_id,
+            message,
+            skill_mentions,
+        );
         Ok(turn_id)
     }
 
-    async fn prepare_turn(&self, agent_id: AgentId) -> Result<TurnId> {
+    async fn prepare_turn(&self, agent_id: AgentId) -> Result<(Arc<AgentRecord>, TurnId)> {
         let agent = self.agent(agent_id).await?;
         let turn_id = Uuid::new_v4();
         let should_start = {
@@ -2018,11 +2054,12 @@ impl AgentRuntime {
             status: AgentStatus::RunningTurn,
         })
         .await;
-        Ok(turn_id)
+        Ok((agent, turn_id))
     }
 
     fn spawn_turn(
         self: &Arc<Self>,
+        agent: &Arc<AgentRecord>,
         agent_id: AgentId,
         session_id: SessionId,
         turn_id: TurnId,
@@ -2030,18 +2067,81 @@ impl AgentRuntime {
         skill_mentions: Vec<String>,
     ) {
         let runtime = Arc::clone(self);
-        tokio::spawn(async move {
-            runtime
-                .run_turn(agent_id, session_id, turn_id, message, skill_mentions)
-                .await;
-        });
+        let cancellation_token = CancellationToken::new();
+        let task_token = cancellation_token.clone();
+        let (abort_handle, abort_registration) = AbortHandle::new_pair();
+        let control = TurnControl {
+            turn_id,
+            session_id,
+            cancellation_token,
+            abort_handle: Some(abort_handle),
+        };
+        *agent.active_turn.lock().expect("active turn lock") = Some(control);
+        tokio::spawn(Abortable::new(
+            async move {
+                runtime
+                    .run_turn(
+                        agent_id,
+                        session_id,
+                        turn_id,
+                        message,
+                        skill_mentions,
+                        task_token,
+                    )
+                    .await;
+            },
+            abort_registration,
+        ));
     }
 
-    pub async fn cancel_agent(&self, agent_id: AgentId) -> Result<()> {
+    pub async fn cancel_agent(self: &Arc<Self>, agent_id: AgentId) -> Result<()> {
         let agent = self.agent(agent_id).await?;
+        let turn_id = agent.summary.read().await.current_turn;
+        match turn_id {
+            Some(turn_id) => self.cancel_agent_turn(agent_id, turn_id).await,
+            None => {
+                agent.cancel_requested.store(true, Ordering::SeqCst);
+                self.set_status(&agent, AgentStatus::Cancelled, None).await
+            }
+        }
+    }
+
+    pub async fn cancel_agent_turn(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        turn_id: TurnId,
+    ) -> Result<()> {
+        let agent = self.agent(agent_id).await?;
+        let control = agent.active_turn.lock().expect("active turn lock").clone();
+        let current_turn = agent.summary.read().await.current_turn;
+        if current_turn != Some(turn_id)
+            && control.as_ref().map(|turn| turn.turn_id) != Some(turn_id)
+        {
+            return Err(RuntimeError::TurnNotFound { agent_id, turn_id });
+        }
         agent.cancel_requested.store(true, Ordering::SeqCst);
-        self.set_status(&agent, AgentStatus::Cancelled, None)
-            .await?;
+        if let Some(control) = control.filter(|turn| turn.turn_id == turn_id) {
+            control.cancellation_token.cancel();
+            if let Some(abort_handle) = control.abort_handle {
+                let token = control.cancellation_token.clone();
+                tokio::spawn(async move {
+                    sleep(TURN_CANCEL_GRACE).await;
+                    if token.is_cancelled() {
+                        abort_handle.abort();
+                    }
+                });
+            }
+        }
+        self.complete_turn_if_current(
+            &agent,
+            agent_id,
+            turn_id,
+            TurnStatus::Cancelled,
+            AgentStatus::Cancelled,
+            None,
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -2111,13 +2211,18 @@ impl AgentRuntime {
         Ok(agent.summary.read().await.clone())
     }
 
-    pub async fn cancel_task(&self, task_id: TaskId) -> Result<()> {
+    pub async fn cancel_task(self: &Arc<Self>, task_id: TaskId) -> Result<()> {
         let task = self.task(task_id).await?;
         let agents = self.task_agents(task_id).await;
         for agent in agents {
             if let Ok(record) = self.agent(agent.id).await {
-                record.cancel_requested.store(true, Ordering::SeqCst);
-                let _ = self.set_status(&record, AgentStatus::Cancelled, None).await;
+                let current_turn = record.summary.read().await.current_turn;
+                if let Some(turn_id) = current_turn {
+                    let _ = self.cancel_agent_turn(agent.id, turn_id).await;
+                } else {
+                    record.cancel_requested.store(true, Ordering::SeqCst);
+                    let _ = self.set_status(&record, AgentStatus::Cancelled, None).await;
+                }
             }
         }
         self.set_task_status(&task, TaskStatus::Cancelled, None, None)
@@ -2149,6 +2254,12 @@ impl AgentRuntime {
         agent.cancel_requested.store(true, Ordering::SeqCst);
         self.set_status(&agent, AgentStatus::DeletingContainer, None)
             .await?;
+        if let Some(control) = agent.active_turn.lock().expect("active turn lock").clone() {
+            control.cancellation_token.cancel();
+            if let Some(abort_handle) = control.abort_handle {
+                abort_handle.abort();
+            }
+        }
         let project_id = agent.summary.read().await.project_id;
         if let Some(manager) = agent.mcp.write().await.take() {
             manager.shutdown().await;
@@ -2293,42 +2404,57 @@ impl AgentRuntime {
         turn_id: TurnId,
         message: String,
         skill_mentions: Vec<String>,
+        cancellation_token: CancellationToken,
     ) {
         let result = self
-            .run_turn_inner(agent_id, session_id, turn_id, message, skill_mentions)
+            .run_turn_inner(
+                agent_id,
+                session_id,
+                turn_id,
+                message,
+                skill_mentions,
+                cancellation_token,
+            )
             .await;
         if let Err(err) = result
             && let Ok(agent) = self.agent(agent_id).await
         {
-            {
-                let mut summary = agent.summary.write().await;
-                summary.status = AgentStatus::Failed;
-                summary.current_turn = None;
-                summary.updated_at = now();
-                summary.last_error = Some(err.to_string());
+            if matches!(err, RuntimeError::TurnCancelled) {
+                let _ = self
+                    .complete_turn_if_current(
+                        &agent,
+                        agent_id,
+                        turn_id,
+                        TurnStatus::Cancelled,
+                        AgentStatus::Cancelled,
+                        None,
+                        None,
+                    )
+                    .await;
+                return;
             }
-            if let Err(store_err) = self.persist_agent(&agent).await {
-                tracing::warn!("failed to persist failed turn state: {store_err}");
+            let message = err.to_string();
+            let completed = self
+                .complete_turn_if_current(
+                    &agent,
+                    agent_id,
+                    turn_id,
+                    TurnStatus::Failed,
+                    AgentStatus::Failed,
+                    None,
+                    Some(message.clone()),
+                )
+                .await
+                .unwrap_or(false);
+            if completed {
+                self.publish(ServiceEventKind::Error {
+                    agent_id: Some(agent_id),
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    message,
+                })
+                .await;
             }
-            self.publish(ServiceEventKind::Error {
-                agent_id: Some(agent_id),
-                session_id: Some(session_id),
-                turn_id: Some(turn_id),
-                message: err.to_string(),
-            })
-            .await;
-            self.publish(ServiceEventKind::TurnCompleted {
-                agent_id,
-                session_id: Some(session_id),
-                turn_id,
-                status: TurnStatus::Failed,
-            })
-            .await;
-            self.publish(ServiceEventKind::AgentStatusChanged {
-                agent_id,
-                status: AgentStatus::Failed,
-            })
-            .await;
         }
     }
 
@@ -2339,11 +2465,24 @@ impl AgentRuntime {
         turn_id: TurnId,
         message: String,
         mut skill_mentions: Vec<String>,
+        cancellation_token: CancellationToken,
     ) -> Result<()> {
         let agent = self.agent(agent_id).await?;
         let _turn_guard = agent.turn_lock.lock().await;
-        self.ensure_agent_container(&agent, AgentStatus::RunningTurn)
-            .await?;
+        let enforce_current_turn = agent.summary.read().await.current_turn == Some(turn_id);
+        if cancellation_token.is_cancelled() {
+            return Err(RuntimeError::TurnCancelled);
+        }
+        self.ensure_agent_container_for_turn(
+            &agent,
+            AgentStatus::RunningTurn,
+            turn_id,
+            &cancellation_token,
+        )
+        .await?;
+        if cancellation_token.is_cancelled() {
+            return Err(RuntimeError::TurnCancelled);
+        }
         self.publish(ServiceEventKind::TurnStarted {
             agent_id,
             session_id: Some(session_id),
@@ -2353,9 +2492,12 @@ impl AgentRuntime {
 
         skill_mentions.extend(extract_skill_mentions(&message));
         if let Err(err) = self
-            .maybe_auto_compact(&agent, agent_id, session_id, turn_id)
+            .maybe_auto_compact(&agent, agent_id, session_id, turn_id, &cancellation_token)
             .await
         {
+            if matches!(err, RuntimeError::TurnCancelled) {
+                return Err(err);
+            }
             tracing::warn!("auto context compaction failed before user message: {err}");
         }
         self.record_message(
@@ -2394,26 +2536,21 @@ impl AgentRuntime {
             })
             .await;
         }
-        self.inject_project_mcp_tools(&agent, agent_id, session_id)
+        self.inject_project_mcp_tools(&agent, agent_id, session_id, &cancellation_token)
             .await?;
         let mut last_assistant_text: Option<String> = None;
         for iteration in 0..MAX_TOOL_ITERATIONS {
-            if agent.cancel_requested.load(Ordering::SeqCst) {
-                self.finish_turn(
-                    &agent,
-                    agent_id,
-                    session_id,
-                    turn_id,
-                    TurnStatus::Cancelled,
-                    AgentStatus::Cancelled,
-                    None,
-                )
-                .await?;
-                return Ok(());
+            if cancellation_token.is_cancelled() {
+                return Err(RuntimeError::TurnCancelled);
             }
-
-            self.set_status(&agent, AgentStatus::RunningTurn, None)
-                .await?;
+            self.set_turn_status(
+                &agent,
+                turn_id,
+                &cancellation_token,
+                enforce_current_turn,
+                AgentStatus::RunningTurn,
+            )
+            .await?;
             let mcp_tools = self.agent_mcp_tools(&agent).await;
             let tools = build_tool_definitions(&mcp_tools);
             let instructions = self
@@ -2434,9 +2571,12 @@ impl AgentRuntime {
                 .resolve_provider(Some(&provider_id), Some(&model_name))
                 .await?;
             if let Err(err) = self
-                .maybe_auto_compact(&agent, agent_id, session_id, turn_id)
+                .maybe_auto_compact(&agent, agent_id, session_id, turn_id, &cancellation_token)
                 .await
             {
+                if matches!(err, RuntimeError::TurnCancelled) {
+                    return Err(err);
+                }
                 tracing::warn!("auto context compaction failed before model request: {err}");
             }
             let mut history = self.session_history(&agent, agent_id, session_id).await?;
@@ -2445,15 +2585,23 @@ impl AgentRuntime {
             }
             let response = self
                 .model
-                .create_response(
+                .create_response_with_cancel(
                     &provider_selection.provider,
                     &provider_selection.model,
                     &instructions,
                     &history,
                     &tools,
                     reasoning_effort,
+                    &cancellation_token,
                 )
-                .await?;
+                .await
+                .map_err(|err| {
+                    if matches!(err, mai_model::ModelError::Cancelled) {
+                        RuntimeError::TurnCancelled
+                    } else {
+                        RuntimeError::Model(err)
+                    }
+                })?;
 
             if let Some(usage) = response.usage {
                 {
@@ -2613,10 +2761,19 @@ impl AgentRuntime {
                 return Ok(());
             }
 
-            self.set_status(&agent, AgentStatus::WaitingTool, None)
-                .await?;
+            self.set_turn_status(
+                &agent,
+                turn_id,
+                &cancellation_token,
+                enforce_current_turn,
+                AgentStatus::WaitingTool,
+            )
+            .await?;
             let mut should_end_turn = false;
             for (call_id, name, arguments) in tool_calls {
+                if cancellation_token.is_cancelled() {
+                    return Err(RuntimeError::TurnCancelled);
+                }
                 let arguments_preview = trace_preview_value(&arguments, 500);
                 let inline_arguments = inline_event_arguments(&arguments);
                 self.publish(ServiceEventKind::ToolStarted {
@@ -2631,7 +2788,14 @@ impl AgentRuntime {
                 .await;
                 let started_at = Instant::now();
                 let output = self
-                    .execute_tool(&agent, agent_id, turn_id, &name, arguments)
+                    .execute_tool(
+                        &agent,
+                        agent_id,
+                        turn_id,
+                        &name,
+                        arguments,
+                        cancellation_token.clone(),
+                    )
                     .await;
                 let duration_ms = u128_to_u64(started_at.elapsed().as_millis());
                 let execution = match output {
@@ -2666,6 +2830,9 @@ impl AgentRuntime {
                     duration_ms: Some(duration_ms),
                 })
                 .await;
+                if cancellation_token.is_cancelled() {
+                    return Err(RuntimeError::TurnCancelled);
+                }
             }
 
             if should_end_turn {
@@ -2699,7 +2866,11 @@ impl AgentRuntime {
         _turn_id: TurnId,
         name: &str,
         arguments: Value,
+        cancellation_token: CancellationToken,
     ) -> Result<ToolExecution> {
+        if cancellation_token.is_cancelled() {
+            return Err(RuntimeError::TurnCancelled);
+        }
         match route_tool(name) {
             RoutedTool::ContainerExec => {
                 let command = required_string(&arguments, "command")?;
@@ -2708,7 +2879,13 @@ impl AgentRuntime {
                 let container_id = self.container_id(agent_id).await?;
                 let output = self
                     .docker
-                    .exec_shell(&container_id, &command, cwd.as_deref(), timeout)
+                    .exec_shell_with_cancel(
+                        &container_id,
+                        &command,
+                        cwd.as_deref(),
+                        timeout,
+                        &cancellation_token,
+                    )
                     .await?;
                 Ok(ToolExecution {
                     success: output.status == 0,
@@ -2810,8 +2987,8 @@ impl AgentRuntime {
                 }
                 let turn_id = if let Some(message) = message {
                     let session_id = self.resolve_session_id(created.id, None).await?;
-                    let turn_id = self.prepare_turn(created.id).await?;
-                    self.spawn_turn(created.id, session_id, turn_id, message, Vec::new());
+                    let (agent, turn_id) = self.prepare_turn(created.id).await?;
+                    self.spawn_turn(&agent, created.id, session_id, turn_id, message, Vec::new());
                     Some(turn_id)
                 } else {
                     None
@@ -2865,7 +3042,9 @@ impl AgentRuntime {
                 let targets = wait_targets(&arguments)?;
                 let timeout = wait_timeout(&arguments);
                 if legacy_single_target && targets.len() == 1 {
-                    let output = self.wait_agent_output(targets[0], timeout).await?;
+                    let output = self
+                        .wait_agent_output_with_cancel(targets[0], timeout, &cancellation_token)
+                        .await?;
                     self.cleanup_finished_explorer_agent(targets[0]).await?;
                     return Ok(ToolExecution {
                         success: true,
@@ -2873,7 +3052,9 @@ impl AgentRuntime {
                         ends_turn: false,
                     });
                 }
-                let output = self.wait_agents_output(targets, timeout).await?;
+                let output = self
+                    .wait_agents_output_with_cancel(targets, timeout, &cancellation_token)
+                    .await?;
                 Ok(ToolExecution {
                     success: true,
                     output: serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string()),
@@ -3077,13 +3258,23 @@ impl AgentRuntime {
             RoutedTool::Mcp(model_name) => {
                 if agent.summary.read().await.project_id.is_some() {
                     return self
-                        .execute_project_mcp_tool(&agent, &model_name, arguments)
+                        .execute_project_mcp_tool(
+                            &agent,
+                            &model_name,
+                            arguments,
+                            cancellation_token,
+                        )
                         .await;
                 }
                 let manager = agent.mcp.read().await.clone().ok_or_else(|| {
                     RuntimeError::InvalidInput("MCP manager not initialized".to_string())
                 })?;
-                let output = manager.call_model_tool(&model_name, arguments).await?;
+                let output = tokio::select! {
+                    output = manager.call_model_tool(&model_name, arguments) => output?,
+                    _ = cancellation_token.cancelled() => {
+                        return Err(RuntimeError::TurnCancelled);
+                    }
+                };
                 Ok(ToolExecution {
                     success: true,
                     output: output.to_string(),
@@ -3384,8 +3575,8 @@ impl AgentRuntime {
         message: String,
     ) -> Result<TurnId> {
         let session_id = self.resolve_session_id(agent_id, None).await?;
-        let turn_id = self.prepare_turn(agent_id).await?;
-        self.spawn_turn(agent_id, session_id, turn_id, message, Vec::new());
+        let (agent, turn_id) = self.prepare_turn(agent_id).await?;
+        self.spawn_turn(&agent, agent_id, session_id, turn_id, message, Vec::new());
         Ok(turn_id)
     }
 
@@ -3397,13 +3588,33 @@ impl AgentRuntime {
         arguments: Value,
     ) -> Result<ToolExecution> {
         let agent = self.agent(agent_id).await?;
-        self.execute_tool(&agent, agent_id, Uuid::new_v4(), name, arguments)
-            .await
+        self.execute_tool(
+            &agent,
+            agent_id,
+            Uuid::new_v4(),
+            name,
+            arguments,
+            CancellationToken::new(),
+        )
+        .await
     }
 
     async fn wait_agent(&self, agent_id: AgentId, timeout: Duration) -> Result<AgentSummary> {
+        self.wait_agent_with_cancel(agent_id, timeout, &CancellationToken::new())
+            .await
+    }
+
+    async fn wait_agent_with_cancel(
+        &self,
+        agent_id: AgentId,
+        timeout: Duration,
+        cancellation_token: &CancellationToken,
+    ) -> Result<AgentSummary> {
         let deadline = Instant::now() + timeout;
         loop {
+            if cancellation_token.is_cancelled() {
+                return Err(RuntimeError::TurnCancelled);
+            }
             let agent = self.agent(agent_id).await?;
             let summary = agent.summary.read().await.clone();
             if summary.current_turn.is_none()
@@ -3421,12 +3632,22 @@ impl AgentRuntime {
             if Instant::now() >= deadline {
                 return Ok(summary);
             }
-            sleep(Duration::from_millis(250)).await;
+            tokio::select! {
+                _ = sleep(Duration::from_millis(250)) => {},
+                _ = cancellation_token.cancelled() => return Err(RuntimeError::TurnCancelled),
+            }
         }
     }
 
-    async fn wait_agent_output(&self, agent_id: AgentId, timeout: Duration) -> Result<Value> {
-        let agent = self.wait_agent(agent_id, timeout).await?;
+    async fn wait_agent_output_with_cancel(
+        &self,
+        agent_id: AgentId,
+        timeout: Duration,
+        cancellation_token: &CancellationToken,
+    ) -> Result<Value> {
+        let agent = self
+            .wait_agent_with_cancel(agent_id, timeout, cancellation_token)
+            .await?;
         let (session_id, recent_messages) = self.agent_recent_messages(agent_id, 12).await?;
         let tracked_response = {
             let agent_rec = self.agent(agent_id).await?;
@@ -3452,13 +3673,17 @@ impl AgentRuntime {
         }))
     }
 
-    async fn wait_agents_output(
+    async fn wait_agents_output_with_cancel(
         &self,
         agent_ids: Vec<AgentId>,
         timeout: Duration,
+        cancellation_token: &CancellationToken,
     ) -> Result<Value> {
         let deadline = Instant::now() + timeout;
         loop {
+            if cancellation_token.is_cancelled() {
+                return Err(RuntimeError::TurnCancelled);
+            }
             let mut completed = Vec::new();
             let mut pending = Vec::new();
             for agent_id in &agent_ids {
@@ -3482,8 +3707,12 @@ impl AgentRuntime {
                 let mut completed_outputs = Vec::new();
                 for agent_id in completed {
                     completed_outputs.push(
-                        self.wait_agent_output(agent_id, Duration::from_secs(0))
-                            .await?,
+                        self.wait_agent_output_with_cancel(
+                            agent_id,
+                            Duration::from_secs(0),
+                            cancellation_token,
+                        )
+                        .await?,
                     );
                     self.cleanup_finished_explorer_agent(agent_id).await?;
                 }
@@ -3493,7 +3722,10 @@ impl AgentRuntime {
                     "timed_out": !pending.is_empty(),
                 }));
             }
-            sleep(Duration::from_millis(250)).await;
+            tokio::select! {
+                _ = sleep(Duration::from_millis(250)) => {},
+                _ = cancellation_token.cancelled() => return Err(RuntimeError::TurnCancelled),
+            }
         }
     }
 
@@ -3506,19 +3738,20 @@ impl AgentRuntime {
     ) -> Result<Value> {
         let agent = self.agent(target).await?;
         if interrupt {
-            agent.cancel_requested.store(true, Ordering::SeqCst);
-            {
-                let mut summary = agent.summary.write().await;
-                summary.current_turn = None;
-                summary.status = AgentStatus::Cancelled;
-                summary.updated_at = now();
+            let current_turn = agent.summary.read().await.current_turn;
+            if let Some(turn_id) = current_turn {
+                self.cancel_agent_turn(target, turn_id).await?;
+            } else {
+                agent.cancel_requested.store(true, Ordering::SeqCst);
+                self.set_status(&agent, AgentStatus::Cancelled, None)
+                    .await?;
             }
-            self.persist_agent(&agent).await?;
+            self.wait_agent(target, TURN_CANCEL_GRACE).await?;
         }
         match self.prepare_turn(target).await {
-            Ok(turn_id) => {
+            Ok((agent, turn_id)) => {
                 let session_id = self.resolve_session_id(target, session_id).await?;
-                self.spawn_turn(target, session_id, turn_id, message, Vec::new());
+                self.spawn_turn(&agent, target, session_id, turn_id, message, Vec::new());
                 Ok(json!({ "turn_id": turn_id, "queued": false }))
             }
             Err(RuntimeError::AgentBusy(_)) if !interrupt => {
@@ -3542,15 +3775,22 @@ impl AgentRuntime {
             return Ok(());
         };
         let session_id = self.resolve_session_id(agent_id, input.session_id).await?;
-        let turn_id = match self.prepare_turn(agent_id).await {
-            Ok(turn_id) => turn_id,
+        let (agent, turn_id) = match self.prepare_turn(agent_id).await {
+            Ok(turn) => turn,
             Err(RuntimeError::AgentBusy(_)) => {
                 agent.pending_inputs.lock().await.push_front(input);
                 return Ok(());
             }
             Err(err) => return Err(err),
         };
-        self.spawn_turn(agent_id, session_id, turn_id, input.message, Vec::new());
+        self.spawn_turn(
+            &agent,
+            agent_id,
+            session_id,
+            turn_id,
+            input.message,
+            Vec::new(),
+        );
         Ok(())
     }
 
@@ -3672,11 +3912,69 @@ impl AgentRuntime {
         agent_status: AgentStatus,
         final_text: Option<String>,
     ) -> Result<()> {
+        let _ = session_id;
+        self.complete_turn_if_current(
+            agent,
+            agent_id,
+            turn_id,
+            turn_status,
+            agent_status,
+            final_text,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn complete_turn_if_current(
+        self: &Arc<Self>,
+        agent: &Arc<AgentRecord>,
+        agent_id: AgentId,
+        turn_id: TurnId,
+        turn_status: TurnStatus,
+        agent_status: AgentStatus,
+        final_text: Option<String>,
+        error: Option<String>,
+    ) -> Result<bool> {
+        let session_id = {
+            let mut active_turn = agent.active_turn.lock().expect("active turn lock");
+            let active_session_id = active_turn
+                .as_ref()
+                .filter(|turn| turn.turn_id == turn_id)
+                .map(|turn| turn.session_id);
+            if active_session_id.is_some() {
+                *active_turn = None;
+            }
+            active_session_id
+        };
+        let session_id = match session_id {
+            Some(session_id) => session_id,
+            None => {
+                let current_turn = agent.summary.read().await.current_turn;
+                if current_turn != Some(turn_id) {
+                    return Ok(false);
+                }
+                // Legacy in-memory records may not have active_turn populated; keep the turn's selected session.
+                agent
+                    .sessions
+                    .lock()
+                    .await
+                    .first()
+                    .map(|session| session.summary.id)
+                    .ok_or(RuntimeError::TurnNotFound { agent_id, turn_id })?
+            }
+        };
         {
             let mut summary = agent.summary.write().await;
+            if summary.current_turn != Some(turn_id) {
+                return Ok(false);
+            }
             summary.status = agent_status.clone();
             summary.current_turn = None;
             summary.updated_at = now();
+            if let Some(error) = error {
+                summary.last_error = Some(error);
+            }
         }
         {
             let mut sessions = agent.sessions.lock().await;
@@ -3700,7 +3998,7 @@ impl AgentRuntime {
         if let Err(err) = self.start_next_queued_input(agent_id).await {
             tracing::warn!("failed to start queued agent input: {err}");
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn set_status(
@@ -3716,6 +4014,32 @@ impl AgentRuntime {
             if let Some(error) = error {
                 summary.last_error = Some(error);
             }
+            summary.id
+        };
+        self.persist_agent(agent).await?;
+        self.publish(ServiceEventKind::AgentStatusChanged { agent_id, status })
+            .await;
+        Ok(())
+    }
+
+    async fn set_turn_status(
+        &self,
+        agent: &Arc<AgentRecord>,
+        turn_id: TurnId,
+        cancellation_token: &CancellationToken,
+        enforce_current_turn: bool,
+        status: AgentStatus,
+    ) -> Result<()> {
+        if cancellation_token.is_cancelled() {
+            return Err(RuntimeError::TurnCancelled);
+        }
+        let agent_id = {
+            let mut summary = agent.summary.write().await;
+            if enforce_current_turn && summary.current_turn != Some(turn_id) {
+                return Err(RuntimeError::TurnCancelled);
+            }
+            summary.status = status.clone();
+            summary.updated_at = now();
             summary.id
         };
         self.persist_agent(agent).await?;
@@ -3842,7 +4166,11 @@ impl AgentRuntime {
         agent_id: AgentId,
         session_id: SessionId,
         turn_id: TurnId,
+        cancellation_token: &CancellationToken,
     ) -> Result<()> {
+        if cancellation_token.is_cancelled() {
+            return Err(RuntimeError::TurnCancelled);
+        }
         let last_context_tokens = self
             .session_context_tokens(agent, agent_id, session_id)
             .await?;
@@ -3879,15 +4207,27 @@ impl AgentRuntime {
             .await?;
         let response = self
             .model
-            .create_response(
+            .create_response_with_cancel(
                 &provider_selection.provider,
                 &provider_selection.model,
                 &instructions,
                 &compact_input,
                 &[],
                 summary.reasoning_effort,
+                cancellation_token,
             )
-            .await?;
+            .await
+            .map_err(|err| {
+                if matches!(err, mai_model::ModelError::Cancelled) {
+                    RuntimeError::TurnCancelled
+                } else {
+                    RuntimeError::Model(err)
+                }
+            })?;
+
+        if cancellation_token.is_cancelled() {
+            return Err(RuntimeError::TurnCancelled);
+        }
 
         if let Some(usage) = response.usage {
             {
@@ -4184,6 +4524,7 @@ impl AgentRuntime {
                 &maintainer,
                 AgentStatus::Idle,
                 &ContainerSource::FreshImage,
+                None,
             )
             .await?;
             self.set_project_clone_result(
@@ -4399,6 +4740,7 @@ impl AgentRuntime {
         agent: &AgentRecord,
         model_name: &str,
         arguments: Value,
+        cancellation_token: CancellationToken,
     ) -> Result<ToolExecution> {
         let Some(token) = self.project_git_token_for_agent(agent).await? else {
             return Err(RuntimeError::InvalidInput(
@@ -4414,7 +4756,13 @@ impl AgentRuntime {
         let sidecar = self.ensure_project_sidecar(project_id, summary.id).await?;
         let configs = project_mcp_configs(&token);
         let manager = McpAgentManager::start(self.docker.clone(), sidecar.id, configs).await;
-        let output = manager.call_model_tool(model_name, arguments).await;
+        let output = tokio::select! {
+            output = manager.call_model_tool(model_name, arguments) => output,
+            _ = cancellation_token.cancelled() => {
+                manager.shutdown().await;
+                return Err(RuntimeError::TurnCancelled);
+            }
+        };
         manager.shutdown().await;
         let output = output
             .map_err(|err| RuntimeError::InvalidInput(redact_secret(&err.to_string(), &token)))?;
@@ -4755,8 +5103,52 @@ esac\n";
         agent: &Arc<AgentRecord>,
         ready_status: AgentStatus,
     ) -> Result<String> {
-        self.ensure_agent_container_with_source(agent, ready_status, &ContainerSource::FreshImage)
-            .await
+        self.ensure_agent_container_with_source(
+            agent,
+            ready_status,
+            &ContainerSource::FreshImage,
+            None,
+        )
+        .await
+    }
+
+    async fn ensure_agent_container_for_turn(
+        &self,
+        agent: &Arc<AgentRecord>,
+        ready_status: AgentStatus,
+        turn_id: TurnId,
+        cancellation_token: &CancellationToken,
+    ) -> Result<String> {
+        if cancellation_token.is_cancelled() {
+            return Err(RuntimeError::TurnCancelled);
+        }
+        let turn_guard =
+            (agent.summary.read().await.current_turn == Some(turn_id)).then(|| TurnGuard {
+                turn_id,
+                cancellation_token: cancellation_token.clone(),
+            });
+        let container_id = self
+            .ensure_agent_container_with_source(
+                agent,
+                ready_status.clone(),
+                &ContainerSource::FreshImage,
+                turn_guard,
+            )
+            .await?;
+        let current_turn = agent.summary.read().await.current_turn;
+        if cancellation_token.is_cancelled()
+            || current_turn.is_some_and(|current| current != turn_id)
+        {
+            if let Some(manager) = agent.mcp.write().await.take() {
+                manager.shutdown().await;
+            }
+            return Err(RuntimeError::TurnCancelled);
+        }
+        let needs_status_restore = agent.summary.read().await.status != ready_status;
+        if needs_status_restore {
+            self.set_status(agent, ready_status, None).await?;
+        }
+        Ok(container_id)
     }
 
     async fn ensure_agent_container_with_source(
@@ -4764,7 +5156,11 @@ esac\n";
         agent: &Arc<AgentRecord>,
         ready_status: AgentStatus,
         container_source: &ContainerSource,
+        turn_guard: Option<TurnGuard>,
     ) -> Result<String> {
+        if let Some(guard) = &turn_guard {
+            self.ensure_turn_current(agent, guard).await?;
+        }
         if let Some(container_id) = agent
             .container
             .read()
@@ -4793,6 +5189,9 @@ esac\n";
 
         self.set_status(agent, AgentStatus::StartingContainer, None)
             .await?;
+        if let Some(guard) = &turn_guard {
+            self.ensure_turn_current(agent, guard).await?;
+        }
         let container_result = match container_source {
             ContainerSource::FreshImage => {
                 self.docker
@@ -4841,6 +5240,16 @@ esac\n";
         };
 
         let container_id = container.id.clone();
+        if let Some(guard) = &turn_guard {
+            if let Err(err) = self.ensure_turn_current(agent, guard).await {
+                drop(container_guard);
+                let _ = self
+                    .docker
+                    .delete_agent_containers(&agent_id.to_string(), Some(&container_id))
+                    .await;
+                return Err(err);
+            }
+        }
         {
             let mut summary = agent.summary.write().await;
             summary.container_id = Some(container_id.clone());
@@ -4864,6 +5273,21 @@ esac\n";
             .await;
         }
         let mcp = McpAgentManager::start(self.docker.clone(), container.id, mcp_configs).await;
+        if let Some(guard) = &turn_guard {
+            if let Err(err) = self.ensure_turn_current(agent, guard).await {
+                mcp.shutdown().await;
+                *agent.container.write().await = None;
+                {
+                    let mut summary = agent.summary.write().await;
+                    summary.container_id = None;
+                }
+                let _ = self
+                    .docker
+                    .delete_agent_containers(&agent_id.to_string(), Some(&container_id))
+                    .await;
+                return Err(err);
+            }
+        }
         for status in mcp.statuses().await {
             self.publish(ServiceEventKind::McpServerStatusChanged {
                 agent_id,
@@ -4905,9 +5329,22 @@ esac\n";
                 "required MCP server startup failed: {message}"
             )));
         }
+        if let Some(guard) = &turn_guard {
+            self.ensure_turn_current(agent, guard).await?;
+        }
         *agent.mcp.write().await = Some(Arc::new(mcp));
         self.set_status(agent, ready_status, None).await?;
         Ok(container_id)
+    }
+
+    async fn ensure_turn_current(&self, agent: &AgentRecord, guard: &TurnGuard) -> Result<()> {
+        if guard.cancellation_token.is_cancelled() {
+            return Err(RuntimeError::TurnCancelled);
+        }
+        if agent.summary.read().await.current_turn != Some(guard.turn_id) {
+            return Err(RuntimeError::TurnCancelled);
+        }
+        Ok(())
     }
 
     async fn agent(&self, agent_id: AgentId) -> Result<Arc<AgentRecord>> {
@@ -4963,7 +5400,11 @@ esac\n";
         agent: &AgentRecord,
         agent_id: AgentId,
         _session_id: SessionId,
+        cancellation_token: &CancellationToken,
     ) -> Result<()> {
+        if cancellation_token.is_cancelled() {
+            return Err(RuntimeError::TurnCancelled);
+        }
         if agent.summary.read().await.project_id.is_none() {
             return Ok(());
         }
@@ -4987,6 +5428,10 @@ esac\n";
         })
         .await;
         let mcp = McpAgentManager::start(self.docker.clone(), sidecar.id, configs).await;
+        if cancellation_token.is_cancelled() {
+            mcp.shutdown().await;
+            return Err(RuntimeError::TurnCancelled);
+        }
         for status in mcp.statuses().await {
             let error = status.error.map(|error| redact_secret(&error, &token));
             self.publish(ServiceEventKind::McpServerStatusChanged {
@@ -4996,6 +5441,10 @@ esac\n";
                 error,
             })
             .await;
+        }
+        if cancellation_token.is_cancelled() {
+            mcp.shutdown().await;
+            return Err(RuntimeError::TurnCancelled);
         }
         *agent.mcp.write().await = Some(Arc::new(mcp));
         Ok(())
@@ -6314,11 +6763,29 @@ mod tests {
                     {
                         return;
                     }
+                    if let Some(delay_ms) = response.get("__delay_ms").and_then(Value::as_u64) {
+                        sleep(Duration::from_millis(delay_ms)).await;
+                    }
                     write_mock_response(&mut stream, response).await;
                 });
             }
         });
         (format!("http://{addr}"), requests)
+    }
+
+    async fn wait_until<F, Fut>(mut condition: F, timeout: Duration)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if condition().await {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for condition");
+            sleep(Duration::from_millis(20)).await;
+        }
     }
 
     async fn read_mock_request(stream: &mut tokio::net::TcpStream) -> Value {
@@ -7935,7 +8402,13 @@ esac
         let agent = runtime.agent(agent_id).await.expect("agent");
 
         let compacted = runtime
-            .maybe_auto_compact(&agent, agent_id, session_id, Uuid::new_v4())
+            .maybe_auto_compact(
+                &agent,
+                agent_id,
+                session_id,
+                Uuid::new_v4(),
+                &CancellationToken::new(),
+            )
             .await;
 
         assert!(matches!(compacted, Err(RuntimeError::InvalidInput(_))));
@@ -8051,6 +8524,7 @@ esac
                 Uuid::new_v4(),
                 "please use a tool".to_string(),
                 Vec::new(),
+                CancellationToken::new(),
             )
             .await
             .expect("turn");
@@ -8171,6 +8645,7 @@ esac
                 turn_id,
                 "please use $demo".to_string(),
                 Vec::new(),
+                CancellationToken::new(),
             )
             .await
             .expect("turn");
@@ -8274,6 +8749,7 @@ esac
                 Uuid::new_v4(),
                 "please use $demo".to_string(),
                 Vec::new(),
+                CancellationToken::new(),
             )
             .await
             .expect("turn");
@@ -8289,6 +8765,258 @@ esac
                 .iter()
                 .any(|event| matches!(event.kind, ServiceEventKind::SkillsActivated { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_agent_turn_stops_model_request_and_marks_cancelled() {
+        let (base_url, _requests) = start_mock_responses(vec![json!({
+            "__delay_ms": 5_000,
+            "id": "slow",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "too late" }]
+            }],
+            "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+        })])
+        .await;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![compact_test_provider(base_url)],
+                default_provider_id: Some("mock".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        store
+            .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
+            .await
+            .expect("save agent");
+        save_test_session(&store, agent_id, session_id).await;
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let turn_id = runtime
+            .send_message(
+                agent_id,
+                Some(session_id),
+                "slow please".to_string(),
+                Vec::new(),
+            )
+            .await
+            .expect("send");
+
+        wait_until(
+            || {
+                let runtime = Arc::clone(&runtime);
+                async move {
+                    runtime
+                        .agent(agent_id)
+                        .await
+                        .expect("agent")
+                        .summary
+                        .read()
+                        .await
+                        .current_turn
+                        == Some(turn_id)
+                }
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        runtime
+            .cancel_agent_turn(agent_id, turn_id)
+            .await
+            .expect("cancel");
+
+        let summary = runtime
+            .agent(agent_id)
+            .await
+            .expect("agent")
+            .summary
+            .read()
+            .await
+            .clone();
+        assert_eq!(summary.status, AgentStatus::Cancelled);
+        assert_eq!(summary.current_turn, None);
+        assert!(
+            runtime
+                .recent_events
+                .lock()
+                .await
+                .iter()
+                .any(|event| matches!(
+                    event.kind,
+                    ServiceEventKind::TurnCompleted {
+                        agent_id: event_agent_id,
+                        turn_id: event_turn_id,
+                        status: TurnStatus::Cancelled,
+                        ..
+                    } if event_agent_id == agent_id && event_turn_id == turn_id
+                ))
+        );
+    }
+
+    #[tokio::test]
+    async fn send_input_interrupt_starts_replacement_without_losing_message() {
+        let (base_url, _requests) = start_mock_responses(vec![json!({
+            "id": "replacement",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "replacement done" }]
+            }],
+            "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+        })])
+        .await;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![compact_test_provider(base_url)],
+                default_provider_id: Some("mock".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        store
+            .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
+            .await
+            .expect("save agent");
+        save_test_session(&store, agent_id, session_id).await;
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let old_turn_id = Uuid::new_v4();
+        let agent = runtime.agent(agent_id).await.expect("agent");
+        {
+            let mut summary = agent.summary.write().await;
+            summary.status = AgentStatus::RunningTurn;
+            summary.current_turn = Some(old_turn_id);
+        }
+        *agent.container.write().await = Some(ContainerHandle {
+            id: "container-1".to_string(),
+            name: "container-1".to_string(),
+            image: "unused".to_string(),
+        });
+        *agent.active_turn.lock().expect("active turn lock") = Some(TurnControl {
+            turn_id: old_turn_id,
+            session_id,
+            cancellation_token: CancellationToken::new(),
+            abort_handle: None,
+        });
+
+        let output = runtime
+            .send_input_to_agent(agent_id, Some(session_id), "replacement".to_string(), true)
+            .await
+            .expect("interrupt");
+        assert_eq!(output["queued"].as_bool(), Some(false));
+        wait_until(
+            || {
+                let runtime = Arc::clone(&runtime);
+                async move {
+                    runtime
+                        .agent(agent_id)
+                        .await
+                        .expect("agent")
+                        .summary
+                        .read()
+                        .await
+                        .current_turn
+                        .is_none()
+                }
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+
+        let detail = runtime
+            .get_agent(agent_id, Some(session_id))
+            .await
+            .expect("detail");
+        let message_dump = detail
+            .messages
+            .iter()
+            .map(|message| format!("{:?}: {}", message.role, message.content))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let event_dump = runtime
+            .recent_events
+            .lock()
+            .await
+            .iter()
+            .map(|event| format!("{:?}", event.kind))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            detail.messages.iter().any(|message| {
+                message.role == MessageRole::User && message.content == "replacement"
+            }),
+            "messages: {message_dump}; status: {:?}; events: {event_dump}",
+            detail.summary.status
+        );
+        assert!(
+            detail.messages.iter().any(|message| {
+                message.role == MessageRole::Assistant && message.content == "replacement done"
+            }),
+            "messages: {message_dump}; status: {:?}; error: {:?}; events: {event_dump}",
+            detail.summary.status,
+            detail.summary.last_error
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_turn_completion_does_not_overwrite_current_turn() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        store
+            .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
+            .await
+            .expect("save agent");
+        save_test_session(&store, agent_id, session_id).await;
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let agent = runtime.agent(agent_id).await.expect("agent");
+        let stale_turn_id = Uuid::new_v4();
+        let current_turn_id = Uuid::new_v4();
+        {
+            let mut summary = agent.summary.write().await;
+            summary.status = AgentStatus::RunningTurn;
+            summary.current_turn = Some(current_turn_id);
+        }
+        *agent.active_turn.lock().expect("active turn lock") = Some(TurnControl {
+            turn_id: current_turn_id,
+            session_id,
+            cancellation_token: CancellationToken::new(),
+            abort_handle: None,
+        });
+
+        let completed = runtime
+            .complete_turn_if_current(
+                &agent,
+                agent_id,
+                stale_turn_id,
+                TurnStatus::Cancelled,
+                AgentStatus::Cancelled,
+                None,
+                None,
+            )
+            .await
+            .expect("complete stale");
+
+        assert!(!completed);
+        let summary = agent.summary.read().await.clone();
+        assert_eq!(summary.status, AgentStatus::RunningTurn);
+        assert_eq!(summary.current_turn, Some(current_turn_id));
+        assert!(runtime.recent_events.lock().await.iter().all(|event| {
+            !matches!(
+                event.kind,
+                ServiceEventKind::TurnCompleted {
+                    turn_id,
+                    status: TurnStatus::Cancelled,
+                    ..
+                } if turn_id == stale_turn_id
+            )
+        }));
     }
 
     #[tokio::test]
@@ -8466,6 +9194,7 @@ esac
                 turn_id,
                 "please help".to_string(),
                 vec![skill_path.display().to_string()],
+                CancellationToken::new(),
             )
             .await
             .expect("turn");
@@ -8631,6 +9360,7 @@ esac
                 Uuid::new_v4(),
                 "please list agents".to_string(),
                 Vec::new(),
+                CancellationToken::new(),
             )
             .await;
 

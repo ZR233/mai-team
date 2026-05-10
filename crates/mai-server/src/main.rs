@@ -21,7 +21,7 @@ use mai_protocol::{
     ProvidersResponse, RepositoryPackagesResponse, RequestPlanRevisionRequest,
     RequestPlanRevisionResponse, RuntimeDefaultsResponse, SendMessageRequest, SendMessageResponse,
     ServiceEvent, SessionId, SkillsConfigRequest, SkillsListResponse, TaskId, ToolTraceDetail,
-    UpdateAgentRequest, UpdateAgentResponse, UpdateProjectRequest, UpdateProjectResponse,
+    TurnId, UpdateAgentRequest, UpdateAgentResponse, UpdateProjectRequest, UpdateProjectResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
 use mai_store::ConfigStore;
@@ -68,6 +68,7 @@ impl From<RuntimeError> for ApiError {
             RuntimeError::AgentNotFound(_)
             | RuntimeError::TaskNotFound(_)
             | RuntimeError::ProjectNotFound(_) => StatusCode::NOT_FOUND,
+            RuntimeError::TurnNotFound { .. } => StatusCode::NOT_FOUND,
             RuntimeError::SessionNotFound { .. } => StatusCode::NOT_FOUND,
             RuntimeError::ToolTraceNotFound { .. } => StatusCode::NOT_FOUND,
             RuntimeError::AgentBusy(_) | RuntimeError::TaskBusy(_) => StatusCode::CONFLICT,
@@ -310,6 +311,10 @@ async fn main() -> Result<()> {
             get(get_session_tool_trace),
         )
         .route("/agents/{id}/tool-calls/{call_id}", get(get_tool_trace))
+        .route(
+            "/agents/{id}/turns/{turn_id}/cancel",
+            post(cancel_agent_turn),
+        )
         .route("/agents/{id}/files:upload", post(upload_file))
         .route("/agents/{id}/files:download", get(download_file))
         .route("/tasks/{id}/artifacts", get(list_artifacts))
@@ -1057,6 +1062,14 @@ async fn cancel_agent(
     Path(id): Path<AgentId>,
 ) -> std::result::Result<StatusCode, ApiError> {
     state.runtime.cancel_agent(id).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn cancel_agent_turn(
+    State(state): State<Arc<AppState>>,
+    Path((id, turn_id)): Path<(AgentId, TurnId)>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state.runtime.cancel_agent_turn(id, turn_id).await?;
     Ok(StatusCode::ACCEPTED)
 }
 

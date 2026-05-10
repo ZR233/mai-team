@@ -78,7 +78,10 @@
       :selected-skills="selectedSkills"
       :skills-loading="skillsLoading"
       :skills-error="skillsError"
+      :stoppable="canStopTurn"
+      :stopping="stopping"
       @send="$emit('send', $event)"
+      @stop="$emit('stop', detail)"
       @update:draft="$emit('update:draft', $event)"
       @update:selected-skills="$emit('update:selectedSkills', $event)"
       @load-skills="$emit('load-skills')"
@@ -108,6 +111,7 @@ const props = defineProps({
   draft: { type: String, default: '' },
   loading: { type: Boolean, default: false },
   sending: { type: Boolean, default: false },
+  stopping: { type: Boolean, default: false },
   updatingModel: { type: Boolean, default: false },
   providers: { type: Array, default: () => [] },
   skills: { type: Array, default: () => [] },
@@ -127,6 +131,7 @@ const emit = defineEmits([
   'cancel',
   'delete',
   'send',
+  'stop',
   'update:draft',
   'update:selectedSkills',
   'load-skills',
@@ -151,6 +156,10 @@ const modelEditor = reactive({
 })
 
 const timelineItems = computed(() => buildAgentTimeline(props.detail, props.events))
+const canStopTurn = computed(() => {
+  if (!props.detail?.current_turn) return false
+  return ['running_turn', 'waiting_tool', 'starting_container'].includes(props.detail.status)
+})
 const pendingUserInput = computed(() => {
   if (!props.inputEnabled) return null
   const items = timelineItems.value
