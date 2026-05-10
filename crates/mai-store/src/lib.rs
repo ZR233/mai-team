@@ -2784,6 +2784,7 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         | ServiceEventKind::ToolCompleted { agent_id, .. }
         | ServiceEventKind::ContextCompacted { agent_id, .. }
         | ServiceEventKind::AgentMessage { agent_id, .. }
+        | ServiceEventKind::SkillsActivated { agent_id, .. }
         | ServiceEventKind::TodoListUpdated { agent_id, .. }
         | ServiceEventKind::McpServerStatusChanged { agent_id, .. }
         | ServiceEventKind::UserInputRequested { agent_id, .. } => Some(*agent_id),
@@ -2806,6 +2807,7 @@ fn event_session_id(event: &ServiceEvent) -> Option<SessionId> {
         | ServiceEventKind::ToolStarted { session_id, .. }
         | ServiceEventKind::ToolCompleted { session_id, .. }
         | ServiceEventKind::AgentMessage { session_id, .. }
+        | ServiceEventKind::SkillsActivated { session_id, .. }
         | ServiceEventKind::UserInputRequested { session_id, .. } => *session_id,
         ServiceEventKind::ContextCompacted { session_id, .. } => Some(*session_id),
         ServiceEventKind::Error { session_id, .. } => *session_id,

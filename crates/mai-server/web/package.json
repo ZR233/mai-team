@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "vite build",
-    "dev": "vite --host 0.0.0.0"
+    "dev": "vite --host 0.0.0.0",
+    "test:timeline": "node src/utils/__tests__/timeline.test.js"
   },
   "dependencies": {
     "@vitejs/plugin-vue": "^6.0.2",

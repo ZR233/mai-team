@@ -525,6 +525,15 @@ pub struct SkillMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillActivationInfo {
+    pub name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    pub path: PathBuf,
+    pub scope: SkillScope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillErrorInfo {
     pub path: PathBuf,
     pub message: String,
@@ -875,6 +884,13 @@ pub enum ServiceEventKind {
         turn_id: Option<TurnId>,
         role: MessageRole,
         content: String,
+    },
+    SkillsActivated {
+        agent_id: AgentId,
+        #[serde(default)]
+        session_id: Option<SessionId>,
+        turn_id: TurnId,
+        skills: Vec<SkillActivationInfo>,
     },
     Error {
         agent_id: Option<AgentId>,

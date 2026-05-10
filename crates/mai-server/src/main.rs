@@ -1108,6 +1108,7 @@ fn event_name(event: &ServiceEvent) -> &'static str {
         mai_protocol::ServiceEventKind::ToolCompleted { .. } => "tool_completed",
         mai_protocol::ServiceEventKind::ContextCompacted { .. } => "context_compacted",
         mai_protocol::ServiceEventKind::AgentMessage { .. } => "agent_message",
+        mai_protocol::ServiceEventKind::SkillsActivated { .. } => "skills_activated",
         mai_protocol::ServiceEventKind::McpServerStatusChanged { .. } => {
             "mcp_server_status_changed"
         }
@@ -1122,6 +1123,9 @@ fn event_name(event: &ServiceEvent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mai_protocol::{
+        AgentId, ServiceEvent, ServiceEventKind, SessionId, SkillActivationInfo, SkillScope, TurnId,
+    };
     use tempfile::tempdir;
 
     #[test]
@@ -1178,5 +1182,26 @@ mod tests {
         assert!(safe_system_skills_target(std::path::Path::new(
             "/tmp/system-skills"
         )));
+    }
+
+    #[test]
+    fn skills_activated_event_has_sse_name() {
+        let event = ServiceEvent {
+            sequence: 1,
+            timestamp: mai_protocol::now(),
+            kind: ServiceEventKind::SkillsActivated {
+                agent_id: AgentId::new_v4(),
+                session_id: Some(SessionId::new_v4()),
+                turn_id: TurnId::new_v4(),
+                skills: vec![SkillActivationInfo {
+                    name: "demo".to_string(),
+                    display_name: Some("Demo".to_string()),
+                    path: std::path::PathBuf::from("/tmp/demo/SKILL.md"),
+                    scope: SkillScope::Repo,
+                }],
+            },
+        };
+
+        assert_eq!(event_name(&event), "skills_activated");
     }
 }

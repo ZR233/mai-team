@@ -43,6 +43,7 @@ export function useSSE() {
       'tool_completed',
       'context_compacted',
       'agent_message',
+      'skills_activated',
       'error',
       'todo_list_updated',
       'user_input_requested',

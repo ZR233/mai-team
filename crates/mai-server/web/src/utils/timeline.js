@@ -96,6 +96,20 @@ export function buildAgentTimeline(detail, liveEvents = []) {
         timestamp: event.timestamp,
         sequence: event.sequence || 0
       })
+    } else if (event.type === 'skills_activated') {
+      const skills = (event.skills || []).map(skillDisplayName).filter(Boolean)
+      if (skills.length) {
+        const anchor = firstMessageByTurn.get(event.turn_id)
+        items.push({
+          type: 'process',
+          key: `skills-activated-${event.turn_id}-${event.sequence || event.timestamp}`,
+          tone: 'done',
+          label: 'Used skills',
+          detail: skills.join(', '),
+          timestamp: anchor ? offsetTimestamp(anchor.timestamp, 0.5) : event.timestamp,
+          sequence: (anchor?.sequence || event.sequence || 0) + 0.05
+        })
+      }
     } else if (event.type === 'agent_status_changed') {
       const row = statusProcessRow(event)
       if (row) items.push(row)
@@ -483,6 +497,10 @@ function eventAgentId(event) {
 
 function eventSessionId(event) {
   return event.session_id || null
+}
+
+function skillDisplayName(skill) {
+  return skill?.display_name || skill?.name || ''
 }
 
 function baseTool(event) {

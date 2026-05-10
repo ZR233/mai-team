@@ -18,9 +18,9 @@ use mai_protocol::{
     ProjectCloneStatus, ProjectDetail, ProjectId, ProjectStatus, ProjectSummary,
     RepositoryPackageSummary, RepositoryPackagesResponse, ResolvedAgentModelPreference,
     RuntimeDefaultsResponse, SendMessageRequest, ServiceEvent, ServiceEventKind, SessionId,
-    SkillsConfigRequest, SkillsListResponse, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus,
-    TaskSummary, TodoItem, TokenUsage, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest,
-    UpdateProjectRequest, UserInputOption, UserInputQuestion, now, preview,
+    SkillActivationInfo, SkillsConfigRequest, SkillsListResponse, TaskDetail, TaskId, TaskPlan,
+    TaskReview, TaskStatus, TaskSummary, TodoItem, TokenUsage, ToolTraceDetail, TurnId, TurnStatus,
+    UpdateAgentRequest, UpdateProjectRequest, UserInputOption, UserInputQuestion, now, preview,
 };
 use mai_skills::{SkillInjections, SkillsManager};
 use mai_store::{ConfigStore, ProviderSelection};
@@ -2343,6 +2343,15 @@ impl AgentRuntime {
         let skill_injections = self
             .skills
             .build_injections(&skill_mentions, &skills_config)?;
+        if !skill_injections.items.is_empty() {
+            self.publish(ServiceEventKind::SkillsActivated {
+                agent_id,
+                session_id: Some(session_id),
+                turn_id,
+                skills: skill_activation_info(&skill_injections),
+            })
+            .await;
+        }
         self.inject_project_mcp_tools(&agent, agent_id, session_id)
             .await?;
         let mut last_assistant_text: Option<String> = None;
@@ -5698,6 +5707,23 @@ fn extract_skill_mentions(text: &str) -> Vec<String> {
     mai_skills::extract_skill_mentions(text)
 }
 
+fn skill_activation_info(skill_injections: &SkillInjections) -> Vec<SkillActivationInfo> {
+    skill_injections
+        .items
+        .iter()
+        .map(|skill| SkillActivationInfo {
+            name: skill.metadata.name.clone(),
+            display_name: skill
+                .metadata
+                .interface
+                .as_ref()
+                .and_then(|interface| interface.display_name.clone()),
+            path: skill.metadata.path.clone(),
+            scope: skill.metadata.scope,
+        })
+        .collect()
+}
+
 fn skill_user_fragment(skill_injections: &SkillInjections) -> Option<ModelInputItem> {
     if skill_injections.items.is_empty() {
         return None;
@@ -5872,6 +5898,7 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         | ServiceEventKind::ToolCompleted { agent_id, .. }
         | ServiceEventKind::ContextCompacted { agent_id, .. }
         | ServiceEventKind::AgentMessage { agent_id, .. }
+        | ServiceEventKind::SkillsActivated { agent_id, .. }
         | ServiceEventKind::TodoListUpdated { agent_id, .. }
         | ServiceEventKind::McpServerStatusChanged { agent_id, .. }
         | ServiceEventKind::UserInputRequested { agent_id, .. } => Some(*agent_id),
@@ -7858,11 +7885,12 @@ esac
             image: "unused".to_string(),
         });
 
+        let turn_id = Uuid::new_v4();
         runtime
             .run_turn_inner(
                 agent_id,
                 session_id,
-                Uuid::new_v4(),
+                turn_id,
                 "please use $demo".to_string(),
                 Vec::new(),
             )
@@ -7879,6 +7907,27 @@ esac
                         && text.contains("Use the demo flow.")
                 })
         }));
+        let events = runtime.recent_events.lock().await;
+        let activated = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                ServiceEventKind::SkillsActivated {
+                    agent_id: event_agent_id,
+                    session_id: event_session_id,
+                    turn_id: event_turn_id,
+                    skills,
+                } if *event_agent_id == agent_id
+                    && *event_session_id == Some(session_id)
+                    && *event_turn_id == turn_id =>
+                {
+                    Some(skills)
+                }
+                _ => None,
+            })
+            .expect("skills activated event");
+        assert_eq!(activated.len(), 1);
+        assert_eq!(activated[0].name, "demo");
+        assert_eq!(activated[0].scope, mai_protocol::SkillScope::Repo);
     }
 
     #[tokio::test]
@@ -7954,6 +8003,14 @@ esac
         let request_text = serde_json::to_string(&requests.lock().await[0]).expect("request json");
         assert!(!request_text.contains("<skill>"));
         assert!(!request_text.contains("Use the demo flow."));
+        assert!(
+            !runtime
+                .recent_events
+                .lock()
+                .await
+                .iter()
+                .any(|event| matches!(event.kind, ServiceEventKind::SkillsActivated { .. }))
+        );
     }
 
     #[tokio::test]
