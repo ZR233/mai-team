@@ -1122,7 +1122,7 @@ fn parent_dir(path: &str) -> String {
 }
 
 fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+    shell_words::quote(value).into_owned()
 }
 
 #[cfg(test)]

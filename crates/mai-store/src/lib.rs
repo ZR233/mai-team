@@ -50,6 +50,8 @@ pub enum StoreError {
     TomlSer(#[from] toml::ser::Error),
     #[error("time parse error: {0}")]
     Time(#[from] chrono::ParseError),
+    #[error("parse error: {0}")]
+    Parse(#[from] strum::ParseError),
     #[error("invalid config: {0}")]
     InvalidConfig(String),
 }
@@ -1134,9 +1136,9 @@ impl ConfigStore {
             parent_id: summary.parent_id.map(|id| id.to_string()),
             task_id: summary.task_id.map(|id| id.to_string()),
             project_id: summary.project_id.map(|id| id.to_string()),
-            role: summary.role.map(agent_role_to_str).map(str::to_string),
+            role: summary.role.map(|r| r.to_string()),
             name: summary.name.clone(),
-            status: agent_status_to_str(&summary.status).to_string(),
+            status: summary.status.to_string(),
             container_id: summary.container_id.clone(),
             docker_image: summary.docker_image.clone(),
             provider_id: summary.provider_id.clone(),
@@ -1169,7 +1171,7 @@ impl ConfigStore {
         toasty::create!(ProjectRecordRow {
             id: project.id.to_string(),
             name: project.name.clone(),
-            status: project_status_to_str(&project.status).to_string(),
+            status: project.status.to_string(),
             owner: project.owner.clone(),
             repo: project.repo.clone(),
             repository_full_name: project.repository_full_name.clone(),
@@ -1179,14 +1181,14 @@ impl ConfigStore {
             installation_account: project.installation_account.clone(),
             branch: project.branch.clone(),
             docker_image: project.docker_image.clone(),
-            clone_status: project_clone_status_to_str(&project.clone_status).to_string(),
+            clone_status: project.clone_status.to_string(),
             maintainer_agent_id: project.maintainer_agent_id.to_string(),
             created_at: project.created_at.to_rfc3339(),
             updated_at: project.updated_at.to_rfc3339(),
             last_error: project.last_error.clone(),
             auto_review_enabled: project.auto_review_enabled,
             reviewer_extra_prompt: project.reviewer_extra_prompt.clone(),
-            review_status: project_review_status_to_str(&project.review_status).to_string(),
+            review_status: project.review_status.to_string(),
             current_reviewer_agent_id: project.current_reviewer_agent_id.map(|id| id.to_string()),
             last_review_started_at: project.last_review_started_at.map(|time| time.to_rfc3339()),
             last_review_finished_at: project
@@ -1196,8 +1198,7 @@ impl ConfigStore {
             last_review_outcome: project
                 .last_review_outcome
                 .as_ref()
-                .map(project_review_outcome_to_str)
-                .map(str::to_string),
+                .map(|o| o.to_string()),
             review_last_error: project.review_last_error.clone(),
         })
         .exec(&mut db)
@@ -1234,14 +1235,14 @@ impl ConfigStore {
         toasty::create!(TaskRecordRow {
             id: task.id.to_string(),
             title: task.title.clone(),
-            status: task_status_to_str(&task.status).to_string(),
+            status: task.status.to_string(),
             planner_agent_id: task.planner_agent_id.to_string(),
             current_agent_id: task.current_agent_id.map(|id| id.to_string()),
             created_at: task.created_at.to_rfc3339(),
             updated_at: task.updated_at.to_rfc3339(),
             last_error: task.last_error.clone(),
             final_report: task.final_report.clone(),
-            plan_status: plan_status_to_str(&plan.status).to_string(),
+            plan_status: plan.status.to_string(),
             plan_title: plan.title.clone(),
             plan_markdown: plan.markdown.clone(),
             plan_version: u64_to_i64(plan.version),
@@ -1486,7 +1487,7 @@ impl ConfigStore {
             agent_id: agent_id.to_string(),
             session_id: session_id.to_string(),
             position: position as i64,
-            role: message_role_to_str(&message.role).to_string(),
+            role: message.role.to_string(),
             content: message.content.clone(),
             created_at: message.created_at.to_rfc3339(),
         })
@@ -1774,9 +1775,9 @@ impl AgentRecordRow {
                 .as_deref()
                 .map(parse_project_id)
                 .transpose()?,
-            role: self.role.as_deref().map(parse_agent_role).transpose()?,
+            role: self.role.as_deref().map(|r| r.parse()).transpose()?,
             name: self.name,
-            status: parse_agent_status(&self.status)?,
+            status: self.status.parse()?,
             container_id: self.container_id,
             docker_image: self.docker_image,
             provider_id: self.provider_id,
@@ -1805,7 +1806,7 @@ impl ProjectRecordRow {
         Ok(ProjectSummary {
             id: parse_project_id(&self.id)?,
             name: self.name,
-            status: parse_project_status(&self.status)?,
+            status: self.status.parse()?,
             owner: self.owner,
             repo: self.repo,
             repository_full_name: self.repository_full_name,
@@ -1815,14 +1816,14 @@ impl ProjectRecordRow {
             installation_account: self.installation_account,
             branch: self.branch,
             docker_image: self.docker_image,
-            clone_status: parse_project_clone_status(&self.clone_status)?,
+            clone_status: self.clone_status.parse()?,
             maintainer_agent_id: parse_agent_id(&self.maintainer_agent_id)?,
             created_at: parse_utc(&self.created_at)?,
             updated_at: parse_utc(&self.updated_at)?,
             last_error: self.last_error,
             auto_review_enabled: self.auto_review_enabled,
             reviewer_extra_prompt: self.reviewer_extra_prompt,
-            review_status: parse_project_review_status(&self.review_status)?,
+            review_status: self.review_status.parse()?,
             current_reviewer_agent_id: self
                 .current_reviewer_agent_id
                 .as_deref()
@@ -1842,7 +1843,7 @@ impl ProjectRecordRow {
             last_review_outcome: self
                 .last_review_outcome
                 .as_deref()
-                .map(parse_project_review_outcome)
+                .map(|o| o.parse())
                 .transpose()?,
             review_last_error: self.review_last_error,
         })
@@ -1895,7 +1896,7 @@ impl TaskRecordRow {
         plan_history: Vec<PlanHistoryEntry>,
     ) -> Result<PersistedTask> {
         let plan = TaskPlan {
-            status: parse_plan_status(&self.plan_status)?,
+            status: self.plan_status.parse()?,
             title: self.plan_title,
             markdown: self.plan_markdown,
             version: i64_to_u64(self.plan_version),
@@ -1920,7 +1921,7 @@ impl TaskRecordRow {
         let summary = TaskSummary {
             id: parse_task_id(&self.id)?,
             title: self.title,
-            status: parse_task_status(&self.status)?,
+            status: self.status.parse()?,
             plan_status: plan.status.clone(),
             plan_version: plan.version,
             planner_agent_id: parse_agent_id(&self.planner_agent_id)?,
@@ -1949,7 +1950,7 @@ impl TaskRecordRow {
 impl AgentMessageRecord {
     fn into_message(self) -> Result<AgentMessage> {
         Ok(AgentMessage {
-            role: parse_message_role(&self.role)?,
+            role: self.role.parse()?,
             content: self.content,
             created_at: parse_utc(&self.created_at)?,
         })
@@ -2729,215 +2730,6 @@ fn parse_turn_id(value: &str) -> Result<TurnId> {
 
 fn parse_utc(value: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
-}
-
-fn agent_status_to_str(status: &AgentStatus) -> &'static str {
-    match status {
-        AgentStatus::Created => "created",
-        AgentStatus::StartingContainer => "starting_container",
-        AgentStatus::Idle => "idle",
-        AgentStatus::RunningTurn => "running_turn",
-        AgentStatus::WaitingTool => "waiting_tool",
-        AgentStatus::Completed => "completed",
-        AgentStatus::Failed => "failed",
-        AgentStatus::Cancelled => "cancelled",
-        AgentStatus::DeletingContainer => "deleting_container",
-        AgentStatus::Deleted => "deleted",
-    }
-}
-
-fn parse_agent_status(value: &str) -> Result<AgentStatus> {
-    match value {
-        "created" => Ok(AgentStatus::Created),
-        "starting_container" => Ok(AgentStatus::StartingContainer),
-        "idle" => Ok(AgentStatus::Idle),
-        "running_turn" => Ok(AgentStatus::RunningTurn),
-        "waiting_tool" => Ok(AgentStatus::WaitingTool),
-        "completed" => Ok(AgentStatus::Completed),
-        "failed" => Ok(AgentStatus::Failed),
-        "cancelled" => Ok(AgentStatus::Cancelled),
-        "deleting_container" => Ok(AgentStatus::DeletingContainer),
-        "deleted" => Ok(AgentStatus::Deleted),
-        other => Err(StoreError::InvalidConfig(format!(
-            "invalid agent status `{other}`"
-        ))),
-    }
-}
-
-fn task_status_to_str(status: &TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Planning => "planning",
-        TaskStatus::AwaitingApproval => "awaiting_approval",
-        TaskStatus::Executing => "executing",
-        TaskStatus::Reviewing => "reviewing",
-        TaskStatus::Completed => "completed",
-        TaskStatus::Failed => "failed",
-        TaskStatus::Cancelled => "cancelled",
-    }
-}
-
-fn parse_task_status(value: &str) -> Result<TaskStatus> {
-    match value {
-        "planning" => Ok(TaskStatus::Planning),
-        "awaiting_approval" => Ok(TaskStatus::AwaitingApproval),
-        "executing" => Ok(TaskStatus::Executing),
-        "reviewing" => Ok(TaskStatus::Reviewing),
-        "completed" => Ok(TaskStatus::Completed),
-        "failed" => Ok(TaskStatus::Failed),
-        "cancelled" => Ok(TaskStatus::Cancelled),
-        other => Err(StoreError::InvalidConfig(format!(
-            "invalid task status `{other}`"
-        ))),
-    }
-}
-
-fn project_status_to_str(status: &ProjectStatus) -> &'static str {
-    match status {
-        ProjectStatus::Creating => "creating",
-        ProjectStatus::Ready => "ready",
-        ProjectStatus::Failed => "failed",
-        ProjectStatus::Deleting => "deleting",
-    }
-}
-
-fn parse_project_status(value: &str) -> Result<ProjectStatus> {
-    match value {
-        "creating" => Ok(ProjectStatus::Creating),
-        "ready" => Ok(ProjectStatus::Ready),
-        "failed" => Ok(ProjectStatus::Failed),
-        "deleting" => Ok(ProjectStatus::Deleting),
-        other => Err(StoreError::InvalidConfig(format!(
-            "invalid project status `{other}`"
-        ))),
-    }
-}
-
-fn project_clone_status_to_str(status: &ProjectCloneStatus) -> &'static str {
-    match status {
-        ProjectCloneStatus::Pending => "pending",
-        ProjectCloneStatus::Cloning => "cloning",
-        ProjectCloneStatus::Ready => "ready",
-        ProjectCloneStatus::Failed => "failed",
-    }
-}
-
-fn parse_project_clone_status(value: &str) -> Result<ProjectCloneStatus> {
-    match value {
-        "pending" => Ok(ProjectCloneStatus::Pending),
-        "cloning" => Ok(ProjectCloneStatus::Cloning),
-        "ready" => Ok(ProjectCloneStatus::Ready),
-        "failed" => Ok(ProjectCloneStatus::Failed),
-        other => Err(StoreError::InvalidConfig(format!(
-            "invalid project clone status `{other}`"
-        ))),
-    }
-}
-
-fn project_review_status_to_str(status: &ProjectReviewStatus) -> &'static str {
-    match status {
-        ProjectReviewStatus::Disabled => "disabled",
-        ProjectReviewStatus::Idle => "idle",
-        ProjectReviewStatus::Syncing => "syncing",
-        ProjectReviewStatus::Running => "running",
-        ProjectReviewStatus::Waiting => "waiting",
-        ProjectReviewStatus::Failed => "failed",
-    }
-}
-
-fn parse_project_review_status(value: &str) -> Result<ProjectReviewStatus> {
-    match value {
-        "" | "disabled" => Ok(ProjectReviewStatus::Disabled),
-        "idle" => Ok(ProjectReviewStatus::Idle),
-        "syncing" => Ok(ProjectReviewStatus::Syncing),
-        "running" => Ok(ProjectReviewStatus::Running),
-        "waiting" => Ok(ProjectReviewStatus::Waiting),
-        "failed" => Ok(ProjectReviewStatus::Failed),
-        other => Err(StoreError::InvalidConfig(format!(
-            "invalid project review status `{other}`"
-        ))),
-    }
-}
-
-fn project_review_outcome_to_str(outcome: &ProjectReviewOutcome) -> &'static str {
-    match outcome {
-        ProjectReviewOutcome::ReviewSubmitted => "review_submitted",
-        ProjectReviewOutcome::NoEligiblePr => "no_eligible_pr",
-        ProjectReviewOutcome::Failed => "failed",
-    }
-}
-
-fn parse_project_review_outcome(value: &str) -> Result<ProjectReviewOutcome> {
-    match value {
-        "review_submitted" => Ok(ProjectReviewOutcome::ReviewSubmitted),
-        "no_eligible_pr" => Ok(ProjectReviewOutcome::NoEligiblePr),
-        "failed" => Ok(ProjectReviewOutcome::Failed),
-        other => Err(StoreError::InvalidConfig(format!(
-            "invalid project review outcome `{other}`"
-        ))),
-    }
-}
-
-fn plan_status_to_str(status: &PlanStatus) -> &'static str {
-    match status {
-        PlanStatus::Missing => "missing",
-        PlanStatus::Ready => "ready",
-        PlanStatus::NeedsRevision => "needs_revision",
-        PlanStatus::Approved => "approved",
-    }
-}
-
-fn parse_plan_status(value: &str) -> Result<PlanStatus> {
-    match value {
-        "missing" => Ok(PlanStatus::Missing),
-        "ready" => Ok(PlanStatus::Ready),
-        "needs_revision" => Ok(PlanStatus::NeedsRevision),
-        "approved" => Ok(PlanStatus::Approved),
-        other => Err(StoreError::InvalidConfig(format!(
-            "invalid plan status `{other}`"
-        ))),
-    }
-}
-
-fn agent_role_to_str(role: AgentRole) -> &'static str {
-    match role {
-        AgentRole::Planner => "planner",
-        AgentRole::Explorer => "explorer",
-        AgentRole::Executor => "executor",
-        AgentRole::Reviewer => "reviewer",
-    }
-}
-
-fn parse_agent_role(value: &str) -> Result<AgentRole> {
-    match value {
-        "planner" => Ok(AgentRole::Planner),
-        "explorer" => Ok(AgentRole::Explorer),
-        "executor" => Ok(AgentRole::Executor),
-        "reviewer" => Ok(AgentRole::Reviewer),
-        other => Err(StoreError::InvalidConfig(format!(
-            "invalid agent role `{other}`"
-        ))),
-    }
-}
-
-fn message_role_to_str(role: &MessageRole) -> &'static str {
-    match role {
-        MessageRole::User => "user",
-        MessageRole::Assistant => "assistant",
-        MessageRole::System => "system",
-        MessageRole::Tool => "tool",
-    }
-}
-
-fn parse_message_role(value: &str) -> Result<MessageRole> {
-    match value {
-        "user" => Ok(MessageRole::User),
-        "assistant" => Ok(MessageRole::Assistant),
-        "system" => Ok(MessageRole::System),
-        "tool" => Ok(MessageRole::Tool),
-        other => Err(StoreError::InvalidConfig(format!(
-            "invalid message role `{other}`"
-        ))),
-    }
 }
 
 fn u64_to_i64(value: u64) -> i64 {

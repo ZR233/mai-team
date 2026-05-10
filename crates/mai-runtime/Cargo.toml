@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 base64.workspace = true
+percent-encoding.workspace = true
+shell-words.workspace = true
 chrono.workspace = true
 futures.workspace = true
 jsonwebtoken.workspace = true

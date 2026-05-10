@@ -6737,15 +6737,7 @@ fn normalize_github_api_get_path(path: &str) -> Result<String> {
 }
 
 fn github_path_segment(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.as_bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(*byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
+    percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
 fn sanitize_origin(origin: &str) -> Result<String> {
@@ -6906,7 +6898,7 @@ async fn decode_github_response<T: DeserializeOwned>(
 }
 
 fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+    shell_words::quote(value).into_owned()
 }
 
 fn redact_secret(value: &str, secret: &str) -> String {
@@ -8276,7 +8268,7 @@ esac
             "main",
         );
         assert!(command.contains("'+refs/pull/*/head:refs/remotes/origin/pr/*'"));
-        assert!(command.contains("git reset --hard 'origin/main'"));
+        assert!(command.contains("git reset --hard origin/main"));
         assert!(command.contains("MAI_GITHUB_REVIEW_TOKEN"));
         assert!(!command.contains("ghp_"));
     }

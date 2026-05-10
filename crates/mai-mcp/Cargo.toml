@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 mai-docker = { path = "../mai-docker" }
 mai-protocol = { path = "../mai-protocol" }
+fnv.workspace = true
 futures.workspace = true
 reqwest.workspace = true
 rmcp = { workspace = true, features = ["client", "reqwest", "transport-async-rw", "transport-streamable-http-client-reqwest"] }

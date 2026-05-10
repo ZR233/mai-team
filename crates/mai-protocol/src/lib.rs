@@ -11,7 +11,7 @@ pub type SessionId = Uuid;
 pub type TaskId = Uuid;
 pub type TurnId = Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Created,
@@ -26,7 +26,7 @@ pub enum AgentStatus {
     Deleted,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Planning,
@@ -38,7 +38,7 @@ pub enum TaskStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectStatus {
     Creating,
@@ -47,7 +47,7 @@ pub enum ProjectStatus {
     Deleting,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectCloneStatus {
     Pending,
@@ -56,9 +56,10 @@ pub enum ProjectCloneStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectReviewStatus {
+    #[strum(serialize = "disabled", serialize = "")]
     Disabled,
     Idle,
     Syncing,
@@ -73,7 +74,7 @@ impl Default for ProjectReviewStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectReviewOutcome {
     ReviewSubmitted,
@@ -81,7 +82,7 @@ pub enum ProjectReviewOutcome {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStatus {
     Missing,
@@ -125,7 +126,7 @@ pub enum TurnStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
     User,
@@ -758,7 +759,7 @@ pub struct AgentModelPreference {
     pub reasoning_effort: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
     Planner,
