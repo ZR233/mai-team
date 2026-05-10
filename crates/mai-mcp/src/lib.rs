@@ -179,8 +179,8 @@ impl McpAgentManager {
                 .await;
         }
 
-        let mut startup_tasks = stream::iter(enabled_configs.into_iter().map(
-            |(server_name, config)| {
+        let mut startup_tasks =
+            stream::iter(enabled_configs.into_iter().map(|(server_name, config)| {
                 let docker = docker.clone();
                 let workspace_volume = workspace_volume.clone();
                 let image = image.clone();
@@ -196,9 +196,8 @@ impl McpAgentManager {
                     .await;
                     (server_name, required, result)
                 }
-            },
-        ))
-        .buffer_unordered(16);
+            }))
+            .buffer_unordered(16);
 
         while let Some((server_name, required, result)) = startup_tasks.next().await {
             match result {

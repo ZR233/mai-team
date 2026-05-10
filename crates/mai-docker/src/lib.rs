@@ -78,6 +78,16 @@ pub struct SidecarParams<'a> {
     pub timeout_secs: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerCreateOptions {
+    pub memory: Option<String>,
+    pub cpus: Option<String>,
+    pub pids_limit: Option<u32>,
+    pub cap_drop_all: bool,
+    pub no_new_privileges: bool,
+    pub network: Option<String>,
+}
+
 impl DockerClient {
     pub fn new(image: impl Into<String>) -> Self {
         Self {
@@ -99,6 +109,10 @@ impl DockerClient {
 
     pub fn workspace_volume_for_agent(agent_id: &str) -> String {
         agent_workspace_volume(agent_id)
+    }
+
+    pub fn workspace_volume_for_project(project_id: &str) -> String {
+        project_workspace_volume(project_id)
     }
 
     pub async fn check_available(&self) -> Result<String> {
@@ -266,10 +280,10 @@ impl DockerClient {
     pub async fn ensure_project_sidecar_container(
         &self,
         project_id: &str,
-        agent_id: &str,
         preferred_container_id: Option<&str>,
         image: &str,
         workspace_volume: &str,
+        options: &ContainerCreateOptions,
     ) -> Result<ContainerHandle> {
         let image = validate_image(image)?;
         if let Some(container) = self
@@ -279,25 +293,25 @@ impl DockerClient {
             return self.prepare_existing_container(container).await;
         }
 
-        self.create_project_sidecar_container(project_id, agent_id, image, workspace_volume)
+        self.create_project_sidecar_container(project_id, image, workspace_volume, options)
             .await
     }
 
     async fn create_project_sidecar_container(
         &self,
         project_id: &str,
-        agent_id: &str,
         image: &str,
         workspace_volume: &str,
+        options: &ContainerCreateOptions,
     ) -> Result<ContainerHandle> {
         let image = validate_image(image)?;
         let name = project_sidecar_container_name(project_id);
         let args = create_project_sidecar_container_args(
             &name,
             project_id,
-            agent_id,
             image,
             workspace_volume,
+            options,
         );
         let create = Command::new(&self.binary)
             .args(args.iter().map(String::as_str))
@@ -571,8 +585,7 @@ impl DockerClient {
             cmd.arg("-e").arg(key);
             cmd.env(key, value);
         }
-        cmd.arg(image)
-            .args(["/bin/sh", "-lc", &shell_command]);
+        cmd.arg(image).args(["/bin/sh", "-lc", &shell_command]);
 
         let output = cmd.output().await?;
         Ok(ExecOutput {
@@ -867,11 +880,11 @@ fn create_agent_container_args(
 fn create_project_sidecar_container_args(
     name: &str,
     project_id: &str,
-    agent_id: &str,
     image: &str,
     workspace_volume: &str,
+    options: &ContainerCreateOptions,
 ) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "create".to_string(),
         "--name".to_string(),
         name.to_string(),
@@ -883,20 +896,65 @@ fn create_project_sidecar_container_args(
         format!("{SIDECAR_KIND_LABEL_KEY}={PROJECT_SIDECAR_KIND}"),
         "--label".to_string(),
         format!("{PROJECT_LABEL_KEY}={project_id}"),
-        "--label".to_string(),
-        agent_label(agent_id),
         "-v".to_string(),
         format!("{workspace_volume}:/workspace"),
         "-w".to_string(),
         "/workspace".to_string(),
+    ];
+    apply_container_create_options(&mut args, options);
+    args.extend([
         image.to_string(),
         "sleep".to_string(),
         "infinity".to_string(),
-    ]
+    ]);
+    args
 }
 
 fn agent_workspace_volume(agent_id: &str) -> String {
     format!("mai-team-workspace-{agent_id}")
+}
+
+fn project_workspace_volume(project_id: &str) -> String {
+    format!("mai-team-project-{project_id}")
+}
+
+fn apply_container_create_options(args: &mut Vec<String>, options: &ContainerCreateOptions) {
+    if let Some(memory) = options
+        .memory
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.extend(["--memory".to_string(), memory.to_string()]);
+    }
+    if let Some(cpus) = options
+        .cpus
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.extend(["--cpus".to_string(), cpus.to_string()]);
+    }
+    if let Some(pids_limit) = options.pids_limit {
+        args.extend(["--pids-limit".to_string(), pids_limit.to_string()]);
+    }
+    if options.cap_drop_all {
+        args.extend(["--cap-drop".to_string(), "ALL".to_string()]);
+    }
+    if options.no_new_privileges {
+        args.extend([
+            "--security-opt".to_string(),
+            "no-new-privileges".to_string(),
+        ]);
+    }
+    if let Some(network) = options
+        .network
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.extend(["--network".to_string(), network.to_string()]);
+    }
 }
 
 fn validate_image(image: &str) -> Result<&str> {
@@ -1243,9 +1301,9 @@ mod tests {
         let args = create_project_sidecar_container_args(
             "mai-team-project-sidecar-project-1",
             "project-1",
-            "agent-1",
             image,
-            "mai-team-workspace-agent-1",
+            "mai-team-project-project-1",
+            &ContainerCreateOptions::default(),
         );
 
         assert_eq!(args[0], "create");
@@ -1271,13 +1329,60 @@ mod tests {
         );
         assert!(
             args.windows(2)
-                .any(|window| window == ["--label", "mai.team.agent=agent-1"])
+                .any(|window| window == ["-v", "mai-team-project-project-1:/workspace"])
+        );
+        assert!(!args.windows(2).any(|window| window[0] == "-e"));
+        assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
+        assert!(
+            args.windows(3)
+                .any(|window| { window == [image, "sleep", "infinity"] })
+        );
+    }
+
+    #[test]
+    fn project_workspace_volume_uses_project_id() {
+        assert_eq!(
+            DockerClient::workspace_volume_for_project("project-1"),
+            "mai-team-project-project-1"
+        );
+    }
+
+    #[test]
+    fn create_project_sidecar_container_args_include_optional_hardening() {
+        let image = "ghcr.io/zr233/mai-team-sidecar:latest";
+        let args = create_project_sidecar_container_args(
+            "mai-team-project-sidecar-project-1",
+            "project-1",
+            image,
+            "mai-team-project-project-1",
+            &ContainerCreateOptions {
+                memory: Some("1g".to_string()),
+                cpus: Some("2".to_string()),
+                pids_limit: Some(100),
+                cap_drop_all: true,
+                no_new_privileges: true,
+                network: Some("mai-team".to_string()),
+            },
+        );
+
+        assert!(args.windows(2).any(|window| window == ["--memory", "1g"]));
+        assert!(args.windows(2).any(|window| window == ["--cpus", "2"]));
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--pids-limit", "100"])
         );
         assert!(
             args.windows(2)
-                .any(|window| window == ["-v", "mai-team-workspace-agent-1:/workspace"])
+                .any(|window| window == ["--cap-drop", "ALL"])
         );
-        assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--security-opt", "no-new-privileges"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--network", "mai-team"])
+        );
         assert!(
             args.windows(3)
                 .any(|window| { window == [image, "sleep", "infinity"] })

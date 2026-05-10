@@ -74,18 +74,33 @@ pub fn route_tool(name: &str) -> RoutedTool {
 }
 
 pub fn build_tool_definitions(mcp_tools: &[McpTool]) -> Vec<ToolDefinition> {
-    let mut tools = builtin_tool_definitions();
-    tools.extend(mcp_tools.iter().map(|tool| {
-        ToolDefinition::function(
-            tool.model_name.clone(),
-            if tool.description.is_empty() {
-                format!("Call MCP tool `{}` on server `{}`.", tool.name, tool.server)
-            } else {
-                tool.description.clone()
-            },
-            tool.input_schema.clone(),
-        )
-    }));
+    build_tool_definitions_with_filter(mcp_tools, |_| true)
+}
+
+pub fn build_tool_definitions_with_filter(
+    mcp_tools: &[McpTool],
+    allow_tool: impl Fn(&str) -> bool,
+) -> Vec<ToolDefinition> {
+    let mut tools = builtin_tool_definitions()
+        .into_iter()
+        .filter(|tool| allow_tool(&tool.name))
+        .collect::<Vec<_>>();
+    tools.extend(
+        mcp_tools
+            .iter()
+            .filter(|tool| allow_tool(&tool.model_name))
+            .map(|tool| {
+                ToolDefinition::function(
+                    tool.model_name.clone(),
+                    if tool.description.is_empty() {
+                        format!("Call MCP tool `{}` on server `{}`.", tool.name, tool.server)
+                    } else {
+                        tool.description.clone()
+                    },
+                    tool.input_schema.clone(),
+                )
+            }),
+    );
     tools
 }
 

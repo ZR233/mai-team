@@ -3,7 +3,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::{AbortHandle, Abortable};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use mai_docker::{ContainerHandle, DockerClient};
+use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient};
 use mai_mcp::{McpAgentManager, McpTool};
 use mai_model::{ModelRequest, ResponsesClient};
 use mai_protocol::{
@@ -14,8 +14,8 @@ use mai_protocol::{
     GithubAppManifestAccountType, GithubAppManifestStartRequest, GithubAppManifestStartResponse,
     GithubAppSettingsRequest, GithubAppSettingsResponse, GithubInstallationSummary,
     GithubInstallationsResponse, GithubRepositoriesResponse, GithubRepositorySummary,
-    McpServerConfig, McpServerTransport, MessageRole, ModelConfig, ModelContentItem,
-    ModelInputItem, ModelOutputItem, ModelToolCall, PlanHistoryEntry, PlanStatus,
+    McpServerConfig, McpServerScope, McpServerTransport, MessageRole, ModelConfig,
+    ModelContentItem, ModelInputItem, ModelOutputItem, ModelToolCall, PlanHistoryEntry, PlanStatus,
     ProjectCloneStatus, ProjectDetail, ProjectId, ProjectStatus, ProjectSummary,
     RepositoryPackageSummary, RepositoryPackagesResponse, ResolvedAgentModelPreference,
     RuntimeDefaultsResponse, SendMessageRequest, ServiceEvent, ServiceEventKind, SessionId,
@@ -26,7 +26,7 @@ use mai_protocol::{
 };
 use mai_skills::{SkillInjections, SkillsManager};
 use mai_store::{ConfigStore, ProviderSelection};
-use mai_tools::{RoutedTool, build_tool_definitions, route_tool};
+use mai_tools::{RoutedTool, build_tool_definitions_with_filter, route_tool};
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -34,12 +34,10 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
-use tempfile::{NamedTempFile, tempdir};
+use tempfile::NamedTempFile;
 use thiserror::Error;
-use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::time::{Duration, Instant, sleep};
 use tokio_util::sync::CancellationToken;
@@ -160,7 +158,6 @@ pub struct AgentRuntime {
     repo_root: PathBuf,
     sidecar_image: String,
     github_api_base_url: String,
-    git_binary: String,
 }
 
 struct ProjectRecord {
@@ -230,6 +227,19 @@ struct ToolExecution {
     success: bool,
     output: String,
     ends_turn: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AgentCapability {
+    can_spawn_agents: bool,
+    can_close_agents: bool,
+    communication: AgentCommunicationPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentCommunicationPolicy {
+    All,
+    ParentAndMaintainer,
 }
 
 #[derive(Debug, Clone)]
@@ -500,14 +510,6 @@ impl AgentRuntime {
             .as_deref()
             .unwrap_or(DEFAULT_GITHUB_API_BASE_URL)
             .to_string();
-        let git_binary = config
-            .git_binary
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("git")
-            .to_string();
-
         let github_http = reqwest::Client::builder()
             .timeout(Duration::from_secs(GITHUB_HTTP_TIMEOUT_SECS))
             .build()?;
@@ -529,7 +531,6 @@ impl AgentRuntime {
             repo_root: config.repo_root,
             sidecar_image,
             github_api_base_url,
-            git_binary,
         }))
     }
 
@@ -619,9 +620,7 @@ impl AgentRuntime {
             ));
         }
 
-        let sidecar = self
-            .ensure_project_sidecar(project_id, summary.maintainer_agent_id)
-            .await?;
+        let sidecar = self.ensure_project_sidecar(project_id).await?;
         let existing = self.existing_project_skill_dirs(&sidecar.id).await?;
         self.refresh_project_skill_cache(project_id, &sidecar.id, &existing)
             .await?;
@@ -1182,9 +1181,7 @@ impl AgentRuntime {
         if let Some(message) = initial_message.filter(|message| !message.trim().is_empty()) {
             let _ = self.send_task_message(task_id, message, Vec::new()).await?;
         }
-        if user_omitted_title
-            && let Some(message_text) = message_for_title
-        {
+        if user_omitted_title && let Some(message_text) = message_for_title {
             let runtime = Arc::clone(self);
             tokio::spawn(async move {
                 match runtime.generate_task_title(&message_text).await {
@@ -2173,15 +2170,9 @@ impl AgentRuntime {
     async fn close_agent(&self, agent_id: AgentId) -> Result<AgentStatus> {
         let agent = self.agent(agent_id).await?;
         agent.cancel_requested.store(true, Ordering::SeqCst);
-        let (previous_status, project_id) = {
-            let summary = agent.summary.read().await;
-            (summary.status.clone(), summary.project_id)
-        };
+        let previous_status = agent.summary.read().await.status.clone();
         if let Some(manager) = agent.mcp.write().await.take() {
             manager.shutdown().await;
-        }
-        if let Some(project_id) = project_id {
-            let _ = self.delete_project_sidecar(project_id).await;
         }
         let in_memory_container_id = agent
             .container
@@ -2277,12 +2268,8 @@ impl AgentRuntime {
                 abort_handle.abort();
             }
         }
-        let project_id = agent.summary.read().await.project_id;
         if let Some(manager) = agent.mcp.write().await.take() {
             manager.shutdown().await;
-        }
-        if let Some(project_id) = project_id {
-            let _ = self.delete_project_sidecar(project_id).await;
         }
         let in_memory_container_id = agent
             .container
@@ -2577,7 +2564,9 @@ impl AgentRuntime {
             )
             .await?;
             let mcp_tools = self.agent_mcp_tools(&agent).await;
-            let tools = build_tool_definitions(&mcp_tools);
+            let visible_tools = self.visible_tool_names(&agent, &mcp_tools).await;
+            let tools =
+                build_tool_definitions_with_filter(&mcp_tools, |name| visible_tools.contains(name));
             let instructions = self
                 .build_instructions(
                     &agent,
@@ -2904,6 +2893,7 @@ impl AgentRuntime {
         if cancellation_token.is_cancelled() {
             return Err(RuntimeError::TurnCancelled);
         }
+        self.check_tool_permission(agent, name, &arguments).await?;
         match route_tool(name) {
             RoutedTool::ContainerExec => {
                 let command = required_string(&arguments, "command")?;
@@ -3305,12 +3295,7 @@ impl AgentRuntime {
             RoutedTool::Mcp(model_name) => {
                 if agent.summary.read().await.project_id.is_some() {
                     return self
-                        .execute_project_mcp_tool(
-                            agent,
-                            &model_name,
-                            arguments,
-                            cancellation_token,
-                        )
+                        .execute_project_mcp_tool(agent, &model_name, arguments, cancellation_token)
                         .await;
                 }
                 let manager = agent.mcp.read().await.clone().ok_or_else(|| {
@@ -3776,6 +3761,127 @@ impl AgentRuntime {
         }
     }
 
+    async fn agent_capability(&self, agent: &AgentRecord) -> AgentCapability {
+        let summary = agent.summary.read().await.clone();
+        let is_project_maintainer = if let Some(project_id) = summary.project_id {
+            let project = self.projects.read().await.get(&project_id).cloned();
+            if let Some(project) = project {
+                project.summary.read().await.maintainer_agent_id == summary.id
+            } else {
+                false
+            }
+        } else {
+            summary.parent_id.is_none()
+        };
+        if is_project_maintainer || summary.parent_id.is_none() {
+            AgentCapability {
+                can_spawn_agents: true,
+                can_close_agents: true,
+                communication: AgentCommunicationPolicy::All,
+            }
+        } else {
+            AgentCapability {
+                can_spawn_agents: false,
+                can_close_agents: false,
+                communication: AgentCommunicationPolicy::ParentAndMaintainer,
+            }
+        }
+    }
+
+    async fn agent_can_access_target(&self, agent: &AgentRecord, target: AgentId) -> bool {
+        let capability = self.agent_capability(agent).await;
+        if capability.communication == AgentCommunicationPolicy::All {
+            return true;
+        }
+        let summary = agent.summary.read().await.clone();
+        if summary.parent_id == Some(target) {
+            return true;
+        }
+        let Some(project_id) = summary.project_id else {
+            return false;
+        };
+        let project = self.projects.read().await.get(&project_id).cloned();
+        if let Some(project) = project {
+            project.summary.read().await.maintainer_agent_id == target
+        } else {
+            false
+        }
+    }
+
+    async fn check_tool_permission(
+        &self,
+        agent: &AgentRecord,
+        tool_name: &str,
+        arguments: &Value,
+    ) -> Result<()> {
+        let capability = self.agent_capability(agent).await;
+        match route_tool(tool_name) {
+            RoutedTool::SpawnAgent if !capability.can_spawn_agents => {
+                return Err(RuntimeError::InvalidInput(
+                    "Tool 'spawn_agent' is not available for worker agents".to_string(),
+                ));
+            }
+            RoutedTool::CloseAgent if !capability.can_close_agents => {
+                return Err(RuntimeError::InvalidInput(
+                    "Tool 'close_agent' is not available for worker agents".to_string(),
+                ));
+            }
+            RoutedTool::SendInput | RoutedTool::SendMessage => {
+                let target = match route_tool(tool_name) {
+                    RoutedTool::SendInput => {
+                        parse_agent_id(&required_any_string(arguments, &["target", "agent_id"])?)?
+                    }
+                    RoutedTool::SendMessage => {
+                        parse_agent_id(&required_string(arguments, "agent_id")?)?
+                    }
+                    _ => unreachable!(),
+                };
+                if !self.agent_can_access_target(agent, target).await {
+                    return Err(RuntimeError::InvalidInput(
+                        "target agent is outside this agent's communication policy".to_string(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn visible_tool_names(
+        &self,
+        agent: &AgentRecord,
+        mcp_tools: &[McpTool],
+    ) -> HashSet<String> {
+        let capability = self.agent_capability(agent).await;
+        let mut names = HashSet::from([
+            mai_tools::TOOL_CONTAINER_EXEC.to_string(),
+            mai_tools::TOOL_CONTAINER_CP_UPLOAD.to_string(),
+            mai_tools::TOOL_CONTAINER_CP_DOWNLOAD.to_string(),
+            mai_tools::TOOL_SEND_INPUT.to_string(),
+            mai_tools::TOOL_SEND_MESSAGE.to_string(),
+            mai_tools::TOOL_WAIT_AGENT.to_string(),
+            mai_tools::TOOL_LIST_AGENTS.to_string(),
+            mai_tools::TOOL_RESUME_AGENT.to_string(),
+            mai_tools::TOOL_LIST_MCP_RESOURCES.to_string(),
+            mai_tools::TOOL_LIST_MCP_RESOURCE_TEMPLATES.to_string(),
+            mai_tools::TOOL_READ_MCP_RESOURCE.to_string(),
+            mai_tools::TOOL_SAVE_TASK_PLAN.to_string(),
+            mai_tools::TOOL_SUBMIT_REVIEW_RESULT.to_string(),
+            mai_tools::TOOL_UPDATE_TODO_LIST.to_string(),
+            mai_tools::TOOL_REQUEST_USER_INPUT.to_string(),
+            mai_tools::TOOL_SAVE_ARTIFACT.to_string(),
+            mai_tools::TOOL_GITHUB_API_GET.to_string(),
+        ]);
+        if capability.can_spawn_agents {
+            names.insert(mai_tools::TOOL_SPAWN_AGENT.to_string());
+        }
+        if capability.can_close_agents {
+            names.insert(mai_tools::TOOL_CLOSE_AGENT.to_string());
+        }
+        names.extend(mcp_tools.iter().map(|tool| tool.model_name.clone()));
+        names
+    }
+
     async fn send_input_to_agent(
         self: &Arc<Self>,
         target: AgentId,
@@ -3979,7 +4085,8 @@ impl AgentRuntime {
         result: TurnResult,
     ) -> Result<()> {
         let _ = session_id;
-        self.complete_turn_if_current(agent, agent_id, result).await?;
+        self.complete_turn_if_current(agent, agent_id, result)
+            .await?;
         Ok(())
     }
 
@@ -4486,11 +4593,7 @@ impl AgentRuntime {
         Ok(())
     }
 
-    async fn ensure_project_sidecar(
-        &self,
-        project_id: ProjectId,
-        agent_id: AgentId,
-    ) -> Result<ContainerHandle> {
+    async fn ensure_project_sidecar(&self, project_id: ProjectId) -> Result<ContainerHandle> {
         let project = self.project(project_id).await?;
         if let Some(container) = project.sidecar.read().await.clone() {
             return Ok(container);
@@ -4501,15 +4604,15 @@ impl AgentRuntime {
             return Ok(container);
         }
 
-        let workspace_volume = DockerClient::workspace_volume_for_agent(&agent_id.to_string());
+        let workspace_volume = DockerClient::workspace_volume_for_project(&project_id.to_string());
         let container = self
             .docker
             .ensure_project_sidecar_container(
                 &project_id.to_string(),
-                &agent_id.to_string(),
                 None,
                 &self.sidecar_image,
                 &workspace_volume,
+                &ContainerCreateOptions::default(),
             )
             .await?;
         *sidecar_guard = Some(container.clone());
@@ -4809,7 +4912,7 @@ impl AgentRuntime {
                 "agent is not attached to a project".to_string(),
             ));
         };
-        let sidecar = self.ensure_project_sidecar(project_id, summary.id).await?;
+        let sidecar = self.ensure_project_sidecar(project_id).await?;
         let configs = project_mcp_configs(&token);
         let manager = McpAgentManager::start(self.docker.clone(), sidecar.id, configs).await;
         let output = tokio::select! {
@@ -4874,7 +4977,7 @@ impl AgentRuntime {
     async fn clone_project_repository(
         &self,
         project_id: ProjectId,
-        maintainer_agent_id: AgentId,
+        _maintainer_agent_id: AgentId,
     ) -> Result<()> {
         let project = self.project(project_id).await?;
         let summary = project.summary.read().await.clone();
@@ -4883,34 +4986,8 @@ impl AgentRuntime {
         })?;
         let token = self.git_account_token(&account_id).await?;
         let repo_url = github_clone_url(&summary.owner, &summary.repo);
-        let sidecar = self
-            .ensure_project_sidecar(project_id, maintainer_agent_id)
-            .await?;
-        let temp = tempdir()?;
-        let checkout_path = temp.path().join("repo");
-        self.clone_repository_on_host(&repo_url, summary.branch.trim(), &checkout_path, &token)
-            .await?;
-        let output = self
-            .docker
-            .exec_shell(
-                &sidecar.id,
-                &format!(
-                    "rm -rf {workspace}",
-                    workspace = shell_quote(PROJECT_WORKSPACE_PATH)
-                ),
-                Some("/"),
-                Some(30),
-            )
-            .await?;
-        if output.status != 0 {
-            let combined = format!("{}\n{}", output.stderr, output.stdout);
-            let message = preview(redact_secret(combined.trim(), &token).trim(), 500);
-            return Err(RuntimeError::InvalidInput(format!(
-                "repository workspace cleanup failed: {message}"
-            )));
-        }
-        self.docker
-            .copy_to_container(&sidecar.id, &checkout_path, PROJECT_WORKSPACE_PATH)
+        let sidecar = self.ensure_project_sidecar(project_id).await?;
+        self.clone_repository_in_sidecar(&sidecar.id, &repo_url, summary.branch.trim(), &token)
             .await?;
         self.prepare_copied_project_workspace(&sidecar.id).await?;
         Ok(())
@@ -4937,51 +5014,56 @@ impl AgentRuntime {
         Ok(())
     }
 
-    async fn clone_repository_on_host(
+    async fn clone_repository_in_sidecar(
         &self,
+        container_id: &str,
         repo_url: &str,
         branch: &str,
-        checkout_path: &Path,
         token: &str,
     ) -> Result<()> {
-        let askpass = NamedTempFile::new()?;
-        let askpass_script = "#!/bin/sh\n\
+        let branch_arg = if branch.is_empty() {
+            String::new()
+        } else {
+            format!(" --branch {}", shell_quote(branch))
+        };
+        let command = format!(
+            "set -eu\n\
+             tmp=$(mktemp -d)\n\
+             askpass=\"$tmp/askpass.sh\"\n\
+             cleanup() {{ rm -rf \"$tmp\"; }}\n\
+             trap cleanup EXIT HUP INT TERM\n\
+             cat >\"$askpass\" <<'EOF'\n\
+#!/bin/sh\n\
 case \"$1\" in\n\
   *Username*) printf '%s\\n' x-access-token ;;\n\
   *Password*) printf '%s\\n' \"$MAI_GITHUB_INSTALLATION_TOKEN\" ;;\n\
   *) printf '\\n' ;;\n\
-esac\n";
-        std::fs::write(askpass.path(), askpass_script)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(askpass.path())?.permissions();
-            permissions.set_mode(0o700);
-            std::fs::set_permissions(askpass.path(), permissions)?;
-        }
-
-        let mut command = Command::new(&self.git_binary);
-        command.arg("-c").arg("credential.helper=").arg("clone");
-        if !branch.is_empty() {
-            command.arg("--branch").arg(branch);
-        }
-        command.arg("--").arg(repo_url).arg(checkout_path);
-        command
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_ASKPASS", askpass.path())
-            .env("MAI_GITHUB_INSTALLATION_TOKEN", token)
-            .stdin(Stdio::null());
-
-        let output = command.output().await?;
-        if !output.status.success() {
-            let combined = format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stderr),
-                String::from_utf8_lossy(&output.stdout)
-            );
+esac\n\
+EOF\n\
+             chmod 700 \"$askpass\"\n\
+             rm -rf {workspace}\n\
+             GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=\"$askpass\" git -c credential.helper= clone{branch_arg} -- {repo_url} {workspace}",
+            workspace = shell_quote(PROJECT_WORKSPACE_PATH),
+            repo_url = shell_quote(repo_url),
+        );
+        let output = self
+            .docker
+            .exec_shell_env(
+                container_id,
+                &command,
+                Some("/"),
+                Some(600),
+                &[(
+                    "MAI_GITHUB_INSTALLATION_TOKEN".to_string(),
+                    token.to_string(),
+                )],
+            )
+            .await?;
+        if output.status != 0 {
+            let combined = format!("{}\n{}", output.stderr, output.stdout);
             let message = preview(redact_secret(combined.trim(), token).trim(), 500);
             return Err(RuntimeError::InvalidInput(format!(
-                "repository clone failed on server host: {message}"
+                "repository clone failed in project sidecar: {message}"
             )));
         }
         Ok(())
@@ -5315,7 +5397,13 @@ esac\n";
         *container_guard = Some(container.clone());
         drop(container_guard);
 
-        let mcp_configs = self.store.list_mcp_servers().await?;
+        let mcp_configs = self
+            .store
+            .list_mcp_servers()
+            .await?
+            .into_iter()
+            .filter(|(_, config)| config.scope == McpServerScope::Agent)
+            .collect::<std::collections::BTreeMap<_, _>>();
         for server in mcp_configs
             .iter()
             .filter_map(|(server, config)| config.enabled.then_some(server))
@@ -5474,7 +5562,7 @@ esac\n";
         let Some(project_id) = summary.project_id else {
             return Ok(());
         };
-        let sidecar = self.ensure_project_sidecar(project_id, summary.id).await?;
+        let sidecar = self.ensure_project_sidecar(project_id).await?;
         let configs = project_mcp_configs(&token);
         self.publish(ServiceEventKind::McpServerStatusChanged {
             agent_id,
@@ -5981,6 +6069,7 @@ fn project_mcp_configs(token: &str) -> std::collections::BTreeMap<String, McpSer
     configs.insert(
         PROJECT_GITHUB_MCP_SERVER.to_string(),
         McpServerConfig {
+            scope: McpServerScope::Project,
             transport: McpServerTransport::Stdio,
             command: Some("github-mcp-server".to_string()),
             args: vec!["stdio".to_string()],
@@ -5996,6 +6085,7 @@ fn project_mcp_configs(token: &str) -> std::collections::BTreeMap<String, McpSer
     configs.insert(
         PROJECT_GIT_MCP_SERVER.to_string(),
         McpServerConfig {
+            scope: McpServerScope::Project,
             transport: McpServerTransport::Stdio,
             command: Some("uvx".to_string()),
             args: vec![
@@ -7156,13 +7246,21 @@ case "$1" in
       fi
       last="$arg"
     done
-    if printf '%s' "$command" | grep -q "/workspace/repo/.claude/skills"; then
-      [ -d "$WORKSPACE/.claude/skills" ] && printf '%s\t%s\t%s\n' ".claude/skills" "claude" "/workspace/repo/.claude/skills"
-      [ -d "$WORKSPACE/.agents/skills" ] && printf '%s\t%s\t%s\n' ".agents/skills" "agents" "/workspace/repo/.agents/skills"
-      [ -d "$WORKSPACE/skills" ] && printf '%s\t%s\t%s\n' "skills" "skills" "/workspace/repo/skills"
-    fi
-    exit 0
-    ;;
+	    if printf '%s' "$command" | grep -q "/workspace/repo/.claude/skills"; then
+	      [ -d "$WORKSPACE/.claude/skills" ] && printf '%s\t%s\t%s\n' ".claude/skills" "claude" "/workspace/repo/.claude/skills"
+	      [ -d "$WORKSPACE/.agents/skills" ] && printf '%s\t%s\t%s\n' ".agents/skills" "agents" "/workspace/repo/.agents/skills"
+	      [ -d "$WORKSPACE/skills" ] && printf '%s\t%s\t%s\n' "skills" "skills" "/workspace/repo/skills"
+	    fi
+	    if printf '%s' "$command" | grep -q "git -c credential.helper= clone"; then
+	      echo "sidecar-git-clone" >> "$LOG"
+	      if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
+	        echo "token-present" >> "$LOG"
+	      fi
+	      mkdir -p "$WORKSPACE"
+	      printf 'hello\n' > "$WORKSPACE/README.md"
+	    fi
+	    exit 0
+	    ;;
   cp)
     echo "$*" >> "$LOG"
     if [ "$2" = "created-container:/workspace/repo/.claude/skills" ]; then
@@ -7467,8 +7565,8 @@ esac
         let store = test_store(&dir).await;
         store
             .save_providers(ProvidersConfigRequest {
-                providers: vec![test_provider()],
-                default_provider_id: Some("openai".to_string()),
+                providers: vec![compact_test_provider("http://localhost".to_string())],
+                default_provider_id: Some("mock".to_string()),
             })
             .await
             .expect("save providers");
@@ -8613,7 +8711,7 @@ esac
 
         let requests = requests.lock().await.clone();
         assert_eq!(requests.len(), 3);
-        let expected_tool_count = build_tool_definitions(&[]).len();
+        let expected_tool_count = build_tool_definitions_with_filter(&[], |_| true).len();
         assert_eq!(
             requests[0]["tools"].as_array().expect("first tools").len(),
             expected_tool_count
@@ -10173,6 +10271,105 @@ esac
     }
 
     #[tokio::test]
+    async fn project_worker_cannot_spawn_agents_and_hidden_from_tools() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        maintainer.role = Some(AgentRole::Planner);
+        let mut worker = test_agent_summary_with_parent(
+            worker_id,
+            Some(maintainer_id),
+            Some("worker-container"),
+        );
+        worker.project_id = Some(project_id);
+        worker.role = Some(AgentRole::Executor);
+        save_agent_with_session(&store, &maintainer).await;
+        save_agent_with_session(&store, &worker).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                maintainer_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let worker_record = runtime.agent(worker_id).await.expect("worker");
+
+        let visible = runtime.visible_tool_names(&worker_record, &[]).await;
+        assert!(!visible.contains(mai_tools::TOOL_SPAWN_AGENT));
+        assert!(!visible.contains(mai_tools::TOOL_CLOSE_AGENT));
+
+        let result = runtime
+            .execute_tool_for_test(
+                worker_id,
+                "spawn_agent",
+                json!({
+                    "message": "should fail"
+                }),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidInput(message)) if message.contains("spawn_agent"))
+        );
+    }
+
+    #[tokio::test]
+    async fn project_maintainer_can_spawn_agent() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![compact_test_provider("http://localhost".to_string())],
+                default_provider_id: Some("mock".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        maintainer.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &maintainer).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                maintainer_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let maintainer_record = runtime.agent(maintainer_id).await.expect("maintainer");
+        *maintainer_record.container.write().await = Some(ContainerHandle {
+            id: "maintainer-container".to_string(),
+            name: "maintainer-container".to_string(),
+            image: "unused".to_string(),
+        });
+
+        let visible = runtime.visible_tool_names(&maintainer_record, &[]).await;
+        assert!(visible.contains(mai_tools::TOOL_SPAWN_AGENT));
+
+        let result = runtime
+            .execute_tool_for_test(
+                maintainer_id,
+                "spawn_agent",
+                json!({
+                    "agent_type": "worker"
+                }),
+            )
+            .await
+            .expect("spawn");
+
+        assert!(result.success);
+    }
+
+    #[tokio::test]
     async fn wait_agent_accepts_targets_and_send_input_queues_busy_target() {
         let dir = tempdir().expect("tempdir");
         let store = test_store(&dir).await;
@@ -10555,16 +10752,13 @@ esac
         assert!(docker_log.contains("exec -w / created-container /bin/sh -lc"));
         assert!(docker_log.contains("rm -rf"));
         assert!(docker_log.contains("/workspace/repo"));
-        assert!(docker_log.contains("cp "));
-        assert!(docker_log.contains("created-container:/workspace/repo"));
+        assert!(docker_log.contains("git -c credential.helper= clone"));
+        assert!(docker_log.contains("sidecar-git-clone"));
         assert!(docker_log.contains("chown -R"));
         assert!(docker_log.contains("safe.directory"));
         let git_log = fake_git_log(&dir);
-        assert!(git_log.contains(
-            "-c credential.helper= clone --branch main -- https://github.com/owner/repo.git"
-        ));
-        assert!(git_log.contains("askpass="));
-        assert!(git_log.contains("token-present"));
+        assert!(git_log.is_empty());
+        assert!(docker_log.contains("token-present"));
         assert!(docker_log.contains("created-container"));
         assert!(!docker_log.contains("unused-agent sleep infinity"));
         assert!(!docker_log.contains("secret-token"));
@@ -10621,8 +10815,10 @@ esac
         assert_eq!(detail.summary.status, ProjectStatus::Ready);
         assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Ready);
         assert_eq!(detail.maintainer_agent.summary.status, AgentStatus::Idle);
-        assert!(fake_docker_log(&dir).contains("created-container:/workspace/repo"));
-        assert!(fake_git_log(&dir).contains("https://github.com/owner/repo.git"));
+        let docker_log = fake_docker_log(&dir);
+        assert!(docker_log.contains("git -c credential.helper= clone"));
+        assert!(docker_log.contains("https://github.com/owner/repo.git"));
+        assert!(fake_git_log(&dir).is_empty());
 
         let mut saw_cloning = false;
         let mut saw_ready = false;

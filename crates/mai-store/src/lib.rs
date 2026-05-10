@@ -2825,6 +2825,7 @@ fn github_app_install_url(app_slug: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mai_protocol::McpServerScope;
     use mai_protocol::{
         AgentStatus, McpServerTransport, MessageRole, ModelContentItem, ModelToolCall,
         ServiceEventKind,
@@ -3832,6 +3833,7 @@ mod tests {
             (
                 "stdio".to_string(),
                 McpServerConfig {
+                    scope: McpServerScope::Project,
                     command: Some("demo-mcp".to_string()),
                     args: vec!["--stdio".to_string()],
                     env: BTreeMap::from([("A".to_string(), "B".to_string())]),
@@ -3861,5 +3863,9 @@ mod tests {
         let loaded = store.list_mcp_servers().await.expect("load");
 
         assert_eq!(loaded, servers);
+        assert_eq!(
+            loaded.get("stdio").map(|config| config.scope),
+            Some(McpServerScope::Project)
+        );
     }
 }

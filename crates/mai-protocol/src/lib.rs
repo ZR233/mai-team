@@ -1066,8 +1066,19 @@ pub enum McpServerTransport {
     StreamableHttp,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerScope {
+    #[default]
+    Agent,
+    Project,
+    System,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerConfig {
+    #[serde(default)]
+    pub scope: McpServerScope,
     #[serde(default)]
     pub transport: McpServerTransport,
     #[serde(default)]
@@ -1103,6 +1114,7 @@ pub struct McpServerConfig {
 impl Default for McpServerConfig {
     fn default() -> Self {
         Self {
+            scope: McpServerScope::Agent,
             transport: McpServerTransport::Stdio,
             command: None,
             args: Vec::new(),
