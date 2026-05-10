@@ -11,6 +11,16 @@ const isProjectsLoading = ref(false)
 const isProjectDetailLoading = ref(false)
 const isProjectSending = ref(false)
 const projectConversationRef = ref(null)
+const projectSkillsState = reactive({
+  projectId: null,
+  roots: [],
+  skills: [],
+  errors: [],
+  loading: false,
+  refreshing: false,
+  loaded: false,
+  error: ''
+})
 
 export function useProjects() {
   const { api } = useApi()
@@ -23,6 +33,7 @@ export function useProjects() {
       selectedProjectAgentId.value = null
       selectedProjectSessionId.value = null
       selectedProjectDetail.value = null
+      resetProjectSkillsState()
     }
   }
 
@@ -43,6 +54,9 @@ export function useProjects() {
       selectedProjectSessionId.value = selectedProjectDetail.value?.maintainer_agent?.selected_session_id
         || selectedProjectSessionId.value
         || null
+      if (selectedProjectDetail.value?.status === 'ready' || selectedProjectDetail.value?.clone_status === 'ready') {
+        ensureProjectSkillsLoaded(selectedProjectId.value).catch(() => {})
+      }
       await nextTick()
       highlightCodeBlocks(projectConversationRef.value)
       await scrollProjectConversationToBottom()
@@ -56,6 +70,7 @@ export function useProjects() {
     selectedProjectAgentId.value = null
     selectedProjectSessionId.value = null
     selectedProjectDetail.value = null
+    resetProjectSkillsState(id)
     await refreshProjects()
     await refreshProjectDetail()
   }
@@ -101,6 +116,7 @@ export function useProjects() {
     selectedProjectAgentId.value = project?.maintainer_agent_id || null
     selectedProjectSessionId.value = null
     selectedProjectDetail.value = project || null
+    resetProjectSkillsState(project?.id || null)
     refreshProjectCreationState()
     return project
   }
@@ -122,6 +138,7 @@ export function useProjects() {
       selectedProjectAgentId.value = null
       selectedProjectSessionId.value = null
       selectedProjectDetail.value = null
+      resetProjectSkillsState()
     }
     await refreshProjects()
   }
@@ -144,6 +161,46 @@ export function useProjects() {
     } finally {
       isProjectSending.value = false
     }
+  }
+
+  async function loadProjectSkills(projectId = selectedProjectId.value) {
+    if (!projectId) return null
+    if (projectSkillsState.projectId !== projectId) resetProjectSkillsState(projectId)
+    projectSkillsState.loading = true
+    projectSkillsState.error = ''
+    try {
+      const response = await api(`/projects/${projectId}/skills`)
+      applyProjectSkillsResponse(projectId, response)
+      return response
+    } catch (error) {
+      projectSkillsState.error = error.message
+      throw error
+    } finally {
+      projectSkillsState.loading = false
+    }
+  }
+
+  async function detectProjectSkills(projectId = selectedProjectId.value) {
+    if (!projectId) return null
+    if (projectSkillsState.projectId !== projectId) resetProjectSkillsState(projectId)
+    projectSkillsState.refreshing = true
+    projectSkillsState.error = ''
+    try {
+      const response = await api(`/projects/${projectId}/skills/detect`, { method: 'POST' })
+      applyProjectSkillsResponse(projectId, response)
+      return response
+    } catch (error) {
+      projectSkillsState.error = error.message
+      throw error
+    } finally {
+      projectSkillsState.refreshing = false
+    }
+  }
+
+  async function ensureProjectSkillsLoaded(projectId = selectedProjectId.value) {
+    if (!projectId || projectSkillsState.loading || projectSkillsState.refreshing) return null
+    if (projectSkillsState.projectId === projectId && projectSkillsState.loaded) return projectSkillsState
+    return loadProjectSkills(projectId)
   }
 
   async function cancelProject(id) {
@@ -244,6 +301,7 @@ export function useProjects() {
     isProjectDetailLoading,
     isProjectSending,
     projectConversationRef,
+    projectSkillsState,
     projectDialog,
     refreshProjects,
     refreshProjectDetail,
@@ -254,6 +312,9 @@ export function useProjects() {
     updateProject,
     deleteProject,
     sendProjectMessage,
+    loadProjectSkills,
+    detectProjectSkills,
+    ensureProjectSkillsLoaded,
     cancelProject,
     cancelProjectAgent,
     createProjectSession,
@@ -267,4 +328,23 @@ export function useProjects() {
 
 function nextFrame() {
   return new Promise((resolve) => requestAnimationFrame(() => resolve()))
+}
+
+function resetProjectSkillsState(projectId = null) {
+  projectSkillsState.projectId = projectId
+  projectSkillsState.roots = []
+  projectSkillsState.skills = []
+  projectSkillsState.errors = []
+  projectSkillsState.loading = false
+  projectSkillsState.refreshing = false
+  projectSkillsState.loaded = false
+  projectSkillsState.error = ''
+}
+
+function applyProjectSkillsResponse(projectId, response) {
+  projectSkillsState.projectId = projectId
+  projectSkillsState.roots = response?.roots || []
+  projectSkillsState.skills = response?.skills || []
+  projectSkillsState.errors = response?.errors || []
+  projectSkillsState.loaded = true
 }

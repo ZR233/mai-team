@@ -18,9 +18,10 @@ use mai_protocol::{
     ProjectCloneStatus, ProjectDetail, ProjectId, ProjectStatus, ProjectSummary,
     RepositoryPackageSummary, RepositoryPackagesResponse, ResolvedAgentModelPreference,
     RuntimeDefaultsResponse, SendMessageRequest, ServiceEvent, ServiceEventKind, SessionId,
-    SkillActivationInfo, SkillsConfigRequest, SkillsListResponse, TaskDetail, TaskId, TaskPlan,
-    TaskReview, TaskStatus, TaskSummary, TodoItem, TokenUsage, ToolTraceDetail, TurnId, TurnStatus,
-    UpdateAgentRequest, UpdateProjectRequest, UserInputOption, UserInputQuestion, now, preview,
+    SkillActivationInfo, SkillScope, SkillsConfigRequest, SkillsListResponse, TaskDetail, TaskId,
+    TaskPlan, TaskReview, TaskStatus, TaskSummary, TodoItem, TokenUsage, ToolTraceDetail, TurnId,
+    TurnStatus, UpdateAgentRequest, UpdateProjectRequest, UserInputOption, UserInputQuestion, now,
+    preview,
 };
 use mai_skills::{SkillInjections, SkillsManager};
 use mai_store::{ConfigStore, ProviderSelection};
@@ -30,6 +31,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -46,6 +48,12 @@ const RECENT_EVENT_LIMIT: usize = 500;
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
 const REVIEW_ROUND_LIMIT: u64 = 5;
 const PROJECT_WORKSPACE_PATH: &str = "/workspace/repo";
+const PROJECT_SKILLS_CACHE_DIR: &str = "project-skills";
+const PROJECT_SKILL_CANDIDATE_DIRS: [(&str, &str); 3] = [
+    (".claude/skills", "claude"),
+    (".agents/skills", "agents"),
+    ("skills", "skills"),
+];
 const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const DEFAULT_GITHUB_WEB_BASE_URL: &str = "https://github.com";
 const GITHUB_API_VERSION: &str = "2022-11-28";
@@ -220,6 +228,13 @@ struct GithubManifestState {
 struct ResolvedAgentModel {
     preference: AgentModelPreference,
     effective: ResolvedAgentModelPreference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectSkillSourceDir {
+    relative: PathBuf,
+    cache_name: String,
+    container_path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -546,6 +561,33 @@ impl AgentRuntime {
         let normalized = mai_skills::normalize_config(&request)?;
         self.store.save_skills_config(&normalized).await?;
         Ok(self.skills.list(&normalized)?)
+    }
+
+    pub async fn list_project_skills(&self, project_id: ProjectId) -> Result<SkillsListResponse> {
+        if !self.project_skill_cache_dir(project_id).exists() {
+            return self.detect_project_skills(project_id).await;
+        }
+        self.project_skills_from_cache(project_id).await
+    }
+
+    pub async fn detect_project_skills(&self, project_id: ProjectId) -> Result<SkillsListResponse> {
+        let project = self.project(project_id).await?;
+        let summary = project.summary.read().await.clone();
+        if summary.status != ProjectStatus::Ready
+            || summary.clone_status != ProjectCloneStatus::Ready
+        {
+            return Err(RuntimeError::InvalidInput(
+                "project repository workspace is not ready".to_string(),
+            ));
+        }
+
+        let sidecar = self
+            .ensure_project_sidecar(project_id, summary.maintainer_agent_id)
+            .await?;
+        let existing = self.existing_project_skill_dirs(&sidecar.id).await?;
+        self.refresh_project_skill_cache(project_id, &sidecar.id, &existing)
+            .await?;
+        self.project_skills_from_cache(project_id).await
     }
 
     pub async fn update_agent_config(
@@ -1403,6 +1445,7 @@ impl AgentRuntime {
         self.projects.write().await.remove(&project_id);
         self.publish(ServiceEventKind::ProjectDeleted { project_id })
             .await;
+        let _ = fs::remove_dir_all(self.project_skill_cache_dir(project_id));
         Ok(())
     }
 
@@ -2340,9 +2383,8 @@ impl AgentRuntime {
         .await;
 
         let skills_config = self.store.load_skills_config().await?;
-        let skill_injections = self
-            .skills
-            .build_injections(&skill_mentions, &skills_config)?;
+        let skills_manager = self.skills_manager_for_agent(&agent).await?;
+        let skill_injections = skills_manager.build_injections(&skill_mentions, &skills_config)?;
         if !skill_injections.items.is_empty() {
             self.publish(ServiceEventKind::SkillsActivated {
                 agent_id,
@@ -2375,7 +2417,13 @@ impl AgentRuntime {
             let mcp_tools = self.agent_mcp_tools(&agent).await;
             let tools = build_tool_definitions(&mcp_tools);
             let instructions = self
-                .build_instructions(&agent, &skill_injections, &skills_config, &mcp_tools)
+                .build_instructions(
+                    &agent,
+                    &skills_manager,
+                    &skill_injections,
+                    &skills_config,
+                    &mcp_tools,
+                )
                 .await?;
             let summary = agent.summary.read().await.clone();
             let model_name = summary.model.clone();
@@ -3582,6 +3630,7 @@ impl AgentRuntime {
     async fn build_instructions(
         &self,
         agent: &AgentRecord,
+        skills_manager: &SkillsManager,
         skill_injections: &SkillInjections,
         skills_config: &SkillsConfigRequest,
         mcp_tools: &[mai_mcp::McpTool],
@@ -3592,7 +3641,7 @@ impl AgentRuntime {
             instructions.push_str(system_prompt);
         }
         instructions.push_str("\n\n## Available Skills\n");
-        instructions.push_str(&self.skills.render_available(skills_config)?);
+        instructions.push_str(&skills_manager.render_available(skills_config)?);
         if !skill_injections.warnings.is_empty() {
             instructions.push_str("\n\n## Skill Warnings\n");
             for warning in &skill_injections.warnings {
@@ -3818,8 +3867,15 @@ impl AgentRuntime {
         let mut compact_input = history.clone();
         compact_input.push(ModelInputItem::user_text(COMPACT_PROMPT));
         let skills_config = self.store.load_skills_config().await?;
+        let skills_manager = self.skills_manager_for_agent(agent).await?;
         let instructions = self
-            .build_instructions(agent, &SkillInjections::default(), &skills_config, &[])
+            .build_instructions(
+                agent,
+                &skills_manager,
+                &SkillInjections::default(),
+                &skills_config,
+                &[],
+            )
             .await?;
         let response = self
             .model
@@ -3913,6 +3969,125 @@ impl AgentRuntime {
         }
         summaries.sort_by_key(|summary| summary.created_at);
         summaries
+    }
+
+    async fn project_skills_from_cache(&self, project_id: ProjectId) -> Result<SkillsListResponse> {
+        let config = self.store.load_skills_config().await?;
+        let mut response =
+            SkillsManager::with_roots(self.project_skill_roots(project_id)).list(&config)?;
+        self.apply_project_skill_source_paths(project_id, &mut response);
+        Ok(response)
+    }
+
+    fn skills_manager_with_project_roots(&self, project_id: ProjectId) -> SkillsManager {
+        self.skills
+            .clone_with_extra_roots(self.project_skill_roots(project_id))
+    }
+
+    async fn skills_manager_for_agent(&self, agent: &AgentRecord) -> Result<SkillsManager> {
+        let project_id = agent.summary.read().await.project_id;
+        Ok(project_id
+            .map(|project_id| self.skills_manager_with_project_roots(project_id))
+            .unwrap_or_else(|| self.skills.clone()))
+    }
+
+    fn project_skill_cache_dir(&self, project_id: ProjectId) -> PathBuf {
+        self.repo_root
+            .join(PROJECT_SKILLS_CACHE_DIR)
+            .join(project_id.to_string())
+    }
+
+    fn project_skill_roots(&self, project_id: ProjectId) -> Vec<(PathBuf, SkillScope)> {
+        let cache_dir = self.project_skill_cache_dir(project_id);
+        PROJECT_SKILL_CANDIDATE_DIRS
+            .iter()
+            .map(|(_, cache_name)| (cache_dir.join(cache_name), SkillScope::Project))
+            .collect()
+    }
+
+    fn apply_project_skill_source_paths(
+        &self,
+        project_id: ProjectId,
+        response: &mut SkillsListResponse,
+    ) {
+        let cache_dir = self.project_skill_cache_dir(project_id);
+        for skill in &mut response.skills {
+            if skill.scope != SkillScope::Project {
+                continue;
+            }
+            if let Some(source_path) = project_skill_source_path(&cache_dir, &skill.path) {
+                skill.source_path = Some(source_path);
+            }
+        }
+        for error in &mut response.errors {
+            if let Some(source_path) = project_skill_source_path(&cache_dir, &error.path) {
+                error.path = source_path;
+            }
+        }
+        response.roots = PROJECT_SKILL_CANDIDATE_DIRS
+            .iter()
+            .filter_map(|(relative, cache_name)| {
+                let root = cache_dir.join(cache_name);
+                root.exists()
+                    .then(|| PathBuf::from(PROJECT_WORKSPACE_PATH).join(relative))
+            })
+            .collect();
+    }
+
+    async fn existing_project_skill_dirs(
+        &self,
+        container_id: &str,
+    ) -> Result<Vec<ProjectSkillSourceDir>> {
+        let checks = PROJECT_SKILL_CANDIDATE_DIRS
+            .iter()
+            .map(|(relative, cache_name)| {
+                let container_path = format!("{PROJECT_WORKSPACE_PATH}/{relative}");
+                format!(
+                    "if [ -d {path} ]; then printf '%s\\t%s\\t%s\\n' {relative} {cache_name} {path}; fi",
+                    path = shell_quote(&container_path),
+                    relative = shell_quote(relative),
+                    cache_name = shell_quote(cache_name),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = self
+            .docker
+            .exec_shell(container_id, &checks, Some("/"), Some(20))
+            .await?;
+        if output.status != 0 {
+            let combined = format!("{}\n{}", output.stderr, output.stdout);
+            let message = preview(combined.trim(), 500);
+            return Err(RuntimeError::InvalidInput(format!(
+                "project skill directory detection failed: {message}"
+            )));
+        }
+        Ok(output
+            .stdout
+            .lines()
+            .filter_map(ProjectSkillSourceDir::from_line)
+            .collect())
+    }
+
+    async fn refresh_project_skill_cache(
+        &self,
+        project_id: ProjectId,
+        container_id: &str,
+        sources: &[ProjectSkillSourceDir],
+    ) -> Result<()> {
+        let cache_dir = self.project_skill_cache_dir(project_id);
+        if cache_dir.exists() {
+            fs::remove_dir_all(&cache_dir)?;
+        }
+        fs::create_dir_all(&cache_dir)?;
+        for source in sources {
+            let target = cache_dir.join(&source.cache_name);
+            self.docker
+                .copy_from_container_to_file(container_id, &source.container_path, &target)
+                .await?;
+            normalize_copied_project_skill_dir(&target, &source.cache_name)?;
+        }
+        Ok(())
     }
 
     async fn ensure_project_sidecar(
@@ -5740,6 +5915,59 @@ fn skill_user_fragment(skill_injections: &SkillInjections) -> Option<ModelInputI
     Some(ModelInputItem::user_text(text))
 }
 
+impl ProjectSkillSourceDir {
+    fn from_line(line: &str) -> Option<Self> {
+        let mut parts = line.splitn(3, '\t');
+        let relative = parts.next()?.trim();
+        let cache_name = parts.next()?.trim();
+        let container_path = parts.next()?.trim();
+        if relative.is_empty() || cache_name.is_empty() || container_path.is_empty() {
+            return None;
+        }
+        Some(Self {
+            relative: PathBuf::from(relative),
+            cache_name: cache_name.to_string(),
+            container_path: container_path.to_string(),
+        })
+    }
+}
+
+fn normalize_copied_project_skill_dir(target: &Path, cache_name: &str) -> Result<()> {
+    let nested = target.join(cache_name);
+    if nested.is_dir() {
+        let temp = target.with_extension("tmp");
+        if temp.exists() {
+            fs::remove_dir_all(&temp)?;
+        }
+        fs::rename(&nested, &temp)?;
+        fs::remove_dir_all(target)?;
+        fs::rename(temp, target)?;
+    }
+    Ok(())
+}
+
+fn project_skill_source_path(cache_dir: &Path, path: &Path) -> Option<PathBuf> {
+    let relative = path.strip_prefix(cache_dir).ok()?;
+    let mut components = relative.components();
+    let cache_name = match components.next()? {
+        std::path::Component::Normal(name) => name.to_string_lossy(),
+        _ => return None,
+    };
+    let source_relative = PROJECT_SKILL_CANDIDATE_DIRS
+        .iter()
+        .find(|(_, name)| *name == cache_name.as_ref())
+        .map(|(relative, _)| *relative)?;
+    let mut source_path = PathBuf::from(PROJECT_WORKSPACE_PATH).join(source_relative);
+    for component in components {
+        match component {
+            std::path::Component::Normal(part) => source_path.push(part),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    Some(source_path)
+}
+
 fn should_auto_compact(last_context_tokens: u64, context_tokens: u64) -> bool {
     if last_context_tokens == 0 || context_tokens == 0 {
         return false;
@@ -6333,12 +6561,25 @@ mod tests {
         }
     }
 
+    fn ready_test_project_summary(
+        project_id: ProjectId,
+        maintainer_agent_id: AgentId,
+        git_account_id: &str,
+    ) -> ProjectSummary {
+        let mut summary = test_project_summary(project_id, maintainer_agent_id, git_account_id);
+        summary.status = ProjectStatus::Ready;
+        summary.clone_status = ProjectCloneStatus::Ready;
+        summary
+    }
+
     fn fake_docker_path(dir: &tempfile::TempDir) -> String {
         let path = dir.path().join("fake-docker.sh");
         let log_path = fake_docker_log_path(dir);
+        let workspace_root = dir.path().join("fake-sidecar-workspace");
         let script = format!(
             r#"#!/bin/sh
 LOG={}
+WORKSPACE={}
 case "$1" in
   ps)
     exit 0
@@ -6353,8 +6594,39 @@ case "$1" in
     echo "created-container"
     exit 0
     ;;
-  rm|rmi|start|exec|cp)
+  rm|rmi|start)
     echo "$*" >> "$LOG"
+    exit 0
+    ;;
+  exec)
+    echo "$*" >> "$LOG"
+    command=""
+    last=""
+    for arg in "$@"; do
+      if [ "$last" = "-lc" ]; then
+        command="$arg"
+      fi
+      last="$arg"
+    done
+    if printf '%s' "$command" | grep -q "/workspace/repo/.claude/skills"; then
+      [ -d "$WORKSPACE/.claude/skills" ] && printf '%s\t%s\t%s\n' ".claude/skills" "claude" "/workspace/repo/.claude/skills"
+      [ -d "$WORKSPACE/.agents/skills" ] && printf '%s\t%s\t%s\n' ".agents/skills" "agents" "/workspace/repo/.agents/skills"
+      [ -d "$WORKSPACE/skills" ] && printf '%s\t%s\t%s\n' "skills" "skills" "/workspace/repo/skills"
+    fi
+    exit 0
+    ;;
+  cp)
+    echo "$*" >> "$LOG"
+    if [ "$2" = "created-container:/workspace/repo/.claude/skills" ]; then
+      rm -rf "$3"
+      cp -R "$WORKSPACE/.claude/skills" "$3"
+    elif [ "$2" = "created-container:/workspace/repo/.agents/skills" ]; then
+      rm -rf "$3"
+      cp -R "$WORKSPACE/.agents/skills" "$3"
+    elif [ "$2" = "created-container:/workspace/repo/skills" ]; then
+      rm -rf "$3"
+      cp -R "$WORKSPACE/skills" "$3"
+    fi
     exit 0
     ;;
   *)
@@ -6363,7 +6635,8 @@ case "$1" in
     ;;
 esac
 "#,
-            test_shell_quote(&log_path.to_string_lossy())
+            test_shell_quote(&log_path.to_string_lossy()),
+            test_shell_quote(&workspace_root.to_string_lossy())
         );
         std::fs::write(&path, script).expect("write fake docker");
         #[cfg(unix)]
@@ -6376,6 +6649,10 @@ esac
             std::fs::set_permissions(&path, permissions).expect("chmod fake docker");
         }
         path.to_string_lossy().to_string()
+    }
+
+    fn fake_sidecar_workspace_path(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("fake-sidecar-workspace")
     }
 
     fn fake_git_path(dir: &tempfile::TempDir) -> String {
@@ -6605,6 +6882,7 @@ esac
                     description: "Demo skill".to_string(),
                     short_description: None,
                     path: path.clone(),
+                    source_path: None,
                     scope: mai_protocol::SkillScope::Repo,
                     enabled: true,
                     interface: None,
@@ -8011,6 +8289,280 @@ esac
                 .iter()
                 .any(|event| matches!(event.kind, ServiceEventKind::SkillsActivated { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn project_skill_cache_lists_project_scope_with_source_paths() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, Some("container-1"));
+        agent.project_id = Some(project_id);
+        save_agent_with_session(&store, &agent).await;
+        let project = ready_test_project_summary(project_id, agent_id, "account-1");
+        store.save_project(&project).await.expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let skill_dir = runtime
+            .project_skill_cache_dir(project_id)
+            .join("claude")
+            .join("demo");
+        fs::create_dir_all(&skill_dir).expect("mkdir skill");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: project-demo\ndescription: Project demo skill.\n---\nUse project demo.",
+        )
+        .expect("write skill");
+
+        let response = runtime
+            .list_project_skills(project_id)
+            .await
+            .expect("project skills");
+
+        assert!(response.errors.is_empty());
+        assert_eq!(response.skills.len(), 1);
+        assert_eq!(response.skills[0].scope, SkillScope::Project);
+        assert_eq!(
+            response.skills[0].source_path.as_deref(),
+            Some(Path::new("/workspace/repo/.claude/skills/demo/SKILL.md"))
+        );
+        assert_eq!(
+            response.roots,
+            vec![PathBuf::from("/workspace/repo/.claude/skills")]
+        );
+    }
+
+    #[tokio::test]
+    async fn detects_project_skills_from_sidecar_candidate_dirs() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, Some("container-1"));
+        agent.project_id = Some(project_id);
+        save_agent_with_session(&store, &agent).await;
+        let project = ready_test_project_summary(project_id, agent_id, "account-1");
+        store.save_project(&project).await.expect("save project");
+        let workspace = fake_sidecar_workspace_path(&dir);
+        let claude_skill = workspace.join(".claude/skills/claude-demo");
+        let agents_skill = workspace.join(".agents/skills/agents-demo");
+        let root_skill = workspace.join("skills/root-demo");
+        for (path, name) in [
+            (&claude_skill, "claude-demo"),
+            (&agents_skill, "agents-demo"),
+            (&root_skill, "root-demo"),
+        ] {
+            fs::create_dir_all(path).expect("mkdir skill");
+            fs::write(
+                path.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name}\n---\nBody."),
+            )
+            .expect("write skill");
+        }
+        fs::create_dir_all(workspace.join("template/ignored")).expect("mkdir ignored");
+        fs::write(
+            workspace.join("template/ignored/SKILL.md"),
+            "---\nname: ignored\ndescription: ignored\n---\nIgnored.",
+        )
+        .expect("write ignored");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let project = runtime.project(project_id).await.expect("project");
+        *project.sidecar.write().await = Some(ContainerHandle {
+            id: "created-container".to_string(),
+            name: "sidecar".to_string(),
+            image: "unused".to_string(),
+        });
+
+        let response = runtime
+            .detect_project_skills(project_id)
+            .await
+            .expect("detect skills");
+
+        let names = response
+            .skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["agents-demo", "claude-demo", "root-demo"]);
+        assert!(
+            response
+                .skills
+                .iter()
+                .all(|skill| skill.scope == SkillScope::Project)
+        );
+        assert_eq!(response.roots.len(), 3);
+        assert!(
+            runtime
+                .project_skill_cache_dir(project_id)
+                .join("claude/claude-demo/SKILL.md")
+                .exists()
+        );
+        assert!(!names.contains(&"ignored"));
+    }
+
+    #[tokio::test]
+    async fn project_turn_injects_selected_project_skill_path() {
+        let (base_url, requests) = start_mock_responses(vec![json!({
+            "id": "project-skill",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "done" }]
+            }],
+            "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+        })])
+        .await;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![compact_test_provider(base_url)],
+                default_provider_id: Some("mock".to_string()),
+            })
+            .await
+            .expect("save providers");
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("account-1".to_string()),
+                label: "GitHub".to_string(),
+                token: Some("secret-token".to_string()),
+                is_default: true,
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, Some("container-1"));
+        agent.project_id = Some(project_id);
+        store.save_agent(&agent, None).await.expect("save agent");
+        save_test_session(&store, agent_id, session_id).await;
+        let project = ready_test_project_summary(project_id, agent_id, "account-1");
+        store.save_project(&project).await.expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let agent_record = runtime.agent(agent_id).await.expect("agent");
+        *agent_record.container.write().await = Some(ContainerHandle {
+            id: "container-1".to_string(),
+            name: "container-1".to_string(),
+            image: "unused".to_string(),
+        });
+        let skill_dir = runtime
+            .project_skill_cache_dir(project_id)
+            .join("claude")
+            .join("demo");
+        fs::create_dir_all(&skill_dir).expect("mkdir skill");
+        let skill_path = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_path,
+            "---\nname: demo\ndescription: Project demo skill.\n---\nUse the project workflow.",
+        )
+        .expect("write skill");
+
+        let turn_id = Uuid::new_v4();
+        runtime
+            .run_turn_inner(
+                agent_id,
+                session_id,
+                turn_id,
+                "please help".to_string(),
+                vec![skill_path.display().to_string()],
+            )
+            .await
+            .expect("turn");
+
+        let requests = requests.lock().await.clone();
+        let input = requests[0]["input"].as_array().expect("input");
+        assert!(input.iter().any(|item| {
+            item["role"] == "user"
+                && item["content"][0]["text"].as_str().is_some_and(|text| {
+                    text.contains("<skill>") && text.contains("Use the project workflow.")
+                })
+        }));
+        let instructions = requests[0]["instructions"].as_str().unwrap_or_default();
+        assert!(instructions.contains("Project demo skill."));
+        let events = runtime.recent_events.lock().await;
+        let activated = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                ServiceEventKind::SkillsActivated {
+                    agent_id: event_agent_id,
+                    turn_id: event_turn_id,
+                    skills,
+                    ..
+                } if *event_agent_id == agent_id && *event_turn_id == turn_id => Some(skills),
+                _ => None,
+            })
+            .expect("skills activated");
+        assert_eq!(activated.len(), 1);
+        assert_eq!(activated[0].scope, SkillScope::Project);
+    }
+
+    #[tokio::test]
+    async fn project_skill_plain_name_is_ambiguous_until_path_selected() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, Some("container-1"));
+        agent.project_id = Some(project_id);
+        save_agent_with_session(&store, &agent).await;
+        let project = ready_test_project_summary(project_id, agent_id, "account-1");
+        store.save_project(&project).await.expect("save project");
+        let global_skill_dir = dir.path().join(".agents/skills/demo");
+        fs::create_dir_all(&global_skill_dir).expect("mkdir global");
+        fs::write(
+            global_skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Global demo.\n---\nGlobal.",
+        )
+        .expect("write global");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let project_skill_dir = runtime
+            .project_skill_cache_dir(project_id)
+            .join("claude")
+            .join("demo");
+        fs::create_dir_all(&project_skill_dir).expect("mkdir project");
+        let project_skill_path = project_skill_dir.join("SKILL.md");
+        fs::write(
+            &project_skill_path,
+            "---\nname: demo\ndescription: Project demo.\n---\nProject.",
+        )
+        .expect("write project");
+        let skills_manager = runtime.skills_manager_with_project_roots(project_id);
+
+        let ambiguous = skills_manager
+            .build_injections(&["demo".to_string()], &SkillsConfigRequest::default())
+            .expect("ambiguous injection");
+        assert!(ambiguous.items.is_empty());
+
+        let selected = skills_manager
+            .build_injections(
+                &[project_skill_path.display().to_string()],
+                &SkillsConfigRequest::default(),
+            )
+            .expect("path injection");
+        assert_eq!(selected.items.len(), 1);
+        assert_eq!(selected.items[0].metadata.scope, SkillScope::Project);
+    }
+
+    #[tokio::test]
+    async fn project_skill_detection_requires_ready_workspace() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, Some("container-1"));
+        agent.project_id = Some(project_id);
+        save_agent_with_session(&store, &agent).await;
+        let project = test_project_summary(project_id, agent_id, "account-1");
+        store.save_project(&project).await.expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        let err = runtime
+            .detect_project_skills(project_id)
+            .await
+            .expect_err("not ready");
+
+        assert!(err.to_string().contains("workspace is not ready"));
     }
 
     #[tokio::test]

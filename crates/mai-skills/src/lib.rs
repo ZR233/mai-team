@@ -163,6 +163,23 @@ impl SkillsManager {
         }
     }
 
+    pub fn new_with_system_root_and_extra_roots(
+        repo_root: impl AsRef<Path>,
+        system_root: Option<impl AsRef<Path>>,
+        extra_roots: Vec<(PathBuf, SkillScope)>,
+    ) -> Self {
+        let mut roots = default_roots_with_system(
+            repo_root.as_ref(),
+            system_root.as_ref().map(|path| path.as_ref()),
+        );
+        roots.extend(
+            extra_roots
+                .into_iter()
+                .map(|(path, scope)| SkillRoot { path, scope }),
+        );
+        Self { roots }
+    }
+
     pub fn with_roots(roots: Vec<(PathBuf, SkillScope)>) -> Self {
         Self {
             roots: roots
@@ -174,6 +191,16 @@ impl SkillsManager {
 
     pub fn root_paths(&self) -> Vec<PathBuf> {
         self.roots.iter().map(|root| root.path.clone()).collect()
+    }
+
+    pub fn clone_with_extra_roots(&self, extra_roots: Vec<(PathBuf, SkillScope)>) -> Self {
+        let mut roots = self.roots.clone();
+        roots.extend(
+            extra_roots
+                .into_iter()
+                .map(|(path, scope)| SkillRoot { path, scope }),
+        );
+        Self { roots }
     }
 
     pub fn list(&self, config: &SkillsConfigRequest) -> Result<SkillsListResponse> {
@@ -412,6 +439,7 @@ fn parse_skill_file(
         description,
         short_description,
         path: path.to_path_buf(),
+        source_path: None,
         scope,
         enabled: true,
         interface: metadata.interface,
@@ -542,12 +570,18 @@ fn apply_config(skills: &mut [SkillMetadata], config: &SkillsConfigRequest) -> R
     for entry in normalized.config {
         match (entry.path, entry.name) {
             (Some(path), None) => {
-                for skill in skills.iter_mut().filter(|skill| skill.path == path) {
+                for skill in skills
+                    .iter_mut()
+                    .filter(|skill| skill.scope != SkillScope::Project && skill.path == path)
+                {
                     skill.enabled = entry.enabled;
                 }
             }
             (None, Some(name)) => {
-                for skill in skills.iter_mut().filter(|skill| skill.name == name) {
+                for skill in skills
+                    .iter_mut()
+                    .filter(|skill| skill.scope != SkillScope::Project && skill.name == name)
+                {
                     skill.enabled = entry.enabled;
                 }
             }
@@ -702,9 +736,10 @@ fn skill_sort(left: &SkillMetadata, right: &SkillMetadata) -> std::cmp::Ordering
 
 fn scope_rank(scope: SkillScope) -> u8 {
     match scope {
-        SkillScope::Repo => 0,
-        SkillScope::User => 1,
-        SkillScope::System => 2,
+        SkillScope::Project => 0,
+        SkillScope::Repo => 1,
+        SkillScope::User => 2,
+        SkillScope::System => 3,
     }
 }
 
@@ -858,9 +893,10 @@ mod tests {
     fn root_order_and_dedupe_prefers_repo() {
         let dir = tempdir().expect("tempdir");
         let repo = dir.path().join("repo");
+        let project = dir.path().join("project");
         let user = dir.path().join("user");
         let system = dir.path().join("system");
-        for root in [&repo, &user, &system] {
+        for root in [&repo, &project, &user, &system] {
             let skill_dir = root.join("demo");
             fs::create_dir_all(&skill_dir).expect("mkdir");
             fs::write(
@@ -873,13 +909,16 @@ mod tests {
             (system.clone(), SkillScope::System),
             (user, SkillScope::User),
             (repo.clone(), SkillScope::Repo),
+            (project.clone(), SkillScope::Project),
         ]);
         let response = manager.list(&SkillsConfigRequest::default()).expect("list");
-        assert_eq!(response.skills[0].scope, SkillScope::Repo);
-        assert!(response.skills[0].path.starts_with(repo));
-        assert_eq!(response.skills[1].scope, SkillScope::User);
-        assert_eq!(response.skills[2].scope, SkillScope::System);
-        assert!(response.skills[2].path.starts_with(system));
+        assert_eq!(response.skills[0].scope, SkillScope::Project);
+        assert!(response.skills[0].path.starts_with(project));
+        assert_eq!(response.skills[1].scope, SkillScope::Repo);
+        assert!(response.skills[1].path.starts_with(repo));
+        assert_eq!(response.skills[2].scope, SkillScope::User);
+        assert_eq!(response.skills[3].scope, SkillScope::System);
+        assert!(response.skills[3].path.starts_with(system));
     }
 
     #[test]
@@ -904,6 +943,43 @@ mod tests {
             .expect("system skill");
         assert_eq!(skill.scope, SkillScope::System);
         assert!(response.roots.iter().any(|root| root == &system));
+    }
+
+    #[test]
+    fn new_with_system_root_and_extra_roots_discovers_project_skills() {
+        let dir = tempdir().expect("tempdir");
+        let system = dir.path().join("system");
+        let project = dir.path().join("project");
+        for (root, name) in [(&system, "system-demo"), (&project, "project-demo")] {
+            let skill_dir = root.join(name);
+            fs::create_dir_all(&skill_dir).expect("mkdir");
+            fs::write(
+                skill_dir.join(SKILL_FILE),
+                format!("---\nname: {name}\ndescription: {name}\n---\nbody"),
+            )
+            .expect("write");
+        }
+
+        let manager = SkillsManager::new_with_system_root_and_extra_roots(
+            dir.path(),
+            Some(&system),
+            vec![(project.clone(), SkillScope::Project)],
+        );
+        let response = manager.list(&SkillsConfigRequest::default()).expect("list");
+
+        let project_skill = response
+            .skills
+            .iter()
+            .find(|skill| skill.name == "project-demo")
+            .expect("project skill");
+        assert_eq!(project_skill.scope, SkillScope::Project);
+        assert!(project_skill.path.starts_with(project));
+        assert!(
+            response
+                .skills
+                .iter()
+                .any(|skill| skill.name == "system-demo")
+        );
     }
 
     #[test]
@@ -971,6 +1047,31 @@ mod tests {
             })
             .expect("list");
         assert!(response.skills.iter().all(|skill| !skill.enabled));
+    }
+
+    #[test]
+    fn global_config_does_not_disable_project_scoped_skills() {
+        let dir = tempdir().expect("tempdir");
+        let project = dir.path().join("project");
+        let skill_dir = project.join("demo");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join(SKILL_FILE),
+            "---\nname: demo\ndescription: Demo.\n---\nbody",
+        )
+        .expect("write");
+        let manager = SkillsManager::with_roots(vec![(project, SkillScope::Project)]);
+        let response = manager
+            .list(&SkillsConfigRequest {
+                config: vec![SkillConfigEntry {
+                    name: Some("demo".to_string()),
+                    path: None,
+                    enabled: false,
+                }],
+            })
+            .expect("list");
+
+        assert!(response.skills[0].enabled);
     }
 
     #[test]

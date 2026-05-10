@@ -212,6 +212,78 @@
         </div>
       </div>
 
+      <div v-else-if="activeSection === 'skills'" class="project-panel">
+        <header class="settings-section-header">
+          <div>
+            <h2>Skills</h2>
+            <p>{{ repositoryName(detail) }}</p>
+          </div>
+          <button
+            class="ghost-button"
+            type="button"
+            :disabled="projectSkillsBusy || !projectReady"
+            @click="$emit('detect-project-skills')"
+          >
+            <span v-if="projectSkillsState.refreshing" class="spinner-sm"></span>
+            <template v-else>Refresh</template>
+          </button>
+        </header>
+        <div class="settings-summary">
+          <div class="settings-summary-item" :class="{ ready: projectSkillCount }">
+            <span>Detected</span>
+            <strong>{{ projectSkillCount }}</strong>
+            <small>Project-scoped skills</small>
+          </div>
+          <div class="settings-summary-item">
+            <span>Roots</span>
+            <strong>{{ projectRootCount }}</strong>
+            <small>.claude, .agents, and skills</small>
+          </div>
+          <div class="settings-summary-item" :class="{ danger: projectSkillIssueCount }">
+            <span>Parse Errors</span>
+            <strong>{{ projectSkillIssueCount }}</strong>
+            <small>{{ projectSkillsState.error || 'No runtime detection error' }}</small>
+          </div>
+        </div>
+        <div class="skills-root-list">
+          <span v-for="root in projectSkillsState.roots" :key="root" class="skill-root">{{ root }}</span>
+          <span v-if="!projectSkillsState.roots?.length" class="skill-root muted">No project skill roots detected</span>
+        </div>
+        <div v-if="projectSkillsState.error" class="skill-error-row">
+          <strong>Detection failed</strong>
+          <span>{{ projectSkillsState.error }}</span>
+        </div>
+        <div v-if="projectSkillsState.errors?.length" class="skill-errors">
+          <div v-for="item in projectSkillsState.errors" :key="item.path" class="skill-error-row">
+            <strong>{{ item.path }}</strong>
+            <span>{{ item.message }}</span>
+          </div>
+        </div>
+        <div class="skills-config-list">
+          <div
+            v-for="skill in projectSkillsState.skills"
+            :key="skill.path"
+            class="skill-config-row"
+          >
+            <span class="skill-toggle on">On</span>
+            <span class="skill-config-main">
+              <strong>{{ skillDisplayName(skill) }}</strong>
+              <small>{{ skill.description || skill.short_description }}</small>
+              <code>{{ skill.source_path || skill.path }}</code>
+            </span>
+            <span class="mini-pill">{{ skill.scope }}</span>
+          </div>
+          <div v-if="projectSkillsEmpty" class="quiet-empty skills-empty">
+            <strong>No project skills found</strong>
+            <span>Checked `.claude/skills`, `.agents/skills`, and `skills` under `/workspace/repo`.</span>
+          </div>
+          <div v-if="projectSkillsState.loading" class="loading-center">
+            <span class="spinner"></span>
+            <span>Loading project skills...</span>
+          </div>
+        </div>
+      </div>
+
       <div v-else class="project-panel">
         <header class="settings-section-header">
           <div>
@@ -261,7 +333,8 @@ const props = defineProps({
   skills: { type: Array, default: () => [] },
   selectedSkills: { type: Array, default: () => [] },
   skillsLoading: { type: Boolean, default: false },
-  skillsError: { type: String, default: '' }
+  skillsError: { type: String, default: '' },
+  projectSkillsState: { type: Object, default: () => ({}) }
 })
 
 const conversationRef = defineModel('conversationRef', { default: null })
@@ -279,6 +352,7 @@ defineEmits([
   'update:draft',
   'update:selectedSkills',
   'load-skills',
+  'detect-project-skills',
   'create-session',
   'select-session'
 ])
@@ -288,6 +362,7 @@ const navItems = [
   { id: 'planner', label: 'Planner Chat', meta: 'Project maintainer', icon: 'P' },
   { id: 'review', label: 'Review Status', meta: 'Project health', icon: 'R' },
   { id: 'repository', label: 'Repository', meta: 'GitHub and workspace', icon: 'G' },
+  { id: 'skills', label: 'Skills', meta: 'Project scope', icon: 'S' },
   { id: 'agents', label: 'Agents', meta: 'Project agents', icon: 'A' }
 ]
 
@@ -305,6 +380,17 @@ const isProjectSettingUp = computed(() => {
     || props.detail.clone_status === 'cloning'
 })
 const projectStageTitle = computed(() => (isProjectFailed.value ? 'Project setup failed' : 'Setting up project'))
+const projectReady = computed(() => props.detail?.status === 'ready' || props.detail?.clone_status === 'ready')
+const projectSkillsBusy = computed(() => props.projectSkillsState?.loading || props.projectSkillsState?.refreshing)
+const projectSkillCount = computed(() => props.projectSkillsState?.skills?.length || 0)
+const projectRootCount = computed(() => props.projectSkillsState?.roots?.length || 0)
+const projectSkillIssueCount = computed(() => props.projectSkillsState?.errors?.length || 0)
+const projectSkillsEmpty = computed(() => (
+  !projectSkillsBusy.value
+    && props.projectSkillsState?.loaded
+    && !props.projectSkillsState?.error
+    && !projectSkillCount.value
+))
 const projectProgressMessage = computed(() => {
   if (!props.detail) return ''
   if (isProjectFailed.value) return 'Project setup failed.'
@@ -372,5 +458,9 @@ function roleInitial(role) {
   if (value === 'reviewer') return 'R'
   if (value === 'executor') return 'E'
   return 'A'
+}
+
+function skillDisplayName(skill) {
+  return skill?.interface?.display_name || skill?.name || 'Skill'
 }
 </script>

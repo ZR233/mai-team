@@ -458,6 +458,7 @@ pub struct SendMessageResponse {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillScope {
+    Project,
     Repo,
     User,
     System,
@@ -513,6 +514,8 @@ pub struct SkillMetadata {
     #[serde(default)]
     pub short_description: Option<String>,
     pub path: PathBuf,
+    #[serde(default)]
+    pub source_path: Option<PathBuf>,
     pub scope: SkillScope,
     #[serde(default = "default_true")]
     pub enabled: bool,

@@ -132,7 +132,7 @@ function togglePicker() {
 }
 
 function skillMentionValue(skill) {
-  return nameCounts.value.get(skill.name) > 1 ? skill.path : (skill.path || skill.name)
+  return skill.scope === 'project' ? (skill.path || skill.name) : (nameCounts.value.get(skill.name) > 1 ? skill.path : (skill.path || skill.name))
 }
 
 function isSelected(skill) {

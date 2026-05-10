@@ -288,6 +288,8 @@ async fn main() -> Result<()> {
                 .delete(delete_project),
         )
         .route("/projects/{id}/messages", post(send_project_message))
+        .route("/projects/{id}/skills", get(list_project_skills))
+        .route("/projects/{id}/skills/detect", post(detect_project_skills))
         .route("/projects/{id}/cancel", post(cancel_project))
         .route("/agents", get(list_agents).post(create_agent))
         .route(
@@ -859,6 +861,20 @@ async fn send_project_message(
     Ok(Json(SendMessageResponse { turn_id }))
 }
 
+async fn list_project_skills(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<ProjectId>,
+) -> std::result::Result<Json<SkillsListResponse>, ApiError> {
+    Ok(Json(state.runtime.list_project_skills(id).await?))
+}
+
+async fn detect_project_skills(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<ProjectId>,
+) -> std::result::Result<Json<SkillsListResponse>, ApiError> {
+    Ok(Json(state.runtime.detect_project_skills(id).await?))
+}
+
 async fn cancel_project(
     State(state): State<Arc<AppState>>,
     Path(id): Path<ProjectId>,
@@ -1197,7 +1213,7 @@ mod tests {
                     name: "demo".to_string(),
                     display_name: Some("Demo".to_string()),
                     path: std::path::PathBuf::from("/tmp/demo/SKILL.md"),
-                    scope: SkillScope::Repo,
+                    scope: SkillScope::Project,
                 }],
             },
         };

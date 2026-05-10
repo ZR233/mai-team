@@ -49,10 +49,11 @@
         :loading="isProjectDetailLoading"
         :sending="isProjectSending"
         :providers="providersState.providers"
-        :skills="enabledSkills"
+        :skills="projectComposerSkills"
         :selected-skills="selectedProjectSkills"
-        :skills-loading="skillsState.loading"
-        :skills-error="skillsError"
+        :skills-loading="projectSkillsLoading"
+        :skills-error="projectSkillsCombinedError"
+        :project-skills-state="projectSkillsState"
         :updating-model="isUpdatingProjectAgentModel"
         @create="openCreateProjectDialog"
         @select-project="selectProject"
@@ -63,7 +64,8 @@
         @update-model="onUpdateProjectAgentModel"
         @update:draft="projectMessageDraft = $event"
         @update:selected-skills="selectedProjectSkills = $event"
-        @load-skills="onLoadSkills"
+        @load-skills="onLoadProjectComposerSkills"
+        @detect-project-skills="onDetectProjectSkills"
         @create-session="onCreateProjectSession"
         @select-session="selectProjectSession"
       />
@@ -246,6 +248,7 @@ const {
   isProjectSending,
   isProjectDetailLoading,
   projectConversationRef,
+  projectSkillsState,
   projectDialog,
   refreshProjects,
   refreshProjectDetail,
@@ -254,6 +257,9 @@ const {
   selectProjectSession,
   createProject,
   sendProjectMessage,
+  loadProjectSkills,
+  detectProjectSkills,
+  ensureProjectSkillsLoaded,
   cancelProjectAgent,
   createProjectSession,
   updateProjectAgent,
@@ -317,6 +323,22 @@ const connectionLabel = computed(() => {
   if (connectionState.value === 'connecting') return 'Connecting'
   return 'Offline'
 })
+
+const projectComposerSkills = computed(() => {
+  const skills = [...enabledSkills.value]
+  const seen = new Set(skills.map((skill) => skill.path || skill.name))
+  for (const skill of projectSkillsState.skills || []) {
+    const key = skill.path || skill.name
+    if (skill.enabled && key && !seen.has(key)) {
+      skills.push(skill)
+      seen.add(key)
+    }
+  }
+  return skills
+})
+
+const projectSkillsLoading = computed(() => skillsState.loading || projectSkillsState.loading || projectSkillsState.refreshing)
+const projectSkillsCombinedError = computed(() => skillsError.value || projectSkillsState.error || '')
 
 watch(
   () => [
@@ -447,6 +469,28 @@ async function onSendProjectMessage(payload) {
     await sendProjectMessage(message, skillMentions)
     selectedProjectSkills.value = []
     await loadSkills()
+    if (selectedProjectId.value) await loadProjectSkills(selectedProjectId.value)
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onLoadProjectComposerSkills() {
+  await Promise.allSettled([onLoadSkills(), onLoadProjectSkills()])
+}
+
+async function onLoadProjectSkills() {
+  try {
+    await ensureProjectSkillsLoaded(selectedProjectId.value)
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onDetectProjectSkills() {
+  try {
+    await detectProjectSkills(selectedProjectId.value)
+    showToast('Project skills refreshed.')
   } catch (error) {
     showToast(error.message)
   }
