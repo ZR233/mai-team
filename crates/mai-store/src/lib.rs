@@ -1001,25 +1001,25 @@ impl ConfigStore {
             Some(value) if !value.trim().is_empty() => serde_json::from_str(&value)?,
             _ => GitAccountsConfig::default(),
         };
-        if config.accounts.is_empty() {
-            if let Some(token) = self.get_setting(SETTING_GITHUB_TOKEN).await? {
-                let token = token.trim().to_string();
-                if !token.is_empty() {
-                    config.accounts.push(StoredGitAccount {
-                        id: "github-default".to_string(),
-                        provider: GitProvider::Github,
-                        label: "GitHub".to_string(),
-                        login: None,
-                        token_kind: GitTokenKind::Unknown,
-                        scopes: Vec::new(),
-                        status: GitAccountStatus::Unverified,
-                        is_default: true,
-                        token_secret: token,
-                        last_verified_at: None,
-                        last_error: None,
-                    });
-                    config.default_account_id = Some("github-default".to_string());
-                }
+        if config.accounts.is_empty()
+            && let Some(token) = self.get_setting(SETTING_GITHUB_TOKEN).await?
+        {
+            let token = token.trim().to_string();
+            if !token.is_empty() {
+                config.accounts.push(StoredGitAccount {
+                    id: "github-default".to_string(),
+                    provider: GitProvider::Github,
+                    label: "GitHub".to_string(),
+                    login: None,
+                    token_kind: GitTokenKind::Unknown,
+                    scopes: Vec::new(),
+                    status: GitAccountStatus::Unverified,
+                    is_default: true,
+                    token_secret: token,
+                    last_verified_at: None,
+                    last_error: None,
+                });
+                config.default_account_id = Some("github-default".to_string());
             }
         }
         normalize_git_account_defaults(&mut config);
@@ -1360,7 +1360,7 @@ impl ConfigStore {
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(true, |ext| ext != "json") {
+            if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
             let data = std::fs::read_to_string(&path)?;
@@ -1382,7 +1382,7 @@ impl ConfigStore {
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(true, |ext| ext != "json") {
+            if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
             let data = std::fs::read_to_string(&path)?;
@@ -2357,7 +2357,7 @@ fn mimo_model(id: &str, with_reasoning: bool) -> ModelConfig {
         context_tokens: mimo_context_tokens(id),
         output_tokens: mimo_output_tokens(id),
         supports_tools: true,
-        reasoning: with_reasoning.then(|| mimo_reasoning_config()),
+        reasoning: with_reasoning.then(mimo_reasoning_config),
         options: serde_json::Value::Null,
         headers: BTreeMap::new(),
     }

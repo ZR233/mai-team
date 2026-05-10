@@ -373,7 +373,7 @@ fn system_skills_path() -> Result<PathBuf> {
         .or_else(|_| {
             dirs::home_dir()
                 .map(|home| home.join(".mai-team").join("system-skills"))
-                .ok_or_else(|| env::VarError::NotPresent)
+                .ok_or(env::VarError::NotPresent)
         })
         .context("home directory not found; set MAI_SYSTEM_SKILLS_PATH")
 }

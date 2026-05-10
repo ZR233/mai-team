@@ -396,8 +396,8 @@ async fn start_sidecar_server_session(
 }
 
 enum McpSession {
-    Stdio(StdioMcpSession),
-    Http(RmcpSession),
+    Stdio(Box<StdioMcpSession>),
+    Http(Box<RmcpSession>),
 }
 
 impl McpSession {
@@ -408,12 +408,15 @@ impl McpSession {
         config: McpServerConfig,
     ) -> Result<Self> {
         match config.transport {
-            McpServerTransport::Stdio => Ok(Self::Stdio(
-                StdioMcpSession::start(docker, container_id, server_name, config).await?,
-            )),
-            McpServerTransport::StreamableHttp => Ok(Self::Http(
-                RmcpSession::start_http(server_name, config).await?,
-            )),
+            McpServerTransport::Stdio => {
+                let session =
+                    StdioMcpSession::start(docker, container_id, server_name, config).await?;
+                Ok(Self::Stdio(Box::new(session)))
+            }
+            McpServerTransport::StreamableHttp => {
+                let session = RmcpSession::start_http(server_name, config).await?;
+                Ok(Self::Http(Box::new(session)))
+            }
         }
     }
 
@@ -426,20 +429,20 @@ impl McpSession {
     ) -> Result<Self> {
         match config.transport {
             McpServerTransport::Stdio => {
-                Ok(Self::Stdio(
-                    StdioMcpSession::start_sidecar(
-                        docker,
-                        workspace_volume,
-                        image,
-                        server_name,
-                        config,
-                    )
-                    .await?,
-                ))
+                let session = StdioMcpSession::start_sidecar(
+                    docker,
+                    workspace_volume,
+                    image,
+                    server_name,
+                    config,
+                )
+                .await?;
+                Ok(Self::Stdio(Box::new(session)))
             }
-            McpServerTransport::StreamableHttp => Ok(Self::Http(
-                RmcpSession::start_http(server_name, config).await?,
-            )),
+            McpServerTransport::StreamableHttp => {
+                let session = RmcpSession::start_http(server_name, config).await?;
+                Ok(Self::Http(Box::new(session)))
+            }
         }
     }
 

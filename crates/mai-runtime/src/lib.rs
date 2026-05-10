@@ -1167,22 +1167,22 @@ impl AgentRuntime {
         if let Some(message) = initial_message.filter(|message| !message.trim().is_empty()) {
             let _ = self.send_task_message(task_id, message, Vec::new()).await?;
         }
-        if user_omitted_title {
-            if let Some(message_text) = message_for_title {
-                let runtime = Arc::clone(&self);
-                tokio::spawn(async move {
-                    match runtime.generate_task_title(&message_text).await {
-                        Ok(new_title) => {
-                            if let Err(err) = runtime.update_task_title(task_id, new_title).await {
-                                tracing::warn!("failed to update task title: {err}");
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!("failed to generate task title: {err}");
+        if user_omitted_title
+            && let Some(message_text) = message_for_title
+        {
+            let runtime = Arc::clone(self);
+            tokio::spawn(async move {
+                match runtime.generate_task_title(&message_text).await {
+                    Ok(new_title) => {
+                        if let Err(err) = runtime.update_task_title(task_id, new_title).await {
+                            tracing::warn!("failed to update task title: {err}");
                         }
                     }
-                });
-            }
+                    Err(err) => {
+                        tracing::warn!("failed to generate task title: {err}");
+                    }
+                }
+            });
         }
         Ok(summary)
     }
@@ -1344,7 +1344,7 @@ impl AgentRuntime {
             name
         };
         let account = self.git_account_summary(&account_id).await?;
-        let installation_account = account.login.unwrap_or_else(|| account.label);
+        let installation_account = account.login.unwrap_or(account.label);
         let project_id = Uuid::new_v4();
         let planner_model = self.resolve_role_agent_model(AgentRole::Planner).await?;
         let clone_url = github_clone_url(&owner, &repo);
@@ -3253,13 +3253,13 @@ impl AgentRuntime {
             }
             RoutedTool::GithubApiGet => {
                 let path = required_string(&arguments, "path")?;
-                self.execute_project_github_api_get(&agent, &path).await
+                self.execute_project_github_api_get(agent, &path).await
             }
             RoutedTool::Mcp(model_name) => {
                 if agent.summary.read().await.project_id.is_some() {
                     return self
                         .execute_project_mcp_tool(
-                            &agent,
+                            agent,
                             &model_name,
                             arguments,
                             cancellation_token,
@@ -3655,7 +3655,7 @@ impl AgentRuntime {
             sessions
                 .iter()
                 .filter_map(|s| s.last_turn_response.as_ref())
-                .last()
+                .next_back()
                 .cloned()
         };
         let final_response = tracked_response.or_else(|| {
@@ -5240,15 +5240,15 @@ esac\n";
         };
 
         let container_id = container.id.clone();
-        if let Some(guard) = &turn_guard {
-            if let Err(err) = self.ensure_turn_current(agent, guard).await {
-                drop(container_guard);
-                let _ = self
-                    .docker
-                    .delete_agent_containers(&agent_id.to_string(), Some(&container_id))
-                    .await;
-                return Err(err);
-            }
+        if let Some(guard) = &turn_guard
+            && let Err(err) = self.ensure_turn_current(agent, guard).await
+        {
+            drop(container_guard);
+            let _ = self
+                .docker
+                .delete_agent_containers(&agent_id.to_string(), Some(&container_id))
+                .await;
+            return Err(err);
         }
         {
             let mut summary = agent.summary.write().await;
@@ -5273,20 +5273,20 @@ esac\n";
             .await;
         }
         let mcp = McpAgentManager::start(self.docker.clone(), container.id, mcp_configs).await;
-        if let Some(guard) = &turn_guard {
-            if let Err(err) = self.ensure_turn_current(agent, guard).await {
-                mcp.shutdown().await;
-                *agent.container.write().await = None;
-                {
-                    let mut summary = agent.summary.write().await;
-                    summary.container_id = None;
-                }
-                let _ = self
-                    .docker
-                    .delete_agent_containers(&agent_id.to_string(), Some(&container_id))
-                    .await;
-                return Err(err);
+        if let Some(guard) = &turn_guard
+            && let Err(err) = self.ensure_turn_current(agent, guard).await
+        {
+            mcp.shutdown().await;
+            *agent.container.write().await = None;
+            {
+                let mut summary = agent.summary.write().await;
+                summary.container_id = None;
             }
+            let _ = self
+                .docker
+                .delete_agent_containers(&agent_id.to_string(), Some(&container_id))
+                .await;
+            return Err(err);
         }
         for status in mcp.statuses().await {
             self.publish(ServiceEventKind::McpServerStatusChanged {

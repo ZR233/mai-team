@@ -242,21 +242,13 @@ impl SkillsManager {
         lines.push("### Available Skills".to_string());
         for skill in skills {
             let duplicate = name_counts.get(&skill.name).copied().unwrap_or_default() > 1;
-            if duplicate {
-                lines.push(format!(
-                    "- ${}: {} (path: {})",
-                    skill.name,
-                    display_description(&skill),
-                    skill.path.display()
-                ));
-            } else {
-                lines.push(format!(
-                    "- ${}: {} (path: {})",
-                    skill.name,
-                    display_description(&skill),
-                    skill.path.display()
-                ));
-            }
+            let _ = duplicate;
+            lines.push(format!(
+                "- ${}: {} (path: {})",
+                skill.name,
+                display_description(&skill),
+                skill.path.display()
+            ));
         }
         lines.push("### How to use skills".to_string());
         lines.push("- Use a skill when the user names it with `$SkillName`, selects it from the UI, or the task clearly matches its description. Do not carry skills across turns unless re-mentioned.".to_string());
@@ -562,7 +554,7 @@ fn resolve_asset_path(skill_dir: &Path, path: Option<PathBuf>) -> Option<PathBuf
         Some(Component::Normal(part)) if part == "assets" => {}
         _ => return None,
     }
-    Some(canonicalize_or_clone(&skill_dir.join(normalized)))
+    Some(canonicalize_or_clone(skill_dir.join(normalized)))
 }
 
 fn apply_config(skills: &mut [SkillMetadata], config: &SkillsConfigRequest) -> Result<()> {

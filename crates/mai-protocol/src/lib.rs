@@ -1242,45 +1242,30 @@ pub struct RepositoryPackageSummary {
     pub html_url: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GitProvider {
+    #[default]
     Github,
 }
 
-impl Default for GitProvider {
-    fn default() -> Self {
-        Self::Github
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GitTokenKind {
     Classic,
     FineGrainedPat,
+    #[default]
     Unknown,
 }
 
-impl Default for GitTokenKind {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GitAccountStatus {
+    #[default]
     Unverified,
     Verifying,
     Verified,
     Failed,
-}
-
-impl Default for GitAccountStatus {
-    fn default() -> Self {
-        Self::Unverified
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
