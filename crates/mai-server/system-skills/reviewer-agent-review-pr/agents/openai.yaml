@@ -1,0 +1,6 @@
+interface:
+  display_name: Reviewer Agent — Review PR
+  short_description: Reviewer agent deep single-PR review with worktree, local tests, and inline comments
+  default_prompt: As a reviewer agent, review the most eligible open pull request in this repository with deep analysis, local test verification, and inline GitHub comments.
+policy:
+  allow_implicit_invocation: false

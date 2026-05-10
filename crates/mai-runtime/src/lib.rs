@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast};
@@ -82,9 +82,6 @@ const AGENT_ROLES: [AgentRole; 4] = [
     AgentRole::Executor,
     AgentRole::Reviewer,
 ];
-static PROJECT_GITHUB_TOOLS: LazyLock<Vec<McpTool>> = LazyLock::new(project_github_tools);
-static PROJECT_GIT_TOOLS: LazyLock<Vec<McpTool>> = LazyLock::new(project_git_tools);
-
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error("agent not found: {0}")]
@@ -149,6 +146,7 @@ pub struct AgentRuntime {
     agents: RwLock<HashMap<AgentId, Arc<AgentRecord>>>,
     tasks: RwLock<HashMap<TaskId, Arc<TaskRecord>>>,
     projects: RwLock<HashMap<ProjectId, Arc<ProjectRecord>>>,
+    project_mcp_managers: RwLock<HashMap<ProjectId, Arc<McpAgentManager>>>,
     github_tokens: Mutex<HashMap<String, CachedGithubToken>>,
     github_manifest_states: Mutex<HashMap<String, GithubManifestState>>,
     github_http: reqwest::Client,
@@ -522,6 +520,7 @@ impl AgentRuntime {
             agents: RwLock::new(agents),
             tasks: RwLock::new(tasks),
             projects: RwLock::new(projects),
+            project_mcp_managers: RwLock::new(HashMap::new()),
             github_tokens: Mutex::new(HashMap::new()),
             github_manifest_states: Mutex::new(HashMap::new()),
             github_http,
@@ -1475,6 +1474,7 @@ impl AgentRuntime {
         for agent_id in root_agents {
             let _ = self.delete_agent(agent_id).await;
         }
+        self.shutdown_project_mcp_manager(project_id).await;
         let _ = self.delete_project_sidecar(project_id).await;
         self.store.delete_project(project_id).await?;
         self.projects.write().await.remove(&project_id);
@@ -1510,6 +1510,7 @@ impl AgentRuntime {
         self.store.save_project(&updated).await?;
         self.publish(ServiceEventKind::ProjectUpdated { project: updated })
             .await;
+        self.shutdown_project_mcp_manager(project_id).await;
         let _ = self.delete_project_sidecar(project_id).await;
         Ok(())
     }
@@ -3127,9 +3128,9 @@ impl AgentRuntime {
                 })
             }
             RoutedTool::ListMcpResources => {
-                let manager = agent.mcp.read().await.clone().ok_or_else(|| {
-                    RuntimeError::InvalidInput("MCP manager not initialized".to_string())
-                })?;
+                let manager = self
+                    .mcp_manager_for_tool(agent, agent_id, &cancellation_token)
+                    .await?;
                 let output = manager
                     .list_resources(
                         optional_string(&arguments, "server").as_deref(),
@@ -3143,9 +3144,9 @@ impl AgentRuntime {
                 })
             }
             RoutedTool::ListMcpResourceTemplates => {
-                let manager = agent.mcp.read().await.clone().ok_or_else(|| {
-                    RuntimeError::InvalidInput("MCP manager not initialized".to_string())
-                })?;
+                let manager = self
+                    .mcp_manager_for_tool(agent, agent_id, &cancellation_token)
+                    .await?;
                 let output = manager
                     .list_resource_templates(
                         optional_string(&arguments, "server").as_deref(),
@@ -3159,9 +3160,9 @@ impl AgentRuntime {
                 })
             }
             RoutedTool::ReadMcpResource => {
-                let manager = agent.mcp.read().await.clone().ok_or_else(|| {
-                    RuntimeError::InvalidInput("MCP manager not initialized".to_string())
-                })?;
+                let manager = self
+                    .mcp_manager_for_tool(agent, agent_id, &cancellation_token)
+                    .await?;
                 let server = required_string(&arguments, "server")?;
                 let uri = required_string(&arguments, "uri")?;
                 let output = manager.read_resource(&server, &uri).await?;
@@ -4619,6 +4620,90 @@ impl AgentRuntime {
         Ok(container)
     }
 
+    async fn ensure_project_mcp_manager(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        cancellation_token: &CancellationToken,
+    ) -> Result<Option<Arc<McpAgentManager>>> {
+        if cancellation_token.is_cancelled() {
+            return Err(RuntimeError::TurnCancelled);
+        }
+        if let Some(manager) = self
+            .project_mcp_managers
+            .read()
+            .await
+            .get(&project_id)
+            .cloned()
+        {
+            return Ok(Some(manager));
+        }
+
+        let Some(token) = self.project_git_token(project_id).await? else {
+            return Ok(None);
+        };
+        let sidecar = self.ensure_project_sidecar(project_id).await?;
+        let configs = project_mcp_configs(&token);
+        self.publish(ServiceEventKind::McpServerStatusChanged {
+            agent_id,
+            server: "project".to_string(),
+            status: mai_protocol::McpStartupStatus::Starting,
+            error: None,
+        })
+        .await;
+        let manager = McpAgentManager::start(self.docker.clone(), sidecar.id, configs).await;
+        if cancellation_token.is_cancelled() {
+            manager.shutdown().await;
+            return Err(RuntimeError::TurnCancelled);
+        }
+        for status in manager.statuses().await {
+            let error = status.error.map(|error| redact_secret(&error, &token));
+            self.publish(ServiceEventKind::McpServerStatusChanged {
+                agent_id,
+                server: status.server,
+                status: status.status,
+                error,
+            })
+            .await;
+        }
+        let manager = Arc::new(manager);
+        let mut managers = self.project_mcp_managers.write().await;
+        if let Some(existing) = managers.get(&project_id).cloned() {
+            manager.shutdown().await;
+            return Ok(Some(existing));
+        }
+        managers.insert(project_id, Arc::clone(&manager));
+        Ok(Some(manager))
+    }
+
+    async fn project_git_token(&self, project_id: ProjectId) -> Result<Option<String>> {
+        let project = self.project(project_id).await?;
+        let summary = project.summary.read().await.clone();
+        let Some(account_id) = summary.git_account_id else {
+            return Ok(None);
+        };
+        Ok(Some(self.git_account_token(&account_id).await?))
+    }
+
+    async fn project_mcp_manager_for_agent(
+        &self,
+        agent: &AgentRecord,
+        agent_id: AgentId,
+        cancellation_token: &CancellationToken,
+    ) -> Result<Option<Arc<McpAgentManager>>> {
+        let Some(project_id) = agent.summary.read().await.project_id else {
+            return Ok(None);
+        };
+        self.ensure_project_mcp_manager(project_id, agent_id, cancellation_token)
+            .await
+    }
+
+    async fn shutdown_project_mcp_manager(&self, project_id: ProjectId) {
+        if let Some(manager) = self.project_mcp_managers.write().await.remove(&project_id) {
+            manager.shutdown().await;
+        }
+    }
+
     async fn delete_project_sidecar(&self, project_id: ProjectId) -> Result<Vec<String>> {
         let project = match self.project(project_id).await {
             Ok(project) => project,
@@ -4709,6 +4794,7 @@ impl AgentRuntime {
                 .await
             }
             Err(err) => {
+                self.shutdown_project_mcp_manager(project_id).await;
                 let _ = self.delete_project_sidecar(project_id).await;
                 self.set_project_clone_result(
                     project_id,
@@ -4886,12 +4972,7 @@ impl AgentRuntime {
         let Some(project_id) = agent.summary.read().await.project_id else {
             return Ok(None);
         };
-        let project = self.project(project_id).await?;
-        let summary = project.summary.read().await.clone();
-        let Some(account_id) = summary.git_account_id else {
-            return Ok(None);
-        };
-        Ok(Some(self.git_account_token(&account_id).await?))
+        self.project_git_token(project_id).await
     }
 
     async fn execute_project_mcp_tool(
@@ -4901,35 +4982,58 @@ impl AgentRuntime {
         arguments: Value,
         cancellation_token: CancellationToken,
     ) -> Result<ToolExecution> {
-        let Some(token) = self.project_git_token_for_agent(agent).await? else {
+        let agent_id = agent.summary.read().await.id;
+        let Some(manager) = self
+            .project_mcp_manager_for_agent(agent, agent_id, &cancellation_token)
+            .await?
+        else {
             return Err(RuntimeError::InvalidInput(
-                "agent is not attached to a project".to_string(),
+                "project MCP manager is not available".to_string(),
             ));
         };
-        let summary = agent.summary.read().await.clone();
-        let Some(project_id) = summary.project_id else {
-            return Err(RuntimeError::InvalidInput(
-                "agent is not attached to a project".to_string(),
-            ));
-        };
-        let sidecar = self.ensure_project_sidecar(project_id).await?;
-        let configs = project_mcp_configs(&token);
-        let manager = McpAgentManager::start(self.docker.clone(), sidecar.id, configs).await;
+        let token = self
+            .project_git_token_for_agent(agent)
+            .await?
+            .unwrap_or_default();
         let output = tokio::select! {
             output = manager.call_model_tool(model_name, arguments) => output,
             _ = cancellation_token.cancelled() => {
-                manager.shutdown().await;
                 return Err(RuntimeError::TurnCancelled);
             }
         };
-        manager.shutdown().await;
-        let output = output
-            .map_err(|err| RuntimeError::InvalidInput(redact_secret(&err.to_string(), &token)))?;
+        let output = output.map_err(|err| match err {
+            mai_mcp::McpError::ToolNotFound(_) => RuntimeError::InvalidInput(format!(
+                "project MCP tool `{model_name}` was not discovered"
+            )),
+            other => RuntimeError::InvalidInput(redact_secret(&other.to_string(), &token)),
+        })?;
         Ok(ToolExecution {
             success: true,
             output: redact_secret(&output.to_string(), &token),
             ends_turn: false,
         })
+    }
+
+    async fn mcp_manager_for_tool(
+        &self,
+        agent: &AgentRecord,
+        agent_id: AgentId,
+        cancellation_token: &CancellationToken,
+    ) -> Result<Arc<McpAgentManager>> {
+        if agent.summary.read().await.project_id.is_some() {
+            return self
+                .project_mcp_manager_for_agent(agent, agent_id, cancellation_token)
+                .await?
+                .ok_or_else(|| {
+                    RuntimeError::InvalidInput("project MCP manager is not available".to_string())
+                });
+        }
+        agent
+            .mcp
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| RuntimeError::InvalidInput("MCP manager not initialized".to_string()))
     }
 
     async fn execute_project_github_api_get(
@@ -5524,14 +5628,17 @@ EOF\n\
     }
 
     async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<mai_mcp::McpTool> {
-        if agent.summary.read().await.project_id.is_some() {
-            if let Some(manager) = agent.mcp.read().await.clone() {
-                let tools = manager.tools().await;
-                if !tools.is_empty() {
-                    return tools;
-                }
-            }
-            return project_builtin_tools();
+        if let Some(project_id) = agent.summary.read().await.project_id {
+            let Some(manager) = self
+                .project_mcp_managers
+                .read()
+                .await
+                .get(&project_id)
+                .cloned()
+            else {
+                return Vec::new();
+            };
+            return manager.tools().await;
         }
         let Some(manager) = agent.mcp.read().await.clone() else {
             return Vec::new();
@@ -5552,45 +5659,9 @@ EOF\n\
         if agent.summary.read().await.project_id.is_none() {
             return Ok(());
         }
-        if agent.mcp.read().await.is_some() {
-            return Ok(());
-        }
-        let Some(token) = self.project_git_token_for_agent(agent).await? else {
-            return Ok(());
-        };
-        let summary = agent.summary.read().await.clone();
-        let Some(project_id) = summary.project_id else {
-            return Ok(());
-        };
-        let sidecar = self.ensure_project_sidecar(project_id).await?;
-        let configs = project_mcp_configs(&token);
-        self.publish(ServiceEventKind::McpServerStatusChanged {
-            agent_id,
-            server: "project".to_string(),
-            status: mai_protocol::McpStartupStatus::Starting,
-            error: None,
-        })
-        .await;
-        let mcp = McpAgentManager::start(self.docker.clone(), sidecar.id, configs).await;
-        if cancellation_token.is_cancelled() {
-            mcp.shutdown().await;
-            return Err(RuntimeError::TurnCancelled);
-        }
-        for status in mcp.statuses().await {
-            let error = status.error.map(|error| redact_secret(&error, &token));
-            self.publish(ServiceEventKind::McpServerStatusChanged {
-                agent_id,
-                server: status.server,
-                status: status.status,
-                error,
-            })
-            .await;
-        }
-        if cancellation_token.is_cancelled() {
-            mcp.shutdown().await;
-            return Err(RuntimeError::TurnCancelled);
-        }
-        *agent.mcp.write().await = Some(Arc::new(mcp));
+        let _ = self
+            .project_mcp_manager_for_agent(agent, agent_id, cancellation_token)
+            .await?;
         Ok(())
     }
 
@@ -6073,10 +6144,16 @@ fn project_mcp_configs(token: &str) -> std::collections::BTreeMap<String, McpSer
             transport: McpServerTransport::Stdio,
             command: Some("github-mcp-server".to_string()),
             args: vec!["stdio".to_string()],
-            env: std::collections::BTreeMap::from([(
-                "GITHUB_PERSONAL_ACCESS_TOKEN".to_string(),
-                token.to_string(),
-            )]),
+            env: std::collections::BTreeMap::from([
+                (
+                    "GITHUB_PERSONAL_ACCESS_TOKEN".to_string(),
+                    token.to_string(),
+                ),
+                (
+                    "GITHUB_TOOLSETS".to_string(),
+                    "context,repos,issues,pull_requests".to_string(),
+                ),
+            ]),
             enabled: true,
             startup_timeout_secs: Some(20),
             ..McpServerConfig::default()
@@ -6093,85 +6170,13 @@ fn project_mcp_configs(token: &str) -> std::collections::BTreeMap<String, McpSer
                 "--repository".to_string(),
                 PROJECT_WORKSPACE_PATH.to_string(),
             ],
-            env: std::collections::BTreeMap::from([(
-                "GITHUB_TOKEN".to_string(),
-                token.to_string(),
-            )]),
+            env: std::collections::BTreeMap::new(),
             enabled: true,
             startup_timeout_secs: Some(20),
             ..McpServerConfig::default()
         },
     );
     configs
-}
-
-fn project_github_tools() -> Vec<McpTool> {
-    [
-        ("get_me", "Get the authenticated GitHub user."),
-        ("search_repositories", "Search GitHub repositories."),
-        (
-            "get_file_contents",
-            "Read file contents from a GitHub repository.",
-        ),
-        ("create_issue", "Create a GitHub issue."),
-        ("create_pull_request", "Create a GitHub pull request."),
-        ("create_branch", "Create a GitHub branch."),
-        (
-            "create_or_update_file",
-            "Create or update a file in a GitHub repository.",
-        ),
-        ("push_files", "Push multiple files to a GitHub repository."),
-        ("list_issues", "List GitHub issues."),
-        ("list_pull_requests", "List GitHub pull requests."),
-        ("get_pull_request", "Get a GitHub pull request."),
-        ("pull_request_read", "Read pull request details, files, comments, reviews, or status when supported by the GitHub MCP server."),
-        ("pull_request_review_write", "Submit a GitHub pull request review when supported by the GitHub MCP server."),
-        ("create_pull_request_review", "Create a GitHub pull request review."),
-        ("add_issue_comment", "Add a comment to a GitHub issue or pull request."),
-        ("get_issue", "Get a GitHub issue."),
-    ]
-    .into_iter()
-    .map(|(name, description)| McpTool {
-        server: PROJECT_GITHUB_MCP_SERVER.to_string(),
-        name: name.to_string(),
-        model_name: mai_mcp::model_tool_name(PROJECT_GITHUB_MCP_SERVER, name),
-        description: description.to_string(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": true
-        }),
-        output_schema: None,
-    })
-    .collect()
-}
-
-fn project_git_tools() -> Vec<McpTool> {
-    [
-        ("git_status", "Show repository working tree status."),
-        ("git_diff", "Show changes in the repository."),
-        ("git_log", "Show recent commit history."),
-        ("git_add", "Stage files."),
-        ("git_commit", "Create a commit."),
-    ]
-    .into_iter()
-    .map(|(name, description)| McpTool {
-        server: PROJECT_GIT_MCP_SERVER.to_string(),
-        name: name.to_string(),
-        model_name: mai_mcp::model_tool_name(PROJECT_GIT_MCP_SERVER, name),
-        description: description.to_string(),
-        input_schema: json!({ "type": "object" }),
-        output_schema: None,
-    })
-    .collect()
-}
-
-fn project_builtin_tools() -> Vec<McpTool> {
-    PROJECT_GITHUB_TOOLS
-        .iter()
-        .cloned()
-        .chain(PROJECT_GIT_TOOLS.iter().cloned())
-        .collect()
 }
 
 async fn decode_github_response<T: DeserializeOwned>(
@@ -7208,6 +7213,23 @@ mod tests {
         summary.status = ProjectStatus::Ready;
         summary.clone_status = ProjectCloneStatus::Ready;
         summary
+    }
+
+    fn test_mcp_tool(server: &str, name: &str) -> McpTool {
+        McpTool {
+            server: server.to_string(),
+            name: name.to_string(),
+            model_name: mai_mcp::model_tool_name(server, name),
+            description: format!("{server} {name}"),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            output_schema: None,
+        }
     }
 
     fn fake_docker_path(dir: &tempfile::TempDir) -> String {
@@ -10370,6 +10392,112 @@ esac
     }
 
     #[tokio::test]
+    async fn project_agent_without_discovered_mcp_tools_has_no_static_fallback() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        save_agent_with_session(&store, &maintainer).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                maintainer_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let maintainer_record = runtime.agent(maintainer_id).await.expect("maintainer");
+
+        let tools = runtime.agent_mcp_tools(&maintainer_record).await;
+
+        assert!(tools.is_empty());
+        let visible = runtime.visible_tool_names(&maintainer_record, &tools).await;
+        assert!(!visible.contains("mcp__github__create_pull_request_review"));
+        assert!(!visible.contains("mcp__github__pull_request_review_write"));
+        assert!(!visible.contains("mcp__git__git_status"));
+    }
+
+    #[tokio::test]
+    async fn project_agent_mcp_tools_match_project_manager_discovery() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        save_agent_with_session(&store, &maintainer).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                maintainer_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let discovered = vec![
+            test_mcp_tool("github", "pull_request_review_write"),
+            test_mcp_tool("git", "git_diff_unstaged"),
+        ];
+        runtime.project_mcp_managers.write().await.insert(
+            project_id,
+            Arc::new(McpAgentManager::from_tools_for_test(discovered.clone())),
+        );
+        let maintainer_record = runtime.agent(maintainer_id).await.expect("maintainer");
+
+        let tools = runtime.agent_mcp_tools(&maintainer_record).await;
+
+        let names = tools
+            .iter()
+            .map(|tool| tool.model_name.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            names,
+            HashSet::from([
+                "mcp__github__pull_request_review_write",
+                "mcp__git__git_diff_unstaged",
+            ])
+        );
+        assert_eq!(tools.len(), discovered.len());
+        let visible = runtime.visible_tool_names(&maintainer_record, &tools).await;
+        assert!(visible.contains("mcp__github__pull_request_review_write"));
+        assert!(visible.contains("mcp__git__git_diff_unstaged"));
+        assert!(!visible.contains("mcp__github__create_pull_request_review"));
+        assert!(!visible.contains("mcp__git__git_status"));
+    }
+
+    #[test]
+    fn project_mcp_configs_use_official_defaults_without_git_token_env() {
+        let configs = project_mcp_configs("secret-token");
+        let github = configs.get(PROJECT_GITHUB_MCP_SERVER).expect("github");
+        assert_eq!(
+            github
+                .env
+                .get("GITHUB_PERSONAL_ACCESS_TOKEN")
+                .map(String::as_str),
+            Some("secret-token")
+        );
+        assert_eq!(
+            github.env.get("GITHUB_TOOLSETS").map(String::as_str),
+            Some("context,repos,issues,pull_requests")
+        );
+        let git = configs.get(PROJECT_GIT_MCP_SERVER).expect("git");
+        assert_eq!(git.command.as_deref(), Some("uvx"));
+        assert_eq!(
+            git.args,
+            vec![
+                "mcp-server-git".to_string(),
+                "--repository".to_string(),
+                PROJECT_WORKSPACE_PATH.to_string(),
+            ]
+        );
+        assert!(!git.env.contains_key("GITHUB_TOKEN"));
+    }
+
+    #[tokio::test]
     async fn wait_agent_accepts_targets_and_send_input_queues_busy_target() {
         let dir = tempdir().expect("tempdir");
         let store = test_store(&dir).await;
@@ -10841,6 +10969,49 @@ esac
         }
         assert!(saw_cloning);
         assert!(saw_ready);
+    }
+
+    #[tokio::test]
+    async fn delete_project_removes_project_mcp_manager() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, Some("maintainer-container"));
+        agent.project_id = Some(project_id);
+        save_agent_with_session(&store, &agent).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                agent_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        runtime.project_mcp_managers.write().await.insert(
+            project_id,
+            Arc::new(McpAgentManager::from_tools_for_test(vec![test_mcp_tool(
+                "github", "get_me",
+            )])),
+        );
+
+        runtime.delete_project(project_id).await.expect("delete");
+
+        assert!(
+            !runtime
+                .project_mcp_managers
+                .read()
+                .await
+                .contains_key(&project_id)
+        );
     }
 
     #[tokio::test]

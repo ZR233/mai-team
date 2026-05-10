@@ -1,6 +1,0 @@
-interface:
-  display_name: GitHub PR Review
-  short_description: Review unreviewed open PRs in the current project.
-  default_prompt: Review all open PRs in this project that my GitHub account has not reviewed yet.
-policy:
-  allow_implicit_invocation: false

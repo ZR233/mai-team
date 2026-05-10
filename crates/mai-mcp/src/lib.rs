@@ -78,6 +78,20 @@ pub struct McpAgentManager {
 }
 
 impl McpAgentManager {
+    #[doc(hidden)]
+    pub fn from_tools_for_test(tools: Vec<McpTool>) -> Self {
+        Self {
+            sessions: RwLock::new(BTreeMap::new()),
+            tools: RwLock::new(
+                tools
+                    .into_iter()
+                    .map(|tool| (tool.model_name.clone(), tool))
+                    .collect(),
+            ),
+            statuses: RwLock::new(BTreeMap::new()),
+        }
+    }
+
     pub async fn start(
         docker: DockerClient,
         container_id: String,

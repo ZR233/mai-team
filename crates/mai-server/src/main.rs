@@ -1164,9 +1164,9 @@ mod tests {
 
         release_embedded_system_skills(&target).expect("release skills");
 
-        let skill_path = target.join("github-pr-review").join("SKILL.md");
+        let skill_path = target.join("reviewer-agent-review-pr").join("SKILL.md");
         let contents = fs::read_to_string(skill_path).expect("skill contents");
-        assert!(contents.contains("name: github-pr-review"));
+        assert!(contents.contains("name: reviewer-agent-review-pr"));
 
         let anthropic_skill_path = target.join("anthropic").join("docx").join("SKILL.md");
         let anthropic_contents =
@@ -1184,7 +1184,12 @@ mod tests {
         release_embedded_system_skills(&target).expect("release skills");
 
         assert!(!target.join("stale.txt").exists());
-        assert!(target.join("github-pr-review").join("SKILL.md").exists());
+        assert!(
+            target
+                .join("reviewer-agent-review-pr")
+                .join("SKILL.md")
+                .exists()
+        );
         assert!(
             target
                 .join("anthropic")
@@ -1197,8 +1202,8 @@ mod tests {
     #[test]
     fn safe_embedded_relative_path_rejects_parent_components() {
         assert_eq!(
-            safe_embedded_relative_path("github-pr-review/SKILL.md"),
-            Some(PathBuf::from("github-pr-review").join("SKILL.md"))
+            safe_embedded_relative_path("reviewer-agent-review-pr/SKILL.md"),
+            Some(PathBuf::from("reviewer-agent-review-pr").join("SKILL.md"))
         );
         assert_eq!(safe_embedded_relative_path("../SKILL.md"), None);
         assert_eq!(safe_embedded_relative_path("/tmp/SKILL.md"), None);
