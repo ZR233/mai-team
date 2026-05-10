@@ -13,6 +13,8 @@ The skill selects the most eligible unreviewed PR, checks out the code in an iso
 
 As a reviewer agent, your role is to provide objective, thorough code review. GitHub interactions must use the GitHub MCP tools that are actually visible in the current tool list; git worktree and local test execution use Bash commands.
 
+The repository is pre-cloned and refreshed by Mai at `/workspace/repo` before this skill starts. Do not fetch credentials or configure tokens yourself. Use local refs under `/workspace/repo`, including `refs/remotes/origin/pr/<number>`, when creating review worktrees.
+
 ## Workflow
 
 ### 1. Identify Repository and Account
@@ -33,7 +35,11 @@ Apply eligibility filters in order:
 - **Freshness**: for each remaining PR, fetch the current user's reviews through a visible GitHub MCP review/read tool when available, and fetch the latest commit timestamp from PR details. A PR is eligible if the user has never reviewed it, OR the PR's latest commit time is strictly newer than the user's last submitted review timestamp. Compare commit dates, not `updatedAt` — comments and CI runs can update the PR without new code.
 - **Review request priority**: among eligible PRs, prefer the one where the authenticated user is explicitly requested as a reviewer.
 
-Pick the single most recently updated eligible PR. If no PRs match, report which filter eliminated each PR and exit.
+Pick the single most recently updated eligible PR. If no PRs match, finish with only:
+
+```json
+{"outcome":"no_eligible_pr","pr":null,"summary":"No eligible pull request found.","error":null}
+```
 
 ### 3. Follow Review Standards
 
@@ -48,11 +54,13 @@ Adopt this review methodology:
 
 ### 4. Create Git Worktree for Isolated Review
 
-Fetch the PR head and create an isolated worktree:
+The scheduler fetches PR refs before this skill starts. Verify the local PR ref exists and create an isolated worktree under `/workspace/reviews/<reviewer-agent-id>/`:
 
 ```bash
-git fetch origin '+refs/pull/<pr>/head:refs/remotes/origin/pr/<pr>'
-WORKTREE=$(mktemp -d /tmp/review-pr-<pr>-XXXXXX)
+cd /workspace/repo
+git rev-parse refs/remotes/origin/pr/<pr>
+mkdir -p /workspace/reviews/<reviewer-agent-id>
+WORKTREE=$(mktemp -d /workspace/reviews/<reviewer-agent-id>/review-pr-<pr>-XXXXXX)
 git worktree add --detach "$WORKTREE" origin/pr/<pr>
 ```
 
@@ -70,6 +78,7 @@ Work exclusively inside this worktree for code inspection and test execution. Wh
 
 ```bash
 git worktree remove "$WORKTREE"
+git -C /workspace/repo worktree prune
 ```
 
 ### 5. Code and Design Review
@@ -214,20 +223,30 @@ If submission fails because the head SHA changed, re-fetch the PR state and rest
 
 ### 10. Final Response
 
-Summarize the completed review with:
+The final response is consumed by the Mai project review scheduler. Return **only** one JSON object, with no Markdown, prose, or code fence.
 
-- PR number, title, and URL
-- Decision submitted: APPROVE / REQUEST_CHANGES / COMMENT
-- Blocking findings: file:line and brief description for each
-- Local validation results: commands run and their pass/fail status
-- Similar PRs found and relevance notes
-- Test coverage observations
-- Link to the submitted GitHub review
+If a review was submitted:
+
+```json
+{"outcome":"review_submitted","pr":123,"summary":"Submitted APPROVE for owner/repo#123 after cargo fmt --check and cargo test passed.","error":null}
+```
+
+If no PR was eligible:
+
+```json
+{"outcome":"no_eligible_pr","pr":null,"summary":"No eligible pull request found.","error":null}
+```
+
+If the review could not be completed:
+
+```json
+{"outcome":"failed","pr":123,"summary":"Review could not be completed.","error":"GitHub MCP did not expose a review-writing tool."}
+```
 
 ## Key Constraints
 
 - Review exactly one PR per invocation. Do not batch.
-- Always use an isolated git worktree under `/tmp/`; never review in the user's main checkout.
+- Always use an isolated git worktree under `/workspace/reviews/`; never review in `/workspace/repo`.
 - Run `cargo fmt --check` and `cargo clippy` for Rust PRs regardless of CI status — CI may run different targets.
 - Search for similar PRs before submitting the review.
 - Clean up the temporary worktree after review completion.

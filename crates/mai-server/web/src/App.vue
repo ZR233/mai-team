@@ -68,6 +68,7 @@
         @update:selected-skills="selectedProjectSkills = $event"
         @load-skills="onLoadProjectComposerSkills"
         @detect-project-skills="onDetectProjectSkills"
+        @update-review-settings="onUpdateProjectReviewSettings"
         @create-session="onCreateProjectSession"
         @select-session="selectProjectSession"
       />
@@ -263,6 +264,7 @@ const {
   selectProjectAgent,
   selectProjectSession,
   createProject,
+  updateProject,
   sendProjectMessage,
   loadProjectSkills,
   detectProjectSkills,
@@ -499,6 +501,15 @@ async function onDetectProjectSkills() {
   try {
     await detectProjectSkills(selectedProjectId.value)
     showToast('Project skills refreshed.')
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onUpdateProjectReviewSettings({ projectId, patch }) {
+  try {
+    await updateProject(projectId, patch)
+    showToast('Project review settings saved.')
   } catch (error) {
     showToast(error.message)
   }

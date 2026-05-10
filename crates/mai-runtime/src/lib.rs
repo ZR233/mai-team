@@ -16,13 +16,13 @@ use mai_protocol::{
     GithubInstallationsResponse, GithubRepositoriesResponse, GithubRepositorySummary,
     McpServerConfig, McpServerScope, McpServerTransport, MessageRole, ModelConfig,
     ModelContentItem, ModelInputItem, ModelOutputItem, ModelToolCall, PlanHistoryEntry, PlanStatus,
-    ProjectCloneStatus, ProjectDetail, ProjectId, ProjectStatus, ProjectSummary,
-    RepositoryPackageSummary, RepositoryPackagesResponse, ResolvedAgentModelPreference,
-    RuntimeDefaultsResponse, SendMessageRequest, ServiceEvent, ServiceEventKind, SessionId,
-    SkillActivationInfo, SkillScope, SkillsConfigRequest, SkillsListResponse, TaskDetail, TaskId,
-    TaskPlan, TaskReview, TaskStatus, TaskSummary, TodoItem, TokenUsage, ToolTraceDetail, TurnId,
-    TurnStatus, UpdateAgentRequest, UpdateProjectRequest, UserInputOption, UserInputQuestion, now,
-    preview,
+    ProjectCloneStatus, ProjectDetail, ProjectId, ProjectReviewOutcome, ProjectReviewStatus,
+    ProjectStatus, ProjectSummary, RepositoryPackageSummary, RepositoryPackagesResponse,
+    ResolvedAgentModelPreference, RuntimeDefaultsResponse, SendMessageRequest, ServiceEvent,
+    ServiceEventKind, SessionId, SkillActivationInfo, SkillScope, SkillsConfigRequest,
+    SkillsListResponse, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary,
+    TodoItem, TokenUsage, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest,
+    UpdateProjectRequest, UserInputOption, UserInputQuestion, now, preview,
 };
 use mai_skills::{SkillInjections, SkillsManager};
 use mai_store::{ConfigStore, ProviderSelection};
@@ -43,7 +43,10 @@ use tokio::time::{Duration, Instant, sleep};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const MAX_TOOL_ITERATIONS: usize = 16;
+/// Safety limit to prevent truly infinite tool-call loops.
+/// Normal workflows (e.g. reviewer-agent) may need 30-40+ iterations;
+/// this cap is intentionally high and should never be reached in practice.
+const MAX_TOOL_ITERATIONS: usize = 128;
 const RECENT_EVENT_LIMIT: usize = 500;
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
 const REVIEW_ROUND_LIMIT: u64 = 5;
@@ -60,6 +63,9 @@ const GITHUB_API_VERSION: &str = "2022-11-28";
 const GITHUB_TOKEN_REFRESH_SKEW_SECS: i64 = 120;
 const GITHUB_MANIFEST_STATE_TTL_SECS: u64 = 900;
 const GITHUB_HTTP_TIMEOUT_SECS: u64 = 10;
+const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;
+const PROJECT_REVIEW_FAILURE_RETRY_SECS: u64 = 600;
+const PROJECT_REVIEW_TURN_TIMEOUT_SECS: u64 = 3600;
 const PROJECT_GITHUB_MCP_SERVER: &str = "github";
 const PROJECT_GIT_MCP_SERVER: &str = "git";
 const DEFAULT_SIDECAR_IMAGE: &str = "ghcr.io/zr233/mai-team-sidecar:latest";
@@ -161,6 +167,12 @@ pub struct AgentRuntime {
 struct ProjectRecord {
     summary: RwLock<ProjectSummary>,
     sidecar: RwLock<Option<ContainerHandle>>,
+    review_worker: Mutex<Option<ProjectReviewWorker>>,
+}
+
+struct ProjectReviewWorker {
+    cancellation_token: CancellationToken,
+    abort_handle: AbortHandle,
 }
 
 struct TaskRecord {
@@ -227,6 +239,24 @@ struct ToolExecution {
     ends_turn: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ProjectReviewCycleReport {
+    outcome: ProjectReviewOutcome,
+    #[serde(default)]
+    pr: Option<u64>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectReviewCycleResult {
+    outcome: ProjectReviewOutcome,
+    summary: Option<String>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct AgentCapability {
     can_spawn_agents: bool,
@@ -246,7 +276,14 @@ enum ContainerSource {
     CloneFrom {
         parent_container_id: String,
         docker_image: String,
+        workspace_volume: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReviewRepoCommand {
+    Ensure,
+    Sync,
 }
 
 #[derive(Debug, Clone)]
@@ -499,6 +536,7 @@ impl AgentRuntime {
                 Arc::new(ProjectRecord {
                     summary: RwLock::new(summary),
                     sidecar: RwLock::new(None),
+                    review_worker: Mutex::new(None),
                 }),
             );
         }
@@ -512,7 +550,7 @@ impl AgentRuntime {
             .timeout(Duration::from_secs(GITHUB_HTTP_TIMEOUT_SECS))
             .build()?;
 
-        Ok(Arc::new(Self {
+        let runtime = Arc::new(Self {
             docker,
             model,
             store,
@@ -530,7 +568,9 @@ impl AgentRuntime {
             repo_root: config.repo_root,
             sidecar_image,
             github_api_base_url,
-        }))
+        });
+        runtime.start_enabled_project_review_workers().await;
+        Ok(runtime)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ServiceEvent> {
@@ -1396,6 +1436,19 @@ impl AgentRuntime {
             created_at,
             updated_at: created_at,
             last_error: None,
+            auto_review_enabled: request.auto_review_enabled,
+            reviewer_extra_prompt: normalize_optional_text(request.reviewer_extra_prompt),
+            review_status: if request.auto_review_enabled {
+                ProjectReviewStatus::Idle
+            } else {
+                ProjectReviewStatus::Disabled
+            },
+            current_reviewer_agent_id: None,
+            last_review_started_at: None,
+            last_review_finished_at: None,
+            next_review_at: None,
+            last_review_outcome: None,
+            review_last_error: None,
         };
         self.store.save_project(&project).await?;
         self.projects.write().await.insert(
@@ -1403,6 +1456,7 @@ impl AgentRuntime {
             Arc::new(ProjectRecord {
                 summary: RwLock::new(project.clone()),
                 sidecar: RwLock::new(None),
+                review_worker: Mutex::new(None),
             }),
         );
         self.publish(ServiceEventKind::ProjectCreated {
@@ -1422,7 +1476,7 @@ impl AgentRuntime {
     }
 
     pub async fn update_project(
-        &self,
+        self: &Arc<Self>,
         project_id: ProjectId,
         request: UpdateProjectRequest,
     ) -> Result<ProjectSummary> {
@@ -1441,6 +1495,21 @@ impl AgentRuntime {
                     summary.docker_image = docker_image.to_string();
                 }
             }
+            if let Some(enabled) = request.auto_review_enabled {
+                summary.auto_review_enabled = enabled;
+                if enabled && summary.review_status == ProjectReviewStatus::Disabled {
+                    summary.review_status = ProjectReviewStatus::Idle;
+                }
+                if !enabled {
+                    summary.review_status = ProjectReviewStatus::Disabled;
+                    summary.current_reviewer_agent_id = None;
+                    summary.next_review_at = None;
+                }
+            }
+            if request.reviewer_extra_prompt.is_some() {
+                summary.reviewer_extra_prompt =
+                    normalize_optional_text(request.reviewer_extra_prompt);
+            }
             summary.updated_at = now();
             summary.clone()
         };
@@ -1449,11 +1518,17 @@ impl AgentRuntime {
             project: updated.clone(),
         })
         .await;
+        if updated.auto_review_enabled {
+            self.start_project_review_loop_if_ready(project_id).await?;
+        } else {
+            self.stop_project_review_loop(project_id).await;
+        }
         Ok(updated)
     }
 
     pub async fn delete_project(self: &Arc<Self>, project_id: ProjectId) -> Result<()> {
         let project = self.project(project_id).await?;
+        self.stop_project_review_loop(project_id).await;
         let root_agents = self
             .project_agents(project_id)
             .await
@@ -1476,6 +1551,7 @@ impl AgentRuntime {
         }
         self.shutdown_project_mcp_manager(project_id).await;
         let _ = self.delete_project_sidecar(project_id).await;
+        let _ = self.delete_project_review_workspace(project_id).await;
         self.store.delete_project(project_id).await?;
         self.projects.write().await.remove(&project_id);
         self.publish(ServiceEventKind::ProjectDeleted { project_id })
@@ -1486,6 +1562,7 @@ impl AgentRuntime {
 
     pub async fn cancel_project(self: &Arc<Self>, project_id: ProjectId) -> Result<()> {
         let project = self.project(project_id).await?;
+        self.stop_project_review_loop(project_id).await;
         let agents = self.project_agents(project_id).await;
         for agent in agents {
             if let Ok(record) = self.agent(agent.id).await {
@@ -2552,7 +2629,13 @@ impl AgentRuntime {
         self.inject_project_mcp_tools(&agent, agent_id, session_id, &cancellation_token)
             .await?;
         let mut last_assistant_text: Option<String> = None;
-        for iteration in 0..MAX_TOOL_ITERATIONS {
+        let mut iteration: usize = 0;
+        loop {
+            if iteration >= MAX_TOOL_ITERATIONS {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "tool iteration limit reached ({MAX_TOOL_ITERATIONS})"
+                )));
+            }
             if cancellation_token.is_cancelled() {
                 return Err(RuntimeError::TurnCancelled);
             }
@@ -2872,14 +2955,8 @@ impl AgentRuntime {
                 return Ok(());
             }
 
-            if iteration + 1 == MAX_TOOL_ITERATIONS {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "tool iteration limit reached ({MAX_TOOL_ITERATIONS})"
-                )));
-            }
+            iteration += 1;
         }
-
-        Ok(())
     }
 
     async fn execute_tool(
@@ -2996,6 +3073,7 @@ impl AgentRuntime {
                         ContainerSource::CloneFrom {
                             parent_container_id,
                             docker_image: parent_docker_image,
+                            workspace_volume: None,
                         },
                         parent_summary.task_id,
                         parent_summary.project_id,
@@ -3594,6 +3672,7 @@ impl AgentRuntime {
             ContainerSource::CloneFrom {
                 parent_container_id,
                 docker_image: parent_summary.docker_image,
+                workspace_volume: None,
             },
             Some(task_id),
             parent_summary.project_id,
@@ -4809,6 +4888,496 @@ impl AgentRuntime {
             tracing::warn!(project_id = %project_id, "failed to update project clone status: {err}");
             return Err(err);
         }
+        self.start_project_review_loop_if_ready(project_id).await?;
+        Ok(())
+    }
+
+    async fn start_enabled_project_review_workers(self: &Arc<Self>) {
+        let project_ids = {
+            let projects = self.projects.read().await;
+            projects.keys().copied().collect::<Vec<_>>()
+        };
+        for project_id in project_ids {
+            if let Err(err) = self.start_project_review_loop_if_ready(project_id).await {
+                tracing::warn!(project_id = %project_id, "failed to start project review loop: {err}");
+            }
+        }
+    }
+
+    async fn start_project_review_loop_if_ready(
+        self: &Arc<Self>,
+        project_id: ProjectId,
+    ) -> Result<()> {
+        let project = self.project(project_id).await?;
+        let should_start = {
+            let summary = project.summary.read().await;
+            summary.auto_review_enabled
+                && summary.status == ProjectStatus::Ready
+                && summary.clone_status == ProjectCloneStatus::Ready
+        };
+        if !should_start {
+            return Ok(());
+        }
+
+        let mut worker = project.review_worker.lock().await;
+        if worker.is_some() {
+            return Ok(());
+        }
+        let cancellation_token = CancellationToken::new();
+        let runtime = Arc::clone(self);
+        let token = cancellation_token.clone();
+        let (abort_handle, abort_registration) = AbortHandle::new_pair();
+        tokio::spawn(Abortable::new(
+            async move {
+                runtime.run_project_review_loop(project_id, token).await;
+            },
+            abort_registration,
+        ));
+        *worker = Some(ProjectReviewWorker {
+            cancellation_token,
+            abort_handle,
+        });
+        Ok(())
+    }
+
+    async fn stop_project_review_loop(self: &Arc<Self>, project_id: ProjectId) {
+        let project = match self.project(project_id).await {
+            Ok(project) => project,
+            Err(_) => return,
+        };
+        let worker = project.review_worker.lock().await.take();
+        if let Some(worker) = worker {
+            worker.cancellation_token.cancel();
+            worker.abort_handle.abort();
+        }
+        let reviewer_id = project.summary.read().await.current_reviewer_agent_id;
+        if let Some(reviewer_id) = reviewer_id {
+            if let Ok(agent) = self.agent(reviewer_id).await {
+                let current_turn = agent.summary.read().await.current_turn;
+                if let Some(turn_id) = current_turn {
+                    let _ = self.cancel_agent_turn(reviewer_id, turn_id).await;
+                }
+            }
+            let _ = self.delete_agent(reviewer_id).await;
+        }
+        let _ = self
+            .set_project_review_state(
+                project_id,
+                ProjectReviewStatus::Disabled,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+            )
+            .await;
+    }
+
+    async fn run_project_review_loop(
+        self: Arc<Self>,
+        project_id: ProjectId,
+        cancellation_token: CancellationToken,
+    ) {
+        if let Err(err) = self.ensure_project_review_workspace(project_id).await {
+            let next = Utc::now() + TimeDelta::seconds(PROJECT_REVIEW_FAILURE_RETRY_SECS as i64);
+            let _ = self
+                .set_project_review_state(
+                    project_id,
+                    ProjectReviewStatus::Failed,
+                    None,
+                    Some(next),
+                    None,
+                    None,
+                    Some(err.to_string()),
+                    false,
+                )
+                .await;
+        }
+        loop {
+            if cancellation_token.is_cancelled() {
+                break;
+            }
+            let should_continue = match self.project(project_id).await {
+                Ok(project) => {
+                    let summary = project.summary.read().await;
+                    summary.auto_review_enabled
+                        && summary.status == ProjectStatus::Ready
+                        && summary.clone_status == ProjectCloneStatus::Ready
+                }
+                Err(_) => false,
+            };
+            if !should_continue {
+                break;
+            }
+
+            let result = self
+                .run_project_review_once(project_id, cancellation_token.clone())
+                .await;
+            let (delay, status, outcome, summary, error) = match result {
+                Ok(result) => match result.outcome {
+                    ProjectReviewOutcome::ReviewSubmitted => (
+                        Duration::from_secs(0),
+                        ProjectReviewStatus::Idle,
+                        Some(result.outcome),
+                        result.summary,
+                        None,
+                    ),
+                    ProjectReviewOutcome::NoEligiblePr => (
+                        Duration::from_secs(PROJECT_REVIEW_IDLE_RETRY_SECS),
+                        ProjectReviewStatus::Waiting,
+                        Some(result.outcome),
+                        result.summary,
+                        None,
+                    ),
+                    ProjectReviewOutcome::Failed => (
+                        Duration::from_secs(PROJECT_REVIEW_FAILURE_RETRY_SECS),
+                        ProjectReviewStatus::Failed,
+                        Some(result.outcome),
+                        result.summary,
+                        result
+                            .error
+                            .or_else(|| Some("reviewer reported failure".to_string())),
+                    ),
+                },
+                Err(RuntimeError::TurnCancelled) if cancellation_token.is_cancelled() => break,
+                Err(err) => (
+                    Duration::from_secs(PROJECT_REVIEW_FAILURE_RETRY_SECS),
+                    ProjectReviewStatus::Failed,
+                    Some(ProjectReviewOutcome::Failed),
+                    None,
+                    Some(err.to_string()),
+                ),
+            };
+            let next_review_at = (delay.as_secs() > 0)
+                .then(|| Utc::now() + TimeDelta::seconds(delay.as_secs() as i64));
+            let _ = self
+                .set_project_review_state(
+                    project_id,
+                    status,
+                    None,
+                    next_review_at,
+                    outcome,
+                    summary,
+                    error,
+                    false,
+                )
+                .await;
+            if delay.is_zero() {
+                continue;
+            }
+            tokio::select! {
+                _ = sleep(delay) => {}
+                _ = cancellation_token.cancelled() => break,
+            }
+        }
+        if let Ok(project) = self.project(project_id).await {
+            let mut worker = project.review_worker.lock().await;
+            *worker = None;
+        }
+    }
+
+    async fn run_project_review_once(
+        self: &Arc<Self>,
+        project_id: ProjectId,
+        cancellation_token: CancellationToken,
+    ) -> Result<ProjectReviewCycleResult> {
+        self.set_project_review_state(
+            project_id,
+            ProjectReviewStatus::Syncing,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        self.sync_project_review_repo(project_id).await?;
+        if cancellation_token.is_cancelled() {
+            return Err(RuntimeError::TurnCancelled);
+        }
+        let reviewer = self.spawn_project_reviewer_agent(project_id).await?;
+        let reviewer_id = reviewer.id;
+        self.set_project_review_state(
+            project_id,
+            ProjectReviewStatus::Running,
+            Some(reviewer_id),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        let cycle_result = async {
+            let message = self
+                .project_reviewer_initial_message(project_id, reviewer_id)
+                .await?;
+            self.start_agent_turn_with_skills(
+                reviewer_id,
+                message,
+                vec!["reviewer-agent-review-pr".to_string()],
+            )
+            .await?;
+            let summary = self
+                .wait_agent_with_cancel(
+                    reviewer_id,
+                    Duration::from_secs(PROJECT_REVIEW_TURN_TIMEOUT_SECS),
+                    &cancellation_token,
+                )
+                .await?;
+            if matches!(summary.status, AgentStatus::Failed | AgentStatus::Cancelled) {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "reviewer ended with status {:?}",
+                    summary.status
+                )));
+            }
+            let response = self.last_turn_response(reviewer_id).await?.ok_or_else(|| {
+                RuntimeError::InvalidInput("reviewer did not return a final response".to_string())
+            })?;
+            parse_project_review_cycle_report(&response)
+        }
+        .await;
+        let _ = self
+            .cleanup_project_review_worktree(project_id, reviewer_id)
+            .await;
+        let _ = self.delete_agent(reviewer_id).await;
+        self.set_project_review_state(
+            project_id,
+            ProjectReviewStatus::Idle,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        cycle_result
+    }
+
+    async fn ensure_project_review_workspace(&self, project_id: ProjectId) -> Result<()> {
+        self.run_project_review_repo_command(project_id, ReviewRepoCommand::Ensure)
+            .await
+    }
+
+    async fn sync_project_review_repo(&self, project_id: ProjectId) -> Result<()> {
+        self.run_project_review_repo_command(project_id, ReviewRepoCommand::Sync)
+            .await
+    }
+
+    async fn cleanup_project_review_worktree(
+        &self,
+        project_id: ProjectId,
+        reviewer_id: AgentId,
+    ) -> Result<()> {
+        let volume = DockerClient::workspace_volume_for_project_review(&project_id.to_string());
+        let command = format!(
+            "set -eu\n\
+             git -C /workspace/repo worktree prune 2>/dev/null || true\n\
+             rm -rf {}",
+            shell_quote(&format!("/workspace/reviews/{reviewer_id}"))
+        );
+        let output = self
+            .docker
+            .run_sidecar_shell_env(&mai_docker::SidecarParams {
+                name: &format!("mai-review-cleanup-{reviewer_id}"),
+                image: &self.sidecar_image,
+                command: &command,
+                args: &[],
+                cwd: Some("/workspace"),
+                env: &[],
+                workspace_volume: Some(&volume),
+                timeout_secs: Some(120),
+            })
+            .await?;
+        if output.status != 0 {
+            return Err(RuntimeError::InvalidInput(format!(
+                "review workspace cleanup failed: {}",
+                preview(format!("{}\n{}", output.stderr, output.stdout).trim(), 500)
+            )));
+        }
+        Ok(())
+    }
+
+    async fn run_project_review_repo_command(
+        &self,
+        project_id: ProjectId,
+        command: ReviewRepoCommand,
+    ) -> Result<()> {
+        let project = self.project(project_id).await?;
+        let summary = project.summary.read().await.clone();
+        let token = self.project_git_token(project_id).await?.ok_or_else(|| {
+            RuntimeError::InvalidInput("project git account token is not configured".to_string())
+        })?;
+        let volume = DockerClient::workspace_volume_for_project_review(&project_id.to_string());
+        let repo_url = github_clone_url(&summary.owner, &summary.repo);
+        let expected_remote = repo_url.clone();
+        let branch = if summary.branch.trim().is_empty() {
+            "main".to_string()
+        } else {
+            summary.branch.clone()
+        };
+        let command_text = match command {
+            ReviewRepoCommand::Ensure => {
+                review_repo_ensure_command(&repo_url, &expected_remote, &branch)
+            }
+            ReviewRepoCommand::Sync => {
+                review_repo_sync_command(&repo_url, &expected_remote, &branch)
+            }
+        };
+        let env = [("MAI_GITHUB_REVIEW_TOKEN".to_string(), token.to_string())];
+        let output = self
+            .docker
+            .run_sidecar_shell_env(&mai_docker::SidecarParams {
+                name: &format!("mai-review-sync-{project_id}"),
+                image: &self.sidecar_image,
+                command: &command_text,
+                args: &[],
+                cwd: Some("/workspace"),
+                env: &env,
+                workspace_volume: Some(&volume),
+                timeout_secs: Some(900),
+            })
+            .await?;
+        if output.status != 0 {
+            let combined = format!("{}\n{}", output.stderr, output.stdout);
+            let message = preview(redact_secret(combined.trim(), &token).trim(), 500);
+            return Err(RuntimeError::InvalidInput(format!(
+                "project review workspace sync failed: {message}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn spawn_project_reviewer_agent(
+        self: &Arc<Self>,
+        project_id: ProjectId,
+    ) -> Result<AgentSummary> {
+        let project = self.project(project_id).await?;
+        let project_summary = project.summary.read().await.clone();
+        let maintainer = self.agent(project_summary.maintainer_agent_id).await?;
+        let maintainer_summary = maintainer.summary.read().await.clone();
+        let parent_container_id = self
+            .ensure_agent_container(&maintainer, maintainer_summary.status.clone())
+            .await?;
+        let model = self.resolve_role_agent_model(AgentRole::Reviewer).await?;
+        let workspace_volume =
+            DockerClient::workspace_volume_for_project_review(&project_id.to_string());
+        self.create_agent_with_container_source(
+            CreateAgentRequest {
+                name: Some(format!("{} Auto Reviewer", project_summary.name)),
+                provider_id: Some(model.preference.provider_id),
+                model: Some(model.preference.model),
+                reasoning_effort: model.preference.reasoning_effort,
+                docker_image: Some(maintainer_summary.docker_image.clone()),
+                parent_id: Some(project_summary.maintainer_agent_id),
+                system_prompt: Some(project_reviewer_system_prompt().to_string()),
+            },
+            ContainerSource::CloneFrom {
+                parent_container_id,
+                docker_image: maintainer_summary.docker_image,
+                workspace_volume: Some(workspace_volume),
+            },
+            maintainer_summary.task_id,
+            Some(project_id),
+            Some(AgentRole::Reviewer),
+        )
+        .await
+    }
+
+    async fn project_reviewer_initial_message(
+        &self,
+        project_id: ProjectId,
+        reviewer_id: AgentId,
+    ) -> Result<String> {
+        let project = self.project(project_id).await?;
+        let summary = project.summary.read().await.clone();
+        let extra = summary
+            .reviewer_extra_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("None");
+        Ok(format!(
+            "Run one automatic pull request review for project `{}`.\n\nRepository: {}/{}\nDefault branch: {}\nWorkspace repo: /workspace/repo\nReview worktree root: /workspace/reviews/{}\n\nExtra reviewer instructions:\n{}\n\nUse the $reviewer-agent-review-pr skill. At the end of the turn, return only one JSON object matching this schema exactly:\n{{\"outcome\":\"review_submitted|no_eligible_pr|failed\",\"pr\":123|null,\"summary\":\"short result\",\"error\":null|\"failure reason\"}}",
+            summary.name, summary.owner, summary.repo, summary.branch, reviewer_id, extra
+        ))
+    }
+
+    async fn last_turn_response(&self, agent_id: AgentId) -> Result<Option<String>> {
+        let agent = self.agent(agent_id).await?;
+        let sessions = agent.sessions.lock().await;
+        Ok(sessions
+            .iter()
+            .filter_map(|session| session.last_turn_response.clone())
+            .last())
+    }
+
+    async fn start_agent_turn_with_skills(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        message: String,
+        skill_mentions: Vec<String>,
+    ) -> Result<TurnId> {
+        let session_id = self.resolve_session_id(agent_id, None).await?;
+        let (agent, turn_id) = self.prepare_turn(agent_id).await?;
+        self.spawn_turn(
+            &agent,
+            agent_id,
+            session_id,
+            turn_id,
+            message,
+            skill_mentions,
+        );
+        Ok(turn_id)
+    }
+
+    async fn set_project_review_state(
+        &self,
+        project_id: ProjectId,
+        status: ProjectReviewStatus,
+        current_reviewer_agent_id: Option<AgentId>,
+        next_review_at: Option<DateTime<Utc>>,
+        outcome: Option<ProjectReviewOutcome>,
+        _summary_text: Option<String>,
+        error: Option<String>,
+        force_disabled: bool,
+    ) -> Result<ProjectSummary> {
+        let project = self.project(project_id).await?;
+        let updated = {
+            let mut summary = project.summary.write().await;
+            summary.review_status = status;
+            summary.current_reviewer_agent_id = current_reviewer_agent_id;
+            summary.next_review_at = next_review_at;
+            if current_reviewer_agent_id.is_some() {
+                summary.last_review_started_at = Some(now());
+                summary.last_review_finished_at = None;
+            } else if outcome.is_some() || error.is_some() {
+                summary.last_review_finished_at = Some(now());
+            }
+            if let Some(outcome) = outcome {
+                summary.last_review_outcome = Some(outcome);
+            }
+            summary.review_last_error = error;
+            if force_disabled {
+                summary.auto_review_enabled = false;
+            }
+            summary.updated_at = now();
+            summary.clone()
+        };
+        self.store.save_project(&updated).await?;
+        self.publish(ServiceEventKind::ProjectUpdated {
+            project: updated.clone(),
+        })
+        .await;
+        Ok(updated)
+    }
+
+    async fn delete_project_review_workspace(&self, project_id: ProjectId) -> Result<()> {
+        let volume = DockerClient::workspace_volume_for_project_review(&project_id.to_string());
+        self.docker.delete_volume(&volume).await?;
         Ok(())
     }
 
@@ -5447,8 +6016,9 @@ EOF\n\
             ContainerSource::CloneFrom {
                 parent_container_id,
                 docker_image,
+                workspace_volume,
             } => {
-                if preferred_container_id.is_some() {
+                if preferred_container_id.is_some() && workspace_volume.is_none() {
                     self.docker
                         .ensure_agent_container_from_image(
                             &agent_id.to_string(),
@@ -5458,9 +6028,10 @@ EOF\n\
                         .await
                 } else {
                     self.docker
-                        .create_agent_container_from_parent(
+                        .create_agent_container_from_parent_with_workspace(
                             &agent_id.to_string(),
                             parent_container_id,
+                            workspace_volume.as_deref(),
                         )
                         .await
                 }
@@ -5946,6 +6517,142 @@ fn normalize_optional_path_segment(value: Option<&str>, field: &str) -> Result<O
         )));
     }
     Ok(Some(value.to_string()))
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn review_repo_auth_prelude() -> &'static str {
+    "tmp=$(mktemp -d)\n\
+     askpass=\"$tmp/askpass.sh\"\n\
+     cleanup() { rm -rf \"$tmp\"; }\n\
+     trap cleanup EXIT HUP INT TERM\n\
+     cat >\"$askpass\" <<'EOF'\n\
+#!/bin/sh\n\
+case \"$1\" in\n\
+  *Username*) printf '%s\\n' x-access-token ;;\n\
+  *Password*) printf '%s\\n' \"$MAI_GITHUB_REVIEW_TOKEN\" ;;\n\
+  *) printf '\\n' ;;\n\
+esac\n\
+EOF\n\
+     chmod 700 \"$askpass\"\n\
+     export GIT_TERMINAL_PROMPT=0\n\
+     export GIT_ASKPASS=\"$askpass\"\n\
+     git config --global --add safe.directory /workspace/repo 2>/dev/null || true"
+}
+
+fn review_repo_ensure_command(repo_url: &str, expected_remote: &str, branch: &str) -> String {
+    let branch_arg = if branch.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" --branch {}", shell_quote(branch))
+    };
+    format!(
+        "set -eu\n\
+         {prelude}\n\
+         mkdir -p /workspace\n\
+         if [ -d /workspace/repo/.git ]; then\n\
+           remote=$(git -C /workspace/repo remote get-url origin 2>/dev/null || true)\n\
+           if [ \"$remote\" != {expected_remote} ]; then\n\
+             rm -rf /workspace/repo\n\
+           fi\n\
+         fi\n\
+         if [ ! -d /workspace/repo/.git ]; then\n\
+           rm -rf /workspace/repo\n\
+           git -c credential.helper= clone{branch_arg} -- {repo_url} /workspace/repo\n\
+         fi",
+        prelude = review_repo_auth_prelude(),
+        expected_remote = shell_quote(expected_remote),
+        repo_url = shell_quote(repo_url),
+    )
+}
+
+fn review_repo_sync_command(repo_url: &str, expected_remote: &str, branch: &str) -> String {
+    let origin_branch = format!("origin/{branch}");
+    format!(
+        "set -eu\n\
+         {ensure}\n\
+         cd /workspace/repo\n\
+         git -c credential.helper= remote set-url origin {repo_url}\n\
+         git -c credential.helper= fetch --prune origin\n\
+         git -c credential.helper= fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'\n\
+         git checkout {branch}\n\
+         git reset --hard {origin_branch}\n\
+         git worktree prune\n\
+         mkdir -p /workspace/reviews",
+        ensure = review_repo_ensure_command(repo_url, expected_remote, branch),
+        repo_url = shell_quote(repo_url),
+        branch = shell_quote(branch),
+        origin_branch = shell_quote(&origin_branch),
+    )
+}
+
+fn project_reviewer_system_prompt() -> &'static str {
+    "You are an autonomous project pull request reviewer. Review exactly one eligible GitHub pull request for this project, using only the GitHub MCP tools visible in the current tool list for GitHub reads/writes and local shell commands for git/test work. The repository has already been cloned and synced at /workspace/repo. Use an isolated git worktree under /workspace/reviews for the selected PR and clean it up before finishing. Do not look for GitHub tokens in the environment or write credentials. Finish with only the required JSON object so the project scheduler can decide the next cycle."
+}
+
+fn parse_project_review_cycle_report(text: &str) -> Result<ProjectReviewCycleResult> {
+    let value = match serde_json::from_str::<ProjectReviewCycleReport>(text) {
+        Ok(value) => value,
+        Err(_) => {
+            let json = extract_json_object(text).ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "invalid project review final JSON: missing json object".to_string(),
+                )
+            })?;
+            serde_json::from_str::<ProjectReviewCycleReport>(json).map_err(|err| {
+                RuntimeError::InvalidInput(format!("invalid project review final JSON: {err}"))
+            })?
+        }
+    };
+    let summary = value
+        .summary
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let pr_summary = value.pr.map(|pr| format!("PR #{pr}"));
+    Ok(ProjectReviewCycleResult {
+        outcome: value.outcome,
+        summary: summary.or(pr_summary),
+        error: value
+            .error
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    })
+}
+
+fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in text[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let end = start + offset + ch.len_utf8();
+                    return Some(&text[start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn github_clone_url(owner: &str, repo: &str) -> String {
@@ -7201,6 +7908,15 @@ mod tests {
             created_at: timestamp,
             updated_at: timestamp,
             last_error: None,
+            auto_review_enabled: false,
+            reviewer_extra_prompt: None,
+            review_status: ProjectReviewStatus::Disabled,
+            current_reviewer_agent_id: None,
+            last_review_started_at: None,
+            last_review_finished_at: None,
+            next_review_at: None,
+            last_review_outcome: None,
+            review_last_error: None,
         }
     }
 
@@ -7538,6 +8254,31 @@ esac
             extract_skill_mentions("please use $rust-dev, then $plugin:doc and $PATH."),
             vec!["rust-dev", "plugin:doc"]
         );
+    }
+
+    #[test]
+    fn parses_project_review_cycle_json_from_final_text() {
+        let report = parse_project_review_cycle_report(
+            r#"Done.
+            {"outcome":"no_eligible_pr","pr":null,"summary":"Nothing to review.","error":null}"#,
+        )
+        .expect("parse report");
+        assert_eq!(report.outcome, ProjectReviewOutcome::NoEligiblePr);
+        assert_eq!(report.summary.as_deref(), Some("Nothing to review."));
+        assert_eq!(report.error, None);
+    }
+
+    #[test]
+    fn project_review_sync_command_fetches_pr_refs_without_token_literal() {
+        let command = review_repo_sync_command(
+            "https://github.com/owner/repo.git",
+            "https://github.com/owner/repo.git",
+            "main",
+        );
+        assert!(command.contains("'+refs/pull/*/head:refs/remotes/origin/pr/*'"));
+        assert!(command.contains("git reset --hard 'origin/main'"));
+        assert!(command.contains("MAI_GITHUB_REVIEW_TOKEN"));
+        assert!(!command.contains("ghp_"));
     }
 
     #[test]

@@ -58,6 +58,31 @@ pub enum ProjectCloneStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum ProjectReviewStatus {
+    Disabled,
+    Idle,
+    Syncing,
+    Running,
+    Waiting,
+    Failed,
+}
+
+impl Default for ProjectReviewStatus {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectReviewOutcome {
+    ReviewSubmitted,
+    NoEligiblePr,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum PlanStatus {
     Missing,
     Ready,
@@ -327,6 +352,24 @@ pub struct ProjectSummary {
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub auto_review_enabled: bool,
+    #[serde(default)]
+    pub reviewer_extra_prompt: Option<String>,
+    #[serde(default)]
+    pub review_status: ProjectReviewStatus,
+    #[serde(default)]
+    pub current_reviewer_agent_id: Option<AgentId>,
+    #[serde(default)]
+    pub last_review_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_review_finished_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub next_review_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_review_outcome: Option<ProjectReviewOutcome>,
+    #[serde(default)]
+    pub review_last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,6 +436,10 @@ pub struct CreateProjectRequest {
     pub branch: Option<String>,
     #[serde(default)]
     pub docker_image: Option<String>,
+    #[serde(default)]
+    pub auto_review_enabled: bool,
+    #[serde(default)]
+    pub reviewer_extra_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -401,6 +448,10 @@ pub struct UpdateProjectRequest {
     pub name: Option<String>,
     #[serde(default)]
     pub docker_image: Option<String>,
+    #[serde(default)]
+    pub auto_review_enabled: Option<bool>,
+    #[serde(default)]
+    pub reviewer_extra_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

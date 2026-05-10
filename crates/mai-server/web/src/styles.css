@@ -536,6 +536,65 @@ p {
   align-content: start;
 }
 
+.review-settings {
+  display: grid;
+  gap: 14px;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  padding: 16px;
+  background: #fff;
+  box-shadow: 0 10px 22px rgba(22, 32, 51, 0.05);
+}
+
+.review-toggle-row,
+.review-settings-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-width: 0;
+}
+
+.review-toggle-row div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.review-toggle-row strong {
+  color: #172033;
+  font-size: 15px;
+}
+
+.review-toggle-row span,
+.review-settings-actions small {
+  color: #66758a;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.review-prompt-field {
+  display: grid;
+  gap: 8px;
+}
+
+.review-prompt-field > span {
+  color: #28384e;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.review-prompt-field textarea {
+  min-height: 130px;
+}
+
+.small-button.secondary {
+  color: #26354a;
+  border-color: #ccd6e3;
+  background: #fff;
+  box-shadow: none;
+}
+
 .project-progress-bar {
   position: relative;
   overflow: hidden;

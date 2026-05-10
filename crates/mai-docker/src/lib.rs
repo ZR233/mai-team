@@ -115,6 +115,10 @@ impl DockerClient {
         project_workspace_volume(project_id)
     }
 
+    pub fn workspace_volume_for_project_review(project_id: &str) -> String {
+        project_review_workspace_volume(project_id)
+    }
+
     pub async fn check_available(&self) -> Result<String> {
         let output = Command::new(&self.binary)
             .args(["version", "--format", "{{.Server.Version}}"])
@@ -223,6 +227,16 @@ impl DockerClient {
         agent_id: &str,
         parent_container_id: &str,
     ) -> Result<ContainerHandle> {
+        self.create_agent_container_from_parent_with_workspace(agent_id, parent_container_id, None)
+            .await
+    }
+
+    pub async fn create_agent_container_from_parent_with_workspace(
+        &self,
+        agent_id: &str,
+        parent_container_id: &str,
+        workspace_volume: Option<&str>,
+    ) -> Result<ContainerHandle> {
         let image = snapshot_image_name(agent_id);
         let commit = Command::new(&self.binary)
             .args(["commit", parent_container_id, &image])
@@ -233,7 +247,7 @@ impl DockerClient {
         }
 
         let result = self
-            .create_agent_container_from_image(agent_id, &image)
+            .create_agent_container_from_image_with_workspace(agent_id, &image, workspace_volume)
             .await;
         if let Err(err) = self.delete_image(&image).await {
             tracing::warn!(image = %image, "failed to remove temporary snapshot image: {err}");
@@ -246,10 +260,27 @@ impl DockerClient {
         agent_id: &str,
         image: &str,
     ) -> Result<ContainerHandle> {
+        self.create_agent_container_from_image_with_workspace(agent_id, image, None)
+            .await
+    }
+
+    async fn create_agent_container_from_image_with_workspace(
+        &self,
+        agent_id: &str,
+        image: &str,
+        workspace_volume: Option<&str>,
+    ) -> Result<ContainerHandle> {
         let image = validate_image(image)?;
         let name = agent_container_name(agent_id);
         let label = agent_label(agent_id);
-        let workspace_volume = agent_workspace_volume(agent_id);
+        let default_workspace_volume;
+        let workspace_volume = match workspace_volume {
+            Some(value) => value,
+            None => {
+                default_workspace_volume = agent_workspace_volume(agent_id);
+                &default_workspace_volume
+            }
+        };
         let args = create_agent_container_args(&name, &label, image, &workspace_volume);
         let create = Command::new(&self.binary)
             .args(args.iter().map(String::as_str))
@@ -389,6 +420,21 @@ impl DockerClient {
         if !output.status.success() {
             let message = stderr_or_stdout(&output);
             if is_missing_image_error(&message) {
+                return Ok(());
+            }
+            return Err(DockerError::CommandFailed(message));
+        }
+        Ok(())
+    }
+
+    pub async fn delete_volume(&self, volume: &str) -> Result<()> {
+        let output = Command::new(&self.binary)
+            .args(["volume", "rm", "-f", volume])
+            .output()
+            .await?;
+        if !output.status.success() {
+            let message = stderr_or_stdout(&output);
+            if message.to_ascii_lowercase().contains("no such volume") {
                 return Ok(());
             }
             return Err(DockerError::CommandFailed(message));
@@ -918,6 +964,10 @@ fn project_workspace_volume(project_id: &str) -> String {
     format!("mai-team-project-{project_id}")
 }
 
+fn project_review_workspace_volume(project_id: &str) -> String {
+    format!("mai-team-project-review-{project_id}")
+}
+
 fn apply_container_create_options(args: &mut Vec<String>, options: &ContainerCreateOptions) {
     if let Some(memory) = options
         .memory
@@ -1344,6 +1394,36 @@ mod tests {
         assert_eq!(
             DockerClient::workspace_volume_for_project("project-1"),
             "mai-team-project-project-1"
+        );
+    }
+
+    #[test]
+    fn project_review_workspace_volume_uses_project_id() {
+        assert_eq!(
+            DockerClient::workspace_volume_for_project_review("project-1"),
+            "mai-team-project-review-project-1"
+        );
+    }
+
+    #[test]
+    fn reviewer_agent_container_args_can_use_project_review_volume() {
+        let image = "ghcr.io/rcore-os/tgoskits-container:latest";
+        let review_volume = DockerClient::workspace_volume_for_project_review("project-1");
+        let args = create_agent_container_args(
+            "mai-team-reviewer",
+            "mai.team.agent=reviewer",
+            image,
+            &review_volume,
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-v", "mai-team-project-review-project-1:/workspace"])
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|window| window == ["-v", "mai-team-workspace-reviewer:/workspace"])
         );
     }
 

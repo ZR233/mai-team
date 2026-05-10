@@ -5,11 +5,11 @@ use mai_protocol::{
     GitAccountsResponse, GitProvider, GitTokenKind, GithubAppSettingsRequest,
     GithubAppSettingsResponse, GithubSettingsResponse, McpServerConfig, MessageRole, ModelConfig,
     ModelInputItem, ModelReasoningConfig, ModelReasoningVariant, PlanHistoryEntry, PlanStatus,
-    ProjectCloneStatus, ProjectId, ProjectStatus, ProjectSummary, ProviderConfig, ProviderKind,
-    ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
-    ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind, SessionId,
-    SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary, TokenUsage, TurnId,
-    default_true,
+    ProjectCloneStatus, ProjectId, ProjectReviewOutcome, ProjectReviewStatus, ProjectStatus,
+    ProjectSummary, ProviderConfig, ProviderKind, ProviderPreset, ProviderPresetsResponse,
+    ProviderSecret, ProviderSummary, ProvidersConfigRequest, ProvidersResponse, ServiceEvent,
+    ServiceEventKind, SessionId, SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskStatus,
+    TaskSummary, TokenUsage, TurnId, default_true,
 };
 use rusqlite::Connection as SqliteConnection;
 use serde::{Deserialize, Serialize};
@@ -259,6 +259,15 @@ struct ProjectRecordRow {
     created_at: String,
     updated_at: String,
     last_error: Option<String>,
+    auto_review_enabled: bool,
+    reviewer_extra_prompt: Option<String>,
+    review_status: String,
+    current_reviewer_agent_id: Option<String>,
+    last_review_started_at: Option<String>,
+    last_review_finished_at: Option<String>,
+    next_review_at: Option<String>,
+    last_review_outcome: Option<String>,
+    review_last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, toasty::Model)]
@@ -1175,6 +1184,21 @@ impl ConfigStore {
             created_at: project.created_at.to_rfc3339(),
             updated_at: project.updated_at.to_rfc3339(),
             last_error: project.last_error.clone(),
+            auto_review_enabled: project.auto_review_enabled,
+            reviewer_extra_prompt: project.reviewer_extra_prompt.clone(),
+            review_status: project_review_status_to_str(&project.review_status).to_string(),
+            current_reviewer_agent_id: project.current_reviewer_agent_id.map(|id| id.to_string()),
+            last_review_started_at: project.last_review_started_at.map(|time| time.to_rfc3339()),
+            last_review_finished_at: project
+                .last_review_finished_at
+                .map(|time| time.to_rfc3339()),
+            next_review_at: project.next_review_at.map(|time| time.to_rfc3339()),
+            last_review_outcome: project
+                .last_review_outcome
+                .as_ref()
+                .map(project_review_outcome_to_str)
+                .map(str::to_string),
+            review_last_error: project.review_last_error.clone(),
         })
         .exec(&mut db)
         .await?;
@@ -1796,6 +1820,31 @@ impl ProjectRecordRow {
             created_at: parse_utc(&self.created_at)?,
             updated_at: parse_utc(&self.updated_at)?,
             last_error: self.last_error,
+            auto_review_enabled: self.auto_review_enabled,
+            reviewer_extra_prompt: self.reviewer_extra_prompt,
+            review_status: parse_project_review_status(&self.review_status)?,
+            current_reviewer_agent_id: self
+                .current_reviewer_agent_id
+                .as_deref()
+                .map(parse_agent_id)
+                .transpose()?,
+            last_review_started_at: self
+                .last_review_started_at
+                .as_deref()
+                .map(parse_utc)
+                .transpose()?,
+            last_review_finished_at: self
+                .last_review_finished_at
+                .as_deref()
+                .map(parse_utc)
+                .transpose()?,
+            next_review_at: self.next_review_at.as_deref().map(parse_utc).transpose()?,
+            last_review_outcome: self
+                .last_review_outcome
+                .as_deref()
+                .map(parse_project_review_outcome)
+                .transpose()?,
+            review_last_error: self.review_last_error,
         })
     }
 }
@@ -1964,7 +2013,16 @@ fn migrate_to_v12(path: &Path) -> Result<()> {
             maintainer_agent_id TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            last_error TEXT
+            last_error TEXT,
+            auto_review_enabled BOOLEAN NOT NULL DEFAULT 0,
+            reviewer_extra_prompt TEXT,
+            review_status TEXT NOT NULL DEFAULT 'disabled',
+            current_reviewer_agent_id TEXT,
+            last_review_started_at TEXT,
+            last_review_finished_at TEXT,
+            next_review_at TEXT,
+            last_review_outcome TEXT,
+            review_last_error TEXT
         )",
         [],
     )?;
@@ -1983,6 +2041,7 @@ fn migrate_to_v12(path: &Path) -> Result<()> {
             [],
         )?;
     }
+    ensure_project_review_columns(&conn)?;
     conn.execute(
         "UPDATE projects
             SET repository_full_name = owner || '/' || repo
@@ -2017,7 +2076,16 @@ fn drop_project_path_columns(conn: &SqliteConnection) -> Result<()> {
             maintainer_agent_id TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            last_error TEXT
+            last_error TEXT,
+            auto_review_enabled BOOLEAN NOT NULL DEFAULT 0,
+            reviewer_extra_prompt TEXT,
+            review_status TEXT NOT NULL DEFAULT 'disabled',
+            current_reviewer_agent_id TEXT,
+            last_review_started_at TEXT,
+            last_review_finished_at TEXT,
+            next_review_at TEXT,
+            last_review_outcome TEXT,
+            review_last_error TEXT
         )",
         [],
     )?;
@@ -2039,7 +2107,16 @@ fn drop_project_path_columns(conn: &SqliteConnection) -> Result<()> {
             maintainer_agent_id,
             created_at,
             updated_at,
-            last_error
+            last_error,
+            auto_review_enabled,
+            reviewer_extra_prompt,
+            review_status,
+            current_reviewer_agent_id,
+            last_review_started_at,
+            last_review_finished_at,
+            next_review_at,
+            last_review_outcome,
+            review_last_error
         )
         SELECT
             id,
@@ -2058,12 +2135,68 @@ fn drop_project_path_columns(conn: &SqliteConnection) -> Result<()> {
             maintainer_agent_id,
             created_at,
             updated_at,
-            last_error
+            last_error,
+            auto_review_enabled,
+            reviewer_extra_prompt,
+            review_status,
+            current_reviewer_agent_id,
+            last_review_started_at,
+            last_review_finished_at,
+            next_review_at,
+            last_review_outcome,
+            review_last_error
         FROM projects",
         [],
     )?;
     conn.execute("DROP TABLE projects", [])?;
     conn.execute("ALTER TABLE projects_v12 RENAME TO projects", [])?;
+    Ok(())
+}
+
+fn ensure_project_review_columns(conn: &SqliteConnection) -> Result<()> {
+    let columns = [
+        (
+            "auto_review_enabled",
+            "ALTER TABLE projects ADD COLUMN auto_review_enabled BOOLEAN NOT NULL DEFAULT 0",
+        ),
+        (
+            "reviewer_extra_prompt",
+            "ALTER TABLE projects ADD COLUMN reviewer_extra_prompt TEXT",
+        ),
+        (
+            "review_status",
+            "ALTER TABLE projects ADD COLUMN review_status TEXT NOT NULL DEFAULT 'disabled'",
+        ),
+        (
+            "current_reviewer_agent_id",
+            "ALTER TABLE projects ADD COLUMN current_reviewer_agent_id TEXT",
+        ),
+        (
+            "last_review_started_at",
+            "ALTER TABLE projects ADD COLUMN last_review_started_at TEXT",
+        ),
+        (
+            "last_review_finished_at",
+            "ALTER TABLE projects ADD COLUMN last_review_finished_at TEXT",
+        ),
+        (
+            "next_review_at",
+            "ALTER TABLE projects ADD COLUMN next_review_at TEXT",
+        ),
+        (
+            "last_review_outcome",
+            "ALTER TABLE projects ADD COLUMN last_review_outcome TEXT",
+        ),
+        (
+            "review_last_error",
+            "ALTER TABLE projects ADD COLUMN review_last_error TEXT",
+        ),
+    ];
+    for (column, statement) in columns {
+        if !sqlite_column_exists(conn, "projects", column)? {
+            conn.execute(statement, [])?;
+        }
+    }
     Ok(())
 }
 
@@ -2696,6 +2829,50 @@ fn parse_project_clone_status(value: &str) -> Result<ProjectCloneStatus> {
         "failed" => Ok(ProjectCloneStatus::Failed),
         other => Err(StoreError::InvalidConfig(format!(
             "invalid project clone status `{other}`"
+        ))),
+    }
+}
+
+fn project_review_status_to_str(status: &ProjectReviewStatus) -> &'static str {
+    match status {
+        ProjectReviewStatus::Disabled => "disabled",
+        ProjectReviewStatus::Idle => "idle",
+        ProjectReviewStatus::Syncing => "syncing",
+        ProjectReviewStatus::Running => "running",
+        ProjectReviewStatus::Waiting => "waiting",
+        ProjectReviewStatus::Failed => "failed",
+    }
+}
+
+fn parse_project_review_status(value: &str) -> Result<ProjectReviewStatus> {
+    match value {
+        "" | "disabled" => Ok(ProjectReviewStatus::Disabled),
+        "idle" => Ok(ProjectReviewStatus::Idle),
+        "syncing" => Ok(ProjectReviewStatus::Syncing),
+        "running" => Ok(ProjectReviewStatus::Running),
+        "waiting" => Ok(ProjectReviewStatus::Waiting),
+        "failed" => Ok(ProjectReviewStatus::Failed),
+        other => Err(StoreError::InvalidConfig(format!(
+            "invalid project review status `{other}`"
+        ))),
+    }
+}
+
+fn project_review_outcome_to_str(outcome: &ProjectReviewOutcome) -> &'static str {
+    match outcome {
+        ProjectReviewOutcome::ReviewSubmitted => "review_submitted",
+        ProjectReviewOutcome::NoEligiblePr => "no_eligible_pr",
+        ProjectReviewOutcome::Failed => "failed",
+    }
+}
+
+fn parse_project_review_outcome(value: &str) -> Result<ProjectReviewOutcome> {
+    match value {
+        "review_submitted" => Ok(ProjectReviewOutcome::ReviewSubmitted),
+        "no_eligible_pr" => Ok(ProjectReviewOutcome::NoEligiblePr),
+        "failed" => Ok(ProjectReviewOutcome::Failed),
+        other => Err(StoreError::InvalidConfig(format!(
+            "invalid project review outcome `{other}`"
         ))),
     }
 }
@@ -3796,6 +3973,15 @@ mod tests {
                 created_at: timestamp,
                 updated_at: timestamp,
                 last_error: None,
+                auto_review_enabled: true,
+                reviewer_extra_prompt: Some("Focus on safety.".to_string()),
+                review_status: ProjectReviewStatus::Waiting,
+                current_reviewer_agent_id: Some(Uuid::new_v4()),
+                last_review_started_at: Some(timestamp),
+                last_review_finished_at: Some(timestamp),
+                next_review_at: Some(timestamp),
+                last_review_outcome: Some(ProjectReviewOutcome::NoEligiblePr),
+                review_last_error: None,
             })
             .await
             .expect("save project");
@@ -3820,6 +4006,16 @@ mod tests {
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].id, project_id);
         assert_eq!(projects[0].repository_full_name, "owner/repo");
+        assert!(projects[0].auto_review_enabled);
+        assert_eq!(
+            projects[0].reviewer_extra_prompt.as_deref(),
+            Some("Focus on safety.")
+        );
+        assert_eq!(projects[0].review_status, ProjectReviewStatus::Waiting);
+        assert_eq!(
+            projects[0].last_review_outcome,
+            Some(ProjectReviewOutcome::NoEligiblePr)
+        );
 
         let conn = SqliteConnection::open(&db_path).expect("sqlite");
         assert!(!sqlite_column_exists(&conn, "projects", "project_path").expect("column"));

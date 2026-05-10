@@ -139,21 +139,57 @@
           </div>
           <span class="section-status" :class="statusTone(detail.status)">{{ formatStatus(detail.status) }}</span>
         </header>
+        <div class="review-settings">
+          <div class="review-toggle-row">
+            <div>
+              <strong>Automatic PR Review</strong>
+              <span>Runs one ephemeral reviewer agent per cycle with a project reviewer workspace.</span>
+            </div>
+            <button
+              class="small-button"
+              type="button"
+              :class="{ secondary: detail.auto_review_enabled }"
+              :disabled="!projectReady"
+              @click="toggleAutoReview"
+            >
+              {{ detail.auto_review_enabled ? 'Disable' : 'Enable' }}
+            </button>
+          </div>
+          <label class="review-prompt-field">
+            <span>Reviewer extra prompt</span>
+            <textarea
+              v-model="reviewerExtraPromptDraft"
+              rows="5"
+              placeholder="Focus areas, repository conventions, or review policy for this project"
+            ></textarea>
+          </label>
+          <div class="review-settings-actions">
+            <small>{{ projectReady ? reviewSettingsHint : 'Project review can be enabled after setup completes.' }}</small>
+            <button
+              class="ghost-button"
+              type="button"
+              :disabled="!reviewPromptDirty"
+              @click="saveReviewerPrompt"
+            >
+              Save Prompt
+            </button>
+          </div>
+        </div>
         <div class="settings-summary">
           <div class="settings-summary-item">
-            <span>Maintainer</span>
-            <strong>{{ detail.maintainer_agent?.name || detail.maintainer_agent_id || 'None' }}</strong>
-            <small>{{ formatStatus(detail.maintainer_agent?.status) }}</small>
+            <span>Auto Review</span>
+            <strong>{{ detail.auto_review_enabled ? 'Enabled' : 'Disabled' }}</strong>
+            <small>{{ formatStatus(detail.review_status || 'disabled') }}</small>
           </div>
-          <div class="settings-summary-item" :class="{ danger: detail.last_error }">
-            <span>Clone</span>
-            <strong>{{ formatStatus(detail.clone_status) }}</strong>
-            <small>{{ detail.last_error || 'No clone error reported' }}</small>
+          <div class="settings-summary-item" :class="{ danger: detail.review_last_error }">
+            <span>Outcome</span>
+            <strong>{{ formatStatus(detail.last_review_outcome || 'none') }}</strong>
+            <small>{{ detail.review_last_error || reviewLastFinishedLabel }}</small>
           </div>
           <div class="settings-summary-item">
-            <span>Agents</span>
-            <strong>{{ projectAgents.length }}</strong>
-            <small>Project-owned agents</small>
+            <span>Next Run</span>
+            <strong>{{ nextReviewLabel }}</strong>
+            <small>{{ currentReviewerLabel }}</small>
           </div>
         </div>
       </div>
@@ -342,7 +378,7 @@ const props = defineProps({
 
 const conversationRef = defineModel('conversationRef', { default: null })
 
-defineEmits([
+const emit = defineEmits([
   'create',
   'select-project',
   'select-agent',
@@ -357,6 +393,7 @@ defineEmits([
   'update:selectedSkills',
   'load-skills',
   'detect-project-skills',
+  'update-review-settings',
   'create-session',
   'select-session'
 ])
@@ -394,6 +431,27 @@ const projectSkillsEmpty = computed(() => (
     && props.projectSkillsState?.loaded
     && !props.projectSkillsState?.error
     && !projectSkillCount.value
+))
+const reviewerExtraPromptDraft = ref('')
+const reviewPromptDirty = computed(() => reviewerExtraPromptDraft.value !== (props.detail?.reviewer_extra_prompt || ''))
+const reviewSettingsHint = computed(() => (
+  props.detail?.auto_review_enabled
+    ? 'The scheduler keeps the reviewer workspace warm and polls for eligible PRs.'
+    : 'Enable to let Mai periodically review eligible open pull requests.'
+))
+const nextReviewLabel = computed(() => {
+  if (!props.detail?.auto_review_enabled) return 'Not scheduled'
+  return props.detail?.next_review_at ? formatDateTime(props.detail.next_review_at) : 'As soon as possible'
+})
+const reviewLastFinishedLabel = computed(() => (
+  props.detail?.last_review_finished_at
+    ? `Finished ${formatDateTime(props.detail.last_review_finished_at)}`
+    : 'No review cycle completed yet'
+))
+const currentReviewerLabel = computed(() => (
+  props.detail?.current_reviewer_agent_id
+    ? `Reviewer ${props.detail.current_reviewer_agent_id}`
+    : 'No reviewer running'
 ))
 const projectProgressMessage = computed(() => {
   if (!props.detail) return ''
@@ -442,6 +500,14 @@ watch(
   }
 )
 
+watch(
+  () => props.detail?.reviewer_extra_prompt,
+  (value) => {
+    reviewerExtraPromptDraft.value = value || ''
+  },
+  { immediate: true }
+)
+
 function repositoryName(project) {
   return [project?.owner, project?.repo].filter(Boolean).join('/') || 'Repository pending'
 }
@@ -466,5 +532,34 @@ function roleInitial(role) {
 
 function skillDisplayName(skill) {
   return skill?.interface?.display_name || skill?.name || 'Skill'
+}
+
+function toggleAutoReview() {
+  if (!props.detail?.id) return
+  emitReviewSettings({
+    auto_review_enabled: !props.detail.auto_review_enabled,
+    reviewer_extra_prompt: reviewerExtraPromptDraft.value
+  })
+}
+
+function saveReviewerPrompt() {
+  if (!props.detail?.id) return
+  emitReviewSettings({
+    reviewer_extra_prompt: reviewerExtraPromptDraft.value
+  })
+}
+
+function emitReviewSettings(patch) {
+  emit('update-review-settings', {
+    projectId: props.detail.id,
+    patch
+  })
+}
+
+function formatDateTime(value) {
+  if (!value) return 'Never'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString()
 }
 </script>
