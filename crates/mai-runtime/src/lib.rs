@@ -216,6 +216,13 @@ struct AgentSessionRecord {
 struct QueuedAgentInput {
     session_id: Option<SessionId>,
     message: String,
+    skill_mentions: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct CollabInput {
+    message: Option<String>,
+    skill_mentions: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -2534,13 +2541,17 @@ impl AgentRuntime {
             session_id: Some(session_id),
             turn_id: Some(turn_id),
             role: MessageRole::User,
-            content: message,
+            content: message.clone(),
         })
         .await;
 
         let skills_config = self.store.load_skills_config().await?;
         let skills_manager = self.skills_manager_for_agent(&agent).await?;
-        let skill_injections = skills_manager.build_injections(&skill_mentions, &skills_config)?;
+        let skill_injections = skills_manager.build_injections_for_message(
+            &message,
+            &skill_mentions,
+            &skills_config,
+        )?;
         if !skill_injections.items.is_empty() {
             self.publish(ServiceEventKind::SkillsActivated {
                 agent_id,
@@ -2947,7 +2958,7 @@ impl AgentRuntime {
             }
             RoutedTool::SpawnAgent => {
                 let name = optional_string(&arguments, "name");
-                let message = collab_message_from_args(&arguments)?;
+                let collab_input = collab_input_from_args(&arguments)?;
                 let legacy_role = optional_string(&arguments, "role")
                     .as_deref()
                     .map(parse_agent_role)
@@ -3007,10 +3018,17 @@ impl AgentRuntime {
                 {
                     self.fork_agent_context(agent_id, created.id).await?;
                 }
-                let turn_id = if let Some(message) = message {
+                let turn_id = if let Some(message) = collab_input.message {
                     let session_id = self.resolve_session_id(created.id, None).await?;
                     let (agent, turn_id) = self.prepare_turn(created.id).await?;
-                    self.spawn_turn(&agent, created.id, session_id, turn_id, message, Vec::new());
+                    self.spawn_turn(
+                        &agent,
+                        created.id,
+                        session_id,
+                        turn_id,
+                        message,
+                        collab_input.skill_mentions,
+                    );
                     Some(turn_id)
                 } else {
                     None
@@ -3024,7 +3042,8 @@ impl AgentRuntime {
             RoutedTool::SendInput => {
                 let target =
                     parse_agent_id(&required_any_string(&arguments, &["target", "agent_id"])?)?;
-                let message = collab_message_from_args(&arguments)?.ok_or_else(|| {
+                let collab_input = collab_input_from_args(&arguments)?;
+                let message = collab_input.message.ok_or_else(|| {
                     RuntimeError::InvalidInput(
                         "send_input requires message or text items".to_string(),
                     )
@@ -3034,7 +3053,13 @@ impl AgentRuntime {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let output = self
-                    .send_input_to_agent(target, None, message, interrupt)
+                    .send_input_to_agent(
+                        target,
+                        None,
+                        message,
+                        collab_input.skill_mentions,
+                        interrupt,
+                    )
                     .await?;
                 Ok(ToolExecution {
                     success: true,
@@ -3050,7 +3075,7 @@ impl AgentRuntime {
                     .transpose()?;
                 let message = required_string(&arguments, "message")?;
                 let output = self
-                    .send_input_to_agent(target, session_id, message, false)
+                    .send_input_to_agent(target, session_id, message, Vec::new(), false)
                     .await?;
                 Ok(ToolExecution {
                     success: true,
@@ -3756,6 +3781,7 @@ impl AgentRuntime {
         target: AgentId,
         session_id: Option<SessionId>,
         message: String,
+        skill_mentions: Vec<String>,
         interrupt: bool,
     ) -> Result<Value> {
         let agent = self.agent(target).await?;
@@ -3773,7 +3799,7 @@ impl AgentRuntime {
         match self.prepare_turn(target).await {
             Ok((agent, turn_id)) => {
                 let session_id = self.resolve_session_id(target, session_id).await?;
-                self.spawn_turn(&agent, target, session_id, turn_id, message, Vec::new());
+                self.spawn_turn(&agent, target, session_id, turn_id, message, skill_mentions);
                 Ok(json!({ "turn_id": turn_id, "queued": false }))
             }
             Err(RuntimeError::AgentBusy(_)) if !interrupt => {
@@ -3784,6 +3810,7 @@ impl AgentRuntime {
                     .push_back(QueuedAgentInput {
                         session_id,
                         message,
+                        skill_mentions,
                     });
                 Ok(json!({ "queued": true }))
             }
@@ -3811,7 +3838,7 @@ impl AgentRuntime {
             session_id,
             turn_id,
             input.message,
-            Vec::new(),
+            input.skill_mentions,
         );
         Ok(())
     }
@@ -3908,6 +3935,26 @@ impl AgentRuntime {
             instructions.push_str("\n\n## Skill Warnings\n");
             for warning in &skill_injections.warnings {
                 instructions.push_str(&format!("\n- {warning}"));
+            }
+        }
+        if !skill_injections.suggestions.is_empty() {
+            instructions.push_str("\n\n## Skill Suggestions for This Turn\n");
+            instructions.push_str(
+                "The following skills look potentially relevant but were not injected. Use them only if they fit the current task; read the path before relying on one.",
+            );
+            for suggestion in &skill_injections.suggestions {
+                let display = suggestion
+                    .display_name
+                    .as_deref()
+                    .unwrap_or(&suggestion.name);
+                instructions.push_str(&format!(
+                    "\n- ${name} ({display}): {description} (reason: {reason}; path: {path})",
+                    name = suggestion.name,
+                    display = display,
+                    description = suggestion.description,
+                    reason = suggestion.reason,
+                    path = suggestion.path.display()
+                ));
             }
         }
         instructions.push_str("\n\n## MCP Tools\n");
@@ -5535,27 +5582,52 @@ fn optional_string(arguments: &Value, field: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn collab_message_from_args(arguments: &Value) -> Result<Option<String>> {
+fn collab_input_from_args(arguments: &Value) -> Result<CollabInput> {
+    let mut input = CollabInput::default();
     if let Some(message) = optional_string(arguments, "message") {
-        return Ok(Some(message));
+        input.message = Some(message);
     }
     let Some(items) = arguments.get("items").and_then(Value::as_array) else {
-        return Ok(None);
+        return Ok(input);
     };
     let mut parts = Vec::new();
     for item in items {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("text");
-        if item_type != "text" {
-            return Err(RuntimeError::InvalidInput(format!(
-                "unsupported collab item type `{item_type}`; only text is supported"
-            )));
+        match item_type {
+            "text" => {
+                let text = item.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    RuntimeError::InvalidInput("text collab items require `text`".to_string())
+                })?;
+                parts.push(text.to_string());
+            }
+            "skill" => {
+                let mention = item
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("name").and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidInput(
+                            "skill collab items require `name` or `path`".to_string(),
+                        )
+                    })?;
+                input.skill_mentions.push(mention.to_string());
+            }
+            _ => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "unsupported collab item type `{item_type}`; expected text or skill"
+                )));
+            }
         }
-        let text = item.get("text").and_then(Value::as_str).ok_or_else(|| {
-            RuntimeError::InvalidInput("text collab items require `text`".to_string())
-        })?;
-        parts.push(text.to_string());
     }
-    Ok((!parts.is_empty()).then(|| parts.join("\n")))
+    if !parts.is_empty() {
+        input.message = Some(match input.message {
+            Some(existing) if !existing.is_empty() => format!("{existing}\n{}", parts.join("\n")),
+            _ => parts.join("\n"),
+        });
+    }
+    Ok(input)
 }
 
 fn agent_type_role(value: &str) -> Option<AgentRole> {
@@ -7367,6 +7439,7 @@ esac
                 },
                 contents: "skill body".to_string(),
             }],
+            suggestions: Vec::new(),
             warnings: Vec::new(),
         })
         .expect("fragment");
@@ -8693,6 +8766,71 @@ esac
     }
 
     #[tokio::test]
+    async fn user_turn_fuzzy_message_injects_skill() {
+        let (base_url, requests) = start_mock_responses(vec![json!({
+            "id": "skill",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "done" }]
+            }],
+            "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+        })])
+        .await;
+        let dir = tempdir().expect("tempdir");
+        let skill_dir = dir.path().join(".agents/skills/frontend-app-builder");
+        fs::create_dir_all(&skill_dir).expect("mkdir skill");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: frontend-app-builder\ndescription: Build frontend apps.\n---\nUse the frontend app builder flow.",
+        )
+        .expect("write skill");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![compact_test_provider(base_url)],
+                default_provider_id: Some("mock".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        store
+            .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
+            .await
+            .expect("save agent");
+        save_test_session(&store, agent_id, session_id).await;
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let agent = runtime.agent(agent_id).await.expect("agent");
+        *agent.container.write().await = Some(ContainerHandle {
+            id: "container-1".to_string(),
+            name: "container-1".to_string(),
+            image: "unused".to_string(),
+        });
+
+        runtime
+            .run_turn_inner(
+                agent_id,
+                session_id,
+                Uuid::new_v4(),
+                "please use the frontend app builder".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn");
+
+        let requests = requests.lock().await.clone();
+        let input = requests[0]["input"].as_array().expect("input");
+        assert!(input.iter().any(|item| {
+            item["role"] == "user"
+                && item["content"][0]["text"].as_str().is_some_and(|text| {
+                    text.contains("<name>frontend-app-builder</name>")
+                        && text.contains("Use the frontend app builder flow.")
+                })
+        }));
+    }
+
+    #[tokio::test]
     async fn disabled_skill_is_not_injected() {
         let (base_url, requests) = start_mock_responses(vec![json!({
             "id": "skill",
@@ -8914,7 +9052,13 @@ esac
         });
 
         let output = runtime
-            .send_input_to_agent(agent_id, Some(session_id), "replacement".to_string(), true)
+            .send_input_to_agent(
+                agent_id,
+                Some(session_id),
+                "replacement".to_string(),
+                Vec::new(),
+                true,
+            )
             .await
             .expect("interrupt");
         assert_eq!(output["queued"].as_bool(), Some(false));
@@ -9952,6 +10096,83 @@ esac
     }
 
     #[tokio::test]
+    async fn spawn_agent_skill_item_injects_child_initial_turn() {
+        let (base_url, requests) = start_mock_responses(vec![json!({
+            "id": "child-skill",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "child done" }]
+            }],
+            "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+        })])
+        .await;
+        let dir = tempdir().expect("tempdir");
+        let skill_dir = dir.path().join(".agents/skills/demo");
+        fs::create_dir_all(&skill_dir).expect("mkdir skill");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo skill.\n---\nUse child demo.",
+        )
+        .expect("write skill");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![compact_test_provider(base_url)],
+                default_provider_id: Some("mock".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let parent_id = Uuid::new_v4();
+        store
+            .save_agent(
+                &test_agent_summary(parent_id, Some("parent-container")),
+                None,
+            )
+            .await
+            .expect("save parent");
+        save_test_session(&store, parent_id, Uuid::new_v4()).await;
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let parent = runtime.agent(parent_id).await.expect("parent");
+        *parent.container.write().await = Some(ContainerHandle {
+            id: "parent-container".to_string(),
+            name: "parent-container".to_string(),
+            image: "unused".to_string(),
+        });
+
+        let result = runtime
+            .execute_tool_for_test(
+                parent_id,
+                "spawn_agent",
+                json!({
+                    "items": [
+                        { "type": "text", "text": "child task" },
+                        { "type": "skill", "name": "demo" }
+                    ]
+                }),
+            )
+            .await
+            .expect("spawn");
+        assert!(result.success);
+
+        wait_until(
+            || {
+                let requests = Arc::clone(&requests);
+                async move { !requests.lock().await.is_empty() }
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        let requests = requests.lock().await.clone();
+        let input = requests[0]["input"].as_array().expect("input");
+        assert!(input.iter().any(|item| {
+            item["role"] == "user"
+                && item["content"][0]["text"].as_str().is_some_and(|text| {
+                    text.contains("<name>demo</name>") && text.contains("Use child demo.")
+                })
+        }));
+    }
+
+    #[tokio::test]
     async fn wait_agent_accepts_targets_and_send_input_queues_busy_target() {
         let dir = tempdir().expect("tempdir");
         let store = test_store(&dir).await;
@@ -10026,6 +10247,117 @@ esac
         assert!(value["completed"].as_array().expect("completed").is_empty());
         assert_eq!(value["pending"].as_array().expect("pending").len(), 1);
         assert_eq!(value["timed_out"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn send_input_queued_skill_item_is_preserved_for_next_turn() {
+        let (base_url, requests) = start_mock_responses(vec![json!({
+            "id": "queued-skill",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "queued done" }]
+            }],
+            "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+        })])
+        .await;
+        let dir = tempdir().expect("tempdir");
+        let skill_dir = dir.path().join(".agents/skills/demo");
+        fs::create_dir_all(&skill_dir).expect("mkdir skill");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo skill.\n---\nQueued demo body.",
+        )
+        .expect("write skill");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![compact_test_provider(base_url)],
+                default_provider_id: Some("mock".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let parent_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let child_session_id = Uuid::new_v4();
+        let timestamp = now();
+        store
+            .save_agent(&test_agent_summary_at(parent_id, None, timestamp), None)
+            .await
+            .expect("save parent");
+        save_test_session(&store, parent_id, Uuid::new_v4()).await;
+        let mut child = test_agent_summary_at(child_id, Some(parent_id), timestamp);
+        child.status = AgentStatus::RunningTurn;
+        child.current_turn = Some(Uuid::new_v4());
+        child.container_id = Some("child-container".to_string());
+        store.save_agent(&child, None).await.expect("save child");
+        store
+            .save_agent_session(
+                child_id,
+                &AgentSessionSummary {
+                    id: child_session_id,
+                    title: "Task".to_string(),
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    message_count: 0,
+                },
+            )
+            .await
+            .expect("save child session");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let child_record = runtime.agent(child_id).await.expect("child");
+        {
+            let mut summary = child_record.summary.write().await;
+            summary.status = AgentStatus::RunningTurn;
+            summary.current_turn = Some(Uuid::new_v4());
+            summary.container_id = Some("child-container".to_string());
+        }
+        *child_record.container.write().await = Some(ContainerHandle {
+            id: "child-container".to_string(),
+            name: "child-container".to_string(),
+            image: "unused".to_string(),
+        });
+
+        let queued = runtime
+            .execute_tool_for_test(
+                parent_id,
+                "send_input",
+                json!({
+                    "target": child_id.to_string(),
+                    "items": [
+                        { "type": "text", "text": "queued hello" },
+                        { "type": "skill", "name": "demo" }
+                    ]
+                }),
+            )
+            .await
+            .expect("send input");
+        assert!(queued.success);
+        {
+            let mut summary = child_record.summary.write().await;
+            summary.status = AgentStatus::Idle;
+            summary.current_turn = None;
+        }
+        runtime
+            .start_next_queued_input(child_id)
+            .await
+            .expect("start queued");
+
+        wait_until(
+            || {
+                let requests = Arc::clone(&requests);
+                async move { !requests.lock().await.is_empty() }
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        let requests = requests.lock().await.clone();
+        let input = requests[0]["input"].as_array().expect("input");
+        assert!(input.iter().any(|item| {
+            item["role"] == "user"
+                && item["content"][0]["text"].as_str().is_some_and(|text| {
+                    text.contains("<name>demo</name>") && text.contains("Queued demo body.")
+                })
+        }));
     }
 
     #[tokio::test]

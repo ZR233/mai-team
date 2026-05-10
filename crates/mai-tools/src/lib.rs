@@ -384,13 +384,31 @@ fn collab_items_schema() -> Value {
     json!({
         "type": "array",
         "items": {
-            "type": "object",
-            "properties": {
-                "type": { "type": "string", "enum": ["text"] },
-                "text": { "type": "string" }
-            },
-            "required": ["type", "text"],
-            "additionalProperties": false
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "type": { "type": "string", "enum": ["text"] },
+                        "text": { "type": "string" }
+                    },
+                    "required": ["type", "text"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "type": { "type": "string", "enum": ["skill"] },
+                        "name": { "type": "string" },
+                        "path": { "type": "string" }
+                    },
+                    "required": ["type"],
+                    "anyOf": [
+                        { "required": ["name"] },
+                        { "required": ["path"] }
+                    ],
+                    "additionalProperties": false
+                }
+            ]
         }
     })
 }
@@ -434,6 +452,38 @@ mod tests {
         assert!(properties.contains_key("agent_type"));
         assert!(properties.contains_key("model"));
         assert!(!properties.contains_key("provider_id"));
+    }
+
+    #[test]
+    fn collab_items_schema_accepts_skill_items() {
+        let tools = build_tool_definitions(&[]);
+        for tool_name in [TOOL_SPAWN_AGENT, TOOL_SEND_INPUT] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == tool_name)
+                .expect("tool");
+            let item_variants = tool
+                .parameters
+                .pointer("/properties/items/items/oneOf")
+                .and_then(Value::as_array)
+                .expect("oneOf item variants");
+            assert_eq!(item_variants.len(), 2);
+            let skill_variant = item_variants
+                .iter()
+                .find(|variant| {
+                    variant
+                        .pointer("/properties/type/enum/0")
+                        .and_then(Value::as_str)
+                        == Some("skill")
+                })
+                .expect("skill variant");
+            assert!(
+                skill_variant
+                    .get("anyOf")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| items.len() == 2)
+            );
+        }
     }
 
     #[test]

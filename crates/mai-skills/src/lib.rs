@@ -17,6 +17,12 @@ const METADATA_FILE: &str = "openai.yaml";
 const MAX_SCAN_DEPTH: usize = 6;
 const MAX_NAME_LEN: usize = 64;
 const MAX_DESCRIPTION_LEN: usize = 8192;
+const EXPLICIT_MATCH_THRESHOLD: i32 = 70;
+const IMPLICIT_INJECT_THRESHOLD: i32 = 90;
+const IMPLICIT_SUGGEST_THRESHOLD: i32 = 60;
+const IMPLICIT_LEAD_THRESHOLD: i32 = 25;
+const MAX_IMPLICIT_INJECTIONS: usize = 2;
+const MAX_SKILL_SUGGESTIONS: usize = 3;
 
 #[derive(Debug, Error)]
 pub enum SkillError {
@@ -39,7 +45,19 @@ pub struct LoadedSkill {
 #[derive(Debug, Clone, Default)]
 pub struct SkillInjections {
     pub items: Vec<LoadedSkill>,
+    pub suggestions: Vec<SkillSuggestion>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillSuggestion {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub description: String,
+    pub path: PathBuf,
+    pub scope: SkillScope,
+    pub reason: String,
+    pub score: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +282,21 @@ impl SkillsManager {
         let mut outcome = self.load_outcome();
         apply_config(&mut outcome.skills, config)?;
         Ok(build_injections_from_outcome(&outcome, explicit_mentions))
+    }
+
+    pub fn build_injections_for_message(
+        &self,
+        message: &str,
+        explicit_mentions: &[String],
+        config: &SkillsConfigRequest,
+    ) -> Result<SkillInjections> {
+        let mut outcome = self.load_outcome();
+        apply_config(&mut outcome.skills, config)?;
+        Ok(build_injections_for_message_from_outcome(
+            &outcome,
+            message,
+            explicit_mentions,
+        ))
     }
 
     fn load_outcome(&self) -> SkillLoadOutcome {
@@ -629,7 +662,138 @@ fn build_injections_from_outcome(
         }
     }
 
+    for mention in explicit_mentions {
+        let trimmed = normalize_mention(mention);
+        if trimmed.is_empty() || looks_like_path(trimmed) || blocked_plain_names.contains(trimmed) {
+            continue;
+        }
+        if result
+            .items
+            .iter()
+            .any(|skill| skill.metadata.name == trimmed)
+        {
+            continue;
+        }
+        if let Some(skill) = unique_explicit_skill_match(trimmed, &enabled, &seen_paths) {
+            load_skill_contents(skill, &mut seen_paths, &mut result);
+        }
+    }
+
     result
+}
+
+fn build_injections_for_message_from_outcome(
+    outcome: &SkillLoadOutcome,
+    message: &str,
+    explicit_mentions: &[String],
+) -> SkillInjections {
+    let mut mentions = explicit_mentions.to_vec();
+    mentions.extend(extract_skill_mentions(message));
+    let mut result = build_injections_from_outcome(outcome, &mentions);
+    add_implicit_matches(outcome, message, &mut result);
+    result
+}
+
+fn unique_explicit_skill_match<'a>(
+    mention: &str,
+    skills: &[&'a SkillMetadata],
+    seen_paths: &BTreeSet<PathBuf>,
+) -> Option<&'a SkillMetadata> {
+    let mut matches = skills
+        .iter()
+        .copied()
+        .filter(|skill| !seen_paths.contains(&skill.path))
+        .filter_map(|skill| explicit_skill_match_score(skill, mention).map(|score| (score, skill)))
+        .filter(|(score, _)| *score >= EXPLICIT_MATCH_THRESHOLD)
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| skill_sort(left, right))
+    });
+    let (best_score, best_skill) = matches.first().copied()?;
+    if matches
+        .get(1)
+        .is_some_and(|(score, _)| *score == best_score)
+    {
+        return None;
+    }
+    Some(best_skill)
+}
+
+#[derive(Debug, Clone)]
+struct SkillCandidate<'a> {
+    skill: &'a SkillMetadata,
+    score: i32,
+    reason: String,
+}
+
+fn add_implicit_matches(outcome: &SkillLoadOutcome, message: &str, result: &mut SkillInjections) {
+    if message.trim().is_empty() {
+        return;
+    }
+    let seen_paths = result
+        .items
+        .iter()
+        .map(|skill| skill.metadata.path.clone())
+        .collect::<BTreeSet<_>>();
+    let mut candidates = outcome
+        .skills
+        .iter()
+        .filter(|skill| {
+            skill.enabled && skill_allows_implicit(skill) && !seen_paths.contains(&skill.path)
+        })
+        .filter_map(|skill| implicit_skill_match_score(skill, message))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| skill_sort(left.skill, right.skill))
+    });
+
+    let mut auto_paths = BTreeSet::<PathBuf>::new();
+    for index in 0..candidates.len().min(MAX_IMPLICIT_INJECTIONS) {
+        let candidate = &candidates[index];
+        if candidate.score < IMPLICIT_INJECT_THRESHOLD {
+            break;
+        }
+        let next_score = candidates
+            .get(index + 1)
+            .map(|item| item.score)
+            .unwrap_or(0);
+        if candidate.score - next_score < IMPLICIT_LEAD_THRESHOLD {
+            break;
+        }
+        load_skill_contents(candidate.skill, &mut auto_paths, result);
+    }
+
+    let injected_paths = result
+        .items
+        .iter()
+        .map(|skill| skill.metadata.path.clone())
+        .collect::<BTreeSet<_>>();
+    result.suggestions = candidates
+        .into_iter()
+        .filter(|candidate| {
+            candidate.score >= IMPLICIT_SUGGEST_THRESHOLD
+                && !injected_paths.contains(&candidate.skill.path)
+        })
+        .take(MAX_SKILL_SUGGESTIONS)
+        .map(skill_suggestion)
+        .collect();
+}
+
+fn skill_suggestion(candidate: SkillCandidate<'_>) -> SkillSuggestion {
+    SkillSuggestion {
+        name: candidate.skill.name.clone(),
+        display_name: skill_display_name(candidate.skill),
+        description: display_description(candidate.skill).to_string(),
+        path: candidate.skill.path.clone(),
+        scope: candidate.skill.scope,
+        reason: candidate.reason,
+        score: candidate.score,
+    }
 }
 
 fn load_skill_contents(
@@ -651,6 +815,256 @@ fn load_skill_contents(
             path = skill.path.display()
         )),
     }
+}
+
+fn explicit_skill_match_score(skill: &SkillMetadata, mention: &str) -> Option<i32> {
+    let mention = normalize_token(mention);
+    if mention.is_empty() {
+        return None;
+    }
+    skill_aliases(skill)
+        .into_iter()
+        .filter_map(|alias| alias_match_score(&alias, &mention))
+        .max()
+}
+
+fn implicit_skill_match_score<'a>(
+    skill: &'a SkillMetadata,
+    message: &str,
+) -> Option<SkillCandidate<'a>> {
+    let message_tokens = tokenize_for_match(message);
+    if message_tokens.is_empty() {
+        return None;
+    }
+    let message_norm = message_tokens.join(" ");
+    let mut best: Option<(i32, String)> = None;
+    for alias in skill_aliases(skill) {
+        let alias_tokens = tokenize_for_match(&alias);
+        if alias_tokens.is_empty() {
+            continue;
+        }
+        let alias_norm = alias_tokens.join(" ");
+        let score = if message_norm == alias_norm {
+            115
+        } else if contains_word_sequence(&message_tokens, &alias_tokens) {
+            110
+        } else if alias_tokens.iter().all(|token| {
+            message_tokens
+                .iter()
+                .any(|message_token| message_token == token)
+        }) {
+            100
+        } else {
+            message_tokens
+                .iter()
+                .filter_map(|token| alias_match_score(&alias_norm, token))
+                .max()
+                .unwrap_or(0)
+                .saturating_sub(5)
+        };
+        if score > best.as_ref().map(|(score, _)| *score).unwrap_or_default() {
+            best = Some((score, format!("matched alias `{alias}`")));
+        }
+    }
+
+    let description_tokens = tokenize_for_match(display_description(skill));
+    if !description_tokens.is_empty() {
+        let overlap = message_tokens
+            .iter()
+            .filter(|token| {
+                token.len() >= 4 && description_tokens.iter().any(|desc| desc == *token)
+            })
+            .count();
+        let score = match overlap {
+            0 => 0,
+            1 => 55,
+            2 => 75,
+            _ => 92 + (overlap.min(6) as i32 - 3) * 2,
+        };
+        if score > best.as_ref().map(|(score, _)| *score).unwrap_or_default() {
+            best = Some((score, format!("matched {overlap} description keywords")));
+        }
+    }
+
+    let (score, reason) = best?;
+    (score >= IMPLICIT_SUGGEST_THRESHOLD).then_some(SkillCandidate {
+        skill,
+        score,
+        reason,
+    })
+}
+
+fn skill_aliases(skill: &SkillMetadata) -> Vec<String> {
+    let mut aliases = Vec::new();
+    push_alias(&mut aliases, &skill.name);
+    if let Some((_plugin, name)) = skill.name.split_once(':') {
+        push_alias(&mut aliases, name);
+    }
+    if let Some(display_name) = skill_display_name(skill) {
+        push_alias(&mut aliases, &display_name);
+    }
+    if let Some(parent) = skill
+        .path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    {
+        push_alias(&mut aliases, parent);
+    }
+    let current = aliases.clone();
+    for alias in current {
+        let abbreviation = alias_abbreviation(&alias);
+        push_alias(&mut aliases, &abbreviation);
+    }
+    aliases
+}
+
+fn push_alias(aliases: &mut Vec<String>, value: &str) {
+    let normalized = normalize_token(value);
+    if !normalized.is_empty() && !aliases.contains(&normalized) {
+        aliases.push(normalized);
+    }
+}
+
+fn skill_display_name(skill: &SkillMetadata) -> Option<String> {
+    skill
+        .interface
+        .as_ref()
+        .and_then(|interface| interface.display_name.as_deref())
+        .map(ToOwned::to_owned)
+}
+
+fn alias_abbreviation(value: &str) -> String {
+    tokenize_for_match(value)
+        .into_iter()
+        .filter_map(|token| token.chars().next())
+        .collect()
+}
+
+fn alias_match_score(alias: &str, needle: &str) -> Option<i32> {
+    let alias = normalize_token(alias);
+    let needle = normalize_token(needle);
+    if alias.is_empty() || needle.is_empty() {
+        return None;
+    }
+    if alias == needle {
+        return Some(120);
+    }
+    if alias.starts_with(&needle) {
+        return Some(105);
+    }
+    if alias
+        .split_whitespace()
+        .any(|part| part == needle || part.starts_with(&needle))
+    {
+        return Some(100);
+    }
+    if alias.contains(&needle) {
+        return Some(90);
+    }
+    fuzzy_match_score(&alias, &needle).map(|score| score.saturating_sub(10))
+}
+
+fn fuzzy_match_score(haystack: &str, needle: &str) -> Option<i32> {
+    if needle.is_empty() {
+        return None;
+    }
+    let haystack_chars = haystack.chars().collect::<Vec<_>>();
+    let needle_chars = needle.chars().collect::<Vec<_>>();
+    let mut matched_positions = Vec::with_capacity(needle_chars.len());
+    let mut cursor = 0usize;
+    for needle_char in needle_chars {
+        let mut found = None;
+        while cursor < haystack_chars.len() {
+            if haystack_chars[cursor] == needle_char {
+                found = Some(cursor);
+                cursor += 1;
+                break;
+            }
+            cursor += 1;
+        }
+        matched_positions.push(found?);
+    }
+    let first = *matched_positions.first()?;
+    let last = *matched_positions.last()?;
+    let span = last.saturating_sub(first) + 1;
+    let gaps = span.saturating_sub(matched_positions.len());
+    let prefix_bonus = if first == 0 { 20 } else { 0 };
+    let boundary_bonus = if first == 0
+        || haystack_chars
+            .get(first.saturating_sub(1))
+            .is_some_and(|ch| !ch.is_alphanumeric())
+    {
+        10
+    } else {
+        0
+    };
+    Some((80 + prefix_bonus + boundary_bonus - gaps as i32).clamp(0, 100))
+}
+
+fn tokenize_for_match(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter_map(|part| {
+            let token = normalize_token(part);
+            (!token.is_empty() && !is_stop_word(&token)).then_some(token)
+        })
+        .collect()
+}
+
+fn contains_word_sequence(haystack: &[String], needle: &[String]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+fn normalize_token(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches('$')
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn skill_allows_implicit(skill: &SkillMetadata) -> bool {
+    skill
+        .policy
+        .as_ref()
+        .and_then(|policy| policy.allow_implicit_invocation)
+        .unwrap_or(true)
+}
+
+fn is_stop_word(value: &str) -> bool {
+    matches!(
+        value,
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "be"
+            | "by"
+            | "for"
+            | "from"
+            | "help"
+            | "i"
+            | "in"
+            | "is"
+            | "it"
+            | "me"
+            | "of"
+            | "on"
+            | "or"
+            | "please"
+            | "the"
+            | "this"
+            | "to"
+            | "use"
+            | "with"
+            | "you"
+    )
 }
 
 fn skill_name_counts(skills: &[&SkillMetadata]) -> BTreeMap<String, usize> {
@@ -1097,6 +1511,133 @@ mod tests {
             .expect("inject");
         assert_eq!(selected.items.len(), 1);
         assert_eq!(selected.items[0].metadata.scope, SkillScope::User);
+    }
+
+    #[test]
+    fn explicit_fuzzy_matches_display_plugin_directory_and_abbreviation() {
+        let dir = tempdir().expect("tempdir");
+        let skill_dir = dir.path().join("doc-reviewer");
+        fs::create_dir_all(skill_dir.join("agents")).expect("mkdir metadata");
+        fs::write(
+            skill_dir.join(SKILL_FILE),
+            "---\nname: github:doc-review\ndescription: Review docs.\n---\nBody.",
+        )
+        .expect("write skill");
+        fs::write(
+            skill_dir.join("agents/openai.yaml"),
+            "interface:\n  display_name: Documentation Review\n",
+        )
+        .expect("write metadata");
+        let manager = SkillsManager::with_roots(vec![(dir.path().to_path_buf(), SkillScope::Repo)]);
+
+        for mention in ["Documentation Review", "doc-reviewer", "dr"] {
+            let injected = manager
+                .build_injections(&[mention.to_string()], &SkillsConfigRequest::default())
+                .expect("inject");
+            assert_eq!(injected.items.len(), 1, "mention {mention}");
+            assert_eq!(injected.items[0].metadata.name, "github:doc-review");
+        }
+    }
+
+    #[test]
+    fn explicit_fuzzy_ambiguous_same_score_does_not_inject() {
+        let dir = tempdir().expect("tempdir");
+        for name in ["alpha-review", "alpha-runner"] {
+            let skill_dir = dir.path().join(name);
+            fs::create_dir_all(&skill_dir).expect("mkdir");
+            fs::write(
+                skill_dir.join(SKILL_FILE),
+                format!("---\nname: {name}\ndescription: {name}\n---\nBody."),
+            )
+            .expect("write skill");
+        }
+        let manager = SkillsManager::with_roots(vec![(dir.path().to_path_buf(), SkillScope::Repo)]);
+
+        let injected = manager
+            .build_injections(&["alpha".to_string()], &SkillsConfigRequest::default())
+            .expect("inject");
+
+        assert!(injected.items.is_empty());
+    }
+
+    #[test]
+    fn implicit_message_injects_high_confidence_and_suggests_lower_confidence() {
+        let dir = tempdir().expect("tempdir");
+        for (name, description, body) in [
+            (
+                "frontend-app-builder",
+                "Build frontend apps.",
+                "Frontend body.",
+            ),
+            (
+                "release-notes",
+                "Prepare changelog release summary migration notes.",
+                "Release body.",
+            ),
+        ] {
+            let skill_dir = dir.path().join(name);
+            fs::create_dir_all(&skill_dir).expect("mkdir");
+            fs::write(
+                skill_dir.join(SKILL_FILE),
+                format!("---\nname: {name}\ndescription: {description}\n---\n{body}"),
+            )
+            .expect("write skill");
+        }
+        let manager = SkillsManager::with_roots(vec![(dir.path().to_path_buf(), SkillScope::Repo)]);
+
+        let injected = manager
+            .build_injections_for_message(
+                "please use the frontend app builder",
+                &[],
+                &SkillsConfigRequest::default(),
+            )
+            .expect("inject");
+        assert_eq!(injected.items.len(), 1);
+        assert_eq!(injected.items[0].metadata.name, "frontend-app-builder");
+
+        let suggested = manager
+            .build_injections_for_message("changelog summary", &[], &SkillsConfigRequest::default())
+            .expect("suggest");
+        assert!(suggested.items.is_empty());
+        assert_eq!(suggested.suggestions.len(), 1);
+        assert_eq!(suggested.suggestions[0].name, "release-notes");
+    }
+
+    #[test]
+    fn implicit_policy_blocks_auto_but_explicit_can_inject() {
+        let dir = tempdir().expect("tempdir");
+        let skill_dir = dir.path().join("guarded");
+        fs::create_dir_all(skill_dir.join("agents")).expect("mkdir metadata");
+        fs::write(
+            skill_dir.join(SKILL_FILE),
+            "---\nname: guarded-skill\ndescription: Guarded skill.\n---\nGuarded body.",
+        )
+        .expect("write skill");
+        fs::write(
+            skill_dir.join("agents/openai.yaml"),
+            "policy:\n  allow_implicit_invocation: false\n",
+        )
+        .expect("write metadata");
+        let manager = SkillsManager::with_roots(vec![(dir.path().to_path_buf(), SkillScope::Repo)]);
+
+        let implicit = manager
+            .build_injections_for_message(
+                "please use guarded skill",
+                &[],
+                &SkillsConfigRequest::default(),
+            )
+            .expect("implicit");
+        assert!(implicit.items.is_empty());
+        assert!(implicit.suggestions.is_empty());
+
+        let explicit = manager
+            .build_injections_for_message(
+                "please help",
+                &["guarded-skill".to_string()],
+                &SkillsConfigRequest::default(),
+            )
+            .expect("explicit");
+        assert_eq!(explicit.items.len(), 1);
     }
 
     #[test]
