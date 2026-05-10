@@ -3,6 +3,12 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const ANTHROPIC_SKILLS_REPO: &str = "https://github.com/anthropics/skills.git";
+const ANTHROPIC_SKILLS_BRANCH: &str = "main";
+const ANTHROPIC_SKILLS_SOURCE_DIR: &str = "skills";
+const ANTHROPIC_SYSTEM_SKILLS_DIR: &str = "anthropic";
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -11,11 +17,18 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let static_dir = out_dir.join("static");
     let embedded_system_skills_dir = out_dir.join("system-skills");
+    let anthropic_skills_repo_dir = out_dir.join("anthropic-skills");
     let staging_dir = out_dir.join("web-src");
     let npm_cache_dir = out_dir.join("npm-cache");
+    let system_skills_refresh_stamp = out_dir.join("system-skills-refresh.stamp");
 
+    force_system_skills_refresh(&system_skills_refresh_stamp);
     watch_dir(&system_skills_dir);
-    prepare_system_skills_dir(&system_skills_dir, &embedded_system_skills_dir);
+    prepare_system_skills_dir(
+        &system_skills_dir,
+        &embedded_system_skills_dir,
+        &anthropic_skills_repo_dir,
+    );
 
     watch_frontend(&web_dir);
     prepare_staging_dir(&web_dir, &staging_dir);
@@ -43,7 +56,29 @@ fn main() {
     }
 }
 
-fn prepare_system_skills_dir(source_dir: &Path, target_dir: &Path) {
+fn force_system_skills_refresh(stamp: &Path) {
+    println!("cargo:rerun-if-changed={}", stamp.display());
+    if let Some(parent) = stamp.parent() {
+        fs::create_dir_all(parent).unwrap_or_else(|err| {
+            panic!(
+                "failed to create system skills refresh stamp dir {}: {err}",
+                parent.display()
+            )
+        });
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    fs::write(stamp, now.to_string()).unwrap_or_else(|err| {
+        panic!(
+            "failed to write system skills refresh stamp {}: {err}",
+            stamp.display()
+        )
+    });
+}
+
+fn prepare_system_skills_dir(source_dir: &Path, target_dir: &Path, anthropic_repo_dir: &Path) {
     if target_dir.exists() {
         fs::remove_dir_all(target_dir).unwrap_or_else(|err| {
             panic!(
@@ -62,6 +97,118 @@ fn prepare_system_skills_dir(source_dir: &Path, target_dir: &Path) {
             )
         });
     }
+    update_anthropic_skills_repo(anthropic_repo_dir);
+    copy_anthropic_skills(anthropic_repo_dir, target_dir);
+}
+
+fn update_anthropic_skills_repo(repo_dir: &Path) {
+    if repo_dir.join(".git").is_dir() {
+        run_git(
+            repo_dir,
+            [
+                "fetch",
+                "--depth",
+                "1",
+                "--filter=blob:none",
+                "origin",
+                ANTHROPIC_SKILLS_BRANCH,
+            ],
+        );
+        run_git(
+            repo_dir,
+            [
+                "checkout",
+                "--force",
+                &format!("origin/{ANTHROPIC_SKILLS_BRANCH}"),
+            ],
+        );
+        run_git(
+            repo_dir,
+            ["sparse-checkout", "set", ANTHROPIC_SKILLS_SOURCE_DIR],
+        );
+        return;
+    }
+
+    if repo_dir.exists() {
+        fs::remove_dir_all(repo_dir).unwrap_or_else(|err| {
+            panic!(
+                "failed to remove invalid anthropic skills repo dir {}: {err}",
+                repo_dir.display()
+            )
+        });
+    }
+    let parent = repo_dir.parent().unwrap_or_else(|| {
+        panic!(
+            "anthropic skills repo dir {} has no parent",
+            repo_dir.display()
+        )
+    });
+    fs::create_dir_all(parent).unwrap_or_else(|err| {
+        panic!(
+            "failed to create anthropic skills repo parent {}: {err}",
+            parent.display()
+        )
+    });
+    run_git(
+        parent,
+        [
+            "clone",
+            "--depth",
+            "1",
+            "--filter=blob:none",
+            "--sparse",
+            "--branch",
+            ANTHROPIC_SKILLS_BRANCH,
+            ANTHROPIC_SKILLS_REPO,
+            repo_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "anthropic skills repo dir {} does not end in valid utf-8",
+                        repo_dir.display()
+                    )
+                }),
+        ],
+    );
+    run_git(
+        repo_dir,
+        ["sparse-checkout", "set", ANTHROPIC_SKILLS_SOURCE_DIR],
+    );
+}
+
+fn run_git<const N: usize>(working_dir: &Path, args: [&str; N]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(working_dir)
+        .status()
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to execute git in {}; install git first: {err}",
+                working_dir.display()
+            )
+        });
+    if !status.success() {
+        panic!(
+            "git command failed in {} with status {status}",
+            working_dir.display()
+        );
+    }
+}
+
+fn copy_anthropic_skills(repo_dir: &Path, target_dir: &Path) {
+    let source_dir = repo_dir.join(ANTHROPIC_SKILLS_SOURCE_DIR);
+    if !source_dir.is_dir() {
+        panic!(
+            "anthropic skills clone did not contain {}",
+            source_dir.display()
+        );
+    }
+    copy_dir(
+        &source_dir,
+        &target_dir.join(ANTHROPIC_SYSTEM_SKILLS_DIR),
+        should_skip_anthropic_skill_entry,
+    );
 }
 
 fn watch_frontend(web_dir: &Path) {
@@ -223,4 +370,11 @@ fn should_skip_web_source_entry(file_name: &OsStr) -> bool {
 
 fn should_skip_system_skill_entry(file_name: &OsStr) -> bool {
     matches!(file_name.to_str(), Some(".DS_Store"))
+}
+
+fn should_skip_anthropic_skill_entry(file_name: &OsStr) -> bool {
+    let Some(name) = file_name.to_str() else {
+        return false;
+    };
+    name == ".DS_Store" || name.starts_with('.')
 }

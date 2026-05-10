@@ -16,7 +16,7 @@ const METADATA_DIR: &str = "agents";
 const METADATA_FILE: &str = "openai.yaml";
 const MAX_SCAN_DEPTH: usize = 6;
 const MAX_NAME_LEN: usize = 64;
-const MAX_DESCRIPTION_LEN: usize = 1024;
+const MAX_DESCRIPTION_LEN: usize = 8192;
 
 #[derive(Debug, Error)]
 pub enum SkillError {
@@ -808,6 +808,27 @@ mod tests {
         let response = manager.list(&SkillsConfigRequest::default()).expect("list");
         assert!(response.skills.is_empty());
         assert_eq!(response.errors.len(), 1);
+    }
+
+    #[test]
+    fn discovers_skill_with_long_description() {
+        let dir = tempdir().expect("tempdir");
+        let skill_dir = dir.path().join("anthropic-like");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        let description = "Long description sentence. ".repeat(120);
+        fs::write(
+            skill_dir.join(SKILL_FILE),
+            format!("---\nname: anthropic-like\ndescription: {description}\n---\nbody"),
+        )
+        .expect("write skill");
+
+        let manager =
+            SkillsManager::with_roots(vec![(dir.path().to_path_buf(), SkillScope::System)]);
+        let response = manager.list(&SkillsConfigRequest::default()).expect("list");
+
+        assert!(response.errors.is_empty());
+        assert_eq!(response.skills.len(), 1);
+        assert_eq!(response.skills[0].description, description.trim());
     }
 
     #[test]

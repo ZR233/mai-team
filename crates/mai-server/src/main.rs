@@ -1134,6 +1134,11 @@ mod tests {
         let skill_path = target.join("github-pr-review").join("SKILL.md");
         let contents = fs::read_to_string(skill_path).expect("skill contents");
         assert!(contents.contains("name: github-pr-review"));
+
+        let anthropic_skill_path = target.join("anthropic").join("docx").join("SKILL.md");
+        let anthropic_contents =
+            fs::read_to_string(anthropic_skill_path).expect("anthropic skill contents");
+        assert!(anthropic_contents.contains("name: docx"));
     }
 
     #[test]
@@ -1147,6 +1152,13 @@ mod tests {
 
         assert!(!target.join("stale.txt").exists());
         assert!(target.join("github-pr-review").join("SKILL.md").exists());
+        assert!(
+            target
+                .join("anthropic")
+                .join("docx")
+                .join("SKILL.md")
+                .exists()
+        );
     }
 
     #[test]
