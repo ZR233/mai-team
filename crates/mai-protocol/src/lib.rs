@@ -105,6 +105,19 @@ pub enum ProjectReviewOutcome {
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
+pub enum ProjectReviewRunStatus {
+    Syncing,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum PlanStatus {
     Missing,
     Ready,
@@ -398,6 +411,43 @@ pub struct ProjectSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectReviewRunSummary {
+    pub id: Uuid,
+    pub project_id: ProjectId,
+    #[serde(default)]
+    pub reviewer_agent_id: Option<AgentId>,
+    #[serde(default)]
+    pub turn_id: Option<TurnId>,
+    pub started_at: DateTime<Utc>,
+    #[serde(default)]
+    pub finished_at: Option<DateTime<Utc>>,
+    pub status: ProjectReviewRunStatus,
+    #[serde(default)]
+    pub outcome: Option<ProjectReviewOutcome>,
+    #[serde(default)]
+    pub pr: Option<u64>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectReviewRunDetail {
+    #[serde(flatten)]
+    pub summary: ProjectReviewRunSummary,
+    #[serde(default)]
+    pub messages: Vec<AgentMessage>,
+    #[serde(default)]
+    pub events: Vec<ServiceEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectReviewRunsResponse {
+    pub runs: Vec<ProjectReviewRunSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDetail {
     #[serde(flatten)]
     pub summary: ProjectSummary,
@@ -409,6 +459,8 @@ pub struct ProjectDetail {
     pub auth_status: String,
     #[serde(default)]
     pub mcp_status: String,
+    #[serde(default)]
+    pub review_runs: Vec<ProjectReviewRunSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -588,6 +588,193 @@ p {
   min-height: 130px;
 }
 
+.review-runs {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.review-runs-head,
+.review-run-summary,
+.review-run-meta,
+.review-run-loading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.review-runs-head {
+  justify-content: space-between;
+}
+
+.review-runs-head h3 {
+  margin: 0;
+  color: #172033;
+  font-size: 16px;
+}
+
+.review-runs-head p {
+  margin: 3px 0 0;
+  color: #66758a;
+  font-size: 12px;
+}
+
+.review-runs-head > span {
+  color: #28384e;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.review-run-list {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.review-run-card {
+  min-width: 0;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 10px 22px rgba(22, 32, 51, 0.05);
+}
+
+.review-run-card.open {
+  border-color: #b9c8db;
+}
+
+.review-run-summary {
+  width: 100%;
+  border: 0;
+  padding: 12px;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.review-run-main {
+  display: grid;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+}
+
+.review-run-main strong,
+.review-run-main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.review-run-main strong {
+  color: #172033;
+  font-size: 13px;
+}
+
+.review-run-main small,
+.review-run-meta,
+.review-run-loading {
+  color: #66758a;
+  font-size: 12px;
+}
+
+.review-run-status,
+.review-run-outcome {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  padding: 5px 8px;
+  color: #35506f;
+  background: #edf3f8;
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.review-run-status.ready {
+  color: #0b684f;
+  background: #daf4ea;
+}
+
+.review-run-status.active {
+  color: #07539d;
+  background: #deedff;
+}
+
+.review-run-status.danger {
+  color: #b42318;
+  background: #fee4e2;
+}
+
+.review-run-detail {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid #e5ebf2;
+  padding: 12px;
+}
+
+.review-run-detail p {
+  margin: 0;
+  color: #28384e;
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.review-run-detail .review-run-error {
+  color: #b42318;
+}
+
+.review-run-meta {
+  flex-wrap: wrap;
+}
+
+.review-snapshot-block {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.review-snapshot-block > strong {
+  color: #172033;
+  font-size: 12px;
+}
+
+.review-snapshot-row,
+.review-event-row {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  border: 1px solid #e5ebf2;
+  border-radius: 8px;
+  padding: 10px;
+  background: #f8fafc;
+}
+
+.review-snapshot-row span,
+.review-event-row span {
+  color: #66758a;
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.review-snapshot-row p,
+.review-event-row code {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: #28384e;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.review-runs-empty {
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  background: #fff;
+}
+
 .small-button.secondary {
   color: #26354a;
   border-color: #ccd6e3;

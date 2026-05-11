@@ -11,6 +11,7 @@ const isProjectsLoading = ref(false)
 const isProjectDetailLoading = ref(false)
 const isProjectSending = ref(false)
 const isProjectStopping = ref(false)
+const isProjectReviewRunLoading = ref(false)
 const projectConversationRef = ref(null)
 const projectSkillsState = reactive({
   projectId: null,
@@ -255,6 +256,24 @@ export function useProjects() {
     return response?.agent || response
   }
 
+  async function loadProjectReviewRun(runId) {
+    if (!selectedProjectId.value || !runId) return null
+    isProjectReviewRunLoading.value = true
+    try {
+      const run = await api(`/projects/${selectedProjectId.value}/review-runs/${runId}`)
+      if (selectedProjectDetail.value?.id === selectedProjectId.value) {
+        const runs = selectedProjectDetail.value.review_runs || []
+        const index = runs.findIndex((item) => item.id === runId)
+        if (index >= 0) {
+          runs.splice(index, 1, { ...runs[index], ...run, detail_loaded: true })
+        }
+      }
+      return run
+    } finally {
+      isProjectReviewRunLoading.value = false
+    }
+  }
+
   async function loadGitAccountRepositories(accountId) {
     if (!accountId) return { repositories: [] }
     return api(`/git/accounts/${encodeURIComponent(accountId)}/repositories`)
@@ -320,6 +339,7 @@ export function useProjects() {
     isProjectDetailLoading,
     isProjectSending,
     isProjectStopping,
+    isProjectReviewRunLoading,
     projectConversationRef,
     projectSkillsState,
     projectDialog,
@@ -340,6 +360,7 @@ export function useProjects() {
     stopProjectAgentTurn,
     createProjectSession,
     updateProjectAgent,
+    loadProjectReviewRun,
     loadGitAccountRepositories,
     loadRuntimeDefaults,
     loadGitAccountRepositoryPackages,

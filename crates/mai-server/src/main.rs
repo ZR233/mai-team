@@ -17,11 +17,12 @@ use mai_protocol::{
     GitAccountsResponse, GithubAppManifestStartRequest, GithubAppManifestStartResponse,
     GithubAppSettingsRequest, GithubAppSettingsResponse, GithubInstallationsResponse,
     GithubRepositoriesResponse, GithubSettingsRequest, GithubSettingsResponse,
-    McpServersConfigRequest, ProjectId, ProviderPresetsResponse, ProvidersConfigRequest,
-    ProvidersResponse, RepositoryPackagesResponse, RequestPlanRevisionRequest,
-    RequestPlanRevisionResponse, RuntimeDefaultsResponse, SendMessageRequest, SendMessageResponse,
-    ServiceEvent, SessionId, SkillsConfigRequest, SkillsListResponse, TaskId, ToolTraceDetail,
-    TurnId, UpdateAgentRequest, UpdateAgentResponse, UpdateProjectRequest, UpdateProjectResponse,
+    McpServersConfigRequest, ProjectId, ProjectReviewRunDetail, ProjectReviewRunsResponse,
+    ProviderPresetsResponse, ProvidersConfigRequest, ProvidersResponse, RepositoryPackagesResponse,
+    RequestPlanRevisionRequest, RequestPlanRevisionResponse, RuntimeDefaultsResponse,
+    SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId, SkillsConfigRequest,
+    SkillsListResponse, TaskId, ToolTraceDetail, TurnId, UpdateAgentRequest, UpdateAgentResponse,
+    UpdateProjectRequest, UpdateProjectResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
 use mai_store::ConfigStore;
@@ -66,7 +67,8 @@ impl From<RuntimeError> for ApiError {
         let status = match value {
             RuntimeError::AgentNotFound(_)
             | RuntimeError::TaskNotFound(_)
-            | RuntimeError::ProjectNotFound(_) => StatusCode::NOT_FOUND,
+            | RuntimeError::ProjectNotFound(_)
+            | RuntimeError::ProjectReviewRunNotFound(_) => StatusCode::NOT_FOUND,
             RuntimeError::TurnNotFound { .. } => StatusCode::NOT_FOUND,
             RuntimeError::SessionNotFound { .. } => StatusCode::NOT_FOUND,
             RuntimeError::ToolTraceNotFound { .. } => StatusCode::NOT_FOUND,
@@ -125,6 +127,12 @@ struct TaskDetailQuery {
 struct ProjectDetailQuery {
     agent_id: Option<AgentId>,
     session_id: Option<SessionId>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectReviewRunsQuery {
+    offset: Option<usize>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -307,6 +315,11 @@ async fn main() -> Result<()> {
                 .delete(delete_project),
         )
         .route("/projects/{id}/messages", post(send_project_message))
+        .route("/projects/{id}/review-runs", get(list_project_review_runs))
+        .route(
+            "/projects/{id}/review-runs/{run_id}",
+            get(get_project_review_run),
+        )
         .route("/projects/{id}/skills", get(list_project_skills))
         .route("/projects/{id}/skills/detect", post(detect_project_skills))
         .route("/projects/{id}/cancel", post(cancel_project))
@@ -933,6 +946,32 @@ async fn send_project_message(
 ) -> std::result::Result<Json<SendMessageResponse>, ApiError> {
     let turn_id = state.runtime.send_project_message(id, request).await?;
     Ok(Json(SendMessageResponse { turn_id }))
+}
+
+async fn list_project_review_runs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<ProjectId>,
+    Query(query): Query<ProjectReviewRunsQuery>,
+) -> std::result::Result<Json<ProjectReviewRunsResponse>, ApiError> {
+    Ok(Json(
+        state
+            .runtime
+            .list_project_review_runs(id, query.offset.unwrap_or(0), query.limit.unwrap_or(50))
+            .await?,
+    ))
+}
+
+async fn get_project_review_run(
+    State(state): State<Arc<AppState>>,
+    Path((id, run_id)): Path<(ProjectId, String)>,
+) -> std::result::Result<Json<ProjectReviewRunDetail>, ApiError> {
+    let run_id = run_id.parse().map_err(|err| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("invalid review run id: {err}"),
+    })?;
+    Ok(Json(
+        state.runtime.get_project_review_run(id, run_id).await?,
+    ))
 }
 
 async fn list_project_skills(

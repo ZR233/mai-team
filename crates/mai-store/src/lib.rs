@@ -5,10 +5,11 @@ use mai_protocol::{
     GitTokenKind, GithubAppSettingsRequest, GithubAppSettingsResponse, GithubSettingsResponse,
     McpServerConfig, ModelCapabilities, ModelConfig, ModelInputItem, ModelReasoningConfig,
     ModelReasoningVariant, ModelRequestPolicy, ModelWireApi, PlanHistoryEntry, ProjectId,
-    ProjectSummary, ProviderConfig, ProviderKind, ProviderPreset, ProviderPresetsResponse,
-    ProviderSecret, ProviderSummary, ProvidersConfigRequest, ProvidersResponse, ServiceEvent,
-    ServiceEventKind, SessionId, SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskSummary,
-    TokenUsage, TurnId, default_true,
+    ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary, ProviderConfig, ProviderKind,
+    ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
+    ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind, SessionId,
+    SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskSummary, TokenUsage, TurnId,
+    default_true,
 };
 use rusqlite::Connection as SqliteConnection;
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,7 @@ const SETTING_GITHUB_TOKEN: &str = "github_token";
 const SETTING_GITHUB_APP_CONFIG: &str = "github_app_config";
 const SETTING_GIT_ACCOUNTS: &str = "git_accounts";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-const SCHEMA_VERSION: &str = "13";
+const SCHEMA_VERSION: &str = "14";
 const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const DEEPSEEK_V4_CONTEXT_TOKENS: u64 = 1_000_000;
@@ -319,6 +320,27 @@ struct TaskReviewRecord {
 }
 
 #[derive(Debug, Clone, toasty::Model)]
+#[table = "project_review_runs"]
+struct ProjectReviewRunRecord {
+    #[key]
+    id: String,
+    #[index]
+    project_id: String,
+    reviewer_agent_id: Option<String>,
+    turn_id: Option<String>,
+    #[index]
+    started_at: String,
+    finished_at: Option<String>,
+    status: String,
+    outcome: Option<String>,
+    pr: Option<i64>,
+    summary: Option<String>,
+    error: Option<String>,
+    messages_json: String,
+    events_json: String,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
 #[table = "plan_history"]
 struct PlanHistoryRecord {
     #[key]
@@ -432,10 +454,10 @@ impl ConfigStore {
             if current_schema_version.as_deref() != Some(SCHEMA_VERSION) {
                 if matches!(
                     current_schema_version.as_deref(),
-                    Some("8" | "9" | "10" | "11" | "12")
+                    Some("8" | "9" | "10" | "11" | "12" | "13")
                 ) {
                     drop(db);
-                    migrate_to_v13(&path)?;
+                    migrate_to_v14(&path)?;
                     db = build_db(&path).await?;
                     set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
                 } else {
@@ -1240,12 +1262,22 @@ impl ConfigStore {
 
     pub async fn delete_project(&self, project_id: ProjectId) -> Result<()> {
         let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
         Query::<List<ProjectRecordRow>>::filter(
             ProjectRecordRow::fields().id().eq(project_id.to_string()),
         )
         .delete()
-        .exec(&mut db)
+        .exec(&mut tx)
         .await?;
+        Query::<List<ProjectReviewRunRecord>>::filter(
+            ProjectReviewRunRecord::fields()
+                .project_id()
+                .eq(project_id.to_string()),
+        )
+        .delete()
+        .exec(&mut tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1335,6 +1367,119 @@ impl ConfigStore {
         .exec(&mut db)
         .await?;
         Ok(())
+    }
+
+    pub async fn save_project_review_run(&self, run: &ProjectReviewRunDetail) -> Result<()> {
+        let mut db = self.db.clone();
+        Query::<List<ProjectReviewRunRecord>>::filter(
+            ProjectReviewRunRecord::fields()
+                .id()
+                .eq(run.summary.id.to_string()),
+        )
+        .delete()
+        .exec(&mut db)
+        .await?;
+        toasty::create!(ProjectReviewRunRecord {
+            id: run.summary.id.to_string(),
+            project_id: run.summary.project_id.to_string(),
+            reviewer_agent_id: run.summary.reviewer_agent_id.map(|id| id.to_string()),
+            turn_id: run.summary.turn_id.map(|id| id.to_string()),
+            started_at: run.summary.started_at.to_rfc3339(),
+            finished_at: run.summary.finished_at.map(|time| time.to_rfc3339()),
+            status: run.summary.status.to_string(),
+            outcome: run
+                .summary
+                .outcome
+                .as_ref()
+                .map(|outcome| outcome.to_string()),
+            pr: run.summary.pr.map(u64_to_i64),
+            summary: run.summary.summary.clone(),
+            error: run.summary.error.clone(),
+            messages_json: serde_json::to_string(&run.messages)?,
+            events_json: serde_json::to_string(&run.events)?,
+        })
+        .exec(&mut db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn load_project_review_runs(
+        &self,
+        project_id: ProjectId,
+        since: Option<DateTime<Utc>>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ProjectReviewRunSummary>> {
+        let mut rows = self.load_project_review_run_records(project_id).await?;
+        if let Some(since) = since {
+            let cutoff = since.to_rfc3339();
+            rows.retain(|row| row.started_at >= cutoff);
+        }
+        rows.sort_by(|left, right| {
+            right
+                .started_at
+                .cmp(&left.started_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        let limit = limit.max(1);
+        rows.into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(ProjectReviewRunRecord::into_summary)
+            .collect()
+    }
+
+    pub async fn load_project_review_run(
+        &self,
+        project_id: ProjectId,
+        run_id: Uuid,
+    ) -> Result<Option<ProjectReviewRunDetail>> {
+        let mut db = self.db.clone();
+        let row = Query::<List<ProjectReviewRunRecord>>::filter(
+            ProjectReviewRunRecord::fields().id().eq(run_id.to_string()),
+        )
+        .first()
+        .exec(&mut db)
+        .await?;
+        row.filter(|row| row.project_id == project_id.to_string())
+            .map(ProjectReviewRunRecord::into_detail)
+            .transpose()
+    }
+
+    pub async fn prune_project_review_runs_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+        let mut db = self.db.clone();
+        let cutoff = cutoff.to_rfc3339();
+        let rows = Query::<List<ProjectReviewRunRecord>>::all()
+            .exec(&mut db)
+            .await?;
+        let old_ids = rows
+            .into_iter()
+            .filter(|row| row.started_at < cutoff)
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        for id in &old_ids {
+            Query::<List<ProjectReviewRunRecord>>::filter(
+                ProjectReviewRunRecord::fields().id().eq(id.clone()),
+            )
+            .delete()
+            .exec(&mut db)
+            .await?;
+        }
+        Ok(old_ids.len())
+    }
+
+    async fn load_project_review_run_records(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<ProjectReviewRunRecord>> {
+        let mut db = self.db.clone();
+        Ok(Query::<List<ProjectReviewRunRecord>>::filter(
+            ProjectReviewRunRecord::fields()
+                .project_id()
+                .eq(project_id.to_string()),
+        )
+        .exec(&mut db)
+        .await?)
     }
 
     pub async fn save_plan_history_entry(
@@ -1625,6 +1770,28 @@ impl ConfigStore {
         .exec(&mut db)
         .await?;
         Ok(())
+    }
+
+    pub async fn prune_service_events_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+        let mut db = self.db.clone();
+        let cutoff = cutoff.to_rfc3339();
+        let rows = Query::<List<ServiceEventRecord>>::all()
+            .exec(&mut db)
+            .await?;
+        let old_sequences = rows
+            .into_iter()
+            .filter(|row| row.timestamp < cutoff)
+            .map(|row| row.sequence)
+            .collect::<Vec<_>>();
+        for sequence in &old_sequences {
+            Query::<List<ServiceEventRecord>>::filter(
+                ServiceEventRecord::fields().sequence().eq(*sequence),
+            )
+            .delete()
+            .exec(&mut db)
+            .await?;
+        }
+        Ok(old_sequences.len())
     }
 
     pub async fn load_runtime_snapshot(
@@ -1997,6 +2164,38 @@ impl TaskReviewRecord {
     }
 }
 
+impl ProjectReviewRunRecord {
+    fn into_summary(self) -> Result<ProjectReviewRunSummary> {
+        Ok(ProjectReviewRunSummary {
+            id: parse_uuid(&self.id)?,
+            project_id: parse_project_id(&self.project_id)?,
+            reviewer_agent_id: self
+                .reviewer_agent_id
+                .as_deref()
+                .map(parse_agent_id)
+                .transpose()?,
+            turn_id: self.turn_id.as_deref().map(parse_turn_id).transpose()?,
+            started_at: parse_utc(&self.started_at)?,
+            finished_at: self.finished_at.as_deref().map(parse_utc).transpose()?,
+            status: parse_store_enum(&self.status)?,
+            outcome: self.outcome.as_deref().map(parse_store_enum).transpose()?,
+            pr: self.pr.map(i64_to_u64),
+            summary: self.summary,
+            error: self.error,
+        })
+    }
+
+    fn into_detail(self) -> Result<ProjectReviewRunDetail> {
+        let messages = serde_json::from_str::<Vec<AgentMessage>>(&self.messages_json)?;
+        let events = serde_json::from_str::<Vec<ServiceEvent>>(&self.events_json)?;
+        Ok(ProjectReviewRunDetail {
+            summary: self.into_summary()?,
+            messages,
+            events,
+        })
+    }
+}
+
 async fn build_db(path: &Path) -> Result<Db> {
     let mut builder = Db::builder();
     builder.models(toasty::models!(
@@ -2005,6 +2204,7 @@ async fn build_db(path: &Path) -> Result<Db> {
         ProjectRecordRow,
         TaskRecordRow,
         TaskReviewRecord,
+        ProjectReviewRunRecord,
         PlanHistoryRecord,
         AgentRecordRow,
         AgentSessionRecord,
@@ -2016,7 +2216,7 @@ async fn build_db(path: &Path) -> Result<Db> {
     Ok(builder.build(Sqlite::open(path)).await?)
 }
 
-fn migrate_to_v13(path: &Path) -> Result<()> {
+fn migrate_to_v14(path: &Path) -> Result<()> {
     let conn = SqliteConnection::open(path)?;
     if !sqlite_column_exists(&conn, "agents", "project_id")? {
         conn.execute("ALTER TABLE agents ADD COLUMN project_id TEXT", [])?;
@@ -2075,6 +2275,7 @@ fn migrate_to_v13(path: &Path) -> Result<()> {
         [],
     )?;
     drop_project_path_columns(&conn)?;
+    ensure_project_review_runs_table(&conn)?;
     Ok(())
 }
 
@@ -2226,6 +2427,38 @@ fn ensure_project_review_columns(conn: &SqliteConnection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_project_review_runs_table(conn: &SqliteConnection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS project_review_runs (
+            id TEXT PRIMARY KEY NOT NULL,
+            project_id TEXT NOT NULL,
+            reviewer_agent_id TEXT,
+            turn_id TEXT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            status TEXT NOT NULL,
+            outcome TEXT,
+            pr BIGINT,
+            summary TEXT,
+            error TEXT,
+            messages_json TEXT NOT NULL DEFAULT '[]',
+            events_json TEXT NOT NULL DEFAULT '[]'
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_review_runs_project_id
+            ON project_review_runs(project_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_review_runs_started_at
+            ON project_review_runs(started_at)",
+        [],
+    )?;
+    Ok(())
+}
+
 fn sqlite_column_exists(conn: &SqliteConnection, table: &str, column: &str) -> Result<bool> {
     let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -2235,6 +2468,14 @@ fn sqlite_column_exists(conn: &SqliteConnection, table: &str, column: &str) -> R
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+fn sqlite_table_exists(conn: &SqliteConnection, table: &str) -> Result<bool> {
+    let mut statement =
+        conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1")?;
+    let mut rows = statement.query([table])?;
+    Ok(rows.next()?.is_some())
 }
 
 trait StringDefault {
@@ -2889,6 +3130,11 @@ fn parse_turn_id(value: &str) -> Result<TurnId> {
         .map_err(|err| StoreError::InvalidConfig(format!("invalid turn id `{value}`: {err}")))
 }
 
+fn parse_uuid(value: &str) -> Result<Uuid> {
+    Uuid::parse_str(value)
+        .map_err(|err| StoreError::InvalidConfig(format!("invalid uuid `{value}`: {err}")))
+}
+
 fn parse_utc(value: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
 }
@@ -2980,8 +3226,8 @@ mod tests {
     use super::*;
     use mai_protocol::{
         AgentStatus, McpServerScope, McpServerTransport, MessageRole, ModelContentItem,
-        ModelToolCall, ProjectCloneStatus, ProjectReviewOutcome, ProjectReviewStatus,
-        ProjectStatus, ServiceEventKind,
+        ModelToolCall, ProjectCloneStatus, ProjectReviewOutcome, ProjectReviewRunStatus,
+        ProjectReviewStatus, ProjectStatus, ServiceEventKind, TurnStatus,
     };
     use serde_json::json;
     use tempfile::{TempDir, tempdir};
@@ -3830,6 +4076,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_review_runs_round_trip_and_prune() {
+        let (_dir, store) = store().await;
+        let project_id = Uuid::new_v4();
+        let reviewer_agent_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let started_at = Utc::now() - chrono::TimeDelta::days(1);
+        let finished_at = started_at + chrono::TimeDelta::minutes(3);
+        store
+            .save_project_review_run(&ProjectReviewRunDetail {
+                summary: ProjectReviewRunSummary {
+                    id: run_id,
+                    project_id,
+                    reviewer_agent_id: Some(reviewer_agent_id),
+                    turn_id: Some(turn_id),
+                    started_at,
+                    finished_at: Some(finished_at),
+                    status: ProjectReviewRunStatus::Completed,
+                    outcome: Some(ProjectReviewOutcome::ReviewSubmitted),
+                    pr: Some(42),
+                    summary: Some("approved".to_string()),
+                    error: None,
+                },
+                messages: vec![AgentMessage {
+                    role: MessageRole::Assistant,
+                    content: "done".to_string(),
+                    created_at: finished_at,
+                }],
+                events: vec![ServiceEvent {
+                    sequence: 1,
+                    timestamp: finished_at,
+                    kind: ServiceEventKind::TurnCompleted {
+                        agent_id: reviewer_agent_id,
+                        session_id: None,
+                        turn_id,
+                        status: TurnStatus::Completed,
+                    },
+                }],
+            })
+            .await
+            .expect("save run");
+
+        let runs = store
+            .load_project_review_runs(project_id, None, 0, 10)
+            .await
+            .expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].pr, Some(42));
+        assert_eq!(runs[0].outcome, Some(ProjectReviewOutcome::ReviewSubmitted));
+        let detail = store
+            .load_project_review_run(project_id, run_id)
+            .await
+            .expect("detail")
+            .expect("run exists");
+        assert_eq!(detail.messages[0].content, "done");
+        assert_eq!(detail.events.len(), 1);
+
+        let removed = store
+            .prune_project_review_runs_before(Utc::now() - chrono::TimeDelta::days(2))
+            .await
+            .expect("no prune");
+        assert_eq!(removed, 0);
+        let removed = store
+            .prune_project_review_runs_before(Utc::now())
+            .await
+            .expect("prune");
+        assert_eq!(removed, 1);
+        assert!(
+            store
+                .load_project_review_run(project_id, run_id)
+                .await
+                .expect("load")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_project_removes_review_runs() {
+        let (_dir, store) = store().await;
+        let project_id = Uuid::new_v4();
+        let maintainer_agent_id = Uuid::new_v4();
+        let timestamp = Utc::now();
+        store
+            .save_project(&ProjectSummary {
+                id: project_id,
+                name: "owner/repo".to_string(),
+                status: ProjectStatus::Ready,
+                owner: "owner".to_string(),
+                repo: "repo".to_string(),
+                repository_full_name: "owner/repo".to_string(),
+                git_account_id: Some("account-1".to_string()),
+                repository_id: 42,
+                installation_id: 0,
+                installation_account: "owner".to_string(),
+                branch: "main".to_string(),
+                docker_image: "ubuntu:latest".to_string(),
+                clone_status: ProjectCloneStatus::Ready,
+                maintainer_agent_id,
+                created_at: timestamp,
+                updated_at: timestamp,
+                last_error: None,
+                auto_review_enabled: true,
+                reviewer_extra_prompt: None,
+                review_status: ProjectReviewStatus::Waiting,
+                current_reviewer_agent_id: None,
+                last_review_started_at: None,
+                last_review_finished_at: None,
+                next_review_at: None,
+                last_review_outcome: None,
+                review_last_error: None,
+            })
+            .await
+            .expect("save project");
+        store
+            .save_project_review_run(&ProjectReviewRunDetail {
+                summary: ProjectReviewRunSummary {
+                    id: Uuid::new_v4(),
+                    project_id,
+                    reviewer_agent_id: None,
+                    turn_id: None,
+                    started_at: timestamp,
+                    finished_at: None,
+                    status: ProjectReviewRunStatus::Syncing,
+                    outcome: None,
+                    pr: None,
+                    summary: None,
+                    error: None,
+                },
+                messages: Vec::new(),
+                events: Vec::new(),
+            })
+            .await
+            .expect("save run");
+        store
+            .delete_project(project_id)
+            .await
+            .expect("delete project");
+        assert!(
+            store
+                .load_project_review_runs(project_id, None, 0, 10)
+                .await
+                .expect("runs")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_sqlite_file_is_rebuilt() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.sqlite3");
@@ -4148,9 +4541,50 @@ mod tests {
         ] {
             assert!(
                 sqlite_column_exists(&conn, "projects", column).expect("column check"),
-                "{column} should be added during v12 -> v13 migration"
+                "{column} should be added during migration"
             );
         }
+        assert!(
+            sqlite_table_exists(&conn, "project_review_runs").expect("table check"),
+            "project_review_runs should be added during migration"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_v13_adds_project_review_runs_without_rebuild() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("config.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("open");
+        store
+            .set_setting(SETTING_SCHEMA_VERSION, "13")
+            .await
+            .expect("mark v13 schema");
+        drop(store);
+
+        let conn = SqliteConnection::open(&db_path).expect("sqlite");
+        conn.execute("DROP TABLE project_review_runs", [])
+            .expect("drop review runs table");
+        drop(conn);
+
+        let reopened = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("reopen");
+        assert_eq!(
+            reopened
+                .get_setting(SETTING_SCHEMA_VERSION)
+                .await
+                .expect("schema marker")
+                .as_deref(),
+            Some(SCHEMA_VERSION)
+        );
+        let conn = SqliteConnection::open(&db_path).expect("sqlite");
+        assert!(
+            sqlite_table_exists(&conn, "project_review_runs").expect("table check"),
+            "project_review_runs should be added during v13 -> v14 migration"
+        );
     }
 
     #[tokio::test]

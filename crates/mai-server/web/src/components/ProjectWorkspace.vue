@@ -192,6 +192,73 @@
             <small>{{ currentReviewerLabel }}</small>
           </div>
         </div>
+        <section class="review-runs">
+          <header class="review-runs-head">
+            <div>
+              <h3>Recent Runs</h3>
+              <p>Kept for 5 days</p>
+            </div>
+            <span>{{ reviewRuns.length }}</span>
+          </header>
+          <div v-if="reviewRuns.length" class="review-run-list">
+            <article
+              v-for="run in reviewRuns"
+              :key="run.id"
+              class="review-run-card"
+              :class="{ open: expandedReviewRunId === run.id }"
+            >
+              <button type="button" class="review-run-summary" @click="toggleReviewRun(run)">
+                <span class="review-run-status" :class="reviewRunTone(run.status)">
+                  {{ formatStatus(run.status) }}
+                </span>
+                <span class="review-run-main">
+                  <strong>{{ reviewRunTitle(run) }}</strong>
+                  <small>{{ formatDateTime(run.started_at) }} · {{ reviewRunDuration(run) }}</small>
+                </span>
+                <span class="review-run-outcome">{{ formatStatus(run.outcome || 'pending') }}</span>
+              </button>
+              <div v-if="expandedReviewRunId === run.id" class="review-run-detail">
+                <p v-if="run.summary">{{ run.summary }}</p>
+                <p v-if="run.error" class="review-run-error">{{ run.error }}</p>
+                <div class="review-run-meta">
+                  <span>Reviewer {{ shortId(run.reviewer_agent_id) }}</span>
+                  <span>Turn {{ shortId(run.turn_id) }}</span>
+                  <span>{{ run.finished_at ? `Finished ${formatDateTime(run.finished_at)}` : 'Still running' }}</span>
+                </div>
+                <div v-if="reviewRunLoading && !run.detail_loaded" class="review-run-loading">
+                  <span class="spinner-sm"></span>
+                  <span>Loading run snapshot...</span>
+                </div>
+                <div v-if="run.messages?.length" class="review-snapshot-block">
+                  <strong>Messages</strong>
+                  <div
+                    v-for="(message, index) in run.messages"
+                    :key="`${run.id}-message-${index}`"
+                    class="review-snapshot-row"
+                  >
+                    <span>{{ formatStatus(message.role) }}</span>
+                    <p>{{ message.content }}</p>
+                  </div>
+                </div>
+                <div v-if="run.events?.length" class="review-snapshot-block">
+                  <strong>Events</strong>
+                  <div
+                    v-for="event in run.events"
+                    :key="event.sequence"
+                    class="review-event-row"
+                  >
+                    <span>{{ formatDateTime(event.timestamp) }}</span>
+                    <code>{{ reviewEventLabel(event) }}</code>
+                  </div>
+                </div>
+              </div>
+            </article>
+          </div>
+          <div v-else class="quiet-empty review-runs-empty">
+            <strong>No review runs yet</strong>
+            <span>Runs will appear here after automatic PR review starts.</span>
+          </div>
+        </section>
       </div>
 
       <div v-else-if="activeSection === 'repository'" class="project-panel">
@@ -397,6 +464,7 @@ const props = defineProps({
   loading: { type: Boolean, default: false },
   sending: { type: Boolean, default: false },
   stopping: { type: Boolean, default: false },
+  reviewRunLoading: { type: Boolean, default: false },
   updatingModel: { type: Boolean, default: false },
   providers: { type: Array, default: () => [] },
   skills: { type: Array, default: () => [] },
@@ -424,6 +492,7 @@ const emit = defineEmits([
   'load-skills',
   'detect-project-skills',
   'update-review-settings',
+  'load-review-run',
   'create-session',
   'select-session'
 ])
@@ -468,7 +537,9 @@ const projectSkillsEmpty = computed(() => (
     && !projectSkillCount.value
 ))
 const reviewerExtraPromptDraft = ref('')
+const expandedReviewRunId = ref(null)
 const reviewPromptDirty = computed(() => reviewerExtraPromptDraft.value !== (props.detail?.reviewer_extra_prompt || ''))
+const reviewRuns = computed(() => props.detail?.review_runs || [])
 const reviewSettingsHint = computed(() => (
   props.detail?.auto_review_enabled
     ? 'The scheduler keeps the reviewer workspace warm and polls for eligible PRs.'
@@ -589,6 +660,57 @@ function saveReviewerPrompt() {
   emitReviewSettings({
     reviewer_extra_prompt: reviewerExtraPromptDraft.value
   })
+}
+
+function toggleReviewRun(run) {
+  if (!run?.id) return
+  expandedReviewRunId.value = expandedReviewRunId.value === run.id ? null : run.id
+  if (expandedReviewRunId.value === run.id && !run.detail_loaded && (!run.messages || !run.events)) {
+    emit('load-review-run', run.id)
+  }
+}
+
+function reviewRunTitle(run) {
+  const pr = run?.pr ? `PR #${run.pr}` : 'No PR selected'
+  if (run?.summary) return `${pr}: ${run.summary}`
+  if (run?.error) return `${pr}: ${run.error}`
+  return pr
+}
+
+function reviewRunTone(status) {
+  if (status === 'completed') return 'ready'
+  if (status === 'failed' || status === 'cancelled') return 'danger'
+  if (status === 'running' || status === 'syncing') return 'active'
+  return ''
+}
+
+function reviewRunDuration(run) {
+  if (!run?.started_at) return 'Duration unknown'
+  const start = new Date(run.started_at)
+  const end = run.finished_at ? new Date(run.finished_at) : new Date()
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return 'Duration unknown'
+  const seconds = Math.max(0, Math.round((end.getTime() - start.getTime()) / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  const rest = seconds % 60
+  if (minutes < 60) return rest ? `${minutes}m ${rest}s` : `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  const minuteRest = minutes % 60
+  return minuteRest ? `${hours}h ${minuteRest}m` : `${hours}h`
+}
+
+function shortId(value) {
+  return value ? String(value).slice(0, 8) : 'none'
+}
+
+function reviewEventLabel(event) {
+  if (!event?.type) return 'event'
+  if (event.type === 'tool_started' || event.type === 'tool_completed') {
+    return `${formatStatus(event.type)} ${event.tool_name || event.call_id || ''}`.trim()
+  }
+  if (event.type === 'agent_message') return `message ${formatStatus(event.role || '')}`.trim()
+  if (event.type === 'turn_completed') return `turn ${formatStatus(event.status || 'completed')}`
+  return formatStatus(event.type)
 }
 
 function emitReviewSettings(patch) {

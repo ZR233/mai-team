@@ -16,12 +16,13 @@ use mai_protocol::{
     GithubInstallationsResponse, GithubRepositoriesResponse, GithubRepositorySummary,
     McpServerConfig, McpServerScope, McpServerTransport, MessageRole, ModelConfig,
     ModelContentItem, ModelInputItem, ModelOutputItem, ModelToolCall, PlanHistoryEntry, PlanStatus,
-    ProjectCloneStatus, ProjectDetail, ProjectId, ProjectReviewOutcome, ProjectReviewStatus,
-    ProjectStatus, ProjectSummary, RepositoryPackageSummary, RepositoryPackagesResponse,
-    ResolvedAgentModelPreference, RuntimeDefaultsResponse, SendMessageRequest, ServiceEvent,
-    ServiceEventKind, SessionId, SkillActivationInfo, SkillScope, SkillsConfigRequest,
-    SkillsListResponse, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary,
-    TodoItem, TokenUsage, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest,
+    ProjectCloneStatus, ProjectDetail, ProjectId, ProjectReviewOutcome, ProjectReviewRunDetail,
+    ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewRunsResponse,
+    ProjectReviewStatus, ProjectStatus, ProjectSummary, RepositoryPackageSummary,
+    RepositoryPackagesResponse, ResolvedAgentModelPreference, RuntimeDefaultsResponse,
+    SendMessageRequest, ServiceEvent, ServiceEventKind, SessionId, SkillActivationInfo, SkillScope,
+    SkillsConfigRequest, SkillsListResponse, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus,
+    TaskSummary, TodoItem, TokenUsage, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest,
     UpdateProjectRequest, UserInputOption, UserInputQuestion, now, preview,
 };
 use mai_skills::{SkillInjections, SkillsManager};
@@ -61,6 +62,11 @@ const GITHUB_MANIFEST_STATE_TTL_SECS: u64 = 900;
 const GITHUB_HTTP_TIMEOUT_SECS: u64 = 10;
 const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;
 const PROJECT_REVIEW_FAILURE_RETRY_SECS: u64 = 600;
+const PROJECT_REVIEW_HISTORY_RETENTION_DAYS: i64 = 5;
+const PROJECT_REVIEW_CLEANUP_INTERVAL_SECS: u64 = 3600;
+const PROJECT_REVIEW_RUN_LIST_LIMIT: usize = 50;
+const PROJECT_REVIEW_SNAPSHOT_MESSAGE_LIMIT: usize = 40;
+const PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT: usize = 80;
 const DEFAULT_WAIT_AGENT_OBSERVATION_SECS: u64 = 30;
 const PROJECT_GITHUB_MCP_SERVER: &str = "github";
 const PROJECT_GIT_MCP_SERVER: &str = "git";
@@ -92,6 +98,8 @@ pub enum RuntimeError {
     TaskNotFound(TaskId),
     #[error("project not found: {0}")]
     ProjectNotFound(ProjectId),
+    #[error("project review run not found: {0}")]
+    ProjectReviewRunNotFound(Uuid),
     #[error("agent is busy: {0}")]
     AgentBusy(AgentId),
     #[error("task is busy: {0}")]
@@ -252,6 +260,7 @@ struct ProjectReviewCycleReport {
 #[derive(Debug, Clone)]
 struct ProjectReviewCycleResult {
     outcome: ProjectReviewOutcome,
+    pr: Option<u64>,
     summary: Option<String>,
     error: Option<String>,
 }
@@ -568,6 +577,10 @@ impl AgentRuntime {
             artifact_files_root: config.artifact_files_root,
             sidecar_image,
             github_api_base_url,
+        });
+        let cleanup_runtime = Arc::clone(&runtime);
+        tokio::spawn(async move {
+            cleanup_runtime.run_project_review_cleanup_loop().await;
         });
         runtime.start_enabled_project_review_workers().await;
         Ok(runtime)
@@ -1359,6 +1372,10 @@ impl AgentRuntime {
         } else {
             "pending"
         };
+        let review_runs = self
+            .list_project_review_runs(project_id, 0, PROJECT_REVIEW_RUN_LIST_LIMIT)
+            .await?
+            .runs;
         Ok(ProjectDetail {
             summary,
             maintainer_agent,
@@ -1367,7 +1384,35 @@ impl AgentRuntime {
             selected_agent,
             auth_status: status.to_string(),
             mcp_status: status.to_string(),
+            review_runs,
         })
+    }
+
+    pub async fn list_project_review_runs(
+        &self,
+        project_id: ProjectId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<ProjectReviewRunsResponse> {
+        self.project(project_id).await?;
+        let since = Utc::now() - TimeDelta::days(PROJECT_REVIEW_HISTORY_RETENTION_DAYS);
+        let runs = self
+            .store
+            .load_project_review_runs(project_id, Some(since), offset, limit)
+            .await?;
+        Ok(ProjectReviewRunsResponse { runs })
+    }
+
+    pub async fn get_project_review_run(
+        &self,
+        project_id: ProjectId,
+        run_id: Uuid,
+    ) -> Result<ProjectReviewRunDetail> {
+        self.project(project_id).await?;
+        self.store
+            .load_project_review_run(project_id, run_id)
+            .await?
+            .ok_or(RuntimeError::ProjectReviewRunNotFound(run_id))
     }
 
     pub async fn create_project(
@@ -5048,6 +5093,9 @@ impl AgentRuntime {
             worker.abort_handle.abort();
         }
         let reviewer_id = project.summary.read().await.current_reviewer_agent_id;
+        let _ = self
+            .cancel_active_project_review_runs(project_id, reviewer_id)
+            .await;
         if let Some(reviewer_id) = reviewer_id {
             if let Ok(agent) = self.agent(reviewer_id).await {
                 let current_turn = agent.summary.read().await.current_turn;
@@ -5077,6 +5125,9 @@ impl AgentRuntime {
         cancellation_token: CancellationToken,
     ) {
         if let Err(err) = self.ensure_project_review_workspace(project_id).await {
+            let _ = self
+                .record_project_review_startup_failure(project_id, err.to_string())
+                .await;
             let next = Utc::now() + TimeDelta::seconds(PROJECT_REVIEW_FAILURE_RETRY_SECS as i64);
             let _ = self
                 .set_project_review_state(
@@ -5179,6 +5230,7 @@ impl AgentRuntime {
         project_id: ProjectId,
         cancellation_token: CancellationToken,
     ) -> Result<ProjectReviewCycleResult> {
+        let run_id = Uuid::new_v4();
         self.set_project_review_state(
             project_id,
             ProjectReviewStatus::Syncing,
@@ -5190,11 +5242,73 @@ impl AgentRuntime {
             false,
         )
         .await?;
-        self.sync_project_review_repo(project_id).await?;
+        self.save_project_review_run_status(
+            ProjectReviewRunSummary {
+                id: run_id,
+                project_id,
+                reviewer_agent_id: None,
+                turn_id: None,
+                started_at: now(),
+                finished_at: None,
+                status: ProjectReviewRunStatus::Syncing,
+                outcome: None,
+                pr: None,
+                summary: None,
+                error: None,
+            },
+            Vec::new(),
+            Vec::new(),
+        )
+        .await?;
+        if let Err(err) = self.sync_project_review_repo(project_id).await {
+            let error = err.to_string();
+            self.finish_project_review_run(
+                run_id,
+                project_id,
+                None,
+                None,
+                ProjectReviewRunStatus::Failed,
+                Some(ProjectReviewOutcome::Failed),
+                None,
+                None,
+                Some(error),
+            )
+            .await?;
+            return Err(err);
+        }
         if cancellation_token.is_cancelled() {
+            self.finish_project_review_run(
+                run_id,
+                project_id,
+                None,
+                None,
+                ProjectReviewRunStatus::Cancelled,
+                None,
+                None,
+                None,
+                Some("review cancelled".to_string()),
+            )
+            .await?;
             return Err(RuntimeError::TurnCancelled);
         }
-        let reviewer = self.spawn_project_reviewer_agent(project_id).await?;
+        let reviewer = match self.spawn_project_reviewer_agent(project_id).await {
+            Ok(reviewer) => reviewer,
+            Err(err) => {
+                self.finish_project_review_run(
+                    run_id,
+                    project_id,
+                    None,
+                    None,
+                    ProjectReviewRunStatus::Failed,
+                    Some(ProjectReviewOutcome::Failed),
+                    None,
+                    None,
+                    Some(err.to_string()),
+                )
+                .await?;
+                return Err(err);
+            }
+        };
         let reviewer_id = reviewer.id;
         self.set_project_review_state(
             project_id,
@@ -5207,16 +5321,43 @@ impl AgentRuntime {
             false,
         )
         .await?;
+        let started_at = self
+            .store
+            .load_project_review_run(project_id, run_id)
+            .await?
+            .map(|run| run.summary.started_at)
+            .unwrap_or_else(now);
+        self.save_project_review_run_status(
+            ProjectReviewRunSummary {
+                id: run_id,
+                project_id,
+                reviewer_agent_id: Some(reviewer_id),
+                turn_id: None,
+                started_at,
+                finished_at: None,
+                status: ProjectReviewRunStatus::Running,
+                outcome: None,
+                pr: None,
+                summary: None,
+                error: None,
+            },
+            Vec::new(),
+            Vec::new(),
+        )
+        .await?;
         let cycle_result = async {
             let message = self
                 .project_reviewer_initial_message(project_id, reviewer_id)
                 .await?;
-            self.start_agent_turn_with_skills(
-                reviewer_id,
-                message,
-                vec!["reviewer-agent-review-pr".to_string()],
-            )
-            .await?;
+            let turn_id = self
+                .start_agent_turn_with_skills(
+                    reviewer_id,
+                    message,
+                    vec!["reviewer-agent-review-pr".to_string()],
+                )
+                .await?;
+            self.update_project_review_run_turn(project_id, run_id, reviewer_id, turn_id)
+                .await?;
             let summary = self
                 .wait_agent_until_complete_with_cancel(reviewer_id, &cancellation_token)
                 .await?;
@@ -5232,6 +5373,54 @@ impl AgentRuntime {
             parse_project_review_cycle_report(&response)
         }
         .await;
+        let turn_id = self
+            .store
+            .load_project_review_run(project_id, run_id)
+            .await?
+            .and_then(|run| run.summary.turn_id);
+        let (status, outcome, pr, summary, error) = match &cycle_result {
+            Ok(result) => {
+                let status = if result.outcome == ProjectReviewOutcome::Failed {
+                    ProjectReviewRunStatus::Failed
+                } else {
+                    ProjectReviewRunStatus::Completed
+                };
+                (
+                    status,
+                    Some(result.outcome.clone()),
+                    result.pr,
+                    result.summary.clone(),
+                    result.error.clone(),
+                )
+            }
+            Err(RuntimeError::TurnCancelled) if cancellation_token.is_cancelled() => (
+                ProjectReviewRunStatus::Cancelled,
+                None,
+                None,
+                None,
+                Some("review cancelled".to_string()),
+            ),
+            Err(err) => (
+                ProjectReviewRunStatus::Failed,
+                Some(ProjectReviewOutcome::Failed),
+                None,
+                None,
+                Some(err.to_string()),
+            ),
+        };
+        let _ = self
+            .finish_project_review_run(
+                run_id,
+                project_id,
+                Some(reviewer_id),
+                turn_id,
+                status,
+                outcome,
+                pr,
+                summary,
+                error,
+            )
+            .await;
         let _ = self
             .cleanup_project_review_worktree(project_id, reviewer_id)
             .await;
@@ -5258,6 +5447,258 @@ impl AgentRuntime {
     async fn sync_project_review_repo(&self, project_id: ProjectId) -> Result<()> {
         self.run_project_review_repo_command(project_id, ReviewRepoCommand::Sync)
             .await
+    }
+
+    async fn run_project_review_cleanup_loop(self: Arc<Self>) {
+        if let Err(err) = self.cleanup_project_review_history().await {
+            tracing::warn!("project review cleanup failed: {err}");
+        }
+        loop {
+            sleep(Duration::from_secs(PROJECT_REVIEW_CLEANUP_INTERVAL_SECS)).await;
+            if let Err(err) = self.cleanup_project_review_history().await {
+                tracing::warn!("project review cleanup failed: {err}");
+            }
+        }
+    }
+
+    async fn cleanup_project_review_history(&self) -> Result<()> {
+        let cutoff = Utc::now() - TimeDelta::days(PROJECT_REVIEW_HISTORY_RETENTION_DAYS);
+        let removed_runs = self.store.prune_project_review_runs_before(cutoff).await?;
+        let removed_events = self.store.prune_service_events_before(cutoff).await?;
+        if removed_runs > 0 || removed_events > 0 {
+            tracing::info!(
+                removed_runs,
+                removed_events,
+                "pruned project review history"
+            );
+        }
+        self.recent_events
+            .lock()
+            .await
+            .retain(|event| event.timestamp >= cutoff);
+        let projects = self.list_projects().await;
+        for project in projects {
+            if let Err(err) = self
+                .cleanup_project_review_workspace_history(project.id, cutoff)
+                .await
+            {
+                tracing::warn!(project_id = %project.id, "failed to clean project review workspace history: {err}");
+            }
+        }
+        Ok(())
+    }
+
+    async fn cleanup_project_review_workspace_history(
+        &self,
+        project_id: ProjectId,
+        cutoff: DateTime<Utc>,
+    ) -> Result<()> {
+        let volume = DockerClient::workspace_volume_for_project_review(&project_id.to_string());
+        let active_reviewer = match self.project(project_id).await {
+            Ok(project) => project.summary.read().await.current_reviewer_agent_id,
+            Err(_) => None,
+        };
+        let active_path = active_reviewer
+            .map(|id| format!("/workspace/reviews/{id}"))
+            .unwrap_or_default();
+        let cutoff_epoch = cutoff.timestamp();
+        let command = format!(
+            "set -eu\n\
+             git -C /workspace/repo worktree prune 2>/dev/null || true\n\
+             mkdir -p /workspace/reviews\n\
+             find /workspace/reviews -mindepth 1 -maxdepth 1 {active_filter} -type d ! -newermt @{cutoff_epoch} -exec rm -rf -- {{}} +\n\
+             find /workspace/reviews -type f \\( -name '*.log' -o -name '*.tmp' -o -name '*.temp' -o -name 'tmp.*' \\) ! -newermt @{cutoff_epoch} -delete\n",
+            active_filter = if active_path.is_empty() {
+                String::new()
+            } else {
+                format!("! -path {}", shell_quote(&active_path))
+            },
+            cutoff_epoch = cutoff_epoch,
+        );
+        let output = self
+            .docker
+            .run_sidecar_shell_env(&mai_docker::SidecarParams {
+                name: &format!("mai-review-retention-{project_id}"),
+                image: &self.sidecar_image,
+                command: &command,
+                args: &[],
+                cwd: Some("/workspace"),
+                env: &[],
+                workspace_volume: Some(&volume),
+                timeout_secs: Some(120),
+            })
+            .await?;
+        if output.status != 0 {
+            return Err(RuntimeError::InvalidInput(format!(
+                "review retention cleanup failed: {}",
+                preview(format!("{}\n{}", output.stderr, output.stdout).trim(), 500)
+            )));
+        }
+        Ok(())
+    }
+
+    async fn record_project_review_startup_failure(
+        &self,
+        project_id: ProjectId,
+        error: String,
+    ) -> Result<()> {
+        let run_id = Uuid::new_v4();
+        let started_at = now();
+        self.save_project_review_run_status(
+            ProjectReviewRunSummary {
+                id: run_id,
+                project_id,
+                reviewer_agent_id: None,
+                turn_id: None,
+                started_at,
+                finished_at: Some(now()),
+                status: ProjectReviewRunStatus::Failed,
+                outcome: Some(ProjectReviewOutcome::Failed),
+                pr: None,
+                summary: None,
+                error: Some(error),
+            },
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn cancel_active_project_review_runs(
+        &self,
+        project_id: ProjectId,
+        reviewer_agent_id: Option<AgentId>,
+    ) -> Result<()> {
+        let runs = self
+            .store
+            .load_project_review_runs(project_id, None, 0, PROJECT_REVIEW_RUN_LIST_LIMIT)
+            .await?;
+        for run in runs {
+            if run.finished_at.is_some()
+                || !matches!(
+                    run.status,
+                    ProjectReviewRunStatus::Syncing | ProjectReviewRunStatus::Running
+                )
+                || reviewer_agent_id.is_some_and(|id| run.reviewer_agent_id != Some(id))
+            {
+                continue;
+            }
+            let _ = self
+                .finish_project_review_run(
+                    run.id,
+                    project_id,
+                    run.reviewer_agent_id,
+                    run.turn_id,
+                    ProjectReviewRunStatus::Cancelled,
+                    None,
+                    run.pr,
+                    run.summary,
+                    Some("review cancelled".to_string()),
+                )
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn save_project_review_run_status(
+        &self,
+        summary: ProjectReviewRunSummary,
+        messages: Vec<AgentMessage>,
+        events: Vec<ServiceEvent>,
+    ) -> Result<()> {
+        self.store
+            .save_project_review_run(&ProjectReviewRunDetail {
+                summary,
+                messages,
+                events,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn update_project_review_run_turn(
+        &self,
+        project_id: ProjectId,
+        run_id: Uuid,
+        reviewer_agent_id: AgentId,
+        turn_id: TurnId,
+    ) -> Result<()> {
+        let Some(mut run) = self
+            .store
+            .load_project_review_run(project_id, run_id)
+            .await?
+        else {
+            return Err(RuntimeError::ProjectReviewRunNotFound(run_id));
+        };
+        run.summary.reviewer_agent_id = Some(reviewer_agent_id);
+        run.summary.turn_id = Some(turn_id);
+        run.summary.status = ProjectReviewRunStatus::Running;
+        self.store.save_project_review_run(&run).await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_project_review_run(
+        &self,
+        run_id: Uuid,
+        project_id: ProjectId,
+        reviewer_agent_id: Option<AgentId>,
+        turn_id: Option<TurnId>,
+        status: ProjectReviewRunStatus,
+        outcome: Option<ProjectReviewOutcome>,
+        pr: Option<u64>,
+        summary_text: Option<String>,
+        error: Option<String>,
+    ) -> Result<()> {
+        let Some(existing) = self
+            .store
+            .load_project_review_run(project_id, run_id)
+            .await?
+        else {
+            return Err(RuntimeError::ProjectReviewRunNotFound(run_id));
+        };
+        let reviewer_agent_id = reviewer_agent_id.or(existing.summary.reviewer_agent_id);
+        let turn_id = turn_id.or(existing.summary.turn_id);
+        let (messages, events) = if let Some(reviewer_agent_id) = reviewer_agent_id {
+            self.project_review_run_snapshot(reviewer_agent_id).await
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        self.store
+            .save_project_review_run(&ProjectReviewRunDetail {
+                summary: ProjectReviewRunSummary {
+                    id: run_id,
+                    project_id,
+                    reviewer_agent_id,
+                    turn_id,
+                    started_at: existing.summary.started_at,
+                    finished_at: Some(now()),
+                    status,
+                    outcome,
+                    pr,
+                    summary: summary_text,
+                    error,
+                },
+                messages,
+                events,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn project_review_run_snapshot(
+        &self,
+        reviewer_agent_id: AgentId,
+    ) -> (Vec<AgentMessage>, Vec<ServiceEvent>) {
+        let messages = self
+            .agent_recent_messages(reviewer_agent_id, PROJECT_REVIEW_SNAPSHOT_MESSAGE_LIMIT)
+            .await
+            .map(|(_, messages)| messages)
+            .unwrap_or_default();
+        let events = self
+            .agent_recent_events(reviewer_agent_id, PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT)
+            .await;
+        (messages, events)
     }
 
     async fn cleanup_project_review_worktree(
@@ -6775,6 +7216,7 @@ fn parse_project_review_cycle_report(text: &str) -> Result<ProjectReviewCycleRes
     let pr_summary = value.pr.map(|pr| format!("PR #{pr}"));
     Ok(ProjectReviewCycleResult {
         outcome: value.outcome,
+        pr: value.pr,
         summary: summary.or(pr_summary),
         error: value
             .error
@@ -12080,6 +12522,236 @@ esac
         }
         assert!(saw_cloning);
         assert!(saw_ready);
+    }
+
+    #[tokio::test]
+    async fn project_detail_includes_recent_review_runs() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, None);
+        agent.project_id = Some(project_id);
+        agent.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &agent).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                agent_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let run_id = Uuid::new_v4();
+        let started_at = now();
+        store
+            .save_project_review_run(&ProjectReviewRunDetail {
+                summary: ProjectReviewRunSummary {
+                    id: run_id,
+                    project_id,
+                    reviewer_agent_id: Some(Uuid::new_v4()),
+                    turn_id: Some(Uuid::new_v4()),
+                    started_at,
+                    finished_at: Some(started_at + TimeDelta::minutes(1)),
+                    status: ProjectReviewRunStatus::Completed,
+                    outcome: Some(ProjectReviewOutcome::ReviewSubmitted),
+                    pr: Some(7),
+                    summary: Some("submitted review".to_string()),
+                    error: None,
+                },
+                messages: vec![AgentMessage {
+                    role: MessageRole::Assistant,
+                    content: "review complete".to_string(),
+                    created_at: started_at,
+                }],
+                events: Vec::new(),
+            })
+            .await
+            .expect("save run");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        let detail = runtime
+            .get_project(project_id, None, None)
+            .await
+            .expect("detail");
+        assert_eq!(detail.review_runs.len(), 1);
+        assert_eq!(detail.review_runs[0].id, run_id);
+        assert_eq!(detail.review_runs[0].pr, Some(7));
+        let run = runtime
+            .get_project_review_run(project_id, run_id)
+            .await
+            .expect("run detail");
+        assert_eq!(run.messages[0].content, "review complete");
+    }
+
+    #[tokio::test]
+    async fn finishing_project_review_run_captures_reviewer_snapshot() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let reviewer_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, None);
+        maintainer.project_id = Some(project_id);
+        maintainer.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &maintainer).await;
+        let mut reviewer = test_agent_summary(reviewer_id, None);
+        reviewer.project_id = Some(project_id);
+        reviewer.parent_id = Some(maintainer_id);
+        reviewer.role = Some(AgentRole::Reviewer);
+        store
+            .save_agent(&reviewer, None)
+            .await
+            .expect("save reviewer");
+        store
+            .save_agent_session(
+                reviewer_id,
+                &AgentSessionSummary {
+                    id: session_id,
+                    title: "Review".to_string(),
+                    created_at: now(),
+                    updated_at: now(),
+                    message_count: 0,
+                },
+            )
+            .await
+            .expect("save reviewer session");
+        store
+            .append_agent_message(
+                reviewer_id,
+                session_id,
+                0,
+                &AgentMessage {
+                    role: MessageRole::Assistant,
+                    content: "snapshot summary".to_string(),
+                    created_at: now(),
+                },
+            )
+            .await
+            .expect("message");
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                maintainer_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        store
+            .save_project_review_run(&ProjectReviewRunDetail {
+                summary: ProjectReviewRunSummary {
+                    id: run_id,
+                    project_id,
+                    reviewer_agent_id: Some(reviewer_id),
+                    turn_id: Some(turn_id),
+                    started_at: now(),
+                    finished_at: None,
+                    status: ProjectReviewRunStatus::Running,
+                    outcome: None,
+                    pr: None,
+                    summary: None,
+                    error: None,
+                },
+                messages: Vec::new(),
+                events: Vec::new(),
+            })
+            .await
+            .expect("save run");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        runtime
+            .publish(ServiceEventKind::TurnCompleted {
+                agent_id: reviewer_id,
+                session_id: Some(session_id),
+                turn_id,
+                status: TurnStatus::Completed,
+            })
+            .await;
+
+        runtime
+            .finish_project_review_run(
+                run_id,
+                project_id,
+                Some(reviewer_id),
+                Some(turn_id),
+                ProjectReviewRunStatus::Completed,
+                Some(ProjectReviewOutcome::ReviewSubmitted),
+                Some(12),
+                Some("submitted".to_string()),
+                None,
+            )
+            .await
+            .expect("finish");
+
+        let run = runtime
+            .get_project_review_run(project_id, run_id)
+            .await
+            .expect("run");
+        assert_eq!(run.summary.pr, Some(12));
+        assert_eq!(run.messages[0].content, "snapshot summary");
+        assert!(run.events.iter().any(|event| {
+            matches!(
+                event.kind,
+                ServiceEventKind::TurnCompleted { agent_id, .. } if agent_id == reviewer_id
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn project_review_retention_cleanup_preserves_repo_path() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, None);
+        agent.project_id = Some(project_id);
+        agent.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &agent).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                agent_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        runtime
+            .cleanup_project_review_workspace_history(
+                project_id,
+                now() - TimeDelta::days(PROJECT_REVIEW_HISTORY_RETENTION_DAYS),
+            )
+            .await
+            .expect("cleanup");
+
+        let docker_log = fake_docker_log(&dir);
+        assert!(docker_log.contains("git -C /workspace/repo worktree prune"));
+        assert!(docker_log.contains("/workspace/reviews"));
+        assert!(!docker_log.contains("rm -rf /workspace/repo"));
     }
 
     #[tokio::test]

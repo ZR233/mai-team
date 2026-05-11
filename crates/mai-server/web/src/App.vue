@@ -49,6 +49,7 @@
         :loading="isProjectDetailLoading"
         :sending="isProjectSending"
         :stopping="isProjectStopping"
+        :review-run-loading="isProjectReviewRunLoading"
         :providers="providersState.providers"
         :skills="projectComposerSkills"
         :selected-skills="selectedProjectSkills"
@@ -69,6 +70,7 @@
         @load-skills="onLoadProjectComposerSkills"
         @detect-project-skills="onDetectProjectSkills"
         @update-review-settings="onUpdateProjectReviewSettings"
+        @load-review-run="onLoadProjectReviewRun"
         @create-session="onCreateProjectSession"
         @select-session="selectProjectSession"
       />
@@ -254,6 +256,7 @@ const {
   isProjectsLoading,
   isProjectSending,
   isProjectStopping,
+  isProjectReviewRunLoading,
   isProjectDetailLoading,
   projectConversationRef,
   projectSkillsState,
@@ -273,6 +276,7 @@ const {
   stopProjectAgentTurn,
   createProjectSession,
   updateProjectAgent,
+  loadProjectReviewRun,
   loadGitAccountRepositories,
   loadRuntimeDefaults,
   loadGitAccountRepositoryPackages,
@@ -510,6 +514,14 @@ async function onUpdateProjectReviewSettings({ projectId, patch }) {
   try {
     await updateProject(projectId, patch)
     showToast('Project review settings saved.')
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onLoadProjectReviewRun(runId) {
+  try {
+    await loadProjectReviewRun(runId)
   } catch (error) {
     showToast(error.message)
   }
