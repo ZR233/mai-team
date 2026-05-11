@@ -598,6 +598,7 @@ impl AgentRuntime {
         tokio::spawn(async move {
             cleanup_runtime.run_project_review_cleanup_loop().await;
         });
+        runtime.reconcile_project_review_singletons().await;
         runtime.start_enabled_project_review_workers().await;
         Ok(runtime)
     }
@@ -4706,6 +4707,22 @@ impl AgentRuntime {
         summaries
     }
 
+    async fn project_auto_reviewer_agents(&self, project_id: ProjectId) -> Vec<AgentSummary> {
+        let maintainer_agent_id = match self.project(project_id).await {
+            Ok(project) => project.summary.read().await.maintainer_agent_id,
+            Err(_) => return Vec::new(),
+        };
+        self.project_agents(project_id)
+            .await
+            .into_iter()
+            .filter(|summary| {
+                summary.role == Some(AgentRole::Reviewer)
+                    && summary.parent_id == Some(maintainer_agent_id)
+                    && !summary.status.is_terminal()
+            })
+            .collect()
+    }
+
     async fn project_skills_from_cache(&self, project_id: ProjectId) -> Result<SkillsListResponse> {
         let config = self.store.load_skills_config().await?;
         let mut response =
@@ -5060,6 +5077,90 @@ impl AgentRuntime {
                 tracing::warn!(project_id = %project_id, "failed to start project review loop: {err}");
             }
         }
+    }
+
+    async fn reconcile_project_review_singletons(self: &Arc<Self>) {
+        let project_ids = {
+            let projects = self.projects.read().await;
+            projects.keys().copied().collect::<Vec<_>>()
+        };
+        for project_id in project_ids {
+            if let Err(err) = self.reconcile_project_review_singleton(project_id).await {
+                tracing::warn!(project_id = %project_id, "failed to reconcile project reviewer singleton: {err}");
+            }
+        }
+    }
+
+    async fn reconcile_project_review_singleton(
+        self: &Arc<Self>,
+        project_id: ProjectId,
+    ) -> Result<()> {
+        let project = self.project(project_id).await?;
+        let summary = project.summary.read().await.clone();
+        let mut stale_reviewer_ids = HashSet::new();
+        if let Some(reviewer_id) = summary.current_reviewer_agent_id {
+            stale_reviewer_ids.insert(reviewer_id);
+        }
+
+        let runs = self
+            .store
+            .load_project_review_runs(project_id, None, 0, PROJECT_REVIEW_RUN_LIST_LIMIT)
+            .await?;
+        let mut has_stale_activity = summary.current_reviewer_agent_id.is_some();
+        for run in runs {
+            if run.finished_at.is_some()
+                || !matches!(
+                    run.status,
+                    ProjectReviewRunStatus::Syncing | ProjectReviewRunStatus::Running
+                )
+            {
+                continue;
+            }
+            has_stale_activity = true;
+            if let Some(reviewer_id) = run.reviewer_agent_id {
+                stale_reviewer_ids.insert(reviewer_id);
+            }
+            let _ = self
+                .finish_project_review_run(
+                    run.id,
+                    project_id,
+                    run.reviewer_agent_id,
+                    run.turn_id,
+                    ProjectReviewRunStatus::Cancelled,
+                    None,
+                    run.pr,
+                    run.summary,
+                    Some("review interrupted by server restart".to_string()),
+                )
+                .await;
+        }
+
+        for agent in self.project_auto_reviewer_agents(project_id).await {
+            has_stale_activity = true;
+            stale_reviewer_ids.insert(agent.id);
+        }
+
+        for reviewer_id in stale_reviewer_ids {
+            if let Err(err) = self.delete_agent(reviewer_id).await {
+                tracing::warn!(
+                    project_id = %project_id,
+                    reviewer_id = %reviewer_id,
+                    "failed to delete stale project reviewer agent: {err}"
+                );
+            }
+        }
+
+        if has_stale_activity {
+            let status = if summary.auto_review_enabled {
+                ProjectReviewStatus::Idle
+            } else {
+                ProjectReviewStatus::Disabled
+            };
+            let _ = self
+                .set_project_review_state(project_id, status, None, None, None, None, None, false)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn start_project_review_loop_if_ready(
@@ -12856,6 +12957,198 @@ esac
     }
 
     #[tokio::test]
+    async fn runtime_start_cleans_stale_project_reviewer_before_new_worker() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("account-1".to_string()),
+                label: "GitHub".to_string(),
+                token: Some("secret-token".to_string()),
+                is_default: true,
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let reviewer_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        maintainer.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &maintainer).await;
+        let mut reviewer = test_agent_summary_with_parent(
+            reviewer_id,
+            Some(maintainer_id),
+            Some("reviewer-container"),
+        );
+        reviewer.project_id = Some(project_id);
+        reviewer.role = Some(AgentRole::Reviewer);
+        reviewer.status = AgentStatus::RunningTurn;
+        reviewer.current_turn = Some(turn_id);
+        save_agent_with_session(&store, &reviewer).await;
+        let mut project = ready_test_project_summary(project_id, maintainer_id, "account-1");
+        project.auto_review_enabled = true;
+        project.review_status = ProjectReviewStatus::Running;
+        project.current_reviewer_agent_id = Some(reviewer_id);
+        store.save_project(&project).await.expect("save project");
+        store
+            .save_project_review_run(&ProjectReviewRunDetail {
+                summary: ProjectReviewRunSummary {
+                    id: run_id,
+                    project_id,
+                    reviewer_agent_id: Some(reviewer_id),
+                    turn_id: Some(turn_id),
+                    started_at: now(),
+                    finished_at: None,
+                    status: ProjectReviewRunStatus::Running,
+                    outcome: None,
+                    pr: None,
+                    summary: Some("in progress".to_string()),
+                    error: None,
+                },
+                messages: Vec::new(),
+                events: Vec::new(),
+            })
+            .await
+            .expect("save run");
+
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let project_record = runtime.project(project_id).await.expect("project");
+
+        wait_until(
+            || {
+                let project_record = Arc::clone(&project_record);
+                async move { project_record.review_worker.lock().await.is_some() }
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(matches!(
+            runtime.agent(reviewer_id).await,
+            Err(RuntimeError::AgentNotFound(id)) if id == reviewer_id
+        ));
+        let run = runtime
+            .get_project_review_run(project_id, run_id)
+            .await
+            .expect("run");
+        assert_eq!(run.summary.status, ProjectReviewRunStatus::Cancelled);
+        assert_eq!(
+            run.summary.error.as_deref(),
+            Some("review interrupted by server restart")
+        );
+        let project = runtime.project(project_id).await.expect("project");
+        let summary = project.summary.read().await.clone();
+        assert_eq!(summary.current_reviewer_agent_id, None);
+        assert_eq!(summary.next_review_at, None);
+        runtime.stop_project_review_loop(project_id).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_start_deletes_orphan_project_reviewer() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("account-1".to_string()),
+                label: "GitHub".to_string(),
+                token: Some("secret-token".to_string()),
+                is_default: true,
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let orphan_reviewer_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        maintainer.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &maintainer).await;
+        let mut reviewer = test_agent_summary_with_parent(
+            orphan_reviewer_id,
+            Some(maintainer_id),
+            Some("orphan-reviewer-container"),
+        );
+        reviewer.project_id = Some(project_id);
+        reviewer.role = Some(AgentRole::Reviewer);
+        reviewer.status = AgentStatus::RunningTurn;
+        reviewer.current_turn = Some(Uuid::new_v4());
+        save_agent_with_session(&store, &reviewer).await;
+        let mut project = ready_test_project_summary(project_id, maintainer_id, "account-1");
+        project.auto_review_enabled = true;
+        project.review_status = ProjectReviewStatus::Idle;
+        store.save_project(&project).await.expect("save project");
+
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        assert!(matches!(
+            runtime.agent(orphan_reviewer_id).await,
+            Err(RuntimeError::AgentNotFound(id)) if id == orphan_reviewer_id
+        ));
+        let project_record = runtime.project(project_id).await.expect("project");
+        assert!(project_record.review_worker.lock().await.is_some());
+        runtime.stop_project_review_loop(project_id).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_start_reviewer_singleton_keeps_non_reviewer_project_agents() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let executor_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        maintainer.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &maintainer).await;
+        let mut executor = test_agent_summary_with_parent(
+            executor_id,
+            Some(maintainer_id),
+            Some("executor-container"),
+        );
+        executor.project_id = Some(project_id);
+        executor.role = Some(AgentRole::Executor);
+        executor.status = AgentStatus::RunningTurn;
+        executor.current_turn = Some(Uuid::new_v4());
+        save_agent_with_session(&store, &executor).await;
+        let mut project = test_project_summary(project_id, maintainer_id, "account-1");
+        project.auto_review_enabled = true;
+        project.review_status = ProjectReviewStatus::Idle;
+        store.save_project(&project).await.expect("save project");
+
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        runtime.agent(maintainer_id).await.expect("maintainer");
+        runtime.agent(executor_id).await.expect("executor");
+        let project_record = runtime.project(project_id).await.expect("project");
+        assert!(project_record.review_worker.lock().await.is_none());
+    }
+
+    #[tokio::test]
     async fn runtime_start_does_not_start_auto_review_for_not_ready_project() {
         let dir = tempdir().expect("tempdir");
         let store = test_store(&dir).await;
@@ -13017,6 +13310,7 @@ esac
         reviewer.project_id = Some(project_id);
         reviewer.parent_id = Some(maintainer_id);
         reviewer.role = Some(AgentRole::Reviewer);
+        reviewer.status = AgentStatus::Completed;
         store
             .save_agent(&reviewer, None)
             .await
@@ -13055,6 +13349,7 @@ esac
             ))
             .await
             .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
         store
             .save_project_review_run(&ProjectReviewRunDetail {
                 summary: ProjectReviewRunSummary {
@@ -13075,7 +13370,6 @@ esac
             })
             .await
             .expect("save run");
-        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
         runtime
             .publish(ServiceEventKind::TurnCompleted {
                 agent_id: reviewer_id,
