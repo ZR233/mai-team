@@ -1333,10 +1333,23 @@ impl AgentRuntime {
         let project = self.project(project_id).await?;
         let summary = project.summary.read().await.clone();
         let agents = self.project_agents(project_id).await;
-        let selected_agent_id = selected_agent_id
-            .filter(|id| agents.iter().any(|agent| agent.id == *id))
-            .unwrap_or(summary.maintainer_agent_id);
-        let maintainer_agent = self.get_agent(selected_agent_id, session_id).await?;
+        let requested_agent_id =
+            selected_agent_id.filter(|id| agents.iter().any(|agent| agent.id == *id));
+        let selected_session_id = if selected_agent_id.is_some() && requested_agent_id.is_none() {
+            None
+        } else {
+            session_id
+        };
+        let selected_agent_id = requested_agent_id.unwrap_or(summary.maintainer_agent_id);
+        let maintainer_session_id = (selected_agent_id == summary.maintainer_agent_id)
+            .then_some(selected_session_id)
+            .flatten();
+        let maintainer_agent = self
+            .get_agent(summary.maintainer_agent_id, maintainer_session_id)
+            .await?;
+        let selected_agent = self
+            .get_agent(selected_agent_id, selected_session_id)
+            .await?;
         let status = if summary.status == ProjectStatus::Ready {
             "ready"
         } else {
@@ -1346,6 +1359,8 @@ impl AgentRuntime {
             summary,
             maintainer_agent,
             agents,
+            selected_agent_id,
+            selected_agent,
             auth_status: status.to_string(),
             mcp_status: status.to_string(),
         })
@@ -10876,6 +10891,87 @@ esac
             })
             .await;
         assert!(matches!(invalid, Err(RuntimeError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn project_detail_selects_live_reviewer_without_replacing_maintainer() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let reviewer_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        maintainer.role = Some(AgentRole::Planner);
+        let mut reviewer = test_agent_summary_with_parent(
+            reviewer_id,
+            Some(maintainer_id),
+            Some("reviewer-container"),
+        );
+        reviewer.project_id = Some(project_id);
+        reviewer.role = Some(AgentRole::Reviewer);
+        save_agent_with_session(&store, &maintainer).await;
+        save_agent_with_session(&store, &reviewer).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                maintainer_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        let detail = runtime
+            .get_project(project_id, Some(reviewer_id), None)
+            .await
+            .expect("project detail");
+
+        assert_eq!(detail.selected_agent_id, reviewer_id);
+        assert_eq!(detail.selected_agent.summary.id, reviewer_id);
+        assert_eq!(
+            detail.selected_agent.summary.role,
+            Some(AgentRole::Reviewer)
+        );
+        assert_eq!(detail.maintainer_agent.summary.id, maintainer_id);
+        assert_eq!(
+            detail.maintainer_agent.summary.role,
+            Some(AgentRole::Planner)
+        );
+        assert!(detail.agents.iter().any(|agent| agent.id == maintainer_id));
+        assert!(detail.agents.iter().any(|agent| agent.id == reviewer_id));
+    }
+
+    #[tokio::test]
+    async fn project_detail_falls_back_to_maintainer_when_selected_reviewer_is_gone() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let reviewer_id = Uuid::new_v4();
+        let reviewer_session_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        maintainer.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &maintainer).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                maintainer_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        let detail = runtime
+            .get_project(project_id, Some(reviewer_id), Some(reviewer_session_id))
+            .await
+            .expect("project detail");
+
+        assert_eq!(detail.selected_agent_id, maintainer_id);
+        assert_eq!(detail.selected_agent.summary.id, maintainer_id);
+        assert_eq!(detail.maintainer_agent.summary.id, maintainer_id);
     }
 
     #[tokio::test]

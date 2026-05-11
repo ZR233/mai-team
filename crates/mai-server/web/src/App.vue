@@ -366,9 +366,9 @@ watch(
 
 watch(
   () => [
-    selectedProjectDetail.value?.maintainer_agent?.messages?.length,
-    selectedProjectDetail.value?.maintainer_agent?.recent_events?.length,
-    selectedProjectDetail.value?.maintainer_agent?.selected_session_id,
+    selectedProjectDetail.value?.selected_agent?.messages?.length,
+    selectedProjectDetail.value?.selected_agent?.recent_events?.length,
+    selectedProjectDetail.value?.selected_agent?.selected_session_id,
     eventFeed.value.length
   ],
   async () => {
@@ -515,9 +515,9 @@ async function onUpdateProjectReviewSettings({ projectId, patch }) {
   }
 }
 
-async function onCreateProjectSession() {
+async function onCreateProjectSession(agent) {
   try {
-    await createProjectSession()
+    await createProjectSession(agent)
   } catch (error) {
     showToast(error.message)
   }
@@ -544,7 +544,8 @@ async function onRequestPlanRevision(feedback) {
 async function onUpdateAgentModel(payload) {
   isUpdatingAgentModel.value = true
   try {
-    await updateAgent(selectedTaskDetail.value.selected_agent.id, payload.provider_id, payload.model, payload.reasoning_effort)
+    const agentId = payload.agent_id || selectedTaskDetail.value.selected_agent.id
+    await updateAgent(agentId, payload.provider_id, payload.model, payload.reasoning_effort)
     showToast('Agent model updated.')
   } catch (error) {
     showToast(error.message)
@@ -554,7 +555,7 @@ async function onUpdateAgentModel(payload) {
 }
 
 async function onUpdateProjectAgentModel(payload) {
-  const agentId = selectedProjectDetail.value?.maintainer_agent?.id
+  const agentId = payload.agent_id || selectedProjectDetail.value?.selected_agent?.id
   if (!agentId) return
   isUpdatingProjectAgentModel.value = true
   try {

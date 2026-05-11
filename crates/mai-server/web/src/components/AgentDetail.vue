@@ -7,6 +7,7 @@
       :providers-count="providers.length"
       :model-change-busy="isModelChangeBusy"
       :updating-model="updatingModel"
+      :show-actions="showActions"
       @change-reasoning-effort="saveReasoningEffort"
       @open-model="openModelEditor"
       @cancel="$emit('cancel', $event)"
@@ -120,6 +121,7 @@ const props = defineProps({
   skillsError: { type: String, default: '' },
   showSessions: { type: Boolean, default: true },
   showComposer: { type: Boolean, default: true },
+  showActions: { type: Boolean, default: true },
   planApprovalPending: { type: Boolean, default: false },
   approvingPlan: { type: Boolean, default: false },
   planVersion: { type: Number, default: 0 },
@@ -263,6 +265,7 @@ function saveReasoningEffort(value = currentReasoningEffort.value) {
   if (!props.detail || !currentReasoningOptions.value.length) return
   currentReasoningEffort.value = value
   emit('update-model', {
+    agent_id: props.detail.id,
     provider_id: props.detail.provider_id,
     model: props.detail.model,
     reasoning_effort: value
@@ -283,6 +286,7 @@ function saveModelEdit() {
     return
   }
   emit('update-model', {
+    agent_id: props.detail?.id,
     provider_id: modelEditor.provider_id,
     model: modelEditor.model,
     reasoning_effort: modelEditor.reasoning_effort

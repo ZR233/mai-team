@@ -40,7 +40,7 @@
         class="settings-nav-item"
         :class="{ active: activeSection === item.id }"
         :disabled="!detail"
-        @click="activeSection = item.id"
+        @click="selectSection(item.id)"
       >
         <span class="settings-nav-icon">{{ item.icon }}</span>
         <span class="settings-nav-copy">
@@ -126,8 +126,8 @@
           @update:draft="$emit('update:draft', $event)"
           @update:selected-skills="$emit('update:selectedSkills', $event)"
           @load-skills="$emit('load-skills')"
-          @create-session="$emit('create-session')"
-          @select-session="$emit('select-session', $event)"
+          @create-session="$emit('create-session', detail.maintainer_agent)"
+          @select-session="$emit('select-session', { agentId: detail.maintainer_agent?.id, sessionId: $event })"
         />
       </template>
 
@@ -335,7 +335,7 @@
             :key="agent.id"
             type="button"
             class="agent-row project-agent-row"
-            :class="{ active: detail.maintainer_agent?.id === agent.id }"
+            :class="{ active: selectedProjectAgentId === agent.id }"
             @click="$emit('select-agent', agent.id)"
           >
             <span class="avatar">{{ roleInitial(agent.role) }}</span>
@@ -348,6 +348,36 @@
             <span class="status-dot" :class="statusTone(agent.status)" :title="formatStatus(agent.status)" />
           </button>
         </div>
+        <AgentDetail
+          v-if="detail.selected_agent"
+          :detail="detail.selected_agent"
+          :events="events"
+          :draft="selectedAgentInputEnabled ? draft : ''"
+          :loading="loading"
+          :sending="sending"
+          :stopping="stopping"
+          :providers="providers"
+          :skills="skills"
+          :selected-skills="selectedSkills"
+          :skills-loading="skillsLoading"
+          :skills-error="skillsError"
+          :updating-model="updatingModel"
+          :show-sessions="true"
+          :show-composer="selectedAgentInputEnabled"
+          :show-actions="selectedAgentInputEnabled"
+          :input-enabled="selectedAgentInputEnabled"
+          v-model:conversation-ref="conversationRef"
+          @cancel="$emit('cancel-agent', $event)"
+          @delete="(...args) => $emit('delete-agent', ...args)"
+          @send="$emit('send', $event)"
+          @stop="$emit('stop', $event)"
+          @update-model="$emit('update-model', $event)"
+          @update:draft="$emit('update:draft', $event)"
+          @update:selected-skills="$emit('update:selectedSkills', $event)"
+          @load-skills="$emit('load-skills')"
+          @create-session="$emit('create-session', detail.selected_agent)"
+          @select-session="$emit('select-session', { agentId: detail.selected_agent?.id, sessionId: $event })"
+        />
       </div>
     </section>
   </section>
@@ -411,6 +441,11 @@ const projectAgents = computed(() => {
   const agents = props.detail?.agents?.length ? props.detail.agents : [props.detail?.maintainer_agent].filter(Boolean)
   return agents
 })
+const selectedProjectAgentId = computed(() => props.detail?.selected_agent_id || props.detail?.maintainer_agent?.id || null)
+const selectedAgentInputEnabled = computed(() => (
+  Boolean(props.detail?.selected_agent?.id)
+    && props.detail.selected_agent.id === props.detail?.maintainer_agent?.id
+))
 
 const isProjectFailed = computed(() => props.detail?.status === 'failed' || props.detail?.clone_status === 'failed')
 const isProjectSettingUp = computed(() => {
@@ -540,6 +575,13 @@ function toggleAutoReview() {
     auto_review_enabled: !props.detail.auto_review_enabled,
     reviewer_extra_prompt: reviewerExtraPromptDraft.value
   })
+}
+
+function selectSection(id) {
+  activeSection.value = id
+  if (id === 'planner' && props.detail?.maintainer_agent?.id && selectedProjectAgentId.value !== props.detail.maintainer_agent.id) {
+    emit('select-agent', props.detail.maintainer_agent.id)
+  }
 }
 
 function saveReviewerPrompt() {

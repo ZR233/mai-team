@@ -49,6 +49,7 @@
 
       <div class="agent-actions">
         <button
+          v-if="showActions"
           class="ghost-button"
           type="button"
           :disabled="!providersCount || modelChangeBusy || updatingModel"
@@ -56,8 +57,8 @@
         >
           Change Model
         </button>
-        <button class="ghost-button" type="button" @click="$emit('cancel', detail.id)">Cancel</button>
-        <button class="danger-button" type="button" @click="$emit('delete', detail.id, detail.name)">Delete</button>
+        <button v-if="showActions" class="ghost-button" type="button" @click="$emit('cancel', detail.id)">Cancel</button>
+        <button v-if="showActions" class="danger-button" type="button" @click="$emit('delete', detail.id, detail.name)">Delete</button>
       </div>
     </div>
   </header>
@@ -72,7 +73,8 @@ defineProps({
   reasoningOptions: { type: Array, default: () => [] },
   providersCount: { type: Number, default: 0 },
   modelChangeBusy: { type: Boolean, default: false },
-  updatingModel: { type: Boolean, default: false }
+  updatingModel: { type: Boolean, default: false },
+  showActions: { type: Boolean, default: true }
 })
 
 defineEmits([

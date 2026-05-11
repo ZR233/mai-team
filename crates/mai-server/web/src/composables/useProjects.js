@@ -52,7 +52,7 @@ export function useProjects() {
         || selectedProjectDetail.value?.maintainer_agent?.id
         || selectedProjectAgentId.value
         || null
-      selectedProjectSessionId.value = selectedProjectDetail.value?.maintainer_agent?.selected_session_id
+      selectedProjectSessionId.value = selectedProjectDetail.value?.selected_agent?.selected_session_id
         || selectedProjectSessionId.value
         || null
       if (selectedProjectDetail.value?.status === 'ready' || selectedProjectDetail.value?.clone_status === 'ready') {
@@ -83,9 +83,12 @@ export function useProjects() {
     await refreshProjectDetail()
   }
 
-  async function selectProjectSession(id) {
-    if (!selectedProjectId.value || !id) return
-    selectedProjectSessionId.value = id
+  async function selectProjectSession(input) {
+    const agentId = typeof input === 'object' ? input?.agentId : null
+    const sessionId = typeof input === 'object' ? input?.sessionId : input
+    if (!selectedProjectId.value || !sessionId) return
+    if (agentId) selectedProjectAgentId.value = agentId
+    selectedProjectSessionId.value = sessionId
     await refreshProjectDetail()
   }
 
@@ -153,7 +156,7 @@ export function useProjects() {
         body: JSON.stringify({
           message,
           skill_mentions: skillMentions,
-          session_id: selectedProjectSessionId.value || selectedProjectDetail.value?.maintainer_agent?.selected_session_id || null
+          session_id: selectedProjectDetail.value?.maintainer_agent?.selected_session_id || null
         })
       })
       await refreshProjects()
@@ -215,9 +218,9 @@ export function useProjects() {
     await refreshProjectDetail()
   }
 
-  async function stopProjectAgentTurn(agent = selectedProjectDetail.value?.maintainer_agent) {
+  async function stopProjectAgentTurn(agent = selectedProjectDetail.value?.selected_agent) {
     const agentId = agent?.id || selectedProjectAgentId.value
-    const turnId = agent?.current_turn || selectedProjectDetail.value?.maintainer_agent?.current_turn
+    const turnId = agent?.current_turn || selectedProjectDetail.value?.selected_agent?.current_turn
     if (!agentId || !turnId) return null
     isProjectStopping.value = true
     try {
@@ -229,9 +232,10 @@ export function useProjects() {
     }
   }
 
-  async function createProjectSession() {
-    const agentId = selectedProjectDetail.value?.maintainer_agent?.id || selectedProjectAgentId.value
+  async function createProjectSession(agent = selectedProjectDetail.value?.selected_agent) {
+    const agentId = agent?.id || selectedProjectAgentId.value
     if (!agentId) return null
+    selectedProjectAgentId.value = agentId
     const response = await api(`/agents/${agentId}/sessions`, { method: 'POST' })
     selectedProjectSessionId.value = response?.session?.id || response?.id || null
     await refreshProjectDetail()

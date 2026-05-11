@@ -403,6 +403,8 @@ pub struct ProjectDetail {
     pub summary: ProjectSummary,
     pub maintainer_agent: AgentDetail,
     pub agents: Vec<AgentSummary>,
+    pub selected_agent_id: AgentId,
+    pub selected_agent: AgentDetail,
     #[serde(default)]
     pub auth_status: String,
     #[serde(default)]
