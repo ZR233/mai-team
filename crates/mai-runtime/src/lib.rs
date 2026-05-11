@@ -67,6 +67,8 @@ const PROJECT_REVIEW_CLEANUP_INTERVAL_SECS: u64 = 3600;
 const PROJECT_REVIEW_RUN_LIST_LIMIT: usize = 50;
 const PROJECT_REVIEW_SNAPSHOT_MESSAGE_LIMIT: usize = 40;
 const PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT: usize = 80;
+const PROJECT_REVIEW_REPO_COMMAND_MAX_ATTEMPTS: usize = 3;
+const PROJECT_REVIEW_REPO_COMMAND_RETRY_SECS: u64 = 5;
 const DEFAULT_WAIT_AGENT_OBSERVATION_SECS: u64 = 30;
 const PROJECT_GITHUB_MCP_SERVER: &str = "github";
 const PROJECT_GIT_MCP_SERVER: &str = "git";
@@ -5753,36 +5755,53 @@ impl AgentRuntime {
         } else {
             summary.branch.clone()
         };
-        let command_text = match command {
-            ReviewRepoCommand::Ensure => {
-                review_repo_ensure_command(&repo_url, &expected_remote, &branch)
-            }
-            ReviewRepoCommand::Sync => {
-                review_repo_sync_command(&repo_url, &expected_remote, &branch)
-            }
+        let (command_label, command_text) = match command {
+            ReviewRepoCommand::Ensure => (
+                "ensure",
+                review_repo_ensure_command(&repo_url, &expected_remote, &branch),
+            ),
+            ReviewRepoCommand::Sync => (
+                "sync",
+                review_repo_sync_command(&repo_url, &expected_remote, &branch),
+            ),
         };
         let env = [("MAI_GITHUB_REVIEW_TOKEN".to_string(), token.to_string())];
-        let output = self
-            .docker
-            .run_sidecar_shell_env(&mai_docker::SidecarParams {
-                name: &format!("mai-review-sync-{project_id}"),
-                image: &self.sidecar_image,
-                command: &command_text,
-                args: &[],
-                cwd: Some("/workspace"),
-                env: &env,
-                workspace_volume: Some(&volume),
-                timeout_secs: Some(900),
-            })
-            .await?;
-        if output.status != 0 {
+        let mut last_message = String::new();
+        for attempt in 1..=PROJECT_REVIEW_REPO_COMMAND_MAX_ATTEMPTS {
+            let sidecar_name = format!("mai-review-sync-{project_id}-{attempt}");
+            let output = self
+                .docker
+                .run_sidecar_shell_env(&mai_docker::SidecarParams {
+                    name: &sidecar_name,
+                    image: &self.sidecar_image,
+                    command: &command_text,
+                    args: &[],
+                    cwd: Some("/workspace"),
+                    env: &env,
+                    workspace_volume: Some(&volume),
+                    timeout_secs: Some(900),
+                })
+                .await?;
+            if output.status == 0 {
+                return Ok(());
+            }
             let combined = format!("{}\n{}", output.stderr, output.stdout);
-            let message = preview(redact_secret(combined.trim(), &token).trim(), 500);
-            return Err(RuntimeError::InvalidInput(format!(
-                "project review workspace sync failed: {message}"
-            )));
+            last_message = preview(redact_secret(combined.trim(), &token).trim(), 500);
+            if attempt < PROJECT_REVIEW_REPO_COMMAND_MAX_ATTEMPTS {
+                tracing::warn!(
+                    project_id = %project_id,
+                    command = command_label,
+                    attempt,
+                    attempts = PROJECT_REVIEW_REPO_COMMAND_MAX_ATTEMPTS,
+                    "project review workspace command failed; retrying"
+                );
+                sleep(Duration::from_secs(PROJECT_REVIEW_REPO_COMMAND_RETRY_SECS)).await;
+            }
         }
-        Ok(())
+        Err(RuntimeError::InvalidInput(format!(
+            "project review workspace sync failed after {} attempts: {last_message}",
+            PROJECT_REVIEW_REPO_COMMAND_MAX_ATTEMPTS
+        )))
     }
 
     async fn spawn_project_reviewer_agent(

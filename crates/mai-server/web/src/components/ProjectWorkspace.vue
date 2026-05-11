@@ -671,10 +671,16 @@ function toggleReviewRun(run) {
 }
 
 function reviewRunTitle(run) {
-  const pr = run?.pr ? `PR #${run.pr}` : 'No PR selected'
-  if (run?.summary) return `${pr}: ${run.summary}`
-  if (run?.error) return `${pr}: ${run.error}`
-  return pr
+  if (run?.pr) {
+    const pr = `PR #${run.pr}`
+    if (run?.summary) return `${pr}: ${run.summary}`
+    if (run?.error) return `${pr}: ${run.error}`
+    return pr
+  }
+  if (run?.summary) return run.summary
+  if (run?.error) return run.error
+  if (run?.status === 'failed') return 'Review setup failed'
+  return 'No PR selected'
 }
 
 function reviewRunTone(status) {
