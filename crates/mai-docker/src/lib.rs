@@ -881,7 +881,9 @@ fn dedupe_container_ids(ids: impl IntoIterator<Item = String>) -> Vec<String> {
 
 fn is_missing_container_error(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
-    message.contains("no such container") || message.contains("no such object")
+    message.contains("no such container")
+        || message.contains("no such object")
+        || (message.contains("removal of container") && message.contains("already in progress"))
 }
 
 fn is_missing_image_error(message: &str) -> bool {
@@ -1234,6 +1236,13 @@ mod tests {
             orphaned_container_ids(&containers, &active_agent_ids, &active_project_ids),
             vec!["sidecar-orphan".to_string()]
         );
+    }
+
+    #[test]
+    fn container_removal_in_progress_is_idempotent() {
+        assert!(is_missing_container_error(
+            "Error response from daemon: removal of container 7a73dc22f0e3 is already in progress"
+        ));
     }
 
     #[test]
