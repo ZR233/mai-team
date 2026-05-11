@@ -514,6 +514,16 @@ p {
   padding: 14px;
 }
 
+.project-danger-zone {
+  margin-top: auto;
+  border-top: 1px solid #e1e7ef;
+  padding-top: 12px;
+}
+
+.project-danger-zone .danger-button {
+  width: 100%;
+}
+
 .project-content {
   display: flex;
   flex-direction: column;

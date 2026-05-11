@@ -48,6 +48,16 @@
           <small>{{ item.meta }}</small>
         </span>
       </button>
+      <div v-if="detail" class="project-danger-zone">
+        <button
+          class="danger-button"
+          type="button"
+          :disabled="detail.status === 'deleting'"
+          @click="$emit('delete-project', detail.id, detail.name)"
+        >
+          {{ detail.status === 'deleting' ? 'Deleting...' : 'Delete Project' }}
+        </button>
+      </div>
     </aside>
 
     <section class="project-content">

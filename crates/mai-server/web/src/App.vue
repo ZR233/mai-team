@@ -60,6 +60,7 @@
         @create="openCreateProjectDialog"
         @select-project="selectProject"
         @select-agent="selectProjectAgent"
+        @delete-project="confirmDeleteProject"
         @cancel-agent="onCancelProjectAgent"
         @delete-agent="confirmDeleteProjectAgent"
         @send="onSendProjectMessage"
@@ -268,6 +269,7 @@ const {
   selectProjectSession,
   createProject,
   updateProject,
+  deleteProject,
   sendProjectMessage,
   loadProjectSkills,
   detectProjectSkills,
@@ -860,6 +862,21 @@ function confirmDeleteTask(id, title) {
 
 function confirmDeleteTaskAgent() {
   showToast('Delete the task to remove task-owned agents.')
+}
+
+function confirmDeleteProject(id, name) {
+  confirmDialog.title = 'Delete Project'
+  confirmDialog.message = `Delete "${name || id}" and all project agents, review runs, and workspaces? This action cannot be undone.`
+  confirmDialog.onConfirm = async () => {
+    confirmDialog.open = false
+    try {
+      await deleteProject(id)
+      showToast('Project deleted.')
+    } catch (error) {
+      showToast(error.message)
+    }
+  }
+  confirmDialog.open = true
 }
 
 function confirmDeleteProjectAgent() {
