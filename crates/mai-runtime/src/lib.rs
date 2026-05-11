@@ -8359,12 +8359,14 @@ impl AgentResourceBroker {
     }
 
     fn read_skill_resource(&self, uri: &str) -> Result<Value> {
-        let Some(name) = uri.strip_prefix(SKILL_RESOURCE_SCHEME) else {
+        let Some(resource) = uri.strip_prefix(SKILL_RESOURCE_SCHEME) else {
             return Err(RuntimeError::InvalidInput(format!(
                 "invalid skill resource uri `{uri}`; expected skill:///<skill-name>"
             )));
         };
-        let name = name.trim_matches('/');
+        let resource = resource.trim_start_matches('/');
+        let (name, relative) = resource.split_once('/').unwrap_or((resource, ""));
+        let name = name.trim();
         if name.is_empty() {
             return Err(RuntimeError::InvalidInput(
                 "skill resource uri must include a skill name".to_string(),
@@ -8389,11 +8391,22 @@ impl AgentResourceBroker {
                 )));
             }
         };
-        let contents = fs::read_to_string(&skill.path)?;
+        let path = if relative.is_empty() {
+            skill.path.clone()
+        } else {
+            let relative = safe_skill_resource_relative_path(relative)?;
+            let Some(skill_dir) = skill.path.parent() else {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "skill resource has no parent directory: {uri}"
+                )));
+            };
+            skill_dir.join(relative)
+        };
+        let contents = fs::read_to_string(&path)?;
         Ok(json!({
             "contents": [{
-                "uri": skill_uri(&skill.name),
-                "mimeType": "text/markdown",
+                "uri": uri,
+                "mimeType": skill_resource_mime_type(&path),
                 "text": contents,
             }]
         }))
@@ -8463,6 +8476,40 @@ fn skill_resource_server_for_scope(scope: SkillScope) -> &'static str {
 
 fn skill_uri(name: &str) -> String {
     format!("{SKILL_RESOURCE_SCHEME}{name}")
+}
+
+fn safe_skill_resource_relative_path(path: &str) -> Result<PathBuf> {
+    let path = Path::new(path);
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err(RuntimeError::InvalidInput(
+                    "skill resource relative path cannot be absolute or contain parent components"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "skill resource relative path cannot be empty".to_string(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn skill_resource_mime_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("md") => "text/markdown",
+        Some("py") => "text/x-python",
+        Some("sh") => "text/x-shellscript",
+        Some("json") => "application/json",
+        Some("yaml" | "yml") => "application/yaml",
+        _ => "text/plain",
+    }
 }
 
 fn is_skill_resource_server(server: Option<&str>) -> bool {
@@ -13203,6 +13250,66 @@ esac
         let text = output["contents"][0]["text"].as_str().unwrap_or_default();
         assert!(text.contains("name: review-open-prs"));
         assert!(text.contains("Use the review workflow."));
+    }
+
+    #[tokio::test]
+    async fn skill_resource_can_read_bundled_relative_file() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let system_skill_dir = dir.path().join("system-skills").join("demo");
+        fs::create_dir_all(system_skill_dir.join("scripts")).expect("mkdir skill");
+        fs::write(
+            system_skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo skill.\n---\nDemo body.",
+        )
+        .expect("write skill");
+        fs::write(
+            system_skill_dir.join("scripts/helper.py"),
+            "print('hello from helper')\n",
+        )
+        .expect("write helper");
+        let agent_id = Uuid::new_v4();
+        save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container-1"))).await;
+        let runtime = AgentRuntime::new(
+            DockerClient::new_with_binary("unused", fake_docker_path(&dir)),
+            ResponsesClient::new(),
+            Arc::clone(&store),
+            RuntimeConfig {
+                system_skills_root: Some(dir.path().join("system-skills")),
+                ..test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE)
+            },
+        )
+        .await
+        .expect("runtime");
+
+        let result = runtime
+            .execute_tool_for_test(
+                agent_id,
+                "read_mcp_resource",
+                json!({
+                    "server": "skill",
+                    "uri": "skill:///demo/scripts/helper.py"
+                }),
+            )
+            .await
+            .expect("read helper");
+
+        assert!(result.success);
+        let output: Value = serde_json::from_str(&result.output).expect("json output");
+        assert_eq!(output["contents"][0]["mimeType"], "text/x-python");
+        assert!(
+            output["contents"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("hello from helper")
+        );
     }
 
     #[tokio::test]

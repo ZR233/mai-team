@@ -1,255 +1,163 @@
 ---
 name: reviewer-agent-review-pr
-description: Reviewer agent skill for performing a deep, single GitHub pull request review. The reviewer agent selects the most eligible unreviewed PR (CI completed or review requested), checks out code locally via git worktree, runs local tests for Rust/cargo projects, checks design and architecture conformance, verifies code style against repository conventions, searches for similar PRs, and submits a GitHub review with inline comments. Trigger when the reviewer agent is invoked to review PRs, or when tasks are assigned for PR code review.
+description: Reviewer agent skill for performing a script-assisted, deep, single GitHub pull request review. The reviewer agent uses bundled helper scripts for deterministic PR eligibility, git worktree preparation, changed-file/crate detection, Rust validation command planning, and final scheduler JSON, then performs human-quality code review and submits a GitHub review with inline comments. Trigger when the reviewer agent is invoked to review PRs, or when tasks are assigned for PR code review.
 metadata:
-  short-description: Reviewer agent deep single-PR review with worktree and MCP tools
+  short-description: Script-assisted reviewer agent single-PR review
 ---
 
-# Reviewer Agent — Review PR
+# Reviewer Agent - Review PR
 
-This skill is designed for a **reviewer agent** in the multi-agent team workflow. It performs a deep, focused review of a single GitHub pull request on behalf of the reviewer agent role.
+Review exactly one eligible GitHub pull request for the current project. Use GitHub MCP tools for GitHub reads/writes, local shell commands for git/test work, and the bundled helper for fixed rules.
 
-The skill selects the most eligible unreviewed PR, checks out the code in an isolated git worktree, runs targeted local validation, analyzes design and architecture, searches for duplicate PRs, and submits a complete GitHub review with inline comments.
+Mai refreshes `/workspace/repo` before this skill starts and fetches PR refs as `refs/remotes/origin/pr/<number>`. Do not fetch credentials, read `GITHUB_TOKEN`, write credential files, or add model footers. Mai appends the model footer to submitted project reviews.
 
-As a reviewer agent, your role is to provide objective, thorough code review. GitHub interactions must use the GitHub MCP tools that are actually visible in the current tool list; git worktree and local test execution use Bash commands.
+## Use Bundled Scripts First
 
-The repository is pre-cloned and refreshed by Mai at `/workspace/repo` before this skill starts. Do not fetch credentials or configure tokens yourself. Use local refs under `/workspace/repo`, including `refs/remotes/origin/pr/<number>`, when creating review worktrees.
+Use `scripts/review_pr_helper.py` for deterministic steps before doing review judgment. The script has no third-party dependencies and does not access the network.
+
+Preferred invocation:
+
+```bash
+python3 scripts/review_pr_helper.py test
+```
+
+If `scripts/review_pr_helper.py` is not directly readable from the container, read the skill resource `skill:///reviewer-agent-review-pr/scripts/review_pr_helper.py`, copy its text to `/tmp/review_pr_helper.py`, and run:
+
+```bash
+python3 /tmp/review_pr_helper.py test
+```
+
+The helper commands are:
+
+```bash
+python3 scripts/review_pr_helper.py select-pr --prs prs.json --login "$LOGIN" --details details.json --reviews reviews.json --checks checks.json
+python3 scripts/review_pr_helper.py prepare-worktree --repo /workspace/repo --review-root /workspace/reviews --agent-id "$REVIEWER_AGENT_ID" --pr "$PR"
+python3 scripts/review_pr_helper.py changed-files --repo "$WORKTREE" --files files.json
+python3 scripts/review_pr_helper.py rust-plan --repo "$WORKTREE" --changed changed.json
+python3 scripts/review_pr_helper.py final-json --outcome review_submitted --pr "$PR" --summary "Submitted APPROVE for owner/repo#$PR after validation passed."
+```
+
+Treat helper output as structured facts and command suggestions. You still own code understanding, finding severity, inline comment wording, and the final GitHub review decision.
 
 ## Workflow
 
 ### 1. Identify Repository and Account
 
-Use the visible GitHub MCP account tool, usually `mcp__github__get_me`, to get the authenticated user login. Identify `owner` and `repo` from the project context or the git remote of the current working directory.
+Use the visible GitHub MCP account tool, usually `mcp__github__get_me`, to get the authenticated user login. Identify `owner` and `repo` from the project context or `/workspace/repo` remote.
 
-If the GitHub MCP tools are unavailable, report that this skill requires a configured GitHub MCP server and exit.
+If GitHub MCP tools are unavailable, return only:
 
-### 2. Select an Eligible PR
+```json
+{"outcome":"failed","pr":null,"summary":"Review could not be completed.","error":"GitHub MCP tools are unavailable."}
+```
 
-List all open PRs with a visible GitHub MCP pull request listing tool, sorted by `updated_at` descending.
+### 2. Select One Eligible PR
 
-Apply eligibility filters in order:
+List open PRs with a visible GitHub MCP pull request listing tool, sorted by `updated_at` descending. Fetch PR details, checks/status, and current-user reviews where visible tools allow it.
 
-- **Skip self-authored PRs**: exclude any PR where `author.login` equals the authenticated user.
-- **Skip drafts**: exclude PRs where `isDraft` is true.
-- **CI gate**: check CI status for each remaining PR. A PR is eligible if all CI checks have completed and passed. If CI is still running or has failures, the PR is only eligible when `reviewDecision` is `REVIEW_REQUIRED` and the authenticated user is in the requested reviewers list. Use a visible GitHub MCP pull request read tool when available, following its schema exactly, or use `github_api_get` with path `/repos/OWNER/REPO/pulls/NUMBER` and check the status/check-runs fields.
-- **Freshness**: for each remaining PR, fetch the current user's reviews through a visible GitHub MCP review/read tool when available, and fetch the latest commit timestamp from PR details. A PR is eligible if the user has never reviewed it, OR the PR's latest commit time is strictly newer than the user's last submitted review timestamp. Compare commit dates, not `updatedAt` — comments and CI runs can update the PR without new code.
-- **Review request priority**: among eligible PRs, prefer the one where the authenticated user is explicitly requested as a reviewer.
+Save the MCP JSON outputs to files and run `select-pr`. The helper applies these fixed rules:
 
-Pick the single most recently updated eligible PR. If no PRs match, finish with only:
+- Skip self-authored PRs.
+- Skip draft PRs.
+- Accept PRs with completed passing CI.
+- If CI is pending or failed, accept only when the authenticated user is requested for review.
+- Re-review only if the latest commit is newer than this user's latest submitted review.
+- Prefer explicitly requested reviews, then most recently updated PR.
+
+If `select-pr` returns `no_eligible_pr`, finish with:
 
 ```json
 {"outcome":"no_eligible_pr","pr":null,"summary":"No eligible pull request found.","error":null}
 ```
 
-### 3. Follow Review Standards
+### 3. Prepare an Isolated Worktree
 
-Adopt this review methodology:
+Run `prepare-worktree` for the selected PR. Work only inside the returned worktree path. Do not review or run tests directly in `/workspace/repo`.
 
-- Inspect PR metadata, changed files, diff, existing comments, review threads, and checks context.
-- Focus on: bugs, regressions, security risks, data-loss risks, missing tests, broken edge cases, and behavior mismatches.
-- Do not request changes for style-only preferences.
-- Keep review bodies concise with concrete file and function references when possible.
-- Use `REQUEST_CHANGES` for blocking findings, `APPROVE` when safe to merge, `COMMENT` only for purely advisory notes.
-- If submission fails because the account is the PR author or GitHub rejects the event, leave a normal PR comment only when a visible comment tool is available; otherwise report the failure.
+Before submitting the review, confirm the PR head SHA still matches the checked-out worktree SHA. If it changed, restart from PR selection.
 
-### 4. Create Git Worktree for Isolated Review
-
-The scheduler fetches PR refs before this skill starts. Verify the local PR ref exists and create an isolated worktree under `/workspace/reviews/<reviewer-agent-id>/`:
-
-```bash
-cd /workspace/repo
-git rev-parse refs/remotes/origin/pr/<pr>
-mkdir -p /workspace/reviews/<reviewer-agent-id>
-WORKTREE=$(mktemp -d /workspace/reviews/<reviewer-agent-id>/review-pr-<pr>-XXXXXX)
-git worktree add --detach "$WORKTREE" origin/pr/<pr>
-```
-
-If a worktree for this PR already exists at a known path, verify it is clean and at the expected PR head before reusing:
-
-```bash
-git -C "$WORKTREE" status --short
-git -C "$WORKTREE" rev-parse HEAD
-git rev-parse refs/remotes/origin/pr/<pr>
-```
-
-If the existing worktree is stale and clean, update it with a detached checkout to the fetched PR head. If it has local changes, create a fresh worktree at a new path instead of overwriting.
-
-Work exclusively inside this worktree for code inspection and test execution. When the review is complete, clean up:
+Clean up at the end:
 
 ```bash
 git worktree remove "$WORKTREE"
 git -C /workspace/repo worktree prune
 ```
 
-### 5. Code and Design Review
+### 4. Inspect and Validate
 
-Inspect the PR thoroughly within the worktree:
+Use visible GitHub MCP tools to inspect PR metadata, changed files, diff, existing comments, review threads, and checks context. Save changed files JSON and run:
 
-**Obtain the diff and changed files** via visible GitHub MCP pull request read/file tools when available, following their current schemas exactly. Also inspect the PR body.
-
-**Architecture and design review:**
-- Does the change introduce new abstractions, modules, or layers? Assess whether they fit the existing project architecture and dependency graph.
-- Check for adherence to the repository's established patterns. Read 2-3 existing files in the repo that are similar to the changed code for comparison.
-- For Rust projects: assess module structure, trait usage, error handling patterns (`thiserror` vs `anyhow`), and whether the change respects ownership and borrowing conventions.
-- If the PR adds or modifies a public API, check for backwards compatibility and serde attribute correctness.
-- Verify that the change does not introduce circular dependencies between crates.
-
-**Code style conformance:**
-- Compare naming conventions (functions, types, variables, modules) against 2-3 similar existing files in the repository.
-- Check for idiomatic patterns: appropriate use of `Result`/`Option`, `use` statement grouping, derive macro usage.
-- Verify the change follows the same comment style, whitespace patterns, and organizational conventions as the surrounding code.
-
-**Security and correctness:**
-- Flag `unwrap()` and `expect()` in non-test, non-benchmark code paths.
-- Inspect any `unsafe` blocks for missing SAFETY comments and soundness justification.
-- Verify input validation and error handling for new or modified public APIs.
-- Check for potential deadlocks (lock ordering), race conditions, or resource leaks.
-- For code that allocates or manages resources, verify RAII compliance and proper cleanup.
-
-### 6. Local Test Execution
-
-If the PR description mentions testing, the changed files include test code, or CI checks show test runs, execute tests locally in the worktree:
-
-**For Rust workspace projects:**
-
-Identify changed crates from the changed files:
 ```bash
-cd "$WORKTREE"
-# Extract crate directories from changed file paths
-CHANGED_CRATES=$(echo "<changed files from PR>" | grep -oE '^crates/[^/]+' | sort -u)
+python3 scripts/review_pr_helper.py changed-files --repo "$WORKTREE" --files files.json > changed.json
+python3 scripts/review_pr_helper.py rust-plan --repo "$WORKTREE" --changed changed.json > rust-plan.json
 ```
 
-Run formatting check:
-```bash
-cargo fmt --check
+Run the commands in `rust-plan.json` when present. For Rust PRs, always run `cargo fmt --check` and clippy commands suggested by the helper; run tests for changed crates unless the repository clearly cannot support them in the current environment.
+
+Record exact validation failures. Treat these as blocking:
+
+- `cargo fmt --check` fails.
+- `cargo clippy ... -D warnings` fails.
+- `cargo test` fails.
+- Security, data-loss, resource leak, panic, race/deadlock, or behavior-regression findings.
+- Unsafe code without an adequate SAFETY justification.
+- Public API or architecture changes that contradict established project patterns.
+
+### 5. Review Standards
+
+Prioritize bugs, regressions, security risks, data-loss risks, missing tests, broken edge cases, and behavior mismatches. Do not request changes for style-only preferences.
+
+Compare changed code with 2-3 similar existing files in the worktree. For Rust, check module boundaries, trait usage, error handling style, serde compatibility, dependency direction, `unwrap()`/`expect()` in production paths, lock ordering, and RAII cleanup.
+
+Search similar PRs before submission:
+
+```text
+repo:OWNER/REPO type:pr <3-5 title keywords>
+repo:OWNER/REPO type:pr <changed/path.rs>
 ```
 
-Run clippy on changed crates:
-```bash
-for crate in $CHANGED_CRATES; do
-  if [ -f "$crate/Cargo.toml" ]; then
-    cargo clippy --manifest-path "$crate/Cargo.toml" --all-features -- -D warnings
-  fi
-done
-```
+Mention overlapping or duplicate PRs in the review body when relevant.
 
-Run tests on changed crates:
-```bash
-for crate in $CHANGED_CRATES; do
-  if [ -f "$crate/Cargo.toml" ]; then
-    cargo test --manifest-path "$crate/Cargo.toml" --all-features
-  fi
-done
-```
+### 6. Prepare Findings and Inline Comments
 
-**Failure classification:**
+Use `REQUEST_CHANGES` when any blocking finding exists, `APPROVE` when safe to merge, and `COMMENT` only for advisory-only reviews.
 
-| Failure | Severity |
-|---------|----------|
-| `cargo fmt --check` fails | Blocking — code is not formatted per project standard |
-| `cargo clippy` with `-D warnings` fails | Blocking — lint violations that the project treats as errors |
-| `cargo test` fails | Blocking — broken functionality |
-| Bug fix without a reproduction test | Concern — note in review but not necessarily blocking if fix is clearly correct |
+For each line-specific finding, submit an inline comment on the changed line with `side: "RIGHT"`. Each comment should state the problem, why it matters, and a concrete fix or alternative. Put non-line-specific findings in the review body.
 
-Record exact command output for each failure — include it in the inline comment or review body so the author can reproduce.
+Keep the review body concise. Include validation results, similar-PR notes, and any non-inline findings.
 
-If the project has no `Cargo.toml` (not a Rust project), skip Rust-specific checks. Adapt the validation to match the project's build system (e.g., `npm test`, `go test ./...`, `pytest`).
+### 7. Submit the GitHub Review
 
-### 7. Similar PR Check
+Submit through a visible GitHub MCP review-writing tool and follow its current schema exactly. Do not assume parameter names beyond the visible schema.
 
-Search for PRs that overlap with or may duplicate the current PR:
+If no visible MCP tool can submit a pull request review, return a `failed` JSON result. If submission fails because the account is the PR author or GitHub rejects the event, leave a normal PR comment only when a visible comment tool is available; otherwise report the failure.
 
-Use a visible GitHub MCP search tool to search issues and pull requests with keywords extracted from the PR title (3-5 significant words), restricted to the current repository:
+### 8. Final Response
 
-```
-repo:OWNER/REPO type:pr <key terms>
-```
+The final response is consumed by the Mai project review scheduler. Return only one JSON object, with no Markdown, prose, or code fence. You may use `final-json` to generate it.
 
-Also search for PRs touching the same files using a visible GitHub MCP search tool:
-```
-repo:OWNER/REPO type:pr <path:key/file.rs>
-```
-
-Review findings:
-- If there are open PRs touching the same files, note potential merge conflicts.
-- If there are merged PRs with very similar changes, check whether the current PR is a re-submission or duplicate.
-- If there is a clearly duplicate PR attempting the same change, flag it prominently.
-- Include similar PR references in the review body. This is informational, not blocking unless there is an actual conflict or duplication.
-
-### 8. Prepare Findings and Inline Comments
-
-For each finding, classify as blocking or non-blocking:
-
-**Blocking findings** (require `REQUEST_CHANGES`):
-- Test failures (local or CI)
-- `cargo fmt --check` failure
-- `cargo clippy` violations with `-D warnings`
-- Security vulnerabilities (unsafe patterns, missing validation)
-- Behavior that contradicts documented requirements or established project conventions
-- Missing error handling that could cause panics in production code
-- `unsafe` blocks without SAFETY comments or soundness justification
-- Architectural decisions that conflict with established project patterns
-- Resource leaks or incorrect RAII implementation
-
-**Non-blocking findings** (can accompany `APPROVE`):
-- Minor style variations that do not contradict project conventions
-- Suggestions for documentation improvements
-- Questions about design choices that appear reasonable
-- Minor optimization opportunities
-- Test coverage suggestions for existing but untested code
-
-For each finding that ties to a specific line, prepare an inline comment anchored to the changed line, using `side=RIGHT` to comment on the new code. Each comment should include:
-
-1. The concrete problem or observation
-2. Why it matters (correctness, convention, security, performance)
-3. A suggested fix or alternative
-
-If a finding cannot be attached to a specific diff line, include it in the review body instead.
-
-### 9. Submit the GitHub Review
-
-Before submission, confirm the PR head SHA has not changed. Fetch the current state through a visible GitHub MCP PR read tool and compare `head.sha` with the commit checked out in the worktree.
-
-Submit the review through a visible GitHub MCP review-writing tool when one is available. Follow that tool's current schema exactly; do not assume parameter names beyond the schema shown to you. Use:
-- `event`: `REQUEST_CHANGES` if any blocking finding exists, `APPROVE` if none, `COMMENT` only for purely advisory notes.
-- `body`: concise summary including decision, local validation results, similar PR notes, and any findings that could not be attached to specific lines.
-- `comments`: array of inline comments, each with `path`, `line` (use the right-side line number), `side: "RIGHT"`, and `body`.
-
-The Mai runtime automatically appends `Powered by {model}` to the review body for project review submissions. Do not add that footer yourself, and do not add model footers to inline comments.
-
-If no visible MCP tool can submit a pull request review, report that review submission is unavailable in the final response.
-
-Do not look for `GITHUB_TOKEN`, run ad hoc GitHub REST scripts, or write credential files inside the agent container.
-
-If submission fails because the head SHA changed, re-fetch the PR state and restart from the eligibility check.
-
-### 10. Final Response
-
-The final response is consumed by the Mai project review scheduler. Return **only** one JSON object, with no Markdown, prose, or code fence.
-
-If a review was submitted:
+Submitted:
 
 ```json
 {"outcome":"review_submitted","pr":123,"summary":"Submitted APPROVE for owner/repo#123 after cargo fmt --check and cargo test passed.","error":null}
 ```
 
-If no PR was eligible:
+No eligible PR:
 
 ```json
 {"outcome":"no_eligible_pr","pr":null,"summary":"No eligible pull request found.","error":null}
 ```
 
-If the review could not be completed:
+Failed:
 
 ```json
 {"outcome":"failed","pr":123,"summary":"Review could not be completed.","error":"GitHub MCP did not expose a review-writing tool."}
 ```
 
-## Key Constraints
+## Constraints
 
-- Review exactly one PR per invocation. Do not batch.
-- Always use an isolated git worktree under `/workspace/reviews/`; never review in `/workspace/repo`.
-- Run `cargo fmt --check` and `cargo clippy` for Rust PRs regardless of CI status — CI may run different targets.
-- Search for similar PRs before submitting the review.
-- Clean up the temporary worktree after review completion.
-- If GitHub MCP tools are not available, report the missing dependency and exit before making any changes.
+- Review exactly one PR per invocation.
+- Always use an isolated worktree under `/workspace/reviews/`.
+- Use helper scripts for fixed rules; use reviewer judgment for code review.
+- Use only visible GitHub MCP tools for GitHub reads/writes.
+- Clean up temporary worktrees before finishing.
