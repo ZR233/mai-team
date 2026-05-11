@@ -69,6 +69,8 @@ const PROJECT_REVIEW_SNAPSHOT_MESSAGE_LIMIT: usize = 40;
 const PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT: usize = 80;
 const PROJECT_REVIEW_REPO_COMMAND_MAX_ATTEMPTS: usize = 3;
 const PROJECT_REVIEW_REPO_COMMAND_RETRY_SECS: u64 = 5;
+const PROJECT_REVIEW_GIT_LOW_SPEED_LIMIT: u64 = 1;
+const PROJECT_REVIEW_GIT_LOW_SPEED_TIME_SECS: u64 = 30;
 const DEFAULT_WAIT_AGENT_OBSERVATION_SECS: u64 = 30;
 const PROJECT_GITHUB_MCP_SERVER: &str = "github";
 const PROJECT_GIT_MCP_SERVER: &str = "git";
@@ -7193,10 +7195,11 @@ fn review_repo_ensure_command(repo_url: &str, expected_remote: &str, branch: &st
          fi\n\
          if [ ! -d /workspace/repo/.git ]; then\n\
            rm -rf /workspace/repo\n\
-           git -c credential.helper= clone{branch_arg} -- {repo_url} /workspace/repo\n\
+           {git_network} clone{branch_arg} -- {repo_url} /workspace/repo\n\
          fi",
         prelude = review_repo_auth_prelude(),
         expected_remote = shell_quote(expected_remote),
+        git_network = review_repo_git_network_command_prefix(),
         repo_url = shell_quote(repo_url),
     )
 }
@@ -7208,16 +7211,24 @@ fn review_repo_sync_command(repo_url: &str, expected_remote: &str, branch: &str)
          {ensure}\n\
          cd /workspace/repo\n\
          git -c credential.helper= remote set-url origin {repo_url}\n\
-         git -c credential.helper= fetch --prune origin\n\
-         git -c credential.helper= fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'\n\
+         {git_network} fetch --prune origin\n\
+         {git_network} fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'\n\
          git checkout {branch}\n\
          git reset --hard {origin_branch}\n\
          git worktree prune\n\
          mkdir -p /workspace/reviews",
         ensure = review_repo_ensure_command(repo_url, expected_remote, branch),
+        git_network = review_repo_git_network_command_prefix(),
         repo_url = shell_quote(repo_url),
         branch = shell_quote(branch),
         origin_branch = shell_quote(&origin_branch),
+    )
+}
+
+fn review_repo_git_network_command_prefix() -> String {
+    format!(
+        "git -c credential.helper= -c http.lowSpeedLimit={} -c http.lowSpeedTime={}",
+        PROJECT_REVIEW_GIT_LOW_SPEED_LIMIT, PROJECT_REVIEW_GIT_LOW_SPEED_TIME_SECS
     )
 }
 
@@ -9084,6 +9095,7 @@ esac
             "main",
         );
         assert!(command.contains("'+refs/pull/*/head:refs/remotes/origin/pr/*'"));
+        assert!(command.contains("-c http.lowSpeedLimit=1 -c http.lowSpeedTime=30"));
         assert!(command.contains("git reset --hard origin/main"));
         assert!(command.contains("MAI_GITHUB_REVIEW_TOKEN"));
         assert!(!command.contains("ghp_"));
