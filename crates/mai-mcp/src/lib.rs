@@ -75,6 +75,8 @@ pub struct McpAgentManager {
     sessions: RwLock<BTreeMap<String, Arc<McpSession>>>,
     tools: RwLock<BTreeMap<String, McpTool>>,
     statuses: RwLock<BTreeMap<String, McpServerStatus>>,
+    #[cfg(debug_assertions)]
+    test_resources: RwLock<BTreeMap<String, Vec<Value>>>,
 }
 
 impl McpAgentManager {
@@ -89,6 +91,24 @@ impl McpAgentManager {
                     .collect(),
             ),
             statuses: RwLock::new(BTreeMap::new()),
+            #[cfg(debug_assertions)]
+            test_resources: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn from_resources_for_test(resources: Vec<(&str, Vec<Value>)>) -> Self {
+        Self {
+            sessions: RwLock::new(BTreeMap::new()),
+            tools: RwLock::new(BTreeMap::new()),
+            statuses: RwLock::new(BTreeMap::new()),
+            test_resources: RwLock::new(
+                resources
+                    .into_iter()
+                    .map(|(server, resources)| (server.to_string(), resources))
+                    .collect(),
+            ),
         }
     }
 
@@ -101,6 +121,8 @@ impl McpAgentManager {
             sessions: RwLock::new(BTreeMap::new()),
             tools: RwLock::new(BTreeMap::new()),
             statuses: RwLock::new(BTreeMap::new()),
+            #[cfg(debug_assertions)]
+            test_resources: RwLock::new(BTreeMap::new()),
         };
 
         let enabled_configs = configs
@@ -176,6 +198,8 @@ impl McpAgentManager {
             sessions: RwLock::new(BTreeMap::new()),
             tools: RwLock::new(BTreeMap::new()),
             statuses: RwLock::new(BTreeMap::new()),
+            #[cfg(debug_assertions)]
+            test_resources: RwLock::new(BTreeMap::new()),
         };
 
         let enabled_configs = configs
@@ -272,6 +296,25 @@ impl McpAgentManager {
         self.tools.read().await.values().cloned().collect()
     }
 
+    pub async fn resource_servers(&self) -> Vec<String> {
+        let mut servers = self
+            .sessions
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        #[cfg(debug_assertions)]
+        {
+            for server in self.test_resources.read().await.keys() {
+                if !servers.iter().any(|existing| existing == server) {
+                    servers.push(server.clone());
+                }
+            }
+        }
+        servers
+    }
+
     pub async fn call_model_tool(&self, model_name: &str, arguments: Value) -> Result<Value> {
         let tool = self
             .tools
@@ -292,6 +335,10 @@ impl McpAgentManager {
         server: Option<&str>,
         cursor: Option<String>,
     ) -> Result<Value> {
+        #[cfg(debug_assertions)]
+        if let Some(value) = self.test_list_resources(server).await {
+            return Ok(value);
+        }
         if let Some(server) = server {
             let result = self.session(server).await?.list_resources(cursor).await?;
             return Ok(list_resources_value(Some(server), result));
@@ -330,9 +377,54 @@ impl McpAgentManager {
     }
 
     pub async fn read_resource(&self, server: &str, uri: &str) -> Result<Value> {
+        #[cfg(debug_assertions)]
+        if let Some(value) = self.test_read_resource(server, uri).await {
+            return Ok(value);
+        }
         Ok(serde_json::to_value(
             self.session(server).await?.read_resource(uri).await?,
         )?)
+    }
+
+    #[cfg(debug_assertions)]
+    async fn test_list_resources(&self, server: Option<&str>) -> Option<Value> {
+        let resources = self.test_resources.read().await;
+        if resources.is_empty() {
+            return None;
+        }
+        if let Some(server) = server {
+            return resources.get(server).map(|items| {
+                json!({
+                    "server": server,
+                    "resources": items,
+                    "nextCursor": null,
+                })
+            });
+        }
+        let all = resources
+            .iter()
+            .flat_map(|(server, items)| items.iter().map(|item| with_server(server, item.clone())))
+            .collect::<Vec<_>>();
+        Some(json!({ "resources": all }))
+    }
+
+    #[cfg(debug_assertions)]
+    async fn test_read_resource(&self, server: &str, uri: &str) -> Option<Value> {
+        let resources = self.test_resources.read().await;
+        let item = resources
+            .get(server)?
+            .iter()
+            .find(|item| item.get("uri").and_then(Value::as_str) == Some(uri))?;
+        Some(json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": item
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("application/json"),
+                "text": item.to_string(),
+            }]
+        }))
     }
 
     async fn session(&self, server: &str) -> Result<Arc<McpSession>> {

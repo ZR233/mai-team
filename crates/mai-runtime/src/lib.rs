@@ -32,6 +32,7 @@ use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -74,6 +75,9 @@ const PROJECT_REVIEW_GIT_LOW_SPEED_TIME_SECS: u64 = 30;
 const DEFAULT_WAIT_AGENT_OBSERVATION_SECS: u64 = 30;
 const PROJECT_GITHUB_MCP_SERVER: &str = "github";
 const PROJECT_GIT_MCP_SERVER: &str = "git";
+const SKILL_RESOURCE_SERVER: &str = "skill";
+const PROJECT_SKILL_RESOURCE_SERVER: &str = "project-skill";
+const SKILL_RESOURCE_SCHEME: &str = "skill:///";
 const PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL: &str =
     "mcp__github__pull_request_review_write";
 const PROJECT_GITHUB_CREATE_PULL_REQUEST_REVIEW_TOOL: &str =
@@ -336,6 +340,12 @@ struct ProjectSkillSourceDir {
     relative: PathBuf,
     cache_name: String,
     container_path: String,
+}
+
+struct AgentResourceBroker {
+    agent_mcp: Option<Arc<McpAgentManager>>,
+    project_mcp: Option<Arc<McpAgentManager>>,
+    skills: SkillsListResponse,
 }
 
 struct TurnResult {
@@ -3308,10 +3318,10 @@ impl AgentRuntime {
                 })
             }
             RoutedTool::ListMcpResources => {
-                let manager = self
-                    .mcp_manager_for_tool(agent, agent_id, &cancellation_token)
+                let broker = self
+                    .agent_resource_broker(agent, agent_id, &cancellation_token)
                     .await?;
-                let output = manager
+                let output = broker
                     .list_resources(
                         optional_string(&arguments, "server").as_deref(),
                         optional_string(&arguments, "cursor"),
@@ -3324,10 +3334,10 @@ impl AgentRuntime {
                 })
             }
             RoutedTool::ListMcpResourceTemplates => {
-                let manager = self
-                    .mcp_manager_for_tool(agent, agent_id, &cancellation_token)
+                let broker = self
+                    .agent_resource_broker(agent, agent_id, &cancellation_token)
                     .await?;
-                let output = manager
+                let output = broker
                     .list_resource_templates(
                         optional_string(&arguments, "server").as_deref(),
                         optional_string(&arguments, "cursor"),
@@ -3340,12 +3350,12 @@ impl AgentRuntime {
                 })
             }
             RoutedTool::ReadMcpResource => {
-                let manager = self
-                    .mcp_manager_for_tool(agent, agent_id, &cancellation_token)
+                let broker = self
+                    .agent_resource_broker(agent, agent_id, &cancellation_token)
                     .await?;
                 let server = required_string(&arguments, "server")?;
                 let uri = required_string(&arguments, "uri")?;
-                let output = manager.read_resource(&server, &uri).await?;
+                let output = broker.read_resource(&server, &uri).await?;
                 Ok(ToolExecution {
                     success: true,
                     output: output.to_string(),
@@ -6224,26 +6234,30 @@ impl AgentRuntime {
         })
     }
 
-    async fn mcp_manager_for_tool(
+    async fn agent_resource_broker(
         &self,
         agent: &AgentRecord,
         agent_id: AgentId,
         cancellation_token: &CancellationToken,
-    ) -> Result<Arc<McpAgentManager>> {
-        if agent.summary.read().await.project_id.is_some() {
-            return self
-                .project_mcp_manager_for_agent(agent, agent_id, cancellation_token)
-                .await?
-                .ok_or_else(|| {
-                    RuntimeError::InvalidInput("project MCP manager is not available".to_string())
-                });
-        }
-        agent
-            .mcp
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| RuntimeError::InvalidInput("MCP manager not initialized".to_string()))
+    ) -> Result<AgentResourceBroker> {
+        let agent_mcp = agent.mcp.read().await.clone();
+        let project_mcp = if agent.summary.read().await.project_id.is_some() {
+            self.project_mcp_manager_for_agent(agent, agent_id, cancellation_token)
+                .await
+                .unwrap_or(None)
+        } else {
+            None
+        };
+        let skills_config = self.store.load_skills_config().await?;
+        let skills = self
+            .skills_manager_for_agent(agent)
+            .await?
+            .list(&skills_config)?;
+        Ok(AgentResourceBroker {
+            agent_mcp,
+            project_mcp,
+            skills,
+        })
     }
 
     async fn execute_project_github_api_get(
@@ -8041,6 +8055,207 @@ fn skill_user_fragment(skill_injections: &SkillInjections) -> Option<ModelInputI
     Some(ModelInputItem::user_text(text))
 }
 
+impl AgentResourceBroker {
+    async fn list_resources(&self, server: Option<&str>, cursor: Option<String>) -> Result<Value> {
+        if cursor.is_some() && is_skill_resource_server(server) {
+            return Ok(json!({
+                "server": server,
+                "resources": [],
+                "nextCursor": null,
+            }));
+        }
+        if is_skill_resource_server(server) {
+            return Ok(skill_resources_value(server, &self.skills.skills));
+        }
+        if let Some(server) = server {
+            let normalized = normalize_mcp_resource_server(server);
+            if let Some(manager) = self.manager_for_server(&normalized).await {
+                return Ok(manager.list_resources(Some(&normalized), cursor).await?);
+            }
+            return Err(resource_provider_not_found(server));
+        }
+
+        let mut resources = Vec::new();
+        resources.extend(skill_resource_values(&self.skills.skills));
+        for manager in self.mcp_managers() {
+            let value = manager.list_resources(None, None).await?;
+            if let Some(items) = value.get("resources").and_then(Value::as_array) {
+                resources.extend(items.iter().cloned());
+            }
+        }
+        Ok(json!({ "resources": resources }))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        server: Option<&str>,
+        cursor: Option<String>,
+    ) -> Result<Value> {
+        if is_skill_resource_server(server) {
+            return Ok(json!({
+                "server": server,
+                "resourceTemplates": [],
+                "nextCursor": null,
+            }));
+        }
+        if let Some(server) = server {
+            let normalized = normalize_mcp_resource_server(server);
+            if let Some(manager) = self.manager_for_server(&normalized).await {
+                return Ok(manager
+                    .list_resource_templates(Some(&normalized), cursor)
+                    .await?);
+            }
+            return Err(resource_provider_not_found(server));
+        }
+
+        let mut templates = Vec::new();
+        for manager in self.mcp_managers() {
+            let value = manager.list_resource_templates(None, None).await?;
+            if let Some(items) = value.get("resourceTemplates").and_then(Value::as_array) {
+                templates.extend(items.iter().cloned());
+            }
+        }
+        Ok(json!({ "resourceTemplates": templates }))
+    }
+
+    async fn read_resource(&self, server: &str, uri: &str) -> Result<Value> {
+        if is_skill_resource_server(Some(server)) || uri.starts_with(SKILL_RESOURCE_SCHEME) {
+            return self.read_skill_resource(uri);
+        }
+        let normalized = normalize_mcp_resource_server(server);
+        if let Some(manager) = self.manager_for_server(&normalized).await {
+            return Ok(manager.read_resource(&normalized, uri).await?);
+        }
+        Err(resource_provider_not_found(server))
+    }
+
+    fn read_skill_resource(&self, uri: &str) -> Result<Value> {
+        let Some(name) = uri.strip_prefix(SKILL_RESOURCE_SCHEME) else {
+            return Err(RuntimeError::InvalidInput(format!(
+                "invalid skill resource uri `{uri}`; expected skill:///<skill-name>"
+            )));
+        };
+        let name = name.trim_matches('/');
+        if name.is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "skill resource uri must include a skill name".to_string(),
+            ));
+        }
+        let matches = self
+            .skills
+            .skills
+            .iter()
+            .filter(|skill| skill.enabled && skill.name == name)
+            .collect::<Vec<_>>();
+        let skill = match matches.as_slice() {
+            [skill] => *skill,
+            [] => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "skill resource not found: {uri}"
+                )));
+            }
+            _ => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "ambiguous skill resource `{name}`; select a specific skill path"
+                )));
+            }
+        };
+        let contents = fs::read_to_string(&skill.path)?;
+        Ok(json!({
+            "contents": [{
+                "uri": skill_uri(&skill.name),
+                "mimeType": "text/markdown",
+                "text": contents,
+            }]
+        }))
+    }
+
+    async fn manager_for_server(&self, server: &str) -> Option<Arc<McpAgentManager>> {
+        for manager in self.mcp_managers() {
+            if manager
+                .resource_servers()
+                .await
+                .iter()
+                .any(|resource_server| resource_server == server)
+            {
+                return Some(manager);
+            }
+        }
+        None
+    }
+
+    fn mcp_managers(&self) -> Vec<Arc<McpAgentManager>> {
+        let mut managers = Vec::new();
+        if let Some(manager) = &self.agent_mcp {
+            managers.push(Arc::clone(manager));
+        }
+        if let Some(manager) = &self.project_mcp
+            && !managers
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, manager))
+        {
+            managers.push(Arc::clone(manager));
+        }
+        managers
+    }
+}
+
+fn skill_resources_value(server: Option<&str>, skills: &[mai_protocol::SkillMetadata]) -> Value {
+    json!({
+        "server": server,
+        "resources": skill_resource_values(skills),
+        "nextCursor": null,
+    })
+}
+
+fn skill_resource_values(skills: &[mai_protocol::SkillMetadata]) -> Vec<Value> {
+    skills
+        .iter()
+        .filter(|skill| skill.enabled)
+        .map(|skill| {
+            json!({
+                "server": skill_resource_server_for_scope(skill.scope),
+                "uri": skill_uri(&skill.name),
+                "name": skill.name,
+                "description": skill.description,
+                "mimeType": "text/markdown",
+            })
+        })
+        .collect()
+}
+
+fn skill_resource_server_for_scope(scope: SkillScope) -> &'static str {
+    if scope == SkillScope::Project {
+        PROJECT_SKILL_RESOURCE_SERVER
+    } else {
+        SKILL_RESOURCE_SERVER
+    }
+}
+
+fn skill_uri(name: &str) -> String {
+    format!("{SKILL_RESOURCE_SCHEME}{name}")
+}
+
+fn is_skill_resource_server(server: Option<&str>) -> bool {
+    server.is_some_and(|server| {
+        server == SKILL_RESOURCE_SERVER
+            || server == PROJECT_SKILL_RESOURCE_SERVER
+            || server == format!("mcp:{SKILL_RESOURCE_SERVER}")
+            || server == format!("mcp:{PROJECT_SKILL_RESOURCE_SERVER}")
+    })
+}
+
+fn normalize_mcp_resource_server(server: &str) -> Cow<'_, str> {
+    server
+        .strip_prefix("mcp:")
+        .map(Cow::Borrowed)
+        .unwrap_or_else(|| Cow::Borrowed(server))
+}
+
+fn resource_provider_not_found(server: &str) -> RuntimeError {
+    RuntimeError::InvalidInput(format!("resource provider not found: {server}"))
+}
+
 impl ProjectSkillSourceDir {
     fn from_line(line: &str) -> Option<Self> {
         let mut parts = line.splitn(3, '\t');
@@ -8822,6 +9037,27 @@ mod tests {
     async fn save_agent_with_session(store: &ConfigStore, summary: &AgentSummary) {
         store.save_agent(summary, None).await.expect("save agent");
         save_test_session(store, summary.id, Uuid::new_v4()).await;
+    }
+
+    fn write_project_skill(
+        runtime: &AgentRuntime,
+        project_id: ProjectId,
+        name: &str,
+        description: &str,
+        body: &str,
+    ) -> PathBuf {
+        let skill_dir = runtime
+            .project_skill_cache_dir(project_id)
+            .join("claude")
+            .join(name);
+        fs::create_dir_all(&skill_dir).expect("mkdir skill");
+        let path = skill_dir.join("SKILL.md");
+        fs::write(
+            &path,
+            format!("---\nname: {name}\ndescription: {description}\n---\n{body}"),
+        )
+        .expect("write skill");
+        path
     }
 
     async fn test_runtime(dir: &tempfile::TempDir, store: Arc<ConfigStore>) -> Arc<AgentRuntime> {
@@ -11780,11 +12016,8 @@ esac
         let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
         maintainer.project_id = Some(project_id);
         maintainer.role = Some(AgentRole::Planner);
-        let mut reviewer = test_agent_summary_with_parent(
-            reviewer_id,
-            Some(maintainer_id),
-            Some("reviewer-container"),
-        );
+        let mut reviewer =
+            test_agent_summary_with_parent(reviewer_id, None, Some("reviewer-container"));
         reviewer.project_id = Some(project_id);
         reviewer.role = Some(AgentRole::Reviewer);
         save_agent_with_session(&store, &maintainer).await;
@@ -12406,6 +12639,228 @@ esac
         assert!(visible.contains("mcp__git__git_diff_unstaged"));
         assert!(!visible.contains("mcp__github__create_pull_request_review"));
         assert!(!visible.contains("mcp__git__git_status"));
+    }
+
+    #[tokio::test]
+    async fn project_reviewer_reads_project_skill_resource_without_mcp_session() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        maintainer.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &maintainer).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                maintainer_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        write_project_skill(
+            &runtime,
+            project_id,
+            "review-open-prs",
+            "Review open PRs.",
+            "Use the review workflow.",
+        );
+        let reviewer = runtime
+            .spawn_project_reviewer_agent(project_id)
+            .await
+            .expect("spawn reviewer");
+
+        let result = runtime
+            .execute_tool_for_test(
+                reviewer.id,
+                "read_mcp_resource",
+                json!({
+                    "server": "project-skill",
+                    "uri": "skill:///review-open-prs"
+                }),
+            )
+            .await
+            .expect("read skill resource");
+
+        assert!(result.success);
+        let output: Value = serde_json::from_str(&result.output).expect("json output");
+        let text = output["contents"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("name: review-open-prs"));
+        assert!(text.contains("Use the review workflow."));
+    }
+
+    #[tokio::test]
+    async fn project_subagent_inherits_project_skill_resources() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        save_agent_with_session(&store, &maintainer).await;
+        let mut child =
+            test_agent_summary_with_parent(child_id, Some(maintainer_id), Some("child-container"));
+        child.project_id = Some(project_id);
+        child.role = Some(AgentRole::Explorer);
+        save_agent_with_session(&store, &child).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                maintainer_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        write_project_skill(
+            &runtime,
+            project_id,
+            "review-open-prs",
+            "Review open PRs.",
+            "Inherited by child agents.",
+        );
+
+        let result = runtime
+            .execute_tool_for_test(
+                child_id,
+                "read_mcp_resource",
+                json!({
+                    "server": "project-skill",
+                    "uri": "skill:///review-open-prs"
+                }),
+            )
+            .await
+            .expect("child reads skill");
+
+        let output: Value = serde_json::from_str(&result.output).expect("json output");
+        assert!(
+            output["contents"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Inherited by child agents.")
+        );
+    }
+
+    #[tokio::test]
+    async fn project_agent_lists_project_mcp_and_skill_resources() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        save_agent_with_session(&store, &maintainer).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                maintainer_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        write_project_skill(
+            &runtime,
+            project_id,
+            "review-open-prs",
+            "Review open PRs.",
+            "Use the review workflow.",
+        );
+        runtime.project_mcp_managers.write().await.insert(
+            project_id,
+            Arc::new(McpAgentManager::from_resources_for_test(vec![(
+                "github",
+                vec![json!({
+                    "uri": "github://pulls",
+                    "name": "pulls",
+                    "mimeType": "application/json"
+                })],
+            )])),
+        );
+
+        let result = runtime
+            .execute_tool_for_test(maintainer_id, "list_mcp_resources", json!({}))
+            .await
+            .expect("list resources");
+
+        let output: Value = serde_json::from_str(&result.output).expect("json output");
+        let uris = output["resources"]
+            .as_array()
+            .expect("resources")
+            .iter()
+            .filter_map(|item| item.get("uri").and_then(Value::as_str))
+            .collect::<HashSet<_>>();
+        assert!(uris.contains("skill:///review-open-prs"));
+        assert!(uris.contains("github://pulls"));
+    }
+
+    #[tokio::test]
+    async fn unknown_resource_provider_returns_clear_error() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let agent_id = Uuid::new_v4();
+        save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container"))).await;
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        let err = runtime
+            .execute_tool_for_test(
+                agent_id,
+                "read_mcp_resource",
+                json!({
+                    "server": "missing-provider",
+                    "uri": "missing://resource"
+                }),
+            )
+            .await
+            .expect_err("missing provider");
+
+        let message = err.to_string();
+        assert!(message.contains("resource provider not found: missing-provider"));
+        assert!(!message.contains("session not found"));
+    }
+
+    #[tokio::test]
+    async fn task_agent_reads_agent_mcp_resources() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let agent_id = Uuid::new_v4();
+        save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container"))).await;
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let agent = runtime.agent(agent_id).await.expect("agent");
+        *agent.mcp.write().await =
+            Some(Arc::new(McpAgentManager::from_resources_for_test(vec![(
+                "agent-docs",
+                vec![json!({
+                    "uri": "agent://docs",
+                    "name": "docs",
+                    "mimeType": "text/plain"
+                })],
+            )])));
+
+        let result = runtime
+            .execute_tool_for_test(
+                agent_id,
+                "read_mcp_resource",
+                json!({
+                    "server": "agent-docs",
+                    "uri": "agent://docs"
+                }),
+            )
+            .await
+            .expect("read agent resource");
+
+        let output: Value = serde_json::from_str(&result.output).expect("json output");
+        assert_eq!(output["contents"][0]["uri"], "agent://docs");
     }
 
     #[test]
