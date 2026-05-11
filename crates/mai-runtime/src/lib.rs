@@ -5,7 +5,7 @@ use futures::future::{AbortHandle, Abortable};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient};
 use mai_mcp::{McpAgentManager, McpTool};
-use mai_model::{ModelRequest, ResponsesClient};
+use mai_model::{ModelRequest, ModelTurnState, ResponsesClient};
 use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentMessage,
     AgentModelPreference, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary, ArtifactInfo,
@@ -43,10 +43,6 @@ use tokio::time::{Duration, Instant, sleep};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-/// Safety limit to prevent truly infinite tool-call loops.
-/// Normal workflows (e.g. reviewer-agent) may need 30-40+ iterations;
-/// this cap is intentionally high and should never be reached in practice.
-const MAX_TOOL_ITERATIONS: usize = 128;
 const RECENT_EVENT_LIMIT: usize = 500;
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
 const REVIEW_ROUND_LIMIT: u64 = 5;
@@ -65,7 +61,7 @@ const GITHUB_MANIFEST_STATE_TTL_SECS: u64 = 900;
 const GITHUB_HTTP_TIMEOUT_SECS: u64 = 10;
 const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;
 const PROJECT_REVIEW_FAILURE_RETRY_SECS: u64 = 600;
-const PROJECT_REVIEW_TURN_TIMEOUT_SECS: u64 = 3600;
+const DEFAULT_WAIT_AGENT_OBSERVATION_SECS: u64 = 30;
 const PROJECT_GITHUB_MCP_SERVER: &str = "github";
 const PROJECT_GIT_MCP_SERVER: &str = "git";
 const DEFAULT_SIDECAR_IMAGE: &str = "ghcr.io/zr233/mai-team-sidecar:latest";
@@ -2629,13 +2625,9 @@ impl AgentRuntime {
         self.inject_project_mcp_tools(&agent, agent_id, session_id, &cancellation_token)
             .await?;
         let mut last_assistant_text: Option<String> = None;
-        let mut iteration: usize = 0;
+        let mut turn_model_state = ModelTurnState::default();
+        let mut empty_progress_count: usize = 0;
         loop {
-            if iteration >= MAX_TOOL_ITERATIONS {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "tool iteration limit reached ({MAX_TOOL_ITERATIONS})"
-                )));
-            }
             if cancellation_token.is_cancelled() {
                 return Err(RuntimeError::TurnCancelled);
             }
@@ -2678,12 +2670,14 @@ impl AgentRuntime {
                 tracing::warn!("auto context compaction failed before model request: {err}");
             }
             let mut history = self.session_history(&agent, agent_id, session_id).await?;
-            if let Some(skill_fragment) = skill_user_fragment(&skill_injections) {
+            if turn_model_state.previous_response_id.is_none()
+                && let Some(skill_fragment) = skill_user_fragment(&skill_injections)
+            {
                 history.push(skill_fragment);
             }
             let response = self
                 .model
-                .create_response_with_cancel(
+                .create_turn_response_with_cancel(
                     &ModelRequest {
                         provider: &provider_selection.provider,
                         model: &provider_selection.model,
@@ -2692,6 +2686,7 @@ impl AgentRuntime {
                         tools: &tools,
                         reasoning_effort,
                     },
+                    &mut turn_model_state,
                     &cancellation_token,
                 )
                 .await
@@ -2720,10 +2715,12 @@ impl AgentRuntime {
             }
 
             let mut tool_calls = Vec::new();
+            let mut made_progress = false;
             for item in response.output {
                 match item {
                     ModelOutputItem::Message { text } => {
                         if !text.trim().is_empty() {
+                            made_progress = true;
                             last_assistant_text = Some(text.clone());
                             self.record_message(
                                 &agent,
@@ -2756,6 +2753,7 @@ impl AgentRuntime {
                         arguments,
                         raw_arguments,
                     } => {
+                        made_progress = true;
                         let call_id = if call_id.is_empty() {
                             format!("call_{}", Uuid::new_v4())
                         } else {
@@ -2804,6 +2802,7 @@ impl AgentRuntime {
                             .as_ref()
                             .is_some_and(|reasoning| !reasoning.trim().is_empty());
                         if has_content || has_reasoning || !assistant_tool_calls.is_empty() {
+                            made_progress = true;
                             self.record_history_item(
                                 &agent,
                                 agent_id,
@@ -2846,6 +2845,26 @@ impl AgentRuntime {
                     ModelOutputItem::Other { .. } => {}
                 }
             }
+            let acknowledged_history_len = self
+                .raw_session_history_len(&agent, agent_id, session_id)
+                .await?;
+            turn_model_state.acknowledge_history_len(acknowledged_history_len);
+
+            if !made_progress {
+                empty_progress_count = empty_progress_count.saturating_add(1);
+                let diagnostic = format!(
+                    "Runtime diagnostic: the previous model response produced no assistant text and no tool calls (empty_progress_count={empty_progress_count}). Decide whether to continue, ask the user for clarification, retry with a different approach, or explain the issue."
+                );
+                self.record_history_item(
+                    &agent,
+                    agent_id,
+                    session_id,
+                    ModelInputItem::user_text(diagnostic),
+                )
+                .await?;
+                continue;
+            }
+            empty_progress_count = 0;
 
             if tool_calls.is_empty() {
                 self.finish_turn(
@@ -2903,6 +2922,7 @@ impl AgentRuntime {
                 let duration_ms = u128_to_u64(started_at.elapsed().as_millis());
                 let execution = match output {
                     Ok(execution) => execution,
+                    Err(RuntimeError::TurnCancelled) => return Err(RuntimeError::TurnCancelled),
                     Err(err) => ToolExecution {
                         success: false,
                         output: err.to_string(),
@@ -2954,8 +2974,6 @@ impl AgentRuntime {
                 .await?;
                 return Ok(());
             }
-
-            iteration += 1;
         }
     }
 
@@ -3159,9 +3177,8 @@ impl AgentRuntime {
                 let timeout = wait_timeout(&arguments);
                 if legacy_single_target && targets.len() == 1 {
                     let output = self
-                        .wait_agent_output_with_cancel(targets[0], timeout, &cancellation_token)
+                        .wait_agents_output_with_cancel(targets, timeout, &cancellation_token)
                         .await?;
-                    self.cleanup_finished_explorer_agent(targets[0]).await?;
                     return Ok(ToolExecution {
                         success: true,
                         output: serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string()),
@@ -3751,38 +3768,104 @@ impl AgentRuntime {
         }
     }
 
-    async fn wait_agent_output_with_cancel(
+    async fn wait_agent_until_complete_with_cancel(
         &self,
         agent_id: AgentId,
-        timeout: Duration,
         cancellation_token: &CancellationToken,
-    ) -> Result<Value> {
-        let agent = self
-            .wait_agent_with_cancel(agent_id, timeout, cancellation_token)
-            .await?;
+    ) -> Result<AgentSummary> {
+        loop {
+            if cancellation_token.is_cancelled() {
+                return Err(RuntimeError::TurnCancelled);
+            }
+            let agent = self.agent(agent_id).await?;
+            let summary = agent.summary.read().await.clone();
+            if Self::is_agent_wait_complete(&summary) {
+                return Ok(summary);
+            }
+            tokio::select! {
+                _ = sleep(Duration::from_millis(250)) => {},
+                _ = cancellation_token.cancelled() => return Err(RuntimeError::TurnCancelled),
+            }
+        }
+    }
+
+    fn is_agent_wait_complete(summary: &AgentSummary) -> bool {
+        summary.current_turn.is_none()
+            || matches!(
+                summary.status,
+                AgentStatus::Completed
+                    | AgentStatus::Failed
+                    | AgentStatus::Cancelled
+                    | AgentStatus::Deleted
+                    | AgentStatus::Idle
+            )
+    }
+
+    async fn agent_wait_snapshot(&self, agent_id: AgentId) -> Result<Value> {
+        let agent = self.agent(agent_id).await?;
+        let summary = agent.summary.read().await.clone();
         let (session_id, recent_messages) = self.agent_recent_messages(agent_id, 12).await?;
+        let last_message = recent_messages.last().cloned();
         let tracked_response = {
-            let agent_rec = self.agent(agent_id).await?;
-            let sessions = agent_rec.sessions.lock().await;
+            let sessions = agent.sessions.lock().await;
             sessions
                 .iter()
                 .filter_map(|s| s.last_turn_response.as_ref())
                 .next_back()
                 .cloned()
         };
-        let final_response = tracked_response.or_else(|| {
-            recent_messages
-                .iter()
-                .rev()
-                .find(|message| message.role == MessageRole::Assistant)
-                .map(|message| message.content.clone())
+        let final_response = if Self::is_agent_wait_complete(&summary) {
+            tracked_response.or_else(|| {
+                recent_messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == MessageRole::Assistant)
+                    .map(|message| message.content.clone())
+            })
+        } else {
+            None
+        };
+        let recent_events = self.agent_recent_events(agent_id, 12).await;
+        let last_activity_at = last_activity_at(&summary, &recent_messages, &recent_events);
+        let active_tool = active_tool_snapshot(&recent_events);
+        let idle_ms = (now() - last_activity_at).num_milliseconds().max(0) as u64;
+        let diagnostics = json!({
+            "current_turn": summary.current_turn,
+            "active_tool": active_tool.clone(),
+            "last_error": summary.last_error.clone(),
+            "idle_ms": idle_ms,
+            "recent_events": recent_events.clone(),
         });
         Ok(json!({
-            "agent": agent,
+            "agent": summary.clone(),
+            "agent_id": agent_id,
+            "name": summary.name.clone(),
+            "role": summary.role.clone(),
+            "status": summary.status.clone(),
+            "current_turn": summary.current_turn,
+            "updated_at": summary.updated_at,
+            "last_activity_at": last_activity_at,
+            "last_message": last_message,
             "session_id": session_id,
             "final_response": final_response,
             "recent_messages": recent_messages,
+            "recent_events": recent_events,
+            "active_tool": active_tool,
+            "diagnostics": diagnostics,
         }))
+    }
+
+    async fn agent_recent_events(&self, agent_id: AgentId, limit: usize) -> Vec<ServiceEvent> {
+        let events = self.recent_events.lock().await;
+        let mut selected = events
+            .iter()
+            .rev()
+            .filter(|event| event_agent_id(event) == Some(agent_id))
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        selected.reverse();
+        selected
     }
 
     async fn wait_agents_output_with_cancel(
@@ -3800,16 +3883,7 @@ impl AgentRuntime {
             let mut pending = Vec::new();
             for agent_id in &agent_ids {
                 let summary = self.agent(*agent_id).await?.summary.read().await.clone();
-                if summary.current_turn.is_none()
-                    || matches!(
-                        summary.status,
-                        AgentStatus::Completed
-                            | AgentStatus::Failed
-                            | AgentStatus::Cancelled
-                            | AgentStatus::Deleted
-                            | AgentStatus::Idle
-                    )
-                {
+                if Self::is_agent_wait_complete(&summary) {
                     completed.push(*agent_id);
                 } else {
                     pending.push(*agent_id);
@@ -3818,20 +3892,17 @@ impl AgentRuntime {
             if !completed.is_empty() || pending.is_empty() || Instant::now() >= deadline {
                 let mut completed_outputs = Vec::new();
                 for agent_id in completed {
-                    completed_outputs.push(
-                        self.wait_agent_output_with_cancel(
-                            agent_id,
-                            Duration::from_secs(0),
-                            cancellation_token,
-                        )
-                        .await?,
-                    );
+                    completed_outputs.push(self.agent_wait_snapshot(agent_id).await?);
                     self.cleanup_finished_explorer_agent(agent_id).await?;
+                }
+                let mut pending_outputs = Vec::new();
+                for agent_id in pending {
+                    pending_outputs.push(self.agent_wait_snapshot(agent_id).await?);
                 }
                 return Ok(json!({
                     "completed": completed_outputs,
-                    "pending": pending,
-                    "timed_out": !pending.is_empty(),
+                    "pending": pending_outputs,
+                    "timed_out": !pending_outputs.is_empty(),
                 }));
             }
             tokio::select! {
@@ -5121,11 +5192,7 @@ impl AgentRuntime {
             )
             .await?;
             let summary = self
-                .wait_agent_with_cancel(
-                    reviewer_id,
-                    Duration::from_secs(PROJECT_REVIEW_TURN_TIMEOUT_SECS),
-                    &cancellation_token,
-                )
+                .wait_agent_until_complete_with_cancel(reviewer_id, &cancellation_token)
                 .await?;
             if matches!(summary.status, AgentStatus::Failed | AgentStatus::Cancelled) {
                 return Err(RuntimeError::InvalidInput(format!(
@@ -5896,17 +5963,39 @@ EOF\n\
         agent_id: AgentId,
         session_id: SessionId,
     ) -> Result<Vec<ModelInputItem>> {
+        let mut history = {
+            let sessions = agent.sessions.lock().await;
+            sessions
+                .iter()
+                .find(|session| session.summary.id == session_id)
+                .map(|session| session.history.clone())
+                .ok_or(RuntimeError::SessionNotFound {
+                    agent_id,
+                    session_id,
+                })?
+        };
+        if repair_incomplete_tool_history(&mut history) {
+            self.replace_session_history(agent, agent_id, session_id, history.clone())
+                .await?;
+        }
+        Ok(history)
+    }
+
+    async fn raw_session_history_len(
+        &self,
+        agent: &AgentRecord,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> Result<usize> {
         let sessions = agent.sessions.lock().await;
-        let mut history = sessions
+        sessions
             .iter()
             .find(|session| session.summary.id == session_id)
-            .map(|session| session.history.clone())
+            .map(|session| session.history.len())
             .ok_or(RuntimeError::SessionNotFound {
                 agent_id,
                 session_id,
-            })?;
-        repair_incomplete_tool_history(&mut history);
-        Ok(history)
+            })
     }
 
     async fn ensure_agent_container(
@@ -6400,8 +6489,53 @@ fn wait_timeout(arguments: &Value) -> Duration {
         arguments
             .get("timeout_secs")
             .and_then(Value::as_u64)
-            .unwrap_or(300),
+            .unwrap_or(DEFAULT_WAIT_AGENT_OBSERVATION_SECS),
     )
+}
+
+fn last_activity_at(
+    summary: &AgentSummary,
+    recent_messages: &[AgentMessage],
+    recent_events: &[ServiceEvent],
+) -> DateTime<Utc> {
+    let mut timestamp = summary.updated_at;
+    if let Some(message) = recent_messages.last() {
+        timestamp = timestamp.max(message.created_at);
+    }
+    if let Some(event) = recent_events.last() {
+        timestamp = timestamp.max(event.timestamp);
+    }
+    timestamp
+}
+
+fn active_tool_snapshot(recent_events: &[ServiceEvent]) -> Option<Value> {
+    let mut completed = HashSet::new();
+    for event in recent_events.iter().rev() {
+        match &event.kind {
+            ServiceEventKind::ToolCompleted { call_id, .. } => {
+                completed.insert(call_id.clone());
+            }
+            ServiceEventKind::ToolStarted {
+                turn_id,
+                call_id,
+                tool_name,
+                arguments_preview,
+                arguments,
+                ..
+            } if !completed.contains(call_id) => {
+                return Some(json!({
+                    "turn_id": turn_id,
+                    "call_id": call_id,
+                    "tool_name": tool_name,
+                    "arguments_preview": arguments_preview,
+                    "arguments": arguments,
+                    "started_at": event.timestamp,
+                }));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_agent_role(value: &str) -> Result<AgentRole> {
@@ -7149,7 +7283,7 @@ fn recovered_summary(mut summary: AgentSummary) -> (AgentSummary, bool) {
             | AgentStatus::WaitingTool
             | AgentStatus::DeletingContainer
     ) {
-        summary.status = AgentStatus::Failed;
+        summary.status = AgentStatus::Idle;
         summary.last_error = Some("interrupted by server restart".to_string());
         summary.updated_at = now();
         changed = true;
@@ -7320,7 +7454,7 @@ fn compact_summary_from_output(output: &[ModelOutputItem]) -> Option<String> {
     })
 }
 
-fn repair_incomplete_tool_history(history: &mut Vec<ModelInputItem>) {
+fn repair_incomplete_tool_history(history: &mut Vec<ModelInputItem>) -> bool {
     use std::collections::HashSet;
     let mut insertions: Vec<(usize, ModelInputItem)> = Vec::new();
     let mut i = 0;
@@ -7368,9 +7502,11 @@ fn repair_incomplete_tool_history(history: &mut Vec<ModelInputItem>) {
         }
         i = j;
     }
+    let changed = !insertions.is_empty();
     for (pos, item) in insertions.into_iter().rev() {
         history.insert(pos, item);
     }
+    changed
 }
 
 fn build_compacted_history(history: &[ModelInputItem], summary: &str) -> Vec<ModelInputItem> {
@@ -7503,6 +7639,9 @@ mod tests {
             ])),
             options: serde_json::Value::Null,
             headers: Default::default(),
+            wire_api: Default::default(),
+            capabilities: Default::default(),
+            request_policy: Default::default(),
         }
     }
 
@@ -7548,6 +7687,9 @@ mod tests {
                 reasoning: Some(deepseek_reasoning_config()),
                 options: serde_json::Value::Null,
                 headers: Default::default(),
+                wire_api: mai_protocol::ModelWireApi::ChatCompletions,
+                capabilities: Default::default(),
+                request_policy: Default::default(),
             }],
             default_model: "deepseek-v4-pro".to_string(),
             enabled: true,
@@ -7755,6 +7897,12 @@ mod tests {
             default_model: "mock-model".to_string(),
             enabled: true,
         }
+    }
+
+    fn compact_no_continuation_test_provider(base_url: String) -> ProviderConfig {
+        let mut provider = compact_test_provider(base_url);
+        provider.models[0].capabilities.continuation = false;
+        provider
     }
 
     fn test_agent_summary(agent_id: AgentId, container_id: Option<&str>) -> AgentSummary {
@@ -8910,7 +9058,7 @@ esac
 
         let agents = runtime.list_agents().await;
         assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].status, AgentStatus::Failed);
+        assert_eq!(agents[0].status, AgentStatus::Idle);
         assert_eq!(agents[0].container_id.as_deref(), Some("old-container"));
         assert_eq!(agents[0].current_turn, None);
         assert_eq!(
@@ -9023,18 +9171,25 @@ esac
             .expect("wait agent");
         assert!(output.success);
         let value: Value = serde_json::from_str(&output.output).expect("wait output json");
+        let completed = value["completed"].as_array().expect("completed");
+        assert_eq!(completed.len(), 1);
+        let child_output = &completed[0];
         assert_eq!(
-            value["final_response"].as_str(),
+            child_output["final_response"].as_str(),
             Some("Explorer conclusion: auth lives in crates/auth.")
         );
         assert_eq!(
-            value["recent_messages"].as_array().expect("messages").len(),
+            child_output["recent_messages"]
+                .as_array()
+                .expect("messages")
+                .len(),
             2
         );
         assert_eq!(
-            value["agent"]["id"].as_str(),
+            child_output["agent"]["id"].as_str(),
             Some(child_id.to_string().as_str())
         );
+        assert_eq!(value["timed_out"].as_bool(), Some(false));
         assert!(matches!(
             runtime.agent(child_id).await,
             Err(RuntimeError::AgentNotFound(id)) if id == child_id
@@ -9294,7 +9449,7 @@ esac
         );
         store
             .save_providers(ProvidersConfigRequest {
-                providers: vec![compact_test_provider(base_url)],
+                providers: vec![compact_no_continuation_test_provider(base_url)],
                 default_provider_id: Some("mock".to_string()),
             })
             .await
@@ -9419,7 +9574,7 @@ esac
         );
         store
             .save_providers(ProvidersConfigRequest {
-                providers: vec![compact_test_provider(base_url)],
+                providers: vec![compact_no_continuation_test_provider(base_url)],
                 default_provider_id: Some("mock".to_string()),
             })
             .await
@@ -9521,6 +9676,76 @@ esac
                     }
                 ))
         );
+    }
+
+    #[tokio::test]
+    async fn turn_loop_has_no_tool_iteration_budget() {
+        let mut responses = Vec::new();
+        for i in 0..205 {
+            responses.push(json!({
+                "id": format!("tool_{i}"),
+                "output": [{
+                    "type": "function_call",
+                    "call_id": format!("call_{i}"),
+                    "name": "list_agents",
+                    "arguments": "{}"
+                }],
+                "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+            }));
+        }
+        responses.push(json!({
+            "id": "final",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "done after many tools" }]
+            }],
+            "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+        }));
+        let (base_url, requests) = start_mock_responses(responses).await;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![compact_test_provider(base_url)],
+                default_provider_id: Some("mock".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        store
+            .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
+            .await
+            .expect("save agent");
+        save_test_session(&store, agent_id, session_id).await;
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let agent = runtime.agent(agent_id).await.expect("agent");
+        *agent.container.write().await = Some(ContainerHandle {
+            id: "container-1".to_string(),
+            name: "container-1".to_string(),
+            image: "unused".to_string(),
+        });
+
+        runtime
+            .run_turn_inner(
+                agent_id,
+                session_id,
+                Uuid::new_v4(),
+                "keep going".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn completes");
+
+        assert_eq!(requests.lock().await.len(), 206);
+        let (_, messages) = runtime
+            .agent_recent_messages(agent_id, 4)
+            .await
+            .expect("messages");
+        assert!(messages.iter().any(|message| {
+            message.role == MessageRole::Assistant && message.content == "done after many tools"
+        }));
     }
 
     #[tokio::test]
@@ -10383,6 +10608,14 @@ esac
                 ..
             } if call_id == "call_1" && tool_name == "list_agents"
         )));
+        drop(events);
+        let snapshot = store.load_runtime_snapshot(20).await.expect("snapshot");
+        assert!(snapshot.agents[0].sessions[0].history.iter().any(|item| {
+            matches!(
+                item,
+                ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_1"
+            )
+        }));
     }
 
     #[tokio::test]
@@ -11303,7 +11536,18 @@ esac
             .expect("wait");
         let value: Value = serde_json::from_str(&waited.output).expect("json");
         assert!(value["completed"].as_array().expect("completed").is_empty());
-        assert_eq!(value["pending"].as_array().expect("pending").len(), 1);
+        let pending = value["pending"].as_array().expect("pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0]["agent_id"].as_str(),
+            Some(child_id.to_string().as_str())
+        );
+        assert_eq!(pending[0]["status"].as_str(), Some("running_turn"));
+        assert_eq!(
+            pending[0]["diagnostics"]["current_turn"].as_str(),
+            pending[0]["current_turn"].as_str()
+        );
+        assert!(pending[0]["diagnostics"]["idle_ms"].as_u64().is_some());
         assert_eq!(value["timed_out"].as_bool(), Some(true));
     }
 

@@ -3,11 +3,12 @@ use mai_protocol::{
     AgentConfigRequest, AgentId, AgentMessage, AgentSessionSummary, AgentSummary, ArtifactInfo,
     GitAccountRequest, GitAccountStatus, GitAccountSummary, GitAccountsResponse, GitProvider,
     GitTokenKind, GithubAppSettingsRequest, GithubAppSettingsResponse, GithubSettingsResponse,
-    McpServerConfig, ModelConfig, ModelInputItem, ModelReasoningConfig, ModelReasoningVariant,
-    PlanHistoryEntry, ProjectId, ProjectSummary, ProviderConfig, ProviderKind, ProviderPreset,
-    ProviderPresetsResponse, ProviderSecret, ProviderSummary, ProvidersConfigRequest,
-    ProvidersResponse, ServiceEvent, ServiceEventKind, SessionId, SkillsConfigRequest, TaskId,
-    TaskPlan, TaskReview, TaskSummary, TokenUsage, TurnId, default_true,
+    McpServerConfig, ModelCapabilities, ModelConfig, ModelInputItem, ModelReasoningConfig,
+    ModelReasoningVariant, ModelRequestPolicy, ModelWireApi, PlanHistoryEntry, ProjectId,
+    ProjectSummary, ProviderConfig, ProviderKind, ProviderPreset, ProviderPresetsResponse,
+    ProviderSecret, ProviderSummary, ProvidersConfigRequest, ProvidersResponse, ServiceEvent,
+    ServiceEventKind, SessionId, SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskSummary,
+    TokenUsage, TurnId, default_true,
 };
 use rusqlite::Connection as SqliteConnection;
 use serde::{Deserialize, Serialize};
@@ -186,6 +187,12 @@ struct ModelToml {
     output_tokens: u64,
     #[serde(default = "default_true")]
     supports_tools: bool,
+    #[serde(default)]
+    wire_api: ModelWireApi,
+    #[serde(default)]
+    capabilities: ModelCapabilities,
+    #[serde(default)]
+    request_policy: ModelRequestPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reasoning: Option<ModelReasoningConfig>,
     #[serde(default, skip_serializing_if = "is_null")]
@@ -665,7 +672,7 @@ impl ConfigStore {
                 models: provider
                     .models
                     .into_iter()
-                    .map(|(id, model)| model.into_model(id))
+                    .map(|(id, model)| model.into_model(id, provider.kind))
                     .collect(),
                 id,
                 kind: provider.kind,
@@ -2275,24 +2282,86 @@ impl ModelToml {
             context_tokens: model.context_tokens,
             output_tokens: model.output_tokens,
             supports_tools: model.supports_tools,
+            wire_api: model.wire_api,
+            capabilities: model.capabilities,
+            request_policy: model.request_policy,
             reasoning: model.reasoning,
             options: model.options,
             headers: model.headers,
         }
     }
 
-    fn into_model(self, id: String) -> ModelConfig {
+    fn into_model(self, id: String, provider_kind: ProviderKind) -> ModelConfig {
+        let wire_api = migrated_wire_api(provider_kind, self.wire_api);
+        let capabilities = migrated_capabilities(provider_kind, &id, self.capabilities);
+        let request_policy = migrated_request_policy(provider_kind, self.request_policy);
         ModelConfig {
             id,
             name: self.name,
             context_tokens: self.context_tokens,
             output_tokens: self.output_tokens,
             supports_tools: self.supports_tools,
+            wire_api,
+            capabilities,
+            request_policy,
             reasoning: self.reasoning,
             options: self.options,
             headers: self.headers,
         }
     }
+}
+
+fn migrated_wire_api(provider_kind: ProviderKind, wire_api: ModelWireApi) -> ModelWireApi {
+    match provider_kind {
+        ProviderKind::Openai => wire_api,
+        ProviderKind::Deepseek | ProviderKind::Mimo => ModelWireApi::ChatCompletions,
+    }
+}
+
+fn migrated_capabilities(
+    provider_kind: ProviderKind,
+    model_id: &str,
+    mut capabilities: ModelCapabilities,
+) -> ModelCapabilities {
+    match provider_kind {
+        ProviderKind::Openai => {
+            capabilities.continuation = true;
+            capabilities.parallel_tools = true;
+        }
+        ProviderKind::Deepseek => {
+            capabilities.continuation = false;
+            capabilities.reasoning_replay = capabilities.reasoning_replay
+                || model_id.contains("reasoner")
+                || model_id.contains("pro");
+        }
+        ProviderKind::Mimo => {
+            capabilities.continuation = false;
+        }
+    }
+    capabilities
+}
+
+fn migrated_request_policy(
+    provider_kind: ProviderKind,
+    mut request_policy: ModelRequestPolicy,
+) -> ModelRequestPolicy {
+    match provider_kind {
+        ProviderKind::Openai => {
+            request_policy.store = request_policy.store.or(Some(true));
+            if request_policy.max_tokens_field == "max_tokens" {
+                request_policy.max_tokens_field = "max_output_tokens".to_string();
+            }
+        }
+        ProviderKind::Deepseek | ProviderKind::Mimo => {
+            if request_policy.store == Some(true) {
+                request_policy.store = None;
+            }
+            if request_policy.max_tokens_field.trim().is_empty() {
+                request_policy.max_tokens_field = "max_tokens".to_string();
+            }
+        }
+    }
+    request_policy
 }
 
 fn provider_preset(kind: ProviderKind) -> ProviderPreset {
@@ -2334,6 +2403,9 @@ fn builtin_provider(kind: ProviderKind) -> ProviderConfig {
                     context_tokens: 1_047_576,
                     output_tokens: 32_768,
                     supports_tools: true,
+                    wire_api: ModelWireApi::Responses,
+                    capabilities: openai_capabilities(),
+                    request_policy: openai_request_policy(),
                     reasoning: None,
                     options: serde_json::Value::Null,
                     headers: BTreeMap::new(),
@@ -2401,6 +2473,9 @@ fn openai_reasoning_model(id: &str, context_tokens: u64, output_tokens: u64) -> 
         context_tokens,
         output_tokens,
         supports_tools: true,
+        wire_api: ModelWireApi::Responses,
+        capabilities: openai_capabilities(),
+        request_policy: openai_request_policy(),
         reasoning: Some(openai_reasoning_config(variants, "medium")),
         options: serde_json::Value::Null,
         headers: BTreeMap::new(),
@@ -2414,6 +2489,9 @@ fn deepseek_model(id: &str, with_reasoning: bool) -> ModelConfig {
         context_tokens: deepseek_context_tokens(id),
         output_tokens: deepseek_output_tokens(id),
         supports_tools: true,
+        wire_api: ModelWireApi::ChatCompletions,
+        capabilities: deepseek_capabilities(with_reasoning),
+        request_policy: chat_request_policy("max_tokens"),
         reasoning: with_reasoning.then(|| deepseek_reasoning_config(vec!["high", "max"], "high")),
         options: serde_json::Value::Null,
         headers: BTreeMap::new(),
@@ -2487,6 +2565,9 @@ fn mimo_model(id: &str, with_reasoning: bool) -> ModelConfig {
         context_tokens: mimo_context_tokens(id),
         output_tokens: mimo_output_tokens(id),
         supports_tools: true,
+        wire_api: ModelWireApi::ChatCompletions,
+        capabilities: mimo_capabilities(with_reasoning),
+        request_policy: chat_request_policy("max_tokens"),
         reasoning: with_reasoning.then(mimo_reasoning_config),
         options: serde_json::Value::Null,
         headers: BTreeMap::new(),
@@ -2526,6 +2607,51 @@ fn mimo_reasoning_config() -> ModelReasoningConfig {
     }
 }
 
+fn openai_capabilities() -> ModelCapabilities {
+    ModelCapabilities {
+        tools: true,
+        parallel_tools: true,
+        reasoning_replay: false,
+        strict_schema: false,
+        continuation: true,
+    }
+}
+
+fn deepseek_capabilities(with_reasoning: bool) -> ModelCapabilities {
+    ModelCapabilities {
+        tools: true,
+        parallel_tools: false,
+        reasoning_replay: with_reasoning,
+        strict_schema: false,
+        continuation: false,
+    }
+}
+
+fn mimo_capabilities(with_reasoning: bool) -> ModelCapabilities {
+    ModelCapabilities {
+        tools: true,
+        parallel_tools: false,
+        reasoning_replay: with_reasoning,
+        strict_schema: false,
+        continuation: false,
+    }
+}
+
+fn openai_request_policy() -> ModelRequestPolicy {
+    ModelRequestPolicy {
+        max_tokens_field: "max_output_tokens".to_string(),
+        store: Some(true),
+        ..ModelRequestPolicy::default()
+    }
+}
+
+fn chat_request_policy(max_tokens_field: &str) -> ModelRequestPolicy {
+    ModelRequestPolicy {
+        max_tokens_field: max_tokens_field.to_string(),
+        ..ModelRequestPolicy::default()
+    }
+}
+
 fn fallback_model(id: &str) -> ModelConfig {
     ModelConfig {
         id: id.to_string(),
@@ -2533,6 +2659,9 @@ fn fallback_model(id: &str) -> ModelConfig {
         context_tokens: 128_000,
         output_tokens: 8_192,
         supports_tools: true,
+        wire_api: ModelWireApi::Responses,
+        capabilities: ModelCapabilities::default(),
+        request_policy: ModelRequestPolicy::default(),
         reasoning: None,
         options: serde_json::Value::Null,
         headers: BTreeMap::new(),
@@ -2575,7 +2704,7 @@ fn validate_providers_toml(file: &ProvidersToml) -> Result<()> {
             models: provider
                 .models
                 .iter()
-                .map(|(model_id, model)| model.clone().into_model(model_id.clone()))
+                .map(|(model_id, model)| model.clone().into_model(model_id.clone(), provider.kind))
                 .collect(),
         })
         .collect();
@@ -2623,6 +2752,20 @@ fn validate_provider_request(request: &ProvidersConfigRequest) -> Result<()> {
             if model.context_tokens == 0 || model.output_tokens == 0 {
                 return Err(StoreError::InvalidConfig(format!(
                     "model `{}` must configure context_tokens and output_tokens",
+                    model.id
+                )));
+            }
+            if model.request_policy.max_tokens_field.trim().is_empty() {
+                return Err(StoreError::InvalidConfig(format!(
+                    "model `{}` request_policy.max_tokens_field is required",
+                    model.id
+                )));
+            }
+            if !(model.request_policy.extra_body.is_null()
+                || model.request_policy.extra_body.is_object())
+            {
+                return Err(StoreError::InvalidConfig(format!(
+                    "model `{}` request_policy.extra_body must be an object",
                     model.id
                 )));
             }
@@ -2870,6 +3013,9 @@ mod tests {
             }),
             options: serde_json::Value::Null,
             headers: BTreeMap::new(),
+            wire_api: ModelWireApi::Responses,
+            capabilities: ModelCapabilities::default(),
+            request_policy: ModelRequestPolicy::default(),
         }
     }
 
@@ -3200,6 +3346,45 @@ mod tests {
         assert!(!model.supports_tools);
         assert_eq!(model.options["temperature"], json!(0.2));
         assert_eq!(model.headers["X-Test-Model"], "custom");
+    }
+
+    #[tokio::test]
+    async fn legacy_deepseek_models_migrate_to_chat_policy() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+                default_provider_id = "deepseek"
+
+                [providers.deepseek]
+                kind = "deepseek"
+                name = "DeepSeek"
+                base_url = "https://api.deepseek.com"
+                api_key = "secret"
+                default_model = "deepseek-v4-pro"
+                enabled = true
+
+                [providers.deepseek.models.deepseek-v4-pro]
+                name = "deepseek-v4-pro"
+                context_tokens = 1000000
+                output_tokens = 384000
+                supports_tools = true
+            "#,
+        )
+        .expect("write config");
+        let store =
+            ConfigStore::open_with_config_path(dir.path().join("config.sqlite3"), &config_path)
+                .await
+                .expect("open");
+
+        let response = store.providers_response().await.expect("providers");
+        let model = response.providers[0].models.first().expect("model");
+        assert_eq!(model.wire_api, ModelWireApi::ChatCompletions);
+        assert!(!model.capabilities.continuation);
+        assert!(model.capabilities.reasoning_replay);
+        assert_eq!(model.request_policy.store, None);
+        assert_eq!(model.request_policy.max_tokens_field, "max_tokens");
     }
 
     #[tokio::test]

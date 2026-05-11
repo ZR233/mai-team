@@ -1,6 +1,6 @@
 use mai_protocol::{
-    ModelConfig, ModelInputItem, ModelOutputItem, ModelOutputToolCall, ModelResponse, ProviderKind,
-    ProviderSecret, TokenUsage, ToolDefinition,
+    ModelConfig, ModelInputItem, ModelOutputItem, ModelOutputToolCall, ModelResponse, ModelWireApi,
+    ProviderKind, ProviderSecret, TokenUsage, ToolDefinition,
 };
 use reqwest::StatusCode;
 use serde::Serialize;
@@ -49,6 +49,8 @@ struct ResponsesRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     store: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<&'a str>,
     #[serde(flatten)]
     options: BTreeMap<String, Value>,
 }
@@ -117,6 +119,18 @@ pub struct ModelRequest<'a> {
     pub reasoning_effort: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ModelTurnState {
+    pub previous_response_id: Option<String>,
+    pub acknowledged_input_len: usize,
+}
+
+impl ModelTurnState {
+    pub fn acknowledge_history_len(&mut self, len: usize) {
+        self.acknowledged_input_len = len;
+    }
+}
+
 impl ResponsesClient {
     pub fn new() -> Self {
         Self::default()
@@ -131,8 +145,8 @@ impl ResponsesClient {
         tools: &[ToolDefinition],
         reasoning_effort: Option<String>,
     ) -> Result<ModelResponse> {
-        match provider.kind {
-            ProviderKind::Openai => {
+        match model_wire_api(provider, model) {
+            ModelWireApi::Responses => {
                 self.create_openai_response(
                     provider,
                     model,
@@ -140,10 +154,12 @@ impl ResponsesClient {
                     input,
                     tools,
                     reasoning_effort,
+                    None,
+                    Some(false),
                 )
                 .await
             }
-            ProviderKind::Deepseek => {
+            ModelWireApi::ChatCompletions if provider.kind == ProviderKind::Deepseek => {
                 self.create_deepseek_chat(
                     provider,
                     model,
@@ -154,7 +170,7 @@ impl ResponsesClient {
                 )
                 .await
             }
-            ProviderKind::Mimo => {
+            ModelWireApi::ChatCompletions => {
                 self.create_mimo_chat(
                     provider,
                     model,
@@ -186,6 +202,57 @@ impl ResponsesClient {
         }
     }
 
+    pub async fn create_turn_response_with_cancel(
+        &self,
+        req: &ModelRequest<'_>,
+        state: &mut ModelTurnState,
+        cancellation_token: &CancellationToken,
+    ) -> Result<ModelResponse> {
+        tokio::select! {
+            response = self.create_turn_response(req, state) => response,
+            _ = cancellation_token.cancelled() => Err(ModelError::Cancelled),
+        }
+    }
+
+    async fn create_turn_response(
+        &self,
+        req: &ModelRequest<'_>,
+        state: &mut ModelTurnState,
+    ) -> Result<ModelResponse> {
+        if model_wire_api(req.provider, req.model) != ModelWireApi::Responses
+            || !req.model.capabilities.continuation
+        {
+            return self
+                .create_response(
+                    req.provider,
+                    req.model,
+                    req.instructions,
+                    req.input,
+                    req.tools,
+                    req.reasoning_effort.clone(),
+                )
+                .await;
+        }
+
+        let (input, previous_response_id) = openai_turn_input(req.input, state);
+        let response = self
+            .create_openai_response(
+                req.provider,
+                req.model,
+                req.instructions,
+                input,
+                req.tools,
+                req.reasoning_effort.clone(),
+                previous_response_id,
+                Some(true),
+            )
+            .await?;
+        if let Some(id) = &response.id {
+            state.previous_response_id = Some(id.clone());
+        }
+        Ok(response)
+    }
+
     async fn create_openai_response(
         &self,
         provider: &ProviderSecret,
@@ -194,9 +261,15 @@ impl ResponsesClient {
         input: &[ModelInputItem],
         tools: &[ToolDefinition],
         reasoning_effort: Option<String>,
+        previous_response_id: Option<&str>,
+        store: Option<bool>,
     ) -> Result<ModelResponse> {
         let endpoint = format!("{}/responses", provider.base_url.trim_end_matches('/'));
-        let active_tools = if model.supports_tools { tools } else { &[] };
+        let active_tools = if model_supports_tools(model) {
+            tools
+        } else {
+            &[]
+        };
         let request = ResponsesRequest {
             model: &model.id,
             instructions,
@@ -204,14 +277,15 @@ impl ResponsesClient {
             tools: active_tools,
             tool_choice: (!active_tools.is_empty()).then_some("auto"),
             stream: false,
-            store: Some(false),
+            store: store.or(model.request_policy.store),
+            previous_response_id,
             options: request_options(model, reasoning_effort.as_deref()),
         };
         let response = self
             .http
             .post(&endpoint)
             .bearer_auth(&provider.api_key)
-            .headers(headers(&provider.headers(&model.headers)))
+            .headers(headers(&provider.headers(&request_headers(model))))
             .json(&request)
             .send()
             .await
@@ -251,7 +325,7 @@ impl ResponsesClient {
             "{}/chat/completions",
             provider.base_url.trim_end_matches('/')
         );
-        let active_tools = if model.supports_tools {
+        let active_tools = if model_supports_tools(model) {
             tools.iter().map(chat_tool).collect()
         } else {
             Vec::new()
@@ -267,7 +341,7 @@ impl ResponsesClient {
             .http
             .post(&endpoint)
             .bearer_auth(&provider.api_key)
-            .headers(headers(&provider.headers(&model.headers)))
+            .headers(headers(&provider.headers(&request_headers(model))))
             .json(&request)
             .send()
             .await
@@ -307,7 +381,7 @@ impl ResponsesClient {
             "{}/chat/completions",
             provider.base_url.trim_end_matches('/')
         );
-        let active_tools = if model.supports_tools {
+        let active_tools = if model_supports_tools(model) {
             tools.iter().map(chat_tool).collect()
         } else {
             Vec::new()
@@ -323,7 +397,7 @@ impl ResponsesClient {
             .http
             .post(&endpoint)
             .bearer_auth(&provider.api_key)
-            .headers(headers(&provider.headers(&model.headers)))
+            .headers(headers(&provider.headers(&request_headers(model))))
             .json(&request)
             .send()
             .await
@@ -355,11 +429,21 @@ impl Default for ResponsesClient {
     fn default() -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(600))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { http }
     }
+}
+
+fn model_wire_api(provider: &ProviderSecret, model: &ModelConfig) -> ModelWireApi {
+    match provider.kind {
+        ProviderKind::Openai => model.wire_api,
+        ProviderKind::Deepseek | ProviderKind::Mimo => ModelWireApi::ChatCompletions,
+    }
+}
+
+fn model_supports_tools(model: &ModelConfig) -> bool {
+    model.supports_tools && model.capabilities.tools
 }
 
 trait HeaderMerge {
@@ -372,6 +456,12 @@ impl HeaderMerge for ProviderSecret {
         headers.extend(model_headers.clone());
         headers
     }
+}
+
+fn request_headers(model: &ModelConfig) -> BTreeMap<String, String> {
+    let mut headers = model.headers.clone();
+    headers.extend(model.request_policy.headers.clone());
+    headers
 }
 
 fn headers(values: &BTreeMap<String, String>) -> reqwest::header::HeaderMap {
@@ -402,6 +492,7 @@ fn request_options(model: &ModelConfig, reasoning_effort: Option<&str>) -> BTree
     if let Some(request) = reasoning_variant_request(model, reasoning_effort) {
         merge_json_objects(&mut options, request);
     }
+    merge_json_objects(&mut options, &model.request_policy.extra_body);
     option_map(&options)
 }
 
@@ -495,6 +586,28 @@ fn mimo_chat_request(
         max_tokens: mimo_max_tokens(model.output_tokens),
         options: request_options(model, reasoning_effort),
     }
+}
+
+fn openai_turn_input<'a>(
+    input: &'a [ModelInputItem],
+    state: &'a ModelTurnState,
+) -> (&'a [ModelInputItem], Option<&'a str>) {
+    let previous_response_id = state.previous_response_id.as_deref();
+    let input = if previous_response_id.is_some() {
+        let start = state.acknowledged_input_len.min(input.len());
+        &input[start..]
+    } else {
+        input
+    };
+    (input, previous_response_id)
+}
+
+#[cfg(test)]
+fn openai_turn_input_for_test<'a>(
+    input: &'a [ModelInputItem],
+    state: &'a ModelTurnState,
+) -> (&'a [ModelInputItem], Option<&'a str>) {
+    openai_turn_input(input, state)
 }
 
 fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessage> {
@@ -791,6 +904,9 @@ mod tests {
             }),
             options: serde_json::Value::Null,
             headers: BTreeMap::new(),
+            wire_api: ModelWireApi::Responses,
+            capabilities: Default::default(),
+            request_policy: Default::default(),
         }
     }
 
@@ -806,7 +922,7 @@ mod tests {
     }
 
     fn openai_model() -> ModelConfig {
-        model_with_reasoning(
+        let mut model = model_with_reasoning(
             "gpt-5.5",
             &["minimal", "low", "medium", "high", "xhigh"],
             "medium",
@@ -817,7 +933,10 @@ mod tests {
                     },
                 })
             },
-        )
+        );
+        model.capabilities.continuation = true;
+        model.request_policy.store = Some(true);
+        model
     }
 
     #[test]
@@ -1002,6 +1121,67 @@ mod tests {
             Some("need a tool")
         );
         assert_eq!(request.messages[2].tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn openai_turn_request_uses_previous_response_id_and_delta_input() {
+        let model = openai_model();
+        let input = vec![
+            ModelInputItem::user_text("do work"),
+            ModelInputItem::FunctionCall {
+                call_id: "call_1".to_string(),
+                name: "container_exec".to_string(),
+                arguments: "{\"command\":\"pwd\"}".to_string(),
+            },
+            ModelInputItem::FunctionCallOutput {
+                call_id: "call_1".to_string(),
+                output: "{\"status\":0}".to_string(),
+            },
+        ];
+        let mut state = ModelTurnState {
+            previous_response_id: Some("resp_1".to_string()),
+            acknowledged_input_len: 2,
+        };
+        let (request_input, previous_response_id) = openai_turn_input_for_test(&input, &state);
+        let request = ResponsesRequest {
+            model: &model.id,
+            instructions: "instructions",
+            input: request_input,
+            tools: &[],
+            tool_choice: None,
+            stream: false,
+            store: Some(true),
+            previous_response_id,
+            options: request_options(&model, None),
+        };
+        let value = serde_json::to_value(&request).expect("request json");
+
+        assert_eq!(value["previous_response_id"].as_str(), Some("resp_1"));
+        assert_eq!(value["store"].as_bool(), Some(true));
+        assert_eq!(value["input"].as_array().expect("input").len(), 1);
+        assert_eq!(value["input"][0]["call_id"].as_str(), Some("call_1"));
+        state.acknowledge_history_len(input.len());
+        assert_eq!(state.acknowledged_input_len, 3);
+    }
+
+    #[test]
+    fn mimo_request_policy_is_independent_from_deepseek_replay() {
+        let mut model = openai_model();
+        model.id = "mimo-v2.5-pro".to_string();
+        model.wire_api = ModelWireApi::ChatCompletions;
+        model.capabilities.reasoning_replay = false;
+        model.request_policy.extra_body = json!({ "mimo_only": true });
+        let request = mimo_chat_request(
+            &model,
+            "instructions",
+            &[ModelInputItem::user_text("hello")],
+            Vec::new(),
+            None,
+        );
+        let value = serde_json::to_value(&request).expect("request json");
+
+        assert_eq!(value.get("mimo_only").and_then(Value::as_bool), Some(true));
+        assert!(value.get("thinking").is_none());
     }
 
     #[test]

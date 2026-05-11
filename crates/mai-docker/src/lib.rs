@@ -568,15 +568,7 @@ impl DockerClient {
         env: &[(String, String)],
         cancellation_token: &CancellationToken,
     ) -> Result<ExecOutput> {
-        let shell_command = match timeout_secs {
-            Some(seconds) if seconds > 0 => {
-                format!(
-                    "timeout --preserve-status {seconds}s /bin/sh -lc {}",
-                    shell_quote(command)
-                )
-            }
-            _ => command.to_string(),
-        };
+        let shell_command = shell_command_with_optional_timeout(command, timeout_secs);
         let mut cmd = Command::new(&self.binary);
         cmd.arg("exec");
         if let Some(cwd) = cwd {
@@ -604,17 +596,15 @@ impl DockerClient {
         })
     }
 
+    #[cfg(test)]
+    fn exec_shell_command_for_test(command: &str, timeout_secs: Option<u64>) -> String {
+        shell_command_with_optional_timeout(command, timeout_secs)
+    }
+
     pub async fn run_sidecar_shell_env(&self, params: &SidecarParams<'_>) -> Result<ExecOutput> {
         let image = validate_image(params.image)?;
-        let shell_command = match params.timeout_secs {
-            Some(seconds) if seconds > 0 => {
-                format!(
-                    "timeout --preserve-status {seconds}s /bin/sh -lc {}",
-                    shell_quote(params.command)
-                )
-            }
-            _ => params.command.to_string(),
-        };
+        let shell_command =
+            shell_command_with_optional_timeout(params.command, params.timeout_secs);
         let mut cmd = Command::new(&self.binary);
         cmd.arg("run")
             .arg("--rm")
@@ -764,6 +754,18 @@ fn stderr_or_stdout(output: &std::process::Output) -> String {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     } else {
         stderr
+    }
+}
+
+fn shell_command_with_optional_timeout(command: &str, timeout_secs: Option<u64>) -> String {
+    match timeout_secs {
+        Some(seconds) if seconds > 0 => {
+            format!(
+                "timeout --preserve-status {seconds}s /bin/sh -lc {}",
+                shell_quote(command)
+            )
+        }
+        _ => command.to_string(),
     }
 }
 
@@ -1134,6 +1136,22 @@ mod tests {
         assert_eq!(parent_dir("/tmp/file.txt"), "/tmp");
         assert_eq!(parent_dir("relative/file.txt"), "relative");
         assert_eq!(parent_dir("file.txt"), "");
+    }
+
+    #[test]
+    fn exec_shell_command_omits_timeout_wrapper_when_unlimited() {
+        assert_eq!(
+            DockerClient::exec_shell_command_for_test("sleep 1000", None),
+            "sleep 1000"
+        );
+        assert_eq!(
+            DockerClient::exec_shell_command_for_test("sleep 1000", Some(0)),
+            "sleep 1000"
+        );
+        assert!(
+            DockerClient::exec_shell_command_for_test("sleep 1000", Some(5))
+                .starts_with("timeout --preserve-status 5s /bin/sh -lc ")
+        );
     }
 
     #[test]

@@ -702,11 +702,93 @@ pub struct ModelConfig {
     #[serde(default = "default_true")]
     pub supports_tools: bool,
     #[serde(default)]
+    pub wire_api: ModelWireApi,
+    #[serde(default)]
+    pub capabilities: ModelCapabilities,
+    #[serde(default)]
+    pub request_policy: ModelRequestPolicy,
+    #[serde(default)]
     pub reasoning: Option<ModelReasoningConfig>,
     #[serde(default)]
     pub options: Value,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelWireApi {
+    #[default]
+    Responses,
+    ChatCompletions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelCapabilities {
+    #[serde(default = "default_true")]
+    pub tools: bool,
+    #[serde(default)]
+    pub parallel_tools: bool,
+    #[serde(default)]
+    pub reasoning_replay: bool,
+    #[serde(default)]
+    pub strict_schema: bool,
+    #[serde(default)]
+    pub continuation: bool,
+}
+
+impl Default for ModelCapabilities {
+    fn default() -> Self {
+        Self {
+            tools: true,
+            parallel_tools: false,
+            reasoning_replay: false,
+            strict_schema: false,
+            continuation: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSchemaPolicy {
+    #[default]
+    Standard,
+    Strict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelRequestPolicy {
+    #[serde(default = "default_chat_max_tokens_field")]
+    pub max_tokens_field: String,
+    #[serde(default)]
+    pub store: Option<bool>,
+    #[serde(default)]
+    pub tool_schema: ToolSchemaPolicy,
+    #[serde(default, skip_serializing_if = "is_null")]
+    pub extra_body: Value,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+impl Default for ModelRequestPolicy {
+    fn default() -> Self {
+        Self {
+            max_tokens_field: default_chat_max_tokens_field(),
+            store: None,
+            tool_schema: ToolSchemaPolicy::Standard,
+            extra_body: Value::Null,
+            headers: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_chat_max_tokens_field() -> String {
+    "max_tokens".to_string()
+}
+
+fn is_null(value: &Value) -> bool {
+    value.is_null()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -108,13 +108,13 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition::function(
             TOOL_CONTAINER_EXEC,
-            "Execute a shell command inside this agent's Docker container.",
+            "Execute a shell command inside this agent's Docker container. timeout_secs is optional; omit it for no command time limit.",
             object_schema(vec![
                 ("command", json!({ "type": "string" }), true),
                 ("cwd", json!({ "type": "string" }), false),
                 (
                     "timeout_secs",
-                    json!({ "type": "integer", "minimum": 1, "maximum": 600 }),
+                    json!({ "type": "integer", "minimum": 1 }),
                     false,
                 ),
             ]),
@@ -183,7 +183,7 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             TOOL_WAIT_AGENT,
-            "Wait for one or more agents to finish their current turns and return final assistant responses.",
+            "Sample one or more agents for a short observation window. Timeout is a normal pending result with diagnostics, not task failure.",
             object_schema(vec![
                 (
                     "targets",
@@ -193,12 +193,12 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 ("agent_id", json!({ "type": "string" }), false),
                 (
                     "timeout_ms",
-                    json!({ "type": "integer", "minimum": 100, "maximum": 3600000 }),
+                    json!({ "type": "integer", "minimum": 100 }),
                     false,
                 ),
                 (
                     "timeout_secs",
-                    json!({ "type": "integer", "minimum": 1, "maximum": 3600 }),
+                    json!({ "type": "integer", "minimum": 1 }),
                     false,
                 ),
             ]),
@@ -524,8 +524,37 @@ mod tests {
         assert!(properties.contains_key("targets"));
         assert!(properties.contains_key("timeout_ms"));
         assert!(properties.contains_key("agent_id"));
+        assert_eq!(properties["timeout_ms"]["type"].as_str(), Some("integer"));
+        assert_eq!(properties["timeout_ms"]["minimum"].as_u64(), Some(100));
+        assert!(properties["timeout_ms"].get("maximum").is_none());
+        assert_eq!(properties["timeout_secs"]["type"].as_str(), Some("integer"));
+        assert_eq!(properties["timeout_secs"]["minimum"].as_u64(), Some(1));
+        assert!(properties["timeout_secs"].get("maximum").is_none());
         assert_eq!(route_tool("send_input"), RoutedTool::SendInput);
         assert_eq!(route_tool("resume_agent"), RoutedTool::ResumeAgent);
         assert_eq!(route_tool("github_api_get"), RoutedTool::GithubApiGet);
+    }
+
+    #[test]
+    fn container_exec_timeout_is_optional_without_budget_cap() {
+        let tools = build_tool_definitions(&[]);
+        let exec = tools
+            .iter()
+            .find(|tool| tool.name == TOOL_CONTAINER_EXEC)
+            .expect("container_exec");
+        let timeout = exec
+            .parameters
+            .pointer("/properties/timeout_secs")
+            .expect("timeout_secs schema");
+        assert_eq!(timeout["type"].as_str(), Some("integer"));
+        assert_eq!(timeout["minimum"].as_u64(), Some(1));
+        assert!(timeout.get("maximum").is_none());
+        assert!(
+            !exec
+                .parameters
+                .pointer("/required")
+                .and_then(Value::as_array)
+                .is_some_and(|required| required.iter().any(|item| item == "timeout_secs"))
+        );
     }
 }
