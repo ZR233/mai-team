@@ -215,6 +215,8 @@ Submit the review through a visible GitHub MCP review-writing tool when one is a
 - `body`: concise summary including decision, local validation results, similar PR notes, and any findings that could not be attached to specific lines.
 - `comments`: array of inline comments, each with `path`, `line` (use the right-side line number), `side: "RIGHT"`, and `body`.
 
+The Mai runtime automatically appends `Powered by {model}` to the review body for project review submissions. Do not add that footer yourself, and do not add model footers to inline comments.
+
 If no visible MCP tool can submit a pull request review, report that review submission is unavailable in the final response.
 
 Do not look for `GITHUB_TOKEN`, run ad hoc GitHub REST scripts, or write credential files inside the agent container.

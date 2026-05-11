@@ -72,6 +72,10 @@ const PROJECT_REVIEW_REPO_COMMAND_RETRY_SECS: u64 = 5;
 const DEFAULT_WAIT_AGENT_OBSERVATION_SECS: u64 = 30;
 const PROJECT_GITHUB_MCP_SERVER: &str = "github";
 const PROJECT_GIT_MCP_SERVER: &str = "git";
+const PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL: &str =
+    "mcp__github__pull_request_review_write";
+const PROJECT_GITHUB_CREATE_PULL_REQUEST_REVIEW_TOOL: &str =
+    "mcp__github__create_pull_request_review";
 const DEFAULT_SIDECAR_IMAGE: &str = "ghcr.io/zr233/mai-team-sidecar:latest";
 const COMPACT_USER_MESSAGE_MAX_CHARS: usize = 80_000;
 const COMPACT_SUMMARY_PREVIEW_CHARS: usize = 240;
@@ -6117,6 +6121,13 @@ impl AgentRuntime {
             .project_git_token_for_agent(agent)
             .await?
             .unwrap_or_default();
+        let summary = agent.summary.read().await.clone();
+        let arguments = project_review_mcp_arguments_with_model_footer(
+            model_name,
+            arguments,
+            summary.role.as_ref(),
+            &summary.model,
+        );
         let output = tokio::select! {
             output = manager.call_model_tool(model_name, arguments) => output,
             _ = cancellation_token.cancelled() => {
@@ -7357,6 +7368,40 @@ fn normalize_github_api_get_path(path: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
+fn project_review_mcp_arguments_with_model_footer(
+    model_tool_name: &str,
+    mut arguments: Value,
+    role: Option<&AgentRole>,
+    model_id: &str,
+) -> Value {
+    if !matches!(role, Some(AgentRole::Reviewer))
+        || !is_github_pull_request_review_write_tool(model_tool_name)
+    {
+        return arguments;
+    }
+    let Some(body) = arguments.get("body").and_then(Value::as_str) else {
+        return arguments;
+    };
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return arguments;
+    }
+    let footer = format!("Powered by {model_id}");
+    if body.contains(&footer) {
+        return arguments;
+    }
+    let body = format!("{}\n\n{}", body.trim_end(), footer);
+    if let Some(value) = arguments.get_mut("body") {
+        *value = Value::String(body);
+    }
+    arguments
+}
+
+fn is_github_pull_request_review_write_tool(model_tool_name: &str) -> bool {
+    model_tool_name == PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL
+        || model_tool_name == PROJECT_GITHUB_CREATE_PULL_REQUEST_REVIEW_TOOL
+}
+
 fn github_path_segment(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
@@ -8113,6 +8158,138 @@ mod tests {
     };
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn project_reviewer_review_body_gets_model_footer() {
+        let arguments = json!({
+            "body": "Looks good after local validation.",
+            "comments": [
+                {
+                    "path": "src/lib.rs",
+                    "line": 12,
+                    "side": "RIGHT",
+                    "body": "Please cover this edge case."
+                }
+            ]
+        });
+
+        let updated = project_review_mcp_arguments_with_model_footer(
+            PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL,
+            arguments,
+            Some(&AgentRole::Reviewer),
+            "gpt-5.4",
+        );
+
+        assert_eq!(
+            updated.get("body").and_then(Value::as_str),
+            Some("Looks good after local validation.\n\nPowered by gpt-5.4")
+        );
+        assert_eq!(
+            updated.pointer("/comments/0/body").and_then(Value::as_str),
+            Some("Please cover this edge case.")
+        );
+    }
+
+    #[test]
+    fn project_reviewer_review_body_footer_is_not_duplicated() {
+        let arguments = json!({
+            "body": "Looks good.\n\nPowered by gpt-5.4"
+        });
+
+        let updated = project_review_mcp_arguments_with_model_footer(
+            PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL,
+            arguments,
+            Some(&AgentRole::Reviewer),
+            "gpt-5.4",
+        );
+
+        assert_eq!(
+            updated.get("body").and_then(Value::as_str),
+            Some("Looks good.\n\nPowered by gpt-5.4")
+        );
+    }
+
+    #[test]
+    fn project_reviewer_review_body_footer_supports_legacy_tool_name() {
+        let arguments = json!({
+            "body": "Review submitted."
+        });
+
+        let updated = project_review_mcp_arguments_with_model_footer(
+            PROJECT_GITHUB_CREATE_PULL_REQUEST_REVIEW_TOOL,
+            arguments,
+            Some(&AgentRole::Reviewer),
+            "gpt-5.4",
+        );
+
+        assert_eq!(
+            updated.get("body").and_then(Value::as_str),
+            Some("Review submitted.\n\nPowered by gpt-5.4")
+        );
+    }
+
+    #[test]
+    fn project_reviewer_model_footer_leaves_non_review_tools_unchanged() {
+        let arguments = json!({
+            "body": "A regular issue comment."
+        });
+
+        let updated = project_review_mcp_arguments_with_model_footer(
+            "mcp__github__add_issue_comment",
+            arguments,
+            Some(&AgentRole::Reviewer),
+            "gpt-5.4",
+        );
+
+        assert_eq!(
+            updated.get("body").and_then(Value::as_str),
+            Some("A regular issue comment.")
+        );
+    }
+
+    #[test]
+    fn project_reviewer_model_footer_leaves_non_reviewer_agents_unchanged() {
+        let arguments = json!({
+            "body": "Maintainer review body."
+        });
+
+        let updated = project_review_mcp_arguments_with_model_footer(
+            PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL,
+            arguments,
+            Some(&AgentRole::Planner),
+            "gpt-5.4",
+        );
+
+        assert_eq!(
+            updated.get("body").and_then(Value::as_str),
+            Some("Maintainer review body.")
+        );
+    }
+
+    #[test]
+    fn project_reviewer_model_footer_leaves_missing_or_non_string_body_unchanged() {
+        let missing = json!({
+            "event": "APPROVE"
+        });
+        let updated_missing = project_review_mcp_arguments_with_model_footer(
+            PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL,
+            missing,
+            Some(&AgentRole::Reviewer),
+            "gpt-5.4",
+        );
+        assert_eq!(updated_missing, json!({ "event": "APPROVE" }));
+
+        let non_string = json!({
+            "body": null
+        });
+        let updated_non_string = project_review_mcp_arguments_with_model_footer(
+            PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL,
+            non_string,
+            Some(&AgentRole::Reviewer),
+            "gpt-5.4",
+        );
+        assert_eq!(updated_non_string, json!({ "body": null }));
+    }
 
     fn test_model(id: &str) -> ModelConfig {
         ModelConfig {
