@@ -25,7 +25,9 @@ use mai_protocol::{
     TaskSummary, TodoItem, TokenUsage, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest,
     UpdateProjectRequest, UserInputOption, UserInputQuestion, now, preview,
 };
-use mai_skills::{SkillInjections, SkillsManager};
+use mai_skills::{
+    SkillInjections, SkillInput, SkillSelection, SkillsManager, render_available_response,
+};
 use mai_store::{ConfigStore, ProviderSelection};
 use mai_tools::{RoutedTool, build_tool_definitions_with_filter, route_tool};
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
@@ -2655,7 +2657,7 @@ impl AgentRuntime {
         session_id: SessionId,
         turn_id: TurnId,
         message: String,
-        mut skill_mentions: Vec<String>,
+        skill_mentions: Vec<String>,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
         let agent = self.agent(agent_id).await?;
@@ -2681,7 +2683,6 @@ impl AgentRuntime {
         })
         .await;
 
-        skill_mentions.extend(extract_skill_mentions(&message));
         if let Err(err) = self.refresh_project_skills_for_agent(&agent).await {
             if matches!(err, RuntimeError::TurnCancelled) {
                 return Err(err);
@@ -2723,11 +2724,24 @@ impl AgentRuntime {
 
         let skills_config = self.store.load_skills_config().await?;
         let skills_manager = self.skills_manager_for_agent(&agent).await?;
+        let reserved_tool_names = {
+            let mcp_tools = self.agent_mcp_tools(&agent).await;
+            self.visible_tool_names(&agent, &mcp_tools)
+                .await
+                .into_iter()
+                .collect()
+        };
         let skill_injections = {
             let _project_skill_guard = self.project_skill_read_guard(&agent).await;
-            skills_manager.build_injections_for_message(
-                &message,
-                &skill_mentions,
+            skills_manager.build_injections_for_input(
+                SkillInput {
+                    text: Some(&message),
+                    selections: skill_mentions
+                        .iter()
+                        .map(|mention| SkillSelection::from_mention(mention.clone()))
+                        .collect(),
+                    reserved_names: reserved_tool_names,
+                },
                 &skills_config,
             )?
         };
@@ -4307,7 +4321,13 @@ impl AgentRuntime {
             instructions.push_str(system_prompt);
         }
         instructions.push_str("\n\n## Available Skills\n");
-        instructions.push_str(&skills_manager.render_available(skills_config)?);
+        if let Some(project_id) = agent.summary.read().await.project_id {
+            let mut response = skills_manager.list(skills_config)?;
+            self.apply_project_skill_source_paths(project_id, &mut response);
+            instructions.push_str(&render_available_response(response));
+        } else {
+            instructions.push_str(&skills_manager.render_available(skills_config)?);
+        }
         if !skill_injections.warnings.is_empty() {
             instructions.push_str("\n\n## Skill Warnings\n");
             for warning in &skill_injections.warnings {
@@ -11165,7 +11185,7 @@ esac
     }
 
     #[tokio::test]
-    async fn user_turn_fuzzy_message_injects_skill() {
+    async fn user_turn_semantic_match_is_available_but_not_runtime_injected() {
         let (base_url, requests) = start_mock_responses(vec![json!({
             "id": "skill",
             "output": [{
@@ -11219,14 +11239,20 @@ esac
             .expect("turn");
 
         let requests = requests.lock().await.clone();
-        let input = requests[0]["input"].as_array().expect("input");
-        assert!(input.iter().any(|item| {
-            item["role"] == "user"
-                && item["content"][0]["text"].as_str().is_some_and(|text| {
-                    text.contains("<name>frontend-app-builder</name>")
-                        && text.contains("Use the frontend app builder flow.")
-                })
-        }));
+        let request_text = serde_json::to_string(&requests[0]).expect("request json");
+        assert!(!request_text.contains("<name>frontend-app-builder</name>"));
+        let instructions = requests[0]["instructions"].as_str().unwrap_or_default();
+        assert!(instructions.contains("$frontend-app-builder"));
+        assert!(instructions.contains("Build frontend apps."));
+        assert!(instructions.contains("task clearly matches a skill's description"));
+        assert!(
+            !runtime
+                .recent_events
+                .lock()
+                .await
+                .iter()
+                .any(|event| matches!(event.kind, ServiceEventKind::SkillsActivated { .. }))
+        );
     }
 
     #[tokio::test]
@@ -11918,6 +11944,7 @@ esac
         }));
         let instructions = requests[0]["instructions"].as_str().unwrap_or_default();
         assert!(instructions.contains("Project demo skill."));
+        assert!(instructions.contains("/workspace/repo/.claude/skills/demo/SKILL.md"));
         let events = runtime.recent_events.lock().await;
         let activated = events
             .iter()
@@ -14268,6 +14295,110 @@ esac
             "---\nname: review-default-branch\ndescription: New review skill.\n---\nNew review body."
         );
         assert!(fake_docker_log(&dir).contains("review-sync"));
+    }
+
+    #[tokio::test]
+    async fn project_reviewer_instructions_include_extra_prompt_project_skill() {
+        let (base_url, requests) = start_mock_responses(vec![json!({
+            "id": "review-skill",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "{\"outcome\":\"no_eligible_pr\",\"pr\":null,\"summary\":\"No eligible pull request found.\",\"error\":null}" }]
+            }],
+            "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+        })])
+        .await;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![compact_test_provider(base_url)],
+                default_provider_id: Some("mock".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let project_id = Uuid::new_v4();
+        let reviewer_id = Uuid::new_v4();
+        let project = ProjectSummary {
+            reviewer_extra_prompt: Some("用中文评论, review-single-pr".to_string()),
+            ..ready_test_project_summary(project_id, reviewer_id, "account-1")
+        };
+        store.save_project(&project).await.expect("save project");
+        let mut reviewer = test_agent_summary(reviewer_id, Some("container-1"));
+        reviewer.project_id = Some(project_id);
+        reviewer.role = Some(AgentRole::Reviewer);
+        let session_id = Uuid::new_v4();
+        store.save_agent(&reviewer, None).await.expect("save agent");
+        save_test_session(&store, reviewer_id, session_id).await;
+        let system_skill_dir = dir
+            .path()
+            .join("system-skills")
+            .join("reviewer-agent-review-pr");
+        fs::create_dir_all(&system_skill_dir).expect("mkdir system skill");
+        fs::write(
+            system_skill_dir.join("SKILL.md"),
+            "---\nname: reviewer-agent-review-pr\ndescription: Review one PR.\n---\nReviewer system body.",
+        )
+        .expect("write system skill");
+        let runtime = AgentRuntime::new(
+            DockerClient::new_with_binary("unused", fake_docker_path(&dir)),
+            ResponsesClient::new(),
+            Arc::clone(&store),
+            RuntimeConfig {
+                system_skills_root: Some(dir.path().join("system-skills")),
+                ..test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE)
+            },
+        )
+        .await
+        .expect("runtime");
+        let agent = runtime.agent(reviewer_id).await.expect("agent");
+        *agent.container.write().await = Some(ContainerHandle {
+            id: "container-1".to_string(),
+            name: "container-1".to_string(),
+            image: "unused".to_string(),
+        });
+        runtime.project_mcp_managers.write().await.insert(
+            project_id,
+            Arc::new(McpAgentManager::from_tools_for_test(Vec::new())),
+        );
+        write_project_skill(
+            &runtime,
+            project_id,
+            "review-single-pr",
+            "Review exactly one pull request with Chinese comments.",
+            "Review single PR body.",
+        );
+        write_workspace_project_skill(
+            &dir,
+            ".claude/skills",
+            "review-single-pr",
+            "Review exactly one pull request with Chinese comments.",
+            "Review single PR body.",
+        );
+        let message = runtime
+            .project_reviewer_initial_message(project_id, reviewer_id)
+            .await
+            .expect("message");
+        runtime
+            .run_turn_inner(
+                reviewer_id,
+                session_id,
+                Uuid::new_v4(),
+                message,
+                vec!["reviewer-agent-review-pr".to_string()],
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn");
+
+        let requests = requests.lock().await.clone();
+        let request_text = serde_json::to_string(&requests[0]).expect("request json");
+        assert!(request_text.contains("用中文评论, review-single-pr"));
+        assert!(request_text.contains("$review-single-pr"));
+        assert!(request_text.contains("Review exactly one pull request with Chinese comments."));
+        assert!(request_text.contains("/workspace/repo/.claude/skills/review-single-pr/SKILL.md"));
+        assert!(request_text.contains("<name>reviewer-agent-review-pr</name>"));
+        assert!(!request_text.contains("<name>review-single-pr</name>"));
     }
 
     #[tokio::test]

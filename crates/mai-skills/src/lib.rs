@@ -3,7 +3,7 @@ use mai_protocol::{
     SkillPolicy, SkillScope, SkillToolDependency, SkillsConfigRequest, SkillsListResponse,
 };
 use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -17,12 +17,7 @@ const METADATA_FILE: &str = "openai.yaml";
 const MAX_SCAN_DEPTH: usize = 6;
 const MAX_NAME_LEN: usize = 64;
 const MAX_DESCRIPTION_LEN: usize = 8192;
-const EXPLICIT_MATCH_THRESHOLD: i32 = 70;
-const IMPLICIT_INJECT_THRESHOLD: i32 = 90;
-const IMPLICIT_SUGGEST_THRESHOLD: i32 = 60;
-const IMPLICIT_LEAD_THRESHOLD: i32 = 25;
-const MAX_IMPLICIT_INJECTIONS: usize = 2;
-const MAX_SKILL_SUGGESTIONS: usize = 3;
+const SKILL_PATH_PREFIX: &str = "skill://";
 
 #[derive(Debug, Error)]
 pub enum SkillError {
@@ -47,6 +42,44 @@ pub struct SkillInjections {
     pub items: Vec<LoadedSkill>,
     pub suggestions: Vec<SkillSuggestion>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SkillInput<'a> {
+    pub text: Option<&'a str>,
+    pub selections: Vec<SkillSelection>,
+    pub reserved_names: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillSelection {
+    pub name: Option<String>,
+    pub path: Option<PathBuf>,
+}
+
+impl SkillSelection {
+    pub fn from_mention(value: impl Into<String>) -> Self {
+        let value = value.into();
+        if looks_like_path(normalize_mention(&value)) {
+            Self {
+                name: None,
+                path: Some(PathBuf::from(normalize_mention(&value))),
+            }
+        } else {
+            Self {
+                name: Some(normalize_mention(&value).to_string()),
+                path: None,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ToolMentions {
+    names: BTreeSet<String>,
+    paths: BTreeSet<PathBuf>,
+    plain_names: BTreeSet<String>,
+    blocked_plain_names: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,46 +265,7 @@ impl SkillsManager {
     }
 
     pub fn render_available(&self, config: &SkillsConfigRequest) -> Result<String> {
-        let response = self.list(config)?;
-        let mut skills = response
-            .skills
-            .into_iter()
-            .filter(|skill| {
-                skill.enabled
-                    && skill
-                        .policy
-                        .as_ref()
-                        .and_then(|policy| policy.allow_implicit_invocation)
-                        .unwrap_or(true)
-            })
-            .collect::<Vec<_>>();
-        if skills.is_empty() {
-            return Ok("No skills are currently available.".to_string());
-        }
-
-        skills.sort_by(skill_sort);
-        let mut name_counts = BTreeMap::<String, usize>::new();
-        for skill in &skills {
-            *name_counts.entry(skill.name.clone()).or_default() += 1;
-        }
-
-        let mut lines = Vec::with_capacity(skills.len() + 3);
-        lines.push("A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and file path so you can open the source for full instructions when using a specific skill.".to_string());
-        lines.push("### Available Skills".to_string());
-        for skill in skills {
-            let duplicate = name_counts.get(&skill.name).copied().unwrap_or_default() > 1;
-            let _ = duplicate;
-            lines.push(format!(
-                "- ${}: {} (path: {})",
-                skill.name,
-                display_description(&skill),
-                skill.path.display()
-            ));
-        }
-        lines.push("### How to use skills".to_string());
-        lines.push("- Use a skill when the user names it with `$SkillName`, selects it from the UI, or the task clearly matches its description. Do not carry skills across turns unless re-mentioned.".to_string());
-        lines.push("- After deciding to use a skill, read only the relevant parts of its `SKILL.md`; resolve relative references from that file's directory.".to_string());
-        Ok(lines.join("\n"))
+        Ok(render_available_response(self.list(config)?))
     }
 
     pub fn build_injections(
@@ -281,7 +275,16 @@ impl SkillsManager {
     ) -> Result<SkillInjections> {
         let mut outcome = self.load_outcome();
         apply_config(&mut outcome.skills, config)?;
-        Ok(build_injections_from_outcome(&outcome, explicit_mentions))
+        Ok(build_injections_from_outcome(
+            &outcome,
+            &SkillInput {
+                selections: explicit_mentions
+                    .iter()
+                    .map(|mention| SkillSelection::from_mention(mention.clone()))
+                    .collect(),
+                ..Default::default()
+            },
+        ))
     }
 
     pub fn build_injections_for_message(
@@ -292,11 +295,35 @@ impl SkillsManager {
     ) -> Result<SkillInjections> {
         let mut outcome = self.load_outcome();
         apply_config(&mut outcome.skills, config)?;
-        Ok(build_injections_for_message_from_outcome(
+        Ok(self.build_injections_for_input_from_outcome(
             &outcome,
-            message,
-            explicit_mentions,
+            SkillInput {
+                text: Some(message),
+                selections: explicit_mentions
+                    .iter()
+                    .map(|mention| SkillSelection::from_mention(mention.clone()))
+                    .collect(),
+                ..Default::default()
+            },
         ))
+    }
+
+    pub fn build_injections_for_input(
+        &self,
+        input: SkillInput<'_>,
+        config: &SkillsConfigRequest,
+    ) -> Result<SkillInjections> {
+        let mut outcome = self.load_outcome();
+        apply_config(&mut outcome.skills, config)?;
+        Ok(self.build_injections_for_input_from_outcome(&outcome, input))
+    }
+
+    fn build_injections_for_input_from_outcome(
+        &self,
+        outcome: &SkillLoadOutcome,
+        input: SkillInput<'_>,
+    ) -> SkillInjections {
+        build_injections_from_outcome(outcome, &input)
     }
 
     fn load_outcome(&self) -> SkillLoadOutcome {
@@ -347,12 +374,66 @@ impl SkillsManager {
     }
 }
 
+pub fn render_available_response(response: SkillsListResponse) -> String {
+    let mut skills = response
+        .skills
+        .into_iter()
+        .filter(|skill| {
+            skill.enabled
+                && skill
+                    .policy
+                    .as_ref()
+                    .and_then(|policy| policy.allow_implicit_invocation)
+                    .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    if skills.is_empty() {
+        return "No skills are currently available.".to_string();
+    }
+
+    skills.sort_by(skill_sort);
+    let mut name_counts = BTreeMap::<String, usize>::new();
+    for skill in &skills {
+        *name_counts.entry(skill.name.clone()).or_default() += 1;
+    }
+
+    let mut lines = Vec::with_capacity(skills.len() + 7);
+    lines.push("A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and file path so you can open the source for full instructions when using a specific skill.".to_string());
+    lines.push("### Available Skills".to_string());
+    for skill in skills {
+        let duplicate = name_counts.get(&skill.name).copied().unwrap_or_default() > 1;
+        let _ = duplicate;
+        lines.push(format!(
+            "- ${}: {} (path: {})",
+            skill.name,
+            display_description(&skill),
+            skill_display_path(&skill).display()
+        ));
+    }
+    lines.push("### How to use skills".to_string());
+    lines.push("- Discovery: The list above is the skills available in this session (name + description + file path). Skill bodies live on disk at the listed paths.".to_string());
+    lines.push("- Trigger rules: If the user names a skill (with `$SkillName` or plain text), selects it from the UI, or the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.".to_string());
+    lines.push("- Missing/blocked: If a named skill is not in the list or the path cannot be read, say so briefly and continue with the best fallback.".to_string());
+    lines.push("- How to use a skill: after deciding to use a skill, open its `SKILL.md`. Read only enough to follow the workflow. Resolve relative references from the directory containing that `SKILL.md`; if it points to `references/`, `scripts/`, or `assets/`, load only the specific files needed.".to_string());
+    lines.push("- Coordination and context hygiene: if multiple skills apply, choose the minimal set that covers the request and state the order you will use them. Keep context small and avoid deep reference-chasing unless blocked.".to_string());
+    lines.join("\n")
+}
+
 pub fn extract_skill_mentions(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
-    let mut seen = HashSet::<String>::new();
+    let mut seen = BTreeSet::<String>::new();
     let mut index = 0;
     while index < bytes.len() {
+        if bytes[index] == b'['
+            && let Some((name, _path, end)) = parse_linked_skill_mention(text, bytes, index)
+        {
+            if !is_common_env_var(name) && seen.insert(name.to_string()) {
+                out.push(name.to_string());
+            }
+            index = end;
+            continue;
+        }
         if bytes[index] != b'$' {
             index += 1;
             continue;
@@ -373,6 +454,51 @@ pub fn extract_skill_mentions(text: &str) -> Vec<String> {
         index = end;
     }
     out
+}
+
+pub fn extract_tool_mentions(text: &str) -> ToolMentions {
+    let bytes = text.as_bytes();
+    let mut out = ToolMentions::default();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'['
+            && let Some((name, path, end)) = parse_linked_skill_mention(text, bytes, index)
+        {
+            if !is_common_env_var(name) {
+                out.names.insert(name.to_string());
+                out.paths.insert(normalized_skill_path(Path::new(path)));
+                out.blocked_plain_names.insert(name.to_string());
+            }
+            index = end;
+            continue;
+        }
+        if bytes[index] != b'$' {
+            index += 1;
+            continue;
+        }
+        let start = index + 1;
+        let mut end = start;
+        while end < bytes.len() && is_mention_name_char(bytes[end]) {
+            end += 1;
+        }
+        if end == start {
+            index += 1;
+            continue;
+        }
+        let name = &text[start..end];
+        if !is_common_env_var(name) {
+            out.names.insert(name.to_string());
+            out.plain_names.insert(name.to_string());
+        }
+        index = end;
+    }
+    out
+}
+
+impl ToolMentions {
+    fn blocked_plain_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.blocked_plain_names.iter().cloned()
+    }
 }
 
 pub fn normalize_config(config: &SkillsConfigRequest) -> Result<SkillsConfigRequest> {
@@ -618,11 +744,14 @@ fn apply_config(skills: &mut [SkillMetadata], config: &SkillsConfigRequest) -> R
 
 fn build_injections_from_outcome(
     outcome: &SkillLoadOutcome,
-    explicit_mentions: &[String],
+    input: &SkillInput<'_>,
 ) -> SkillInjections {
     let mut result = SkillInjections::default();
     let mut seen_paths = BTreeSet::<PathBuf>::new();
     let mut blocked_plain_names = BTreeSet::<String>::new();
+    let mut selection_names = BTreeSet::<String>::new();
+    let mut plain_names = BTreeSet::<String>::new();
+    let mut paths = BTreeSet::<PathBuf>::new();
     let enabled = outcome
         .skills
         .iter()
@@ -630,170 +759,57 @@ fn build_injections_from_outcome(
         .collect::<Vec<_>>();
     let name_counts = skill_name_counts(&enabled);
 
-    for mention in explicit_mentions {
-        let trimmed = normalize_mention(mention);
-        if trimmed.is_empty() {
-            continue;
+    for selection in &input.selections {
+        if let Some(path) = &selection.path {
+            paths.insert(normalized_skill_path(path));
         }
-        if looks_like_path(trimmed) {
-            let path = canonicalize_or_clone(Path::new(trimmed));
-            blocked_plain_names.extend(
-                enabled
-                    .iter()
-                    .filter(|skill| skill.path == path)
-                    .map(|skill| skill.name.clone()),
-            );
-            if let Some(skill) = enabled.iter().find(|skill| skill.path == path) {
-                load_skill_contents(skill, &mut seen_paths, &mut result);
+        if let Some(name) = &selection.name {
+            let name = normalize_mention(name).trim();
+            if !name.is_empty() {
+                selection_names.insert(name.to_string());
             }
         }
     }
 
-    for mention in explicit_mentions {
-        let trimmed = normalize_mention(mention);
-        if trimmed.is_empty() || looks_like_path(trimmed) || blocked_plain_names.contains(trimmed) {
-            continue;
-        }
-        if name_counts.get(trimmed).copied().unwrap_or_default() != 1 {
-            continue;
-        }
-        if let Some(skill) = enabled.iter().find(|skill| skill.name == trimmed) {
+    if let Some(text) = input.text {
+        let mentions = extract_tool_mentions(text);
+        blocked_plain_names.extend(mentions.blocked_plain_names());
+        paths.extend(mentions.paths);
+        plain_names.extend(mentions.plain_names);
+    }
+
+    for path in &paths {
+        let path = canonicalize_or_clone(path);
+        if let Some(skill) = enabled.iter().find(|skill| skill.path == path) {
+            blocked_plain_names.insert(skill.name.clone());
             load_skill_contents(skill, &mut seen_paths, &mut result);
         }
     }
 
-    for mention in explicit_mentions {
-        let trimmed = normalize_mention(mention);
-        if trimmed.is_empty() || looks_like_path(trimmed) || blocked_plain_names.contains(trimmed) {
-            continue;
-        }
-        if result
-            .items
-            .iter()
-            .any(|skill| skill.metadata.name == trimmed)
+    for name in selection_names {
+        if blocked_plain_names.contains(&name)
+            || name_counts.get(&name).copied().unwrap_or_default() != 1
         {
             continue;
         }
-        if let Some(skill) = unique_explicit_skill_match(trimmed, &enabled, &seen_paths) {
+        if let Some(skill) = enabled.iter().find(|skill| skill.name == name) {
+            load_skill_contents(skill, &mut seen_paths, &mut result);
+        }
+    }
+
+    for name in plain_names {
+        if blocked_plain_names.contains(&name)
+            || input.reserved_names.contains(&name)
+            || name_counts.get(&name).copied().unwrap_or_default() != 1
+        {
+            continue;
+        }
+        if let Some(skill) = enabled.iter().find(|skill| skill.name == name) {
             load_skill_contents(skill, &mut seen_paths, &mut result);
         }
     }
 
     result
-}
-
-fn build_injections_for_message_from_outcome(
-    outcome: &SkillLoadOutcome,
-    message: &str,
-    explicit_mentions: &[String],
-) -> SkillInjections {
-    let mut mentions = explicit_mentions.to_vec();
-    mentions.extend(extract_skill_mentions(message));
-    let mut result = build_injections_from_outcome(outcome, &mentions);
-    add_implicit_matches(outcome, message, &mut result);
-    result
-}
-
-fn unique_explicit_skill_match<'a>(
-    mention: &str,
-    skills: &[&'a SkillMetadata],
-    seen_paths: &BTreeSet<PathBuf>,
-) -> Option<&'a SkillMetadata> {
-    let mut matches = skills
-        .iter()
-        .copied()
-        .filter(|skill| !seen_paths.contains(&skill.path))
-        .filter_map(|skill| explicit_skill_match_score(skill, mention).map(|score| (score, skill)))
-        .filter(|(score, _)| *score >= EXPLICIT_MATCH_THRESHOLD)
-        .collect::<Vec<_>>();
-    matches.sort_by(|(left_score, left), (right_score, right)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| skill_sort(left, right))
-    });
-    let (best_score, best_skill) = matches.first().copied()?;
-    if matches
-        .get(1)
-        .is_some_and(|(score, _)| *score == best_score)
-    {
-        return None;
-    }
-    Some(best_skill)
-}
-
-#[derive(Debug, Clone)]
-struct SkillCandidate<'a> {
-    skill: &'a SkillMetadata,
-    score: i32,
-    reason: String,
-}
-
-fn add_implicit_matches(outcome: &SkillLoadOutcome, message: &str, result: &mut SkillInjections) {
-    if message.trim().is_empty() {
-        return;
-    }
-    let seen_paths = result
-        .items
-        .iter()
-        .map(|skill| skill.metadata.path.clone())
-        .collect::<BTreeSet<_>>();
-    let mut candidates = outcome
-        .skills
-        .iter()
-        .filter(|skill| {
-            skill.enabled && skill_allows_implicit(skill) && !seen_paths.contains(&skill.path)
-        })
-        .filter_map(|skill| implicit_skill_match_score(skill, message))
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| skill_sort(left.skill, right.skill))
-    });
-
-    let mut auto_paths = BTreeSet::<PathBuf>::new();
-    for index in 0..candidates.len().min(MAX_IMPLICIT_INJECTIONS) {
-        let candidate = &candidates[index];
-        if candidate.score < IMPLICIT_INJECT_THRESHOLD {
-            break;
-        }
-        let next_score = candidates
-            .get(index + 1)
-            .map(|item| item.score)
-            .unwrap_or(0);
-        if candidate.score - next_score < IMPLICIT_LEAD_THRESHOLD {
-            break;
-        }
-        load_skill_contents(candidate.skill, &mut auto_paths, result);
-    }
-
-    let injected_paths = result
-        .items
-        .iter()
-        .map(|skill| skill.metadata.path.clone())
-        .collect::<BTreeSet<_>>();
-    result.suggestions = candidates
-        .into_iter()
-        .filter(|candidate| {
-            candidate.score >= IMPLICIT_SUGGEST_THRESHOLD
-                && !injected_paths.contains(&candidate.skill.path)
-        })
-        .take(MAX_SKILL_SUGGESTIONS)
-        .map(skill_suggestion)
-        .collect();
-}
-
-fn skill_suggestion(candidate: SkillCandidate<'_>) -> SkillSuggestion {
-    SkillSuggestion {
-        name: candidate.skill.name.clone(),
-        display_name: skill_display_name(candidate.skill),
-        description: display_description(candidate.skill).to_string(),
-        path: candidate.skill.path.clone(),
-        scope: candidate.skill.scope,
-        reason: candidate.reason,
-        score: candidate.score,
-    }
 }
 
 fn load_skill_contents(
@@ -815,256 +831,6 @@ fn load_skill_contents(
             path = skill.path.display()
         )),
     }
-}
-
-fn explicit_skill_match_score(skill: &SkillMetadata, mention: &str) -> Option<i32> {
-    let mention = normalize_token(mention);
-    if mention.is_empty() {
-        return None;
-    }
-    skill_aliases(skill)
-        .into_iter()
-        .filter_map(|alias| alias_match_score(&alias, &mention))
-        .max()
-}
-
-fn implicit_skill_match_score<'a>(
-    skill: &'a SkillMetadata,
-    message: &str,
-) -> Option<SkillCandidate<'a>> {
-    let message_tokens = tokenize_for_match(message);
-    if message_tokens.is_empty() {
-        return None;
-    }
-    let message_norm = message_tokens.join(" ");
-    let mut best: Option<(i32, String)> = None;
-    for alias in skill_aliases(skill) {
-        let alias_tokens = tokenize_for_match(&alias);
-        if alias_tokens.is_empty() {
-            continue;
-        }
-        let alias_norm = alias_tokens.join(" ");
-        let score = if message_norm == alias_norm {
-            115
-        } else if contains_word_sequence(&message_tokens, &alias_tokens) {
-            110
-        } else if alias_tokens.iter().all(|token| {
-            message_tokens
-                .iter()
-                .any(|message_token| message_token == token)
-        }) {
-            100
-        } else {
-            message_tokens
-                .iter()
-                .filter_map(|token| alias_match_score(&alias_norm, token))
-                .max()
-                .unwrap_or(0)
-                .saturating_sub(5)
-        };
-        if score > best.as_ref().map(|(score, _)| *score).unwrap_or_default() {
-            best = Some((score, format!("matched alias `{alias}`")));
-        }
-    }
-
-    let description_tokens = tokenize_for_match(display_description(skill));
-    if !description_tokens.is_empty() {
-        let overlap = message_tokens
-            .iter()
-            .filter(|token| {
-                token.len() >= 4 && description_tokens.iter().any(|desc| desc == *token)
-            })
-            .count();
-        let score = match overlap {
-            0 => 0,
-            1 => 55,
-            2 => 75,
-            _ => 92 + (overlap.min(6) as i32 - 3) * 2,
-        };
-        if score > best.as_ref().map(|(score, _)| *score).unwrap_or_default() {
-            best = Some((score, format!("matched {overlap} description keywords")));
-        }
-    }
-
-    let (score, reason) = best?;
-    (score >= IMPLICIT_SUGGEST_THRESHOLD).then_some(SkillCandidate {
-        skill,
-        score,
-        reason,
-    })
-}
-
-fn skill_aliases(skill: &SkillMetadata) -> Vec<String> {
-    let mut aliases = Vec::new();
-    push_alias(&mut aliases, &skill.name);
-    if let Some((_plugin, name)) = skill.name.split_once(':') {
-        push_alias(&mut aliases, name);
-    }
-    if let Some(display_name) = skill_display_name(skill) {
-        push_alias(&mut aliases, &display_name);
-    }
-    if let Some(parent) = skill
-        .path
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-    {
-        push_alias(&mut aliases, parent);
-    }
-    let current = aliases.clone();
-    for alias in current {
-        let abbreviation = alias_abbreviation(&alias);
-        push_alias(&mut aliases, &abbreviation);
-    }
-    aliases
-}
-
-fn push_alias(aliases: &mut Vec<String>, value: &str) {
-    let normalized = normalize_token(value);
-    if !normalized.is_empty() && !aliases.contains(&normalized) {
-        aliases.push(normalized);
-    }
-}
-
-fn skill_display_name(skill: &SkillMetadata) -> Option<String> {
-    skill
-        .interface
-        .as_ref()
-        .and_then(|interface| interface.display_name.as_deref())
-        .map(ToOwned::to_owned)
-}
-
-fn alias_abbreviation(value: &str) -> String {
-    tokenize_for_match(value)
-        .into_iter()
-        .filter_map(|token| token.chars().next())
-        .collect()
-}
-
-fn alias_match_score(alias: &str, needle: &str) -> Option<i32> {
-    let alias = normalize_token(alias);
-    let needle = normalize_token(needle);
-    if alias.is_empty() || needle.is_empty() {
-        return None;
-    }
-    if alias == needle {
-        return Some(120);
-    }
-    if alias.starts_with(&needle) {
-        return Some(105);
-    }
-    if alias
-        .split_whitespace()
-        .any(|part| part == needle || part.starts_with(&needle))
-    {
-        return Some(100);
-    }
-    if alias.contains(&needle) {
-        return Some(90);
-    }
-    fuzzy_match_score(&alias, &needle).map(|score| score.saturating_sub(10))
-}
-
-fn fuzzy_match_score(haystack: &str, needle: &str) -> Option<i32> {
-    if needle.is_empty() {
-        return None;
-    }
-    let haystack_chars = haystack.chars().collect::<Vec<_>>();
-    let needle_chars = needle.chars().collect::<Vec<_>>();
-    let mut matched_positions = Vec::with_capacity(needle_chars.len());
-    let mut cursor = 0usize;
-    for needle_char in needle_chars {
-        let mut found = None;
-        while cursor < haystack_chars.len() {
-            if haystack_chars[cursor] == needle_char {
-                found = Some(cursor);
-                cursor += 1;
-                break;
-            }
-            cursor += 1;
-        }
-        matched_positions.push(found?);
-    }
-    let first = *matched_positions.first()?;
-    let last = *matched_positions.last()?;
-    let span = last.saturating_sub(first) + 1;
-    let gaps = span.saturating_sub(matched_positions.len());
-    let prefix_bonus = if first == 0 { 20 } else { 0 };
-    let boundary_bonus = if first == 0
-        || haystack_chars
-            .get(first.saturating_sub(1))
-            .is_some_and(|ch| !ch.is_alphanumeric())
-    {
-        10
-    } else {
-        0
-    };
-    Some((80 + prefix_bonus + boundary_bonus - gaps as i32).clamp(0, 100))
-}
-
-fn tokenize_for_match(text: &str) -> Vec<String> {
-    text.split(|ch: char| !ch.is_alphanumeric())
-        .filter_map(|part| {
-            let token = normalize_token(part);
-            (!token.is_empty() && !is_stop_word(&token)).then_some(token)
-        })
-        .collect()
-}
-
-fn contains_word_sequence(haystack: &[String], needle: &[String]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
-}
-
-fn normalize_token(value: &str) -> String {
-    value
-        .trim()
-        .trim_start_matches('$')
-        .to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn skill_allows_implicit(skill: &SkillMetadata) -> bool {
-    skill
-        .policy
-        .as_ref()
-        .and_then(|policy| policy.allow_implicit_invocation)
-        .unwrap_or(true)
-}
-
-fn is_stop_word(value: &str) -> bool {
-    matches!(
-        value,
-        "a" | "an"
-            | "and"
-            | "are"
-            | "as"
-            | "at"
-            | "be"
-            | "by"
-            | "for"
-            | "from"
-            | "help"
-            | "i"
-            | "in"
-            | "is"
-            | "it"
-            | "me"
-            | "of"
-            | "on"
-            | "or"
-            | "please"
-            | "the"
-            | "this"
-            | "to"
-            | "use"
-            | "with"
-            | "you"
-    )
 }
 
 fn skill_name_counts(skills: &[&SkillMetadata]) -> BTreeMap<String, usize> {
@@ -1133,6 +899,10 @@ fn display_description(skill: &SkillMetadata) -> &str {
         .unwrap_or(&skill.description)
 }
 
+fn skill_display_path(skill: &SkillMetadata) -> &Path {
+    skill.source_path.as_deref().unwrap_or(&skill.path)
+}
+
 fn skill_sort(left: &SkillMetadata, right: &SkillMetadata) -> std::cmp::Ordering {
     scope_rank(left.scope)
         .cmp(&scope_rank(right.scope))
@@ -1158,7 +928,72 @@ fn normalize_mention(value: &str) -> &str {
 }
 
 fn looks_like_path(value: &str) -> bool {
-    value.contains('/') || value.contains('\\') || value.ends_with(SKILL_FILE)
+    value.starts_with(SKILL_PATH_PREFIX)
+        || value.contains('/')
+        || value.contains('\\')
+        || value.ends_with(SKILL_FILE)
+}
+
+fn normalized_skill_path(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    let normalized = raw.strip_prefix(SKILL_PATH_PREFIX).unwrap_or(&raw);
+    canonicalize_or_clone(Path::new(normalized))
+}
+
+fn parse_linked_skill_mention<'a>(
+    text: &'a str,
+    bytes: &[u8],
+    start: usize,
+) -> Option<(&'a str, &'a str, usize)> {
+    let sigil_index = start + 1;
+    if bytes.get(sigil_index) != Some(&b'$') {
+        return None;
+    }
+
+    let name_start = sigil_index + 1;
+    let first_name_byte = bytes.get(name_start)?;
+    if !is_mention_name_char(*first_name_byte) {
+        return None;
+    }
+
+    let mut name_end = name_start + 1;
+    while let Some(next_byte) = bytes.get(name_end)
+        && is_mention_name_char(*next_byte)
+    {
+        name_end += 1;
+    }
+
+    if bytes.get(name_end) != Some(&b']') {
+        return None;
+    }
+
+    let mut path_start = name_end + 1;
+    while let Some(next_byte) = bytes.get(path_start)
+        && next_byte.is_ascii_whitespace()
+    {
+        path_start += 1;
+    }
+    if bytes.get(path_start) != Some(&b'(') {
+        return None;
+    }
+
+    let mut path_end = path_start + 1;
+    while let Some(next_byte) = bytes.get(path_end)
+        && *next_byte != b')'
+    {
+        path_end += 1;
+    }
+    if bytes.get(path_end) != Some(&b')') {
+        return None;
+    }
+
+    let path = text[path_start + 1..path_end].trim();
+    if path.is_empty() {
+        return None;
+    }
+
+    let name = &text[name_start..name_end];
+    Some((name, path, path_end + 1))
 }
 
 fn is_mention_name_char(byte: u8) -> bool {
@@ -1514,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_fuzzy_matches_display_plugin_directory_and_abbreviation() {
+    fn explicit_mentions_do_not_fuzzy_match_display_plugin_directory_or_abbreviation() {
         let dir = tempdir().expect("tempdir");
         let skill_dir = dir.path().join("doc-reviewer");
         fs::create_dir_all(skill_dir.join("agents")).expect("mkdir metadata");
@@ -1534,77 +1369,143 @@ mod tests {
             let injected = manager
                 .build_injections(&[mention.to_string()], &SkillsConfigRequest::default())
                 .expect("inject");
-            assert_eq!(injected.items.len(), 1, "mention {mention}");
-            assert_eq!(injected.items[0].metadata.name, "github:doc-review");
+            assert!(injected.items.is_empty(), "mention {mention}");
         }
     }
 
     #[test]
-    fn explicit_fuzzy_ambiguous_same_score_does_not_inject() {
+    fn text_skill_mentions_require_exact_boundary() {
         let dir = tempdir().expect("tempdir");
-        for name in ["alpha-review", "alpha-runner"] {
-            let skill_dir = dir.path().join(name);
-            fs::create_dir_all(&skill_dir).expect("mkdir");
-            fs::write(
-                skill_dir.join(SKILL_FILE),
-                format!("---\nname: {name}\ndescription: {name}\n---\nBody."),
-            )
-            .expect("write skill");
-        }
+        let skill_dir = dir.path().join("alpha-skill");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join(SKILL_FILE),
+            "---\nname: alpha-skill\ndescription: Alpha.\n---\nBody.",
+        )
+        .expect("write skill");
         let manager = SkillsManager::with_roots(vec![(dir.path().to_path_buf(), SkillScope::Repo)]);
 
-        let injected = manager
-            .build_injections(&["alpha".to_string()], &SkillsConfigRequest::default())
-            .expect("inject");
+        let near_miss = manager
+            .build_injections_for_message("$alpha-skillx", &[], &SkillsConfigRequest::default())
+            .expect("near miss");
+        assert!(near_miss.items.is_empty());
 
-        assert!(injected.items.is_empty());
+        let matched = manager
+            .build_injections_for_message("$alpha-skill.", &[], &SkillsConfigRequest::default())
+            .expect("match");
+        assert_eq!(matched.items.len(), 1);
+        assert_eq!(matched.items[0].metadata.name, "alpha-skill");
     }
 
     #[test]
-    fn implicit_message_injects_high_confidence_and_suggests_lower_confidence() {
+    fn linked_path_mentions_select_by_path_and_block_plain_fallback() {
         let dir = tempdir().expect("tempdir");
-        for (name, description, body) in [
-            (
-                "frontend-app-builder",
-                "Build frontend apps.",
-                "Frontend body.",
-            ),
-            (
-                "release-notes",
-                "Prepare changelog release summary migration notes.",
-                "Release body.",
-            ),
-        ] {
-            let skill_dir = dir.path().join(name);
+        let alpha = dir.path().join("alpha");
+        let beta = dir.path().join("beta");
+        for root in [&alpha, &beta] {
+            let skill_dir = root.join("demo");
             fs::create_dir_all(&skill_dir).expect("mkdir");
             fs::write(
                 skill_dir.join(SKILL_FILE),
-                format!("---\nname: {name}\ndescription: {description}\n---\n{body}"),
+                "---\nname: demo\ndescription: Demo.\n---\nBody.",
             )
             .expect("write skill");
         }
-        let manager = SkillsManager::with_roots(vec![(dir.path().to_path_buf(), SkillScope::Repo)]);
+        let manager = SkillsManager::with_roots(vec![
+            (alpha, SkillScope::Repo),
+            (beta.clone(), SkillScope::User),
+        ]);
+        let beta_path = canonicalize_or_clone(beta.join("demo/SKILL.md"));
 
         let injected = manager
             .build_injections_for_message(
-                "please use the frontend app builder",
+                &format!("use [$demo]({}) and $demo", beta_path.display()),
                 &[],
                 &SkillsConfigRequest::default(),
             )
             .expect("inject");
         assert_eq!(injected.items.len(), 1);
-        assert_eq!(injected.items[0].metadata.name, "frontend-app-builder");
+        assert_eq!(injected.items[0].metadata.scope, SkillScope::User);
 
-        let suggested = manager
-            .build_injections_for_message("changelog summary", &[], &SkillsConfigRequest::default())
-            .expect("suggest");
-        assert!(suggested.items.is_empty());
-        assert_eq!(suggested.suggestions.len(), 1);
-        assert_eq!(suggested.suggestions[0].name, "release-notes");
+        let missing = manager
+            .build_injections_for_message(
+                "use [$demo](/tmp/missing/SKILL.md) and $demo",
+                &[],
+                &SkillsConfigRequest::default(),
+            )
+            .expect("missing");
+        assert!(missing.items.is_empty());
     }
 
     #[test]
-    fn implicit_policy_blocks_auto_but_explicit_can_inject() {
+    fn reserved_name_conflict_blocks_plain_name_but_not_path() {
+        let dir = tempdir().expect("tempdir");
+        let skill_dir = dir.path().join("demo");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join(SKILL_FILE),
+            "---\nname: demo\ndescription: Demo.\n---\nBody.",
+        )
+        .expect("write skill");
+        let manager = SkillsManager::with_roots(vec![(dir.path().to_path_buf(), SkillScope::Repo)]);
+        let reserved_names = BTreeSet::from(["demo".to_string()]);
+
+        let blocked = manager
+            .build_injections_for_input(
+                SkillInput {
+                    text: Some("$demo"),
+                    reserved_names: reserved_names.clone(),
+                    ..Default::default()
+                },
+                &SkillsConfigRequest::default(),
+            )
+            .expect("blocked");
+        assert!(blocked.items.is_empty());
+
+        let path = canonicalize_or_clone(skill_dir.join(SKILL_FILE));
+        let selected = manager
+            .build_injections_for_input(
+                SkillInput {
+                    text: Some(&format!("use [$demo]({})", path.display())),
+                    reserved_names,
+                    ..Default::default()
+                },
+                &SkillsConfigRequest::default(),
+            )
+            .expect("path");
+        assert_eq!(selected.items.len(), 1);
+    }
+
+    #[test]
+    fn semantic_matches_are_available_but_not_runtime_auto_injected() {
+        let dir = tempdir().expect("tempdir");
+        let skill_dir = dir.path().join("frontend-app-builder");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join(SKILL_FILE),
+            "---\nname: frontend-app-builder\ndescription: Build frontend apps.\n---\nFrontend body.",
+        )
+        .expect("write skill");
+        let manager = SkillsManager::with_roots(vec![(dir.path().to_path_buf(), SkillScope::Repo)]);
+
+        let injected = manager
+            .build_injections_for_message(
+                "please build a frontend app",
+                &[],
+                &SkillsConfigRequest::default(),
+            )
+            .expect("inject");
+        assert!(injected.items.is_empty());
+        assert!(injected.suggestions.is_empty());
+
+        let available = manager
+            .render_available(&SkillsConfigRequest::default())
+            .expect("available");
+        assert!(available.contains("task clearly matches a skill's description"));
+    }
+
+    #[test]
+    fn implicit_policy_hides_from_available_but_explicit_can_inject() {
         let dir = tempdir().expect("tempdir");
         let skill_dir = dir.path().join("guarded");
         fs::create_dir_all(skill_dir.join("agents")).expect("mkdir metadata");
@@ -1620,15 +1521,10 @@ mod tests {
         .expect("write metadata");
         let manager = SkillsManager::with_roots(vec![(dir.path().to_path_buf(), SkillScope::Repo)]);
 
-        let implicit = manager
-            .build_injections_for_message(
-                "please use guarded skill",
-                &[],
-                &SkillsConfigRequest::default(),
-            )
-            .expect("implicit");
-        assert!(implicit.items.is_empty());
-        assert!(implicit.suggestions.is_empty());
+        let available = manager
+            .render_available(&SkillsConfigRequest::default())
+            .expect("available");
+        assert_eq!(available, "No skills are currently available.");
 
         let explicit = manager
             .build_injections_for_message(
