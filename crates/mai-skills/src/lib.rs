@@ -78,7 +78,7 @@ impl SkillSelection {
 pub struct ToolMentions {
     names: BTreeSet<String>,
     paths: BTreeSet<PathBuf>,
-    plain_names: BTreeSet<String>,
+    explicit_names: BTreeSet<String>,
     blocked_plain_names: BTreeSet<String>,
 }
 
@@ -488,7 +488,7 @@ pub fn extract_tool_mentions(text: &str) -> ToolMentions {
         let name = &text[start..end];
         if !is_common_env_var(name) {
             out.names.insert(name.to_string());
-            out.plain_names.insert(name.to_string());
+            out.explicit_names.insert(name.to_string());
         }
         index = end;
     }
@@ -750,7 +750,8 @@ fn build_injections_from_outcome(
     let mut seen_paths = BTreeSet::<PathBuf>::new();
     let mut blocked_plain_names = BTreeSet::<String>::new();
     let mut selection_names = BTreeSet::<String>::new();
-    let mut plain_names = BTreeSet::<String>::new();
+    let mut explicit_names = BTreeSet::<String>::new();
+    let mut plain_text_names = BTreeSet::<String>::new();
     let mut paths = BTreeSet::<PathBuf>::new();
     let enabled = outcome
         .skills
@@ -775,7 +776,8 @@ fn build_injections_from_outcome(
         let mentions = extract_tool_mentions(text);
         blocked_plain_names.extend(mentions.blocked_plain_names());
         paths.extend(mentions.paths);
-        plain_names.extend(mentions.plain_names);
+        explicit_names.extend(mentions.explicit_names);
+        plain_text_names.extend(extract_plain_skill_names(text, &enabled));
     }
 
     for path in &paths {
@@ -797,7 +799,7 @@ fn build_injections_from_outcome(
         }
     }
 
-    for name in plain_names {
+    for name in explicit_names {
         if blocked_plain_names.contains(&name)
             || input.reserved_names.contains(&name)
             || name_counts.get(&name).copied().unwrap_or_default() != 1
@@ -805,6 +807,20 @@ fn build_injections_from_outcome(
             continue;
         }
         if let Some(skill) = enabled.iter().find(|skill| skill.name == name) {
+            load_skill_contents(skill, &mut seen_paths, &mut result);
+        }
+    }
+
+    for name in plain_text_names {
+        if blocked_plain_names.contains(&name)
+            || input.reserved_names.contains(&name)
+            || name_counts.get(&name).copied().unwrap_or_default() != 1
+        {
+            continue;
+        }
+        if let Some(skill) = enabled.iter().find(|skill| skill.name == name)
+            && skill_allows_implicit(skill)
+        {
             load_skill_contents(skill, &mut seen_paths, &mut result);
         }
     }
@@ -839,6 +855,47 @@ fn skill_name_counts(skills: &[&SkillMetadata]) -> BTreeMap<String, usize> {
         *counts.entry(skill.name.clone()).or_default() += 1;
     }
     counts
+}
+
+fn skill_allows_implicit(skill: &SkillMetadata) -> bool {
+    skill
+        .policy
+        .as_ref()
+        .and_then(|policy| policy.allow_implicit_invocation)
+        .unwrap_or(true)
+}
+
+fn extract_plain_skill_names(text: &str, skills: &[&SkillMetadata]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for skill in skills {
+        if contains_plain_skill_name(text, &skill.name) {
+            names.insert(skill.name.clone());
+        }
+    }
+    names
+}
+
+fn contains_plain_skill_name(text: &str, name: &str) -> bool {
+    if name.is_empty() || is_common_env_var(name) {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let name_len = name.len();
+    let mut index = 0;
+    while index < text.len() {
+        let Some(relative_start) = text[index..].find(name) else {
+            return false;
+        };
+        let start = index + relative_start;
+        let end = start + name_len;
+        let before_ok = start == 0 || !is_mention_name_char(bytes[start - 1]);
+        let after_ok = end == bytes.len() || !is_mention_name_char(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        index = end;
+    }
+    false
 }
 
 fn extract_frontmatter(contents: &str) -> Option<&str> {
@@ -1398,6 +1455,38 @@ mod tests {
     }
 
     #[test]
+    fn plain_text_skill_mentions_require_exact_boundary() {
+        let dir = tempdir().expect("tempdir");
+        let skill_dir = dir.path().join("alpha-skill");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join(SKILL_FILE),
+            "---\nname: alpha-skill\ndescription: Alpha.\n---\nBody.",
+        )
+        .expect("write skill");
+        let manager = SkillsManager::with_roots(vec![(dir.path().to_path_buf(), SkillScope::Repo)]);
+
+        let near_miss = manager
+            .build_injections_for_message(
+                "please use alpha-skillx",
+                &[],
+                &SkillsConfigRequest::default(),
+            )
+            .expect("near miss");
+        assert!(near_miss.items.is_empty());
+
+        let matched = manager
+            .build_injections_for_message(
+                "please use alpha-skill, thanks",
+                &[],
+                &SkillsConfigRequest::default(),
+            )
+            .expect("match");
+        assert_eq!(matched.items.len(), 1);
+        assert_eq!(matched.items[0].metadata.name, "alpha-skill");
+    }
+
+    #[test]
     fn linked_path_mentions_select_by_path_and_block_plain_fallback() {
         let dir = tempdir().expect("tempdir");
         let alpha = dir.path().join("alpha");
@@ -1461,6 +1550,18 @@ mod tests {
             )
             .expect("blocked");
         assert!(blocked.items.is_empty());
+
+        let plain_blocked = manager
+            .build_injections_for_input(
+                SkillInput {
+                    text: Some("please use demo"),
+                    reserved_names: reserved_names.clone(),
+                    ..Default::default()
+                },
+                &SkillsConfigRequest::default(),
+            )
+            .expect("plain blocked");
+        assert!(plain_blocked.items.is_empty());
 
         let path = canonicalize_or_clone(skill_dir.join(SKILL_FILE));
         let selected = manager
@@ -1534,6 +1635,24 @@ mod tests {
             )
             .expect("explicit");
         assert_eq!(explicit.items.len(), 1);
+
+        let plain = manager
+            .build_injections_for_message(
+                "please use guarded-skill",
+                &[],
+                &SkillsConfigRequest::default(),
+            )
+            .expect("plain");
+        assert!(plain.items.is_empty());
+
+        let explicit_text = manager
+            .build_injections_for_message(
+                "please use $guarded-skill",
+                &[],
+                &SkillsConfigRequest::default(),
+            )
+            .expect("explicit text");
+        assert_eq!(explicit_text.items.len(), 1);
     }
 
     #[test]

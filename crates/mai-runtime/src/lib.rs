@@ -14398,7 +14398,7 @@ esac
         assert!(request_text.contains("Review exactly one pull request with Chinese comments."));
         assert!(request_text.contains("/workspace/repo/.claude/skills/review-single-pr/SKILL.md"));
         assert!(request_text.contains("<name>reviewer-agent-review-pr</name>"));
-        assert!(!request_text.contains("<name>review-single-pr</name>"));
+        assert!(request_text.contains("<name>review-single-pr</name>"));
     }
 
     #[tokio::test]
