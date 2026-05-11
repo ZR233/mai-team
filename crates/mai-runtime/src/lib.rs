@@ -170,6 +170,7 @@ pub struct AgentRuntime {
     agents: RwLock<HashMap<AgentId, Arc<AgentRecord>>>,
     tasks: RwLock<HashMap<TaskId, Arc<TaskRecord>>>,
     projects: RwLock<HashMap<ProjectId, Arc<ProjectRecord>>>,
+    project_skill_locks: RwLock<HashMap<ProjectId, Arc<RwLock<()>>>>,
     project_mcp_managers: RwLock<HashMap<ProjectId, Arc<McpAgentManager>>>,
     github_tokens: Mutex<HashMap<String, CachedGithubToken>>,
     github_manifest_states: Mutex<HashMap<String, GithubManifestState>>,
@@ -192,6 +193,11 @@ struct ProjectRecord {
 struct ProjectReviewWorker {
     cancellation_token: CancellationToken,
     abort_handle: AbortHandle,
+}
+
+enum ProjectSkillRefreshSource {
+    ProjectSidecar,
+    ReviewWorkspace,
 }
 
 struct TaskRecord {
@@ -346,6 +352,7 @@ struct AgentResourceBroker {
     agent_mcp: Option<Arc<McpAgentManager>>,
     project_mcp: Option<Arc<McpAgentManager>>,
     skills: SkillsListResponse,
+    _project_skill_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
 
 struct TurnResult {
@@ -595,6 +602,7 @@ impl AgentRuntime {
             agents: RwLock::new(agents),
             tasks: RwLock::new(tasks),
             projects: RwLock::new(projects),
+            project_skill_locks: RwLock::new(HashMap::new()),
             project_mcp_managers: RwLock::new(HashMap::new()),
             github_tokens: Mutex::new(HashMap::new()),
             github_manifest_states: Mutex::new(HashMap::new()),
@@ -704,8 +712,13 @@ impl AgentRuntime {
 
         let sidecar = self.ensure_project_sidecar(project_id).await?;
         let existing = self.existing_project_skill_dirs(&sidecar.id).await?;
-        self.refresh_project_skill_cache(project_id, &sidecar.id, &existing)
-            .await?;
+        self.refresh_project_skill_cache(
+            project_id,
+            ProjectSkillRefreshSource::ProjectSidecar,
+            Some(&sidecar.id),
+            &existing,
+        )
+        .await?;
         self.project_skills_from_cache(project_id).await
     }
 
@@ -1644,6 +1657,7 @@ impl AgentRuntime {
         let _ = self.delete_project_review_workspace(project_id).await;
         self.store.delete_project(project_id).await?;
         self.projects.write().await.remove(&project_id);
+        self.project_skill_locks.write().await.remove(&project_id);
         self.publish(ServiceEventKind::ProjectDeleted { project_id })
             .await;
         let _ = fs::remove_dir_all(self.project_skill_cache_dir(project_id));
@@ -2668,6 +2682,12 @@ impl AgentRuntime {
         .await;
 
         skill_mentions.extend(extract_skill_mentions(&message));
+        if let Err(err) = self.refresh_project_skills_for_agent(&agent).await {
+            if matches!(err, RuntimeError::TurnCancelled) {
+                return Err(err);
+            }
+            tracing::warn!(agent_id = %agent_id, "failed to refresh project skills before turn: {err}");
+        }
         if let Err(err) = self
             .maybe_auto_compact(&agent, agent_id, session_id, turn_id, &cancellation_token)
             .await
@@ -2703,11 +2723,14 @@ impl AgentRuntime {
 
         let skills_config = self.store.load_skills_config().await?;
         let skills_manager = self.skills_manager_for_agent(&agent).await?;
-        let skill_injections = skills_manager.build_injections_for_message(
-            &message,
-            &skill_mentions,
-            &skills_config,
-        )?;
+        let skill_injections = {
+            let _project_skill_guard = self.project_skill_read_guard(&agent).await;
+            skills_manager.build_injections_for_message(
+                &message,
+                &skill_mentions,
+                &skills_config,
+            )?
+        };
         if !skill_injections.items.is_empty() {
             self.publish(ServiceEventKind::SkillsActivated {
                 agent_id,
@@ -2738,15 +2761,17 @@ impl AgentRuntime {
             let visible_tools = self.visible_tool_names(&agent, &mcp_tools).await;
             let tools =
                 build_tool_definitions_with_filter(&mcp_tools, |name| visible_tools.contains(name));
-            let instructions = self
-                .build_instructions(
+            let instructions = {
+                let _project_skill_guard = self.project_skill_read_guard(&agent).await;
+                self.build_instructions(
                     &agent,
                     &skills_manager,
                     &skill_injections,
                     &skills_config,
                     &mcp_tools,
                 )
-                .await?;
+                .await?
+            };
             let summary = agent.summary.read().await.clone();
             let model_name = summary.model.clone();
             let provider_id = summary.provider_id.clone();
@@ -4603,15 +4628,17 @@ impl AgentRuntime {
         compact_input.push(ModelInputItem::user_text(COMPACT_PROMPT));
         let skills_config = self.store.load_skills_config().await?;
         let skills_manager = self.skills_manager_for_agent(agent).await?;
-        let instructions = self
-            .build_instructions(
+        let instructions = {
+            let _project_skill_guard = self.project_skill_read_guard(agent).await;
+            self.build_instructions(
                 agent,
                 &skills_manager,
                 &SkillInjections::default(),
                 &skills_config,
                 &[],
             )
-            .await?;
+            .await?
+        };
         let response = self
             .model
             .create_response_with_cancel(
@@ -4707,6 +4734,23 @@ impl AgentRuntime {
             .ok_or(RuntimeError::ProjectNotFound(project_id))
     }
 
+    async fn project_skill_lock(&self, project_id: ProjectId) -> Arc<RwLock<()>> {
+        if let Some(lock) = self
+            .project_skill_locks
+            .read()
+            .await
+            .get(&project_id)
+            .cloned()
+        {
+            return lock;
+        }
+        let mut locks = self.project_skill_locks.write().await;
+        locks
+            .entry(project_id)
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+
     async fn project_agents(&self, project_id: ProjectId) -> Vec<AgentSummary> {
         let agents = self.agents.read().await;
         let mut summaries = Vec::new();
@@ -4737,6 +4781,8 @@ impl AgentRuntime {
     }
 
     async fn project_skills_from_cache(&self, project_id: ProjectId) -> Result<SkillsListResponse> {
+        let lock = self.project_skill_lock(project_id).await;
+        let _guard = lock.read().await;
         let config = self.store.load_skills_config().await?;
         let mut response =
             SkillsManager::with_roots(self.project_skill_roots(project_id)).list(&config)?;
@@ -4754,6 +4800,61 @@ impl AgentRuntime {
         Ok(project_id
             .map(|project_id| self.skills_manager_with_project_roots(project_id))
             .unwrap_or_else(|| self.skills.clone()))
+    }
+
+    async fn project_skill_read_guard(
+        &self,
+        agent: &AgentRecord,
+    ) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+        let project_id = agent.summary.read().await.project_id?;
+        let lock = self.project_skill_lock(project_id).await;
+        Some(lock.read_owned().await)
+    }
+
+    async fn refresh_project_skills_for_agent(&self, agent: &AgentRecord) -> Result<()> {
+        let Some(project_id) = agent.summary.read().await.project_id else {
+            return Ok(());
+        };
+        self.refresh_project_skills_from_project_sidecar_if_ready(project_id)
+            .await
+    }
+
+    async fn refresh_project_skills_from_project_sidecar_if_ready(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<()> {
+        let project = self.project(project_id).await?;
+        let summary = project.summary.read().await.clone();
+        if summary.status != ProjectStatus::Ready
+            || summary.clone_status != ProjectCloneStatus::Ready
+        {
+            return Ok(());
+        }
+        let sidecar = self.ensure_project_sidecar(project_id).await?;
+        let existing = self.existing_project_skill_dirs(&sidecar.id).await?;
+        self.refresh_project_skill_cache(
+            project_id,
+            ProjectSkillRefreshSource::ProjectSidecar,
+            Some(&sidecar.id),
+            &existing,
+        )
+        .await
+    }
+
+    async fn refresh_project_skills_from_review_workspace(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<()> {
+        let sources = self
+            .existing_project_skill_dirs_in_review_workspace(project_id)
+            .await?;
+        self.refresh_project_skill_cache(
+            project_id,
+            ProjectSkillRefreshSource::ReviewWorkspace,
+            None,
+            &sources,
+        )
+        .await
     }
 
     fn project_skill_cache_dir(&self, project_id: ProjectId) -> PathBuf {
@@ -4840,23 +4941,101 @@ impl AgentRuntime {
             .collect())
     }
 
+    async fn existing_project_skill_dirs_in_review_workspace(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<ProjectSkillSourceDir>> {
+        let checks = PROJECT_SKILL_CANDIDATE_DIRS
+            .iter()
+            .map(|(relative, cache_name)| {
+                let container_path = format!("{PROJECT_WORKSPACE_PATH}/{relative}");
+                format!(
+                    "if [ -d {path} ]; then printf '%s\\t%s\\t%s\\n' {relative} {cache_name} {path}; fi",
+                    path = shell_quote(&container_path),
+                    relative = shell_quote(relative),
+                    cache_name = shell_quote(cache_name),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let volume = DockerClient::workspace_volume_for_project_review(&project_id.to_string());
+        let output = self
+            .docker
+            .run_sidecar_shell_env(&mai_docker::SidecarParams {
+                name: &format!("mai-review-skill-detect-{project_id}"),
+                image: &self.sidecar_image,
+                command: &checks,
+                args: &[],
+                cwd: Some("/"),
+                env: &[],
+                workspace_volume: Some(&volume),
+                timeout_secs: Some(20),
+            })
+            .await?;
+        if output.status != 0 {
+            let combined = format!("{}\n{}", output.stderr, output.stdout);
+            let message = preview(combined.trim(), 500);
+            return Err(RuntimeError::InvalidInput(format!(
+                "project review skill directory detection failed: {message}"
+            )));
+        }
+        Ok(output
+            .stdout
+            .lines()
+            .filter_map(ProjectSkillSourceDir::from_line)
+            .collect())
+    }
+
     async fn refresh_project_skill_cache(
         &self,
         project_id: ProjectId,
-        container_id: &str,
+        source: ProjectSkillRefreshSource,
+        container_id: Option<&str>,
         sources: &[ProjectSkillSourceDir],
     ) -> Result<()> {
+        let lock = self.project_skill_lock(project_id).await;
+        let _guard = lock.write().await;
         let cache_dir = self.project_skill_cache_dir(project_id);
         if cache_dir.exists() {
             fs::remove_dir_all(&cache_dir)?;
         }
         fs::create_dir_all(&cache_dir)?;
-        for source in sources {
-            let target = cache_dir.join(&source.cache_name);
-            self.docker
-                .copy_from_container_to_file(container_id, &source.container_path, &target)
-                .await?;
-            normalize_copied_project_skill_dir(&target, &source.cache_name)?;
+        for project_source in sources {
+            let target = cache_dir.join(&project_source.cache_name);
+            match source {
+                ProjectSkillRefreshSource::ProjectSidecar => {
+                    let container_id = container_id.ok_or_else(|| {
+                        RuntimeError::InvalidInput(
+                            "project skill refresh requires a sidecar container".to_string(),
+                        )
+                    })?;
+                    self.docker
+                        .copy_from_container_to_file(
+                            container_id,
+                            &project_source.container_path,
+                            &target,
+                        )
+                        .await?;
+                }
+                ProjectSkillRefreshSource::ReviewWorkspace => {
+                    let volume =
+                        DockerClient::workspace_volume_for_project_review(&project_id.to_string());
+                    self.docker
+                        .copy_from_workspace_volume_to_file(
+                            &format!(
+                                "mai-review-skill-copy-{project_id}-{}-{}",
+                                project_source.cache_name,
+                                Uuid::new_v4()
+                            ),
+                            &self.sidecar_image,
+                            &volume,
+                            &project_source.container_path,
+                            &target,
+                        )
+                        .await?;
+                }
+            }
+            normalize_copied_project_skill_dir(&target, &project_source.cache_name)?;
         }
         Ok(())
     }
@@ -5361,6 +5540,25 @@ impl AgentRuntime {
         )
         .await?;
         if let Err(err) = self.sync_project_review_repo(project_id).await {
+            let error = err.to_string();
+            self.finish_project_review_run(
+                run_id,
+                project_id,
+                None,
+                None,
+                ProjectReviewRunStatus::Failed,
+                Some(ProjectReviewOutcome::Failed),
+                None,
+                None,
+                Some(error),
+            )
+            .await?;
+            return Err(err);
+        }
+        if let Err(err) = self
+            .refresh_project_skills_from_review_workspace(project_id)
+            .await
+        {
             let error = err.to_string();
             self.finish_project_review_run(
                 run_id,
@@ -6248,15 +6446,18 @@ impl AgentRuntime {
         } else {
             None
         };
+        let project_skill_guard = self.project_skill_read_guard(agent).await;
         let skills_config = self.store.load_skills_config().await?;
-        let skills = self
-            .skills_manager_for_agent(agent)
-            .await?
-            .list(&skills_config)?;
+        let skills = {
+            self.skills_manager_for_agent(agent)
+                .await?
+                .list(&skills_config)?
+        };
         Ok(AgentResourceBroker {
             agent_mcp,
             project_mcp,
             skills,
+            _project_skill_guard: project_skill_guard,
         })
     }
 
@@ -6318,6 +6519,14 @@ impl AgentRuntime {
         self.clone_repository_in_sidecar(&sidecar.id, &repo_url, summary.branch.trim(), &token)
             .await?;
         self.prepare_copied_project_workspace(&sidecar.id).await?;
+        let existing = self.existing_project_skill_dirs(&sidecar.id).await?;
+        self.refresh_project_skill_cache(
+            project_id,
+            ProjectSkillRefreshSource::ProjectSidecar,
+            Some(&sidecar.id),
+            &existing,
+        )
+        .await?;
         Ok(())
     }
 
@@ -9060,6 +9269,24 @@ mod tests {
         path
     }
 
+    fn write_workspace_project_skill(
+        dir: &tempfile::TempDir,
+        root: &str,
+        name: &str,
+        description: &str,
+        body: &str,
+    ) -> PathBuf {
+        let skill_dir = fake_sidecar_workspace_path(dir).join(root).join(name);
+        fs::create_dir_all(&skill_dir).expect("mkdir workspace skill");
+        let path = skill_dir.join("SKILL.md");
+        fs::write(
+            &path,
+            format!("---\nname: {name}\ndescription: {description}\n---\n{body}"),
+        )
+        .expect("write workspace skill");
+        path
+    }
+
     async fn test_runtime(dir: &tempfile::TempDir, store: Arc<ConfigStore>) -> Arc<AgentRuntime> {
         AgentRuntime::new(
             DockerClient::new_with_binary("unused", fake_docker_path(dir)),
@@ -9189,9 +9416,10 @@ mod tests {
         let workspace_root = dir.path().join("fake-sidecar-workspace");
         let script = format!(
             r#"#!/bin/sh
-LOG={}
-WORKSPACE={}
-case "$1" in
+	LOG={}
+	WORKSPACE={}
+	last_created="created-container"
+	case "$1" in
   ps)
     exit 0
     ;;
@@ -9200,11 +9428,35 @@ case "$1" in
     echo "sha256:snapshot"
     exit 0
     ;;
-  create)
-    echo "$*" >> "$LOG"
-    echo "created-container"
-    exit 0
-    ;;
+	  create)
+	    echo "$*" >> "$LOG"
+	    if printf '%s' "$*" | grep -q 'mai-review-skill-copy'; then
+	      echo "review-copy-container"
+	    else
+	      echo "created-container"
+	    fi
+	    exit 0
+	    ;;
+	  run)
+	    echo "$*" >> "$LOG"
+	    command=""
+	    last=""
+	    for arg in "$@"; do
+	      if [ "$last" = "-lc" ]; then
+	        command="$arg"
+	      fi
+	      last="$arg"
+	    done
+	    if printf '%s' "$command" | grep -q "/workspace/repo/.claude/skills"; then
+	      [ -d "$WORKSPACE/.claude/skills" ] && printf '%s\t%s\t%s\n' ".claude/skills" "claude" "/workspace/repo/.claude/skills"
+	      [ -d "$WORKSPACE/.agents/skills" ] && printf '%s\t%s\t%s\n' ".agents/skills" "agents" "/workspace/repo/.agents/skills"
+	      [ -d "$WORKSPACE/skills" ] && printf '%s\t%s\t%s\n' "skills" "skills" "/workspace/repo/skills"
+	    fi
+	    if printf '%s' "$command" | grep -q "fetch --prune origin"; then
+	      echo "review-sync" >> "$LOG"
+	    fi
+	    exit 0
+	    ;;
   rm|rmi|start)
     echo "$*" >> "$LOG"
     exit 0
@@ -9236,15 +9488,15 @@ case "$1" in
 	    ;;
   cp)
     echo "$*" >> "$LOG"
-    if [ "$2" = "created-container:/workspace/repo/.claude/skills" ]; then
-      rm -rf "$3"
-      cp -R "$WORKSPACE/.claude/skills" "$3"
-    elif [ "$2" = "created-container:/workspace/repo/.agents/skills" ]; then
-      rm -rf "$3"
-      cp -R "$WORKSPACE/.agents/skills" "$3"
-    elif [ "$2" = "created-container:/workspace/repo/skills" ]; then
-      rm -rf "$3"
-      cp -R "$WORKSPACE/skills" "$3"
+	    if [ "$2" = "created-container:/workspace/repo/.claude/skills" ] || [ "$2" = "review-copy-container:/workspace/repo/.claude/skills" ]; then
+	      rm -rf "$3"
+	      cp -R "$WORKSPACE/.claude/skills" "$3"
+	    elif [ "$2" = "created-container:/workspace/repo/.agents/skills" ] || [ "$2" = "review-copy-container:/workspace/repo/.agents/skills" ]; then
+	      rm -rf "$3"
+	      cp -R "$WORKSPACE/.agents/skills" "$3"
+	    elif [ "$2" = "created-container:/workspace/repo/skills" ] || [ "$2" = "review-copy-container:/workspace/repo/skills" ]; then
+	      rm -rf "$3"
+	      cp -R "$WORKSPACE/skills" "$3"
     elif printf '%s' "$2" | grep -q '^created-container:'; then
       mkdir -p "$(dirname "$3")"
       printf 'artifact\n' > "$3"
@@ -11514,6 +11766,65 @@ esac
     }
 
     #[tokio::test]
+    async fn project_skill_refresh_serializes_cache_replacement() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, Some("created-container"));
+        agent.project_id = Some(project_id);
+        save_agent_with_session(&store, &agent).await;
+        let project = ready_test_project_summary(project_id, agent_id, "account-1");
+        store.save_project(&project).await.expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let project = runtime.project(project_id).await.expect("project");
+        *project.sidecar.write().await = Some(ContainerHandle {
+            id: "created-container".to_string(),
+            name: "sidecar".to_string(),
+            image: "unused".to_string(),
+        });
+        write_project_skill(
+            &runtime,
+            project_id,
+            "serialized-refresh",
+            "Old serialized skill.",
+            "Old body.",
+        );
+        write_workspace_project_skill(
+            &dir,
+            ".claude/skills",
+            "serialized-refresh",
+            "New serialized skill.",
+            "New body.",
+        );
+        let reader_runtime = Arc::clone(&runtime);
+        let refresher_runtime = Arc::clone(&runtime);
+
+        let (read_result, refresh_result) = tokio::join!(
+            async move { reader_runtime.project_skills_from_cache(project_id).await },
+            async move { refresher_runtime.detect_project_skills(project_id).await },
+        );
+
+        read_result.expect("read skills");
+        refresh_result.expect("refresh skills");
+        let response = runtime
+            .project_skills_from_cache(project_id)
+            .await
+            .expect("skills after refresh");
+        let skill = response
+            .skills
+            .iter()
+            .find(|skill| skill.name == "serialized-refresh")
+            .expect("serialized skill");
+        assert_eq!(skill.description, "New serialized skill.");
+        assert!(
+            fs::read_to_string(&skill.path)
+                .expect("skill body")
+                .contains("New body.")
+        );
+    }
+
+    #[tokio::test]
     async fn project_turn_injects_selected_project_skill_path() {
         let (base_url, requests) = start_mock_responses(vec![json!({
             "id": "project-skill",
@@ -11559,6 +11870,12 @@ esac
             name: "container-1".to_string(),
             image: "unused".to_string(),
         });
+        let project = runtime.project(project_id).await.expect("project");
+        *project.sidecar.write().await = Some(ContainerHandle {
+            id: "created-container".to_string(),
+            name: "sidecar".to_string(),
+            image: "unused".to_string(),
+        });
         let skill_dir = runtime
             .project_skill_cache_dir(project_id)
             .join("claude")
@@ -11570,6 +11887,13 @@ esac
             "---\nname: demo\ndescription: Project demo skill.\n---\nUse the project workflow.",
         )
         .expect("write skill");
+        write_workspace_project_skill(
+            &dir,
+            ".claude/skills",
+            "demo",
+            "Project demo skill.",
+            "Use the project workflow.",
+        );
 
         let turn_id = Uuid::new_v4();
         runtime
@@ -11609,6 +11933,99 @@ esac
             .expect("skills activated");
         assert_eq!(activated.len(), 1);
         assert_eq!(activated[0].scope, SkillScope::Project);
+    }
+
+    #[tokio::test]
+    async fn project_turn_refreshes_stale_project_skill_cache_before_injection() {
+        let (base_url, requests) = start_mock_responses(vec![json!({
+            "id": "project-skill-refresh",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "done" }]
+            }],
+            "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+        })])
+        .await;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![compact_test_provider(base_url)],
+                default_provider_id: Some("mock".to_string()),
+            })
+            .await
+            .expect("save providers");
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("account-1".to_string()),
+                label: "GitHub".to_string(),
+                token: Some("secret-token".to_string()),
+                is_default: true,
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, Some("created-container"));
+        agent.project_id = Some(project_id);
+        store.save_agent(&agent, None).await.expect("save agent");
+        save_test_session(&store, agent_id, session_id).await;
+        let project = ready_test_project_summary(project_id, agent_id, "account-1");
+        store.save_project(&project).await.expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let agent_record = runtime.agent(agent_id).await.expect("agent");
+        *agent_record.container.write().await = Some(ContainerHandle {
+            id: "created-container".to_string(),
+            name: "created-container".to_string(),
+            image: "unused".to_string(),
+        });
+        let project = runtime.project(project_id).await.expect("project");
+        *project.sidecar.write().await = Some(ContainerHandle {
+            id: "created-container".to_string(),
+            name: "sidecar".to_string(),
+            image: "unused".to_string(),
+        });
+        write_project_skill(
+            &runtime,
+            project_id,
+            "dynamic-demo",
+            "Old project skill.",
+            "Old cached body.",
+        );
+        write_workspace_project_skill(
+            &dir,
+            ".claude/skills",
+            "dynamic-demo",
+            "New project skill.",
+            "New workspace body.",
+        );
+
+        runtime
+            .run_turn_inner(
+                agent_id,
+                session_id,
+                Uuid::new_v4(),
+                "please use dynamic-demo".to_string(),
+                vec!["dynamic-demo".to_string()],
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn");
+
+        let requests = requests.lock().await.clone();
+        let input = requests[0]["input"].as_array().expect("input");
+        assert!(input.iter().any(|item| {
+            item["role"] == "user"
+                && item["content"][0]["text"].as_str().is_some_and(|text| {
+                    text.contains("<name>dynamic-demo</name>")
+                        && text.contains("New workspace body.")
+                        && !text.contains("Old cached body.")
+                })
+        }));
+        let instructions = requests[0]["instructions"].as_str().unwrap_or_default();
+        assert!(instructions.contains("New project skill."));
     }
 
     #[tokio::test]
@@ -12462,6 +12879,69 @@ esac
                     text.contains("<name>demo</name>") && text.contains("Use child demo.")
                 })
         }));
+    }
+
+    #[tokio::test]
+    async fn project_subagent_refreshes_and_reads_new_project_skill_resource() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        let mut child =
+            test_agent_summary_with_parent(child_id, Some(maintainer_id), Some("child-container"));
+        child.project_id = Some(project_id);
+        child.role = Some(AgentRole::Explorer);
+        save_agent_with_session(&store, &maintainer).await;
+        save_agent_with_session(&store, &child).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                maintainer_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let project = runtime.project(project_id).await.expect("project");
+        *project.sidecar.write().await = Some(ContainerHandle {
+            id: "created-container".to_string(),
+            name: "sidecar".to_string(),
+            image: "unused".to_string(),
+        });
+        write_workspace_project_skill(
+            &dir,
+            ".claude/skills",
+            "fresh-child-skill",
+            "Fresh child skill.",
+            "Fresh child body.",
+        );
+
+        runtime
+            .refresh_project_skills_for_agent(&runtime.agent(child_id).await.expect("child"))
+            .await
+            .expect("refresh");
+        let result = runtime
+            .execute_tool_for_test(
+                child_id,
+                "read_mcp_resource",
+                json!({
+                    "server": "project-skill",
+                    "uri": "skill:///fresh-child-skill"
+                }),
+            )
+            .await
+            .expect("read skill");
+
+        let output: Value = serde_json::from_str(&result.output).expect("json output");
+        assert!(
+            output["contents"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Fresh child body.")
+        );
     }
 
     #[tokio::test]
@@ -13718,6 +14198,76 @@ esac
 
         assert!(message.contains("new prompt"));
         assert!(!message.contains("old prompt"));
+    }
+
+    #[tokio::test]
+    async fn auto_review_refreshes_project_skills_from_synced_default_branch() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("account-1".to_string()),
+                label: "GitHub".to_string(),
+                token: Some("secret-token".to_string()),
+                is_default: true,
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        maintainer.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &maintainer).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                maintainer_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        write_project_skill(
+            &runtime,
+            project_id,
+            "review-default-branch",
+            "Old review skill.",
+            "Old review body.",
+        );
+        write_workspace_project_skill(
+            &dir,
+            ".claude/skills",
+            "review-default-branch",
+            "New review skill.",
+            "New review body.",
+        );
+
+        runtime
+            .sync_project_review_repo(project_id)
+            .await
+            .expect("sync review repo");
+        runtime
+            .refresh_project_skills_from_review_workspace(project_id)
+            .await
+            .expect("refresh review skills");
+
+        let response = runtime
+            .project_skills_from_cache(project_id)
+            .await
+            .expect("skills");
+        let skill = response
+            .skills
+            .iter()
+            .find(|skill| skill.name == "review-default-branch")
+            .expect("review skill");
+        assert_eq!(skill.description, "New review skill.");
+        assert_eq!(
+            fs::read_to_string(&skill.path).expect("skill body"),
+            "---\nname: review-default-branch\ndescription: New review skill.\n---\nNew review body."
+        );
+        assert!(fake_docker_log(&dir).contains("review-sync"));
     }
 
     #[tokio::test]

@@ -790,6 +790,36 @@ impl DockerClient {
         }
         Ok(())
     }
+
+    pub async fn copy_from_workspace_volume_to_file(
+        &self,
+        name: &str,
+        image: &str,
+        workspace_volume: &str,
+        container_path: &str,
+        host_path: &Path,
+    ) -> Result<()> {
+        let image = validate_image(image)?;
+        let args = create_workspace_copy_container_args(name, image, workspace_volume);
+        let create = Command::new(&self.binary)
+            .args(args.iter().map(String::as_str))
+            .output()
+            .await?;
+        if !create.status.success() {
+            return Err(DockerError::CommandFailed(stderr_or_stdout(&create)));
+        }
+        let id = String::from_utf8(create.stdout)?.trim().to_string();
+
+        let copy_result = self
+            .copy_from_container_to_file(&id, container_path, host_path)
+            .await;
+        let delete_result = self.delete_container(&id).await;
+        match (copy_result, delete_result) {
+            (Err(copy_err), _) => Err(copy_err),
+            (Ok(()), Err(delete_err)) => Err(delete_err),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
 }
 
 fn stderr_or_stdout(output: &std::process::Output) -> String {
@@ -1002,6 +1032,27 @@ fn create_project_sidecar_container_args(
         "infinity".to_string(),
     ]);
     args
+}
+
+fn create_workspace_copy_container_args(
+    name: &str,
+    image: &str,
+    workspace_volume: &str,
+) -> Vec<String> {
+    vec![
+        "create".to_string(),
+        "--name".to_string(),
+        name.to_string(),
+        "--label".to_string(),
+        MANAGED_LABEL.to_string(),
+        "-v".to_string(),
+        format!("{workspace_volume}:/workspace"),
+        "-w".to_string(),
+        "/workspace".to_string(),
+        image.to_string(),
+        "sleep".to_string(),
+        "infinity".to_string(),
+    ]
 }
 
 fn agent_workspace_volume(agent_id: &str) -> String {
@@ -1460,6 +1511,35 @@ mod tests {
                 .any(|window| window == ["-v", "mai-team-project-project-1:/workspace"])
         );
         assert!(!args.windows(2).any(|window| window[0] == "-e"));
+        assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
+        assert!(
+            args.windows(3)
+                .any(|window| { window == [image, "sleep", "infinity"] })
+        );
+    }
+
+    #[test]
+    fn create_workspace_copy_container_args_mount_workspace_volume() {
+        let image = "ghcr.io/zr233/mai-team-sidecar:latest";
+        let args = create_workspace_copy_container_args(
+            "mai-team-project-skill-copy-project-1",
+            image,
+            "mai-team-project-review-project-1",
+        );
+
+        assert_eq!(args[0], "create");
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--name", "mai-team-project-skill-copy-project-1"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--label", MANAGED_LABEL])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-v", "mai-team-project-review-project-1:/workspace"])
+        );
         assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
         assert!(
             args.windows(3)
