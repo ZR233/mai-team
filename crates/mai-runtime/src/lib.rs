@@ -297,6 +297,9 @@ enum AgentCommunicationPolicy {
 #[derive(Debug, Clone)]
 enum ContainerSource {
     FreshImage,
+    ImageWithWorkspace {
+        workspace_volume: String,
+    },
     CloneFrom {
         parent_container_id: String,
         docker_image: String,
@@ -5897,9 +5900,6 @@ impl AgentRuntime {
         let project_summary = project.summary.read().await.clone();
         let maintainer = self.agent(project_summary.maintainer_agent_id).await?;
         let maintainer_summary = maintainer.summary.read().await.clone();
-        let parent_container_id = self
-            .ensure_agent_container(&maintainer, maintainer_summary.status.clone())
-            .await?;
         let model = self.resolve_role_agent_model(AgentRole::Reviewer).await?;
         let workspace_volume =
             DockerClient::workspace_volume_for_project_review(&project_id.to_string());
@@ -5913,11 +5913,7 @@ impl AgentRuntime {
                 parent_id: Some(project_summary.maintainer_agent_id),
                 system_prompt: Some(project_reviewer_system_prompt().to_string()),
             },
-            ContainerSource::CloneFrom {
-                parent_container_id,
-                docker_image: maintainer_summary.docker_image,
-                workspace_volume: Some(workspace_volume),
-            },
+            ContainerSource::ImageWithWorkspace { workspace_volume },
             maintainer_summary.task_id,
             Some(project_id),
             Some(AgentRole::Reviewer),
@@ -6677,6 +6673,16 @@ EOF\n\
                         &agent_id.to_string(),
                         preferred_container_id.as_deref(),
                         &docker_image,
+                    )
+                    .await
+            }
+            ContainerSource::ImageWithWorkspace { workspace_volume } => {
+                self.docker
+                    .ensure_agent_container_from_image_with_workspace(
+                        &agent_id.to_string(),
+                        preferred_container_id.as_deref(),
+                        &docker_image,
+                        Some(workspace_volume),
                     )
                     .await
             }
@@ -13174,6 +13180,47 @@ esac
         let project_record = runtime.project(project_id).await.expect("project");
 
         assert!(project_record.review_worker.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn project_reviewer_starts_from_image_with_review_workspace_without_snapshot() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        maintainer.role = Some(AgentRole::Planner);
+        maintainer.docker_image = "ghcr.io/rcore-os/tgoskits-container:latest".to_string();
+        save_agent_with_session(&store, &maintainer).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                maintainer_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        let reviewer = runtime
+            .spawn_project_reviewer_agent(project_id)
+            .await
+            .expect("spawn reviewer");
+
+        assert_eq!(reviewer.role, Some(AgentRole::Reviewer));
+        assert_eq!(reviewer.parent_id, Some(maintainer_id));
+        let docker_log = fake_docker_log(&dir);
+        assert!(!docker_log.contains("commit maintainer-container"));
+        assert!(docker_log.contains(&format!("create --name mai-team-{}", reviewer.id)));
+        assert!(docker_log.contains(&format!("mai-team-project-review-{project_id}:/workspace")));
     }
 
     #[tokio::test]

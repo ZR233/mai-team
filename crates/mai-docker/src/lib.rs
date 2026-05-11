@@ -205,6 +205,22 @@ impl DockerClient {
         preferred_container_id: Option<&str>,
         image: &str,
     ) -> Result<ContainerHandle> {
+        self.ensure_agent_container_from_image_with_workspace(
+            agent_id,
+            preferred_container_id,
+            image,
+            None,
+        )
+        .await
+    }
+
+    pub async fn ensure_agent_container_from_image_with_workspace(
+        &self,
+        agent_id: &str,
+        preferred_container_id: Option<&str>,
+        image: &str,
+        workspace_volume: Option<&str>,
+    ) -> Result<ContainerHandle> {
         let image = validate_image(image)?;
         if let Some(container) = self
             .reusable_agent_container(agent_id, preferred_container_id)
@@ -213,7 +229,7 @@ impl DockerClient {
             return self.prepare_existing_container(container).await;
         }
 
-        self.create_agent_container_from_image(agent_id, image)
+        self.create_agent_container_from_image_with_workspace(agent_id, image, workspace_volume)
             .await
     }
 
