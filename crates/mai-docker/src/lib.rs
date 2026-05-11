@@ -150,16 +150,7 @@ impl DockerClient {
             return Ok(Vec::new());
         }
 
-        let inspect = Command::new(&self.binary)
-            .arg("inspect")
-            .args(&ids)
-            .output()
-            .await?;
-        if !inspect.status.success() {
-            return Err(DockerError::CommandFailed(stderr_or_stdout(&inspect)));
-        }
-
-        managed_containers_from_inspect(&String::from_utf8(inspect.stdout)?)
+        self.inspect_managed_containers(&ids).await
     }
 
     pub async fn cleanup_orphaned_agent_containers(
@@ -188,6 +179,43 @@ impl DockerClient {
     pub async fn cleanup_stale_containers(&self) -> Result<Vec<String>> {
         self.cleanup_orphaned_agent_containers(&HashSet::new())
             .await
+    }
+
+    async fn inspect_managed_containers(&self, ids: &[String]) -> Result<Vec<ManagedContainer>> {
+        let inspect = Command::new(&self.binary)
+            .arg("inspect")
+            .args(ids)
+            .output()
+            .await?;
+        if inspect.status.success() {
+            return managed_containers_from_inspect(&String::from_utf8(inspect.stdout)?);
+        }
+
+        let message = stderr_or_stdout(&inspect);
+        if !is_missing_container_error(&message) {
+            return Err(DockerError::CommandFailed(message));
+        }
+
+        let mut containers = Vec::new();
+        for id in ids {
+            let inspect = Command::new(&self.binary)
+                .arg("inspect")
+                .arg(id)
+                .output()
+                .await?;
+            if !inspect.status.success() {
+                let message = stderr_or_stdout(&inspect);
+                if is_missing_container_error(&message) {
+                    continue;
+                }
+                return Err(DockerError::CommandFailed(message));
+            }
+            containers.extend(managed_containers_from_inspect(&String::from_utf8(
+                inspect.stdout,
+            )?)?);
+        }
+
+        Ok(containers)
     }
 
     pub async fn ensure_agent_container(
@@ -1258,6 +1286,13 @@ mod tests {
     fn container_removal_in_progress_is_idempotent() {
         assert!(is_missing_container_error(
             "Error response from daemon: removal of container 7a73dc22f0e3 is already in progress"
+        ));
+    }
+
+    #[test]
+    fn missing_object_during_inspect_is_idempotent() {
+        assert!(is_missing_container_error(
+            "Error response from daemon: no such object: 6d80b0090847"
         ));
     }
 
