@@ -273,6 +273,14 @@ struct ProjectReviewCycleResult {
     error: Option<String>,
 }
 
+struct ProjectReviewLoopDecision {
+    delay: Duration,
+    status: ProjectReviewStatus,
+    outcome: Option<ProjectReviewOutcome>,
+    summary: Option<String>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct AgentCapability {
     can_spawn_agents: bool,
@@ -5167,63 +5175,33 @@ impl AgentRuntime {
                 break;
             }
 
-            let result = self
+            let decision = self
                 .run_project_review_once(project_id, cancellation_token.clone())
                 .await;
-            let (delay, status, outcome, summary, error) = match result {
-                Ok(result) => match result.outcome {
-                    ProjectReviewOutcome::ReviewSubmitted => (
-                        Duration::from_secs(0),
-                        ProjectReviewStatus::Idle,
-                        Some(result.outcome),
-                        result.summary,
-                        None,
-                    ),
-                    ProjectReviewOutcome::NoEligiblePr => (
-                        Duration::from_secs(PROJECT_REVIEW_IDLE_RETRY_SECS),
-                        ProjectReviewStatus::Waiting,
-                        Some(result.outcome),
-                        result.summary,
-                        None,
-                    ),
-                    ProjectReviewOutcome::Failed => (
-                        Duration::from_secs(PROJECT_REVIEW_FAILURE_RETRY_SECS),
-                        ProjectReviewStatus::Failed,
-                        Some(result.outcome),
-                        result.summary,
-                        result
-                            .error
-                            .or_else(|| Some("reviewer reported failure".to_string())),
-                    ),
-                },
+            let decision = match decision {
+                Ok(result) => project_review_loop_decision_for_result(result),
                 Err(RuntimeError::TurnCancelled) if cancellation_token.is_cancelled() => break,
-                Err(err) => (
-                    Duration::from_secs(PROJECT_REVIEW_FAILURE_RETRY_SECS),
-                    ProjectReviewStatus::Failed,
-                    Some(ProjectReviewOutcome::Failed),
-                    None,
-                    Some(err.to_string()),
-                ),
+                Err(err) => project_review_loop_decision_for_error(err.to_string()),
             };
-            let next_review_at = (delay.as_secs() > 0)
-                .then(|| Utc::now() + TimeDelta::seconds(delay.as_secs() as i64));
+            let next_review_at = (decision.delay.as_secs() > 0)
+                .then(|| Utc::now() + TimeDelta::seconds(decision.delay.as_secs() as i64));
             let _ = self
                 .set_project_review_state(
                     project_id,
-                    status,
+                    decision.status,
                     None,
                     next_review_at,
-                    outcome,
-                    summary,
-                    error,
+                    decision.outcome,
+                    decision.summary,
+                    decision.error,
                     false,
                 )
                 .await;
-            if delay.is_zero() {
+            if decision.delay.is_zero() {
                 continue;
             }
             tokio::select! {
-                _ = sleep(delay) => {}
+                _ = sleep(decision.delay) => {}
                 _ = cancellation_token.cancelled() => break,
             }
         }
@@ -7236,6 +7214,46 @@ fn project_reviewer_system_prompt() -> &'static str {
     "You are an autonomous project pull request reviewer. Review exactly one eligible GitHub pull request for this project, using only the GitHub MCP tools visible in the current tool list for GitHub reads/writes and local shell commands for git/test work. The repository has already been cloned and synced at /workspace/repo. Use an isolated git worktree under /workspace/reviews for the selected PR and clean it up before finishing. Do not look for GitHub tokens in the environment or write credentials. Finish with only the required JSON object so the project scheduler can decide the next cycle."
 }
 
+fn project_review_loop_decision_for_result(
+    result: ProjectReviewCycleResult,
+) -> ProjectReviewLoopDecision {
+    match result.outcome {
+        ProjectReviewOutcome::ReviewSubmitted => ProjectReviewLoopDecision {
+            delay: Duration::ZERO,
+            status: ProjectReviewStatus::Idle,
+            outcome: Some(ProjectReviewOutcome::ReviewSubmitted),
+            summary: result.summary,
+            error: None,
+        },
+        ProjectReviewOutcome::NoEligiblePr => ProjectReviewLoopDecision {
+            delay: Duration::from_secs(PROJECT_REVIEW_IDLE_RETRY_SECS),
+            status: ProjectReviewStatus::Waiting,
+            outcome: Some(ProjectReviewOutcome::NoEligiblePr),
+            summary: result.summary,
+            error: None,
+        },
+        ProjectReviewOutcome::Failed => ProjectReviewLoopDecision {
+            delay: Duration::from_secs(PROJECT_REVIEW_FAILURE_RETRY_SECS),
+            status: ProjectReviewStatus::Failed,
+            outcome: Some(ProjectReviewOutcome::Failed),
+            summary: result.summary,
+            error: result
+                .error
+                .or_else(|| Some("reviewer reported failure".to_string())),
+        },
+    }
+}
+
+fn project_review_loop_decision_for_error(error: String) -> ProjectReviewLoopDecision {
+    ProjectReviewLoopDecision {
+        delay: Duration::from_secs(PROJECT_REVIEW_FAILURE_RETRY_SECS),
+        status: ProjectReviewStatus::Failed,
+        outcome: Some(ProjectReviewOutcome::Failed),
+        summary: None,
+        error: Some(error),
+    }
+}
+
 fn parse_project_review_cycle_report(text: &str) -> Result<ProjectReviewCycleResult> {
     let value = match serde_json::from_str::<ProjectReviewCycleReport>(text) {
         Ok(value) => value,
@@ -8300,6 +8318,64 @@ mod tests {
             "gpt-5.4",
         );
         assert_eq!(updated_non_string, json!({ "body": null }));
+    }
+
+    #[test]
+    fn project_review_submitted_continues_immediately() {
+        let decision = project_review_loop_decision_for_result(ProjectReviewCycleResult {
+            outcome: ProjectReviewOutcome::ReviewSubmitted,
+            pr: Some(123),
+            summary: Some("submitted".to_string()),
+            error: None,
+        });
+
+        assert_eq!(decision.delay, Duration::ZERO);
+        assert_eq!(decision.status, ProjectReviewStatus::Idle);
+        assert_eq!(
+            decision.outcome,
+            Some(ProjectReviewOutcome::ReviewSubmitted)
+        );
+        assert_eq!(decision.summary.as_deref(), Some("submitted"));
+        assert_eq!(decision.error, None);
+    }
+
+    #[test]
+    fn project_review_no_eligible_pr_waits_two_minutes() {
+        let decision = project_review_loop_decision_for_result(ProjectReviewCycleResult {
+            outcome: ProjectReviewOutcome::NoEligiblePr,
+            pr: None,
+            summary: Some("nothing to review".to_string()),
+            error: None,
+        });
+
+        assert_eq!(
+            decision.delay,
+            Duration::from_secs(PROJECT_REVIEW_IDLE_RETRY_SECS)
+        );
+        assert_eq!(PROJECT_REVIEW_IDLE_RETRY_SECS, 120);
+        assert_eq!(decision.status, ProjectReviewStatus::Waiting);
+        assert_eq!(decision.outcome, Some(ProjectReviewOutcome::NoEligiblePr));
+        assert_eq!(decision.summary.as_deref(), Some("nothing to review"));
+        assert_eq!(decision.error, None);
+    }
+
+    #[test]
+    fn project_review_failure_keeps_backoff() {
+        let decision = project_review_loop_decision_for_result(ProjectReviewCycleResult {
+            outcome: ProjectReviewOutcome::Failed,
+            pr: None,
+            summary: Some("failed".to_string()),
+            error: None,
+        });
+
+        assert_eq!(
+            decision.delay,
+            Duration::from_secs(PROJECT_REVIEW_FAILURE_RETRY_SECS)
+        );
+        assert_eq!(decision.status, ProjectReviewStatus::Failed);
+        assert_eq!(decision.outcome, Some(ProjectReviewOutcome::Failed));
+        assert_eq!(decision.summary.as_deref(), Some("failed"));
+        assert_eq!(decision.error.as_deref(), Some("reviewer reported failure"));
     }
 
     fn test_model(id: &str) -> ModelConfig {
@@ -12730,6 +12806,123 @@ esac
         }
         assert!(saw_cloning);
         assert!(saw_ready);
+    }
+
+    #[tokio::test]
+    async fn runtime_start_starts_auto_review_worker_immediately() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("account-1".to_string()),
+                label: "GitHub".to_string(),
+                token: Some("secret-token".to_string()),
+                is_default: true,
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, Some("maintainer-container"));
+        agent.project_id = Some(project_id);
+        agent.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &agent).await;
+        let mut project = ready_test_project_summary(project_id, agent_id, "account-1");
+        project.auto_review_enabled = true;
+        project.review_status = ProjectReviewStatus::Waiting;
+        project.next_review_at = Some(now() + TimeDelta::minutes(30));
+        store.save_project(&project).await.expect("save project");
+
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let project_record = runtime.project(project_id).await.expect("project");
+
+        wait_until(
+            || {
+                let project_record = Arc::clone(&project_record);
+                async move { project_record.review_worker.lock().await.is_some() }
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        runtime.stop_project_review_loop(project_id).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_start_does_not_start_auto_review_for_not_ready_project() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, Some("maintainer-container"));
+        agent.project_id = Some(project_id);
+        agent.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &agent).await;
+        let mut project = test_project_summary(project_id, agent_id, "account-1");
+        project.auto_review_enabled = true;
+        project.review_status = ProjectReviewStatus::Idle;
+        store.save_project(&project).await.expect("save project");
+
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let project_record = runtime.project(project_id).await.expect("project");
+
+        assert!(project_record.review_worker.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn project_reviewer_initial_message_uses_latest_extra_prompt() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let project_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let reviewer_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, Some("maintainer-container"));
+        agent.project_id = Some(project_id);
+        agent.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &agent).await;
+        let mut project = ready_test_project_summary(project_id, agent_id, "account-1");
+        project.reviewer_extra_prompt = Some("old prompt".to_string());
+        store.save_project(&project).await.expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        runtime
+            .update_project(
+                project_id,
+                UpdateProjectRequest {
+                    reviewer_extra_prompt: Some("new prompt".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update project");
+        let message = runtime
+            .project_reviewer_initial_message(project_id, reviewer_id)
+            .await
+            .expect("message");
+
+        assert!(message.contains("new prompt"));
+        assert!(!message.contains("old prompt"));
     }
 
     #[tokio::test]
