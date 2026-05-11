@@ -61,6 +61,7 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct ConfigStore {
     path: PathBuf,
     config_path: PathBuf,
+    artifact_index_dir: PathBuf,
     db: Db,
     git_accounts_lock: Mutex<()>,
 }
@@ -393,8 +394,18 @@ impl ConfigStore {
         path: impl AsRef<Path>,
         config_path: impl AsRef<Path>,
     ) -> Result<Self> {
+        let artifact_index_dir = Self::default_artifact_index_dir()?;
+        Self::open_with_config_and_artifact_index_path(path, config_path, artifact_index_dir).await
+    }
+
+    pub async fn open_with_config_and_artifact_index_path(
+        path: impl AsRef<Path>,
+        config_path: impl AsRef<Path>,
+        artifact_index_dir: impl AsRef<Path>,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let config_path = config_path.as_ref().to_path_buf();
+        let artifact_index_dir = artifact_index_dir.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -440,6 +451,7 @@ impl ConfigStore {
         let store = Self {
             path,
             config_path,
+            artifact_index_dir,
             db,
             git_accounts_lock: Mutex::new(()),
         };
@@ -461,12 +473,29 @@ impl ConfigStore {
         Ok(home.join(".mai-team").join("config.toml"))
     }
 
+    pub fn default_artifact_index_dir() -> Result<PathBuf> {
+        let data_dir = std::env::var("MAI_DATA_DIR")
+            .map(PathBuf::from)
+            .or_else(|_| {
+                dirs::home_dir()
+                    .map(|home| home.join(".mai-team"))
+                    .ok_or(std::env::VarError::NotPresent)
+            });
+        data_dir
+            .map(|path| path.join("artifacts").join("index"))
+            .map_err(|_| StoreError::InvalidConfig("home directory not found".to_string()))
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     pub fn config_path(&self) -> &Path {
         &self.config_path
+    }
+
+    pub fn artifact_index_dir(&self) -> &Path {
+        &self.artifact_index_dir
     }
 
     pub async fn seed_default_provider_from_env(
@@ -1363,15 +1392,8 @@ impl ConfigStore {
             .collect()
     }
 
-    fn artifacts_dir(&self) -> PathBuf {
-        self.path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("artifacts")
-    }
-
     pub fn save_artifact(&self, info: &ArtifactInfo) -> Result<()> {
-        let dir = self.artifacts_dir();
+        let dir = self.artifact_index_dir();
         std::fs::create_dir_all(&dir)?;
         let file = dir.join(format!("{}.json", info.id));
         let data = serde_json::to_string(info)?;
@@ -1380,7 +1402,7 @@ impl ConfigStore {
     }
 
     pub fn load_artifacts(&self, task_id: &TaskId) -> Result<Vec<ArtifactInfo>> {
-        let dir = self.artifacts_dir();
+        let dir = self.artifact_index_dir();
         if !dir.exists() {
             return Ok(Vec::new());
         }
@@ -1402,7 +1424,7 @@ impl ConfigStore {
     }
 
     pub fn load_all_artifacts(&self) -> Result<Vec<ArtifactInfo>> {
-        let dir = self.artifacts_dir();
+        let dir = self.artifact_index_dir();
         if !dir.exists() {
             return Ok(Vec::new());
         }
@@ -2966,9 +2988,10 @@ mod tests {
 
     async fn store() -> (TempDir, ConfigStore) {
         let dir = tempdir().expect("tempdir");
-        let store = ConfigStore::open_with_config_path(
+        let store = ConfigStore::open_with_config_and_artifact_index_path(
             dir.path().join("config.sqlite3"),
             dir.path().join("config.toml"),
+            dir.path().join("artifacts/index"),
         )
         .await
         .expect("open store");
@@ -3045,6 +3068,43 @@ mod tests {
             .expect("resolve");
         assert_eq!(resolved.provider.api_key, "secret");
         assert_eq!(resolved.model.id, "gpt-5.4");
+    }
+
+    #[tokio::test]
+    async fn artifacts_use_configured_index_dir() {
+        let dir = tempdir().expect("tempdir");
+        let index_dir = dir.path().join("artifact-index");
+        let store = ConfigStore::open_with_config_and_artifact_index_path(
+            dir.path().join("config.sqlite3"),
+            dir.path().join("config.toml"),
+            &index_dir,
+        )
+        .await
+        .expect("open store");
+        let task_id = Uuid::new_v4();
+        let artifact = ArtifactInfo {
+            id: "artifact-1".to_string(),
+            agent_id: Uuid::new_v4(),
+            task_id,
+            name: "report.txt".to_string(),
+            path: "/workspace/report.txt".to_string(),
+            size_bytes: 7,
+            created_at: Utc::now(),
+        };
+
+        store.save_artifact(&artifact).expect("save artifact");
+
+        assert!(index_dir.join("artifact-1.json").exists());
+        assert!(!dir.path().join("artifacts/index/artifact-1.json").exists());
+        let artifacts = store.load_artifacts(&task_id).expect("load artifacts");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].id, artifact.id);
+        assert_eq!(artifacts[0].task_id, artifact.task_id);
+        assert_eq!(artifacts[0].name, artifact.name);
+
+        let all_artifacts = store.load_all_artifacts().expect("load all artifacts");
+        assert_eq!(all_artifacts.len(), 1);
+        assert_eq!(all_artifacts[0].id, artifact.id);
     }
 
     #[tokio::test]

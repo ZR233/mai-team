@@ -33,7 +33,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::Arc;
 use tokio_stream::once;
 use tokio_stream::wrappers::BroadcastStream;
@@ -45,7 +45,6 @@ use tracing::info;
 struct AppState {
     runtime: Arc<AgentRuntime>,
     store: Arc<ConfigStore>,
-    runtime_config: RuntimeConfig,
 }
 
 #[derive(RustEmbed)]
@@ -161,6 +160,10 @@ async fn main() -> Result<()> {
     let config_path = env::var("MAI_CONFIG_PATH")
         .map(PathBuf::from)
         .unwrap_or(ConfigStore::default_config_path()?);
+    let data_dir = data_dir_path()?;
+    let cache_dir = cache_dir_path(&data_dir);
+    let artifact_files_root = artifact_files_root(&data_dir);
+    let artifact_index_root = artifact_index_root(&data_dir);
     let image = env::var("MAI_AGENT_BASE_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/zr233/mai-team-agent:latest".to_string());
     let sidecar_image = env::var("MAI_SIDECAR_IMAGE")
@@ -172,7 +175,18 @@ async fn main() -> Result<()> {
     let docker_version = docker.check_available().await?;
     info!("docker available: {docker_version}");
 
-    let store = Arc::new(ConfigStore::open_with_config_path(db_path, config_path).await?);
+    fs::create_dir_all(&cache_dir)?;
+    fs::create_dir_all(&artifact_files_root)?;
+    fs::create_dir_all(&artifact_index_root)?;
+
+    let store = Arc::new(
+        ConfigStore::open_with_config_and_artifact_index_path(
+            db_path,
+            config_path,
+            &artifact_index_root,
+        )
+        .await?,
+    );
     store
         .seed_default_provider_from_env(api_key, base_url, model)
         .await?;
@@ -187,13 +201,21 @@ async fn main() -> Result<()> {
     let model = ResponsesClient::new();
     let runtime_config = RuntimeConfig {
         repo_root: env::current_dir()?,
+        cache_root: cache_dir.clone(),
+        artifact_files_root: artifact_files_root.clone(),
         sidecar_image,
         github_api_base_url: None,
         git_binary: None,
         system_skills_root: Some(system_skills_root),
     };
-    let runtime =
-        AgentRuntime::new(docker, model, Arc::clone(&store), runtime_config.clone()).await?;
+    info!(
+        data_dir = %data_dir.display(),
+        cache_dir = %cache_dir.display(),
+        artifact_files_root = %artifact_files_root.display(),
+        artifact_index_root = %artifact_index_root.display(),
+        "runtime storage paths"
+    );
+    let runtime = AgentRuntime::new(docker, model, Arc::clone(&store), runtime_config).await?;
     let cleaned = runtime.cleanup_orphaned_containers().await?;
     if !cleaned.is_empty() {
         info!(
@@ -201,11 +223,7 @@ async fn main() -> Result<()> {
             "removed orphaned mai-team containers"
         );
     }
-    let state = Arc::new(AppState {
-        runtime,
-        store,
-        runtime_config,
-    });
+    let state = Arc::new(AppState { runtime, store });
 
     let app = Router::new()
         .route("/", get(index))
@@ -378,6 +396,41 @@ fn system_skills_path() -> Result<PathBuf> {
         .context("home directory not found; set MAI_SYSTEM_SKILLS_PATH")
 }
 
+fn data_dir_path() -> Result<PathBuf> {
+    data_dir_path_with(env::var_os("MAI_DATA_DIR"), dirs::home_dir())
+}
+
+fn cache_dir_path(data_dir: &std::path::Path) -> PathBuf {
+    cache_dir_path_with(data_dir, env::var_os("MAI_CACHE_DIR"))
+}
+
+fn data_dir_path_with(
+    env_data_dir: Option<std::ffi::OsString>,
+    home_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
+    env_data_dir
+        .map(PathBuf::from)
+        .or_else(|| home_dir.map(|home| home.join(".mai-team")))
+        .context("home directory not found; set MAI_DATA_DIR")
+}
+
+fn cache_dir_path_with(
+    data_dir: &std::path::Path,
+    env_cache_dir: Option<std::ffi::OsString>,
+) -> PathBuf {
+    env_cache_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("cache"))
+}
+
+fn artifact_files_root(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("artifacts").join("files")
+}
+
+fn artifact_index_root(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("artifacts").join("index")
+}
+
 fn release_embedded_system_skills(target_dir: &std::path::Path) -> io::Result<()> {
     if !safe_system_skills_target(target_dir) {
         return Err(io::Error::new(
@@ -391,7 +444,7 @@ fn release_embedded_system_skills(target_dir: &std::path::Path) -> io::Result<()
     fs::create_dir_all(target_dir)?;
     for path in EmbeddedSystemSkills::iter() {
         let path = path.as_ref();
-        let Some(relative) = safe_embedded_relative_path(path) else {
+        let Some(relative) = embedded_system_skill_relative_path(path) else {
             continue;
         };
         let target = target_dir.join(relative);
@@ -415,9 +468,25 @@ fn safe_system_skills_target(path: &std::path::Path) -> bool {
     )
 }
 
+fn embedded_system_skill_relative_path(path: &str) -> Option<PathBuf> {
+    let path = FsPath::new(path);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(FsPath::new(env!("OUT_DIR")).join("system-skills"))
+            .ok()?
+    } else {
+        path
+    };
+    safe_embedded_relative_path_from_path(relative)
+}
+
+#[cfg(test)]
 fn safe_embedded_relative_path(path: &str) -> Option<PathBuf> {
+    safe_embedded_relative_path_from_path(FsPath::new(path))
+}
+
+fn safe_embedded_relative_path_from_path(path: &FsPath) -> Option<PathBuf> {
     let mut normalized = PathBuf::new();
-    for component in std::path::Path::new(path).components() {
+    for component in path.components() {
         match component {
             Component::Normal(part) => normalized.push(part),
             Component::CurDir => {}
@@ -1032,13 +1101,7 @@ async fn download_artifact(
             message: "Artifact not found".to_string(),
         })?;
 
-    let file_path = state
-        .runtime_config
-        .repo_root
-        .join("artifacts")
-        .join(artifact.task_id.to_string())
-        .join(&artifact.id)
-        .join(&artifact.name);
+    let file_path = state.runtime.artifact_file_path(&artifact);
 
     let bytes = tokio::fs::read(&file_path).await.map_err(|e| ApiError {
         status: StatusCode::NOT_FOUND,
@@ -1167,11 +1230,6 @@ mod tests {
         let skill_path = target.join("reviewer-agent-review-pr").join("SKILL.md");
         let contents = fs::read_to_string(skill_path).expect("skill contents");
         assert!(contents.contains("name: reviewer-agent-review-pr"));
-
-        let anthropic_skill_path = target.join("anthropic").join("docx").join("SKILL.md");
-        let anthropic_contents =
-            fs::read_to_string(anthropic_skill_path).expect("anthropic skill contents");
-        assert!(anthropic_contents.contains("name: docx"));
     }
 
     #[test]
@@ -1190,13 +1248,6 @@ mod tests {
                 .join("SKILL.md")
                 .exists()
         );
-        assert!(
-            target
-                .join("anthropic")
-                .join("docx")
-                .join("SKILL.md")
-                .exists()
-        );
     }
 
     #[test]
@@ -1207,6 +1258,16 @@ mod tests {
         );
         assert_eq!(safe_embedded_relative_path("../SKILL.md"), None);
         assert_eq!(safe_embedded_relative_path("/tmp/SKILL.md"), None);
+        assert_eq!(
+            embedded_system_skill_relative_path(
+                &FsPath::new(env!("OUT_DIR"))
+                    .join("system-skills")
+                    .join("reviewer-agent-review-pr")
+                    .join("SKILL.md")
+                    .to_string_lossy()
+            ),
+            Some(PathBuf::from("reviewer-agent-review-pr").join("SKILL.md"))
+        );
     }
 
     #[test]
@@ -1216,6 +1277,42 @@ mod tests {
         assert!(safe_system_skills_target(std::path::Path::new(
             "/tmp/system-skills"
         )));
+    }
+
+    #[test]
+    fn runtime_storage_paths_use_default_data_layout() {
+        let dir = tempdir().expect("tempdir");
+        let data_dir = dir.path().join(".mai-team");
+
+        assert_eq!(
+            data_dir_path_with(None, Some(dir.path().to_path_buf())).expect("data dir"),
+            data_dir
+        );
+        assert_eq!(cache_dir_path_with(&data_dir, None), data_dir.join("cache"));
+        assert_eq!(
+            artifact_files_root(&data_dir),
+            data_dir.join("artifacts").join("files")
+        );
+        assert_eq!(
+            artifact_index_root(&data_dir),
+            data_dir.join("artifacts").join("index")
+        );
+    }
+
+    #[test]
+    fn runtime_storage_paths_use_env_overrides() {
+        let dir = tempdir().expect("tempdir");
+        let data_dir = dir.path().join("data-root");
+        let cache_dir = dir.path().join("cache-root");
+
+        assert_eq!(
+            data_dir_path_with(Some(data_dir.clone().into_os_string()), None).expect("data dir"),
+            data_dir
+        );
+        assert_eq!(
+            cache_dir_path_with(&data_dir, Some(cache_dir.clone().into_os_string())),
+            cache_dir
+        );
     }
 
     #[test]

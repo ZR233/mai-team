@@ -134,6 +134,8 @@ pub type Result<T> = std::result::Result<T, RuntimeError>;
 #[derive(Clone)]
 pub struct RuntimeConfig {
     pub repo_root: PathBuf,
+    pub cache_root: PathBuf,
+    pub artifact_files_root: PathBuf,
     pub sidecar_image: String,
     pub github_api_base_url: Option<String>,
     pub git_binary: Option<String>,
@@ -155,7 +157,8 @@ pub struct AgentRuntime {
     event_tx: broadcast::Sender<ServiceEvent>,
     sequence: AtomicU64,
     recent_events: Mutex<VecDeque<ServiceEvent>>,
-    repo_root: PathBuf,
+    cache_root: PathBuf,
+    artifact_files_root: PathBuf,
     sidecar_image: String,
     github_api_base_url: String,
 }
@@ -561,7 +564,8 @@ impl AgentRuntime {
             event_tx,
             sequence: AtomicU64::new(snapshot.next_sequence),
             recent_events: Mutex::new(snapshot.recent_events.into_iter().collect()),
-            repo_root: config.repo_root,
+            cache_root: config.cache_root,
+            artifact_files_root: config.artifact_files_root,
             sidecar_image,
             github_api_base_url,
         });
@@ -2453,11 +2457,7 @@ impl AgentRuntime {
         });
 
         let artifact_id = Uuid::new_v4().to_string();
-        let dir = self
-            .repo_root
-            .join("artifacts")
-            .join(task_id.to_string())
-            .join(&artifact_id);
+        let dir = self.artifact_file_dir(task_id, &artifact_id);
         std::fs::create_dir_all(&dir)?;
 
         let dest = dir.join(&name);
@@ -2488,6 +2488,11 @@ impl AgentRuntime {
         .await;
 
         Ok(info)
+    }
+
+    pub fn artifact_file_path(&self, info: &ArtifactInfo) -> PathBuf {
+        self.artifact_file_dir(info.task_id, &info.id)
+            .join(&info.name)
     }
 
     async fn run_turn(
@@ -4661,9 +4666,15 @@ impl AgentRuntime {
     }
 
     fn project_skill_cache_dir(&self, project_id: ProjectId) -> PathBuf {
-        self.repo_root
+        self.cache_root
             .join(PROJECT_SKILLS_CACHE_DIR)
             .join(project_id.to_string())
+    }
+
+    fn artifact_file_dir(&self, task_id: TaskId, artifact_id: &str) -> PathBuf {
+        self.artifact_files_root
+            .join(task_id.to_string())
+            .join(artifact_id)
     }
 
     fn project_skill_roots(&self, project_id: ProjectId) -> Vec<(PathBuf, SkillScope)> {
@@ -7966,9 +7977,10 @@ mod tests {
 
     async fn test_store(dir: &tempfile::TempDir) -> Arc<ConfigStore> {
         Arc::new(
-            ConfigStore::open_with_config_path(
+            ConfigStore::open_with_config_and_artifact_index_path(
                 &dir.path().join("runtime.sqlite3"),
                 &dir.path().join("config.toml"),
+                &dir.path().join("data/artifacts/index"),
             )
             .await
             .expect("open store"),
@@ -7985,13 +7997,7 @@ mod tests {
             DockerClient::new_with_binary("unused", fake_docker_path(dir)),
             ResponsesClient::new(),
             store,
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-            },
+            test_runtime_config(dir, DEFAULT_SIDECAR_IMAGE),
         )
         .await
         .expect("runtime")
@@ -8007,11 +8013,8 @@ mod tests {
             ResponsesClient::new(),
             store,
             RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: sidecar_image.to_string(),
-                github_api_base_url: None,
                 git_binary: Some(fake_git_path(dir)),
-                system_skills_root: None,
+                ..test_runtime_config(dir, sidecar_image)
             },
         )
         .await
@@ -8028,15 +8031,24 @@ mod tests {
             ResponsesClient::new(),
             store,
             RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
                 github_api_base_url: Some(github_api_base_url),
-                git_binary: None,
-                system_skills_root: None,
+                ..test_runtime_config(dir, DEFAULT_SIDECAR_IMAGE)
             },
         )
         .await
         .expect("runtime")
+    }
+
+    fn test_runtime_config(dir: &tempfile::TempDir, sidecar_image: &str) -> RuntimeConfig {
+        RuntimeConfig {
+            repo_root: dir.path().to_path_buf(),
+            cache_root: dir.path().join("cache"),
+            artifact_files_root: dir.path().join("data/artifacts/files"),
+            sidecar_image: sidecar_image.to_string(),
+            github_api_base_url: None,
+            git_binary: None,
+            system_skills_root: None,
+        }
     }
 
     fn test_project_summary(
@@ -8165,6 +8177,9 @@ case "$1" in
     elif [ "$2" = "created-container:/workspace/repo/skills" ]; then
       rm -rf "$3"
       cp -R "$WORKSPACE/skills" "$3"
+    elif printf '%s' "$2" | grep -q '^created-container:'; then
+      mkdir -p "$(dirname "$3")"
+      printf 'artifact\n' > "$3"
     fi
     exit 0
     ;;
@@ -9060,13 +9075,7 @@ esac
             DockerClient::new("unused"),
             ResponsesClient::new(),
             store,
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-            },
+            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
         .await
         .expect("runtime");
@@ -9316,13 +9325,7 @@ esac
                     .await
                     .expect("reopen store"),
             ),
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-            },
+            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
         .await
         .expect("runtime");
@@ -9422,13 +9425,7 @@ esac
                     .await
                     .expect("reopen store"),
             ),
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-            },
+            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
         .await
         .expect("runtime");
@@ -9494,13 +9491,7 @@ esac
             DockerClient::new("unused"),
             ResponsesClient::new(),
             Arc::clone(&store),
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-            },
+            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
         .await
         .expect("runtime");
@@ -9605,13 +9596,7 @@ esac
             DockerClient::new("unused"),
             ResponsesClient::new(),
             Arc::clone(&store),
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-            },
+            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
         .await
         .expect("runtime");
@@ -10268,6 +10253,83 @@ esac
     }
 
     #[tokio::test]
+    async fn save_artifact_uses_configured_artifact_roots() {
+        let dir = tempdir().expect("tempdir");
+        let artifact_index_root = dir.path().join("data/artifacts/index");
+        let store = Arc::new(
+            ConfigStore::open_with_config_and_artifact_index_path(
+                dir.path().join("runtime.sqlite3"),
+                dir.path().join("config.toml"),
+                &artifact_index_root,
+            )
+            .await
+            .expect("open store"),
+        );
+        let task_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(agent_id, Some("created-container"));
+        agent.task_id = Some(task_id);
+        store.save_agent(&agent, None).await.expect("save agent");
+        let plan = TaskPlan::default();
+        let timestamp = now();
+        let task = TaskSummary {
+            id: task_id,
+            title: "Artifact Task".to_string(),
+            status: TaskStatus::Planning,
+            plan_status: plan.status.clone(),
+            plan_version: plan.version,
+            planner_agent_id: agent_id,
+            current_agent_id: Some(agent_id),
+            agent_count: 1,
+            review_rounds: 0,
+            created_at: timestamp,
+            updated_at: timestamp,
+            last_error: None,
+            final_report: None,
+        };
+        store.save_task(&task, &plan).await.expect("save task");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let agent_record = runtime.agent(agent_id).await.expect("agent");
+        *agent_record.container.write().await = Some(ContainerHandle {
+            id: "created-container".to_string(),
+            name: "created-container".to_string(),
+            image: "unused".to_string(),
+        });
+
+        let artifact = runtime
+            .save_artifact(
+                agent_id,
+                "/workspace/report.txt".to_string(),
+                Some("report.txt".to_string()),
+            )
+            .await
+            .expect("save artifact");
+
+        let file_path = dir
+            .path()
+            .join("data/artifacts/files")
+            .join(task_id.to_string())
+            .join(&artifact.id)
+            .join("report.txt");
+        assert_eq!(runtime.artifact_file_path(&artifact), file_path);
+        assert_eq!(
+            fs::read_to_string(&file_path).expect("artifact file"),
+            "artifact\n"
+        );
+        assert!(
+            artifact_index_root
+                .join(format!("{}.json", artifact.id))
+                .exists()
+        );
+        let artifacts = store.load_artifacts(&task_id).expect("load artifacts");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].id, artifact.id);
+        assert_eq!(artifacts[0].task_id, task_id);
+        assert_eq!(artifacts[0].name, "report.txt");
+        assert!(!dir.path().join("artifacts").exists());
+    }
+
+    #[tokio::test]
     async fn project_skill_cache_lists_project_scope_with_source_paths() {
         let dir = tempdir().expect("tempdir");
         let store = test_store(&dir).await;
@@ -10279,10 +10341,16 @@ esac
         let project = ready_test_project_summary(project_id, agent_id, "account-1");
         store.save_project(&project).await.expect("save project");
         let runtime = test_runtime(&dir, Arc::clone(&store)).await;
-        let skill_dir = runtime
-            .project_skill_cache_dir(project_id)
-            .join("claude")
-            .join("demo");
+        let cache_dir = runtime.project_skill_cache_dir(project_id);
+        assert_eq!(
+            cache_dir,
+            dir.path()
+                .join("cache")
+                .join(PROJECT_SKILLS_CACHE_DIR)
+                .join(project_id.to_string())
+        );
+        assert!(!dir.path().join(PROJECT_SKILLS_CACHE_DIR).exists());
+        let skill_dir = cache_dir.join("claude").join("demo");
         fs::create_dir_all(&skill_dir).expect("mkdir skill");
         fs::write(
             skill_dir.join("SKILL.md"),
@@ -10584,13 +10652,7 @@ esac
             DockerClient::new("unused"),
             ResponsesClient::new(),
             Arc::clone(&store),
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-            },
+            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
         .await
         .expect("runtime");
@@ -10654,13 +10716,7 @@ esac
             DockerClient::new("unused"),
             ResponsesClient::new(),
             Arc::clone(&store),
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-            },
+            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
         .await
         .expect("runtime");
@@ -10784,13 +10840,7 @@ esac
             DockerClient::new("unused"),
             ResponsesClient::new(),
             store,
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-            },
+            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
         .await
         .expect("runtime");
@@ -10831,13 +10881,7 @@ esac
             DockerClient::new("unused"),
             ResponsesClient::new(),
             Arc::clone(&store),
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-            },
+            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
         .await
         .expect("runtime");
@@ -11779,13 +11823,7 @@ esac
             DockerClient::new_with_binary("ubuntu:latest", fake_docker_path(&dir)),
             ResponsesClient::new(),
             Arc::clone(&store),
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-            },
+            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
         .await
         .expect("runtime");
@@ -12121,13 +12159,7 @@ esac
             DockerClient::new_with_binary("unused-agent", failing_docker_path(&dir)),
             ResponsesClient::new(),
             Arc::clone(&store),
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-            },
+            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
         .await
         .expect("runtime");
@@ -12253,13 +12285,7 @@ esac
             DockerClient::new("unused"),
             ResponsesClient::new(),
             Arc::clone(&store),
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-            },
+            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
         .await
         .expect("runtime");
@@ -12338,13 +12364,7 @@ esac
             DockerClient::new("unused"),
             ResponsesClient::new(),
             Arc::clone(&store),
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-            },
+            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
         .await
         .expect("runtime");
@@ -12420,13 +12440,7 @@ esac
             DockerClient::new("unused"),
             ResponsesClient::new(),
             store,
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-            },
+            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
         .await
         .expect("runtime");
