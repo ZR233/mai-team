@@ -528,13 +528,22 @@ def parse_time(value: str | None) -> dt.datetime | None:
 
 
 def run_git(repo: str | Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    completed = subprocess.run(
         ["git", "-C", str(repo), *args],
-        check=check,
+        check=False,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    if check and completed.returncode != 0:
+        command = " ".join(["git", "-C", str(repo), *args])
+        message = f"git command failed ({completed.returncode}): {command}"
+        if completed.stderr.strip():
+            message += f"\nstderr:\n{completed.stderr.strip()}"
+        if completed.stdout.strip():
+            message += f"\nstdout:\n{completed.stdout.strip()}"
+        raise SystemExit(message)
+    return completed
 
 
 def prepare_worktree(repo: str, review_root: str, agent_id: str, pr: int) -> dict[str, Any]:
@@ -599,12 +608,37 @@ def changed_file_names(value: Any) -> list[str]:
 def changed_crates(repo: Path, files: list[str]) -> list[str]:
     crates: list[str] = []
     for name in files:
-        parts = Path(name).parts
+        path = Path(name)
+        if path.is_absolute() or ".." in path.parts:
+            continue
+        parts = path.parts
         if len(parts) >= 2 and parts[0] == "crates":
             crate = str(Path(parts[0]) / parts[1])
             if (repo / crate / "Cargo.toml").exists() and crate not in crates:
                 crates.append(crate)
+                continue
+        crate = nearest_package_crate(repo, path)
+        if crate and crate not in crates:
+            crates.append(crate)
     return sorted(crates)
+
+
+def nearest_package_crate(repo: Path, path: Path) -> str | None:
+    for parent in path.parents:
+        if str(parent) in {"", "."}:
+            continue
+        manifest = repo / parent / "Cargo.toml"
+        if manifest_is_package(manifest):
+            return str(parent)
+    return None
+
+
+def manifest_is_package(path: Path) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return re.search(r"(?m)^\s*\[package\]\s*$", text) is not None
 
 
 def rust_plan_summary(repo: str, *, changed: str | None = None, files: str | None = None) -> dict[str, Any]:
@@ -899,6 +933,37 @@ class ReviewPrHelperTests(unittest.TestCase):
             summary = changed_files_summary(str(root), files=str(files))
         self.assertEqual(summary["changed_crates"], ["crates/demo"])
         self.assertTrue(summary["is_rust_workspace"])
+
+    def test_changed_files_extracts_nested_package_crates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "os/StarryOS/kernel/src").mkdir(parents=True)
+            (root / "os/StarryOS/kernel/Cargo.toml").write_text(
+                "[package]\nname='starry-kernel'\n", encoding="utf-8"
+            )
+            (root / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+            files = root / "files.json"
+            files.write_text(
+                json.dumps(
+                    [
+                        {"filename": "os/StarryOS/kernel/src/syscall/ipc/msg.rs"},
+                        {"filename": "test-suit/starryos/normal/test-msg/test.c"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            summary = changed_files_summary(str(root), files=str(files))
+        self.assertEqual(summary["changed_crates"], ["os/StarryOS/kernel"])
+        self.assertEqual(summary["cargo_tomls"], ["os/StarryOS/kernel/Cargo.toml"])
+
+    def test_changed_files_ignores_workspace_root_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+            files = root / "files.json"
+            files.write_text(json.dumps([{"filename": "test-suit/starryos/normal/test.c"}]), encoding="utf-8")
+            summary = changed_files_summary(str(root), files=str(files))
+        self.assertEqual(summary["changed_crates"], [])
 
     def test_final_json_shape(self) -> None:
         result = final_result("review_submitted", 9, "Submitted APPROVE.", None)

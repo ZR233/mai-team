@@ -41,6 +41,13 @@ python3 scripts/review_pr_helper.py final-json --outcome review_submitted --pr "
 
 Treat helper output as structured facts and command suggestions. You still own code understanding, finding severity, inline comment wording, and the final GitHub review decision.
 
+When dogfooding this skill outside Mai, `/workspace/repo` and `/workspace/reviews` may not exist. Use the local clone as `--repo`, use a writable review root such as `/tmp/mai-reviews`, and make sure PR refs exist first:
+
+```bash
+git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'
+python3 scripts/review_pr_helper.py prepare-worktree --repo /path/to/repo --review-root /tmp/mai-reviews --agent-id "$REVIEWER_AGENT_ID" --pr "$PR"
+```
+
 ## Workflow
 
 ### 1. Identify Repository and Account
@@ -109,6 +116,8 @@ python3 scripts/review_pr_helper.py rust-plan --repo "$WORKTREE" --changed chang
 ```
 
 Run the commands in `rust-plan.json` when present. For Rust PRs, always run `cargo fmt --check` and clippy commands suggested by the helper; run tests for changed crates unless the repository clearly cannot support them in the current environment.
+
+`rust-plan` is intentionally conservative. If it still falls back to broad workspace commands for a large repository, prefer the repository's established CI entry point for the changed area and record any broad-command failures separately from PR-local validation. For example, StarryOS syscall test changes in `tgoskits` should be validated with the StarryOS QEMU test command used by that repository, not only with workspace-wide `cargo test`.
 
 When the repository is large and the GitHub MCP list response is sparse, prefer fetching details only for the PRs that are plausible candidates after `list_pull_requests` ordering and explicit review-request checks. The helper is designed to select from a small set of recent open PRs; you do not need to exhaustively fetch every open PR in a busy repository.
 
