@@ -75,7 +75,7 @@ const PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT: usize = 80;
 const PROJECT_REVIEW_REPO_COMMAND_MAX_ATTEMPTS: usize = 3;
 const PROJECT_REVIEW_REPO_COMMAND_RETRY_SECS: u64 = 5;
 const PROJECT_REVIEW_GIT_LOW_SPEED_LIMIT: u64 = 1;
-const PROJECT_REVIEW_GIT_LOW_SPEED_TIME_SECS: u64 = 30;
+const PROJECT_REVIEW_GIT_LOW_SPEED_TIME_SECS: u64 = 300;
 const DEFAULT_WAIT_AGENT_OBSERVATION_SECS: u64 = 30;
 const PROJECT_GITHUB_MCP_SERVER: &str = "github";
 const PROJECT_GIT_MCP_SERVER: &str = "git";
@@ -6193,6 +6193,14 @@ impl AgentRuntime {
                 review_repo_sync_command(&repo_url, &expected_remote, &branch),
             ),
         };
+        let fallback_command_text = match command {
+            ReviewRepoCommand::Ensure => None,
+            ReviewRepoCommand::Sync => Some(review_repo_reclone_command(
+                &repo_url,
+                &expected_remote,
+                &branch,
+            )),
+        };
         let env = [("MAI_GITHUB_REVIEW_TOKEN".to_string(), token.to_string())];
         let mut last_message = String::new();
         for attempt in 1..=PROJECT_REVIEW_REPO_COMMAND_MAX_ATTEMPTS {
@@ -6226,6 +6234,33 @@ impl AgentRuntime {
                 );
                 sleep(Duration::from_secs(PROJECT_REVIEW_REPO_COMMAND_RETRY_SECS)).await;
             }
+        }
+        if let Some(fallback_command_text) = fallback_command_text {
+            tracing::warn!(
+                project_id = %project_id,
+                command = command_label,
+                error = %last_message,
+                "project review workspace sync failed; recreating review repository"
+            );
+            let sidecar_name = format!("mai-review-sync-{project_id}-reclone");
+            let output = self
+                .docker
+                .run_sidecar_shell_env(&mai_docker::SidecarParams {
+                    name: &sidecar_name,
+                    image: &self.sidecar_image,
+                    command: &fallback_command_text,
+                    args: &[],
+                    cwd: Some("/workspace"),
+                    env: &env,
+                    workspace_volume: Some(&volume),
+                    timeout_secs: Some(900),
+                })
+                .await?;
+            if output.status == 0 {
+                return Ok(());
+            }
+            let combined = format!("{}\n{}", output.stderr, output.stdout);
+            last_message = preview(redact_secret(combined.trim(), &token).trim(), 500);
         }
         Err(RuntimeError::InvalidInput(format!(
             "project review workspace {command_label} failed after {} attempts: {last_message}",
@@ -6840,8 +6875,19 @@ EOF\n\
 
     async fn resolve_role_agent_model(&self, role: AgentRole) -> Result<ResolvedAgentModel> {
         let config = self.store.load_agent_config().await?;
-        self.resolve_agent_model_preference(role, role_preference(&config, role))
-            .await
+        let preference = role_preference(&config, role);
+        match self.resolve_agent_model_preference(role, preference).await {
+            Ok(resolved) => Ok(resolved),
+            Err(err) if preference.is_some() && is_stale_agent_model_preference_error(&err) => {
+                tracing::warn!(
+                    role = agent_role_label(role),
+                    error = %err,
+                    "agent role model preference is stale; falling back to the default provider"
+                );
+                self.resolve_agent_model_preference(role, None).await
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn resolve_effective_agent_model(
@@ -7565,6 +7611,14 @@ fn agent_role_label(role: AgentRole) -> &'static str {
     }
 }
 
+fn is_stale_agent_model_preference_error(err: &RuntimeError) -> bool {
+    let RuntimeError::Store(mai_store::StoreError::InvalidConfig(message)) = err else {
+        return false;
+    };
+    (message.starts_with("provider `") && message.ends_with("` not found"))
+        || (message.starts_with("model `") && message.contains("` is not configured for provider `"))
+}
+
 fn project_maintainer_system_prompt(
     owner: &str,
     repo: &str,
@@ -7662,6 +7716,7 @@ fn review_repo_ensure_command(repo_url: &str, expected_remote: &str, branch: &st
 }
 
 fn review_repo_sync_command(repo_url: &str, expected_remote: &str, branch: &str) -> String {
+    let branch_refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
     let origin_branch = format!("origin/{branch}");
     format!(
         "set -eu\n\
@@ -7671,8 +7726,8 @@ fn review_repo_sync_command(repo_url: &str, expected_remote: &str, branch: &str)
          git worktree prune\n\
          git reset --hard HEAD\n\
          git clean -fdx\n\
-         {git_network} fetch --prune origin\n\
-         {git_network} fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'\n\
+         {git_network} fetch --prune --no-tags origin {branch_refspec}\n\
+         {git_network} fetch --prune --no-tags origin '+refs/pull/*/head:refs/remotes/origin/pr/*'\n\
          git checkout -B {branch} {origin_branch}\n\
          git reset --hard {origin_branch}\n\
          git clean -fdx\n\
@@ -7681,14 +7736,28 @@ fn review_repo_sync_command(repo_url: &str, expected_remote: &str, branch: &str)
         ensure = review_repo_ensure_command(repo_url, expected_remote, branch),
         git_network = review_repo_git_network_command_prefix(),
         repo_url = shell_quote(repo_url),
+        branch_refspec = shell_quote(&branch_refspec),
         branch = shell_quote(branch),
         origin_branch = shell_quote(&origin_branch),
     )
 }
 
+fn review_repo_reclone_command(repo_url: &str, expected_remote: &str, branch: &str) -> String {
+    format!(
+        "set -eu\n\
+         rm -rf /workspace/repo\n\
+         {ensure}\n\
+         cd /workspace/repo\n\
+         {git_network} fetch --prune --no-tags origin '+refs/pull/*/head:refs/remotes/origin/pr/*'\n\
+         mkdir -p /workspace/reviews",
+        ensure = review_repo_ensure_command(repo_url, expected_remote, branch),
+        git_network = review_repo_git_network_command_prefix(),
+    )
+}
+
 fn review_repo_git_network_command_prefix() -> String {
     format!(
-        "git -c credential.helper= -c http.lowSpeedLimit={} -c http.lowSpeedTime={}",
+        "git -c credential.helper= -c http.version=HTTP/1.1 -c http.lowSpeedLimit={} -c http.lowSpeedTime={}",
         PROJECT_REVIEW_GIT_LOW_SPEED_LIMIT, PROJECT_REVIEW_GIT_LOW_SPEED_TIME_SECS
     )
 }
@@ -10066,7 +10135,10 @@ esac
             "main",
         );
         assert!(command.contains("'+refs/pull/*/head:refs/remotes/origin/pr/*'"));
-        assert!(command.contains("-c http.lowSpeedLimit=1 -c http.lowSpeedTime=30"));
+        assert!(command.contains("--no-tags origin +refs/heads/main:refs/remotes/origin/main"));
+        assert!(command.contains("--no-tags origin '+refs/pull/*/head:refs/remotes/origin/pr/*'"));
+        assert!(command.contains("-c http.version=HTTP/1.1"));
+        assert!(command.contains("-c http.lowSpeedLimit=1 -c http.lowSpeedTime=300"));
         assert!(command.contains("git worktree prune"));
         assert!(command.contains("git reset --hard HEAD"));
         assert!(command.contains("git clean -fdx"));
@@ -10074,6 +10146,19 @@ esac
         assert!(command.contains("git reset --hard origin/main"));
         assert!(command.contains("MAI_GITHUB_REVIEW_TOKEN"));
         assert!(!command.contains("ghp_"));
+    }
+
+    #[test]
+    fn project_review_reclone_command_removes_stale_repo_before_ensure() {
+        let command = review_repo_reclone_command(
+            "https://github.com/owner/repo.git",
+            "https://github.com/owner/repo.git",
+            "main",
+        );
+        assert!(command.contains("rm -rf /workspace/repo"));
+        assert!(command.contains("clone --branch main"));
+        assert!(command.contains("--no-tags origin '+refs/pull/*/head:refs/remotes/origin/pr/*'"));
+        assert!(command.contains("mkdir -p /workspace/reviews"));
     }
 
     #[test]
@@ -12813,6 +12898,52 @@ esac
             })
             .await;
         assert!(matches!(invalid, Err(RuntimeError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn role_model_resolution_falls_back_when_saved_provider_is_removed() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = Arc::new(
+            ConfigStore::open_with_config_path(&db_path, &config_path)
+                .await
+                .expect("open store"),
+        );
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        store
+            .save_agent_config(&AgentConfigRequest {
+                reviewer: Some(AgentModelPreference {
+                    provider_id: "mimo-token-plan".to_string(),
+                    model: "mimo-v1".to_string(),
+                    reasoning_effort: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("save stale config");
+        let runtime = AgentRuntime::new(
+            DockerClient::new("unused"),
+            ResponsesClient::new(),
+            Arc::clone(&store),
+            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
+        )
+        .await
+        .expect("runtime");
+
+        let resolved = runtime
+            .resolve_role_agent_model(AgentRole::Reviewer)
+            .await
+            .expect("fallback reviewer model");
+
+        assert_eq!(resolved.preference.provider_id, "openai");
+        assert_eq!(resolved.preference.model, "gpt-5.5");
     }
 
     #[tokio::test]
