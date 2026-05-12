@@ -385,7 +385,7 @@ watch(
 )
 
 onMounted(async () => {
-  connectEvents(handleSSEEvent)
+  connectEvents(handleSSEEvent, refreshAll)
   applyStartupHash()
   await refreshAll()
 })

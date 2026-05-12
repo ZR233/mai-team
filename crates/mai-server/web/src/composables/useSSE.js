@@ -5,26 +5,28 @@ const connectionState = ref('offline')
 let eventSource = null
 let sseRetryCount = 0
 let sseRetryTimer = null
-const SSE_MAX_RETRIES = 5
+let lastEventId = null
 
 export function useSSE() {
-  function connectEvents(onEvent) {
+  function connectEvents(onEvent, onReconnect) {
     disconnect()
     connectionState.value = 'connecting'
-    eventSource = new EventSource('/events')
+    const query = lastEventId ? `?last_event_id=${encodeURIComponent(lastEventId)}` : ''
+    eventSource = new EventSource(`/events${query}`)
     eventSource.onopen = () => {
+      const wasRetrying = sseRetryCount > 0
       connectionState.value = 'online'
       sseRetryCount = 0
+      if (wasRetrying && onReconnect) onReconnect()
     }
     eventSource.onerror = () => {
       connectionState.value = 'offline'
       eventSource?.close()
       eventSource = null
-      if (sseRetryCount < SSE_MAX_RETRIES) {
-        sseRetryCount++
-        const delay = Math.min(1000 * Math.pow(2, sseRetryCount - 1), 30000)
-        sseRetryTimer = setTimeout(() => connectEvents(onEvent), delay)
-      }
+      sseRetryCount++
+      const delay = Math.min(1000 * Math.pow(2, sseRetryCount - 1), 30000)
+      const jitter = Math.floor(Math.random() * 500)
+      sseRetryTimer = setTimeout(() => connectEvents(onEvent, onReconnect), delay + jitter)
     }
     const names = [
       'agent_created',
@@ -44,6 +46,7 @@ export function useSSE() {
       'context_compacted',
       'agent_message',
       'skills_activated',
+      'plan_updated',
       'error',
       'todo_list_updated',
       'user_input_requested',
@@ -54,6 +57,7 @@ export function useSSE() {
       eventSource.addEventListener(name, (event) => {
         try {
           const parsed = JSON.parse(event.data)
+          if (parsed.sequence) lastEventId = parsed.sequence
           eventFeed.value = [parsed, ...eventFeed.value].slice(0, 150)
           if (onEvent) onEvent(parsed)
         } catch {

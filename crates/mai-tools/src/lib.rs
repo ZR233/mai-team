@@ -3,6 +3,8 @@ use mai_protocol::ToolDefinition;
 use serde_json::{Value, json};
 
 pub const TOOL_CONTAINER_EXEC: &str = "container_exec";
+pub const TOOL_READ_FILE: &str = "read_file";
+pub const TOOL_LIST_FILES: &str = "list_files";
 pub const TOOL_CONTAINER_CP_UPLOAD: &str = "container_cp_upload";
 pub const TOOL_CONTAINER_CP_DOWNLOAD: &str = "container_cp_download";
 pub const TOOL_SPAWN_AGENT: &str = "spawn_agent";
@@ -25,6 +27,8 @@ pub const TOOL_GITHUB_API_GET: &str = "github_api_get";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutedTool {
     ContainerExec,
+    ReadFile,
+    ListFiles,
     ContainerCpUpload,
     ContainerCpDownload,
     SpawnAgent,
@@ -50,6 +54,8 @@ pub enum RoutedTool {
 pub fn route_tool(name: &str) -> RoutedTool {
     match normalize_name(name).as_str() {
         TOOL_CONTAINER_EXEC => RoutedTool::ContainerExec,
+        TOOL_READ_FILE => RoutedTool::ReadFile,
+        TOOL_LIST_FILES => RoutedTool::ListFiles,
         TOOL_CONTAINER_CP_UPLOAD => RoutedTool::ContainerCpUpload,
         TOOL_CONTAINER_CP_DOWNLOAD => RoutedTool::ContainerCpDownload,
         TOOL_SPAWN_AGENT => RoutedTool::SpawnAgent,
@@ -114,6 +120,44 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 ("cwd", json!({ "type": "string" }), false),
                 (
                     "timeout_secs",
+                    json!({ "type": "integer", "minimum": 1 }),
+                    false,
+                ),
+            ]),
+        ),
+        ToolDefinition::function(
+            TOOL_READ_FILE,
+            "Read a text file inside this agent's Docker container with bounded output. Use line_start/line_count for source files or offset/max_bytes for byte paging.",
+            object_schema(vec![
+                ("path", json!({ "type": "string" }), true),
+                ("cwd", json!({ "type": "string" }), false),
+                (
+                    "line_start",
+                    json!({ "type": "integer", "minimum": 1 }),
+                    false,
+                ),
+                (
+                    "line_count",
+                    json!({ "type": "integer", "minimum": 1 }),
+                    false,
+                ),
+                ("offset", json!({ "type": "integer", "minimum": 0 }), false),
+                (
+                    "max_bytes",
+                    json!({ "type": "integer", "minimum": 1 }),
+                    false,
+                ),
+            ]),
+        ),
+        ToolDefinition::function(
+            TOOL_LIST_FILES,
+            "List files inside this agent's Docker container with bounded output.",
+            object_schema(vec![
+                ("path", json!({ "type": "string" }), false),
+                ("cwd", json!({ "type": "string" }), false),
+                ("pattern", json!({ "type": "string" }), false),
+                (
+                    "max_files",
                     json!({ "type": "integer", "minimum": 1 }),
                     false,
                 ),

@@ -5,9 +5,11 @@ use mai_protocol::{
 use reqwest::StatusCode;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Error)]
@@ -35,6 +37,7 @@ pub type Result<T> = std::result::Result<T, ModelError>;
 #[derive(Debug, Clone)]
 pub struct ResponsesClient {
     http: reqwest::Client,
+    unsupported_http_continuation: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,6 +146,28 @@ impl ResponsesClient {
         Self::default()
     }
 
+    async fn http_continuation_is_unsupported(
+        &self,
+        provider: &ProviderSecret,
+        model: &ModelConfig,
+    ) -> bool {
+        self.unsupported_http_continuation
+            .lock()
+            .await
+            .contains(&continuation_cache_key(provider, model))
+    }
+
+    async fn mark_http_continuation_unsupported(
+        &self,
+        provider: &ProviderSecret,
+        model: &ModelConfig,
+    ) {
+        self.unsupported_http_continuation
+            .lock()
+            .await
+            .insert(continuation_cache_key(provider, model));
+    }
+
     pub async fn create_response(
         &self,
         provider: &ProviderSecret,
@@ -228,6 +253,13 @@ impl ResponsesClient {
         req: &ModelRequest<'_>,
         state: &mut ModelTurnState,
     ) -> Result<ModelResponse> {
+        if self
+            .http_continuation_is_unsupported(req.provider, req.model)
+            .await
+        {
+            state.continuation_disabled = true;
+            state.previous_response_id = None;
+        }
         if model_wire_api(req.provider, req.model) != ModelWireApi::Responses
             || !req.model.capabilities.continuation
             || state.continuation_disabled
@@ -265,6 +297,8 @@ impl ResponsesClient {
                 if previous_response_id.is_some()
                     && response_id_unsupported_for_responses_http(&err) =>
             {
+                self.mark_http_continuation_unsupported(req.provider, req.model)
+                    .await;
                 state.continuation_disabled = true;
                 state.previous_response_id = None;
                 self.create_response(
@@ -465,7 +499,10 @@ impl Default for ResponsesClient {
             .connect_timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { http }
+        Self {
+            http,
+            unsupported_http_continuation: Arc::new(Mutex::new(HashSet::new())),
+        }
     }
 }
 
@@ -487,6 +524,15 @@ fn response_id_unsupported_for_responses_http(err: &ModelError) -> bool {
     *status == StatusCode::BAD_REQUEST
         && body.contains("previous_response_id")
         && body.contains("only supported on Responses WebSocket")
+}
+
+fn continuation_cache_key(provider: &ProviderSecret, model: &ModelConfig) -> String {
+    format!(
+        "{:?}|{}|{}",
+        provider.kind,
+        provider.base_url.trim_end_matches('/'),
+        model.id
+    )
 }
 
 trait HeaderMerge {
@@ -1310,6 +1356,118 @@ mod tests {
             requests[2]["input"].as_array().expect("full input").len(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn openai_http_continuation_unsupported_is_cached_across_turns() {
+        let (base_url, requests) = start_mock_responses(vec![
+            json!({
+                "id": "resp_1",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{ "type": "output_text", "text": "ok" }]
+                    }
+                ]
+            }),
+            json!({
+                "__status": 400,
+                "error": {
+                    "message": "previous_response_id is only supported on Responses WebSocket v2",
+                    "type": "invalid_request_error"
+                }
+            }),
+            json!({
+                "id": "resp_2",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{ "type": "output_text", "text": "fallback" }]
+                    }
+                ]
+            }),
+            json!({
+                "id": "resp_3",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{ "type": "output_text", "text": "next" }]
+                    }
+                ]
+            }),
+        ])
+        .await;
+        let provider = openai_provider_secret(base_url);
+        let model = openai_model();
+        let client = ResponsesClient::new();
+        let cancellation_token = CancellationToken::new();
+        let mut first_state = ModelTurnState::default();
+
+        let first_input = vec![ModelInputItem::user_text("first")];
+        client
+            .create_turn_response_with_cancel(
+                &ModelRequest {
+                    provider: &provider,
+                    model: &model,
+                    instructions: "instructions",
+                    input: &first_input,
+                    tools: &[],
+                    reasoning_effort: None,
+                },
+                &mut first_state,
+                &cancellation_token,
+            )
+            .await
+            .expect("first response");
+        first_state.acknowledge_history_len(1);
+        let second_input = vec![
+            ModelInputItem::user_text("first"),
+            ModelInputItem::assistant_text("ok"),
+            ModelInputItem::user_text("second"),
+        ];
+        client
+            .create_turn_response_with_cancel(
+                &ModelRequest {
+                    provider: &provider,
+                    model: &model,
+                    instructions: "instructions",
+                    input: &second_input,
+                    tools: &[],
+                    reasoning_effort: None,
+                },
+                &mut first_state,
+                &cancellation_token,
+            )
+            .await
+            .expect("fallback response");
+
+        let mut next_state = ModelTurnState {
+            previous_response_id: Some("resp_cached".to_string()),
+            acknowledged_input_len: 1,
+            ..Default::default()
+        };
+        client
+            .create_turn_response_with_cancel(
+                &ModelRequest {
+                    provider: &provider,
+                    model: &model,
+                    instructions: "instructions",
+                    input: &second_input,
+                    tools: &[],
+                    reasoning_effort: None,
+                },
+                &mut next_state,
+                &cancellation_token,
+            )
+            .await
+            .expect("cached no-continuation response");
+
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[1]["previous_response_id"], "resp_1");
+        assert!(requests[2].get("previous_response_id").is_none());
+        assert!(requests[3].get("previous_response_id").is_none());
+        assert_eq!(requests[3]["store"], false);
     }
 
     #[test]

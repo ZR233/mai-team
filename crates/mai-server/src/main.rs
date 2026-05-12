@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::http::{StatusCode, Uri, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -47,10 +48,17 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+const SSE_REPLAY_LIMIT: usize = 1_000;
+
 #[derive(Clone)]
 struct AppState {
     runtime: Arc<AgentRuntime>,
     store: Arc<ConfigStore>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EventsQuery {
+    last_event_id: Option<u64>,
 }
 
 #[derive(RustEmbed)]
@@ -1587,18 +1595,38 @@ fn content_disposition_filename(name: &str) -> String {
 
 async fn events(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<EventsQuery>,
+    headers: HeaderMap,
 ) -> std::result::Result<
     Sse<impl futures::Stream<Item = std::result::Result<Event, Infallible>>>,
     ApiError,
 > {
     let initial = once(Ok(Event::default().comment("connected")));
+    let last_event_id = query.last_event_id.or_else(|| {
+        headers
+            .get("last-event-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+    });
+    let replay = if let Some(last_event_id) = last_event_id {
+        state
+            .store
+            .service_events_after(last_event_id, SSE_REPLAY_LIMIT)
+            .await?
+    } else {
+        Vec::new()
+    };
+    let replay = tokio_stream::iter(replay.into_iter().map(|event| Ok(sse_event(event))));
     let events = BroadcastStream::new(state.runtime.subscribe()).filter_map(|event| async move {
         match event {
             Ok(event) => Some(Ok(sse_event(event))),
-            Err(_) => None,
+            Err(err) => {
+                tracing::warn!("SSE broadcast lagged or closed: {err}");
+                None
+            }
         }
     });
-    let stream = initial.chain(events);
+    let stream = initial.chain(replay).chain(events);
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
@@ -1821,6 +1849,55 @@ mod tests {
         };
 
         assert_eq!(event_name(&event), "skills_activated");
+    }
+
+    #[test]
+    fn plan_updated_event_has_sse_name() {
+        let event = ServiceEvent {
+            sequence: 1,
+            timestamp: mai_protocol::now(),
+            kind: ServiceEventKind::PlanUpdated {
+                task_id: TaskId::new_v4(),
+                plan: mai_protocol::TaskPlan::default(),
+            },
+        };
+
+        assert_eq!(event_name(&event), "plan_updated");
+    }
+
+    #[tokio::test]
+    async fn service_event_replay_returns_events_after_sequence() {
+        let dir = tempdir().expect("tempdir");
+        let store = ConfigStore::open_with_config_path(
+            dir.path().join("server.sqlite3"),
+            dir.path().join("config.toml"),
+        )
+        .await
+        .expect("open store");
+        for sequence in 1..=3 {
+            store
+                .append_service_event(&ServiceEvent {
+                    sequence,
+                    timestamp: mai_protocol::now(),
+                    kind: ServiceEventKind::Error {
+                        agent_id: None,
+                        session_id: None,
+                        turn_id: None,
+                        message: format!("event {sequence}"),
+                    },
+                })
+                .await
+                .expect("append event");
+        }
+
+        let replay = store.service_events_after(1, 10).await.expect("replay");
+        assert_eq!(
+            replay
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 
     #[tokio::test]

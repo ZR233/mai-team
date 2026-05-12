@@ -24,8 +24,9 @@ use mai_protocol::{
     ResolvedAgentModelPreference, RuntimeDefaultsResponse, SendMessageRequest, ServiceEvent,
     ServiceEventKind, SessionId, SkillActivationInfo, SkillScope, SkillsConfigRequest,
     SkillsListResponse, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary,
-    TodoItem, TokenUsage, ToolTraceDetail, ToolTraceListResponse, TurnId, TurnStatus,
-    UpdateAgentRequest, UpdateProjectRequest, UserInputOption, UserInputQuestion, now, preview,
+    TodoItem, TokenUsage, ToolDefinition, ToolTraceDetail, ToolTraceListResponse, TurnId,
+    TurnStatus, UpdateAgentRequest, UpdateProjectRequest, UserInputOption, UserInputQuestion, now,
+    preview,
 };
 use mai_skills::{
     SkillInjections, SkillInput, SkillSelection, SkillsManager, render_available_response,
@@ -51,6 +52,11 @@ use uuid::Uuid;
 
 const RECENT_EVENT_LIMIT: usize = 500;
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
+const DEFAULT_MODEL_TOOL_OUTPUT_BYTES: usize = 50 * 1024;
+const DEFAULT_READ_FILE_BYTES: usize = 50 * 1024;
+const MAX_READ_FILE_BYTES: usize = 512 * 1024;
+const DEFAULT_LIST_FILES_LIMIT: usize = 200;
+const MAX_LIST_FILES_LIMIT: usize = 1_000;
 const REVIEW_ROUND_LIMIT: u64 = 5;
 const PROJECT_WORKSPACE_PATH: &str = "/workspace/repo";
 const PROJECT_SKILLS_CACHE_DIR: &str = "project-skills";
@@ -279,7 +285,30 @@ struct CollabInput {
 struct ToolExecution {
     success: bool,
     output: String,
+    model_output: String,
     ends_turn: bool,
+}
+
+impl ToolExecution {
+    fn new(success: bool, output: String, ends_turn: bool) -> Self {
+        let model_output = bounded_model_tool_output(&output);
+        Self {
+            success,
+            output,
+            model_output,
+            ends_turn,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TurnModelContext {
+    provider_id: String,
+    model_name: String,
+    reasoning_effort: Option<String>,
+    provider_selection: mai_store::ProviderSelection,
+    tools: Vec<ToolDefinition>,
+    instructions: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2888,21 +2917,8 @@ impl AgentRuntime {
         }
         self.inject_project_mcp_tools(&agent, agent_id, session_id, &cancellation_token)
             .await?;
-        let mut last_assistant_text: Option<String> = None;
-        let mut turn_model_state = ModelTurnState::default();
-        let mut empty_progress_count: usize = 0;
-        loop {
-            if cancellation_token.is_cancelled() {
-                return Err(RuntimeError::TurnCancelled);
-            }
-            self.set_turn_status(
-                &agent,
-                turn_id,
-                &cancellation_token,
-                enforce_current_turn,
-                AgentStatus::RunningTurn,
-            )
-            .await?;
+        let model_context = {
+            let context_started = Instant::now();
             let mcp_tools = self.agent_mcp_tools(&agent).await;
             let visible_tools = self.visible_tool_names(&agent, &mcp_tools).await;
             let tools =
@@ -2920,13 +2936,54 @@ impl AgentRuntime {
                 .await?
             };
             let summary = agent.summary.read().await.clone();
-            let model_name = summary.model.clone();
             let provider_id = summary.provider_id.clone();
+            let model_name = summary.model.clone();
             let reasoning_effort = summary.reasoning_effort;
             let provider_selection = self
                 .store
                 .resolve_provider(Some(&provider_id), Some(&model_name))
                 .await?;
+            self.record_agent_log(
+                agent_id,
+                Some(session_id),
+                Some(turn_id),
+                "info",
+                "runtime",
+                "turn model context prepared",
+                json!({
+                    "provider_id": provider_id,
+                    "model": model_name,
+                    "tool_count": tools.len(),
+                    "mcp_tool_count": mcp_tools.len(),
+                    "instructions_bytes": instructions.len(),
+                    "duration_ms": u128_to_u64(context_started.elapsed().as_millis()),
+                }),
+            )
+            .await;
+            TurnModelContext {
+                provider_id,
+                model_name,
+                reasoning_effort,
+                provider_selection,
+                tools,
+                instructions,
+            }
+        };
+        let mut last_assistant_text: Option<String> = None;
+        let mut turn_model_state = ModelTurnState::default();
+        let mut empty_progress_count: usize = 0;
+        loop {
+            if cancellation_token.is_cancelled() {
+                return Err(RuntimeError::TurnCancelled);
+            }
+            self.set_turn_status(
+                &agent,
+                turn_id,
+                &cancellation_token,
+                enforce_current_turn,
+                AgentStatus::RunningTurn,
+            )
+            .await?;
             if let Err(err) = self
                 .maybe_auto_compact(&agent, agent_id, session_id, turn_id, &cancellation_token)
                 .await
@@ -2946,6 +3003,7 @@ impl AgentRuntime {
                 )
                 .await;
             }
+            let history_started = Instant::now();
             let mut history = self.session_history(&agent, agent_id, session_id).await?;
             if turn_model_state.previous_response_id.is_none()
                 && let Some(skill_fragment) =
@@ -2953,16 +3011,18 @@ impl AgentRuntime {
             {
                 history.push(skill_fragment);
             }
+            let history_duration_ms = u128_to_u64(history_started.elapsed().as_millis());
+            let model_started = Instant::now();
             let response = self
                 .model
                 .create_turn_response_with_cancel(
                     &ModelRequest {
-                        provider: &provider_selection.provider,
-                        model: &provider_selection.model,
-                        instructions: &instructions,
+                        provider: &model_context.provider_selection.provider,
+                        model: &model_context.provider_selection.model,
+                        instructions: &model_context.instructions,
                         input: &history,
-                        tools: &tools,
-                        reasoning_effort,
+                        tools: &model_context.tools,
+                        reasoning_effort: model_context.reasoning_effort.clone(),
                     },
                     &mut turn_model_state,
                     &cancellation_token,
@@ -2975,6 +3035,7 @@ impl AgentRuntime {
                         RuntimeError::Model(err)
                     }
                 })?;
+            let model_duration_ms = u128_to_u64(model_started.elapsed().as_millis());
             self.record_agent_log(
                 agent_id,
                 Some(session_id),
@@ -2983,9 +3044,12 @@ impl AgentRuntime {
                 "model",
                 "model response received",
                 json!({
-                    "provider_id": provider_id,
-                    "model": model_name,
+                    "provider_id": model_context.provider_id,
+                    "model": model_context.model_name,
                     "output_items": response.output.len(),
+                    "history_items": history.len(),
+                    "history_load_ms": history_duration_ms,
+                    "duration_ms": model_duration_ms,
                     "usage": response.usage,
                 }),
             )
@@ -3250,11 +3314,7 @@ impl AgentRuntime {
                 let execution = match output {
                     Ok(execution) => execution,
                     Err(RuntimeError::TurnCancelled) => return Err(RuntimeError::TurnCancelled),
-                    Err(err) => ToolExecution {
-                        success: false,
-                        output: err.to_string(),
-                        ends_turn: false,
-                    },
+                    Err(err) => ToolExecution::new(false, err.to_string(), false),
                 };
                 if execution.ends_turn {
                     should_end_turn = true;
@@ -3265,7 +3325,7 @@ impl AgentRuntime {
                     session_id,
                     ModelInputItem::FunctionCallOutput {
                         call_id: call_id.clone(),
-                        output: execution.output.clone(),
+                        output: execution.model_output.clone(),
                     },
                 )
                 .await?;
@@ -3370,16 +3430,24 @@ impl AgentRuntime {
                         &cancellation_token,
                     )
                     .await?;
-                Ok(ToolExecution {
-                    success: output.status == 0,
-                    output: serde_json::to_string(&json!({
+                Ok(ToolExecution::new(
+                    output.status == 0,
+                    serde_json::to_string(&json!({
                         "status": output.status,
                         "stdout": output.stdout,
                         "stderr": output.stderr,
                     }))
                     .unwrap_or_else(|_| "{}".to_string()),
-                    ends_turn: false,
-                })
+                    false,
+                ))
+            }
+            RoutedTool::ReadFile => {
+                let output = self.read_container_file(agent_id, &arguments).await?;
+                Ok(ToolExecution::new(true, output.to_string(), false))
+            }
+            RoutedTool::ListFiles => {
+                let output = self.list_container_files(agent_id, &arguments).await?;
+                Ok(ToolExecution::new(true, output.to_string(), false))
             }
             RoutedTool::ContainerCpUpload => {
                 let path = required_string(&arguments, "path")?;
@@ -3387,24 +3455,24 @@ impl AgentRuntime {
                 let bytes = self
                     .upload_file(agent_id, path.clone(), content_base64)
                     .await?;
-                Ok(ToolExecution {
-                    success: true,
-                    output: json!({ "path": path, "bytes": bytes }).to_string(),
-                    ends_turn: false,
-                })
+                Ok(ToolExecution::new(
+                    true,
+                    json!({ "path": path, "bytes": bytes }).to_string(),
+                    false,
+                ))
             }
             RoutedTool::ContainerCpDownload => {
                 let path = required_string(&arguments, "path")?;
                 let bytes = self.download_file_tar(agent_id, path.clone()).await?;
-                Ok(ToolExecution {
-                    success: true,
-                    output: json!({
+                Ok(ToolExecution::new(
+                    true,
+                    json!({
                         "path": path,
                         "tar_base64": BASE64.encode(bytes),
                     })
                     .to_string(),
-                    ends_turn: false,
-                })
+                    false,
+                ))
             }
             RoutedTool::SpawnAgent => {
                 let name = optional_string(&arguments, "name");
@@ -3484,11 +3552,11 @@ impl AgentRuntime {
                 } else {
                     None
                 };
-                Ok(ToolExecution {
-                    success: true,
-                    output: json!({ "agent": created, "turn_id": turn_id }).to_string(),
-                    ends_turn: false,
-                })
+                Ok(ToolExecution::new(
+                    true,
+                    json!({ "agent": created, "turn_id": turn_id }).to_string(),
+                    false,
+                ))
             }
             RoutedTool::SendInput => {
                 let target =
@@ -3512,11 +3580,7 @@ impl AgentRuntime {
                         interrupt,
                     )
                     .await?;
-                Ok(ToolExecution {
-                    success: true,
-                    output: output.to_string(),
-                    ends_turn: false,
-                })
+                Ok(ToolExecution::new(true, output.to_string(), false))
             }
             RoutedTool::SendMessage => {
                 let target = parse_agent_id(&required_string(&arguments, "agent_id")?)?;
@@ -3528,11 +3592,7 @@ impl AgentRuntime {
                 let output = self
                     .send_input_to_agent(target, session_id, message, Vec::new(), false)
                     .await?;
-                Ok(ToolExecution {
-                    success: true,
-                    output: output.to_string(),
-                    ends_turn: false,
-                })
+                Ok(ToolExecution::new(true, output.to_string(), false))
             }
             RoutedTool::WaitAgent => {
                 let legacy_single_target =
@@ -3543,36 +3603,36 @@ impl AgentRuntime {
                     let output = self
                         .wait_agents_output_with_cancel(targets, timeout, &cancellation_token)
                         .await?;
-                    return Ok(ToolExecution {
-                        success: true,
-                        output: serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string()),
-                        ends_turn: false,
-                    });
+                    return Ok(ToolExecution::new(
+                        true,
+                        serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string()),
+                        false,
+                    ));
                 }
                 let output = self
                     .wait_agents_output_with_cancel(targets, timeout, &cancellation_token)
                     .await?;
-                Ok(ToolExecution {
-                    success: true,
-                    output: serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string()),
-                    ends_turn: false,
-                })
+                Ok(ToolExecution::new(
+                    true,
+                    serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string()),
+                    false,
+                ))
             }
-            RoutedTool::ListAgents => Ok(ToolExecution {
-                success: true,
-                output: serde_json::to_string(&self.list_agents().await)
+            RoutedTool::ListAgents => Ok(ToolExecution::new(
+                true,
+                serde_json::to_string(&self.list_agents().await)
                     .unwrap_or_else(|_| "[]".to_string()),
-                ends_turn: false,
-            }),
+                false,
+            )),
             RoutedTool::CloseAgent => {
                 let target =
                     parse_agent_id(&required_any_string(&arguments, &["target", "agent_id"])?)?;
                 let previous = self.close_agent(target).await?;
-                Ok(ToolExecution {
-                    success: true,
-                    output: json!({ "closed": target, "previous_status": previous }).to_string(),
-                    ends_turn: false,
-                })
+                Ok(ToolExecution::new(
+                    true,
+                    json!({ "closed": target, "previous_status": previous }).to_string(),
+                    false,
+                ))
             }
             RoutedTool::ResumeAgent => {
                 let target = parse_agent_id(&required_any_string(
@@ -3580,11 +3640,11 @@ impl AgentRuntime {
                     &["id", "agent_id", "target"],
                 )?)?;
                 let resumed = self.resume_agent(target).await?;
-                Ok(ToolExecution {
-                    success: true,
-                    output: json!({ "agent": resumed }).to_string(),
-                    ends_turn: false,
-                })
+                Ok(ToolExecution::new(
+                    true,
+                    json!({ "agent": resumed }).to_string(),
+                    false,
+                ))
             }
             RoutedTool::ListMcpResources => {
                 let broker = self
@@ -3596,11 +3656,7 @@ impl AgentRuntime {
                         optional_string(&arguments, "cursor"),
                     )
                     .await?;
-                Ok(ToolExecution {
-                    success: true,
-                    output: output.to_string(),
-                    ends_turn: false,
-                })
+                Ok(ToolExecution::new(true, output.to_string(), false))
             }
             RoutedTool::ListMcpResourceTemplates => {
                 let broker = self
@@ -3612,11 +3668,7 @@ impl AgentRuntime {
                         optional_string(&arguments, "cursor"),
                     )
                     .await?;
-                Ok(ToolExecution {
-                    success: true,
-                    output: output.to_string(),
-                    ends_turn: false,
-                })
+                Ok(ToolExecution::new(true, output.to_string(), false))
             }
             RoutedTool::ReadMcpResource => {
                 let broker = self
@@ -3625,21 +3677,17 @@ impl AgentRuntime {
                 let server = required_string(&arguments, "server")?;
                 let uri = required_string(&arguments, "uri")?;
                 let output = broker.read_resource(&server, &uri).await?;
-                Ok(ToolExecution {
-                    success: true,
-                    output: output.to_string(),
-                    ends_turn: false,
-                })
+                Ok(ToolExecution::new(true, output.to_string(), false))
             }
             RoutedTool::SaveTaskPlan => {
                 let title = required_string(&arguments, "title")?;
                 let markdown = required_string(&arguments, "markdown")?;
                 let task = self.save_task_plan(agent_id, title, markdown).await?;
-                Ok(ToolExecution {
-                    success: true,
-                    output: serde_json::to_string(&task).unwrap_or_else(|_| "{}".to_string()),
-                    ends_turn: false,
-                })
+                Ok(ToolExecution::new(
+                    true,
+                    serde_json::to_string(&task).unwrap_or_else(|_| "{}".to_string()),
+                    false,
+                ))
             }
             RoutedTool::SubmitReviewResult => {
                 let passed = arguments
@@ -3653,11 +3701,11 @@ impl AgentRuntime {
                 let review = self
                     .submit_review_result(agent_id, passed, findings, summary)
                     .await?;
-                Ok(ToolExecution {
-                    success: true,
-                    output: serde_json::to_string(&review).unwrap_or_else(|_| "{}".to_string()),
-                    ends_turn: false,
-                })
+                Ok(ToolExecution::new(
+                    true,
+                    serde_json::to_string(&review).unwrap_or_else(|_| "{}".to_string()),
+                    false,
+                ))
             }
             RoutedTool::UpdateTodoList => {
                 let items = todo_items_from_arguments(&arguments)?;
@@ -3668,11 +3716,11 @@ impl AgentRuntime {
                     items,
                 })
                 .await;
-                Ok(ToolExecution {
-                    success: true,
-                    output: "Todo list updated".to_string(),
-                    ends_turn: false,
-                })
+                Ok(ToolExecution::new(
+                    true,
+                    "Todo list updated".to_string(),
+                    false,
+                ))
             }
             RoutedTool::RequestUserInput => {
                 let header = required_string(&arguments, "header")?;
@@ -3727,22 +3775,22 @@ impl AgentRuntime {
                     questions,
                 })
                 .await;
-                Ok(ToolExecution {
-                    success: true,
-                    output: "Questions sent to user. Wait for their response in the next message."
+                Ok(ToolExecution::new(
+                    true,
+                    "Questions sent to user. Wait for their response in the next message."
                         .to_string(),
-                    ends_turn: true,
-                })
+                    true,
+                ))
             }
             RoutedTool::SaveArtifact => {
                 let path = required_string(&arguments, "path")?;
                 let name = optional_string(&arguments, "name");
                 let artifact = self.save_artifact(agent_id, path, name).await?;
-                Ok(ToolExecution {
-                    success: true,
-                    output: serde_json::to_string(&artifact).unwrap_or_else(|_| "{}".to_string()),
-                    ends_turn: false,
-                })
+                Ok(ToolExecution::new(
+                    true,
+                    serde_json::to_string(&artifact).unwrap_or_else(|_| "{}".to_string()),
+                    false,
+                ))
             }
             RoutedTool::GithubApiGet => {
                 let path = required_string(&arguments, "path")?;
@@ -3763,18 +3811,115 @@ impl AgentRuntime {
                         return Err(RuntimeError::TurnCancelled);
                     }
                 };
-                Ok(ToolExecution {
-                    success: true,
-                    output: output.to_string(),
-                    ends_turn: false,
-                })
+                Ok(ToolExecution::new(true, output.to_string(), false))
             }
-            RoutedTool::Unknown(name) => Ok(ToolExecution {
-                success: false,
-                output: format!("unknown tool: {name}"),
-                ends_turn: false,
-            }),
+            RoutedTool::Unknown(name) => Ok(ToolExecution::new(
+                false,
+                format!("unknown tool: {name}"),
+                false,
+            )),
         }
+    }
+
+    async fn read_container_file(&self, agent_id: AgentId, arguments: &Value) -> Result<Value> {
+        let path = required_string(arguments, "path")?;
+        let cwd = optional_string(arguments, "cwd");
+        let line_start = optional_usize(arguments, "line_start")?;
+        let line_count = optional_usize(arguments, "line_count")?;
+        let offset = optional_usize(arguments, "offset")?.unwrap_or(0);
+        let max_bytes = optional_usize(arguments, "max_bytes")?
+            .unwrap_or(DEFAULT_READ_FILE_BYTES)
+            .clamp(1, MAX_READ_FILE_BYTES);
+        if line_start.is_some() && offset > 0 {
+            return Err(RuntimeError::InvalidInput(
+                "read_file cannot combine line_start with offset".to_string(),
+            ));
+        }
+        let container_id = self.container_id(agent_id).await?;
+        let command = if let Some(line_start) = line_start {
+            let line_count = line_count.unwrap_or(200).clamp(1, 10_000);
+            let end = line_start.saturating_add(line_count).saturating_sub(1);
+            format!(
+                "if [ ! -f {path} ]; then echo __MAI_FILE_MISSING__; exit 0; fi; sed -n '{start},{end}p' {path}",
+                path = shell_quote(&path),
+                start = line_start,
+                end = end
+            )
+        } else {
+            format!(
+                "if [ ! -f {path} ]; then echo __MAI_FILE_MISSING__; exit 0; fi; dd if={path} bs=1 skip={offset} count={count} 2>/dev/null",
+                path = shell_quote(&path),
+                offset = offset,
+                count = max_bytes.saturating_add(1)
+            )
+        };
+        let output = self
+            .docker
+            .exec_shell(&container_id, &command, cwd.as_deref(), Some(20))
+            .await?;
+        if output.stdout.trim() == "__MAI_FILE_MISSING__" {
+            return Err(RuntimeError::InvalidInput(format!(
+                "file not found: {path}"
+            )));
+        }
+        if output.status != 0 {
+            return Err(RuntimeError::InvalidInput(format!(
+                "read_file failed: {}",
+                preview(format!("{}\n{}", output.stderr, output.stdout).trim(), 500)
+            )));
+        }
+        let (text, truncated, bytes_omitted, next_offset) =
+            bounded_text(&output.stdout, max_bytes, offset);
+        Ok(json!({
+            "path": path,
+            "offset": offset,
+            "bytes_returned": text.len(),
+            "bytes_omitted": bytes_omitted,
+            "truncated": truncated,
+            "next_offset": next_offset,
+            "text": text,
+        }))
+    }
+
+    async fn list_container_files(&self, agent_id: AgentId, arguments: &Value) -> Result<Value> {
+        let path = optional_string(arguments, "path").unwrap_or_else(|| ".".to_string());
+        let cwd = optional_string(arguments, "cwd");
+        let pattern = optional_string(arguments, "pattern").unwrap_or_else(|| "*".to_string());
+        let max_files = optional_usize(arguments, "max_files")?
+            .unwrap_or(DEFAULT_LIST_FILES_LIMIT)
+            .clamp(1, MAX_LIST_FILES_LIMIT);
+        let container_id = self.container_id(agent_id).await?;
+        let command = format!(
+            "find {path} -type f -name {pattern} | sort | head -n {limit}",
+            path = shell_quote(&path),
+            pattern = shell_quote(&pattern),
+            limit = max_files.saturating_add(1)
+        );
+        let output = self
+            .docker
+            .exec_shell(&container_id, &command, cwd.as_deref(), Some(20))
+            .await?;
+        if output.status != 0 {
+            return Err(RuntimeError::InvalidInput(format!(
+                "list_files failed: {}",
+                preview(format!("{}\n{}", output.stderr, output.stdout).trim(), 500)
+            )));
+        }
+        let mut files = output
+            .stdout
+            .lines()
+            .take(max_files.saturating_add(1))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let truncated = files.len() > max_files;
+        files.truncate(max_files);
+        Ok(json!({
+            "path": path,
+            "pattern": pattern,
+            "files": files,
+            "count": files.len(),
+            "truncated": truncated,
+        }))
     }
 
     async fn save_task_plan(
@@ -4366,6 +4511,8 @@ impl AgentRuntime {
         let capability = self.agent_capability(agent).await;
         let mut names = HashSet::from([
             mai_tools::TOOL_CONTAINER_EXEC.to_string(),
+            mai_tools::TOOL_READ_FILE.to_string(),
+            mai_tools::TOOL_LIST_FILES.to_string(),
             mai_tools::TOOL_CONTAINER_CP_UPLOAD.to_string(),
             mai_tools::TOOL_CONTAINER_CP_DOWNLOAD.to_string(),
             mai_tools::TOOL_SEND_INPUT.to_string(),
@@ -6843,11 +6990,11 @@ impl AgentRuntime {
             )),
             other => RuntimeError::InvalidInput(redact_secret(&other.to_string(), &token)),
         })?;
-        Ok(ToolExecution {
-            success: true,
-            output: redact_secret(&output.to_string(), &token),
-            ends_turn: false,
-        })
+        Ok(ToolExecution::new(
+            true,
+            redact_secret(&output.to_string(), &token),
+            false,
+        ))
     }
 
     async fn agent_resource_broker(
@@ -6914,11 +7061,11 @@ impl AgentRuntime {
                 "error": redact_secret(&message, &token),
             })
         };
-        Ok(ToolExecution {
-            success: status.is_success(),
-            output: redact_secret(&output.to_string(), &token),
-            ends_turn: false,
-        })
+        Ok(ToolExecution::new(
+            status.is_success(),
+            redact_secret(&output.to_string(), &token),
+            false,
+        ))
     }
 
     async fn clone_project_repository(
@@ -7635,6 +7782,18 @@ fn optional_string(arguments: &Value, field: &str) -> Option<String> {
         .get(field)
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn optional_usize(arguments: &Value, field: &str) -> Result<Option<usize>> {
+    let Some(value) = arguments.get(field) else {
+        return Ok(None);
+    };
+    let raw = value
+        .as_u64()
+        .ok_or_else(|| RuntimeError::InvalidInput(format!("field `{field}` must be an integer")))?;
+    usize::try_from(raw)
+        .map(Some)
+        .map_err(|_| RuntimeError::InvalidInput(format!("field `{field}` is too large")))
 }
 
 fn todo_items_from_arguments(arguments: &Value) -> Result<Vec<TodoItem>> {
@@ -8604,6 +8763,91 @@ fn trace_preview_output(output: &str, max: usize) -> String {
     serde_json::from_str::<Value>(output)
         .map(|value| trace_preview_value(&value, max))
         .unwrap_or_else(|_| preview(&redact_preview_string(output), max))
+}
+
+fn bounded_model_tool_output(output: &str) -> String {
+    if output.len() <= DEFAULT_MODEL_TOOL_OUTPUT_BYTES {
+        return output.to_string();
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(output) {
+        return bounded_json_tool_output(value, DEFAULT_MODEL_TOOL_OUTPUT_BYTES).to_string();
+    }
+    let (text, truncated, bytes_omitted, next_offset) =
+        bounded_text(output, DEFAULT_MODEL_TOOL_OUTPUT_BYTES, 0);
+    json!({
+        "truncated": truncated,
+        "bytes_returned": text.len(),
+        "bytes_omitted": bytes_omitted,
+        "next_offset": next_offset,
+        "text": text,
+    })
+    .to_string()
+}
+
+fn bounded_json_tool_output(mut value: Value, max_bytes: usize) -> Value {
+    match &mut value {
+        Value::Object(map) => {
+            for key in ["stdout", "stderr", "body", "text", "tar_base64"] {
+                if let Some(Value::String(text)) = map.get_mut(key) {
+                    let (bounded, truncated, bytes_omitted, next_offset) =
+                        bounded_text(text, max_bytes, 0);
+                    if truncated {
+                        *text = bounded;
+                        map.insert("truncated".to_string(), Value::Bool(true));
+                        map.insert("bytes_returned".to_string(), json!(max_bytes));
+                        map.insert("bytes_omitted".to_string(), json!(bytes_omitted));
+                        map.insert("next_offset".to_string(), json!(next_offset));
+                        break;
+                    }
+                }
+            }
+            if value.to_string().len() > max_bytes {
+                let serialized = value.to_string();
+                let (text, _, bytes_omitted, next_offset) = bounded_text(&serialized, max_bytes, 0);
+                json!({
+                    "truncated": true,
+                    "bytes_returned": text.len(),
+                    "bytes_omitted": bytes_omitted,
+                    "next_offset": next_offset,
+                    "json_preview": text,
+                })
+            } else {
+                value
+            }
+        }
+        _ => {
+            let serialized = value.to_string();
+            if serialized.len() <= max_bytes {
+                value
+            } else {
+                let (text, _, bytes_omitted, next_offset) = bounded_text(&serialized, max_bytes, 0);
+                json!({
+                    "truncated": true,
+                    "bytes_returned": text.len(),
+                    "bytes_omitted": bytes_omitted,
+                    "next_offset": next_offset,
+                    "json_preview": text,
+                })
+            }
+        }
+    }
+}
+
+fn bounded_text(
+    value: &str,
+    max_bytes: usize,
+    offset: usize,
+) -> (String, bool, usize, Option<usize>) {
+    if value.len() <= max_bytes {
+        return (value.to_string(), false, 0, None);
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let text = value[..end].to_string();
+    let omitted = value.len().saturating_sub(end);
+    (text, true, omitted, Some(offset.saturating_add(end)))
 }
 
 fn inline_event_arguments(value: &Value) -> Option<Value> {
@@ -10104,6 +10348,14 @@ mod tests {
 	      mkdir -p "$WORKSPACE"
 	      printf 'hello\n' > "$WORKSPACE/README.md"
 	    fi
+	    command=$(printf '%s' "$command" | sed "s#/workspace/repo#$WORKSPACE#g")
+	    if printf '%s' "$command" | grep -q "sed -n"; then
+	      /bin/sh -lc "$command"
+	    elif printf '%s' "$command" | grep -q "dd if="; then
+	      /bin/sh -lc "$command"
+	    elif printf '%s' "$command" | grep -q "^find "; then
+	      /bin/sh -lc "$command"
+	    fi
 	    exit 0
 	    ;;
     cp)
@@ -10670,6 +10922,70 @@ esac
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].step, "获取认证用户信息和读取 helper 脚本");
         assert_eq!(items[0].status, mai_protocol::TodoListStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn read_file_returns_bounded_paged_output() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let agent_id = Uuid::new_v4();
+        save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container-1"))).await;
+        let workspace = fake_sidecar_workspace_path(&dir);
+        fs::create_dir_all(&workspace).expect("mkdir workspace");
+        fs::write(workspace.join("sample.txt"), "alpha\nbeta\ngamma\n").expect("write file");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        let output = runtime
+            .execute_tool_for_test(
+                agent_id,
+                "read_file",
+                json!({
+                    "path": "/workspace/repo/sample.txt",
+                    "line_start": 2,
+                    "line_count": 2,
+                    "max_bytes": 20
+                }),
+            )
+            .await
+            .expect("read file");
+
+        assert!(output.success);
+        let value = serde_json::from_str::<Value>(&output.output).expect("json output");
+        assert_eq!(value["text"], "beta\ngamma\n");
+        assert_eq!(value["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn tool_output_is_truncated_for_model_history_but_trace_keeps_full_output() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        store
+            .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
+            .await
+            .expect("save agent");
+        save_test_session(&store, agent_id, session_id).await;
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let long_stdout = "x".repeat(DEFAULT_MODEL_TOOL_OUTPUT_BYTES + 100);
+        let execution = ToolExecution::new(
+            true,
+            json!({ "status": 0, "stdout": long_stdout, "stderr": "" }).to_string(),
+            false,
+        );
+
+        assert!(execution.output.len() > execution.model_output.len());
+        assert!(execution.output.contains(&"x".repeat(100)));
+        let model_value =
+            serde_json::from_str::<Value>(&execution.model_output).expect("model output json");
+        assert_eq!(model_value["truncated"], true);
+        let visible = model_value
+            .get("stdout")
+            .or_else(|| model_value.get("json_preview"))
+            .and_then(Value::as_str)
+            .expect("visible output");
+        assert!(visible.len() <= DEFAULT_MODEL_TOOL_OUTPUT_BYTES);
+        drop(runtime);
     }
 
     #[tokio::test]

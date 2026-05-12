@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::SystemTime;
 use thiserror::Error;
 use toasty::Db;
 use toasty::stmt::{List, Query};
@@ -65,12 +66,26 @@ pub struct ConfigStore {
     artifact_index_dir: PathBuf,
     db: Db,
     git_accounts_lock: Mutex<()>,
+    providers_cache: Mutex<Option<ProvidersCache>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ProviderSelection {
     pub provider: ProviderSecret,
     pub model: ModelConfig,
+}
+
+#[derive(Debug, Clone)]
+struct ProvidersCache {
+    stamp: ProvidersCacheStamp,
+    file: ProvidersToml,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProvidersCacheStamp {
+    exists: bool,
+    modified: Option<SystemTime>,
+    len: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -540,6 +555,7 @@ impl ConfigStore {
             artifact_index_dir,
             db,
             git_accounts_lock: Mutex::new(()),
+            providers_cache: Mutex::new(None),
         };
         Ok(store)
     }
@@ -611,7 +627,7 @@ impl ConfigStore {
     }
 
     pub async fn provider_count(&self) -> Result<usize> {
-        Ok(self.load_providers_toml()?.providers.len())
+        Ok(self.load_providers_toml().await?.providers.len())
     }
 
     pub fn provider_presets_response(&self) -> ProviderPresetsResponse {
@@ -637,7 +653,7 @@ impl ConfigStore {
 
     pub async fn providers_response(&self) -> Result<ProvidersResponse> {
         let providers = self.list_provider_secrets().await?;
-        let file = self.load_providers_toml()?;
+        let file = self.load_providers_toml().await?;
         Ok(ProvidersResponse {
             providers: providers
                 .into_iter()
@@ -661,6 +677,7 @@ impl ConfigStore {
         validate_provider_request(&request)?;
         let existing = self
             .load_providers_toml()
+            .await
             .unwrap_or_else(|_| ProvidersToml::default());
         let mut file = ProvidersToml::default();
         for provider in &request.providers {
@@ -702,6 +719,7 @@ impl ConfigStore {
         }
 
         self.write_providers_toml(&file)?;
+        self.clear_providers_cache().await;
         Ok(())
     }
 
@@ -769,7 +787,7 @@ impl ConfigStore {
         if providers.is_empty() {
             return Ok(None);
         }
-        if let Some(default_provider_id) = self.load_providers_toml()?.default_provider_id
+        if let Some(default_provider_id) = self.load_providers_toml().await?.default_provider_id
             && let Some(provider) = providers
                 .iter()
                 .find(|provider| provider.id == default_provider_id && provider.enabled)
@@ -780,7 +798,7 @@ impl ConfigStore {
     }
 
     pub async fn list_provider_secrets(&self) -> Result<Vec<ProviderSecret>> {
-        let file = self.load_providers_toml()?;
+        let file = self.load_providers_toml().await?;
         let mut out = Vec::with_capacity(file.providers.len());
         for (id, provider) in file.providers {
             out.push(ProviderSecret {
@@ -802,28 +820,56 @@ impl ConfigStore {
         Ok(out)
     }
 
-    fn load_providers_toml(&self) -> Result<ProvidersToml> {
-        if !self.config_path.exists() {
-            return Ok(ProvidersToml::default());
+    async fn load_providers_toml(&self) -> Result<ProvidersToml> {
+        let stamp = providers_cache_stamp(&self.config_path)?;
+        if let Some(cache) = self.providers_cache.lock().await.as_ref()
+            && cache.stamp == stamp
+        {
+            return Ok(cache.file.clone());
+        }
+
+        let (file, stamp) = self.read_providers_toml_with_stamp(stamp)?;
+        *self.providers_cache.lock().await = Some(ProvidersCache {
+            stamp,
+            file: file.clone(),
+        });
+        Ok(file)
+    }
+
+    fn read_providers_toml_with_stamp(
+        &self,
+        stamp: ProvidersCacheStamp,
+    ) -> Result<(ProvidersToml, ProvidersCacheStamp)> {
+        if !stamp.exists {
+            return Ok((ProvidersToml::default(), stamp));
         }
         let text = match std::fs::read_to_string(&self.config_path) {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ProvidersToml::default());
+                return Ok((
+                    ProvidersToml::default(),
+                    providers_cache_stamp(&self.config_path)?,
+                ));
             }
             Err(err) => return Err(err.into()),
         };
         match toml::from_str::<ProvidersToml>(&text) {
             Ok(file) => match validate_providers_toml(&file) {
-                Ok(()) => Ok(file),
+                Ok(()) => Ok((file, providers_cache_stamp(&self.config_path)?)),
                 Err(_) => {
                     let _ = std::fs::remove_file(&self.config_path);
-                    Ok(ProvidersToml::default())
+                    Ok((
+                        ProvidersToml::default(),
+                        providers_cache_stamp(&self.config_path)?,
+                    ))
                 }
             },
             Err(_) => {
                 let _ = std::fs::remove_file(&self.config_path);
-                Ok(ProvidersToml::default())
+                Ok((
+                    ProvidersToml::default(),
+                    providers_cache_stamp(&self.config_path)?,
+                ))
             }
         }
     }
@@ -835,6 +881,10 @@ impl ConfigStore {
         let text = toml::to_string_pretty(file)?;
         std::fs::write(&self.config_path, text)?;
         Ok(())
+    }
+
+    async fn clear_providers_cache(&self) {
+        *self.providers_cache.lock().await = None;
     }
 
     pub async fn list_mcp_servers(&self) -> Result<BTreeMap<String, McpServerConfig>> {
@@ -1852,6 +1902,26 @@ impl ConfigStore {
         .exec(&mut db)
         .await?;
         Ok(())
+    }
+
+    pub async fn service_events_after(
+        &self,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<ServiceEvent>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut db = self.db.clone();
+        let mut rows = Query::<List<ServiceEventRecord>>::all()
+            .exec(&mut db)
+            .await?;
+        rows.retain(|row| i64_to_u64(row.sequence) > sequence);
+        rows.sort_by_key(|row| row.sequence);
+        rows.into_iter()
+            .take(limit)
+            .map(|row| serde_json::from_str::<ServiceEvent>(&row.event_json).map_err(Into::into))
+            .collect()
     }
 
     pub async fn prune_service_events_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
@@ -3138,6 +3208,22 @@ impl ModelToml {
     }
 }
 
+fn providers_cache_stamp(path: &Path) -> Result<ProvidersCacheStamp> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(ProvidersCacheStamp {
+            exists: true,
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(ProvidersCacheStamp {
+            exists: false,
+            modified: None,
+            len: 0,
+        }),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn migrated_wire_api(provider_kind: ProviderKind, wire_api: ModelWireApi) -> ModelWireApi {
     match provider_kind {
         ProviderKind::Openai => wire_api,
@@ -3876,6 +3962,46 @@ mod tests {
             .expect("resolve");
         assert_eq!(resolved.provider.api_key, "secret");
         assert_eq!(resolved.model.id, "gpt-5.4");
+    }
+
+    #[tokio::test]
+    async fn provider_cache_reloads_when_config_file_changes() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let store =
+            ConfigStore::open_with_config_path(dir.path().join("config.sqlite3"), &config_path)
+                .await
+                .expect("open");
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![provider(Some("first-secret"))],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save");
+        assert_eq!(
+            store
+                .resolve_provider(Some("openai"), Some("gpt-5.4"))
+                .await
+                .expect("resolve")
+                .provider
+                .api_key,
+            "first-secret"
+        );
+
+        let text = std::fs::read_to_string(&config_path)
+            .expect("read config")
+            .replace("first-secret", "second-secret-longer");
+        std::fs::write(&config_path, text).expect("write config");
+        assert_eq!(
+            store
+                .resolve_provider(Some("openai"), Some("gpt-5.4"))
+                .await
+                .expect("resolve changed")
+                .provider
+                .api_key,
+            "second-secret-longer"
+        );
     }
 
     #[tokio::test]
