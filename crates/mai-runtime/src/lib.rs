@@ -168,6 +168,17 @@ pub struct RuntimeConfig {
     pub system_agents_root: Option<PathBuf>,
 }
 
+#[derive(Default)]
+struct ReviewStateUpdate {
+    current_reviewer_agent_id: Option<AgentId>,
+    next_review_at: Option<DateTime<Utc>>,
+    outcome: Option<ProjectReviewOutcome>,
+    #[allow(dead_code)]
+    summary_text: Option<String>,
+    error: Option<String>,
+    force_disabled: bool,
+}
+
 pub struct AgentRuntime {
     docker: DockerClient,
     model: ResponsesClient,
@@ -5481,7 +5492,7 @@ impl AgentRuntime {
                 ProjectReviewStatus::Disabled
             };
             let _ = self
-                .set_project_review_state(project_id, status, None, None, None, None, None, false)
+                .set_project_review_state(project_id, status, ReviewStateUpdate::default())
                 .await?;
         }
         Ok(())
@@ -5550,12 +5561,7 @@ impl AgentRuntime {
             .set_project_review_state(
                 project_id,
                 ProjectReviewStatus::Disabled,
-                None,
-                None,
-                None,
-                None,
-                None,
-                true,
+                ReviewStateUpdate { force_disabled: true, ..Default::default() },
             )
             .await;
     }
@@ -5574,12 +5580,7 @@ impl AgentRuntime {
                 .set_project_review_state(
                     project_id,
                     ProjectReviewStatus::Failed,
-                    None,
-                    Some(next),
-                    None,
-                    None,
-                    Some(err.to_string()),
-                    false,
+                    ReviewStateUpdate { next_review_at: Some(next), error: Some(err.to_string()), ..Default::default() },
                 )
                 .await;
         }
@@ -5614,12 +5615,13 @@ impl AgentRuntime {
                 .set_project_review_state(
                     project_id,
                     decision.status,
-                    None,
-                    next_review_at,
-                    decision.outcome,
-                    decision.summary,
-                    decision.error,
-                    false,
+                    ReviewStateUpdate {
+                        next_review_at,
+                        outcome: decision.outcome,
+                        summary_text: decision.summary,
+                        error: decision.error,
+                        ..Default::default()
+                    },
                 )
                 .await;
             if decision.delay.is_zero() {
@@ -5645,12 +5647,7 @@ impl AgentRuntime {
         self.set_project_review_state(
             project_id,
             ProjectReviewStatus::Syncing,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
+            ReviewStateUpdate::default(),
         )
         .await?;
         self.save_project_review_run_status(
@@ -5743,12 +5740,7 @@ impl AgentRuntime {
         self.set_project_review_state(
             project_id,
             ProjectReviewStatus::Running,
-            Some(reviewer_id),
-            None,
-            None,
-            None,
-            None,
-            false,
+            ReviewStateUpdate { current_reviewer_agent_id: Some(reviewer_id), ..Default::default() },
         )
         .await?;
         let started_at = self
@@ -5858,12 +5850,7 @@ impl AgentRuntime {
         self.set_project_review_state(
             project_id,
             ProjectReviewStatus::Idle,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
+            ReviewStateUpdate::default(),
         )
         .await?;
         cycle_result
@@ -6322,7 +6309,7 @@ impl AgentRuntime {
         Ok(sessions
             .iter()
             .filter_map(|session| session.last_turn_response.clone())
-            .last())
+            .next_back())
     }
 
     async fn start_agent_turn_with_skills(
@@ -6348,30 +6335,25 @@ impl AgentRuntime {
         &self,
         project_id: ProjectId,
         status: ProjectReviewStatus,
-        current_reviewer_agent_id: Option<AgentId>,
-        next_review_at: Option<DateTime<Utc>>,
-        outcome: Option<ProjectReviewOutcome>,
-        _summary_text: Option<String>,
-        error: Option<String>,
-        force_disabled: bool,
+        update: ReviewStateUpdate,
     ) -> Result<ProjectSummary> {
         let project = self.project(project_id).await?;
         let updated = {
             let mut summary = project.summary.write().await;
             summary.review_status = status;
-            summary.current_reviewer_agent_id = current_reviewer_agent_id;
-            summary.next_review_at = next_review_at;
-            if current_reviewer_agent_id.is_some() {
+            summary.current_reviewer_agent_id = update.current_reviewer_agent_id;
+            summary.next_review_at = update.next_review_at;
+            if update.current_reviewer_agent_id.is_some() {
                 summary.last_review_started_at = Some(now());
                 summary.last_review_finished_at = None;
-            } else if outcome.is_some() || error.is_some() {
+            } else if update.outcome.is_some() || update.error.is_some() {
                 summary.last_review_finished_at = Some(now());
             }
-            if let Some(outcome) = outcome {
+            if let Some(outcome) = update.outcome {
                 summary.last_review_outcome = Some(outcome);
             }
-            summary.review_last_error = error;
-            if force_disabled {
+            summary.review_last_error = update.error;
+            if update.force_disabled {
                 summary.auto_review_enabled = false;
             }
             summary.updated_at = now();
@@ -8462,10 +8444,6 @@ fn selected_session(
 
 fn short_id(id: AgentId) -> String {
     id.to_string().chars().take(8).collect()
-}
-
-fn extract_skill_mentions(text: &str) -> Vec<String> {
-    mai_skills::extract_skill_mentions(text)
 }
 
 fn skill_activation_info(

@@ -1539,7 +1539,7 @@ impl ConfigStore {
 
     pub fn save_artifact(&self, info: &ArtifactInfo) -> Result<()> {
         let dir = self.artifact_index_dir();
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(dir)?;
         let file = dir.join(format!("{}.json", info.id));
         let data = serde_json::to_string(info)?;
         std::fs::write(file, data)?;
@@ -1552,7 +1552,7 @@ impl ConfigStore {
             return Ok(Vec::new());
         }
         let mut result = Vec::new();
-        for entry in std::fs::read_dir(&dir)? {
+        for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().is_none_or(|ext| ext != "json") {
@@ -1574,7 +1574,7 @@ impl ConfigStore {
             return Ok(Vec::new());
         }
         let mut result = Vec::new();
-        for entry in std::fs::read_dir(&dir)? {
+        for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().is_none_or(|ext| ext != "json") {

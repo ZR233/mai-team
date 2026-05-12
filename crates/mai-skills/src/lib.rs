@@ -776,21 +776,24 @@ fn build_injections_from_outcome(
 
     for name in selection_names {
         load_unique_skill(
-            &name, &enabled, &blocked_plain_names, &BTreeSet::new(), &name_counts,
+            &name,
+            &SkillLookupContext { enabled: &enabled, blocked: &blocked_plain_names, reserved: &BTreeSet::new(), name_counts: &name_counts },
             false, &mut seen_paths, &mut result,
         );
     }
 
     for name in explicit_names {
         load_unique_skill(
-            &name, &enabled, &blocked_plain_names, &input.reserved_names, &name_counts,
+            &name,
+            &SkillLookupContext { enabled: &enabled, blocked: &blocked_plain_names, reserved: &input.reserved_names, name_counts: &name_counts },
             false, &mut seen_paths, &mut result,
         );
     }
 
     for name in plain_text_names {
         load_unique_skill(
-            &name, &enabled, &blocked_plain_names, &input.reserved_names, &name_counts,
+            &name,
+            &SkillLookupContext { enabled: &enabled, blocked: &blocked_plain_names, reserved: &input.reserved_names, name_counts: &name_counts },
             true, &mut seen_paths, &mut result,
         );
     }
@@ -798,26 +801,30 @@ fn build_injections_from_outcome(
     result
 }
 
+struct SkillLookupContext<'a> {
+    enabled: &'a [&'a SkillMetadata],
+    blocked: &'a BTreeSet<String>,
+    reserved: &'a BTreeSet<String>,
+    name_counts: &'a BTreeMap<String, usize>,
+}
+
 fn load_unique_skill(
     name: &str,
-    enabled: &[&SkillMetadata],
-    blocked: &BTreeSet<String>,
-    reserved: &BTreeSet<String>,
-    name_counts: &BTreeMap<String, usize>,
+    ctx: &SkillLookupContext<'_>,
     require_implicit: bool,
     seen_paths: &mut BTreeSet<PathBuf>,
     result: &mut SkillInjections,
 ) {
-    if blocked.contains(name)
-        || reserved.contains(name)
-        || name_counts.get(name).copied().unwrap_or_default() != 1
+    if ctx.blocked.contains(name)
+        || ctx.reserved.contains(name)
+        || ctx.name_counts.get(name).copied().unwrap_or_default() != 1
     {
         return;
     }
-    if let Some(skill) = enabled.iter().find(|skill| skill.name == name) {
-        if !require_implicit || skill_allows_implicit(skill) {
-            load_skill_contents(skill, seen_paths, result);
-        }
+    if let Some(skill) = ctx.enabled.iter().find(|skill| skill.name == name)
+        && (!require_implicit || skill_allows_implicit(skill))
+    {
+        load_skill_contents(skill, seen_paths, result);
     }
 }
 

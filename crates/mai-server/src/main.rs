@@ -534,14 +534,6 @@ fn safe_system_resource_target(path: &std::path::Path) -> bool {
     )
 }
 
-fn embedded_system_skill_relative_path(path: &str) -> Option<PathBuf> {
-    embedded_system_resource_relative_path(path, "system-skills")
-}
-
-fn embedded_system_agent_relative_path(path: &str) -> Option<PathBuf> {
-    embedded_system_resource_relative_path(path, "system-agents")
-}
-
 fn embedded_system_resource_relative_path(path: &str, out_dir_name: &str) -> Option<PathBuf> {
     let path = FsPath::new(path);
     let relative = if path.is_absolute() {

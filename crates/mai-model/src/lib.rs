@@ -131,8 +131,13 @@ impl ModelTurnState {
     }
 }
 
-impl ResponsesClient {
-    pub fn new() -> Self {
+struct ResponseOptions<'a> {
+    reasoning_effort: Option<String>,
+    previous_response_id: Option<&'a str>,
+    store: Option<bool>,
+}
+
+impl ResponsesClient {    pub fn new() -> Self {
         Self::default()
     }
 
@@ -153,9 +158,7 @@ impl ResponsesClient {
                     instructions,
                     input,
                     tools,
-                    reasoning_effort,
-                    None,
-                    Some(false),
+                    ResponseOptions { reasoning_effort, previous_response_id: None, store: Some(false) },
                 )
                 .await
             }
@@ -242,9 +245,7 @@ impl ResponsesClient {
                 req.instructions,
                 input,
                 req.tools,
-                req.reasoning_effort.clone(),
-                previous_response_id,
-                Some(true),
+                ResponseOptions { reasoning_effort: req.reasoning_effort.clone(), previous_response_id, store: Some(true) },
             )
             .await?;
         if let Some(id) = &response.id {
@@ -260,9 +261,7 @@ impl ResponsesClient {
         instructions: &str,
         input: &[ModelInputItem],
         tools: &[ToolDefinition],
-        reasoning_effort: Option<String>,
-        previous_response_id: Option<&str>,
-        store: Option<bool>,
+        options: ResponseOptions<'_>,
     ) -> Result<ModelResponse> {
         let endpoint = format!("{}/responses", provider.base_url.trim_end_matches('/'));
         let active_tools = if model_supports_tools(model) {
@@ -277,9 +276,9 @@ impl ResponsesClient {
             tools: active_tools,
             tool_choice: (!active_tools.is_empty()).then_some("auto"),
             stream: false,
-            store: store.or(model.request_policy.store),
-            previous_response_id,
-            options: request_options(model, reasoning_effort.as_deref()),
+            store: options.store.or(model.request_policy.store),
+            previous_response_id: options.previous_response_id,
+            options: request_options(model, options.reasoning_effort.as_deref()),
         };
         let response = self
             .http

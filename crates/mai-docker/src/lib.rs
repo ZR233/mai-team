@@ -325,7 +325,7 @@ impl DockerClient {
                 &default_workspace_volume
             }
         };
-        let args = create_agent_container_args(&name, &label, image, &workspace_volume);
+        let args = create_agent_container_args(&name, &label, image, workspace_volume);
         let create = Command::new(&self.binary)
             .args(args.iter().map(String::as_str))
             .output()

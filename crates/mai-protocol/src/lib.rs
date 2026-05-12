@@ -69,11 +69,12 @@ pub enum ProjectCloneStatus {
 }
 
 #[derive(
-    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString,
+    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString, Default,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum ProjectReviewStatus {
+    #[default]
     #[strum(serialize = "disabled", serialize = "")]
     Disabled,
     Idle,
@@ -81,12 +82,6 @@ pub enum ProjectReviewStatus {
     Running,
     Waiting,
     Failed,
-}
-
-impl Default for ProjectReviewStatus {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 #[derive(
