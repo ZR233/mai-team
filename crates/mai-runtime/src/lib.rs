@@ -3430,11 +3430,7 @@ impl AgentRuntime {
                 })
             }
             RoutedTool::UpdateTodoList => {
-                let items_arg = arguments.get("items").ok_or_else(|| {
-                    RuntimeError::InvalidInput("missing field `items`".to_string())
-                })?;
-                let items: Vec<TodoItem> = serde_json::from_value(items_arg.clone())
-                    .map_err(|e| RuntimeError::InvalidInput(format!("invalid items: {e}")))?;
+                let items = todo_items_from_arguments(&arguments)?;
                 self.publish(ServiceEventKind::TodoListUpdated {
                     agent_id,
                     session_id: None,
@@ -7220,6 +7216,22 @@ fn optional_string(arguments: &Value, field: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn todo_items_from_arguments(arguments: &Value) -> Result<Vec<TodoItem>> {
+    let Some(items_arg) = arguments.get("items").or_else(|| arguments.get("todos")) else {
+        return Err(RuntimeError::InvalidInput(
+            "missing field `items`".to_string(),
+        ));
+    };
+    let items_value = if let Some(raw) = items_arg.as_str() {
+        serde_json::from_str(raw)
+            .map_err(|e| RuntimeError::InvalidInput(format!("invalid items JSON string: {e}")))?
+    } else {
+        items_arg.clone()
+    };
+    serde_json::from_value(items_value)
+        .map_err(|e| RuntimeError::InvalidInput(format!("invalid items: {e}")))
+}
+
 fn collab_input_from_args(arguments: &Value) -> Result<CollabInput> {
     let mut input = CollabInput::default();
     if let Some(message) = optional_string(arguments, "message") {
@@ -9983,6 +9995,44 @@ esac
             )
             .await;
         assert!(rejected.is_err());
+    }
+
+    #[tokio::test]
+    async fn update_todo_list_accepts_todos_json_string_alias() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let agent_id = Uuid::new_v4();
+        save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container-1"))).await;
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        let output = runtime
+            .execute_tool_for_test(
+                agent_id,
+                "update_todo_list",
+                json!({
+                    "todos": r#"[{"step":"获取认证用户信息和读取 helper 脚本","status":"in_progress"},{"step":"选择一个符合条件的 PR","status":"pending"}]"#
+                }),
+            )
+            .await
+            .expect("update todo list");
+
+        assert!(output.success);
+        let events = runtime.recent_events.lock().await;
+        let items = events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                ServiceEventKind::TodoListUpdated {
+                    agent_id: event_agent_id,
+                    items,
+                    ..
+                } if *event_agent_id == agent_id => Some(items),
+                _ => None,
+            })
+            .expect("todo event");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].step, "获取认证用户信息和读取 helper 脚本");
+        assert_eq!(items[0].status, mai_protocol::TodoListStatus::InProgress);
     }
 
     #[tokio::test]

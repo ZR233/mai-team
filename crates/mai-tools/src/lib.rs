@@ -270,7 +270,8 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition::function(
             TOOL_UPDATE_TODO_LIST,
             "Update your task todo list. Replaces the entire list each call. \
-             Each item has a step description and a status (pending, in_progress, or completed). \
+             Call this with an items array. Each item has a step description and a status \
+             (pending, in_progress, or completed). \
              At most one item should be in_progress at a time. \
              Use this to communicate your progress plan to the user.",
             object_schema(vec![(
@@ -499,6 +500,26 @@ mod tests {
                     .is_some_and(|items| items.len() == 2)
             );
         }
+    }
+
+    #[test]
+    fn update_todo_list_schema_uses_items_field() {
+        let tools = build_tool_definitions(&[]);
+        let update_todo = tools
+            .iter()
+            .find(|tool| tool.name == TOOL_UPDATE_TODO_LIST)
+            .expect("update_todo_list tool");
+        let properties = update_todo
+            .parameters
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("properties");
+        assert!(properties.contains_key("items"));
+        assert!(!properties.contains_key("todos"));
+        assert_eq!(
+            update_todo.parameters.get("required"),
+            Some(&json!(["items"]))
+        );
     }
 
     #[test]
