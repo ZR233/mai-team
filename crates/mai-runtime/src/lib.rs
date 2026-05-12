@@ -4755,17 +4755,9 @@ impl AgentRuntime {
     }
 
     async fn project_skill_lock(&self, project_id: ProjectId) -> Arc<RwLock<()>> {
-        if let Some(lock) = self
-            .project_skill_locks
-            .read()
+        self.project_skill_locks
+            .write()
             .await
-            .get(&project_id)
-            .cloned()
-        {
-            return lock;
-        }
-        let mut locks = self.project_skill_locks.write().await;
-        locks
             .entry(project_id)
             .or_insert_with(|| Arc::new(RwLock::new(())))
             .clone()
@@ -9315,17 +9307,8 @@ mod tests {
         save_test_session(store, summary.id, Uuid::new_v4()).await;
     }
 
-    fn write_project_skill(
-        runtime: &AgentRuntime,
-        project_id: ProjectId,
-        name: &str,
-        description: &str,
-        body: &str,
-    ) -> PathBuf {
-        let skill_dir = runtime
-            .project_skill_cache_dir(project_id)
-            .join("claude")
-            .join(name);
+    fn write_skill_at(base: PathBuf, name: &str, description: &str, body: &str) -> PathBuf {
+        let skill_dir = base.join(name);
         fs::create_dir_all(&skill_dir).expect("mkdir skill");
         let path = skill_dir.join("SKILL.md");
         fs::write(
@@ -9336,6 +9319,21 @@ mod tests {
         path
     }
 
+    fn write_project_skill(
+        runtime: &AgentRuntime,
+        project_id: ProjectId,
+        name: &str,
+        description: &str,
+        body: &str,
+    ) -> PathBuf {
+        write_skill_at(
+            runtime.project_skill_cache_dir(project_id).join("claude"),
+            name,
+            description,
+            body,
+        )
+    }
+
     fn write_workspace_project_skill(
         dir: &tempfile::TempDir,
         root: &str,
@@ -9343,15 +9341,12 @@ mod tests {
         description: &str,
         body: &str,
     ) -> PathBuf {
-        let skill_dir = fake_sidecar_workspace_path(dir).join(root).join(name);
-        fs::create_dir_all(&skill_dir).expect("mkdir workspace skill");
-        let path = skill_dir.join("SKILL.md");
-        fs::write(
-            &path,
-            format!("---\nname: {name}\ndescription: {description}\n---\n{body}"),
+        write_skill_at(
+            fake_sidecar_workspace_path(dir).join(root),
+            name,
+            description,
+            body,
         )
-        .expect("write workspace skill");
-        path
     }
 
     async fn test_runtime(dir: &tempfile::TempDir, store: Arc<ConfigStore>) -> Arc<AgentRuntime> {
@@ -9555,13 +9550,14 @@ mod tests {
 	    ;;
   cp)
     echo "$*" >> "$LOG"
-	    if [ "$2" = "created-container:/workspace/repo/.claude/skills" ] || [ "$2" = "review-copy-container:/workspace/repo/.claude/skills" ]; then
+	    container="${{2%%:*}}"
+	    if [ "$2" = "${{container}}:/workspace/repo/.claude/skills" ]; then
 	      rm -rf "$3"
 	      cp -R "$WORKSPACE/.claude/skills" "$3"
-	    elif [ "$2" = "created-container:/workspace/repo/.agents/skills" ] || [ "$2" = "review-copy-container:/workspace/repo/.agents/skills" ]; then
+	    elif [ "$2" = "${{container}}:/workspace/repo/.agents/skills" ]; then
 	      rm -rf "$3"
 	      cp -R "$WORKSPACE/.agents/skills" "$3"
-	    elif [ "$2" = "created-container:/workspace/repo/skills" ] || [ "$2" = "review-copy-container:/workspace/repo/skills" ]; then
+	    elif [ "$2" = "${{container}}:/workspace/repo/skills" ]; then
 	      rm -rf "$3"
 	      cp -R "$WORKSPACE/skills" "$3"
     elif printf '%s' "$2" | grep -q '^created-container:'; then

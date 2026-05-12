@@ -295,9 +295,9 @@ impl SkillsManager {
     ) -> Result<SkillInjections> {
         let mut outcome = self.load_outcome();
         apply_config(&mut outcome.skills, config)?;
-        Ok(self.build_injections_for_input_from_outcome(
+        Ok(build_injections_from_outcome(
             &outcome,
-            SkillInput {
+            &SkillInput {
                 text: Some(message),
                 selections: explicit_mentions
                     .iter()
@@ -315,15 +315,7 @@ impl SkillsManager {
     ) -> Result<SkillInjections> {
         let mut outcome = self.load_outcome();
         apply_config(&mut outcome.skills, config)?;
-        Ok(self.build_injections_for_input_from_outcome(&outcome, input))
-    }
-
-    fn build_injections_for_input_from_outcome(
-        &self,
-        outcome: &SkillLoadOutcome,
-        input: SkillInput<'_>,
-    ) -> SkillInjections {
-        build_injections_from_outcome(outcome, &input)
+        Ok(build_injections_from_outcome(&outcome, &input))
     }
 
     fn load_outcome(&self) -> SkillLoadOutcome {
@@ -392,17 +384,11 @@ pub fn render_available_response(response: SkillsListResponse) -> String {
     }
 
     skills.sort_by(skill_sort);
-    let mut name_counts = BTreeMap::<String, usize>::new();
-    for skill in &skills {
-        *name_counts.entry(skill.name.clone()).or_default() += 1;
-    }
 
     let mut lines = Vec::with_capacity(skills.len() + 7);
     lines.push("A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and file path so you can open the source for full instructions when using a specific skill.".to_string());
     lines.push("### Available Skills".to_string());
     for skill in skills {
-        let duplicate = name_counts.get(&skill.name).copied().unwrap_or_default() > 1;
-        let _ = duplicate;
         lines.push(format!(
             "- ${}: {} (path: {})",
             skill.name,
@@ -789,43 +775,50 @@ fn build_injections_from_outcome(
     }
 
     for name in selection_names {
-        if blocked_plain_names.contains(&name)
-            || name_counts.get(&name).copied().unwrap_or_default() != 1
-        {
-            continue;
-        }
-        if let Some(skill) = enabled.iter().find(|skill| skill.name == name) {
-            load_skill_contents(skill, &mut seen_paths, &mut result);
-        }
+        load_unique_skill(
+            &name, &enabled, &blocked_plain_names, &BTreeSet::new(), &name_counts,
+            false, &mut seen_paths, &mut result,
+        );
     }
 
     for name in explicit_names {
-        if blocked_plain_names.contains(&name)
-            || input.reserved_names.contains(&name)
-            || name_counts.get(&name).copied().unwrap_or_default() != 1
-        {
-            continue;
-        }
-        if let Some(skill) = enabled.iter().find(|skill| skill.name == name) {
-            load_skill_contents(skill, &mut seen_paths, &mut result);
-        }
+        load_unique_skill(
+            &name, &enabled, &blocked_plain_names, &input.reserved_names, &name_counts,
+            false, &mut seen_paths, &mut result,
+        );
     }
 
     for name in plain_text_names {
-        if blocked_plain_names.contains(&name)
-            || input.reserved_names.contains(&name)
-            || name_counts.get(&name).copied().unwrap_or_default() != 1
-        {
-            continue;
-        }
-        if let Some(skill) = enabled.iter().find(|skill| skill.name == name)
-            && skill_allows_implicit(skill)
-        {
-            load_skill_contents(skill, &mut seen_paths, &mut result);
-        }
+        load_unique_skill(
+            &name, &enabled, &blocked_plain_names, &input.reserved_names, &name_counts,
+            true, &mut seen_paths, &mut result,
+        );
     }
 
     result
+}
+
+fn load_unique_skill(
+    name: &str,
+    enabled: &[&SkillMetadata],
+    blocked: &BTreeSet<String>,
+    reserved: &BTreeSet<String>,
+    name_counts: &BTreeMap<String, usize>,
+    require_implicit: bool,
+    seen_paths: &mut BTreeSet<PathBuf>,
+    result: &mut SkillInjections,
+) {
+    if blocked.contains(name)
+        || reserved.contains(name)
+        || name_counts.get(name).copied().unwrap_or_default() != 1
+    {
+        return;
+    }
+    if let Some(skill) = enabled.iter().find(|skill| skill.name == name) {
+        if !require_implicit || skill_allows_implicit(skill) {
+            load_skill_contents(skill, seen_paths, result);
+        }
+    }
 }
 
 fn load_skill_contents(
