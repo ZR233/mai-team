@@ -9,7 +9,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use mai_docker::DockerClient;
-use mai_model::ResponsesClient;
+use mai_model::{ModelError, ModelRequest, ModelTurnState, ResponsesClient};
 use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentId, AgentLogsResponse, AgentProfilesResponse,
     ApproveTaskPlanResponse, ArtifactInfo, CreateAgentRequest, CreateAgentResponse,
@@ -18,9 +18,10 @@ use mai_protocol::{
     GitAccountDefaultRequest, GitAccountRequest, GitAccountResponse, GitAccountsResponse,
     GithubAppManifestStartRequest, GithubAppManifestStartResponse, GithubAppSettingsRequest,
     GithubAppSettingsResponse, GithubInstallationsResponse, GithubRepositoriesResponse,
-    GithubSettingsRequest, GithubSettingsResponse, McpServersConfigRequest, ProjectId,
-    ProjectReviewRunDetail, ProjectReviewRunsResponse, ProviderPresetsResponse,
-    ProvidersConfigRequest, ProvidersResponse, RepositoryPackagesResponse,
+    GithubSettingsRequest, GithubSettingsResponse, McpServersConfigRequest, ModelInputItem,
+    ModelOutputItem, ModelResponse, ModelWireApi, ProjectId, ProjectReviewRunDetail,
+    ProjectReviewRunsResponse, ProviderKind, ProviderPresetsResponse, ProviderTestRequest,
+    ProviderTestResponse, ProvidersConfigRequest, ProvidersResponse, RepositoryPackagesResponse,
     RequestPlanRevisionRequest, RequestPlanRevisionResponse, RuntimeDefaultsResponse,
     SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId, SkillsConfigRequest,
     SkillsListResponse, TaskId, ToolTraceDetail, ToolTraceListResponse, TurnId, UpdateAgentRequest,
@@ -38,8 +39,10 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 use tokio_stream::once;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -272,6 +275,7 @@ async fn main() -> Result<()> {
         .route("/", get(index))
         .route("/health", get(health))
         .route("/providers", get(get_providers).put(save_providers))
+        .route("/providers/{id}/test", post(test_provider))
         .route("/mcp-servers", get(get_mcp_servers).put(save_mcp_servers))
         .route(
             "/git/accounts",
@@ -665,6 +669,234 @@ async fn save_providers(
 ) -> std::result::Result<Json<ProvidersResponse>, ApiError> {
     state.store.save_providers(request).await?;
     Ok(Json(state.store.providers_response().await?))
+}
+
+async fn test_provider(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<ProviderTestRequest>,
+) -> std::result::Result<Response, ApiError> {
+    let result = run_provider_test(&state.store, &id, request).await;
+    Ok((result.status, Json(result.response)).into_response())
+}
+
+struct ProviderTestResult {
+    status: StatusCode,
+    response: ProviderTestResponse,
+}
+
+async fn run_provider_test(
+    store: &ConfigStore,
+    provider_id: &str,
+    request: ProviderTestRequest,
+) -> ProviderTestResult {
+    let started = Instant::now();
+    let selection = match store
+        .resolve_provider(Some(provider_id), request.model.as_deref())
+        .await
+    {
+        Ok(selection) => selection,
+        Err(err) => {
+            let provider = store.get_provider_secret(provider_id).await.ok().flatten();
+            let model = request.model.clone().or_else(|| {
+                provider
+                    .as_ref()
+                    .map(|provider| provider.default_model.clone())
+            });
+            return ProviderTestResult {
+                status: StatusCode::BAD_REQUEST,
+                response: ProviderTestResponse {
+                    ok: false,
+                    provider_id: provider
+                        .as_ref()
+                        .map(|provider| provider.id.clone())
+                        .unwrap_or_else(|| provider_id.to_string()),
+                    provider_name: provider
+                        .as_ref()
+                        .map(|provider| provider.name.clone())
+                        .unwrap_or_default(),
+                    provider_kind: provider
+                        .as_ref()
+                        .map(|provider| provider.kind)
+                        .unwrap_or_default(),
+                    model: model.unwrap_or_default(),
+                    base_url: provider
+                        .as_ref()
+                        .map(|provider| provider.base_url.clone())
+                        .unwrap_or_default(),
+                    latency_ms: elapsed_millis(started),
+                    output_preview: String::new(),
+                    usage: None,
+                    error: Some(err.to_string()),
+                },
+            };
+        }
+    };
+
+    let provider = selection.provider;
+    let model = selection.model;
+    let base_url = provider.base_url.clone();
+    let reasoning_effort = request.reasoning_effort;
+    let client = ResponsesClient::new();
+    let response = if request.deep && provider_test_should_check_continuation(&provider, &model) {
+        run_provider_deep_model_test(&client, &provider, &model, reasoning_effort).await
+    } else {
+        let input = [ModelInputItem::user_text("ping")];
+        client
+            .create_response(
+                &provider,
+                &model,
+                "You are a provider connectivity test. Reply with exactly: ok",
+                &input,
+                &[],
+                reasoning_effort,
+            )
+            .await
+    };
+    let latency_ms = elapsed_millis(started);
+    match response {
+        Ok(response) => ProviderTestResult {
+            status: StatusCode::OK,
+            response: ProviderTestResponse {
+                ok: true,
+                provider_id: provider.id,
+                provider_name: provider.name,
+                provider_kind: provider.kind,
+                model: model.id,
+                base_url,
+                latency_ms,
+                output_preview: model_output_preview(&response),
+                usage: response.usage,
+                error: None,
+            },
+        },
+        Err(err) => ProviderTestResult {
+            status: StatusCode::OK,
+            response: ProviderTestResponse {
+                ok: false,
+                provider_id: provider.id,
+                provider_name: provider.name,
+                provider_kind: provider.kind,
+                model: model.id,
+                base_url,
+                latency_ms,
+                output_preview: String::new(),
+                usage: None,
+                error: Some(sanitize_provider_test_error(&err, &provider.api_key)),
+            },
+        },
+    }
+}
+
+fn provider_test_should_check_continuation(
+    provider: &mai_protocol::ProviderSecret,
+    model: &mai_protocol::ModelConfig,
+) -> bool {
+    provider.kind == ProviderKind::Openai
+        && model.wire_api == ModelWireApi::Responses
+        && model.capabilities.continuation
+}
+
+async fn run_provider_deep_model_test(
+    client: &ResponsesClient,
+    provider: &mai_protocol::ProviderSecret,
+    model: &mai_protocol::ModelConfig,
+    reasoning_effort: Option<String>,
+) -> std::result::Result<ModelResponse, ModelError> {
+    let cancellation_token = CancellationToken::new();
+    let mut state = ModelTurnState::default();
+    let first_input = vec![ModelInputItem::user_text(
+        "Provider deep connectivity test, step 1. Reply exactly: ok",
+    )];
+    let first = client
+        .create_turn_response_with_cancel(
+            &ModelRequest {
+                provider,
+                model,
+                instructions: "You are a provider connectivity test. Reply with exactly: ok",
+                input: &first_input,
+                tools: &[],
+                reasoning_effort: reasoning_effort.clone(),
+            },
+            &mut state,
+            &cancellation_token,
+        )
+        .await?;
+    let mut second_input = first_input;
+    second_input.push(ModelInputItem::assistant_text(model_output_preview(&first)));
+    second_input.push(ModelInputItem::user_text(
+        "Provider deep connectivity test, step 2. Reply exactly: ok",
+    ));
+    state.acknowledge_history_len(2);
+    client
+        .create_turn_response_with_cancel(
+            &ModelRequest {
+                provider,
+                model,
+                instructions: "You are a provider connectivity test. Reply with exactly: ok",
+                input: &second_input,
+                tools: &[],
+                reasoning_effort,
+            },
+            &mut state,
+            &cancellation_token,
+        )
+        .await
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn model_output_preview(response: &ModelResponse) -> String {
+    let text = response
+        .output
+        .iter()
+        .filter_map(model_output_item_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    mai_protocol::preview(&text, 500)
+}
+
+fn model_output_item_text(item: &ModelOutputItem) -> Option<String> {
+    match item {
+        ModelOutputItem::Message { text } => Some(text.clone()),
+        ModelOutputItem::AssistantTurn { content, .. } => content.clone(),
+        ModelOutputItem::FunctionCall {
+            call_id,
+            name,
+            raw_arguments,
+            ..
+        } => Some(format!("function_call {name} {call_id}: {raw_arguments}")),
+        ModelOutputItem::Other { raw } => Some(raw.to_string()),
+    }
+}
+
+fn sanitize_provider_test_error(err: &ModelError, api_key: &str) -> String {
+    let message = match err {
+        ModelError::Request { endpoint, source } => {
+            format!("request to {endpoint} failed: {source}")
+        }
+        ModelError::Api {
+            endpoint,
+            status,
+            body,
+        } => {
+            let body = mai_protocol::preview(&redact_secret(body, api_key), 1_000);
+            format!("request to {endpoint} returned {status}: {body}")
+        }
+        ModelError::Json(err) => format!("json error: {err}"),
+        ModelError::Cancelled => "request cancelled".to_string(),
+    };
+    mai_protocol::preview(&redact_secret(&message, api_key), 1_500)
+}
+
+fn redact_secret(value: &str, secret: &str) -> String {
+    if secret.trim().is_empty() {
+        value.to_string()
+    } else {
+        value.replace(secret, "[redacted]")
+    }
 }
 
 async fn get_mcp_servers(
@@ -1412,9 +1644,16 @@ fn event_name(event: &ServiceEvent) -> &'static str {
 mod tests {
     use super::*;
     use mai_protocol::{
-        AgentId, ServiceEvent, ServiceEventKind, SessionId, SkillActivationInfo, SkillScope, TurnId,
+        AgentId, ModelCapabilities, ModelConfig, ModelReasoningConfig, ModelReasoningVariant,
+        ModelRequestPolicy, ModelWireApi, ProviderConfig, ProviderKind, ProvidersConfigRequest,
+        ServiceEvent, ServiceEventKind, SessionId, SkillActivationInfo, SkillScope, TurnId,
     };
+    use serde_json::{Value, json};
+    use std::collections::{BTreeMap, VecDeque};
     use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Mutex as TokioMutex;
 
     #[test]
     fn embedded_system_skills_release_to_target_dir() {
@@ -1582,5 +1821,398 @@ mod tests {
         };
 
         assert_eq!(event_name(&event), "skills_activated");
+    }
+
+    #[tokio::test]
+    async fn provider_test_succeeds_against_mock_responses_server() {
+        let (base_url, requests) = start_provider_mock(vec![
+            json!({
+                "id": "resp_test_1",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{ "type": "output_text", "text": "ok" }]
+                    }
+                ],
+                "usage": { "input_tokens": 3, "output_tokens": 2, "total_tokens": 5 }
+            }),
+            json!({
+                "id": "resp_test_2",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{ "type": "output_text", "text": "ok" }]
+                    }
+                ],
+                "usage": { "input_tokens": 4, "output_tokens": 2, "total_tokens": 6 }
+            }),
+        ])
+        .await;
+        let (_dir, store) = provider_test_store(provider_config(&base_url, Some("secret"))).await;
+
+        let response = run_provider_test(
+            &store,
+            "openai",
+            ProviderTestRequest {
+                model: None,
+                reasoning_effort: Some("minimal".to_string()),
+                deep: true,
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::OK);
+        let response = response.response;
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.provider_id, "openai");
+        assert_eq!(response.provider_name, "OpenAI");
+        assert_eq!(response.provider_kind, ProviderKind::Openai);
+        assert_eq!(response.model, "gpt-5.5");
+        assert_eq!(response.base_url, base_url);
+        assert_eq!(response.output_preview, "ok");
+        assert_eq!(response.usage.expect("usage").total_tokens, 6);
+        assert_eq!(response.error, None);
+
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["path"], "/responses");
+        assert_eq!(requests[0]["authorization"], "Bearer secret");
+        assert_eq!(requests[0]["body"]["model"], "gpt-5.5");
+        assert_eq!(requests[0]["body"]["store"], true);
+        assert_eq!(
+            requests[0]["body"].pointer("/reasoning/effort"),
+            Some(&json!("minimal"))
+        );
+        assert_eq!(requests[1]["body"]["previous_response_id"], "resp_test_1");
+        assert_eq!(
+            requests[1]["body"].pointer("/reasoning/effort"),
+            Some(&json!("minimal"))
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_test_deep_mode_covers_continuation_fallback() {
+        let (base_url, requests) = start_provider_mock(vec![
+            json!({
+                "id": "resp_test_1",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{ "type": "output_text", "text": "ok" }]
+                    }
+                ],
+                "usage": { "input_tokens": 3, "output_tokens": 2, "total_tokens": 5 }
+            }),
+            json!({
+                "__status": 400,
+                "error": {
+                    "message": "previous_response_id is only supported on Responses WebSocket v2",
+                    "type": "invalid_request_error"
+                }
+            }),
+            json!({
+                "id": "resp_test_2",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{ "type": "output_text", "text": "ok" }]
+                    }
+                ],
+                "usage": { "input_tokens": 6, "output_tokens": 2, "total_tokens": 8 }
+            }),
+        ])
+        .await;
+        let (_dir, store) = provider_test_store(provider_config(&base_url, Some("secret"))).await;
+
+        let response = run_provider_test(&store, "openai", ProviderTestRequest::default()).await;
+
+        assert_eq!(response.status, StatusCode::OK);
+        let response = response.response;
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.output_preview, "ok");
+        assert_eq!(response.usage.expect("usage").total_tokens, 8);
+
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0]["body"].get("previous_response_id").is_none());
+        assert_eq!(requests[1]["body"]["previous_response_id"], "resp_test_1");
+        assert!(requests[2]["body"].get("previous_response_id").is_none());
+        assert_eq!(requests[2]["body"]["store"], false);
+        assert_eq!(
+            requests[2]["body"]["input"]
+                .as_array()
+                .expect("input")
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_test_reports_missing_provider() {
+        let (_dir, store) =
+            provider_test_store(provider_config("http://127.0.0.1:1", Some("secret"))).await;
+
+        let response = run_provider_test(&store, "missing", ProviderTestRequest::default()).await;
+
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        let response = response.response;
+        assert!(!response.ok);
+        assert_eq!(response.provider_id, "missing");
+        assert!(
+            response
+                .error
+                .unwrap()
+                .contains("provider `missing` not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_test_reports_missing_api_key_with_provider_context() {
+        let (_dir, store) = provider_test_store(provider_config("http://127.0.0.1:1", None)).await;
+
+        let response = run_provider_test(&store, "openai", ProviderTestRequest::default()).await;
+
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        let response = response.response;
+        assert!(!response.ok);
+        assert_eq!(response.provider_id, "openai");
+        assert_eq!(response.provider_name, "OpenAI");
+        assert_eq!(response.model, "gpt-5.5");
+        assert_eq!(response.base_url, "http://127.0.0.1:1");
+        assert!(
+            response
+                .error
+                .unwrap()
+                .contains("provider `openai` has no API key")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_test_reports_unknown_model_with_provider_context() {
+        let (_dir, store) =
+            provider_test_store(provider_config("http://127.0.0.1:1", Some("secret"))).await;
+
+        let response = run_provider_test(
+            &store,
+            "openai",
+            ProviderTestRequest {
+                model: Some("missing-model".to_string()),
+                reasoning_effort: None,
+                deep: true,
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        let response = response.response;
+        assert!(!response.ok);
+        assert_eq!(response.provider_id, "openai");
+        assert_eq!(response.model, "missing-model");
+        assert!(
+            response
+                .error
+                .unwrap()
+                .contains("model `missing-model` is not configured for provider `openai`")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_test_reports_upstream_error_without_leaking_key() {
+        let (base_url, _requests) = start_provider_mock(vec![json!({
+            "__status": 401,
+            "error": {
+                "message": "bad token secret-token",
+                "type": "invalid_request_error"
+            }
+        })])
+        .await;
+        let (_dir, store) =
+            provider_test_store(provider_config(&base_url, Some("secret-token"))).await;
+
+        let response = run_provider_test(&store, "openai", ProviderTestRequest::default()).await;
+
+        assert_eq!(response.status, StatusCode::OK);
+        let response = response.response;
+        assert!(!response.ok);
+        assert_eq!(response.base_url, base_url);
+        let error = response.error.expect("error");
+        assert!(error.contains("returned 401 Unauthorized"));
+        assert!(error.contains("[redacted]"));
+        assert!(
+            !error.contains("secret-token"),
+            "provider test leaked api key: {error}"
+        );
+    }
+
+    async fn provider_test_store(provider: ProviderConfig) -> (tempfile::TempDir, ConfigStore) {
+        let dir = tempdir().expect("tempdir");
+        let store = ConfigStore::open_with_config_and_artifact_index_path(
+            dir.path().join("config.sqlite3"),
+            dir.path().join("config.toml"),
+            dir.path().join("artifacts/index"),
+        )
+        .await
+        .expect("open store");
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![provider],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        (dir, store)
+    }
+
+    fn provider_config(base_url: &str, api_key: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            id: "openai".to_string(),
+            kind: ProviderKind::Openai,
+            name: "OpenAI".to_string(),
+            base_url: base_url.to_string(),
+            api_key: api_key.map(str::to_string),
+            api_key_env: None,
+            models: vec![provider_test_model("gpt-5.5")],
+            default_model: "gpt-5.5".to_string(),
+            enabled: true,
+        }
+    }
+
+    fn provider_test_model(id: &str) -> ModelConfig {
+        ModelConfig {
+            id: id.to_string(),
+            name: Some(id.to_string()),
+            context_tokens: 400_000,
+            output_tokens: 128_000,
+            supports_tools: true,
+            wire_api: ModelWireApi::Responses,
+            capabilities: ModelCapabilities::default(),
+            request_policy: ModelRequestPolicy::default(),
+            reasoning: Some(ModelReasoningConfig {
+                default_variant: Some("medium".to_string()),
+                variants: ["minimal", "medium"]
+                    .into_iter()
+                    .map(|id| ModelReasoningVariant {
+                        id: id.to_string(),
+                        label: None,
+                        request: json!({
+                            "reasoning": {
+                                "effort": id
+                            }
+                        }),
+                    })
+                    .collect(),
+            }),
+            options: Value::Null,
+            headers: BTreeMap::new(),
+        }
+    }
+
+    async fn start_provider_mock(responses: Vec<Value>) -> (String, Arc<TokioMutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let addr = listener.local_addr().expect("mock addr");
+        let responses = Arc::new(TokioMutex::new(VecDeque::from(responses)));
+        let requests = Arc::new(TokioMutex::new(Vec::new()));
+        let server_responses = Arc::clone(&responses);
+        let server_requests = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let responses = Arc::clone(&server_responses);
+                let requests = Arc::clone(&server_requests);
+                tokio::spawn(async move {
+                    let request = read_provider_mock_request(&mut stream).await;
+                    requests.lock().await.push(request);
+                    let response = responses.lock().await.pop_front().unwrap_or_else(|| {
+                        json!({
+                            "id": "resp_empty",
+                            "output": [],
+                            "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+                        })
+                    });
+                    write_provider_mock_response(&mut stream, response).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    async fn read_provider_mock_request(stream: &mut TcpStream) -> Value {
+        let mut buffer = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.expect("read request");
+            if n == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..n]);
+            if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                let text = String::from_utf8_lossy(&buffer);
+                let header_end = text.find("\r\n\r\n").expect("header end");
+                let headers = &text[..header_end];
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                let body_start = header_end + 4;
+                if buffer.len() >= body_start + content_length {
+                    break;
+                }
+            }
+        }
+        let text = String::from_utf8_lossy(&buffer);
+        let header_end = text.find("\r\n\r\n").expect("header end");
+        let headers = &text[..header_end];
+        let body = &buffer[header_end + 4..];
+        let path = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default();
+        let authorization = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':')
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, value)| value.trim().to_string())
+            })
+            .unwrap_or_default();
+        json!({
+            "path": path,
+            "authorization": authorization,
+            "body": serde_json::from_slice::<Value>(body).unwrap_or(Value::Null),
+        })
+    }
+
+    async fn write_provider_mock_response(stream: &mut TcpStream, mut response: Value) {
+        let status = response
+            .as_object_mut()
+            .and_then(|object| object.remove("__status"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(200);
+        let reason = match status {
+            200 => "OK",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            404 => "Not Found",
+            500 => "Internal Server Error",
+            _ => "Status",
+        };
+        let body = serde_json::to_string(&response).expect("response json");
+        let raw = format!(
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(raw.as_bytes())
+            .await
+            .expect("write response");
     }
 }

@@ -1056,6 +1056,39 @@ pub struct ProvidersConfigRequest {
     pub default_provider_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderTestRequest {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    #[serde(default = "default_true")]
+    pub deep: bool,
+}
+
+impl Default for ProviderTestRequest {
+    fn default() -> Self {
+        Self {
+            model: None,
+            reasoning_effort: None,
+            deep: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderTestResponse {
+    pub ok: bool,
+    pub provider_id: String,
+    pub provider_name: String,
+    pub provider_kind: ProviderKind,
+    pub model: String,
+    pub base_url: String,
+    pub latency_ms: u64,
+    pub output_preview: String,
+    pub usage: Option<TokenUsage>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct McpServersConfigRequest {
     #[serde(default)]
@@ -1750,6 +1783,15 @@ mod tests {
         .expect("request");
 
         assert_eq!(request.docker_image, None);
+    }
+
+    #[test]
+    fn provider_test_request_accepts_empty_body() {
+        let request: ProviderTestRequest = serde_json::from_value(json!({})).expect("request");
+
+        assert_eq!(request.model, None);
+        assert_eq!(request.reasoning_effort, None);
+        assert!(request.deep);
     }
 
     #[test]
