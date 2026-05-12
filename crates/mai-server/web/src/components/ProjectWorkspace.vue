@@ -111,36 +111,6 @@
         </div>
       </div>
 
-      <template v-else-if="activeSection === 'planner'">
-        <AgentDetail
-          :detail="detail.maintainer_agent"
-          :events="events"
-          :draft="draft"
-          :loading="loading"
-          :sending="sending"
-          :stopping="stopping"
-          :providers="providers"
-          :skills="skills"
-          :selected-skills="selectedSkills"
-          :skills-loading="skillsLoading"
-          :skills-error="skillsError"
-          :updating-model="updatingModel"
-          :show-sessions="true"
-          :show-composer="true"
-          v-model:conversation-ref="conversationRef"
-          @cancel="$emit('cancel-agent', $event)"
-          @delete="(...args) => $emit('delete-agent', ...args)"
-          @send="$emit('send', $event)"
-          @stop="$emit('stop', $event)"
-          @update-model="$emit('update-model', $event)"
-          @update:draft="$emit('update:draft', $event)"
-          @update:selected-skills="$emit('update:selectedSkills', $event)"
-          @load-skills="$emit('load-skills')"
-          @create-session="$emit('create-session', detail.maintainer_agent)"
-          @select-session="$emit('select-session', { agentId: detail.maintainer_agent?.id, sessionId: $event })"
-        />
-      </template>
-
       <div v-else-if="activeSection === 'review'" class="project-panel">
         <header class="settings-section-header">
           <div>
@@ -507,9 +477,8 @@ const emit = defineEmits([
   'select-session'
 ])
 
-const activeSection = ref('planner')
+const activeSection = ref('agents')
 const navItems = [
-  { id: 'planner', label: 'Planner Chat', meta: 'Project maintainer', icon: 'P' },
   { id: 'review', label: 'Review Status', meta: 'Project health', icon: 'R' },
   { id: 'repository', label: 'Repository', meta: 'GitHub and workspace', icon: 'G' },
   { id: 'skills', label: 'Skills', meta: 'Project scope', icon: 'S' },
@@ -612,7 +581,7 @@ const projectSetupSteps = computed(() => {
 watch(
   () => props.selectedProjectId,
   () => {
-    activeSection.value = 'planner'
+    activeSection.value = 'agents'
   }
 )
 
@@ -660,9 +629,6 @@ function toggleAutoReview() {
 
 function selectSection(id) {
   activeSection.value = id
-  if (id === 'planner' && props.detail?.maintainer_agent?.id && selectedProjectAgentId.value !== props.detail.maintainer_agent.id) {
-    emit('select-agent', props.detail.maintainer_agent.id)
-  }
 }
 
 function saveReviewerPrompt() {
