@@ -12,6 +12,7 @@ chrono.workspace = true
 futures.workspace = true
 jsonwebtoken.workspace = true
 mai-docker = { path = "../mai-docker" }
+mai-agents = { path = "../mai-agents" }
 mai-mcp = { path = "../mai-mcp" }
 mai-model = { path = "../mai-model" }
 mai-protocol = { path = "../mai-protocol" }

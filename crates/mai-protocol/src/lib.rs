@@ -694,6 +694,108 @@ pub struct SkillConfigEntry {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProfileScope {
+    Project,
+    Repo,
+    User,
+    System,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AgentCapabilities {
+    #[serde(default)]
+    pub spawn_agents: bool,
+    #[serde(default)]
+    pub close_agents: bool,
+    #[serde(default)]
+    pub communication: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentProfile {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub slot: String,
+    pub version: u64,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub source_path: Option<PathBuf>,
+    pub scope: AgentProfileScope,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub prompt: String,
+    #[serde(default)]
+    pub default_model_role: Option<String>,
+    #[serde(default)]
+    pub default_skills: Vec<String>,
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub capabilities: AgentCapabilities,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentProfileSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub slot: String,
+    pub version: u64,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub source_path: Option<PathBuf>,
+    pub scope: AgentProfileScope,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub default_model_role: Option<String>,
+    #[serde(default)]
+    pub default_skills: Vec<String>,
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub capabilities: AgentCapabilities,
+    pub hash: String,
+}
+
+impl From<&AgentProfile> for AgentProfileSummary {
+    fn from(profile: &AgentProfile) -> Self {
+        Self {
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            description: profile.description.clone(),
+            slot: profile.slot.clone(),
+            version: profile.version,
+            path: profile.path.clone(),
+            source_path: profile.source_path.clone(),
+            scope: profile.scope,
+            enabled: profile.enabled,
+            default_model_role: profile.default_model_role.clone(),
+            default_skills: profile.default_skills.clone(),
+            mcp_servers: profile.mcp_servers.clone(),
+            capabilities: profile.capabilities.clone(),
+            hash: profile.hash.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentProfileErrorInfo {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentProfilesResponse {
+    pub roots: Vec<PathBuf>,
+    pub profiles: Vec<AgentProfileSummary>,
+    pub errors: Vec<AgentProfileErrorInfo>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSessionResponse {
     pub session: AgentSessionSummary,

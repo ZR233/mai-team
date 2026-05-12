@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/mai-agents",
     "crates/mai-docker",
     "crates/mai-mcp",
     "crates/mai-model",

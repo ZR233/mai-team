@@ -10,15 +10,16 @@ use futures::StreamExt;
 use mai_docker::DockerClient;
 use mai_model::ResponsesClient;
 use mai_protocol::{
-    AgentConfigRequest, AgentConfigResponse, AgentId, ApproveTaskPlanResponse, ArtifactInfo,
-    CreateAgentRequest, CreateAgentResponse, CreateProjectRequest, CreateProjectResponse,
-    CreateSessionResponse, CreateTaskRequest, CreateTaskResponse, ErrorResponse, FileUploadRequest,
-    FileUploadResponse, GitAccountDefaultRequest, GitAccountRequest, GitAccountResponse,
-    GitAccountsResponse, GithubAppManifestStartRequest, GithubAppManifestStartResponse,
-    GithubAppSettingsRequest, GithubAppSettingsResponse, GithubInstallationsResponse,
-    GithubRepositoriesResponse, GithubSettingsRequest, GithubSettingsResponse,
-    McpServersConfigRequest, ProjectId, ProjectReviewRunDetail, ProjectReviewRunsResponse,
-    ProviderPresetsResponse, ProvidersConfigRequest, ProvidersResponse, RepositoryPackagesResponse,
+    AgentConfigRequest, AgentConfigResponse, AgentId, AgentProfilesResponse,
+    ApproveTaskPlanResponse, ArtifactInfo, CreateAgentRequest, CreateAgentResponse,
+    CreateProjectRequest, CreateProjectResponse, CreateSessionResponse, CreateTaskRequest,
+    CreateTaskResponse, ErrorResponse, FileUploadRequest, FileUploadResponse,
+    GitAccountDefaultRequest, GitAccountRequest, GitAccountResponse, GitAccountsResponse,
+    GithubAppManifestStartRequest, GithubAppManifestStartResponse, GithubAppSettingsRequest,
+    GithubAppSettingsResponse, GithubInstallationsResponse, GithubRepositoriesResponse,
+    GithubSettingsRequest, GithubSettingsResponse, McpServersConfigRequest, ProjectId,
+    ProjectReviewRunDetail, ProjectReviewRunsResponse, ProviderPresetsResponse,
+    ProvidersConfigRequest, ProvidersResponse, RepositoryPackagesResponse,
     RequestPlanRevisionRequest, RequestPlanRevisionResponse, RuntimeDefaultsResponse,
     SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId, SkillsConfigRequest,
     SkillsListResponse, TaskId, ToolTraceDetail, TurnId, UpdateAgentRequest, UpdateAgentResponse,
@@ -35,7 +36,7 @@ use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Component, Path as FsPath, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio_stream::once;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
@@ -55,6 +56,12 @@ struct StaticAssets;
 #[derive(RustEmbed)]
 #[folder = "$OUT_DIR/system-skills"]
 struct EmbeddedSystemSkills;
+
+#[derive(RustEmbed)]
+#[folder = "$OUT_DIR/system-agents"]
+struct EmbeddedSystemAgents;
+
+static EMBEDDED_RESOURCE_RELEASE_LOCK: StdMutex<()> = StdMutex::new(());
 
 #[derive(Debug)]
 struct ApiError {
@@ -205,6 +212,12 @@ async fn main() -> Result<()> {
         path = %system_skills_root.display(),
         "released embedded system skills"
     );
+    let system_agents_root = system_agents_path()?;
+    release_embedded_system_agents(&system_agents_root)?;
+    info!(
+        path = %system_agents_root.display(),
+        "released embedded system agents"
+    );
 
     let model = ResponsesClient::new();
     let runtime_config = RuntimeConfig {
@@ -215,6 +228,7 @@ async fn main() -> Result<()> {
         github_api_base_url: None,
         git_binary: None,
         system_skills_root: Some(system_skills_root),
+        system_agents_root: Some(system_agents_root),
     };
     info!(
         data_dir = %data_dir.display(),
@@ -292,6 +306,8 @@ async fn main() -> Result<()> {
         .route("/provider-presets", get(get_provider_presets))
         .route("/skills", get(list_skills))
         .route("/skills/config", axum::routing::put(save_skills_config))
+        .route("/agent-profiles", get(list_agent_profiles))
+        .route("/agent-profiles:reload", post(list_agent_profiles))
         .route(
             "/agent-config",
             get(get_agent_config).put(save_agent_config),
@@ -409,6 +425,17 @@ fn system_skills_path() -> Result<PathBuf> {
         .context("home directory not found; set MAI_SYSTEM_SKILLS_PATH")
 }
 
+fn system_agents_path() -> Result<PathBuf> {
+    env::var("MAI_SYSTEM_AGENTS_PATH")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            dirs::home_dir()
+                .map(|home| home.join(".mai-team").join("system-agents"))
+                .ok_or(env::VarError::NotPresent)
+        })
+        .context("home directory not found; set MAI_SYSTEM_AGENTS_PATH")
+}
+
 fn data_dir_path() -> Result<PathBuf> {
     data_dir_path_with(env::var_os("MAI_DATA_DIR"), dirs::home_dir())
 }
@@ -445,33 +472,59 @@ fn artifact_index_root(data_dir: &std::path::Path) -> PathBuf {
 }
 
 fn release_embedded_system_skills(target_dir: &std::path::Path) -> io::Result<()> {
-    if !safe_system_skills_target(target_dir) {
+    release_embedded_resources::<EmbeddedSystemSkills>(
+        target_dir,
+        safe_system_resource_target,
+        "system-skills",
+    )
+}
+
+fn release_embedded_system_agents(target_dir: &std::path::Path) -> io::Result<()> {
+    release_embedded_resources::<EmbeddedSystemAgents>(
+        target_dir,
+        safe_system_resource_target,
+        "system-agents",
+    )
+}
+
+fn release_embedded_resources<E>(
+    target_dir: &std::path::Path,
+    is_safe_target: fn(&std::path::Path) -> bool,
+    out_dir_name: &str,
+) -> io::Result<()>
+where
+    E: RustEmbed,
+{
+    let _guard = EMBEDDED_RESOURCE_RELEASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !is_safe_target(target_dir) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("unsafe system skills target: {}", target_dir.display()),
+            format!("unsafe system resource target: {}", target_dir.display()),
         ));
     }
     if target_dir.exists() {
         fs::remove_dir_all(target_dir)?;
     }
     fs::create_dir_all(target_dir)?;
-    for path in EmbeddedSystemSkills::iter() {
+    for path in E::iter() {
         let path = path.as_ref();
-        let Some(relative) = embedded_system_skill_relative_path(path) else {
+        let Some(relative) = embedded_system_resource_relative_path(path, out_dir_name) else {
             continue;
         };
         let target = target_dir.join(relative);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        if let Some(asset) = EmbeddedSystemSkills::get(path) {
+        if let Some(asset) = E::get(path) {
             fs::write(target, asset.data.as_ref())?;
         }
     }
     Ok(())
 }
 
-fn safe_system_skills_target(path: &std::path::Path) -> bool {
+fn safe_system_resource_target(path: &std::path::Path) -> bool {
     if path.as_os_str().is_empty() {
         return false;
     }
@@ -482,13 +535,22 @@ fn safe_system_skills_target(path: &std::path::Path) -> bool {
 }
 
 fn embedded_system_skill_relative_path(path: &str) -> Option<PathBuf> {
+    embedded_system_resource_relative_path(path, "system-skills")
+}
+
+fn embedded_system_agent_relative_path(path: &str) -> Option<PathBuf> {
+    embedded_system_resource_relative_path(path, "system-agents")
+}
+
+fn embedded_system_resource_relative_path(path: &str, out_dir_name: &str) -> Option<PathBuf> {
     let path = FsPath::new(path);
     let relative = if path.is_absolute() {
-        path.strip_prefix(FsPath::new(env!("OUT_DIR")).join("system-skills"))
+        path.strip_prefix(FsPath::new(env!("OUT_DIR")).join(out_dir_name))
             .ok()?
     } else {
         path
     };
+    let relative = relative.strip_prefix(out_dir_name).unwrap_or(relative);
     safe_embedded_relative_path_from_path(relative)
 }
 
@@ -790,6 +852,12 @@ async fn list_skills(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<SkillsListResponse>, ApiError> {
     Ok(Json(state.runtime.list_skills().await?))
+}
+
+async fn list_agent_profiles(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<AgentProfilesResponse>, ApiError> {
+    Ok(Json(state.runtime.list_agent_profiles().await?))
 }
 
 async fn save_skills_config(
@@ -1272,6 +1340,20 @@ mod tests {
     }
 
     #[test]
+    fn embedded_system_agents_release_to_target_dir() {
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("system-agents");
+
+        release_embedded_system_agents(&target).expect("release agents");
+
+        let maintainer_path = target.join("project-maintainer").join("AGENT.md");
+        let reviewer_path = target.join("project-reviewer").join("AGENT.md");
+        let contents = fs::read_to_string(maintainer_path).expect("agent contents");
+        assert!(contents.contains("id: project-maintainer"));
+        assert!(reviewer_path.exists());
+    }
+
+    #[test]
     fn embedded_system_skills_release_overwrites_target_dir() {
         let dir = tempdir().expect("tempdir");
         let target = dir.path().join("system-skills");
@@ -1281,18 +1363,46 @@ mod tests {
         release_embedded_system_skills(&target).expect("release skills");
 
         assert!(!target.join("stale.txt").exists());
+        let expected = target.join("reviewer-agent-review-pr").join("SKILL.md");
         assert!(
-            target
-                .join("reviewer-agent-review-pr")
-                .join("SKILL.md")
-                .exists()
+            expected.exists(),
+            "expected {}, found {:?}",
+            expected.display(),
+            list_relative_files(&target)
         );
+    }
+
+    fn list_relative_files(root: &FsPath) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                collect_relative_files(root, &entry.path(), &mut files);
+            }
+        }
+        files.sort();
+        files
+    }
+
+    fn collect_relative_files(root: &FsPath, path: &FsPath, files: &mut Vec<PathBuf>) {
+        if path.is_dir() {
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    collect_relative_files(root, &entry.path(), files);
+                }
+            }
+        } else if let Ok(relative) = path.strip_prefix(root) {
+            files.push(relative.to_path_buf());
+        }
     }
 
     #[test]
     fn safe_embedded_relative_path_rejects_parent_components() {
         assert_eq!(
             safe_embedded_relative_path("reviewer-agent-review-pr/SKILL.md"),
+            Some(PathBuf::from("reviewer-agent-review-pr").join("SKILL.md"))
+        );
+        assert_eq!(
+            embedded_system_skill_relative_path("system-skills/reviewer-agent-review-pr/SKILL.md"),
             Some(PathBuf::from("reviewer-agent-review-pr").join("SKILL.md"))
         );
         assert_eq!(safe_embedded_relative_path("../SKILL.md"), None);
@@ -1307,13 +1417,23 @@ mod tests {
             ),
             Some(PathBuf::from("reviewer-agent-review-pr").join("SKILL.md"))
         );
+        assert_eq!(
+            embedded_system_agent_relative_path(
+                &FsPath::new(env!("OUT_DIR"))
+                    .join("system-agents")
+                    .join("project-maintainer")
+                    .join("AGENT.md")
+                    .to_string_lossy()
+            ),
+            Some(PathBuf::from("project-maintainer").join("AGENT.md"))
+        );
     }
 
     #[test]
     fn system_skills_release_rejects_root_target() {
-        assert!(!safe_system_skills_target(std::path::Path::new("")));
-        assert!(!safe_system_skills_target(std::path::Path::new("/")));
-        assert!(safe_system_skills_target(std::path::Path::new(
+        assert!(!safe_system_resource_target(std::path::Path::new("")));
+        assert!(!safe_system_resource_target(std::path::Path::new("/")));
+        assert!(safe_system_resource_target(std::path::Path::new(
             "/tmp/system-skills"
         )));
     }

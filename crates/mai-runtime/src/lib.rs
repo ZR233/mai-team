@@ -3,27 +3,29 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::{AbortHandle, Abortable};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use mai_agents::AgentProfilesManager;
 use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient};
 use mai_mcp::{McpAgentManager, McpTool};
 use mai_model::{ModelRequest, ModelTurnState, ResponsesClient};
 use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentMessage,
-    AgentModelPreference, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary, ArtifactInfo,
-    ContextUsage, CreateAgentRequest, CreateProjectRequest, GitAccountRequest, GitAccountResponse,
-    GitAccountStatus, GitAccountSummary, GitAccountsResponse, GitTokenKind,
-    GithubAppManifestAccountType, GithubAppManifestStartRequest, GithubAppManifestStartResponse,
-    GithubAppSettingsRequest, GithubAppSettingsResponse, GithubInstallationSummary,
-    GithubInstallationsResponse, GithubRepositoriesResponse, GithubRepositorySummary,
-    McpServerConfig, McpServerScope, McpServerTransport, MessageRole, ModelConfig,
-    ModelContentItem, ModelInputItem, ModelOutputItem, ModelToolCall, PlanHistoryEntry, PlanStatus,
-    ProjectCloneStatus, ProjectDetail, ProjectId, ProjectReviewOutcome, ProjectReviewRunDetail,
-    ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewRunsResponse,
-    ProjectReviewStatus, ProjectStatus, ProjectSummary, RepositoryPackageSummary,
-    RepositoryPackagesResponse, ResolvedAgentModelPreference, RuntimeDefaultsResponse,
-    SendMessageRequest, ServiceEvent, ServiceEventKind, SessionId, SkillActivationInfo, SkillScope,
-    SkillsConfigRequest, SkillsListResponse, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus,
-    TaskSummary, TodoItem, TokenUsage, ToolTraceDetail, TurnId, TurnStatus, UpdateAgentRequest,
-    UpdateProjectRequest, UserInputOption, UserInputQuestion, now, preview,
+    AgentModelPreference, AgentProfilesResponse, AgentRole, AgentSessionSummary, AgentStatus,
+    AgentSummary, ArtifactInfo, ContextUsage, CreateAgentRequest, CreateProjectRequest,
+    GitAccountRequest, GitAccountResponse, GitAccountStatus, GitAccountSummary,
+    GitAccountsResponse, GitTokenKind, GithubAppManifestAccountType, GithubAppManifestStartRequest,
+    GithubAppManifestStartResponse, GithubAppSettingsRequest, GithubAppSettingsResponse,
+    GithubInstallationSummary, GithubInstallationsResponse, GithubRepositoriesResponse,
+    GithubRepositorySummary, McpServerConfig, McpServerScope, McpServerTransport, MessageRole,
+    ModelConfig, ModelContentItem, ModelInputItem, ModelOutputItem, ModelToolCall,
+    PlanHistoryEntry, PlanStatus, ProjectCloneStatus, ProjectDetail, ProjectId,
+    ProjectReviewOutcome, ProjectReviewRunDetail, ProjectReviewRunStatus, ProjectReviewRunSummary,
+    ProjectReviewRunsResponse, ProjectReviewStatus, ProjectStatus, ProjectSummary,
+    RepositoryPackageSummary, RepositoryPackagesResponse, ResolvedAgentModelPreference,
+    RuntimeDefaultsResponse, SendMessageRequest, ServiceEvent, ServiceEventKind, SessionId,
+    SkillActivationInfo, SkillScope, SkillsConfigRequest, SkillsListResponse, TaskDetail, TaskId,
+    TaskPlan, TaskReview, TaskStatus, TaskSummary, TodoItem, TokenUsage, ToolTraceDetail, TurnId,
+    TurnStatus, UpdateAgentRequest, UpdateProjectRequest, UserInputOption, UserInputQuestion, now,
+    preview,
 };
 use mai_skills::{
     SkillInjections, SkillInput, SkillSelection, SkillsManager, render_available_response,
@@ -163,6 +165,7 @@ pub struct RuntimeConfig {
     pub github_api_base_url: Option<String>,
     pub git_binary: Option<String>,
     pub system_skills_root: Option<PathBuf>,
+    pub system_agents_root: Option<PathBuf>,
 }
 
 pub struct AgentRuntime {
@@ -170,6 +173,7 @@ pub struct AgentRuntime {
     model: ResponsesClient,
     store: Arc<ConfigStore>,
     skills: SkillsManager,
+    agent_profiles: AgentProfilesManager,
     agents: RwLock<HashMap<AgentId, Arc<AgentRecord>>>,
     tasks: RwLock<HashMap<TaskId, Arc<TaskRecord>>>,
     projects: RwLock<HashMap<ProjectId, Arc<ProjectRecord>>>,
@@ -506,6 +510,10 @@ impl AgentRuntime {
             &config.repo_root,
             config.system_skills_root.as_ref(),
         );
+        let agent_profiles = AgentProfilesManager::new_with_system_root(
+            &config.repo_root,
+            config.system_agents_root.as_ref(),
+        );
         let (event_tx, _) = broadcast::channel(1024);
         let snapshot = store.load_runtime_snapshot(RECENT_EVENT_LIMIT).await?;
         let mut agents = HashMap::new();
@@ -613,6 +621,7 @@ impl AgentRuntime {
             model,
             store,
             skills,
+            agent_profiles,
             agents: RwLock::new(agents),
             tasks: RwLock::new(tasks),
             projects: RwLock::new(projects),
@@ -695,6 +704,10 @@ impl AgentRuntime {
     pub async fn list_skills(&self) -> Result<SkillsListResponse> {
         let config = self.store.load_skills_config().await?;
         Ok(self.skills.list(&config)?)
+    }
+
+    pub async fn list_agent_profiles(&self) -> Result<AgentProfilesResponse> {
+        Ok(self.agent_profiles.list())
     }
 
     pub async fn update_skills_config(
@@ -9600,6 +9613,7 @@ mod tests {
             github_api_base_url: None,
             git_binary: None,
             system_skills_root: None,
+            system_agents_root: None,
         }
     }
 
