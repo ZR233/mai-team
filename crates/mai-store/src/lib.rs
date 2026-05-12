@@ -9,7 +9,7 @@ use mai_protocol::{
     ProviderConfig, ProviderKind, ProviderPreset, ProviderPresetsResponse, ProviderSecret,
     ProviderSummary, ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind,
     SessionId, SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskSummary, TokenUsage,
-    ToolTraceDetail, ToolTraceSummary, TurnId, default_true,
+    ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceSummary, TurnId, default_true,
 };
 use rusqlite::Connection as SqliteConnection;
 use serde::{Deserialize, Serialize};
@@ -484,6 +484,7 @@ struct ToolTraceRecord {
     started_at: String,
     completed_at: Option<String>,
     output_preview: String,
+    output_artifacts_json: String,
 }
 
 impl ConfigStore {
@@ -2049,6 +2050,7 @@ impl ConfigStore {
             started_at: started_at.to_rfc3339(),
             completed_at: None,
             output_preview: String::new(),
+            output_artifacts_json: "[]".to_string(),
         })
         .exec(&mut db)
         .await?;
@@ -2077,6 +2079,7 @@ impl ConfigStore {
             started_at: started_at.to_rfc3339(),
             completed_at: Some(completed_at.to_rfc3339()),
             output_preview: trace.output_preview.clone(),
+            output_artifacts_json: serde_json::to_string(&trace.output_artifacts)?,
         })
         .exec(&mut db)
         .await?;
@@ -2620,8 +2623,16 @@ impl ToolTraceRecord {
             started_at: Some(parse_utc(&self.started_at)?),
             completed_at: self.completed_at.as_deref().map(parse_utc).transpose()?,
             output_preview: self.output_preview,
+            output_artifacts: parse_tool_output_artifacts(&self.output_artifacts_json)?,
         })
     }
+}
+
+fn parse_tool_output_artifacts(value: &str) -> Result<Vec<ToolOutputArtifactInfo>> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(serde_json::from_str(value)?)
 }
 
 async fn delete_matching_tool_trace(db: &mut Db, trace: &ToolTraceDetail) -> Result<()> {
@@ -2995,11 +3006,13 @@ fn ensure_agent_log_tables(conn: &SqliteConnection) -> Result<()> {
             duration_ms BIGINT,
             started_at TEXT NOT NULL,
             completed_at TEXT,
-            output_preview TEXT NOT NULL DEFAULT ''
+            output_preview TEXT NOT NULL DEFAULT '',
+            output_artifacts_json TEXT NOT NULL DEFAULT '[]'
         )",
         [],
     )?;
     ensure_tool_trace_id_column(conn)?;
+    ensure_tool_trace_output_artifacts_column(conn)?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tool_trace_records_call_id
             ON tool_trace_records(call_id)",
@@ -3053,7 +3066,8 @@ fn ensure_tool_trace_id_column(conn: &SqliteConnection) -> Result<()> {
             duration_ms BIGINT,
             started_at TEXT NOT NULL,
             completed_at TEXT,
-            output_preview TEXT NOT NULL DEFAULT ''
+            output_preview TEXT NOT NULL DEFAULT '',
+            output_artifacts_json TEXT NOT NULL DEFAULT '[]'
         )",
         [],
     )?;
@@ -3071,7 +3085,8 @@ fn ensure_tool_trace_id_column(conn: &SqliteConnection) -> Result<()> {
             duration_ms,
             started_at,
             completed_at,
-            output_preview
+            output_preview,
+            output_artifacts_json
         )
         SELECT
             agent_id || ':' || COALESCE(session_id, '') || ':' || COALESCE(turn_id, '') || ':' || call_id,
@@ -3086,11 +3101,26 @@ fn ensure_tool_trace_id_column(conn: &SqliteConnection) -> Result<()> {
             duration_ms,
             started_at,
             completed_at,
-            output_preview
+            output_preview,
+            '[]'
         FROM tool_trace_records_v15",
         [],
     )?;
     conn.execute("DROP TABLE tool_trace_records_v15", [])?;
+    Ok(())
+}
+
+fn ensure_tool_trace_output_artifacts_column(conn: &SqliteConnection) -> Result<()> {
+    if !sqlite_table_exists(conn, "tool_trace_records")?
+        || sqlite_column_exists(conn, "tool_trace_records", "output_artifacts_json")?
+    {
+        return Ok(());
+    }
+    conn.execute(
+        "ALTER TABLE tool_trace_records
+            ADD COLUMN output_artifacts_json TEXT NOT NULL DEFAULT '[]'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -4952,6 +4982,15 @@ mod tests {
             started_at: Some(new_time),
             completed_at: Some(new_time),
             output_preview: "hi".to_string(),
+            output_artifacts: vec![ToolOutputArtifactInfo {
+                id: "artifact-1".to_string(),
+                call_id: "call_1".to_string(),
+                agent_id,
+                name: "stdout.txt".to_string(),
+                stream: "stdout".to_string(),
+                size_bytes: 2,
+                created_at: new_time,
+            }],
         };
         store
             .save_tool_trace_started(&trace, new_time)
@@ -4999,6 +5038,8 @@ mod tests {
             .expect("trace");
         assert_eq!(loaded.arguments["command"], "printf hi");
         assert_eq!(loaded.output_preview, "hi");
+        assert_eq!(loaded.output_artifacts.len(), 1);
+        assert_eq!(loaded.output_artifacts[0].stream, "stdout");
 
         let removed = store
             .prune_tool_traces_before(Utc::now() - chrono::TimeDelta::days(5))
@@ -5047,6 +5088,7 @@ mod tests {
                         started_at: Some(timestamp),
                         completed_at: Some(timestamp),
                         output_preview: command.to_string(),
+                        output_artifacts: Vec::new(),
                     },
                     timestamp,
                     timestamp,

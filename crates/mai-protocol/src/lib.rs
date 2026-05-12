@@ -858,6 +858,19 @@ pub struct ToolTraceDetail {
     #[serde(default)]
     pub completed_at: Option<DateTime<Utc>>,
     pub output_preview: String,
+    #[serde(default)]
+    pub output_artifacts: Vec<ToolOutputArtifactInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolOutputArtifactInfo {
+    pub id: String,
+    pub call_id: String,
+    pub agent_id: AgentId,
+    pub name: String,
+    pub stream: String,
+    pub size_bytes: u64,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

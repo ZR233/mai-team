@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 const MANAGED_LABEL: &str = "mai.team.managed=true";
@@ -64,6 +66,22 @@ pub struct ExecOutput {
     pub status: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecCaptureOptions<'a> {
+    pub stdout_path: &'a Path,
+    pub stderr_path: &'a Path,
+    pub output_bytes_cap: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapturedExecOutput {
+    pub output: ExecOutput,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -603,6 +621,96 @@ impl DockerClient {
         .await
     }
 
+    pub async fn exec_shell_captured_with_cancel(
+        &self,
+        container_id: &str,
+        command: &str,
+        cwd: Option<&str>,
+        timeout_secs: Option<u64>,
+        capture: ExecCaptureOptions<'_>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<CapturedExecOutput> {
+        self.exec_shell_env_captured_with_cancel(
+            container_id,
+            command,
+            cwd,
+            timeout_secs,
+            &[],
+            capture,
+            cancellation_token,
+        )
+        .await
+    }
+
+    pub async fn exec_shell_env_captured_with_cancel(
+        &self,
+        container_id: &str,
+        command: &str,
+        cwd: Option<&str>,
+        timeout_secs: Option<u64>,
+        env: &[(String, String)],
+        capture: ExecCaptureOptions<'_>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<CapturedExecOutput> {
+        let shell_command = shell_command_with_optional_timeout(command, timeout_secs);
+        let mut cmd = Command::new(&self.binary);
+        cmd.arg("exec");
+        if let Some(cwd) = cwd {
+            cmd.args(["-w", cwd]);
+        }
+        for (key, value) in env {
+            cmd.arg("-e").arg(key);
+            cmd.env(key, value);
+        }
+        cmd.args([container_id, "/bin/sh", "-lc", &shell_command]);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+
+        let mut child = cmd.spawn()?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            DockerError::CommandFailed("docker exec stdout pipe unavailable".to_string())
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            DockerError::CommandFailed("docker exec stderr pipe unavailable".to_string())
+        })?;
+        let stdout_task = capture_stream(
+            stdout,
+            capture.stdout_path.to_path_buf(),
+            capture.output_bytes_cap,
+        );
+        let stderr_task = capture_stream(
+            stderr,
+            capture.stderr_path.to_path_buf(),
+            capture.output_bytes_cap,
+        );
+
+        let status = tokio::select! {
+            status = child.wait() => status?,
+            _ = cancellation_token.cancelled() => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                await_capture_task(stdout_task).await?;
+                await_capture_task(stderr_task).await?;
+                return Err(DockerError::Cancelled);
+            }
+        };
+        let stdout_capture = await_capture_task(stdout_task).await?;
+        let stderr_capture = await_capture_task(stderr_task).await?;
+        Ok(CapturedExecOutput {
+            output: ExecOutput {
+                status: status.code().unwrap_or(-1),
+                stdout: stdout_capture.text,
+                stderr: stderr_capture.text,
+            },
+            stdout_bytes: stdout_capture.total_bytes,
+            stderr_bytes: stderr_capture.total_bytes,
+            stdout_truncated: stdout_capture.truncated,
+            stderr_truncated: stderr_capture.truncated,
+        })
+    }
+
     pub async fn exec_shell_env_with_cancel(
         &self,
         container_id: &str,
@@ -1067,6 +1175,156 @@ fn project_review_workspace_volume(project_id: &str) -> String {
     format!("mai-team-project-review-{project_id}")
 }
 
+#[derive(Debug)]
+struct StreamCapture {
+    text: String,
+    total_bytes: u64,
+    truncated: bool,
+}
+
+fn capture_stream<R>(reader: R, path: PathBuf, output_bytes_cap: usize) -> JoinHandle<Result<StreamCapture>>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let mut reader = reader;
+        let mut file = tokio::fs::File::create(path).await?;
+        let mut view = HeadTailBuffer::new(output_bytes_cap);
+        let mut total_bytes = 0_u64;
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let n = reader.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            let bytes = &chunk[..n];
+            file.write_all(bytes).await?;
+            view.push(bytes);
+            total_bytes = total_bytes.saturating_add(n as u64);
+        }
+        file.flush().await?;
+        let truncated = view.truncated();
+        Ok(StreamCapture {
+            text: String::from_utf8_lossy(&view.into_bytes()).into_owned(),
+            total_bytes,
+            truncated,
+        })
+    })
+}
+
+async fn await_capture_task(task: JoinHandle<Result<StreamCapture>>) -> Result<StreamCapture> {
+    match task.await {
+        Ok(result) => result,
+        Err(err) => Err(DockerError::CommandFailed(format!(
+            "stream capture task failed: {err}"
+        ))),
+    }
+}
+
+#[derive(Debug)]
+struct HeadTailBuffer {
+    cap: usize,
+    head: Vec<u8>,
+    tail: VecDequeBytes,
+    total: usize,
+}
+
+impl HeadTailBuffer {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            head: Vec::new(),
+            tail: VecDequeBytes::new(cap / 2),
+            total: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.total = self.total.saturating_add(bytes.len());
+        if self.cap == 0 {
+            return;
+        }
+        let head_cap = self.head_cap();
+        if self.head.len() < head_cap {
+            let take = (head_cap - self.head.len()).min(bytes.len());
+            self.head.extend_from_slice(&bytes[..take]);
+            if take < bytes.len() {
+                self.tail.push(&bytes[take..]);
+            }
+        } else {
+            self.tail.push(bytes);
+        }
+    }
+
+    fn truncated(&self) -> bool {
+        self.total > self.cap
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        if !self.truncated() {
+            let mut out = self.head;
+            out.extend_from_slice(&self.tail.into_vec());
+            return out;
+        }
+        let omitted = self
+            .total
+            .saturating_sub(self.head.len())
+            .saturating_sub(self.tail.len());
+        let marker = format!("\n... omitted {omitted} bytes ...\n");
+        let mut out = self.head;
+        out.extend_from_slice(marker.as_bytes());
+        out.extend_from_slice(&self.tail.into_vec());
+        out
+    }
+
+    fn head_cap(&self) -> usize {
+        self.cap.saturating_sub(self.cap / 2)
+    }
+}
+
+#[derive(Debug)]
+struct VecDequeBytes {
+    cap: usize,
+    bytes: VecDeque<u8>,
+}
+
+impl VecDequeBytes {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            bytes: VecDeque::new(),
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        if self.cap == 0 {
+            return;
+        }
+        if bytes.len() >= self.cap {
+            self.bytes.clear();
+            self.bytes
+                .extend(bytes[bytes.len().saturating_sub(self.cap)..].iter().copied());
+            return;
+        }
+        self.bytes.extend(bytes.iter().copied());
+        if self.bytes.len() > self.cap {
+            let excess = self.bytes.len() - self.cap;
+            self.bytes.drain(..excess);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        self.bytes.into_iter().collect()
+    }
+}
+
 fn apply_container_create_options(args: &mut Vec<String>, options: &ContainerCreateOptions) {
     if let Some(memory) = options
         .memory
@@ -1249,6 +1507,29 @@ mod tests {
             DockerClient::exec_shell_command_for_test("sleep 1000", Some(5))
                 .starts_with("timeout --preserve-status 5s /bin/sh -lc ")
         );
+    }
+
+    #[test]
+    fn head_tail_buffer_keeps_bounded_head_and_tail() {
+        let mut buffer = HeadTailBuffer::new(10);
+        buffer.push(b"abcdef");
+        buffer.push(b"ghijklmnop");
+
+        assert!(buffer.truncated());
+        let text = String::from_utf8(buffer.into_bytes()).expect("utf8");
+        assert!(text.starts_with("abcde"));
+        assert!(text.contains("omitted 6 bytes"));
+        assert!(text.ends_with("lmnop"));
+    }
+
+    #[test]
+    fn head_tail_buffer_keeps_full_when_under_cap() {
+        let mut buffer = HeadTailBuffer::new(10);
+        buffer.push(b"abc");
+        buffer.push(b"def");
+
+        assert!(!buffer.truncated());
+        assert_eq!(buffer.into_bytes(), b"abcdef");
     }
 
     #[test]

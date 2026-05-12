@@ -4,7 +4,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::{AbortHandle, Abortable};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use mai_agents::AgentProfilesManager;
-use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient};
+use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient, ExecCaptureOptions};
 use mai_mcp::{McpAgentManager, McpTool};
 use mai_model::{ModelRequest, ModelTurnState, ResponsesClient};
 use mai_protocol::{
@@ -24,9 +24,9 @@ use mai_protocol::{
     ResolvedAgentModelPreference, RuntimeDefaultsResponse, SendMessageRequest, ServiceEvent,
     ServiceEventKind, SessionId, SkillActivationInfo, SkillScope, SkillsConfigRequest,
     SkillsListResponse, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary,
-    TodoItem, TokenUsage, ToolDefinition, ToolTraceDetail, ToolTraceListResponse, TurnId,
-    TurnStatus, UpdateAgentRequest, UpdateProjectRequest, UserInputOption, UserInputQuestion, now,
-    preview,
+    TodoItem, TokenUsage, ToolDefinition, ToolOutputArtifactInfo, ToolTraceDetail,
+    ToolTraceListResponse, TurnId, TurnStatus, UpdateAgentRequest, UpdateProjectRequest,
+    UserInputOption, UserInputQuestion, now, preview,
 };
 use mai_skills::{
     SkillInjections, SkillInput, SkillSelection, SkillsManager, render_available_response,
@@ -51,10 +51,19 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const RECENT_EVENT_LIMIT: usize = 500;
-const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
-const DEFAULT_MODEL_TOOL_OUTPUT_BYTES: usize = 50 * 1024;
+const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 90;
+const TOKEN_ESTIMATE_BYTES: usize = 4;
+const DEFAULT_MODEL_TOOL_OUTPUT_TOKENS: usize = 10_000;
+const DEFAULT_MODEL_TOOL_OUTPUT_BYTES: usize =
+    DEFAULT_MODEL_TOOL_OUTPUT_TOKENS * TOKEN_ESTIMATE_BYTES;
+const DEFAULT_EXEC_OUTPUT_BYTES_CAP: usize = 1024 * 1024;
+const MAX_EXEC_OUTPUT_BYTES_CAP: usize = 16 * 1024 * 1024;
+const MAX_MODEL_TOOL_OUTPUT_TOKENS: usize = 100_000;
 const DEFAULT_READ_FILE_BYTES: usize = 50 * 1024;
 const MAX_READ_FILE_BYTES: usize = 512 * 1024;
+const DEFAULT_READ_FILE_LINE_COUNT: usize = 200;
+const MAX_READ_FILE_LINE_COUNT: usize = 10_000;
+const DEFAULT_READ_FILE_MAX_LINE_LEN: usize = 2_000;
 const DEFAULT_LIST_FILES_LIMIT: usize = 200;
 const MAX_LIST_FILES_LIMIT: usize = 1_000;
 const REVIEW_ROUND_LIMIT: u64 = 5;
@@ -287,16 +296,45 @@ struct ToolExecution {
     output: String,
     model_output: String,
     ends_turn: bool,
+    output_artifacts: Vec<ToolOutputArtifactInfo>,
+}
+
+#[derive(Debug)]
+struct ToolOutputCapture {
+    call_id: String,
+    stdout_id: String,
+    stderr_id: String,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    stdout_name: String,
+    stderr_name: String,
 }
 
 impl ToolExecution {
     fn new(success: bool, output: String, ends_turn: bool) -> Self {
-        let model_output = bounded_model_tool_output(&output);
+        Self::with_model_tokens(
+            success,
+            output,
+            ends_turn,
+            DEFAULT_MODEL_TOOL_OUTPUT_TOKENS,
+            Vec::new(),
+        )
+    }
+
+    fn with_model_tokens(
+        success: bool,
+        output: String,
+        ends_turn: bool,
+        max_output_tokens: usize,
+        output_artifacts: Vec<ToolOutputArtifactInfo>,
+    ) -> Self {
+        let model_output = bounded_model_tool_output_with_tokens(&output, max_output_tokens);
         Self {
             success,
             output,
             model_output,
             ends_turn,
+            output_artifacts,
         }
     }
 }
@@ -2280,7 +2318,32 @@ impl AgentRuntime {
             duration_ms,
             started_at: None,
             completed_at: None,
+            output_artifacts: Vec::new(),
         })
+    }
+
+    pub async fn tool_output_artifact(
+        &self,
+        agent_id: AgentId,
+        session_id: Option<SessionId>,
+        call_id: String,
+        artifact_id: String,
+    ) -> Result<(ToolOutputArtifactInfo, PathBuf)> {
+        let trace = self.tool_trace(agent_id, session_id, call_id.clone()).await?;
+        let artifact = trace
+            .output_artifacts
+            .into_iter()
+            .find(|artifact| artifact.id == artifact_id && artifact.call_id == call_id)
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput("tool output artifact not found".to_string())
+            })?;
+        let path = self.tool_output_artifact_file_path(
+            artifact.agent_id,
+            &artifact.call_id,
+            &artifact.id,
+            &artifact.name,
+        );
+        Ok((artifact, path))
     }
 
     pub async fn agent_logs(
@@ -2702,6 +2765,86 @@ impl AgentRuntime {
     pub fn artifact_file_path(&self, info: &ArtifactInfo) -> PathBuf {
         self.artifact_file_dir(info.task_id, &info.id)
             .join(&info.name)
+    }
+
+    pub fn tool_output_artifact_file_path(
+        &self,
+        agent_id: AgentId,
+        call_id: &str,
+        artifact_id: &str,
+        name: &str,
+    ) -> PathBuf {
+        self.tool_output_artifact_dir(agent_id, call_id, artifact_id)
+            .join(name)
+    }
+
+    async fn prepare_tool_output_capture(
+        &self,
+        agent_id: AgentId,
+        command: &str,
+    ) -> Result<ToolOutputCapture> {
+        let call_id = Uuid::new_v4().to_string();
+        let stdout_id = Uuid::new_v4().to_string();
+        let stderr_id = Uuid::new_v4().to_string();
+        let stdout_name = tool_output_file_name(command, "stdout");
+        let stderr_name = tool_output_file_name(command, "stderr");
+        let stdout_path =
+            self.tool_output_artifact_file_path(agent_id, &call_id, &stdout_id, &stdout_name);
+        let stderr_path =
+            self.tool_output_artifact_file_path(agent_id, &call_id, &stderr_id, &stderr_name);
+        if let Some(parent) = stdout_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        if let Some(parent) = stderr_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        Ok(ToolOutputCapture {
+            call_id,
+            stdout_id,
+            stderr_id,
+            stdout_path,
+            stderr_path,
+            stdout_name,
+            stderr_name,
+        })
+    }
+
+    async fn tool_output_artifacts_from_capture(
+        &self,
+        agent_id: AgentId,
+        capture: &ToolOutputCapture,
+        stdout_bytes: u64,
+        stderr_bytes: u64,
+    ) -> Result<Vec<ToolOutputArtifactInfo>> {
+        let created_at = now();
+        let mut artifacts = Vec::new();
+        if stdout_bytes > 0 {
+            artifacts.push(ToolOutputArtifactInfo {
+                id: capture.stdout_id.clone(),
+                call_id: capture.call_id.clone(),
+                agent_id,
+                name: capture.stdout_name.clone(),
+                stream: "stdout".to_string(),
+                size_bytes: stdout_bytes,
+                created_at,
+            });
+        } else {
+            let _ = tokio::fs::remove_file(&capture.stdout_path).await;
+        }
+        if stderr_bytes > 0 {
+            artifacts.push(ToolOutputArtifactInfo {
+                id: capture.stderr_id.clone(),
+                call_id: capture.call_id.clone(),
+                agent_id,
+                name: capture.stderr_name.clone(),
+                stream: "stderr".to_string(),
+                size_bytes: stderr_bytes,
+                created_at,
+            });
+        } else {
+            let _ = tokio::fs::remove_file(&capture.stderr_path).await;
+        }
+        Ok(artifacts)
     }
 
     async fn run_turn(
@@ -3285,6 +3428,7 @@ impl AgentRuntime {
                         started_at: Some(started_wall_time),
                         completed_at: None,
                         output_preview: String::new(),
+                        output_artifacts: Vec::new(),
                     },
                     started_wall_time,
                 )
@@ -3345,6 +3489,7 @@ impl AgentRuntime {
                         started_at: Some(started_wall_time),
                         completed_at: Some(completed_wall_time),
                         output_preview: output_preview.clone(),
+                        output_artifacts: execution.output_artifacts.clone(),
                     },
                     started_wall_time,
                     completed_wall_time,
@@ -3419,26 +3564,53 @@ impl AgentRuntime {
                 let command = required_string(&arguments, "command")?;
                 let cwd = optional_string(&arguments, "cwd");
                 let timeout = arguments.get("timeout_secs").and_then(Value::as_u64);
+                let max_output_tokens = optional_usize(&arguments, "max_output_tokens")?
+                    .unwrap_or(DEFAULT_MODEL_TOOL_OUTPUT_TOKENS)
+                    .clamp(1, MAX_MODEL_TOOL_OUTPUT_TOKENS);
+                let output_bytes_cap = optional_usize(&arguments, "output_bytes_cap")?
+                    .unwrap_or(DEFAULT_EXEC_OUTPUT_BYTES_CAP)
+                    .clamp(1, MAX_EXEC_OUTPUT_BYTES_CAP);
                 let container_id = self.container_id(agent_id).await?;
+                let capture = self.prepare_tool_output_capture(agent_id, &command).await?;
                 let output = self
                     .docker
-                    .exec_shell_with_cancel(
+                    .exec_shell_captured_with_cancel(
                         &container_id,
                         &command,
                         cwd.as_deref(),
                         timeout,
+                        ExecCaptureOptions {
+                            stdout_path: &capture.stdout_path,
+                            stderr_path: &capture.stderr_path,
+                            output_bytes_cap,
+                        },
                         &cancellation_token,
                     )
                     .await?;
-                Ok(ToolExecution::new(
-                    output.status == 0,
+                let artifacts = self
+                    .tool_output_artifacts_from_capture(
+                        agent_id,
+                        &capture,
+                        output.stdout_bytes,
+                        output.stderr_bytes,
+                    )
+                    .await?;
+                Ok(ToolExecution::with_model_tokens(
+                    output.output.status == 0,
                     serde_json::to_string(&json!({
-                        "status": output.status,
-                        "stdout": output.stdout,
-                        "stderr": output.stderr,
+                        "status": output.output.status,
+                        "stdout": output.output.stdout,
+                        "stderr": output.output.stderr,
+                        "stdout_truncated": output.stdout_truncated,
+                        "stderr_truncated": output.stderr_truncated,
+                        "stdout_bytes": output.stdout_bytes,
+                        "stderr_bytes": output.stderr_bytes,
+                        "output_artifacts": artifacts,
                     }))
                     .unwrap_or_else(|_| "{}".to_string()),
                     false,
+                    max_output_tokens,
+                    artifacts,
                 ))
             }
             RoutedTool::ReadFile => {
@@ -5410,6 +5582,19 @@ impl AgentRuntime {
     fn artifact_file_dir(&self, task_id: TaskId, artifact_id: &str) -> PathBuf {
         self.artifact_files_root
             .join(task_id.to_string())
+            .join(artifact_id)
+    }
+
+    fn tool_output_artifact_dir(
+        &self,
+        agent_id: AgentId,
+        call_id: &str,
+        artifact_id: &str,
+    ) -> PathBuf {
+        self.artifact_files_root
+            .join("tool-output")
+            .join(agent_id.to_string())
+            .join(safe_path_component(call_id))
             .join(artifact_id)
     }
 
@@ -8614,6 +8799,31 @@ fn safe_artifact_name(raw: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
+fn tool_output_file_name(command: &str, stream: &str) -> String {
+    let command = command
+        .split_whitespace()
+        .next()
+        .map(safe_path_component)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "command".to_string());
+    format!("{command}-{stream}.txt")
+}
+
+fn safe_path_component(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('.')
+        .trim_matches('_')
+        .to_string()
+}
+
 trait IfEmpty {
     fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str;
 }
@@ -11761,6 +11971,7 @@ esac
                     started_at: Some(timestamp),
                     completed_at: Some(timestamp),
                     output_preview: "persisted".to_string(),
+                    output_artifacts: Vec::new(),
                 },
                 timestamp,
                 timestamp,
