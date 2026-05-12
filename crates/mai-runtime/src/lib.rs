@@ -2455,6 +2455,12 @@ impl AgentRuntime {
 
     async fn delete_agent_record(&self, agent_id: AgentId) -> Result<()> {
         let agent = self.agent(agent_id).await?;
+        let reviewer_project_id = {
+            let summary = agent.summary.read().await;
+            (summary.role == Some(AgentRole::Reviewer))
+                .then_some(summary.project_id)
+                .flatten()
+        };
         agent.cancel_requested.store(true, Ordering::SeqCst);
         self.set_status(&agent, AgentStatus::DeletingContainer, None)
             .await?;
@@ -2484,6 +2490,17 @@ impl AgentRuntime {
                 agent_id = %agent_id,
                 count = deleted.len(),
                 "removed agent containers"
+            );
+        }
+        if let Some(project_id) = reviewer_project_id
+            && let Err(err) = self
+                .cleanup_project_review_worktree(project_id, agent_id)
+                .await
+        {
+            tracing::warn!(
+                project_id = %project_id,
+                reviewer_id = %agent_id,
+                "failed to clean project reviewer worktree during agent deletion: {err}"
             );
         }
         let _turn_guard = agent.turn_lock.lock().await;
@@ -6191,13 +6208,14 @@ impl AgentRuntime {
                     command = command_label,
                     attempt,
                     attempts = PROJECT_REVIEW_REPO_COMMAND_MAX_ATTEMPTS,
+                    error = %last_message,
                     "project review workspace command failed; retrying"
                 );
                 sleep(Duration::from_secs(PROJECT_REVIEW_REPO_COMMAND_RETRY_SECS)).await;
             }
         }
         Err(RuntimeError::InvalidInput(format!(
-            "project review workspace sync failed after {} attempts: {last_message}",
+            "project review workspace {command_label} failed after {} attempts: {last_message}",
             PROJECT_REVIEW_REPO_COMMAND_MAX_ATTEMPTS
         )))
     }
@@ -7637,10 +7655,14 @@ fn review_repo_sync_command(repo_url: &str, expected_remote: &str, branch: &str)
          {ensure}\n\
          cd /workspace/repo\n\
          git -c credential.helper= remote set-url origin {repo_url}\n\
+         git worktree prune\n\
+         git reset --hard HEAD\n\
+         git clean -fdx\n\
          {git_network} fetch --prune origin\n\
          {git_network} fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'\n\
-         git checkout {branch}\n\
+         git checkout -B {branch} {origin_branch}\n\
          git reset --hard {origin_branch}\n\
+         git clean -fdx\n\
          git worktree prune\n\
          mkdir -p /workspace/reviews",
         ensure = review_repo_ensure_command(repo_url, expected_remote, branch),
@@ -10031,6 +10053,10 @@ esac
         );
         assert!(command.contains("'+refs/pull/*/head:refs/remotes/origin/pr/*'"));
         assert!(command.contains("-c http.lowSpeedLimit=1 -c http.lowSpeedTime=30"));
+        assert!(command.contains("git worktree prune"));
+        assert!(command.contains("git reset --hard HEAD"));
+        assert!(command.contains("git clean -fdx"));
+        assert!(command.contains("git checkout -B main origin/main"));
         assert!(command.contains("git reset --hard origin/main"));
         assert!(command.contains("MAI_GITHUB_REVIEW_TOKEN"));
         assert!(!command.contains("ghp_"));
@@ -14653,6 +14679,48 @@ esac
         assert!(!docker_log.contains("commit maintainer-container"));
         assert!(docker_log.contains(&format!("create --name mai-team-{}", reviewer.id)));
         assert!(docker_log.contains(&format!("mai-team-project-review-{project_id}:/workspace")));
+    }
+
+    #[tokio::test]
+    async fn deleting_project_reviewer_cleans_review_worktree() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![test_provider()],
+                default_provider_id: Some("openai".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        maintainer.role = Some(AgentRole::Planner);
+        save_agent_with_session(&store, &maintainer).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                maintainer_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let reviewer = runtime
+            .spawn_project_reviewer_agent(project_id)
+            .await
+            .expect("spawn reviewer");
+        let reviewer_id = reviewer.id;
+
+        runtime
+            .delete_agent(reviewer_id)
+            .await
+            .expect("delete reviewer");
+
+        let docker_log = fake_docker_log(&dir);
+        assert!(docker_log.contains(&format!("/workspace/reviews/{reviewer_id}")));
+        assert!(docker_log.contains("git -C /workspace/repo worktree prune"));
     }
 
     #[tokio::test]
