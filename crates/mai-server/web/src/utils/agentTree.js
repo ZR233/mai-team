@@ -6,7 +6,7 @@ export function buildAgentTreeRows(agents = []) {
 
   for (const agent of sorted) {
     const parentId = agent.parent_id || null
-    if (parentId && byId.has(parentId)) {
+    if (canAttachToParent(agent, byId)) {
       const children = childrenByParent.get(parentId) || []
       children.push(agent)
       childrenByParent.set(parentId, children)
@@ -16,13 +16,16 @@ export function buildAgentTreeRows(agents = []) {
   }
 
   const rows = []
+  const visited = new Set()
   const append = (agent, depth, isOrphan) => {
+    if (!agent?.id || visited.has(agent.id)) return
+    visited.add(agent.id)
     const children = childrenByParent.get(agent.id) || []
     rows.push({
       agent,
       depth,
       child_count: countDescendants(agent.id, childrenByParent),
-      is_orphan: isOrphan || Boolean(agent.parent_id && !byId.has(agent.parent_id))
+      is_orphan: isOrphan || hasBrokenParent(agent, byId)
     })
     for (const child of children) {
       append(child, depth + 1, false)
@@ -47,12 +50,38 @@ export function countAgentDescendants(agentId, agents = []) {
   return countDescendants(agentId, childrenByParent)
 }
 
-function countDescendants(agentId, childrenByParent) {
+function countDescendants(agentId, childrenByParent, visited = new Set([agentId])) {
   const children = childrenByParent.get(agentId) || []
-  return children.reduce(
-    (count, child) => count + 1 + countDescendants(child.id, childrenByParent),
-    0
-  )
+  let count = 0
+  for (const child of children) {
+    if (!child?.id || visited.has(child.id)) continue
+    visited.add(child.id)
+    count += 1 + countDescendants(child.id, childrenByParent, visited)
+  }
+  return count
+}
+
+function canAttachToParent(agent, byId) {
+  const parentId = agent.parent_id || null
+  return Boolean(parentId && byId.has(parentId) && !parentChainHasCycle(agent, byId))
+}
+
+function hasBrokenParent(agent, byId) {
+  const parentId = agent.parent_id || null
+  return Boolean(parentId && (!byId.has(parentId) || parentChainHasCycle(agent, byId)))
+}
+
+function parentChainHasCycle(agent, byId) {
+  const seen = new Set([agent.id])
+  let parentId = agent.parent_id || null
+  while (parentId) {
+    if (seen.has(parentId)) return true
+    seen.add(parentId)
+    const parent = byId.get(parentId)
+    if (!parent) return false
+    parentId = parent.parent_id || null
+  }
+  return false
 }
 
 function compareAgents(left, right) {

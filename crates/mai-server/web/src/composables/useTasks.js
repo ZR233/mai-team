@@ -12,12 +12,16 @@ const isStopping = ref(false)
 const isDetailLoading = ref(false)
 const isApprovingPlan = ref(false)
 const conversationRef = ref(null)
+let tasksRequestSeq = 0
+let detailRequestSeq = 0
 
 export function useTasks() {
   const { api, showToast } = useApi()
 
   async function refreshTasks() {
+    const requestSeq = ++tasksRequestSeq
     const response = await api('/tasks')
+    if (requestSeq !== tasksRequestSeq) return
     tasks.value = response || []
     if (selectedTaskId.value && !tasks.value.some((task) => task.id === selectedTaskId.value)) {
       selectedTaskId.value = null
@@ -38,11 +42,18 @@ export function useTasks() {
 
   async function refreshDetail() {
     if (!selectedTaskId.value) return
+    const requestSeq = ++detailRequestSeq
+    const taskId = selectedTaskId.value
+    const agentId = selectedAgentId.value
     const isFirstLoad = !selectedTaskDetail.value
     if (isFirstLoad) isDetailLoading.value = true
     try {
-      const query = selectedAgentId.value ? `?agent_id=${encodeURIComponent(selectedAgentId.value)}` : ''
-      selectedTaskDetail.value = await api(`/tasks/${selectedTaskId.value}${query}`)
+      const query = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : ''
+      const detail = await api(`/tasks/${taskId}${query}`)
+      if (requestSeq !== detailRequestSeq || selectedTaskId.value !== taskId || selectedAgentId.value !== agentId) {
+        return
+      }
+      selectedTaskDetail.value = detail
       selectedAgentId.value = selectedTaskDetail.value?.selected_agent_id || null
       await nextTick()
       highlightCodeBlocks(conversationRef.value)
@@ -75,8 +86,8 @@ export function useTasks() {
     })
     selectedTaskId.value = response.task.id
     selectedAgentId.value = response.task.planner_agent_id
-    refreshTasks()
-    refreshDetail()
+    await refreshTasks()
+    await refreshDetail()
     return response.task
   }
 

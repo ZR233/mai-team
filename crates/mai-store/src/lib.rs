@@ -29,7 +29,7 @@ const SETTING_GITHUB_TOKEN: &str = "github_token";
 const SETTING_GITHUB_APP_CONFIG: &str = "github_app_config";
 const SETTING_GIT_ACCOUNTS: &str = "git_accounts";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-const SCHEMA_VERSION: &str = "15";
+const SCHEMA_VERSION: &str = "16";
 const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const DEEPSEEK_V4_CONTEXT_TOKENS: u64 = 1_000_000;
@@ -451,6 +451,8 @@ struct AgentLogRecord {
 #[table = "tool_trace_records"]
 struct ToolTraceRecord {
     #[key]
+    id: String,
+    #[index]
     call_id: String,
     #[index]
     agent_id: String,
@@ -516,10 +518,10 @@ impl ConfigStore {
             if current_schema_version.as_deref() != Some(SCHEMA_VERSION) {
                 if matches!(
                     current_schema_version.as_deref(),
-                    Some("8" | "9" | "10" | "11" | "12" | "13" | "14")
+                    Some("8" | "9" | "10" | "11" | "12" | "13" | "14" | "15")
                 ) {
                     drop(db);
-                    migrate_to_v15(&path)?;
+                    migrate_to_v16(&path)?;
                     db = build_db(&path).await?;
                     set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
                 } else {
@@ -1281,11 +1283,12 @@ impl ConfigStore {
 
     pub async fn save_project(&self, project: &ProjectSummary) -> Result<()> {
         let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
         Query::<List<ProjectRecordRow>>::filter(
             ProjectRecordRow::fields().id().eq(project.id.to_string()),
         )
         .delete()
-        .exec(&mut db)
+        .exec(&mut tx)
         .await?;
         toasty::create!(ProjectRecordRow {
             id: project.id.to_string(),
@@ -1317,8 +1320,9 @@ impl ConfigStore {
             last_review_outcome: project.last_review_outcome.as_ref().map(|o| o.to_string()),
             review_last_error: project.review_last_error.clone(),
         })
-        .exec(&mut db)
+        .exec(&mut tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1354,9 +1358,10 @@ impl ConfigStore {
 
     pub async fn save_task(&self, task: &TaskSummary, plan: &TaskPlan) -> Result<()> {
         let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
         Query::<List<TaskRecordRow>>::filter(TaskRecordRow::fields().id().eq(task.id.to_string()))
             .delete()
-            .exec(&mut db)
+            .exec(&mut tx)
             .await?;
         toasty::create!(TaskRecordRow {
             id: task.id.to_string(),
@@ -1378,8 +1383,9 @@ impl ConfigStore {
             plan_revision_feedback: plan.revision_feedback.clone(),
             plan_revision_requested_at: plan.revision_requested_at.map(|time| time.to_rfc3339()),
         })
-        .exec(&mut db)
+        .exec(&mut tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1685,7 +1691,9 @@ impl ConfigStore {
         .exec(&mut tx)
         .await?;
         Query::<List<ToolTraceRecord>>::filter(
-            ToolTraceRecord::fields().agent_id().eq(agent_id.to_string()),
+            ToolTraceRecord::fields()
+                .agent_id()
+                .eq(agent_id.to_string()),
         )
         .delete()
         .exec(&mut tx)
@@ -1956,13 +1964,9 @@ impl ConfigStore {
         started_at: DateTime<Utc>,
     ) -> Result<()> {
         let mut db = self.db.clone();
-        Query::<List<ToolTraceRecord>>::filter(
-            ToolTraceRecord::fields().call_id().eq(trace.call_id.clone()),
-        )
-        .delete()
-        .exec(&mut db)
-        .await?;
+        delete_matching_tool_trace(&mut db, trace).await?;
         toasty::create!(ToolTraceRecord {
+            id: tool_trace_record_id(trace),
             call_id: trace.call_id.clone(),
             agent_id: trace.agent_id.to_string(),
             session_id: trace.session_id.map(|id| id.to_string()),
@@ -1988,13 +1992,9 @@ impl ConfigStore {
         completed_at: DateTime<Utc>,
     ) -> Result<()> {
         let mut db = self.db.clone();
-        Query::<List<ToolTraceRecord>>::filter(
-            ToolTraceRecord::fields().call_id().eq(trace.call_id.clone()),
-        )
-        .delete()
-        .exec(&mut db)
-        .await?;
+        delete_matching_tool_trace(&mut db, trace).await?;
         toasty::create!(ToolTraceRecord {
+            id: tool_trace_record_id(trace),
             call_id: trace.call_id.clone(),
             agent_id: trace.agent_id.to_string(),
             session_id: trace.session_id.map(|id| id.to_string()),
@@ -2020,21 +2020,22 @@ impl ConfigStore {
         call_id: &str,
     ) -> Result<Option<ToolTraceDetail>> {
         let mut db = self.db.clone();
-        let row = Query::<List<ToolTraceRecord>>::filter(
+        let rows = Query::<List<ToolTraceRecord>>::filter(
             ToolTraceRecord::fields().call_id().eq(call_id.to_string()),
         )
-        .first()
         .exec(&mut db)
         .await?;
-        row.filter(|row| {
-            row.agent_id == agent_id.to_string()
-                && session_id.is_none_or(|id| {
-                    let id = id.to_string();
-                    row.session_id.as_deref() == Some(id.as_str())
-                })
-        })
-        .map(ToolTraceRecord::into_detail)
-        .transpose()
+        rows.into_iter()
+            .find(|row| {
+                tool_trace_belongs_to(
+                    row,
+                    agent_id,
+                    session_id.map(|id| id.to_string()).as_deref(),
+                    None,
+                )
+            })
+            .map(ToolTraceRecord::into_detail)
+            .transpose()
     }
 
     pub async fn list_tool_traces(
@@ -2044,7 +2045,9 @@ impl ConfigStore {
     ) -> Result<Vec<ToolTraceSummary>> {
         let mut db = self.db.clone();
         let mut rows = Query::<List<ToolTraceRecord>>::filter(
-            ToolTraceRecord::fields().agent_id().eq(agent_id.to_string()),
+            ToolTraceRecord::fields()
+                .agent_id()
+                .eq(agent_id.to_string()),
         )
         .exec(&mut db)
         .await?;
@@ -2072,23 +2075,19 @@ impl ConfigStore {
     pub async fn prune_tool_traces_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
         let mut db = self.db.clone();
         let cutoff = cutoff.to_rfc3339();
-        let rows = Query::<List<ToolTraceRecord>>::all()
-            .exec(&mut db)
-            .await?;
-        let old_call_ids = rows
+        let rows = Query::<List<ToolTraceRecord>>::all().exec(&mut db).await?;
+        let old_ids = rows
             .into_iter()
             .filter(|row| row.started_at < cutoff)
-            .map(|row| row.call_id)
+            .map(|row| row.id)
             .collect::<Vec<_>>();
-        for call_id in &old_call_ids {
-            Query::<List<ToolTraceRecord>>::filter(
-                ToolTraceRecord::fields().call_id().eq(call_id.clone()),
-            )
-            .delete()
-            .exec(&mut db)
-            .await?;
+        for id in &old_ids {
+            Query::<List<ToolTraceRecord>>::filter(ToolTraceRecord::fields().id().eq(id.clone()))
+                .delete()
+                .exec(&mut db)
+                .await?;
         }
-        Ok(old_call_ids.len())
+        Ok(old_ids.len())
     }
 
     pub async fn load_runtime_snapshot(
@@ -2498,7 +2497,11 @@ impl AgentLogRecord {
         Ok(AgentLogEntry {
             id: parse_uuid(&self.id)?,
             agent_id: parse_agent_id(&self.agent_id)?,
-            session_id: self.session_id.as_deref().map(parse_session_id).transpose()?,
+            session_id: self
+                .session_id
+                .as_deref()
+                .map(parse_session_id)
+                .transpose()?,
             turn_id: self.turn_id.as_deref().map(parse_turn_id).transpose()?,
             level: self.level,
             category: self.category,
@@ -2514,7 +2517,11 @@ impl ToolTraceRecord {
         Ok(ToolTraceSummary {
             call_id: self.call_id,
             agent_id: parse_agent_id(&self.agent_id)?,
-            session_id: self.session_id.as_deref().map(parse_session_id).transpose()?,
+            session_id: self
+                .session_id
+                .as_deref()
+                .map(parse_session_id)
+                .transpose()?,
             turn_id: self.turn_id.as_deref().map(parse_turn_id).transpose()?,
             tool_name: self.tool_name,
             success: self.success,
@@ -2528,7 +2535,11 @@ impl ToolTraceRecord {
     fn into_detail(self) -> Result<ToolTraceDetail> {
         Ok(ToolTraceDetail {
             agent_id: parse_agent_id(&self.agent_id)?,
-            session_id: self.session_id.as_deref().map(parse_session_id).transpose()?,
+            session_id: self
+                .session_id
+                .as_deref()
+                .map(parse_session_id)
+                .transpose()?,
             turn_id: self.turn_id.as_deref().map(parse_turn_id).transpose()?,
             call_id: self.call_id,
             tool_name: self.tool_name,
@@ -2541,6 +2552,56 @@ impl ToolTraceRecord {
             output_preview: self.output_preview,
         })
     }
+}
+
+async fn delete_matching_tool_trace(db: &mut Db, trace: &ToolTraceDetail) -> Result<()> {
+    let rows = Query::<List<ToolTraceRecord>>::filter(
+        ToolTraceRecord::fields()
+            .call_id()
+            .eq(trace.call_id.clone()),
+    )
+    .exec(db)
+    .await?;
+    let session_id = trace.session_id.map(|id| id.to_string());
+    let turn_id = trace.turn_id.map(|id| id.to_string());
+    for row in rows {
+        if tool_trace_belongs_to(
+            &row,
+            trace.agent_id,
+            session_id.as_deref(),
+            turn_id.as_deref(),
+        ) {
+            Query::<List<ToolTraceRecord>>::filter(ToolTraceRecord::fields().id().eq(row.id))
+                .delete()
+                .exec(db)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+fn tool_trace_record_id(trace: &ToolTraceDetail) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        trace.agent_id,
+        trace
+            .session_id
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        trace.turn_id.map(|id| id.to_string()).unwrap_or_default(),
+        trace.call_id
+    )
+}
+
+fn tool_trace_belongs_to(
+    row: &ToolTraceRecord,
+    agent_id: AgentId,
+    session_id: Option<&str>,
+    turn_id: Option<&str>,
+) -> bool {
+    row.agent_id == agent_id.to_string()
+        && session_id.is_none_or(|id| row.session_id.as_deref() == Some(id))
+        && turn_id.is_none_or(|id| row.turn_id.as_deref() == Some(id))
 }
 
 async fn build_db(path: &Path) -> Result<Db> {
@@ -2565,7 +2626,7 @@ async fn build_db(path: &Path) -> Result<Db> {
     Ok(builder.build(Sqlite::open(path)).await?)
 }
 
-fn migrate_to_v15(path: &Path) -> Result<()> {
+fn migrate_to_v16(path: &Path) -> Result<()> {
     let conn = SqliteConnection::open(path)?;
     if !sqlite_column_exists(&conn, "agents", "project_id")? {
         conn.execute("ALTER TABLE agents ADD COLUMN project_id TEXT", [])?;
@@ -2852,7 +2913,8 @@ fn ensure_agent_log_tables(conn: &SqliteConnection) -> Result<()> {
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS tool_trace_records (
-            call_id TEXT PRIMARY KEY NOT NULL,
+            id TEXT PRIMARY KEY NOT NULL,
+            call_id TEXT NOT NULL,
             agent_id TEXT NOT NULL,
             session_id TEXT,
             turn_id TEXT,
@@ -2865,6 +2927,12 @@ fn ensure_agent_log_tables(conn: &SqliteConnection) -> Result<()> {
             completed_at TEXT,
             output_preview TEXT NOT NULL DEFAULT ''
         )",
+        [],
+    )?;
+    ensure_tool_trace_id_column(conn)?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_trace_records_call_id
+            ON tool_trace_records(call_id)",
         [],
     )?;
     conn.execute(
@@ -2890,6 +2958,72 @@ fn ensure_agent_log_tables(conn: &SqliteConnection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_tool_trace_id_column(conn: &SqliteConnection) -> Result<()> {
+    if !sqlite_table_exists(conn, "tool_trace_records")?
+        || sqlite_column_exists(conn, "tool_trace_records", "id")?
+    {
+        return Ok(());
+    }
+
+    conn.execute(
+        "ALTER TABLE tool_trace_records RENAME TO tool_trace_records_v15",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE tool_trace_records (
+            id TEXT PRIMARY KEY NOT NULL,
+            call_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            session_id TEXT,
+            turn_id TEXT,
+            tool_name TEXT NOT NULL,
+            arguments_json TEXT NOT NULL DEFAULT '{}',
+            output TEXT NOT NULL DEFAULT '',
+            success BOOLEAN NOT NULL DEFAULT 0,
+            duration_ms BIGINT,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            output_preview TEXT NOT NULL DEFAULT ''
+        )",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO tool_trace_records (
+            id,
+            call_id,
+            agent_id,
+            session_id,
+            turn_id,
+            tool_name,
+            arguments_json,
+            output,
+            success,
+            duration_ms,
+            started_at,
+            completed_at,
+            output_preview
+        )
+        SELECT
+            agent_id || ':' || COALESCE(session_id, '') || ':' || COALESCE(turn_id, '') || ':' || call_id,
+            call_id,
+            agent_id,
+            session_id,
+            turn_id,
+            tool_name,
+            arguments_json,
+            output,
+            success,
+            duration_ms,
+            started_at,
+            completed_at,
+            output_preview
+        FROM tool_trace_records_v15",
+        [],
+    )?;
+    conn.execute("DROP TABLE tool_trace_records_v15", [])?;
+    Ok(())
+}
+
 fn sqlite_column_exists(conn: &SqliteConnection, table: &str, column: &str) -> Result<bool> {
     let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -2901,7 +3035,6 @@ fn sqlite_column_exists(conn: &SqliteConnection, table: &str, column: &str) -> R
     Ok(false)
 }
 
-#[cfg(test)]
 fn sqlite_table_exists(conn: &SqliteConnection, table: &str) -> Result<bool> {
     let mut statement =
         conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1")?;
@@ -4761,6 +4894,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_traces_keep_same_call_id_for_different_agents() {
+        let (_dir, store) = store().await;
+        let first_agent_id = Uuid::new_v4();
+        let second_agent_id = Uuid::new_v4();
+        let first_session_id = Uuid::new_v4();
+        let second_session_id = Uuid::new_v4();
+        let timestamp = Utc::now();
+
+        for (agent_id, session_id, command) in [
+            (first_agent_id, first_session_id, "pwd"),
+            (second_agent_id, second_session_id, "ls"),
+        ] {
+            store
+                .save_tool_trace_completed(
+                    &ToolTraceDetail {
+                        agent_id,
+                        session_id: Some(session_id),
+                        turn_id: Some(Uuid::new_v4()),
+                        call_id: "call_duplicate".to_string(),
+                        tool_name: "container_exec".to_string(),
+                        arguments: json!({ "command": command }),
+                        output: format!("{{\"command\":\"{command}\"}}"),
+                        success: true,
+                        duration_ms: Some(1),
+                        started_at: Some(timestamp),
+                        completed_at: Some(timestamp),
+                        output_preview: command.to_string(),
+                    },
+                    timestamp,
+                    timestamp,
+                )
+                .await
+                .expect("save trace");
+        }
+
+        let first = store
+            .load_tool_trace(first_agent_id, Some(first_session_id), "call_duplicate")
+            .await
+            .expect("load first")
+            .expect("first trace");
+        let second = store
+            .load_tool_trace(second_agent_id, Some(second_session_id), "call_duplicate")
+            .await
+            .expect("load second")
+            .expect("second trace");
+
+        assert_eq!(first.arguments["command"], "pwd");
+        assert_eq!(second.arguments["command"], "ls");
+    }
+
+    #[tokio::test]
     async fn delete_project_removes_review_runs() {
         let (_dir, store) = store().await;
         let project_id = Uuid::new_v4();
@@ -5201,6 +5385,82 @@ mod tests {
             sqlite_table_exists(&conn, "tool_trace_records").expect("table check"),
             "tool_trace_records should be added during v14 -> v15 migration"
         );
+    }
+
+    #[tokio::test]
+    async fn schema_v15_adds_tool_trace_id_without_rebuild() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("config.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("open");
+        store
+            .set_setting(SETTING_SCHEMA_VERSION, "15")
+            .await
+            .expect("mark v15 schema");
+        drop(store);
+
+        let conn = SqliteConnection::open(&db_path).expect("sqlite");
+        conn.execute("DROP TABLE tool_trace_records", [])
+            .expect("drop current traces");
+        conn.execute(
+            "CREATE TABLE tool_trace_records (
+                call_id TEXT PRIMARY KEY NOT NULL,
+                agent_id TEXT NOT NULL,
+                session_id TEXT,
+                turn_id TEXT,
+                tool_name TEXT NOT NULL,
+                arguments_json TEXT NOT NULL DEFAULT '{}',
+                output TEXT NOT NULL DEFAULT '',
+                success BOOLEAN NOT NULL DEFAULT 0,
+                duration_ms BIGINT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                output_preview TEXT NOT NULL DEFAULT ''
+            )",
+            [],
+        )
+        .expect("create old traces");
+        conn.execute(
+            "INSERT INTO tool_trace_records (
+                call_id,
+                agent_id,
+                session_id,
+                turn_id,
+                tool_name,
+                arguments_json,
+                output,
+                success,
+                duration_ms,
+                started_at,
+                completed_at,
+                output_preview
+            ) VALUES (?1, ?2, ?3, ?4, 'container_exec', '{\"command\":\"pwd\"}', '', 1, 1, ?5, ?5, 'pwd')",
+            rusqlite::params![
+                "call_1",
+                Uuid::new_v4().to_string(),
+                Uuid::new_v4().to_string(),
+                Uuid::new_v4().to_string(),
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .expect("insert old trace");
+        drop(conn);
+
+        let reopened = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("reopen");
+        assert_eq!(
+            reopened
+                .get_setting(SETTING_SCHEMA_VERSION)
+                .await
+                .expect("schema marker")
+                .as_deref(),
+            Some(SCHEMA_VERSION)
+        );
+        let conn = SqliteConnection::open(&db_path).expect("sqlite");
+        assert!(sqlite_column_exists(&conn, "tool_trace_records", "id").expect("column"));
     }
 
     #[tokio::test]

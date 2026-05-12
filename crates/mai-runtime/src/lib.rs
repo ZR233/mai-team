@@ -10,23 +10,22 @@ use mai_model::{ModelRequest, ModelTurnState, ResponsesClient};
 use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentLogEntry,
     AgentLogsResponse, AgentMessage, AgentModelPreference, AgentProfilesResponse, AgentRole,
-    AgentSessionSummary, AgentStatus, AgentSummary, ArtifactInfo, ContextUsage,
-    CreateAgentRequest, CreateProjectRequest, GitAccountRequest, GitAccountResponse,
-    GitAccountStatus, GitAccountSummary, GitAccountsResponse, GitTokenKind,
-    GithubAppManifestAccountType, GithubAppManifestStartRequest, GithubAppManifestStartResponse,
-    GithubAppSettingsRequest, GithubAppSettingsResponse, GithubInstallationSummary,
-    GithubInstallationsResponse, GithubRepositoriesResponse, GithubRepositorySummary,
-    McpServerConfig, McpServerScope, McpServerTransport, MessageRole, ModelConfig,
-    ModelContentItem, ModelInputItem, ModelOutputItem, ModelToolCall, PlanHistoryEntry,
-    PlanStatus, ProjectCloneStatus, ProjectDetail, ProjectId, ProjectReviewOutcome,
-    ProjectReviewRunDetail, ProjectReviewRunStatus, ProjectReviewRunSummary,
-    ProjectReviewRunsResponse, ProjectReviewStatus, ProjectStatus, ProjectSummary,
-    RepositoryPackageSummary, RepositoryPackagesResponse, ResolvedAgentModelPreference,
-    RuntimeDefaultsResponse, SendMessageRequest, ServiceEvent, ServiceEventKind, SessionId,
-    SkillActivationInfo, SkillScope, SkillsConfigRequest, SkillsListResponse, TaskDetail, TaskId,
-    TaskPlan, TaskReview, TaskStatus, TaskSummary, TodoItem, TokenUsage, ToolTraceDetail,
-    ToolTraceListResponse, TurnId, TurnStatus, UpdateAgentRequest, UpdateProjectRequest,
-    UserInputOption, UserInputQuestion, now, preview,
+    AgentSessionSummary, AgentStatus, AgentSummary, ArtifactInfo, ContextUsage, CreateAgentRequest,
+    CreateProjectRequest, GitAccountRequest, GitAccountResponse, GitAccountStatus,
+    GitAccountSummary, GitAccountsResponse, GitTokenKind, GithubAppManifestAccountType,
+    GithubAppManifestStartRequest, GithubAppManifestStartResponse, GithubAppSettingsRequest,
+    GithubAppSettingsResponse, GithubInstallationSummary, GithubInstallationsResponse,
+    GithubRepositoriesResponse, GithubRepositorySummary, McpServerConfig, McpServerScope,
+    McpServerTransport, MessageRole, ModelConfig, ModelContentItem, ModelInputItem,
+    ModelOutputItem, ModelToolCall, PlanHistoryEntry, PlanStatus, ProjectCloneStatus,
+    ProjectDetail, ProjectId, ProjectReviewOutcome, ProjectReviewRunDetail, ProjectReviewRunStatus,
+    ProjectReviewRunSummary, ProjectReviewRunsResponse, ProjectReviewStatus, ProjectStatus,
+    ProjectSummary, RepositoryPackageSummary, RepositoryPackagesResponse,
+    ResolvedAgentModelPreference, RuntimeDefaultsResponse, SendMessageRequest, ServiceEvent,
+    ServiceEventKind, SessionId, SkillActivationInfo, SkillScope, SkillsConfigRequest,
+    SkillsListResponse, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary,
+    TodoItem, TokenUsage, ToolTraceDetail, ToolTraceListResponse, TurnId, TurnStatus,
+    UpdateAgentRequest, UpdateProjectRequest, UserInputOption, UserInputQuestion, now, preview,
 };
 use mai_skills::{
     SkillInjections, SkillInput, SkillSelection, SkillsManager, render_available_response,
@@ -2635,6 +2634,7 @@ impl AgentRuntime {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.clone())
         });
+        let name = safe_artifact_name(&name)?;
 
         let artifact_id = Uuid::new_v4().to_string();
         let dir = self.artifact_file_dir(task_id, &artifact_id);
@@ -4548,14 +4548,22 @@ impl AgentRuntime {
             instructions.push_str(system_prompt);
         }
         instructions.push_str("\n\n## Available Skills\n");
-        if let Some(project_id) = agent.summary.read().await.project_id {
+        let summary = agent.summary.read().await;
+        let project_id = summary.project_id;
+        let prefer_container_skill_paths = summary.role == Some(AgentRole::Reviewer);
+        drop(summary);
+        if let Some(project_id) = project_id {
             let mut response = skills_manager.list(skills_config)?;
             self.apply_project_skill_source_paths(project_id, &mut response);
-            apply_container_skill_paths(&mut response, container_skill_paths);
+            apply_container_skill_paths(
+                &mut response,
+                container_skill_paths,
+                prefer_container_skill_paths,
+            );
             instructions.push_str(&render_available_response(response));
         } else {
             let mut response = skills_manager.list(skills_config)?;
-            apply_container_skill_paths(&mut response, container_skill_paths);
+            apply_container_skill_paths(&mut response, container_skill_paths, false);
             instructions.push_str(&render_available_response(response));
         }
         if !skill_injections.warnings.is_empty() {
@@ -5155,6 +5163,9 @@ impl AgentRuntime {
                     && skill.path.parent().is_some()
             })
             .collect::<Vec<_>>();
+        if skills.is_empty() {
+            return Ok(ContainerSkillPaths::default());
+        }
 
         let cleanup = self
             .docker
@@ -5804,7 +5815,10 @@ impl AgentRuntime {
             .set_project_review_state(
                 project_id,
                 ProjectReviewStatus::Disabled,
-                ReviewStateUpdate { force_disabled: true, ..Default::default() },
+                ReviewStateUpdate {
+                    force_disabled: true,
+                    ..Default::default()
+                },
             )
             .await;
     }
@@ -5823,7 +5837,11 @@ impl AgentRuntime {
                 .set_project_review_state(
                     project_id,
                     ProjectReviewStatus::Failed,
-                    ReviewStateUpdate { next_review_at: Some(next), error: Some(err.to_string()), ..Default::default() },
+                    ReviewStateUpdate {
+                        next_review_at: Some(next),
+                        error: Some(err.to_string()),
+                        ..Default::default()
+                    },
                 )
                 .await;
         }
@@ -5983,7 +6001,10 @@ impl AgentRuntime {
         self.set_project_review_state(
             project_id,
             ProjectReviewStatus::Running,
-            ReviewStateUpdate { current_reviewer_agent_id: Some(reviewer_id), ..Default::default() },
+            ReviewStateUpdate {
+                current_reviewer_agent_id: Some(reviewer_id),
+                ..Default::default()
+            },
         )
         .await?;
         let started_at = self
@@ -7845,7 +7866,8 @@ fn is_stale_agent_model_preference_error(err: &RuntimeError) -> bool {
         return false;
     };
     (message.starts_with("provider `") && message.ends_with("` not found"))
-        || (message.starts_with("model `") && message.contains("` is not configured for provider `"))
+        || (message.starts_with("model `")
+            && message.contains("` is not configured for provider `"))
 }
 
 fn project_maintainer_system_prompt(
@@ -8408,6 +8430,31 @@ fn runtime_sidecar_image(image: String) -> String {
     }
 }
 
+fn safe_artifact_name(raw: &str) -> Result<String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "artifact name cannot be empty".to_string(),
+        ));
+    }
+    if name == "." || name == ".." {
+        return Err(RuntimeError::InvalidInput(
+            "artifact name must be a file name".to_string(),
+        ));
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err(RuntimeError::InvalidInput(
+            "artifact name cannot contain path separators".to_string(),
+        ));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(RuntimeError::InvalidInput(
+            "artifact name cannot contain control characters".to_string(),
+        ));
+    }
+    Ok(name.to_string())
+}
+
 trait IfEmpty {
     fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str;
 }
@@ -8741,9 +8788,12 @@ fn skill_user_fragment(
 fn apply_container_skill_paths(
     response: &mut SkillsListResponse,
     container_skill_paths: &ContainerSkillPaths,
+    overwrite_existing_source: bool,
 ) {
     for skill in &mut response.skills {
-        if let Some(container_path) = container_skill_paths.get(&skill.path) {
+        if (overwrite_existing_source || skill.source_path.is_none())
+            && let Some(container_path) = container_skill_paths.get(&skill.path)
+        {
             skill.source_path = Some(container_path.clone());
         }
     }

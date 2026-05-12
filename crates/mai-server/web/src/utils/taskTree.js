@@ -24,7 +24,7 @@ function buildAgentRows(agents = []) {
 
   for (const agent of sorted) {
     const parentId = agent.parent_id || null
-    if (parentId && byId.has(parentId)) {
+    if (canAttachToParent(agent, byId)) {
       const children = childrenByParent.get(parentId) || []
       children.push(agent)
       childrenByParent.set(parentId, children)
@@ -34,7 +34,10 @@ function buildAgentRows(agents = []) {
   }
 
   const rows = []
+  const visited = new Set()
   const append = (agent, depth) => {
+    if (!agent?.id || visited.has(agent.id)) return
+    visited.add(agent.id)
     rows.push({
       type: 'agent',
       agent,
@@ -71,4 +74,22 @@ function roleRank(role) {
     executor: 2,
     reviewer: 3
   }[String(role || '').toLowerCase()] ?? 9
+}
+
+function canAttachToParent(agent, byId) {
+  const parentId = agent.parent_id || null
+  return Boolean(parentId && byId.has(parentId) && !parentChainHasCycle(agent, byId))
+}
+
+function parentChainHasCycle(agent, byId) {
+  const seen = new Set([agent.id])
+  let parentId = agent.parent_id || null
+  while (parentId) {
+    if (seen.has(parentId)) return true
+    seen.add(parentId)
+    const parent = byId.get(parentId)
+    if (!parent) return false
+    parentId = parent.parent_id || null
+  }
+  return false
 }

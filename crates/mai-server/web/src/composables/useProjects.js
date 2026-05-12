@@ -13,6 +13,8 @@ const isProjectSending = ref(false)
 const isProjectStopping = ref(false)
 const isProjectReviewRunLoading = ref(false)
 const projectConversationRef = ref(null)
+let projectsRequestSeq = 0
+let projectDetailRequestSeq = 0
 const projectSkillsState = reactive({
   projectId: null,
   roots: [],
@@ -28,7 +30,9 @@ export function useProjects() {
   const { api } = useApi()
 
   async function refreshProjects() {
+    const requestSeq = ++projectsRequestSeq
     const response = await api('/projects')
+    if (requestSeq !== projectsRequestSeq) return
     projects.value = response || []
     if (selectedProjectId.value && !projects.value.some((project) => project.id === selectedProjectId.value)) {
       selectedProjectId.value = null
@@ -41,14 +45,27 @@ export function useProjects() {
 
   async function refreshProjectDetail() {
     if (!selectedProjectId.value) return
+    const requestSeq = ++projectDetailRequestSeq
+    const projectId = selectedProjectId.value
+    const agentId = selectedProjectAgentId.value
+    const sessionId = selectedProjectSessionId.value
     const isFirstLoad = !selectedProjectDetail.value
     if (isFirstLoad) isProjectDetailLoading.value = true
     try {
       const params = new URLSearchParams()
-      if (selectedProjectAgentId.value) params.set('agent_id', selectedProjectAgentId.value)
-      if (selectedProjectSessionId.value) params.set('session_id', selectedProjectSessionId.value)
+      if (agentId) params.set('agent_id', agentId)
+      if (sessionId) params.set('session_id', sessionId)
       const query = params.toString() ? `?${params.toString()}` : ''
-      selectedProjectDetail.value = await api(`/projects/${selectedProjectId.value}${query}`)
+      const detail = await api(`/projects/${projectId}${query}`)
+      if (
+        requestSeq !== projectDetailRequestSeq ||
+        selectedProjectId.value !== projectId ||
+        selectedProjectAgentId.value !== agentId ||
+        selectedProjectSessionId.value !== sessionId
+      ) {
+        return
+      }
+      selectedProjectDetail.value = detail
       selectedProjectAgentId.value = selectedProjectDetail.value?.selected_agent_id
         || selectedProjectDetail.value?.maintainer_agent?.id
         || selectedProjectAgentId.value
@@ -157,7 +174,10 @@ export function useProjects() {
         body: JSON.stringify({
           message,
           skill_mentions: skillMentions,
-          session_id: selectedProjectDetail.value?.maintainer_agent?.selected_session_id || null
+          session_id: selectedProjectSessionId.value
+            || selectedProjectDetail.value?.selected_agent?.selected_session_id
+            || selectedProjectDetail.value?.maintainer_agent?.selected_session_id
+            || null
         })
       })
       await refreshProjects()

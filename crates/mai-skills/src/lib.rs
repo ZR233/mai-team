@@ -777,24 +777,45 @@ fn build_injections_from_outcome(
     for name in selection_names {
         load_unique_skill(
             &name,
-            &SkillLookupContext { enabled: &enabled, blocked: &blocked_plain_names, reserved: &BTreeSet::new(), name_counts: &name_counts },
-            false, &mut seen_paths, &mut result,
+            &SkillLookupContext {
+                enabled: &enabled,
+                blocked: &blocked_plain_names,
+                reserved: &BTreeSet::new(),
+                name_counts: &name_counts,
+            },
+            false,
+            &mut seen_paths,
+            &mut result,
         );
     }
 
     for name in explicit_names {
         load_unique_skill(
             &name,
-            &SkillLookupContext { enabled: &enabled, blocked: &blocked_plain_names, reserved: &input.reserved_names, name_counts: &name_counts },
-            false, &mut seen_paths, &mut result,
+            &SkillLookupContext {
+                enabled: &enabled,
+                blocked: &blocked_plain_names,
+                reserved: &input.reserved_names,
+                name_counts: &name_counts,
+            },
+            false,
+            &mut seen_paths,
+            &mut result,
         );
     }
 
     for name in plain_text_names {
         load_unique_skill(
             &name,
-            &SkillLookupContext { enabled: &enabled, blocked: &blocked_plain_names, reserved: &input.reserved_names, name_counts: &name_counts },
-            true, &mut seen_paths, &mut result,
+            &SkillLookupContext {
+                enabled: &enabled,
+                blocked: &blocked_plain_names,
+                reserved: &input.reserved_names,
+                name_counts: &name_counts,
+            },
+            true,
+            &mut seen_paths,
+            &mut result,
         );
     }
 

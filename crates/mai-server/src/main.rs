@@ -23,8 +23,8 @@ use mai_protocol::{
     ProvidersConfigRequest, ProvidersResponse, RepositoryPackagesResponse,
     RequestPlanRevisionRequest, RequestPlanRevisionResponse, RuntimeDefaultsResponse,
     SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId, SkillsConfigRequest,
-    SkillsListResponse, TaskId, ToolTraceDetail, ToolTraceListResponse, TurnId,
-    UpdateAgentRequest, UpdateAgentResponse, UpdateProjectRequest, UpdateProjectResponse,
+    SkillsListResponse, TaskId, ToolTraceDetail, ToolTraceListResponse, TurnId, UpdateAgentRequest,
+    UpdateAgentResponse, UpdateProjectRequest, UpdateProjectResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
 use mai_store::{AgentLogFilter, ConfigStore, ToolTraceFilter};
@@ -1288,16 +1288,16 @@ async fn download_artifact(
         message: format!("File not found: {e}"),
     })?;
 
-    let filename = artifact.name.clone();
+    let filename = content_disposition_filename(&artifact.name);
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{filename}\""),
-        )
+        .header(header::CONTENT_DISPOSITION, filename)
         .body(Body::from(bytes))
-        .expect("response builder"))
+        .map_err(|error| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: error.to_string(),
+        })?)
 }
 
 async fn cancel_agent(
@@ -1339,6 +1339,18 @@ async fn delete_agent(
 
 fn bounded_api_limit(limit: Option<usize>, default: usize, max: usize) -> usize {
     limit.unwrap_or(default).clamp(1, max)
+}
+
+fn content_disposition_filename(name: &str) -> String {
+    let escaped = name
+        .chars()
+        .map(|ch| match ch {
+            '"' | '\\' | '\r' | '\n' => '_',
+            ch if ch.is_control() || !ch.is_ascii() => '_',
+            ch => ch,
+        })
+        .collect::<String>();
+    format!("attachment; filename=\"{escaped}\"")
 }
 
 async fn events(

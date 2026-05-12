@@ -3,10 +3,14 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
   "scripts": {
     "build": "vite build",
     "dev": "vite --host 0.0.0.0",
-    "test:timeline": "node src/utils/__tests__/timeline.test.js"
+    "test:timeline": "node src/utils/__tests__/timeline.test.js",
+    "test:tree": "node src/utils/__tests__/tree.test.js"
   },
   "dependencies": {
     "@vitejs/plugin-vue": "^6.0.2",

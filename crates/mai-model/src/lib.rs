@@ -137,7 +137,8 @@ struct ResponseOptions<'a> {
     store: Option<bool>,
 }
 
-impl ResponsesClient {    pub fn new() -> Self {
+impl ResponsesClient {
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -158,7 +159,11 @@ impl ResponsesClient {    pub fn new() -> Self {
                     instructions,
                     input,
                     tools,
-                    ResponseOptions { reasoning_effort, previous_response_id: None, store: Some(false) },
+                    ResponseOptions {
+                        reasoning_effort,
+                        previous_response_id: None,
+                        store: Some(false),
+                    },
                 )
                 .await
             }
@@ -245,7 +250,11 @@ impl ResponsesClient {    pub fn new() -> Self {
                 req.instructions,
                 input,
                 req.tools,
-                ResponseOptions { reasoning_effort: req.reasoning_effort.clone(), previous_response_id, store: Some(true) },
+                ResponseOptions {
+                    reasoning_effort: req.reasoning_effort.clone(),
+                    previous_response_id,
+                    store: Some(true),
+                },
             )
             .await?;
         if let Some(id) = &response.id {
