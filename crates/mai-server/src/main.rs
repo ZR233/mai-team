@@ -6,11 +6,12 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use mai_docker::DockerClient;
 use mai_model::ResponsesClient;
 use mai_protocol::{
-    AgentConfigRequest, AgentConfigResponse, AgentId, AgentProfilesResponse,
+    AgentConfigRequest, AgentConfigResponse, AgentId, AgentLogsResponse, AgentProfilesResponse,
     ApproveTaskPlanResponse, ArtifactInfo, CreateAgentRequest, CreateAgentResponse,
     CreateProjectRequest, CreateProjectResponse, CreateSessionResponse, CreateTaskRequest,
     CreateTaskResponse, ErrorResponse, FileUploadRequest, FileUploadResponse,
@@ -22,11 +23,11 @@ use mai_protocol::{
     ProvidersConfigRequest, ProvidersResponse, RepositoryPackagesResponse,
     RequestPlanRevisionRequest, RequestPlanRevisionResponse, RuntimeDefaultsResponse,
     SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId, SkillsConfigRequest,
-    SkillsListResponse, TaskId, ToolTraceDetail, TurnId, UpdateAgentRequest, UpdateAgentResponse,
-    UpdateProjectRequest, UpdateProjectResponse,
+    SkillsListResponse, TaskId, ToolTraceDetail, ToolTraceListResponse, TurnId,
+    UpdateAgentRequest, UpdateAgentResponse, UpdateProjectRequest, UpdateProjectResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
-use mai_store::ConfigStore;
+use mai_store::{AgentLogFilter, ConfigStore, ToolTraceFilter};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde_json::json;
@@ -123,6 +124,26 @@ struct DownloadQuery {
 #[derive(Debug, Deserialize)]
 struct AgentDetailQuery {
     session_id: Option<SessionId>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentLogsQuery {
+    session_id: Option<SessionId>,
+    turn_id: Option<TurnId>,
+    level: Option<String>,
+    category: Option<String>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolTraceListQuery {
+    session_id: Option<SessionId>,
+    turn_id: Option<TurnId>,
+    offset: Option<usize>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -357,6 +378,8 @@ async fn main() -> Result<()> {
             "/agents/{id}/sessions/{session_id}/tool-calls/{call_id}",
             get(get_session_tool_trace),
         )
+        .route("/agents/{id}/logs", get(list_agent_logs))
+        .route("/agents/{id}/tool-calls", get(list_tool_traces))
         .route("/agents/{id}/tool-calls/{call_id}", get(get_tool_trace))
         .route(
             "/agents/{id}/turns/{turn_id}/cancel",
@@ -532,6 +555,16 @@ fn safe_system_resource_target(path: &std::path::Path) -> bool {
         path.components().next_back(),
         None | Some(Component::RootDir | Component::Prefix(_))
     )
+}
+
+#[cfg(test)]
+fn embedded_system_skill_relative_path(path: &str) -> Option<PathBuf> {
+    embedded_system_resource_relative_path(path, "system-skills")
+}
+
+#[cfg(test)]
+fn embedded_system_agent_relative_path(path: &str) -> Option<PathBuf> {
+    embedded_system_resource_relative_path(path, "system-agents")
 }
 
 fn embedded_system_resource_relative_path(path: &str, out_dir_name: &str) -> Option<PathBuf> {
@@ -1126,6 +1159,54 @@ async fn send_session_message(
     Ok(Json(SendMessageResponse { turn_id }))
 }
 
+async fn list_agent_logs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<AgentId>,
+    Query(query): Query<AgentLogsQuery>,
+) -> std::result::Result<Json<AgentLogsResponse>, ApiError> {
+    let limit = bounded_api_limit(query.limit, 100, 500);
+    Ok(Json(
+        state
+            .runtime
+            .agent_logs(
+                id,
+                AgentLogFilter {
+                    session_id: query.session_id,
+                    turn_id: query.turn_id,
+                    level: query.level.filter(|value| !value.trim().is_empty()),
+                    category: query.category.filter(|value| !value.trim().is_empty()),
+                    since: query.since,
+                    until: query.until,
+                    offset: query.offset.unwrap_or(0),
+                    limit,
+                },
+            )
+            .await?,
+    ))
+}
+
+async fn list_tool_traces(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<AgentId>,
+    Query(query): Query<ToolTraceListQuery>,
+) -> std::result::Result<Json<ToolTraceListResponse>, ApiError> {
+    let limit = bounded_api_limit(query.limit, 100, 500);
+    Ok(Json(
+        state
+            .runtime
+            .tool_traces(
+                id,
+                ToolTraceFilter {
+                    session_id: query.session_id,
+                    turn_id: query.turn_id,
+                    offset: query.offset.unwrap_or(0),
+                    limit,
+                },
+            )
+            .await?,
+    ))
+}
+
 async fn get_tool_trace(
     State(state): State<Arc<AppState>>,
     Path((id, call_id)): Path<(AgentId, String)>,
@@ -1254,6 +1335,10 @@ async fn delete_agent(
 ) -> std::result::Result<StatusCode, ApiError> {
     state.runtime.delete_agent(id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn bounded_api_limit(limit: Option<usize>, default: usize, max: usize) -> usize {
+    limit.unwrap_or(default).clamp(1, max)
 }
 
 async fn events(

@@ -1,15 +1,15 @@
 use chrono::{DateTime, Utc};
 use mai_protocol::{
-    AgentConfigRequest, AgentId, AgentMessage, AgentSessionSummary, AgentSummary, ArtifactInfo,
-    GitAccountRequest, GitAccountStatus, GitAccountSummary, GitAccountsResponse, GitProvider,
-    GitTokenKind, GithubAppSettingsRequest, GithubAppSettingsResponse, GithubSettingsResponse,
-    McpServerConfig, ModelCapabilities, ModelConfig, ModelInputItem, ModelReasoningConfig,
-    ModelReasoningVariant, ModelRequestPolicy, ModelWireApi, PlanHistoryEntry, ProjectId,
-    ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary, ProviderConfig, ProviderKind,
-    ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
-    ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind, SessionId,
-    SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskSummary, TokenUsage, TurnId,
-    default_true,
+    AgentConfigRequest, AgentId, AgentLogEntry, AgentMessage, AgentSessionSummary, AgentSummary,
+    ArtifactInfo, GitAccountRequest, GitAccountStatus, GitAccountSummary, GitAccountsResponse,
+    GitProvider, GitTokenKind, GithubAppSettingsRequest, GithubAppSettingsResponse,
+    GithubSettingsResponse, McpServerConfig, ModelCapabilities, ModelConfig, ModelInputItem,
+    ModelReasoningConfig, ModelReasoningVariant, ModelRequestPolicy, ModelWireApi,
+    PlanHistoryEntry, ProjectId, ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary,
+    ProviderConfig, ProviderKind, ProviderPreset, ProviderPresetsResponse, ProviderSecret,
+    ProviderSummary, ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind,
+    SessionId, SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskSummary, TokenUsage,
+    ToolTraceDetail, ToolTraceSummary, TurnId, default_true,
 };
 use rusqlite::Connection as SqliteConnection;
 use serde::{Deserialize, Serialize};
@@ -29,7 +29,7 @@ const SETTING_GITHUB_TOKEN: &str = "github_token";
 const SETTING_GITHUB_APP_CONFIG: &str = "github_app_config";
 const SETTING_GIT_ACCOUNTS: &str = "git_accounts";
 const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-const SCHEMA_VERSION: &str = "14";
+const SCHEMA_VERSION: &str = "15";
 const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const DEEPSEEK_V4_CONTEXT_TOKENS: u64 = 1_000_000;
@@ -152,6 +152,26 @@ pub struct PersistedTask {
     pub plan_history: Vec<PlanHistoryEntry>,
     pub reviews: Vec<TaskReview>,
     pub artifacts: Vec<ArtifactInfo>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AgentLogFilter {
+    pub session_id: Option<SessionId>,
+    pub turn_id: Option<TurnId>,
+    pub level: Option<String>,
+    pub category: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ToolTraceFilter {
+    pub session_id: Option<SessionId>,
+    pub turn_id: Option<TurnId>,
+    pub offset: usize,
+    pub limit: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -407,6 +427,48 @@ struct ServiceEventRecord {
     event_json: String,
 }
 
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "agent_log_entries"]
+struct AgentLogRecord {
+    #[key]
+    id: String,
+    #[index]
+    agent_id: String,
+    #[index]
+    session_id: Option<String>,
+    #[index]
+    turn_id: Option<String>,
+    level: String,
+    #[index]
+    category: String,
+    message: String,
+    details_json: String,
+    #[index]
+    timestamp: String,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "tool_trace_records"]
+struct ToolTraceRecord {
+    #[key]
+    call_id: String,
+    #[index]
+    agent_id: String,
+    #[index]
+    session_id: Option<String>,
+    #[index]
+    turn_id: Option<String>,
+    tool_name: String,
+    arguments_json: String,
+    output: String,
+    success: bool,
+    duration_ms: Option<i64>,
+    #[index]
+    started_at: String,
+    completed_at: Option<String>,
+    output_preview: String,
+}
+
 impl ConfigStore {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_config_path(path, Self::default_config_path()?).await
@@ -454,10 +516,10 @@ impl ConfigStore {
             if current_schema_version.as_deref() != Some(SCHEMA_VERSION) {
                 if matches!(
                     current_schema_version.as_deref(),
-                    Some("8" | "9" | "10" | "11" | "12" | "13")
+                    Some("8" | "9" | "10" | "11" | "12" | "13" | "14")
                 ) {
                     drop(db);
-                    migrate_to_v14(&path)?;
+                    migrate_to_v15(&path)?;
                     db = build_db(&path).await?;
                     set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
                 } else {
@@ -1616,6 +1678,18 @@ impl ConfigStore {
         .delete()
         .exec(&mut tx)
         .await?;
+        Query::<List<AgentLogRecord>>::filter(
+            AgentLogRecord::fields().agent_id().eq(agent_id.to_string()),
+        )
+        .delete()
+        .exec(&mut tx)
+        .await?;
+        Query::<List<ToolTraceRecord>>::filter(
+            ToolTraceRecord::fields().agent_id().eq(agent_id.to_string()),
+        )
+        .delete()
+        .exec(&mut tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1792,6 +1866,229 @@ impl ConfigStore {
             .await?;
         }
         Ok(old_sequences.len())
+    }
+
+    pub async fn append_agent_log_entry(&self, entry: &AgentLogEntry) -> Result<()> {
+        let mut db = self.db.clone();
+        toasty::create!(AgentLogRecord {
+            id: entry.id.to_string(),
+            agent_id: entry.agent_id.to_string(),
+            session_id: entry.session_id.map(|id| id.to_string()),
+            turn_id: entry.turn_id.map(|id| id.to_string()),
+            level: entry.level.clone(),
+            category: entry.category.clone(),
+            message: entry.message.clone(),
+            details_json: serde_json::to_string(&entry.details)?,
+            timestamp: entry.timestamp.to_rfc3339(),
+        })
+        .exec(&mut db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_agent_logs(
+        &self,
+        agent_id: AgentId,
+        filter: AgentLogFilter,
+    ) -> Result<Vec<AgentLogEntry>> {
+        let mut db = self.db.clone();
+        let mut rows = Query::<List<AgentLogRecord>>::filter(
+            AgentLogRecord::fields().agent_id().eq(agent_id.to_string()),
+        )
+        .exec(&mut db)
+        .await?;
+        if let Some(session_id) = filter.session_id {
+            let session_id = session_id.to_string();
+            rows.retain(|row| row.session_id.as_deref() == Some(session_id.as_str()));
+        }
+        if let Some(turn_id) = filter.turn_id {
+            let turn_id = turn_id.to_string();
+            rows.retain(|row| row.turn_id.as_deref() == Some(turn_id.as_str()));
+        }
+        if let Some(level) = filter.level {
+            rows.retain(|row| row.level == level);
+        }
+        if let Some(category) = filter.category {
+            rows.retain(|row| row.category == category);
+        }
+        if let Some(since) = filter.since {
+            let since = since.to_rfc3339();
+            rows.retain(|row| row.timestamp >= since);
+        }
+        if let Some(until) = filter.until {
+            let until = until.to_rfc3339();
+            rows.retain(|row| row.timestamp <= until);
+        }
+        rows.sort_by(|left, right| {
+            right
+                .timestamp
+                .cmp(&left.timestamp)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        rows.into_iter()
+            .skip(filter.offset)
+            .take(filter.limit.max(1))
+            .map(AgentLogRecord::into_entry)
+            .collect()
+    }
+
+    pub async fn prune_agent_logs_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+        let mut db = self.db.clone();
+        let cutoff = cutoff.to_rfc3339();
+        let rows = Query::<List<AgentLogRecord>>::all().exec(&mut db).await?;
+        let old_ids = rows
+            .into_iter()
+            .filter(|row| row.timestamp < cutoff)
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        for id in &old_ids {
+            Query::<List<AgentLogRecord>>::filter(AgentLogRecord::fields().id().eq(id.clone()))
+                .delete()
+                .exec(&mut db)
+                .await?;
+        }
+        Ok(old_ids.len())
+    }
+
+    pub async fn save_tool_trace_started(
+        &self,
+        trace: &ToolTraceDetail,
+        started_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut db = self.db.clone();
+        Query::<List<ToolTraceRecord>>::filter(
+            ToolTraceRecord::fields().call_id().eq(trace.call_id.clone()),
+        )
+        .delete()
+        .exec(&mut db)
+        .await?;
+        toasty::create!(ToolTraceRecord {
+            call_id: trace.call_id.clone(),
+            agent_id: trace.agent_id.to_string(),
+            session_id: trace.session_id.map(|id| id.to_string()),
+            turn_id: trace.turn_id.map(|id| id.to_string()),
+            tool_name: trace.tool_name.clone(),
+            arguments_json: serde_json::to_string(&trace.arguments)?,
+            output: String::new(),
+            success: false,
+            duration_ms: None,
+            started_at: started_at.to_rfc3339(),
+            completed_at: None,
+            output_preview: String::new(),
+        })
+        .exec(&mut db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn save_tool_trace_completed(
+        &self,
+        trace: &ToolTraceDetail,
+        started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut db = self.db.clone();
+        Query::<List<ToolTraceRecord>>::filter(
+            ToolTraceRecord::fields().call_id().eq(trace.call_id.clone()),
+        )
+        .delete()
+        .exec(&mut db)
+        .await?;
+        toasty::create!(ToolTraceRecord {
+            call_id: trace.call_id.clone(),
+            agent_id: trace.agent_id.to_string(),
+            session_id: trace.session_id.map(|id| id.to_string()),
+            turn_id: trace.turn_id.map(|id| id.to_string()),
+            tool_name: trace.tool_name.clone(),
+            arguments_json: serde_json::to_string(&trace.arguments)?,
+            output: trace.output.clone(),
+            success: trace.success,
+            duration_ms: trace.duration_ms.map(u64_to_i64),
+            started_at: started_at.to_rfc3339(),
+            completed_at: Some(completed_at.to_rfc3339()),
+            output_preview: trace.output_preview.clone(),
+        })
+        .exec(&mut db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn load_tool_trace(
+        &self,
+        agent_id: AgentId,
+        session_id: Option<SessionId>,
+        call_id: &str,
+    ) -> Result<Option<ToolTraceDetail>> {
+        let mut db = self.db.clone();
+        let row = Query::<List<ToolTraceRecord>>::filter(
+            ToolTraceRecord::fields().call_id().eq(call_id.to_string()),
+        )
+        .first()
+        .exec(&mut db)
+        .await?;
+        row.filter(|row| {
+            row.agent_id == agent_id.to_string()
+                && session_id.is_none_or(|id| {
+                    let id = id.to_string();
+                    row.session_id.as_deref() == Some(id.as_str())
+                })
+        })
+        .map(ToolTraceRecord::into_detail)
+        .transpose()
+    }
+
+    pub async fn list_tool_traces(
+        &self,
+        agent_id: AgentId,
+        filter: ToolTraceFilter,
+    ) -> Result<Vec<ToolTraceSummary>> {
+        let mut db = self.db.clone();
+        let mut rows = Query::<List<ToolTraceRecord>>::filter(
+            ToolTraceRecord::fields().agent_id().eq(agent_id.to_string()),
+        )
+        .exec(&mut db)
+        .await?;
+        if let Some(session_id) = filter.session_id {
+            let session_id = session_id.to_string();
+            rows.retain(|row| row.session_id.as_deref() == Some(session_id.as_str()));
+        }
+        if let Some(turn_id) = filter.turn_id {
+            let turn_id = turn_id.to_string();
+            rows.retain(|row| row.turn_id.as_deref() == Some(turn_id.as_str()));
+        }
+        rows.sort_by(|left, right| {
+            right
+                .started_at
+                .cmp(&left.started_at)
+                .then_with(|| right.call_id.cmp(&left.call_id))
+        });
+        rows.into_iter()
+            .skip(filter.offset)
+            .take(filter.limit.max(1))
+            .map(ToolTraceRecord::into_summary)
+            .collect()
+    }
+
+    pub async fn prune_tool_traces_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+        let mut db = self.db.clone();
+        let cutoff = cutoff.to_rfc3339();
+        let rows = Query::<List<ToolTraceRecord>>::all()
+            .exec(&mut db)
+            .await?;
+        let old_call_ids = rows
+            .into_iter()
+            .filter(|row| row.started_at < cutoff)
+            .map(|row| row.call_id)
+            .collect::<Vec<_>>();
+        for call_id in &old_call_ids {
+            Query::<List<ToolTraceRecord>>::filter(
+                ToolTraceRecord::fields().call_id().eq(call_id.clone()),
+            )
+            .delete()
+            .exec(&mut db)
+            .await?;
+        }
+        Ok(old_call_ids.len())
     }
 
     pub async fn load_runtime_snapshot(
@@ -2196,6 +2493,56 @@ impl ProjectReviewRunRecord {
     }
 }
 
+impl AgentLogRecord {
+    fn into_entry(self) -> Result<AgentLogEntry> {
+        Ok(AgentLogEntry {
+            id: parse_uuid(&self.id)?,
+            agent_id: parse_agent_id(&self.agent_id)?,
+            session_id: self.session_id.as_deref().map(parse_session_id).transpose()?,
+            turn_id: self.turn_id.as_deref().map(parse_turn_id).transpose()?,
+            level: self.level,
+            category: self.category,
+            message: self.message,
+            details: serde_json::from_str(&self.details_json)?,
+            timestamp: parse_utc(&self.timestamp)?,
+        })
+    }
+}
+
+impl ToolTraceRecord {
+    fn into_summary(self) -> Result<ToolTraceSummary> {
+        Ok(ToolTraceSummary {
+            call_id: self.call_id,
+            agent_id: parse_agent_id(&self.agent_id)?,
+            session_id: self.session_id.as_deref().map(parse_session_id).transpose()?,
+            turn_id: self.turn_id.as_deref().map(parse_turn_id).transpose()?,
+            tool_name: self.tool_name,
+            success: self.success,
+            started_at: parse_utc(&self.started_at)?,
+            completed_at: self.completed_at.as_deref().map(parse_utc).transpose()?,
+            duration_ms: self.duration_ms.map(i64_to_u64),
+            output_preview: self.output_preview,
+        })
+    }
+
+    fn into_detail(self) -> Result<ToolTraceDetail> {
+        Ok(ToolTraceDetail {
+            agent_id: parse_agent_id(&self.agent_id)?,
+            session_id: self.session_id.as_deref().map(parse_session_id).transpose()?,
+            turn_id: self.turn_id.as_deref().map(parse_turn_id).transpose()?,
+            call_id: self.call_id,
+            tool_name: self.tool_name,
+            arguments: serde_json::from_str(&self.arguments_json)?,
+            output: self.output,
+            success: self.success,
+            duration_ms: self.duration_ms.map(i64_to_u64),
+            started_at: Some(parse_utc(&self.started_at)?),
+            completed_at: self.completed_at.as_deref().map(parse_utc).transpose()?,
+            output_preview: self.output_preview,
+        })
+    }
+}
+
 async fn build_db(path: &Path) -> Result<Db> {
     let mut builder = Db::builder();
     builder.models(toasty::models!(
@@ -2211,12 +2558,14 @@ async fn build_db(path: &Path) -> Result<Db> {
         AgentMessageRecord,
         AgentHistoryRecord,
         ServiceEventRecord,
+        AgentLogRecord,
+        ToolTraceRecord,
     ));
     builder.max_pool_size(1);
     Ok(builder.build(Sqlite::open(path)).await?)
 }
 
-fn migrate_to_v14(path: &Path) -> Result<()> {
+fn migrate_to_v15(path: &Path) -> Result<()> {
     let conn = SqliteConnection::open(path)?;
     if !sqlite_column_exists(&conn, "agents", "project_id")? {
         conn.execute("ALTER TABLE agents ADD COLUMN project_id TEXT", [])?;
@@ -2276,6 +2625,7 @@ fn migrate_to_v14(path: &Path) -> Result<()> {
     )?;
     drop_project_path_columns(&conn)?;
     ensure_project_review_runs_table(&conn)?;
+    ensure_agent_log_tables(&conn)?;
     Ok(())
 }
 
@@ -2454,6 +2804,87 @@ fn ensure_project_review_runs_table(conn: &SqliteConnection) -> Result<()> {
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_project_review_runs_started_at
             ON project_review_runs(started_at)",
+        [],
+    )?;
+    Ok(())
+}
+
+fn ensure_agent_log_tables(conn: &SqliteConnection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_log_entries (
+            id TEXT PRIMARY KEY NOT NULL,
+            agent_id TEXT NOT NULL,
+            session_id TEXT,
+            turn_id TEXT,
+            level TEXT NOT NULL,
+            category TEXT NOT NULL,
+            message TEXT NOT NULL,
+            details_json TEXT NOT NULL DEFAULT '{}',
+            timestamp TEXT NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_log_entries_agent_id
+            ON agent_log_entries(agent_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_log_entries_session_id
+            ON agent_log_entries(session_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_log_entries_turn_id
+            ON agent_log_entries(turn_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_log_entries_category
+            ON agent_log_entries(category)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_log_entries_timestamp
+            ON agent_log_entries(timestamp)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS tool_trace_records (
+            call_id TEXT PRIMARY KEY NOT NULL,
+            agent_id TEXT NOT NULL,
+            session_id TEXT,
+            turn_id TEXT,
+            tool_name TEXT NOT NULL,
+            arguments_json TEXT NOT NULL DEFAULT '{}',
+            output TEXT NOT NULL DEFAULT '',
+            success BOOLEAN NOT NULL DEFAULT 0,
+            duration_ms BIGINT,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            output_preview TEXT NOT NULL DEFAULT ''
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_trace_records_agent_id
+            ON tool_trace_records(agent_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_trace_records_session_id
+            ON tool_trace_records(session_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_trace_records_turn_id
+            ON tool_trace_records(turn_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_trace_records_started_at
+            ON tool_trace_records(started_at)",
         [],
     )?;
     Ok(())
@@ -4166,6 +4597,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_logs_round_trip_filter_and_prune() {
+        let (_dir, store) = store().await;
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let old_time = Utc::now() - chrono::TimeDelta::days(6);
+        let new_time = Utc::now();
+
+        store
+            .append_agent_log_entry(&AgentLogEntry {
+                id: Uuid::new_v4(),
+                agent_id,
+                session_id: Some(session_id),
+                turn_id: Some(turn_id),
+                level: "info".to_string(),
+                category: "tool".to_string(),
+                message: "tool started".to_string(),
+                details: json!({ "call_id": "call_1" }),
+                timestamp: new_time,
+            })
+            .await
+            .expect("save new log");
+        store
+            .append_agent_log_entry(&AgentLogEntry {
+                id: Uuid::new_v4(),
+                agent_id,
+                session_id: None,
+                turn_id: None,
+                level: "warn".to_string(),
+                category: "model".to_string(),
+                message: "old".to_string(),
+                details: json!({}),
+                timestamp: old_time,
+            })
+            .await
+            .expect("save old log");
+
+        let logs = store
+            .list_agent_logs(
+                agent_id,
+                AgentLogFilter {
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    level: Some("info".to_string()),
+                    category: Some("tool".to_string()),
+                    limit: 100,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list logs");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].message, "tool started");
+        assert_eq!(logs[0].details["call_id"], "call_1");
+
+        let removed = store
+            .prune_agent_logs_before(Utc::now() - chrono::TimeDelta::days(5))
+            .await
+            .expect("prune logs");
+        assert_eq!(removed, 1);
+        let remaining = store
+            .list_agent_logs(
+                agent_id,
+                AgentLogFilter {
+                    limit: 100,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("remaining logs");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].category, "tool");
+    }
+
+    #[tokio::test]
+    async fn tool_traces_round_trip_filter_and_prune() {
+        let (_dir, store) = store().await;
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let old_time = Utc::now() - chrono::TimeDelta::days(6);
+        let new_time = Utc::now();
+
+        let trace = ToolTraceDetail {
+            agent_id,
+            session_id: Some(session_id),
+            turn_id: Some(turn_id),
+            call_id: "call_1".to_string(),
+            tool_name: "container_exec".to_string(),
+            arguments: json!({ "command": "printf hi" }),
+            output: r#"{"status":0,"stdout":"hi","stderr":""}"#.to_string(),
+            success: true,
+            duration_ms: Some(42),
+            started_at: Some(new_time),
+            completed_at: Some(new_time),
+            output_preview: "hi".to_string(),
+        };
+        store
+            .save_tool_trace_started(&trace, new_time)
+            .await
+            .expect("save start");
+        store
+            .save_tool_trace_completed(&trace, new_time, new_time)
+            .await
+            .expect("save completed");
+        store
+            .save_tool_trace_completed(
+                &ToolTraceDetail {
+                    call_id: "call_old".to_string(),
+                    started_at: Some(old_time),
+                    completed_at: Some(old_time),
+                    output_preview: "old".to_string(),
+                    ..trace.clone()
+                },
+                old_time,
+                old_time,
+            )
+            .await
+            .expect("save old");
+
+        let summaries = store
+            .list_tool_traces(
+                agent_id,
+                ToolTraceFilter {
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    limit: 100,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list traces");
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].call_id, "call_1");
+        assert_eq!(summaries[0].duration_ms, Some(42));
+
+        let loaded = store
+            .load_tool_trace(agent_id, Some(session_id), "call_1")
+            .await
+            .expect("load trace")
+            .expect("trace");
+        assert_eq!(loaded.arguments["command"], "printf hi");
+        assert_eq!(loaded.output_preview, "hi");
+
+        let removed = store
+            .prune_tool_traces_before(Utc::now() - chrono::TimeDelta::days(5))
+            .await
+            .expect("prune traces");
+        assert_eq!(removed, 1);
+        let remaining = store
+            .list_tool_traces(
+                agent_id,
+                ToolTraceFilter {
+                    limit: 100,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("remaining traces");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].call_id, "call_1");
+    }
+
+    #[tokio::test]
     async fn delete_project_removes_review_runs() {
         let (_dir, store) = store().await;
         let project_id = Uuid::new_v4();
@@ -4597,6 +5192,14 @@ mod tests {
         assert!(
             sqlite_table_exists(&conn, "project_review_runs").expect("table check"),
             "project_review_runs should be added during v13 -> v14 migration"
+        );
+        assert!(
+            sqlite_table_exists(&conn, "agent_log_entries").expect("table check"),
+            "agent_log_entries should be added during v14 -> v15 migration"
+        );
+        assert!(
+            sqlite_table_exists(&conn, "tool_trace_records").expect("table check"),
+            "tool_trace_records should be added during v14 -> v15 migration"
         );
     }
 

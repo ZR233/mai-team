@@ -8,29 +8,30 @@ use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient};
 use mai_mcp::{McpAgentManager, McpTool};
 use mai_model::{ModelRequest, ModelTurnState, ResponsesClient};
 use mai_protocol::{
-    AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentMessage,
-    AgentModelPreference, AgentProfilesResponse, AgentRole, AgentSessionSummary, AgentStatus,
-    AgentSummary, ArtifactInfo, ContextUsage, CreateAgentRequest, CreateProjectRequest,
-    GitAccountRequest, GitAccountResponse, GitAccountStatus, GitAccountSummary,
-    GitAccountsResponse, GitTokenKind, GithubAppManifestAccountType, GithubAppManifestStartRequest,
-    GithubAppManifestStartResponse, GithubAppSettingsRequest, GithubAppSettingsResponse,
-    GithubInstallationSummary, GithubInstallationsResponse, GithubRepositoriesResponse,
-    GithubRepositorySummary, McpServerConfig, McpServerScope, McpServerTransport, MessageRole,
-    ModelConfig, ModelContentItem, ModelInputItem, ModelOutputItem, ModelToolCall,
-    PlanHistoryEntry, PlanStatus, ProjectCloneStatus, ProjectDetail, ProjectId,
-    ProjectReviewOutcome, ProjectReviewRunDetail, ProjectReviewRunStatus, ProjectReviewRunSummary,
+    AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentLogEntry,
+    AgentLogsResponse, AgentMessage, AgentModelPreference, AgentProfilesResponse, AgentRole,
+    AgentSessionSummary, AgentStatus, AgentSummary, ArtifactInfo, ContextUsage,
+    CreateAgentRequest, CreateProjectRequest, GitAccountRequest, GitAccountResponse,
+    GitAccountStatus, GitAccountSummary, GitAccountsResponse, GitTokenKind,
+    GithubAppManifestAccountType, GithubAppManifestStartRequest, GithubAppManifestStartResponse,
+    GithubAppSettingsRequest, GithubAppSettingsResponse, GithubInstallationSummary,
+    GithubInstallationsResponse, GithubRepositoriesResponse, GithubRepositorySummary,
+    McpServerConfig, McpServerScope, McpServerTransport, MessageRole, ModelConfig,
+    ModelContentItem, ModelInputItem, ModelOutputItem, ModelToolCall, PlanHistoryEntry,
+    PlanStatus, ProjectCloneStatus, ProjectDetail, ProjectId, ProjectReviewOutcome,
+    ProjectReviewRunDetail, ProjectReviewRunStatus, ProjectReviewRunSummary,
     ProjectReviewRunsResponse, ProjectReviewStatus, ProjectStatus, ProjectSummary,
     RepositoryPackageSummary, RepositoryPackagesResponse, ResolvedAgentModelPreference,
     RuntimeDefaultsResponse, SendMessageRequest, ServiceEvent, ServiceEventKind, SessionId,
     SkillActivationInfo, SkillScope, SkillsConfigRequest, SkillsListResponse, TaskDetail, TaskId,
-    TaskPlan, TaskReview, TaskStatus, TaskSummary, TodoItem, TokenUsage, ToolTraceDetail, TurnId,
-    TurnStatus, UpdateAgentRequest, UpdateProjectRequest, UserInputOption, UserInputQuestion, now,
-    preview,
+    TaskPlan, TaskReview, TaskStatus, TaskSummary, TodoItem, TokenUsage, ToolTraceDetail,
+    ToolTraceListResponse, TurnId, TurnStatus, UpdateAgentRequest, UpdateProjectRequest,
+    UserInputOption, UserInputQuestion, now, preview,
 };
 use mai_skills::{
     SkillInjections, SkillInput, SkillSelection, SkillsManager, render_available_response,
 };
-use mai_store::{ConfigStore, ProviderSelection};
+use mai_store::{AgentLogFilter, ConfigStore, ProviderSelection, ToolTraceFilter};
 use mai_tools::{RoutedTool, build_tool_definitions_with_filter, route_tool};
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use serde::de::DeserializeOwned;
@@ -2176,6 +2177,13 @@ impl AgentRuntime {
         session_id: Option<SessionId>,
         call_id: String,
     ) -> Result<ToolTraceDetail> {
+        if let Some(trace) = self
+            .store
+            .load_tool_trace(agent_id, session_id, &call_id)
+            .await?
+        {
+            return Ok(trace);
+        }
         let agent = self.agent(agent_id).await?;
         let (session_id, history) = {
             let sessions = agent.sessions.lock().await;
@@ -2232,12 +2240,40 @@ impl AgentRuntime {
             .tool_event_metadata(agent_id, session_id, &call_id)
             .await;
         Ok(ToolTraceDetail {
+            agent_id,
+            session_id: Some(session_id),
+            turn_id: None,
             call_id,
             tool_name,
             arguments: arguments.unwrap_or_else(|| json!({})),
             success: event_success.unwrap_or(!output.is_empty()),
+            output_preview: trace_preview_output(&output, 500),
             output,
             duration_ms,
+            started_at: None,
+            completed_at: None,
+        })
+    }
+
+    pub async fn agent_logs(
+        &self,
+        agent_id: AgentId,
+        filter: AgentLogFilter,
+    ) -> Result<AgentLogsResponse> {
+        self.agent(agent_id).await?;
+        Ok(AgentLogsResponse {
+            logs: self.store.list_agent_logs(agent_id, filter).await?,
+        })
+    }
+
+    pub async fn tool_traces(
+        &self,
+        agent_id: AgentId,
+        filter: ToolTraceFilter,
+    ) -> Result<ToolTraceListResponse> {
+        self.agent(agent_id).await?;
+        Ok(ToolTraceListResponse {
+            tool_calls: self.store.list_tool_traces(agent_id, filter).await?,
         })
     }
 
@@ -2735,12 +2771,32 @@ impl AgentRuntime {
             turn_id,
         })
         .await;
+        self.record_agent_log(
+            agent_id,
+            Some(session_id),
+            Some(turn_id),
+            "info",
+            "turn",
+            "turn started",
+            json!({}),
+        )
+        .await;
 
         if let Err(err) = self.refresh_project_skills_for_agent(&agent).await {
             if matches!(err, RuntimeError::TurnCancelled) {
                 return Err(err);
             }
             tracing::warn!(agent_id = %agent_id, "failed to refresh project skills before turn: {err}");
+            self.record_agent_log(
+                agent_id,
+                Some(session_id),
+                Some(turn_id),
+                "warn",
+                "skills",
+                "project skill refresh failed",
+                json!({ "error": err.to_string() }),
+            )
+            .await;
         }
         let skills_config = self.store.load_skills_config().await?;
         let skills_manager = self.skills_manager_for_agent(&agent).await?;
@@ -2755,6 +2811,16 @@ impl AgentRuntime {
                 return Err(err);
             }
             tracing::warn!("auto context compaction failed before user message: {err}");
+            self.record_agent_log(
+                agent_id,
+                Some(session_id),
+                Some(turn_id),
+                "warn",
+                "context",
+                "auto context compaction failed",
+                json!({ "stage": "before_user_message", "error": err.to_string() }),
+            )
+            .await;
         }
         self.record_message(
             &agent,
@@ -2809,6 +2875,16 @@ impl AgentRuntime {
                 skills: skill_activation_info(&skill_injections, &container_skill_paths),
             })
             .await;
+            self.record_agent_log(
+                agent_id,
+                Some(session_id),
+                Some(turn_id),
+                "info",
+                "skills",
+                "skills activated",
+                json!({ "count": skill_injections.items.len() }),
+            )
+            .await;
         }
         self.inject_project_mcp_tools(&agent, agent_id, session_id, &cancellation_token)
             .await?;
@@ -2859,6 +2935,16 @@ impl AgentRuntime {
                     return Err(err);
                 }
                 tracing::warn!("auto context compaction failed before model request: {err}");
+                self.record_agent_log(
+                    agent_id,
+                    Some(session_id),
+                    Some(turn_id),
+                    "warn",
+                    "context",
+                    "auto context compaction failed",
+                    json!({ "stage": "before_model_request", "error": err.to_string() }),
+                )
+                .await;
             }
             let mut history = self.session_history(&agent, agent_id, session_id).await?;
             if turn_model_state.previous_response_id.is_none()
@@ -2889,6 +2975,21 @@ impl AgentRuntime {
                         RuntimeError::Model(err)
                     }
                 })?;
+            self.record_agent_log(
+                agent_id,
+                Some(session_id),
+                Some(turn_id),
+                "info",
+                "model",
+                "model response received",
+                json!({
+                    "provider_id": provider_id,
+                    "model": model_name,
+                    "output_items": response.output.len(),
+                    "usage": response.usage,
+                }),
+            )
+            .await;
 
             if let Some(usage) = response.usage {
                 {
@@ -3090,6 +3191,40 @@ impl AgentRuntime {
                 }
                 let arguments_preview = trace_preview_value(&arguments, 500);
                 let inline_arguments = inline_event_arguments(&arguments);
+                let trace_arguments = arguments.clone();
+                let started_wall_time = now();
+                self.record_agent_log(
+                    agent_id,
+                    Some(session_id),
+                    Some(turn_id),
+                    "info",
+                    "tool",
+                    "tool started",
+                    json!({
+                        "call_id": call_id.as_str(),
+                        "tool_name": name.as_str(),
+                        "arguments_preview": arguments_preview.as_str(),
+                    }),
+                )
+                .await;
+                self.record_tool_trace_started(
+                    ToolTraceDetail {
+                        agent_id,
+                        session_id: Some(session_id),
+                        turn_id: Some(turn_id),
+                        call_id: call_id.clone(),
+                        tool_name: name.clone(),
+                        arguments: trace_arguments.clone(),
+                        output: String::new(),
+                        success: false,
+                        duration_ms: None,
+                        started_at: Some(started_wall_time),
+                        completed_at: None,
+                        output_preview: String::new(),
+                    },
+                    started_wall_time,
+                )
+                .await;
                 self.publish(ServiceEventKind::ToolStarted {
                     agent_id,
                     session_id: Some(session_id),
@@ -3107,7 +3242,7 @@ impl AgentRuntime {
                         agent_id,
                         turn_id,
                         &name,
-                        arguments,
+                        arguments.clone(),
                         cancellation_token.clone(),
                     )
                     .await;
@@ -3134,6 +3269,43 @@ impl AgentRuntime {
                     },
                 )
                 .await?;
+                let completed_wall_time = now();
+                let output_preview = trace_preview_output(&execution.output, 500);
+                self.record_tool_trace_completed(
+                    ToolTraceDetail {
+                        agent_id,
+                        session_id: Some(session_id),
+                        turn_id: Some(turn_id),
+                        call_id: call_id.clone(),
+                        tool_name: name.clone(),
+                        arguments: trace_arguments,
+                        output: execution.output.clone(),
+                        success: execution.success,
+                        duration_ms: Some(duration_ms),
+                        started_at: Some(started_wall_time),
+                        completed_at: Some(completed_wall_time),
+                        output_preview: output_preview.clone(),
+                    },
+                    started_wall_time,
+                    completed_wall_time,
+                )
+                .await;
+                self.record_agent_log(
+                    agent_id,
+                    Some(session_id),
+                    Some(turn_id),
+                    if execution.success { "info" } else { "warn" },
+                    "tool",
+                    "tool completed",
+                    json!({
+                        "call_id": call_id.as_str(),
+                        "tool_name": name.as_str(),
+                        "success": execution.success,
+                        "duration_ms": duration_ms,
+                        "output_preview": output_preview.as_str(),
+                    }),
+                )
+                .await;
                 self.publish(ServiceEventKind::ToolCompleted {
                     agent_id,
                     session_id: Some(session_id),
@@ -3141,7 +3313,7 @@ impl AgentRuntime {
                     call_id,
                     tool_name: name,
                     success: execution.success,
-                    output_preview: trace_preview_output(&execution.output, 500),
+                    output_preview,
                     duration_ms: Some(duration_ms),
                 })
                 .await;
@@ -4493,12 +4665,23 @@ impl AgentRuntime {
             }
         }
         self.persist_agent(agent).await?;
+        let turn_status = result.status.clone();
         self.publish(ServiceEventKind::TurnCompleted {
             agent_id,
             session_id: Some(session_id),
             turn_id,
-            status: result.status,
+            status: turn_status.clone(),
         })
+        .await;
+        self.record_agent_log(
+            agent_id,
+            Some(session_id),
+            Some(turn_id),
+            "info",
+            "turn",
+            "turn completed",
+            json!({ "status": turn_status }),
+        )
         .await;
         self.publish(ServiceEventKind::AgentStatusChanged {
             agent_id,
@@ -4670,6 +4853,53 @@ impl AgentRuntime {
         Ok(())
     }
 
+    async fn record_agent_log(
+        &self,
+        agent_id: AgentId,
+        session_id: Option<SessionId>,
+        turn_id: Option<TurnId>,
+        level: &str,
+        category: &str,
+        message: &str,
+        details: Value,
+    ) {
+        let entry = AgentLogEntry {
+            id: Uuid::new_v4(),
+            agent_id,
+            session_id,
+            turn_id,
+            level: level.to_string(),
+            category: category.to_string(),
+            message: message.to_string(),
+            details,
+            timestamp: now(),
+        };
+        if let Err(err) = self.store.append_agent_log_entry(&entry).await {
+            tracing::warn!(agent_id = %agent_id, "failed to persist agent log entry: {err}");
+        }
+    }
+
+    async fn record_tool_trace_started(&self, trace: ToolTraceDetail, started_at: DateTime<Utc>) {
+        if let Err(err) = self.store.save_tool_trace_started(&trace, started_at).await {
+            tracing::warn!(agent_id = %trace.agent_id, call_id = %trace.call_id, "failed to persist tool trace start: {err}");
+        }
+    }
+
+    async fn record_tool_trace_completed(
+        &self,
+        trace: ToolTraceDetail,
+        started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+    ) {
+        if let Err(err) = self
+            .store
+            .save_tool_trace_completed(&trace, started_at, completed_at)
+            .await
+        {
+            tracing::warn!(agent_id = %trace.agent_id, call_id = %trace.call_id, "failed to persist tool trace completion: {err}");
+        }
+    }
+
     async fn maybe_auto_compact(
         self: &Arc<Self>,
         agent: &Arc<AgentRecord>,
@@ -4766,6 +4996,19 @@ impl AgentRuntime {
             tokens_before,
             summary_preview: preview(&summary_text, COMPACT_SUMMARY_PREVIEW_CHARS),
         })
+        .await;
+        self.record_agent_log(
+            agent_id,
+            Some(session_id),
+            Some(turn_id),
+            "info",
+            "context",
+            "context compacted",
+            json!({
+                "tokens_before": tokens_before,
+                "summary_preview": preview(&summary_text, COMPACT_SUMMARY_PREVIEW_CHARS),
+            }),
+        )
         .await;
         Ok(())
     }
@@ -5882,10 +6125,14 @@ impl AgentRuntime {
         let cutoff = Utc::now() - TimeDelta::days(PROJECT_REVIEW_HISTORY_RETENTION_DAYS);
         let removed_runs = self.store.prune_project_review_runs_before(cutoff).await?;
         let removed_events = self.store.prune_service_events_before(cutoff).await?;
-        if removed_runs > 0 || removed_events > 0 {
+        let removed_logs = self.store.prune_agent_logs_before(cutoff).await?;
+        let removed_traces = self.store.prune_tool_traces_before(cutoff).await?;
+        if removed_runs > 0 || removed_events > 0 || removed_logs > 0 || removed_traces > 0 {
             tracing::info!(
                 removed_runs,
                 removed_events,
+                removed_logs,
+                removed_traces,
                 "pruned project review history"
             );
         }
@@ -8444,6 +8691,11 @@ fn selected_session(
 
 fn short_id(id: AgentId) -> String {
     id.to_string().chars().take(8).collect()
+}
+
+#[cfg(test)]
+fn extract_skill_mentions(text: &str) -> Vec<String> {
+    mai_skills::extract_skill_mentions(text)
 }
 
 fn skill_activation_info(
@@ -11108,6 +11360,72 @@ esac
         assert_eq!(trace.output, r#"{"status":0,"stdout":"hello","stderr":""}"#);
         assert!(trace.success);
         assert_eq!(trace.duration_ms, Some(27));
+        assert_eq!(trace.agent_id, agent_id);
+        assert_eq!(trace.session_id, Some(session_id));
+        assert!(trace.output_preview.contains("\"stdout\": \"hello\""));
+    }
+
+    #[tokio::test]
+    async fn tool_trace_prefers_persisted_trace_records() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let store = ConfigStore::open_with_config_path(&db_path, &config_path)
+            .await
+            .expect("open store");
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let timestamp = now();
+        let summary = test_agent_summary(agent_id, None);
+        store.save_agent(&summary, None).await.expect("save agent");
+        save_test_session(&store, agent_id, session_id).await;
+        store
+            .save_tool_trace_completed(
+                &ToolTraceDetail {
+                    agent_id,
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    call_id: "call_persisted".to_string(),
+                    tool_name: "container_exec".to_string(),
+                    arguments: json!({ "command": "printf persisted" }),
+                    output: r#"{"status":0,"stdout":"persisted","stderr":""}"#.to_string(),
+                    success: true,
+                    duration_ms: Some(99),
+                    started_at: Some(timestamp),
+                    completed_at: Some(timestamp),
+                    output_preview: "persisted".to_string(),
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .expect("save trace");
+        drop(store);
+
+        let runtime = AgentRuntime::new(
+            DockerClient::new("unused"),
+            ResponsesClient::new(),
+            Arc::new(
+                ConfigStore::open_with_config_path(&db_path, &config_path)
+                    .await
+                    .expect("reopen store"),
+            ),
+            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
+        )
+        .await
+        .expect("runtime");
+
+        let trace = runtime
+            .tool_trace(agent_id, Some(session_id), "call_persisted".to_string())
+            .await
+            .expect("trace");
+        assert_eq!(trace.turn_id, Some(turn_id));
+        assert_eq!(trace.arguments["command"], "printf persisted");
+        assert_eq!(trace.duration_ms, Some(99));
+        assert_eq!(trace.output_preview, "persisted");
+        assert_eq!(trace.started_at, Some(timestamp));
+        assert_eq!(trace.completed_at, Some(timestamp));
     }
 
     #[tokio::test]

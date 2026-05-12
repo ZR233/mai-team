@@ -797,13 +797,67 @@ pub struct CreateSessionResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentLogEntry {
+    pub id: Uuid,
+    pub agent_id: AgentId,
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+    #[serde(default)]
+    pub turn_id: Option<TurnId>,
+    pub level: String,
+    pub category: String,
+    pub message: String,
+    #[serde(default)]
+    pub details: Value,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentLogsResponse {
+    pub logs: Vec<AgentLogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolTraceSummary {
+    pub call_id: String,
+    pub agent_id: AgentId,
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+    #[serde(default)]
+    pub turn_id: Option<TurnId>,
+    pub tool_name: String,
+    pub success: bool,
+    pub started_at: DateTime<Utc>,
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    pub output_preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolTraceListResponse {
+    pub tool_calls: Vec<ToolTraceSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolTraceDetail {
+    pub agent_id: AgentId,
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+    #[serde(default)]
+    pub turn_id: Option<TurnId>,
     pub call_id: String,
     pub tool_name: String,
     pub arguments: Value,
     pub output: String,
     pub success: bool,
     pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+    pub output_preview: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
