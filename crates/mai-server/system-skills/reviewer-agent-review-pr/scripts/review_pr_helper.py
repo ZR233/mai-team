@@ -111,17 +111,24 @@ def load_json_path(path: str | None) -> Any:
 
 def unwrap_mcp_json(value: Any) -> Any:
     """Accept raw JSON or common MCP wrappers containing JSON text."""
-    if isinstance(value, dict) and isinstance(value.get("content"), list):
-        texts = [
-            item.get("text")
-            for item in value["content"]
-            if isinstance(item, dict) and isinstance(item.get("text"), str)
-        ]
-        if len(texts) == 1:
+    if isinstance(value, dict):
+        for key in ("content", "contents"):
+            if isinstance(value.get(key), list):
+                texts = [
+                    item.get("text")
+                    for item in value[key]
+                    if isinstance(item, dict) and isinstance(item.get("text"), str)
+                ]
+                if len(texts) == 1:
+                    try:
+                        return json.loads(texts[0])
+                    except json.JSONDecodeError:
+                        return texts[0]
+        if isinstance(value.get("text"), str):
             try:
-                return json.loads(texts[0])
+                return json.loads(value["text"])
             except json.JSONDecodeError:
-                return texts[0]
+                return value
     if isinstance(value, dict) and isinstance(value.get("text"), str):
         try:
             return json.loads(value["text"])
@@ -162,9 +169,24 @@ def select_pr(
             continue
 
         review_items = reviews_by_pr.get(number, [])
-        last_review_at = latest_user_review_at(review_items, login)
+        last_review = latest_user_review(review_items, login)
+        last_review_at = parse_time(first_string(last_review, "submitted_at", "submittedAt", "created_at", "createdAt"))
+        last_review_commit_id = first_string(last_review, "commit_id", "commitId")
         commit_at = latest_commit_at(detail)
-        if last_review_at is not None and commit_at is None:
+        current_head_sha = head_sha(detail)
+        if (
+            last_review is not None
+            and current_head_sha is not None
+            and last_review_commit_id is not None
+            and current_head_sha == last_review_commit_id
+        ):
+            skipped.append(skip(number, "already_reviewed_latest_commit"))
+            continue
+        if (
+            last_review_at is not None
+            and commit_at is None
+            and (current_head_sha is None or last_review_commit_id is None)
+        ):
             skipped.append(skip(number, "missing_latest_commit_time"))
             continue
         if last_review_at is not None and commit_at is not None and commit_at <= last_review_at:
@@ -201,13 +223,40 @@ def normalize_list(value: Any, list_keys: tuple[str, ...]) -> list[Any]:
     if value is None:
         return []
     if isinstance(value, list):
-        return [unwrap_mcp_json(item) for item in value]
+        items = []
+        for item in value:
+            if isinstance(item, dict) and "node" in item:
+                items.append(unwrap_mcp_json(item["node"]))
+            else:
+                items.append(unwrap_mcp_json(item))
+        return items
     if isinstance(value, dict):
         for key in list_keys:
-            if isinstance(value.get(key), list):
-                return [unwrap_mcp_json(item) for item in value[key]]
-        if isinstance(value.get("data"), dict):
-            return normalize_list(value["data"], list_keys)
+            if key in value:
+                items = normalize_list(value[key], list_keys)
+                if items or value[key] == []:
+                    return items
+        if isinstance(value.get("edges"), list):
+            return normalize_list(value["edges"], list_keys)
+        for container_key in (
+            "data",
+            "repository",
+            "organization",
+            "viewer",
+            "pullRequest",
+            "pullRequests",
+            "reviews",
+            "reviewRequests",
+            "files",
+            "statusCheckRollup",
+            "checkSuites",
+            "checkRuns",
+        ):
+            nested = value.get(container_key)
+            if isinstance(nested, (dict, list)):
+                items = normalize_list(nested, list_keys)
+                if items:
+                    return items
     return []
 
 
@@ -315,12 +364,17 @@ def is_review_requested(value: dict[str, Any], login: str) -> bool:
 
 def collect_logins(value: Any) -> set[str]:
     value = unwrap_mcp_json(value)
+    if isinstance(value, str):
+        return {value}
     if isinstance(value, dict):
         if isinstance(value.get("login"), str):
             return {value["login"]}
         out: set[str] = set()
-        for key in ("nodes", "items", "users", "reviewers"):
+        for key in ("nodes", "items", "users", "reviewers", "edges"):
             out |= collect_logins(value.get(key))
+        node = value.get("node")
+        if node is not None:
+            out |= collect_logins(node)
         requested_reviewer = value.get("requestedReviewer")
         if requested_reviewer is not None:
             out |= collect_logins(requested_reviewer)
@@ -370,6 +424,26 @@ def ci_state(value: dict[str, Any]) -> str:
 
 
 def latest_user_review_at(reviews: list[Any], login: str) -> dt.datetime | None:
+    review = latest_user_review(reviews, login)
+    return parse_time(first_string(review, "submitted_at", "submittedAt", "created_at", "createdAt"))
+
+
+def latest_user_review(reviews: list[Any], login: str) -> dict[str, Any] | None:
+    latest: tuple[dt.datetime, dict[str, Any]] | None = None
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        if author_login(review) != login:
+            continue
+        submitted = parse_time(first_string(review, "submitted_at", "submittedAt", "created_at", "createdAt"))
+        if submitted is None:
+            continue
+        if latest is None or submitted > latest[0]:
+            latest = (submitted, review)
+    return latest[1] if latest is not None else None
+
+
+def latest_user_review_at_legacy(reviews: list[Any], login: str) -> dt.datetime | None:
     times = []
     for review in reviews:
         if not isinstance(review, dict):
@@ -394,6 +468,22 @@ def latest_commit_at(value: dict[str, Any]) -> dt.datetime | None:
             parsed = parse_time(first_string(commit, "committedDate", "committed_at", "date"))
             if parsed is not None:
                 return parsed
+    head_ref = value.get("headRef")
+    if isinstance(head_ref, dict):
+        target = head_ref.get("target")
+        if isinstance(target, dict):
+            parsed = parse_time(first_string(target, "committedDate", "committed_at", "pushedDate", "date"))
+            if parsed is not None:
+                return parsed
+            history = normalize_list(target.get("history"), list_keys=("nodes", "items", "edges"))
+            times = []
+            for item in history:
+                if isinstance(item, dict):
+                    parsed = parse_time(first_string(item, "committedDate", "committed_at", "pushedDate", "date"))
+                    if parsed is not None:
+                        times.append(parsed)
+            if times:
+                return max(times)
     commits = normalize_list(value.get("commits"), list_keys=("nodes", "items", "commits"))
     times = []
     for item in commits:
@@ -411,6 +501,14 @@ def head_sha(value: dict[str, Any]) -> str | None:
         for key in ("sha", "oid"):
             if isinstance(head.get(key), str):
                 return head[key]
+    head_ref = value.get("headRef")
+    if isinstance(head_ref, dict):
+        for key in ("oid",):
+            if isinstance(head_ref.get(key), str):
+                return head_ref[key]
+        target = head_ref.get("target")
+        if isinstance(target, dict) and isinstance(target.get("oid"), str):
+            return target["oid"]
     return first_string(value, "head_sha", "headSha", "headRefOid")
 
 
@@ -654,6 +752,141 @@ class ReviewPrHelperTests(unittest.TestCase):
             "me",
         )
         self.assertEqual(result["selected_pr"]["number"], 8)
+
+    def test_select_pr_accepts_graphql_connection_wrappers(self) -> None:
+        result = select_pr(
+            {
+                "data": {
+                    "repository": {
+                        "pullRequests": {
+                            "nodes": [
+                                {
+                                    "number": 10,
+                                    "author": {"login": "alice"},
+                                    "updatedAt": "2026-01-04T00:00:00Z",
+                                    "headRef": {
+                                        "target": {
+                                            "oid": "abc123",
+                                            "committedDate": "2026-01-04T00:00:00Z",
+                                        }
+                                    },
+                                    "checkRuns": {
+                                        "nodes": [{"status": "COMPLETED", "conclusion": "SUCCESS"}]
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                }
+            },
+            "me",
+        )
+        self.assertEqual(result["outcome"], "selected_pr")
+        self.assertEqual(result["selected_pr"]["number"], 10)
+        self.assertEqual(result["selected_pr"]["head_sha"], "abc123")
+
+    def test_changed_files_accepts_mcp_contents_wrapper(self) -> None:
+        names = changed_file_names(
+            {
+                "contents": [
+                    {
+                        "mimeType": "application/json",
+                        "text": json.dumps(
+                            {"files": [{"filename": "crates/demo/src/lib.rs"}, {"filename": "README.md"}]}
+                        ),
+                    }
+                ]
+            }
+        )
+        self.assertEqual(names, ["README.md", "crates/demo/src/lib.rs"])
+
+    def test_select_pr_uses_head_ref_commit_time_for_rereview(self) -> None:
+        result = select_pr(
+            [
+                {
+                    "number": 11,
+                    "author": {"login": "alice"},
+                    "updated_at": "2026-01-05T00:00:00Z",
+                    "headRef": {
+                        "target": {
+                            "committedDate": "2026-01-05T00:00:00Z",
+                            "oid": "def456",
+                        }
+                    },
+                    "check_runs": [{"status": "completed", "conclusion": "success"}],
+                }
+            ],
+            "me",
+            reviews={"11": [{"user": {"login": "me"}, "submitted_at": "2026-01-04T00:00:00Z"}]},
+        )
+        self.assertEqual(result["outcome"], "selected_pr")
+        self.assertEqual(result["selected_pr"]["head_sha"], "def456")
+
+    def test_select_pr_accepts_requested_reviewer_string_list(self) -> None:
+        result = select_pr(
+            [
+                {
+                    "number": 12,
+                    "author": {"login": "alice"},
+                    "updated_at": "2026-01-06T00:00:00Z",
+                    "requested_reviewers": ["me"],
+                    "check_runs": [{"status": "completed", "conclusion": "failure"}],
+                }
+            ],
+            "me",
+        )
+        self.assertEqual(result["outcome"], "selected_pr")
+        self.assertTrue(result["selected_pr"]["requested_review"])
+
+    def test_select_pr_uses_review_commit_id_when_commit_time_missing(self) -> None:
+        result = select_pr(
+            [
+                {
+                    "number": 13,
+                    "author": {"login": "alice"},
+                    "updated_at": "2026-01-07T00:00:00Z",
+                    "head": {"sha": "new-head"},
+                    "check_runs": [{"status": "completed", "conclusion": "success"}],
+                }
+            ],
+            "me",
+            reviews={
+                "13": [
+                    {
+                        "user": {"login": "me"},
+                        "commit_id": "old-head",
+                        "submitted_at": "2026-01-06T00:00:00Z",
+                    }
+                ]
+            },
+        )
+        self.assertEqual(result["outcome"], "selected_pr")
+        self.assertEqual(result["selected_pr"]["number"], 13)
+
+    def test_select_pr_skips_when_review_commit_matches_head(self) -> None:
+        result = select_pr(
+            [
+                {
+                    "number": 14,
+                    "author": {"login": "alice"},
+                    "updated_at": "2026-01-08T00:00:00Z",
+                    "head": {"sha": "same-head"},
+                    "check_runs": [{"status": "completed", "conclusion": "success"}],
+                }
+            ],
+            "me",
+            reviews={
+                "14": [
+                    {
+                        "user": {"login": "me"},
+                        "commit_id": "same-head",
+                        "submitted_at": "2026-01-07T00:00:00Z",
+                    }
+                ]
+            },
+        )
+        self.assertEqual(result["outcome"], "no_eligible_pr")
+        self.assertEqual(result["skipped"][0]["reason"], "already_reviewed_latest_commit")
 
     def test_changed_files_extracts_crates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

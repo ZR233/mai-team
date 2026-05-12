@@ -15,6 +15,8 @@ Mai refreshes `/workspace/repo` before this skill starts and fetches PR refs as 
 
 Use `scripts/review_pr_helper.py` for deterministic steps before doing review judgment. The script has no third-party dependencies and does not access the network.
 
+Important: save the raw GitHub MCP JSON responses exactly as returned and feed those files directly to the helper. Do not hand-normalize fields such as `requested_reviewers`, review `commit_id`, GraphQL `nodes`/`edges`, or MCP `content`/`contents` wrappers before invoking the helper.
+
 Preferred invocation:
 
 ```bash
@@ -53,7 +55,19 @@ If GitHub MCP tools are unavailable, return only:
 
 ### 2. Select One Eligible PR
 
-List open PRs with a visible GitHub MCP pull request listing tool, sorted by `updated_at` descending. Fetch PR details, checks/status, and current-user reviews where visible tools allow it.
+List open PRs with a visible GitHub MCP pull request listing tool, sorted by `updated_at` descending. In the current GitHub MCP surface, this normally means:
+
+- `list_pull_requests(owner=..., repo=..., state="open", sort="updated", direction="desc")`
+- `pull_request_read(..., method="get")`
+- `pull_request_read(..., method="get_reviews")`
+- `pull_request_read(..., method="get_check_runs")`
+
+Use the helper on the raw JSON files from those calls. The helper already understands the common GitHub MCP response shapes that matter in practice, including:
+
+- `requested_reviewers` as a list of login strings such as `["ZR233"]`
+- MCP text wrappers such as `content`, `contents`, or top-level `text`
+- GraphQL-style `nodes` / `edges`
+- re-review detection from review `commit_id` versus current PR head SHA when PR details do not expose a latest commit timestamp
 
 Save the MCP JSON outputs to files and run `select-pr`. The helper applies these fixed rules:
 
@@ -61,8 +75,10 @@ Save the MCP JSON outputs to files and run `select-pr`. The helper applies these
 - Skip draft PRs.
 - Accept PRs with completed passing CI.
 - If CI is pending or failed, accept only when the authenticated user is requested for review.
-- Re-review only if the latest commit is newer than this user's latest submitted review.
+- Re-review only if the latest commit is newer than this user's latest submitted review, or the current head SHA differs from the latest submitted review `commit_id`.
 - Prefer explicitly requested reviews, then most recently updated PR.
+
+Practical note: many PRs expose `mergeable_state: "unknown"` even when `get_check_runs` is available. Do not infer passing CI from `mergeable_state == "unknown"`; rely on actual check runs when possible and let the helper apply the fallback rules.
 
 If `select-pr` returns `no_eligible_pr`, finish with:
 
@@ -93,6 +109,8 @@ python3 scripts/review_pr_helper.py rust-plan --repo "$WORKTREE" --changed chang
 ```
 
 Run the commands in `rust-plan.json` when present. For Rust PRs, always run `cargo fmt --check` and clippy commands suggested by the helper; run tests for changed crates unless the repository clearly cannot support them in the current environment.
+
+When the repository is large and the GitHub MCP list response is sparse, prefer fetching details only for the PRs that are plausible candidates after `list_pull_requests` ordering and explicit review-request checks. The helper is designed to select from a small set of recent open PRs; you do not need to exhaustively fetch every open PR in a busy repository.
 
 Record exact validation failures. Treat these as blocking:
 
@@ -129,6 +147,8 @@ Keep the review body concise. Include validation results, similar-PR notes, and 
 ### 7. Submit the GitHub Review
 
 Submit through a visible GitHub MCP review-writing tool and follow its current schema exactly. Do not assume parameter names beyond the visible schema.
+
+In the current GitHub MCP surface, the review submission path is usually `pull_request_review_write`, with inline comments created through `add_comment_to_pending_review` after creating a pending review and before `submit_pending`. If the visible tool schema differs, follow the visible schema instead of these names.
 
 If no visible MCP tool can submit a pull request review, return a `failed` JSON result. If submission fails because the account is the PR author or GitHub rejects the event, leave a normal PR comment only when a visible comment tool is available; otherwise report the failure.
 
