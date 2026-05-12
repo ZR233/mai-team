@@ -2839,17 +2839,15 @@ fn mimo_model(id: &str, with_reasoning: bool) -> ModelConfig {
 
 fn mimo_context_tokens(id: &str) -> u64 {
     match id {
-        "mimo-v2.5-pro" | "mimo-v2-pro" => 256_000,
-        "mimo-v2.5" | "mimo-v2-omni" => 128_000,
-        "mimo-v2-flash" => 128_000,
+        "mimo-v2.5-pro" | "mimo-v2-pro" | "mimo-v2.5" => 1_000_000,
+        "mimo-v2-omni" | "mimo-v2-flash" => 256_000,
         _ => 128_000,
     }
 }
 
 fn mimo_output_tokens(id: &str) -> u64 {
     match id {
-        "mimo-v2.5-pro" | "mimo-v2-pro" => 131_072,
-        "mimo-v2.5" | "mimo-v2-omni" => 32_768,
+        "mimo-v2.5-pro" | "mimo-v2-pro" | "mimo-v2.5" | "mimo-v2-omni" => 131_072,
         "mimo-v2-flash" => 65_536,
         _ => 32_768,
     }
@@ -3603,19 +3601,34 @@ mod tests {
         assert_eq!(mimo_api.base_url, "https://api.xiaomimimo.com/v1");
         assert_eq!(mimo_tp.base_url, "https://token-plan-cn.xiaomimimo.com/v1");
         assert_eq!(mimo_api.default_model, "mimo-v2.5-pro");
+
+        for (id, context_tokens, output_tokens) in [
+            ("mimo-v2.5-pro", 1_000_000, 131_072),
+            ("mimo-v2.5", 1_000_000, 131_072),
+            ("mimo-v2-pro", 1_000_000, 131_072),
+            ("mimo-v2-omni", 256_000, 131_072),
+            ("mimo-v2-flash", 256_000, 65_536),
+        ] {
+            let model = mimo_api
+                .models
+                .iter()
+                .find(|model| model.id == id)
+                .expect("mimo model");
+            assert_eq!(model.context_tokens, context_tokens);
+            assert_eq!(model.output_tokens, output_tokens);
+        }
+
         let mimo_pro = mimo_api
             .models
             .iter()
             .find(|model| model.id == "mimo-v2.5-pro")
             .expect("mimo-v2.5-pro");
-        assert_eq!(mimo_pro.output_tokens, 131_072);
         assert!(mimo_pro.reasoning.is_some());
         let mimo_flash = mimo_api
             .models
             .iter()
             .find(|model| model.id == "mimo-v2-flash")
             .expect("mimo-v2-flash");
-        assert_eq!(mimo_flash.output_tokens, 65_536);
         assert!(mimo_flash.reasoning.is_none());
     }
 
