@@ -84,6 +84,7 @@ const PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL: &str =
     "mcp__github__pull_request_review_write";
 const PROJECT_GITHUB_CREATE_PULL_REQUEST_REVIEW_TOOL: &str =
     "mcp__github__create_pull_request_review";
+const CONTAINER_SKILLS_ROOT: &str = "/workspace/.mai-team/skills";
 const DEFAULT_SIDECAR_IMAGE: &str = "ghcr.io/zr233/mai-team-sidecar:latest";
 const COMPACT_USER_MESSAGE_MAX_CHARS: usize = 80_000;
 const COMPACT_SUMMARY_PREVIEW_CHARS: usize = 240;
@@ -264,6 +265,17 @@ struct ToolExecution {
     success: bool,
     output: String,
     ends_turn: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ContainerSkillPaths {
+    paths: HashMap<PathBuf, PathBuf>,
+}
+
+impl ContainerSkillPaths {
+    fn get(&self, path: &Path) -> Option<&PathBuf> {
+        self.paths.get(path)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2689,6 +2701,11 @@ impl AgentRuntime {
             }
             tracing::warn!(agent_id = %agent_id, "failed to refresh project skills before turn: {err}");
         }
+        let skills_config = self.store.load_skills_config().await?;
+        let skills_manager = self.skills_manager_for_agent(&agent).await?;
+        let container_skill_paths = self
+            .sync_agent_skills_to_container(&agent, &skills_manager, &skills_config)
+            .await?;
         if let Err(err) = self
             .maybe_auto_compact(&agent, agent_id, session_id, turn_id, &cancellation_token)
             .await
@@ -2722,8 +2739,6 @@ impl AgentRuntime {
         })
         .await;
 
-        let skills_config = self.store.load_skills_config().await?;
-        let skills_manager = self.skills_manager_for_agent(&agent).await?;
         let reserved_tool_names = {
             let mcp_tools = self.agent_mcp_tools(&agent).await;
             self.visible_tool_names(&agent, &mcp_tools)
@@ -2750,7 +2765,7 @@ impl AgentRuntime {
                 agent_id,
                 session_id: Some(session_id),
                 turn_id,
-                skills: skill_activation_info(&skill_injections),
+                skills: skill_activation_info(&skill_injections, &container_skill_paths),
             })
             .await;
         }
@@ -2783,6 +2798,7 @@ impl AgentRuntime {
                     &skill_injections,
                     &skills_config,
                     &mcp_tools,
+                    &container_skill_paths,
                 )
                 .await?
             };
@@ -2805,7 +2821,8 @@ impl AgentRuntime {
             }
             let mut history = self.session_history(&agent, agent_id, session_id).await?;
             if turn_model_state.previous_response_id.is_none()
-                && let Some(skill_fragment) = skill_user_fragment(&skill_injections)
+                && let Some(skill_fragment) =
+                    skill_user_fragment(&skill_injections, &container_skill_paths)
             {
                 history.push(skill_fragment);
             }
@@ -4310,6 +4327,7 @@ impl AgentRuntime {
         skill_injections: &SkillInjections,
         skills_config: &SkillsConfigRequest,
         mcp_tools: &[mai_mcp::McpTool],
+        container_skill_paths: &ContainerSkillPaths,
     ) -> Result<String> {
         let mut instructions = String::from(BASE_INSTRUCTIONS);
         if let Some(system_prompt) = &agent.system_prompt {
@@ -4320,9 +4338,12 @@ impl AgentRuntime {
         if let Some(project_id) = agent.summary.read().await.project_id {
             let mut response = skills_manager.list(skills_config)?;
             self.apply_project_skill_source_paths(project_id, &mut response);
+            apply_container_skill_paths(&mut response, container_skill_paths);
             instructions.push_str(&render_available_response(response));
         } else {
-            instructions.push_str(&skills_manager.render_available(skills_config)?);
+            let mut response = skills_manager.list(skills_config)?;
+            apply_container_skill_paths(&mut response, container_skill_paths);
+            instructions.push_str(&render_available_response(response));
         }
         if !skill_injections.warnings.is_empty() {
             instructions.push_str("\n\n## Skill Warnings\n");
@@ -4652,6 +4673,7 @@ impl AgentRuntime {
                 &SkillInjections::default(),
                 &skills_config,
                 &[],
+                &ContainerSkillPaths::default(),
             )
             .await?
         };
@@ -4825,6 +4847,78 @@ impl AgentRuntime {
         };
         self.refresh_project_skills_from_project_sidecar_if_ready(project_id)
             .await
+    }
+
+    async fn sync_agent_skills_to_container(
+        &self,
+        agent: &Arc<AgentRecord>,
+        skills_manager: &SkillsManager,
+        skills_config: &SkillsConfigRequest,
+    ) -> Result<ContainerSkillPaths> {
+        let agent_id = agent.summary.read().await.id;
+        let container_id = self.container_id(agent_id).await?;
+        let _project_skill_guard = self.project_skill_read_guard(agent).await;
+        let mut response = skills_manager.list(skills_config)?;
+        if let Some(project_id) = agent.summary.read().await.project_id {
+            self.apply_project_skill_source_paths(project_id, &mut response);
+        }
+        let skills = response
+            .skills
+            .into_iter()
+            .filter(|skill| {
+                skill.enabled
+                    && matches!(skill.scope, SkillScope::System | SkillScope::Project)
+                    && skill.path.parent().is_some()
+            })
+            .collect::<Vec<_>>();
+
+        let cleanup = self
+            .docker
+            .exec_shell(
+                &container_id,
+                &format!(
+                    "rm -rf {root} && mkdir -p {root}",
+                    root = shell_quote(CONTAINER_SKILLS_ROOT)
+                ),
+                Some("/"),
+                Some(10),
+            )
+            .await
+            .map_err(|err| {
+                RuntimeError::InvalidInput(format!(
+                    "failed to sync skills into agent container: {err}"
+                ))
+            })?;
+        if cleanup.status != 0 {
+            let message = preview(
+                format!("{}\n{}", cleanup.stderr, cleanup.stdout).trim(),
+                500,
+            );
+            return Err(RuntimeError::InvalidInput(format!(
+                "failed to sync skills into agent container: {message}"
+            )));
+        }
+
+        let mut mapped = HashMap::new();
+        let mut copied_dirs = HashSet::new();
+        for skill in skills {
+            let Some(skill_dir) = skill.path.parent() else {
+                continue;
+            };
+            let container_dir = container_skill_dir(&skill);
+            if copied_dirs.insert(container_dir.clone()) {
+                self.docker
+                    .copy_to_container(&container_id, skill_dir, &container_dir.to_string_lossy())
+                    .await
+                    .map_err(|err| {
+                        RuntimeError::InvalidInput(format!(
+                            "failed to sync skills into agent container: {err}"
+                        ))
+                    })?;
+            }
+            mapped.insert(skill.path, container_dir.join("SKILL.md"));
+        }
+        Ok(ContainerSkillPaths { paths: mapped })
     }
 
     async fn refresh_project_skills_from_project_sidecar_if_ready(
@@ -5667,11 +5761,11 @@ impl AgentRuntime {
             let summary = self
                 .wait_agent_until_complete_with_cancel(reviewer_id, &cancellation_token)
                 .await?;
-            if matches!(summary.status, AgentStatus::Failed | AgentStatus::Cancelled) {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "reviewer ended with status {:?}",
-                    summary.status
-                )));
+            if summary.status == AgentStatus::Cancelled && cancellation_token.is_cancelled() {
+                return Err(RuntimeError::TurnCancelled);
+            }
+            if let Some(result) = project_review_cycle_result_for_reviewer_status(&summary) {
+                return Ok(result);
             }
             let response = self.last_turn_response(reviewer_id).await?.ok_or_else(|| {
                 RuntimeError::InvalidInput("reviewer did not return a final response".to_string())
@@ -7608,6 +7702,21 @@ fn project_review_loop_decision_for_error(error: String) -> ProjectReviewLoopDec
     }
 }
 
+fn project_review_cycle_result_for_reviewer_status(
+    summary: &AgentSummary,
+) -> Option<ProjectReviewCycleResult> {
+    if summary.status == AgentStatus::Completed {
+        return None;
+    }
+    let status_error = format!("reviewer ended with status {:?}", summary.status);
+    Some(ProjectReviewCycleResult {
+        outcome: ProjectReviewOutcome::Failed,
+        pr: None,
+        summary: Some("Review could not be completed.".to_string()),
+        error: Some(normalize_optional_text(summary.last_error.clone()).unwrap_or(status_error)),
+    })
+}
+
 fn parse_project_review_cycle_report(text: &str) -> Result<ProjectReviewCycleResult> {
     let value = match serde_json::from_str::<ProjectReviewCycleReport>(text) {
         Ok(value) => value,
@@ -8255,7 +8364,10 @@ fn extract_skill_mentions(text: &str) -> Vec<String> {
     mai_skills::extract_skill_mentions(text)
 }
 
-fn skill_activation_info(skill_injections: &SkillInjections) -> Vec<SkillActivationInfo> {
+fn skill_activation_info(
+    skill_injections: &SkillInjections,
+    container_skill_paths: &ContainerSkillPaths,
+) -> Vec<SkillActivationInfo> {
     skill_injections
         .items
         .iter()
@@ -8266,26 +8378,75 @@ fn skill_activation_info(skill_injections: &SkillInjections) -> Vec<SkillActivat
                 .interface
                 .as_ref()
                 .and_then(|interface| interface.display_name.clone()),
-            path: skill.metadata.path.clone(),
+            path: display_skill_path(&skill.metadata.path, container_skill_paths),
             scope: skill.metadata.scope,
         })
         .collect()
 }
 
-fn skill_user_fragment(skill_injections: &SkillInjections) -> Option<ModelInputItem> {
+fn skill_user_fragment(
+    skill_injections: &SkillInjections,
+    container_skill_paths: &ContainerSkillPaths,
+) -> Option<ModelInputItem> {
     if skill_injections.items.is_empty() {
         return None;
     }
     let mut text = String::new();
     for skill in &skill_injections.items {
+        let path = display_skill_path(&skill.metadata.path, container_skill_paths);
         text.push_str(&format!(
             "\n<skill>\n<name>{}</name>\n<path>{}</path>\n{}\n</skill>\n",
             skill.metadata.name,
-            skill.metadata.path.display(),
+            path.display(),
             skill.contents
         ));
     }
     Some(ModelInputItem::user_text(text))
+}
+
+fn apply_container_skill_paths(
+    response: &mut SkillsListResponse,
+    container_skill_paths: &ContainerSkillPaths,
+) {
+    for skill in &mut response.skills {
+        if let Some(container_path) = container_skill_paths.get(&skill.path) {
+            skill.source_path = Some(container_path.clone());
+        }
+    }
+}
+
+fn display_skill_path(path: &Path, container_skill_paths: &ContainerSkillPaths) -> PathBuf {
+    container_skill_paths
+        .get(path)
+        .cloned()
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+fn container_skill_dir(skill: &mai_protocol::SkillMetadata) -> PathBuf {
+    let scope = match skill.scope {
+        SkillScope::System => "system",
+        SkillScope::Project => "project",
+        SkillScope::Repo => "repo",
+        SkillScope::User => "user",
+    };
+    PathBuf::from(CONTAINER_SKILLS_ROOT)
+        .join(scope)
+        .join(safe_container_skill_segment(&skill.name))
+}
+
+fn safe_container_skill_segment(value: &str) -> String {
+    let segment = value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
+            _ => '_',
+        })
+        .collect::<String>();
+    if segment.is_empty() {
+        "skill".to_string()
+    } else {
+        segment
+    }
 }
 
 impl AgentResourceBroker {
@@ -9560,7 +9721,7 @@ mod tests {
 	    fi
 	    exit 0
 	    ;;
-  cp)
+    cp)
     echo "$*" >> "$LOG"
 	    container="${{2%%:*}}"
 	    if [ "$2" = "${{container}}:/workspace/repo/.claude/skills" ]; then
@@ -9572,6 +9733,8 @@ mod tests {
 	    elif [ "$2" = "${{container}}:/workspace/repo/skills" ]; then
 	      rm -rf "$3"
 	      cp -R "$WORKSPACE/skills" "$3"
+    elif printf '%s' "$3" | grep -q ':/workspace/.mai-team/skills'; then
+      :
     elif printf '%s' "$2" | grep -q '^created-container:'; then
       mkdir -p "$(dirname "$3")"
       printf 'artifact\n' > "$3"
@@ -9834,6 +9997,32 @@ esac
     }
 
     #[test]
+    fn failed_reviewer_status_becomes_project_review_failure_result() {
+        let mut summary = test_agent_summary(Uuid::new_v4(), None);
+        summary.status = AgentStatus::Failed;
+        summary.last_error = Some("container command timed out".to_string());
+
+        let result = project_review_cycle_result_for_reviewer_status(&summary)
+            .expect("failed reviewer should produce failed review result");
+
+        assert_eq!(result.outcome, ProjectReviewOutcome::Failed);
+        assert_eq!(result.pr, None);
+        assert_eq!(
+            result.summary.as_deref(),
+            Some("Review could not be completed.")
+        );
+        assert_eq!(result.error.as_deref(), Some("container command timed out"));
+    }
+
+    #[test]
+    fn completed_reviewer_status_does_not_skip_final_json_parsing() {
+        let mut summary = test_agent_summary(Uuid::new_v4(), None);
+        summary.status = AgentStatus::Completed;
+
+        assert!(project_review_cycle_result_for_reviewer_status(&summary).is_none());
+    }
+
+    #[test]
     fn project_review_sync_command_fetches_pr_refs_without_token_literal() {
         let command = review_repo_sync_command(
             "https://github.com/owner/repo.git",
@@ -9850,25 +10039,28 @@ esac
     #[test]
     fn skill_user_fragment_wraps_loaded_skill_contents() {
         let path = std::path::PathBuf::from("/tmp/demo/SKILL.md");
-        let fragment = skill_user_fragment(&SkillInjections {
-            items: vec![mai_skills::LoadedSkill {
-                metadata: mai_protocol::SkillMetadata {
-                    name: "demo".to_string(),
-                    description: "Demo skill".to_string(),
-                    short_description: None,
-                    path: path.clone(),
-                    source_path: None,
-                    scope: mai_protocol::SkillScope::Repo,
-                    enabled: true,
-                    interface: None,
-                    dependencies: None,
-                    policy: None,
-                },
-                contents: "skill body".to_string(),
-            }],
-            suggestions: Vec::new(),
-            warnings: Vec::new(),
-        })
+        let fragment = skill_user_fragment(
+            &SkillInjections {
+                items: vec![mai_skills::LoadedSkill {
+                    metadata: mai_protocol::SkillMetadata {
+                        name: "demo".to_string(),
+                        description: "Demo skill".to_string(),
+                        short_description: None,
+                        path: path.clone(),
+                        source_path: None,
+                        scope: mai_protocol::SkillScope::Repo,
+                        enabled: true,
+                        interface: None,
+                        dependencies: None,
+                        policy: None,
+                    },
+                    contents: "skill body".to_string(),
+                }],
+                suggestions: Vec::new(),
+                warnings: Vec::new(),
+            },
+            &ContainerSkillPaths::default(),
+        )
         .expect("fragment");
         assert!(matches!(
             fragment,
@@ -9879,6 +10071,46 @@ esac
                             && text.contains("<name>demo</name>")
                             && text.contains(path.to_string_lossy().as_ref())
                             && text.contains("skill body"))
+        ));
+    }
+
+    #[test]
+    fn skill_user_fragment_uses_container_skill_path_when_synced() {
+        let path = std::path::PathBuf::from("/tmp/system/demo/SKILL.md");
+        let container_path = PathBuf::from("/workspace/.mai-team/skills/system/demo/SKILL.md");
+        let mut paths = HashMap::new();
+        paths.insert(path.clone(), container_path.clone());
+        let fragment = skill_user_fragment(
+            &SkillInjections {
+                items: vec![mai_skills::LoadedSkill {
+                    metadata: mai_protocol::SkillMetadata {
+                        name: "demo".to_string(),
+                        description: "Demo skill".to_string(),
+                        short_description: None,
+                        path: path.clone(),
+                        source_path: None,
+                        scope: mai_protocol::SkillScope::System,
+                        enabled: true,
+                        interface: None,
+                        dependencies: None,
+                        policy: None,
+                    },
+                    contents: "skill body".to_string(),
+                }],
+                suggestions: Vec::new(),
+                warnings: Vec::new(),
+            },
+            &ContainerSkillPaths { paths },
+        )
+        .expect("fragment");
+
+        assert!(matches!(
+            fragment,
+            ModelInputItem::Message { role, content }
+                if role == "user"
+                    && matches!(&content[0], ModelContentItem::InputText { text }
+                        if text.contains(container_path.to_string_lossy().as_ref())
+                            && !text.contains(path.to_string_lossy().as_ref()))
         ));
     }
 
@@ -13065,6 +13297,91 @@ esac
     }
 
     #[tokio::test]
+    async fn project_subagent_turn_syncs_project_skill_to_container() {
+        let (base_url, _requests) = start_mock_responses(vec![json!({
+            "id": "project-child-skill",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "child done" }]
+            }],
+            "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+        })])
+        .await;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .save_providers(ProvidersConfigRequest {
+                providers: vec![compact_test_provider(base_url)],
+                default_provider_id: Some("mock".to_string()),
+            })
+            .await
+            .expect("save providers");
+        let project_id = Uuid::new_v4();
+        let maintainer_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+        maintainer.project_id = Some(project_id);
+        let mut child =
+            test_agent_summary_with_parent(child_id, Some(maintainer_id), Some("child-container"));
+        child.project_id = Some(project_id);
+        child.role = Some(AgentRole::Explorer);
+        save_agent_with_session(&store, &maintainer).await;
+        let session_id = Uuid::new_v4();
+        store.save_agent(&child, None).await.expect("save child");
+        save_test_session(&store, child_id, session_id).await;
+        store
+            .save_project(&ready_test_project_summary(
+                project_id,
+                maintainer_id,
+                "account-1",
+            ))
+            .await
+            .expect("save project");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        runtime.project_mcp_managers.write().await.insert(
+            project_id,
+            Arc::new(McpAgentManager::from_tools_for_test(Vec::new())),
+        );
+        let project = runtime.project(project_id).await.expect("project");
+        *project.sidecar.write().await = Some(ContainerHandle {
+            id: "created-container".to_string(),
+            name: "sidecar".to_string(),
+            image: "unused".to_string(),
+        });
+        let child_record = runtime.agent(child_id).await.expect("child");
+        *child_record.container.write().await = Some(ContainerHandle {
+            id: "child-container".to_string(),
+            name: "child".to_string(),
+            image: "unused".to_string(),
+        });
+        write_workspace_project_skill(
+            &dir,
+            ".claude/skills",
+            "fresh-child-skill",
+            "Fresh child skill.",
+            "Fresh child body.",
+        );
+
+        runtime
+            .run_turn_inner(
+                child_id,
+                session_id,
+                Uuid::new_v4(),
+                "Use $fresh-child-skill".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn");
+
+        let docker_log = fake_docker_log(&dir);
+        assert!(
+            docker_log.contains("cp")
+                && docker_log.contains("/workspace/.mai-team/skills/project/fresh-child-skill")
+        );
+    }
+
+    #[tokio::test]
     async fn project_worker_cannot_spawn_agents_and_hidden_from_tools() {
         let dir = tempdir().expect("tempdir");
         let store = test_store(&dir).await;
@@ -14549,9 +14866,26 @@ esac
         assert!(request_text.contains("用中文评论, review-single-pr"));
         assert!(request_text.contains("$review-single-pr"));
         assert!(request_text.contains("Review exactly one pull request with Chinese comments."));
-        assert!(request_text.contains("/workspace/repo/.claude/skills/review-single-pr/SKILL.md"));
+        assert!(
+            request_text.contains("/workspace/.mai-team/skills/project/review-single-pr/SKILL.md")
+        );
+        assert!(
+            request_text
+                .contains("/workspace/.mai-team/skills/system/reviewer-agent-review-pr/SKILL.md")
+        );
+        assert!(!request_text.contains("/workspace/repo/.claude/skills/review-single-pr/SKILL.md"));
         assert!(request_text.contains("<name>reviewer-agent-review-pr</name>"));
         assert!(request_text.contains("<name>review-single-pr</name>"));
+        let docker_log = fake_docker_log(&dir);
+        assert!(
+            docker_log.contains("cp")
+                && docker_log
+                    .contains("/workspace/.mai-team/skills/system/reviewer-agent-review-pr")
+        );
+        assert!(
+            docker_log.contains("cp")
+                && docker_log.contains("/workspace/.mai-team/skills/project/review-single-pr")
+        );
     }
 
     #[tokio::test]
