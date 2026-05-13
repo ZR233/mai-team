@@ -47,6 +47,7 @@ fn run_remote_relay() -> Result<()> {
     let remote_db_path = format!("{remote_dir}/mai-relay.sqlite3");
     let remote_env_file = format!("{remote_dir}/mai-relay.env");
     let remote_pid_file = format!("{remote_dir}/mai-relay.pid");
+    let cleanup_command = remote_cleanup_command(&remote_env_file, &remote_pid_file);
 
     println!("built relay binary: {}", relay_bin.display());
     println!("uploading to {remote}:{remote_bin}");
@@ -57,6 +58,7 @@ fn run_remote_relay() -> Result<()> {
     )
     .context("creating remote relay directory")?;
     let remote_private_key_path = maybe_upload_private_key(&remote, remote_dir)?;
+    run_remote_cleanup(&remote, &cleanup_command).context("stopping previous remote relay")?;
     upload_remote_env(
         &remote,
         &remote_env_file,
@@ -64,21 +66,10 @@ fn run_remote_relay() -> Result<()> {
         remote_private_key_path.as_deref(),
     )
     .context("uploading remote relay environment")?;
-    run_status(
-        Command::new("scp")
-            .arg(&relay_bin)
-            .arg(format!("{remote}:{remote_bin}")),
-    )
-    .context("copying relay binary to remote host")?;
-    run_status(
-        Command::new("ssh")
-            .arg(&remote)
-            .arg(format!("chmod +x {}", sh_quote(&remote_bin))),
-    )
-    .context("marking remote relay binary executable")?;
+    upload_remote_binary(&remote, &relay_bin, &remote_bin)
+        .context("copying relay binary to remote host")?;
 
     let remote_command = remote_relay_command(&remote_bin, &remote_env_file, &remote_pid_file)?;
-    let cleanup_command = remote_cleanup_command(&remote_env_file, &remote_pid_file);
     println!("starting remote relay over ssh; stop this command to stop the remote process");
     run_ssh_foreground(&remote, &remote_command, &cleanup_command)
 }
@@ -217,6 +208,20 @@ fn upload_remote_env(
     drop(stdin);
     let status = child.wait().context("waiting for relay env upload")?;
     check_status("ssh", status)
+}
+
+fn upload_remote_binary(remote: &str, local_bin: &Path, remote_bin: &str) -> Result<()> {
+    let temp_remote_bin = format!("{remote_bin}.upload-{}", std::process::id());
+    run_status(
+        Command::new("scp")
+            .arg(local_bin)
+            .arg(format!("{remote}:{temp_remote_bin}")),
+    )?;
+    run_status(Command::new("ssh").arg(remote).arg(format!(
+        "set -e; chmod +x {tmp}; mv -f {tmp} {bin}",
+        tmp = sh_quote(&temp_remote_bin),
+        bin = sh_quote(remote_bin)
+    )))
 }
 
 fn remote_relay_command(

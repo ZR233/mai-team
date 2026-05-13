@@ -890,6 +890,44 @@ struct GithubPackageRepositoryApi {
 }
 
 #[derive(Debug, Deserialize)]
+struct GithubGraphqlResponse<T> {
+    data: Option<T>,
+    #[serde(default)]
+    errors: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubRepositoryPackagesGraphqlData {
+    repository: Option<GithubRepositoryPackagesGraphqlRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubRepositoryPackagesGraphqlRepository {
+    packages: GithubPackageConnection,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubPackageConnection {
+    nodes: Vec<GithubPackageNode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubPackageNode {
+    name: String,
+    #[serde(default)]
+    repository: Option<GithubPackageNodeRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubPackageNodeRepository {
+    name_with_owner: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct GithubPackageVersionApi {
     #[serde(default)]
     metadata: GithubPackageVersionMetadataApi,
@@ -1409,18 +1447,13 @@ impl AgentRuntime {
                 "repository owner and name are required".to_string(),
             ));
         }
-        let packages = match self
-            .github_container_packages_for_owner(&token, owner.trim())
-            .await
-        {
-            Ok(packages) => packages,
-            Err(err) if github_packages_read_error(err.status()) => {
-                return Ok(RepositoryPackagesResponse {
-                    packages: Vec::new(),
-                    warning: Some("No readable GitHub container packages found for this owner".to_string()),
-                });
-            }
-            Err(err) => return Err(RuntimeError::Http(err)),
+        let packages = self
+            .github_container_packages_for_repository(&token, owner.trim(), repo.trim())
+            .await?;
+        let warning = if packages.is_empty() {
+            Some("No readable GitHub container packages found for this repository".to_string())
+        } else {
+            None
         };
         let mut summaries = Vec::new();
         for package in packages
@@ -1442,7 +1475,7 @@ impl AgentRuntime {
         summaries.sort_by(|left, right| left.name.cmp(&right.name).then(left.tag.cmp(&right.tag)));
         Ok(RepositoryPackagesResponse {
             packages: summaries,
-            warning: None,
+            warning,
         })
     }
 
@@ -1484,6 +1517,99 @@ impl AgentRuntime {
             .error_for_status()?
             .json()
             .await
+    }
+
+    async fn github_container_packages_for_repository(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<GithubPackageApi>> {
+        let repository_ref = format!("{owner}/{repo}");
+        let mut packages = self
+            .github_container_packages_from_graphql_repository(token, owner, repo)
+            .await
+            .unwrap_or_default();
+        match self.github_container_packages_for_owner(token, owner).await {
+            Ok(owner_packages) => packages.extend(
+                owner_packages
+                    .into_iter()
+                    .filter(|package| github_package_belongs_to_repo(package, &repository_ref)),
+            ),
+            Err(err) if github_packages_read_error(err.status()) => {}
+            Err(err) => return Err(RuntimeError::Http(err)),
+        }
+        Ok(dedupe_github_packages(packages))
+    }
+
+    async fn github_container_packages_from_graphql_repository(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<GithubPackageApi>> {
+        let url = github_api_url(&self.github_api_base_url, "/graphql");
+        let response = self
+            .github_http
+            .post(url)
+            .bearer_auth(token)
+            .headers(github_headers())
+            .json(&json!({
+                "query": r#"
+                    query RepositoryPackages($owner: String!, $repo: String!) {
+                      repository(owner: $owner, name: $repo) {
+                        packages(first: 100, packageType: CONTAINER) {
+                          nodes {
+                            name
+                            repository {
+                              nameWithOwner
+                            }
+                          }
+                        }
+                      }
+                    }
+                "#,
+                "variables": {
+                    "owner": owner,
+                    "repo": repo,
+                }
+            }))
+            .send()
+            .await?;
+        if github_packages_read_error(Some(response.status())) {
+            return Ok(Vec::new());
+        }
+        let response: GithubGraphqlResponse<GithubRepositoryPackagesGraphqlData> =
+            decode_github_response(response, "list repository packages").await?;
+        if !response.errors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(repository) = response.data.and_then(|data| data.repository) else {
+            return Ok(Vec::new());
+        };
+        let repository_ref = format!("{owner}/{repo}");
+        Ok(repository
+            .packages
+            .nodes
+            .into_iter()
+            .map(|package| {
+                let package_name = package.name;
+                GithubPackageApi {
+                    html_url: github_package_html_url(
+                        DEFAULT_GITHUB_WEB_BASE_URL,
+                        owner,
+                        &package_name,
+                    ),
+                    name: package_name,
+                    repository: Some(GithubPackageRepositoryApi {
+                        full_name: package
+                            .repository
+                            .map(|repository| repository.name_with_owner)
+                            .unwrap_or_else(|| repository_ref.clone()),
+                    }),
+                }
+            })
+            .collect())
     }
 
     async fn github_container_package_versions(
@@ -8901,6 +9027,40 @@ fn repository_package_summary(
     })
 }
 
+fn dedupe_github_packages(packages: Vec<GithubPackageApi>) -> Vec<GithubPackageApi> {
+    let mut seen = HashMap::new();
+    let mut deduped = Vec::new();
+    for package in packages {
+        let key = github_package_key(&package);
+        if seen.insert(key, ()).is_none() {
+            deduped.push(package);
+        }
+    }
+    deduped
+}
+
+fn github_package_key(package: &GithubPackageApi) -> String {
+    let repository = package
+        .repository
+        .as_ref()
+        .map(|repository| repository.full_name.as_str())
+        .unwrap_or("");
+    format!(
+        "{}:{}",
+        repository.to_ascii_lowercase(),
+        package.name.to_ascii_lowercase()
+    )
+}
+
+fn github_package_html_url(web_base_url: &str, owner: &str, package_name: &str) -> String {
+    format!(
+        "{}/users/{}/packages/container/{}",
+        web_base_url.trim_end_matches('/'),
+        github_path_segment(owner),
+        github_path_segment(package_name)
+    )
+}
+
 fn github_packages_read_error(status: Option<reqwest::StatusCode>) -> bool {
     matches!(
         status,
@@ -15652,6 +15812,29 @@ esac
         assert!(!github_packages_read_error(Some(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR
         )));
+    }
+
+    #[test]
+    fn dedupe_github_packages_merges_repo_and_owner_sources() {
+        let packages = dedupe_github_packages(vec![
+            GithubPackageApi {
+                name: "sidecar".to_string(),
+                html_url: "https://github.com/users/example/packages/container/sidecar".to_string(),
+                repository: Some(GithubPackageRepositoryApi {
+                    full_name: "example/repo".to_string(),
+                }),
+            },
+            GithubPackageApi {
+                name: "SIDECAR".to_string(),
+                html_url: "https://github.com/users/example/packages/container/SIDECAR".to_string(),
+                repository: Some(GithubPackageRepositoryApi {
+                    full_name: "Example/Repo".to_string(),
+                }),
+            },
+        ]);
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "sidecar");
     }
 
     #[test]
