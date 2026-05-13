@@ -17,6 +17,8 @@ pub enum ModelError {
     },
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("stream error: {0}")]
+    Stream(String),
     #[error("request cancelled")]
     Cancelled,
 }

@@ -1,11 +1,9 @@
 use crate::error::Result;
-use crate::wire::{WireProtocol, WireRequest, parse_usage};
-use mai_protocol::{
-    ModelContentItem, ModelInputItem, ModelOutputItem, ModelOutputToolCall, ModelResponse,
-    ToolDefinition,
-};
+use crate::types::ModelStreamEvent;
+use crate::wire::{SseFrame, WireProtocol, WireRequest, parse_usage};
+use mai_protocol::{ModelContentItem, ModelInputItem, ToolDefinition};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Debug)]
@@ -20,9 +18,16 @@ struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'static str>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<ChatStreamOptions>,
     max_tokens: u64,
     #[serde(flatten)]
     options: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,15 +88,29 @@ impl WireProtocol for ChatCompletionsApi {
             tool_choice: (!active_tools.is_empty()).then_some("auto"),
             tools: active_tools,
             stream: req.stream,
+            stream_options: req.stream.then_some(ChatStreamOptions {
+                include_usage: true,
+            }),
             max_tokens: req.max_output_tokens,
             options: req.extra_body.clone(),
         };
         Ok(serde_json::to_vec(&request)?)
     }
 
-    fn parse_response(&self, body: &str) -> Result<ModelResponse> {
-        let value: Value = serde_json::from_str(body)?;
-        parse_chat_response(value)
+    fn parse_stream_event(&self, event: &SseFrame) -> Result<Vec<ModelStreamEvent>> {
+        if event.data.trim() == "[DONE]" || event.data.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let value: Value = serde_json::from_str(&event.data)?;
+        Ok(parse_chat_stream_chunk(value))
+    }
+
+    fn parse_stream_done(&self) -> Result<Vec<ModelStreamEvent>> {
+        Ok(vec![ModelStreamEvent::Completed {
+            id: None,
+            usage: None,
+            end_turn: None,
+        }])
     }
 }
 
@@ -204,77 +223,85 @@ fn assistant_chat_content(
         .or_else(|| (!tool_calls.is_empty() || reasoning_content.is_some()).then(String::new))
 }
 
-fn parse_chat_response(value: Value) -> Result<ModelResponse> {
+pub(crate) fn parse_chat_stream_chunk(value: Value) -> Vec<ModelStreamEvent> {
+    let mut events = Vec::new();
     let id = value
         .get("id")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let mut output = Vec::new();
+    if id.is_some() {
+        events.push(ModelStreamEvent::ResponseStarted { id: id.clone() });
+    }
     if let Some(choices) = value.get("choices").and_then(Value::as_array) {
         for choice in choices {
-            let Some(message) = choice.get("message") else {
+            let output_index = choice
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or_default() as usize;
+            let Some(delta) = choice.get("delta") else {
                 continue;
             };
-            let content = message
-                .get("content")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .filter(|text| !text.is_empty());
-            let reasoning_content = message
-                .get("reasoning_content")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .filter(|reasoning| !reasoning.trim().is_empty());
-            let mut tool_calls = Vec::new();
-            if let Some(raw_tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
-                for tool_call in raw_tool_calls {
-                    let function = tool_call.get("function").unwrap_or(&Value::Null);
-                    let raw_arguments = function
-                        .get("arguments")
-                        .and_then(Value::as_str)
-                        .unwrap_or("{}")
-                        .to_string();
-                    let arguments = serde_json::from_str(&raw_arguments)
-                        .unwrap_or_else(|_| json!({ "raw": raw_arguments.clone() }));
-                    tool_calls.push(ModelOutputToolCall {
-                        call_id: tool_call
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        name: function
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        arguments,
-                        raw_arguments,
+            if let Some(content) = delta.get("content").and_then(Value::as_str) {
+                if !content.is_empty() {
+                    events.push(ModelStreamEvent::TextDelta {
+                        output_index,
+                        content_index: None,
+                        delta: content.to_string(),
                     });
                 }
             }
-            if reasoning_content.is_some() {
-                output.push(ModelOutputItem::AssistantTurn {
-                    content,
-                    reasoning_content,
-                    tool_calls,
-                });
-            } else {
-                if let Some(text) = content {
-                    output.push(ModelOutputItem::Message { text });
+            if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
+                if !reasoning.is_empty() {
+                    events.push(ModelStreamEvent::ReasoningDelta {
+                        output_index,
+                        content_index: None,
+                        delta: reasoning.to_string(),
+                    });
                 }
-                output.extend(tool_calls.into_iter().map(|tool_call| {
-                    ModelOutputItem::FunctionCall {
-                        call_id: tool_call.call_id,
-                        name: tool_call.name,
-                        arguments: tool_call.arguments,
-                        raw_arguments: tool_call.raw_arguments,
+            }
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for tool_call in tool_calls {
+                    let index = tool_call
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(output_index as u64) as usize;
+                    let function = tool_call.get("function").unwrap_or(&Value::Null);
+                    let call_id = tool_call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    let name = function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    if call_id.is_some() || name.is_some() {
+                        events.push(ModelStreamEvent::ToolCallStarted {
+                            output_index: index,
+                            call_id,
+                            name,
+                        });
                     }
-                }));
+                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                        if !arguments.is_empty() {
+                            events.push(ModelStreamEvent::ToolCallArgumentsDelta {
+                                output_index: index,
+                                delta: arguments.to_string(),
+                            });
+                        }
+                    }
+                }
             }
         }
     }
     let usage = parse_usage(value.get("usage"));
-    Ok(ModelResponse { id, output, usage })
+    if usage.is_some() {
+        events.push(ModelStreamEvent::Completed {
+            id,
+            usage,
+            end_turn: None,
+        });
+    }
+    events
 }
 
 #[cfg(test)]
@@ -315,56 +342,13 @@ mod tests {
 
     fn deepseek_model() -> mai_protocol::ModelConfig {
         model_with_reasoning("deepseek-v4-pro", &["high", "max"], "high", |id| {
-            json!({
+            serde_json::json!({
                 "thinking": {
                     "type": "enabled",
                 },
                 "reasoning_effort": id,
             })
         })
-    }
-
-    #[test]
-    fn parses_chat_message_reasoning_tool_calls_and_usage() {
-        let response = parse_chat_response(json!({
-            "id": "chat_1",
-            "choices": [
-                {
-                    "message": {
-                        "content": "hello",
-                        "reasoning_content": "thinking",
-                        "tool_calls": [
-                            {
-                                "id": "call_1",
-                                "type": "function",
-                                "function": {
-                                    "name": "container_exec",
-                                    "arguments": "{\"command\":\"pwd\"}"
-                                }
-                            }
-                        ]
-                    }
-                }
-            ],
-            "usage": { "prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9 }
-        }))
-        .expect("parse");
-
-        assert_eq!(response.id.as_deref(), Some("chat_1"));
-        assert_eq!(response.output.len(), 1);
-        assert_eq!(response.usage.expect("usage").total_tokens, 9);
-        assert!(matches!(
-            &response.output[0],
-            ModelOutputItem::AssistantTurn {
-                content: Some(content),
-                reasoning_content: Some(reasoning),
-                tool_calls,
-            } if content == "hello"
-                && reasoning == "thinking"
-                && tool_calls.len() == 1
-                && tool_calls[0].call_id == "call_1"
-                && tool_calls[0].name == "container_exec"
-        ));
     }
 
     #[test]
@@ -471,7 +455,7 @@ mod tests {
                     kind: "function".to_string(),
                     name: "container_exec".to_string(),
                     description: "run a command".to_string(),
-                    parameters: json!({ "type": "object" }),
+                    parameters: serde_json::json!({ "type": "object" }),
                 }],
                 tool_choice: Some("auto"),
                 stream: false,
@@ -514,7 +498,7 @@ mod tests {
             &["minimal", "low", "medium", "high", "xhigh"],
             "medium",
             |id| {
-                json!({
+                serde_json::json!({
                     "reasoning": {
                         "effort": id,
                     },
@@ -524,7 +508,7 @@ mod tests {
         model.id = "mimo-v2.5-pro".to_string();
         model.wire_api = ModelWireApi::ChatCompletions;
         model.capabilities.reasoning_replay = false;
-        model.request_policy.extra_body = json!({ "mimo_only": true });
+        model.request_policy.extra_body = serde_json::json!({ "mimo_only": true });
 
         let api = ChatCompletionsApi;
         let body = api

@@ -1309,6 +1309,51 @@ pub enum ServiceEventKind {
         role: MessageRole,
         content: String,
     },
+    AgentMessageDelta {
+        agent_id: AgentId,
+        #[serde(default)]
+        session_id: Option<SessionId>,
+        turn_id: TurnId,
+        message_id: String,
+        role: MessageRole,
+        channel: String,
+        delta: String,
+    },
+    AgentMessageCompleted {
+        agent_id: AgentId,
+        #[serde(default)]
+        session_id: Option<SessionId>,
+        turn_id: TurnId,
+        message_id: String,
+        role: MessageRole,
+        channel: String,
+        content: String,
+    },
+    ReasoningDelta {
+        agent_id: AgentId,
+        #[serde(default)]
+        session_id: Option<SessionId>,
+        turn_id: TurnId,
+        message_id: String,
+        delta: String,
+    },
+    ReasoningCompleted {
+        agent_id: AgentId,
+        #[serde(default)]
+        session_id: Option<SessionId>,
+        turn_id: TurnId,
+        message_id: String,
+        content: String,
+    },
+    ToolCallDelta {
+        agent_id: AgentId,
+        #[serde(default)]
+        session_id: Option<SessionId>,
+        turn_id: TurnId,
+        call_id: String,
+        tool_name: String,
+        arguments_delta: String,
+    },
     SkillsActivated {
         agent_id: AgentId,
         #[serde(default)]

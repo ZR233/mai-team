@@ -1,6 +1,7 @@
 import { ref } from 'vue'
 
 const eventFeed = ref([])
+const streamingEvents = ref([])
 const connectionState = ref('offline')
 let eventSource = null
 let sseRetryCount = 0
@@ -45,6 +46,11 @@ export function useSSE() {
       'tool_completed',
       'context_compacted',
       'agent_message',
+      'agent_message_delta',
+      'agent_message_completed',
+      'reasoning_delta',
+      'reasoning_completed',
+      'tool_call_delta',
       'skills_activated',
       'plan_updated',
       'error',
@@ -58,6 +64,7 @@ export function useSSE() {
         try {
           const parsed = JSON.parse(event.data)
           if (parsed.sequence) lastEventId = parsed.sequence
+          updateStreamingEvents(parsed)
           eventFeed.value = [parsed, ...eventFeed.value].slice(0, 150)
           if (onEvent) onEvent(parsed)
         } catch {
@@ -81,8 +88,65 @@ export function useSSE() {
 
   return {
     eventFeed,
+    streamingEvents,
     connectionState,
     connectEvents,
     disconnect
+  }
+}
+
+function updateStreamingEvents(event) {
+  if (!event || !isStreamingEvent(event)) return
+  const key = streamingKey(event)
+  const events = streamingEvents.value.filter((item) => streamingKey(item) !== key)
+  const existing = streamingEvents.value.find((item) => streamingKey(item) === key)
+  const merged = mergeStreamingEvent(existing, event)
+  streamingEvents.value = [merged, ...events].slice(0, 100)
+}
+
+function isStreamingEvent(event) {
+  return [
+    'agent_message_delta',
+    'agent_message_completed',
+    'reasoning_delta',
+    'reasoning_completed',
+    'tool_call_delta'
+  ].includes(event.type)
+}
+
+function streamingKey(event) {
+  if (event.type === 'tool_call_delta') {
+    return `tool:${event.agent_id || ''}:${event.session_id || ''}:${event.turn_id || ''}:${event.call_id || ''}`
+  }
+  const channel = event.type.startsWith('reasoning') ? 'reasoning' : (event.channel || 'final')
+  return `message:${event.agent_id || ''}:${event.session_id || ''}:${event.turn_id || ''}:${event.message_id || channel}:${channel}`
+}
+
+function mergeStreamingEvent(existing, event) {
+  if (!existing) return { ...event }
+  if (event.type === 'tool_call_delta') {
+    return {
+      ...existing,
+      ...event,
+      arguments_delta: `${existing.arguments_delta || ''}${event.arguments_delta || ''}`,
+      timestamp: event.timestamp || existing.timestamp,
+      sequence: event.sequence || existing.sequence
+    }
+  }
+  if (event.type.endsWith('_delta')) {
+    return {
+      ...existing,
+      ...event,
+      delta: `${existing.delta || existing.content || ''}${event.delta || ''}`,
+      timestamp: event.timestamp || existing.timestamp,
+      sequence: event.sequence || existing.sequence
+    }
+  }
+  return {
+    ...existing,
+    ...event,
+    delta: event.content || existing.delta || '',
+    timestamp: event.timestamp || existing.timestamp,
+    sequence: event.sequence || existing.sequence
   }
 }

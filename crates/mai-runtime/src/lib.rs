@@ -1,12 +1,13 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, TimeDelta, Utc};
+use futures::StreamExt;
 use futures::future::{AbortHandle, Abortable};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use mai_agents::AgentProfilesManager;
 use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient, ExecCaptureOptions};
 use mai_mcp::{McpAgentManager, McpTool};
-use mai_model::{ModelClient, ModelTurnState};
+use mai_model::{ModelClient, ModelEventStream, ModelStreamAccumulator, ModelStreamEvent, ModelTurnState};
 use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentLogEntry,
     AgentLogsResponse, AgentMessage, AgentModelPreference, AgentProfilesResponse, AgentRole,
@@ -54,6 +55,7 @@ const RECENT_EVENT_LIMIT: usize = 500;
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 90;
 const TOKEN_ESTIMATE_BYTES: usize = 4;
 const DEFAULT_MODEL_TOOL_OUTPUT_TOKENS: usize = 10_000;
+#[cfg(test)]
 const DEFAULT_MODEL_TOOL_OUTPUT_BYTES: usize =
     DEFAULT_MODEL_TOOL_OUTPUT_TOKENS * TOKEN_ESTIMATE_BYTES;
 const DEFAULT_EXEC_OUTPUT_BYTES_CAP: usize = 1024 * 1024;
@@ -61,9 +63,6 @@ const MAX_EXEC_OUTPUT_BYTES_CAP: usize = 16 * 1024 * 1024;
 const MAX_MODEL_TOOL_OUTPUT_TOKENS: usize = 100_000;
 const DEFAULT_READ_FILE_BYTES: usize = 50 * 1024;
 const MAX_READ_FILE_BYTES: usize = 512 * 1024;
-const DEFAULT_READ_FILE_LINE_COUNT: usize = 200;
-const MAX_READ_FILE_LINE_COUNT: usize = 10_000;
-const DEFAULT_READ_FILE_MAX_LINE_LEN: usize = 2_000;
 const DEFAULT_LIST_FILES_LIMIT: usize = 200;
 const MAX_LIST_FILES_LIMIT: usize = 1_000;
 const REVIEW_ROUND_LIMIT: u64 = 5;
@@ -347,6 +346,21 @@ struct TurnModelContext {
     provider_selection: mai_store::ProviderSelection,
     tools: Vec<ToolDefinition>,
     instructions: String,
+}
+
+#[derive(Debug)]
+struct ModelTurnResult {
+    response: mai_protocol::ModelResponse,
+    tool_calls: Vec<(String, String, Value)>,
+    last_assistant_text: Option<String>,
+    made_progress: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StreamToolPreview {
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1412,8 +1426,14 @@ impl AgentRuntime {
         let input = vec![ModelInputItem::user_text(message)];
         let resolved = self.model.resolve(&selection.provider, &selection.model, None);
         let response = self
-            .model
-            .send(&resolved, instructions, &input, &[])
+            .consume_model_stream_to_response(
+                &resolved,
+                instructions,
+                &input,
+                &[],
+                &mut ModelTurnState::default(),
+                &CancellationToken::new(),
+            )
             .await?;
         let title = response
             .output
@@ -3150,28 +3170,18 @@ impl AgentRuntime {
             }
             let history_duration_ms = u128_to_u64(history_started.elapsed().as_millis());
             let model_started = Instant::now();
-            let response = self
-                .model
-                .send_turn(
-                    &self.model.resolve(
-                        &model_context.provider_selection.provider,
-                        &model_context.provider_selection.model,
-                        model_context.reasoning_effort.as_deref(),
-                    ),
-                    &model_context.instructions,
+            let model_turn = self
+                .run_model_stream_turn(
+                    &agent,
+                    agent_id,
+                    session_id,
+                    turn_id,
+                    &model_context,
                     &history,
-                    &model_context.tools,
                     &mut turn_model_state,
                     &cancellation_token,
                 )
-                .await
-                .map_err(|err| {
-                    if matches!(err, mai_model::ModelError::Cancelled) {
-                        RuntimeError::TurnCancelled
-                    } else {
-                        RuntimeError::Model(err)
-                    }
-                })?;
+                .await?;
             let model_duration_ms = u128_to_u64(model_started.elapsed().as_millis());
             self.record_agent_log(
                 agent_id,
@@ -3179,20 +3189,20 @@ impl AgentRuntime {
                 Some(turn_id),
                 "info",
                 "model",
-                "model response received",
+                "model stream completed",
                 json!({
                     "provider_id": model_context.provider_id,
                     "model": model_context.model_name,
-                    "output_items": response.output.len(),
+                    "output_items": model_turn.response.output.len(),
                     "history_items": history.len(),
                     "history_load_ms": history_duration_ms,
                     "duration_ms": model_duration_ms,
-                    "usage": response.usage,
+                    "usage": model_turn.response.usage,
                 }),
             )
             .await;
 
-            if let Some(usage) = response.usage {
+            if let Some(usage) = model_turn.response.usage.clone() {
                 {
                     let mut summary = agent.summary.write().await;
                     summary.token_usage.add(&usage);
@@ -3208,136 +3218,10 @@ impl AgentRuntime {
                 .await?;
             }
 
-            let mut tool_calls = Vec::new();
-            let mut made_progress = false;
-            for item in response.output {
-                match item {
-                    ModelOutputItem::Message { text } => {
-                        if !text.trim().is_empty() {
-                            made_progress = true;
-                            last_assistant_text = Some(text.clone());
-                            self.record_message(
-                                &agent,
-                                agent_id,
-                                session_id,
-                                MessageRole::Assistant,
-                                text.clone(),
-                            )
-                            .await?;
-                            self.record_history_item(
-                                &agent,
-                                agent_id,
-                                session_id,
-                                ModelInputItem::assistant_text(text.clone()),
-                            )
-                            .await?;
-                            self.publish(ServiceEventKind::AgentMessage {
-                                agent_id,
-                                session_id: Some(session_id),
-                                turn_id: Some(turn_id),
-                                role: MessageRole::Assistant,
-                                content: text,
-                            })
-                            .await;
-                        }
-                    }
-                    ModelOutputItem::FunctionCall {
-                        call_id,
-                        name,
-                        arguments,
-                        raw_arguments,
-                    } => {
-                        made_progress = true;
-                        let call_id = if call_id.is_empty() {
-                            format!("call_{}", Uuid::new_v4())
-                        } else {
-                            call_id
-                        };
-                        self.record_history_item(
-                            &agent,
-                            agent_id,
-                            session_id,
-                            ModelInputItem::FunctionCall {
-                                call_id: call_id.clone(),
-                                name: name.clone(),
-                                arguments: raw_arguments,
-                            },
-                        )
-                        .await?;
-                        tool_calls.push((call_id, name, arguments));
-                    }
-                    ModelOutputItem::AssistantTurn {
-                        content,
-                        reasoning_content,
-                        tool_calls: output_tool_calls,
-                    } => {
-                        let assistant_tool_calls = output_tool_calls
-                            .into_iter()
-                            .map(|tool_call| {
-                                let call_id = if tool_call.call_id.is_empty() {
-                                    format!("call_{}", Uuid::new_v4())
-                                } else {
-                                    tool_call.call_id
-                                };
-                                let name = tool_call.name;
-                                let arguments = tool_call.arguments;
-                                let raw_arguments = tool_call.raw_arguments;
-                                tool_calls.push((call_id.clone(), name.clone(), arguments));
-                                ModelToolCall {
-                                    call_id,
-                                    name,
-                                    arguments: raw_arguments,
-                                }
-                            })
-                            .collect::<Vec<_>>();
-                        let has_content =
-                            content.as_ref().is_some_and(|text| !text.trim().is_empty());
-                        let has_reasoning = reasoning_content
-                            .as_ref()
-                            .is_some_and(|reasoning| !reasoning.trim().is_empty());
-                        if has_content || has_reasoning || !assistant_tool_calls.is_empty() {
-                            made_progress = true;
-                            self.record_history_item(
-                                &agent,
-                                agent_id,
-                                session_id,
-                                ModelInputItem::AssistantTurn {
-                                    content: content.clone().filter(|text| !text.is_empty()),
-                                    reasoning_content: reasoning_content
-                                        .as_ref()
-                                        .filter(|reasoning| !reasoning.trim().is_empty())
-                                        .cloned(),
-                                    tool_calls: assistant_tool_calls,
-                                },
-                            )
-                            .await?;
-                        }
-                        if let Some(text) = content.filter(|text| !text.trim().is_empty()) {
-                            last_assistant_text = Some(text.clone());
-                            self.record_message(
-                                &agent,
-                                agent_id,
-                                session_id,
-                                MessageRole::Assistant,
-                                text.clone(),
-                            )
-                            .await?;
-                            self.publish(ServiceEventKind::AgentMessage {
-                                agent_id,
-                                session_id: Some(session_id),
-                                turn_id: Some(turn_id),
-                                role: MessageRole::Assistant,
-                                content: text,
-                            })
-                            .await;
-                        } else if let Some(reasoning) =
-                            reasoning_content.as_ref().filter(|r| !r.trim().is_empty())
-                        {
-                            last_assistant_text = Some(reasoning.clone());
-                        }
-                    }
-                    ModelOutputItem::Other { .. } => {}
-                }
+            let tool_calls = model_turn.tool_calls;
+            let made_progress = model_turn.made_progress;
+            if model_turn.last_assistant_text.is_some() {
+                last_assistant_text = model_turn.last_assistant_text;
             }
             let acknowledged_history_len = self
                 .raw_session_history_len(&agent, agent_id, session_id)
@@ -5062,6 +4946,439 @@ impl AgentRuntime {
         Ok(())
     }
 
+    async fn run_model_stream_turn(
+        &self,
+        agent: &Arc<AgentRecord>,
+        agent_id: AgentId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        model_context: &TurnModelContext,
+        history: &[ModelInputItem],
+        turn_model_state: &mut ModelTurnState,
+        cancellation_token: &CancellationToken,
+    ) -> Result<ModelTurnResult> {
+        let resolved = self.model.resolve(
+            &model_context.provider_selection.provider,
+            &model_context.provider_selection.model,
+            model_context.reasoning_effort.as_deref(),
+        );
+        let stream = self
+            .model
+            .send_turn(
+                &resolved,
+                &model_context.instructions,
+                history,
+                &model_context.tools,
+                turn_model_state,
+                cancellation_token,
+            )
+            .await
+            .map_err(model_error_to_runtime)?;
+        self.consume_turn_stream(
+            agent,
+            agent_id,
+            session_id,
+            turn_id,
+            turn_model_state,
+            stream,
+            cancellation_token,
+        )
+        .await
+    }
+
+    async fn consume_model_stream_to_response(
+        &self,
+        resolved: &mai_model::ResolvedProvider,
+        instructions: &str,
+        input: &[ModelInputItem],
+        tools: &[ToolDefinition],
+        state: &mut ModelTurnState,
+        cancellation_token: &CancellationToken,
+    ) -> std::result::Result<mai_protocol::ModelResponse, mai_model::ModelError> {
+        let mut stream = self
+            .model
+            .send_turn(resolved, instructions, input, tools, state, cancellation_token)
+            .await?;
+        let mut accumulator = ModelStreamAccumulator::default();
+        while let Some(event) = stream.next().await {
+            if cancellation_token.is_cancelled() {
+                return Err(mai_model::ModelError::Cancelled);
+            }
+            let event = event?;
+            accumulator.push(&event);
+        }
+        let response = accumulator.finish()?;
+        self.model.apply_completed_state(state, response.id.as_deref());
+        Ok(response)
+    }
+
+    async fn consume_turn_stream(
+        &self,
+        agent: &Arc<AgentRecord>,
+        agent_id: AgentId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        turn_model_state: &mut ModelTurnState,
+        mut stream: ModelEventStream,
+        cancellation_token: &CancellationToken,
+    ) -> Result<ModelTurnResult> {
+        let message_id = format!("msg_{}", Uuid::new_v4());
+        let reasoning_id = format!("reasoning_{}", Uuid::new_v4());
+        let mut response_id = None;
+        let mut usage = None;
+        let mut text_parts: HashMap<usize, String> = HashMap::new();
+        let mut reasoning_parts: HashMap<usize, String> = HashMap::new();
+        let mut tool_previews: HashMap<usize, StreamToolPreview> = HashMap::new();
+        let mut output_items = Vec::new();
+        let mut tool_calls = Vec::new();
+        let mut made_progress = false;
+        let mut final_text = String::new();
+        let mut final_reasoning = String::new();
+        while let Some(event) = stream.next().await {
+            if cancellation_token.is_cancelled() {
+                return Err(RuntimeError::TurnCancelled);
+            }
+            let event = event.map_err(model_error_to_runtime)?;
+            match &event {
+                ModelStreamEvent::ResponseStarted { id } => {
+                    if response_id.is_none() {
+                        response_id = id.clone();
+                    }
+                }
+                ModelStreamEvent::TextDelta {
+                    output_index,
+                    delta,
+                    ..
+                } if !delta.is_empty() => {
+                    text_parts.entry(*output_index).or_default().push_str(delta);
+                    final_text.push_str(delta);
+                    self.publish(ServiceEventKind::AgentMessageDelta {
+                        agent_id,
+                        session_id: Some(session_id),
+                        turn_id,
+                        message_id: message_id.clone(),
+                        role: MessageRole::Assistant,
+                        channel: "final".to_string(),
+                        delta: delta.clone(),
+                    })
+                    .await;
+                }
+                ModelStreamEvent::ReasoningDelta {
+                    output_index,
+                    delta,
+                    ..
+                } if !delta.is_empty() => {
+                    reasoning_parts
+                        .entry(*output_index)
+                        .or_default()
+                        .push_str(delta);
+                    final_reasoning.push_str(delta);
+                    self.publish(ServiceEventKind::ReasoningDelta {
+                        agent_id,
+                        session_id: Some(session_id),
+                        turn_id,
+                        message_id: reasoning_id.clone(),
+                        delta: delta.clone(),
+                    })
+                    .await;
+                }
+                ModelStreamEvent::OutputItemAdded { output_index, item } => {
+                    if let ModelOutputItem::FunctionCall { call_id, name, .. } = item {
+                        let preview = tool_previews.entry(*output_index).or_default();
+                        if !call_id.is_empty() {
+                            preview.call_id = Some(call_id.clone());
+                        }
+                        if !name.is_empty() {
+                            preview.name = Some(name.clone());
+                        }
+                    }
+                }
+                ModelStreamEvent::ToolCallStarted {
+                    call_id,
+                    name,
+                    output_index,
+                } => {
+                    let preview = tool_previews.entry(*output_index).or_default();
+                    if call_id.is_some() {
+                        preview.call_id = call_id.clone();
+                    }
+                    if name.is_some() {
+                        preview.name = name.clone();
+                    }
+                }
+                ModelStreamEvent::ToolCallArgumentsDelta {
+                    output_index,
+                    delta,
+                } if !delta.is_empty() => {
+                    let preview = tool_previews.entry(*output_index).or_default();
+                    preview.arguments.push_str(delta);
+                    if let (Some(call_id), Some(name)) =
+                        (preview.call_id.clone(), preview.name.clone())
+                    {
+                        self.publish(ServiceEventKind::ToolCallDelta {
+                            agent_id,
+                            session_id: Some(session_id),
+                            turn_id,
+                            call_id,
+                            tool_name: name,
+                            arguments_delta: delta.clone(),
+                        })
+                        .await;
+                    }
+                }
+                ModelStreamEvent::OutputItemDone { output_index, item } => {
+                    output_items.push(item.clone());
+                    match item.clone() {
+                        ModelOutputItem::Message { text } => {
+                            let text = if text.trim().is_empty() {
+                                text_parts.remove(output_index).unwrap_or_default()
+                            } else {
+                                text
+                            };
+                            if !text.trim().is_empty() {
+                                made_progress = true;
+                                final_text = text.clone();
+                                self.record_message(
+                                    agent,
+                                    agent_id,
+                                    session_id,
+                                    MessageRole::Assistant,
+                                    text.clone(),
+                                )
+                                .await?;
+                                self.record_history_item(
+                                    agent,
+                                    agent_id,
+                                    session_id,
+                                    ModelInputItem::assistant_text(text.clone()),
+                                )
+                                .await?;
+                                self.publish(ServiceEventKind::AgentMessageCompleted {
+                                    agent_id,
+                                    session_id: Some(session_id),
+                                    turn_id,
+                                    message_id: message_id.clone(),
+                                    role: MessageRole::Assistant,
+                                    channel: "final".to_string(),
+                                    content: text.clone(),
+                                })
+                                .await;
+                                self.publish(ServiceEventKind::AgentMessage {
+                                    agent_id,
+                                    session_id: Some(session_id),
+                                    turn_id: Some(turn_id),
+                                    role: MessageRole::Assistant,
+                                    content: text,
+                                })
+                                .await;
+                            }
+                        }
+                        ModelOutputItem::FunctionCall {
+                            call_id,
+                            name,
+                            arguments,
+                            raw_arguments,
+                        } => {
+                            made_progress = true;
+                            let call_id = if call_id.is_empty() {
+                                format!("call_{}", Uuid::new_v4())
+                            } else {
+                                call_id
+                            };
+                            if !raw_arguments.is_empty() {
+                                self.publish(ServiceEventKind::ToolCallDelta {
+                                    agent_id,
+                                    session_id: Some(session_id),
+                                    turn_id,
+                                    call_id: call_id.clone(),
+                                    tool_name: name.clone(),
+                                    arguments_delta: raw_arguments.clone(),
+                                })
+                                .await;
+                            }
+                            self.record_history_item(
+                                agent,
+                                agent_id,
+                                session_id,
+                                ModelInputItem::FunctionCall {
+                                    call_id: call_id.clone(),
+                                    name: name.clone(),
+                                    arguments: raw_arguments,
+                                },
+                            )
+                            .await?;
+                            tool_calls.push((call_id, name, arguments));
+                        }
+                        ModelOutputItem::AssistantTurn {
+                            content,
+                            reasoning_content,
+                            tool_calls: output_tool_calls,
+                        } => {
+                            let assistant_tool_calls = output_tool_calls
+                                .into_iter()
+                                .map(|tool_call| {
+                                    let call_id = if tool_call.call_id.is_empty() {
+                                        format!("call_{}", Uuid::new_v4())
+                                    } else {
+                                        tool_call.call_id
+                                    };
+                                    let name = tool_call.name;
+                                    let arguments = tool_call.arguments;
+                                    let raw_arguments = tool_call.raw_arguments;
+                                    tool_calls.push((call_id.clone(), name.clone(), arguments));
+                                    ModelToolCall {
+                                        call_id,
+                                        name,
+                                        arguments: raw_arguments,
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            let content = content
+                                .or_else(|| text_parts.remove(output_index))
+                                .filter(|text| !text.trim().is_empty());
+                            let reasoning_content = reasoning_content
+                                .or_else(|| reasoning_parts.remove(output_index))
+                                .filter(|reasoning| !reasoning.trim().is_empty());
+                            let has_content = content.is_some();
+                            let has_reasoning = reasoning_content.is_some();
+                            if has_content || has_reasoning || !assistant_tool_calls.is_empty() {
+                                made_progress = true;
+                                if let Some(value) = &reasoning_content {
+                                    final_reasoning = value.clone();
+                                }
+                                self.record_history_item(
+                                    agent,
+                                    agent_id,
+                                    session_id,
+                                    ModelInputItem::AssistantTurn {
+                                        content: content.clone(),
+                                        reasoning_content: reasoning_content.clone(),
+                                        tool_calls: assistant_tool_calls,
+                                    },
+                                )
+                                .await?;
+                            }
+                            if let Some(text) = content {
+                                final_text = text.clone();
+                                self.record_message(
+                                    agent,
+                                    agent_id,
+                                    session_id,
+                                    MessageRole::Assistant,
+                                    text.clone(),
+                                )
+                                .await?;
+                                self.publish(ServiceEventKind::AgentMessageCompleted {
+                                    agent_id,
+                                    session_id: Some(session_id),
+                                    turn_id,
+                                    message_id: message_id.clone(),
+                                    role: MessageRole::Assistant,
+                                    channel: "final".to_string(),
+                                    content: text.clone(),
+                                })
+                                .await;
+                                self.publish(ServiceEventKind::AgentMessage {
+                                    agent_id,
+                                    session_id: Some(session_id),
+                                    turn_id: Some(turn_id),
+                                    role: MessageRole::Assistant,
+                                    content: text,
+                                })
+                                .await;
+                            }
+                        }
+                        ModelOutputItem::Other { .. } => {}
+                    }
+                }
+                ModelStreamEvent::Completed { id, usage: done_usage, .. } => {
+                    if let Some(id) = id {
+                        response_id = Some(id.clone());
+                    }
+                    usage = done_usage.clone();
+                }
+                _ => {}
+            }
+        }
+        if !final_text.trim().is_empty() && output_items.is_empty() {
+            made_progress = true;
+            let text = final_text.clone();
+            output_items.push(ModelOutputItem::Message { text: text.clone() });
+            self.record_message(agent, agent_id, session_id, MessageRole::Assistant, text.clone())
+                .await?;
+            self.record_history_item(
+                agent,
+                agent_id,
+                session_id,
+                ModelInputItem::assistant_text(text.clone()),
+            )
+            .await?;
+            self.publish(ServiceEventKind::AgentMessageCompleted {
+                agent_id,
+                session_id: Some(session_id),
+                turn_id,
+                message_id: message_id.clone(),
+                role: MessageRole::Assistant,
+                channel: "final".to_string(),
+                content: text.clone(),
+            })
+            .await;
+            self.publish(ServiceEventKind::AgentMessage {
+                agent_id,
+                session_id: Some(session_id),
+                turn_id: Some(turn_id),
+                role: MessageRole::Assistant,
+                content: text,
+            })
+            .await;
+        }
+        if final_text.trim().is_empty()
+            && !final_reasoning.trim().is_empty()
+            && output_items.is_empty()
+        {
+            made_progress = true;
+            output_items.push(ModelOutputItem::AssistantTurn {
+                content: None,
+                reasoning_content: Some(final_reasoning.clone()),
+                tool_calls: Vec::new(),
+            });
+            self.record_history_item(
+                agent,
+                agent_id,
+                session_id,
+                ModelInputItem::AssistantTurn {
+                    content: None,
+                    reasoning_content: Some(final_reasoning.clone()),
+                    tool_calls: Vec::new(),
+                },
+            )
+            .await?;
+        }
+        if !final_reasoning.trim().is_empty() {
+            self.publish(ServiceEventKind::ReasoningCompleted {
+                agent_id,
+                session_id: Some(session_id),
+                turn_id,
+                message_id: reasoning_id,
+                content: final_reasoning,
+            })
+            .await;
+        }
+        self.model
+            .apply_completed_state(turn_model_state, response_id.as_deref());
+        let response = mai_protocol::ModelResponse {
+            id: response_id,
+            output: output_items,
+            usage,
+        };
+        Ok(ModelTurnResult {
+            response,
+            tool_calls,
+            last_assistant_text: (!final_text.trim().is_empty()).then_some(final_text),
+            made_progress,
+        })
+    }
+
     async fn record_message(
         &self,
         agent: &AgentRecord,
@@ -5275,16 +5592,16 @@ impl AgentRuntime {
             summary.reasoning_effort.as_deref(),
         );
         let response = self
-            .model
-            .send_with_cancel(&resolved, &instructions, &compact_input, &[], cancellation_token)
+            .consume_model_stream_to_response(
+                &resolved,
+                &instructions,
+                &compact_input,
+                &[],
+                &mut ModelTurnState::default(),
+                cancellation_token,
+            )
             .await
-            .map_err(|err| {
-                if matches!(err, mai_model::ModelError::Cancelled) {
-                    RuntimeError::TurnCancelled
-                } else {
-                    RuntimeError::Model(err)
-                }
-            })?;
+            .map_err(model_error_to_runtime)?;
 
         if cancellation_token.is_cancelled() {
             return Err(RuntimeError::TurnCancelled);
@@ -8983,10 +9300,6 @@ fn bounded_model_tool_output_with_tokens(output: &str, max_output_tokens: usize)
     .to_string()
 }
 
-fn bounded_model_tool_output(output: &str) -> String {
-    bounded_model_tool_output_with_tokens(output, DEFAULT_MODEL_TOOL_OUTPUT_TOKENS)
-}
-
 fn bounded_json_tool_output(mut value: Value, max_bytes: usize) -> Value {
     match &mut value {
         Value::Object(map) => {
@@ -9728,6 +10041,14 @@ fn take_last_chars(text: &str, max_chars: usize) -> String {
     chars.into_iter().collect()
 }
 
+fn model_error_to_runtime(err: mai_model::ModelError) -> RuntimeError {
+    if matches!(err, mai_model::ModelError::Cancelled) {
+        RuntimeError::TurnCancelled
+    } else {
+        RuntimeError::Model(err)
+    }
+}
+
 fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
     match &event.kind {
         ServiceEventKind::AgentCreated { agent } | ServiceEventKind::AgentUpdated { agent } => {
@@ -9741,6 +10062,11 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         | ServiceEventKind::ToolCompleted { agent_id, .. }
         | ServiceEventKind::ContextCompacted { agent_id, .. }
         | ServiceEventKind::AgentMessage { agent_id, .. }
+        | ServiceEventKind::AgentMessageDelta { agent_id, .. }
+        | ServiceEventKind::AgentMessageCompleted { agent_id, .. }
+        | ServiceEventKind::ReasoningDelta { agent_id, .. }
+        | ServiceEventKind::ReasoningCompleted { agent_id, .. }
+        | ServiceEventKind::ToolCallDelta { agent_id, .. }
         | ServiceEventKind::SkillsActivated { agent_id, .. }
         | ServiceEventKind::TodoListUpdated { agent_id, .. }
         | ServiceEventKind::McpServerStatusChanged { agent_id, .. }
@@ -10110,6 +10436,11 @@ mod tests {
                 let requests = Arc::clone(&server_requests);
                 tokio::spawn(async move {
                     let request = read_mock_request(&mut stream).await;
+                    let is_model_request = request
+                        .get("request_line")
+                        .and_then(Value::as_str)
+                        .is_some_and(|line| line.contains(" /responses "))
+                        || request.get("model").is_some();
                     requests.lock().await.push(request);
                     let response = responses.lock().await.pop_front().unwrap_or_else(|| {
                         json!({
@@ -10128,7 +10459,7 @@ mod tests {
                     if let Some(delay_ms) = response.get("__delay_ms").and_then(Value::as_u64) {
                         sleep(Duration::from_millis(delay_ms)).await;
                     }
-                    write_mock_response(&mut stream, response).await;
+                    write_mock_response(&mut stream, response, is_model_request).await;
                 });
             }
         });
@@ -10172,11 +10503,20 @@ mod tests {
             let request_line = headers.lines().next().unwrap_or_default();
             return json!({ "request_line": request_line });
         }
-        serde_json::from_slice(&buffer[header_end..header_end + content_length])
-            .expect("request json")
+        let request_line = headers.lines().next().unwrap_or_default();
+        let mut value: Value = serde_json::from_slice(&buffer[header_end..header_end + content_length])
+            .expect("request json");
+        if let Some(object) = value.as_object_mut() {
+            object.insert("request_line".to_string(), json!(request_line));
+        }
+        value
     }
 
-    async fn write_mock_response(stream: &mut tokio::net::TcpStream, response: Value) {
+    async fn write_mock_response(
+        stream: &mut tokio::net::TcpStream,
+        response: Value,
+        is_model_request: bool,
+    ) {
         let status = response
             .get("__status")
             .and_then(Value::as_u64)
@@ -10190,15 +10530,24 @@ mod tests {
             object.remove("__status");
             object.remove("__headers");
         }
-        let body = serde_json::to_string(&body_value).expect("response json");
+        let body = if status == 200 && is_model_request {
+            mock_sse_body(&body_value)
+        } else {
+            serde_json::to_string(&body_value).expect("response json")
+        };
         let reason = if status == 200 { "OK" } else { "ERROR" };
         let extra_headers = headers
             .unwrap_or_default()
             .into_iter()
             .filter_map(|(name, value)| value.as_str().map(|value| format!("{name}: {value}\r\n")))
             .collect::<String>();
+        let content_type = if status == 200 && is_model_request {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
         let reply = format!(
-            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n{extra_headers}content-length: {}\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\n{extra_headers}content-length: {}\r\nconnection: close\r\n\r\n{}",
             body.len(),
             body
         );
@@ -10206,6 +10555,44 @@ mod tests {
             .write_all(reply.as_bytes())
             .await
             .expect("write response");
+    }
+
+    fn mock_sse_body(response: &Value) -> String {
+        let response_id = response
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("resp_mock");
+        let mut events = vec![json!({
+            "type": "response.created",
+            "response": { "id": response_id }
+        })];
+        for (index, item) in response
+            .get("output")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            events.push(json!({
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": item,
+            }));
+        }
+        events.push(json!({
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "usage": response.get("usage").cloned().unwrap_or(Value::Null),
+            }
+        }));
+        events
+            .into_iter()
+            .map(|event| {
+                let kind = event.get("type").and_then(Value::as_str).unwrap_or("message");
+                format!("event: {kind}\ndata: {event}\n\n")
+            })
+            .collect()
     }
 
     fn find_header_end(buffer: &[u8]) -> Option<usize> {

@@ -10,10 +10,14 @@ export function buildAgentTimeline(detail, liveEvents = []) {
     .sort(compareTimelineItems)
 
   const agentMessageEvents = events.filter((event) => event.type === 'agent_message')
+  const streamMessages = buildStreamingMessages(events)
   const matchedMessageCounts = new Map()
   const items = []
 
   for (const event of agentMessageEvents) {
+    if (streamMessages.finalCompletedKeys.has(streamMessageKey(event))) {
+      continue
+    }
     const key = messageMatchKey(event.role, event.content)
     matchedMessageCounts.set(key, (matchedMessageCounts.get(key) || 0) + 1)
     items.push({
@@ -26,6 +30,10 @@ export function buildAgentTimeline(detail, liveEvents = []) {
       turnId: event.turn_id || null,
       fromEvent: true
     })
+  }
+
+  for (const stream of streamMessages.items) {
+    items.push(stream)
   }
 
   for (const [index, message] of (detail.messages || []).entries()) {
@@ -122,6 +130,18 @@ export function buildAgentTimeline(detail, liveEvents = []) {
         argumentsPreview: event.arguments_preview || previewValue(event.arguments),
         arguments: event.arguments || null,
         status: 'running'
+      })
+      tools.set(event.call_id, tool)
+    } else if (event.type === 'tool_call_delta') {
+      const tool = tools.get(event.call_id) || baseTool({
+        ...event,
+        tool_name: event.tool_name || 'tool'
+      })
+      Object.assign(tool, {
+        timestamp: event.timestamp,
+        sequence: event.sequence || 0,
+        argumentsPreview: `${tool.argumentsPreview || ''}${event.arguments_delta || ''}`,
+        status: 'preparing'
       })
       tools.set(event.call_id, tool)
     } else if (event.type === 'tool_completed') {
@@ -255,6 +275,7 @@ export function renderToolTrace({ toolName, kind, value }) {
 }
 
 export function toolStatusLabel(status) {
+  if (status === 'preparing') return 'Preparing'
   if (status === 'running') return 'Running'
   if (status === 'failed') return 'Failed'
   return 'Done'
@@ -479,14 +500,74 @@ function mergeEvents(events) {
   const merged = []
   for (const event of events) {
     if (!event) continue
-    const key = event.sequence
+    const key = streamingEventMergeKey(event) || (event.sequence
       ? `seq:${event.sequence}`
-      : `${event.type}:${event.call_id || event.turn_id || event.agent_id || ''}:${event.timestamp || ''}`
+      : `${event.type}:${event.call_id || event.turn_id || event.agent_id || ''}:${event.timestamp || ''}`)
     if (seen.has(key)) continue
     seen.add(key)
     merged.push(event)
   }
   return merged
+}
+
+function streamingEventMergeKey(event) {
+  if (event.type === 'tool_call_delta') {
+    return `stream-tool:${event.agent_id || ''}:${event.session_id || ''}:${event.turn_id || ''}:${event.call_id || ''}`
+  }
+  if (!['agent_message_delta', 'agent_message_completed', 'reasoning_delta', 'reasoning_completed'].includes(event.type)) {
+    return null
+  }
+  const channel = event.type.startsWith('reasoning') ? 'reasoning' : (event.channel || 'final')
+  return `stream-message:${event.agent_id || ''}:${event.session_id || ''}:${event.turn_id || ''}:${event.message_id || channel}:${channel}`
+}
+
+function buildStreamingMessages(events) {
+  const streams = new Map()
+  const finalCompletedKeys = new Set()
+  for (const event of events) {
+    if (!['agent_message_delta', 'agent_message_completed', 'reasoning_delta', 'reasoning_completed'].includes(event.type)) {
+      continue
+    }
+    const channel = event.type.startsWith('reasoning') ? 'reasoning' : (event.channel || 'final')
+    const key = `${event.turn_id || ''}:${event.message_id || channel}:${channel}`
+    const stream = streams.get(key) || {
+      type: channel === 'reasoning' ? 'process' : 'message',
+      key: `stream-${key}`,
+      role: event.role || 'assistant',
+      content: '',
+      tone: channel === 'reasoning' ? 'active' : undefined,
+      label: channel === 'reasoning' ? 'Reasoning' : undefined,
+      detail: '',
+      timestamp: event.timestamp,
+      sequence: event.sequence || 0,
+      turnId: event.turn_id || null,
+      fromEvent: true,
+      streaming: true,
+      channel
+    }
+    if (event.type.endsWith('_delta')) {
+      stream.content = `${stream.content || ''}${event.delta || ''}`
+      stream.detail = stream.content
+    } else {
+      stream.content = event.content || stream.content || ''
+      stream.detail = stream.content
+      stream.streaming = false
+      if (channel === 'final') {
+        finalCompletedKeys.add(streamMessageKey(event))
+      }
+    }
+    stream.timestamp = event.timestamp || stream.timestamp
+    stream.sequence = event.sequence || stream.sequence
+    streams.set(key, stream)
+  }
+  return {
+    items: [...streams.values()].filter((item) => (item.content || item.detail || '').trim()),
+    finalCompletedKeys
+  }
+}
+
+function streamMessageKey(event) {
+  return `${event.turn_id || ''}:${event.role || 'assistant'}:${event.content || ''}`
 }
 
 function eventAgentId(event) {
@@ -525,7 +606,7 @@ function summarizeTool(tool) {
 
   if (toolName === 'container_exec' && isPlainObject(args)) {
     return {
-      actionLabel: tool.status === 'running' ? 'Running' : tool.status === 'failed' ? 'Failed' : 'Ran',
+      actionLabel: tool.status === 'preparing' ? 'Preparing' : tool.status === 'running' ? 'Running' : tool.status === 'failed' ? 'Failed' : 'Ran',
       primary: cleanOneLine(args.command || tool.toolName),
       secondary: args.cwd ? `cwd ${cleanOneLine(args.cwd)}` : '',
       previewLines: previewOutputLines(output)
@@ -533,7 +614,7 @@ function summarizeTool(tool) {
   }
 
   return {
-    actionLabel: tool.status === 'running' ? 'Calling' : tool.status === 'failed' ? 'Failed' : 'Called',
+    actionLabel: tool.status === 'preparing' ? 'Preparing' : tool.status === 'running' ? 'Calling' : tool.status === 'failed' ? 'Failed' : 'Called',
     primary: tool.toolName,
     secondary: summarizeToolArgs(args),
     previewLines: previewOutputLines(output)

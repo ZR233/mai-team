@@ -691,6 +691,11 @@ function reviewEventLabel(event) {
     return `${formatStatus(event.type)} ${event.tool_name || event.call_id || ''}`.trim()
   }
   if (event.type === 'agent_message') return `message ${formatStatus(event.role || '')}`.trim()
+  if (event.type === 'agent_message_delta') return `message ${formatStatus(event.role || '')} streaming`.trim()
+  if (event.type === 'agent_message_completed') return `message ${formatStatus(event.role || '')} completed`.trim()
+  if (event.type === 'reasoning_delta') return 'reasoning streaming'
+  if (event.type === 'reasoning_completed') return 'reasoning completed'
+  if (event.type === 'tool_call_delta') return `tool preparing ${event.tool_name || event.call_id || ''}`.trim()
   if (event.type === 'turn_completed') return `turn ${formatStatus(event.status || 'completed')}`
   return formatStatus(event.type)
 }

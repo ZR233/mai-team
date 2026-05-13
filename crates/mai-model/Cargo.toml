@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 mai-protocol = { path = "../mai-protocol" }
+async-stream.workspace = true
+futures.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

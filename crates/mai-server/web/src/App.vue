@@ -44,7 +44,7 @@
         :projects="projects"
         :detail="selectedProjectDetail"
         :selected-project-id="selectedProjectId"
-        :events="eventFeed"
+        :events="timelineEvents"
         :draft="projectMessageDraft"
         :loading="isProjectDetailLoading"
         :sending="isProjectSending"
@@ -87,7 +87,7 @@
         <TaskDetail
           v-else
           :detail="selectedTaskDetail"
-          :events="eventFeed"
+          :events="timelineEvents"
           :draft="messageDraft"
           :loading="isDetailLoading"
           :sending="isSending"
@@ -221,7 +221,8 @@ import { useMcpServers } from './composables/useMcpServers'
 import { useGitAccounts } from './composables/useGitAccounts'
 
 const { toast, showToast } = useApi()
-const { eventFeed, connectionState, connectEvents, disconnect } = useSSE()
+const { eventFeed, streamingEvents, connectionState, connectEvents, disconnect } = useSSE()
+const timelineEvents = computed(() => [...streamingEvents.value, ...eventFeed.value])
 const {
   tasks,
   selectedTaskId,
@@ -430,11 +431,22 @@ function openGitAccountsSettings() {
   projectDialog.open = false
 }
 
-async function handleSSEEvent() {
+async function handleSSEEvent(event) {
+  if (isLiveOnlyEvent(event)) return
   await refreshTasks()
   await refreshProjects()
   if (selectedTaskId.value) await refreshDetail()
   if (selectedProjectId.value) await refreshProjectDetail()
+}
+
+function isLiveOnlyEvent(event) {
+  return [
+    'agent_message_delta',
+    'agent_message_completed',
+    'reasoning_delta',
+    'reasoning_completed',
+    'tool_call_delta'
+  ].includes(event?.type)
 }
 
 function openCreateTaskDialog() {

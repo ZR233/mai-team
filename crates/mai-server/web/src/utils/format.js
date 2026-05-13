@@ -78,5 +78,10 @@ export function eventSummary(event, formatStatusFn, roleLabelFn) {
     const content = event.content || ''
     return `${roleLabelFn(event.role)}: ${content.length > 120 ? content.slice(0, 120) + '...' : content}`
   }
+  if (event.type === 'agent_message_delta') return `${roleLabelFn(event.role)} is responding...`
+  if (event.type === 'agent_message_completed') return `${roleLabelFn(event.role)} response completed`
+  if (event.type === 'reasoning_delta') return 'Reasoning...'
+  if (event.type === 'reasoning_completed') return 'Reasoning completed'
+  if (event.type === 'tool_call_delta') return `Tool call prepared: ${event.tool_name || 'tool'}`
   return JSON.stringify(event)
 }

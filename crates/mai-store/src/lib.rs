@@ -3861,6 +3861,11 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         | ServiceEventKind::ToolCompleted { agent_id, .. }
         | ServiceEventKind::ContextCompacted { agent_id, .. }
         | ServiceEventKind::AgentMessage { agent_id, .. }
+        | ServiceEventKind::AgentMessageDelta { agent_id, .. }
+        | ServiceEventKind::AgentMessageCompleted { agent_id, .. }
+        | ServiceEventKind::ReasoningDelta { agent_id, .. }
+        | ServiceEventKind::ReasoningCompleted { agent_id, .. }
+        | ServiceEventKind::ToolCallDelta { agent_id, .. }
         | ServiceEventKind::SkillsActivated { agent_id, .. }
         | ServiceEventKind::TodoListUpdated { agent_id, .. }
         | ServiceEventKind::McpServerStatusChanged { agent_id, .. }
@@ -3884,6 +3889,11 @@ fn event_session_id(event: &ServiceEvent) -> Option<SessionId> {
         | ServiceEventKind::ToolStarted { session_id, .. }
         | ServiceEventKind::ToolCompleted { session_id, .. }
         | ServiceEventKind::AgentMessage { session_id, .. }
+        | ServiceEventKind::AgentMessageDelta { session_id, .. }
+        | ServiceEventKind::AgentMessageCompleted { session_id, .. }
+        | ServiceEventKind::ReasoningDelta { session_id, .. }
+        | ServiceEventKind::ReasoningCompleted { session_id, .. }
+        | ServiceEventKind::ToolCallDelta { session_id, .. }
         | ServiceEventKind::SkillsActivated { session_id, .. }
         | ServiceEventKind::UserInputRequested { session_id, .. } => *session_id,
         ServiceEventKind::ContextCompacted { session_id, .. } => Some(*session_id),

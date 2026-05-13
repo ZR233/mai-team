@@ -1,6 +1,7 @@
-use crate::error::Result;
-use crate::wire::{WireProtocol, WireRequest, parse_usage};
-use mai_protocol::{ModelInputItem, ModelOutputItem, ModelResponse, ToolDefinition};
+use crate::error::{ModelError, Result};
+use crate::types::{ModelStreamEvent, ModelStreamStatus};
+use crate::wire::{SseFrame, WireProtocol, WireRequest, parse_usage};
+use mai_protocol::{ModelInputItem, ModelOutputItem, ToolDefinition};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -62,9 +63,12 @@ impl WireProtocol for ResponsesApi {
         Ok(serde_json::to_vec(&request)?)
     }
 
-    fn parse_response(&self, body: &str) -> Result<ModelResponse> {
-        let value: Value = serde_json::from_str(body)?;
-        parse_response(value)
+    fn parse_stream_event(&self, event: &SseFrame) -> Result<Vec<ModelStreamEvent>> {
+        if event.data.trim() == "[DONE]" || event.data.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let value: Value = serde_json::from_str(&event.data)?;
+        parse_stream_event_value(value)
     }
 }
 
@@ -82,7 +86,175 @@ pub(crate) fn openai_turn_input<'a>(
     (input, previous_response_id)
 }
 
-fn parse_response(value: Value) -> Result<ModelResponse> {
+pub(crate) fn parse_stream_event_value(value: Value) -> Result<Vec<ModelStreamEvent>> {
+    let kind = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut events = Vec::new();
+    match kind {
+        "response.created" => events.push(ModelStreamEvent::ResponseStarted {
+            id: response_id(&value),
+        }),
+        "response.queued" => events.push(ModelStreamEvent::Status {
+            status: ModelStreamStatus::Queued,
+        }),
+        "response.in_progress" => events.push(ModelStreamEvent::Status {
+            status: ModelStreamStatus::InProgress,
+        }),
+        "response.output_text.delta" => {
+            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                events.push(ModelStreamEvent::TextDelta {
+                    output_index: output_index(&value),
+                    content_index: content_index(&value),
+                    delta: delta.to_string(),
+                });
+            }
+        }
+        "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                events.push(ModelStreamEvent::ReasoningDelta {
+                    output_index: output_index(&value),
+                    content_index: content_index(&value)
+                        .or_else(|| value.get("summary_index").and_then(Value::as_u64).map(|v| v as usize)),
+                    delta: delta.to_string(),
+                });
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                events.push(ModelStreamEvent::ToolCallArgumentsDelta {
+                    output_index: output_index(&value),
+                    delta: delta.to_string(),
+                });
+            }
+        }
+        "response.custom_tool_call_input.delta" => {
+            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                let item_id = value
+                    .get("item_id")
+                    .or_else(|| value.get("call_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !item_id.is_empty() {
+                    events.push(ModelStreamEvent::CustomToolInputDelta {
+                        item_id,
+                        call_id: value
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                        delta: delta.to_string(),
+                    });
+                }
+            }
+        }
+        "response.function_call_arguments.done" => {
+            // Ordinary function calls are finalized from response.output_item.done.
+            // The arguments.done event is useful as an upstream lifecycle marker, but
+            // it does not consistently carry stable call metadata across providers.
+        }
+        "response.output_item.added" => {
+            if let Some(item) = value.get("item").cloned() {
+                let item = parse_output_item(item);
+                events.push(ModelStreamEvent::OutputItemAdded {
+                    output_index: output_index(&value),
+                    item,
+                });
+            }
+            if let Some(item) = value.get("item") {
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    events.push(ModelStreamEvent::ToolCallStarted {
+                        output_index: output_index(&value),
+                        call_id: item
+                            .get("call_id")
+                            .or_else(|| item.get("id"))
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                        name: item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                    });
+                }
+            }
+        }
+        "response.output_item.done" => {
+            if let Some(item) = value.get("item").cloned() {
+                let item = parse_output_item(item);
+                events.push(ModelStreamEvent::OutputItemDone {
+                    output_index: output_index(&value),
+                    item,
+                });
+            }
+        }
+        "response.completed" => {
+            events.push(ModelStreamEvent::Completed {
+                id: response_id(&value),
+                usage: value
+                    .get("response")
+                    .and_then(|response| parse_usage(response.get("usage"))),
+                end_turn: value
+                    .get("response")
+                    .and_then(|response| response.get("end_turn"))
+                    .and_then(Value::as_bool),
+            });
+        }
+        "response.failed" => {
+            return Err(ModelError::Stream(response_error_message(
+                &value,
+                "response.failed event received",
+            )));
+        }
+        "response.incomplete" => {
+            return Err(ModelError::Stream(response_error_message(
+                &value,
+                "response.incomplete event received",
+            )));
+        }
+        _ => {}
+    }
+    Ok(events)
+}
+
+fn response_id(value: &Value) -> Option<String> {
+    value
+        .get("response")
+        .and_then(|response| response.get("id"))
+        .or_else(|| value.get("response_id"))
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn output_index(value: &Value) -> usize {
+    value
+        .get("output_index")
+        .or_else(|| value.get("item_index"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default() as usize
+}
+
+fn content_index(value: &Value) -> Option<usize> {
+    value
+        .get("content_index")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+}
+
+fn response_error_message(value: &Value, fallback: &str) -> String {
+    value
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+#[cfg(test)]
+fn parse_response(value: Value) -> mai_protocol::ModelResponse {
     let id = value
         .get("id")
         .and_then(Value::as_str)
@@ -96,7 +268,7 @@ fn parse_response(value: Value) -> Result<ModelResponse> {
         .map(parse_output_item)
         .collect::<Vec<_>>();
     let usage = parse_usage(value.get("usage"));
-    Ok(ModelResponse { id, output, usage })
+    mai_protocol::ModelResponse { id, output, usage }
 }
 
 fn parse_output_item(value: Value) -> ModelOutputItem {
@@ -222,8 +394,7 @@ mod tests {
                 }
             ],
             "usage": { "input_tokens": 1, "output_tokens": 2, "total_tokens": 3 }
-        }))
-        .expect("parse");
+        }));
         assert_eq!(response.output.len(), 2);
         assert_eq!(response.usage.expect("usage").total_tokens, 3);
     }

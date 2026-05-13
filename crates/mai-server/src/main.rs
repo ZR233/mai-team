@@ -10,7 +10,9 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use mai_docker::DockerClient;
-use mai_model::{ModelError, ModelTurnState, ModelClient, ResolvedProvider};
+use mai_model::{
+    ModelClient, ModelError, ModelStreamAccumulator, ModelTurnState, ResolvedProvider,
+};
 use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentId, AgentLogsResponse, AgentProfilesResponse,
     ApproveTaskPlanResponse, ArtifactInfo, CreateAgentRequest, CreateAgentResponse,
@@ -751,14 +753,18 @@ async fn run_provider_test(
         run_provider_deep_model_test(&client, &resolved, reasoning_effort).await
     } else {
         let input = [ModelInputItem::user_text("ping")];
-        client
-            .send(
-                &resolved,
-                "You are a provider connectivity test. Reply with exactly: ok",
-                &input,
-                &[],
-            )
-            .await
+        let mut state = ModelTurnState::default();
+        let cancellation_token = CancellationToken::new();
+        consume_model_stream_to_response(
+            &client,
+            &resolved,
+            "You are a provider connectivity test. Reply with exactly: ok",
+            &input,
+            &[],
+            &mut state,
+            &cancellation_token,
+        )
+        .await
     };
     let latency_ms = elapsed_millis(started);
     match response {
@@ -806,18 +812,57 @@ async fn run_provider_deep_model_test(
         "Provider deep connectivity test, step 1. Reply exactly: ok",
     )];
     let instructions = "You are a provider connectivity test. Reply with exactly: ok";
-    let first = client
-        .send_turn(resolved, instructions, &first_input, &[], &mut state, &cancellation_token)
-        .await?;
+    let first = consume_model_stream_to_response(
+        client,
+        resolved,
+        instructions,
+        &first_input,
+        &[],
+        &mut state,
+        &cancellation_token,
+    )
+    .await?;
     let mut second_input = first_input;
     second_input.push(ModelInputItem::assistant_text(model_output_preview(&first)));
     second_input.push(ModelInputItem::user_text(
         "Provider deep connectivity test, step 2. Reply exactly: ok",
     ));
     state.acknowledge_history_len(2);
-    client
-        .send_turn(resolved, instructions, &second_input, &[], &mut state, &cancellation_token)
-        .await
+    consume_model_stream_to_response(
+        client,
+        resolved,
+        instructions,
+        &second_input,
+        &[],
+        &mut state,
+        &cancellation_token,
+    )
+    .await
+}
+
+async fn consume_model_stream_to_response(
+    client: &ModelClient,
+    resolved: &ResolvedProvider,
+    instructions: &str,
+    input: &[ModelInputItem],
+    tools: &[mai_protocol::ToolDefinition],
+    state: &mut ModelTurnState,
+    cancellation_token: &CancellationToken,
+) -> std::result::Result<ModelResponse, ModelError> {
+    let mut stream = client
+        .send_turn(resolved, instructions, input, tools, state, cancellation_token)
+        .await?;
+    let mut accumulator = ModelStreamAccumulator::default();
+    while let Some(event) = stream.next().await {
+        if cancellation_token.is_cancelled() {
+            return Err(ModelError::Cancelled);
+        }
+        let event = event?;
+        accumulator.push(&event);
+    }
+    let response = accumulator.finish()?;
+    client.apply_completed_state(state, response.id.as_deref());
+    Ok(response)
 }
 
 fn elapsed_millis(started: Instant) -> u64 {
@@ -862,6 +907,7 @@ fn sanitize_provider_test_error(err: &ModelError, api_key: &str) -> String {
             format!("request to {endpoint} returned {status}: {body}")
         }
         ModelError::Json(err) => format!("json error: {err}"),
+        ModelError::Stream(message) => format!("stream error: {message}"),
         ModelError::Cancelled => "request cancelled".to_string(),
     };
     mai_protocol::preview(&redact_secret(&message, api_key), 1_500)
@@ -1624,6 +1670,13 @@ fn event_name(event: &ServiceEvent) -> &'static str {
         mai_protocol::ServiceEventKind::ToolCompleted { .. } => "tool_completed",
         mai_protocol::ServiceEventKind::ContextCompacted { .. } => "context_compacted",
         mai_protocol::ServiceEventKind::AgentMessage { .. } => "agent_message",
+        mai_protocol::ServiceEventKind::AgentMessageDelta { .. } => "agent_message_delta",
+        mai_protocol::ServiceEventKind::AgentMessageCompleted { .. } => {
+            "agent_message_completed"
+        }
+        mai_protocol::ServiceEventKind::ReasoningDelta { .. } => "reasoning_delta",
+        mai_protocol::ServiceEventKind::ReasoningCompleted { .. } => "reasoning_completed",
+        mai_protocol::ServiceEventKind::ToolCallDelta { .. } => "tool_call_delta",
         mai_protocol::ServiceEventKind::SkillsActivated { .. } => "skills_activated",
         mai_protocol::ServiceEventKind::McpServerStatusChanged { .. } => {
             "mcp_server_status_changed"
@@ -2250,14 +2303,61 @@ mod tests {
             500 => "Internal Server Error",
             _ => "Status",
         };
-        let body = serde_json::to_string(&response).expect("response json");
+        let body = if status == 200 {
+            provider_mock_sse_body(&response)
+        } else {
+            serde_json::to_string(&response).expect("response json")
+        };
+        let content_type = if status == 200 {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
         let raw = format!(
-            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         );
         stream
             .write_all(raw.as_bytes())
             .await
             .expect("write response");
+    }
+
+    fn provider_mock_sse_body(response: &Value) -> String {
+        let response_id = response
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("resp_mock");
+        let mut events = vec![json!({
+            "type": "response.created",
+            "response": { "id": response_id }
+        })];
+        for (index, item) in response
+            .get("output")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            events.push(json!({
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": item,
+            }));
+        }
+        events.push(json!({
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "usage": response.get("usage").cloned().unwrap_or(Value::Null),
+            }
+        }));
+        events
+            .into_iter()
+            .map(|event| {
+                let kind = event.get("type").and_then(Value::as_str).unwrap_or("message");
+                format!("event: {kind}\ndata: {event}\n\n")
+            })
+            .collect()
     }
 }
