@@ -25,12 +25,12 @@ Each operation starts with one of:
 Update sections contain hunks introduced by `@@`; hunk lines start with a space, `-`, or `+`. File references must be relative, never absolute."#;
 
 pub(crate) fn exposed_definitions() -> Vec<ToolDefinition> {
-    vec![read_file_definition(), list_files_definition()]
-}
-
-#[allow(dead_code)]
-pub(crate) fn definition_only_definitions() -> Vec<ToolDefinition> {
-    vec![apply_patch_definition(), search_files_definition()]
+    vec![
+        read_file_definition(),
+        list_files_definition(),
+        search_files_definition(),
+        apply_patch_definition(),
+    ]
 }
 
 fn read_file_definition() -> ToolDefinition {
@@ -67,10 +67,25 @@ fn list_files_definition() -> ToolDefinition {
         object_schema(vec![
             ("path", json!({ "type": "string" }), false),
             ("cwd", json!({ "type": "string" }), false),
-            ("pattern", json!({ "type": "string" }), false),
+            (
+                "glob",
+                json!({
+                    "type": "string",
+                    "description": "Optional file glob filter, such as `*.rs`."
+                }),
+                false,
+            ),
             (
                 "max_files",
                 json!({ "type": "integer", "minimum": 1 }),
+                false,
+            ),
+            (
+                "include_dirs",
+                json!({
+                    "type": "boolean",
+                    "description": "Whether directory entries should be included in addition to files."
+                }),
                 false,
             ),
         ]),
@@ -81,14 +96,17 @@ fn apply_patch_definition() -> ToolDefinition {
     ToolDefinition::function(
         TOOL_APPLY_PATCH,
         APPLY_PATCH_DESCRIPTION,
-        object_schema(vec![(
-            "input",
-            json!({
-                "type": "string",
-                "description": "The entire contents of the apply_patch command."
-            }),
-            true,
-        )]),
+        object_schema(vec![
+            (
+                "input",
+                json!({
+                    "type": "string",
+                    "description": "The entire contents of the apply_patch command."
+                }),
+                true,
+            ),
+            ("cwd", json!({ "type": "string" }), false),
+        ]),
     )
 }
 
@@ -133,6 +151,23 @@ fn search_files_definition() -> ToolDefinition {
             (
                 "max_matches",
                 json!({ "type": "integer", "minimum": 1 }),
+                false,
+            ),
+            (
+                "literal",
+                json!({
+                    "type": "boolean",
+                    "description": "Treat query as literal text instead of a regular expression."
+                }),
+                false,
+            ),
+            (
+                "context_lines",
+                json!({
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Number of context lines to include before and after each match."
+                }),
                 false,
             ),
         ]),

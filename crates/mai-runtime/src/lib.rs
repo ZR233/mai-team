@@ -55,6 +55,7 @@ use uuid::Uuid;
 mod deps;
 mod events;
 mod state;
+mod tools;
 mod turn;
 
 use deps::RuntimeDeps;
@@ -76,10 +77,6 @@ const DEFAULT_MODEL_TOOL_OUTPUT_BYTES: usize =
 const DEFAULT_EXEC_OUTPUT_BYTES_CAP: usize = 1024 * 1024;
 const MAX_EXEC_OUTPUT_BYTES_CAP: usize = 16 * 1024 * 1024;
 const MAX_MODEL_TOOL_OUTPUT_TOKENS: usize = 100_000;
-const DEFAULT_READ_FILE_BYTES: usize = 50 * 1024;
-const MAX_READ_FILE_BYTES: usize = 512 * 1024;
-const DEFAULT_LIST_FILES_LIMIT: usize = 200;
-const MAX_LIST_FILES_LIMIT: usize = 1_000;
 const REVIEW_ROUND_LIMIT: u64 = 5;
 const PROJECT_WORKSPACE_PATH: &str = "/workspace/repo";
 const PROJECT_SKILLS_CACHE_DIR: &str = "project-skills";
@@ -3960,18 +3957,37 @@ impl AgentRuntime {
                 ))
             }
             RoutedTool::ReadFile => {
-                let output = self.read_container_file(agent_id, &arguments).await?;
+                let container_id = self.container_id(agent_id).await?;
+                let output =
+                    tools::files::ContainerFileTools::new(&self.deps.docker, &container_id)
+                        .read_file(&arguments)
+                        .await?;
                 Ok(ToolExecution::new(true, output.to_string(), false))
             }
             RoutedTool::ListFiles => {
-                let output = self.list_container_files(agent_id, &arguments).await?;
+                let container_id = self.container_id(agent_id).await?;
+                let output =
+                    tools::files::ContainerFileTools::new(&self.deps.docker, &container_id)
+                        .list_files(&arguments)
+                        .await?;
                 Ok(ToolExecution::new(true, output.to_string(), false))
             }
-            RoutedTool::ApplyPatch | RoutedTool::SearchFiles => Ok(ToolExecution::new(
-                false,
-                format!("{name} is defined but not implemented in runtime"),
-                false,
-            )),
+            RoutedTool::SearchFiles => {
+                let container_id = self.container_id(agent_id).await?;
+                let output =
+                    tools::files::ContainerFileTools::new(&self.deps.docker, &container_id)
+                        .search_files(&arguments, &cancellation_token)
+                        .await?;
+                Ok(ToolExecution::new(true, output.to_string(), false))
+            }
+            RoutedTool::ApplyPatch => {
+                let container_id = self.container_id(agent_id).await?;
+                let output =
+                    tools::files::ContainerFileTools::new(&self.deps.docker, &container_id)
+                        .apply_patch(&arguments)
+                        .await?;
+                Ok(ToolExecution::new(true, output.to_string(), false))
+            }
             RoutedTool::ContainerCpUpload => {
                 let path = required_string(&arguments, "path")?;
                 let content_base64 = required_string(&arguments, "content_base64")?;
@@ -4344,109 +4360,6 @@ impl AgentRuntime {
                 false,
             )),
         }
-    }
-
-    async fn read_container_file(&self, agent_id: AgentId, arguments: &Value) -> Result<Value> {
-        let path = required_string(arguments, "path")?;
-        let cwd = optional_string(arguments, "cwd");
-        let line_start = optional_usize(arguments, "line_start")?;
-        let line_count = optional_usize(arguments, "line_count")?;
-        let offset = optional_usize(arguments, "offset")?.unwrap_or(0);
-        let max_bytes = optional_usize(arguments, "max_bytes")?
-            .unwrap_or(DEFAULT_READ_FILE_BYTES)
-            .clamp(1, MAX_READ_FILE_BYTES);
-        if line_start.is_some() && offset > 0 {
-            return Err(RuntimeError::InvalidInput(
-                "read_file cannot combine line_start with offset".to_string(),
-            ));
-        }
-        let container_id = self.container_id(agent_id).await?;
-        let command = if let Some(line_start) = line_start {
-            let line_count = line_count.unwrap_or(200).clamp(1, 10_000);
-            let end = line_start.saturating_add(line_count).saturating_sub(1);
-            format!(
-                "if [ ! -f {path} ]; then echo __MAI_FILE_MISSING__; exit 0; fi; sed -n '{start},{end}p' {path}",
-                path = shell_quote(&path),
-                start = line_start,
-                end = end
-            )
-        } else {
-            format!(
-                "if [ ! -f {path} ]; then echo __MAI_FILE_MISSING__; exit 0; fi; dd if={path} bs=1 skip={offset} count={count} 2>/dev/null",
-                path = shell_quote(&path),
-                offset = offset,
-                count = max_bytes.saturating_add(1)
-            )
-        };
-        let output = self
-            .deps
-            .docker
-            .exec_shell(&container_id, &command, cwd.as_deref(), Some(20))
-            .await?;
-        if output.stdout.trim() == "__MAI_FILE_MISSING__" {
-            return Err(RuntimeError::InvalidInput(format!(
-                "file not found: {path}"
-            )));
-        }
-        if output.status != 0 {
-            return Err(RuntimeError::InvalidInput(format!(
-                "read_file failed: {}",
-                preview(format!("{}\n{}", output.stderr, output.stdout).trim(), 500)
-            )));
-        }
-        let (text, truncated, bytes_omitted, next_offset) =
-            bounded_text(&output.stdout, max_bytes, offset);
-        Ok(json!({
-            "path": path,
-            "offset": offset,
-            "bytes_returned": text.len(),
-            "bytes_omitted": bytes_omitted,
-            "truncated": truncated,
-            "next_offset": next_offset,
-            "text": text,
-        }))
-    }
-
-    async fn list_container_files(&self, agent_id: AgentId, arguments: &Value) -> Result<Value> {
-        let path = optional_string(arguments, "path").unwrap_or_else(|| ".".to_string());
-        let cwd = optional_string(arguments, "cwd");
-        let pattern = optional_string(arguments, "pattern").unwrap_or_else(|| "*".to_string());
-        let max_files = optional_usize(arguments, "max_files")?
-            .unwrap_or(DEFAULT_LIST_FILES_LIMIT)
-            .clamp(1, MAX_LIST_FILES_LIMIT);
-        let container_id = self.container_id(agent_id).await?;
-        let command = format!(
-            "find {path} -type f -name {pattern} | sort | head -n {limit}",
-            path = shell_quote(&path),
-            pattern = shell_quote(&pattern),
-            limit = max_files.saturating_add(1)
-        );
-        let output = self
-            .deps
-            .docker
-            .exec_shell(&container_id, &command, cwd.as_deref(), Some(20))
-            .await?;
-        if output.status != 0 {
-            return Err(RuntimeError::InvalidInput(format!(
-                "list_files failed: {}",
-                preview(format!("{}\n{}", output.stderr, output.stdout).trim(), 500)
-            )));
-        }
-        let mut files = output
-            .stdout
-            .lines()
-            .take(max_files.saturating_add(1))
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        let truncated = files.len() > max_files;
-        files.truncate(max_files);
-        Ok(json!({
-            "path": path,
-            "pattern": pattern,
-            "files": files,
-            "count": files.len(),
-            "truncated": truncated,
-        }))
     }
 
     async fn save_task_plan(
@@ -5037,6 +4950,8 @@ impl AgentRuntime {
             mai_tools::TOOL_CONTAINER_EXEC.to_string(),
             mai_tools::TOOL_READ_FILE.to_string(),
             mai_tools::TOOL_LIST_FILES.to_string(),
+            mai_tools::TOOL_SEARCH_FILES.to_string(),
+            mai_tools::TOOL_APPLY_PATCH.to_string(),
             mai_tools::TOOL_CONTAINER_CP_UPLOAD.to_string(),
             mai_tools::TOOL_CONTAINER_CP_DOWNLOAD.to_string(),
             mai_tools::TOOL_SEND_INPUT.to_string(),
@@ -10517,6 +10432,16 @@ mod tests {
 	      /bin/sh -lc "$command"
 	    elif printf '%s' "$command" | grep -q "^find "; then
 	      /bin/sh -lc "$command"
+	    elif printf '%s' "$command" | grep -q "rg --files"; then
+	      /bin/sh -lc "$command"
+	    elif printf '%s' "$command" | grep -q "rg --json"; then
+	      /bin/sh -lc "$command"
+	    elif printf '%s' "$command" | grep -q "printf /workspace"; then
+	      /bin/sh -lc "$command"
+	    elif printf '%s' "$command" | grep -q "rm -f"; then
+	      /bin/sh -lc "$command"
+	    elif printf '%s' "$command" | grep -q "test -f"; then
+	      /bin/sh -lc "$command"
 	    fi
 	    exit 0
 	    ;;
@@ -10534,9 +10459,20 @@ mod tests {
 	      cp -R "$WORKSPACE/skills" "$3"
     elif printf '%s' "$3" | grep -q ':/workspace/.mai-team/skills'; then
       :
+    elif printf '%s' "$3" | grep -q '^created-container:'; then
+      dest="${{3#created-container:}}"
+      dest=$(printf '%s' "$dest" | sed "s#/workspace/repo#$WORKSPACE#g")
+      mkdir -p "$(dirname "$dest")"
+      cp "$2" "$dest"
     elif printf '%s' "$2" | grep -q '^created-container:'; then
+      src="${{2#created-container:}}"
+      src=$(printf '%s' "$src" | sed "s#/workspace/repo#$WORKSPACE#g")
       mkdir -p "$(dirname "$3")"
-      printf 'artifact\n' > "$3"
+      if [ -e "$src" ]; then
+        cp "$src" "$3"
+      else
+        printf 'artifact\n' > "$3"
+      fi
     fi
     exit 0
     ;;
@@ -11115,6 +11051,160 @@ esac
         let value = serde_json::from_str::<Value>(&output.output).expect("json output");
         assert_eq!(value["text"], "beta\ngamma\n");
         assert_eq!(value["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn file_tools_list_files_respects_glob_and_limit() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let agent_id = Uuid::new_v4();
+        save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container-1"))).await;
+        let workspace = fake_sidecar_workspace_path(&dir);
+        fs::create_dir_all(workspace.join("src")).expect("mkdir workspace");
+        fs::write(workspace.join("src/a.rs"), "fn a() {}\n").expect("write file");
+        fs::write(workspace.join("src/b.rs"), "fn b() {}\n").expect("write file");
+        fs::write(workspace.join("README.md"), "hello\n").expect("write file");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        let output = runtime
+            .execute_tool_for_test(
+                agent_id,
+                "list_files",
+                json!({
+                    "path": "/workspace/repo",
+                    "glob": "*.rs",
+                    "max_files": 1
+                }),
+            )
+            .await
+            .expect("list files");
+
+        assert!(output.success);
+        let value = serde_json::from_str::<Value>(&output.output).expect("json output");
+        assert_eq!(value["count"], 1);
+        assert_eq!(value["truncated"], true);
+        assert!(
+            value["files"]
+                .as_array()
+                .expect("files")
+                .iter()
+                .all(|path| path.as_str().is_some_and(|path| path.ends_with(".rs")))
+        );
+    }
+
+    #[tokio::test]
+    async fn file_tools_search_files_returns_structured_matches() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let agent_id = Uuid::new_v4();
+        save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container-1"))).await;
+        let workspace = fake_sidecar_workspace_path(&dir);
+        fs::create_dir_all(&workspace).expect("mkdir workspace");
+        fs::write(workspace.join("one.txt"), "alpha\nbeta\n").expect("write file");
+        fs::write(workspace.join("two.md"), "ALPHA\n").expect("write file");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        let output = runtime
+            .execute_tool_for_test(
+                agent_id,
+                "search_files",
+                json!({
+                    "query": "alpha",
+                    "path": "/workspace/repo",
+                    "glob": "*.txt",
+                    "literal": true,
+                    "max_matches": 5
+                }),
+            )
+            .await
+            .expect("search files");
+
+        assert!(output.success);
+        let value = serde_json::from_str::<Value>(&output.output).expect("json output");
+        assert_eq!(value["count"], 1);
+        assert_eq!(value["matches"][0]["line"], 1);
+        assert!(
+            value["matches"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("alpha")
+        );
+    }
+
+    #[tokio::test]
+    async fn file_tools_apply_patch_add_update_delete_and_move() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let agent_id = Uuid::new_v4();
+        save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container-1"))).await;
+        let workspace = fake_sidecar_workspace_path(&dir);
+        fs::create_dir_all(&workspace).expect("mkdir workspace");
+        fs::write(workspace.join("edit.txt"), "one\ntwo\nthree\n").expect("write file");
+        fs::write(workspace.join("delete.txt"), "remove me\n").expect("write file");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+        let patch = "*** Begin Patch\n*** Add File: added.txt\n+created\n*** Update File: edit.txt\n*** Move to: moved.txt\n@@\n one\n-two\n+dos\n three\n*** Delete File: delete.txt\n*** End Patch\n";
+
+        let output = runtime
+            .execute_tool_for_test(
+                agent_id,
+                "apply_patch",
+                json!({
+                    "cwd": "/workspace/repo",
+                    "input": patch
+                }),
+            )
+            .await
+            .expect("apply patch");
+
+        assert!(output.success);
+        assert_eq!(
+            fs::read_to_string(workspace.join("added.txt")).expect("added"),
+            "created\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("moved.txt")).expect("moved"),
+            "one\ndos\nthree\n"
+        );
+        assert!(!workspace.join("edit.txt").exists());
+        assert!(!workspace.join("delete.txt").exists());
+        let value = serde_json::from_str::<Value>(&output.output).expect("json output");
+        assert!(value["changed_files"].as_array().unwrap().len() >= 3);
+    }
+
+    #[tokio::test]
+    async fn file_tools_apply_patch_rejects_bad_paths_and_mismatched_hunks() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let agent_id = Uuid::new_v4();
+        save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container-1"))).await;
+        let workspace = fake_sidecar_workspace_path(&dir);
+        fs::create_dir_all(&workspace).expect("mkdir workspace");
+        fs::write(workspace.join("edit.txt"), "one\n").expect("write file");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+        let bad_path = runtime
+            .execute_tool_for_test(
+                agent_id,
+                "apply_patch",
+                json!({
+                    "cwd": "/workspace/repo",
+                    "input": "*** Begin Patch\n*** Add File: ../bad.txt\n+nope\n*** End Patch\n"
+                }),
+            )
+            .await;
+        assert!(bad_path.is_err());
+
+        let mismatch = runtime
+            .execute_tool_for_test(
+                agent_id,
+                "apply_patch",
+                json!({
+                    "cwd": "/workspace/repo",
+                    "input": "*** Begin Patch\n*** Update File: edit.txt\n@@\n-two\n+dos\n*** End Patch\n"
+                }),
+            )
+            .await;
+        assert!(mismatch.is_err());
     }
 
     #[tokio::test]

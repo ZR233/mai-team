@@ -65,14 +65,61 @@ mod tests {
     }
 
     #[test]
-    fn definition_only_file_tools_are_not_exposed_by_default() {
+    fn file_tools_are_exposed_by_default() {
         let tools = build_tool_definitions(&[]);
         let names = tools
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
-        assert!(!names.contains(&TOOL_APPLY_PATCH));
-        assert!(!names.contains(&TOOL_SEARCH_FILES));
+        assert!(names.contains(&TOOL_READ_FILE));
+        assert!(names.contains(&TOOL_LIST_FILES));
+        assert!(names.contains(&TOOL_SEARCH_FILES));
+        assert!(names.contains(&TOOL_APPLY_PATCH));
+    }
+
+    #[test]
+    fn file_tool_schemas_include_expected_fields() {
+        let tools = build_tool_definitions(&[]);
+        let search = tools
+            .iter()
+            .find(|tool| tool.name == TOOL_SEARCH_FILES)
+            .expect("search_files");
+        assert_eq!(search.parameters.get("required"), Some(&json!(["query"])));
+        for field in [
+            "path",
+            "cwd",
+            "glob",
+            "case_sensitive",
+            "literal",
+            "max_matches",
+            "context_lines",
+        ] {
+            assert!(
+                search
+                    .parameters
+                    .pointer(&format!("/properties/{field}"))
+                    .is_some()
+            );
+        }
+
+        let apply = tools
+            .iter()
+            .find(|tool| tool.name == TOOL_APPLY_PATCH)
+            .expect("apply_patch");
+        assert_eq!(apply.parameters.get("required"), Some(&json!(["input"])));
+        assert!(apply.parameters.pointer("/properties/cwd").is_some());
+
+        let list = tools
+            .iter()
+            .find(|tool| tool.name == TOOL_LIST_FILES)
+            .expect("list_files");
+        assert!(list.parameters.pointer("/properties/glob").is_some());
+        assert!(
+            list.parameters
+                .pointer("/properties/include_dirs")
+                .is_some()
+        );
+        assert!(list.parameters.pointer("/properties/pattern").is_none());
     }
 
     #[test]
