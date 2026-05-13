@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
-dirs.workspace = true
 mai-protocol = { path = "../mai-protocol" }
 rusqlite.workspace = true
 serde.workspace = true

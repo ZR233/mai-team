@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use clap::Parser;
 use futures::StreamExt;
 use mai_docker::DockerClient;
 use mai_model::{
@@ -55,6 +56,13 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 
 const SSE_REPLAY_LIMIT: usize = 1_000;
+
+#[derive(Debug, Parser)]
+#[command(author, version, about)]
+struct Cli {
+    #[arg(long = "data-path", value_name = "PATH")]
+    data_path: Option<PathBuf>,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -206,6 +214,7 @@ struct GithubInstallationCallbackQuery {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -217,13 +226,7 @@ async fn main() -> Result<()> {
     let base_url =
         env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
     let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
-    let db_path = env::var("MAI_DB_PATH")
-        .map(PathBuf::from)
-        .unwrap_or(ConfigStore::default_path()?);
-    let config_path = env::var("MAI_CONFIG_PATH")
-        .map(PathBuf::from)
-        .unwrap_or(ConfigStore::default_config_path()?);
-    let data_dir = data_dir_path()?;
+    let data_dir = data_dir_path(cli.data_path)?;
     let cache_dir = cache_dir_path(&data_dir);
     let artifact_files_root = artifact_files_root(&data_dir);
     let artifact_index_root = artifact_index_root(&data_dir);
@@ -242,25 +245,18 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&artifact_files_root)?;
     fs::create_dir_all(&artifact_index_root)?;
 
-    let store = Arc::new(
-        ConfigStore::open_with_config_and_artifact_index_path(
-            db_path,
-            config_path,
-            &artifact_index_root,
-        )
-        .await?,
-    );
+    let store = Arc::new(ConfigStore::open_in_data_dir(&data_dir).await?);
     store
         .seed_default_provider_from_env(api_key, base_url, model)
         .await?;
 
-    let system_skills_root = system_skills_path()?;
+    let system_skills_root = system_skills_path(&data_dir);
     release_embedded_system_skills(&system_skills_root)?;
     info!(
         path = %system_skills_root.display(),
         "released embedded system skills"
     );
-    let system_agents_root = system_agents_path()?;
+    let system_agents_root = system_agents_path(&data_dir);
     release_embedded_system_agents(&system_agents_root)?;
     info!(
         path = %system_agents_root.display(),
@@ -493,53 +489,28 @@ fn embedded_asset_response(path: &str, fallback_index: bool) -> Response {
         .expect("embedded static response")
 }
 
-fn system_skills_path() -> Result<PathBuf> {
-    env::var("MAI_SYSTEM_SKILLS_PATH")
-        .map(PathBuf::from)
-        .or_else(|_| {
-            dirs::home_dir()
-                .map(|home| home.join(".mai-team").join("system-skills"))
-                .ok_or(env::VarError::NotPresent)
-        })
-        .context("home directory not found; set MAI_SYSTEM_SKILLS_PATH")
+fn system_skills_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("system-skills")
 }
 
-fn system_agents_path() -> Result<PathBuf> {
-    env::var("MAI_SYSTEM_AGENTS_PATH")
-        .map(PathBuf::from)
-        .or_else(|_| {
-            dirs::home_dir()
-                .map(|home| home.join(".mai-team").join("system-agents"))
-                .ok_or(env::VarError::NotPresent)
-        })
-        .context("home directory not found; set MAI_SYSTEM_AGENTS_PATH")
+fn system_agents_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("system-agents")
 }
 
-fn data_dir_path() -> Result<PathBuf> {
-    data_dir_path_with(env::var_os("MAI_DATA_DIR"), dirs::home_dir())
+fn data_dir_path(cli_data_path: Option<PathBuf>) -> Result<PathBuf> {
+    Ok(match cli_data_path {
+        Some(path) => path,
+        None => env::current_dir()?.join(".mai-team"),
+    })
+}
+
+#[cfg(test)]
+fn data_dir_path_with(current_dir: &std::path::Path, cli_data_path: Option<PathBuf>) -> PathBuf {
+    cli_data_path.unwrap_or_else(|| current_dir.join(".mai-team"))
 }
 
 fn cache_dir_path(data_dir: &std::path::Path) -> PathBuf {
-    cache_dir_path_with(data_dir, env::var_os("MAI_CACHE_DIR"))
-}
-
-fn data_dir_path_with(
-    env_data_dir: Option<std::ffi::OsString>,
-    home_dir: Option<PathBuf>,
-) -> Result<PathBuf> {
-    env_data_dir
-        .map(PathBuf::from)
-        .or_else(|| home_dir.map(|home| home.join(".mai-team")))
-        .context("home directory not found; set MAI_DATA_DIR")
-}
-
-fn cache_dir_path_with(
-    data_dir: &std::path::Path,
-    env_cache_dir: Option<std::ffi::OsString>,
-) -> PathBuf {
-    env_cache_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| data_dir.join("cache"))
+    data_dir.join("cache")
 }
 
 fn artifact_files_root(data_dir: &std::path::Path) -> PathBuf {
@@ -925,7 +896,14 @@ async fn consume_model_stream_to_response(
     cancellation_token: &CancellationToken,
 ) -> std::result::Result<ModelResponse, ModelError> {
     let mut stream = client
-        .send_turn(resolved, instructions, input, tools, state, cancellation_token)
+        .send_turn(
+            resolved,
+            instructions,
+            input,
+            tools,
+            state,
+            cancellation_token,
+        )
         .await?;
     let mut accumulator = ModelStreamAccumulator::default();
     while let Some(event) = stream.next().await {
@@ -1814,9 +1792,7 @@ fn event_name(event: &ServiceEvent) -> &'static str {
         mai_protocol::ServiceEventKind::ContextCompacted { .. } => "context_compacted",
         mai_protocol::ServiceEventKind::AgentMessage { .. } => "agent_message",
         mai_protocol::ServiceEventKind::AgentMessageDelta { .. } => "agent_message_delta",
-        mai_protocol::ServiceEventKind::AgentMessageCompleted { .. } => {
-            "agent_message_completed"
-        }
+        mai_protocol::ServiceEventKind::AgentMessageCompleted { .. } => "agent_message_completed",
         mai_protocol::ServiceEventKind::ReasoningDelta { .. } => "reasoning_delta",
         mai_protocol::ServiceEventKind::ReasoningCompleted { .. } => "reasoning_completed",
         mai_protocol::ServiceEventKind::ToolCallDelta { .. } => "tool_call_delta",
@@ -1963,11 +1939,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let data_dir = dir.path().join(".mai-team");
 
-        assert_eq!(
-            data_dir_path_with(None, Some(dir.path().to_path_buf())).expect("data dir"),
-            data_dir
-        );
-        assert_eq!(cache_dir_path_with(&data_dir, None), data_dir.join("cache"));
+        assert_eq!(data_dir_path_with(dir.path(), None), data_dir);
+        assert_eq!(cache_dir_path(&data_dir), data_dir.join("cache"));
         assert_eq!(
             artifact_files_root(&data_dir),
             data_dir.join("artifacts").join("files")
@@ -1976,22 +1949,44 @@ mod tests {
             artifact_index_root(&data_dir),
             data_dir.join("artifacts").join("index")
         );
+        assert_eq!(
+            system_skills_path(&data_dir),
+            data_dir.join("system-skills")
+        );
+        assert_eq!(
+            system_agents_path(&data_dir),
+            data_dir.join("system-agents")
+        );
     }
 
     #[test]
-    fn runtime_storage_paths_use_env_overrides() {
+    fn runtime_storage_paths_use_cli_data_path() {
         let dir = tempdir().expect("tempdir");
         let data_dir = dir.path().join("data-root");
-        let cache_dir = dir.path().join("cache-root");
 
         assert_eq!(
-            data_dir_path_with(Some(data_dir.clone().into_os_string()), None).expect("data dir"),
+            data_dir_path_with(dir.path(), Some(data_dir.clone())),
             data_dir
         );
-        assert_eq!(
-            cache_dir_path_with(&data_dir, Some(cache_dir.clone().into_os_string())),
-            cache_dir
-        );
+        assert_eq!(cache_dir_path(&data_dir), data_dir.join("cache"));
+    }
+
+    #[test]
+    fn cli_parses_data_path() {
+        let cli =
+            Cli::try_parse_from(["mai-server", "--data-path", "/tmp/mai-data"]).expect("parse cli");
+        assert_eq!(cli.data_path, Some(PathBuf::from("/tmp/mai-data")));
+
+        let cli =
+            Cli::try_parse_from(["mai-server", "--data-path=/tmp/mai-data"]).expect("parse cli");
+        assert_eq!(cli.data_path, Some(PathBuf::from("/tmp/mai-data")));
+    }
+
+    #[test]
+    fn cli_rejects_invalid_data_path_usage() {
+        assert!(Cli::try_parse_from(["mai-server", "--data-path"]).is_err());
+        assert!(Cli::try_parse_from(["mai-server", "--unknown"]).is_err());
+        assert!(Cli::try_parse_from(["mai-server", "--help"]).is_err());
     }
 
     #[test]
@@ -2517,7 +2512,10 @@ mod tests {
         events
             .into_iter()
             .map(|event| {
-                let kind = event.get("type").and_then(Value::as_str).unwrap_or("message");
+                let kind = event
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message");
                 format!("event: {kind}\ndata: {event}\n\n")
             })
             .collect()

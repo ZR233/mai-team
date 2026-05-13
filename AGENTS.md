@@ -22,4 +22,4 @@ curl 'http://127.0.0.1:8080/agents/{agent_id}/logs?category=model&limit=20'
 curl 'http://127.0.0.1:8080/agents/{agent_id}/logs?level=warn&limit=50'
 ```
 
-- The default database path is `~/.mai-team/mai-team.sqlite3` unless `MAI_DB_PATH` is set. The default config path is `~/.mai-team/config.toml` unless `MAI_CONFIG_PATH` is set.
+- The default data path is the current working directory's `.mai-team` directory. Pass `--data-path <PATH>` to `mai-server` to place the database, provider config, cache, artifacts, and released system resources elsewhere.
