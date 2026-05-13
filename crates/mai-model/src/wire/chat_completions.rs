@@ -177,7 +177,11 @@ fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessag
                     .flatten();
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
-                    content: assistant_chat_content(content, &tool_calls, reasoning_content.as_deref()),
+                    content: assistant_chat_content(
+                        content,
+                        &tool_calls,
+                        reasoning_content.as_deref(),
+                    ),
                     reasoning_content,
                     tool_calls,
                     tool_call_id: None,
@@ -476,7 +480,10 @@ mod tests {
             value.pointer("/thinking/type").and_then(Value::as_str),
             Some("enabled")
         );
-        let messages = value.get("messages").and_then(Value::as_array).expect("messages");
+        let messages = value
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages");
         let assistant_msg = &messages[2];
         assert_eq!(assistant_msg["role"].as_str(), Some("assistant"));
         assert_eq!(assistant_msg["content"].as_str(), Some(""));

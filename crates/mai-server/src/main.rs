@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+mod relay;
+
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
@@ -19,16 +21,18 @@ use mai_protocol::{
     CreateProjectRequest, CreateProjectResponse, CreateSessionResponse, CreateTaskRequest,
     CreateTaskResponse, ErrorResponse, FileUploadRequest, FileUploadResponse,
     GitAccountDefaultRequest, GitAccountRequest, GitAccountResponse, GitAccountsResponse,
-    GithubAppManifestStartRequest, GithubAppManifestStartResponse, GithubAppSettingsRequest,
-    GithubAppSettingsResponse, GithubInstallationsResponse, GithubRepositoriesResponse,
-    GithubSettingsRequest, GithubSettingsResponse, McpServersConfigRequest, ModelInputItem,
-    ModelOutputItem, ModelResponse, ProjectId, ProjectReviewRunDetail,
-    ProjectReviewRunsResponse, ProviderPresetsResponse, ProviderTestRequest,
-    ProviderTestResponse, ProvidersConfigRequest, ProvidersResponse, RepositoryPackagesResponse,
-    RequestPlanRevisionRequest, RequestPlanRevisionResponse, RuntimeDefaultsResponse,
-    SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId, SkillsConfigRequest,
-    SkillsListResponse, TaskId, ToolTraceDetail, ToolTraceListResponse, TurnId, UpdateAgentRequest,
-    UpdateAgentResponse, UpdateProjectRequest, UpdateProjectResponse,
+    GithubAppInstallationPackagesRequest, GithubAppInstallationStartRequest,
+    GithubAppInstallationStartResponse, GithubAppManifestStartRequest,
+    GithubAppManifestStartResponse, GithubAppSettingsRequest, GithubAppSettingsResponse,
+    GithubInstallationsResponse, GithubRepositoriesResponse, GithubSettingsRequest,
+    GithubSettingsResponse, McpServersConfigRequest, ModelInputItem, ModelOutputItem,
+    ModelResponse, ProjectId, ProjectReviewRunDetail, ProjectReviewRunsResponse,
+    ProviderPresetsResponse, ProviderTestRequest, ProviderTestResponse, ProvidersConfigRequest,
+    ProvidersResponse, RelayStatusResponse, RepositoryPackagesResponse, RequestPlanRevisionRequest,
+    RequestPlanRevisionResponse, RuntimeDefaultsResponse, SendMessageRequest, SendMessageResponse,
+    ServiceEvent, SessionId, SkillsConfigRequest, SkillsListResponse, TaskId, ToolTraceDetail,
+    ToolTraceListResponse, TurnId, UpdateAgentRequest, UpdateAgentResponse, UpdateProjectRequest,
+    UpdateProjectResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
 use mai_store::{AgentLogFilter, ConfigStore, ToolTraceFilter};
@@ -56,6 +60,7 @@ const SSE_REPLAY_LIMIT: usize = 1_000;
 struct AppState {
     runtime: Arc<AgentRuntime>,
     store: Arc<ConfigStore>,
+    relay: Option<Arc<relay::RelayClient>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +118,15 @@ impl From<mai_store::StoreError> for ApiError {
         Self {
             status,
             message: value.to_string(),
+        }
+    }
+}
+
+impl ApiError {
+    fn bad_request(message: String) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message,
         }
     }
 }
@@ -271,7 +285,22 @@ async fn main() -> Result<()> {
         artifact_index_root = %artifact_index_root.display(),
         "runtime storage paths"
     );
-    let runtime = AgentRuntime::new(docker, model, Arc::clone(&store), runtime_config).await?;
+    let relay = relay_config_from_env().map(|config| Arc::new(relay::RelayClient::new(config)));
+    let github_backend = relay
+        .as_ref()
+        .map(|client| Arc::clone(client) as Arc<dyn mai_runtime::GithubAppBackend>);
+    let runtime = AgentRuntime::new_with_github_backend(
+        docker,
+        model,
+        Arc::clone(&store),
+        runtime_config,
+        github_backend,
+    )
+    .await?;
+    if let Some(relay) = &relay {
+        relay.set_runtime(Arc::clone(&runtime)).await;
+        Arc::clone(relay).start();
+    }
     let cleaned = runtime.cleanup_orphaned_containers().await?;
     if !cleaned.is_empty() {
         info!(
@@ -279,7 +308,11 @@ async fn main() -> Result<()> {
             "removed orphaned mai-team containers"
         );
     }
-    let state = Arc::new(AppState { runtime, store });
+    let state = Arc::new(AppState {
+        runtime,
+        store,
+        relay,
+    });
 
     let app = Router::new()
         .route("/", get(index))
@@ -329,6 +362,11 @@ async fn main() -> Result<()> {
             "/github/app-installation/callback",
             get(github_app_installation_callback),
         )
+        .route(
+            "/github/app-installation/start",
+            post(start_github_app_installation),
+        )
+        .route("/relay/status", get(get_relay_status))
         .route("/github/installations", get(list_github_installations))
         .route(
             "/github/installations:refresh",
@@ -337,6 +375,10 @@ async fn main() -> Result<()> {
         .route(
             "/github/installations/{id}/repositories",
             get(list_github_repositories),
+        )
+        .route(
+            "/github/installations/{id}/repositories/{owner}/{repo}/packages",
+            get(list_github_repository_packages),
         )
         .route("/provider-presets", get(get_provider_presets))
         .route("/skills", get(list_skills))
@@ -506,6 +548,39 @@ fn artifact_files_root(data_dir: &std::path::Path) -> PathBuf {
 
 fn artifact_index_root(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("artifacts").join("index")
+}
+
+fn relay_config_from_env() -> Option<relay::RelayClientConfig> {
+    let enabled = env::var("MAI_RELAY_ENABLED")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"));
+    if !enabled {
+        return None;
+    }
+    let token = env::var("MAI_RELAY_TOKEN").unwrap_or_default();
+    if token.trim().is_empty() {
+        tracing::warn!("MAI_RELAY_ENABLED is set but MAI_RELAY_TOKEN is empty; relay disabled");
+        return None;
+    }
+    let node_id = env::var("MAI_RELAY_NODE_ID").unwrap_or_else(|_| "mai-server".to_string());
+    Some(relay::RelayClientConfig {
+        url: relay_url_from_env_values(
+            env::var("MAI_RELAY_PUBLIC_URL").ok().as_deref(),
+            env::var("MAI_RELAY_URL").ok().as_deref(),
+        ),
+        token,
+        node_id,
+    })
+}
+
+fn relay_url_from_env_values(public_url: Option<&str>, legacy_url: Option<&str>) -> String {
+    public_url
+        .or(legacy_url)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("http://127.0.0.1:8090")
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn release_embedded_system_skills(target_dir: &std::path::Path) -> io::Result<()> {
@@ -1037,6 +1112,9 @@ async fn save_github_settings(
 async fn get_github_app_settings(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<GithubAppSettingsResponse>, ApiError> {
+    if let Some(relay) = &state.relay {
+        return Ok(Json(relay.github_app_settings().await?));
+    }
     Ok(Json(state.runtime.github_app_settings().await?))
 }
 
@@ -1051,6 +1129,9 @@ async fn start_github_app_manifest(
     State(state): State<Arc<AppState>>,
     Json(request): Json<GithubAppManifestStartRequest>,
 ) -> std::result::Result<Json<GithubAppManifestStartResponse>, ApiError> {
+    if let Some(relay) = &state.relay {
+        return Ok(Json(relay.start_github_app_manifest(request).await?));
+    }
     Ok(Json(
         state.runtime.start_github_app_manifest(request).await?,
     ))
@@ -1108,15 +1189,31 @@ async fn github_app_installation_callback(
     )
 }
 
+async fn start_github_app_installation(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<GithubAppInstallationStartRequest>,
+) -> std::result::Result<Json<GithubAppInstallationStartResponse>, ApiError> {
+    let relay = state.relay.as_ref().ok_or_else(|| {
+        ApiError::bad_request("GitHub App installation requires relay mode".to_string())
+    })?;
+    Ok(Json(relay.start_github_app_installation(request).await?))
+}
+
 async fn list_github_installations(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<GithubInstallationsResponse>, ApiError> {
+    if let Some(relay) = &state.relay {
+        return Ok(Json(relay.list_github_installations().await?));
+    }
     Ok(Json(state.runtime.list_github_installations().await?))
 }
 
 async fn refresh_github_installations(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<GithubInstallationsResponse>, ApiError> {
+    if let Some(relay) = &state.relay {
+        return Ok(Json(relay.list_github_installations().await?));
+    }
     Ok(Json(state.runtime.refresh_github_installations().await?))
 }
 
@@ -1124,7 +1221,51 @@ async fn list_github_repositories(
     State(state): State<Arc<AppState>>,
     Path(id): Path<u64>,
 ) -> std::result::Result<Json<GithubRepositoriesResponse>, ApiError> {
+    if let Some(relay) = &state.relay {
+        return Ok(Json(relay.list_github_repositories(id).await?));
+    }
     Ok(Json(state.runtime.list_github_repositories(id).await?))
+}
+
+async fn list_github_repository_packages(
+    State(state): State<Arc<AppState>>,
+    Path((id, owner, repo)): Path<(u64, String, String)>,
+) -> std::result::Result<Json<RepositoryPackagesResponse>, ApiError> {
+    let request = GithubAppInstallationPackagesRequest {
+        installation_id: id,
+        owner,
+        repo,
+    };
+    if let Some(relay) = &state.relay {
+        return Ok(Json(relay.list_github_repository_packages(request).await?));
+    }
+    Ok(Json(
+        state
+            .runtime
+            .list_github_installation_repository_packages(
+                request.installation_id,
+                &request.owner,
+                &request.repo,
+            )
+            .await?,
+    ))
+}
+
+async fn get_relay_status(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<RelayStatusResponse>, ApiError> {
+    Ok(Json(match &state.relay {
+        Some(relay) => relay.status().await,
+        None => RelayStatusResponse {
+            enabled: false,
+            connected: false,
+            relay_url: None,
+            node_id: None,
+            last_heartbeat_at: None,
+            queued_deliveries: None,
+            message: Some("relay disabled".to_string()),
+        },
+    }))
 }
 
 async fn list_skills(
@@ -1664,6 +1805,8 @@ fn event_name(event: &ServiceEvent) -> &'static str {
         mai_protocol::ServiceEventKind::ProjectCreated { .. } => "project_created",
         mai_protocol::ServiceEventKind::ProjectUpdated { .. } => "project_updated",
         mai_protocol::ServiceEventKind::ProjectDeleted { .. } => "project_deleted",
+        mai_protocol::ServiceEventKind::GithubWebhookReceived { .. } => "github_webhook_received",
+        mai_protocol::ServiceEventKind::ProjectReviewQueued { .. } => "project_review_queued",
         mai_protocol::ServiceEventKind::TurnStarted { .. } => "turn_started",
         mai_protocol::ServiceEventKind::TurnCompleted { .. } => "turn_completed",
         mai_protocol::ServiceEventKind::ToolStarted { .. } => "tool_started",
@@ -1848,6 +1991,25 @@ mod tests {
         assert_eq!(
             cache_dir_path_with(&data_dir, Some(cache_dir.clone().into_os_string())),
             cache_dir
+        );
+    }
+
+    #[test]
+    fn relay_url_prefers_public_url_and_trims_trailing_slash() {
+        assert_eq!(
+            relay_url_from_env_values(
+                Some("https://relay.example.com/"),
+                Some("http://legacy.example.com")
+            ),
+            "https://relay.example.com"
+        );
+        assert_eq!(
+            relay_url_from_env_values(None, Some("http://legacy.example.com/")),
+            "http://legacy.example.com"
+        );
+        assert_eq!(
+            relay_url_from_env_values(Some("  "), None),
+            "http://127.0.0.1:8090"
         );
     }
 

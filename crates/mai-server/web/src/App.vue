@@ -136,6 +136,7 @@
         :mcp-servers-state="mcpServersState"
         :mcp-saving="mcpServersState.saving"
         :git-accounts-state="gitAccountsState"
+        :github-app-state="githubAppState"
         :initial-section="settingsInitialSection"
         @reload="loadAgentConfig"
         @save="onSaveAgentConfig"
@@ -148,6 +149,8 @@
         @verify-git-account="onVerifyGitAccount"
         @delete-git-account="onDeleteGitAccount"
         @set-default-git-account="onSetDefaultGitAccount"
+        @refresh-github-app="onRefreshGithubAppSettings"
+        @install-github-app="onInstallGithubAppFromSettings"
       />
     </main>
 
@@ -169,6 +172,8 @@
       @close="projectDialog.open = false"
       @create="onCreateProject"
       @configure-git-accounts="openGitAccountsSettings"
+      @configure-github-app="openGithubAppSettings"
+      @refresh-installations="onRefreshGithubAppInstallations"
       @refresh-repositories="onRefreshProjectRepositories"
       @load-repository-packages="onLoadProjectRepositoryPackages"
     />
@@ -219,6 +224,7 @@ import { useAgentConfig } from './composables/useAgentConfig'
 import { useSkills } from './composables/useSkills'
 import { useMcpServers } from './composables/useMcpServers'
 import { useGitAccounts } from './composables/useGitAccounts'
+import { useGithubApp } from './composables/useGithubApp'
 
 const { toast, showToast } = useApi()
 const { eventFeed, streamingEvents, connectionState, connectEvents, disconnect } = useSSE()
@@ -316,6 +322,14 @@ const {
   deleteGitAccount,
   setDefaultGitAccount
 } = useGitAccounts()
+const {
+  githubAppState,
+  loadGithubAppContext,
+  startGithubAppInstallation,
+  loadInstallations,
+  loadInstallationRepositories,
+  loadInstallationRepositoryPackages
+} = useGithubApp()
 
 const activeTab = ref('tasks')
 const messageDraft = ref('')
@@ -387,7 +401,7 @@ watch(
 
 onMounted(async () => {
   connectEvents(handleSSEEvent, refreshAll)
-  applyStartupHash()
+  await applyStartupHash()
   await refreshAll()
 })
 
@@ -397,7 +411,7 @@ async function refreshAll() {
   isLoading.value = true
   isProjectsLoading.value = true
   try {
-    await Promise.all([loadProviders(), loadAgentConfig(), loadSkills(), loadMcpServers(), loadGitAccounts(), refreshTasks(), refreshProjects()])
+    await Promise.all([loadProviders(), loadAgentConfig(), loadSkills(), loadMcpServers(), loadGitAccounts(), refreshGithubAppSettingsState(), refreshTasks(), refreshProjects()])
     if (providersState.providers.length && !tasks.value.length) {
       await ensureDefaultTask()
     } else if (selectedTaskId.value) {
@@ -418,17 +432,39 @@ async function refreshAll() {
   }
 }
 
-function applyStartupHash() {
+async function applyStartupHash() {
   const hash = window.location.hash || ''
-  if (!hash.includes('settings=git-accounts')) return
-  settingsInitialSection.value = 'git-accounts'
-  activeTab.value = 'settings'
+  const parsed = parseHash(hash)
+  if (parsed.path === 'projects') {
+    activeTab.value = 'projects'
+    return
+  }
+  if (parsed.path === 'settings') {
+    const section = parsed.params.get('settings') || 'roles'
+    settingsInitialSection.value = section
+    activeTab.value = 'settings'
+    if (section === 'github-app' && parsed.params.get('github-app')) {
+      await onRefreshGithubAppSettings()
+      if (parsed.params.get('github-app') === 'pending') {
+        showToast('GitHub App installation is pending approval.')
+      } else {
+        showToast('GitHub App installation updated.')
+      }
+    }
+  }
 }
 
 function openGitAccountsSettings() {
   settingsInitialSection.value = 'git-accounts'
   activeTab.value = 'settings'
   projectDialog.open = false
+}
+
+async function openGithubAppSettings() {
+  settingsInitialSection.value = 'github-app'
+  activeTab.value = 'settings'
+  projectDialog.open = false
+  await onRefreshGithubAppSettings()
 }
 
 async function handleSSEEvent(event) {
@@ -626,25 +662,43 @@ async function onStopProjectAgentTurn(agent) {
   }
 }
 
-async function openCreateProjectDialog() {
+async function openCreateProjectDialog(options = {}) {
   resetProjectDialog()
+  if (options.mode) projectDialog.mode = options.mode
   projectDialog.open = true
-  await loadProjectRuntimeDefaults()
-  await loadGitAccounts()
+  await Promise.allSettled([loadProjectRuntimeDefaults(), loadGitAccounts(), loadGithubAppContext()])
   projectDialog.gitAccounts = gitAccountsState.accounts || []
+  projectDialog.relay = githubAppState.relay
+  projectDialog.githubApp = githubAppState.app
+  await loadProjectInstallations()
+  if (!projectDialog.form.installation_id && projectDialog.installations.length === 1) {
+    projectDialog.form.installation_id = String(projectDialog.installations[0].id)
+  }
   const defaultAccount = projectDialog.gitAccounts.find((account) => account.is_default) || projectDialog.gitAccounts[0]
-  if (!defaultAccount) {
+  if (defaultAccount) {
+    projectDialog.form.git_account_id = defaultAccount.id
+  }
+  if (!defaultAccount && projectDialog.form.installation_id) {
+    projectDialog.mode = 'github_app'
+  }
+  if (projectDialog.mode === 'git_account' && !defaultAccount) {
     projectDialog.error = 'Add a Git account before creating a project.'
     return
   }
-  projectDialog.form.git_account_id = defaultAccount.id
-  await onRefreshProjectRepositories()
+  if (projectDialog.mode === 'github_app' && !projectDialog.form.installation_id) {
+    projectDialog.error = projectDialog.installations.length ? '' : 'Install the GitHub App before creating a project.'
+    return
+  }
+  if (projectDialog.mode === 'git_account' || projectDialog.form.installation_id) {
+    await onRefreshProjectRepositories()
+  }
 }
 
 function resetProjectDialog() {
   projectDialog.mode = 'git_account'
   projectDialog.form.name = ''
   projectDialog.form.git_account_id = ''
+  projectDialog.form.installation_id = ''
   projectDialog.form.repository_full_name = ''
   projectDialog.form.branch = ''
   projectDialog.repository.query = ''
@@ -655,9 +709,65 @@ function resetProjectDialog() {
   projectDialog.runtime.loadingPackages = false
   projectDialog.runtime.packageWarning = ''
   projectDialog.gitAccounts = []
+  projectDialog.relay = null
+  projectDialog.githubApp = null
+  projectDialog.installations = []
   projectDialog.repositories = []
+  projectDialog.loadingInstallations = false
   projectDialog.error = ''
   projectDialog.submitting = false
+}
+
+async function loadProjectInstallations(refresh = false) {
+  projectDialog.loadingInstallations = true
+  try {
+    const response = await loadInstallations(refresh)
+    projectDialog.installations = response?.installations || []
+    return response
+  } catch (error) {
+    if (projectDialog.mode === 'github_app') projectDialog.error = error.message
+    projectDialog.installations = []
+    return { installations: [] }
+  } finally {
+    projectDialog.loadingInstallations = false
+  }
+}
+
+async function onInstallGithubAppFromSettings() {
+  githubAppState.error = ''
+  try {
+    const response = await startGithubAppInstallation(window.location.origin, '#settings=github-app')
+    window.open(response.install_url, '_blank', 'noopener,noreferrer')
+  } catch (error) {
+    githubAppState.error = error.message
+  }
+}
+
+async function onRefreshGithubAppSettings() {
+  await refreshGithubAppSettingsState(true)
+}
+
+async function refreshGithubAppSettingsState(refresh = false) {
+  await loadGithubAppContext()
+  const relayReady = githubAppState.relay?.enabled && githubAppState.relay?.connected
+  const appReady = Boolean(githubAppState.app?.app_slug || githubAppState.app?.install_url)
+  if (!relayReady || !appReady) {
+    githubAppState.installations = []
+    return
+  }
+  try {
+    await loadInstallations(refresh)
+  } catch (error) {
+    githubAppState.installations = []
+    githubAppState.error = error.message
+  }
+}
+
+async function onRefreshGithubAppInstallations() {
+  await loadGithubAppContext()
+  projectDialog.relay = githubAppState.relay
+  projectDialog.githubApp = githubAppState.app
+  await loadProjectInstallations(true)
 }
 
 async function loadProjectRuntimeDefaults() {
@@ -671,12 +781,15 @@ async function loadProjectRuntimeDefaults() {
 }
 
 async function onRefreshProjectRepositories() {
-  if (!projectDialog.form.git_account_id) return
+  if (projectDialog.mode === 'github_app' && !projectDialog.form.installation_id) return
+  if (projectDialog.mode !== 'github_app' && !projectDialog.form.git_account_id) return
   projectDialog.loadingRepositories = true
   projectDialog.error = ''
   clearProjectRepositoryPackages()
   try {
-    const response = await loadGitAccountRepositories(projectDialog.form.git_account_id)
+    const response = projectDialog.mode === 'github_app'
+      ? await loadInstallationRepositories(projectDialog.form.installation_id)
+      : await loadGitAccountRepositories(projectDialog.form.git_account_id)
     projectDialog.repositories = response?.repositories || []
     if (projectDialog.form.repository_full_name && !projectDialog.repositories.some((repository) => {
       return repository.full_name === projectDialog.form.repository_full_name
@@ -707,17 +820,24 @@ function clearProjectRepositoryPackages() {
 }
 
 async function onLoadProjectRepositoryPackages() {
-  if (!projectDialog.form.git_account_id || !projectDialog.form.repository_full_name) {
+  if (!projectDialog.form.repository_full_name) {
+    clearProjectRepositoryPackages()
+    return
+  }
+  if (projectDialog.mode === 'github_app' && !projectDialog.form.installation_id) {
+    clearProjectRepositoryPackages()
+    return
+  }
+  if (projectDialog.mode !== 'github_app' && !projectDialog.form.git_account_id) {
     clearProjectRepositoryPackages()
     return
   }
   projectDialog.runtime.loadingPackages = true
   projectDialog.runtime.packageWarning = ''
   try {
-    const response = await loadGitAccountRepositoryPackages(
-      projectDialog.form.git_account_id,
-      projectDialog.form.repository_full_name
-    )
+    const response = projectDialog.mode === 'github_app'
+      ? await loadInstallationRepositoryPackages(projectDialog.form.installation_id, projectDialog.form.repository_full_name)
+      : await loadGitAccountRepositoryPackages(projectDialog.form.git_account_id, projectDialog.form.repository_full_name)
     projectDialog.runtime.packages = response?.packages || []
     projectDialog.runtime.package_image = ''
     projectDialog.runtime.packageWarning = response?.warning || ''
@@ -737,19 +857,28 @@ async function onCreateProject() {
     projectDialog.error = 'Select a repository before creating the project.'
     return
   }
-  if (!projectDialog.form.git_account_id) {
+  if (projectDialog.mode === 'github_app' && !projectDialog.form.installation_id) {
+    projectDialog.error = 'Select a GitHub App installation before creating the project.'
+    return
+  }
+  if (projectDialog.mode !== 'github_app' && !projectDialog.form.git_account_id) {
     projectDialog.error = 'Select a Git account before creating the project.'
     return
   }
   projectDialog.submitting = true
   try {
-    await createProject({
+    const payload = {
       name: projectDialog.form.name,
-      git_account_id: projectDialog.form.git_account_id,
       repository_full_name: projectDialog.form.repository_full_name,
       branch: projectDialog.form.branch || null,
       docker_image: projectDialog.runtime.docker_image || null
-    })
+    }
+    if (projectDialog.mode === 'github_app') {
+      payload.installation_id = Number(projectDialog.form.installation_id)
+    } else {
+      payload.git_account_id = projectDialog.form.git_account_id
+    }
+    await createProject(payload)
     projectDialog.open = false
     activeTab.value = 'projects'
   } catch (error) {
@@ -911,5 +1040,20 @@ function confirmDeleteProvider(index, name) {
 
 function onConfirmAction() {
   if (confirmDialog.onConfirm) confirmDialog.onConfirm()
+}
+
+function parseHash(hash) {
+  const raw = (hash || '').replace(/^#/, '')
+  const [pathPart, queryPart = ''] = raw.split('?')
+  const params = new URLSearchParams(queryPart)
+  let path = pathPart || ''
+  if (path.startsWith('settings=')) {
+    params.set('settings', path.slice('settings='.length) || 'roles')
+    path = 'settings'
+  }
+  return {
+    path,
+    params
+  }
 }
 </script>

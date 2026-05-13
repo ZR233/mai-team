@@ -1,7 +1,7 @@
 use crate::error::ModelError;
+use crate::wire::WireProtocol;
 use crate::wire::chat_completions::ChatCompletionsApi;
 use crate::wire::responses::ResponsesApi;
-use crate::wire::WireProtocol;
 use mai_protocol::{ModelConfig, ModelWireApi, ProviderKind, ProviderSecret};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;

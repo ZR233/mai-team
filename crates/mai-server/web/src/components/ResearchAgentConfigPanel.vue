@@ -323,6 +323,97 @@
           </div>
         </section>
 
+        <section v-else-if="activeSettingsSection === 'github-app'" class="settings-section-panel github-app-settings">
+          <div class="settings-section-header">
+            <div>
+              <h2>GitHub App</h2>
+              <p>Install the relay-owned GitHub App for repository access.</p>
+            </div>
+            <span class="section-status" :class="githubAppStatusClass">
+              {{ githubAppStatusLabel }}
+            </span>
+          </div>
+
+          <div class="settings-summary">
+            <div class="settings-summary-item" :class="githubAppRelayReady ? 'ready' : 'danger'">
+              <span>Relay</span>
+              <strong>{{ githubAppRelayReady ? 'Connected' : 'Unavailable' }}</strong>
+              <small>{{ githubAppRelayMessage }}</small>
+            </div>
+            <div class="settings-summary-item" :class="githubAppConfigured ? 'ready' : 'danger'">
+              <span>App</span>
+              <strong>{{ githubAppName }}</strong>
+              <small>{{ githubAppOwnerLabel }}</small>
+            </div>
+            <div class="settings-summary-item" :class="githubAppInstallationCount ? 'ready' : ''">
+              <span>Installations</span>
+              <strong>{{ githubAppInstallationCount }}</strong>
+              <small>{{ githubAppInstallationCount ? 'Available for project creation.' : 'Install the app before creating projects.' }}</small>
+            </div>
+          </div>
+
+          <div class="git-accounts-layout">
+            <div class="git-account-list">
+              <article
+                v-for="installation in githubAppInstallations"
+                :key="installation.id"
+                class="git-account-card github-app-installation-card"
+              >
+                <span class="git-account-mark">APP</span>
+                <span class="git-account-main">
+                  <strong>{{ installation.account_login || installation.id }}</strong>
+                  <small>{{ installation.account_type || 'GitHub' }}</small>
+                  <span class="git-account-meta">{{ installation.repository_selection || 'repositories' }}</span>
+                </span>
+                <span class="mini-pill green">Installed</span>
+              </article>
+              <div v-if="!githubAppInstallationCount" class="quiet-empty skills-empty">
+                <strong>No GitHub App installations</strong>
+                <span>Install the app for your GitHub account or organization.</span>
+              </div>
+            </div>
+
+            <div class="git-account-form">
+              <div class="integration-card-head">
+                <div>
+                  <h3>{{ githubAppName }}</h3>
+                  <p>{{ githubAppConfigured ? githubAppUrlLabel : 'GitHub App metadata is not available.' }}</p>
+                </div>
+                <span class="section-status" :class="githubAppConfigured ? 'ready' : 'danger'">
+                  {{ githubAppConfigured ? 'Configured' : 'Missing app' }}
+                </span>
+              </div>
+
+              <div class="detected-token-row">
+                <span>Owner</span>
+                <strong>{{ githubAppOwnerLabel }}</strong>
+                <small>{{ githubAppSettings?.base_url || 'Relay will provide the GitHub API base URL.' }}</small>
+              </div>
+
+              <div class="agent-runtime-strip">
+                <span>Project runtime</span>
+                <strong>Installation token -> Git MCP + GitHub MCP</strong>
+                <small>Short-lived tokens are minted by mai-relay and never stored in the browser.</small>
+              </div>
+
+              <p v-if="githubAppState.error" class="dialog-error">{{ githubAppState.error }}</p>
+
+              <div class="settings-actions">
+                <div class="settings-actions-left">
+                  <button class="ghost-button" type="button" :disabled="githubAppState.loading || githubAppState.loadingInstallations" @click="$emit('refresh-github-app')">
+                    <span v-if="githubAppState.loading || githubAppState.loadingInstallations" class="spinner-sm"></span>
+                    <template v-else>Refresh</template>
+                  </button>
+                </div>
+                <button class="primary-button" type="button" :disabled="!canInstallGithubApp || githubAppState.installing" @click="$emit('install-github-app')">
+                  <span v-if="githubAppState.installing" class="spinner-sm"></span>
+                  <template v-else>Install GitHub App</template>
+                </button>
+              </div>
+            </div>
+          </div>
+        </section>
+
         <section v-else class="settings-section-panel mcp-settings">
           <div class="settings-section-header">
             <div>
@@ -391,6 +482,7 @@ const SETTINGS_SECTIONS = [
   { key: 'roles', title: 'Role Models', icon: 'R' },
   { key: 'skills', title: 'Skills', icon: 'S' },
   { key: 'git-accounts', title: 'Git Accounts', icon: 'G' },
+  { key: 'github-app', title: 'GitHub App', icon: 'A' },
   { key: 'mcp', title: 'MCP Servers', icon: 'M' }
 ]
 
@@ -405,6 +497,7 @@ const props = defineProps({
   mcpServersState: { type: Object, required: true },
   mcpSaving: { type: Boolean, default: false },
   gitAccountsState: { type: Object, default: () => ({ accounts: [] }) },
+  githubAppState: { type: Object, default: () => ({ relay: null, app: null, installations: [] }) },
   initialSection: { type: String, default: 'roles' }
 })
 
@@ -419,7 +512,9 @@ const emit = defineEmits([
   'save-git-account',
   'verify-git-account',
   'delete-git-account',
-  'set-default-git-account'
+  'set-default-git-account',
+  'refresh-github-app',
+  'install-github-app'
 ])
 
 const activeSettingsSection = ref('roles')
@@ -485,6 +580,35 @@ const defaultGitAccount = computed(() => gitAccounts.value.find((account) => acc
 const selectedGitAccount = computed(() => gitAccounts.value.find((account) => account.id === selectedGitAccountId.value) || null)
 const canSaveGitAccount = computed(() => {
   return Boolean(gitForm.label.trim() && (gitForm.id || gitForm.token.trim()))
+})
+const githubAppRelayReady = computed(() => props.githubAppState.relay?.enabled && props.githubAppState.relay?.connected)
+const githubAppSettings = computed(() => props.githubAppState.app || null)
+const githubAppConfigured = computed(() => Boolean(githubAppSettings.value?.app_slug || githubAppSettings.value?.install_url))
+const githubAppInstallations = computed(() => props.githubAppState.installations || [])
+const githubAppInstallationCount = computed(() => githubAppInstallations.value.length)
+const canInstallGithubApp = computed(() => githubAppRelayReady.value && githubAppConfigured.value)
+const githubAppName = computed(() => githubAppSettings.value?.app_slug || 'GitHub App')
+const githubAppUrlLabel = computed(() => githubAppSettings.value?.app_html_url || githubAppSettings.value?.install_url || 'Install URL available from relay.')
+const githubAppOwnerLabel = computed(() => {
+  const login = githubAppSettings.value?.owner_login
+  const type = githubAppSettings.value?.owner_type
+  return [login, type].filter(Boolean).join(' · ') || 'Owner pending'
+})
+const githubAppRelayMessage = computed(() => {
+  if (!props.githubAppState.relay?.enabled) return 'Relay mode is disabled.'
+  if (!props.githubAppState.relay?.connected) return props.githubAppState.relay?.message || 'mai-server is not connected to mai-relay.'
+  return props.githubAppState.relay?.relay_url || 'Connected to mai-relay.'
+})
+const githubAppStatusLabel = computed(() => {
+  if (!githubAppRelayReady.value) return 'Relay unavailable'
+  if (!githubAppConfigured.value) return 'App missing'
+  if (!githubAppInstallationCount.value) return 'Not installed'
+  return `${githubAppInstallationCount.value} installed`
+})
+const githubAppStatusClass = computed(() => {
+  if (!githubAppRelayReady.value || !githubAppConfigured.value) return 'danger'
+  if (githubAppInstallationCount.value) return 'ready'
+  return ''
 })
 
 watch(
@@ -625,6 +749,7 @@ function sectionStatus(section) {
   if (section === 'roles') return `${configuredCount.value}/${ROLE_DEFINITIONS.length} configured`
   if (section === 'skills') return `${enabledSkillCount.value} enabled`
   if (section === 'git-accounts') return gitAccountCount.value ? `${gitAccountCount.value} connected` : 'No accounts'
+  if (section === 'github-app') return githubAppStatusLabel.value
   if (section === 'mcp') return `${mcpEnabledCount.value} active`
   return ''
 }

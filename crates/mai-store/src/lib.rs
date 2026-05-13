@@ -158,6 +158,12 @@ struct StoredGitAccount {
     last_verified_at: Option<DateTime<Utc>>,
     #[serde(default)]
     last_error: Option<String>,
+    #[serde(default)]
+    installation_id: Option<u64>,
+    #[serde(default)]
+    installation_account: Option<String>,
+    #[serde(default)]
+    relay_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1032,9 +1038,16 @@ impl ConfigStore {
         } else {
             token
         };
-        if token_secret.trim().is_empty() {
+        if token_secret.trim().is_empty() && request.provider != GitProvider::GithubAppRelay {
             return Err(StoreError::InvalidConfig(
                 "git account token is required".to_string(),
+            ));
+        }
+        if request.provider == GitProvider::GithubAppRelay
+            && request.installation_id.unwrap_or_default() == 0
+        {
+            return Err(StoreError::InvalidConfig(
+                "GitHub App relay account requires installation_id".to_string(),
             ));
         }
         let fallback_label = request
@@ -1063,6 +1076,9 @@ impl ConfigStore {
                 token_secret: token_secret.clone(),
                 last_verified_at: None,
                 last_error: None,
+                installation_id: None,
+                installation_account: None,
+                relay_id: None,
             });
         account.provider = request.provider;
         account.label = label;
@@ -1070,8 +1086,26 @@ impl ConfigStore {
             account.login = Some(login.trim().to_string()).filter(|value| !value.is_empty());
         }
         account.token_secret = token_secret;
-        account.status = GitAccountStatus::Verifying;
+        account.status = if account.provider == GitProvider::GithubAppRelay {
+            GitAccountStatus::Verified
+        } else {
+            GitAccountStatus::Verifying
+        };
         account.last_error = None;
+        account.installation_id = request.installation_id;
+        account.installation_account = request
+            .installation_account
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        account.relay_id = request
+            .relay_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if account.provider == GitProvider::GithubAppRelay {
+            account.token_kind = GitTokenKind::Unknown;
+            account.scopes = Vec::new();
+            account.last_verified_at = Some(Utc::now());
+        }
         if has_new_token {
             account.last_verified_at = None;
         }
@@ -1092,6 +1126,28 @@ impl ConfigStore {
             .find(|account| account.id == id)
             .map(|account| account.summary(config.default_account_id.as_deref()))
             .expect("saved account"))
+    }
+
+    pub async fn upsert_github_app_relay_account(
+        &self,
+        installation_id: u64,
+        installation_account: &str,
+        relay_id: &str,
+        is_default: bool,
+    ) -> Result<GitAccountSummary> {
+        let id = format!("github-app-installation-{installation_id}");
+        self.upsert_git_account(GitAccountRequest {
+            id: Some(id),
+            provider: GitProvider::GithubAppRelay,
+            label: format!("GitHub App: {installation_account}"),
+            login: Some(installation_account.to_string()),
+            token: None,
+            is_default,
+            installation_id: Some(installation_id),
+            installation_account: Some(installation_account.to_string()),
+            relay_id: Some(relay_id.to_string()),
+        })
+        .await
     }
 
     pub async fn update_git_account_verification(
@@ -1179,6 +1235,16 @@ impl ConfigStore {
             .map(|account| account.token_secret))
     }
 
+    pub async fn git_account(&self, account_id: &str) -> Result<Option<GitAccountSummary>> {
+        let _guard = self.git_accounts_lock.lock().await;
+        let config = self.git_accounts_config().await?;
+        Ok(config
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .map(|account| account.summary(config.default_account_id.as_deref())))
+    }
+
     async fn git_accounts_config(&self) -> Result<GitAccountsConfig> {
         let mut config = match self.get_setting(SETTING_GIT_ACCOUNTS).await? {
             Some(value) if !value.trim().is_empty() => serde_json::from_str(&value)?,
@@ -1201,6 +1267,9 @@ impl ConfigStore {
                     token_secret: token,
                     last_verified_at: None,
                     last_error: None,
+                    installation_id: None,
+                    installation_account: None,
+                    relay_id: None,
                 });
                 config.default_account_id = Some("github-default".to_string());
             }
@@ -2425,6 +2494,9 @@ impl StoredGitAccount {
             has_token: !self.token_secret.trim().is_empty(),
             last_verified_at: self.last_verified_at,
             last_error: self.last_error.clone(),
+            installation_id: self.installation_id,
+            installation_account: self.installation_account.clone(),
+            relay_id: self.relay_id.clone(),
         }
     }
 }
@@ -3876,6 +3948,8 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         | ServiceEventKind::ProjectCreated { .. }
         | ServiceEventKind::ProjectUpdated { .. }
         | ServiceEventKind::ProjectDeleted { .. }
+        | ServiceEventKind::GithubWebhookReceived { .. }
+        | ServiceEventKind::ProjectReviewQueued { .. }
         | ServiceEventKind::PlanUpdated { .. } => None,
         ServiceEventKind::ArtifactCreated { artifact } => Some(artifact.agent_id),
         ServiceEventKind::Error { agent_id, .. } => *agent_id,
@@ -4127,6 +4201,31 @@ mod tests {
         assert_eq!(resaved.status, GitAccountStatus::Verifying);
         assert_eq!(resaved.last_error, None);
         assert_eq!(resaved.last_verified_at, None);
+    }
+
+    #[tokio::test]
+    async fn github_app_relay_account_has_installation_metadata_without_token() {
+        let (_dir, store) = store().await;
+        let saved = store
+            .upsert_github_app_relay_account(42, "octo-org", "relay-main", true)
+            .await
+            .expect("save relay account");
+
+        assert_eq!(saved.id, "github-app-installation-42");
+        assert_eq!(saved.provider, GitProvider::GithubAppRelay);
+        assert_eq!(saved.status, GitAccountStatus::Verified);
+        assert!(!saved.has_token);
+        assert_eq!(saved.installation_id, Some(42));
+        assert_eq!(saved.installation_account.as_deref(), Some("octo-org"));
+        assert_eq!(saved.relay_id.as_deref(), Some("relay-main"));
+
+        let loaded = store
+            .git_account("github-app-installation-42")
+            .await
+            .expect("load")
+            .expect("account");
+        assert_eq!(loaded.provider, GitProvider::GithubAppRelay);
+        assert_eq!(loaded.installation_id, Some(42));
     }
 
     #[tokio::test]

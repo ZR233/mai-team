@@ -41,11 +41,7 @@ impl WireProtocol for ResponsesApi {
     }
 
     fn build_body(&self, req: &WireRequest<'_>) -> Result<Vec<u8>> {
-        let active_tools = if req.supports_tools {
-            req.tools
-        } else {
-            &[]
-        };
+        let active_tools = if req.supports_tools { req.tools } else { &[] };
         let request = ResponsesRequest {
             model: req.model_id,
             instructions: req.instructions,

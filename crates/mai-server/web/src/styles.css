@@ -1938,6 +1938,10 @@ p {
   background: #f4f8ff;
 }
 
+.github-app-installation-card {
+  cursor: default;
+}
+
 .git-account-mark {
   display: grid;
   width: 34px;
