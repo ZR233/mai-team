@@ -141,7 +141,7 @@ fn parse_output_item(value: Value) -> ModelOutputItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::request_options;
+    use crate::provider::request_options;
     use crate::types::ModelTurnState;
     use mai_protocol::{ModelReasoningConfig, ModelReasoningVariant, ModelWireApi};
 

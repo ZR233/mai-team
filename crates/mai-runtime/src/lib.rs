@@ -6,7 +6,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use mai_agents::AgentProfilesManager;
 use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient, ExecCaptureOptions};
 use mai_mcp::{McpAgentManager, McpTool};
-use mai_model::{ModelRequest, ModelTurnState, ResponsesClient};
+use mai_model::{ModelClient, ModelTurnState};
 use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentLogEntry,
     AgentLogsResponse, AgentMessage, AgentModelPreference, AgentProfilesResponse, AgentRole,
@@ -196,7 +196,7 @@ struct ReviewStateUpdate {
 
 pub struct AgentRuntime {
     docker: DockerClient,
-    model: ResponsesClient,
+    model: ModelClient,
     store: Arc<ConfigStore>,
     skills: SkillsManager,
     agent_profiles: AgentProfilesManager,
@@ -580,7 +580,7 @@ struct GithubErrorResponse {
 impl AgentRuntime {
     pub async fn new(
         docker: DockerClient,
-        model: ResponsesClient,
+        model: ModelClient,
         store: Arc<ConfigStore>,
         config: RuntimeConfig,
     ) -> Result<Arc<Self>> {
@@ -1410,16 +1410,10 @@ impl AgentRuntime {
             .await?;
         let instructions = "Generate a concise task title of 3-8 words that captures the essence of the user's request. Output only the title text, nothing else. Do not use quotes or punctuation at the end.";
         let input = vec![ModelInputItem::user_text(message)];
+        let resolved = self.model.resolve(&selection.provider, &selection.model, None);
         let response = self
             .model
-            .create_response(
-                &selection.provider,
-                &selection.model,
-                instructions,
-                &input,
-                &[],
-                None,
-            )
+            .send(&resolved, instructions, &input, &[])
             .await?;
         let title = response
             .output
@@ -3158,15 +3152,15 @@ impl AgentRuntime {
             let model_started = Instant::now();
             let response = self
                 .model
-                .create_turn_response_with_cancel(
-                    &ModelRequest {
-                        provider: &model_context.provider_selection.provider,
-                        model: &model_context.provider_selection.model,
-                        instructions: &model_context.instructions,
-                        input: &history,
-                        tools: &model_context.tools,
-                        reasoning_effort: model_context.reasoning_effort.clone(),
-                    },
+                .send_turn(
+                    &self.model.resolve(
+                        &model_context.provider_selection.provider,
+                        &model_context.provider_selection.model,
+                        model_context.reasoning_effort.as_deref(),
+                    ),
+                    &model_context.instructions,
+                    &history,
+                    &model_context.tools,
                     &mut turn_model_state,
                     &cancellation_token,
                 )
@@ -5275,19 +5269,14 @@ impl AgentRuntime {
             )
             .await?
         };
+        let resolved = self.model.resolve(
+            &provider_selection.provider,
+            &provider_selection.model,
+            summary.reasoning_effort.as_deref(),
+        );
         let response = self
             .model
-            .create_response_with_cancel(
-                &ModelRequest {
-                    provider: &provider_selection.provider,
-                    model: &provider_selection.model,
-                    instructions: &instructions,
-                    input: &compact_input,
-                    tools: &[],
-                    reasoning_effort: summary.reasoning_effort,
-                },
-                cancellation_token,
-            )
+            .send_with_cancel(&resolved, &instructions, &compact_input, &[], cancellation_token)
             .await
             .map_err(|err| {
                 if matches!(err, mai_model::ModelError::Cancelled) {
@@ -10367,7 +10356,7 @@ mod tests {
     async fn test_runtime(dir: &tempfile::TempDir, store: Arc<ConfigStore>) -> Arc<AgentRuntime> {
         AgentRuntime::new(
             DockerClient::new_with_binary("unused", fake_docker_path(dir)),
-            ResponsesClient::new(),
+            ModelClient::new(),
             store,
             test_runtime_config(dir, DEFAULT_SIDECAR_IMAGE),
         )
@@ -10382,7 +10371,7 @@ mod tests {
     ) -> Arc<AgentRuntime> {
         AgentRuntime::new(
             DockerClient::new_with_binary("unused-agent", fake_docker_path(dir)),
-            ResponsesClient::new(),
+            ModelClient::new(),
             store,
             RuntimeConfig {
                 git_binary: Some(fake_git_path(dir)),
@@ -10400,7 +10389,7 @@ mod tests {
     ) -> Arc<AgentRuntime> {
         AgentRuntime::new(
             DockerClient::new_with_binary("unused", fake_docker_path(dir)),
-            ResponsesClient::new(),
+            ModelClient::new(),
             store,
             RuntimeConfig {
                 github_api_base_url: Some(github_api_base_url),
@@ -11674,7 +11663,7 @@ esac
         );
         let runtime = AgentRuntime::new(
             DockerClient::new("unused"),
-            ResponsesClient::new(),
+            ModelClient::new(),
             store,
             test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
@@ -11920,7 +11909,7 @@ esac
 
         let runtime = AgentRuntime::new(
             DockerClient::new("unused"),
-            ResponsesClient::new(),
+            ModelClient::new(),
             Arc::new(
                 ConfigStore::open_with_config_path(&db_path, &config_path)
                     .await
@@ -11986,7 +11975,7 @@ esac
 
         let runtime = AgentRuntime::new(
             DockerClient::new("unused"),
-            ResponsesClient::new(),
+            ModelClient::new(),
             Arc::new(
                 ConfigStore::open_with_config_path(&db_path, &config_path)
                     .await
@@ -12087,7 +12076,7 @@ esac
 
         let runtime = AgentRuntime::new(
             DockerClient::new("unused"),
-            ResponsesClient::new(),
+            ModelClient::new(),
             Arc::new(
                 ConfigStore::open_with_config_path(&db_path, &config_path)
                     .await
@@ -12157,7 +12146,7 @@ esac
             .expect("save tokens");
         let runtime = AgentRuntime::new(
             DockerClient::new("unused"),
-            ResponsesClient::new(),
+            ModelClient::new(),
             Arc::clone(&store),
             test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
@@ -12262,7 +12251,7 @@ esac
         save_test_session(&store, agent_id, session_id).await;
         let runtime = AgentRuntime::new(
             DockerClient::new("unused"),
-            ResponsesClient::new(),
+            ModelClient::new(),
             Arc::clone(&store),
             test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
@@ -13490,7 +13479,7 @@ esac
         save_test_session(&store, agent_id, session_id).await;
         let runtime = AgentRuntime::new(
             DockerClient::new("unused"),
-            ResponsesClient::new(),
+            ModelClient::new(),
             Arc::clone(&store),
             test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
@@ -13554,7 +13543,7 @@ esac
             .expect("save providers");
         let runtime = AgentRuntime::new(
             DockerClient::new("unused"),
-            ResponsesClient::new(),
+            ModelClient::new(),
             Arc::clone(&store),
             test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
@@ -13678,7 +13667,7 @@ esac
             .expect("save session");
         let runtime = AgentRuntime::new(
             DockerClient::new("unused"),
-            ResponsesClient::new(),
+            ModelClient::new(),
             store,
             test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
@@ -13719,7 +13708,7 @@ esac
             .expect("save providers");
         let runtime = AgentRuntime::new(
             DockerClient::new("unused"),
-            ResponsesClient::new(),
+            ModelClient::new(),
             Arc::clone(&store),
             test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
@@ -13807,7 +13796,7 @@ esac
             .expect("save stale config");
         let runtime = AgentRuntime::new(
             DockerClient::new("unused"),
-            ResponsesClient::new(),
+            ModelClient::new(),
             Arc::clone(&store),
             test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
@@ -14690,7 +14679,7 @@ esac
         save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container-1"))).await;
         let runtime = AgentRuntime::new(
             DockerClient::new_with_binary("unused", fake_docker_path(&dir)),
-            ResponsesClient::new(),
+            ModelClient::new(),
             Arc::clone(&store),
             RuntimeConfig {
                 system_skills_root: Some(dir.path().join("system-skills")),
@@ -15134,7 +15123,7 @@ esac
             .expect("save providers");
         let runtime = AgentRuntime::new(
             DockerClient::new_with_binary("ubuntu:latest", fake_docker_path(&dir)),
-            ResponsesClient::new(),
+            ModelClient::new(),
             Arc::clone(&store),
             test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
@@ -15902,7 +15891,7 @@ esac
         .expect("write system skill");
         let runtime = AgentRuntime::new(
             DockerClient::new_with_binary("unused", fake_docker_path(&dir)),
-            ResponsesClient::new(),
+            ModelClient::new(),
             Arc::clone(&store),
             RuntimeConfig {
                 system_skills_root: Some(dir.path().join("system-skills")),
@@ -16284,7 +16273,7 @@ esac
         store.save_project(&project).await.expect("save project");
         let runtime = AgentRuntime::new(
             DockerClient::new_with_binary("unused-agent", failing_docker_path(&dir)),
-            ResponsesClient::new(),
+            ModelClient::new(),
             Arc::clone(&store),
             test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
@@ -16410,7 +16399,7 @@ esac
         store.save_agent(&summary, None).await.expect("save agent");
         let runtime = AgentRuntime::new(
             DockerClient::new("unused"),
-            ResponsesClient::new(),
+            ModelClient::new(),
             Arc::clone(&store),
             test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
@@ -16489,7 +16478,7 @@ esac
         store.save_agent(&summary, None).await.expect("save agent");
         let runtime = AgentRuntime::new(
             DockerClient::new("unused"),
-            ResponsesClient::new(),
+            ModelClient::new(),
             Arc::clone(&store),
             test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )
@@ -16565,7 +16554,7 @@ esac
         store.save_agent(&summary, None).await.expect("save agent");
         let runtime = AgentRuntime::new(
             DockerClient::new("unused"),
-            ResponsesClient::new(),
+            ModelClient::new(),
             store,
             test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
         )

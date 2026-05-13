@@ -426,7 +426,7 @@ mod tests {
                 store: None,
                 previous_response_id: None,
                 max_output_tokens: 64_000,
-                extra_body: crate::http::request_options(&model, Some("high")),
+                extra_body: crate::provider::request_options(&model, Some("high")),
                 supports_tools: true,
             })
             .expect("build");
@@ -478,7 +478,7 @@ mod tests {
                 store: None,
                 previous_response_id: None,
                 max_output_tokens: 64_000,
-                extra_body: crate::http::request_options(&model, Some("max")),
+                extra_body: crate::provider::request_options(&model, Some("max")),
                 supports_tools: true,
             })
             .expect("build");
@@ -538,7 +538,7 @@ mod tests {
                 store: None,
                 previous_response_id: None,
                 max_output_tokens: 131_072,
-                extra_body: crate::http::request_options(&model, None),
+                extra_body: crate::provider::request_options(&model, None),
                 supports_tools: true,
             })
             .expect("build");

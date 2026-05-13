@@ -1,13 +1,9 @@
 use crate::error::{ModelError, Result};
-use crate::http::{self, continuation_cache_key, response_id_unsupported_for_responses_http};
-use crate::provider::DefaultProviderResolver;
-use crate::types::{ModelRequest, ModelTurnState};
+use crate::provider::{ProviderResolver, ResolvedProvider, response_id_unsupported_for_responses_http};
+use crate::types::ModelTurnState;
 use crate::wire::responses::openai_turn_input;
 use crate::wire::WireRequest;
-use mai_protocol::{
-    ModelConfig, ModelInputItem, ModelResponse, ModelWireApi, ProviderKind, ProviderSecret,
-    ToolDefinition,
-};
+use mai_protocol::{ModelInputItem, ModelResponse, ToolDefinition};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,135 +13,117 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone)]
 pub struct ModelClient {
     http: reqwest::Client,
-    resolver: Arc<dyn crate::provider::ProviderResolver>,
+    resolver: Arc<dyn ProviderResolver>,
     continuation_cache: Arc<Mutex<HashSet<String>>>,
 }
-
-pub type ResponsesClient = ModelClient;
 
 impl ModelClient {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub async fn create_response(
+    pub fn resolve(
         &self,
-        provider: &ProviderSecret,
-        model: &ModelConfig,
+        provider: &mai_protocol::ProviderSecret,
+        model: &mai_protocol::ModelConfig,
+        reasoning_effort: Option<&str>,
+    ) -> ResolvedProvider {
+        self.resolver.resolve(provider, model, reasoning_effort)
+    }
+
+    pub async fn send(
+        &self,
+        resolved: &ResolvedProvider,
         instructions: &str,
         input: &[ModelInputItem],
         tools: &[ToolDefinition],
-        reasoning_effort: Option<String>,
     ) -> Result<ModelResponse> {
-        let supports_tools = http::model_supports_tools(model);
-        let resolved = self.resolver.resolve(provider, model);
         let wire_req = WireRequest {
-            model_id: &model.id,
+            model_id: &resolved.model_id,
             instructions,
             input,
             tools,
-            tool_choice: tool_choice(tools, supports_tools),
+            tool_choice: tool_choice(tools, resolved.supports_tools),
             stream: false,
             store: Some(false),
             previous_response_id: None,
             max_output_tokens: resolved.max_output_tokens,
-            extra_body: http::request_options(model, reasoning_effort.as_deref()),
-            supports_tools,
+            extra_body: resolved.extra_body.clone(),
+            supports_tools: resolved.supports_tools,
         };
-        self.send_request(&resolved, &wire_req).await
+        self.send_request(resolved, &wire_req).await
     }
 
-    pub async fn create_response_with_cancel(
+    pub async fn send_with_cancel(
         &self,
-        req: &ModelRequest<'_>,
+        resolved: &ResolvedProvider,
+        instructions: &str,
+        input: &[ModelInputItem],
+        tools: &[ToolDefinition],
         cancellation_token: &CancellationToken,
     ) -> Result<ModelResponse> {
         tokio::select! {
-            response = self.create_response(
-                req.provider,
-                req.model,
-                req.instructions,
-                req.input,
-                req.tools,
-                req.reasoning_effort.clone(),
-            ) => response,
+            response = self.send(resolved, instructions, input, tools) => response,
             _ = cancellation_token.cancelled() => Err(ModelError::Cancelled),
         }
     }
 
-    pub async fn create_turn_response_with_cancel(
+    pub async fn send_turn(
         &self,
-        req: &ModelRequest<'_>,
+        resolved: &ResolvedProvider,
+        instructions: &str,
+        input: &[ModelInputItem],
+        tools: &[ToolDefinition],
         state: &mut ModelTurnState,
         cancellation_token: &CancellationToken,
     ) -> Result<ModelResponse> {
         tokio::select! {
-            response = self.create_turn_response(req, state) => response,
+            response = self.send_turn_inner(resolved, instructions, input, tools, state) => response,
             _ = cancellation_token.cancelled() => Err(ModelError::Cancelled),
         }
     }
 
-    async fn create_turn_response(
+    async fn send_turn_inner(
         &self,
-        req: &ModelRequest<'_>,
+        resolved: &ResolvedProvider,
+        instructions: &str,
+        input: &[ModelInputItem],
+        tools: &[ToolDefinition],
         state: &mut ModelTurnState,
     ) -> Result<ModelResponse> {
-        if self
-            .continuation_is_unsupported(req.provider, req.model)
-            .await
-        {
+        if self.continuation_is_unsupported(&resolved.cache_key).await {
             state.continuation_disabled = true;
             state.previous_response_id = None;
         }
-        if !self.can_use_continuation(req.provider, req.model, state) {
-            return self
-                .create_response(
-                    req.provider,
-                    req.model,
-                    req.instructions,
-                    req.input,
-                    req.tools,
-                    req.reasoning_effort.clone(),
-                )
-                .await;
+        if !resolved.supports_continuation || state.continuation_disabled {
+            return self.send(resolved, instructions, input, tools).await;
         }
 
-        let supports_tools = http::model_supports_tools(req.model);
-        let (input, previous_response_id) = openai_turn_input(req.input, state);
-        let resolved = self.resolver.resolve(req.provider, req.model);
+        let (delta_input, previous_response_id) = openai_turn_input(input, state);
         let wire_req = WireRequest {
-            model_id: &req.model.id,
-            instructions: req.instructions,
-            input,
-            tools: req.tools,
-            tool_choice: tool_choice(req.tools, supports_tools),
+            model_id: &resolved.model_id,
+            instructions,
+            input: delta_input,
+            tools,
+            tool_choice: tool_choice(tools, resolved.supports_tools),
             stream: false,
             store: Some(true),
             previous_response_id,
             max_output_tokens: resolved.max_output_tokens,
-            extra_body: http::request_options(req.model, req.reasoning_effort.as_deref()),
-            supports_tools,
+            extra_body: resolved.extra_body.clone(),
+            supports_tools: resolved.supports_tools,
         };
-        let response = self.send_request(&resolved, &wire_req).await;
+        let response = self.send_request(resolved, &wire_req).await;
         let response = match response {
             Ok(response) => response,
             Err(err)
                 if previous_response_id.is_some()
                     && response_id_unsupported_for_responses_http(&err) =>
             {
-                self.mark_continuation_unsupported(req.provider, req.model)
-                    .await;
+                self.mark_continuation_unsupported(&resolved.cache_key).await;
                 state.continuation_disabled = true;
                 state.previous_response_id = None;
-                self.create_response(
-                    req.provider,
-                    req.model,
-                    req.instructions,
-                    req.input,
-                    req.tools,
-                    req.reasoning_effort.clone(),
-                )
-                .await?
+                self.send(resolved, instructions, input, tools).await?
             }
             Err(err) => return Err(err),
         };
@@ -161,7 +139,7 @@ impl ModelClient {
 
     async fn send_request(
         &self,
-        resolved: &crate::provider::ResolvedProvider,
+        resolved: &ResolvedProvider,
         wire_req: &WireRequest<'_>,
     ) -> Result<ModelResponse> {
         let body = resolved.wire_protocol.build_body(wire_req)?;
@@ -195,38 +173,18 @@ impl ModelClient {
         resolved.wire_protocol.parse_response(&text)
     }
 
-    fn can_use_continuation(
-        &self,
-        provider: &ProviderSecret,
-        model: &ModelConfig,
-        state: &ModelTurnState,
-    ) -> bool {
-        model.wire_api == ModelWireApi::Responses
-            && provider.kind == ProviderKind::Openai
-            && model.capabilities.continuation
-            && !state.continuation_disabled
-    }
-
-    async fn continuation_is_unsupported(
-        &self,
-        provider: &ProviderSecret,
-        model: &ModelConfig,
-    ) -> bool {
+    async fn continuation_is_unsupported(&self, cache_key: &str) -> bool {
         self.continuation_cache
             .lock()
             .await
-            .contains(&continuation_cache_key(provider, model))
+            .contains(cache_key)
     }
 
-    async fn mark_continuation_unsupported(
-        &self,
-        provider: &ProviderSecret,
-        model: &ModelConfig,
-    ) {
+    async fn mark_continuation_unsupported(&self, cache_key: &str) {
         self.continuation_cache
             .lock()
             .await
-            .insert(continuation_cache_key(provider, model));
+            .insert(cache_key.to_string());
     }
 }
 
@@ -242,7 +200,7 @@ impl Default for ModelClient {
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             http,
-            resolver: Arc::new(DefaultProviderResolver::new()),
+            resolver: Arc::new(crate::provider::DefaultProviderResolver::new()),
             continuation_cache: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -251,13 +209,12 @@ impl Default for ModelClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ModelRequest;
     use mai_protocol::{
-        ModelReasoningConfig, ModelReasoningVariant, ModelWireApi, ProviderKind,
+        ModelConfig, ModelReasoningConfig, ModelReasoningVariant,
+        ModelWireApi, ProviderKind, ProviderSecret,
     };
     use serde_json::{Value, json};
     use std::collections::VecDeque;
-    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Mutex;
 
@@ -460,19 +417,9 @@ mod tests {
         let mut state = ModelTurnState::default();
 
         let first_input = vec![ModelInputItem::user_text("first")];
+        let resolved = client.resolve(&provider, &model, None);
         let first = client
-            .create_turn_response_with_cancel(
-                &ModelRequest {
-                    provider: &provider,
-                    model: &model,
-                    instructions: "instructions",
-                    input: &first_input,
-                    tools: &[],
-                    reasoning_effort: None,
-                },
-                &mut state,
-                &cancellation_token,
-            )
+            .send_turn(&resolved, "instructions", &first_input, &[], &mut state, &cancellation_token)
             .await
             .expect("first response");
         assert_eq!(first.id.as_deref(), Some("resp_1"));
@@ -485,18 +432,7 @@ mod tests {
         ];
         state.acknowledge_history_len(2);
         let second = client
-            .create_turn_response_with_cancel(
-                &ModelRequest {
-                    provider: &provider,
-                    model: &model,
-                    instructions: "instructions",
-                    input: &second_input,
-                    tools: &[],
-                    reasoning_effort: None,
-                },
-                &mut state,
-                &cancellation_token,
-            )
+            .send_turn(&resolved, "instructions", &second_input, &[], &mut state, &cancellation_token)
             .await
             .expect("fallback response");
         assert_eq!(second.id.as_deref(), Some("resp_2"));
@@ -564,22 +500,12 @@ mod tests {
         let model = openai_model();
         let client = ModelClient::new();
         let cancellation_token = CancellationToken::new();
-        let mut first_state = ModelTurnState::default();
+        let resolved = client.resolve(&provider, &model, None);
 
+        let mut first_state = ModelTurnState::default();
         let first_input = vec![ModelInputItem::user_text("first")];
         client
-            .create_turn_response_with_cancel(
-                &ModelRequest {
-                    provider: &provider,
-                    model: &model,
-                    instructions: "instructions",
-                    input: &first_input,
-                    tools: &[],
-                    reasoning_effort: None,
-                },
-                &mut first_state,
-                &cancellation_token,
-            )
+            .send_turn(&resolved, "instructions", &first_input, &[], &mut first_state, &cancellation_token)
             .await
             .expect("first response");
         first_state.acknowledge_history_len(1);
@@ -589,18 +515,7 @@ mod tests {
             ModelInputItem::user_text("second"),
         ];
         client
-            .create_turn_response_with_cancel(
-                &ModelRequest {
-                    provider: &provider,
-                    model: &model,
-                    instructions: "instructions",
-                    input: &second_input,
-                    tools: &[],
-                    reasoning_effort: None,
-                },
-                &mut first_state,
-                &cancellation_token,
-            )
+            .send_turn(&resolved, "instructions", &second_input, &[], &mut first_state, &cancellation_token)
             .await
             .expect("fallback response");
 
@@ -610,18 +525,7 @@ mod tests {
             ..Default::default()
         };
         client
-            .create_turn_response_with_cancel(
-                &ModelRequest {
-                    provider: &provider,
-                    model: &model,
-                    instructions: "instructions",
-                    input: &second_input,
-                    tools: &[],
-                    reasoning_effort: None,
-                },
-                &mut next_state,
-                &cancellation_token,
-            )
+            .send_turn(&resolved, "instructions", &second_input, &[], &mut next_state, &cancellation_token)
             .await
             .expect("cached no-continuation response");
 
