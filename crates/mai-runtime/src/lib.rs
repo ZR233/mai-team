@@ -8975,15 +8975,15 @@ fn trace_preview_output(output: &str, max: usize) -> String {
         .unwrap_or_else(|_| preview(&redact_preview_string(output), max))
 }
 
-fn bounded_model_tool_output(output: &str) -> String {
-    if output.len() <= DEFAULT_MODEL_TOOL_OUTPUT_BYTES {
+fn bounded_model_tool_output_with_tokens(output: &str, max_output_tokens: usize) -> String {
+    let max_bytes = max_output_tokens * TOKEN_ESTIMATE_BYTES;
+    if output.len() <= max_bytes {
         return output.to_string();
     }
     if let Ok(value) = serde_json::from_str::<Value>(output) {
-        return bounded_json_tool_output(value, DEFAULT_MODEL_TOOL_OUTPUT_BYTES).to_string();
+        return bounded_json_tool_output(value, max_bytes).to_string();
     }
-    let (text, truncated, bytes_omitted, next_offset) =
-        bounded_text(output, DEFAULT_MODEL_TOOL_OUTPUT_BYTES, 0);
+    let (text, truncated, bytes_omitted, next_offset) = bounded_text(output, max_bytes, 0);
     json!({
         "truncated": truncated,
         "bytes_returned": text.len(),
@@ -8992,6 +8992,10 @@ fn bounded_model_tool_output(output: &str) -> String {
         "text": text,
     })
     .to_string()
+}
+
+fn bounded_model_tool_output(output: &str) -> String {
+    bounded_model_tool_output_with_tokens(output, DEFAULT_MODEL_TOOL_OUTPUT_TOKENS)
 }
 
 fn bounded_json_tool_output(mut value: Value, max_bytes: usize) -> Value {
@@ -11346,10 +11350,10 @@ esac
     #[test]
     fn auto_compact_threshold_uses_last_context_tokens() {
         assert!(!should_auto_compact(0, 100));
-        assert!(!should_auto_compact(79, 100));
-        assert!(should_auto_compact(80, 100));
-        assert!(should_auto_compact(330_000, 400_000));
-        assert!(!should_auto_compact(80, 0));
+        assert!(!should_auto_compact(89, 100));
+        assert!(should_auto_compact(90, 100));
+        assert!(should_auto_compact(360_000, 400_000));
+        assert!(!should_auto_compact(90, 0));
     }
 
     #[test]
@@ -12148,7 +12152,7 @@ esac
                 .expect("append history");
         }
         store
-            .save_session_context_tokens(agent_id, session_id, 80)
+            .save_session_context_tokens(agent_id, session_id, 90)
             .await
             .expect("save tokens");
         let runtime = AgentRuntime::new(
@@ -12199,7 +12203,7 @@ esac
                 .agents[0]
                 .sessions[0]
                 .last_context_tokens,
-            Some(80)
+            Some(90)
         );
     }
 
@@ -12214,7 +12218,7 @@ esac
                     "name": "unknown_tool",
                     "arguments": "{}"
                 }],
-                "usage": { "input_tokens": 78, "output_tokens": 2, "total_tokens": 80 }
+                "usage": { "input_tokens": 88, "output_tokens": 2, "total_tokens": 90 }
             }),
             json!({
                 "id": "compact",
@@ -12335,7 +12339,7 @@ esac
                 .any(|event| matches!(
                     event.kind,
                     ServiceEventKind::ContextCompacted {
-                        tokens_before: 80,
+                        tokens_before: 90,
                         ..
                     }
                 ))
@@ -13603,7 +13607,7 @@ esac
                 .context_usage
                 .as_ref()
                 .map(|usage| usage.threshold_percent),
-            Some(80)
+            Some(90)
         );
 
         let reopened = store.load_runtime_snapshot(10).await.expect("snapshot");
