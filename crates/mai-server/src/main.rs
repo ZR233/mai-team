@@ -555,10 +555,6 @@ fn relay_config_from_env() -> Option<relay::RelayClientConfig> {
     if !enabled {
         return None;
     }
-    let url = env::var("MAI_RELAY_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string())
-        .trim_end_matches('/')
-        .to_string();
     let token = env::var("MAI_RELAY_TOKEN").unwrap_or_default();
     if token.trim().is_empty() {
         tracing::warn!("MAI_RELAY_ENABLED is set but MAI_RELAY_TOKEN is empty; relay disabled");
@@ -566,10 +562,23 @@ fn relay_config_from_env() -> Option<relay::RelayClientConfig> {
     }
     let node_id = env::var("MAI_RELAY_NODE_ID").unwrap_or_else(|_| "mai-server".to_string());
     Some(relay::RelayClientConfig {
-        url,
+        url: relay_url_from_env_values(
+            env::var("MAI_RELAY_PUBLIC_URL").ok().as_deref(),
+            env::var("MAI_RELAY_URL").ok().as_deref(),
+        ),
         token,
         node_id,
     })
+}
+
+fn relay_url_from_env_values(public_url: Option<&str>, legacy_url: Option<&str>) -> String {
+    public_url
+        .or(legacy_url)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("http://127.0.0.1:8090")
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn release_embedded_system_skills(target_dir: &std::path::Path) -> io::Result<()> {
@@ -1943,6 +1952,25 @@ mod tests {
         assert_eq!(
             cache_dir_path_with(&data_dir, Some(cache_dir.clone().into_os_string())),
             cache_dir
+        );
+    }
+
+    #[test]
+    fn relay_url_prefers_public_url_and_trims_trailing_slash() {
+        assert_eq!(
+            relay_url_from_env_values(
+                Some("https://relay.example.com/"),
+                Some("http://legacy.example.com")
+            ),
+            "https://relay.example.com"
+        );
+        assert_eq!(
+            relay_url_from_env_values(None, Some("http://legacy.example.com/")),
+            "http://legacy.example.com"
+        );
+        assert_eq!(
+            relay_url_from_env_values(Some("  "), None),
+            "http://127.0.0.1:8090"
         );
     }
 
