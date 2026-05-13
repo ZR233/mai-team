@@ -12,7 +12,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use mai_docker::DockerClient;
-use mai_model::{ModelError, ModelRequest, ModelTurnState, ResponsesClient};
+use mai_model::{ModelClient, ModelError, ModelTurnState, ResolvedProvider};
 use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentId, AgentLogsResponse, AgentProfilesResponse,
     ApproveTaskPlanResponse, ArtifactInfo, CreateAgentRequest, CreateAgentResponse,
@@ -24,13 +24,13 @@ use mai_protocol::{
     GithubAppManifestStartResponse, GithubAppSettingsRequest, GithubAppSettingsResponse,
     GithubInstallationsResponse, GithubRepositoriesResponse, GithubSettingsRequest,
     GithubSettingsResponse, McpServersConfigRequest, ModelInputItem, ModelOutputItem,
-    ModelResponse, ModelWireApi, ProjectId, ProjectReviewRunDetail, ProjectReviewRunsResponse,
-    ProviderKind, ProviderPresetsResponse, ProviderTestRequest, ProviderTestResponse,
-    ProvidersConfigRequest, ProvidersResponse, RelayStatusResponse, RepositoryPackagesResponse,
-    RequestPlanRevisionRequest, RequestPlanRevisionResponse, RuntimeDefaultsResponse,
-    SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId, SkillsConfigRequest,
-    SkillsListResponse, TaskId, ToolTraceDetail, ToolTraceListResponse, TurnId, UpdateAgentRequest,
-    UpdateAgentResponse, UpdateProjectRequest, UpdateProjectResponse,
+    ModelResponse, ProjectId, ProjectReviewRunDetail, ProjectReviewRunsResponse,
+    ProviderPresetsResponse, ProviderTestRequest, ProviderTestResponse, ProvidersConfigRequest,
+    ProvidersResponse, RelayStatusResponse, RepositoryPackagesResponse, RequestPlanRevisionRequest,
+    RequestPlanRevisionResponse, RuntimeDefaultsResponse, SendMessageRequest, SendMessageResponse,
+    ServiceEvent, SessionId, SkillsConfigRequest, SkillsListResponse, TaskId, ToolTraceDetail,
+    ToolTraceListResponse, TurnId, UpdateAgentRequest, UpdateAgentResponse, UpdateProjectRequest,
+    UpdateProjectResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
 use mai_store::{AgentLogFilter, ConfigStore, ToolTraceFilter};
@@ -265,7 +265,7 @@ async fn main() -> Result<()> {
         "released embedded system agents"
     );
 
-    let model = ResponsesClient::new();
+    let model = ModelClient::new();
     let runtime_config = RuntimeConfig {
         repo_root: env::current_dir()?,
         cache_root: cache_dir.clone(),
@@ -811,19 +811,18 @@ async fn run_provider_test(
     let model = selection.model;
     let base_url = provider.base_url.clone();
     let reasoning_effort = request.reasoning_effort;
-    let client = ResponsesClient::new();
-    let response = if request.deep && provider_test_should_check_continuation(&provider, &model) {
-        run_provider_deep_model_test(&client, &provider, &model, reasoning_effort).await
+    let client = ModelClient::new();
+    let resolved = client.resolve(&provider, &model, reasoning_effort.as_deref());
+    let response = if request.deep && resolved.supports_continuation {
+        run_provider_deep_model_test(&client, &resolved, reasoning_effort).await
     } else {
         let input = [ModelInputItem::user_text("ping")];
         client
-            .create_response(
-                &provider,
-                &model,
+            .send(
+                &resolved,
                 "You are a provider connectivity test. Reply with exactly: ok",
                 &input,
                 &[],
-                reasoning_effort,
             )
             .await
     };
@@ -862,36 +861,23 @@ async fn run_provider_test(
     }
 }
 
-fn provider_test_should_check_continuation(
-    provider: &mai_protocol::ProviderSecret,
-    model: &mai_protocol::ModelConfig,
-) -> bool {
-    provider.kind == ProviderKind::Openai
-        && model.wire_api == ModelWireApi::Responses
-        && model.capabilities.continuation
-}
-
 async fn run_provider_deep_model_test(
-    client: &ResponsesClient,
-    provider: &mai_protocol::ProviderSecret,
-    model: &mai_protocol::ModelConfig,
-    reasoning_effort: Option<String>,
+    client: &ModelClient,
+    resolved: &ResolvedProvider,
+    _reasoning_effort: Option<String>,
 ) -> std::result::Result<ModelResponse, ModelError> {
     let cancellation_token = CancellationToken::new();
     let mut state = ModelTurnState::default();
     let first_input = vec![ModelInputItem::user_text(
         "Provider deep connectivity test, step 1. Reply exactly: ok",
     )];
+    let instructions = "You are a provider connectivity test. Reply with exactly: ok";
     let first = client
-        .create_turn_response_with_cancel(
-            &ModelRequest {
-                provider,
-                model,
-                instructions: "You are a provider connectivity test. Reply with exactly: ok",
-                input: &first_input,
-                tools: &[],
-                reasoning_effort: reasoning_effort.clone(),
-            },
+        .send_turn(
+            resolved,
+            instructions,
+            &first_input,
+            &[],
             &mut state,
             &cancellation_token,
         )
@@ -903,15 +889,11 @@ async fn run_provider_deep_model_test(
     ));
     state.acknowledge_history_len(2);
     client
-        .create_turn_response_with_cancel(
-            &ModelRequest {
-                provider,
-                model,
-                instructions: "You are a provider connectivity test. Reply with exactly: ok",
-                input: &second_input,
-                tools: &[],
-                reasoning_effort,
-            },
+        .send_turn(
+            resolved,
+            instructions,
+            &second_input,
+            &[],
             &mut state,
             &cancellation_token,
         )
