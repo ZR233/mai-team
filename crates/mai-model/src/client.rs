@@ -146,6 +146,7 @@ impl ModelClient {
         let response = self
             .http
             .post(&resolved.endpoint)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
             .bearer_auth(&resolved.api_key)
             .headers(resolved.headers.clone())
             .body(body)
