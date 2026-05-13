@@ -1595,6 +1595,20 @@ pub struct GithubAppSettingsResponse {
     pub install_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubAppInstallationStartRequest {
+    pub origin: String,
+    #[serde(default)]
+    pub return_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubAppInstallationStartResponse {
+    pub state: String,
+    pub install_url: String,
+    pub app: GithubAppSettingsResponse,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GithubAppSettingsRequest {
     #[serde(default)]
@@ -1931,6 +1945,20 @@ pub struct RelayGithubInstallationTokenResponse {
     pub expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayGithubRepositoryPackagesRequest {
+    pub installation_id: u64,
+    pub owner: String,
+    pub repo: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubAppInstallationPackagesRequest {
+    pub installation_id: u64,
+    pub owner: String,
+    pub repo: String,
+}
+
 pub fn default_true() -> bool {
     true
 }
@@ -2013,6 +2041,39 @@ mod tests {
             }
             other => panic!("unexpected envelope: {other:?}"),
         }
+    }
+
+    #[test]
+    fn relay_github_app_installation_start_round_trips() {
+        let request = GithubAppInstallationStartRequest {
+            origin: "http://127.0.0.1:8080".to_string(),
+            return_hash: Some("#projects".to_string()),
+        };
+        let value = serde_json::to_value(&request).expect("serialize");
+        let decoded: GithubAppInstallationStartRequest =
+            serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded.origin, "http://127.0.0.1:8080");
+        assert_eq!(decoded.return_hash.as_deref(), Some("#projects"));
+
+        let response = GithubAppInstallationStartResponse {
+            state: "state-1".to_string(),
+            install_url: "https://github.com/apps/mai/installations/new?state=state-1".to_string(),
+            app: GithubAppSettingsResponse {
+                app_id: Some("123".to_string()),
+                base_url: "https://api.github.com".to_string(),
+                has_private_key: true,
+                app_slug: Some("mai".to_string()),
+                app_html_url: None,
+                owner_login: None,
+                owner_type: None,
+                install_url: Some("https://github.com/apps/mai/installations/new".to_string()),
+            },
+        };
+        let value = serde_json::to_value(&response).expect("serialize");
+        let decoded: GithubAppInstallationStartResponse =
+            serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded.state, "state-1");
+        assert!(decoded.app.has_private_key);
     }
 
     #[test]

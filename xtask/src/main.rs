@@ -56,8 +56,14 @@ fn run_remote_relay() -> Result<()> {
             .arg(format!("mkdir -p {}", sh_quote(remote_dir))),
     )
     .context("creating remote relay directory")?;
-    upload_remote_env(&remote, &remote_env_file, &remote_db_path)
-        .context("uploading remote relay environment")?;
+    let remote_private_key_path = maybe_upload_private_key(&remote, remote_dir)?;
+    upload_remote_env(
+        &remote,
+        &remote_env_file,
+        &remote_db_path,
+        remote_private_key_path.as_deref(),
+    )
+    .context("uploading remote relay environment")?;
     run_status(
         Command::new("scp")
             .arg(&relay_bin)
@@ -120,22 +126,71 @@ fn parent_str(path: &str) -> Result<&str> {
         .ok_or_else(|| anyhow!("remote path has no parent: {path}"))
 }
 
-fn upload_remote_env(remote: &str, remote_env_file: &str, remote_db_path: &str) -> Result<()> {
+fn maybe_upload_private_key(remote: &str, remote_dir: &str) -> Result<Option<String>> {
+    let Some(path) = env::var_os("MAI_RELAY_GITHUB_APP_PRIVATE_KEY_PATH") else {
+        return Ok(None);
+    };
+    let local_path = PathBuf::from(path);
+    if !local_path.exists() {
+        return Ok(None);
+    }
+    let remote_path = format!("{remote_dir}/github-app.private-key.pem");
+    run_status(
+        Command::new("scp")
+            .arg(&local_path)
+            .arg(format!("{remote}:{remote_path}")),
+    )
+    .context("copying GitHub App private key to remote host")?;
+    run_status(
+        Command::new("ssh")
+            .arg(remote)
+            .arg(format!("chmod 600 {}", sh_quote(&remote_path))),
+    )
+    .context("marking remote GitHub App private key private")?;
+    Ok(Some(remote_path))
+}
+
+fn upload_remote_env(
+    remote: &str,
+    remote_env_file: &str,
+    remote_db_path: &str,
+    remote_private_key_path: Option<&str>,
+) -> Result<()> {
     let mut env_file = String::new();
     for name in [
         "MAI_RELAY_TOKEN",
         "MAI_RELAY_PUBLIC_URL",
         "MAI_RELAY_BIND_ADDR",
         "MAI_RELAY_DB_PATH",
+        "MAI_RELAY_GITHUB_APP_ID",
+        "MAI_RELAY_GITHUB_APP_PRIVATE_KEY",
+        "MAI_RELAY_GITHUB_APP_SLUG",
+        "MAI_RELAY_GITHUB_APP_HTML_URL",
+        "MAI_RELAY_GITHUB_APP_OWNER_LOGIN",
+        "MAI_RELAY_GITHUB_APP_OWNER_TYPE",
         "GITHUB_API_BASE_URL",
         "GITHUB_WEB_BASE_URL",
     ] {
         if let Ok(value) = env::var(name) {
+            if is_placeholder_env(name, &value) {
+                continue;
+            }
             env_file.push_str(name);
             env_file.push('=');
             env_file.push_str(&sh_quote(&value));
             env_file.push('\n');
         }
+    }
+    if let Some(path) = remote_private_key_path {
+        env_file.push_str("MAI_RELAY_GITHUB_APP_PRIVATE_KEY_PATH=");
+        env_file.push_str(&sh_quote(path));
+        env_file.push('\n');
+    } else if let Ok(value) = env::var("MAI_RELAY_GITHUB_APP_PRIVATE_KEY_PATH")
+        && !is_placeholder_env("MAI_RELAY_GITHUB_APP_PRIVATE_KEY_PATH", &value)
+    {
+        env_file.push_str("MAI_RELAY_GITHUB_APP_PRIVATE_KEY_PATH=");
+        env_file.push_str(&sh_quote(&value));
+        env_file.push('\n');
     }
     if env::var_os("MAI_RELAY_BIND_ADDR").is_none() {
         env_file.push_str("MAI_RELAY_BIND_ADDR='0.0.0.0:8090'\n");
@@ -264,4 +319,16 @@ fn sh_quote(value: &str) -> String {
 
 fn display_os(value: &OsStr) -> String {
     PathBuf::from(OsString::from(value)).display().to_string()
+}
+
+fn is_placeholder_env(name: &str, value: &str) -> bool {
+    matches!(
+        (name, value),
+        ("MAI_RELAY_GITHUB_APP_ID", "github-app-id")
+            | (
+                "MAI_RELAY_GITHUB_APP_PRIVATE_KEY_PATH",
+                "/absolute/path/to/github-app.private-key.pem"
+            )
+            | ("MAI_RELAY_GITHUB_APP_SLUG", "github-app-slug")
+    )
 }

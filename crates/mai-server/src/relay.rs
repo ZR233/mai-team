@@ -1,11 +1,14 @@
 use futures::{SinkExt, StreamExt};
 use mai_protocol::{
-    GithubAppManifestStartRequest, GithubAppManifestStartResponse, GithubInstallationsResponse,
+    GithubAppInstallationPackagesRequest, GithubAppInstallationStartRequest,
+    GithubAppInstallationStartResponse, GithubAppManifestStartRequest,
+    GithubAppManifestStartResponse, GithubAppSettingsResponse, GithubInstallationsResponse,
     GithubRepositoriesResponse, GithubRepositorySummary, ProjectId, RelayAck, RelayAckStatus,
     RelayClientHello, RelayEnvelope, RelayError, RelayEvent, RelayEventKind,
     RelayGithubInstallationTokenRequest, RelayGithubInstallationTokenResponse,
-    RelayGithubRepositoriesRequest, RelayGithubRepositoryGetRequest, RelayRequest, RelayResponse,
-    RelayStatusResponse, ServiceEventKind,
+    RelayGithubRepositoriesRequest, RelayGithubRepositoryGetRequest,
+    RelayGithubRepositoryPackagesRequest, RelayRequest, RelayResponse, RelayStatusResponse,
+    RepositoryPackagesResponse, ServiceEventKind,
 };
 use mai_runtime::{AgentRuntime, GithubAppBackend, RuntimeError};
 use serde::{Serialize, de::DeserializeOwned};
@@ -128,6 +131,17 @@ impl RelayClient {
         self.request("github_app_manifest.start", request).await
     }
 
+    pub async fn github_app_settings(&self) -> Result<GithubAppSettingsResponse, RuntimeError> {
+        self.request("github.app.get", json!({})).await
+    }
+
+    pub async fn start_github_app_installation(
+        &self,
+        request: GithubAppInstallationStartRequest,
+    ) -> Result<GithubAppInstallationStartResponse, RuntimeError> {
+        self.request("github.app_installation.start", request).await
+    }
+
     pub async fn list_github_installations(
         &self,
     ) -> Result<GithubInstallationsResponse, RuntimeError> {
@@ -170,6 +184,21 @@ impl RelayClient {
             RelayGithubInstallationTokenRequest {
                 installation_id,
                 repository_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn list_github_repository_packages(
+        &self,
+        request: GithubAppInstallationPackagesRequest,
+    ) -> Result<RepositoryPackagesResponse, RuntimeError> {
+        self.request(
+            "github.repository_packages.list",
+            RelayGithubRepositoryPackagesRequest {
+                installation_id: request.installation_id,
+                owner: request.owner,
+                repo: request.repo,
             },
         )
         .await
@@ -450,16 +479,7 @@ impl GithubAppBackend for RelayClient {
     async fn github_app_settings(
         &self,
     ) -> mai_runtime::Result<mai_protocol::GithubAppSettingsResponse> {
-        Ok(mai_protocol::GithubAppSettingsResponse {
-            app_id: None,
-            base_url: String::new(),
-            has_private_key: false,
-            app_slug: None,
-            app_html_url: None,
-            owner_login: None,
-            owner_type: None,
-            install_url: None,
-        })
+        RelayClient::github_app_settings(self).await
     }
 
     async fn save_github_app_settings(

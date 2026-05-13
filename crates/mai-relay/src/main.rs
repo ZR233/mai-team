@@ -11,11 +11,14 @@ use futures::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use mai_protocol::{
+    GithubAppInstallationStartRequest, GithubAppInstallationStartResponse,
     GithubAppManifestAccountType, GithubAppManifestStartRequest, GithubAppManifestStartResponse,
-    GithubInstallationSummary, GithubInstallationsResponse, GithubRepositoriesResponse,
-    GithubRepositorySummary, RelayAck, RelayAckStatus, RelayEnvelope, RelayError, RelayEvent,
-    RelayEventKind, RelayGithubInstallationTokenRequest, RelayGithubInstallationTokenResponse,
-    RelayGithubRepositoriesRequest, RelayRequest, RelayResponse, RelayStatusResponse,
+    GithubAppSettingsResponse, GithubInstallationSummary, GithubInstallationsResponse,
+    GithubRepositoriesResponse, GithubRepositorySummary, RelayAck, RelayAckStatus, RelayEnvelope,
+    RelayError, RelayEvent, RelayEventKind, RelayGithubInstallationTokenRequest,
+    RelayGithubInstallationTokenResponse, RelayGithubRepositoriesRequest,
+    RelayGithubRepositoryPackagesRequest, RelayRequest, RelayResponse, RelayStatusResponse,
+    RepositoryPackageSummary, RepositoryPackagesResponse,
 };
 use reqwest::header::{ACCEPT, HeaderValue, USER_AGENT};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -82,12 +85,14 @@ struct GithubManifestCallbackQuery {
 struct GithubInstallationCallbackQuery {
     setup_action: Option<String>,
     installation_id: Option<u64>,
+    state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GithubAppConfig {
     app_id: String,
     private_key: String,
+    #[serde(default)]
     webhook_secret: String,
     app_slug: Option<String>,
     app_html_url: Option<String>,
@@ -101,6 +106,14 @@ struct ManifestState {
     created_at: DateTime<Utc>,
     account_type: GithubAppManifestAccountType,
     org: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct InstallationState {
+    state: String,
+    created_at: DateTime<Utc>,
+    origin: String,
+    return_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +155,37 @@ struct GithubRepositoryApi {
     owner: GithubAccountApi,
 }
 
+#[derive(Debug, Deserialize)]
+struct GithubPackageApi {
+    name: String,
+    html_url: String,
+    #[serde(default)]
+    repository: Option<GithubPackageRepositoryApi>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubPackageRepositoryApi {
+    full_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubPackageVersionApi {
+    #[serde(default)]
+    metadata: GithubPackageVersionMetadataApi,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct GithubPackageVersionMetadataApi {
+    #[serde(default)]
+    container: GithubPackageContainerMetadataApi,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct GithubPackageContainerMetadataApi {
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct GithubAccessTokenRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -177,6 +221,14 @@ struct GithubManifestConversionResponse {
 #[derive(Debug, Deserialize)]
 struct GithubErrorResponse {
     message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GithubAppHookConfigRequest {
+    url: String,
+    content_type: &'static str,
+    insecure_ssl: &'static str,
+    secret: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -234,6 +286,17 @@ async fn main() -> Result<()> {
         .to_string();
 
     let store = Arc::new(RelayStore::open(db_path)?);
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()?;
+    bootstrap_github_app_config(
+        &store,
+        &http,
+        &public_url,
+        &github_api_base_url,
+        &github_web_base_url,
+    )
+    .await?;
     let sequence = Arc::new(AtomicU64::new(store.next_sequence()?));
     let state = AppState {
         store,
@@ -241,9 +304,7 @@ async fn main() -> Result<()> {
         public_url,
         github_api_base_url,
         github_web_base_url,
-        http: reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .build()?,
+        http,
         connection: Arc::new(Mutex::new(None)),
         pending: Arc::new(Mutex::new(HashMap::new())),
         sequence,
@@ -443,6 +504,15 @@ async fn handle_client_request(state: &Arc<AppState>, request: RelayRequest) -> 
                 Err(err) => Err(err),
             }
         }
+        "github.app.get" => github_app_settings(state).and_then(to_value),
+        "github.app_installation.start" => {
+            match parse_params::<GithubAppInstallationStartRequest>(request.params).await {
+                Ok(request) => start_app_installation(state, request)
+                    .await
+                    .and_then(to_value),
+                Err(err) => Err(err),
+            }
+        }
         "github.installations.list" => list_installations(state).await.and_then(to_value),
         "github.repositories.list" => {
             match parse_params::<RelayGithubRepositoriesRequest>(request.params).await {
@@ -461,6 +531,14 @@ async fn handle_client_request(state: &Arc<AppState>, request: RelayRequest) -> 
         "github.installation_token.create" => {
             match parse_params::<RelayGithubInstallationTokenRequest>(request.params).await {
                 Ok(request) => create_installation_token(state, request)
+                    .await
+                    .and_then(to_value),
+                Err(err) => Err(err),
+            }
+        }
+        "github.repository_packages.list" => {
+            match parse_params::<RelayGithubRepositoryPackagesRequest>(request.params).await {
+                Ok(request) => list_repository_packages(state, request)
                     .await
                     .and_then(to_value),
                 Err(err) => Err(err),
@@ -501,15 +579,17 @@ async fn app_manifest_callback(
 }
 
 async fn app_installation_callback(
+    State(state): State<Arc<AppState>>,
     Query(query): Query<GithubInstallationCallbackQuery>,
 ) -> Response {
-    let message = match (query.setup_action.as_deref(), query.installation_id) {
-        (Some(action), Some(id)) => format!("GitHub App installation {action}: {id}"),
-        (Some(action), None) => format!("GitHub App installation {action}."),
-        (None, Some(id)) => format!("GitHub App installation ready: {id}"),
-        (None, None) => "GitHub App installation finished.".to_string(),
-    };
-    callback_page(true, "GitHub App installation updated", &message)
+    match complete_app_installation(&state, &query).await {
+        Ok(response) => response,
+        Err(err) => callback_page(
+            false,
+            "GitHub App installation could not be completed",
+            &err.to_string(),
+        ),
+    }
 }
 
 async fn webhook(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
@@ -670,6 +750,101 @@ async fn complete_manifest(state: &AppState, code: &str, state_id: &str) -> Rela
     Ok(())
 }
 
+fn github_app_settings(state: &AppState) -> RelayResult<GithubAppSettingsResponse> {
+    let config = state
+        .store
+        .github_app_config()?
+        .ok_or_else(|| RelayErrorKind::InvalidInput("GitHub App is not configured".to_string()))?;
+    Ok(github_app_settings_response(
+        &config,
+        &state.github_api_base_url,
+        &state.github_web_base_url,
+        None,
+    ))
+}
+
+async fn start_app_installation(
+    state: &AppState,
+    request: GithubAppInstallationStartRequest,
+) -> RelayResult<GithubAppInstallationStartResponse> {
+    let config = state
+        .store
+        .github_app_config()?
+        .ok_or_else(|| RelayErrorKind::InvalidInput("GitHub App is not configured".to_string()))?;
+    let app_slug = config.app_slug.as_deref().ok_or_else(|| {
+        RelayErrorKind::InvalidInput("GitHub App slug is required for installation".to_string())
+    })?;
+    let origin = if request.origin.trim().is_empty() {
+        state.public_url.clone()
+    } else {
+        sanitize_origin(&request.origin)?
+    };
+    let return_hash = request
+        .return_hash
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("#projects")
+        .to_string();
+    let state_id = Uuid::new_v4().to_string();
+    state.store.save_installation_state(&InstallationState {
+        state: state_id.clone(),
+        created_at: Utc::now(),
+        origin,
+        return_hash,
+    })?;
+    let install_url = github_app_install_url(&state.github_web_base_url, app_slug, Some(&state_id));
+    Ok(GithubAppInstallationStartResponse {
+        state: state_id.clone(),
+        install_url,
+        app: github_app_settings_response(
+            &config,
+            &state.github_api_base_url,
+            &state.github_web_base_url,
+            Some(&state_id),
+        ),
+    })
+}
+
+async fn complete_app_installation(
+    state: &AppState,
+    query: &GithubInstallationCallbackQuery,
+) -> RelayResult<Response> {
+    let Some(state_id) = query
+        .state
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        let message = match (query.setup_action.as_deref(), query.installation_id) {
+            (Some(action), Some(id)) => format!("GitHub App installation {action}: {id}"),
+            (Some(action), None) => format!("GitHub App installation {action}."),
+            (None, Some(id)) => format!("GitHub App installation ready: {id}"),
+            (None, None) => "GitHub App installation finished.".to_string(),
+        };
+        return Ok(callback_page(
+            true,
+            "GitHub App installation updated",
+            &message,
+        ));
+    };
+    let install_state = state.store.take_installation_state(state_id)?;
+    let params = match query.installation_id {
+        Some(installation_id) => {
+            verify_installation(state, installation_id).await?;
+            format!("github-app=installed&installation_id={installation_id}")
+        }
+        None => "github-app=pending".to_string(),
+    };
+    let location = local_return_url(&install_state.origin, &install_state.return_hash, &params)?;
+    Ok((
+        StatusCode::FOUND,
+        [(axum::http::header::LOCATION, location)],
+        "",
+    )
+        .into_response())
+}
+
 async fn list_installations(state: &AppState) -> RelayResult<GithubInstallationsResponse> {
     let (jwt, base_url) = github_app_jwt(state)?;
     let url = github_api_url(&base_url, "/app/installations?per_page=100");
@@ -726,6 +901,21 @@ async fn list_repositories(state: &AppState, installation_id: u64) -> RelayResul
     })
 }
 
+async fn verify_installation(state: &AppState, installation_id: u64) -> RelayResult<()> {
+    let installations = list_installations(state).await?;
+    if installations
+        .installations
+        .iter()
+        .any(|installation| installation.id == installation_id)
+    {
+        Ok(())
+    } else {
+        Err(RelayErrorKind::InvalidInput(format!(
+            "GitHub App installation {installation_id} was not found"
+        )))
+    }
+}
+
 async fn get_repository(
     state: &AppState,
     request: mai_protocol::RelayGithubRepositoryGetRequest,
@@ -750,6 +940,78 @@ async fn get_repository(
     let repository: GithubRepositoryApi =
         decode_github_response(response, "get repository").await?;
     to_value(github_repository_summary(repository))
+}
+
+async fn list_repository_packages(
+    state: &AppState,
+    request: RelayGithubRepositoryPackagesRequest,
+) -> RelayResult<RepositoryPackagesResponse> {
+    if request.installation_id == 0 {
+        return Err(RelayErrorKind::InvalidInput(
+            "installation_id is required".to_string(),
+        ));
+    }
+    let owner = request.owner.trim();
+    let repo = request.repo.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return Err(RelayErrorKind::InvalidInput(
+            "repository owner and name are required".to_string(),
+        ));
+    }
+    let token = create_installation_token(
+        state,
+        RelayGithubInstallationTokenRequest {
+            installation_id: request.installation_id,
+            repository_id: None,
+        },
+    )
+    .await?;
+    let repository_ref = format!("{owner}/{repo}");
+    let packages = match github_container_packages_for_owner(state, &token.token, owner).await {
+        Ok(packages) => packages,
+        Err(err) if err.status() == Some(reqwest::StatusCode::FORBIDDEN) => {
+            return Ok(RepositoryPackagesResponse {
+                packages: Vec::new(),
+                warning: Some(
+                    "GitHub App installation cannot read packages for this owner".to_string(),
+                ),
+            });
+        }
+        Err(err) if err.status() == Some(reqwest::StatusCode::NOT_FOUND) => {
+            return Ok(RepositoryPackagesResponse {
+                packages: Vec::new(),
+                warning: Some("No readable GitHub container packages found".to_string()),
+            });
+        }
+        Err(err) => return Err(RelayErrorKind::Http(err)),
+    };
+    let mut summaries = Vec::new();
+    for package in packages
+        .into_iter()
+        .filter(|package| github_package_belongs_to_repo(package, &repository_ref))
+    {
+        let versions = match github_container_package_versions(
+            state,
+            &token.token,
+            owner,
+            &package.name,
+        )
+        .await
+        {
+            Ok(versions) => versions,
+            Err(err) if err.status() == Some(reqwest::StatusCode::FORBIDDEN) => continue,
+            Err(err) if err.status() == Some(reqwest::StatusCode::NOT_FOUND) => continue,
+            Err(err) => return Err(RelayErrorKind::Http(err)),
+        };
+        if let Some(summary) = repository_package_summary(owner, package, versions) {
+            summaries.push(summary);
+        }
+    }
+    summaries.sort_by(|left, right| left.name.cmp(&right.name).then(left.tag.cmp(&right.tag)));
+    Ok(RepositoryPackagesResponse {
+        packages: summaries,
+        warning: None,
+    })
 }
 
 async fn create_installation_token(
@@ -809,18 +1071,108 @@ fn github_app_jwt(state: &AppState) -> RelayResult<(String, String)> {
         .store
         .github_app_config()?
         .ok_or_else(|| RelayErrorKind::InvalidInput("GitHub App is not configured".to_string()))?;
+    let token = github_app_jwt_for_config(&config)?;
+    Ok((token, state.github_api_base_url.clone()))
+}
+
+fn github_app_jwt_for_config(config: &GithubAppConfig) -> RelayResult<String> {
     let now = Utc::now().timestamp();
     let claims = GithubJwtClaims {
         iat: now.saturating_sub(60) as usize,
         exp: now.saturating_add(540) as usize,
-        iss: config.app_id,
+        iss: config.app_id.clone(),
     };
     let token = encode(
         &Header::new(Algorithm::RS256),
         &claims,
         &EncodingKey::from_rsa_pem(config.private_key.as_bytes())?,
     )?;
-    Ok((token, state.github_api_base_url.clone()))
+    Ok(token)
+}
+
+async fn github_container_packages_for_owner(
+    state: &AppState,
+    token: &str,
+    owner: &str,
+) -> std::result::Result<Vec<GithubPackageApi>, reqwest::Error> {
+    let org_url = github_api_url(
+        &state.github_api_base_url,
+        &format!(
+            "/orgs/{}/packages?package_type=container&per_page=100",
+            github_path_segment(owner)
+        ),
+    );
+    let org_response = state
+        .http
+        .get(org_url)
+        .bearer_auth(token)
+        .headers(github_headers())
+        .send()
+        .await?;
+    if org_response.status() != reqwest::StatusCode::NOT_FOUND {
+        return org_response.error_for_status()?.json().await;
+    }
+    let user_url = github_api_url(
+        &state.github_api_base_url,
+        &format!(
+            "/users/{}/packages?package_type=container&per_page=100",
+            github_path_segment(owner)
+        ),
+    );
+    state
+        .http
+        .get(user_url)
+        .bearer_auth(token)
+        .headers(github_headers())
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+}
+
+async fn github_container_package_versions(
+    state: &AppState,
+    token: &str,
+    owner: &str,
+    package_name: &str,
+) -> std::result::Result<Vec<GithubPackageVersionApi>, reqwest::Error> {
+    let org_url = github_api_url(
+        &state.github_api_base_url,
+        &format!(
+            "/orgs/{}/packages/container/{}/versions?per_page=30",
+            github_path_segment(owner),
+            github_path_segment(package_name)
+        ),
+    );
+    let org_response = state
+        .http
+        .get(org_url)
+        .bearer_auth(token)
+        .headers(github_headers())
+        .send()
+        .await?;
+    if org_response.status() != reqwest::StatusCode::NOT_FOUND {
+        return org_response.error_for_status()?.json().await;
+    }
+    let user_url = github_api_url(
+        &state.github_api_base_url,
+        &format!(
+            "/users/{}/packages/container/{}/versions?per_page=30",
+            github_path_segment(owner),
+            github_path_segment(package_name)
+        ),
+    );
+    state
+        .http
+        .get(user_url)
+        .bearer_auth(token)
+        .headers(github_headers())
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
 }
 
 impl QueuedDelivery {
@@ -860,6 +1212,161 @@ fn error_code(error: &RelayErrorKind) -> &'static str {
         RelayErrorKind::Http(_) => "http",
         RelayErrorKind::Jwt(_) => "jwt",
     }
+}
+
+async fn bootstrap_github_app_config(
+    store: &RelayStore,
+    http: &reqwest::Client,
+    public_url: &str,
+    github_api_base_url: &str,
+    github_web_base_url: &str,
+) -> Result<()> {
+    let env_config = github_app_config_from_env()?;
+    let stored_config = store.github_app_config()?;
+    let Some(mut config) = merge_github_app_config(env_config, stored_config) else {
+        return Ok(());
+    };
+    let mut generated_secret = false;
+    if config.webhook_secret.trim().is_empty() {
+        config.webhook_secret = Uuid::new_v4().to_string();
+        update_github_app_hook_config(http, github_api_base_url, public_url, &config)
+            .await
+            .context("resetting GitHub App webhook secret")?;
+        generated_secret = true;
+    }
+    store.save_github_app_config(&config)?;
+    info!(
+        app_id = %config.app_id,
+        app_slug = config.app_slug.as_deref().unwrap_or(""),
+        generated_webhook_secret = generated_secret,
+        github_web_base_url = %github_web_base_url,
+        "loaded GitHub App config"
+    );
+    Ok(())
+}
+
+fn merge_github_app_config(
+    env_config: Option<GithubAppConfig>,
+    stored_config: Option<GithubAppConfig>,
+) -> Option<GithubAppConfig> {
+    match (env_config, stored_config) {
+        (None, stored) => stored,
+        (Some(mut env), stored) => {
+            if env.webhook_secret.trim().is_empty() {
+                env.webhook_secret = stored
+                    .as_ref()
+                    .map(|config| config.webhook_secret.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_default();
+            }
+            if env.app_html_url.is_none() {
+                env.app_html_url = stored
+                    .as_ref()
+                    .and_then(|config| config.app_html_url.clone());
+            }
+            if env.owner_login.is_none() {
+                env.owner_login = stored
+                    .as_ref()
+                    .and_then(|config| config.owner_login.clone());
+            }
+            if env.owner_type.is_none() {
+                env.owner_type = stored.as_ref().and_then(|config| config.owner_type.clone());
+            }
+            Some(env)
+        }
+    }
+}
+
+async fn update_github_app_hook_config(
+    http: &reqwest::Client,
+    github_api_base_url: &str,
+    public_url: &str,
+    config: &GithubAppConfig,
+) -> RelayResult<()> {
+    if config.app_id.trim().is_empty() || config.private_key.trim().is_empty() {
+        return Err(RelayErrorKind::InvalidInput(
+            "GitHub App ID and private key are required to reset webhook secret".to_string(),
+        ));
+    }
+    let jwt = github_app_jwt_for_config(config)?;
+    let url = github_api_url(github_api_base_url, "/app/hook/config");
+    let body = github_app_hook_config_request(public_url, &config.webhook_secret);
+    let response = http
+        .patch(url)
+        .bearer_auth(jwt)
+        .headers(github_headers())
+        .json(&body)
+        .send()
+        .await?;
+    decode_github_response::<Value>(response, "update GitHub App webhook config").await?;
+    Ok(())
+}
+
+fn github_app_hook_config_request(public_url: &str, secret: &str) -> GithubAppHookConfigRequest {
+    GithubAppHookConfigRequest {
+        url: format!("{}/github/webhook", public_url.trim_end_matches('/')),
+        content_type: "json",
+        insecure_ssl: "0",
+        secret: secret.to_string(),
+    }
+}
+
+fn github_app_config_from_env() -> Result<Option<GithubAppConfig>> {
+    let app_id = env::var("MAI_RELAY_GITHUB_APP_ID").ok();
+    let private_key = env::var("MAI_RELAY_GITHUB_APP_PRIVATE_KEY").ok();
+    let private_key_path = env::var("MAI_RELAY_GITHUB_APP_PRIVATE_KEY_PATH").ok();
+    let slug = env::var("MAI_RELAY_GITHUB_APP_SLUG").ok();
+
+    let any_present = [
+        app_id.as_deref(),
+        private_key.as_deref(),
+        private_key_path.as_deref(),
+        slug.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| !value.trim().is_empty());
+    if !any_present {
+        return Ok(None);
+    }
+
+    let app_id = app_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .context("MAI_RELAY_GITHUB_APP_ID is required when relay GitHub App env is configured")?;
+    let private_key = match private_key
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        Some(private_key) => private_key,
+        None => {
+            let path = private_key_path
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .context("MAI_RELAY_GITHUB_APP_PRIVATE_KEY or MAI_RELAY_GITHUB_APP_PRIVATE_KEY_PATH is required")?;
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("reading MAI_RELAY_GITHUB_APP_PRIVATE_KEY_PATH {path}"))?
+        }
+    };
+    let app_slug = slug
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    Ok(Some(GithubAppConfig {
+        app_id,
+        private_key,
+        webhook_secret: String::new(),
+        app_slug,
+        app_html_url: optional_env("MAI_RELAY_GITHUB_APP_HTML_URL"),
+        owner_login: optional_env("MAI_RELAY_GITHUB_APP_OWNER_LOGIN"),
+        owner_type: optional_env("MAI_RELAY_GITHUB_APP_OWNER_TYPE"),
+    }))
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn parse_params<T>(params: Value) -> impl std::future::Future<Output = RelayResult<T>>
@@ -974,6 +1481,55 @@ fn github_repository_summary(repository: GithubRepositoryApi) -> GithubRepositor
     }
 }
 
+fn github_app_settings_response(
+    config: &GithubAppConfig,
+    api_base_url: &str,
+    web_base_url: &str,
+    state: Option<&str>,
+) -> GithubAppSettingsResponse {
+    GithubAppSettingsResponse {
+        app_id: Some(config.app_id.clone()),
+        base_url: api_base_url.to_string(),
+        has_private_key: !config.private_key.trim().is_empty(),
+        app_slug: config.app_slug.clone(),
+        app_html_url: config.app_html_url.clone(),
+        owner_login: config.owner_login.clone(),
+        owner_type: config.owner_type.clone(),
+        install_url: config
+            .app_slug
+            .as_deref()
+            .map(|slug| github_app_install_url(web_base_url, slug, state)),
+    }
+}
+
+fn github_app_install_url(web_base_url: &str, app_slug: &str, state: Option<&str>) -> String {
+    let base = format!(
+        "{}/apps/{}/installations/new",
+        web_base_url.trim_end_matches('/'),
+        app_slug
+    );
+    match state {
+        Some(state) => format!("{base}?state={state}"),
+        None => base,
+    }
+}
+
+fn local_return_url(origin: &str, return_hash: &str, params: &str) -> RelayResult<String> {
+    let origin = sanitize_origin(origin)?;
+    let hash = if return_hash.trim().is_empty() {
+        "#projects"
+    } else {
+        return_hash.trim()
+    };
+    let hash = if hash.starts_with('#') {
+        hash.to_string()
+    } else {
+        format!("#{hash}")
+    };
+    let separator = if hash.contains('?') { '&' } else { '?' };
+    Ok(format!("{origin}/{hash}{separator}{params}"))
+}
+
 fn sanitize_origin(value: &str) -> RelayResult<String> {
     let value = value.trim().trim_end_matches('/');
     if value.starts_with("http://") || value.starts_with("https://") {
@@ -1001,6 +1557,52 @@ fn is_valid_manifest_code(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn github_package_belongs_to_repo(package: &GithubPackageApi, repository_full_name: &str) -> bool {
+    package.repository.as_ref().is_some_and(|repository| {
+        repository
+            .full_name
+            .eq_ignore_ascii_case(repository_full_name)
+    })
+}
+
+fn repository_package_summary(
+    owner: &str,
+    package: GithubPackageApi,
+    versions: Vec<GithubPackageVersionApi>,
+) -> Option<RepositoryPackageSummary> {
+    let tag = preferred_container_tag(&versions)?;
+    let image = format!("ghcr.io/{}/{}:{}", owner, package.name, tag);
+    Some(RepositoryPackageSummary {
+        name: package.name,
+        image,
+        tag,
+        html_url: package.html_url,
+    })
+}
+
+fn preferred_container_tag(versions: &[GithubPackageVersionApi]) -> Option<String> {
+    let mut first_tag = None;
+    for version in versions {
+        for tag in &version.metadata.container.tags {
+            let tag = tag.trim();
+            if tag.is_empty() {
+                continue;
+            }
+            if tag == "latest" {
+                return Some(tag.to_string());
+            }
+            if first_tag.is_none() {
+                first_tag = Some(tag.to_string());
+            }
+        }
+    }
+    first_tag
+}
+
+fn github_path_segment(value: &str) -> String {
+    percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
 fn github_app_manifest(
@@ -1102,6 +1704,12 @@ impl RelayStore {
                 account_type TEXT NOT NULL,
                 org TEXT,
                 webhook_secret TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS installation_states (
+                state TEXT PRIMARY KEY NOT NULL,
+                created_at TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                return_hash TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS webhook_deliveries (
                 delivery_id TEXT PRIMARY KEY NOT NULL,
@@ -1223,6 +1831,49 @@ impl RelayStore {
             .optional()?
             .ok_or_else(|| RelayErrorKind::InvalidInput("manifest state not found".to_string()))?;
         conn.execute("DELETE FROM manifest_states WHERE state = ?1", [state])?;
+        Ok(row)
+    }
+
+    fn save_installation_state(&self, state: &InstallationState) -> RelayResult<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO installation_states
+             (state, created_at, origin, return_hash)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                state.state,
+                state.created_at.to_rfc3339(),
+                state.origin,
+                state.return_hash,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn take_installation_state(&self, state: &str) -> RelayResult<InstallationState> {
+        let conn = self.connection()?;
+        let row = conn
+            .query_row(
+                "SELECT state, created_at, origin, return_hash
+                 FROM installation_states WHERE state = ?1",
+                [state],
+                |row| {
+                    let created_at: String = row.get(1)?;
+                    Ok(InstallationState {
+                        state: row.get(0)?,
+                        created_at: DateTime::parse_from_rfc3339(&created_at)
+                            .map(|time| time.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now()),
+                        origin: row.get(2)?,
+                        return_hash: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                RelayErrorKind::InvalidInput("installation state not found".to_string())
+            })?;
+        conn.execute("DELETE FROM installation_states WHERE state = ?1", [state])?;
         Ok(row)
     }
 
@@ -1398,6 +2049,108 @@ mod tests {
         assert_eq!(store.list_unacked_deliveries().expect("list").len(), 1);
         store.ack_delivery("delivery-1").expect("ack");
         assert!(store.list_unacked_deliveries().expect("list").is_empty());
+    }
+
+    #[test]
+    fn installation_state_round_trips_and_return_url_is_hash_based() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = RelayStore::open(dir.path().join("relay.sqlite3")).expect("store");
+        store
+            .save_installation_state(&InstallationState {
+                state: "state-1".to_string(),
+                created_at: Utc::now(),
+                origin: "http://127.0.0.1:8080".to_string(),
+                return_hash: "#projects".to_string(),
+            })
+            .expect("save");
+
+        let state = store.take_installation_state("state-1").expect("take");
+        assert_eq!(state.origin, "http://127.0.0.1:8080");
+        assert_eq!(
+            local_return_url(
+                &state.origin,
+                &state.return_hash,
+                "github-app=installed&installation_id=42"
+            )
+            .expect("url"),
+            "http://127.0.0.1:8080/#projects?github-app=installed&installation_id=42"
+        );
+        assert!(store.take_installation_state("state-1").is_err());
+    }
+
+    #[test]
+    fn app_settings_builds_stateful_install_url() {
+        let config = GithubAppConfig {
+            app_id: "123".to_string(),
+            private_key: "pem".to_string(),
+            webhook_secret: "secret".to_string(),
+            app_slug: Some("mai-test".to_string()),
+            app_html_url: Some("https://github.com/apps/mai-test".to_string()),
+            owner_login: Some("owner".to_string()),
+            owner_type: Some("User".to_string()),
+        };
+        let settings = github_app_settings_response(
+            &config,
+            "https://api.github.com",
+            "https://github.com",
+            Some("state-1"),
+        );
+        assert_eq!(settings.app_id.as_deref(), Some("123"));
+        assert!(settings.has_private_key);
+        assert_eq!(
+            settings.install_url.as_deref(),
+            Some("https://github.com/apps/mai-test/installations/new?state=state-1")
+        );
+    }
+
+    #[test]
+    fn github_app_config_deserializes_missing_webhook_secret_as_empty() {
+        let config: GithubAppConfig = serde_json::from_value(json!({
+            "app_id": "123",
+            "private_key": "pem",
+            "app_slug": "mai-test"
+        }))
+        .expect("config");
+
+        assert_eq!(config.webhook_secret, "");
+    }
+
+    #[test]
+    fn env_config_preserves_stored_webhook_secret_when_merged() {
+        let env = GithubAppConfig {
+            app_id: "456".to_string(),
+            private_key: "env-pem".to_string(),
+            webhook_secret: String::new(),
+            app_slug: Some("env-slug".to_string()),
+            app_html_url: None,
+            owner_login: None,
+            owner_type: None,
+        };
+        let stored = GithubAppConfig {
+            app_id: "123".to_string(),
+            private_key: "stored-pem".to_string(),
+            webhook_secret: "stored-secret".to_string(),
+            app_slug: Some("stored-slug".to_string()),
+            app_html_url: Some("https://github.com/apps/stored".to_string()),
+            owner_login: Some("owner".to_string()),
+            owner_type: Some("User".to_string()),
+        };
+
+        let merged = merge_github_app_config(Some(env), Some(stored)).expect("merged");
+        assert_eq!(merged.app_id, "456");
+        assert_eq!(merged.private_key, "env-pem");
+        assert_eq!(merged.webhook_secret, "stored-secret");
+        assert_eq!(merged.app_slug.as_deref(), Some("env-slug"));
+        assert_eq!(merged.owner_login.as_deref(), Some("owner"));
+    }
+
+    #[test]
+    fn github_app_hook_config_request_uses_public_webhook_url() {
+        let request = github_app_hook_config_request("https://relay.example/", "secret-1");
+        assert_eq!(request.url, "https://relay.example/github/webhook");
+        assert_eq!(request.content_type, "json");
+        assert_eq!(request.insecure_ssl, "0");
+        assert_eq!(request.secret, "secret-1");
     }
 
     fn hex_encode(bytes: &[u8]) -> String {

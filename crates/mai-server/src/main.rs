@@ -19,16 +19,18 @@ use mai_protocol::{
     CreateProjectRequest, CreateProjectResponse, CreateSessionResponse, CreateTaskRequest,
     CreateTaskResponse, ErrorResponse, FileUploadRequest, FileUploadResponse,
     GitAccountDefaultRequest, GitAccountRequest, GitAccountResponse, GitAccountsResponse,
-    GithubAppManifestStartRequest, GithubAppManifestStartResponse, GithubAppSettingsRequest,
-    GithubAppSettingsResponse, GithubInstallationsResponse, GithubRepositoriesResponse,
-    GithubSettingsRequest, GithubSettingsResponse, McpServersConfigRequest, ModelInputItem,
-    ModelOutputItem, ModelResponse, ModelWireApi, ProjectId, ProjectReviewRunDetail,
-    ProjectReviewRunsResponse, ProviderKind, ProviderPresetsResponse, ProviderTestRequest,
-    ProviderTestResponse, ProvidersConfigRequest, ProvidersResponse, RelayStatusResponse,
-    RepositoryPackagesResponse, RequestPlanRevisionRequest, RequestPlanRevisionResponse,
-    RuntimeDefaultsResponse, SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId,
-    SkillsConfigRequest, SkillsListResponse, TaskId, ToolTraceDetail, ToolTraceListResponse,
-    TurnId, UpdateAgentRequest, UpdateAgentResponse, UpdateProjectRequest, UpdateProjectResponse,
+    GithubAppInstallationPackagesRequest, GithubAppInstallationStartRequest,
+    GithubAppInstallationStartResponse, GithubAppManifestStartRequest,
+    GithubAppManifestStartResponse, GithubAppSettingsRequest, GithubAppSettingsResponse,
+    GithubInstallationsResponse, GithubRepositoriesResponse, GithubSettingsRequest,
+    GithubSettingsResponse, McpServersConfigRequest, ModelInputItem, ModelOutputItem,
+    ModelResponse, ModelWireApi, ProjectId, ProjectReviewRunDetail, ProjectReviewRunsResponse,
+    ProviderKind, ProviderPresetsResponse, ProviderTestRequest, ProviderTestResponse,
+    ProvidersConfigRequest, ProvidersResponse, RelayStatusResponse, RepositoryPackagesResponse,
+    RequestPlanRevisionRequest, RequestPlanRevisionResponse, RuntimeDefaultsResponse,
+    SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId, SkillsConfigRequest,
+    SkillsListResponse, TaskId, ToolTraceDetail, ToolTraceListResponse, TurnId, UpdateAgentRequest,
+    UpdateAgentResponse, UpdateProjectRequest, UpdateProjectResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
 use mai_store::{AgentLogFilter, ConfigStore, ToolTraceFilter};
@@ -114,6 +116,15 @@ impl From<mai_store::StoreError> for ApiError {
         Self {
             status,
             message: value.to_string(),
+        }
+    }
+}
+
+impl ApiError {
+    fn bad_request(message: String) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message,
         }
     }
 }
@@ -349,6 +360,10 @@ async fn main() -> Result<()> {
             "/github/app-installation/callback",
             get(github_app_installation_callback),
         )
+        .route(
+            "/github/app-installation/start",
+            post(start_github_app_installation),
+        )
         .route("/relay/status", get(get_relay_status))
         .route("/github/installations", get(list_github_installations))
         .route(
@@ -358,6 +373,10 @@ async fn main() -> Result<()> {
         .route(
             "/github/installations/{id}/repositories",
             get(list_github_repositories),
+        )
+        .route(
+            "/github/installations/{id}/repositories/{owner}/{repo}/packages",
+            get(list_github_repository_packages),
         )
         .route("/provider-presets", get(get_provider_presets))
         .route("/skills", get(list_skills))
@@ -1070,6 +1089,9 @@ async fn save_github_settings(
 async fn get_github_app_settings(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<GithubAppSettingsResponse>, ApiError> {
+    if let Some(relay) = &state.relay {
+        return Ok(Json(relay.github_app_settings().await?));
+    }
     Ok(Json(state.runtime.github_app_settings().await?))
 }
 
@@ -1144,6 +1166,16 @@ async fn github_app_installation_callback(
     )
 }
 
+async fn start_github_app_installation(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<GithubAppInstallationStartRequest>,
+) -> std::result::Result<Json<GithubAppInstallationStartResponse>, ApiError> {
+    let relay = state.relay.as_ref().ok_or_else(|| {
+        ApiError::bad_request("GitHub App installation requires relay mode".to_string())
+    })?;
+    Ok(Json(relay.start_github_app_installation(request).await?))
+}
+
 async fn list_github_installations(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<GithubInstallationsResponse>, ApiError> {
@@ -1170,6 +1202,30 @@ async fn list_github_repositories(
         return Ok(Json(relay.list_github_repositories(id).await?));
     }
     Ok(Json(state.runtime.list_github_repositories(id).await?))
+}
+
+async fn list_github_repository_packages(
+    State(state): State<Arc<AppState>>,
+    Path((id, owner, repo)): Path<(u64, String, String)>,
+) -> std::result::Result<Json<RepositoryPackagesResponse>, ApiError> {
+    let request = GithubAppInstallationPackagesRequest {
+        installation_id: id,
+        owner,
+        repo,
+    };
+    if let Some(relay) = &state.relay {
+        return Ok(Json(relay.list_github_repository_packages(request).await?));
+    }
+    Ok(Json(
+        state
+            .runtime
+            .list_github_installation_repository_packages(
+                request.installation_id,
+                &request.owner,
+                &request.repo,
+            )
+            .await?,
+    ))
 }
 
 async fn get_relay_status(

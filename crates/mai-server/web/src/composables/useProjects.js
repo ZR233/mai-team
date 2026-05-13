@@ -327,6 +327,7 @@ export function useProjects() {
     form: {
       name: '',
       git_account_id: '',
+      installation_id: '',
       repository_full_name: '',
       branch: ''
     },
@@ -342,8 +343,13 @@ export function useProjects() {
       packageWarning: ''
     },
     gitAccounts: [],
+    relay: null,
+    githubApp: null,
+    installations: [],
     repositories: [],
     loadingAccounts: false,
+    loadingInstallations: false,
+    installingGithubApp: false,
     loadingRepositories: false,
     submitting: false,
     error: ''

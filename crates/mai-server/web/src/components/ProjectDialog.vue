@@ -19,17 +19,23 @@
               type="button"
               :class="{ active: dialog.mode === mode.id, disabled: mode.disabled }"
               :disabled="mode.disabled"
-              @click="dialog.mode = mode.id"
+              @click="selectMode(mode.id)"
             >
               <strong>{{ mode.label }}</strong>
               <span>{{ mode.description }}</span>
             </button>
           </div>
 
-          <div v-if="!hasAccounts" class="project-github-empty">
+          <div v-if="dialog.mode === 'git_account' && !hasAccounts" class="project-github-empty">
             <strong>No Git accounts configured</strong>
             <span>Add a GitHub token before creating projects.</span>
             <button class="primary-button" type="button" @click="$emit('configure-git-accounts')">Open Git Accounts</button>
+          </div>
+
+          <div v-else-if="dialog.mode === 'github_app' && !githubAppReady" class="project-github-empty">
+            <strong>GitHub App relay unavailable</strong>
+            <span>{{ githubAppStatus }}</span>
+            <button class="ghost-button" type="button" :disabled="dialog.loadingInstallations" @click="$emit('refresh-installations')">Refresh</button>
           </div>
 
           <div class="project-create-form">
@@ -38,7 +44,7 @@
               <input v-model.trim="dialog.form.name" :placeholder="projectNamePlaceholder" />
             </label>
 
-            <div class="project-field-row">
+            <div v-if="dialog.mode === 'git_account'" class="project-field-row">
               <span>Git Account</span>
               <div class="project-control-with-action">
                 <select v-model="dialog.form.git_account_id" :disabled="!hasAccounts" required @change="onAccountChanged">
@@ -50,6 +56,26 @@
                 <button class="ghost-button" type="button" :disabled="dialog.loadingRepositories || !dialog.form.git_account_id" @click="$emit('refresh-repositories')">
                   <span v-if="dialog.loadingRepositories" class="spinner-sm"></span>
                   <template v-else>Load Repos</template>
+                </button>
+              </div>
+            </div>
+
+            <div v-else class="project-field-row">
+              <span>GitHub App</span>
+              <div class="project-control-with-action">
+                <select v-model="dialog.form.installation_id" :disabled="!githubAppReady || dialog.loadingInstallations" required @change="onInstallationChanged">
+                  <option value="" disabled>{{ installationSelectPlaceholder }}</option>
+                  <option v-for="installation in dialog.installations" :key="installation.id" :value="String(installation.id)">
+                    {{ installationLabel(installation) }}
+                  </option>
+                </select>
+                <button class="ghost-button" type="button" :disabled="!canInstallGithubApp || dialog.installingGithubApp" @click="$emit('install-github-app')">
+                  <span v-if="dialog.installingGithubApp" class="spinner-sm"></span>
+                  <template v-else>Install</template>
+                </button>
+                <button class="ghost-button" type="button" :disabled="!githubAppReady || dialog.loadingInstallations" @click="$emit('refresh-installations')">
+                  <span v-if="dialog.loadingInstallations" class="spinner-sm"></span>
+                  <template v-else>Refresh</template>
                 </button>
               </div>
             </div>
@@ -69,7 +95,7 @@
               <div class="project-picker">
                 <input
                   v-model.trim="dialog.repository.query"
-                  :disabled="!dialog.form.git_account_id || dialog.loadingRepositories"
+                  :disabled="!canLoadRepositories || dialog.loadingRepositories"
                   placeholder="Search repositories"
                 />
                 <div class="project-picker-list" aria-label="Repositories">
@@ -138,14 +164,14 @@
               <span></span>
               <div>
                 <strong>Connect GitHub</strong>
-                <small>{{ hasAccounts ? accountCountLabel : 'Add a Git account' }}</small>
+                <small>{{ connectStepLabel }}</small>
               </div>
             </li>
             <li :class="{ done: Boolean(selectedAccount) }">
               <span></span>
               <div>
-                <strong>Select account</strong>
-                <small>{{ selectedAccount ? accountLabel(selectedAccount) : 'No account selected' }}</small>
+                <strong>{{ dialog.mode === 'github_app' ? 'Select installation' : 'Select account' }}</strong>
+                <small>{{ selectedSourceLabel }}</small>
               </div>
             </li>
             <li :class="{ done: Boolean(selectedRepository) }">
@@ -163,7 +189,7 @@
               </div>
             </li>
           </ol>
-          <p class="project-create-note">Repository access is verified with the selected Git account token.</p>
+          <p class="project-create-note">{{ accessNote }}</p>
         </aside>
       </div>
 
@@ -190,19 +216,28 @@ const emit = defineEmits([
   'close',
   'create',
   'configure-git-accounts',
+  'install-github-app',
+  'refresh-installations',
   'refresh-repositories',
   'load-repository-packages'
 ])
 
 const modes = [
   { id: 'git_account', label: 'Git Account', description: 'Select account and repository' },
-  { id: 'local_git', label: 'Local Git', description: 'Coming soon', disabled: true },
-  { id: 'upload', label: 'Upload', description: 'Coming soon', disabled: true }
+  { id: 'github_app', label: 'GitHub App', description: 'Install app and select repository' },
+  { id: 'local_git', label: 'Local Git', description: 'Coming soon', disabled: true }
 ]
 
 const hasAccounts = computed(() => props.dialog.gitAccounts.length > 0)
 const selectedAccount = computed(() => props.dialog.gitAccounts.find((account) => account.id === props.dialog.form.git_account_id) || null)
+const selectedInstallation = computed(() => props.dialog.installations.find((installation) => String(installation.id) === String(props.dialog.form.installation_id)) || null)
 const accountCountLabel = computed(() => `${props.dialog.gitAccounts.length} account${props.dialog.gitAccounts.length === 1 ? '' : 's'}`)
+const installationCountLabel = computed(() => `${props.dialog.installations.length} installation${props.dialog.installations.length === 1 ? '' : 's'}`)
+const relayConnected = computed(() => props.dialog.relay?.enabled && props.dialog.relay?.connected)
+const githubAppReady = computed(() => relayConnected.value && Boolean(props.dialog.githubApp?.app_slug || props.dialog.githubApp?.install_url))
+const canInstallGithubApp = computed(() => relayConnected.value && Boolean(props.dialog.githubApp?.app_slug || props.dialog.githubApp?.install_url))
+const canLoadRepositories = computed(() => props.dialog.mode === 'github_app' ? Boolean(props.dialog.form.installation_id) : Boolean(props.dialog.form.git_account_id))
+const sourceSelected = computed(() => props.dialog.mode === 'github_app' ? Boolean(selectedInstallation.value) : Boolean(selectedAccount.value))
 
 const filteredRepositories = computed(() => {
   const query = props.dialog.repository.query.trim().toLowerCase()
@@ -224,8 +259,7 @@ const runtimeReady = computed(() => {
 })
 
 const canCreate = computed(() => {
-  return hasAccounts.value
-    && props.dialog.form.git_account_id
+  return sourceSelected.value
     && props.dialog.form.repository_full_name
     && runtimeReady.value
     && !props.dialog.submitting
@@ -235,17 +269,49 @@ const projectNamePlaceholder = computed(() => selectedRepository.value ? reposit
 
 const repositoryPlaceholder = computed(() => {
   if (props.dialog.loadingRepositories) return 'Loading repositories'
-  if (!props.dialog.form.git_account_id) return 'Select account first'
+  if (!canLoadRepositories.value) return props.dialog.mode === 'github_app' ? 'Select installation first' : 'Select account first'
   if (!props.dialog.repositories.length) return 'No repositories loaded'
   return 'No repositories match'
 })
 
 const setupSummary = computed(() => {
-  if (!hasAccounts.value) return 'Git account required'
-  if (!selectedAccount.value) return 'Select account'
+  if (props.dialog.mode === 'github_app' && !githubAppReady.value) return 'GitHub App relay required'
+  if (props.dialog.mode === 'git_account' && !hasAccounts.value) return 'Git account required'
+  if (!sourceSelected.value) return props.dialog.mode === 'github_app' ? 'Select installation' : 'Select account'
   if (!selectedRepository.value) return 'Choose repository'
   return 'Ready to create'
 })
+
+const githubAppStatus = computed(() => {
+  if (!props.dialog.relay?.enabled) return 'Enable mai-server relay mode before using GitHub App projects.'
+  if (!props.dialog.relay?.connected) return props.dialog.relay?.message || 'mai-server is not connected to mai-relay.'
+  if (!props.dialog.githubApp?.app_slug && !props.dialog.githubApp?.install_url) return 'Configure GitHub App environment variables on mai-relay.'
+  return 'GitHub App relay is ready.'
+})
+
+const installationSelectPlaceholder = computed(() => {
+  if (props.dialog.loadingInstallations) return 'Loading installations'
+  if (!githubAppReady.value) return 'GitHub App unavailable'
+  if (!props.dialog.installations.length) return 'Install GitHub App first'
+  return 'Select installation'
+})
+
+const connectStepLabel = computed(() => {
+  if (props.dialog.mode === 'github_app') {
+    if (!githubAppReady.value) return githubAppStatus.value
+    return props.dialog.installations.length ? installationCountLabel.value : 'Install GitHub App'
+  }
+  return hasAccounts.value ? accountCountLabel.value : 'Add a Git account'
+})
+
+const selectedSourceLabel = computed(() => {
+  if (props.dialog.mode === 'github_app') return selectedInstallation.value ? installationLabel(selectedInstallation.value) : 'No installation selected'
+  return selectedAccount.value ? accountLabel(selectedAccount.value) : 'No account selected'
+})
+
+const accessNote = computed(() => props.dialog.mode === 'github_app'
+  ? 'Repository access is verified with a short-lived GitHub App installation token.'
+  : 'Repository access is verified with the selected Git account token.')
 
 const runtimeLabel = computed(() => {
   if (!runtimeReady.value) return 'Invalid image ID'
@@ -280,7 +346,23 @@ function onBackdropUp(_event, callback) {
   }
 }
 
+function selectMode(mode) {
+  props.dialog.mode = mode
+  props.dialog.error = ''
+  props.dialog.form.repository_full_name = ''
+  props.dialog.form.branch = ''
+  props.dialog.repository.query = ''
+  emit('refresh-repositories')
+}
+
 function onAccountChanged() {
+  props.dialog.form.repository_full_name = ''
+  props.dialog.form.branch = ''
+  props.dialog.repository.query = ''
+  emit('refresh-repositories')
+}
+
+function onInstallationChanged() {
   props.dialog.form.repository_full_name = ''
   props.dialog.form.branch = ''
   props.dialog.repository.query = ''
@@ -305,6 +387,13 @@ function selectPackageImage() {
 function accountLabel(account) {
   const login = account.login ? `@${account.login}` : account.provider || 'github'
   return `${account.label || 'GitHub'} · ${login}`
+}
+
+function installationLabel(installation) {
+  const account = installation.account_login || installation.id
+  const type = installation.account_type || 'GitHub'
+  const selection = installation.repository_selection ? ` · ${installation.repository_selection}` : ''
+  return `${account} · ${type}${selection}`
 }
 
 function repositoryLabel(repository) {

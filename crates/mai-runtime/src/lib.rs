@@ -1378,6 +1378,31 @@ impl AgentRuntime {
         repo: &str,
     ) -> Result<RepositoryPackagesResponse> {
         let token = self.git_account_token(account_id).await?;
+        self.repository_packages_with_token(&token, owner, repo)
+            .await
+    }
+
+    pub async fn list_github_installation_repository_packages(
+        &self,
+        installation_id: u64,
+        owner: &str,
+        repo: &str,
+    ) -> Result<RepositoryPackagesResponse> {
+        let token = self
+            .github_backend
+            .github_installation_token(installation_id, None)
+            .await?
+            .token;
+        self.repository_packages_with_token(&token, owner, repo)
+            .await
+    }
+
+    async fn repository_packages_with_token(
+        &self,
+        token: &str,
+        owner: &str,
+        repo: &str,
+    ) -> Result<RepositoryPackagesResponse> {
         let repository_ref = format!("{}/{}", owner.trim(), repo.trim());
         if owner.trim().is_empty() || repo.trim().is_empty() {
             return Err(RuntimeError::InvalidInput(
