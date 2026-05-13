@@ -183,7 +183,7 @@ const currentProvider = computed(() => props.providers.find((provider) => provid
 const currentModel = computed(() => currentProvider.value?.models?.find((model) => model.id === props.detail?.model))
 const currentReasoningOptions = computed(() => reasoningOptionsFor(currentProvider.value, currentModel.value))
 const latestActivity = computed(() => {
-  const activeTool = [...timelineItems.value].reverse().find((item) => item.type === 'tool' && item.status === 'running')
+  const activeTool = [...timelineItems.value].reverse().find((item) => isToolTimelineItem(item) && item.status === 'running')
   if (activeTool) return `${activeTool.toolActionLabel || 'Running'} ${activeTool.toolName}`
   const activeProcess = [...timelineItems.value].reverse().find((item) => item.type === 'process' && item.tone === 'active')
   if (activeProcess) return [activeProcess.label, activeProcess.detail].filter(Boolean).join(' · ')
@@ -307,6 +307,10 @@ function trimNumber(value) {
 
 function isToolExpanded(item) {
   return Boolean(expandedTools[item.callId])
+}
+
+function isToolTimelineItem(item) {
+  return item?.type === 'tool_call' || item?.type === 'tool'
 }
 
 function traceState(item) {
