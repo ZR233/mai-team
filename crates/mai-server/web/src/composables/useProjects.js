@@ -349,7 +349,6 @@ export function useProjects() {
     repositories: [],
     loadingAccounts: false,
     loadingInstallations: false,
-    installingGithubApp: false,
     loadingRepositories: false,
     submitting: false,
     error: ''

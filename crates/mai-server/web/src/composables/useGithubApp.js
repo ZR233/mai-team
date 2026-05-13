@@ -37,7 +37,7 @@ export function useGithubApp() {
     }
   }
 
-  async function startGithubAppInstallation(origin = window.location.origin, returnHash = '#projects') {
+  async function startGithubAppInstallation(origin = window.location.origin, returnHash = '#settings=github-app') {
     githubAppState.installing = true
     try {
       return await api('/github/app-installation/start', {

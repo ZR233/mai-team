@@ -136,6 +136,7 @@
         :mcp-servers-state="mcpServersState"
         :mcp-saving="mcpServersState.saving"
         :git-accounts-state="gitAccountsState"
+        :github-app-state="githubAppState"
         :initial-section="settingsInitialSection"
         @reload="loadAgentConfig"
         @save="onSaveAgentConfig"
@@ -148,6 +149,8 @@
         @verify-git-account="onVerifyGitAccount"
         @delete-git-account="onDeleteGitAccount"
         @set-default-git-account="onSetDefaultGitAccount"
+        @refresh-github-app="onRefreshGithubAppSettings"
+        @install-github-app="onInstallGithubAppFromSettings"
       />
     </main>
 
@@ -169,7 +172,7 @@
       @close="projectDialog.open = false"
       @create="onCreateProject"
       @configure-git-accounts="openGitAccountsSettings"
-      @install-github-app="onInstallGithubApp"
+      @configure-github-app="openGithubAppSettings"
       @refresh-installations="onRefreshGithubAppInstallations"
       @refresh-repositories="onRefreshProjectRepositories"
       @load-repository-packages="onLoadProjectRepositoryPackages"
@@ -407,7 +410,7 @@ async function refreshAll() {
   isLoading.value = true
   isProjectsLoading.value = true
   try {
-    await Promise.all([loadProviders(), loadAgentConfig(), loadSkills(), loadMcpServers(), loadGitAccounts(), refreshTasks(), refreshProjects()])
+    await Promise.all([loadProviders(), loadAgentConfig(), loadSkills(), loadMcpServers(), loadGitAccounts(), refreshGithubAppSettingsState(), refreshTasks(), refreshProjects()])
     if (providersState.providers.length && !tasks.value.length) {
       await ensureDefaultTask()
     } else if (selectedTaskId.value) {
@@ -433,20 +436,20 @@ async function applyStartupHash() {
   const parsed = parseHash(hash)
   if (parsed.path === 'projects') {
     activeTab.value = 'projects'
-    if (parsed.params.get('github-app')) {
-      await openCreateProjectDialog({
-        mode: 'github_app',
-        installationId: parsed.params.get('installation_id') || ''
-      })
-      if (parsed.params.get('github-app') === 'pending') {
-        projectDialog.error = 'GitHub App installation is pending approval. Refresh installations after it is approved.'
-      }
-    }
     return
   }
-  if (hash.includes('settings=git-accounts')) {
-    settingsInitialSection.value = 'git-accounts'
+  if (parsed.path === 'settings') {
+    const section = parsed.params.get('settings') || 'roles'
+    settingsInitialSection.value = section
     activeTab.value = 'settings'
+    if (section === 'github-app' && parsed.params.get('github-app')) {
+      await onRefreshGithubAppSettings()
+      if (parsed.params.get('github-app') === 'pending') {
+        showToast('GitHub App installation is pending approval.')
+      } else {
+        showToast('GitHub App installation updated.')
+      }
+    }
   }
 }
 
@@ -454,6 +457,13 @@ function openGitAccountsSettings() {
   settingsInitialSection.value = 'git-accounts'
   activeTab.value = 'settings'
   projectDialog.open = false
+}
+
+async function openGithubAppSettings() {
+  settingsInitialSection.value = 'github-app'
+  activeTab.value = 'settings'
+  projectDialog.open = false
+  await onRefreshGithubAppSettings()
 }
 
 async function handleSSEEvent() {
@@ -649,10 +659,7 @@ async function openCreateProjectDialog(options = {}) {
   projectDialog.relay = githubAppState.relay
   projectDialog.githubApp = githubAppState.app
   await loadProjectInstallations()
-  if (options.installationId) {
-    projectDialog.mode = 'github_app'
-    projectDialog.form.installation_id = String(options.installationId)
-  } else if (!projectDialog.form.installation_id && projectDialog.installations.length === 1) {
+  if (!projectDialog.form.installation_id && projectDialog.installations.length === 1) {
     projectDialog.form.installation_id = String(projectDialog.installations[0].id)
   }
   const defaultAccount = projectDialog.gitAccounts.find((account) => account.is_default) || projectDialog.gitAccounts[0]
@@ -695,7 +702,6 @@ function resetProjectDialog() {
   projectDialog.installations = []
   projectDialog.repositories = []
   projectDialog.loadingInstallations = false
-  projectDialog.installingGithubApp = false
   projectDialog.error = ''
   projectDialog.submitting = false
 }
@@ -715,16 +721,33 @@ async function loadProjectInstallations(refresh = false) {
   }
 }
 
-async function onInstallGithubApp() {
-  projectDialog.installingGithubApp = true
-  projectDialog.error = ''
+async function onInstallGithubAppFromSettings() {
+  githubAppState.error = ''
   try {
-    const response = await startGithubAppInstallation(window.location.origin, '#projects')
+    const response = await startGithubAppInstallation(window.location.origin, '#settings=github-app')
     window.location.href = response.install_url
   } catch (error) {
-    projectDialog.error = error.message
-  } finally {
-    projectDialog.installingGithubApp = false
+    githubAppState.error = error.message
+  }
+}
+
+async function onRefreshGithubAppSettings() {
+  await refreshGithubAppSettingsState(true)
+}
+
+async function refreshGithubAppSettingsState(refresh = false) {
+  await loadGithubAppContext()
+  const relayReady = githubAppState.relay?.enabled && githubAppState.relay?.connected
+  const appReady = Boolean(githubAppState.app?.app_slug || githubAppState.app?.install_url)
+  if (!relayReady || !appReady) {
+    githubAppState.installations = []
+    return
+  }
+  try {
+    await loadInstallations(refresh)
+  } catch (error) {
+    githubAppState.installations = []
+    githubAppState.error = error.message
   }
 }
 
@@ -1010,9 +1033,15 @@ function onConfirmAction() {
 function parseHash(hash) {
   const raw = (hash || '').replace(/^#/, '')
   const [pathPart, queryPart = ''] = raw.split('?')
+  const params = new URLSearchParams(queryPart)
+  let path = pathPart || ''
+  if (path.startsWith('settings=')) {
+    params.set('settings', path.slice('settings='.length) || 'roles')
+    path = 'settings'
+  }
   return {
-    path: pathPart || '',
-    params: new URLSearchParams(queryPart)
+    path,
+    params
   }
 }
 </script>

@@ -829,25 +829,18 @@ async fn complete_app_installation(
     state: &AppState,
     query: &GithubInstallationCallbackQuery,
 ) -> RelayResult<Response> {
-    let Some(state_id) = query
+    let install_state = if let Some(state_id) = query
         .state
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    else {
-        let message = match (query.setup_action.as_deref(), query.installation_id) {
-            (Some(action), Some(id)) => format!("GitHub App installation {action}: {id}"),
-            (Some(action), None) => format!("GitHub App installation {action}."),
-            (None, Some(id)) => format!("GitHub App installation ready: {id}"),
-            (None, None) => "GitHub App installation finished.".to_string(),
-        };
-        return Ok(callback_page(
-            true,
-            "GitHub App installation updated",
-            &message,
-        ));
+    {
+        state.store.take_installation_state(state_id)?
+    } else if query.installation_id.is_some() {
+        state.store.take_latest_installation_state()?
+    } else {
+        return Ok(github_installation_fallback_page(query));
     };
-    let install_state = state.store.take_installation_state(state_id)?;
     let params = match query.installation_id {
         Some(installation_id) => {
             verify_installation(state, installation_id).await?;
@@ -862,6 +855,16 @@ async fn complete_app_installation(
         "",
     )
         .into_response())
+}
+
+fn github_installation_fallback_page(query: &GithubInstallationCallbackQuery) -> Response {
+    let message = match (query.setup_action.as_deref(), query.installation_id) {
+        (Some(action), Some(id)) => format!("GitHub App installation {action}: {id}"),
+        (Some(action), None) => format!("GitHub App installation {action}."),
+        (None, Some(id)) => format!("GitHub App installation ready: {id}"),
+        (None, None) => "GitHub App installation finished.".to_string(),
+    };
+    callback_page(true, "GitHub App installation updated", &message)
 }
 
 async fn list_installations(state: &AppState) -> RelayResult<GithubInstallationsResponse> {
@@ -1989,6 +1992,38 @@ impl RelayStore {
         Ok(row)
     }
 
+    fn take_latest_installation_state(&self) -> RelayResult<InstallationState> {
+        let conn = self.connection()?;
+        let row = conn
+            .query_row(
+                "SELECT state, created_at, origin, return_hash
+                 FROM installation_states
+                 ORDER BY created_at DESC
+                 LIMIT 1",
+                [],
+                |row| {
+                    let created_at: String = row.get(1)?;
+                    Ok(InstallationState {
+                        state: row.get(0)?,
+                        created_at: DateTime::parse_from_rfc3339(&created_at)
+                            .map(|time| time.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now()),
+                        origin: row.get(2)?,
+                        return_hash: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                RelayErrorKind::InvalidInput("installation state not found".to_string())
+            })?;
+        conn.execute(
+            "DELETE FROM installation_states WHERE state = ?1",
+            [&row.state],
+        )?;
+        Ok(row)
+    }
+
     fn insert_delivery(
         &self,
         sequence: u64,
@@ -2188,6 +2223,37 @@ mod tests {
             "http://127.0.0.1:8080/#projects?github-app=installed&installation_id=42"
         );
         assert!(store.take_installation_state("state-1").is_err());
+    }
+
+    #[test]
+    fn latest_installation_state_supports_github_callback_without_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = RelayStore::open(dir.path().join("relay.sqlite3")).expect("store");
+        store
+            .save_installation_state(&InstallationState {
+                state: "state-older".to_string(),
+                created_at: DateTime::parse_from_rfc3339("2026-05-13T01:00:00Z")
+                    .expect("time")
+                    .with_timezone(&Utc),
+                origin: "http://127.0.0.1:8080".to_string(),
+                return_hash: "#projects".to_string(),
+            })
+            .expect("save older");
+        store
+            .save_installation_state(&InstallationState {
+                state: "state-newer".to_string(),
+                created_at: DateTime::parse_from_rfc3339("2026-05-13T02:00:00Z")
+                    .expect("time")
+                    .with_timezone(&Utc),
+                origin: "http://127.0.0.1:8080".to_string(),
+                return_hash: "#projects".to_string(),
+            })
+            .expect("save newer");
+
+        let state = store.take_latest_installation_state().expect("latest");
+        assert_eq!(state.state, "state-newer");
+        assert!(store.take_installation_state("state-newer").is_err());
+        assert!(store.take_installation_state("state-older").is_ok());
     }
 
     #[test]
