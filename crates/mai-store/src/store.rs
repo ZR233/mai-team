@@ -1,7 +1,5 @@
 use crate::providers::ProvidersCache;
-use crate::schema::{
-    SCHEMA_VERSION, SETTING_SCHEMA_VERSION, build_db, has_sqlite_header, migrate_to_current,
-};
+use crate::schema::{SCHEMA_VERSION, SETTING_SCHEMA_VERSION, build_db, has_sqlite_header};
 use crate::settings::{get_setting_on, set_setting_on};
 use crate::*;
 use tokio::sync::Mutex;
@@ -70,21 +68,11 @@ impl ConfigStore {
                 .ok()
                 .flatten();
             if current_schema_version.as_deref() != Some(SCHEMA_VERSION) {
-                if matches!(
-                    current_schema_version.as_deref(),
-                    Some("8" | "9" | "10" | "11" | "12" | "13" | "14" | "15")
-                ) {
-                    drop(db);
-                    migrate_to_current(&path)?;
-                    db = build_db(&path).await?;
-                    set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
-                } else {
-                    drop(db);
-                    let _ = std::fs::remove_file(&path);
-                    db = build_db(&path).await?;
-                    db.push_schema().await?;
-                    set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
-                }
+                drop(db);
+                let _ = std::fs::remove_file(&path);
+                db = build_db(&path).await?;
+                db.push_schema().await?;
+                set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
             }
         }
 

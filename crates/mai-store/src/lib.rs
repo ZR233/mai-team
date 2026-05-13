@@ -44,8 +44,6 @@ pub use providers::ProviderSelection;
 pub use store::ConfigStore;
 
 pub(crate) use convert::*;
-#[cfg(test)]
-use schema::{sqlite_column_exists, sqlite_table_exists};
 
 const SETTING_AGENT_CONFIG: &str = "agent_config";
 const SETTING_SKILLS_CONFIG: &str = "skills_config";
