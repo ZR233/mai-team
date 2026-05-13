@@ -239,6 +239,17 @@ struct GithubAppHookConfigRequest {
     secret: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct GithubAppHookConfigResponse {
+    url: Option<String>,
+}
+
+#[derive(Debug)]
+enum GithubHookReset {
+    Updated,
+    Missing,
+}
+
 #[derive(Debug, thiserror::Error)]
 enum RelayErrorKind {
     #[error("database error: {0}")]
@@ -1239,11 +1250,23 @@ async fn bootstrap_github_app_config(
         .context("loading GitHub App metadata")?;
     let mut generated_secret = false;
     if config.webhook_secret.trim().is_empty() {
-        config.webhook_secret = Uuid::new_v4().to_string();
-        update_github_app_hook_config(http, github_api_base_url, public_url, &config)
+        let webhook_secret = Uuid::new_v4().to_string();
+        config.webhook_secret = webhook_secret;
+        match update_github_app_hook_config(http, github_api_base_url, public_url, &config)
             .await
-            .context("resetting GitHub App webhook secret")?;
-        generated_secret = true;
+            .context("resetting GitHub App webhook secret")?
+        {
+            GithubHookReset::Updated => {
+                generated_secret = true;
+            }
+            GithubHookReset::Missing => {
+                config.webhook_secret = String::new();
+                warn!(
+                    app_id = %config.app_id,
+                    "GitHub App webhook config was not found; enable the app webhook in GitHub settings or manifest flow before webhook signature verification can work"
+                );
+            }
+        }
     }
     store.save_github_app_config(&config)?;
     info!(
@@ -1345,24 +1368,46 @@ async fn update_github_app_hook_config(
     github_api_base_url: &str,
     public_url: &str,
     config: &GithubAppConfig,
-) -> RelayResult<()> {
+) -> RelayResult<GithubHookReset> {
     if config.app_id.trim().is_empty() || config.private_key.trim().is_empty() {
         return Err(RelayErrorKind::InvalidInput(
             "GitHub App ID and private key are required to reset webhook secret".to_string(),
         ));
     }
     let jwt = github_app_jwt_for_config(config)?;
+    let current_url = github_api_url(github_api_base_url, "/app/hook/config");
+    let current = http
+        .get(&current_url)
+        .bearer_auth(&jwt)
+        .headers(github_headers())
+        .send()
+        .await?;
+    if current.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(GithubHookReset::Missing);
+    }
+    let current = decode_github_response::<GithubAppHookConfigResponse>(
+        current,
+        "get GitHub App webhook config",
+    )
+    .await?;
+    if current
+        .url
+        .as_deref()
+        .is_some_and(|url| url.trim().is_empty())
+    {
+        return Ok(GithubHookReset::Missing);
+    }
     let url = github_api_url(github_api_base_url, "/app/hook/config");
     let body = github_app_hook_config_request(public_url, &config.webhook_secret);
     let response = http
         .patch(url)
-        .bearer_auth(jwt)
+        .bearer_auth(&jwt)
         .headers(github_headers())
         .json(&body)
         .send()
         .await?;
     decode_github_response::<Value>(response, "update GitHub App webhook config").await?;
-    Ok(())
+    Ok(GithubHookReset::Updated)
 }
 
 fn github_app_hook_config_request(public_url: &str, secret: &str) -> GithubAppHookConfigRequest {
