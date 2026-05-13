@@ -725,7 +725,7 @@ async function onInstallGithubAppFromSettings() {
   githubAppState.error = ''
   try {
     const response = await startGithubAppInstallation(window.location.origin, '#settings=github-app')
-    window.location.href = response.install_url
+    window.open(response.install_url, '_blank', 'noopener,noreferrer')
   } catch (error) {
     githubAppState.error = error.message
   }
