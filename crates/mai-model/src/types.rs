@@ -189,7 +189,7 @@ impl ModelStreamAccumulator {
         Ok(self.finish_partial())
     }
 
-    pub fn finish_partial(mut self) -> ModelResponse {
+    pub(crate) fn finish_partial(mut self) -> ModelResponse {
         let mut indices = self
             .text_parts
             .keys()

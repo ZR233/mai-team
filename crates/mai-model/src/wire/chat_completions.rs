@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::types::ModelStreamEvent;
 use crate::wire::{SseFrame, WireProtocol, WireRequest, parse_usage};
-use mai_protocol::{ModelContentItem, ModelInputItem, ToolDefinition};
+use mai_protocol::{ModelContentItem, ModelInputItem, ModelOutputItem, ToolDefinition};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -229,6 +229,7 @@ fn assistant_chat_content(
 
 pub(crate) fn parse_chat_stream_chunk(value: Value) -> Vec<ModelStreamEvent> {
     let mut events = Vec::new();
+    let mut tool_calls_completed = Vec::new();
     let id = value
         .get("id")
         .and_then(Value::as_str)
@@ -242,6 +243,7 @@ pub(crate) fn parse_chat_stream_chunk(value: Value) -> Vec<ModelStreamEvent> {
                 .get("index")
                 .and_then(Value::as_u64)
                 .unwrap_or_default() as usize;
+            let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
             let Some(delta) = choice.get("delta") else {
                 continue;
             };
@@ -281,8 +283,8 @@ pub(crate) fn parse_chat_stream_chunk(value: Value) -> Vec<ModelStreamEvent> {
                     if call_id.is_some() || name.is_some() {
                         events.push(ModelStreamEvent::ToolCallStarted {
                             output_index: index,
-                            call_id,
-                            name,
+                            call_id: call_id.clone(),
+                            name: name.clone(),
                         });
                     }
                     if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
@@ -291,11 +293,32 @@ pub(crate) fn parse_chat_stream_chunk(value: Value) -> Vec<ModelStreamEvent> {
                                 output_index: index,
                                 delta: arguments.to_string(),
                             });
+                            if finish_reason == Some("tool_calls") {
+                                tool_calls_completed.push((
+                                    index,
+                                    call_id.clone(),
+                                    name.clone(),
+                                    arguments.to_string(),
+                                ));
+                            }
                         }
                     }
                 }
             }
         }
+    }
+    for (output_index, call_id, name, raw_arguments) in tool_calls_completed {
+        let arguments = serde_json::from_str(&raw_arguments)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw_arguments.clone() }));
+        events.push(ModelStreamEvent::OutputItemDone {
+            output_index,
+            item: ModelOutputItem::FunctionCall {
+                call_id: call_id.unwrap_or_default(),
+                name: name.unwrap_or_default(),
+                arguments,
+                raw_arguments,
+            },
+        });
     }
     let usage = parse_usage(value.get("usage"));
     if usage.is_some() {
@@ -496,6 +519,35 @@ mod tests {
             .and_then(Value::as_array)
             .expect("tool_calls");
         assert_eq!(tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn chat_stream_emits_function_call_output_item_done_on_tool_finish() {
+        let events = parse_chat_stream_chunk(serde_json::json!({
+            "id": "chatcmpl_123",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_123",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"src/main.rs\"}"
+                        }
+                    }]
+                }
+            }]
+        }));
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::OutputItemDone {
+                item: ModelOutputItem::FunctionCall { call_id, name, .. },
+                ..
+            } if call_id == "call_123" && name == "read_file"
+        )));
     }
 
     #[test]

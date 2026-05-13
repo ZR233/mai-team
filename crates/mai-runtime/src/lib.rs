@@ -5596,9 +5596,15 @@ impl AgentRuntime {
                             } else {
                                 text
                             };
+                            let reasoning_content = reasoning_parts
+                                .remove(output_index)
+                                .filter(|reasoning| !reasoning.trim().is_empty());
                             if !text.trim().is_empty() {
                                 made_progress = true;
                                 final_text = text.clone();
+                                if let Some(value) = &reasoning_content {
+                                    final_reasoning = value.clone();
+                                }
                                 self.record_message(
                                     agent,
                                     agent_id,
@@ -5611,7 +5617,15 @@ impl AgentRuntime {
                                     agent,
                                     agent_id,
                                     session_id,
-                                    ModelInputItem::assistant_text(text.clone()),
+                                    if reasoning_content.is_some() {
+                                        ModelInputItem::AssistantTurn {
+                                            content: Some(text.clone()),
+                                            reasoning_content: reasoning_content.clone(),
+                                            tool_calls: Vec::new(),
+                                        }
+                                    } else {
+                                        ModelInputItem::assistant_text(text.clone())
+                                    },
                                 )
                                 .await?;
                                 self.publish(ServiceEventKind::AgentMessageCompleted {
@@ -5646,17 +5660,6 @@ impl AgentRuntime {
                             } else {
                                 call_id
                             };
-                            if !raw_arguments.is_empty() {
-                                self.publish(ServiceEventKind::ToolCallDelta {
-                                    agent_id,
-                                    session_id: Some(session_id),
-                                    turn_id,
-                                    call_id: call_id.clone(),
-                                    tool_name: name.clone(),
-                                    arguments_delta: raw_arguments.clone(),
-                                })
-                                .await;
-                            }
                             self.record_history_item(
                                 agent,
                                 agent_id,
