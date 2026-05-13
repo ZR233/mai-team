@@ -17,13 +17,21 @@ struct ResponsesRequest<'a> {
     tools: &'a [ToolDefinition],
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'a str>,
+    parallel_tool_calls: bool,
     stream: bool,
+    include: &'a [&'a str],
     #[serde(skip_serializing_if = "Option::is_none")]
     store: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_response_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "u64_is_zero")]
+    max_output_tokens: u64,
     #[serde(flatten)]
     options: BTreeMap<String, Value>,
+}
+
+fn u64_is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 impl WireProtocol for ResponsesApi {
@@ -43,9 +51,12 @@ impl WireProtocol for ResponsesApi {
             input: req.input,
             tools: active_tools,
             tool_choice: req.tool_choice,
+            parallel_tool_calls: true,
             stream: req.stream,
+            include: &[],
             store: req.store,
             previous_response_id: req.previous_response_id,
+            max_output_tokens: req.max_output_tokens,
             options: req.extra_body.clone(),
         };
         Ok(serde_json::to_vec(&request)?)
@@ -244,9 +255,12 @@ mod tests {
             input: request_input,
             tools: &[],
             tool_choice: None,
+            parallel_tool_calls: true,
             stream: false,
+            include: &[],
             store: Some(true),
             previous_response_id,
+            max_output_tokens: 384_000,
             options: request_options(&model, None),
         };
         let value = serde_json::to_value(&request).expect("request json");

@@ -143,35 +143,43 @@ impl ModelClient {
         wire_req: &WireRequest<'_>,
     ) -> Result<ModelResponse> {
         let body = resolved.wire_protocol.build_body(wire_req)?;
-        let response = self
-            .http
-            .post(&resolved.endpoint)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .bearer_auth(&resolved.api_key)
-            .headers(resolved.headers.clone())
-            .body(body)
-            .send()
-            .await
-            .map_err(|source| ModelError::Request {
-                endpoint: resolved.endpoint.clone(),
-                source,
-            })?;
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|source| ModelError::Request {
-                endpoint: resolved.endpoint.clone(),
-                source,
-            })?;
-        if !status.is_success() {
-            return Err(ModelError::Api {
-                endpoint: resolved.endpoint.clone(),
-                status,
-                body: text,
-            });
+        let max_retries = 5u32;
+        for attempt in 0..=max_retries {
+            let response = self
+                .http
+                .post(&resolved.endpoint)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .bearer_auth(&resolved.api_key)
+                .headers(resolved.headers.clone())
+                .body(body.clone())
+                .send()
+                .await
+                .map_err(|source| ModelError::Request {
+                    endpoint: resolved.endpoint.clone(),
+                    source,
+                })?;
+            let status = response.status();
+            let text = response
+                .text()
+                .await
+                .map_err(|source| ModelError::Request {
+                    endpoint: resolved.endpoint.clone(),
+                    source,
+                })?;
+            if status.is_server_error() && attempt < max_retries {
+                tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                continue;
+            }
+            if !status.is_success() {
+                return Err(ModelError::Api {
+                    endpoint: resolved.endpoint.clone(),
+                    status,
+                    body: text,
+                });
+            }
+            return resolved.wire_protocol.parse_response(&text);
         }
-        resolved.wire_protocol.parse_response(&text)
+        unreachable!()
     }
 
     async fn continuation_is_unsupported(&self, cache_key: &str) -> bool {
