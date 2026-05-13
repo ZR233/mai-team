@@ -178,12 +178,14 @@ impl RelayClient {
         &self,
         installation_id: u64,
         repository_id: Option<u64>,
+        include_packages: bool,
     ) -> Result<RelayGithubInstallationTokenResponse, RuntimeError> {
         self.request(
             "github.installation_token.create",
             RelayGithubInstallationTokenRequest {
                 installation_id,
                 repository_id,
+                include_packages,
             },
         )
         .await
@@ -535,8 +537,15 @@ impl GithubAppBackend for RelayClient {
         &self,
         installation_id: u64,
         repository_id: Option<u64>,
+        include_packages: bool,
     ) -> mai_runtime::Result<RelayGithubInstallationTokenResponse> {
-        RelayClient::create_installation_token(self, installation_id, repository_id).await
+        RelayClient::create_installation_token(
+            self,
+            installation_id,
+            repository_id,
+            include_packages,
+        )
+        .await
     }
 }
 

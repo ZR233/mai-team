@@ -1982,6 +1982,8 @@ pub struct RelayGithubInstallationTokenRequest {
     pub installation_id: u64,
     #[serde(default)]
     pub repository_id: Option<u64>,
+    #[serde(default)]
+    pub include_packages: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
