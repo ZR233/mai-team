@@ -3967,6 +3967,11 @@ impl AgentRuntime {
                 let output = self.list_container_files(agent_id, &arguments).await?;
                 Ok(ToolExecution::new(true, output.to_string(), false))
             }
+            RoutedTool::ApplyPatch | RoutedTool::SearchFiles => Ok(ToolExecution::new(
+                false,
+                format!("{name} is defined but not implemented in runtime"),
+                false,
+            )),
             RoutedTool::ContainerCpUpload => {
                 let path = required_string(&arguments, "path")?;
                 let content_base64 = required_string(&arguments, "content_base64")?;
