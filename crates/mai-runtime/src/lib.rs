@@ -248,6 +248,7 @@ pub trait GithubAppBackend: Send + Sync {
         &self,
         installation_id: u64,
         repository_id: Option<u64>,
+        include_packages: bool,
     ) -> Result<RelayGithubInstallationTokenResponse>;
 }
 
@@ -697,7 +698,7 @@ impl GithubAppBackend for DirectGithubAppBackend {
             ));
         }
         let token = self
-            .github_installation_token(installation_id, None)
+            .github_installation_token(installation_id, None, false)
             .await?
             .token;
         let (_, _, base_url) = self.github_app_secret().await?;
@@ -726,7 +727,7 @@ impl GithubAppBackend for DirectGithubAppBackend {
         repository_full_name: &str,
     ) -> Result<GithubRepositorySummary> {
         let token = self
-            .github_installation_token(installation_id, None)
+            .github_installation_token(installation_id, None, false)
             .await?
             .token;
         let url = github_api_url(
@@ -749,9 +750,11 @@ impl GithubAppBackend for DirectGithubAppBackend {
         &self,
         installation_id: u64,
         repository_id: Option<u64>,
+        include_packages: bool,
     ) -> Result<RelayGithubInstallationTokenResponse> {
         let cache_key = format!(
-            "{installation_id}:{}",
+            "{installation_id}:{}:{}",
+            if include_packages { "packages" } else { "default" },
             repository_id
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "all".to_string())
@@ -780,6 +783,7 @@ impl GithubAppBackend for DirectGithubAppBackend {
                 contents: "write",
                 pull_requests: "write",
                 issues: "write",
+                packages: include_packages.then_some("read"),
             },
         };
         let response = self
@@ -890,44 +894,6 @@ struct GithubPackageRepositoryApi {
 }
 
 #[derive(Debug, Deserialize)]
-struct GithubGraphqlResponse<T> {
-    data: Option<T>,
-    #[serde(default)]
-    errors: Vec<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GithubRepositoryPackagesGraphqlData {
-    repository: Option<GithubRepositoryPackagesGraphqlRepository>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GithubRepositoryPackagesGraphqlRepository {
-    packages: GithubPackageConnection,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubPackageConnection {
-    nodes: Vec<GithubPackageNode>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GithubPackageNode {
-    name: String,
-    #[serde(default)]
-    repository: Option<GithubPackageNodeRepository>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GithubPackageNodeRepository {
-    name_with_owner: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct GithubPackageVersionApi {
     #[serde(default)]
     metadata: GithubPackageVersionMetadataApi,
@@ -966,6 +932,8 @@ struct GithubAccessTokenPermissions {
     contents: &'static str,
     pull_requests: &'static str,
     issues: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packages: Option<&'static str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1428,7 +1396,7 @@ impl AgentRuntime {
     ) -> Result<RepositoryPackagesResponse> {
         let token = self
             .github_backend
-            .github_installation_token(installation_id, None)
+            .github_installation_token(installation_id, None, true)
             .await?
             .token;
         self.repository_packages_with_token(&token, owner, repo)
@@ -1447,9 +1415,19 @@ impl AgentRuntime {
                 "repository owner and name are required".to_string(),
             ));
         }
-        let packages = self
-            .github_container_packages_for_repository(&token, owner.trim(), repo.trim())
-            .await?;
+        let packages = match self
+            .github_container_packages_for_owner(&token, owner.trim())
+            .await
+        {
+            Ok(packages) => dedupe_github_packages(
+                packages
+                    .into_iter()
+                    .filter(|package| github_package_belongs_to_repo(package, &repository_ref))
+                    .collect(),
+            ),
+            Err(err) if github_packages_read_error(err.status()) => Vec::new(),
+            Err(err) => return Err(RuntimeError::Http(err)),
+        };
         let warning = if packages.is_empty() {
             Some("No readable GitHub container packages found for this repository".to_string())
         } else {
@@ -1517,99 +1495,6 @@ impl AgentRuntime {
             .error_for_status()?
             .json()
             .await
-    }
-
-    async fn github_container_packages_for_repository(
-        &self,
-        token: &str,
-        owner: &str,
-        repo: &str,
-    ) -> Result<Vec<GithubPackageApi>> {
-        let repository_ref = format!("{owner}/{repo}");
-        let mut packages = self
-            .github_container_packages_from_graphql_repository(token, owner, repo)
-            .await
-            .unwrap_or_default();
-        match self.github_container_packages_for_owner(token, owner).await {
-            Ok(owner_packages) => packages.extend(
-                owner_packages
-                    .into_iter()
-                    .filter(|package| github_package_belongs_to_repo(package, &repository_ref)),
-            ),
-            Err(err) if github_packages_read_error(err.status()) => {}
-            Err(err) => return Err(RuntimeError::Http(err)),
-        }
-        Ok(dedupe_github_packages(packages))
-    }
-
-    async fn github_container_packages_from_graphql_repository(
-        &self,
-        token: &str,
-        owner: &str,
-        repo: &str,
-    ) -> Result<Vec<GithubPackageApi>> {
-        let url = github_api_url(&self.github_api_base_url, "/graphql");
-        let response = self
-            .github_http
-            .post(url)
-            .bearer_auth(token)
-            .headers(github_headers())
-            .json(&json!({
-                "query": r#"
-                    query RepositoryPackages($owner: String!, $repo: String!) {
-                      repository(owner: $owner, name: $repo) {
-                        packages(first: 100, packageType: CONTAINER) {
-                          nodes {
-                            name
-                            repository {
-                              nameWithOwner
-                            }
-                          }
-                        }
-                      }
-                    }
-                "#,
-                "variables": {
-                    "owner": owner,
-                    "repo": repo,
-                }
-            }))
-            .send()
-            .await?;
-        if github_packages_read_error(Some(response.status())) {
-            return Ok(Vec::new());
-        }
-        let response: GithubGraphqlResponse<GithubRepositoryPackagesGraphqlData> =
-            decode_github_response(response, "list repository packages").await?;
-        if !response.errors.is_empty() {
-            return Ok(Vec::new());
-        }
-        let Some(repository) = response.data.and_then(|data| data.repository) else {
-            return Ok(Vec::new());
-        };
-        let repository_ref = format!("{owner}/{repo}");
-        Ok(repository
-            .packages
-            .nodes
-            .into_iter()
-            .map(|package| {
-                let package_name = package.name;
-                GithubPackageApi {
-                    html_url: github_package_html_url(
-                        DEFAULT_GITHUB_WEB_BASE_URL,
-                        owner,
-                        &package_name,
-                    ),
-                    name: package_name,
-                    repository: Some(GithubPackageRepositoryApi {
-                        full_name: package
-                            .repository
-                            .map(|repository| repository.name_with_owner)
-                            .unwrap_or_else(|| repository_ref.clone()),
-                    }),
-                }
-            })
-            .collect())
     }
 
     async fn github_container_package_versions(
@@ -7627,7 +7512,7 @@ impl AgentRuntime {
             })?;
             return Ok(self
                 .github_backend
-                .github_installation_token(installation_id, None)
+                .github_installation_token(installation_id, None, false)
                 .await?
                 .token);
         }
@@ -9049,15 +8934,6 @@ fn github_package_key(package: &GithubPackageApi) -> String {
         "{}:{}",
         repository.to_ascii_lowercase(),
         package.name.to_ascii_lowercase()
-    )
-}
-
-fn github_package_html_url(web_base_url: &str, owner: &str, package_name: &str) -> String {
-    format!(
-        "{}/users/{}/packages/container/{}",
-        web_base_url.trim_end_matches('/'),
-        github_path_segment(owner),
-        github_path_segment(package_name)
     )
 }
 
