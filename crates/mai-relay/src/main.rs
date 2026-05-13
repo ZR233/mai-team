@@ -219,6 +219,14 @@ struct GithubManifestConversionResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct GithubAppApi {
+    slug: String,
+    html_url: String,
+    #[serde(default)]
+    owner: Option<GithubAccountApi>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GithubErrorResponse {
     message: Option<String>,
 }
@@ -1226,6 +1234,9 @@ async fn bootstrap_github_app_config(
     let Some(mut config) = merge_github_app_config(env_config, stored_config) else {
         return Ok(());
     };
+    hydrate_github_app_metadata(http, github_api_base_url, &mut config)
+        .await
+        .context("loading GitHub App metadata")?;
     let mut generated_secret = false;
     if config.webhook_secret.trim().is_empty() {
         config.webhook_secret = Uuid::new_v4().to_string();
@@ -1243,6 +1254,58 @@ async fn bootstrap_github_app_config(
         "loaded GitHub App config"
     );
     Ok(())
+}
+
+async fn hydrate_github_app_metadata(
+    http: &reqwest::Client,
+    github_api_base_url: &str,
+    config: &mut GithubAppConfig,
+) -> RelayResult<()> {
+    if github_app_config_has_metadata(config) {
+        return Ok(());
+    }
+    let jwt = github_app_jwt_for_config(config)?;
+    let url = github_api_url(github_api_base_url, "/app");
+    let response = http
+        .get(url)
+        .bearer_auth(jwt)
+        .headers(github_headers())
+        .send()
+        .await?;
+    let app = decode_github_response::<GithubAppApi>(response, "get GitHub App metadata").await?;
+    apply_github_app_metadata(config, app);
+    Ok(())
+}
+
+fn github_app_config_has_metadata(config: &GithubAppConfig) -> bool {
+    config
+        .app_slug
+        .as_deref()
+        .is_some_and(|slug| !is_placeholder_github_app_slug(slug))
+        && config.app_html_url.is_some()
+        && config.owner_login.is_some()
+        && config.owner_type.is_some()
+}
+
+fn apply_github_app_metadata(config: &mut GithubAppConfig, app: GithubAppApi) {
+    if config
+        .app_slug
+        .as_deref()
+        .is_none_or(is_placeholder_github_app_slug)
+    {
+        config.app_slug = Some(app.slug);
+    }
+    if config.app_html_url.is_none() {
+        config.app_html_url = Some(app.html_url);
+    }
+    if let Some(owner) = app.owner {
+        if config.owner_login.is_none() {
+            config.owner_login = Some(owner.login);
+        }
+        if config.owner_type.is_none() {
+            config.owner_type = Some(owner.account_type);
+        }
+    }
 }
 
 fn merge_github_app_config(
@@ -1350,7 +1413,7 @@ fn github_app_config_from_env() -> Result<Option<GithubAppConfig>> {
     };
     let app_slug = slug
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty() && !is_placeholder_github_app_slug(value));
     Ok(Some(GithubAppConfig {
         app_id,
         private_key,
@@ -1367,6 +1430,10 @@ fn optional_env(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn is_placeholder_github_app_slug(value: &str) -> bool {
+    value.trim() == "github-app-slug"
 }
 
 fn parse_params<T>(params: Value) -> impl std::future::Future<Output = RelayResult<T>>
@@ -2151,6 +2218,40 @@ mod tests {
         assert_eq!(request.content_type, "json");
         assert_eq!(request.insecure_ssl, "0");
         assert_eq!(request.secret, "secret-1");
+    }
+
+    #[test]
+    fn github_app_api_metadata_fills_config_fields() {
+        let app: GithubAppApi = serde_json::from_value(json!({
+            "slug": "mai-team-app",
+            "html_url": "https://github.com/apps/mai-team-app",
+            "owner": {
+                "login": "mai-team",
+                "type": "Organization"
+            }
+        }))
+        .expect("app");
+
+        let mut config = GithubAppConfig {
+            app_id: "123".to_string(),
+            private_key: "pem".to_string(),
+            webhook_secret: "secret".to_string(),
+            app_slug: Some("github-app-slug".to_string()),
+            app_html_url: None,
+            owner_login: None,
+            owner_type: None,
+        };
+        assert!(!github_app_config_has_metadata(&config));
+        apply_github_app_metadata(&mut config, app);
+
+        assert_eq!(config.app_slug.as_deref(), Some("mai-team-app"));
+        assert_eq!(
+            config.app_html_url.as_deref(),
+            Some("https://github.com/apps/mai-team-app")
+        );
+        assert_eq!(config.owner_login.as_deref(), Some("mai-team"));
+        assert_eq!(config.owner_type.as_deref(), Some("Organization"));
+        assert!(github_app_config_has_metadata(&config));
     }
 
     fn hex_encode(bytes: &[u8]) -> String {
