@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, TimeDelta, Utc};
@@ -20,11 +21,11 @@ use mai_protocol::{
     ModelOutputItem, ModelToolCall, PlanHistoryEntry, PlanStatus, ProjectCloneStatus,
     ProjectDetail, ProjectId, ProjectReviewOutcome, ProjectReviewRunDetail, ProjectReviewRunStatus,
     ProjectReviewRunSummary, ProjectReviewRunsResponse, ProjectReviewStatus, ProjectStatus,
-    ProjectSummary, RepositoryPackageSummary, RepositoryPackagesResponse,
-    ResolvedAgentModelPreference, RuntimeDefaultsResponse, SendMessageRequest, ServiceEvent,
-    ServiceEventKind, SessionId, SkillActivationInfo, SkillScope, SkillsConfigRequest,
-    SkillsListResponse, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary,
-    TodoItem, TokenUsage, ToolDefinition, ToolOutputArtifactInfo, ToolTraceDetail,
+    ProjectSummary, RelayGithubInstallationTokenResponse, RepositoryPackageSummary,
+    RepositoryPackagesResponse, ResolvedAgentModelPreference, RuntimeDefaultsResponse,
+    SendMessageRequest, ServiceEvent, ServiceEventKind, SessionId, SkillActivationInfo, SkillScope,
+    SkillsConfigRequest, SkillsListResponse, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus,
+    TaskSummary, TodoItem, TokenUsage, ToolDefinition, ToolOutputArtifactInfo, ToolTraceDetail,
     ToolTraceListResponse, TurnId, TurnStatus, UpdateAgentRequest, UpdateProjectRequest,
     UserInputOption, UserInputQuestion, now, preview,
 };
@@ -205,8 +206,6 @@ pub struct AgentRuntime {
     projects: RwLock<HashMap<ProjectId, Arc<ProjectRecord>>>,
     project_skill_locks: RwLock<HashMap<ProjectId, Arc<RwLock<()>>>>,
     project_mcp_managers: RwLock<HashMap<ProjectId, Arc<McpAgentManager>>>,
-    github_tokens: Mutex<HashMap<String, CachedGithubToken>>,
-    github_manifest_states: Mutex<HashMap<String, GithubManifestState>>,
     github_http: reqwest::Client,
     event_tx: broadcast::Sender<ServiceEvent>,
     sequence: AtomicU64,
@@ -215,6 +214,41 @@ pub struct AgentRuntime {
     artifact_files_root: PathBuf,
     sidecar_image: String,
     github_api_base_url: String,
+    github_backend: Arc<dyn GithubAppBackend>,
+}
+
+#[async_trait]
+pub trait GithubAppBackend: Send + Sync {
+    async fn github_app_settings(&self) -> Result<GithubAppSettingsResponse>;
+    async fn save_github_app_settings(
+        &self,
+        request: GithubAppSettingsRequest,
+    ) -> Result<GithubAppSettingsResponse>;
+    async fn start_github_app_manifest(
+        &self,
+        request: GithubAppManifestStartRequest,
+    ) -> Result<GithubAppManifestStartResponse>;
+    async fn complete_github_app_manifest(
+        &self,
+        code: &str,
+        state: &str,
+    ) -> Result<GithubAppSettingsResponse>;
+    async fn list_github_installations(&self) -> Result<GithubInstallationsResponse>;
+    async fn refresh_github_installations(&self) -> Result<GithubInstallationsResponse>;
+    async fn list_github_repositories(
+        &self,
+        installation_id: u64,
+    ) -> Result<GithubRepositoriesResponse>;
+    async fn get_github_repository(
+        &self,
+        installation_id: u64,
+        repository_full_name: &str,
+    ) -> Result<GithubRepositorySummary>;
+    async fn github_installation_token(
+        &self,
+        installation_id: u64,
+        repository_id: Option<u64>,
+    ) -> Result<RelayGithubInstallationTokenResponse>;
 }
 
 struct ProjectRecord {
@@ -432,6 +466,346 @@ struct GithubManifestState {
     org: Option<String>,
 }
 
+struct DirectGithubAppBackend {
+    store: Arc<ConfigStore>,
+    github_http: reqwest::Client,
+    github_api_base_url: String,
+    github_tokens: Mutex<HashMap<String, CachedGithubToken>>,
+    github_manifest_states: Mutex<HashMap<String, GithubManifestState>>,
+}
+
+impl DirectGithubAppBackend {
+    fn new(
+        store: Arc<ConfigStore>,
+        github_http: reqwest::Client,
+        github_api_base_url: String,
+    ) -> Self {
+        Self {
+            store,
+            github_http,
+            github_api_base_url,
+            github_tokens: Mutex::new(HashMap::new()),
+            github_manifest_states: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn github_app_secret(&self) -> Result<(String, String, String)> {
+        self.store.github_app_secret().await?.ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "GitHub App ID and private key must be configured before using Projects"
+                    .to_string(),
+            )
+        })
+    }
+
+    async fn github_app_jwt(&self) -> Result<(String, String)> {
+        let (app_id, private_key, base_url) = self.github_app_secret().await?;
+        let now = Utc::now().timestamp();
+        let claims = GithubJwtClaims {
+            iat: now.saturating_sub(60) as usize,
+            exp: now.saturating_add(540) as usize,
+            iss: app_id,
+        };
+        let token = encode(
+            &Header::new(Algorithm::RS256),
+            &claims,
+            &EncodingKey::from_rsa_pem(private_key.as_bytes())?,
+        )?;
+        Ok((token, base_url))
+    }
+
+    async fn prune_github_manifest_states(&self) {
+        let ttl = Duration::from_secs(GITHUB_MANIFEST_STATE_TTL_SECS);
+        let mut states = self.github_manifest_states.lock().await;
+        states.retain(|_, state| state.created_at.elapsed() < ttl);
+    }
+
+    async fn take_github_manifest_state(&self, state: &str) -> Result<GithubManifestState> {
+        self.prune_github_manifest_states().await;
+        let record = self
+            .github_manifest_states
+            .lock()
+            .await
+            .remove(state)
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "GitHub App setup link expired or state is invalid. Start configuration again."
+                        .to_string(),
+                )
+            })?;
+        Ok(record)
+    }
+}
+
+#[async_trait]
+impl GithubAppBackend for DirectGithubAppBackend {
+    async fn github_app_settings(&self) -> Result<GithubAppSettingsResponse> {
+        Ok(self.store.get_github_app_settings().await?)
+    }
+
+    async fn save_github_app_settings(
+        &self,
+        request: GithubAppSettingsRequest,
+    ) -> Result<GithubAppSettingsResponse> {
+        self.github_tokens.lock().await.clear();
+        Ok(self.store.save_github_app_settings(request).await?)
+    }
+
+    async fn start_github_app_manifest(
+        &self,
+        request: GithubAppManifestStartRequest,
+    ) -> Result<GithubAppManifestStartResponse> {
+        let origin = sanitize_origin(&request.origin)?;
+        let org = match request.account_type {
+            GithubAppManifestAccountType::Organization => {
+                let org = request
+                    .org
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidInput("organization is required".to_string())
+                    })?;
+                if !is_valid_github_slug(org) {
+                    return Err(RuntimeError::InvalidInput(
+                        "organization may contain only letters, numbers, or hyphens".to_string(),
+                    ));
+                }
+                Some(org.to_string())
+            }
+            GithubAppManifestAccountType::Personal => None,
+        };
+        let state = Uuid::new_v4().to_string();
+        let redirect_url = format!("{origin}/github/app-manifest/callback");
+        let setup_url = format!("{origin}/github/app-installation/callback");
+        let webhook_url = format!("{origin}/github/webhook-disabled");
+        let manifest = github_app_manifest(&redirect_url, &setup_url, &webhook_url);
+        let action_url = match (&request.account_type, &org) {
+            (GithubAppManifestAccountType::Organization, Some(org)) => {
+                format!(
+                    "{DEFAULT_GITHUB_WEB_BASE_URL}/organizations/{org}/settings/apps/new?state={state}"
+                )
+            }
+            _ => format!("{DEFAULT_GITHUB_WEB_BASE_URL}/settings/apps/new?state={state}"),
+        };
+
+        self.prune_github_manifest_states().await;
+        self.github_manifest_states.lock().await.insert(
+            state.clone(),
+            GithubManifestState {
+                created_at: Instant::now(),
+                account_type: request.account_type,
+                org,
+            },
+        );
+        Ok(GithubAppManifestStartResponse {
+            state,
+            action_url,
+            manifest,
+        })
+    }
+
+    async fn complete_github_app_manifest(
+        &self,
+        code: &str,
+        state: &str,
+    ) -> Result<GithubAppSettingsResponse> {
+        if !is_valid_github_manifest_code(code) {
+            return Err(RuntimeError::InvalidInput(
+                "invalid GitHub manifest code".to_string(),
+            ));
+        }
+        let state_record = self.take_github_manifest_state(state).await?;
+        let url = github_api_url(
+            DEFAULT_GITHUB_API_BASE_URL,
+            &format!("/app-manifests/{code}/conversions"),
+        );
+        let response = self
+            .github_http
+            .post(url)
+            .headers(github_headers())
+            .send()
+            .await?;
+        let conversion: GithubManifestConversionResponse =
+            decode_github_response(response, "create app from manifest").await?;
+        let owner_login = conversion
+            .owner
+            .as_ref()
+            .map(|owner| owner.login.clone())
+            .or_else(|| {
+                state_record.org.clone().filter(|_| {
+                    state_record.account_type == GithubAppManifestAccountType::Organization
+                })
+            });
+        let owner_type = conversion
+            .owner
+            .as_ref()
+            .map(|owner| owner.account_type.clone())
+            .or_else(|| match state_record.account_type {
+                GithubAppManifestAccountType::Organization => Some("Organization".to_string()),
+                GithubAppManifestAccountType::Personal => Some("User".to_string()),
+            });
+        self.save_github_app_settings(GithubAppSettingsRequest {
+            app_id: Some(conversion.id.to_string()),
+            private_key: Some(conversion.pem),
+            base_url: Some(DEFAULT_GITHUB_API_BASE_URL.to_string()),
+            app_slug: Some(conversion.slug),
+            app_html_url: Some(conversion.html_url),
+            owner_login,
+            owner_type,
+        })
+        .await
+    }
+
+    async fn list_github_installations(&self) -> Result<GithubInstallationsResponse> {
+        let (jwt, base_url) = self.github_app_jwt().await?;
+        let url = github_api_url(&base_url, "/app/installations?per_page=100");
+        let response = self
+            .github_http
+            .get(url)
+            .bearer_auth(jwt)
+            .headers(github_headers())
+            .send()
+            .await?;
+        let installations: Vec<GithubInstallationApi> =
+            decode_github_response(response, "list installations").await?;
+        Ok(GithubInstallationsResponse {
+            installations: installations
+                .into_iter()
+                .map(|installation| GithubInstallationSummary {
+                    id: installation.id,
+                    account_login: installation.account.login,
+                    account_type: installation.account.account_type,
+                    repository_selection: installation.repository_selection,
+                })
+                .collect(),
+        })
+    }
+
+    async fn refresh_github_installations(&self) -> Result<GithubInstallationsResponse> {
+        self.github_tokens.lock().await.clear();
+        self.list_github_installations().await
+    }
+
+    async fn list_github_repositories(
+        &self,
+        installation_id: u64,
+    ) -> Result<GithubRepositoriesResponse> {
+        if installation_id == 0 {
+            return Err(RuntimeError::InvalidInput(
+                "installation_id is required".to_string(),
+            ));
+        }
+        let token = self
+            .github_installation_token(installation_id, None)
+            .await?
+            .token;
+        let (_, _, base_url) = self.github_app_secret().await?;
+        let url = github_api_url(&base_url, "/installation/repositories?per_page=100");
+        let response = self
+            .github_http
+            .get(url)
+            .bearer_auth(token)
+            .headers(github_headers())
+            .send()
+            .await?;
+        let response: GithubRepositoriesApi =
+            decode_github_response(response, "list installation repositories").await?;
+        Ok(GithubRepositoriesResponse {
+            repositories: response
+                .repositories
+                .into_iter()
+                .map(github_repository_summary)
+                .collect(),
+        })
+    }
+
+    async fn get_github_repository(
+        &self,
+        installation_id: u64,
+        repository_full_name: &str,
+    ) -> Result<GithubRepositorySummary> {
+        let token = self
+            .github_installation_token(installation_id, None)
+            .await?
+            .token;
+        let url = github_api_url(
+            &self.github_api_base_url,
+            &format!("/repos/{repository_full_name}"),
+        );
+        let response = self
+            .github_http
+            .get(url)
+            .bearer_auth(token)
+            .headers(github_headers())
+            .send()
+            .await?;
+        let repository: GithubRepositoryApi =
+            decode_github_response(response, "get repository").await?;
+        Ok(github_repository_summary(repository))
+    }
+
+    async fn github_installation_token(
+        &self,
+        installation_id: u64,
+        repository_id: Option<u64>,
+    ) -> Result<RelayGithubInstallationTokenResponse> {
+        let cache_key = format!(
+            "{installation_id}:{}",
+            repository_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "all".to_string())
+        );
+        {
+            let tokens = self.github_tokens.lock().await;
+            if let Some(cached) = tokens.get(&cache_key)
+                && cached.expires_at - TimeDelta::seconds(GITHUB_TOKEN_REFRESH_SKEW_SECS)
+                    > Utc::now()
+            {
+                return Ok(RelayGithubInstallationTokenResponse {
+                    token: cached.token.clone(),
+                    expires_at: cached.expires_at,
+                });
+            }
+        }
+
+        let (jwt, base_url) = self.github_app_jwt().await?;
+        let url = github_api_url(
+            &base_url,
+            &format!("/app/installations/{installation_id}/access_tokens"),
+        );
+        let body = GithubAccessTokenRequest {
+            repository_ids: repository_id.map(|id| vec![id]),
+            permissions: GithubAccessTokenPermissions {
+                contents: "write",
+                pull_requests: "write",
+                issues: "write",
+            },
+        };
+        let response = self
+            .github_http
+            .post(url)
+            .bearer_auth(jwt)
+            .headers(github_headers())
+            .json(&body)
+            .send()
+            .await?;
+        let token: GithubAccessTokenResponse =
+            decode_github_response(response, "create installation token").await?;
+        self.github_tokens.lock().await.insert(
+            cache_key,
+            CachedGithubToken {
+                token: token.token.clone(),
+                expires_at: token.expires_at,
+            },
+        );
+        Ok(RelayGithubInstallationTokenResponse {
+            token: token.token,
+            expires_at: token.expires_at,
+        })
+    }
+}
+
 struct ResolvedAgentModel {
     preference: AgentModelPreference,
     effective: ResolvedAgentModelPreference,
@@ -584,6 +958,16 @@ impl AgentRuntime {
         store: Arc<ConfigStore>,
         config: RuntimeConfig,
     ) -> Result<Arc<Self>> {
+        Self::new_with_github_backend(docker, model, store, config, None).await
+    }
+
+    pub async fn new_with_github_backend(
+        docker: DockerClient,
+        model: ResponsesClient,
+        store: Arc<ConfigStore>,
+        config: RuntimeConfig,
+        github_backend: Option<Arc<dyn GithubAppBackend>>,
+    ) -> Result<Arc<Self>> {
         let skills = SkillsManager::new_with_system_root(
             &config.repo_root,
             config.system_skills_root.as_ref(),
@@ -693,6 +1077,13 @@ impl AgentRuntime {
         let github_http = reqwest::Client::builder()
             .timeout(Duration::from_secs(GITHUB_HTTP_TIMEOUT_SECS))
             .build()?;
+        let github_backend = github_backend.unwrap_or_else(|| {
+            Arc::new(DirectGithubAppBackend::new(
+                Arc::clone(&store),
+                github_http.clone(),
+                github_api_base_url.clone(),
+            ))
+        });
 
         let runtime = Arc::new(Self {
             docker,
@@ -705,8 +1096,6 @@ impl AgentRuntime {
             projects: RwLock::new(projects),
             project_skill_locks: RwLock::new(HashMap::new()),
             project_mcp_managers: RwLock::new(HashMap::new()),
-            github_tokens: Mutex::new(HashMap::new()),
-            github_manifest_states: Mutex::new(HashMap::new()),
             github_http,
             event_tx,
             sequence: AtomicU64::new(snapshot.next_sequence),
@@ -715,6 +1104,7 @@ impl AgentRuntime {
             artifact_files_root: config.artifact_files_root,
             sidecar_image,
             github_api_base_url,
+            github_backend,
         });
         let cleanup_runtime = Arc::clone(&runtime);
         tokio::spawn(async move {
@@ -1122,69 +1512,21 @@ impl AgentRuntime {
     }
 
     pub async fn github_app_settings(&self) -> Result<GithubAppSettingsResponse> {
-        Ok(self.store.get_github_app_settings().await?)
+        self.github_backend.github_app_settings().await
     }
 
     pub async fn save_github_app_settings(
         &self,
         request: GithubAppSettingsRequest,
     ) -> Result<GithubAppSettingsResponse> {
-        self.github_tokens.lock().await.clear();
-        Ok(self.store.save_github_app_settings(request).await?)
+        self.github_backend.save_github_app_settings(request).await
     }
 
     pub async fn start_github_app_manifest(
         &self,
         request: GithubAppManifestStartRequest,
     ) -> Result<GithubAppManifestStartResponse> {
-        let origin = sanitize_origin(&request.origin)?;
-        let org = match request.account_type {
-            GithubAppManifestAccountType::Organization => {
-                let org = request
-                    .org
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        RuntimeError::InvalidInput("organization is required".to_string())
-                    })?;
-                if !is_valid_github_slug(org) {
-                    return Err(RuntimeError::InvalidInput(
-                        "organization may contain only letters, numbers, or hyphens".to_string(),
-                    ));
-                }
-                Some(org.to_string())
-            }
-            GithubAppManifestAccountType::Personal => None,
-        };
-        let state = Uuid::new_v4().to_string();
-        let redirect_url = format!("{origin}/github/app-manifest/callback");
-        let setup_url = format!("{origin}/github/app-installation/callback");
-        let webhook_url = format!("{origin}/github/webhook-disabled");
-        let manifest = github_app_manifest(&redirect_url, &setup_url, &webhook_url);
-        let action_url = match (&request.account_type, &org) {
-            (GithubAppManifestAccountType::Organization, Some(org)) => {
-                format!(
-                    "{DEFAULT_GITHUB_WEB_BASE_URL}/organizations/{org}/settings/apps/new?state={state}"
-                )
-            }
-            _ => format!("{DEFAULT_GITHUB_WEB_BASE_URL}/settings/apps/new?state={state}"),
-        };
-
-        self.prune_github_manifest_states().await;
-        self.github_manifest_states.lock().await.insert(
-            state.clone(),
-            GithubManifestState {
-                created_at: Instant::now(),
-                account_type: request.account_type,
-                org,
-            },
-        );
-        Ok(GithubAppManifestStartResponse {
-            state,
-            action_url,
-            manifest,
-        })
+        self.github_backend.start_github_app_manifest(request).await
     }
 
     pub async fn complete_github_app_manifest(
@@ -1192,113 +1534,26 @@ impl AgentRuntime {
         code: &str,
         state: &str,
     ) -> Result<GithubAppSettingsResponse> {
-        if !is_valid_github_manifest_code(code) {
-            return Err(RuntimeError::InvalidInput(
-                "invalid GitHub manifest code".to_string(),
-            ));
-        }
-        let state_record = self.take_github_manifest_state(state).await?;
-        let url = github_api_url(
-            DEFAULT_GITHUB_API_BASE_URL,
-            &format!("/app-manifests/{code}/conversions"),
-        );
-        let response = self
-            .github_http
-            .post(url)
-            .headers(github_headers())
-            .send()
-            .await?;
-        let conversion: GithubManifestConversionResponse =
-            decode_github_response(response, "create app from manifest").await?;
-        let owner_login = conversion
-            .owner
-            .as_ref()
-            .map(|owner| owner.login.clone())
-            .or_else(|| {
-                state_record.org.clone().filter(|_| {
-                    state_record.account_type == GithubAppManifestAccountType::Organization
-                })
-            });
-        let owner_type = conversion
-            .owner
-            .as_ref()
-            .map(|owner| owner.account_type.clone())
-            .or_else(|| match state_record.account_type {
-                GithubAppManifestAccountType::Organization => Some("Organization".to_string()),
-                GithubAppManifestAccountType::Personal => Some("User".to_string()),
-            });
-        self.save_github_app_settings(GithubAppSettingsRequest {
-            app_id: Some(conversion.id.to_string()),
-            private_key: Some(conversion.pem),
-            base_url: Some(DEFAULT_GITHUB_API_BASE_URL.to_string()),
-            app_slug: Some(conversion.slug),
-            app_html_url: Some(conversion.html_url),
-            owner_login,
-            owner_type,
-        })
-        .await
+        self.github_backend
+            .complete_github_app_manifest(code, state)
+            .await
     }
 
     pub async fn list_github_installations(&self) -> Result<GithubInstallationsResponse> {
-        let (jwt, base_url) = self.github_app_jwt().await?;
-        let url = github_api_url(&base_url, "/app/installations?per_page=100");
-        let response = self
-            .github_http
-            .get(url)
-            .bearer_auth(jwt)
-            .headers(github_headers())
-            .send()
-            .await?;
-        let installations: Vec<GithubInstallationApi> =
-            decode_github_response(response, "list installations").await?;
-        Ok(GithubInstallationsResponse {
-            installations: installations
-                .into_iter()
-                .map(|installation| GithubInstallationSummary {
-                    id: installation.id,
-                    account_login: installation.account.login,
-                    account_type: installation.account.account_type,
-                    repository_selection: installation.repository_selection,
-                })
-                .collect(),
-        })
+        self.github_backend.list_github_installations().await
     }
 
     pub async fn refresh_github_installations(&self) -> Result<GithubInstallationsResponse> {
-        self.github_tokens.lock().await.clear();
-        self.list_github_installations().await
+        self.github_backend.refresh_github_installations().await
     }
 
     pub async fn list_github_repositories(
         &self,
         installation_id: u64,
     ) -> Result<GithubRepositoriesResponse> {
-        if installation_id == 0 {
-            return Err(RuntimeError::InvalidInput(
-                "installation_id is required".to_string(),
-            ));
-        }
-        let token = self
-            .github_installation_token(installation_id, None)
-            .await?;
-        let (_, _, base_url) = self.github_app_secret().await?;
-        let url = github_api_url(&base_url, "/installation/repositories?per_page=100");
-        let response = self
-            .github_http
-            .get(url)
-            .bearer_auth(token)
-            .headers(github_headers())
-            .send()
-            .await?;
-        let response: GithubRepositoriesApi =
-            decode_github_response(response, "list installation repositories").await?;
-        Ok(GithubRepositoriesResponse {
-            repositories: response
-                .repositories
-                .into_iter()
-                .map(github_repository_summary)
-                .collect(),
-        })
+        self.github_backend
+            .list_github_repositories(installation_id)
+            .await
     }
 
     pub async fn ensure_default_task(self: &Arc<Self>) -> Result<Option<TaskSummary>> {
@@ -1567,13 +1822,40 @@ impl AgentRuntime {
         self: &Arc<Self>,
         request: CreateProjectRequest,
     ) -> Result<ProjectSummary> {
-        let account_id = request
+        let relay_installation_id = request.installation_id;
+        let account_id = match request
             .git_account_id
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| RuntimeError::InvalidInput("git_account_id is required".to_string()))?
-            .to_string();
+            .map(str::to_string)
+        {
+            Some(account_id) => account_id,
+            None if relay_installation_id > 0 => {
+                let installations = self.list_github_installations().await?;
+                let installation = installations
+                    .installations
+                    .into_iter()
+                    .find(|installation| installation.id == relay_installation_id)
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidInput("GitHub App installation not found".to_string())
+                    })?;
+                self.store
+                    .upsert_github_app_relay_account(
+                        relay_installation_id,
+                        &installation.account_login,
+                        "default",
+                        false,
+                    )
+                    .await?
+                    .id
+            }
+            None => {
+                return Err(RuntimeError::InvalidInput(
+                    "git_account_id or installation_id is required".to_string(),
+                ));
+            }
+        };
         let repository_ref = request
             .repository_full_name
             .as_deref()
@@ -1603,7 +1885,12 @@ impl AgentRuntime {
             name
         };
         let account = self.git_account_summary(&account_id).await?;
-        let installation_account = account.login.unwrap_or(account.label);
+        let installation_id = account.installation_id.unwrap_or(relay_installation_id);
+        let installation_account = account
+            .installation_account
+            .clone()
+            .or(account.login)
+            .unwrap_or(account.label);
         let project_id = Uuid::new_v4();
         let planner_model = self.resolve_role_agent_model(AgentRole::Planner).await?;
         let clone_url = github_clone_url(&owner, &repo);
@@ -1635,7 +1922,7 @@ impl AgentRuntime {
             repository_full_name: repository.full_name,
             git_account_id: Some(account_id),
             repository_id,
-            installation_id: 0,
+            installation_id,
             installation_account,
             branch,
             docker_image: maintainer_summary.docker_image.clone(),
@@ -1815,6 +2102,147 @@ impl AgentRuntime {
             request.skill_mentions,
         )
         .await
+    }
+
+    pub async fn publish_external_event(&self, kind: ServiceEventKind) {
+        self.publish(kind).await;
+    }
+
+    pub async fn find_project_for_github_event(
+        &self,
+        installation_id: Option<u64>,
+        repository_id: Option<u64>,
+        repository_full_name: Option<&str>,
+    ) -> Option<ProjectId> {
+        let repository_full_name = repository_full_name.map(str::to_ascii_lowercase);
+        let projects = self.projects.read().await;
+        for (project_id, project) in projects.iter() {
+            let summary = project.summary.read().await;
+            let installation_matches = installation_id
+                .filter(|id| *id != 0)
+                .is_none_or(|id| summary.installation_id == 0 || summary.installation_id == id);
+            let repository_id_matches = repository_id
+                .filter(|id| *id != 0)
+                .is_none_or(|id| summary.repository_id == 0 || summary.repository_id == id);
+            let full_name_matches = repository_full_name.as_ref().is_none_or(|full_name| {
+                summary.repository_full_name.eq_ignore_ascii_case(full_name)
+                    || format!("{}/{}", summary.owner, summary.repo).eq_ignore_ascii_case(full_name)
+            });
+            if installation_matches && repository_id_matches && full_name_matches {
+                return Some(*project_id);
+            }
+        }
+        None
+    }
+
+    pub async fn handle_project_push_event(
+        self: &Arc<Self>,
+        project_id: ProjectId,
+        payload: &Value,
+    ) -> Result<()> {
+        let project = self.project(project_id).await?;
+        let summary = project.summary.read().await.clone();
+        let pushed_ref = payload
+            .get("ref")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let default_ref = format!("refs/heads/{}", summary.branch);
+        if pushed_ref == default_ref
+            && summary.status == ProjectStatus::Ready
+            && summary.clone_status == ProjectCloneStatus::Ready
+        {
+            self.shutdown_project_mcp_manager(project_id).await;
+            self.sync_project_review_repo(project_id).await?;
+            let _ = self
+                .refresh_project_skills_from_review_workspace(project_id)
+                .await;
+            self.publish(ServiceEventKind::ProjectUpdated { project: summary })
+                .await;
+        }
+        Ok(())
+    }
+
+    pub async fn trigger_project_review(
+        self: &Arc<Self>,
+        project_id: ProjectId,
+        pr: u64,
+        delivery_id: String,
+        reason: String,
+    ) -> Result<()> {
+        let project = self.project(project_id).await?;
+        {
+            let summary = project.summary.read().await;
+            if !summary.auto_review_enabled {
+                return Ok(());
+            }
+            if summary.status != ProjectStatus::Ready
+                || summary.clone_status != ProjectCloneStatus::Ready
+            {
+                return Ok(());
+            }
+            if matches!(
+                summary.review_status,
+                ProjectReviewStatus::Syncing | ProjectReviewStatus::Running
+            ) {
+                tracing::info!(
+                    project_id = %project_id,
+                    pr,
+                    delivery_id = %delivery_id,
+                    "project review already active; webhook review trigger recorded only"
+                );
+                return Ok(());
+            }
+        }
+        {
+            let mut worker = project.review_worker.lock().await;
+            if let Some(worker) = worker.take() {
+                worker.cancellation_token.cancel();
+                worker.abort_handle.abort();
+            }
+        }
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            let cancellation_token = CancellationToken::new();
+            if let Err(err) = runtime.ensure_project_review_workspace(project_id).await {
+                let _ = runtime
+                    .record_project_review_startup_failure(project_id, err.to_string())
+                    .await;
+                return;
+            }
+            let result = runtime
+                .run_project_review_once(project_id, cancellation_token, Some(pr))
+                .await;
+            let decision = match result {
+                Ok(result) => project_review_loop_decision_for_result(result),
+                Err(err) => project_review_loop_decision_for_error(err.to_string()),
+            };
+            let next_review_at = (decision.delay.as_secs() > 0)
+                .then(|| Utc::now() + TimeDelta::seconds(decision.delay.as_secs() as i64));
+            let _ = runtime
+                .set_project_review_state(
+                    project_id,
+                    decision.status,
+                    ReviewStateUpdate {
+                        next_review_at,
+                        outcome: decision.outcome,
+                        summary_text: decision.summary,
+                        error: decision.error,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if let Err(err) = runtime.start_project_review_loop_if_ready(project_id).await {
+                tracing::warn!(project_id = %project_id, "failed to resume review loop after webhook trigger: {err}");
+            }
+        });
+        tracing::info!(
+            project_id = %project_id,
+            pr,
+            delivery_id = %delivery_id,
+            reason = %reason,
+            "queued targeted project review"
+        );
+        Ok(())
     }
 
     pub async fn send_task_message(
@@ -2329,7 +2757,9 @@ impl AgentRuntime {
         call_id: String,
         artifact_id: String,
     ) -> Result<(ToolOutputArtifactInfo, PathBuf)> {
-        let trace = self.tool_trace(agent_id, session_id, call_id.clone()).await?;
+        let trace = self
+            .tool_trace(agent_id, session_id, call_id.clone())
+            .await?;
         let artifact = trace
             .output_artifacts
             .into_iter()
@@ -6195,7 +6625,7 @@ impl AgentRuntime {
             }
 
             let decision = self
-                .run_project_review_once(project_id, cancellation_token.clone())
+                .run_project_review_once(project_id, cancellation_token.clone(), None)
                 .await;
             let decision = match decision {
                 Ok(result) => project_review_loop_decision_for_result(result),
@@ -6235,6 +6665,7 @@ impl AgentRuntime {
         self: &Arc<Self>,
         project_id: ProjectId,
         cancellation_token: CancellationToken,
+        target_pr: Option<u64>,
     ) -> Result<ProjectReviewCycleResult> {
         let run_id = Uuid::new_v4();
         self.set_project_review_state(
@@ -6253,7 +6684,7 @@ impl AgentRuntime {
                 finished_at: None,
                 status: ProjectReviewRunStatus::Syncing,
                 outcome: None,
-                pr: None,
+                pr: target_pr,
                 summary: None,
                 error: None,
             },
@@ -6270,7 +6701,7 @@ impl AgentRuntime {
                 None,
                 ProjectReviewRunStatus::Failed,
                 Some(ProjectReviewOutcome::Failed),
-                None,
+                target_pr,
                 None,
                 Some(error),
             )
@@ -6289,7 +6720,7 @@ impl AgentRuntime {
                 None,
                 ProjectReviewRunStatus::Failed,
                 Some(ProjectReviewOutcome::Failed),
-                None,
+                target_pr,
                 None,
                 Some(error),
             )
@@ -6304,7 +6735,7 @@ impl AgentRuntime {
                 None,
                 ProjectReviewRunStatus::Cancelled,
                 None,
-                None,
+                target_pr,
                 None,
                 Some("review cancelled".to_string()),
             )
@@ -6321,7 +6752,7 @@ impl AgentRuntime {
                     None,
                     ProjectReviewRunStatus::Failed,
                     Some(ProjectReviewOutcome::Failed),
-                    None,
+                    target_pr,
                     None,
                     Some(err.to_string()),
                 )
@@ -6355,7 +6786,7 @@ impl AgentRuntime {
                 finished_at: None,
                 status: ProjectReviewRunStatus::Running,
                 outcome: None,
-                pr: None,
+                pr: target_pr,
                 summary: None,
                 error: None,
             },
@@ -6365,7 +6796,7 @@ impl AgentRuntime {
         .await?;
         let cycle_result = async {
             let message = self
-                .project_reviewer_initial_message(project_id, reviewer_id)
+                .project_reviewer_initial_message(project_id, reviewer_id, target_pr)
                 .await?;
             let turn_id = self
                 .start_agent_turn_with_skills(
@@ -6888,6 +7319,7 @@ impl AgentRuntime {
         &self,
         project_id: ProjectId,
         reviewer_id: AgentId,
+        target_pr: Option<u64>,
     ) -> Result<String> {
         let project = self.project(project_id).await?;
         let summary = project.summary.read().await.clone();
@@ -6897,9 +7329,15 @@ impl AgentRuntime {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("None");
+        let target = target_pr
+            .map(|pr| format!("Target pull request: review PR #{pr} only. Do not select another pull request. Use `select-pr --target-pr {pr}` when invoking the helper."))
+            .unwrap_or_else(|| {
+                "Target pull request: none. Select exactly one eligible pull request using the helper."
+                    .to_string()
+            });
         Ok(format!(
-            "Run one automatic pull request review for project `{}`.\n\nRepository: {}/{}\nDefault branch: {}\nWorkspace repo: /workspace/repo\nReview worktree root: /workspace/reviews/{}\n\nExtra reviewer instructions:\n{}\n\nUse the $reviewer-agent-review-pr skill. At the end of the turn, return only one JSON object matching this schema exactly:\n{{\"outcome\":\"review_submitted|no_eligible_pr|failed\",\"pr\":123|null,\"summary\":\"short result\",\"error\":null|\"failure reason\"}}",
-            summary.name, summary.owner, summary.repo, summary.branch, reviewer_id, extra
+            "Run one automatic pull request review for project `{}`.\n\nRepository: {}/{}\nDefault branch: {}\nWorkspace repo: /workspace/repo\nReview worktree root: /workspace/reviews/{}\n{}\n\nExtra reviewer instructions:\n{}\n\nUse the $reviewer-agent-review-pr skill. At the end of the turn, return only one JSON object matching this schema exactly:\n{{\"outcome\":\"review_submitted|no_eligible_pr|failed\",\"pr\":123|null,\"summary\":\"short result\",\"error\":null|\"failure reason\"}}",
+            summary.name, summary.owner, summary.repo, summary.branch, reviewer_id, target, extra
         ))
     }
 
@@ -6973,49 +7411,39 @@ impl AgentRuntime {
         Ok(())
     }
 
-    async fn prune_github_manifest_states(&self) {
-        let ttl = Duration::from_secs(GITHUB_MANIFEST_STATE_TTL_SECS);
-        let mut states = self.github_manifest_states.lock().await;
-        states.retain(|_, state| state.created_at.elapsed() < ttl);
-    }
-
-    async fn take_github_manifest_state(&self, state: &str) -> Result<GithubManifestState> {
-        self.prune_github_manifest_states().await;
-        let record = self
-            .github_manifest_states
-            .lock()
-            .await
-            .remove(state)
-            .ok_or_else(|| {
-                RuntimeError::InvalidInput(
-                    "GitHub App setup link expired or state is invalid. Start configuration again."
-                        .to_string(),
-                )
-            })?;
-        Ok(record)
-    }
-
-    async fn github_app_secret(&self) -> Result<(String, String, String)> {
-        self.store.github_app_secret().await?.ok_or_else(|| {
-            RuntimeError::InvalidInput(
-                "GitHub App ID and private key must be configured before using Projects"
-                    .to_string(),
-            )
-        })
-    }
-
     async fn verified_git_account_repository(
         &self,
         account_id: &str,
         repository_full_name: &str,
     ) -> Result<VerifiedGithubRepository> {
         let token = self.git_account_token(account_id).await?;
+        let account = self.git_account_summary(account_id).await?;
         let repository_full_name = repository_full_name.trim();
         if !repository_full_name.contains('/') || repository_full_name.contains(char::is_whitespace)
         {
             return Err(RuntimeError::InvalidInput(
                 "repository_full_name must look like owner/repo".to_string(),
             ));
+        }
+        if account.provider == mai_protocol::GitProvider::GithubAppRelay {
+            let installation_id = account.installation_id.ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "relay git account installation_id is missing".to_string(),
+                )
+            })?;
+            let repository = self
+                .github_backend
+                .get_github_repository(installation_id, repository_full_name)
+                .await?;
+            return Ok(VerifiedGithubRepository {
+                id: repository.id,
+                owner: repository.owner,
+                name: repository.name,
+                full_name: repository.full_name,
+                default_branch: repository
+                    .default_branch
+                    .unwrap_or_else(|| "main".to_string()),
+            });
         }
         let url = github_api_url(
             &self.github_api_base_url,
@@ -7043,90 +7471,30 @@ impl AgentRuntime {
 
     async fn git_account_summary(&self, account_id: &str) -> Result<GitAccountSummary> {
         self.store
-            .list_git_accounts()
+            .git_account(account_id)
             .await?
-            .accounts
-            .into_iter()
-            .find(|account| account.id == account_id)
             .ok_or_else(|| RuntimeError::InvalidInput("git account not found".to_string()))
     }
 
     async fn git_account_token(&self, account_id: &str) -> Result<String> {
+        let account = self.git_account_summary(account_id).await?;
+        if account.provider == mai_protocol::GitProvider::GithubAppRelay {
+            let installation_id = account.installation_id.ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "relay git account installation_id is missing".to_string(),
+                )
+            })?;
+            return Ok(self
+                .github_backend
+                .github_installation_token(installation_id, None)
+                .await?
+                .token);
+        }
         self.store
             .git_account_token(account_id)
             .await?
             .filter(|token| !token.trim().is_empty())
             .ok_or_else(|| RuntimeError::InvalidInput("git account token not found".to_string()))
-    }
-
-    async fn github_app_jwt(&self) -> Result<(String, String)> {
-        let (app_id, private_key, base_url) = self.github_app_secret().await?;
-        let now = Utc::now().timestamp();
-        let claims = GithubJwtClaims {
-            iat: now.saturating_sub(60) as usize,
-            exp: now.saturating_add(540) as usize,
-            iss: app_id,
-        };
-        let token = encode(
-            &Header::new(Algorithm::RS256),
-            &claims,
-            &EncodingKey::from_rsa_pem(private_key.as_bytes())?,
-        )?;
-        Ok((token, base_url))
-    }
-
-    async fn github_installation_token(
-        &self,
-        installation_id: u64,
-        repository_id: Option<u64>,
-    ) -> Result<String> {
-        let cache_key = format!(
-            "{installation_id}:{}",
-            repository_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "all".to_string())
-        );
-        {
-            let tokens = self.github_tokens.lock().await;
-            if let Some(cached) = tokens.get(&cache_key)
-                && cached.expires_at - TimeDelta::seconds(GITHUB_TOKEN_REFRESH_SKEW_SECS)
-                    > Utc::now()
-            {
-                return Ok(cached.token.clone());
-            }
-        }
-
-        let (jwt, base_url) = self.github_app_jwt().await?;
-        let url = github_api_url(
-            &base_url,
-            &format!("/app/installations/{installation_id}/access_tokens"),
-        );
-        let body = GithubAccessTokenRequest {
-            repository_ids: repository_id.map(|id| vec![id]),
-            permissions: GithubAccessTokenPermissions {
-                contents: "write",
-                pull_requests: "write",
-                issues: "write",
-            },
-        };
-        let response = self
-            .github_http
-            .post(url)
-            .bearer_auth(jwt)
-            .headers(github_headers())
-            .json(&body)
-            .send()
-            .await?;
-        let token: GithubAccessTokenResponse =
-            decode_github_response(response, "create installation token").await?;
-        self.github_tokens.lock().await.insert(
-            cache_key,
-            CachedGithubToken {
-                token: token.token.clone(),
-                expires_at: token.expires_at,
-            },
-        );
-        Ok(token.token)
     }
 
     async fn project_git_token_for_agent(&self, agent: &AgentRecord) -> Result<Option<String>> {
@@ -9762,6 +10130,8 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         | ServiceEventKind::ProjectCreated { .. }
         | ServiceEventKind::ProjectUpdated { .. }
         | ServiceEventKind::ProjectDeleted { .. }
+        | ServiceEventKind::GithubWebhookReceived { .. }
+        | ServiceEventKind::ProjectReviewQueued { .. }
         | ServiceEventKind::PlanUpdated { .. } => None,
         ServiceEventKind::ArtifactCreated { artifact } => Some(artifact.agent_id),
         ServiceEventKind::Error { agent_id, .. } => *agent_id,
@@ -15779,12 +16149,36 @@ esac
             .await
             .expect("update project");
         let message = runtime
-            .project_reviewer_initial_message(project_id, reviewer_id)
+            .project_reviewer_initial_message(project_id, reviewer_id, None)
             .await
             .expect("message");
 
         assert!(message.contains("new prompt"));
         assert!(!message.contains("old prompt"));
+        assert!(message.contains("Target pull request: none."));
+    }
+
+    #[tokio::test]
+    async fn project_reviewer_initial_message_can_target_pr() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        let project_id = Uuid::new_v4();
+        let reviewer_id = Uuid::new_v4();
+        let mut agent = test_agent_summary(reviewer_id, None);
+        agent.project_id = Some(project_id);
+        agent.role = Some(AgentRole::Reviewer);
+        save_agent_with_session(&store, &agent).await;
+        let project = ready_test_project_summary(project_id, reviewer_id, "account-1");
+        store.save_project(&project).await.expect("save project");
+        let runtime = test_runtime(&dir, store).await;
+
+        let message = runtime
+            .project_reviewer_initial_message(project_id, reviewer_id, Some(42))
+            .await
+            .expect("message");
+
+        assert!(message.contains("review PR #42 only"));
+        assert!(message.contains("select-pr --target-pr 42"));
     }
 
     #[tokio::test]
@@ -15936,7 +16330,7 @@ esac
             "Review single PR body.",
         );
         let message = runtime
-            .project_reviewer_initial_message(project_id, reviewer_id)
+            .project_reviewer_initial_message(project_id, reviewer_id, None)
             .await
             .expect("message");
         runtime

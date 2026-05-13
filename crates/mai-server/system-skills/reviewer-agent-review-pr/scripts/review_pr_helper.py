@@ -41,6 +41,7 @@ def main() -> int:
     select.add_argument("--details", help="optional PR details JSON path")
     select.add_argument("--reviews", help="optional reviews JSON path")
     select.add_argument("--checks", help="optional checks/status JSON path")
+    select.add_argument("--target-pr", type=int, help="only consider this PR number")
 
     worktree = subparsers.add_parser("prepare-worktree", help="create or reuse review worktree")
     worktree.add_argument("--repo", default="/workspace/repo")
@@ -80,6 +81,7 @@ def main() -> int:
                 details=load_json_path(args.details) if args.details else None,
                 reviews=load_json_path(args.reviews) if args.reviews else None,
                 checks=load_json_path(args.checks) if args.checks else None,
+                target_pr=args.target_pr,
             )
         )
     elif args.command == "prepare-worktree":
@@ -144,6 +146,7 @@ def select_pr(
     details: Any = None,
     reviews: Any = None,
     checks: Any = None,
+    target_pr: int | None = None,
 ) -> dict[str, Any]:
     prs = normalize_list(prs_json, list_keys=("pull_requests", "pullRequests", "items", "nodes"))
     details_by_pr = index_by_pr(details)
@@ -154,6 +157,8 @@ def select_pr(
 
     for pr in prs:
         number = pr_number(pr)
+        if target_pr is not None and number != target_pr:
+            continue
         detail = merge_dicts(pr, details_by_pr.get(number))
         if author_login(detail) == login:
             skipped.append(skip(number, "self_authored"))
@@ -214,8 +219,13 @@ def select_pr(
         reverse=True,
     )
     if not eligible:
-        return {"outcome": "no_eligible_pr", "selected_pr": None, "skipped": skipped}
-    return {"outcome": "selected_pr", "selected_pr": eligible[0], "skipped": skipped}
+        return {
+            "outcome": "no_eligible_pr",
+            "selected_pr": None,
+            "target_pr": target_pr,
+            "skipped": skipped,
+        }
+    return {"outcome": "selected_pr", "selected_pr": eligible[0], "target_pr": target_pr, "skipped": skipped}
 
 
 def normalize_list(value: Any, list_keys: tuple[str, ...]) -> list[Any]:
@@ -921,6 +931,52 @@ class ReviewPrHelperTests(unittest.TestCase):
         )
         self.assertEqual(result["outcome"], "no_eligible_pr")
         self.assertEqual(result["skipped"][0]["reason"], "already_reviewed_latest_commit")
+
+    def test_select_pr_target_pr_only_considers_requested_number(self) -> None:
+        result = select_pr(
+            [
+                {
+                    "number": 20,
+                    "author": {"login": "alice"},
+                    "updated_at": "2026-01-08T00:00:00Z",
+                    "check_runs": [{"status": "completed", "conclusion": "success"}],
+                },
+                {
+                    "number": 21,
+                    "author": {"login": "bob"},
+                    "updated_at": "2026-01-09T00:00:00Z",
+                    "check_runs": [{"status": "completed", "conclusion": "success"}],
+                },
+            ],
+            "me",
+            target_pr=20,
+        )
+        self.assertEqual(result["outcome"], "selected_pr")
+        self.assertEqual(result["selected_pr"]["number"], 20)
+        self.assertEqual(result["target_pr"], 20)
+
+    def test_select_pr_target_pr_can_be_ineligible(self) -> None:
+        result = select_pr(
+            [
+                {
+                    "number": 22,
+                    "author": {"login": "alice"},
+                    "updated_at": "2026-01-08T00:00:00Z",
+                    "check_runs": [{"status": "completed", "conclusion": "success"}],
+                },
+                {
+                    "number": 23,
+                    "author": {"login": "me"},
+                    "updated_at": "2026-01-09T00:00:00Z",
+                    "check_runs": [{"status": "completed", "conclusion": "success"}],
+                },
+            ],
+            "me",
+            target_pr=23,
+        )
+        self.assertEqual(result["outcome"], "no_eligible_pr")
+        self.assertEqual(result["target_pr"], 23)
+        self.assertEqual(result["skipped"][0]["reason"], "self_authored")
 
     def test_changed_files_extracts_crates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

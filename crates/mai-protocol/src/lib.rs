@@ -1257,6 +1257,19 @@ pub enum ServiceEventKind {
     ProjectDeleted {
         project_id: ProjectId,
     },
+    GithubWebhookReceived {
+        delivery_id: String,
+        event: String,
+        action: Option<String>,
+        repository_full_name: Option<String>,
+        installation_id: Option<u64>,
+    },
+    ProjectReviewQueued {
+        project_id: ProjectId,
+        delivery_id: String,
+        pr: u64,
+        reason: String,
+    },
     TurnStarted {
         agent_id: AgentId,
         #[serde(default)]
@@ -1680,6 +1693,7 @@ pub struct RepositoryPackageSummary {
 pub enum GitProvider {
     #[default]
     Github,
+    GithubAppRelay,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1722,6 +1736,12 @@ pub struct GitAccountSummary {
     pub last_verified_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub installation_id: Option<u64>,
+    #[serde(default)]
+    pub installation_account: Option<String>,
+    #[serde(default)]
+    pub relay_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1746,6 +1766,12 @@ pub struct GitAccountRequest {
     pub token: Option<String>,
     #[serde(default)]
     pub is_default: bool,
+    #[serde(default)]
+    pub installation_id: Option<u64>,
+    #[serde(default)]
+    pub installation_account: Option<String>,
+    #[serde(default)]
+    pub relay_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1756,6 +1782,153 @@ pub struct GitAccountResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GitAccountDefaultRequest {
     pub account_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayClientHello {
+    pub node_id: String,
+    pub version: String,
+    pub token: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayRequest {
+    pub id: String,
+    pub method: String,
+    #[serde(default)]
+    pub params: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayResponse {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<RelayError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayError {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayEvent {
+    pub sequence: u64,
+    pub delivery_id: String,
+    pub kind: RelayEventKind,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayEventKind {
+    PullRequest,
+    Push,
+    CheckRun,
+    CheckSuite,
+    Installation,
+    InstallationRepositories,
+    Other(String),
+}
+
+impl RelayEventKind {
+    pub fn from_github_event(value: &str) -> Self {
+        match value {
+            "pull_request" => Self::PullRequest,
+            "push" => Self::Push,
+            "check_run" => Self::CheckRun,
+            "check_suite" => Self::CheckSuite,
+            "installation" => Self::Installation,
+            "installation_repositories" => Self::InstallationRepositories,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    pub fn as_github_event(&self) -> &str {
+        match self {
+            Self::PullRequest => "pull_request",
+            Self::Push => "push",
+            Self::CheckRun => "check_run",
+            Self::CheckSuite => "check_suite",
+            Self::Installation => "installation",
+            Self::InstallationRepositories => "installation_repositories",
+            Self::Other(value) => value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayAck {
+    pub delivery_id: String,
+    pub status: RelayAckStatus,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayAckStatus {
+    Processed,
+    Ignored,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RelayEnvelope {
+    Hello(RelayClientHello),
+    Request(RelayRequest),
+    Response(RelayResponse),
+    Event(RelayEvent),
+    Ack(RelayAck),
+    Ping { id: String },
+    Pong { id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RelayStatusResponse {
+    pub enabled: bool,
+    pub connected: bool,
+    #[serde(default)]
+    pub relay_url: Option<String>,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub queued_deliveries: Option<u64>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayGithubRepositoriesRequest {
+    pub installation_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayGithubRepositoryGetRequest {
+    pub installation_id: u64,
+    pub repository_full_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayGithubInstallationTokenRequest {
+    pub installation_id: u64,
+    #[serde(default)]
+    pub repository_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayGithubInstallationTokenResponse {
+    pub token: String,
+    pub expires_at: DateTime<Utc>,
 }
 
 pub fn default_true() -> bool {
@@ -1821,5 +1994,36 @@ mod tests {
         assert_eq!(request.installation_id, 0);
         assert_eq!(request.repository_id, 0);
         assert_eq!(request.repository_full_name.as_deref(), Some("owner/repo"));
+    }
+
+    #[test]
+    fn relay_envelope_round_trips() {
+        let envelope = RelayEnvelope::Request(RelayRequest {
+            id: "1".to_string(),
+            method: "github.installations.list".to_string(),
+            params: json!({}),
+        });
+        let value = serde_json::to_value(&envelope).expect("serialize");
+        assert_eq!(value["type"], "request");
+        let decoded: RelayEnvelope = serde_json::from_value(value).expect("deserialize");
+        match decoded {
+            RelayEnvelope::Request(request) => {
+                assert_eq!(request.id, "1");
+                assert_eq!(request.method, "github.installations.list");
+            }
+            other => panic!("unexpected envelope: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_event_kind_maps_github_events() {
+        assert_eq!(
+            RelayEventKind::from_github_event("pull_request").as_github_event(),
+            "pull_request"
+        );
+        assert_eq!(
+            RelayEventKind::from_github_event("workflow_job").as_github_event(),
+            "workflow_job"
+        );
     }
 }

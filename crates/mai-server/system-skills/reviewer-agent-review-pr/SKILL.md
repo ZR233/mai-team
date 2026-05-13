@@ -33,6 +33,7 @@ The helper commands are:
 
 ```bash
 python3 scripts/review_pr_helper.py select-pr --prs prs.json --login "$LOGIN" --details details.json --reviews reviews.json --checks checks.json
+python3 scripts/review_pr_helper.py select-pr --prs prs.json --login "$LOGIN" --details details.json --reviews reviews.json --checks checks.json --target-pr "$PR"
 python3 scripts/review_pr_helper.py prepare-worktree --repo /workspace/repo --review-root /workspace/reviews --agent-id "$REVIEWER_AGENT_ID" --pr "$PR"
 python3 scripts/review_pr_helper.py changed-files --repo "$WORKTREE" --files files.json
 python3 scripts/review_pr_helper.py rust-plan --repo "$WORKTREE" --changed changed.json
@@ -76,7 +77,7 @@ Use the helper on the raw JSON files from those calls. The helper already unders
 - GraphQL-style `nodes` / `edges`
 - re-review detection from review `commit_id` versus current PR head SHA when PR details do not expose a latest commit timestamp
 
-Save the MCP JSON outputs to files and run `select-pr`. The helper applies these fixed rules:
+Save the MCP JSON outputs to files and run `select-pr`. If Mai's initial message names a target pull request, pass `--target-pr <number>` and review only that PR; if that target is ineligible, finish with `no_eligible_pr` instead of selecting another PR. The helper applies these fixed rules:
 
 - Skip self-authored PRs.
 - Skip draft PRs.

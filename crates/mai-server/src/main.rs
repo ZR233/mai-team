@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+mod relay;
+
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
@@ -22,11 +24,11 @@ use mai_protocol::{
     GithubSettingsRequest, GithubSettingsResponse, McpServersConfigRequest, ModelInputItem,
     ModelOutputItem, ModelResponse, ModelWireApi, ProjectId, ProjectReviewRunDetail,
     ProjectReviewRunsResponse, ProviderKind, ProviderPresetsResponse, ProviderTestRequest,
-    ProviderTestResponse, ProvidersConfigRequest, ProvidersResponse, RepositoryPackagesResponse,
-    RequestPlanRevisionRequest, RequestPlanRevisionResponse, RuntimeDefaultsResponse,
-    SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId, SkillsConfigRequest,
-    SkillsListResponse, TaskId, ToolTraceDetail, ToolTraceListResponse, TurnId, UpdateAgentRequest,
-    UpdateAgentResponse, UpdateProjectRequest, UpdateProjectResponse,
+    ProviderTestResponse, ProvidersConfigRequest, ProvidersResponse, RelayStatusResponse,
+    RepositoryPackagesResponse, RequestPlanRevisionRequest, RequestPlanRevisionResponse,
+    RuntimeDefaultsResponse, SendMessageRequest, SendMessageResponse, ServiceEvent, SessionId,
+    SkillsConfigRequest, SkillsListResponse, TaskId, ToolTraceDetail, ToolTraceListResponse,
+    TurnId, UpdateAgentRequest, UpdateAgentResponse, UpdateProjectRequest, UpdateProjectResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeConfig, RuntimeError};
 use mai_store::{AgentLogFilter, ConfigStore, ToolTraceFilter};
@@ -54,6 +56,7 @@ const SSE_REPLAY_LIMIT: usize = 1_000;
 struct AppState {
     runtime: Arc<AgentRuntime>,
     store: Arc<ConfigStore>,
+    relay: Option<Arc<relay::RelayClient>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,7 +272,22 @@ async fn main() -> Result<()> {
         artifact_index_root = %artifact_index_root.display(),
         "runtime storage paths"
     );
-    let runtime = AgentRuntime::new(docker, model, Arc::clone(&store), runtime_config).await?;
+    let relay = relay_config_from_env().map(|config| Arc::new(relay::RelayClient::new(config)));
+    let github_backend = relay
+        .as_ref()
+        .map(|client| Arc::clone(client) as Arc<dyn mai_runtime::GithubAppBackend>);
+    let runtime = AgentRuntime::new_with_github_backend(
+        docker,
+        model,
+        Arc::clone(&store),
+        runtime_config,
+        github_backend,
+    )
+    .await?;
+    if let Some(relay) = &relay {
+        relay.set_runtime(Arc::clone(&runtime)).await;
+        Arc::clone(relay).start();
+    }
     let cleaned = runtime.cleanup_orphaned_containers().await?;
     if !cleaned.is_empty() {
         info!(
@@ -277,7 +295,11 @@ async fn main() -> Result<()> {
             "removed orphaned mai-team containers"
         );
     }
-    let state = Arc::new(AppState { runtime, store });
+    let state = Arc::new(AppState {
+        runtime,
+        store,
+        relay,
+    });
 
     let app = Router::new()
         .route("/", get(index))
@@ -327,6 +349,7 @@ async fn main() -> Result<()> {
             "/github/app-installation/callback",
             get(github_app_installation_callback),
         )
+        .route("/relay/status", get(get_relay_status))
         .route("/github/installations", get(list_github_installations))
         .route(
             "/github/installations:refresh",
@@ -504,6 +527,30 @@ fn artifact_files_root(data_dir: &std::path::Path) -> PathBuf {
 
 fn artifact_index_root(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("artifacts").join("index")
+}
+
+fn relay_config_from_env() -> Option<relay::RelayClientConfig> {
+    let enabled = env::var("MAI_RELAY_ENABLED")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"));
+    if !enabled {
+        return None;
+    }
+    let url = env::var("MAI_RELAY_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let token = env::var("MAI_RELAY_TOKEN").unwrap_or_default();
+    if token.trim().is_empty() {
+        tracing::warn!("MAI_RELAY_ENABLED is set but MAI_RELAY_TOKEN is empty; relay disabled");
+        return None;
+    }
+    let node_id = env::var("MAI_RELAY_NODE_ID").unwrap_or_else(|_| "mai-server".to_string());
+    Some(relay::RelayClientConfig {
+        url,
+        token,
+        node_id,
+    })
 }
 
 fn release_embedded_system_skills(target_dir: &std::path::Path) -> io::Result<()> {
@@ -1037,6 +1084,9 @@ async fn start_github_app_manifest(
     State(state): State<Arc<AppState>>,
     Json(request): Json<GithubAppManifestStartRequest>,
 ) -> std::result::Result<Json<GithubAppManifestStartResponse>, ApiError> {
+    if let Some(relay) = &state.relay {
+        return Ok(Json(relay.start_github_app_manifest(request).await?));
+    }
     Ok(Json(
         state.runtime.start_github_app_manifest(request).await?,
     ))
@@ -1097,12 +1147,18 @@ async fn github_app_installation_callback(
 async fn list_github_installations(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<GithubInstallationsResponse>, ApiError> {
+    if let Some(relay) = &state.relay {
+        return Ok(Json(relay.list_github_installations().await?));
+    }
     Ok(Json(state.runtime.list_github_installations().await?))
 }
 
 async fn refresh_github_installations(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<GithubInstallationsResponse>, ApiError> {
+    if let Some(relay) = &state.relay {
+        return Ok(Json(relay.list_github_installations().await?));
+    }
     Ok(Json(state.runtime.refresh_github_installations().await?))
 }
 
@@ -1110,7 +1166,27 @@ async fn list_github_repositories(
     State(state): State<Arc<AppState>>,
     Path(id): Path<u64>,
 ) -> std::result::Result<Json<GithubRepositoriesResponse>, ApiError> {
+    if let Some(relay) = &state.relay {
+        return Ok(Json(relay.list_github_repositories(id).await?));
+    }
     Ok(Json(state.runtime.list_github_repositories(id).await?))
+}
+
+async fn get_relay_status(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<RelayStatusResponse>, ApiError> {
+    Ok(Json(match &state.relay {
+        Some(relay) => relay.status().await,
+        None => RelayStatusResponse {
+            enabled: false,
+            connected: false,
+            relay_url: None,
+            node_id: None,
+            last_heartbeat_at: None,
+            queued_deliveries: None,
+            message: Some("relay disabled".to_string()),
+        },
+    }))
 }
 
 async fn list_skills(
@@ -1650,6 +1726,8 @@ fn event_name(event: &ServiceEvent) -> &'static str {
         mai_protocol::ServiceEventKind::ProjectCreated { .. } => "project_created",
         mai_protocol::ServiceEventKind::ProjectUpdated { .. } => "project_updated",
         mai_protocol::ServiceEventKind::ProjectDeleted { .. } => "project_deleted",
+        mai_protocol::ServiceEventKind::GithubWebhookReceived { .. } => "github_webhook_received",
+        mai_protocol::ServiceEventKind::ProjectReviewQueued { .. } => "project_review_queued",
         mai_protocol::ServiceEventKind::TurnStarted { .. } => "turn_started",
         mai_protocol::ServiceEventKind::TurnCompleted { .. } => "turn_completed",
         mai_protocol::ServiceEventKind::ToolStarted { .. } => "tool_started",

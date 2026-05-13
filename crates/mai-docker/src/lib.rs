@@ -1182,7 +1182,11 @@ struct StreamCapture {
     truncated: bool,
 }
 
-fn capture_stream<R>(reader: R, path: PathBuf, output_bytes_cap: usize) -> JoinHandle<Result<StreamCapture>>
+fn capture_stream<R>(
+    reader: R,
+    path: PathBuf,
+    output_bytes_cap: usize,
+) -> JoinHandle<Result<StreamCapture>>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -1305,8 +1309,11 @@ impl VecDequeBytes {
         }
         if bytes.len() >= self.cap {
             self.bytes.clear();
-            self.bytes
-                .extend(bytes[bytes.len().saturating_sub(self.cap)..].iter().copied());
+            self.bytes.extend(
+                bytes[bytes.len().saturating_sub(self.cap)..]
+                    .iter()
+                    .copied(),
+            );
             return;
         }
         self.bytes.extend(bytes.iter().copied());
