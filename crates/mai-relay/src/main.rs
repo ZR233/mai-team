@@ -991,18 +991,10 @@ async fn list_repository_packages(
     let repository_ref = format!("{owner}/{repo}");
     let packages = match github_container_packages_for_owner(state, &token.token, owner).await {
         Ok(packages) => packages,
-        Err(err) if err.status() == Some(reqwest::StatusCode::FORBIDDEN) => {
+        Err(err) if github_packages_read_error(err.status()) => {
             return Ok(RepositoryPackagesResponse {
                 packages: Vec::new(),
-                warning: Some(
-                    "GitHub App installation cannot read packages for this owner".to_string(),
-                ),
-            });
-        }
-        Err(err) if err.status() == Some(reqwest::StatusCode::NOT_FOUND) => {
-            return Ok(RepositoryPackagesResponse {
-                packages: Vec::new(),
-                warning: Some("No readable GitHub container packages found".to_string()),
+                warning: Some("No readable GitHub container packages found for this owner".to_string()),
             });
         }
         Err(err) => return Err(RelayErrorKind::Http(err)),
@@ -1021,8 +1013,7 @@ async fn list_repository_packages(
         .await
         {
             Ok(versions) => versions,
-            Err(err) if err.status() == Some(reqwest::StatusCode::FORBIDDEN) => continue,
-            Err(err) if err.status() == Some(reqwest::StatusCode::NOT_FOUND) => continue,
+            Err(err) if github_packages_read_error(err.status()) => continue,
             Err(err) => return Err(RelayErrorKind::Http(err)),
         };
         if let Some(summary) = repository_package_summary(owner, package, versions) {
@@ -1697,6 +1688,17 @@ fn repository_package_summary(
     })
 }
 
+fn github_packages_read_error(status: Option<reqwest::StatusCode>) -> bool {
+    matches!(
+        status,
+        Some(
+            reqwest::StatusCode::BAD_REQUEST
+                | reqwest::StatusCode::FORBIDDEN
+                | reqwest::StatusCode::NOT_FOUND
+        )
+    )
+}
+
 fn preferred_container_tag(versions: &[GithubPackageVersionApi]) -> Option<String> {
     let mut first_tag = None;
     for version in versions {
@@ -2363,6 +2365,22 @@ mod tests {
         assert_eq!(config.owner_login.as_deref(), Some("mai-team"));
         assert_eq!(config.owner_type.as_deref(), Some("Organization"));
         assert!(github_app_config_has_metadata(&config));
+    }
+
+    #[test]
+    fn github_packages_bad_request_is_read_warning() {
+        assert!(github_packages_read_error(Some(
+            reqwest::StatusCode::BAD_REQUEST
+        )));
+        assert!(github_packages_read_error(Some(
+            reqwest::StatusCode::FORBIDDEN
+        )));
+        assert!(github_packages_read_error(Some(
+            reqwest::StatusCode::NOT_FOUND
+        )));
+        assert!(!github_packages_read_error(Some(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        )));
     }
 
     fn hex_encode(bytes: &[u8]) -> String {

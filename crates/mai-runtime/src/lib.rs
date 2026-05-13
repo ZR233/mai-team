@@ -1414,16 +1414,10 @@ impl AgentRuntime {
             .await
         {
             Ok(packages) => packages,
-            Err(err) if err.status() == Some(reqwest::StatusCode::FORBIDDEN) => {
+            Err(err) if github_packages_read_error(err.status()) => {
                 return Ok(RepositoryPackagesResponse {
                     packages: Vec::new(),
-                    warning: Some("GitHub token cannot read packages for this owner".to_string()),
-                });
-            }
-            Err(err) if err.status() == Some(reqwest::StatusCode::NOT_FOUND) => {
-                return Ok(RepositoryPackagesResponse {
-                    packages: Vec::new(),
-                    warning: Some("No readable GitHub container packages found".to_string()),
+                    warning: Some("No readable GitHub container packages found for this owner".to_string()),
                 });
             }
             Err(err) => return Err(RuntimeError::Http(err)),
@@ -1438,8 +1432,7 @@ impl AgentRuntime {
                 .await
             {
                 Ok(versions) => versions,
-                Err(err) if err.status() == Some(reqwest::StatusCode::FORBIDDEN) => continue,
-                Err(err) if err.status() == Some(reqwest::StatusCode::NOT_FOUND) => continue,
+                Err(err) if github_packages_read_error(err.status()) => continue,
                 Err(err) => return Err(RuntimeError::Http(err)),
             };
             if let Some(summary) = repository_package_summary(owner.trim(), package, versions) {
@@ -8908,6 +8901,17 @@ fn repository_package_summary(
     })
 }
 
+fn github_packages_read_error(status: Option<reqwest::StatusCode>) -> bool {
+    matches!(
+        status,
+        Some(
+            reqwest::StatusCode::BAD_REQUEST
+                | reqwest::StatusCode::FORBIDDEN
+                | reqwest::StatusCode::NOT_FOUND
+        )
+    )
+}
+
 fn preferred_container_tag(versions: &[GithubPackageVersionApi]) -> Option<String> {
     let mut first_tag = None;
     for version in versions {
@@ -15632,6 +15636,22 @@ esac
             &missing_repo_package,
             "example/mai-team"
         ));
+    }
+
+    #[test]
+    fn github_packages_bad_request_is_read_warning() {
+        assert!(github_packages_read_error(Some(
+            reqwest::StatusCode::BAD_REQUEST
+        )));
+        assert!(github_packages_read_error(Some(
+            reqwest::StatusCode::FORBIDDEN
+        )));
+        assert!(github_packages_read_error(Some(
+            reqwest::StatusCode::NOT_FOUND
+        )));
+        assert!(!github_packages_read_error(Some(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        )));
     }
 
     #[test]
