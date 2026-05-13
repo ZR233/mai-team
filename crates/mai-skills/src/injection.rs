@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
-use mai_protocol::{SkillMetadata, SkillScope};
+use mai_protocol::SkillMetadata;
 
 use crate::mentions::{extract_plain_skill_names, extract_tool_mentions, normalize_mention};
 use crate::paths::{canonicalize_or_clone, looks_like_path, normalized_skill_path};
@@ -17,7 +17,6 @@ pub struct LoadedSkill {
 #[derive(Debug, Clone, Default)]
 pub struct SkillInjections {
     pub items: Vec<LoadedSkill>,
-    pub suggestions: Vec<SkillSuggestion>,
     pub warnings: Vec<String>,
 }
 
@@ -49,17 +48,6 @@ impl SkillSelection {
             }
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillSuggestion {
-    pub name: String,
-    pub display_name: Option<String>,
-    pub description: String,
-    pub path: PathBuf,
-    pub scope: SkillScope,
-    pub reason: String,
-    pub score: i32,
 }
 
 pub(crate) fn build_injections_from_outcome(

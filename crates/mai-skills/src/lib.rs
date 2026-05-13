@@ -12,9 +12,9 @@ mod scan;
 
 pub use config::normalize_config;
 pub use error::{Result, SkillError};
-pub use injection::{LoadedSkill, SkillInjections, SkillInput, SkillSelection, SkillSuggestion};
+pub use injection::{LoadedSkill, SkillInjections, SkillInput, SkillSelection};
 pub use manager::SkillsManager;
-pub use mentions::{ToolMentions, extract_skill_mentions, extract_tool_mentions};
+pub use mentions::extract_skill_mentions;
 pub use render::render_available_response;
 
 #[cfg(test)]

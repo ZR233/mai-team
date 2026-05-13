@@ -6,8 +6,7 @@ use mai_protocol::SkillMetadata;
 use crate::paths::normalized_skill_path;
 
 #[derive(Debug, Clone, Default)]
-pub struct ToolMentions {
-    pub(crate) names: BTreeSet<String>,
+pub(crate) struct ToolMentions {
     pub(crate) paths: BTreeSet<PathBuf>,
     pub(crate) explicit_names: BTreeSet<String>,
     blocked_plain_names: BTreeSet<String>,
@@ -50,7 +49,7 @@ pub fn extract_skill_mentions(text: &str) -> Vec<String> {
     out
 }
 
-pub fn extract_tool_mentions(text: &str) -> ToolMentions {
+pub(crate) fn extract_tool_mentions(text: &str) -> ToolMentions {
     let bytes = text.as_bytes();
     let mut out = ToolMentions::default();
     let mut index = 0;
@@ -59,7 +58,6 @@ pub fn extract_tool_mentions(text: &str) -> ToolMentions {
             && let Some((name, path, end)) = parse_linked_skill_mention(text, bytes, index)
         {
             if !is_common_env_var(name) {
-                out.names.insert(name.to_string());
                 out.paths.insert(normalized_skill_path(Path::new(path)));
                 out.blocked_plain_names.insert(name.to_string());
             }
@@ -81,7 +79,6 @@ pub fn extract_tool_mentions(text: &str) -> ToolMentions {
         }
         let name = &text[start..end];
         if !is_common_env_var(name) {
-            out.names.insert(name.to_string());
             out.explicit_names.insert(name.to_string());
         }
         index = end;

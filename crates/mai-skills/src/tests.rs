@@ -506,34 +506,6 @@ fn reserved_name_conflict_blocks_plain_name_but_not_path() {
 }
 
 #[test]
-fn semantic_matches_are_available_but_not_runtime_auto_injected() {
-    let dir = tempdir().expect("tempdir");
-    let skill_dir = dir.path().join("frontend-app-builder");
-    fs::create_dir_all(&skill_dir).expect("mkdir");
-    fs::write(
-        skill_dir.join(SKILL_FILE),
-        "---\nname: frontend-app-builder\ndescription: Build frontend apps.\n---\nFrontend body.",
-    )
-    .expect("write skill");
-    let manager = SkillsManager::with_roots(vec![(dir.path().to_path_buf(), SkillScope::Repo)]);
-
-    let injected = manager
-        .build_injections_for_message(
-            "please build a frontend app",
-            &[],
-            &SkillsConfigRequest::default(),
-        )
-        .expect("inject");
-    assert!(injected.items.is_empty());
-    assert!(injected.suggestions.is_empty());
-
-    let available = manager
-        .render_available(&SkillsConfigRequest::default())
-        .expect("available");
-    assert!(available.contains("task clearly matches a skill's description"));
-}
-
-#[test]
 fn implicit_policy_hides_from_available_but_explicit_can_inject() {
     let dir = tempdir().expect("tempdir");
     let skill_dir = dir.path().join("guarded");
