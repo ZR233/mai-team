@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 #[derive(Debug)]
-pub struct ChatCompletionsApi;
+pub(crate) struct ChatCompletionsApi;
 
 #[derive(Debug, Serialize)]
 struct ChatRequest {

@@ -1,32 +1,31 @@
-use crate::http::HeaderMerge;
+use crate::http;
 use crate::wire::chat_completions::ChatCompletionsApi;
 use crate::wire::responses::ResponsesApi;
 use crate::wire::WireProtocol;
 use mai_protocol::{ModelConfig, ModelWireApi, ProviderKind, ProviderSecret};
-use reqwest::header::HeaderMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-pub struct ResolvedProvider {
-    pub endpoint: String,
-    pub api_key: String,
-    pub headers: HeaderMap,
-    pub wire_protocol: Arc<dyn WireProtocol>,
-    pub max_output_tokens: u64,
+pub(crate) struct ResolvedProvider {
+    pub(crate) endpoint: String,
+    pub(crate) api_key: String,
+    pub(crate) headers: reqwest::header::HeaderMap,
+    pub(crate) wire_protocol: Arc<dyn WireProtocol>,
+    pub(crate) max_output_tokens: u64,
 }
 
-pub trait ProviderResolver: Debug + Send + Sync {
+pub(crate) trait ProviderResolver: Debug + Send + Sync {
     fn resolve(&self, provider: &ProviderSecret, model: &ModelConfig) -> ResolvedProvider;
 }
 
 #[derive(Debug)]
-pub struct DefaultProviderResolver {
+pub(crate) struct DefaultProviderResolver {
     responses: Arc<ResponsesApi>,
     chat_completions: Arc<ChatCompletionsApi>,
 }
 
 impl DefaultProviderResolver {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             responses: Arc::new(ResponsesApi),
             chat_completions: Arc::new(ChatCompletionsApi),
@@ -54,16 +53,15 @@ impl ProviderResolver for DefaultProviderResolver {
             provider.base_url.trim_end_matches('/'),
             wire_protocol.path()
         );
-        let headers =
-            crate::http::headers(&provider.headers(&crate::http::request_headers(model)));
-        let max_output_tokens = resolve_max_tokens(provider, model);
+        let model_headers = http::request_headers(model);
+        let headers = http::headers(&model_headers);
 
         ResolvedProvider {
             endpoint,
             api_key: provider.api_key.clone(),
             headers,
             wire_protocol,
-            max_output_tokens,
+            max_output_tokens: resolve_max_tokens(provider, model),
         }
     }
 }

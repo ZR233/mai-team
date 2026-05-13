@@ -7,24 +7,24 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 
-pub trait WireProtocol: Debug + Send + Sync {
+pub(crate) trait WireProtocol: Debug + Send + Sync {
     fn path(&self) -> &'static str;
     fn build_body(&self, req: &WireRequest<'_>) -> Result<Vec<u8>>;
     fn parse_response(&self, body: &str) -> Result<ModelResponse>;
 }
 
-pub struct WireRequest<'a> {
-    pub model_id: &'a str,
-    pub instructions: &'a str,
-    pub input: &'a [ModelInputItem],
-    pub tools: &'a [ToolDefinition],
-    pub tool_choice: Option<&'a str>,
-    pub stream: bool,
-    pub store: Option<bool>,
-    pub previous_response_id: Option<&'a str>,
-    pub max_output_tokens: u64,
-    pub extra_body: BTreeMap<String, Value>,
-    pub supports_tools: bool,
+pub(crate) struct WireRequest<'a> {
+    pub(crate) model_id: &'a str,
+    pub(crate) instructions: &'a str,
+    pub(crate) input: &'a [ModelInputItem],
+    pub(crate) tools: &'a [ToolDefinition],
+    pub(crate) tool_choice: Option<&'a str>,
+    pub(crate) stream: bool,
+    pub(crate) store: Option<bool>,
+    pub(crate) previous_response_id: Option<&'a str>,
+    pub(crate) max_output_tokens: u64,
+    pub(crate) extra_body: BTreeMap<String, Value>,
+    pub(crate) supports_tools: bool,
 }
 
 pub(crate) fn parse_usage(value: Option<&Value>) -> Option<mai_protocol::TokenUsage> {

@@ -25,18 +25,6 @@ pub(crate) fn continuation_cache_key(provider: &ProviderSecret, model: &ModelCon
     )
 }
 
-pub(crate) trait HeaderMerge {
-    fn headers(&self, model_headers: &BTreeMap<String, String>) -> BTreeMap<String, String>;
-}
-
-impl HeaderMerge for ProviderSecret {
-    fn headers(&self, model_headers: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-        let mut headers = BTreeMap::new();
-        headers.extend(model_headers.clone());
-        headers
-    }
-}
-
 pub(crate) fn request_headers(model: &ModelConfig) -> BTreeMap<String, String> {
     let mut headers = model.headers.clone();
     headers.extend(model.request_policy.headers.clone());
@@ -55,17 +43,6 @@ pub(crate) fn headers(values: &BTreeMap<String, String>) -> reqwest::header::Hea
     out
 }
 
-pub(crate) fn option_map(value: &Value) -> BTreeMap<String, Value> {
-    value
-        .as_object()
-        .map(|map| {
-            map.iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 pub(crate) fn request_options(
     model: &ModelConfig,
     reasoning_effort: Option<&str>,
@@ -75,7 +52,18 @@ pub(crate) fn request_options(
         merge_json_objects(&mut options, request);
     }
     merge_json_objects(&mut options, &model.request_policy.extra_body);
-    option_map(&options)
+    value_to_map(&options)
+}
+
+fn value_to_map(value: &Value) -> BTreeMap<String, Value> {
+    value
+        .as_object()
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn reasoning_variant_request<'a>(
@@ -120,7 +108,6 @@ mod tests {
     use super::*;
     use mai_protocol::{ModelReasoningConfig, ModelReasoningVariant, ModelWireApi};
     use serde_json::json;
-    use std::collections::BTreeMap;
 
     fn model_with_reasoning(
         id: &str,

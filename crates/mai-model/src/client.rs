@@ -1,10 +1,13 @@
 use crate::error::{ModelError, Result};
 use crate::http::{self, continuation_cache_key, response_id_unsupported_for_responses_http};
-use crate::provider::{DefaultProviderResolver, ProviderResolver};
+use crate::provider::DefaultProviderResolver;
 use crate::types::{ModelRequest, ModelTurnState};
 use crate::wire::responses::openai_turn_input;
 use crate::wire::WireRequest;
-use mai_protocol::{ModelConfig, ModelInputItem, ModelResponse, ModelWireApi, ProviderKind, ProviderSecret, ToolDefinition};
+use mai_protocol::{
+    ModelConfig, ModelInputItem, ModelResponse, ModelWireApi, ProviderKind, ProviderSecret,
+    ToolDefinition,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone)]
 pub struct ModelClient {
     http: reqwest::Client,
-    resolver: Arc<dyn ProviderResolver>,
+    resolver: Arc<dyn crate::provider::ProviderResolver>,
     continuation_cache: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -34,23 +37,20 @@ impl ModelClient {
         tools: &[ToolDefinition],
         reasoning_effort: Option<String>,
     ) -> Result<ModelResponse> {
+        let supports_tools = http::model_supports_tools(model);
         let resolved = self.resolver.resolve(provider, model);
         let wire_req = WireRequest {
             model_id: &model.id,
             instructions,
             input,
             tools,
-            tool_choice: if !tools.is_empty() && http::model_supports_tools(model) {
-                Some("auto")
-            } else {
-                None
-            },
+            tool_choice: tool_choice(tools, supports_tools),
             stream: false,
             store: Some(false),
             previous_response_id: None,
             max_output_tokens: resolved.max_output_tokens,
-            extra_body: crate::http::request_options(model, reasoning_effort.as_deref()),
-            supports_tools: http::model_supports_tools(model),
+            extra_body: http::request_options(model, reasoning_effort.as_deref()),
+            supports_tools,
         };
         self.send_request(&resolved, &wire_req).await
     }
@@ -110,6 +110,7 @@ impl ModelClient {
                 .await;
         }
 
+        let supports_tools = http::model_supports_tools(req.model);
         let (input, previous_response_id) = openai_turn_input(req.input, state);
         let resolved = self.resolver.resolve(req.provider, req.model);
         let wire_req = WireRequest {
@@ -117,22 +118,13 @@ impl ModelClient {
             instructions: req.instructions,
             input,
             tools: req.tools,
-            tool_choice: if !req.tools.is_empty()
-                && http::model_supports_tools(req.model)
-            {
-                Some("auto")
-            } else {
-                None
-            },
+            tool_choice: tool_choice(req.tools, supports_tools),
             stream: false,
             store: Some(true),
             previous_response_id,
             max_output_tokens: resolved.max_output_tokens,
-            extra_body: crate::http::request_options(
-                req.model,
-                req.reasoning_effort.as_deref(),
-            ),
-            supports_tools: http::model_supports_tools(req.model),
+            extra_body: http::request_options(req.model, req.reasoning_effort.as_deref()),
+            supports_tools,
         };
         let response = self.send_request(&resolved, &wire_req).await;
         let response = match response {
@@ -238,6 +230,10 @@ impl ModelClient {
     }
 }
 
+fn tool_choice(tools: &[ToolDefinition], supports_tools: bool) -> Option<&'static str> {
+    (!tools.is_empty() && supports_tools).then_some("auto")
+}
+
 impl Default for ModelClient {
     fn default() -> Self {
         let http = reqwest::Client::builder()
@@ -257,8 +253,7 @@ mod tests {
     use super::*;
     use crate::types::ModelRequest;
     use mai_protocol::{
-        ModelReasoningConfig, ModelReasoningVariant,
-        ModelWireApi, ProviderKind,
+        ModelReasoningConfig, ModelReasoningVariant, ModelWireApi, ProviderKind,
     };
     use serde_json::{Value, json};
     use std::collections::VecDeque;

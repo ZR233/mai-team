@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 #[derive(Debug)]
-pub struct ResponsesApi;
+pub(crate) struct ResponsesApi;
 
 #[derive(Debug, Serialize)]
 struct ResponsesRequest<'a> {
