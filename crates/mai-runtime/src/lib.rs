@@ -2248,13 +2248,8 @@ impl AgentRuntime {
     }
 
     pub async fn list_agents(&self) -> Vec<AgentSummary> {
-        let agents = self.state.agents.read().await;
-        let mut summaries = Vec::with_capacity(agents.len());
-        for agent in agents.values() {
-            summaries.push(agent.summary.read().await.clone());
-        }
-        summaries.sort_by_key(|s| s.created_at);
-        summaries
+        let agents = self.state.agents.read().await.values().cloned().collect();
+        agents::list_agents(agents).await
     }
 
     pub async fn update_agent(
@@ -2334,67 +2329,11 @@ impl AgentRuntime {
         agent_id: AgentId,
         session_id: Option<SessionId>,
     ) -> Result<AgentDetail> {
-        let agent = self.agent(agent_id).await?;
-        let summary = agent.summary.read().await.clone();
-        let (sessions, selected_session_id, context_tokens_used, messages) = {
-            let sessions = agent.sessions.lock().await;
-            let selected_session =
-                agents::selected_session(&sessions, session_id).ok_or_else(|| {
-                    RuntimeError::SessionNotFound {
-                        agent_id,
-                        session_id: session_id.unwrap_or_default(),
-                    }
-                })?;
-            (
-                sessions
-                    .iter()
-                    .map(|session| session.summary.clone())
-                    .collect(),
-                selected_session.summary.id,
-                selected_session.last_context_tokens.unwrap_or_default(),
-                selected_session.messages.clone(),
-            )
-        };
-        let context_usage = self
-            .deps
-            .store
-            .resolve_provider(Some(&summary.provider_id), Some(&summary.model))
-            .await
-            .ok()
-            .map(|provider_selection| ContextUsage {
-                used_tokens: context_tokens_used,
-                context_tokens: provider_selection.model.context_tokens,
-                threshold_percent: AUTO_COMPACT_THRESHOLD_PERCENT,
-            });
-        let recent_events = self.events.for_agent(agent_id).await;
-        Ok(AgentDetail {
-            summary,
-            sessions,
-            selected_session_id,
-            context_usage,
-            messages,
-            recent_events,
-        })
+        agents::get_agent(self, agent_id, session_id, AUTO_COMPACT_THRESHOLD_PERCENT).await
     }
 
     pub async fn create_session(&self, agent_id: AgentId) -> Result<AgentSessionSummary> {
-        let agent = self.agent(agent_id).await?;
-        if agent.summary.read().await.task_id.is_some() {
-            return Err(RuntimeError::InvalidInput(
-                "task-owned agents use a single internal task session".to_string(),
-            ));
-        }
-        let session = {
-            let mut sessions = agent.sessions.lock().await;
-            let session = agents::next_chat_session_record(sessions.len());
-            sessions.push(session.clone());
-            session.summary
-        };
-        self.deps
-            .store
-            .save_agent_session(agent_id, &session)
-            .await?;
-        Ok(session)
+        agents::create_session(self, agent_id).await
     }
 
     pub async fn tool_trace(
@@ -2554,32 +2493,7 @@ impl AgentRuntime {
     }
 
     async fn prepare_turn(&self, agent_id: AgentId) -> Result<(Arc<AgentRecord>, TurnId)> {
-        let agent = self.agent(agent_id).await?;
-        let turn_id = Uuid::new_v4();
-        let should_start = {
-            let mut summary = agent.summary.write().await;
-            if !summary.status.can_start_turn() {
-                false
-            } else {
-                summary.status = AgentStatus::RunningTurn;
-                summary.current_turn = Some(turn_id);
-                summary.updated_at = now();
-                summary.last_error = None;
-                agent.cancel_requested.store(false, Ordering::SeqCst);
-                true
-            }
-        };
-        if !should_start {
-            return Err(RuntimeError::AgentBusy(agent_id));
-        }
-        self.persist_agent(&agent).await?;
-        self.events
-            .publish(ServiceEventKind::AgentStatusChanged {
-                agent_id,
-                status: AgentStatus::RunningTurn,
-            })
-            .await;
-        Ok((agent, turn_id))
+        agents::prepare_turn(self, agent_id).await
     }
 
     fn spawn_turn(
@@ -2686,57 +2600,11 @@ impl AgentRuntime {
     }
 
     async fn close_agent(&self, agent_id: AgentId) -> Result<AgentStatus> {
-        let agent = self.agent(agent_id).await?;
-        agent.cancel_requested.store(true, Ordering::SeqCst);
-        let previous_status = agent.summary.read().await.status.clone();
-        if let Some(manager) = agent.mcp.write().await.take() {
-            manager.shutdown().await;
-        }
-        let in_memory_container_id = agent
-            .container
-            .write()
-            .await
-            .take()
-            .map(|container| container.id);
-        let persisted_container_id = agent.summary.read().await.container_id.clone();
-        let preferred_container_id = in_memory_container_id.or(persisted_container_id);
-        let _ = self
-            .deps
-            .docker
-            .delete_agent_containers(&agent_id.to_string(), preferred_container_id.as_deref())
-            .await?;
-        {
-            let mut summary = agent.summary.write().await;
-            summary.status = AgentStatus::Deleted;
-            summary.container_id = None;
-            summary.current_turn = None;
-            summary.updated_at = now();
-        }
-        self.persist_agent(&agent).await?;
-        self.events
-            .publish(ServiceEventKind::AgentStatusChanged {
-                agent_id,
-                status: AgentStatus::Deleted,
-            })
-            .await;
-        Ok(previous_status)
+        agents::close_agent(self, agent_id).await
     }
 
     async fn resume_agent(&self, agent_id: AgentId) -> Result<AgentSummary> {
-        let agent = self.agent(agent_id).await?;
-        {
-            let mut summary = agent.summary.write().await;
-            if summary.status == AgentStatus::Deleted {
-                summary.status = AgentStatus::Idle;
-                summary.last_error = None;
-                summary.updated_at = now();
-            }
-            summary.container_id = None;
-        }
-        self.persist_agent(&agent).await?;
-        self.ensure_agent_container(&agent, AgentStatus::Idle)
-            .await?;
-        Ok(agent.summary.read().await.clone())
+        agents::resume_agent(self, agent_id).await
     }
 
     pub async fn cancel_task(self: &Arc<Self>, task_id: TaskId) -> Result<()> {
@@ -6293,6 +6161,68 @@ EOF\n\
             .project_mcp_manager_for_agent(agent, agent_id, cancellation_token)
             .await?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl agents::AgentServiceOps for AgentRuntime {
+    async fn agent(&self, agent_id: AgentId) -> Result<Arc<AgentRecord>> {
+        AgentRuntime::agent(self, agent_id).await
+    }
+
+    async fn save_agent_session(
+        &self,
+        agent_id: AgentId,
+        session: &AgentSessionSummary,
+    ) -> Result<()> {
+        self.deps
+            .store
+            .save_agent_session(agent_id, session)
+            .await?;
+        Ok(())
+    }
+
+    async fn persist_agent(&self, agent: &AgentRecord) -> Result<()> {
+        AgentRuntime::persist_agent(self, agent).await
+    }
+
+    async fn publish(&self, event: ServiceEventKind) {
+        self.events.publish(event).await;
+    }
+
+    async fn recent_events_for_agent(&self, agent_id: AgentId) -> Vec<ServiceEvent> {
+        self.events.for_agent(agent_id).await
+    }
+
+    async fn provider_context_tokens(&self, provider_id: &str, model: &str) -> Option<u64> {
+        self.deps
+            .store
+            .resolve_provider(Some(provider_id), Some(model))
+            .await
+            .ok()
+            .map(|selection| selection.model.context_tokens)
+    }
+
+    async fn delete_agent_containers(
+        &self,
+        agent_id: AgentId,
+        preferred_container_id: Option<String>,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .deps
+            .docker
+            .delete_agent_containers(&agent_id.to_string(), preferred_container_id.as_deref())
+            .await?)
+    }
+
+    async fn ensure_agent_container(
+        &self,
+        agent: &Arc<AgentRecord>,
+        status: AgentStatus,
+    ) -> Result<()> {
+        AgentRuntime::ensure_agent_container(self, agent, status)
+            .await
+            .map(|_| ())
     }
 }
 
