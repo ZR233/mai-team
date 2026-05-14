@@ -1693,68 +1693,7 @@ impl AgentRuntime {
         title: String,
         markdown: String,
     ) -> Result<TaskSummary> {
-        let agent = self.agent(agent_id).await?;
-        let summary = agent.summary.read().await.clone();
-        if summary.role != Some(AgentRole::Planner) {
-            return Err(RuntimeError::InvalidInput(
-                "only planner task agents can save task plans".to_string(),
-            ));
-        }
-        let task_id = summary.task_id.ok_or_else(|| {
-            RuntimeError::InvalidInput("agent is not attached to a task".to_string())
-        })?;
-        let task = self.task(task_id).await?;
-        {
-            let mut plan = task.plan.write().await;
-            if plan.version > 0 {
-                let entry = PlanHistoryEntry {
-                    version: plan.version,
-                    title: plan.title.clone(),
-                    markdown: plan.markdown.clone(),
-                    saved_at: plan.saved_at,
-                    saved_by_agent_id: plan.saved_by_agent_id,
-                    revision_feedback: plan.revision_feedback.clone(),
-                    revision_requested_at: plan.revision_requested_at,
-                };
-                self.deps
-                    .store
-                    .save_plan_history_entry(task_id, &entry)
-                    .await?;
-                task.plan_history.write().await.push(entry);
-            }
-            let version = plan.version.saturating_add(1).max(1);
-            *plan = TaskPlan {
-                status: PlanStatus::Ready,
-                title: Some(title.trim().to_string()),
-                markdown: Some(markdown.trim().to_string()),
-                version,
-                saved_by_agent_id: Some(agent_id),
-                saved_at: Some(now()),
-                approved_at: None,
-                revision_feedback: None,
-                revision_requested_at: None,
-            };
-            let mut task_summary = task.summary.write().await;
-            task_summary.status = TaskStatus::AwaitingApproval;
-            task_summary.plan_status = PlanStatus::Ready;
-            task_summary.plan_version = version;
-            task_summary.current_agent_id = Some(agent_id);
-            task_summary.updated_at = now();
-            tasks::refresh_summary_counts(&self.state, &mut task_summary).await;
-            self.deps.store.save_task(&task_summary, &plan).await?;
-            self.events
-                .publish(ServiceEventKind::PlanUpdated {
-                    task_id,
-                    plan: plan.clone(),
-                })
-                .await;
-            self.events
-                .publish(ServiceEventKind::TaskUpdated {
-                    task: task_summary.clone(),
-                })
-                .await;
-        }
-        Ok(self.task_summary(&task).await)
+        tasks::save_task_plan(&self.state, self.as_ref(), agent_id, title, markdown).await
     }
 
     async fn submit_review_result(
@@ -1764,47 +1703,15 @@ impl AgentRuntime {
         findings: String,
         summary: String,
     ) -> Result<TaskReview> {
-        let agent = self.agent(agent_id).await?;
-        let agent_summary = agent.summary.read().await.clone();
-        if agent_summary.role != Some(AgentRole::Reviewer) {
-            return Err(RuntimeError::InvalidInput(
-                "only reviewer task agents can submit review results".to_string(),
-            ));
-        }
-        let task_id = agent_summary.task_id.ok_or_else(|| {
-            RuntimeError::InvalidInput("agent is not attached to a task".to_string())
-        })?;
-        let task = self.task(task_id).await?;
-        let review = {
-            let mut reviews = task.reviews.write().await;
-            let review = TaskReview {
-                id: Uuid::new_v4(),
-                task_id,
-                reviewer_agent_id: agent_id,
-                round: reviews.len() as u64 + 1,
-                passed,
-                findings,
-                summary,
-                created_at: now(),
-            };
-            self.deps.store.append_task_review(&review).await?;
-            reviews.push(review.clone());
-            review
-        };
-        {
-            let plan = task.plan.read().await.clone();
-            let mut summary = task.summary.write().await;
-            summary.review_rounds = task.reviews.read().await.len() as u64;
-            summary.updated_at = now();
-            tasks::refresh_summary_counts(&self.state, &mut summary).await;
-            self.deps.store.save_task(&summary, &plan).await?;
-            self.events
-                .publish(ServiceEventKind::TaskUpdated {
-                    task: summary.clone(),
-                })
-                .await;
-        }
-        Ok(review)
+        tasks::submit_review_result(
+            &self.state,
+            self.as_ref(),
+            agent_id,
+            passed,
+            findings,
+            summary,
+        )
+        .await
     }
 
     fn spawn_task_workflow(self: &Arc<Self>, task_id: TaskId) {
@@ -4353,6 +4260,36 @@ impl tasks::TaskUpdateOps for AgentRuntime {
     async fn publish_task_updated(&self, task: TaskSummary) {
         self.events
             .publish(ServiceEventKind::TaskUpdated { task })
+            .await;
+    }
+}
+
+impl tasks::TaskToolOps for AgentRuntime {
+    async fn agent_summary(&self, agent_id: AgentId) -> Result<AgentSummary> {
+        let agent = self.agent(agent_id).await?;
+        Ok(agent.summary.read().await.clone())
+    }
+
+    async fn save_plan_history_entry(
+        &self,
+        task_id: TaskId,
+        entry: &PlanHistoryEntry,
+    ) -> Result<()> {
+        self.deps
+            .store
+            .save_plan_history_entry(task_id, entry)
+            .await?;
+        Ok(())
+    }
+
+    async fn append_task_review(&self, review: &TaskReview) -> Result<()> {
+        self.deps.store.append_task_review(review).await?;
+        Ok(())
+    }
+
+    async fn publish_plan_updated(&self, task_id: TaskId, plan: TaskPlan) {
+        self.events
+            .publish(ServiceEventKind::PlanUpdated { task_id, plan })
             .await;
     }
 }
