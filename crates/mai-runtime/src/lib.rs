@@ -2164,43 +2164,14 @@ impl AgentRuntime {
         arguments: Value,
         cancellation_token: CancellationToken,
     ) -> Result<ToolExecution> {
-        let agent_id = agent.summary.read().await.id;
-        let Some(manager) = self
-            .project_mcp_manager_for_agent(agent, agent_id, &cancellation_token)
-            .await?
-        else {
-            return Err(RuntimeError::InvalidInput(
-                "project MCP manager is not available".to_string(),
-            ));
-        };
-        let token = self
-            .project_git_token_for_agent(agent)
-            .await?
-            .unwrap_or_default();
-        let summary = agent.summary.read().await.clone();
-        let arguments = projects::review::project_review_mcp_arguments_with_model_footer(
+        projects::mcp::execute_project_mcp_tool(
+            self,
+            agent,
             model_name,
             arguments,
-            summary.role.as_ref(),
-            &summary.model,
-        );
-        let output = tokio::select! {
-            output = manager.call_model_tool(model_name, arguments) => output,
-            _ = cancellation_token.cancelled() => {
-                return Err(RuntimeError::TurnCancelled);
-            }
-        };
-        let output = output.map_err(|err| match err {
-            mai_mcp::McpError::ToolNotFound(_) => RuntimeError::InvalidInput(format!(
-                "project MCP tool `{model_name}` was not discovered"
-            )),
-            other => RuntimeError::InvalidInput(redact_secret(&other.to_string(), &token)),
-        })?;
-        Ok(ToolExecution::new(
-            true,
-            redact_secret(&output.to_string(), &token),
-            false,
-        ))
+            cancellation_token,
+        )
+        .await
     }
 
     async fn agent_resource_broker(
@@ -3223,6 +3194,24 @@ impl projects::review::workspace::ProjectReviewWorkspaceOps for AgentRuntime {
             )
             .await
         }
+    }
+}
+
+impl projects::mcp::ProjectMcpToolOps for AgentRuntime {
+    fn project_mcp_manager_for_agent(
+        &self,
+        agent: &AgentRecord,
+        agent_id: AgentId,
+        cancellation_token: &CancellationToken,
+    ) -> impl std::future::Future<Output = Result<Option<Arc<McpAgentManager>>>> + Send {
+        AgentRuntime::project_mcp_manager_for_agent(self, agent, agent_id, cancellation_token)
+    }
+
+    fn project_git_token_for_agent(
+        &self,
+        agent: &AgentRecord,
+    ) -> impl std::future::Future<Output = Result<Option<String>>> + Send {
+        AgentRuntime::project_git_token_for_agent(self, agent)
     }
 }
 
