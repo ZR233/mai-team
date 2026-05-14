@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -18,7 +18,11 @@ use crate::{Result, RuntimeError};
 mod fork;
 mod input;
 mod wait;
+mod delete;
 
+pub(crate) use delete::{
+    AgentContainerDeleteRequest, AgentDeleteOps, AgentDeleteStatusChange, delete_agent,
+};
 pub(crate) use fork::fork_agent_context;
 #[cfg(test)]
 pub(crate) use input::start_next_queued_input;
@@ -347,38 +351,6 @@ pub(crate) fn session_record_with_title(title: &str) -> AgentSessionRecord {
         last_context_tokens: None,
         last_turn_response: None,
     }
-}
-
-pub(crate) fn descendant_delete_order_from_summaries(
-    root_id: AgentId,
-    summaries: &[AgentSummary],
-) -> Vec<AgentId> {
-    let mut children: HashMap<AgentId, Vec<&AgentSummary>> = HashMap::new();
-    for summary in summaries {
-        if let Some(parent_id) = summary.parent_id {
-            children.entry(parent_id).or_default().push(summary);
-        }
-    }
-    for values in children.values_mut() {
-        values.sort_by_key(|summary| summary.created_at);
-    }
-
-    let mut order = Vec::new();
-    push_delete_order(root_id, &children, &mut order);
-    order
-}
-
-fn push_delete_order(
-    agent_id: AgentId,
-    children: &HashMap<AgentId, Vec<&AgentSummary>>,
-    order: &mut Vec<AgentId>,
-) {
-    if let Some(child_summaries) = children.get(&agent_id) {
-        for child in child_summaries {
-            push_delete_order(child.id, children, order);
-        }
-    }
-    order.push(agent_id);
 }
 
 pub(crate) fn selected_session(

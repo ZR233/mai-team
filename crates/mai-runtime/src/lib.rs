@@ -1916,11 +1916,7 @@ impl AgentRuntime {
     }
 
     pub async fn delete_agent(&self, agent_id: AgentId) -> Result<()> {
-        let targets = self.descendant_delete_order(agent_id).await?;
-        for target_id in targets {
-            self.delete_agent_record(target_id).await?;
-        }
-        Ok(())
+        agents::delete_agent(self, agent_id).await
     }
 
     async fn close_agent(&self, agent_id: AgentId) -> Result<AgentStatus> {
@@ -1968,85 +1964,6 @@ impl AgentRuntime {
             .publish(ServiceEventKind::TaskDeleted { task_id })
             .await;
         Ok(())
-    }
-
-    async fn delete_agent_record(&self, agent_id: AgentId) -> Result<()> {
-        let agent = self.agent(agent_id).await?;
-        let reviewer_project_id = {
-            let summary = agent.summary.read().await;
-            (summary.role == Some(AgentRole::Reviewer))
-                .then_some(summary.project_id)
-                .flatten()
-        };
-        agent.cancel_requested.store(true, Ordering::SeqCst);
-        self.set_status(&agent, AgentStatus::DeletingContainer, None)
-            .await?;
-        if let Some(control) = agent.active_turn.lock().expect("active turn lock").clone() {
-            control.cancellation_token.cancel();
-            if let Some(abort_handle) = control.abort_handle {
-                abort_handle.abort();
-            }
-        }
-        if let Some(manager) = agent.mcp.write().await.take() {
-            manager.shutdown().await;
-        }
-        let in_memory_container_id = agent
-            .container
-            .write()
-            .await
-            .take()
-            .map(|container| container.id);
-        let persisted_container_id = agent.summary.read().await.container_id.clone();
-        let preferred_container_id = in_memory_container_id.or(persisted_container_id);
-        let deleted = self
-            .deps
-            .docker
-            .delete_agent_containers(&agent_id.to_string(), preferred_container_id.as_deref())
-            .await?;
-        if !deleted.is_empty() {
-            tracing::info!(
-                agent_id = %agent_id,
-                count = deleted.len(),
-                "removed agent containers"
-            );
-        }
-        if let Some(project_id) = reviewer_project_id
-            && let Err(err) = self
-                .cleanup_project_review_worktree(project_id, agent_id)
-                .await
-        {
-            tracing::warn!(
-                project_id = %project_id,
-                reviewer_id = %agent_id,
-                "failed to clean project reviewer worktree during agent deletion: {err}"
-            );
-        }
-        let _turn_guard = agent.turn_lock.lock().await;
-        self.set_status(&agent, AgentStatus::Deleted, None).await?;
-        self.deps.store.delete_agent(agent_id).await?;
-        self.state.agents.write().await.remove(&agent_id);
-        self.events
-            .publish(ServiceEventKind::AgentDeleted { agent_id })
-            .await;
-        Ok(())
-    }
-
-    async fn descendant_delete_order(&self, root_id: AgentId) -> Result<Vec<AgentId>> {
-        let summaries = {
-            let agents = self.state.agents.read().await;
-            let mut summaries = Vec::with_capacity(agents.len());
-            for agent in agents.values() {
-                summaries.push(agent.summary.read().await.clone());
-            }
-            summaries
-        };
-        if !summaries.iter().any(|summary| summary.id == root_id) {
-            return Err(RuntimeError::AgentNotFound(root_id));
-        }
-
-        Ok(agents::descendant_delete_order_from_summaries(
-            root_id, &summaries,
-        ))
     }
 
     pub async fn upload_file(
@@ -4903,6 +4820,71 @@ impl agents::AgentInputOps for Arc<AgentRuntime> {
     }
 }
 
+impl agents::AgentDeleteOps for AgentRuntime {
+    fn agent(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<Arc<AgentRecord>>> + Send {
+        AgentRuntime::agent(self, agent_id)
+    }
+
+    async fn agent_summaries(&self) -> Vec<AgentSummary> {
+        let agents = self.state.agents.read().await;
+        let mut summaries = Vec::with_capacity(agents.len());
+        for agent in agents.values() {
+            summaries.push(agent.summary.read().await.clone());
+        }
+        summaries
+    }
+
+    fn set_agent_status(
+        &self,
+        agent: Arc<AgentRecord>,
+        change: agents::AgentDeleteStatusChange,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            AgentRuntime::set_status(self, &agent, change.status, change.error).await
+        }
+    }
+
+    async fn delete_agent_containers(
+        &self,
+        request: agents::AgentContainerDeleteRequest,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .deps
+            .docker
+            .delete_agent_containers(
+                &request.agent_id.to_string(),
+                request.preferred_container_id.as_deref(),
+            )
+            .await?)
+    }
+
+    fn cleanup_project_review_worktree(
+        &self,
+        project_id: ProjectId,
+        reviewer_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::cleanup_project_review_worktree(self, project_id, reviewer_id)
+    }
+
+    async fn delete_agent_from_store(&self, agent_id: AgentId) -> Result<()> {
+        self.deps.store.delete_agent(agent_id).await?;
+        Ok(())
+    }
+
+    async fn remove_agent_from_memory(&self, agent_id: AgentId) {
+        self.state.agents.write().await.remove(&agent_id);
+    }
+
+    async fn publish_agent_deleted(&self, agent_id: AgentId) {
+        self.events
+            .publish(ServiceEventKind::AgentDeleted { agent_id })
+            .await;
+    }
+}
+
 impl projects::review::runs::ReviewRunSnapshotSource for AgentRuntime {
     async fn snapshot(&self, reviewer_agent_id: AgentId) -> (Vec<AgentMessage>, Vec<ServiceEvent>) {
         let messages = self
@@ -7162,40 +7144,6 @@ esac
             .expect("create task");
 
         assert!(runtime.approve_task_plan(task.id).await.is_err());
-    }
-
-    #[test]
-    fn descendant_delete_order_deletes_children_before_parents() {
-        let parent = Uuid::new_v4();
-        let older_child = Uuid::new_v4();
-        let younger_child = Uuid::new_v4();
-        let grandchild = Uuid::new_v4();
-        let unrelated = Uuid::new_v4();
-        let base = now();
-        let summaries = vec![
-            test_agent_summary_at(parent, None, base),
-            test_agent_summary_at(
-                younger_child,
-                Some(parent),
-                base + chrono::Duration::seconds(2),
-            ),
-            test_agent_summary_at(
-                older_child,
-                Some(parent),
-                base + chrono::Duration::seconds(1),
-            ),
-            test_agent_summary_at(
-                grandchild,
-                Some(older_child),
-                base + chrono::Duration::seconds(3),
-            ),
-            test_agent_summary_at(unrelated, None, base + chrono::Duration::seconds(4)),
-        ];
-
-        assert_eq!(
-            agents::descendant_delete_order_from_summaries(parent, &summaries),
-            vec![grandchild, older_child, younger_child, parent]
-        );
     }
 
     #[tokio::test]
