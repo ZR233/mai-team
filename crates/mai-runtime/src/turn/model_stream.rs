@@ -250,11 +250,12 @@ impl<'a> ModelStreamReducer<'a> {
                 let reasoning_content =
                     (!active.reasoning.trim().is_empty()).then_some(active.reasoning);
                 if reasoning_content.is_some() {
-                    self.final_output_items.push(ModelOutputItem::AssistantTurn {
-                        content: (!text.trim().is_empty()).then_some(text.clone()),
-                        reasoning_content: reasoning_content.clone(),
-                        tool_calls: Vec::new(),
-                    });
+                    self.final_output_items
+                        .push(ModelOutputItem::AssistantTurn {
+                            content: (!text.trim().is_empty()).then_some(text.clone()),
+                            reasoning_content: reasoning_content.clone(),
+                            tool_calls: Vec::new(),
+                        });
                 } else {
                     self.final_output_items
                         .push(ModelOutputItem::Message { text: text.clone() });
@@ -345,17 +346,16 @@ impl<'a> ModelStreamReducer<'a> {
                     .or_else(|| (!active.text.trim().is_empty()).then_some(active.text))
                     .filter(|text| !text.trim().is_empty());
                 let reasoning_content = reasoning_content
-                    .or_else(|| {
-                        (!active.reasoning.trim().is_empty()).then_some(active.reasoning)
-                    })
+                    .or_else(|| (!active.reasoning.trim().is_empty()).then_some(active.reasoning))
                     .filter(|reasoning| !reasoning.trim().is_empty());
                 let has_content = content.is_some();
                 let has_reasoning = reasoning_content.is_some();
-                self.final_output_items.push(ModelOutputItem::AssistantTurn {
-                    content: content.clone(),
-                    reasoning_content: reasoning_content.clone(),
-                    tool_calls: output_tool_calls,
-                });
+                self.final_output_items
+                    .push(ModelOutputItem::AssistantTurn {
+                        content: content.clone(),
+                        reasoning_content: reasoning_content.clone(),
+                        tool_calls: output_tool_calls,
+                    });
                 if has_content || has_reasoning || !assistant_tool_calls.is_empty() {
                     self.made_progress = true;
                     if let Some(reasoning) = &reasoning_content {
@@ -437,11 +437,12 @@ impl<'a> ModelStreamReducer<'a> {
             self.made_progress = true;
             let reasoning = self.fallback_reasoning.clone();
             self.last_reasoning_content = Some(reasoning.clone());
-            self.final_output_items.push(ModelOutputItem::AssistantTurn {
-                content: None,
-                reasoning_content: Some(reasoning.clone()),
-                tool_calls: Vec::new(),
-            });
+            self.final_output_items
+                .push(ModelOutputItem::AssistantTurn {
+                    content: None,
+                    reasoning_content: Some(reasoning.clone()),
+                    tool_calls: Vec::new(),
+                });
             super::history::record_history_item(
                 self.store,
                 self.agent,
@@ -625,8 +626,7 @@ mod tests {
     use super::*;
     use futures::stream;
     use mai_protocol::{
-        AgentSessionSummary, AgentStatus, AgentSummary, ModelContentItem, ModelOutputToolCall,
-        now,
+        AgentSessionSummary, AgentStatus, AgentSummary, ModelContentItem, ModelOutputToolCall, now,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
@@ -710,10 +710,7 @@ mod tests {
                 })),
                 pending_inputs: Mutex::new(VecDeque::new()),
             });
-            store
-                .save_agent(&summary, None)
-                .await
-                .expect("save agent");
+            store.save_agent(&summary, None).await.expect("save agent");
             store
                 .save_agent_session(agent_id, &session_summary)
                 .await
@@ -1039,7 +1036,10 @@ mod tests {
             .await
             .expect("consume");
 
-        assert_eq!(result.last_assistant_text.as_deref(), Some("fallback answer"));
+        assert_eq!(
+            result.last_assistant_text.as_deref(),
+            Some("fallback answer")
+        );
         assert!(matches!(
             &result.response.output[0],
             ModelOutputItem::Message { text } if text == "fallback answer"

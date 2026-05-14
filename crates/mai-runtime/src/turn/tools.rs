@@ -1,19 +1,220 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use mai_mcp::McpTool;
 use mai_protocol::{
     AgentId, ModelInputItem, ServiceEventKind, SessionId, ToolOutputArtifactInfo, ToolTraceDetail,
     TurnId, now, preview,
 };
 use mai_store::ConfigStore;
+use mai_tools::{RoutedTool, route_tool};
 use serde_json::{Value, json};
 use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::events::RuntimeEvents;
-use crate::state::{AgentRecord, ToolExecution, ToolOutputCapture};
+use crate::state::{AgentRecord, RuntimeState};
 use crate::{Result, RuntimeError};
+
+const TOKEN_ESTIMATE_BYTES: usize = 4;
+pub(crate) const DEFAULT_MODEL_TOOL_OUTPUT_TOKENS: usize = 10_000;
+#[cfg(test)]
+const DEFAULT_MODEL_TOOL_OUTPUT_BYTES: usize =
+    DEFAULT_MODEL_TOOL_OUTPUT_TOKENS * TOKEN_ESTIMATE_BYTES;
+
+#[derive(Debug)]
+pub(crate) struct ToolExecution {
+    pub(crate) success: bool,
+    pub(crate) output: String,
+    pub(crate) model_output: String,
+    pub(crate) ends_turn: bool,
+    pub(crate) output_artifacts: Vec<ToolOutputArtifactInfo>,
+}
+
+impl ToolExecution {
+    pub(crate) fn new(success: bool, output: String, ends_turn: bool) -> Self {
+        Self::with_model_tokens(
+            success,
+            output,
+            ends_turn,
+            DEFAULT_MODEL_TOOL_OUTPUT_TOKENS,
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn with_model_tokens(
+        success: bool,
+        output: String,
+        ends_turn: bool,
+        max_output_tokens: usize,
+        output_artifacts: Vec<ToolOutputArtifactInfo>,
+    ) -> Self {
+        let model_output = bounded_model_tool_output_with_tokens(&output, max_output_tokens);
+        Self {
+            success,
+            output,
+            model_output,
+            ends_turn,
+            output_artifacts,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ToolOutputCapture {
+    pub(crate) call_id: String,
+    pub(crate) stdout_id: String,
+    pub(crate) stderr_id: String,
+    pub(crate) stdout_path: PathBuf,
+    pub(crate) stderr_path: PathBuf,
+    pub(crate) stdout_name: String,
+    pub(crate) stderr_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct AgentCapability {
+    can_spawn_agents: bool,
+    can_close_agents: bool,
+    communication: AgentCommunicationPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentCommunicationPolicy {
+    All,
+    ParentAndMaintainer,
+}
+
+pub(crate) async fn check_tool_permission(
+    state: &RuntimeState,
+    agent: &AgentRecord,
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<()> {
+    let capability = agent_capability(state, agent).await;
+    match route_tool(tool_name) {
+        RoutedTool::SpawnAgent if !capability.can_spawn_agents => {
+            return Err(RuntimeError::InvalidInput(
+                "Tool 'spawn_agent' is not available for worker agents".to_string(),
+            ));
+        }
+        RoutedTool::CloseAgent if !capability.can_close_agents => {
+            return Err(RuntimeError::InvalidInput(
+                "Tool 'close_agent' is not available for worker agents".to_string(),
+            ));
+        }
+        RoutedTool::SendInput | RoutedTool::SendMessage => {
+            let target = match route_tool(tool_name) {
+                RoutedTool::SendInput => parse_agent_id(&required_any_string_argument(
+                    arguments,
+                    &["target", "agent_id"],
+                )?)?,
+                RoutedTool::SendMessage => {
+                    parse_agent_id(&required_string_argument(arguments, "agent_id")?)?
+                }
+                _ => unreachable!(),
+            };
+            if !agent_can_access_target(state, agent, target).await {
+                return Err(RuntimeError::InvalidInput(
+                    "target agent is outside this agent's communication policy".to_string(),
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub(crate) async fn visible_tool_names(
+    state: &RuntimeState,
+    agent: &AgentRecord,
+    mcp_tools: &[McpTool],
+) -> HashSet<String> {
+    let capability = agent_capability(state, agent).await;
+    let mut names = HashSet::from([
+        mai_tools::TOOL_CONTAINER_EXEC.to_string(),
+        mai_tools::TOOL_READ_FILE.to_string(),
+        mai_tools::TOOL_LIST_FILES.to_string(),
+        mai_tools::TOOL_SEARCH_FILES.to_string(),
+        mai_tools::TOOL_APPLY_PATCH.to_string(),
+        mai_tools::TOOL_CONTAINER_CP_UPLOAD.to_string(),
+        mai_tools::TOOL_CONTAINER_CP_DOWNLOAD.to_string(),
+        mai_tools::TOOL_SEND_INPUT.to_string(),
+        mai_tools::TOOL_SEND_MESSAGE.to_string(),
+        mai_tools::TOOL_WAIT_AGENT.to_string(),
+        mai_tools::TOOL_LIST_AGENTS.to_string(),
+        mai_tools::TOOL_RESUME_AGENT.to_string(),
+        mai_tools::TOOL_LIST_MCP_RESOURCES.to_string(),
+        mai_tools::TOOL_LIST_MCP_RESOURCE_TEMPLATES.to_string(),
+        mai_tools::TOOL_READ_MCP_RESOURCE.to_string(),
+        mai_tools::TOOL_SAVE_TASK_PLAN.to_string(),
+        mai_tools::TOOL_SUBMIT_REVIEW_RESULT.to_string(),
+        mai_tools::TOOL_UPDATE_TODO_LIST.to_string(),
+        mai_tools::TOOL_REQUEST_USER_INPUT.to_string(),
+        mai_tools::TOOL_SAVE_ARTIFACT.to_string(),
+        mai_tools::TOOL_GITHUB_API_GET.to_string(),
+    ]);
+    if capability.can_spawn_agents {
+        names.insert(mai_tools::TOOL_SPAWN_AGENT.to_string());
+    }
+    if capability.can_close_agents {
+        names.insert(mai_tools::TOOL_CLOSE_AGENT.to_string());
+    }
+    names.extend(mcp_tools.iter().map(|tool| tool.model_name.clone()));
+    names
+}
+
+async fn agent_capability(state: &RuntimeState, agent: &AgentRecord) -> AgentCapability {
+    let summary = agent.summary.read().await.clone();
+    let is_project_maintainer = if let Some(project_id) = summary.project_id {
+        let project = state.projects.read().await.get(&project_id).cloned();
+        if let Some(project) = project {
+            project.summary.read().await.maintainer_agent_id == summary.id
+        } else {
+            false
+        }
+    } else {
+        summary.parent_id.is_none()
+    };
+    if is_project_maintainer || summary.parent_id.is_none() {
+        AgentCapability {
+            can_spawn_agents: true,
+            can_close_agents: true,
+            communication: AgentCommunicationPolicy::All,
+        }
+    } else {
+        AgentCapability {
+            can_spawn_agents: false,
+            can_close_agents: false,
+            communication: AgentCommunicationPolicy::ParentAndMaintainer,
+        }
+    }
+}
+
+async fn agent_can_access_target(
+    state: &RuntimeState,
+    agent: &AgentRecord,
+    target: AgentId,
+) -> bool {
+    let capability = agent_capability(state, agent).await;
+    if capability.communication == AgentCommunicationPolicy::All {
+        return true;
+    }
+    let summary = agent.summary.read().await.clone();
+    if summary.parent_id == Some(target) {
+        return true;
+    }
+    let Some(project_id) = summary.project_id else {
+        return false;
+    };
+    let project = state.projects.read().await.get(&project_id).cloned();
+    if let Some(project) = project {
+        project.summary.read().await.maintainer_agent_id == target
+    } else {
+        false
+    }
+}
 
 pub(crate) async fn run_tool_call<F, Fut>(
     store: &ConfigStore,
@@ -260,6 +461,120 @@ pub(crate) fn trace_preview_output(output: &str, max: usize) -> String {
         .unwrap_or_else(|_| preview(&redact_preview_string(output), max))
 }
 
+fn required_string_argument(arguments: &Value, field: &str) -> Result<String> {
+    arguments
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| RuntimeError::InvalidInput(format!("missing string field `{field}`")))
+}
+
+fn required_any_string_argument(arguments: &Value, fields: &[&str]) -> Result<String> {
+    for field in fields {
+        if let Some(value) = arguments
+            .get(field)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        {
+            return Ok(value);
+        }
+    }
+    Err(RuntimeError::InvalidInput(format!(
+        "missing string field `{}`",
+        fields.join("` or `")
+    )))
+}
+
+fn parse_agent_id(value: &str) -> Result<AgentId> {
+    Uuid::parse_str(value)
+        .map_err(|err| RuntimeError::InvalidInput(format!("invalid agent_id `{value}`: {err}")))
+}
+
+fn bounded_model_tool_output_with_tokens(output: &str, max_output_tokens: usize) -> String {
+    let max_bytes = max_output_tokens * TOKEN_ESTIMATE_BYTES;
+    if output.len() <= max_bytes {
+        return output.to_string();
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(output) {
+        return bounded_json_tool_output(value, max_bytes).to_string();
+    }
+    let (text, truncated, bytes_omitted, next_offset) = bounded_text(output, max_bytes, 0);
+    json!({
+        "truncated": truncated,
+        "bytes_returned": text.len(),
+        "bytes_omitted": bytes_omitted,
+        "next_offset": next_offset,
+        "text": text,
+    })
+    .to_string()
+}
+
+fn bounded_json_tool_output(mut value: Value, max_bytes: usize) -> Value {
+    match &mut value {
+        Value::Object(map) => {
+            for key in ["stdout", "stderr", "body", "text", "tar_base64"] {
+                if let Some(Value::String(text)) = map.get_mut(key) {
+                    let (bounded, truncated, bytes_omitted, next_offset) =
+                        bounded_text(text, max_bytes, 0);
+                    if truncated {
+                        *text = bounded;
+                        map.insert("truncated".to_string(), Value::Bool(true));
+                        map.insert("bytes_returned".to_string(), json!(max_bytes));
+                        map.insert("bytes_omitted".to_string(), json!(bytes_omitted));
+                        map.insert("next_offset".to_string(), json!(next_offset));
+                        break;
+                    }
+                }
+            }
+            if value.to_string().len() > max_bytes {
+                let serialized = value.to_string();
+                let (text, _, bytes_omitted, next_offset) = bounded_text(&serialized, max_bytes, 0);
+                json!({
+                    "truncated": true,
+                    "bytes_returned": text.len(),
+                    "bytes_omitted": bytes_omitted,
+                    "next_offset": next_offset,
+                    "json_preview": text,
+                })
+            } else {
+                value
+            }
+        }
+        _ => {
+            let serialized = value.to_string();
+            if serialized.len() <= max_bytes {
+                value
+            } else {
+                let (text, _, bytes_omitted, next_offset) = bounded_text(&serialized, max_bytes, 0);
+                json!({
+                    "truncated": true,
+                    "bytes_returned": text.len(),
+                    "bytes_omitted": bytes_omitted,
+                    "next_offset": next_offset,
+                    "json_preview": text,
+                })
+            }
+        }
+    }
+}
+
+fn bounded_text(
+    value: &str,
+    max_bytes: usize,
+    offset: usize,
+) -> (String, bool, usize, Option<usize>) {
+    if value.len() <= max_bytes {
+        return (value.to_string(), false, 0, None);
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let text = value[..end].to_string();
+    let omitted = value.len().saturating_sub(end);
+    (text, true, omitted, Some(offset.saturating_add(end)))
+}
+
 fn inline_event_arguments(value: &Value) -> Option<Value> {
     let redacted = redacted_preview_value(value);
     let serialized = serde_json::to_string(&redacted).ok()?;
@@ -454,10 +769,7 @@ mod tests {
                 })),
                 pending_inputs: Mutex::new(VecDeque::new()),
             });
-            store
-                .save_agent(&summary, None)
-                .await
-                .expect("save agent");
+            store.save_agent(&summary, None).await.expect("save agent");
             store
                 .save_agent_session(agent_id, &session_summary)
                 .await
@@ -571,10 +883,14 @@ mod tests {
 
         assert!(matches!(err, RuntimeError::TurnCancelled));
         assert!(harness.history().await.is_empty());
-        assert!(!harness.events.snapshot().await.iter().any(|event| matches!(
-            event.kind,
-            ServiceEventKind::ToolCompleted { .. }
-        )));
+        assert!(
+            !harness
+                .events
+                .snapshot()
+                .await
+                .iter()
+                .any(|event| matches!(event.kind, ServiceEventKind::ToolCompleted { .. }))
+        );
     }
 
     #[tokio::test]
@@ -614,5 +930,27 @@ mod tests {
         assert!(preview.contains("visible"));
         assert!(!preview.contains("secret-token"));
         assert!(!preview.contains("secret-key"));
+    }
+
+    #[test]
+    fn tool_output_is_truncated_for_model_history_but_trace_keeps_full_output() {
+        let long_stdout = "x".repeat(DEFAULT_MODEL_TOOL_OUTPUT_BYTES + 100);
+        let execution = ToolExecution::new(
+            true,
+            json!({ "status": 0, "stdout": long_stdout, "stderr": "" }).to_string(),
+            false,
+        );
+
+        assert!(execution.output.len() > execution.model_output.len());
+        assert!(execution.output.contains(&"x".repeat(100)));
+        let model_value =
+            serde_json::from_str::<Value>(&execution.model_output).expect("model output json");
+        assert_eq!(model_value["truncated"], true);
+        let visible = model_value
+            .get("stdout")
+            .or_else(|| model_value.get("json_preview"))
+            .and_then(Value::as_str)
+            .expect("visible output");
+        assert!(visible.len() <= DEFAULT_MODEL_TOOL_OUTPUT_BYTES);
     }
 }

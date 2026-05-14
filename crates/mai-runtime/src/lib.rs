@@ -9,7 +9,9 @@ use mai_docker::{
     ContainerCreateOptions, ContainerHandle, DockerClient, ExecCaptureOptions,
     project_review_workspace_volume, project_workspace_volume,
 };
-use mai_mcp::{McpAgentManager, McpTool};
+use mai_mcp::McpAgentManager;
+#[cfg(test)]
+use mai_mcp::McpTool;
 use mai_model::{ModelClient, ModelTurnState};
 use mai_protocol::{
     AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentLogsResponse, AgentMessage,
@@ -25,17 +27,15 @@ use mai_protocol::{
     ProjectReviewRunSummary, ProjectReviewRunsResponse, ProjectReviewStatus, ProjectStatus,
     ProjectSummary, RelayGithubInstallationTokenResponse, RepositoryPackageSummary,
     RepositoryPackagesResponse, ResolvedAgentModelPreference, RuntimeDefaultsResponse,
-    SendMessageRequest, ServiceEvent, ServiceEventKind, SessionId, SkillActivationInfo, SkillScope,
-    SkillsConfigRequest, SkillsListResponse, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus,
-    TaskSummary, TodoItem, TokenUsage, ToolOutputArtifactInfo, ToolTraceDetail,
-    ToolTraceListResponse, TurnId, TurnStatus, UpdateAgentRequest, UpdateProjectRequest,
-    UserInputOption, UserInputQuestion, now, preview,
+    SendMessageRequest, ServiceEvent, ServiceEventKind, SessionId, SkillScope, SkillsConfigRequest,
+    SkillsListResponse, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary,
+    TodoItem, TokenUsage, ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceListResponse, TurnId,
+    TurnStatus, UpdateAgentRequest, UpdateProjectRequest, UserInputOption, UserInputQuestion, now,
+    preview,
 };
 #[cfg(test)]
 use mai_protocol::{ModelContentItem, ModelToolCall};
-use mai_skills::{
-    SkillInjections, SkillInput, SkillSelection, SkillsManager, render_available_response,
-};
+use mai_skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
 use mai_store::{AgentLogFilter, ConfigStore, ProviderSelection, ToolTraceFilter};
 use mai_tools::{RoutedTool, build_tool_definitions_with_filter, route_tool};
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
@@ -57,25 +57,24 @@ use uuid::Uuid;
 
 mod deps;
 mod events;
+mod instructions;
 mod state;
 mod tools;
 mod turn;
 
 use deps::RuntimeDeps;
 use events::{RECENT_EVENT_LIMIT, RuntimeEvents};
+use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
 use state::{
     AgentRecord, AgentSessionRecord, CollabInput, ProjectRecord, ProjectReviewWorker,
-    QueuedAgentInput, RuntimeState, TaskRecord, ToolExecution, TurnControl, TurnGuard,
+    QueuedAgentInput, RuntimeState, TaskRecord, TurnControl, TurnGuard,
 };
 use turn::completion::TurnResult;
 use turn::model_stream::TurnModelContext;
+use turn::tools::ToolExecution;
 
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 90;
-const TOKEN_ESTIMATE_BYTES: usize = 4;
-const DEFAULT_MODEL_TOOL_OUTPUT_TOKENS: usize = 10_000;
-#[cfg(test)]
-const DEFAULT_MODEL_TOOL_OUTPUT_BYTES: usize =
-    DEFAULT_MODEL_TOOL_OUTPUT_TOKENS * TOKEN_ESTIMATE_BYTES;
+const DEFAULT_MODEL_TOOL_OUTPUT_TOKENS: usize = turn::tools::DEFAULT_MODEL_TOOL_OUTPUT_TOKENS;
 const DEFAULT_EXEC_OUTPUT_BYTES_CAP: usize = 1024 * 1024;
 const MAX_EXEC_OUTPUT_BYTES_CAP: usize = 16 * 1024 * 1024;
 const MAX_MODEL_TOOL_OUTPUT_TOKENS: usize = 100_000;
@@ -114,7 +113,6 @@ const PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL: &str =
     "mcp__github__pull_request_review_write";
 const PROJECT_GITHUB_CREATE_PULL_REQUEST_REVIEW_TOOL: &str =
     "mcp__github__create_pull_request_review";
-const CONTAINER_SKILLS_ROOT: &str = "/workspace/.mai-team/skills";
 const DEFAULT_SIDECAR_IMAGE: &str = "ghcr.io/zr233/mai-team-sidecar:latest";
 const COMPACT_USER_MESSAGE_MAX_CHARS: usize = 80_000;
 const COMPACT_SUMMARY_PREVIEW_CHARS: usize = 240;
@@ -257,46 +255,6 @@ enum ProjectSkillRefreshSource {
     ReviewWorkspace,
 }
 
-impl ToolExecution {
-    fn new(success: bool, output: String, ends_turn: bool) -> Self {
-        Self::with_model_tokens(
-            success,
-            output,
-            ends_turn,
-            DEFAULT_MODEL_TOOL_OUTPUT_TOKENS,
-            Vec::new(),
-        )
-    }
-
-    fn with_model_tokens(
-        success: bool,
-        output: String,
-        ends_turn: bool,
-        max_output_tokens: usize,
-        output_artifacts: Vec<ToolOutputArtifactInfo>,
-    ) -> Self {
-        let model_output = bounded_model_tool_output_with_tokens(&output, max_output_tokens);
-        Self {
-            success,
-            output,
-            model_output,
-            ends_turn,
-            output_artifacts,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct ContainerSkillPaths {
-    paths: HashMap<PathBuf, PathBuf>,
-}
-
-impl ContainerSkillPaths {
-    fn get(&self, path: &Path) -> Option<&PathBuf> {
-        self.paths.get(path)
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct ProjectReviewCycleReport {
     outcome: ProjectReviewOutcome,
@@ -322,19 +280,6 @@ struct ProjectReviewLoopDecision {
     outcome: Option<ProjectReviewOutcome>,
     summary: Option<String>,
     error: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct AgentCapability {
-    can_spawn_agents: bool,
-    can_close_agents: bool,
-    communication: AgentCommunicationPolicy,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentCommunicationPolicy {
-    All,
-    ParentAndMaintainer,
 }
 
 #[derive(Debug, Clone)]
@@ -3408,7 +3353,7 @@ impl AgentRuntime {
 
         let reserved_tool_names = {
             let mcp_tools = self.agent_mcp_tools(&agent).await;
-            self.visible_tool_names(&agent, &mcp_tools)
+            turn::tools::visible_tool_names(&self.state, &agent, &mcp_tools)
                 .await
                 .into_iter()
                 .collect()
@@ -3433,7 +3378,10 @@ impl AgentRuntime {
                     agent_id,
                     session_id: Some(session_id),
                     turn_id,
-                    skills: skill_activation_info(&skill_injections, &container_skill_paths),
+                    skills: instructions::skill_activation_info(
+                        &skill_injections,
+                        &container_skill_paths,
+                    ),
                 })
                 .await;
             turn::persistence::record_agent_log(
@@ -3453,7 +3401,8 @@ impl AgentRuntime {
         let model_context = {
             let context_started = Instant::now();
             let mcp_tools = self.agent_mcp_tools(&agent).await;
-            let visible_tools = self.visible_tool_names(&agent, &mcp_tools).await;
+            let visible_tools =
+                turn::tools::visible_tool_names(&self.state, &agent, &mcp_tools).await;
             let tools =
                 build_tool_definitions_with_filter(&mcp_tools, |name| visible_tools.contains(name));
             let instructions = {
@@ -3549,7 +3498,7 @@ impl AgentRuntime {
             .await?;
             if turn_model_state.previous_response_id.is_none()
                 && let Some(skill_fragment) =
-                    skill_user_fragment(&skill_injections, &container_skill_paths)
+                    instructions::skill_user_fragment(&skill_injections, &container_skill_paths)
             {
                 history.push(skill_fragment);
             }
@@ -3738,7 +3687,7 @@ impl AgentRuntime {
         if cancellation_token.is_cancelled() {
             return Err(RuntimeError::TurnCancelled);
         }
-        self.check_tool_permission(agent, name, &arguments).await?;
+        turn::tools::check_tool_permission(&self.state, agent, name, &arguments).await?;
         match route_tool(name) {
             RoutedTool::ContainerExec => {
                 let command = required_string(&arguments, "command")?;
@@ -4696,131 +4645,6 @@ impl AgentRuntime {
         }
     }
 
-    async fn agent_capability(&self, agent: &AgentRecord) -> AgentCapability {
-        let summary = agent.summary.read().await.clone();
-        let is_project_maintainer = if let Some(project_id) = summary.project_id {
-            let project = self.state.projects.read().await.get(&project_id).cloned();
-            if let Some(project) = project {
-                project.summary.read().await.maintainer_agent_id == summary.id
-            } else {
-                false
-            }
-        } else {
-            summary.parent_id.is_none()
-        };
-        if is_project_maintainer || summary.parent_id.is_none() {
-            AgentCapability {
-                can_spawn_agents: true,
-                can_close_agents: true,
-                communication: AgentCommunicationPolicy::All,
-            }
-        } else {
-            AgentCapability {
-                can_spawn_agents: false,
-                can_close_agents: false,
-                communication: AgentCommunicationPolicy::ParentAndMaintainer,
-            }
-        }
-    }
-
-    async fn agent_can_access_target(&self, agent: &AgentRecord, target: AgentId) -> bool {
-        let capability = self.agent_capability(agent).await;
-        if capability.communication == AgentCommunicationPolicy::All {
-            return true;
-        }
-        let summary = agent.summary.read().await.clone();
-        if summary.parent_id == Some(target) {
-            return true;
-        }
-        let Some(project_id) = summary.project_id else {
-            return false;
-        };
-        let project = self.state.projects.read().await.get(&project_id).cloned();
-        if let Some(project) = project {
-            project.summary.read().await.maintainer_agent_id == target
-        } else {
-            false
-        }
-    }
-
-    async fn check_tool_permission(
-        &self,
-        agent: &AgentRecord,
-        tool_name: &str,
-        arguments: &Value,
-    ) -> Result<()> {
-        let capability = self.agent_capability(agent).await;
-        match route_tool(tool_name) {
-            RoutedTool::SpawnAgent if !capability.can_spawn_agents => {
-                return Err(RuntimeError::InvalidInput(
-                    "Tool 'spawn_agent' is not available for worker agents".to_string(),
-                ));
-            }
-            RoutedTool::CloseAgent if !capability.can_close_agents => {
-                return Err(RuntimeError::InvalidInput(
-                    "Tool 'close_agent' is not available for worker agents".to_string(),
-                ));
-            }
-            RoutedTool::SendInput | RoutedTool::SendMessage => {
-                let target = match route_tool(tool_name) {
-                    RoutedTool::SendInput => {
-                        parse_agent_id(&required_any_string(arguments, &["target", "agent_id"])?)?
-                    }
-                    RoutedTool::SendMessage => {
-                        parse_agent_id(&required_string(arguments, "agent_id")?)?
-                    }
-                    _ => unreachable!(),
-                };
-                if !self.agent_can_access_target(agent, target).await {
-                    return Err(RuntimeError::InvalidInput(
-                        "target agent is outside this agent's communication policy".to_string(),
-                    ));
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    async fn visible_tool_names(
-        &self,
-        agent: &AgentRecord,
-        mcp_tools: &[McpTool],
-    ) -> HashSet<String> {
-        let capability = self.agent_capability(agent).await;
-        let mut names = HashSet::from([
-            mai_tools::TOOL_CONTAINER_EXEC.to_string(),
-            mai_tools::TOOL_READ_FILE.to_string(),
-            mai_tools::TOOL_LIST_FILES.to_string(),
-            mai_tools::TOOL_SEARCH_FILES.to_string(),
-            mai_tools::TOOL_APPLY_PATCH.to_string(),
-            mai_tools::TOOL_CONTAINER_CP_UPLOAD.to_string(),
-            mai_tools::TOOL_CONTAINER_CP_DOWNLOAD.to_string(),
-            mai_tools::TOOL_SEND_INPUT.to_string(),
-            mai_tools::TOOL_SEND_MESSAGE.to_string(),
-            mai_tools::TOOL_WAIT_AGENT.to_string(),
-            mai_tools::TOOL_LIST_AGENTS.to_string(),
-            mai_tools::TOOL_RESUME_AGENT.to_string(),
-            mai_tools::TOOL_LIST_MCP_RESOURCES.to_string(),
-            mai_tools::TOOL_LIST_MCP_RESOURCE_TEMPLATES.to_string(),
-            mai_tools::TOOL_READ_MCP_RESOURCE.to_string(),
-            mai_tools::TOOL_SAVE_TASK_PLAN.to_string(),
-            mai_tools::TOOL_SUBMIT_REVIEW_RESULT.to_string(),
-            mai_tools::TOOL_UPDATE_TODO_LIST.to_string(),
-            mai_tools::TOOL_REQUEST_USER_INPUT.to_string(),
-            mai_tools::TOOL_SAVE_ARTIFACT.to_string(),
-            mai_tools::TOOL_GITHUB_API_GET.to_string(),
-        ]);
-        if capability.can_spawn_agents {
-            names.insert(mai_tools::TOOL_SPAWN_AGENT.to_string());
-        }
-        if capability.can_close_agents {
-            names.insert(mai_tools::TOOL_CLOSE_AGENT.to_string());
-        }
-        names.extend(mcp_tools.iter().map(|tool| tool.model_name.clone()));
-        names
-    }
-
     async fn send_input_to_agent(
         self: &Arc<Self>,
         target: AgentId,
@@ -4981,48 +4805,25 @@ impl AgentRuntime {
         mcp_tools: &[mai_mcp::McpTool],
         container_skill_paths: &ContainerSkillPaths,
     ) -> Result<String> {
-        let mut instructions = String::from(BASE_INSTRUCTIONS);
-        if let Some(system_prompt) = &agent.system_prompt {
-            instructions.push_str("\n\n## Agent System Prompt\n");
-            instructions.push_str(system_prompt);
-        }
-        instructions.push_str("\n\n## Available Skills\n");
         let summary = agent.summary.read().await;
         let project_id = summary.project_id;
         let prefer_container_skill_paths = summary.role == Some(AgentRole::Reviewer);
         drop(summary);
-        if let Some(project_id) = project_id {
+        let skills_response = if let Some(project_id) = project_id {
             let mut response = skills_manager.list(skills_config)?;
             self.apply_project_skill_source_paths(project_id, &mut response);
-            apply_container_skill_paths(
-                &mut response,
-                container_skill_paths,
-                prefer_container_skill_paths,
-            );
-            instructions.push_str(&render_available_response(response));
+            response
         } else {
-            let mut response = skills_manager.list(skills_config)?;
-            apply_container_skill_paths(&mut response, container_skill_paths, false);
-            instructions.push_str(&render_available_response(response));
-        }
-        if !skill_injections.warnings.is_empty() {
-            instructions.push_str("\n\n## Skill Warnings\n");
-            for warning in &skill_injections.warnings {
-                instructions.push_str(&format!("\n- {warning}"));
-            }
-        }
-        instructions.push_str("\n\n## MCP Tools\n");
-        if mcp_tools.is_empty() {
-            instructions.push_str("No MCP tools are currently available.");
-        } else {
-            for tool in mcp_tools {
-                instructions.push_str(&format!(
-                    "\n- {} maps to MCP `{}` on server `{}`",
-                    tool.model_name, tool.name, tool.server
-                ));
-            }
-        }
-        Ok(instructions)
+            skills_manager.list(skills_config)?
+        };
+        Ok(instructions::build_instructions(
+            agent.system_prompt.as_deref(),
+            skills_response,
+            skill_injections,
+            mcp_tools,
+            container_skill_paths,
+            prefer_container_skill_paths,
+        ))
     }
 
     async fn set_status(
@@ -5372,7 +5173,7 @@ impl AgentRuntime {
             let Some(skill_dir) = skill.path.parent() else {
                 continue;
             };
-            let container_dir = container_skill_dir(&skill);
+            let container_dir = instructions::container_skill_dir(&skill);
             if copied_dirs.insert(container_dir.clone()) {
                 self.deps
                     .docker
@@ -5386,7 +5187,7 @@ impl AgentRuntime {
             }
             mapped.insert(skill.path, container_dir.join("SKILL.md"));
         }
-        Ok(ContainerSkillPaths { paths: mapped })
+        Ok(ContainerSkillPaths::from_paths(mapped))
     }
 
     async fn refresh_project_skills_from_project_sidecar_if_ready(
@@ -8714,91 +8515,6 @@ fn parse_tool_arguments(raw_arguments: &str) -> Value {
     serde_json::from_str(raw_arguments).unwrap_or_else(|_| json!({ "raw": raw_arguments }))
 }
 
-fn bounded_model_tool_output_with_tokens(output: &str, max_output_tokens: usize) -> String {
-    let max_bytes = max_output_tokens * TOKEN_ESTIMATE_BYTES;
-    if output.len() <= max_bytes {
-        return output.to_string();
-    }
-    if let Ok(value) = serde_json::from_str::<Value>(output) {
-        return bounded_json_tool_output(value, max_bytes).to_string();
-    }
-    let (text, truncated, bytes_omitted, next_offset) = bounded_text(output, max_bytes, 0);
-    json!({
-        "truncated": truncated,
-        "bytes_returned": text.len(),
-        "bytes_omitted": bytes_omitted,
-        "next_offset": next_offset,
-        "text": text,
-    })
-    .to_string()
-}
-
-fn bounded_json_tool_output(mut value: Value, max_bytes: usize) -> Value {
-    match &mut value {
-        Value::Object(map) => {
-            for key in ["stdout", "stderr", "body", "text", "tar_base64"] {
-                if let Some(Value::String(text)) = map.get_mut(key) {
-                    let (bounded, truncated, bytes_omitted, next_offset) =
-                        bounded_text(text, max_bytes, 0);
-                    if truncated {
-                        *text = bounded;
-                        map.insert("truncated".to_string(), Value::Bool(true));
-                        map.insert("bytes_returned".to_string(), json!(max_bytes));
-                        map.insert("bytes_omitted".to_string(), json!(bytes_omitted));
-                        map.insert("next_offset".to_string(), json!(next_offset));
-                        break;
-                    }
-                }
-            }
-            if value.to_string().len() > max_bytes {
-                let serialized = value.to_string();
-                let (text, _, bytes_omitted, next_offset) = bounded_text(&serialized, max_bytes, 0);
-                json!({
-                    "truncated": true,
-                    "bytes_returned": text.len(),
-                    "bytes_omitted": bytes_omitted,
-                    "next_offset": next_offset,
-                    "json_preview": text,
-                })
-            } else {
-                value
-            }
-        }
-        _ => {
-            let serialized = value.to_string();
-            if serialized.len() <= max_bytes {
-                value
-            } else {
-                let (text, _, bytes_omitted, next_offset) = bounded_text(&serialized, max_bytes, 0);
-                json!({
-                    "truncated": true,
-                    "bytes_returned": text.len(),
-                    "bytes_omitted": bytes_omitted,
-                    "next_offset": next_offset,
-                    "json_preview": text,
-                })
-            }
-        }
-    }
-}
-
-fn bounded_text(
-    value: &str,
-    max_bytes: usize,
-    offset: usize,
-) -> (String, bool, usize, Option<usize>) {
-    if value.len() <= max_bytes {
-        return (value.to_string(), false, 0, None);
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end = end.saturating_sub(1);
-    }
-    let text = value[..end].to_string();
-    let omitted = value.len().saturating_sub(end);
-    (text, true, omitted, Some(offset.saturating_add(end)))
-}
-
 fn u128_to_u64(value: u128) -> u64 {
     value.min(u64::MAX as u128) as u64
 }
@@ -8872,94 +8588,6 @@ fn short_id(id: AgentId) -> String {
 #[cfg(test)]
 fn extract_skill_mentions(text: &str) -> Vec<String> {
     mai_skills::extract_skill_mentions(text)
-}
-
-fn skill_activation_info(
-    skill_injections: &SkillInjections,
-    container_skill_paths: &ContainerSkillPaths,
-) -> Vec<SkillActivationInfo> {
-    skill_injections
-        .items
-        .iter()
-        .map(|skill| SkillActivationInfo {
-            name: skill.metadata.name.clone(),
-            display_name: skill
-                .metadata
-                .interface
-                .as_ref()
-                .and_then(|interface| interface.display_name.clone()),
-            path: display_skill_path(&skill.metadata.path, container_skill_paths),
-            scope: skill.metadata.scope,
-        })
-        .collect()
-}
-
-fn skill_user_fragment(
-    skill_injections: &SkillInjections,
-    container_skill_paths: &ContainerSkillPaths,
-) -> Option<ModelInputItem> {
-    if skill_injections.items.is_empty() {
-        return None;
-    }
-    let mut text = String::new();
-    for skill in &skill_injections.items {
-        let path = display_skill_path(&skill.metadata.path, container_skill_paths);
-        text.push_str(&format!(
-            "\n<skill>\n<name>{}</name>\n<path>{}</path>\n{}\n</skill>\n",
-            skill.metadata.name,
-            path.display(),
-            skill.contents
-        ));
-    }
-    Some(ModelInputItem::user_text(text))
-}
-
-fn apply_container_skill_paths(
-    response: &mut SkillsListResponse,
-    container_skill_paths: &ContainerSkillPaths,
-    overwrite_existing_source: bool,
-) {
-    for skill in &mut response.skills {
-        if (overwrite_existing_source || skill.source_path.is_none())
-            && let Some(container_path) = container_skill_paths.get(&skill.path)
-        {
-            skill.source_path = Some(container_path.clone());
-        }
-    }
-}
-
-fn display_skill_path(path: &Path, container_skill_paths: &ContainerSkillPaths) -> PathBuf {
-    container_skill_paths
-        .get(path)
-        .cloned()
-        .unwrap_or_else(|| path.to_path_buf())
-}
-
-fn container_skill_dir(skill: &mai_protocol::SkillMetadata) -> PathBuf {
-    let scope = match skill.scope {
-        SkillScope::System => "system",
-        SkillScope::Project => "project",
-        SkillScope::Repo => "repo",
-        SkillScope::User => "user",
-    };
-    PathBuf::from(CONTAINER_SKILLS_ROOT)
-        .join(scope)
-        .join(safe_container_skill_segment(&skill.name))
-}
-
-fn safe_container_skill_segment(value: &str) -> String {
-    let segment = value
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
-            _ => '_',
-        })
-        .collect::<String>();
-    if segment.is_empty() {
-        "skill".to_string()
-    } else {
-        segment
-    }
 }
 
 impl AgentResourceBroker {
@@ -9270,21 +8898,6 @@ fn should_auto_compact(last_context_tokens: u64, context_tokens: u64) -> bool {
     last_context_tokens.saturating_mul(100)
         >= context_tokens.saturating_mul(AUTO_COMPACT_THRESHOLD_PERCENT)
 }
-
-const BASE_INSTRUCTIONS: &str = r#"You are Mai, a coding agent running inside a Docker-backed multi-agent service.
-
-General rules:
-- You execute all local work inside your own Docker container; do not assume access to a host workspace.
-- Use `container_exec` for shell commands inside your container.
-- Use `container_cp_upload` and `container_cp_download` for file transfer.
-- Use `spawn_agent`, `send_input`, `wait_agent`, `list_agents`, `close_agent`, and `resume_agent` for multi-agent collaboration.
-- Use `list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource` to inspect MCP resources when available.
-- Keep each child agent task concrete and bounded. Multiple agents can run in parallel.
-- Child agent model selection is controlled by Research Agent settings, falling back to the service default model when unset.
-- Use available skills only when explicitly requested by the user or when clearly relevant.
-- MCP tools are exposed as ordinary function tools whose names begin with `mcp__`.
-- Be concise with final answers and include important file paths or command outputs when they matter.
-"#;
 
 #[cfg(test)]
 mod tests {
@@ -10497,82 +10110,6 @@ esac
     }
 
     #[test]
-    fn skill_user_fragment_wraps_loaded_skill_contents() {
-        let path = std::path::PathBuf::from("/tmp/demo/SKILL.md");
-        let fragment = skill_user_fragment(
-            &SkillInjections {
-                items: vec![mai_skills::LoadedSkill {
-                    metadata: mai_protocol::SkillMetadata {
-                        name: "demo".to_string(),
-                        description: "Demo skill".to_string(),
-                        short_description: None,
-                        path: path.clone(),
-                        source_path: None,
-                        scope: mai_protocol::SkillScope::Repo,
-                        enabled: true,
-                        interface: None,
-                        dependencies: None,
-                        policy: None,
-                    },
-                    contents: "skill body".to_string(),
-                }],
-                warnings: Vec::new(),
-            },
-            &ContainerSkillPaths::default(),
-        )
-        .expect("fragment");
-        assert!(matches!(
-            fragment,
-            ModelInputItem::Message { role, content }
-                if role == "user"
-                    && matches!(&content[0], ModelContentItem::InputText { text }
-                        if text.contains("<skill>")
-                            && text.contains("<name>demo</name>")
-                            && text.contains(path.to_string_lossy().as_ref())
-                            && text.contains("skill body"))
-        ));
-    }
-
-    #[test]
-    fn skill_user_fragment_uses_container_skill_path_when_synced() {
-        let path = std::path::PathBuf::from("/tmp/system/demo/SKILL.md");
-        let container_path = PathBuf::from("/workspace/.mai-team/skills/system/demo/SKILL.md");
-        let mut paths = HashMap::new();
-        paths.insert(path.clone(), container_path.clone());
-        let fragment = skill_user_fragment(
-            &SkillInjections {
-                items: vec![mai_skills::LoadedSkill {
-                    metadata: mai_protocol::SkillMetadata {
-                        name: "demo".to_string(),
-                        description: "Demo skill".to_string(),
-                        short_description: None,
-                        path: path.clone(),
-                        source_path: None,
-                        scope: mai_protocol::SkillScope::System,
-                        enabled: true,
-                        interface: None,
-                        dependencies: None,
-                        policy: None,
-                    },
-                    contents: "skill body".to_string(),
-                }],
-                warnings: Vec::new(),
-            },
-            &ContainerSkillPaths { paths },
-        )
-        .expect("fragment");
-
-        assert!(matches!(
-            fragment,
-            ModelInputItem::Message { role, content }
-                if role == "user"
-                    && matches!(&content[0], ModelContentItem::InputText { text }
-                        if text.contains(container_path.to_string_lossy().as_ref())
-                            && !text.contains(path.to_string_lossy().as_ref()))
-        ));
-    }
-
-    #[test]
     fn agent_status_allows_new_turn_after_completion() {
         assert!(AgentStatus::Completed.can_start_turn());
         assert!(!AgentStatus::RunningTurn.can_start_turn());
@@ -10908,39 +10445,6 @@ esac
             )
             .await;
         assert!(mismatch.is_err());
-    }
-
-    #[tokio::test]
-    async fn tool_output_is_truncated_for_model_history_but_trace_keeps_full_output() {
-        let dir = tempdir().expect("tempdir");
-        let store = test_store(&dir).await;
-        let agent_id = Uuid::new_v4();
-        let session_id = Uuid::new_v4();
-        store
-            .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
-            .await
-            .expect("save agent");
-        save_test_session(&store, agent_id, session_id).await;
-        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
-        let long_stdout = "x".repeat(DEFAULT_MODEL_TOOL_OUTPUT_BYTES + 100);
-        let execution = ToolExecution::new(
-            true,
-            json!({ "status": 0, "stdout": long_stdout, "stderr": "" }).to_string(),
-            false,
-        );
-
-        assert!(execution.output.len() > execution.model_output.len());
-        assert!(execution.output.contains(&"x".repeat(100)));
-        let model_value =
-            serde_json::from_str::<Value>(&execution.model_output).expect("model output json");
-        assert_eq!(model_value["truncated"], true);
-        let visible = model_value
-            .get("stdout")
-            .or_else(|| model_value.get("json_preview"))
-            .and_then(Value::as_str)
-            .expect("visible output");
-        assert!(visible.len() <= DEFAULT_MODEL_TOOL_OUTPUT_BYTES);
-        drop(runtime);
     }
 
     #[tokio::test]
@@ -14205,7 +13709,7 @@ esac
         let runtime = test_runtime(&dir, Arc::clone(&store)).await;
         let worker_record = runtime.agent(worker_id).await.expect("worker");
 
-        let visible = runtime.visible_tool_names(&worker_record, &[]).await;
+        let visible = turn::tools::visible_tool_names(&runtime.state, &worker_record, &[]).await;
         assert!(!visible.contains(mai_tools::TOOL_SPAWN_AGENT));
         assert!(!visible.contains(mai_tools::TOOL_CLOSE_AGENT));
 
@@ -14257,7 +13761,8 @@ esac
             image: "unused".to_string(),
         });
 
-        let visible = runtime.visible_tool_names(&maintainer_record, &[]).await;
+        let visible =
+            turn::tools::visible_tool_names(&runtime.state, &maintainer_record, &[]).await;
         assert!(visible.contains(mai_tools::TOOL_SPAWN_AGENT));
 
         let result = runtime
@@ -14297,7 +13802,8 @@ esac
         let tools = runtime.agent_mcp_tools(&maintainer_record).await;
 
         assert!(tools.is_empty());
-        let visible = runtime.visible_tool_names(&maintainer_record, &tools).await;
+        let visible =
+            turn::tools::visible_tool_names(&runtime.state, &maintainer_record, &tools).await;
         assert!(!visible.contains("mcp__github__create_pull_request_review"));
         assert!(!visible.contains("mcp__github__pull_request_review_write"));
         assert!(!visible.contains("mcp__git__git_status"));
@@ -14345,7 +13851,8 @@ esac
             ])
         );
         assert_eq!(tools.len(), discovered.len());
-        let visible = runtime.visible_tool_names(&maintainer_record, &tools).await;
+        let visible =
+            turn::tools::visible_tool_names(&runtime.state, &maintainer_record, &tools).await;
         assert!(visible.contains("mcp__github__pull_request_review_write"));
         assert!(visible.contains("mcp__git__git_diff_unstaged"));
         assert!(!visible.contains("mcp__github__create_pull_request_review"));

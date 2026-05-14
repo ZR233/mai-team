@@ -7,7 +7,7 @@ use mai_mcp::McpAgentManager;
 use mai_protocol::{
     AgentId, AgentMessage, AgentSessionSummary, AgentSummary, ArtifactInfo, ModelInputItem,
     PlanHistoryEntry, ProjectId, ProjectSummary, SessionId, TaskId, TaskPlan, TaskReview,
-    TaskSummary, ToolOutputArtifactInfo, TurnId,
+    TaskSummary, TurnId,
 };
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -102,24 +102,4 @@ pub(crate) struct QueuedAgentInput {
 pub(crate) struct CollabInput {
     pub(crate) message: Option<String>,
     pub(crate) skill_mentions: Vec<String>,
-}
-
-#[derive(Debug)]
-pub(crate) struct ToolExecution {
-    pub(crate) success: bool,
-    pub(crate) output: String,
-    pub(crate) model_output: String,
-    pub(crate) ends_turn: bool,
-    pub(crate) output_artifacts: Vec<ToolOutputArtifactInfo>,
-}
-
-#[derive(Debug)]
-pub(crate) struct ToolOutputCapture {
-    pub(crate) call_id: String,
-    pub(crate) stdout_id: String,
-    pub(crate) stderr_id: String,
-    pub(crate) stdout_path: std::path::PathBuf,
-    pub(crate) stderr_path: std::path::PathBuf,
-    pub(crate) stdout_name: String,
-    pub(crate) stderr_name: String,
 }
