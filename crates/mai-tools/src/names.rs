@@ -28,4 +28,5 @@ pub const TOOL_GIT_FETCH: &str = "git_fetch";
 pub const TOOL_GIT_COMMIT: &str = "git_commit";
 pub const TOOL_GIT_PUSH: &str = "git_push";
 pub const TOOL_GIT_WORKTREE_INFO: &str = "git_worktree_info";
+pub const TOOL_GIT_WORKSPACE_INFO: &str = "git_workspace_info";
 pub const TOOL_GIT_SYNC_DEFAULT_BRANCH: &str = "git_sync_default_branch";

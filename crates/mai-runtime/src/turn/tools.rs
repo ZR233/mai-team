@@ -294,6 +294,7 @@ pub(crate) async fn visible_tool_names(
         mai_tools::TOOL_GIT_COMMIT.to_string(),
         mai_tools::TOOL_GIT_PUSH.to_string(),
         mai_tools::TOOL_GIT_WORKTREE_INFO.to_string(),
+        mai_tools::TOOL_GIT_WORKSPACE_INFO.to_string(),
         mai_tools::TOOL_GIT_SYNC_DEFAULT_BRANCH.to_string(),
     ]);
     if capability.can_spawn_agents {
@@ -681,6 +682,7 @@ pub(crate) async fn execute_tool(
         | RoutedTool::GitCommit
         | RoutedTool::GitPush
         | RoutedTool::GitWorktreeInfo
+        | RoutedTool::GitWorkspaceInfo
         | RoutedTool::GitSyncDefaultBranch => {
             context
                 .ops

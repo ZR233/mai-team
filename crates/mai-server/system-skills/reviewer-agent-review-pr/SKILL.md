@@ -1,6 +1,6 @@
 ---
 name: reviewer-agent-review-pr
-description: Reviewer agent skill for performing a script-assisted, deep, single GitHub pull request review. The reviewer agent uses bundled helper scripts for deterministic PR eligibility, git worktree preparation, changed-file/crate detection, Rust validation command planning, and final scheduler JSON, then performs human-quality code review and submits a GitHub review with inline comments. Trigger when the reviewer agent is invoked to review PRs, or when tasks are assigned for PR code review.
+description: Reviewer agent skill for performing a script-assisted, deep, single GitHub pull request review. The reviewer agent uses bundled helper scripts for deterministic PR eligibility, reviewer clone checkout, changed-file/crate detection, Rust validation command planning, and final scheduler JSON, then performs human-quality code review and submits a GitHub review with inline comments. Trigger when the reviewer agent is invoked to review PRs, or when tasks are assigned for PR code review.
 metadata:
   short-description: Script-assisted reviewer agent single-PR review
 ---
@@ -9,7 +9,7 @@ metadata:
 
 Review exactly one eligible GitHub pull request for the current project. Use GitHub MCP tools for GitHub reads/writes, local shell commands for git/test work, and the bundled helper for fixed rules.
 
-Mai refreshes `/workspace/repo` before this skill starts and fetches PR refs as `refs/remotes/origin/pr/<number>`. Do not fetch credentials, read `GITHUB_TOKEN`, write credential files, or add model footers. Mai appends the model footer to submitted project reviews.
+Mai refreshes the reviewer-owned clone at `/workspace/repo` before this skill starts. PR refs are available in the local clone, commonly as `refs/remotes/origin/pr/<number>` or `refs/pull/<number>/head`. Do not fetch credentials, read `GITHUB_TOKEN`, write credential files, or add model footers. Mai appends the model footer to submitted project reviews.
 
 ## Use Bundled Scripts First
 
@@ -34,19 +34,19 @@ The helper commands are:
 ```bash
 python3 scripts/review_pr_helper.py select-pr --prs prs.json --login "$LOGIN" --details details.json --reviews reviews.json --checks checks.json
 python3 scripts/review_pr_helper.py select-pr --prs prs.json --login "$LOGIN" --details details.json --reviews reviews.json --checks checks.json --target-pr "$PR"
-python3 scripts/review_pr_helper.py prepare-worktree --repo /workspace/repo --review-root /workspace/reviews --agent-id "$REVIEWER_AGENT_ID" --pr "$PR"
-python3 scripts/review_pr_helper.py changed-files --repo "$WORKTREE" --files files.json
-python3 scripts/review_pr_helper.py rust-plan --repo "$WORKTREE" --changed changed.json
+python3 scripts/review_pr_helper.py prepare-review --repo /workspace/repo --agent-id "$REVIEWER_AGENT_ID" --pr "$PR"
+python3 scripts/review_pr_helper.py changed-files --repo "$REVIEW_REPO" --files files.json
+python3 scripts/review_pr_helper.py rust-plan --repo "$REVIEW_REPO" --changed changed.json
 python3 scripts/review_pr_helper.py final-json --outcome review_submitted --pr "$PR" --summary "Submitted APPROVE for owner/repo#$PR after validation passed."
 ```
 
 Treat helper output as structured facts and command suggestions. You still own code understanding, finding severity, inline comment wording, and the final GitHub review decision.
 
-When dogfooding this skill outside Mai, `/workspace/repo` and `/workspace/reviews` may not exist. Use the local clone as `--repo`, use a writable review root such as `/tmp/mai-reviews`, and make sure PR refs exist first:
+When dogfooding this skill outside Mai, `/workspace/repo` may not exist. Use the local clone as `--repo` and make sure PR refs exist first:
 
 ```bash
 git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'
-python3 scripts/review_pr_helper.py prepare-worktree --repo /path/to/repo --review-root /tmp/mai-reviews --agent-id "$REVIEWER_AGENT_ID" --pr "$PR"
+python3 scripts/review_pr_helper.py prepare-review --repo /path/to/repo --agent-id "$REVIEWER_AGENT_ID" --pr "$PR"
 ```
 
 ## Workflow
@@ -94,26 +94,19 @@ If `select-pr` returns `no_eligible_pr`, finish with:
 {"outcome":"no_eligible_pr","pr":null,"summary":"No eligible pull request found.","error":null}
 ```
 
-### 3. Prepare an Isolated Worktree
+### 3. Prepare the Reviewer Clone
 
-Run `prepare-worktree` for the selected PR. Work only inside the returned worktree path. Do not review or run tests directly in `/workspace/repo`.
+Run `prepare-review` for the selected PR. Work only inside `/workspace/repo`, which is this reviewer agent's isolated clone. Treat the returned `repo` value as `REVIEW_REPO`; in Mai it should be `/workspace/repo`.
 
-Before submitting the review, confirm the PR head SHA still matches the checked-out worktree SHA. If it changed, restart from PR selection.
-
-Clean up at the end:
-
-```bash
-git worktree remove "$WORKTREE"
-git -C /workspace/repo worktree prune
-```
+Before submitting the review, confirm the PR head SHA still matches the checked-out clone SHA. If it changed, restart from PR selection.
 
 ### 4. Inspect and Validate
 
 Use visible GitHub MCP tools to inspect PR metadata, changed files, diff, existing comments, review threads, and checks context. Save changed files JSON and run:
 
 ```bash
-python3 scripts/review_pr_helper.py changed-files --repo "$WORKTREE" --files files.json > changed.json
-python3 scripts/review_pr_helper.py rust-plan --repo "$WORKTREE" --changed changed.json > rust-plan.json
+python3 scripts/review_pr_helper.py changed-files --repo "$REVIEW_REPO" --files files.json > changed.json
+python3 scripts/review_pr_helper.py rust-plan --repo "$REVIEW_REPO" --changed changed.json > rust-plan.json
 ```
 
 Run the commands in `rust-plan.json` when present. For Rust PRs, always run `cargo fmt --check` and clippy commands suggested by the helper; run tests for changed crates unless the repository clearly cannot support them in the current environment.
@@ -135,7 +128,7 @@ Record exact validation failures. Treat these as blocking:
 
 Prioritize bugs, regressions, security risks, data-loss risks, missing tests, broken edge cases, and behavior mismatches. Do not request changes for style-only preferences.
 
-Compare changed code with 2-3 similar existing files in the worktree. For Rust, check module boundaries, trait usage, error handling style, serde compatibility, dependency direction, `unwrap()`/`expect()` in production paths, lock ordering, and RAII cleanup.
+Compare changed code with 2-3 similar existing files in the clone. For Rust, check module boundaries, trait usage, error handling style, serde compatibility, dependency direction, `unwrap()`/`expect()` in production paths, lock ordering, and RAII cleanup.
 
 Search similar PRs before submission:
 
@@ -187,7 +180,7 @@ Failed:
 ## Constraints
 
 - Review exactly one PR per invocation.
-- Always use an isolated worktree under `/workspace/reviews/`.
+- Always work in the reviewer-owned clone at `/workspace/repo`.
 - Use helper scripts for fixed rules; use reviewer judgment for code review.
 - Use only visible GitHub MCP tools for GitHub reads/writes.
-- Clean up temporary worktrees before finishing.
+- Leave cleanup to Mai; reviewer agent deletion removes the clone.

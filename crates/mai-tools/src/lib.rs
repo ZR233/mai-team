@@ -90,6 +90,7 @@ mod tests {
             TOOL_GIT_COMMIT,
             TOOL_GIT_PUSH,
             TOOL_GIT_WORKTREE_INFO,
+            TOOL_GIT_WORKSPACE_INFO,
             TOOL_GIT_SYNC_DEFAULT_BRANCH,
         ] {
             let tool = tools
@@ -259,6 +260,10 @@ mod tests {
         assert_eq!(route_tool("send_input"), RoutedTool::SendInput);
         assert_eq!(route_tool("resume_agent"), RoutedTool::ResumeAgent);
         assert_eq!(route_tool("github_api_get"), RoutedTool::GithubApiGet);
+        assert_eq!(
+            route_tool("git_workspace_info"),
+            RoutedTool::GitWorkspaceInfo
+        );
     }
 
     #[test]

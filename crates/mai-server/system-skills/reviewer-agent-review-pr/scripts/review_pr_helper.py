@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import glob
 import json
 import re
 import subprocess
@@ -43,11 +42,10 @@ def main() -> int:
     select.add_argument("--checks", help="optional checks/status JSON path")
     select.add_argument("--target-pr", type=int, help="only consider this PR number")
 
-    worktree = subparsers.add_parser("prepare-worktree", help="create or reuse review worktree")
-    worktree.add_argument("--repo", default="/workspace/repo")
-    worktree.add_argument("--review-root", default="/workspace/reviews")
-    worktree.add_argument("--agent-id", required=True)
-    worktree.add_argument("--pr", required=True, type=int)
+    prepare = subparsers.add_parser("prepare-review", help="check out the selected PR in this clone")
+    prepare.add_argument("--repo", default="/workspace/repo")
+    prepare.add_argument("--agent-id", required=True)
+    prepare.add_argument("--pr", required=True, type=int)
 
     changed = subparsers.add_parser("changed-files", help="summarize changed files")
     changed.add_argument("--files", help="GitHub PR files JSON path")
@@ -84,8 +82,8 @@ def main() -> int:
                 target_pr=args.target_pr,
             )
         )
-    elif args.command == "prepare-worktree":
-        write_json(prepare_worktree(args.repo, args.review_root, args.agent_id, args.pr))
+    elif args.command == "prepare-review":
+        write_json(prepare_review_checkout(args.repo, args.agent_id, args.pr))
     elif args.command == "changed-files":
         write_json(changed_files_summary(args.repo, files=args.files, base=args.base, head=args.head))
     elif args.command == "rust-plan":
@@ -556,30 +554,37 @@ def run_git(repo: str | Path, *args: str, check: bool = True) -> subprocess.Comp
     return completed
 
 
-def prepare_worktree(repo: str, review_root: str, agent_id: str, pr: int) -> dict[str, Any]:
+def prepare_review_checkout(repo: str, agent_id: str, pr: int) -> dict[str, Any]:
     repo_path = Path(repo)
-    pr_ref = f"refs/remotes/origin/pr/{pr}"
-    head = run_git(repo_path, "rev-parse", pr_ref).stdout.strip()
-    agent_root = Path(review_root) / agent_id
-    agent_root.mkdir(parents=True, exist_ok=True)
+    pr_ref, head = resolve_pr_ref(repo_path, pr)
+    branch = f"mai-review/{pr}/{agent_id}"
+    run_git(repo_path, "reset", "--hard", "HEAD")
+    run_git(repo_path, "clean", "-fdx")
+    run_git(repo_path, "checkout", "-B", branch, head)
+    run_git(repo_path, "reset", "--hard", head)
+    run_git(repo_path, "clean", "-fdx")
+    current = run_git(repo_path, "rev-parse", "HEAD").stdout.strip()
+    return {
+        "repo": str(repo_path),
+        "head_sha": current,
+        "pr_ref": pr_ref,
+        "branch": branch,
+        "action": "checked_out",
+    }
 
-    for candidate in sorted(glob.glob(str(agent_root / f"review-pr-{pr}-*"))):
-        path = Path(candidate)
-        if not (path / ".git").exists():
-            continue
-        status = run_git(path, "status", "--short").stdout.strip()
-        if status:
-            continue
-        current = run_git(path, "rev-parse", "HEAD").stdout.strip()
-        if current == head:
-            return {"worktree": str(path), "head_sha": head, "pr_ref": pr_ref, "action": "reused"}
-        run_git(path, "checkout", "--detach", head)
-        return {"worktree": str(path), "head_sha": head, "pr_ref": pr_ref, "action": "updated"}
 
-    worktree = Path(tempfile.mkdtemp(prefix=f"review-pr-{pr}-", dir=str(agent_root)))
-    worktree.rmdir()
-    run_git(repo_path, "worktree", "add", "--detach", str(worktree), head)
-    return {"worktree": str(worktree), "head_sha": head, "pr_ref": pr_ref, "action": "created"}
+def resolve_pr_ref(repo: Path, pr: int) -> tuple[str, str]:
+    refs = [
+        f"refs/remotes/origin/pr/{pr}",
+        f"refs/pull/{pr}/head",
+        f"refs/remotes/origin/pull/{pr}/head",
+    ]
+    for ref in refs:
+        completed = run_git(repo, "rev-parse", "--verify", ref, check=False)
+        if completed.returncode == 0:
+            return ref, completed.stdout.strip()
+    joined = ", ".join(refs)
+    raise SystemExit(f"could not find PR ref for #{pr}; tried {joined}")
 
 
 def changed_files_summary(
@@ -1020,6 +1025,29 @@ class ReviewPrHelperTests(unittest.TestCase):
             files.write_text(json.dumps([{"filename": "test-suit/starryos/normal/test.c"}]), encoding="utf-8")
             summary = changed_files_summary(str(root), files=str(files))
         self.assertEqual(summary["changed_crates"], [])
+
+    def test_prepare_review_checkout_uses_current_clone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main", str(root)], check=True, stdout=subprocess.PIPE)
+            (root / "README.md").write_text("main\n", encoding="utf-8")
+            run_git(root, "add", "README.md")
+            run_git(root, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "main")
+            main_head = run_git(root, "rev-parse", "HEAD").stdout.strip()
+            (root / "README.md").write_text("pr\n", encoding="utf-8")
+            run_git(root, "add", "README.md")
+            run_git(root, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "pr")
+            pr_head = run_git(root, "rev-parse", "HEAD").stdout.strip()
+            run_git(root, "update-ref", "refs/remotes/origin/pr/7", pr_head)
+            run_git(root, "checkout", "-B", "main", main_head)
+
+            result = prepare_review_checkout(str(root), "agent-1", 7)
+
+        self.assertEqual(result["repo"], str(root))
+        self.assertEqual(result["head_sha"], pr_head)
+        self.assertEqual(result["pr_ref"], "refs/remotes/origin/pr/7")
+        self.assertEqual(result["branch"], "mai-review/7/agent-1")
+        self.assertEqual(result["action"], "checked_out")
 
     def test_final_json_shape(self) -> None:
         result = final_result("review_submitted", 9, "Submitted APPROVE.", None)

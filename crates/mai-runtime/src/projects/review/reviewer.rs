@@ -126,7 +126,7 @@ fn project_reviewer_initial_message_from_summary(
                 .to_string()
         });
     format!(
-        "Run one automatic pull request review for project `{}`.\n\nRepository: {}/{}\nDefault branch: {}\nWorkspace repo: /workspace/repo\nReview worktree root: /workspace/repo\nReviewer agent: {}\n{}\n\nExtra reviewer instructions:\n{}\n\nUse the $reviewer-agent-review-pr skill. At the end of the turn, return only one JSON object matching this schema exactly:\n{{\"outcome\":\"review_submitted|no_eligible_pr|failed\",\"pr\":123|null,\"summary\":\"short result\",\"error\":null|\"failure reason\"}}",
+        "Run one automatic pull request review for project `{}`.\n\nRepository: {}/{}\nDefault branch: {}\nReviewer clone: /workspace/repo\nReviewer agent: {}\n{}\n\nExtra reviewer instructions:\n{}\n\nUse the $reviewer-agent-review-pr skill. At the end of the turn, return only one JSON object matching this schema exactly:\n{{\"outcome\":\"review_submitted|no_eligible_pr|failed\",\"pr\":123|null,\"summary\":\"short result\",\"error\":null|\"failure reason\"}}",
         summary.name, summary.owner, summary.repo, summary.branch, reviewer_id, target, extra
     )
 }

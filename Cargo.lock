@@ -1647,6 +1647,7 @@ dependencies = [
  "mai-store",
  "mai-tools",
  "percent-encoding",
+ "pretty_assertions",
  "reqwest",
  "serde",
  "serde_json",
