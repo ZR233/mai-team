@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::state::{AgentRecord, AgentSessionRecord};
 use crate::{Result, RuntimeError};
 
+mod container;
 mod create;
 mod delete;
 mod fork;
@@ -23,6 +24,11 @@ mod model;
 mod update;
 mod wait;
 
+pub(crate) use container::{
+    AgentContainerOps, AgentContainerStartRequest, AgentContainerStatusChange,
+    AgentMcpStatusChange, ContainerSource, ensure_agent_container, ensure_agent_container_for_turn,
+    ensure_agent_container_with_source,
+};
 pub(crate) use create::{AgentCreateOps, CreateAgentRecordContext, create_agent_record};
 pub(crate) use delete::{
     AgentContainerDeleteRequest, AgentDeleteOps, AgentDeleteStatusChange, delete_agent,

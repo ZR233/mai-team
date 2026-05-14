@@ -57,7 +57,7 @@ use projects::skills::PROJECT_SKILLS_CACHE_DIR;
 use projects::skills::{ProjectSkillRefreshSource, ProjectSkillSourceDir};
 use state::{
     AgentRecord, AgentSessionRecord, ProjectRecord, ProjectReviewWorker, RuntimeState, TaskRecord,
-    TurnControl, TurnGuard,
+    TurnControl,
 };
 use turn::completion::TurnResult;
 use turn::tools::ToolExecution;
@@ -173,19 +173,6 @@ pub struct AgentRuntime {
     artifact_files_root: PathBuf,
     sidecar_image: String,
     github_api_base_url: String,
-}
-
-#[derive(Debug, Clone)]
-enum ContainerSource {
-    FreshImage,
-    ImageWithWorkspace {
-        workspace_volume: String,
-    },
-    CloneFrom {
-        parent_container_id: String,
-        docker_image: String,
-        workspace_volume: Option<String>,
-    },
 }
 
 struct ResolvedAgentModel {
@@ -669,7 +656,7 @@ impl AgentRuntime {
                         agents::task_role_system_prompt(AgentRole::Planner).to_string(),
                     ),
                 },
-                ContainerSource::FreshImage,
+                agents::ContainerSource::FreshImage,
                 Some(task_id),
                 None,
                 Some(AgentRole::Planner),
@@ -1447,7 +1434,7 @@ impl AgentRuntime {
     ) -> Result<AgentSummary> {
         self.create_agent_with_container_source(
             request,
-            ContainerSource::FreshImage,
+            agents::ContainerSource::FreshImage,
             None,
             None,
             None,
@@ -1458,7 +1445,7 @@ impl AgentRuntime {
     async fn create_agent_with_container_source(
         self: &Arc<Self>,
         request: CreateAgentRequest,
-        container_source: ContainerSource,
+        container_source: agents::ContainerSource,
         task_id: Option<TaskId>,
         project_id: Option<ProjectId>,
         role: Option<AgentRole>,
@@ -1474,9 +1461,14 @@ impl AgentRuntime {
         )
         .await?;
 
-        match self
-            .ensure_agent_container_with_source(&agent, AgentStatus::Idle, &container_source, None)
-            .await
+        match agents::ensure_agent_container_with_source(
+            self.as_ref(),
+            &agent,
+            AgentStatus::Idle,
+            &container_source,
+            None,
+        )
+        .await
         {
             Ok(_) => Ok(agent.summary.read().await.clone()),
             Err(err) => {
@@ -2303,9 +2295,9 @@ impl AgentRuntime {
         let task_id = parent_summary.task_id.ok_or_else(|| {
             RuntimeError::InvalidInput("parent agent is not attached to a task".to_string())
         })?;
-        let parent_container_id = self
-            .ensure_agent_container(&parent, parent_summary.status.clone())
-            .await?;
+        let parent_container_id =
+            agents::ensure_agent_container(self.as_ref(), &parent, parent_summary.status.clone())
+                .await?;
         let model = self.resolve_role_agent_model(role).await?;
         self.create_agent_with_container_source(
             CreateAgentRequest {
@@ -2317,7 +2309,7 @@ impl AgentRuntime {
                 parent_id: Some(parent_agent_id),
                 system_prompt: Some(agents::task_role_system_prompt(role).to_string()),
             },
-            ContainerSource::CloneFrom {
+            agents::ContainerSource::CloneFrom {
                 parent_container_id,
                 docker_image: parent_summary.docker_image,
                 workspace_volume: None,
@@ -3108,10 +3100,11 @@ impl AgentRuntime {
     ) -> Result<()> {
         let setup_result = async {
             let maintainer = self.agent(maintainer_agent_id).await?;
-            self.ensure_agent_container_with_source(
+            agents::ensure_agent_container_with_source(
+                self.as_ref(),
                 &maintainer,
                 AgentStatus::Idle,
-                &ContainerSource::FreshImage,
+                &agents::ContainerSource::FreshImage,
                 None,
             )
             .await?;
@@ -3800,7 +3793,7 @@ impl AgentRuntime {
                 parent_id: Some(project_summary.maintainer_agent_id),
                 system_prompt: Some(projects::review::project_reviewer_system_prompt().to_string()),
             },
-            ContainerSource::ImageWithWorkspace { workspace_volume },
+            agents::ContainerSource::ImageWithWorkspace { workspace_volume },
             maintainer_summary.task_id,
             Some(project_id),
             Some(AgentRole::Reviewer),
@@ -4222,283 +4215,6 @@ impl AgentRuntime {
         Ok(resolved_agent_model(selection, reasoning_effort))
     }
 
-    async fn ensure_agent_container(
-        &self,
-        agent: &Arc<AgentRecord>,
-        ready_status: AgentStatus,
-    ) -> Result<String> {
-        self.ensure_agent_container_with_source(
-            agent,
-            ready_status,
-            &ContainerSource::FreshImage,
-            None,
-        )
-        .await
-    }
-
-    async fn ensure_agent_container_for_turn(
-        &self,
-        agent: &Arc<AgentRecord>,
-        ready_status: AgentStatus,
-        turn_id: TurnId,
-        cancellation_token: &CancellationToken,
-    ) -> Result<String> {
-        if cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
-        let turn_guard =
-            (agent.summary.read().await.current_turn == Some(turn_id)).then(|| TurnGuard {
-                turn_id,
-                cancellation_token: cancellation_token.clone(),
-            });
-        let container_id = self
-            .ensure_agent_container_with_source(
-                agent,
-                ready_status.clone(),
-                &ContainerSource::FreshImage,
-                turn_guard,
-            )
-            .await?;
-        let current_turn = agent.summary.read().await.current_turn;
-        if cancellation_token.is_cancelled()
-            || current_turn.is_some_and(|current| current != turn_id)
-        {
-            if let Some(manager) = agent.mcp.write().await.take() {
-                manager.shutdown().await;
-            }
-            return Err(RuntimeError::TurnCancelled);
-        }
-        let needs_status_restore = agent.summary.read().await.status != ready_status;
-        if needs_status_restore {
-            self.set_status(agent, ready_status, None).await?;
-        }
-        Ok(container_id)
-    }
-
-    async fn ensure_agent_container_with_source(
-        &self,
-        agent: &Arc<AgentRecord>,
-        ready_status: AgentStatus,
-        container_source: &ContainerSource,
-        turn_guard: Option<TurnGuard>,
-    ) -> Result<String> {
-        if let Some(guard) = &turn_guard {
-            self.ensure_turn_current(agent, guard).await?;
-        }
-        if let Some(container_id) = agent
-            .container
-            .read()
-            .await
-            .as_ref()
-            .map(|container| container.id.clone())
-        {
-            return Ok(container_id);
-        }
-
-        let (agent_id, preferred_container_id, docker_image) = {
-            let summary = agent.summary.read().await;
-            (
-                summary.id,
-                summary.container_id.clone(),
-                summary.docker_image.clone(),
-            )
-        };
-        let mut container_guard = agent.container.write().await;
-        if let Some(container_id) = container_guard
-            .as_ref()
-            .map(|container| container.id.clone())
-        {
-            return Ok(container_id);
-        }
-
-        self.set_status(agent, AgentStatus::StartingContainer, None)
-            .await?;
-        if let Some(guard) = &turn_guard {
-            self.ensure_turn_current(agent, guard).await?;
-        }
-        let container_result = match container_source {
-            ContainerSource::FreshImage => {
-                self.deps
-                    .docker
-                    .ensure_agent_container_from_image(
-                        &agent_id.to_string(),
-                        preferred_container_id.as_deref(),
-                        &docker_image,
-                    )
-                    .await
-            }
-            ContainerSource::ImageWithWorkspace { workspace_volume } => {
-                self.deps
-                    .docker
-                    .ensure_agent_container_from_image_with_workspace(
-                        &agent_id.to_string(),
-                        preferred_container_id.as_deref(),
-                        &docker_image,
-                        Some(workspace_volume),
-                    )
-                    .await
-            }
-            ContainerSource::CloneFrom {
-                parent_container_id,
-                docker_image,
-                workspace_volume,
-            } => {
-                if preferred_container_id.is_some() && workspace_volume.is_none() {
-                    self.deps
-                        .docker
-                        .ensure_agent_container_from_image(
-                            &agent_id.to_string(),
-                            preferred_container_id.as_deref(),
-                            docker_image,
-                        )
-                        .await
-                } else {
-                    self.deps
-                        .docker
-                        .create_agent_container_from_parent_with_workspace(
-                            &agent_id.to_string(),
-                            parent_container_id,
-                            workspace_volume.as_deref(),
-                        )
-                        .await
-                }
-            }
-        };
-        let container = match container_result {
-            Ok(container) => container,
-            Err(err) => {
-                let message = err.to_string();
-                drop(container_guard);
-                if let Err(store_err) = self
-                    .set_status(agent, AgentStatus::Failed, Some(message))
-                    .await
-                {
-                    tracing::warn!("failed to persist container startup failure: {store_err}");
-                }
-                return Err(err.into());
-            }
-        };
-
-        let container_id = container.id.clone();
-        if let Some(guard) = &turn_guard
-            && let Err(err) = self.ensure_turn_current(agent, guard).await
-        {
-            drop(container_guard);
-            let _ = self
-                .deps
-                .docker
-                .delete_agent_containers(&agent_id.to_string(), Some(&container_id))
-                .await;
-            return Err(err);
-        }
-        {
-            let mut summary = agent.summary.write().await;
-            summary.container_id = Some(container_id.clone());
-            summary.updated_at = now();
-        }
-        self.persist_agent(agent).await?;
-        *container_guard = Some(container.clone());
-        drop(container_guard);
-
-        let mcp_configs = self
-            .deps
-            .store
-            .list_mcp_servers()
-            .await?
-            .into_iter()
-            .filter(|(_, config)| config.scope == McpServerScope::Agent)
-            .collect::<std::collections::BTreeMap<_, _>>();
-        for server in mcp_configs
-            .iter()
-            .filter_map(|(server, config)| config.enabled.then_some(server))
-        {
-            self.events
-                .publish(ServiceEventKind::McpServerStatusChanged {
-                    agent_id,
-                    server: server.clone(),
-                    status: mai_protocol::McpStartupStatus::Starting,
-                    error: None,
-                })
-                .await;
-        }
-        let mcp = McpAgentManager::start(self.deps.docker.clone(), container.id, mcp_configs).await;
-        if let Some(guard) = &turn_guard
-            && let Err(err) = self.ensure_turn_current(agent, guard).await
-        {
-            mcp.shutdown().await;
-            *agent.container.write().await = None;
-            {
-                let mut summary = agent.summary.write().await;
-                summary.container_id = None;
-            }
-            let _ = self
-                .deps
-                .docker
-                .delete_agent_containers(&agent_id.to_string(), Some(&container_id))
-                .await;
-            return Err(err);
-        }
-        for status in mcp.statuses().await {
-            self.events
-                .publish(ServiceEventKind::McpServerStatusChanged {
-                    agent_id,
-                    server: status.server,
-                    status: status.status,
-                    error: status.error,
-                })
-                .await;
-        }
-        let required_failures = mcp.required_failures().await;
-        if !required_failures.is_empty() {
-            let message = required_failures
-                .iter()
-                .map(|status| {
-                    format!(
-                        "{}: {}",
-                        status.server,
-                        status
-                            .error
-                            .as_deref()
-                            .unwrap_or("required MCP server failed")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            mcp.shutdown().await;
-            *agent.container.write().await = None;
-            {
-                let mut summary = agent.summary.write().await;
-                summary.container_id = None;
-            }
-            let _ = self
-                .deps
-                .docker
-                .delete_agent_containers(&agent_id.to_string(), Some(&container_id))
-                .await;
-            self.set_status(agent, AgentStatus::Failed, Some(message.clone()))
-                .await?;
-            return Err(RuntimeError::InvalidInput(format!(
-                "required MCP server startup failed: {message}"
-            )));
-        }
-        if let Some(guard) = &turn_guard {
-            self.ensure_turn_current(agent, guard).await?;
-        }
-        *agent.mcp.write().await = Some(Arc::new(mcp));
-        self.set_status(agent, ready_status, None).await?;
-        Ok(container_id)
-    }
-
-    async fn ensure_turn_current(&self, agent: &AgentRecord, guard: &TurnGuard) -> Result<()> {
-        if guard.cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
-        if agent.summary.read().await.current_turn != Some(guard.turn_id) {
-            return Err(RuntimeError::TurnCancelled);
-        }
-        Ok(())
-    }
-
     async fn agent(&self, agent_id: AgentId) -> Result<Arc<AgentRecord>> {
         self.state
             .agents
@@ -4521,7 +4237,7 @@ impl AgentRuntime {
             return Ok(container_id);
         }
         let ready_status = agent.summary.read().await.status.clone();
-        self.ensure_agent_container(&agent, ready_status).await
+        agents::ensure_agent_container(self, &agent, ready_status).await
     }
 
     async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<mai_mcp::McpTool> {
@@ -4655,7 +4371,7 @@ impl agents::AgentServiceOps for AgentRuntime {
         agent: &Arc<AgentRecord>,
         status: AgentStatus,
     ) -> Result<()> {
-        AgentRuntime::ensure_agent_container(self, agent, status)
+        agents::ensure_agent_container(self, agent, status)
             .await
             .map(|_| ())
     }
@@ -4835,6 +4551,117 @@ impl agents::AgentCreateOps for AgentRuntime {
     }
 }
 
+impl agents::AgentContainerOps for AgentRuntime {
+    async fn start_agent_container(
+        &self,
+        request: agents::AgentContainerStartRequest,
+    ) -> Result<ContainerHandle> {
+        match request.source {
+            agents::ContainerSource::FreshImage => Ok(self
+                .deps
+                .docker
+                .ensure_agent_container_from_image(
+                    &request.agent_id.to_string(),
+                    request.preferred_container_id.as_deref(),
+                    &request.docker_image,
+                )
+                .await?),
+            agents::ContainerSource::ImageWithWorkspace { workspace_volume } => Ok(self
+                .deps
+                .docker
+                .ensure_agent_container_from_image_with_workspace(
+                    &request.agent_id.to_string(),
+                    request.preferred_container_id.as_deref(),
+                    &request.docker_image,
+                    Some(&workspace_volume),
+                )
+                .await?),
+            agents::ContainerSource::CloneFrom {
+                parent_container_id,
+                docker_image,
+                workspace_volume,
+            } => {
+                if request.preferred_container_id.is_some() && workspace_volume.is_none() {
+                    Ok(self
+                        .deps
+                        .docker
+                        .ensure_agent_container_from_image(
+                            &request.agent_id.to_string(),
+                            request.preferred_container_id.as_deref(),
+                            &docker_image,
+                        )
+                        .await?)
+                } else {
+                    Ok(self
+                        .deps
+                        .docker
+                        .create_agent_container_from_parent_with_workspace(
+                            &request.agent_id.to_string(),
+                            &parent_container_id,
+                            workspace_volume.as_deref(),
+                        )
+                        .await?)
+                }
+            }
+        }
+    }
+
+    async fn remove_agent_container(&self, agent_id: AgentId, container_id: String) {
+        let _ = self
+            .deps
+            .docker
+            .delete_agent_containers(&agent_id.to_string(), Some(&container_id))
+            .await;
+    }
+
+    async fn agent_mcp_server_configs(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, McpServerConfig>> {
+        Ok(self
+            .deps
+            .store
+            .list_mcp_servers()
+            .await?
+            .into_iter()
+            .filter(|(_, config)| config.scope == McpServerScope::Agent)
+            .collect())
+    }
+
+    async fn start_agent_mcp_manager(
+        &self,
+        container_id: String,
+        configs: std::collections::BTreeMap<String, McpServerConfig>,
+    ) -> McpAgentManager {
+        McpAgentManager::start(self.deps.docker.clone(), container_id, configs).await
+    }
+
+    fn set_agent_status(
+        &self,
+        agent: Arc<AgentRecord>,
+        change: agents::AgentContainerStatusChange,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move { AgentRuntime::set_status(self, &agent, change.status, change.error).await }
+    }
+
+    fn persist_agent(
+        &self,
+        agent: Arc<AgentRecord>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move { AgentRuntime::persist_agent(self, &agent).await }
+    }
+
+    async fn publish_mcp_status(&self, change: agents::AgentMcpStatusChange) {
+        self.events
+            .publish(ServiceEventKind::McpServerStatusChanged {
+                agent_id: change.agent_id,
+                server: change.server,
+                status: change.status,
+                error: change.error,
+            })
+            .await;
+    }
+}
+
 impl projects::review::runs::ReviewRunSnapshotSource for AgentRuntime {
     async fn snapshot(&self, reviewer_agent_id: AgentId) -> (Vec<AgentMessage>, Vec<ServiceEvent>) {
         let messages = self
@@ -4882,7 +4709,7 @@ impl turn::orchestrator::TurnOrchestratorOps for Arc<AgentRuntime> {
         turn_id: TurnId,
         cancellation_token: &CancellationToken,
     ) -> Result<()> {
-        AgentRuntime::ensure_agent_container_for_turn(
+        agents::ensure_agent_container_for_turn(
             self.as_ref(),
             agent,
             status,
@@ -5050,7 +4877,8 @@ impl turn::tools::ToolDispatchOps for Arc<AgentRuntime> {
         let parent = self.agent(parent_agent_id).await?;
         let parent_status = parent.summary.read().await.status.clone();
         let parent_summary = parent.summary.read().await.clone();
-        let parent_container_id = self.ensure_agent_container(&parent, parent_status).await?;
+        let parent_container_id =
+            agents::ensure_agent_container(self.as_ref(), &parent, parent_status).await?;
         let parent_docker_image = parent_summary.docker_image.clone();
         let (provider_id, model, reasoning_effort) = if request.legacy_role.is_some() {
             let child_model = self.resolve_role_agent_model(request.role).await?;
@@ -5081,7 +4909,7 @@ impl turn::tools::ToolDispatchOps for Arc<AgentRuntime> {
                     parent_id: Some(parent_agent_id),
                     system_prompt: Some(agents::task_role_system_prompt(request.role).to_string()),
                 },
-                ContainerSource::CloneFrom {
+                agents::ContainerSource::CloneFrom {
                     parent_container_id,
                     docker_image: parent_docker_image,
                     workspace_volume: None,
