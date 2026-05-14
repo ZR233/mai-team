@@ -740,3 +740,81 @@ impl IfEmpty for &str {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    async fn test_store(dir: &tempfile::TempDir) -> Arc<ConfigStore> {
+        Arc::new(
+            ConfigStore::open_with_config_and_artifact_index_path(
+                dir.path().join("runtime.sqlite3"),
+                dir.path().join("config.toml"),
+                dir.path().join("data/artifacts/index"),
+            )
+            .await
+            .expect("open store"),
+        )
+    }
+
+    async fn test_backend(dir: &tempfile::TempDir) -> DirectGithubAppBackend {
+        DirectGithubAppBackend::new(
+            test_store(dir).await,
+            reqwest::Client::new(),
+            DEFAULT_GITHUB_API_BASE_URL.to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn manifest_start_builds_org_action_and_manifest() {
+        let dir = tempdir().expect("tempdir");
+        let backend = test_backend(&dir).await;
+
+        let response = backend
+            .start_github_app_manifest(GithubAppManifestStartRequest {
+                origin: "http://127.0.0.1:8080/".to_string(),
+                account_type: GithubAppManifestAccountType::Organization,
+                org: Some("mai-org".to_string()),
+            })
+            .await
+            .expect("start manifest");
+
+        assert!(
+            response
+                .action_url
+                .starts_with("https://github.com/organizations/mai-org/settings/apps/new?state=")
+        );
+        assert!(response.action_url.ends_with(&response.state));
+        assert_eq!(
+            response.manifest["redirect_url"],
+            "http://127.0.0.1:8080/github/app-manifest/callback"
+        );
+        assert_eq!(
+            response.manifest["default_permissions"]["contents"],
+            "write"
+        );
+        assert_eq!(
+            response.manifest["default_permissions"]["pull_requests"],
+            "write"
+        );
+        assert_eq!(response.manifest["default_permissions"]["issues"], "write");
+        assert_eq!(response.manifest["hook_attributes"]["active"], false);
+    }
+
+    #[tokio::test]
+    async fn manifest_start_rejects_invalid_org() {
+        let dir = tempdir().expect("tempdir");
+        let backend = test_backend(&dir).await;
+
+        let result = backend
+            .start_github_app_manifest(GithubAppManifestStartRequest {
+                origin: "http://127.0.0.1:8080".to_string(),
+                account_type: GithubAppManifestAccountType::Organization,
+                org: Some("-bad-".to_string()),
+            })
+            .await;
+
+        assert!(matches!(result, Err(RuntimeError::InvalidInput(_))));
+    }
+}
