@@ -101,3 +101,46 @@ pub(crate) fn event_name(event: &ServiceEvent) -> &'static str {
         mai_protocol::ServiceEventKind::ArtifactCreated { .. } => "artifact_created",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mai_protocol::{
+        AgentId, ServiceEvent, ServiceEventKind, SessionId, SkillActivationInfo, SkillScope, TurnId,
+    };
+
+    #[test]
+    fn skills_activated_event_has_sse_name() {
+        let event = ServiceEvent {
+            sequence: 1,
+            timestamp: mai_protocol::now(),
+            kind: ServiceEventKind::SkillsActivated {
+                agent_id: AgentId::new_v4(),
+                session_id: Some(SessionId::new_v4()),
+                turn_id: TurnId::new_v4(),
+                skills: vec![SkillActivationInfo {
+                    name: "demo".to_string(),
+                    display_name: Some("Demo".to_string()),
+                    path: std::path::PathBuf::from("/tmp/demo/SKILL.md"),
+                    scope: SkillScope::Project,
+                }],
+            },
+        };
+
+        assert_eq!(event_name(&event), "skills_activated");
+    }
+
+    #[test]
+    fn plan_updated_event_has_sse_name() {
+        let event = ServiceEvent {
+            sequence: 1,
+            timestamp: mai_protocol::now(),
+            kind: ServiceEventKind::PlanUpdated {
+                task_id: TurnId::new_v4(),
+                plan: mai_protocol::TaskPlan::default(),
+            },
+        };
+
+        assert_eq!(event_name(&event), "plan_updated");
+    }
+}

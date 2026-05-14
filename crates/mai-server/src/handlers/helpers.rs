@@ -203,3 +203,40 @@ pub(crate) fn data_dir_path_with(
 ) -> PathBuf {
     cli_data_path.unwrap_or_else(|| current_dir.join(".mai-team"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn runtime_storage_paths_use_cli_data_path() {
+        let dir = tempdir().expect("tempdir");
+        let data_dir = dir.path().join("data-root");
+
+        assert_eq!(
+            data_dir_path_with(dir.path(), Some(data_dir.clone())),
+            data_dir
+        );
+        assert_eq!(cache_dir_path(&data_dir), data_dir.join("cache"));
+    }
+
+    #[test]
+    fn relay_url_prefers_public_url_and_trims_trailing_slash() {
+        assert_eq!(
+            relay_url_from_env_values(
+                Some("https://relay.example.com/"),
+                Some("http://legacy.example.com")
+            ),
+            "https://relay.example.com"
+        );
+        assert_eq!(
+            relay_url_from_env_values(None, Some("http://legacy.example.com/")),
+            "http://legacy.example.com"
+        );
+        assert_eq!(
+            relay_url_from_env_values(Some("  "), None),
+            "http://127.0.0.1:8090"
+        );
+    }
+}
