@@ -1047,11 +1047,13 @@ p {
 .mini-pill {
   color: #334155;
   background: #e8edf4;
+  box-shadow: 0 1px 2px rgba(22, 32, 51, 0.06);
 }
 
 .mini-pill.green {
   color: #0b684f;
   background: #daf4ea;
+  box-shadow: 0 1px 2px rgba(18, 168, 125, 0.1);
 }
 
 .mini-pill.amber {
@@ -1130,16 +1132,23 @@ p {
   align-items: center;
   justify-content: space-between;
   gap: 18px;
-  padding: 24px;
-  border-bottom: 1px solid #d8e0ea;
-  background: rgba(255, 255, 255, 0.78);
+  padding: 24px 28px;
+  border-bottom: 2px solid #e1e7ef;
+  background: linear-gradient(180deg, #fff, rgba(255, 255, 255, 0.78));
 }
 
-.settings-page-title h2,
-.settings-section-header h2 {
+.settings-page-title h2 {
   color: #172033;
   font-size: 22px;
   line-height: 1.25;
+  letter-spacing: -0.02em;
+}
+
+.settings-section-header h2 {
+  color: #172033;
+  font-size: 18px;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
 }
 
 .settings-page-title p,
@@ -1162,20 +1171,20 @@ p {
 .settings-sidebar {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 4px;
   min-width: 0;
-  padding: 18px;
+  padding: 18px 14px;
   border-right: 1px solid #d8e0ea;
-  background: rgba(255, 255, 255, 0.72);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.85), rgba(246, 248, 251, 0.72));
 }
 
 .settings-nav-item {
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr);
+  grid-template-columns: 36px minmax(0, 1fr);
   gap: 10px;
   align-items: center;
   width: 100%;
-  min-height: 58px;
+  min-height: 56px;
   border: 1px solid transparent;
   border-radius: 8px;
   padding: 10px;
@@ -1197,18 +1206,24 @@ p {
 .settings-nav-item.active {
   color: #172033;
   border-color: #cbd8e8;
+  border-left: 3px solid #1f6feb;
+  padding-left: 7px;
   background: #fff;
-  box-shadow: 0 8px 20px rgba(22, 32, 51, 0.06);
+  box-shadow: 0 10px 22px rgba(22, 32, 51, 0.05);
+}
+
+.settings-nav-item:not(:last-child) {
+  border-bottom: 1px solid #edf1f6;
 }
 
 .settings-nav-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  height: 34px;
+  width: 36px;
+  height: 36px;
   border: 1px solid #dbe3ef;
-  border-radius: 8px;
+  border-radius: 9px;
   color: #526176;
   background: #f8fafc;
   font-size: 12px;
@@ -1216,9 +1231,10 @@ p {
 }
 
 .settings-nav-item.active .settings-nav-icon {
-  color: #1f6feb;
-  border-color: #c9dcff;
-  background: #e7f0ff;
+  color: #fff;
+  border-color: transparent;
+  background: linear-gradient(135deg, #1f6feb, #11a683);
+  box-shadow: 0 4px 10px rgba(31, 111, 235, 0.25);
 }
 
 .settings-nav-copy {
@@ -1249,12 +1265,12 @@ p {
   min-width: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 22px;
+  padding: 22px 28px;
 }
 
 .settings-section-panel {
   display: grid;
-  gap: 16px;
+  gap: 20px;
   min-width: 0;
 }
 
@@ -1269,9 +1285,10 @@ p {
   gap: 16px;
   min-width: 0;
   border: 1px solid #d8e0ea;
+  border-left: 4px solid #1f6feb;
   border-radius: 8px;
-  padding: 18px;
-  background: #fff;
+  padding: 18px 18px 18px 20px;
+  background: linear-gradient(180deg, #fff, #fafbfd);
   box-shadow: 0 10px 22px rgba(22, 32, 51, 0.05);
 }
 
@@ -1279,10 +1296,11 @@ p {
   display: inline-flex;
   align-items: center;
   flex-shrink: 0;
-  min-height: 28px;
+  gap: 6px;
+  min-height: 30px;
   border: 1px solid #dbe3ef;
-  border-radius: 999px;
-  padding: 0 10px;
+  border-radius: 7px;
+  padding: 0 12px;
   color: #526176;
   background: #f8fafc;
   font-size: 11px;
@@ -1293,13 +1311,31 @@ p {
 .section-status.ready {
   color: #0b684f;
   border-color: #bfe8d8;
-  background: #e6f7ef;
+  background: linear-gradient(90deg, #e6f7ef, #edfaf3);
+}
+
+.section-status.ready::before {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #12a87d;
 }
 
 .section-status.danger {
   color: #b42318;
   border-color: #f3b4ad;
   background: #fff1ef;
+}
+
+.section-status.danger::before {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #d33f32;
 }
 
 .settings-console {
@@ -1316,7 +1352,7 @@ p {
   border: 1px solid #d8e0ea;
   border-radius: 8px;
   background: #fff;
-  box-shadow: 0 10px 22px rgba(22, 32, 51, 0.05);
+  box-shadow: 0 4px 16px rgba(22, 32, 51, 0.06);
 }
 
 .settings-summary-item {
@@ -1324,7 +1360,12 @@ p {
   gap: 4px;
   min-width: 0;
   padding: 16px 18px;
-  border-left: 1px solid #e1e7ef;
+  border-left: 3px solid #e1e7ef;
+  transition: background 0.15s ease;
+}
+
+.settings-summary-item:hover {
+  background: #f8fafc;
 }
 
 .settings-summary-item:first-child {
@@ -1343,10 +1384,11 @@ p {
 .settings-summary-item strong {
   overflow: hidden;
   color: #172033;
-  font-size: 15px;
+  font-size: 16px;
   line-height: 1.3;
   text-overflow: ellipsis;
   white-space: nowrap;
+  letter-spacing: -0.01em;
 }
 
 .settings-summary-item small {
@@ -1359,8 +1401,16 @@ p {
   color: #0b684f;
 }
 
+.settings-summary-item.ready {
+  border-left-color: #12a87d;
+}
+
 .settings-summary-item.danger strong {
   color: #b42318;
+}
+
+.settings-summary-item.danger {
+  border-left-color: #d33f32;
 }
 
 .settings-summary.single {
@@ -1546,6 +1596,12 @@ p {
   justify-content: space-between;
   gap: 12px;
   min-width: 0;
+}
+
+.integration-card-head {
+  padding-bottom: 12px;
+  border-bottom: 1px solid #e5ebf2;
+  margin-bottom: 4px;
 }
 
 .role-health-head h3,
@@ -1845,6 +1901,7 @@ p {
 .segmented-control button.active {
   color: #0f3f86;
   background: #e8f0ff;
+  box-shadow: 0 2px 6px rgba(31, 111, 235, 0.12);
 }
 
 .github-org-field {
@@ -1910,13 +1967,20 @@ p {
 .git-accounts-layout {
   display: grid;
   grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
-  gap: 14px;
+  gap: 18px;
 }
 
 .git-account-list,
 .git-account-form {
   display: grid;
   gap: 12px;
+}
+
+.git-account-list {
+  padding: 12px;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  background: #f8fafc;
 }
 
 .git-account-card {
@@ -1931,27 +1995,238 @@ p {
   background: #fff;
   text-align: left;
   cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, box-shadow 0.15s, transform 0.15s;
 }
 
 .git-account-card.active {
-  border-color: #8fb7f3;
+  border-color: #7aaef0;
+  border-left: 3px solid #1f6feb;
+  padding-left: 9px;
   background: #f4f8ff;
+  box-shadow: 0 4px 12px rgba(31, 111, 235, 0.08);
+}
+
+.git-account-card:hover:not(.github-app-installation-card) {
+  border-color: #b9c8db;
+  background: #fafbfc;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(22, 32, 51, 0.06);
 }
 
 .github-app-installation-card {
   cursor: default;
 }
 
+/* ─── GitHub App Section ─── */
+.github-app-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 380px);
+  gap: 18px;
+  align-items: start;
+}
+
+.github-app-info-panel {
+  display: grid;
+  gap: 16px;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  padding: 18px;
+  background: #fff;
+  box-shadow: 0 4px 16px rgba(22, 32, 51, 0.06);
+}
+
+.github-app-brand {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+}
+
+.github-app-brand-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  color: #fff;
+  background: linear-gradient(135deg, #24292f, #424a53);
+  box-shadow: 0 4px 10px rgba(36, 41, 47, 0.2);
+}
+
+.github-app-brand-icon svg {
+  display: block;
+}
+
+.github-app-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.github-app-detail-item {
+  display: grid;
+  gap: 4px;
+  border: 1px solid #e1e7ef;
+  border-left: 3px solid #1f6feb;
+  border-radius: 8px;
+  padding: 14px 14px 14px 16px;
+  background: linear-gradient(90deg, #f0f6ff, #f8fafc 40%);
+}
+
+.github-app-detail-label {
+  color: #718096;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.github-app-detail-item strong {
+  color: #172033;
+  font-size: 14px;
+  letter-spacing: -0.01em;
+}
+
+.github-app-detail-item small {
+  color: #66758a;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.github-app-installations {
+  display: grid;
+  gap: 12px;
+}
+
+.github-app-installations-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.github-app-installations-header h3 {
+  color: #172033;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.github-app-installation-list {
+  display: grid;
+  gap: 8px;
+}
+
+.github-app-installation-row {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fff;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.github-app-installation-row:hover {
+  border-color: #c8d3e0;
+  box-shadow: 0 2px 8px rgba(22, 32, 51, 0.05);
+}
+
+.github-app-installation-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  color: #fff;
+  background: linear-gradient(135deg, #4766df, #1f6feb);
+}
+
+.github-app-installation-icon svg {
+  display: block;
+}
+
+.github-app-installation-main {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.github-app-installation-main strong {
+  overflow: hidden;
+  color: #172033;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.github-app-installation-main small {
+  overflow: hidden;
+  color: #66758a;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.github-app-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 160px;
+  padding: 24px;
+  border: 2px dashed #d8e0ea;
+  border-radius: 8px;
+  color: #718096;
+  text-align: center;
+}
+
+.github-app-empty-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  color: #66758a;
+  background: #edf2f7;
+  margin-bottom: 4px;
+}
+
+.github-app-empty-icon svg {
+  display: block;
+}
+
+.github-app-empty strong {
+  color: #405066;
+  font-size: 14px;
+}
+
+.github-app-empty span {
+  max-width: 260px;
+  color: #8896a7;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .git-account-mark {
   display: grid;
-  width: 34px;
-  height: 34px;
+  width: 36px;
+  height: 36px;
   place-items: center;
-  border-radius: 8px;
-  color: #172033;
-  background: #edf2f7;
-  font-size: 11px;
+  border-radius: 9px;
+  color: #fff;
+  background: linear-gradient(135deg, #1f6feb, #11a683);
+  font-size: 10px;
   font-weight: 900;
+}
+
+.github-app-installation-card .git-account-mark {
+  background: linear-gradient(135deg, #4766df, #1f6feb);
 }
 
 .git-account-main {
@@ -1980,10 +2255,12 @@ p {
 }
 
 .git-account-form {
-  border: 1px solid #d8e0ea;
+  border: 1px solid #c8d3e0;
   border-radius: 8px;
   padding: 16px;
   background: #fff;
+  box-shadow: 0 4px 16px rgba(22, 32, 51, 0.04);
+  gap: 16px;
 }
 
 .git-account-form label,
@@ -1996,6 +2273,12 @@ p {
   color: #405066;
   font-size: 12px;
   font-weight: 900;
+}
+
+.git-account-form input:focus {
+  border-color: #1f6feb;
+  box-shadow: 0 0 0 3px rgba(31, 111, 235, 0.1), 0 2px 4px rgba(31, 111, 235, 0.06);
+  outline: none;
 }
 
 .provider-control {
@@ -2013,9 +2296,10 @@ p {
   display: grid;
   gap: 4px;
   border: 1px solid #e1e7ef;
+  border-left: 3px solid #1f6feb;
   border-radius: 8px;
-  padding: 12px;
-  background: #f8fafc;
+  padding: 14px 14px 14px 16px;
+  background: linear-gradient(90deg, #f0f6ff, #f8fafc 40%);
 }
 
 .detected-token-row span,
@@ -4484,6 +4768,18 @@ select:focus {
 
 /* ─── Responsive ─── */
 @media (max-width: 1100px) {
+  .git-accounts-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .github-app-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .github-app-detail-grid {
+    grid-template-columns: 1fr;
+  }
+
   .event-panel {
     min-height: 260px;
     border-top: 1px solid #d8e0ea;
