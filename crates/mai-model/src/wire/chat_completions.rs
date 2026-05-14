@@ -20,7 +20,6 @@ struct ChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<ChatStreamOptions>,
-    max_tokens: u64,
     #[serde(flatten)]
     options: BTreeMap<String, Value>,
 }
@@ -91,8 +90,7 @@ impl WireProtocol for ChatCompletionsApi {
             stream_options: req.stream.then_some(ChatStreamOptions {
                 include_usage: true,
             }),
-            max_tokens: req.max_output_tokens,
-            options: req.extra_body.clone(),
+            options: chat_options(req),
         };
         Ok(serde_json::to_vec(&request)?)
     }
@@ -112,6 +110,17 @@ impl WireProtocol for ChatCompletionsApi {
             end_turn: None,
         }])
     }
+}
+
+fn chat_options(req: &WireRequest<'_>) -> BTreeMap<String, Value> {
+    let mut options = req.extra_body.clone();
+    let max_tokens_field = if req.max_tokens_field.trim().is_empty() {
+        "max_tokens"
+    } else {
+        req.max_tokens_field
+    };
+    options.insert(max_tokens_field.to_string(), Value::from(req.max_output_tokens));
+    options
 }
 
 fn chat_tool(tool: &ToolDefinition) -> ChatTool {
@@ -437,6 +446,7 @@ mod tests {
                 store: None,
                 previous_response_id: None,
                 max_output_tokens: 64_000,
+                max_tokens_field: &model.request_policy.max_tokens_field,
                 extra_body: crate::provider::request_options(&model, Some("high")),
                 supports_tools: true,
             })
@@ -489,6 +499,7 @@ mod tests {
                 store: None,
                 previous_response_id: None,
                 max_output_tokens: 64_000,
+                max_tokens_field: &model.request_policy.max_tokens_field,
                 extra_body: crate::provider::request_options(&model, Some("max")),
                 supports_tools: true,
             })
@@ -581,6 +592,7 @@ mod tests {
                 store: None,
                 previous_response_id: None,
                 max_output_tokens: 131_072,
+                max_tokens_field: &model.request_policy.max_tokens_field,
                 extra_body: crate::provider::request_options(&model, None),
                 supports_tools: true,
             })
@@ -589,5 +601,32 @@ mod tests {
 
         assert_eq!(value.get("mimo_only").and_then(Value::as_bool), Some(true));
         assert!(value.get("thinking").is_none());
+    }
+
+    #[test]
+    fn chat_request_uses_configured_max_token_field() {
+        let mut model = deepseek_model();
+        model.request_policy.max_tokens_field = "max_completion_tokens".to_string();
+        let api = ChatCompletionsApi;
+        let body = api
+            .build_body(&WireRequest {
+                model_id: &model.id,
+                instructions: "instructions",
+                input: &[ModelInputItem::user_text("hello")],
+                tools: &[],
+                tool_choice: None,
+                stream: false,
+                store: None,
+                previous_response_id: None,
+                max_output_tokens: 64_000,
+                max_tokens_field: &model.request_policy.max_tokens_field,
+                extra_body: crate::provider::request_options(&model, Some("high")),
+                supports_tools: true,
+            })
+            .expect("build");
+        let value: Value = serde_json::from_slice(&body).expect("parse");
+
+        assert_eq!(value["max_completion_tokens"].as_u64(), Some(64_000));
+        assert!(value.get("max_tokens").is_none());
     }
 }

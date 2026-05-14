@@ -457,6 +457,11 @@ fn migrated_request_policy(
             if request_policy.max_tokens_field.trim().is_empty() {
                 request_policy.max_tokens_field = "max_tokens".to_string();
             }
+            if provider_kind == ProviderKind::Mimo
+                && request_policy.max_tokens_field == "max_tokens"
+            {
+                request_policy.max_tokens_field = "max_completion_tokens".to_string();
+            }
         }
     }
     request_policy
@@ -665,7 +670,7 @@ fn mimo_model(id: &str, with_reasoning: bool) -> ModelConfig {
         supports_tools: true,
         wire_api: ModelWireApi::ChatCompletions,
         capabilities: mimo_capabilities(with_reasoning),
-        request_policy: chat_request_policy("max_tokens"),
+        request_policy: chat_request_policy("max_completion_tokens"),
         reasoning: with_reasoning.then(mimo_reasoning_config),
         options: serde_json::Value::Null,
         headers: BTreeMap::new(),
