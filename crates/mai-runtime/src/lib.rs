@@ -2342,253 +2342,13 @@ impl AgentRuntime {
         cancellation_token: CancellationToken,
         target_pr: Option<u64>,
     ) -> Result<ProjectReviewCycleResult> {
-        let run_id = Uuid::new_v4();
-        self.set_project_review_state(
+        projects::review::cycle::run_project_review_once(
+            self,
             project_id,
-            ProjectReviewStatus::Syncing,
-            ReviewStateUpdate::default(),
-        )
-        .await?;
-        projects::review::runs::save_project_review_run_status(
-            &self.deps.store,
-            ProjectReviewRunSummary {
-                id: run_id,
-                project_id,
-                reviewer_agent_id: None,
-                turn_id: None,
-                started_at: now(),
-                finished_at: None,
-                status: ProjectReviewRunStatus::Syncing,
-                outcome: None,
-                pr: target_pr,
-                summary: None,
-                error: None,
-            },
-            Vec::new(),
-            Vec::new(),
-        )
-        .await?;
-        if let Err(err) = self.sync_project_review_repo(project_id).await {
-            let error = err.to_string();
-            projects::review::runs::finish_project_review_run(
-                &self.deps.store,
-                self.as_ref(),
-                FinishReviewRun {
-                    run_id,
-                    project_id,
-                    reviewer_agent_id: None,
-                    turn_id: None,
-                    status: ProjectReviewRunStatus::Failed,
-                    outcome: Some(ProjectReviewOutcome::Failed),
-                    pr: target_pr,
-                    summary_text: None,
-                    error: Some(error),
-                },
-            )
-            .await?;
-            return Err(err);
-        }
-        if let Err(err) = self
-            .refresh_project_skills_from_review_workspace(project_id)
-            .await
-        {
-            let error = err.to_string();
-            projects::review::runs::finish_project_review_run(
-                &self.deps.store,
-                self.as_ref(),
-                FinishReviewRun {
-                    run_id,
-                    project_id,
-                    reviewer_agent_id: None,
-                    turn_id: None,
-                    status: ProjectReviewRunStatus::Failed,
-                    outcome: Some(ProjectReviewOutcome::Failed),
-                    pr: target_pr,
-                    summary_text: None,
-                    error: Some(error),
-                },
-            )
-            .await?;
-            return Err(err);
-        }
-        if cancellation_token.is_cancelled() {
-            projects::review::runs::finish_project_review_run(
-                &self.deps.store,
-                self.as_ref(),
-                FinishReviewRun {
-                    run_id,
-                    project_id,
-                    reviewer_agent_id: None,
-                    turn_id: None,
-                    status: ProjectReviewRunStatus::Cancelled,
-                    outcome: None,
-                    pr: target_pr,
-                    summary_text: None,
-                    error: Some("review cancelled".to_string()),
-                },
-            )
-            .await?;
-            return Err(RuntimeError::TurnCancelled);
-        }
-        let reviewer = match projects::review::reviewer::spawn_project_reviewer_agent(
-            self, project_id,
+            cancellation_token,
+            target_pr,
         )
         .await
-        {
-            Ok(reviewer) => reviewer,
-            Err(err) => {
-                projects::review::runs::finish_project_review_run(
-                    &self.deps.store,
-                    self.as_ref(),
-                    FinishReviewRun {
-                        run_id,
-                        project_id,
-                        reviewer_agent_id: None,
-                        turn_id: None,
-                        status: ProjectReviewRunStatus::Failed,
-                        outcome: Some(ProjectReviewOutcome::Failed),
-                        pr: target_pr,
-                        summary_text: None,
-                        error: Some(err.to_string()),
-                    },
-                )
-                .await?;
-                return Err(err);
-            }
-        };
-        let reviewer_id = reviewer.id;
-        self.set_project_review_state(
-            project_id,
-            ProjectReviewStatus::Running,
-            ReviewStateUpdate {
-                current_reviewer_agent_id: Some(reviewer_id),
-                ..Default::default()
-            },
-        )
-        .await?;
-        let started_at = self
-            .deps
-            .store
-            .load_project_review_run(project_id, run_id)
-            .await?
-            .map(|run| run.summary.started_at)
-            .unwrap_or_else(now);
-        projects::review::runs::save_project_review_run_status(
-            &self.deps.store,
-            ProjectReviewRunSummary {
-                id: run_id,
-                project_id,
-                reviewer_agent_id: Some(reviewer_id),
-                turn_id: None,
-                started_at,
-                finished_at: None,
-                status: ProjectReviewRunStatus::Running,
-                outcome: None,
-                pr: target_pr,
-                summary: None,
-                error: None,
-            },
-            Vec::new(),
-            Vec::new(),
-        )
-        .await?;
-        let cycle_result = async {
-            let message = projects::review::reviewer::project_reviewer_initial_message(
-                self,
-                project_id,
-                reviewer_id,
-                target_pr,
-            )
-            .await?;
-            let turn_id =
-                projects::review::reviewer::start_reviewer_turn(self, reviewer_id, message).await?;
-            projects::review::runs::update_project_review_run_turn(
-                &self.deps.store,
-                project_id,
-                run_id,
-                reviewer_id,
-                turn_id,
-            )
-            .await?;
-            let summary = self
-                .wait_agent_until_complete_with_cancel(reviewer_id, &cancellation_token)
-                .await?;
-            if summary.status == AgentStatus::Cancelled && cancellation_token.is_cancelled() {
-                return Err(RuntimeError::TurnCancelled);
-            }
-            if let Some(result) =
-                projects::review::project_review_cycle_result_for_reviewer_status(&summary)
-            {
-                return Ok(result);
-            }
-            let response =
-                projects::review::reviewer::last_turn_response(self, reviewer_id).await?;
-            projects::review::parse_project_review_cycle_report(&response)
-        }
-        .await;
-        let turn_id = self
-            .deps
-            .store
-            .load_project_review_run(project_id, run_id)
-            .await?
-            .and_then(|run| run.summary.turn_id);
-        let (status, outcome, pr, summary, error) = match &cycle_result {
-            Ok(result) => {
-                let status = if result.outcome == ProjectReviewOutcome::Failed {
-                    ProjectReviewRunStatus::Failed
-                } else {
-                    ProjectReviewRunStatus::Completed
-                };
-                (
-                    status,
-                    Some(result.outcome.clone()),
-                    result.pr,
-                    result.summary.clone(),
-                    result.error.clone(),
-                )
-            }
-            Err(RuntimeError::TurnCancelled) if cancellation_token.is_cancelled() => (
-                ProjectReviewRunStatus::Cancelled,
-                None,
-                None,
-                None,
-                Some("review cancelled".to_string()),
-            ),
-            Err(err) => (
-                ProjectReviewRunStatus::Failed,
-                Some(ProjectReviewOutcome::Failed),
-                None,
-                None,
-                Some(err.to_string()),
-            ),
-        };
-        let _ = projects::review::runs::finish_project_review_run(
-            &self.deps.store,
-            self.as_ref(),
-            FinishReviewRun {
-                run_id,
-                project_id,
-                reviewer_agent_id: Some(reviewer_id),
-                turn_id,
-                status,
-                outcome,
-                pr,
-                summary_text: summary,
-                error,
-            },
-        )
-        .await;
-        let _ = self
-            .cleanup_project_review_worktree(project_id, reviewer_id)
-            .await;
-        let _ = self.delete_agent(reviewer_id).await;
-        self.set_project_review_state(
-            project_id,
-            ProjectReviewStatus::Idle,
-            ReviewStateUpdate::default(),
-        )
-        .await?;
-        cycle_result
     }
 
     async fn ensure_project_review_workspace(&self, project_id: ProjectId) -> Result<()> {
@@ -3779,6 +3539,158 @@ impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
             let sessions = agent.sessions.lock().await;
             Ok(agents::last_turn_response(&sessions))
         }
+    }
+}
+
+impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
+    fn set_project_review_state(
+        &self,
+        project_id: ProjectId,
+        status: ProjectReviewStatus,
+        update: ReviewStateUpdate,
+    ) -> impl std::future::Future<Output = Result<ProjectSummary>> + Send {
+        async move {
+            AgentRuntime::set_project_review_state(self.as_ref(), project_id, status, update).await
+        }
+    }
+
+    fn save_project_review_run_status(
+        &self,
+        summary: ProjectReviewRunSummary,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            projects::review::runs::save_project_review_run_status(
+                &self.deps.store,
+                summary,
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+        }
+    }
+
+    fn load_project_review_run(
+        &self,
+        project_id: ProjectId,
+        run_id: Uuid,
+    ) -> impl std::future::Future<Output = Result<Option<ProjectReviewRunDetail>>> + Send {
+        async move {
+            Ok(self
+                .deps
+                .store
+                .load_project_review_run(project_id, run_id)
+                .await?)
+        }
+    }
+
+    fn update_project_review_run_turn(
+        &self,
+        project_id: ProjectId,
+        run_id: Uuid,
+        reviewer_agent_id: AgentId,
+        turn_id: TurnId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            projects::review::runs::update_project_review_run_turn(
+                &self.deps.store,
+                project_id,
+                run_id,
+                reviewer_agent_id,
+                turn_id,
+            )
+            .await
+        }
+    }
+
+    fn finish_project_review_run(
+        &self,
+        request: FinishReviewRun,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            projects::review::runs::finish_project_review_run(
+                &self.deps.store,
+                self.as_ref(),
+                request,
+            )
+            .await
+        }
+    }
+
+    fn sync_project_review_repo(
+        &self,
+        project_id: ProjectId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::sync_project_review_repo(self.as_ref(), project_id)
+    }
+
+    fn refresh_project_skills_from_review_workspace(
+        &self,
+        project_id: ProjectId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::refresh_project_skills_from_review_workspace(self.as_ref(), project_id)
+    }
+
+    fn spawn_project_reviewer_agent(
+        &self,
+        project_id: ProjectId,
+    ) -> impl std::future::Future<Output = Result<AgentSummary>> + Send {
+        projects::review::reviewer::spawn_project_reviewer_agent(self, project_id)
+    }
+
+    fn project_reviewer_initial_message(
+        &self,
+        project_id: ProjectId,
+        reviewer_id: AgentId,
+        target_pr: Option<u64>,
+    ) -> impl std::future::Future<Output = Result<String>> + Send {
+        projects::review::reviewer::project_reviewer_initial_message(
+            self,
+            project_id,
+            reviewer_id,
+            target_pr,
+        )
+    }
+
+    fn start_reviewer_turn(
+        &self,
+        reviewer_id: AgentId,
+        message: String,
+    ) -> impl std::future::Future<Output = Result<TurnId>> + Send {
+        projects::review::reviewer::start_reviewer_turn(self, reviewer_id, message)
+    }
+
+    fn wait_agent_until_complete_with_cancel(
+        &self,
+        agent_id: AgentId,
+        cancellation_token: &CancellationToken,
+    ) -> impl std::future::Future<Output = Result<AgentSummary>> + Send {
+        AgentRuntime::wait_agent_until_complete_with_cancel(
+            self.as_ref(),
+            agent_id,
+            cancellation_token,
+        )
+    }
+
+    fn reviewer_final_response(
+        &self,
+        reviewer_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<String>> + Send {
+        projects::review::reviewer::last_turn_response(self, reviewer_id)
+    }
+
+    fn cleanup_project_review_worktree(
+        &self,
+        project_id: ProjectId,
+        reviewer_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::cleanup_project_review_worktree(self.as_ref(), project_id, reviewer_id)
+    }
+
+    fn delete_agent(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::delete_agent(self.as_ref(), agent_id)
     }
 }
 
