@@ -1,13 +1,12 @@
 use std::sync::Arc;
 
-
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use clap::Parser;
 use mai_protocol::ErrorResponse;
 
-use crate::relay;
+use mai_relay_client::RelayClient;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -20,7 +19,7 @@ pub(crate) struct Cli {
 pub(crate) struct AppState {
     pub(crate) runtime: Arc<mai_runtime::AgentRuntime>,
     pub(crate) store: Arc<mai_store::ConfigStore>,
-    pub(crate) relay: Option<Arc<relay::RelayClient>>,
+    pub(crate) relay: Option<Arc<RelayClient>>,
 }
 
 #[derive(Debug)]

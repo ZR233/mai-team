@@ -6,6 +6,7 @@ members = [
     "crates/mai-model",
     "crates/mai-protocol",
     "crates/mai-relay",
+    "crates/mai-relay-client",
     "crates/mai-runtime",
     "crates/mai-server",
     "crates/mai-skills",

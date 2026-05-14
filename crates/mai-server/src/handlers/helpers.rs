@@ -9,7 +9,7 @@ use axum::response::Response;
 use mai_model::ModelError;
 use mai_protocol::{ModelOutputItem, ModelResponse};
 
-use crate::relay;
+use mai_relay_client::RelayClientConfig;
 
 pub(crate) fn data_dir_path(cli_data_path: Option<PathBuf>) -> Result<PathBuf> {
     Ok(match cli_data_path {
@@ -30,7 +30,7 @@ pub(crate) fn artifact_index_root(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("artifacts").join("index")
 }
 
-pub(crate) fn relay_config_from_env() -> Option<relay::RelayClientConfig> {
+pub(crate) fn relay_config_from_env() -> Option<RelayClientConfig> {
     let enabled = env::var("MAI_RELAY_ENABLED")
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"));
@@ -43,7 +43,7 @@ pub(crate) fn relay_config_from_env() -> Option<relay::RelayClientConfig> {
         return None;
     }
     let node_id = env::var("MAI_RELAY_NODE_ID").unwrap_or_else(|_| "mai-server".to_string());
-    Some(relay::RelayClientConfig {
+    Some(RelayClientConfig {
         url: relay_url_from_env_values(
             env::var("MAI_RELAY_PUBLIC_URL").ok().as_deref(),
             env::var("MAI_RELAY_URL").ok().as_deref(),

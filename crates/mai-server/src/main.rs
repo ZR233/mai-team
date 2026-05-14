@@ -1,5 +1,4 @@
 mod handlers;
-mod relay;
 
 use std::env;
 use std::fs;
@@ -89,7 +88,7 @@ async fn main() -> Result<()> {
         "runtime storage paths"
     );
     let relay = handlers::helpers::relay_config_from_env()
-        .map(|config| Arc::new(relay::RelayClient::new(config)));
+        .map(|config| Arc::new(mai_relay_client::RelayClient::new(config)));
     let github_backend = relay
         .as_ref()
         .map(|client| Arc::clone(client) as Arc<dyn mai_runtime::github::GithubAppBackend>);
