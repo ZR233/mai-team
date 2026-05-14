@@ -13,7 +13,7 @@ mod accounts;
 mod app;
 mod packages;
 
-pub(crate) use accounts::GitAccountService;
+pub(crate) use accounts::{GitAccountService, VerifiedGithubRepository};
 pub(crate) use app::{DirectGithubAppBackend, GithubAppBackend};
 pub(crate) use packages::repository_packages_with_token;
 

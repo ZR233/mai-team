@@ -4,11 +4,15 @@ use std::sync::Arc;
 
 use mai_docker::DockerClient;
 use mai_protocol::{
-    AgentDetail, AgentId, AgentRole, AgentSummary, ProjectDetail, ProjectId, ProjectReviewStatus,
-    ProjectStatus, ProjectSummary, ServiceEventKind, SessionId, UpdateProjectRequest, now, preview,
+    AgentDetail, AgentId, AgentModelPreference, AgentRole, AgentSummary, CreateProjectRequest,
+    GitAccountSummary, GithubInstallationsResponse, ProjectCloneStatus, ProjectDetail, ProjectId,
+    ProjectReviewStatus, ProjectStatus, ProjectSummary, ServiceEventKind, SessionId,
+    UpdateProjectRequest, now, preview,
 };
+use uuid::Uuid;
 
 use super::mcp::PROJECT_WORKSPACE_PATH;
+use crate::github::{VerifiedGithubRepository, github_clone_url};
 use crate::state::{ProjectRecord, RuntimeState};
 use crate::{Result, RuntimeError};
 
@@ -56,6 +60,49 @@ pub(crate) trait ProjectLifecycleOps: Send + Sync {
     fn remove_project_from_memory(&self, project_id: ProjectId) -> impl Future<Output = ()> + Send;
     fn remove_project_skill_lock(&self, project_id: ProjectId) -> impl Future<Output = ()> + Send;
     fn project_skill_cache_dir(&self, project_id: ProjectId) -> PathBuf;
+}
+
+pub(crate) struct ProjectMaintainerAgentRequest {
+    pub(crate) project_id: ProjectId,
+    pub(crate) name: String,
+    pub(crate) model: AgentModelPreference,
+    pub(crate) docker_image: Option<String>,
+    pub(crate) system_prompt: String,
+}
+
+/// Supplies GitHub, agent, persistence, and async workspace setup side effects
+/// required to create a project.
+pub(crate) trait ProjectCreateOps: Send + Sync {
+    fn list_github_installations(
+        &self,
+    ) -> impl Future<Output = Result<GithubInstallationsResponse>> + Send;
+    fn upsert_github_app_relay_account(
+        &self,
+        installation_id: u64,
+        account_login: &str,
+    ) -> impl Future<Output = Result<String>> + Send;
+    fn verified_repository(
+        &self,
+        account_id: &str,
+        repository_full_name: &str,
+    ) -> impl Future<Output = Result<VerifiedGithubRepository>> + Send;
+    fn git_account_summary(
+        &self,
+        account_id: &str,
+    ) -> impl Future<Output = Result<GitAccountSummary>> + Send;
+    fn planner_model(&self) -> impl Future<Output = Result<AgentModelPreference>> + Send;
+    fn create_project_maintainer_agent(
+        &self,
+        request: ProjectMaintainerAgentRequest,
+    ) -> impl Future<Output = Result<AgentSummary>> + Send;
+    fn save_project(&self, project: &ProjectSummary) -> impl Future<Output = Result<()>> + Send;
+    fn insert_project(&self, project: ProjectSummary) -> impl Future<Output = ()> + Send;
+    fn publish_project_event(&self, event: ServiceEventKind) -> impl Future<Output = ()> + Send;
+    fn start_project_workspace(
+        &self,
+        project_id: ProjectId,
+        maintainer_agent_id: AgentId,
+    ) -> impl Future<Output = ()> + Send;
 }
 
 pub(crate) async fn project(
@@ -127,6 +174,118 @@ pub(crate) async fn get_project(
         mcp_status: status.to_string(),
         review_runs,
     })
+}
+
+pub(crate) async fn create_project(
+    ops: &impl ProjectCreateOps,
+    request: CreateProjectRequest,
+) -> Result<ProjectSummary> {
+    let relay_installation_id = request.installation_id;
+    let account_id = match normalize_optional_text(request.git_account_id.clone()) {
+        Some(account_id) => account_id,
+        None if relay_installation_id > 0 => {
+            let installations = ops.list_github_installations().await?;
+            let installation = installations
+                .installations
+                .into_iter()
+                .find(|installation| installation.id == relay_installation_id)
+                .ok_or_else(|| {
+                    RuntimeError::InvalidInput("GitHub App installation not found".to_string())
+                })?;
+            ops.upsert_github_app_relay_account(relay_installation_id, &installation.account_login)
+                .await?
+        }
+        None => {
+            return Err(RuntimeError::InvalidInput(
+                "git_account_id or installation_id is required".to_string(),
+            ));
+        }
+    };
+    let repository_ref = request
+        .repository_full_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let owner = request.owner.trim();
+            let repo = request.repo.trim();
+            (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
+        })
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput("repository_full_name is required".to_string())
+        })?;
+    let repository = ops
+        .verified_repository(&account_id, &repository_ref)
+        .await?;
+    let owner = repository.owner.clone();
+    let repo = repository.name.clone();
+    let repository_id = repository.id;
+    let branch = normalize_optional_path_segment(request.branch.as_deref(), "branch")?
+        .unwrap_or_else(|| repository.default_branch.clone());
+    let name =
+        normalize_optional_text(Some(request.name)).unwrap_or_else(|| format!("{owner}/{repo}"));
+    let account = ops.git_account_summary(&account_id).await?;
+    let installation_id = account.installation_id.unwrap_or(relay_installation_id);
+    let installation_account = account
+        .installation_account
+        .clone()
+        .or(account.login)
+        .unwrap_or(account.label);
+    let project_id = Uuid::new_v4();
+    let planner_model = ops.planner_model().await?;
+    let clone_url = github_clone_url(&owner, &repo);
+    let system_prompt = project_maintainer_system_prompt(&owner, &repo, &clone_url, &branch);
+    let maintainer = ops
+        .create_project_maintainer_agent(ProjectMaintainerAgentRequest {
+            project_id,
+            name: format!("{name} Maintainer"),
+            model: planner_model,
+            docker_image: request.docker_image.clone(),
+            system_prompt,
+        })
+        .await?;
+    let created_at = now();
+    let project = ProjectSummary {
+        id: project_id,
+        name,
+        status: ProjectStatus::Creating,
+        owner,
+        repo,
+        repository_full_name: repository.full_name,
+        git_account_id: Some(account_id),
+        repository_id,
+        installation_id,
+        installation_account,
+        branch,
+        docker_image: maintainer.docker_image.clone(),
+        clone_status: ProjectCloneStatus::Pending,
+        maintainer_agent_id: maintainer.id,
+        created_at,
+        updated_at: created_at,
+        last_error: None,
+        auto_review_enabled: request.auto_review_enabled,
+        reviewer_extra_prompt: normalize_optional_text(request.reviewer_extra_prompt),
+        review_status: if request.auto_review_enabled {
+            ProjectReviewStatus::Idle
+        } else {
+            ProjectReviewStatus::Disabled
+        },
+        current_reviewer_agent_id: None,
+        last_review_started_at: None,
+        last_review_finished_at: None,
+        next_review_at: None,
+        last_review_outcome: None,
+        review_last_error: None,
+    };
+    ops.save_project(&project).await?;
+    ops.insert_project(project.clone()).await;
+    ops.publish_project_event(ServiceEventKind::ProjectCreated {
+        project: project.clone(),
+    })
+    .await;
+    ops.start_project_workspace(project_id, maintainer.id).await;
+    Ok(project)
 }
 
 pub(crate) async fn find_project_for_github_event(
@@ -374,4 +533,48 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+pub(crate) fn project_maintainer_system_prompt(
+    owner: &str,
+    repo: &str,
+    clone_url: &str,
+    branch: &str,
+) -> String {
+    format!(
+        r#"You are the Maintainer agent for the GitHub project `{owner}/{repo}`.
+
+The repository clone URL is `{clone_url}`.
+You run inside an isolated Docker container. The repository is cloned at `/workspace/repo`; use that path for local inspection and edits.
+The selected branch is `{branch}`.
+
+Security rules:
+- Do not look for or persist GitHub credentials.
+- Do not configure credential helpers.
+- Do not write `~/.config/gh`, `~/.git-credentials`, long-lived `GH_TOKEN`, or long-lived `GITHUB_TOKEN`.
+- Use MCP/GitHub API tools for GitHub reads and writes such as issues, branches, commits, and pull requests.
+- Treat the deployment as no-webhook/no-public-inbound: refresh or poll state when you need current GitHub information.
+
+Operational focus:
+- Help the user review, plan, and maintain this repository.
+- Prefer small, testable changes.
+- Run relevant checks before reporting completion."#
+    )
+}
+
+fn normalize_optional_path_segment(value: Option<&str>, field: &str) -> Result<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.contains(char::is_whitespace)
+        || value.starts_with('-')
+        || value.starts_with('/')
+        || value.contains("..")
+        || value.contains('\\')
+    {
+        return Err(RuntimeError::InvalidInput(format!(
+            "{field} must be a safe Git ref name"
+        )));
+    }
+    Ok(Some(value.to_string()))
 }

@@ -853,158 +853,7 @@ impl AgentRuntime {
         self: &Arc<Self>,
         request: CreateProjectRequest,
     ) -> Result<ProjectSummary> {
-        let relay_installation_id = request.installation_id;
-        let account_id = match request
-            .git_account_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-        {
-            Some(account_id) => account_id,
-            None if relay_installation_id > 0 => {
-                let installations = self.list_github_installations().await?;
-                let installation = installations
-                    .installations
-                    .into_iter()
-                    .find(|installation| installation.id == relay_installation_id)
-                    .ok_or_else(|| {
-                        RuntimeError::InvalidInput("GitHub App installation not found".to_string())
-                    })?;
-                self.deps
-                    .store
-                    .upsert_github_app_relay_account(
-                        relay_installation_id,
-                        &installation.account_login,
-                        "default",
-                        false,
-                    )
-                    .await?
-                    .id
-            }
-            None => {
-                return Err(RuntimeError::InvalidInput(
-                    "git_account_id or installation_id is required".to_string(),
-                ));
-            }
-        };
-        let repository_ref = request
-            .repository_full_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                let owner = request.owner.trim();
-                let repo = request.repo.trim();
-                (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
-            })
-            .ok_or_else(|| {
-                RuntimeError::InvalidInput("repository_full_name is required".to_string())
-            })?;
-        let repository = self
-            .deps
-            .git_accounts
-            .verified_repository(&account_id, &repository_ref)
-            .await?;
-        let owner = repository.owner.clone();
-        let repo = repository.name.clone();
-        let repository_id = repository.id;
-        let branch = normalize_optional_path_segment(request.branch.as_deref(), "branch")?
-            .unwrap_or_else(|| repository.default_branch.clone());
-        let name = request.name.trim().to_string();
-        let name = if name.is_empty() {
-            format!("{owner}/{repo}")
-        } else {
-            name
-        };
-        let account = self.deps.git_accounts.summary(&account_id).await?;
-        let installation_id = account.installation_id.unwrap_or(relay_installation_id);
-        let installation_account = account
-            .installation_account
-            .clone()
-            .or(account.login)
-            .unwrap_or(account.label);
-        let project_id = Uuid::new_v4();
-        let planner_model = self.resolve_role_agent_model(AgentRole::Planner).await?;
-        let clone_url = github_clone_url(&owner, &repo);
-        let system_prompt = project_maintainer_system_prompt(&owner, &repo, &clone_url, &branch);
-        let maintainer = agents::create_agent_record(
-            self.as_ref(),
-            CreateAgentRequest {
-                name: Some(format!("{name} Maintainer")),
-                provider_id: Some(planner_model.preference.provider_id),
-                model: Some(planner_model.preference.model),
-                reasoning_effort: planner_model.preference.reasoning_effort,
-                docker_image: request.docker_image.clone(),
-                parent_id: None,
-                system_prompt: Some(system_prompt),
-            },
-            agents::CreateAgentRecordContext {
-                task_id: None,
-                project_id: Some(project_id),
-                role: Some(AgentRole::Planner),
-            },
-        )
-        .await?;
-        let maintainer_summary = maintainer.summary.read().await.clone();
-        let created_at = now();
-        let project = ProjectSummary {
-            id: project_id,
-            name,
-            status: ProjectStatus::Creating,
-            owner,
-            repo,
-            repository_full_name: repository.full_name,
-            git_account_id: Some(account_id),
-            repository_id,
-            installation_id,
-            installation_account,
-            branch,
-            docker_image: maintainer_summary.docker_image.clone(),
-            clone_status: ProjectCloneStatus::Pending,
-            maintainer_agent_id: maintainer_summary.id,
-            created_at,
-            updated_at: created_at,
-            last_error: None,
-            auto_review_enabled: request.auto_review_enabled,
-            reviewer_extra_prompt: normalize_optional_text(request.reviewer_extra_prompt),
-            review_status: if request.auto_review_enabled {
-                ProjectReviewStatus::Idle
-            } else {
-                ProjectReviewStatus::Disabled
-            },
-            current_reviewer_agent_id: None,
-            last_review_started_at: None,
-            last_review_finished_at: None,
-            next_review_at: None,
-            last_review_outcome: None,
-            review_last_error: None,
-        };
-        self.deps.store.save_project(&project).await?;
-        self.state.projects.write().await.insert(
-            project_id,
-            Arc::new(ProjectRecord {
-                summary: RwLock::new(project.clone()),
-                sidecar: RwLock::new(None),
-                review_worker: Mutex::new(None),
-            }),
-        );
-        self.events
-            .publish(ServiceEventKind::ProjectCreated {
-                project: project.clone(),
-            })
-            .await;
-        let runtime = Arc::clone(self);
-        tokio::spawn(async move {
-            if let Err(err) = runtime
-                .start_project_workspace(project_id, maintainer_summary.id)
-                .await
-            {
-                tracing::warn!(project_id = %project_id, "failed to finish project workspace setup: {err}");
-            }
-        });
-        Ok(project)
+        projects::service::create_project(self, request).await
     }
 
     pub async fn update_project(
@@ -4693,6 +4542,104 @@ impl projects::service::ProjectLifecycleOps for Arc<AgentRuntime> {
     }
 }
 
+impl projects::service::ProjectCreateOps for Arc<AgentRuntime> {
+    async fn list_github_installations(&self) -> Result<GithubInstallationsResponse> {
+        AgentRuntime::list_github_installations(self.as_ref()).await
+    }
+
+    async fn upsert_github_app_relay_account(
+        &self,
+        installation_id: u64,
+        account_login: &str,
+    ) -> Result<String> {
+        Ok(self
+            .deps
+            .store
+            .upsert_github_app_relay_account(installation_id, account_login, "default", false)
+            .await?
+            .id)
+    }
+
+    async fn verified_repository(
+        &self,
+        account_id: &str,
+        repository_full_name: &str,
+    ) -> Result<github::VerifiedGithubRepository> {
+        self.deps
+            .git_accounts
+            .verified_repository(account_id, repository_full_name)
+            .await
+    }
+
+    async fn git_account_summary(&self, account_id: &str) -> Result<GitAccountSummary> {
+        self.deps.git_accounts.summary(account_id).await
+    }
+
+    async fn planner_model(&self) -> Result<AgentModelPreference> {
+        Ok(self
+            .resolve_role_agent_model(AgentRole::Planner)
+            .await?
+            .preference)
+    }
+
+    async fn create_project_maintainer_agent(
+        &self,
+        request: projects::service::ProjectMaintainerAgentRequest,
+    ) -> Result<AgentSummary> {
+        let maintainer = agents::create_agent_record(
+            self.as_ref(),
+            CreateAgentRequest {
+                name: Some(request.name),
+                provider_id: Some(request.model.provider_id),
+                model: Some(request.model.model),
+                reasoning_effort: request.model.reasoning_effort,
+                docker_image: request.docker_image,
+                parent_id: None,
+                system_prompt: Some(request.system_prompt),
+            },
+            agents::CreateAgentRecordContext {
+                task_id: None,
+                project_id: Some(request.project_id),
+                role: Some(AgentRole::Planner),
+            },
+        )
+        .await?;
+        Ok(maintainer.summary.read().await.clone())
+    }
+
+    async fn save_project(&self, project: &ProjectSummary) -> Result<()> {
+        self.deps.store.save_project(project).await?;
+        Ok(())
+    }
+
+    async fn insert_project(&self, project: ProjectSummary) {
+        self.state.projects.write().await.insert(
+            project.id,
+            Arc::new(ProjectRecord {
+                summary: RwLock::new(project),
+                sidecar: RwLock::new(None),
+                review_worker: Mutex::new(None),
+            }),
+        );
+    }
+
+    async fn publish_project_event(&self, event: ServiceEventKind) {
+        self.events.publish(event).await;
+    }
+
+    async fn start_project_workspace(&self, project_id: ProjectId, maintainer_agent_id: AgentId) {
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(err) = runtime
+                .start_project_workspace(project_id, maintainer_agent_id)
+                .await
+            {
+                tracing::warn!(project_id = %project_id, "failed to finish project workspace setup: {err}");
+            }
+        });
+    }
+}
+
 #[async_trait]
 impl turn::orchestrator::TurnOrchestratorOps for Arc<AgentRuntime> {
     async fn agent(&self, agent_id: AgentId) -> Result<Arc<AgentRecord>> {
@@ -5153,56 +5100,6 @@ fn is_stale_agent_model_preference_error(err: &RuntimeError) -> bool {
     (message.starts_with("provider `") && message.ends_with("` not found"))
         || (message.starts_with("model `")
             && message.contains("` is not configured for provider `"))
-}
-
-fn project_maintainer_system_prompt(
-    owner: &str,
-    repo: &str,
-    clone_url: &str,
-    branch: &str,
-) -> String {
-    format!(
-        r#"You are the Maintainer agent for the GitHub project `{owner}/{repo}`.
-
-The repository clone URL is `{clone_url}`.
-You run inside an isolated Docker container. The repository is cloned at `/workspace/repo`; use that path for local inspection and edits.
-The selected branch is `{branch}`.
-
-Security rules:
-- Do not look for or persist GitHub credentials.
-- Do not configure credential helpers.
-- Do not write `~/.config/gh`, `~/.git-credentials`, long-lived `GH_TOKEN`, or long-lived `GITHUB_TOKEN`.
-- Use MCP/GitHub API tools for GitHub reads and writes such as issues, branches, commits, and pull requests.
-- Treat the deployment as no-webhook/no-public-inbound: refresh or poll state when you need current GitHub information.
-
-Operational focus:
-- Help the user review, plan, and maintain this repository.
-- Prefer small, testable changes.
-- Run relevant checks before reporting completion."#
-    )
-}
-
-fn normalize_optional_path_segment(value: Option<&str>, field: &str) -> Result<Option<String>> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    if value.contains(char::is_whitespace)
-        || value.starts_with('-')
-        || value.starts_with('/')
-        || value.contains("..")
-        || value.contains('\\')
-    {
-        return Err(RuntimeError::InvalidInput(format!(
-            "{field} must be a safe Git ref name"
-        )));
-    }
-    Ok(Some(value.to_string()))
-}
-
-fn normalize_optional_text(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 fn shell_quote(value: &str) -> String {
@@ -10790,7 +10687,7 @@ esac
 
     #[test]
     fn project_maintainer_prompt_includes_clone_url_and_workspace() {
-        let prompt = project_maintainer_system_prompt(
+        let prompt = projects::service::project_maintainer_system_prompt(
             "owner",
             "repo",
             "https://github.com/owner/repo.git",
