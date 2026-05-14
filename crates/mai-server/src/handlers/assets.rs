@@ -298,19 +298,19 @@ mod tests {
         let data_dir = dir.path().join(".mai-team");
 
         assert_eq!(
-            crate::handlers::helpers::data_dir_path_with(dir.path(), None),
+            crate::config::paths::data_dir_path_with(dir.path(), None),
             data_dir
         );
         assert_eq!(
-            crate::handlers::helpers::cache_dir_path(&data_dir),
+            crate::config::paths::cache_dir_path(&data_dir),
             data_dir.join("cache")
         );
         assert_eq!(
-            crate::handlers::helpers::artifact_files_root(&data_dir),
+            crate::config::paths::artifact_files_root(&data_dir),
             data_dir.join("artifacts").join("files")
         );
         assert_eq!(
-            crate::handlers::helpers::artifact_index_root(&data_dir),
+            crate::config::paths::artifact_index_root(&data_dir),
             data_dir.join("artifacts").join("index")
         );
         assert_eq!(

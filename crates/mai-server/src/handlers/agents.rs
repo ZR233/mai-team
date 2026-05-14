@@ -16,8 +16,11 @@ use mai_protocol::{
 use mai_store::AgentLogFilter;
 use mai_store::ToolTraceFilter;
 
-use super::helpers::bounded_api_limit;
 use super::state::{ApiError, AppState};
+
+fn bounded_api_limit(limit: Option<usize>, default: usize, max: usize) -> usize {
+    limit.unwrap_or(default).clamp(1, max)
+}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AgentDetailQuery {

@@ -13,8 +13,63 @@ use mai_protocol::*;
 use mai_store::ConfigStore;
 use tokio_util::sync::CancellationToken;
 
-use super::helpers::{elapsed_millis, model_output_preview, sanitize_provider_test_error};
 use super::state::{ApiError, AppState};
+
+fn elapsed_millis(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn model_output_preview(response: &ModelResponse) -> String {
+    let text = response
+        .output
+        .iter()
+        .filter_map(model_output_item_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    mai_protocol::preview(&text, 500)
+}
+
+fn model_output_item_text(item: &ModelOutputItem) -> Option<String> {
+    match item {
+        ModelOutputItem::Message { text } => Some(text.clone()),
+        ModelOutputItem::AssistantTurn { content, .. } => content.clone(),
+        ModelOutputItem::FunctionCall {
+            call_id,
+            name,
+            raw_arguments,
+            ..
+        } => Some(format!("function_call {name} {call_id}: {raw_arguments}")),
+        ModelOutputItem::Other { raw } => Some(raw.to_string()),
+    }
+}
+
+fn sanitize_provider_test_error(err: &ModelError, api_key: &str) -> String {
+    let message = match err {
+        ModelError::Request { endpoint, source } => {
+            format!("request to {endpoint} failed: {source}")
+        }
+        ModelError::Api {
+            endpoint,
+            status,
+            body,
+        } => {
+            let body = mai_protocol::preview(&redact_secret(body, api_key), 1_000);
+            format!("request to {endpoint} returned {status}: {body}")
+        }
+        ModelError::Json(err) => format!("json error: {err}"),
+        ModelError::Stream(message) => format!("stream error: {message}"),
+        ModelError::Cancelled => "request cancelled".to_string(),
+    };
+    mai_protocol::preview(&redact_secret(&message, api_key), 1_500)
+}
+
+fn redact_secret(value: &str, secret: &str) -> String {
+    if secret.trim().is_empty() {
+        value.to_string()
+    } else {
+        value.replace(secret, "[redacted]")
+    }
+}
 
 pub(crate) async fn get_providers(
     State(state): State<Arc<AppState>>,
