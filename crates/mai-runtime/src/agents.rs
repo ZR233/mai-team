@@ -21,6 +21,7 @@ mod delete;
 mod fork;
 mod input;
 mod model;
+mod spawn;
 mod update;
 mod wait;
 
@@ -38,6 +39,9 @@ pub(crate) use fork::fork_agent_context;
 pub(crate) use input::start_next_queued_input;
 pub(crate) use input::{send_input_to_agent, start_next_queued_input_after_turn};
 pub(crate) use model::normalize_reasoning_effort;
+pub(crate) use spawn::{
+    AgentSpawnOps, SpawnChildAgentRequest, spawn_child_agent, spawn_task_role_agent,
+};
 pub(crate) use update::{AgentUpdateOps, update_agent};
 pub(crate) use wait::{wait_agent, wait_agent_until_complete_with_cancel};
 

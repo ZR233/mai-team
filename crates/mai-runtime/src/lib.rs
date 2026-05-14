@@ -2058,35 +2058,7 @@ impl AgentRuntime {
         role: AgentRole,
         name: Option<String>,
     ) -> Result<AgentSummary> {
-        let parent = self.agent(parent_agent_id).await?;
-        let parent_summary = parent.summary.read().await.clone();
-        let task_id = parent_summary.task_id.ok_or_else(|| {
-            RuntimeError::InvalidInput("parent agent is not attached to a task".to_string())
-        })?;
-        let parent_container_id =
-            agents::ensure_agent_container(self.as_ref(), &parent, parent_summary.status.clone())
-                .await?;
-        let model = self.resolve_role_agent_model(role).await?;
-        self.create_agent_with_container_source(
-            CreateAgentRequest {
-                name,
-                provider_id: Some(model.preference.provider_id),
-                model: Some(model.preference.model),
-                reasoning_effort: model.preference.reasoning_effort,
-                docker_image: Some(parent_summary.docker_image.clone()),
-                parent_id: Some(parent_agent_id),
-                system_prompt: Some(agents::task_role_system_prompt(role).to_string()),
-            },
-            agents::ContainerSource::CloneFrom {
-                parent_container_id,
-                docker_image: parent_summary.docker_image,
-                workspace_volume: None,
-            },
-            Some(task_id),
-            parent_summary.project_id,
-            Some(role),
-        )
-        .await
+        agents::spawn_task_role_agent(self, parent_agent_id, role, name).await
     }
 
     async fn start_agent_turn(
@@ -4319,6 +4291,83 @@ impl agents::AgentCreateOps for AgentRuntime {
     }
 }
 
+impl agents::AgentSpawnOps for Arc<AgentRuntime> {
+    fn agent(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<Arc<AgentRecord>>> + Send {
+        AgentRuntime::agent(self.as_ref(), agent_id)
+    }
+
+    fn ensure_agent_container(
+        &self,
+        agent: &Arc<AgentRecord>,
+        ready_status: AgentStatus,
+    ) -> impl std::future::Future<Output = Result<String>> + Send {
+        agents::ensure_agent_container(self.as_ref(), agent, ready_status)
+    }
+
+    async fn role_model(&self, role: AgentRole) -> Result<AgentModelPreference> {
+        Ok(self.resolve_role_agent_model(role).await?.preference)
+    }
+
+    fn create_agent_with_container_source(
+        &self,
+        request: CreateAgentRequest,
+        source: agents::ContainerSource,
+        task_id: Option<TaskId>,
+        project_id: Option<ProjectId>,
+        role: Option<AgentRole>,
+    ) -> impl std::future::Future<Output = Result<AgentSummary>> + Send {
+        AgentRuntime::create_agent_with_container_source(
+            self, request, source, task_id, project_id, role,
+        )
+    }
+
+    fn fork_agent_context(
+        &self,
+        parent_id: AgentId,
+        child_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::fork_agent_context(self.as_ref(), parent_id, child_id)
+    }
+
+    fn resolve_session_id(
+        &self,
+        agent_id: AgentId,
+        session_id: Option<SessionId>,
+    ) -> impl std::future::Future<Output = Result<SessionId>> + Send {
+        AgentRuntime::resolve_session_id(self.as_ref(), agent_id, session_id)
+    }
+
+    fn prepare_turn(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<(Arc<AgentRecord>, TurnId)>> + Send {
+        AgentRuntime::prepare_turn(self.as_ref(), agent_id)
+    }
+
+    fn spawn_turn(
+        &self,
+        agent: &Arc<AgentRecord>,
+        agent_id: AgentId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        message: String,
+        skill_mentions: Vec<String>,
+    ) {
+        AgentRuntime::spawn_turn(
+            self,
+            agent,
+            agent_id,
+            session_id,
+            turn_id,
+            message,
+            skill_mentions,
+        );
+    }
+}
+
 impl agents::AgentContainerOps for AgentRuntime {
     async fn start_agent_container(
         &self,
@@ -4818,72 +4867,23 @@ impl turn::tools::ToolDispatchOps for Arc<AgentRuntime> {
         parent_agent_id: AgentId,
         request: turn::tools::SpawnAgentToolRequest,
     ) -> Result<turn::tools::SpawnAgentToolResult> {
-        let parent = self.agent(parent_agent_id).await?;
-        let parent_status = parent.summary.read().await.status.clone();
-        let parent_summary = parent.summary.read().await.clone();
-        let parent_container_id =
-            agents::ensure_agent_container(self.as_ref(), &parent, parent_status).await?;
-        let parent_docker_image = parent_summary.docker_image.clone();
-        let (provider_id, model, reasoning_effort) = if request.legacy_role.is_some() {
-            let child_model = self.resolve_role_agent_model(request.role).await?;
-            (
-                child_model.preference.provider_id,
-                child_model.preference.model,
-                child_model.preference.reasoning_effort,
-            )
-        } else {
-            (
-                parent_summary.provider_id.clone(),
-                request
-                    .model
-                    .unwrap_or_else(|| parent_summary.model.clone()),
-                request
-                    .reasoning_effort
-                    .or_else(|| parent_summary.reasoning_effort.clone()),
-            )
-        };
-        let created = self
-            .create_agent_with_container_source(
-                CreateAgentRequest {
-                    name: request.name,
-                    provider_id: Some(provider_id),
-                    model: Some(model),
-                    reasoning_effort,
-                    docker_image: Some(parent_docker_image.clone()),
-                    parent_id: Some(parent_agent_id),
-                    system_prompt: Some(agents::task_role_system_prompt(request.role).to_string()),
-                },
-                agents::ContainerSource::CloneFrom {
-                    parent_container_id,
-                    docker_image: parent_docker_image,
-                    workspace_volume: None,
-                },
-                parent_summary.task_id,
-                parent_summary.project_id,
-                Some(request.role),
-            )
-            .await?;
-        if request.fork_context {
-            self.fork_agent_context(parent_agent_id, created.id).await?;
-        }
-        let turn_id = if let Some(message) = request.collab_input.message {
-            let session_id = self.resolve_session_id(created.id, None).await?;
-            let (agent, turn_id) = self.prepare_turn(created.id).await?;
-            self.spawn_turn(
-                &agent,
-                created.id,
-                session_id,
-                turn_id,
-                message,
-                request.collab_input.skill_mentions,
-            );
-            Some(turn_id)
-        } else {
-            None
-        };
+        let result = agents::spawn_child_agent(
+            self,
+            parent_agent_id,
+            agents::SpawnChildAgentRequest {
+                name: request.name,
+                role: request.role,
+                model: request.model,
+                reasoning_effort: request.reasoning_effort,
+                use_role_model: request.legacy_role.is_some(),
+                fork_context: request.fork_context,
+                collab_input: request.collab_input,
+            },
+        )
+        .await?;
         Ok(turn::tools::SpawnAgentToolResult {
-            agent: created,
-            turn_id,
+            agent: result.agent,
+            turn_id: result.turn_id,
         })
     }
 
