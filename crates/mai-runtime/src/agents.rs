@@ -22,6 +22,7 @@ mod files;
 mod fork;
 mod input;
 mod model;
+mod observability;
 mod resources;
 mod spawn;
 mod update;
@@ -42,6 +43,9 @@ pub(crate) use fork::fork_agent_context;
 pub(crate) use input::start_next_queued_input;
 pub(crate) use input::{send_input_to_agent, start_next_queued_input_after_turn};
 pub(crate) use model::normalize_reasoning_effort;
+pub(crate) use observability::{
+    AgentObservabilityOps, agent_logs, tool_output_artifact, tool_trace, tool_traces,
+};
 pub(crate) use resources::AgentResourceBroker;
 pub(crate) use spawn::{
     AgentSpawnOps, SpawnChildAgentRequest, spawn_child_agent, spawn_task_role_agent,

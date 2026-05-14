@@ -1007,86 +1007,7 @@ impl AgentRuntime {
         session_id: Option<SessionId>,
         call_id: String,
     ) -> Result<ToolTraceDetail> {
-        if let Some(trace) = self
-            .deps
-            .store
-            .load_tool_trace(agent_id, session_id, &call_id)
-            .await?
-        {
-            return Ok(trace);
-        }
-        let agent = self.agent(agent_id).await?;
-        let (session_id, history) = {
-            let sessions = agent.sessions.lock().await;
-            let selected_session =
-                agents::selected_session(&sessions, session_id).ok_or_else(|| {
-                    RuntimeError::SessionNotFound {
-                        agent_id,
-                        session_id: session_id.unwrap_or_default(),
-                    }
-                })?;
-            (
-                selected_session.summary.id,
-                selected_session.history.clone(),
-            )
-        };
-        let mut tool_name = None;
-        let mut arguments = None;
-        let mut output = None;
-
-        for item in history {
-            match item {
-                ModelInputItem::FunctionCall {
-                    call_id: item_call_id,
-                    name,
-                    arguments: raw_arguments,
-                } if item_call_id == call_id => {
-                    tool_name = Some(name);
-                    arguments = Some(parse_tool_arguments(&raw_arguments));
-                }
-                ModelInputItem::AssistantTurn { tool_calls, .. } => {
-                    for tool_call in tool_calls {
-                        if tool_call.call_id == call_id {
-                            tool_name = Some(tool_call.name);
-                            arguments = Some(parse_tool_arguments(&tool_call.arguments));
-                            break;
-                        }
-                    }
-                }
-                ModelInputItem::FunctionCallOutput {
-                    call_id: item_call_id,
-                    output: item_output,
-                } if item_call_id == call_id => {
-                    output = Some(item_output);
-                }
-                _ => {}
-            }
-        }
-
-        let tool_name = tool_name.ok_or_else(|| RuntimeError::ToolTraceNotFound {
-            agent_id,
-            call_id: call_id.clone(),
-        })?;
-        let output = output.unwrap_or_default();
-        let (event_success, duration_ms) = self
-            .events
-            .tool_metadata(agent_id, session_id, &call_id)
-            .await;
-        Ok(ToolTraceDetail {
-            agent_id,
-            session_id: Some(session_id),
-            turn_id: None,
-            call_id,
-            tool_name,
-            arguments: arguments.unwrap_or_else(|| json!({})),
-            success: event_success.unwrap_or(!output.is_empty()),
-            output_preview: turn::tools::trace_preview_output(&output, 500),
-            output,
-            duration_ms,
-            started_at: None,
-            completed_at: None,
-            output_artifacts: Vec::new(),
-        })
+        agents::tool_trace(self, agent_id, session_id, call_id).await
     }
 
     pub async fn tool_output_artifact(
@@ -1096,23 +1017,7 @@ impl AgentRuntime {
         call_id: String,
         artifact_id: String,
     ) -> Result<(ToolOutputArtifactInfo, PathBuf)> {
-        let trace = self
-            .tool_trace(agent_id, session_id, call_id.clone())
-            .await?;
-        let artifact = trace
-            .output_artifacts
-            .into_iter()
-            .find(|artifact| artifact.id == artifact_id && artifact.call_id == call_id)
-            .ok_or_else(|| {
-                RuntimeError::InvalidInput("tool output artifact not found".to_string())
-            })?;
-        let path = self.tool_output_artifact_file_path(
-            artifact.agent_id,
-            &artifact.call_id,
-            &artifact.id,
-            &artifact.name,
-        );
-        Ok((artifact, path))
+        agents::tool_output_artifact(self, agent_id, session_id, call_id, artifact_id).await
     }
 
     pub async fn agent_logs(
@@ -1120,10 +1025,7 @@ impl AgentRuntime {
         agent_id: AgentId,
         filter: AgentLogFilter,
     ) -> Result<AgentLogsResponse> {
-        self.agent(agent_id).await?;
-        Ok(AgentLogsResponse {
-            logs: self.deps.store.list_agent_logs(agent_id, filter).await?,
-        })
+        agents::agent_logs(self, agent_id, filter).await
     }
 
     pub async fn tool_traces(
@@ -1131,10 +1033,7 @@ impl AgentRuntime {
         agent_id: AgentId,
         filter: ToolTraceFilter,
     ) -> Result<ToolTraceListResponse> {
-        self.agent(agent_id).await?;
-        Ok(ToolTraceListResponse {
-            tool_calls: self.deps.store.list_tool_traces(agent_id, filter).await?,
-        })
+        agents::tool_traces(self, agent_id, filter).await
     }
 
     pub async fn send_message(
@@ -3386,6 +3285,69 @@ impl agents::AgentFileOps for AgentRuntime {
     }
 }
 
+impl agents::AgentObservabilityOps for AgentRuntime {
+    fn agent(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<Arc<AgentRecord>>> + Send {
+        AgentRuntime::agent(self, agent_id)
+    }
+
+    fn load_tool_trace(
+        &self,
+        agent_id: AgentId,
+        session_id: Option<SessionId>,
+        call_id: String,
+    ) -> impl std::future::Future<Output = Result<Option<ToolTraceDetail>>> + Send {
+        async move {
+            Ok(self
+                .deps
+                .store
+                .load_tool_trace(agent_id, session_id, &call_id)
+                .await?)
+        }
+    }
+
+    fn tool_metadata(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        call_id: String,
+    ) -> impl std::future::Future<Output = (Option<bool>, Option<u64>)> + Send {
+        async move {
+            self.events
+                .tool_metadata(agent_id, session_id, &call_id)
+                .await
+        }
+    }
+
+    fn list_agent_logs(
+        &self,
+        agent_id: AgentId,
+        filter: AgentLogFilter,
+    ) -> impl std::future::Future<Output = Result<Vec<AgentLogEntry>>> + Send {
+        async move { Ok(self.deps.store.list_agent_logs(agent_id, filter).await?) }
+    }
+
+    fn list_tool_traces(
+        &self,
+        agent_id: AgentId,
+        filter: ToolTraceFilter,
+    ) -> impl std::future::Future<Output = Result<Vec<ToolTraceSummary>>> + Send {
+        async move { Ok(self.deps.store.list_tool_traces(agent_id, filter).await?) }
+    }
+
+    fn tool_output_artifact_file_path(
+        &self,
+        agent_id: AgentId,
+        call_id: &str,
+        artifact_id: &str,
+        name: &str,
+    ) -> PathBuf {
+        AgentRuntime::tool_output_artifact_file_path(self, agent_id, call_id, artifact_id, name)
+    }
+}
+
 impl agents::AgentInputOps for Arc<AgentRuntime> {
     fn cancel_agent_turn(
         &self,
@@ -4701,10 +4663,6 @@ fn runtime_sidecar_image(image: String) -> String {
     } else {
         image.to_string()
     }
-}
-
-fn parse_tool_arguments(raw_arguments: &str) -> Value {
-    serde_json::from_str(raw_arguments).unwrap_or_else(|_| json!({ "raw": raw_arguments }))
 }
 
 fn recovered_summary(mut summary: AgentSummary) -> (AgentSummary, bool) {
