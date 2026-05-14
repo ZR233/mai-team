@@ -62,14 +62,6 @@ fn embedded_asset_response(path: &str, fallback_index: bool) -> Response {
         .expect("embedded static response")
 }
 
-pub(crate) fn system_skills_path(data_dir: &std::path::Path) -> PathBuf {
-    data_dir.join("system-skills")
-}
-
-pub(crate) fn system_agents_path(data_dir: &std::path::Path) -> PathBuf {
-    data_dir.join("system-agents")
-}
-
 pub(crate) fn release_embedded_system_skills(target_dir: &std::path::Path) -> io::Result<()> {
     release_embedded_resources::<EmbeddedSystemSkills>(
         target_dir,
@@ -290,36 +282,5 @@ mod tests {
         assert!(safe_system_resource_target(std::path::Path::new(
             "/tmp/system-skills"
         )));
-    }
-
-    #[test]
-    fn runtime_storage_paths_use_default_data_layout() {
-        let dir = tempdir().expect("tempdir");
-        let data_dir = dir.path().join(".mai-team");
-
-        assert_eq!(
-            crate::config::paths::data_dir_path_with(dir.path(), None),
-            data_dir
-        );
-        assert_eq!(
-            crate::config::paths::cache_dir_path(&data_dir),
-            data_dir.join("cache")
-        );
-        assert_eq!(
-            crate::config::paths::artifact_files_root(&data_dir),
-            data_dir.join("artifacts").join("files")
-        );
-        assert_eq!(
-            crate::config::paths::artifact_index_root(&data_dir),
-            data_dir.join("artifacts").join("index")
-        );
-        assert_eq!(
-            system_skills_path(&data_dir),
-            data_dir.join("system-skills")
-        );
-        assert_eq!(
-            system_agents_path(&data_dir),
-            data_dir.join("system-agents")
-        );
     }
 }
