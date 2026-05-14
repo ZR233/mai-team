@@ -1,14 +1,20 @@
 use std::path::{Path, PathBuf};
 
-use mai_protocol::{AgentId, ProjectId, ProjectSummary, preview};
+use mai_protocol::{AgentId, ProjectId, preview};
 use tokio::process::Command;
 
-use crate::github::github_clone_url;
 use crate::{Result, RuntimeError};
+
+pub(crate) mod manager;
+pub(crate) mod paths;
+
+pub(crate) use manager::{
+    cleanup_project_agent_clone, prepare_project_agent_clone, sync_project_repo_cache,
+};
+pub(crate) use paths::{agent_clone_path, project_repo_cache_path};
 
 pub(crate) const PROJECT_REPO_DIR: &str = "repo";
 pub(crate) const PROJECT_WORKTREES_DIR: &str = "worktrees";
-pub(crate) const PROJECT_TMP_DIR: &str = "tmp";
 
 pub(crate) fn project_dir(projects_root: &Path, project_id: ProjectId) -> PathBuf {
     projects_root.join(project_id.to_string())
@@ -26,113 +32,6 @@ pub(crate) fn agent_worktree_path(
     project_dir(projects_root, project_id)
         .join(PROJECT_WORKTREES_DIR)
         .join(agent_id.to_string())
-}
-
-fn project_tmp_path(projects_root: &Path, project_id: ProjectId) -> PathBuf {
-    project_dir(projects_root, project_id).join(PROJECT_TMP_DIR)
-}
-
-pub(crate) async fn sync_project_repo(
-    git_binary: &str,
-    projects_root: &Path,
-    project: &ProjectSummary,
-    token: &str,
-) -> Result<()> {
-    let repo_path = project_repo_path(projects_root, project.id);
-    let tmp_path = project_tmp_path(projects_root, project.id);
-    std::fs::create_dir_all(&tmp_path)?;
-    let repo_url = github_clone_url(&project.owner, &project.repo);
-    if repo_path.join(".git").exists() {
-        git_with_token(
-            git_binary,
-            &repo_path,
-            token,
-            ["remote", "set-url", "origin", &repo_url],
-        )
-        .await?;
-        git_with_token(
-            git_binary,
-            &repo_path,
-            token,
-            ["fetch", "--prune", "origin"],
-        )
-        .await?;
-        let origin_branch = format!("origin/{}", project.branch);
-        git_with_token(
-            git_binary,
-            &repo_path,
-            token,
-            ["checkout", "-B", &project.branch, &origin_branch],
-        )
-        .await?;
-        git_with_token(
-            git_binary,
-            &repo_path,
-            token,
-            ["reset", "--hard", &origin_branch],
-        )
-        .await?;
-        git_plain(git_binary, &repo_path, ["clean", "-fdx"]).await?;
-        git_plain(git_binary, &repo_path, ["worktree", "prune"]).await?;
-        return Ok(());
-    }
-
-    let _ = std::fs::remove_dir_all(&repo_path);
-    std::fs::create_dir_all(project_dir(projects_root, project.id))?;
-    let parent = repo_path.parent().ok_or_else(|| {
-        RuntimeError::InvalidInput("project repository path has no parent".to_string())
-    })?;
-    git_with_token(
-        git_binary,
-        parent,
-        token,
-        [
-            "clone",
-            "--branch",
-            &project.branch,
-            "--",
-            &repo_url,
-            &repo_path.to_string_lossy(),
-        ],
-    )
-    .await?;
-    Ok(())
-}
-
-pub(crate) async fn prepare_project_agent_worktree(
-    git_binary: &str,
-    projects_root: &Path,
-    project: &ProjectSummary,
-    agent_id: AgentId,
-) -> Result<PathBuf> {
-    let repo_path = project_repo_path(projects_root, project.id);
-    if !repo_path.join(".git").exists() {
-        return Err(RuntimeError::InvalidInput(
-            "project repository workspace is not ready".to_string(),
-        ));
-    }
-    let worktree_path = agent_worktree_path(projects_root, project.id, agent_id);
-    if worktree_path.exists() {
-        cleanup_project_agent_worktree(git_binary, projects_root, project.id, agent_id).await?;
-    }
-    std::fs::create_dir_all(worktree_path.parent().ok_or_else(|| {
-        RuntimeError::InvalidInput("project worktree path has no parent".to_string())
-    })?)?;
-    let branch = format!("mai-agent/{agent_id}");
-    git_plain(
-        git_binary,
-        &repo_path,
-        [
-            "worktree",
-            "add",
-            "-B",
-            &branch,
-            &worktree_path.to_string_lossy(),
-            &project.branch,
-        ],
-    )
-    .await?;
-    Ok(worktree_path)
 }
 
 pub(crate) async fn cleanup_project_agent_worktree(

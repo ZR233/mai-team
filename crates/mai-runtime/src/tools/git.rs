@@ -20,63 +20,66 @@ pub(crate) async fn execute_git_tool(
     name: &str,
     arguments: Value,
 ) -> Result<ToolExecution> {
-    let worktree = projects::workspace::agent_worktree_path(
+    let clone = projects::workspace::agent_clone_path(
         context.projects_root,
         context.project.id,
         context.agent_id,
     );
-    if !worktree.exists() {
+    if !clone.exists() {
         return Err(RuntimeError::InvalidInput(
-            "project git worktree is not available".to_string(),
+            "project git workspace is not available".to_string(),
         ));
     }
     let output = match name {
         mai_tools::TOOL_GIT_STATUS => {
             git_plain(
                 context.git_binary,
-                &worktree,
+                &clone,
                 ["status", "--short", "--branch"],
             )
             .await?
         }
-        mai_tools::TOOL_GIT_DIFF => git_diff(context.git_binary, &worktree, &arguments).await?,
-        mai_tools::TOOL_GIT_BRANCH => git_branch(context.git_binary, &worktree, &arguments).await?,
+        mai_tools::TOOL_GIT_DIFF => git_diff(context.git_binary, &clone, &arguments).await?,
+        mai_tools::TOOL_GIT_BRANCH => git_branch(context.git_binary, &clone, &arguments).await?,
         mai_tools::TOOL_GIT_FETCH => {
             let token = required_token(context.token.as_deref())?;
-            git_fetch(context.git_binary, &worktree, token, &arguments).await?
+            git_fetch(context.git_binary, &clone, token, &arguments).await?
         }
-        mai_tools::TOOL_GIT_COMMIT => git_commit(context.git_binary, &worktree, &arguments).await?,
+        mai_tools::TOOL_GIT_COMMIT => git_commit(context.git_binary, &clone, &arguments).await?,
         mai_tools::TOOL_GIT_PUSH => {
             let token = required_token(context.token.as_deref())?;
-            git_push(context.git_binary, &worktree, token, &arguments).await?
+            git_push(context.git_binary, &clone, token, &arguments).await?
         }
         mai_tools::TOOL_GIT_WORKTREE_INFO => {
-            let repo =
-                projects::workspace::project_repo_path(context.projects_root, context.project.id);
+            let repo_cache = projects::workspace::project_repo_cache_path(
+                context.projects_root,
+                context.project.id,
+            );
             json!({
                 "project_id": context.project.id,
-                "repo": repo,
-                "worktree": worktree,
+                "repo_cache": repo_cache,
+                "clone": clone,
+                "worktree": clone,
             })
             .to_string()
         }
         mai_tools::TOOL_GIT_SYNC_DEFAULT_BRANCH => {
             let token = required_token(context.token.as_deref())?;
-            projects::workspace::sync_project_repo(
+            projects::workspace::sync_project_repo_cache(
                 context.git_binary,
                 context.projects_root,
                 &context.project,
                 token,
             )
             .await?;
-            let refreshed = projects::workspace::prepare_project_agent_worktree(
+            let refreshed = projects::workspace::prepare_project_agent_clone(
                 context.git_binary,
                 context.projects_root,
                 &context.project,
                 context.agent_id,
             )
             .await?;
-            json!({ "worktree": refreshed }).to_string()
+            json!({ "clone": refreshed, "worktree": refreshed }).to_string()
         }
         _ => {
             return Err(RuntimeError::InvalidInput(format!(
@@ -224,4 +227,147 @@ fn optional_arg(arguments: &Value, name: &str) -> Result<Option<String>> {
         })
         .transpose()?
         .filter(|value| !value.trim().is_empty()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use chrono::Utc;
+    use mai_protocol::{ProjectCloneStatus, ProjectStatus, ProjectSummary};
+    use pretty_assertions::assert_eq;
+    use serde_json::Value;
+
+    use super::*;
+    use crate::projects::workspace;
+
+    #[tokio::test]
+    async fn git_status_runs_inside_agent_clone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fake_git_path(dir.path());
+        let project_id = uuid::Uuid::new_v4();
+        let agent_id = uuid::Uuid::new_v4();
+        let clone_path = workspace::agent_clone_path(dir.path(), project_id, agent_id);
+        std::fs::create_dir_all(&clone_path).expect("clone");
+
+        execute_git_tool(
+            GitToolContext {
+                git_binary: &git,
+                projects_root: dir.path(),
+                agent_id,
+                project: test_project(project_id, agent_id),
+                token: None,
+            },
+            mai_tools::TOOL_GIT_STATUS,
+            json!({}),
+        )
+        .await
+        .expect("execute git status");
+
+        assert_eq!(
+            read_git_log(dir.path()),
+            format!("{}|status --short --branch\n", clone_path.to_string_lossy())
+        );
+    }
+
+    #[tokio::test]
+    async fn git_worktree_info_returns_clone_oriented_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fake_git_path(dir.path());
+        let project_id = uuid::Uuid::new_v4();
+        let agent_id = uuid::Uuid::new_v4();
+        let clone_path = workspace::agent_clone_path(dir.path(), project_id, agent_id);
+        std::fs::create_dir_all(&clone_path).expect("clone");
+
+        let execution = execute_git_tool(
+            GitToolContext {
+                git_binary: &git,
+                projects_root: dir.path(),
+                agent_id,
+                project: test_project(project_id, agent_id),
+                token: None,
+            },
+            mai_tools::TOOL_GIT_WORKTREE_INFO,
+            json!({}),
+        )
+        .await
+        .expect("execute info");
+
+        let payload: Value = serde_json::from_str(&execution.output).expect("json payload");
+        assert_eq!(payload["project_id"], json!(project_id));
+        assert_eq!(
+            payload["repo_cache"],
+            json!(workspace::paths::project_repo_cache_path(
+                dir.path(),
+                project_id
+            ))
+        );
+        assert_eq!(payload["clone"], json!(clone_path));
+    }
+
+    fn test_project(project_id: uuid::Uuid, agent_id: uuid::Uuid) -> ProjectSummary {
+        let timestamp = Utc::now();
+        ProjectSummary {
+            id: project_id,
+            name: "owner/repo".to_string(),
+            status: ProjectStatus::Ready,
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            repository_full_name: "owner/repo".to_string(),
+            git_account_id: Some("account-1".to_string()),
+            repository_id: 1,
+            installation_id: 2,
+            installation_account: "owner".to_string(),
+            branch: "main".to_string(),
+            docker_image: "image".to_string(),
+            clone_status: ProjectCloneStatus::Ready,
+            maintainer_agent_id: agent_id,
+            created_at: timestamp,
+            updated_at: timestamp,
+            last_error: None,
+            auto_review_enabled: false,
+            reviewer_extra_prompt: None,
+            review_status: Default::default(),
+            current_reviewer_agent_id: None,
+            last_review_started_at: None,
+            last_review_finished_at: None,
+            next_review_at: None,
+            last_review_outcome: None,
+            review_last_error: None,
+        }
+    }
+
+    fn fake_git_path(root: &Path) -> String {
+        let path = root.join("fake-git.sh");
+        let log_path = git_log_path(root);
+        let script = format!(
+            r#"#!/bin/sh
+LOG={}
+printf '%s|%s\n' "$PWD" "$*" >> "$LOG"
+exit 0
+"#,
+            shell_quote(&log_path)
+        );
+        std::fs::write(&path, script).expect("fake git");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).expect("chmod");
+        }
+        path.to_string_lossy().to_string()
+    }
+
+    fn read_git_log(root: &Path) -> String {
+        std::fs::read_to_string(git_log_path(root)).unwrap_or_default()
+    }
+
+    fn git_log_path(root: &Path) -> PathBuf {
+        root.join("git.log")
+    }
+
+    fn shell_quote(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    }
 }

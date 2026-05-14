@@ -43,6 +43,12 @@ pub(crate) trait AgentDeleteOps: Send + Sync {
         reviewer_id: AgentId,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    fn cleanup_project_agent_clone(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     fn delete_agent_from_store(&self, agent_id: AgentId)
     -> impl Future<Output = Result<()>> + Send;
 
@@ -61,11 +67,14 @@ pub(crate) async fn delete_agent(ops: &impl AgentDeleteOps, agent_id: AgentId) -
 
 async fn delete_agent_record(ops: &impl AgentDeleteOps, agent_id: AgentId) -> Result<()> {
     let agent = ops.agent(agent_id).await?;
-    let reviewer_project_id = {
+    let (project_id, reviewer_project_id) = {
         let summary = agent.summary.read().await;
-        (summary.role == Some(AgentRole::Reviewer))
-            .then_some(summary.project_id)
-            .flatten()
+        (
+            summary.project_id,
+            (summary.role == Some(AgentRole::Reviewer))
+                .then_some(summary.project_id)
+                .flatten(),
+        )
     };
     agent.cancel_requested.store(true, Ordering::SeqCst);
     ops.set_agent_status(
@@ -115,6 +124,15 @@ async fn delete_agent_record(ops: &impl AgentDeleteOps, agent_id: AgentId) -> Re
             project_id = %project_id,
             reviewer_id = %agent_id,
             "failed to clean project reviewer worktree during agent deletion: {err}"
+        );
+    }
+    if let Some(project_id) = project_id
+        && let Err(err) = ops.cleanup_project_agent_clone(project_id, agent_id).await
+    {
+        tracing::warn!(
+            project_id = %project_id,
+            agent_id = %agent_id,
+            "failed to clean project agent clone during agent deletion: {err}"
         );
     }
     let _turn_guard = agent.turn_lock.lock().await;

@@ -442,16 +442,13 @@ fn write_project_skill(
 fn write_workspace_project_skill(
     dir: &tempfile::TempDir,
     project_id: ProjectId,
+    agent_id: AgentId,
     root: &str,
     name: &str,
     description: &str,
     body: &str,
 ) -> PathBuf {
-    let repo_path = dir
-        .path()
-        .join("data/projects")
-        .join(project_id.to_string())
-        .join("repo");
+    let repo_path = ensure_project_clone(dir, project_id, agent_id);
     write_skill_at(repo_path.join(root), name, description, body)
 }
 
@@ -489,7 +486,46 @@ fn ensure_project_repo(dir: &tempfile::TempDir, project_id: ProjectId) -> PathBu
             .output()
             .expect("git commit");
     }
+    let repo_cache_path = dir
+        .path()
+        .join("data/projects")
+        .join(project_id.to_string())
+        .join("repo.git");
+    if !repo_cache_path.exists() {
+        std::process::Command::new("git")
+            .args(["clone", "--mirror"])
+            .arg(&repo_path)
+            .arg(&repo_cache_path)
+            .output()
+            .expect("git clone mirror");
+    }
     repo_path
+}
+
+fn ensure_project_clone(
+    dir: &tempfile::TempDir,
+    project_id: ProjectId,
+    agent_id: AgentId,
+) -> PathBuf {
+    ensure_project_repo(dir, project_id);
+    let projects_root = dir.path().join("data/projects");
+    let repo_cache_path = projects_root.join(project_id.to_string()).join("repo.git");
+    let clone_path =
+        projects::workspace::paths::agent_clone_path(&projects_root, project_id, agent_id);
+    if !clone_path.exists() {
+        fs::create_dir_all(clone_path.parent().expect("clone parent")).expect("mkdir clone parent");
+        std::process::Command::new("git")
+            .args(["clone", "--local"])
+            .arg(&repo_cache_path)
+            .arg(&clone_path)
+            .output()
+            .expect("git clone local");
+        if !clone_path.join(".git").exists() {
+            fs::create_dir_all(clone_path.join(".git")).expect("mkdir clone git");
+        }
+        fs::write(clone_path.join("README.md"), "test\n").expect("write clone readme");
+    }
+    clone_path
 }
 
 async fn test_runtime(dir: &tempfile::TempDir, store: Arc<ConfigStore>) -> Arc<AgentRuntime> {
@@ -3239,7 +3275,7 @@ async fn detects_project_skills_from_sidecar_candidate_dirs() {
     save_agent_with_session(&store, &agent).await;
     let project = ready_test_project_summary(project_id, agent_id, "account-1");
     store.save_project(&project).await.expect("save project");
-    let workspace = ensure_project_repo(&dir, project_id);
+    let workspace = ensure_project_clone(&dir, project_id, agent_id);
     let claude_skill = workspace.join(".claude/skills/claude-demo");
     let agents_skill = workspace.join(".agents/skills/agents-demo");
     let root_skill = workspace.join("skills/root-demo");
@@ -3324,6 +3360,7 @@ async fn project_skill_refresh_serializes_cache_replacement() {
     write_workspace_project_skill(
         &dir,
         project_id,
+        agent_id,
         ".claude/skills",
         "serialized-refresh",
         "New serialized skill.",
@@ -3422,6 +3459,7 @@ async fn project_turn_injects_selected_project_skill_path() {
     write_workspace_project_skill(
         &dir,
         project_id,
+        agent_id,
         ".claude/skills",
         "demo",
         "Project demo skill.",
@@ -3531,6 +3569,7 @@ async fn project_turn_refreshes_stale_project_skill_cache_before_injection() {
     write_workspace_project_skill(
         &dir,
         project_id,
+        agent_id,
         ".claude/skills",
         "dynamic-demo",
         "New project skill.",
@@ -4495,6 +4534,7 @@ async fn project_subagent_refreshes_and_reads_new_project_skill_resource() {
     write_workspace_project_skill(
         &dir,
         project_id,
+        maintainer_id,
         ".claude/skills",
         "fresh-child-skill",
         "Fresh child skill.",
@@ -4587,6 +4627,7 @@ async fn project_subagent_turn_syncs_project_skill_to_container() {
     write_workspace_project_skill(
         &dir,
         project_id,
+        maintainer_id,
         ".claude/skills",
         "fresh-child-skill",
         "Fresh child skill.",
@@ -5385,12 +5426,29 @@ async fn project_clone_uses_host_git_and_project_data_repo() {
         .expect("clone");
 
     let git_log = fake_git_log(&dir);
-    assert!(git_log.contains("clone --branch main -- https://github.com/owner/repo.git"));
+    let repo_cache_path =
+        projects::workspace::paths::project_repo_cache_path(&runtime.projects_root, project_id);
+    let clone_path =
+        projects::workspace::paths::agent_clone_path(&runtime.projects_root, project_id, agent_id);
+    assert!(git_log.contains(&format!(
+        "clone --mirror -- https://github.com/owner/repo.git {}",
+        repo_cache_path.display()
+    )));
+    assert!(git_log.contains(&format!(
+        "clone --local --no-checkout {} {}",
+        repo_cache_path.display(),
+        clone_path.display()
+    )));
+    assert!(git_log.contains("remote set-url origin https://github.com/owner/repo.git"));
+    assert!(git_log.contains(&format!("checkout -B mai-agent/{agent_id} origin/main")));
     assert!(git_log.contains("token-present"));
     assert!(
-        projects::workspace::project_repo_path(&runtime.projects_root, project_id)
-            .join("README.md")
-            .exists()
+        repo_cache_path.exists(),
+        "project repo cache should be created"
+    );
+    assert!(
+        clone_path.join(".git").exists(),
+        "maintainer agent clone should be created"
     );
     let docker_log = fake_docker_log(&dir);
     assert!(!docker_log.contains("sidecar-git-clone"));
@@ -5449,12 +5507,21 @@ async fn project_workspace_setup_moves_from_pending_to_ready() {
     assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Ready);
     assert_eq!(detail.maintainer_agent.summary.status, AgentStatus::Idle);
     let docker_log = fake_docker_log(&dir);
-    let worktree_path =
-        projects::workspace::agent_worktree_path(&runtime.projects_root, project_id, agent_id);
-    assert!(docker_log.contains(&format!("{}:/workspace/repo", worktree_path.display())));
+    let clone_path =
+        projects::workspace::paths::agent_clone_path(&runtime.projects_root, project_id, agent_id);
+    assert!(docker_log.contains(&format!("{}:/workspace/repo", clone_path.display())));
     let git_log = fake_git_log(&dir);
-    assert!(git_log.contains("clone --branch main -- https://github.com/owner/repo.git"));
-    assert!(git_log.contains("worktree add -B"));
+    let repo_cache_path =
+        projects::workspace::paths::project_repo_cache_path(&runtime.projects_root, project_id);
+    assert!(git_log.contains(&format!(
+        "clone --mirror -- https://github.com/owner/repo.git {}",
+        repo_cache_path.display()
+    )));
+    assert!(git_log.contains(&format!(
+        "clone --local --no-checkout {} {}",
+        repo_cache_path.display(),
+        clone_path.display()
+    )));
     assert!(git_log.contains("token-present"));
 
     let mut saw_cloning = false;
@@ -5819,6 +5886,12 @@ async fn deleting_project_reviewer_cleans_review_worktree() {
         .await
         .expect("spawn reviewer");
     let reviewer_id = reviewer.id;
+    let clone_path = projects::workspace::paths::agent_clone_path(
+        &runtime.projects_root,
+        project_id,
+        reviewer_id,
+    );
+    std::fs::create_dir_all(&clone_path).expect("reviewer clone");
 
     runtime
         .delete_agent(reviewer_id)
@@ -5827,13 +5900,7 @@ async fn deleting_project_reviewer_cleans_review_worktree() {
 
     let docker_log = fake_docker_log(&dir);
     assert!(docker_log.contains("rm -f created-container"));
-    let worktree_path = dir
-        .path()
-        .join("data/projects")
-        .join(project_id.to_string())
-        .join("worktrees")
-        .join(reviewer_id.to_string());
-    assert!(!worktree_path.exists());
+    assert!(!clone_path.exists());
 }
 
 #[tokio::test]
@@ -5965,6 +6032,7 @@ async fn auto_review_refreshes_project_skills_from_synced_default_branch() {
     write_workspace_project_skill(
         &dir,
         project_id,
+        maintainer_id,
         ".claude/skills",
         "review-default-branch",
         "New review skill.",
@@ -6065,6 +6133,7 @@ async fn project_reviewer_instructions_include_extra_prompt_project_skill() {
     write_workspace_project_skill(
         &dir,
         project_id,
+        reviewer_id,
         ".claude/skills",
         "review-single-pr",
         "Review exactly one pull request with Chinese comments.",

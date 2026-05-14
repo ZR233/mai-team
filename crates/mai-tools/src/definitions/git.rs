@@ -10,12 +10,12 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition::function(
             TOOL_GIT_STATUS,
-            "Show git working tree status for this project agent worktree.",
+            "Show git working tree status for this project agent workspace clone.",
             object_schema(vec![]),
         ),
         ToolDefinition::function(
             TOOL_GIT_DIFF,
-            "Show git diff for this project agent worktree.",
+            "Show git diff for this project agent workspace clone.",
             object_schema(vec![
                 ("staged", json!({ "type": "boolean" }), false),
                 ("path", json!({ "type": "string" }), false),
@@ -23,7 +23,7 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             TOOL_GIT_BRANCH,
-            "List branches or create/switch the current branch in this project agent worktree.",
+            "List branches or create/switch the current branch in this project agent workspace clone.",
             object_schema(vec![
                 (
                     "action",
@@ -48,7 +48,7 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             TOOL_GIT_COMMIT,
-            "Create a git commit in this project agent worktree.",
+            "Create a git commit in this project agent workspace clone.",
             object_schema(vec![
                 ("message", json!({ "type": "string" }), true),
                 ("all", json!({ "type": "boolean" }), false),
@@ -65,12 +65,12 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             TOOL_GIT_WORKTREE_INFO,
-            "Show information about this project agent git worktree.",
+            "Show compatibility information about this project agent git workspace clone.",
             object_schema(vec![]),
         ),
         ToolDefinition::function(
             TOOL_GIT_SYNC_DEFAULT_BRANCH,
-            "Sync this project agent worktree with the project's latest default branch.",
+            "Sync this project agent workspace clone with the project's latest default branch.",
             object_schema(vec![]),
         ),
     ]
