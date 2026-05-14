@@ -58,7 +58,6 @@ use state::{
     AgentRecord, AgentSessionRecord, ProjectRecord, ProjectReviewWorker, RuntimeState, TaskRecord,
     TurnControl,
 };
-use turn::completion::TurnResult;
 use turn::tools::ToolExecution;
 
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 90;
@@ -1098,15 +1097,7 @@ impl AgentRuntime {
     }
 
     pub async fn cancel_agent(self: &Arc<Self>, agent_id: AgentId) -> Result<()> {
-        let agent = self.agent(agent_id).await?;
-        let turn_id = agent.summary.read().await.current_turn;
-        match turn_id {
-            Some(turn_id) => self.cancel_agent_turn(agent_id, turn_id).await,
-            None => {
-                agent.cancel_requested.store(true, Ordering::SeqCst);
-                self.set_status(&agent, AgentStatus::Cancelled, None).await
-            }
-        }
+        agents::cancel_agent(self, agent_id).await
     }
 
     pub async fn cancel_agent_turn(
@@ -1114,45 +1105,7 @@ impl AgentRuntime {
         agent_id: AgentId,
         turn_id: TurnId,
     ) -> Result<()> {
-        let agent = self.agent(agent_id).await?;
-        let control = agent.active_turn.lock().expect("active turn lock").clone();
-        let current_turn = agent.summary.read().await.current_turn;
-        if current_turn != Some(turn_id)
-            && control.as_ref().map(|turn| turn.turn_id) != Some(turn_id)
-        {
-            return Ok(());
-        }
-        agent.cancel_requested.store(true, Ordering::SeqCst);
-        if let Some(control) = control.filter(|turn| turn.turn_id == turn_id) {
-            control.cancellation_token.cancel();
-            if let Some(abort_handle) = control.abort_handle {
-                let token = control.cancellation_token.clone();
-                tokio::spawn(async move {
-                    sleep(TURN_CANCEL_GRACE).await;
-                    if token.is_cancelled() {
-                        abort_handle.abort();
-                    }
-                });
-            }
-        }
-        let completed = turn::completion::complete_turn_if_current(
-            self.deps.store.as_ref(),
-            &self.events,
-            &agent,
-            agent_id,
-            TurnResult {
-                turn_id,
-                status: TurnStatus::Cancelled,
-                agent_status: AgentStatus::Cancelled,
-                final_text: None,
-                error: None,
-            },
-        )
-        .await?;
-        if completed {
-            self.start_next_queued_input_after_turn(agent_id).await;
-        }
-        Ok(())
+        agents::cancel_agent_turn(self, agent_id, turn_id).await
     }
 
     pub async fn delete_agent(&self, agent_id: AgentId) -> Result<()> {
@@ -3244,6 +3197,54 @@ impl agents::AgentServiceOps for AgentRuntime {
         agents::ensure_agent_container(self, agent, status)
             .await
             .map(|_| ())
+    }
+}
+
+impl agents::AgentCancelOps for Arc<AgentRuntime> {
+    fn agent(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<Arc<AgentRecord>>> + Send {
+        AgentRuntime::agent(self.as_ref(), agent_id)
+    }
+
+    fn set_agent_status(
+        &self,
+        agent: &Arc<AgentRecord>,
+        status: AgentStatus,
+        error: Option<String>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::set_status(self.as_ref(), agent, status, error)
+    }
+
+    fn complete_turn_if_current(
+        &self,
+        agent: &Arc<AgentRecord>,
+        agent_id: AgentId,
+        result: turn::completion::TurnResult,
+    ) -> impl std::future::Future<Output = Result<bool>> + Send {
+        turn::completion::complete_turn_if_current(
+            self.deps.store.as_ref(),
+            &self.events,
+            agent,
+            agent_id,
+            result,
+        )
+    }
+
+    fn start_next_queued_input_after_turn(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            if let Err(err) = agents::start_next_queued_input(self.as_ref(), self, agent_id).await {
+                tracing::warn!("failed to start queued agent input: {err}");
+            }
+        }
+    }
+
+    fn turn_cancel_grace(&self) -> Duration {
+        TURN_CANCEL_GRACE
     }
 }
 

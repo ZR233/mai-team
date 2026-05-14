@@ -7,6 +7,7 @@ use mai_protocol::{
 use projects::review::cleanup::{
     ProjectReviewCleanupOps, PROJECT_REVIEW_HISTORY_RETENTION_DAYS,
 };
+use turn::completion::TurnResult;
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

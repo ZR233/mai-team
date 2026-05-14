@@ -7,12 +7,13 @@ use chrono::{DateTime, Utc};
 use mai_protocol::{
     AgentDetail, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary,
     ContextUsage, MessageRole, ModelInputItem, ServiceEvent, ServiceEventKind, SessionId, TurnId,
-    now,
+    TurnStatus, now,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::state::{AgentRecord, AgentSessionRecord};
+use crate::turn::completion::TurnResult;
 use crate::{Result, RuntimeError};
 
 mod container;
@@ -39,9 +40,9 @@ pub(crate) use delete::{
 };
 pub(crate) use files::{AgentFileOps, download_file_tar, upload_file};
 pub(crate) use fork::fork_agent_context;
-#[cfg(test)]
-pub(crate) use input::start_next_queued_input;
-pub(crate) use input::{send_input_to_agent, start_next_queued_input_after_turn};
+pub(crate) use input::{
+    send_input_to_agent, start_next_queued_input, start_next_queued_input_after_turn,
+};
 pub(crate) use model::normalize_reasoning_effort;
 pub(crate) use observability::{
     AgentObservabilityOps, agent_logs, tool_output_artifact, tool_trace, tool_traces,
@@ -52,6 +53,33 @@ pub(crate) use spawn::{
 };
 pub(crate) use update::{AgentUpdateOps, update_agent};
 pub(crate) use wait::{wait_agent, wait_agent_until_complete_with_cancel};
+
+/// Provides the status, completion, and queue side effects needed to cancel an
+/// agent or one of its active turns.
+pub(crate) trait AgentCancelOps: Send + Sync {
+    fn agent(&self, agent_id: AgentId) -> impl Future<Output = Result<Arc<AgentRecord>>> + Send;
+
+    fn set_agent_status(
+        &self,
+        agent: &Arc<AgentRecord>,
+        status: AgentStatus,
+        error: Option<String>,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    fn complete_turn_if_current(
+        &self,
+        agent: &Arc<AgentRecord>,
+        agent_id: AgentId,
+        result: TurnResult,
+    ) -> impl Future<Output = Result<bool>> + Send;
+
+    fn start_next_queued_input_after_turn(
+        &self,
+        agent_id: AgentId,
+    ) -> impl Future<Output = ()> + Send;
+
+    fn turn_cancel_grace(&self) -> std::time::Duration;
+}
 
 #[async_trait::async_trait]
 pub(crate) trait AgentServiceOps: Send + Sync {
@@ -118,6 +146,63 @@ pub(crate) trait AgentInputOps: Send + Sync {
         message: String,
         skill_mentions: Vec<String>,
     );
+}
+
+pub(crate) async fn cancel_agent(ops: &impl AgentCancelOps, agent_id: AgentId) -> Result<()> {
+    let agent = ops.agent(agent_id).await?;
+    let turn_id = agent.summary.read().await.current_turn;
+    match turn_id {
+        Some(turn_id) => cancel_agent_turn(ops, agent_id, turn_id).await,
+        None => {
+            agent.cancel_requested.store(true, Ordering::SeqCst);
+            ops.set_agent_status(&agent, AgentStatus::Cancelled, None)
+                .await
+        }
+    }
+}
+
+pub(crate) async fn cancel_agent_turn(
+    ops: &impl AgentCancelOps,
+    agent_id: AgentId,
+    turn_id: TurnId,
+) -> Result<()> {
+    let agent = ops.agent(agent_id).await?;
+    let control = agent.active_turn.lock().expect("active turn lock").clone();
+    let current_turn = agent.summary.read().await.current_turn;
+    if current_turn != Some(turn_id) && control.as_ref().map(|turn| turn.turn_id) != Some(turn_id) {
+        return Ok(());
+    }
+    agent.cancel_requested.store(true, Ordering::SeqCst);
+    if let Some(control) = control.filter(|turn| turn.turn_id == turn_id) {
+        control.cancellation_token.cancel();
+        if let Some(abort_handle) = control.abort_handle {
+            let token = control.cancellation_token.clone();
+            let cancel_grace = ops.turn_cancel_grace();
+            tokio::spawn(async move {
+                tokio::time::sleep(cancel_grace).await;
+                if token.is_cancelled() {
+                    abort_handle.abort();
+                }
+            });
+        }
+    }
+    let completed = ops
+        .complete_turn_if_current(
+            &agent,
+            agent_id,
+            TurnResult {
+                turn_id,
+                status: TurnStatus::Cancelled,
+                agent_status: AgentStatus::Cancelled,
+                final_text: None,
+                error: None,
+            },
+        )
+        .await?;
+    if completed {
+        ops.start_next_queued_input_after_turn(agent_id).await;
+    }
+    Ok(())
 }
 
 pub(crate) async fn list_agents(agents: Vec<Arc<AgentRecord>>) -> Vec<AgentSummary> {
