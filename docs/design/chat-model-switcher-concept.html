@@ -1,0 +1,992 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mai Team Chat Model Switcher Concept</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #182234;
+      --muted: #66758a;
+      --line: #d8e0ea;
+      --soft: #f5f7fa;
+      --panel: #ffffff;
+      --blue: #1f6feb;
+      --teal: #11a683;
+      --green-soft: #daf4ea;
+      --green-ink: #0b684f;
+      --amber-soft: #fff0c2;
+      --amber-ink: #7a4c00;
+      --shadow: 0 18px 44px rgba(22, 32, 51, 0.16);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background: #eef2f7;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+
+    .frame {
+      width: 1440px;
+      height: 960px;
+      display: grid;
+      grid-template-rows: 68px minmax(0, 1fr);
+      overflow: hidden;
+      background: #f8fafc;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 0 24px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.94);
+    }
+
+    .brand,
+    .tabs,
+    .topbar-actions,
+    .agent-identity,
+    .agent-controls,
+    .model-chip,
+    .status-pill,
+    .composer-actions {
+      display: flex;
+      align-items: center;
+    }
+
+    .brand {
+      gap: 12px;
+      min-width: 240px;
+    }
+
+    .brand-mark,
+    .avatar {
+      display: grid;
+      place-items: center;
+      color: #fff;
+      background: linear-gradient(135deg, var(--blue), var(--teal));
+      font-weight: 900;
+    }
+
+    .brand-mark {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      font-size: 16px;
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin: 0;
+    }
+
+    .brand h1 {
+      font-size: 18px;
+      line-height: 1.2;
+    }
+
+    .brand p,
+    .agent-title p,
+    .rail-meta,
+    .small,
+    .message-meta,
+    .popover-hint,
+    .composer-note {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .tabs {
+      gap: 6px;
+      padding: 4px;
+      border: 1px solid #dfe6ef;
+      border-radius: 8px;
+      background: #f3f6fa;
+    }
+
+    .tabs button,
+    .ghost-button,
+    .primary-button,
+    .icon-button,
+    .model-chip,
+    .option-row,
+    .send-button {
+      border: 0;
+      font: inherit;
+    }
+
+    .tabs button {
+      min-height: 32px;
+      border-radius: 6px;
+      padding: 0 12px;
+      color: #526176;
+      background: transparent;
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .tabs .active {
+      color: #174ea6;
+      background: #fff;
+      box-shadow: 0 1px 2px rgba(22, 32, 51, 0.08);
+    }
+
+    .topbar-actions {
+      justify-content: flex-end;
+      gap: 10px;
+      min-width: 240px;
+    }
+
+    .connection {
+      color: var(--green-ink);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .primary-button,
+    .ghost-button,
+    .send-button {
+      min-height: 36px;
+      border-radius: 7px;
+      padding: 0 14px;
+      font-size: 13px;
+      font-weight: 850;
+    }
+
+    .primary-button,
+    .send-button {
+      color: #fff;
+      background: var(--blue);
+    }
+
+    .ghost-button {
+      border: 1px solid #ccd6e3;
+      color: #334155;
+      background: #fff;
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: 316px minmax(0, 1fr);
+      min-height: 0;
+    }
+
+    .rail {
+      min-height: 0;
+      border-right: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .rail-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 18px 18px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .rail-head h2 {
+      font-size: 17px;
+    }
+
+    .agent-list {
+      display: grid;
+      gap: 8px;
+      padding: 12px;
+    }
+
+    .agent-row {
+      display: grid;
+      grid-template-columns: 34px minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      min-height: 64px;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      padding: 9px;
+      background: transparent;
+    }
+
+    .agent-row.active {
+      border-color: #bcd4f6;
+      background: #e7f0ff;
+    }
+
+    .avatar {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+
+    .agent-name {
+      display: block;
+      overflow: hidden;
+      font-size: 13px;
+      font-weight: 850;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .rail-meta {
+      display: block;
+      overflow: hidden;
+      margin-top: 3px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .stage {
+      position: relative;
+      display: grid;
+      grid-template-rows: 78px minmax(0, 1fr) 40px 94px;
+      min-width: 0;
+      min-height: 0;
+      background: #f8fafc;
+    }
+
+    .agent-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 14px 22px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.96);
+    }
+
+    .agent-identity {
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .agent-title {
+      display: grid;
+      gap: 3px;
+      min-width: 0;
+    }
+
+    .title-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .title-row h2 {
+      overflow: hidden;
+      font-size: 18px;
+      line-height: 1.22;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .status-pill {
+      min-height: 24px;
+      border-radius: 999px;
+      padding: 0 9px;
+      color: var(--green-ink);
+      background: var(--green-soft);
+      font-size: 11px;
+      font-weight: 850;
+      white-space: nowrap;
+    }
+
+    .agent-title p {
+      display: flex;
+      gap: 6px;
+    }
+
+    .agent-controls {
+      gap: 10px;
+    }
+
+    .model-chip {
+      position: relative;
+      gap: 9px;
+      min-height: 38px;
+      max-width: 430px;
+      border: 1px solid #bcd4f6;
+      border-radius: 8px;
+      padding: 0 11px;
+      color: #183b68;
+      background: #fff;
+      box-shadow: 0 1px 2px rgba(22, 32, 51, 0.06);
+    }
+
+    .model-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      background: var(--blue);
+      box-shadow: 0 0 0 4px #e7f0ff;
+    }
+
+    .model-chip strong,
+    .model-chip span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .model-chip strong {
+      max-width: 210px;
+      font-size: 13px;
+    }
+
+    .model-chip span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .chevron {
+      color: #66758a;
+      font-size: 12px;
+      font-weight: 900;
+    }
+
+    .model-popover {
+      position: absolute;
+      top: 64px;
+      right: 156px;
+      z-index: 5;
+      width: 390px;
+      border: 1px solid #ccd6e3;
+      border-radius: 8px;
+      padding: 12px;
+      background: #fff;
+      box-shadow: var(--shadow);
+    }
+
+    .popover-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+
+    .popover-head h3 {
+      font-size: 14px;
+    }
+
+    .popover-hint {
+      margin-top: 3px;
+    }
+
+    .option-group {
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .option-label {
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
+
+    .option-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      width: 100%;
+      border: 1px solid #e1e7ef;
+      border-radius: 7px;
+      padding: 10px;
+      color: inherit;
+      background: #fff;
+      text-align: left;
+    }
+
+    .option-row.active {
+      border-color: var(--blue);
+      background: #e7f0ff;
+    }
+
+    .option-row strong {
+      display: block;
+      font-size: 13px;
+    }
+
+    .option-row small {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .option-mark {
+      display: grid;
+      place-items: center;
+      width: 22px;
+      height: 22px;
+      border-radius: 999px;
+      color: #fff;
+      background: var(--blue);
+      font-size: 12px;
+      font-weight: 900;
+    }
+
+    .select-field {
+      position: relative;
+    }
+
+    .select-trigger {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid #ccd6e3;
+      border-radius: 7px;
+      padding: 0 10px;
+      color: #27364a;
+      background: #fff;
+      font-size: 13px;
+      font-weight: 850;
+    }
+
+    .select-trigger span:first-child {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .select-menu {
+      display: grid;
+      gap: 4px;
+      margin-top: 6px;
+      border: 1px solid #dfe6ef;
+      border-radius: 8px;
+      padding: 5px;
+      background: #fff;
+      box-shadow: 0 10px 28px rgba(22, 32, 51, 0.12);
+    }
+
+    .select-menu.model-menu {
+      max-height: 172px;
+      overflow: auto;
+    }
+
+    .model-search {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 8px;
+      align-items: center;
+      min-height: 34px;
+      border: 1px solid #dfe6ef;
+      border-radius: 7px;
+      padding: 0 8px;
+      color: #66758a;
+      background: #f8fafc;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .model-search span:last-child {
+      overflow: hidden;
+      color: #27364a;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .model-result-count {
+      padding: 2px 4px 0;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 800;
+    }
+
+    .select-menu.compact {
+      width: 190px;
+    }
+
+    .select-item {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      min-height: 30px;
+      border-radius: 6px;
+      padding: 0 8px;
+      color: #526176;
+      font-size: 12px;
+      font-weight: 850;
+    }
+
+    .select-item.active {
+      color: #174ea6;
+      background: #e7f0ff;
+    }
+
+    .select-item small {
+      overflow: hidden;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 750;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .select-item.model-item {
+      min-height: 44px;
+    }
+
+    .select-item.model-item span:first-child {
+      display: grid;
+      gap: 2px;
+      min-width: 0;
+    }
+
+    .select-item.model-item strong {
+      overflow: hidden;
+      color: var(--ink);
+      font-size: 13px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .select-item.model-item.active strong {
+      color: #174ea6;
+    }
+
+    .depth-select-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: start;
+    }
+
+    .popover-actions {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 8px;
+      align-items: center;
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid #e6ecf3;
+    }
+
+    .save-state {
+      color: var(--green-ink);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .timeline {
+      min-height: 0;
+      overflow: hidden;
+      padding: 22px 28px;
+    }
+
+    .message {
+      max-width: 820px;
+      margin-bottom: 14px;
+      border: 1px solid #e1e7ef;
+      border-radius: 8px;
+      padding: 14px 16px;
+      background: #fff;
+      box-shadow: 0 1px 2px rgba(22, 32, 51, 0.04);
+    }
+
+    .message.assistant {
+      margin-left: 44px;
+    }
+
+    .message-meta {
+      margin-bottom: 6px;
+      font-weight: 800;
+    }
+
+    .message p {
+      color: #27364a;
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    .tool-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      max-width: 720px;
+      margin: 12px 0 12px 44px;
+      border: 1px solid #dfe6ef;
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: #fff;
+    }
+
+    .tool-row code {
+      color: #174ea6;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+
+    .context-line {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 0 22px;
+      border-top: 1px solid #e6ecf3;
+      color: var(--muted);
+      background: #fff;
+      font-size: 12px;
+      font-weight: 750;
+    }
+
+    .context-meter {
+      width: 180px;
+      height: 7px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #e8edf4;
+    }
+
+    .context-meter span {
+      display: block;
+      width: 42%;
+      height: 100%;
+      background: linear-gradient(90deg, var(--teal), var(--blue));
+    }
+
+    .composer {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: end;
+      padding: 14px 20px;
+      border-top: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .icon-button {
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      border: 1px solid #ccd6e3;
+      border-radius: 7px;
+      color: #334155;
+      background: #fff;
+      font-size: 17px;
+      font-weight: 900;
+    }
+
+    .input-wrap {
+      display: grid;
+      gap: 6px;
+    }
+
+    .fake-input {
+      min-height: 48px;
+      border: 1px solid #ccd6e3;
+      border-radius: 8px;
+      padding: 13px 14px;
+      color: #526176;
+      background: #fff;
+      font-size: 14px;
+    }
+
+    .composer-note {
+      display: flex;
+      gap: 10px;
+    }
+
+    .composer-actions {
+      gap: 8px;
+    }
+
+    .callouts {
+      position: absolute;
+      right: 34px;
+      bottom: 128px;
+      display: grid;
+      gap: 8px;
+      width: 330px;
+    }
+
+    .callout {
+      border: 1px solid #dfe6ef;
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: rgba(255, 255, 255, 0.96);
+      box-shadow: 0 10px 30px rgba(22, 32, 51, 0.09);
+    }
+
+    .callout strong {
+      display: block;
+      font-size: 12px;
+    }
+
+    .callout span {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">M</div>
+        <div>
+          <h1>Mai Team</h1>
+          <p>Task-oriented multi-agent console</p>
+        </div>
+      </div>
+      <nav class="tabs" aria-label="Views">
+        <button class="active">Tasks</button>
+        <button>Projects</button>
+        <button>Providers</button>
+        <button>Settings</button>
+      </nav>
+      <div class="topbar-actions">
+        <span class="connection">● Connected</span>
+        <button class="primary-button">Refresh</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="rail">
+        <div class="rail-head">
+          <div>
+            <h2>Agents</h2>
+            <p class="rail-meta">3 active sessions</p>
+          </div>
+          <button class="ghost-button">New</button>
+        </div>
+        <div class="agent-list">
+          <div class="agent-row active">
+            <span class="avatar">P</span>
+            <span>
+              <span class="agent-name">Planner</span>
+              <span class="rail-meta">OpenAI · GPT-5.5 · high</span>
+            </span>
+            <span class="status-pill">Ready</span>
+          </div>
+          <div class="agent-row">
+            <span class="avatar">R</span>
+            <span>
+              <span class="agent-name">Reviewer</span>
+              <span class="rail-meta">MiMo · mimo-vl-plus</span>
+            </span>
+          </div>
+          <div class="agent-row">
+            <span class="avatar">W</span>
+            <span>
+              <span class="agent-name">Worker</span>
+              <span class="rail-meta">DeepSeek · deepseek-chat</span>
+            </span>
+          </div>
+        </div>
+      </aside>
+
+      <section class="stage">
+        <header class="agent-header">
+          <div class="agent-identity">
+            <span class="avatar">P</span>
+            <div class="agent-title">
+              <div class="title-row">
+                <h2>Planner</h2>
+                <span class="status-pill">Ready</span>
+              </div>
+              <p><span>Docker / mai-agent-runtime</span><span>·</span><span>Context 42%</span></p>
+            </div>
+          </div>
+          <div class="agent-controls">
+            <button class="model-chip">
+              <span class="model-dot"></span>
+              <strong>GPT-5.5</strong>
+              <span>OpenAI · high</span>
+              <span class="chevron">⌄</span>
+            </button>
+            <button class="ghost-button">Cancel</button>
+            <button class="ghost-button">Delete</button>
+          </div>
+        </header>
+
+        <section class="timeline">
+          <article class="message">
+            <div class="message-meta">You</div>
+            <p>重构 chat 界面里的模型切换，让它更轻、更容易发现。</p>
+          </article>
+          <article class="message assistant">
+            <div class="message-meta">Planner · GPT-5.5</div>
+            <p>我会把当前模型、Provider 和思考深度收束成一个顶部控件。常用切换不离开聊天上下文，保存状态在同一块区域反馈。</p>
+          </article>
+          <div class="tool-row">
+            <span class="status-pill">Running</span>
+            <code>rg ModelSelector AgentHeader ComposerBar</code>
+          </div>
+          <article class="message assistant">
+            <div class="message-meta">Planner · GPT-5.5</div>
+            <p>建议保留现有 Provider 管理页，只把“本 agent 下一轮使用哪个模型”做成轻量 popover。</p>
+          </article>
+        </section>
+
+        <div class="context-line">
+          <span>Next turn will use OpenAI / GPT-5.5 / high</span>
+          <span class="context-meter"><span></span></span>
+        </div>
+
+        <form class="composer">
+          <button class="icon-button" type="button">@</button>
+          <div class="input-wrap">
+            <div class="fake-input">Send a command or message...</div>
+            <div class="composer-note">
+              <span>Enter to send</span>
+              <span>Shift+Enter for new line</span>
+            </div>
+          </div>
+          <div class="composer-actions">
+            <button class="send-button" type="button">Send</button>
+          </div>
+        </form>
+
+        <aside class="model-popover">
+          <div class="popover-head">
+            <div>
+              <h3>Model for next turn</h3>
+              <p class="popover-hint">One control owns provider, model, depth, and save state.</p>
+            </div>
+            <span class="status-pill">Saved</span>
+          </div>
+
+          <div class="option-group">
+            <span class="option-label">Provider</span>
+            <div class="select-field">
+              <div class="select-trigger">
+                <span>OpenAI</span>
+                <span class="chevron">⌄</span>
+              </div>
+              <div class="select-menu">
+                <div class="select-item active">
+                  <span>OpenAI</span>
+                  <small>3 models</small>
+                </div>
+                <div class="select-item">
+                  <span>MiMo</span>
+                  <small>2 models</small>
+                </div>
+                <div class="select-item">
+                  <span>DeepSeek</span>
+                  <small>1 model</small>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="option-group">
+            <span class="option-label">Model</span>
+            <div class="select-field">
+              <div class="select-trigger">
+                <span>GPT-5.5 · 400K context · tools · reasoning</span>
+                <span class="chevron">⌄</span>
+              </div>
+              <div class="select-menu model-menu">
+                <div class="model-search">
+                  <span>⌕</span>
+                  <span>Search models... gpt</span>
+                </div>
+                <div class="model-result-count">3 matching models</div>
+                <div class="select-item model-item active">
+                  <span>
+                    <strong>GPT-5.5</strong>
+                    <small>400K context · tools · reasoning</small>
+                  </span>
+                  <span>✓</span>
+                </div>
+                <div class="select-item model-item">
+                  <span>
+                    <strong>GPT-5.4 Mini</strong>
+                    <small>Fast daily coding · lower cost</small>
+                  </span>
+                </div>
+                <div class="select-item model-item">
+                  <span>
+                    <strong>GPT-5.3 Codex</strong>
+                    <small>Coding optimized · medium reasoning</small>
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="option-group">
+            <span class="option-label">Thinking depth</span>
+            <div class="depth-select-row">
+              <div class="select-field">
+                <div class="select-trigger">
+                  <span>High</span>
+                  <span class="chevron">⌄</span>
+                </div>
+                <div class="select-menu compact">
+                  <div class="select-item">
+                    <span>Low</span>
+                  </div>
+                  <div class="select-item">
+                    <span>Medium</span>
+                  </div>
+                  <div class="select-item active">
+                    <span>High</span>
+                    <span>✓</span>
+                  </div>
+                </div>
+              </div>
+              <span class="popover-hint">Only shown when supported.</span>
+            </div>
+          </div>
+
+          <div class="popover-actions">
+            <span class="save-state">下一轮生效</span>
+            <button class="ghost-button" type="button">Manage providers</button>
+            <button class="primary-button" type="button">Apply</button>
+          </div>
+        </aside>
+
+        <div class="callouts">
+          <div class="callout">
+            <strong>Change Model 按钮消失</strong>
+            <span>当前模型本身就是入口，减少“先找按钮再理解表单”的步骤。</span>
+          </div>
+          <div class="callout">
+            <strong>思考深度不再单独漂在右侧</strong>
+            <span>深度跟随模型能力显示，切换模型时同步默认值。</span>
+          </div>
+          <div class="callout">
+            <strong>Provider 管理仍在独立页面</strong>
+            <span>Provider 多了也只是展开列表，聊天里不塞 API Key 和 Models JSON。</span>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

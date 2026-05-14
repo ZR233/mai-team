@@ -419,6 +419,7 @@
           @send="$emit('send', $event)"
           @stop="$emit('stop', $event)"
           @update-model="$emit('update-model', $event)"
+          @open-providers="$emit('open-providers')"
           @update:draft="$emit('update:draft', $event)"
           @update:selected-skills="$emit('update:selectedSkills', $event)"
           @load-skills="$emit('load-skills')"
@@ -467,6 +468,7 @@ const emit = defineEmits([
   'send',
   'stop',
   'update-model',
+  'open-providers',
   'update:draft',
   'update:selectedSkills',
   'load-skills',

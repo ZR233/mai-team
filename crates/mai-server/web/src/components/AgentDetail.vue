@@ -2,34 +2,22 @@
   <template v-if="detail">
     <AgentHeader
       :detail="detail"
-      :reasoning-effort="currentReasoningEffort"
-      :reasoning-options="currentReasoningOptions"
-      :providers-count="providers.length"
-      :model-change-busy="isModelChangeBusy"
-      :updating-model="updatingModel"
       :show-actions="showActions"
-      @change-reasoning-effort="saveReasoningEffort"
-      @open-model="openModelEditor"
       @cancel="$emit('cancel', $event)"
       @delete="(...args) => $emit('delete', ...args)"
-    />
-
-    <div v-if="modelEditor.open" class="agent-model-editor">
-      <ModelSelector
-        v-model:provider-id="modelEditor.provider_id"
-        v-model:model="modelEditor.model"
-        v-model:reasoning-effort="modelEditor.reasoning_effort"
-        :providers="providers"
-        compact
-      />
-      <div class="agent-model-actions">
-        <button class="ghost-button" type="button" @click="modelEditor.open = false">Cancel</button>
-        <button class="primary-button" type="button" :disabled="!modelEditor.model || updatingModel" @click="saveModelEdit">
-          Save
-        </button>
-      </div>
-      <p v-if="modelEditor.error" class="dialog-error">{{ modelEditor.error }}</p>
-    </div>
+    >
+      <template #model-picker>
+        <AgentModelPicker
+          :detail="detail"
+          :providers="providers"
+          :reasoning-effort="currentReasoningEffort"
+          :disabled="isModelChangeBusy || updatingModel"
+          :updating="updatingModel"
+          @apply="saveModelEdit"
+          @open-providers="$emit('open-providers')"
+        />
+      </template>
+    </AgentHeader>
 
     <SessionTabs
       v-if="showSessions"
@@ -93,12 +81,12 @@
 <script setup>
 import { computed, nextTick, reactive, ref, watch } from 'vue'
 import AgentHeader from './AgentHeader.vue'
+import AgentModelPicker from './AgentModelPicker.vue'
 import ChatTimeline from './ChatTimeline.vue'
 import ComposerBar from './ComposerBar.vue'
 import QuestionBar from './QuestionBar.vue'
 import PlanApprovalBar from './PlanApprovalBar.vue'
 import ContextStatusLine from './ContextStatusLine.vue'
-import ModelSelector from './ModelSelector.vue'
 import SessionTabs from './SessionTabs.vue'
 import { defaultReasoningEffort, reasoningOptionsFor } from '../utils/reasoning'
 import { useApi } from '../composables/useApi'
@@ -138,6 +126,7 @@ const emit = defineEmits([
   'update:selectedSkills',
   'load-skills',
   'update-model',
+  'open-providers',
   'create-session',
   'select-session',
   'approve-plan',
@@ -149,13 +138,6 @@ const traces = reactive({})
 const answeredInputKeys = reactive(new Set())
 const emptyTrace = { loading: false, error: '', detail: null }
 const currentReasoningEffort = ref('')
-const modelEditor = reactive({
-  open: false,
-  provider_id: '',
-  model: '',
-  reasoning_effort: '',
-  error: ''
-})
 
 const timelineItems = computed(() => buildAgentTimeline(props.detail, props.events))
 const canStopTurn = computed(() => {
@@ -176,9 +158,6 @@ const pendingUserInput = computed(() => {
   )
   return answered ? null : input
 })
-const editorProvider = computed(() => props.providers.find((provider) => provider.id === modelEditor.provider_id))
-const editorModels = computed(() => editorProvider.value?.models || [])
-const editorModel = computed(() => editorModels.value.find((model) => model.id === modelEditor.model))
 const currentProvider = computed(() => props.providers.find((provider) => provider.id === props.detail?.provider_id))
 const currentModel = computed(() => currentProvider.value?.models?.find((model) => model.id === props.detail?.model))
 const currentReasoningOptions = computed(() => reasoningOptionsFor(currentProvider.value, currentModel.value))
@@ -228,7 +207,6 @@ watch(
     for (const key of Object.keys(expandedTools)) delete expandedTools[key]
     for (const key of Object.keys(traces)) delete traces[key]
     answeredInputKeys.clear()
-    modelEditor.open = false
     syncCurrentReasoningEffort()
   }
 )
@@ -261,37 +239,8 @@ function handleQuestionAnswer(responseText) {
   emit('send', responseText)
 }
 
-function saveReasoningEffort(value = currentReasoningEffort.value) {
-  if (!props.detail || !currentReasoningOptions.value.length) return
-  currentReasoningEffort.value = value
-  emit('update-model', {
-    agent_id: props.detail.id,
-    provider_id: props.detail.provider_id,
-    model: props.detail.model,
-    reasoning_effort: value
-  })
-}
-
-function openModelEditor() {
-  modelEditor.open = true
-  modelEditor.provider_id = props.detail?.provider_id || props.providers[0]?.id || ''
-  modelEditor.model = props.detail?.model || editorProvider.value?.default_model || editorModels.value[0]?.id || ''
-  modelEditor.reasoning_effort = props.detail?.reasoning_effort || defaultReasoningEffort(editorProvider.value, editorModel.value)
-  modelEditor.error = ''
-}
-
-function saveModelEdit() {
-  if (!modelEditor.provider_id || !modelEditor.model) {
-    modelEditor.error = 'Provider and model are required.'
-    return
-  }
-  emit('update-model', {
-    agent_id: props.detail?.id,
-    provider_id: modelEditor.provider_id,
-    model: modelEditor.model,
-    reasoning_effort: modelEditor.reasoning_effort
-  })
-  modelEditor.open = false
+function saveModelEdit(payload) {
+  emit('update-model', payload)
 }
 
 function formatCompactNumber(value) {

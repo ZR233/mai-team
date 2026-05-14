@@ -82,6 +82,7 @@
       @send="$emit('send', $event)"
       @stop="$emit('stop', $event)"
       @update-model="$emit('update-model', $event)"
+      @open-providers="$emit('open-providers')"
       @update:draft="$emit('update:draft', $event)"
       @update:selected-skills="$emit('update:selectedSkills', $event)"
       @load-skills="$emit('load-skills')"
@@ -127,7 +128,8 @@ const emit = defineEmits([
   'update:draft',
   'update:selectedSkills',
   'load-skills',
-  'update-model'
+  'update-model',
+  'open-providers'
 ])
 
 const planCollapsed = ref(false)
