@@ -5,3 +5,4 @@ crates/mai-server/web/node_modules
 /artifacts
 /.cargo/config.toml
 /.claude/worktrees
+/.worktrees
