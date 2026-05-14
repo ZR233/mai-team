@@ -18,6 +18,7 @@ use crate::{Result, RuntimeError};
 mod container;
 mod create;
 mod delete;
+mod files;
 mod fork;
 mod input;
 mod model;
@@ -35,6 +36,7 @@ pub(crate) use create::{AgentCreateOps, CreateAgentRecordContext, create_agent_r
 pub(crate) use delete::{
     AgentContainerDeleteRequest, AgentDeleteOps, AgentDeleteStatusChange, delete_agent,
 };
+pub(crate) use files::{AgentFileOps, download_file_tar, upload_file};
 pub(crate) use fork::fork_agent_context;
 #[cfg(test)]
 pub(crate) use input::start_next_queued_input;

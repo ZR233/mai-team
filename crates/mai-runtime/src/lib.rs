@@ -1,6 +1,4 @@
 use async_trait::async_trait;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::{AbortHandle, Abortable};
 use mai_agents::AgentProfilesManager;
@@ -23,7 +21,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::time::{Duration, Instant, sleep};
@@ -1285,26 +1282,11 @@ impl AgentRuntime {
         path: String,
         content_base64: String,
     ) -> Result<usize> {
-        let bytes = BASE64
-            .decode(content_base64.trim())
-            .map_err(|err| RuntimeError::InvalidInput(format!("invalid base64: {err}")))?;
-        let temp = NamedTempFile::new()?;
-        std::fs::write(temp.path(), &bytes)?;
-        let container_id = self.container_id(agent_id).await?;
-        self.deps
-            .docker
-            .copy_to_container(&container_id, temp.path(), &path)
-            .await?;
-        Ok(bytes.len())
+        agents::upload_file(self, agent_id, path, content_base64).await
     }
 
     pub async fn download_file_tar(&self, agent_id: AgentId, path: String) -> Result<Vec<u8>> {
-        let container_id = self.container_id(agent_id).await?;
-        Ok(self
-            .deps
-            .docker
-            .copy_from_container_tar(&container_id, &path)
-            .await?)
+        agents::download_file_tar(self, agent_id, path).await
     }
 
     pub async fn save_artifact(
@@ -3363,6 +3345,44 @@ impl agents::AgentServiceOps for AgentRuntime {
         agents::ensure_agent_container(self, agent, status)
             .await
             .map(|_| ())
+    }
+}
+
+impl agents::AgentFileOps for AgentRuntime {
+    fn container_id(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<String>> + Send {
+        AgentRuntime::container_id(self, agent_id)
+    }
+
+    fn copy_to_container(
+        &self,
+        container_id: String,
+        local_path: PathBuf,
+        container_path: String,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            self.deps
+                .docker
+                .copy_to_container(&container_id, &local_path, &container_path)
+                .await?;
+            Ok(())
+        }
+    }
+
+    fn copy_from_container_tar(
+        &self,
+        container_id: String,
+        container_path: String,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send {
+        async move {
+            Ok(self
+                .deps
+                .docker
+                .copy_from_container_tar(&container_id, &container_path)
+                .await?)
+        }
     }
 }
 
