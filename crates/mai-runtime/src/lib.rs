@@ -3201,11 +3201,10 @@ impl AgentRuntime {
             return Ok(Some(manager));
         }
 
-        let Some(token) = self.project_git_token(project_id).await? else {
+        let token = self.project_git_token(project_id).await?;
+        if token.is_none() {
             return Ok(None);
-        };
-        let sidecar = self.ensure_project_sidecar(project_id).await?;
-        let configs = projects::mcp::project_mcp_configs(&token);
+        }
         self.events
             .publish(ServiceEventKind::McpServerStatusChanged {
                 agent_id,
@@ -3214,30 +3213,31 @@ impl AgentRuntime {
                 error: None,
             })
             .await;
-        let manager = McpAgentManager::start(self.deps.docker.clone(), sidecar.id, configs).await;
-        if cancellation_token.is_cancelled() {
-            manager.shutdown().await;
-            return Err(RuntimeError::TurnCancelled);
+        let manager = projects::mcp::ensure_manager(
+            &self.state,
+            &self.deps.docker,
+            &self.sidecar_image,
+            project_id,
+            token.as_deref(),
+            cancellation_token,
+        )
+        .await?;
+        if let Some(manager) = manager.as_ref() {
+            for status in manager.statuses().await {
+                let error = status
+                    .error
+                    .map(|error| redact_secret(&error, token.as_deref().unwrap_or_default()));
+                self.events
+                    .publish(ServiceEventKind::McpServerStatusChanged {
+                        agent_id,
+                        server: status.server,
+                        status: status.status,
+                        error,
+                    })
+                    .await;
+            }
         }
-        for status in manager.statuses().await {
-            let error = status.error.map(|error| redact_secret(&error, &token));
-            self.events
-                .publish(ServiceEventKind::McpServerStatusChanged {
-                    agent_id,
-                    server: status.server,
-                    status: status.status,
-                    error,
-                })
-                .await;
-        }
-        let manager = Arc::new(manager);
-        let mut managers = self.state.project_mcp_managers.write().await;
-        if let Some(existing) = managers.get(&project_id).cloned() {
-            manager.shutdown().await;
-            return Ok(Some(existing));
-        }
-        managers.insert(project_id, Arc::clone(&manager));
-        Ok(Some(manager))
+        Ok(manager)
     }
 
     async fn project_git_token(&self, project_id: ProjectId) -> Result<Option<String>> {

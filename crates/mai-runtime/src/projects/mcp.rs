@@ -5,6 +5,7 @@ use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient, project_
 use mai_mcp::McpAgentManager;
 use mai_protocol::ProjectId;
 use mai_protocol::{McpServerConfig, McpServerScope, McpServerTransport};
+use tokio_util::sync::CancellationToken;
 
 use crate::projects::service;
 use crate::state::RuntimeState;
@@ -136,4 +137,39 @@ pub(crate) async fn cached_manager(
         .await
         .get(&project_id)
         .cloned()
+}
+
+pub(crate) async fn ensure_manager(
+    state: &RuntimeState,
+    docker: &DockerClient,
+    sidecar_image: &str,
+    project_id: ProjectId,
+    token: Option<&str>,
+    cancellation_token: &CancellationToken,
+) -> Result<Option<Arc<McpAgentManager>>> {
+    if cancellation_token.is_cancelled() {
+        return Err(RuntimeError::TurnCancelled);
+    }
+    if let Some(manager) = cached_manager(state, project_id).await {
+        return Ok(Some(manager));
+    }
+
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    let sidecar = ensure_sidecar(state, docker, sidecar_image, project_id).await?;
+    let configs = project_mcp_configs(token);
+    let manager = McpAgentManager::start(docker.clone(), sidecar.id, configs).await;
+    if cancellation_token.is_cancelled() {
+        manager.shutdown().await;
+        return Err(RuntimeError::TurnCancelled);
+    }
+    let manager = Arc::new(manager);
+    let mut managers = state.project_mcp_managers.write().await;
+    if let Some(existing) = managers.get(&project_id).cloned() {
+        manager.shutdown().await;
+        return Ok(Some(existing));
+    }
+    managers.insert(project_id, Arc::clone(&manager));
+    Ok(Some(manager))
 }
