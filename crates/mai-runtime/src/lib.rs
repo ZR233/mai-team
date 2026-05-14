@@ -5,7 +5,10 @@ use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::{AbortHandle, Abortable};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use mai_agents::AgentProfilesManager;
-use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient, ExecCaptureOptions};
+use mai_docker::{
+    ContainerCreateOptions, ContainerHandle, DockerClient, ExecCaptureOptions,
+    project_review_workspace_volume, project_workspace_volume,
+};
 use mai_mcp::{McpAgentManager, McpTool};
 use mai_model::{ModelClient, ModelTurnState};
 use mai_protocol::{
@@ -5626,7 +5629,7 @@ impl AgentRuntime {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let volume = DockerClient::workspace_volume_for_project_review(&project_id.to_string());
+        let volume = project_review_workspace_volume(&project_id.to_string());
         let output = self
             .deps
             .docker
@@ -5688,8 +5691,7 @@ impl AgentRuntime {
                         .await?;
                 }
                 ProjectSkillRefreshSource::ReviewWorkspace => {
-                    let volume =
-                        DockerClient::workspace_volume_for_project_review(&project_id.to_string());
+                    let volume = project_review_workspace_volume(&project_id.to_string());
                     self.deps
                         .docker
                         .copy_from_workspace_volume_to_file(
@@ -5722,7 +5724,7 @@ impl AgentRuntime {
             return Ok(container);
         }
 
-        let workspace_volume = DockerClient::workspace_volume_for_project(&project_id.to_string());
+        let workspace_volume = project_workspace_volume(&project_id.to_string());
         let container = self
             .deps
             .docker
@@ -6469,7 +6471,7 @@ impl AgentRuntime {
         project_id: ProjectId,
         cutoff: DateTime<Utc>,
     ) -> Result<()> {
-        let volume = DockerClient::workspace_volume_for_project_review(&project_id.to_string());
+        let volume = project_review_workspace_volume(&project_id.to_string());
         let active_reviewer = match self.project(project_id).await {
             Ok(project) => project.summary.read().await.current_reviewer_agent_id,
             Err(_) => None,
@@ -6688,7 +6690,7 @@ impl AgentRuntime {
         project_id: ProjectId,
         reviewer_id: AgentId,
     ) -> Result<()> {
-        let volume = DockerClient::workspace_volume_for_project_review(&project_id.to_string());
+        let volume = project_review_workspace_volume(&project_id.to_string());
         let command = format!(
             "set -eu\n\
              git -C /workspace/repo worktree prune 2>/dev/null || true\n\
@@ -6728,7 +6730,7 @@ impl AgentRuntime {
         let token = self.project_git_token(project_id).await?.ok_or_else(|| {
             RuntimeError::InvalidInput("project git account token is not configured".to_string())
         })?;
-        let volume = DockerClient::workspace_volume_for_project_review(&project_id.to_string());
+        let volume = project_review_workspace_volume(&project_id.to_string());
         let repo_url = github_clone_url(&summary.owner, &summary.repo);
         let expected_remote = repo_url.clone();
         let branch = if summary.branch.trim().is_empty() {
@@ -6832,8 +6834,7 @@ impl AgentRuntime {
         let maintainer = self.agent(project_summary.maintainer_agent_id).await?;
         let maintainer_summary = maintainer.summary.read().await.clone();
         let model = self.resolve_role_agent_model(AgentRole::Reviewer).await?;
-        let workspace_volume =
-            DockerClient::workspace_volume_for_project_review(&project_id.to_string());
+        let workspace_volume = project_review_workspace_volume(&project_id.to_string());
         self.create_agent_with_container_source(
             CreateAgentRequest {
                 name: Some(format!("{} Auto Reviewer", project_summary.name)),
@@ -6944,7 +6945,7 @@ impl AgentRuntime {
     }
 
     async fn delete_project_review_workspace(&self, project_id: ProjectId) -> Result<()> {
-        let volume = DockerClient::workspace_volume_for_project_review(&project_id.to_string());
+        let volume = project_review_workspace_volume(&project_id.to_string());
         self.deps.docker.delete_volume(&volume).await?;
         Ok(())
     }
