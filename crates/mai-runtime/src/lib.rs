@@ -1509,7 +1509,7 @@ impl AgentRuntime {
             .store
             .resolve_provider(request.provider_id.as_deref(), request.model.as_deref())
             .await?;
-        let reasoning_effort = normalize_reasoning_effort(
+        let reasoning_effort = agents::normalize_reasoning_effort(
             &provider_selection.model,
             request.reasoning_effort.as_deref(),
             true,
@@ -1581,49 +1581,7 @@ impl AgentRuntime {
         agent_id: AgentId,
         request: UpdateAgentRequest,
     ) -> Result<AgentSummary> {
-        let agent = self.agent(agent_id).await?;
-        {
-            let summary = agent.summary.read().await;
-            if !summary.status.can_start_turn() || summary.current_turn.is_some() {
-                return Err(RuntimeError::AgentBusy(agent_id));
-            }
-        }
-        let current = agent.summary.read().await.clone();
-        let provider_id = request
-            .provider_id
-            .as_deref()
-            .or(Some(&current.provider_id));
-        let model = request.model.as_deref().or(Some(&current.model));
-        let provider_selection = self.deps.store.resolve_provider(provider_id, model).await?;
-        let requested_reasoning_effort = if request.reasoning_effort.is_some()
-            || provider_selection.model.id != current.model
-            || provider_selection.provider.id != current.provider_id
-        {
-            request.reasoning_effort
-        } else {
-            current.reasoning_effort
-        };
-        let reasoning_effort = normalize_reasoning_effort(
-            &provider_selection.model,
-            requested_reasoning_effort.as_deref(),
-            true,
-        )?;
-        let updated = {
-            let mut summary = agent.summary.write().await;
-            summary.provider_id = provider_selection.provider.id.clone();
-            summary.provider_name = provider_selection.provider.name.clone();
-            summary.model = provider_selection.model.id.clone();
-            summary.reasoning_effort = reasoning_effort;
-            summary.updated_at = now();
-            summary.clone()
-        };
-        self.persist_agent(&agent).await?;
-        self.events
-            .publish(ServiceEventKind::AgentUpdated {
-                agent: updated.clone(),
-            })
-            .await;
-        Ok(updated)
+        agents::update_agent(self, agent_id, request).await
     }
 
     pub async fn cleanup_orphaned_containers(&self) -> Result<Vec<String>> {
@@ -4326,7 +4284,7 @@ impl AgentRuntime {
                 preference.map(|item| item.model.as_str()),
             )
             .await?;
-        let reasoning_effort = normalize_reasoning_effort(
+        let reasoning_effort = agents::normalize_reasoning_effort(
             &selection.model,
             preference.and_then(|item| item.reasoning_effort.as_deref()),
             true,
@@ -4881,6 +4839,36 @@ impl agents::AgentDeleteOps for AgentRuntime {
     async fn publish_agent_deleted(&self, agent_id: AgentId) {
         self.events
             .publish(ServiceEventKind::AgentDeleted { agent_id })
+            .await;
+    }
+}
+
+impl agents::AgentUpdateOps for AgentRuntime {
+    fn agent(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<Arc<AgentRecord>>> + Send {
+        AgentRuntime::agent(self, agent_id)
+    }
+
+    async fn resolve_provider(
+        &self,
+        provider_id: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<ProviderSelection> {
+        Ok(self.deps.store.resolve_provider(provider_id, model).await?)
+    }
+
+    fn persist_agent(
+        &self,
+        agent: Arc<AgentRecord>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move { AgentRuntime::persist_agent(self, &agent).await }
+    }
+
+    async fn publish_agent_updated(&self, agent: AgentSummary) {
+        self.events
+            .publish(ServiceEventKind::AgentUpdated { agent })
             .await;
     }
 }
@@ -5473,43 +5461,6 @@ fn safe_artifact_name(raw: &str) -> Result<String> {
         ));
     }
     Ok(name.to_string())
-}
-
-fn normalize_reasoning_effort(
-    model: &ModelConfig,
-    effort: Option<&str>,
-    default_when_missing: bool,
-) -> Result<Option<String>> {
-    let Some(reasoning) = &model.reasoning else {
-        return Ok(None);
-    };
-    match effort {
-        Some(value) if value.trim().is_empty() || value == "none" => Ok(None),
-        Some(value) if reasoning.variants.iter().any(|variant| variant.id == value) => {
-            Ok(Some(value.to_string()))
-        }
-        Some(effort) => Err(RuntimeError::InvalidInput(format!(
-            "reasoning effort `{}` is not supported by model `{}`",
-            effort, model.id
-        ))),
-        None if default_when_missing => Ok(default_reasoning_effort(model)),
-        None => Ok(None),
-    }
-}
-
-fn default_reasoning_effort(model: &ModelConfig) -> Option<String> {
-    let reasoning = model.reasoning.as_ref()?;
-    reasoning
-        .default_variant
-        .as_ref()
-        .filter(|variant| {
-            reasoning
-                .variants
-                .iter()
-                .any(|item| item.id == variant.as_str())
-        })
-        .cloned()
-        .or_else(|| reasoning.variants.first().map(|variant| variant.id.clone()))
 }
 
 fn parse_tool_arguments(raw_arguments: &str) -> Value {
