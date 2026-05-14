@@ -1327,42 +1327,11 @@ impl AgentRuntime {
     }
 
     pub async fn cancel_task(self: &Arc<Self>, task_id: TaskId) -> Result<()> {
-        let task = self.task(task_id).await?;
-        let agents = self.task_agents(task_id).await;
-        for agent in agents {
-            if let Ok(record) = self.agent(agent.id).await {
-                let current_turn = record.summary.read().await.current_turn;
-                if let Some(turn_id) = current_turn {
-                    let _ = self.cancel_agent_turn(agent.id, turn_id).await;
-                } else {
-                    record.cancel_requested.store(true, Ordering::SeqCst);
-                    let _ = self.set_status(&record, AgentStatus::Cancelled, None).await;
-                }
-            }
-        }
-        self.set_task_status(&task, TaskStatus::Cancelled, None, None)
-            .await?;
-        Ok(())
+        tasks::cancel_task(&self.state, self, task_id).await
     }
 
     pub async fn delete_task(self: &Arc<Self>, task_id: TaskId) -> Result<()> {
-        let _task = self.task(task_id).await?;
-        let root_agents = self
-            .task_agents(task_id)
-            .await
-            .into_iter()
-            .filter(|agent| agent.parent_id.is_none())
-            .map(|agent| agent.id)
-            .collect::<Vec<_>>();
-        for agent_id in root_agents {
-            let _ = self.delete_agent(agent_id).await;
-        }
-        self.deps.store.delete_task(task_id).await?;
-        self.state.tasks.write().await.remove(&task_id);
-        self.events
-            .publish(ServiceEventKind::TaskDeleted { task_id })
-            .await;
-        Ok(())
+        tasks::delete_task(&self.state, self, task_id).await
     }
 
     pub async fn upload_file(
@@ -3445,10 +3414,6 @@ impl AgentRuntime {
         Ok(())
     }
 
-    async fn task_agents(&self, task_id: TaskId) -> Vec<AgentSummary> {
-        tasks::task_agents(&self.state, task_id).await
-    }
-
     async fn set_task_current_agent(
         &self,
         task: &Arc<TaskRecord>,
@@ -4170,6 +4135,42 @@ impl tasks::TaskPlanningOps for Arc<AgentRuntime> {
 
     async fn spawn_task_workflow(&self, task_id: TaskId) {
         AgentRuntime::spawn_task_workflow(self, task_id);
+    }
+}
+
+impl tasks::TaskLifecycleOps for Arc<AgentRuntime> {
+    async fn cancel_agent_for_task(
+        &self,
+        agent_id: AgentId,
+        current_turn: Option<TurnId>,
+    ) -> Result<()> {
+        if let Some(turn_id) = current_turn {
+            AgentRuntime::cancel_agent_turn(self, agent_id, turn_id).await
+        } else {
+            let record = self.agent(agent_id).await?;
+            record.cancel_requested.store(true, Ordering::SeqCst);
+            self.set_status(&record, AgentStatus::Cancelled, None).await
+        }
+    }
+
+    async fn delete_agent(&self, agent_id: AgentId) -> Result<()> {
+        AgentRuntime::delete_agent(self, agent_id).await
+    }
+
+    async fn agent_current_turn(&self, agent_id: AgentId) -> Result<Option<TurnId>> {
+        let record = self.agent(agent_id).await?;
+        Ok(record.summary.read().await.current_turn)
+    }
+
+    async fn delete_task_from_store(&self, task_id: TaskId) -> Result<()> {
+        self.deps.store.delete_task(task_id).await?;
+        Ok(())
+    }
+
+    async fn publish_task_deleted(&self, task_id: TaskId) {
+        self.events
+            .publish(ServiceEventKind::TaskDeleted { task_id })
+            .await;
     }
 }
 

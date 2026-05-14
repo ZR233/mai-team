@@ -1,9 +1,23 @@
+use std::future::Future;
+
 use mai_protocol::{PlanHistoryEntry, PlanStatus, TaskId, TaskStatus, TaskSummary, TurnId, now};
 
 use crate::state::RuntimeState;
 use crate::{Result, RuntimeError};
 
-use super::{TaskPlanningOps, refresh_summary_counts, set_current_agent, task, task_summary};
+use super::{TaskPlanOps, refresh_summary_counts, set_current_agent, task, task_summary};
+
+/// Supplies agent turn and workflow side effects for task planning interactions.
+pub(crate) trait TaskPlanningOps: TaskPlanOps {
+    fn send_agent_message(
+        &self,
+        agent_id: mai_protocol::AgentId,
+        message: String,
+        skill_mentions: Vec<String>,
+    ) -> impl Future<Output = Result<TurnId>> + Send;
+
+    fn spawn_task_workflow(&self, task_id: TaskId) -> impl Future<Output = ()> + Send;
+}
 
 pub(crate) async fn send_task_message(
     state: &RuntimeState,

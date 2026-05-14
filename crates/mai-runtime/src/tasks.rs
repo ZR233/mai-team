@@ -12,9 +12,13 @@ use uuid::Uuid;
 use crate::state::{RuntimeState, TaskRecord};
 use crate::{Result, RuntimeError};
 
+mod lifecycle;
 mod planning;
 
-pub(crate) use planning::{approve_task_plan, request_plan_revision, send_task_message};
+pub(crate) use lifecycle::{TaskLifecycleOps, cancel_task, delete_task};
+pub(crate) use planning::{
+    TaskPlanningOps, approve_task_plan, request_plan_revision, send_task_message,
+};
 
 /// Supplies agent read models needed to assemble task detail responses.
 pub(crate) trait TaskReadOps: Send + Sync {
@@ -55,18 +59,6 @@ pub(crate) trait TaskToolOps: TaskPlanOps {
     fn agent_summary(&self, agent_id: AgentId)
     -> impl Future<Output = Result<AgentSummary>> + Send;
     fn append_task_review(&self, review: &TaskReview) -> impl Future<Output = Result<()>> + Send;
-}
-
-/// Supplies agent turn and workflow side effects for task planning interactions.
-pub(crate) trait TaskPlanningOps: TaskPlanOps {
-    fn send_agent_message(
-        &self,
-        agent_id: AgentId,
-        message: String,
-        skill_mentions: Vec<String>,
-    ) -> impl Future<Output = Result<TurnId>> + Send;
-
-    fn spawn_task_workflow(&self, task_id: TaskId) -> impl Future<Output = ()> + Send;
 }
 
 impl<T> TaskUpdateOps for Arc<T>
