@@ -37,6 +37,7 @@ mod github;
 mod instructions;
 mod projects;
 mod state;
+mod tasks;
 mod tools;
 mod turn;
 
@@ -473,18 +474,7 @@ impl AgentRuntime {
     }
 
     pub async fn list_tasks(&self) -> Vec<TaskSummary> {
-        let task_records = {
-            let tasks = self.state.tasks.read().await;
-            tasks.values().cloned().collect::<Vec<_>>()
-        };
-        let mut summaries = Vec::with_capacity(task_records.len());
-        for task in task_records {
-            let mut summary = task.summary.read().await.clone();
-            self.refresh_task_summary_counts(&mut summary).await;
-            summaries.push(summary);
-        }
-        summaries.sort_by_key(|summary| summary.created_at);
-        summaries
+        tasks::list_tasks(&self.state).await
     }
 
     pub async fn list_projects(&self) -> Vec<ProjectSummary> {
@@ -768,21 +758,7 @@ impl AgentRuntime {
     }
 
     async fn update_task_title(self: &Arc<Self>, task_id: TaskId, new_title: String) -> Result<()> {
-        let task = self.task(task_id).await?;
-        let plan = task.plan.read().await.clone();
-        {
-            let mut summary = task.summary.write().await;
-            summary.title = new_title;
-            summary.updated_at = now();
-            self.refresh_task_summary_counts(&mut summary).await;
-            self.deps.store.save_task(&summary, &plan).await?;
-            self.events
-                .publish(ServiceEventKind::TaskUpdated {
-                    task: summary.clone(),
-                })
-                .await;
-        }
-        Ok(())
+        tasks::update_task_title(&self.state, self.as_ref(), task_id, new_title).await
     }
 
     pub async fn get_task(
@@ -790,27 +766,7 @@ impl AgentRuntime {
         task_id: TaskId,
         selected_agent_id: Option<AgentId>,
     ) -> Result<TaskDetail> {
-        let task = self.task(task_id).await?;
-        let summary = self.task_summary(&task).await;
-        let plan = task.plan.read().await.clone();
-        let plan_history = task.plan_history.read().await.clone();
-        let reviews = task.reviews.read().await.clone();
-        let agents = self.task_agents(task_id).await;
-        let selected_agent_id = selected_agent_id
-            .filter(|id| agents.iter().any(|agent| agent.id == *id))
-            .or(summary.current_agent_id)
-            .unwrap_or(summary.planner_agent_id);
-        let selected_agent = self.get_agent(selected_agent_id, None).await?;
-        Ok(TaskDetail {
-            summary,
-            plan,
-            plan_history,
-            reviews,
-            agents,
-            selected_agent_id,
-            selected_agent,
-            artifacts: task.artifacts.read().await.clone(),
-        })
+        tasks::get_task(&self.state, self, task_id, selected_agent_id).await
     }
 
     pub async fn get_project(
@@ -1855,7 +1811,7 @@ impl AgentRuntime {
             task_summary.plan_version = version;
             task_summary.current_agent_id = Some(agent_id);
             task_summary.updated_at = now();
-            self.refresh_task_summary_counts(&mut task_summary).await;
+            tasks::refresh_summary_counts(&self.state, &mut task_summary).await;
             self.deps.store.save_task(&task_summary, &plan).await?;
             self.events
                 .publish(ServiceEventKind::PlanUpdated {
@@ -1911,7 +1867,7 @@ impl AgentRuntime {
             let mut summary = task.summary.write().await;
             summary.review_rounds = task.reviews.read().await.len() as u64;
             summary.updated_at = now();
-            self.refresh_task_summary_counts(&mut summary).await;
+            tasks::refresh_summary_counts(&self.state, &mut summary).await;
             self.deps.store.save_task(&summary, &plan).await?;
             self.events
                 .publish(ServiceEventKind::TaskUpdated {
@@ -2472,13 +2428,7 @@ impl AgentRuntime {
     }
 
     async fn task(&self, task_id: TaskId) -> Result<Arc<TaskRecord>> {
-        self.state
-            .tasks
-            .read()
-            .await
-            .get(&task_id)
-            .cloned()
-            .ok_or(RuntimeError::TaskNotFound(task_id))
+        tasks::task(&self.state, task_id).await
     }
 
     async fn project(&self, project_id: ProjectId) -> Result<Arc<ProjectRecord>> {
@@ -3794,33 +3744,11 @@ impl AgentRuntime {
     }
 
     async fn task_summary(&self, task: &Arc<TaskRecord>) -> TaskSummary {
-        let mut summary = task.summary.read().await.clone();
-        self.refresh_task_summary_counts(&mut summary).await;
-        summary
-    }
-
-    async fn refresh_task_summary_counts(&self, summary: &mut TaskSummary) {
-        summary.agent_count = self.task_agents(summary.id).await.len();
-        let task = {
-            let tasks = self.state.tasks.read().await;
-            tasks.get(&summary.id).cloned()
-        };
-        if let Some(task) = task {
-            summary.review_rounds = task.reviews.read().await.len() as u64;
-        }
+        tasks::task_summary(&self.state, task).await
     }
 
     async fn task_agents(&self, task_id: TaskId) -> Vec<AgentSummary> {
-        let agents = self.state.agents.read().await;
-        let mut summaries = Vec::new();
-        for agent in agents.values() {
-            let summary = agent.summary.read().await.clone();
-            if summary.task_id == Some(task_id) {
-                summaries.push(summary);
-            }
-        }
-        summaries.sort_by_key(|summary| summary.created_at);
-        summaries
+        tasks::task_agents(&self.state, task_id).await
     }
 
     async fn set_task_current_agent(
@@ -3830,24 +3758,7 @@ impl AgentRuntime {
         status: TaskStatus,
         error: Option<String>,
     ) -> Result<()> {
-        let plan = task.plan.read().await.clone();
-        let mut summary = task.summary.write().await;
-        summary.current_agent_id = Some(agent_id);
-        summary.status = status;
-        summary.updated_at = now();
-        if let Some(error) = error {
-            summary.last_error = Some(error);
-        }
-        summary.plan_status = plan.status.clone();
-        summary.plan_version = plan.version;
-        self.refresh_task_summary_counts(&mut summary).await;
-        self.deps.store.save_task(&summary, &plan).await?;
-        self.events
-            .publish(ServiceEventKind::TaskUpdated {
-                task: summary.clone(),
-            })
-            .await;
-        Ok(())
+        tasks::set_current_agent(&self.state, self, task, agent_id, status, error).await
     }
 
     async fn set_task_status(
@@ -3857,26 +3768,7 @@ impl AgentRuntime {
         final_report: Option<String>,
         error: Option<String>,
     ) -> Result<()> {
-        let plan = task.plan.read().await.clone();
-        let mut summary = task.summary.write().await;
-        summary.status = status;
-        summary.updated_at = now();
-        if final_report.is_some() {
-            summary.final_report = final_report;
-        }
-        if error.is_some() {
-            summary.last_error = error;
-        }
-        summary.plan_status = plan.status.clone();
-        summary.plan_version = plan.version;
-        self.refresh_task_summary_counts(&mut summary).await;
-        self.deps.store.save_task(&summary, &plan).await?;
-        self.events
-            .publish(ServiceEventKind::TaskUpdated {
-                task: summary.clone(),
-            })
-            .await;
-        Ok(())
+        tasks::set_status(&self.state, self, task, status, final_report, error).await
     }
 
     async fn resolve_session_id(
@@ -4510,6 +4402,29 @@ impl projects::service::ProjectReadOps for AgentRuntime {
             .list_project_review_runs(project_id, 0, PROJECT_REVIEW_RUN_LIST_LIMIT)
             .await?
             .runs)
+    }
+}
+
+impl tasks::TaskReadOps for AgentRuntime {
+    fn get_agent(
+        &self,
+        agent_id: AgentId,
+        session_id: Option<SessionId>,
+    ) -> impl std::future::Future<Output = Result<AgentDetail>> + Send {
+        AgentRuntime::get_agent(self, agent_id, session_id)
+    }
+}
+
+impl tasks::TaskUpdateOps for AgentRuntime {
+    async fn save_task(&self, summary: &TaskSummary, plan: &TaskPlan) -> Result<()> {
+        self.deps.store.save_task(summary, plan).await?;
+        Ok(())
+    }
+
+    async fn publish_task_updated(&self, task: TaskSummary) {
+        self.events
+            .publish(ServiceEventKind::TaskUpdated { task })
+            .await;
     }
 }
 
