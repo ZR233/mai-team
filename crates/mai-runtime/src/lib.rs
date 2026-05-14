@@ -18,7 +18,9 @@ use mai_store::{AgentLogFilter, ConfigStore, ProviderSelection, ToolTraceFilter}
 use mai_tools::build_tool_definitions_with_filter;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::NamedTempFile;
@@ -1367,62 +1369,11 @@ impl AgentRuntime {
         path: String,
         display_name: Option<String>,
     ) -> Result<ArtifactInfo> {
-        let agent = self.agent(agent_id).await?;
-        let task_id = agent
-            .summary
-            .read()
-            .await
-            .task_id
-            .ok_or_else(|| RuntimeError::InvalidInput("Agent has no task".to_string()))?;
-        let container_id = self.container_id(agent_id).await?;
-
-        let name = display_name.unwrap_or_else(|| {
-            Path::new(&path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.clone())
-        });
-        let name = safe_artifact_name(&name)?;
-
-        let artifact_id = Uuid::new_v4().to_string();
-        let dir = self.artifact_file_dir(task_id, &artifact_id);
-        std::fs::create_dir_all(&dir)?;
-
-        let dest = dir.join(&name);
-        self.deps
-            .docker
-            .copy_from_container_to_file(&container_id, &path, &dest)
-            .await?;
-
-        let size_bytes = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-
-        let info = ArtifactInfo {
-            id: artifact_id,
-            agent_id,
-            task_id,
-            name,
-            path,
-            size_bytes,
-            created_at: Utc::now(),
-        };
-
-        self.deps.store.save_artifact(&info)?;
-
-        let task = self.task(task_id).await?;
-        task.artifacts.write().await.push(info.clone());
-
-        self.events
-            .publish(ServiceEventKind::ArtifactCreated {
-                artifact: info.clone(),
-            })
-            .await;
-
-        Ok(info)
+        tasks::save_artifact(&self.state, self.as_ref(), agent_id, path, display_name).await
     }
 
     pub fn artifact_file_path(&self, info: &ArtifactInfo) -> PathBuf {
-        self.artifact_file_dir(info.task_id, &info.id)
-            .join(&info.name)
+        tasks::artifact_file_path(&self.artifact_files_root, info)
     }
 
     pub fn tool_output_artifact_file_path(
@@ -2159,12 +2110,6 @@ impl AgentRuntime {
 
     fn project_skill_cache_dir(&self, project_id: ProjectId) -> PathBuf {
         projects::skills::cache_dir(&self.cache_root, project_id)
-    }
-
-    fn artifact_file_dir(&self, task_id: TaskId, artifact_id: &str) -> PathBuf {
-        self.artifact_files_root
-            .join(task_id.to_string())
-            .join(artifact_id)
     }
 
     fn project_skill_roots(&self, project_id: ProjectId) -> Vec<(PathBuf, SkillScope)> {
@@ -4065,6 +4010,45 @@ impl tasks::TaskWorkflowOps for Arc<AgentRuntime> {
     }
 }
 
+impl tasks::TaskArtifactOps for AgentRuntime {
+    async fn agent_task_id(&self, agent_id: AgentId) -> Result<Option<TaskId>> {
+        let agent = self.agent(agent_id).await?;
+        Ok(agent.summary.read().await.task_id)
+    }
+
+    async fn agent_container_id(&self, agent_id: AgentId) -> Result<String> {
+        self.container_id(agent_id).await
+    }
+
+    fn artifact_files_root(&self) -> PathBuf {
+        self.artifact_files_root.clone()
+    }
+
+    async fn copy_artifact_from_container(
+        &self,
+        container_id: String,
+        source_path: String,
+        dest_path: PathBuf,
+    ) -> Result<()> {
+        self.deps
+            .docker
+            .copy_from_container_to_file(&container_id, &source_path, &dest_path)
+            .await?;
+        Ok(())
+    }
+
+    fn save_artifact_record(&self, info: &ArtifactInfo) -> Result<()> {
+        self.deps.store.save_artifact(info)?;
+        Ok(())
+    }
+
+    async fn publish_artifact_created(&self, info: ArtifactInfo) {
+        self.events
+            .publish(ServiceEventKind::ArtifactCreated { artifact: info })
+            .await;
+    }
+}
+
 impl tasks::TaskCreateOps for Arc<AgentRuntime> {
     async fn planner_model(&self) -> Result<AgentModelPreference> {
         Ok(self
@@ -4739,31 +4723,6 @@ fn runtime_sidecar_image(image: String) -> String {
     } else {
         image.to_string()
     }
-}
-
-fn safe_artifact_name(raw: &str) -> Result<String> {
-    let name = raw.trim();
-    if name.is_empty() {
-        return Err(RuntimeError::InvalidInput(
-            "artifact name cannot be empty".to_string(),
-        ));
-    }
-    if name == "." || name == ".." {
-        return Err(RuntimeError::InvalidInput(
-            "artifact name must be a file name".to_string(),
-        ));
-    }
-    if name.contains('/') || name.contains('\\') {
-        return Err(RuntimeError::InvalidInput(
-            "artifact name cannot contain path separators".to_string(),
-        ));
-    }
-    if name.chars().any(char::is_control) {
-        return Err(RuntimeError::InvalidInput(
-            "artifact name cannot contain control characters".to_string(),
-        ));
-    }
-    Ok(name.to_string())
 }
 
 fn parse_tool_arguments(raw_arguments: &str) -> Value {

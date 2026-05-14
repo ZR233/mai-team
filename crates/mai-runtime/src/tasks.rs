@@ -12,10 +12,12 @@ use uuid::Uuid;
 use crate::state::{RuntimeState, TaskRecord};
 use crate::{Result, RuntimeError};
 
+mod artifacts;
 mod lifecycle;
 mod planning;
 mod workflow;
 
+pub(crate) use artifacts::{TaskArtifactOps, artifact_file_path, save_artifact};
 pub(crate) use lifecycle::{TaskLifecycleOps, cancel_task, delete_task};
 pub(crate) use planning::{
     TaskPlanningOps, approve_task_plan, request_plan_revision, send_task_message,
