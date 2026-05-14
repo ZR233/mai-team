@@ -12,6 +12,10 @@ use uuid::Uuid;
 use crate::state::{RuntimeState, TaskRecord};
 use crate::{Result, RuntimeError};
 
+mod planning;
+
+pub(crate) use planning::{approve_task_plan, request_plan_revision, send_task_message};
+
 /// Supplies agent read models needed to assemble task detail responses.
 pub(crate) trait TaskReadOps: Send + Sync {
     fn get_agent(
@@ -32,21 +36,67 @@ pub(crate) trait TaskUpdateOps: Send + Sync {
     fn publish_task_updated(&self, task: TaskSummary) -> impl Future<Output = ()> + Send;
 }
 
-/// Supplies agent and persistence side effects for task tool mutations.
-pub(crate) trait TaskToolOps: TaskUpdateOps {
-    fn agent_summary(&self, agent_id: AgentId)
-    -> impl Future<Output = Result<AgentSummary>> + Send;
+/// Supplies persistence and event side effects for task plan mutations.
+pub(crate) trait TaskPlanOps: TaskUpdateOps {
     fn save_plan_history_entry(
         &self,
         task_id: TaskId,
         entry: &PlanHistoryEntry,
     ) -> impl Future<Output = Result<()>> + Send;
-    fn append_task_review(&self, review: &TaskReview) -> impl Future<Output = Result<()>> + Send;
     fn publish_plan_updated(
         &self,
         task_id: TaskId,
         plan: TaskPlan,
     ) -> impl Future<Output = ()> + Send;
+}
+
+/// Supplies agent and persistence side effects for task tool mutations.
+pub(crate) trait TaskToolOps: TaskPlanOps {
+    fn agent_summary(&self, agent_id: AgentId)
+    -> impl Future<Output = Result<AgentSummary>> + Send;
+    fn append_task_review(&self, review: &TaskReview) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// Supplies agent turn and workflow side effects for task planning interactions.
+pub(crate) trait TaskPlanningOps: TaskPlanOps {
+    fn send_agent_message(
+        &self,
+        agent_id: AgentId,
+        message: String,
+        skill_mentions: Vec<String>,
+    ) -> impl Future<Output = Result<TurnId>> + Send;
+
+    fn spawn_task_workflow(&self, task_id: TaskId) -> impl Future<Output = ()> + Send;
+}
+
+impl<T> TaskUpdateOps for Arc<T>
+where
+    T: TaskUpdateOps + Send + Sync,
+{
+    async fn save_task(&self, summary: &TaskSummary, plan: &TaskPlan) -> Result<()> {
+        self.as_ref().save_task(summary, plan).await
+    }
+
+    async fn publish_task_updated(&self, task: TaskSummary) {
+        self.as_ref().publish_task_updated(task).await;
+    }
+}
+
+impl<T> TaskPlanOps for Arc<T>
+where
+    T: TaskPlanOps + Send + Sync,
+{
+    async fn save_plan_history_entry(
+        &self,
+        task_id: TaskId,
+        entry: &PlanHistoryEntry,
+    ) -> Result<()> {
+        self.as_ref().save_plan_history_entry(task_id, entry).await
+    }
+
+    async fn publish_plan_updated(&self, task_id: TaskId, plan: TaskPlan) {
+        self.as_ref().publish_plan_updated(task_id, plan).await;
+    }
 }
 
 pub(crate) struct CreateTaskInput {

@@ -39,9 +39,9 @@ mod tasks;
 mod tools;
 mod turn;
 
+use agents::AgentResourceBroker;
 use deps::RuntimeDeps;
 use events::{RECENT_EVENT_LIMIT, RuntimeEvents};
-use agents::AgentResourceBroker;
 use github::{
     DEFAULT_GITHUB_API_BASE_URL, DirectGithubAppBackend, GITHUB_HTTP_TIMEOUT_SECS,
     GithubAppBackend, GithubErrorResponse, github_api_url, github_clone_url, github_headers,
@@ -932,83 +932,11 @@ impl AgentRuntime {
         message: String,
         skill_mentions: Vec<String>,
     ) -> Result<TurnId> {
-        let task = self.task(task_id).await?;
-        let planner_agent_id = task.summary.read().await.planner_agent_id;
-        {
-            let mut plan = task.plan.write().await;
-            if plan.status == PlanStatus::Ready || plan.status == PlanStatus::Approved {
-                let entry = PlanHistoryEntry {
-                    version: plan.version,
-                    title: plan.title.clone(),
-                    markdown: plan.markdown.clone(),
-                    saved_at: plan.saved_at,
-                    saved_by_agent_id: plan.saved_by_agent_id,
-                    revision_feedback: None,
-                    revision_requested_at: None,
-                };
-                self.deps
-                    .store
-                    .save_plan_history_entry(task_id, &entry)
-                    .await?;
-                task.plan_history.write().await.push(entry);
-                plan.status = PlanStatus::NeedsRevision;
-                plan.revision_feedback = None;
-                plan.revision_requested_at = None;
-                plan.approved_at = None;
-                let mut summary = task.summary.write().await;
-                summary.status = TaskStatus::Planning;
-                summary.plan_status = PlanStatus::NeedsRevision;
-                summary.final_report = None;
-                summary.last_error = None;
-                summary.updated_at = now();
-                self.deps.store.save_task(&summary, &plan).await?;
-                self.events
-                    .publish(ServiceEventKind::PlanUpdated {
-                        task_id,
-                        plan: plan.clone(),
-                    })
-                    .await;
-                self.events
-                    .publish(ServiceEventKind::TaskUpdated {
-                        task: summary.clone(),
-                    })
-                    .await;
-            }
-        }
-        let turn_id = self
-            .send_message(planner_agent_id, None, message, skill_mentions)
-            .await?;
-        self.set_task_current_agent(&task, planner_agent_id, TaskStatus::Planning, None)
-            .await?;
-        Ok(turn_id)
+        tasks::send_task_message(&self.state, self, task_id, message, skill_mentions).await
     }
 
     pub async fn approve_task_plan(self: &Arc<Self>, task_id: TaskId) -> Result<TaskSummary> {
-        let task = self.task(task_id).await?;
-        {
-            let mut plan = task.plan.write().await;
-            if plan.status != PlanStatus::Ready || plan.markdown.as_deref().unwrap_or("").is_empty()
-            {
-                return Err(RuntimeError::InvalidInput(
-                    "task has no ready plan to approve".to_string(),
-                ));
-            }
-            plan.status = PlanStatus::Approved;
-            plan.approved_at = Some(now());
-            let mut summary = task.summary.write().await;
-            summary.status = TaskStatus::Executing;
-            summary.plan_status = PlanStatus::Approved;
-            summary.plan_version = plan.version;
-            summary.updated_at = now();
-            self.deps.store.save_task(&summary, &plan).await?;
-            self.events
-                .publish(ServiceEventKind::TaskUpdated {
-                    task: summary.clone(),
-                })
-                .await;
-        }
-        self.spawn_task_workflow(task_id);
-        Ok(self.task_summary(&task).await)
+        tasks::approve_task_plan(&self.state, self, task_id).await
     }
 
     pub async fn request_plan_revision(
@@ -1016,58 +944,7 @@ impl AgentRuntime {
         task_id: TaskId,
         feedback: String,
     ) -> Result<TaskSummary> {
-        let task = self.task(task_id).await?;
-        {
-            let mut plan = task.plan.write().await;
-            if plan.status != PlanStatus::Ready {
-                return Err(RuntimeError::InvalidInput(
-                    "task plan is not in ready status".to_string(),
-                ));
-            }
-            let entry = PlanHistoryEntry {
-                version: plan.version,
-                title: plan.title.clone(),
-                markdown: plan.markdown.clone(),
-                saved_at: plan.saved_at,
-                saved_by_agent_id: plan.saved_by_agent_id,
-                revision_feedback: Some(feedback.clone()),
-                revision_requested_at: Some(now()),
-            };
-            self.deps
-                .store
-                .save_plan_history_entry(task_id, &entry)
-                .await?;
-            task.plan_history.write().await.push(entry);
-            plan.status = PlanStatus::NeedsRevision;
-            plan.revision_feedback = Some(feedback.clone());
-            plan.revision_requested_at = Some(now());
-            let mut summary = task.summary.write().await;
-            summary.status = TaskStatus::Planning;
-            summary.plan_status = PlanStatus::NeedsRevision;
-            summary.updated_at = now();
-            self.deps.store.save_task(&summary, &plan).await?;
-            self.events
-                .publish(ServiceEventKind::PlanUpdated {
-                    task_id,
-                    plan: plan.clone(),
-                })
-                .await;
-            self.events
-                .publish(ServiceEventKind::TaskUpdated {
-                    task: summary.clone(),
-                })
-                .await;
-        }
-        let planner_agent_id = task.summary.read().await.planner_agent_id;
-        let feedback_message = format!(
-            "The user requests revision of the plan.\n\nFeedback:\n{feedback}\n\nPlease address the feedback and save an updated plan."
-        );
-        let _ = self
-            .send_message(planner_agent_id, None, feedback_message, Vec::new())
-            .await?;
-        self.set_task_current_agent(&task, planner_agent_id, TaskStatus::Planning, None)
-            .await?;
-        Ok(self.task_summary(&task).await)
+        tasks::request_plan_revision(&self.state, self, task_id, feedback).await
     }
 
     pub async fn create_agent(
@@ -3568,10 +3445,6 @@ impl AgentRuntime {
         Ok(())
     }
 
-    async fn task_summary(&self, task: &Arc<TaskRecord>) -> TaskSummary {
-        tasks::task_summary(&self.state, task).await
-    }
-
     async fn task_agents(&self, task_id: TaskId) -> Vec<AgentSummary> {
         tasks::task_agents(&self.state, task_id).await
     }
@@ -4253,12 +4126,7 @@ impl tasks::TaskUpdateOps for AgentRuntime {
     }
 }
 
-impl tasks::TaskToolOps for AgentRuntime {
-    async fn agent_summary(&self, agent_id: AgentId) -> Result<AgentSummary> {
-        let agent = self.agent(agent_id).await?;
-        Ok(agent.summary.read().await.clone())
-    }
-
+impl tasks::TaskPlanOps for AgentRuntime {
     async fn save_plan_history_entry(
         &self,
         task_id: TaskId,
@@ -4271,15 +4139,37 @@ impl tasks::TaskToolOps for AgentRuntime {
         Ok(())
     }
 
-    async fn append_task_review(&self, review: &TaskReview) -> Result<()> {
-        self.deps.store.append_task_review(review).await?;
-        Ok(())
-    }
-
     async fn publish_plan_updated(&self, task_id: TaskId, plan: TaskPlan) {
         self.events
             .publish(ServiceEventKind::PlanUpdated { task_id, plan })
             .await;
+    }
+}
+
+impl tasks::TaskToolOps for AgentRuntime {
+    async fn agent_summary(&self, agent_id: AgentId) -> Result<AgentSummary> {
+        let agent = self.agent(agent_id).await?;
+        Ok(agent.summary.read().await.clone())
+    }
+
+    async fn append_task_review(&self, review: &TaskReview) -> Result<()> {
+        self.deps.store.append_task_review(review).await?;
+        Ok(())
+    }
+}
+
+impl tasks::TaskPlanningOps for Arc<AgentRuntime> {
+    async fn send_agent_message(
+        &self,
+        agent_id: AgentId,
+        message: String,
+        skill_mentions: Vec<String>,
+    ) -> Result<TurnId> {
+        AgentRuntime::send_message(self, agent_id, None, message, skill_mentions).await
+    }
+
+    async fn spawn_task_workflow(&self, task_id: TaskId) {
+        AgentRuntime::spawn_task_workflow(self, task_id);
     }
 }
 
@@ -5022,7 +4912,5 @@ fn should_auto_compact(last_context_tokens: u64, context_tokens: u64) -> bool {
         >= context_tokens.saturating_mul(AUTO_COMPACT_THRESHOLD_PERCENT)
 }
 
-
 #[cfg(test)]
 mod tests;
-
