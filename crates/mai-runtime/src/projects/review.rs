@@ -9,6 +9,7 @@ use crate::{Result, RuntimeError};
 
 pub(crate) mod cleanup;
 pub(crate) mod runs;
+pub(crate) mod state;
 pub(crate) mod workspace;
 
 const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;

@@ -51,6 +51,7 @@ use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
 use projects::mcp::PROJECT_WORKSPACE_PATH;
 use projects::review::ProjectReviewCycleResult;
 use projects::review::runs::FinishReviewRun;
+use projects::review::state::ReviewStateUpdate;
 #[cfg(test)]
 use projects::skills::PROJECT_SKILLS_CACHE_DIR;
 use projects::skills::{ProjectSkillRefreshSource, ProjectSkillSourceDir};
@@ -143,17 +144,6 @@ pub struct RuntimeConfig {
     pub git_binary: Option<String>,
     pub system_skills_root: Option<PathBuf>,
     pub system_agents_root: Option<PathBuf>,
-}
-
-#[derive(Default)]
-struct ReviewStateUpdate {
-    current_reviewer_agent_id: Option<AgentId>,
-    next_review_at: Option<DateTime<Utc>>,
-    outcome: Option<ProjectReviewOutcome>,
-    #[allow(dead_code)]
-    summary_text: Option<String>,
-    error: Option<String>,
-    force_disabled: bool,
 }
 
 pub struct AgentRuntime {
@@ -2724,35 +2714,7 @@ impl AgentRuntime {
         status: ProjectReviewStatus,
         update: ReviewStateUpdate,
     ) -> Result<ProjectSummary> {
-        let project = self.project(project_id).await?;
-        let updated = {
-            let mut summary = project.summary.write().await;
-            summary.review_status = status;
-            summary.current_reviewer_agent_id = update.current_reviewer_agent_id;
-            summary.next_review_at = update.next_review_at;
-            if update.current_reviewer_agent_id.is_some() {
-                summary.last_review_started_at = Some(now());
-                summary.last_review_finished_at = None;
-            } else if update.outcome.is_some() || update.error.is_some() {
-                summary.last_review_finished_at = Some(now());
-            }
-            if let Some(outcome) = update.outcome {
-                summary.last_review_outcome = Some(outcome);
-            }
-            summary.review_last_error = update.error;
-            if update.force_disabled {
-                summary.auto_review_enabled = false;
-            }
-            summary.updated_at = now();
-            summary.clone()
-        };
-        self.deps.store.save_project(&updated).await?;
-        self.events
-            .publish(ServiceEventKind::ProjectUpdated {
-                project: updated.clone(),
-            })
-            .await;
-        Ok(updated)
+        projects::review::state::set_project_review_state(self, project_id, status, update).await
     }
 
     async fn delete_project_review_workspace(&self, project_id: ProjectId) -> Result<()> {
@@ -3715,6 +3677,36 @@ impl projects::review::runs::ReviewRunSnapshotSource for AgentRuntime {
             .agent_recent_events(reviewer_agent_id, PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT)
             .await;
         (messages, events)
+    }
+}
+
+impl projects::review::state::ProjectReviewStateOps for AgentRuntime {
+    fn project(
+        &self,
+        project_id: ProjectId,
+    ) -> impl std::future::Future<Output = Result<Arc<ProjectRecord>>> + Send {
+        AgentRuntime::project(self, project_id)
+    }
+
+    fn save_project(
+        &self,
+        project: ProjectSummary,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            self.deps.store.save_project(&project).await?;
+            Ok(())
+        }
+    }
+
+    fn publish_project_updated(
+        &self,
+        project: ProjectSummary,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            self.events
+                .publish(ServiceEventKind::ProjectUpdated { project })
+                .await;
+        }
     }
 }
 
