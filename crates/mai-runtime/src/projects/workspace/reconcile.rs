@@ -12,7 +12,8 @@ use crate::Result;
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct WorkspaceReconcileReport {
     pub(crate) orphan_clones_removed: Vec<AgentId>,
-    pub(crate) legacy_worktree_dirs_removed: Vec<ProjectId>,
+    pub(crate) orphan_project_dirs_archived: Vec<ProjectId>,
+    pub(crate) legacy_worktree_dirs_archived: Vec<ProjectId>,
     pub(crate) missing_repo_caches: Vec<ProjectId>,
     pub(crate) missing_agent_clones: Vec<AgentId>,
     pub(crate) invalid_clone_dirs: Vec<PathBuf>,
@@ -40,8 +41,11 @@ pub(crate) fn reconcile_project_workspaces(
         }
         let legacy_worktrees = paths.project_dir.join("worktrees");
         if legacy_worktrees.exists() {
-            std::fs::remove_dir_all(&legacy_worktrees)?;
-            report.legacy_worktree_dirs_removed.push(project.id);
+            std::fs::rename(
+                &legacy_worktrees,
+                next_legacy_worktree_archive_path(&paths.project_dir),
+            )?;
+            report.legacy_worktree_dirs_archived.push(project.id);
         }
         if paths.clones_dir.exists() {
             for entry in std::fs::read_dir(&paths.clones_dir)? {
@@ -59,6 +63,27 @@ pub(crate) fn reconcile_project_workspaces(
                     report.orphan_clones_removed.push(agent_id);
                 }
             }
+        }
+    }
+    if projects_root.exists() {
+        for entry in std::fs::read_dir(projects_root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let project_name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(project_id) = ProjectId::parse_str(&project_name) else {
+                continue;
+            };
+            if live_project_ids.contains(&project_id) {
+                continue;
+            }
+            let archive_path = next_orphan_project_archive_path(projects_root, project_id);
+            if let Some(parent) = archive_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(entry.path(), archive_path)?;
+            report.orphan_project_dirs_archived.push(project_id);
         }
     }
 
@@ -83,7 +108,8 @@ pub(crate) fn reconcile_project_workspaces(
     }
 
     report.orphan_clones_removed.sort();
-    report.legacy_worktree_dirs_removed.sort();
+    report.orphan_project_dirs_archived.sort();
+    report.legacy_worktree_dirs_archived.sort();
     report.missing_repo_caches.sort();
     report.missing_agent_clones.sort();
     report.invalid_clone_dirs.sort();
@@ -108,6 +134,40 @@ fn project_workspace_should_exist(project: &ProjectSummary) -> bool {
         | (ProjectStatus::Deleting, ProjectCloneStatus::Cloning)
         | (ProjectStatus::Deleting, ProjectCloneStatus::Ready)
         | (ProjectStatus::Deleting, ProjectCloneStatus::Failed) => false,
+    }
+}
+
+fn next_orphan_project_archive_path(projects_root: &Path, project_id: ProjectId) -> PathBuf {
+    let orphaned_root = projects_root.join("orphaned");
+    let project_name = project_id.to_string();
+    let mut index = 0;
+    loop {
+        let name = if index == 0 {
+            project_name.clone()
+        } else {
+            format!("{project_name}-{index}")
+        };
+        let candidate = orphaned_root.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn next_legacy_worktree_archive_path(project_dir: &Path) -> PathBuf {
+    let mut index = 0;
+    loop {
+        let name = if index == 0 {
+            "legacy-worktrees".to_string()
+        } else {
+            format!("legacy-worktrees-{index}")
+        };
+        let candidate = project_dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+        index += 1;
     }
 }
 

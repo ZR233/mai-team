@@ -5488,6 +5488,86 @@ async fn runtime_start_reconciles_orphan_project_clone_dirs() {
 }
 
 #[tokio::test]
+async fn runtime_start_marks_missing_project_repo_cache_failed() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    maintainer.role = Some(AgentRole::Planner);
+    save_agent_with_session(&store, &maintainer).await;
+    let project = ready_test_project_summary(project_id, maintainer_id, "account-1");
+    store.save_project(&project).await.expect("save project");
+    let clone_path = dir
+        .path()
+        .join("data/projects")
+        .join(project_id.to_string())
+        .join("clones")
+        .join(maintainer_id.to_string())
+        .join("repo");
+    fs::create_dir_all(&clone_path).expect("mkdir clone");
+
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let detail = runtime
+        .get_project(project_id, None, None)
+        .await
+        .expect("project");
+    assert_eq!(detail.summary.status, ProjectStatus::Failed);
+    assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Failed);
+    assert!(
+        detail
+            .summary
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("repository cache"))
+    );
+}
+
+#[tokio::test]
+async fn runtime_start_restores_missing_project_agent_clone() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    maintainer.role = Some(AgentRole::Planner);
+    save_agent_with_session(&store, &maintainer).await;
+    let project = ready_test_project_summary(project_id, maintainer_id, "account-1");
+    store.save_project(&project).await.expect("save project");
+    ensure_project_repo(&dir, project_id);
+
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let agent = runtime.get_agent(maintainer_id, None).await.expect("agent");
+    assert_eq!(agent.summary.status, AgentStatus::Idle);
+    assert!(
+        projects::workspace::paths::agent_clone_path(
+            &runtime.projects_root,
+            project_id,
+            maintainer_id,
+        )
+        .exists()
+    );
+}
+
+#[tokio::test]
 async fn runtime_start_starts_auto_review_worker_immediately() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;

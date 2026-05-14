@@ -1022,10 +1022,16 @@ impl AgentRuntime {
                 "removed orphan project clone directories during startup reconcile"
             );
         }
-        if !report.legacy_worktree_dirs_removed.is_empty() {
+        if !report.orphan_project_dirs_archived.is_empty() {
             tracing::info!(
-                count = report.legacy_worktree_dirs_removed.len(),
-                "removed legacy project worktree directories during startup reconcile"
+                count = report.orphan_project_dirs_archived.len(),
+                "archived orphan project directories during startup reconcile"
+            );
+        }
+        if !report.legacy_worktree_dirs_archived.is_empty() {
+            tracing::info!(
+                count = report.legacy_worktree_dirs_archived.len(),
+                "archived legacy project worktree directories during startup reconcile"
             );
         }
         if !report.missing_repo_caches.is_empty() {
@@ -1033,12 +1039,61 @@ impl AgentRuntime {
                 count = report.missing_repo_caches.len(),
                 "found projects with missing repository caches during startup reconcile"
             );
+            for project_id in &report.missing_repo_caches {
+                let repo_cache_path = self.workspace_manager.repo_cache_path(*project_id);
+                let project_dir_exists = repo_cache_path
+                    .parent()
+                    .is_some_and(|project_dir| project_dir.exists());
+                if !project_dir_exists {
+                    continue;
+                }
+                self.set_project_clone_result(
+                    *project_id,
+                    ProjectStatus::Failed,
+                    ProjectCloneStatus::Failed,
+                    Some("project repository cache is missing after startup reconcile".to_string()),
+                )
+                .await?;
+            }
         }
         if !report.missing_agent_clones.is_empty() {
             tracing::warn!(
                 count = report.missing_agent_clones.len(),
                 "found project agents with missing clones during startup reconcile"
             );
+            for agent_id in &report.missing_agent_clones {
+                let Some(agent_summary) = agents.iter().find(|agent| agent.id == *agent_id) else {
+                    continue;
+                };
+                let Some(project_id) = agent_summary.project_id else {
+                    continue;
+                };
+                if report.missing_repo_caches.contains(&project_id) {
+                    continue;
+                }
+                let Some(project) = projects.iter().find(|project| project.id == project_id) else {
+                    continue;
+                };
+                if let Err(err) = self
+                    .workspace_manager
+                    .prepare_agent_clone(
+                        project,
+                        *agent_id,
+                        projects::workspace::CloneSeed::DefaultBranch,
+                    )
+                    .await
+                {
+                    let agent = self.agent(*agent_id).await?;
+                    self.set_status(
+                        &agent,
+                        AgentStatus::Failed,
+                        Some(format!(
+                            "project clone could not be restored after startup reconcile: {err}"
+                        )),
+                    )
+                    .await?;
+                }
+            }
         }
         if !report.invalid_clone_dirs.is_empty() {
             tracing::warn!(

@@ -589,7 +589,8 @@ mod tests {
             report,
             WorkspaceReconcileReport {
                 orphan_clones_removed: vec![orphan_agent_id],
-                legacy_worktree_dirs_removed: Vec::new(),
+                orphan_project_dirs_archived: Vec::new(),
+                legacy_worktree_dirs_archived: Vec::new(),
                 missing_repo_caches: Vec::new(),
                 missing_agent_clones: Vec::new(),
                 invalid_clone_dirs: Vec::new(),
@@ -600,7 +601,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_workspace_manager_reconcile_removes_legacy_worktree_dir() {
+    async fn local_workspace_manager_reconcile_archives_legacy_worktree_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
         let git = fake_git_path(dir.path());
         let project_id = uuid::Uuid::new_v4();
@@ -624,13 +625,54 @@ mod tests {
             report,
             WorkspaceReconcileReport {
                 orphan_clones_removed: Vec::new(),
-                legacy_worktree_dirs_removed: vec![project_id],
+                orphan_project_dirs_archived: Vec::new(),
+                legacy_worktree_dirs_archived: vec![project_id],
                 missing_repo_caches: Vec::new(),
                 missing_agent_clones: Vec::new(),
                 invalid_clone_dirs: Vec::new(),
             }
         );
         assert!(!legacy_worktrees.exists());
+        assert!(
+            project_paths(dir.path(), project_id)
+                .project_dir
+                .join("legacy-worktrees")
+                .join(agent_id.to_string())
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_workspace_manager_reconcile_archives_orphan_project_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fake_git_path(dir.path());
+        let orphan_project_id = uuid::Uuid::new_v4();
+        let orphan_project_dir = project_paths(dir.path(), orphan_project_id).project_dir;
+        std::fs::create_dir_all(&orphan_project_dir).expect("orphan project dir");
+        std::fs::write(orphan_project_dir.join("state.txt"), "legacy").expect("state");
+        let manager = LocalProjectWorkspaceManager::new(git, dir.path().to_path_buf());
+
+        let report = manager.reconcile(&[], &[]).await.expect("reconcile");
+
+        assert_eq!(
+            report,
+            WorkspaceReconcileReport {
+                orphan_clones_removed: Vec::new(),
+                orphan_project_dirs_archived: vec![orphan_project_id],
+                legacy_worktree_dirs_archived: Vec::new(),
+                missing_repo_caches: Vec::new(),
+                missing_agent_clones: Vec::new(),
+                invalid_clone_dirs: Vec::new(),
+            }
+        );
+        assert!(!orphan_project_dir.exists());
+        assert!(
+            dir.path()
+                .join("orphaned")
+                .join(orphan_project_id.to_string())
+                .join("state.txt")
+                .exists()
+        );
     }
 
     #[test]
