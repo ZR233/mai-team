@@ -3,17 +3,9 @@ use std::sync::Arc;
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use clap::Parser;
 use mai_protocol::ErrorResponse;
 
 use mai_relay_client::RelayClient;
-
-#[derive(Debug, Parser)]
-#[command(author, version, about)]
-pub(crate) struct Cli {
-    #[arg(long = "data-path", value_name = "PATH")]
-    pub(crate) data_path: Option<std::path::PathBuf>,
-}
 
 #[derive(Clone)]
 pub(crate) struct AppState {

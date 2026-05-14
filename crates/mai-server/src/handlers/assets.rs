@@ -174,3 +174,152 @@ pub(crate) fn embedded_system_agent_relative_path(path: &str) -> Option<PathBuf>
 pub(crate) fn safe_embedded_relative_path(path: &str) -> Option<PathBuf> {
     safe_embedded_relative_path_from_path(FsPath::new(path))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn embedded_system_skills_release_to_target_dir() {
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("system-skills");
+
+        release_embedded_system_skills(&target).expect("release skills");
+
+        let skill_path = target.join("reviewer-agent-review-pr").join("SKILL.md");
+        let contents = fs::read_to_string(skill_path).expect("skill contents");
+        assert!(contents.contains("name: reviewer-agent-review-pr"));
+    }
+
+    #[test]
+    fn embedded_system_agents_release_to_target_dir() {
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("system-agents");
+
+        release_embedded_system_agents(&target).expect("release agents");
+
+        let maintainer_path = target.join("project-maintainer").join("AGENT.md");
+        let reviewer_path = target.join("project-reviewer").join("AGENT.md");
+        let contents = fs::read_to_string(maintainer_path).expect("agent contents");
+        assert!(contents.contains("id: project-maintainer"));
+        assert!(reviewer_path.exists());
+    }
+
+    #[test]
+    fn embedded_system_skills_release_overwrites_target_dir() {
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("system-skills");
+        fs::create_dir_all(&target).expect("mkdir");
+        fs::write(target.join("stale.txt"), "old").expect("write stale");
+
+        release_embedded_system_skills(&target).expect("release skills");
+
+        assert!(!target.join("stale.txt").exists());
+        let expected = target.join("reviewer-agent-review-pr").join("SKILL.md");
+        assert!(
+            expected.exists(),
+            "expected {}, found {:?}",
+            expected.display(),
+            list_relative_files(&target)
+        );
+    }
+
+    fn list_relative_files(root: &FsPath) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                collect_relative_files(root, &entry.path(), &mut files);
+            }
+        }
+        files.sort();
+        files
+    }
+
+    fn collect_relative_files(root: &FsPath, path: &FsPath, files: &mut Vec<PathBuf>) {
+        if path.is_dir() {
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    collect_relative_files(root, &entry.path(), files);
+                }
+            }
+        } else if let Ok(relative) = path.strip_prefix(root) {
+            files.push(relative.to_path_buf());
+        }
+    }
+
+    #[test]
+    fn safe_embedded_relative_path_rejects_parent_components() {
+        assert_eq!(
+            safe_embedded_relative_path("reviewer-agent-review-pr/SKILL.md"),
+            Some(PathBuf::from("reviewer-agent-review-pr").join("SKILL.md"))
+        );
+        assert_eq!(
+            embedded_system_skill_relative_path("system-skills/reviewer-agent-review-pr/SKILL.md"),
+            Some(PathBuf::from("reviewer-agent-review-pr").join("SKILL.md"))
+        );
+        assert_eq!(safe_embedded_relative_path("../SKILL.md"), None);
+        assert_eq!(safe_embedded_relative_path("/tmp/SKILL.md"), None);
+        assert_eq!(
+            embedded_system_skill_relative_path(
+                &FsPath::new(env!("OUT_DIR"))
+                    .join("system-skills")
+                    .join("reviewer-agent-review-pr")
+                    .join("SKILL.md")
+                    .to_string_lossy()
+            ),
+            Some(PathBuf::from("reviewer-agent-review-pr").join("SKILL.md"))
+        );
+        assert_eq!(
+            embedded_system_agent_relative_path(
+                &FsPath::new(env!("OUT_DIR"))
+                    .join("system-agents")
+                    .join("project-maintainer")
+                    .join("AGENT.md")
+                    .to_string_lossy()
+            ),
+            Some(PathBuf::from("project-maintainer").join("AGENT.md"))
+        );
+    }
+
+    #[test]
+    fn system_skills_release_rejects_root_target() {
+        assert!(!safe_system_resource_target(std::path::Path::new("")));
+        assert!(!safe_system_resource_target(std::path::Path::new("/")));
+        assert!(safe_system_resource_target(std::path::Path::new(
+            "/tmp/system-skills"
+        )));
+    }
+
+    #[test]
+    fn runtime_storage_paths_use_default_data_layout() {
+        let dir = tempdir().expect("tempdir");
+        let data_dir = dir.path().join(".mai-team");
+
+        assert_eq!(
+            crate::handlers::helpers::data_dir_path_with(dir.path(), None),
+            data_dir
+        );
+        assert_eq!(
+            crate::handlers::helpers::cache_dir_path(&data_dir),
+            data_dir.join("cache")
+        );
+        assert_eq!(
+            crate::handlers::helpers::artifact_files_root(&data_dir),
+            data_dir.join("artifacts").join("files")
+        );
+        assert_eq!(
+            crate::handlers::helpers::artifact_index_root(&data_dir),
+            data_dir.join("artifacts").join("index")
+        );
+        assert_eq!(
+            system_skills_path(&data_dir),
+            data_dir.join("system-skills")
+        );
+        assert_eq!(
+            system_agents_path(&data_dir),
+            data_dir.join("system-agents")
+        );
+    }
+}
