@@ -138,9 +138,6 @@ fn chat_tool(tool: &ToolDefinition) -> ChatTool {
 }
 
 fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessage> {
-    let last_user_index = input
-        .iter()
-        .rposition(|item| matches!(item, ModelInputItem::Message { role, .. } if role == "user"));
     let mut messages = vec![ChatMessage {
         role: "system".to_string(),
         content: Some(instructions.to_string()),
@@ -148,7 +145,7 @@ fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessag
         tool_calls: Vec::new(),
         tool_call_id: None,
     }];
-    for (index, item) in input.iter().enumerate() {
+    for item in input.iter() {
         match item {
             ModelInputItem::Message { role, content } => {
                 let text = content
@@ -183,10 +180,7 @@ fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessag
                         },
                     })
                     .collect::<Vec<_>>();
-                let reasoning_content = last_user_index
-                    .is_none_or(|last_user_index| index > last_user_index)
-                    .then(|| reasoning_content.clone())
-                    .flatten();
+                let reasoning_content = reasoning_content.clone();
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: assistant_chat_content(
@@ -415,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_messages_drop_stale_reasoning_content_before_latest_user_message() {
+    fn chat_messages_preserve_reasoning_content_for_all_assistant_turns() {
         let messages = chat_messages(
             "instructions",
             &[
@@ -431,7 +425,7 @@ mod tests {
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[2].role, "assistant");
-        assert_eq!(messages[2].reasoning_content, None);
+        assert_eq!(messages[2].reasoning_content.as_deref(), Some("old thinking"));
     }
 
     #[test]

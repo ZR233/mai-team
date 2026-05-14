@@ -392,6 +392,7 @@ impl<'a> ModelStreamReducer<'a> {
             )));
         }
         self.persist_legacy_delta_fallback().await?;
+        self.finalize_pending_tool_calls().await?;
         if let Some(reasoning) = self.completed_reasoning_content() {
             self.events
                 .publish(ServiceEventKind::ReasoningCompleted {
@@ -419,7 +420,33 @@ impl<'a> ModelStreamReducer<'a> {
         if !self.final_output_items.is_empty() {
             return Ok(());
         }
-        if !self.fallback_text.trim().is_empty() {
+        let has_text = !self.fallback_text.trim().is_empty();
+        let has_reasoning = !self.fallback_reasoning.trim().is_empty();
+        if has_text && has_reasoning {
+            self.made_progress = true;
+            let text = self.fallback_text.clone();
+            let reasoning = self.fallback_reasoning.clone();
+            self.last_reasoning_content = Some(reasoning.clone());
+            self.final_output_items
+                .push(ModelOutputItem::AssistantTurn {
+                    content: Some(text.clone()),
+                    reasoning_content: Some(reasoning.clone()),
+                    tool_calls: Vec::new(),
+                });
+            self.record_assistant_message(text.clone()).await?;
+            super::history::record_history_item(
+                self.store,
+                self.agent,
+                self.agent_id,
+                self.session_id,
+                ModelInputItem::AssistantTurn {
+                    content: Some(text),
+                    reasoning_content: Some(reasoning),
+                    tool_calls: Vec::new(),
+                },
+            )
+            .await?;
+        } else if has_text {
             self.made_progress = true;
             let text = self.fallback_text.clone();
             self.final_output_items
@@ -433,7 +460,7 @@ impl<'a> ModelStreamReducer<'a> {
                 ModelInputItem::assistant_text(text),
             )
             .await?;
-        } else if !self.fallback_reasoning.trim().is_empty() {
+        } else if has_reasoning {
             self.made_progress = true;
             let reasoning = self.fallback_reasoning.clone();
             self.last_reasoning_content = Some(reasoning.clone());
@@ -455,6 +482,60 @@ impl<'a> ModelStreamReducer<'a> {
                 },
             )
             .await?;
+        }
+        Ok(())
+    }
+
+    async fn finalize_pending_tool_calls(&mut self) -> Result<()> {
+        if self.pending_tool_previews.is_empty() {
+            return Ok(());
+        }
+        let pending_indices: Vec<usize> = self.pending_tool_previews.keys().copied().collect();
+        for index in pending_indices {
+            let active = self.active_items.remove(&index).unwrap_or_default();
+            let preview = match self.pending_tool_previews.remove(&index) {
+                Some(preview) => preview,
+                None => continue,
+            };
+            let call_id = normalized_call_id(preview.call_id.unwrap_or_default());
+            let name = preview.name.unwrap_or_default();
+            let raw_arguments = preview.arguments;
+            let arguments = mai_model::types::parse_arguments(&raw_arguments);
+            let reasoning_content = (!active.reasoning.trim().is_empty())
+                .then_some(active.reasoning.clone());
+            if reasoning_content.is_some() {
+                self.last_reasoning_content = reasoning_content.clone();
+            }
+            self.made_progress = true;
+            let output_tool_call = mai_protocol::ModelOutputToolCall {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+                raw_arguments: raw_arguments.clone(),
+            };
+            self.final_output_items
+                .push(ModelOutputItem::AssistantTurn {
+                    content: None,
+                    reasoning_content: reasoning_content.clone(),
+                    tool_calls: vec![output_tool_call],
+                });
+            super::history::record_history_item(
+                self.store,
+                self.agent,
+                self.agent_id,
+                self.session_id,
+                ModelInputItem::AssistantTurn {
+                    content: None,
+                    reasoning_content,
+                    tool_calls: vec![ModelToolCall {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        arguments: raw_arguments,
+                    }],
+                },
+            )
+            .await?;
+            self.tool_calls.push((call_id, name, arguments));
         }
         Ok(())
     }
@@ -1047,6 +1128,44 @@ mod tests {
             ModelInputItem::Message { role, content }
                 if role == "assistant"
                     && matches!(&content[0], ModelContentItem::OutputText { text } if text == "fallback answer")
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_tool_calls_are_finalized_without_output_item_done() {
+        let harness = Harness::new().await;
+        let result = harness
+            .consume(vec![
+                ModelStreamEvent::ToolCallStarted {
+                    output_index: 0,
+                    call_id: Some("call_1".to_string()),
+                    name: Some("list_files".to_string()),
+                },
+                ModelStreamEvent::ToolCallArgumentsDelta {
+                    output_index: 0,
+                    delta: "{\"max_files\":3}".to_string(),
+                },
+                completed(),
+            ])
+            .await
+            .expect("consume");
+
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].0, "call_1");
+        assert_eq!(result.tool_calls[0].1, "list_files");
+        assert_eq!(result.tool_calls[0].2["max_files"], 3);
+        let history = harness.history().await;
+        assert_eq!(history.len(), 1);
+        assert!(matches!(
+            &history[0],
+            ModelInputItem::AssistantTurn {
+                content: None,
+                reasoning_content: None,
+                tool_calls,
+            } if tool_calls.len() == 1
+                && tool_calls[0].call_id == "call_1"
+                && tool_calls[0].name == "list_files"
+                && tool_calls[0].arguments == "{\"max_files\":3}"
         ));
     }
 }
