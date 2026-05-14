@@ -48,6 +48,7 @@ use github::{
     normalize_github_api_get_path, repository_packages_with_token,
 };
 use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
+#[cfg(test)]
 use projects::mcp::PROJECT_WORKSPACE_PATH;
 use projects::review::ProjectReviewCycleResult;
 use projects::review::runs::FinishReviewRun;
@@ -4234,9 +4235,15 @@ impl AgentRuntime {
         let token = self.deps.git_accounts.token(&account_id).await?;
         let repo_url = github_clone_url(&summary.owner, &summary.repo);
         let sidecar = self.ensure_project_sidecar(project_id).await?;
-        self.clone_repository_in_sidecar(&sidecar.id, &repo_url, summary.branch.trim(), &token)
-            .await?;
-        self.prepare_copied_project_workspace(&sidecar.id).await?;
+        projects::service::clone_repository_in_sidecar(
+            &self.deps.docker,
+            &sidecar.id,
+            &repo_url,
+            summary.branch.trim(),
+            &token,
+        )
+        .await?;
+        projects::service::prepare_copied_workspace(&self.deps.docker, &sidecar.id).await?;
         let existing = self.existing_project_skill_dirs(&sidecar.id).await?;
         self.refresh_project_skill_cache(
             project_id,
@@ -4245,84 +4252,6 @@ impl AgentRuntime {
             &existing,
         )
         .await?;
-        Ok(())
-    }
-
-    async fn prepare_copied_project_workspace(&self, container_id: &str) -> Result<()> {
-        let command = format!(
-            "set -eu\n\
-             owner=$(id -u):$(id -g)\n\
-             chown -R \"$owner\" {workspace} 2>/dev/null || git config --global --add safe.directory {workspace}",
-            workspace = shell_quote(PROJECT_WORKSPACE_PATH),
-        );
-        let output = self
-            .deps
-            .docker
-            .exec_shell(container_id, &command, Some("/"), Some(60))
-            .await?;
-        if output.status != 0 {
-            let combined = format!("{}\n{}", output.stderr, output.stdout);
-            let message = preview(combined.trim(), 500);
-            return Err(RuntimeError::InvalidInput(format!(
-                "repository workspace ownership setup failed: {message}"
-            )));
-        }
-        Ok(())
-    }
-
-    async fn clone_repository_in_sidecar(
-        &self,
-        container_id: &str,
-        repo_url: &str,
-        branch: &str,
-        token: &str,
-    ) -> Result<()> {
-        let branch_arg = if branch.is_empty() {
-            String::new()
-        } else {
-            format!(" --branch {}", shell_quote(branch))
-        };
-        let command = format!(
-            "set -eu\n\
-             tmp=$(mktemp -d)\n\
-             askpass=\"$tmp/askpass.sh\"\n\
-             cleanup() {{ rm -rf \"$tmp\"; }}\n\
-             trap cleanup EXIT HUP INT TERM\n\
-             cat >\"$askpass\" <<'EOF'\n\
-#!/bin/sh\n\
-case \"$1\" in\n\
-  *Username*) printf '%s\\n' x-access-token ;;\n\
-  *Password*) printf '%s\\n' \"$MAI_GITHUB_INSTALLATION_TOKEN\" ;;\n\
-  *) printf '\\n' ;;\n\
-esac\n\
-EOF\n\
-             chmod 700 \"$askpass\"\n\
-             rm -rf {workspace}\n\
-             GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=\"$askpass\" git -c credential.helper= clone{branch_arg} -- {repo_url} {workspace}",
-            workspace = shell_quote(PROJECT_WORKSPACE_PATH),
-            repo_url = shell_quote(repo_url),
-        );
-        let output = self
-            .deps
-            .docker
-            .exec_shell_env(
-                container_id,
-                &command,
-                Some("/"),
-                Some(600),
-                &[(
-                    "MAI_GITHUB_INSTALLATION_TOKEN".to_string(),
-                    token.to_string(),
-                )],
-            )
-            .await?;
-        if output.status != 0 {
-            let combined = format!("{}\n{}", output.stderr, output.stdout);
-            let message = preview(redact_secret(combined.trim(), token).trim(), 500);
-            return Err(RuntimeError::InvalidInput(format!(
-                "repository clone failed in project sidecar: {message}"
-            )));
-        }
         Ok(())
     }
 

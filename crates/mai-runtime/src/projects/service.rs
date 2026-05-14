@@ -1,11 +1,13 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use mai_docker::DockerClient;
 use mai_protocol::{
     AgentDetail, AgentId, AgentRole, AgentSummary, ProjectDetail, ProjectId, ProjectStatus,
-    ProjectSummary, SessionId,
+    ProjectSummary, SessionId, preview,
 };
 
+use super::mcp::PROJECT_WORKSPACE_PATH;
 use crate::state::{ProjectRecord, RuntimeState};
 use crate::{Result, RuntimeError};
 
@@ -156,4 +158,93 @@ pub(crate) async fn project_auto_reviewer_agents(
                 && !summary.status.is_terminal()
         })
         .collect()
+}
+
+pub(crate) async fn prepare_copied_workspace(
+    docker: &DockerClient,
+    container_id: &str,
+) -> Result<()> {
+    let command = format!(
+        "set -eu\n\
+         owner=$(id -u):$(id -g)\n\
+         chown -R \"$owner\" {workspace} 2>/dev/null || git config --global --add safe.directory {workspace}",
+        workspace = shell_quote(PROJECT_WORKSPACE_PATH),
+    );
+    let output = docker
+        .exec_shell(container_id, &command, Some("/"), Some(60))
+        .await?;
+    if output.status != 0 {
+        let combined = format!("{}\n{}", output.stderr, output.stdout);
+        let message = preview(combined.trim(), 500);
+        return Err(RuntimeError::InvalidInput(format!(
+            "repository workspace ownership setup failed: {message}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) async fn clone_repository_in_sidecar(
+    docker: &DockerClient,
+    container_id: &str,
+    repo_url: &str,
+    branch: &str,
+    token: &str,
+) -> Result<()> {
+    let branch_arg = if branch.is_empty() {
+        String::new()
+    } else {
+        format!(" --branch {}", shell_quote(branch))
+    };
+    let command = format!(
+        "set -eu\n\
+         tmp=$(mktemp -d)\n\
+         askpass=\"$tmp/askpass.sh\"\n\
+         cleanup() {{ rm -rf \"$tmp\"; }}\n\
+         trap cleanup EXIT HUP INT TERM\n\
+         cat >\"$askpass\" <<'EOF'\n\
+#!/bin/sh\n\
+case \"$1\" in\n\
+  *Username*) printf '%s\\n' x-access-token ;;\n\
+  *Password*) printf '%s\\n' \"$MAI_GITHUB_INSTALLATION_TOKEN\" ;;\n\
+  *) printf '\\n' ;;\n\
+esac\n\
+EOF\n\
+         chmod 700 \"$askpass\"\n\
+         rm -rf {workspace}\n\
+         GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=\"$askpass\" git -c credential.helper= clone{branch_arg} -- {repo_url} {workspace}",
+        workspace = shell_quote(PROJECT_WORKSPACE_PATH),
+        repo_url = shell_quote(repo_url),
+    );
+    let output = docker
+        .exec_shell_env(
+            container_id,
+            &command,
+            Some("/"),
+            Some(600),
+            &[(
+                "MAI_GITHUB_INSTALLATION_TOKEN".to_string(),
+                token.to_string(),
+            )],
+        )
+        .await?;
+    if output.status != 0 {
+        let combined = format!("{}\n{}", output.stderr, output.stdout);
+        let message = preview(redact_secret(combined.trim(), token).trim(), 500);
+        return Err(RuntimeError::InvalidInput(format!(
+            "repository clone failed in project sidecar: {message}"
+        )));
+    }
+    Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    shell_words::quote(value).into_owned()
+}
+
+fn redact_secret(value: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        value.to_string()
+    } else {
+        value.replace(secret, "[redacted]")
+    }
 }
