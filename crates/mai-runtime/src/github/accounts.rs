@@ -13,6 +13,15 @@ use super::{
 };
 use crate::{GithubAppBackend, Result, RuntimeError};
 
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedGithubRepository {
+    pub(crate) id: u64,
+    pub(crate) owner: String,
+    pub(crate) name: String,
+    pub(crate) full_name: String,
+    pub(crate) default_branch: String,
+}
+
 #[derive(Clone)]
 pub(crate) struct GitAccountService {
     store: Arc<ConfigStore>,
@@ -151,6 +160,64 @@ impl GitAccountService {
     ) -> Result<RepositoryPackagesResponse> {
         let token = self.token(account_id).await?;
         repository_packages_with_token(&self.http, &self.api_base_url, &token, owner, repo).await
+    }
+
+    pub(crate) async fn verified_repository(
+        &self,
+        account_id: &str,
+        repository_full_name: &str,
+    ) -> Result<VerifiedGithubRepository> {
+        let token = self.token(account_id).await?;
+        let account = self.summary(account_id).await?;
+        let repository_full_name = repository_full_name.trim();
+        if !repository_full_name.contains('/') || repository_full_name.contains(char::is_whitespace)
+        {
+            return Err(RuntimeError::InvalidInput(
+                "repository_full_name must look like owner/repo".to_string(),
+            ));
+        }
+        if account.provider == GitProvider::GithubAppRelay {
+            let installation_id = account.installation_id.ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "relay git account installation_id is missing".to_string(),
+                )
+            })?;
+            let repository = self
+                .github_backend
+                .get_github_repository(installation_id, repository_full_name)
+                .await?;
+            return Ok(VerifiedGithubRepository {
+                id: repository.id,
+                owner: repository.owner,
+                name: repository.name,
+                full_name: repository.full_name,
+                default_branch: repository
+                    .default_branch
+                    .unwrap_or_else(|| "main".to_string()),
+            });
+        }
+        let url = github_api_url(
+            &self.api_base_url,
+            &format!("/repos/{repository_full_name}"),
+        );
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(&token)
+            .headers(github_headers())
+            .send()
+            .await?;
+        let repository: GithubRepositoryApi =
+            decode_github_response(response, "get repository").await?;
+        Ok(VerifiedGithubRepository {
+            id: repository.id,
+            owner: repository.owner.login,
+            name: repository.name,
+            full_name: repository.full_name,
+            default_branch: repository
+                .default_branch
+                .unwrap_or_else(|| "main".to_string()),
+        })
     }
 
     pub(crate) async fn summary(&self, account_id: &str) -> Result<GitAccountSummary> {

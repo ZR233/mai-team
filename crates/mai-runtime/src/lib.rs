@@ -48,9 +48,8 @@ use deps::RuntimeDeps;
 use events::{RECENT_EVENT_LIMIT, RuntimeEvents};
 use github::{
     DEFAULT_GITHUB_API_BASE_URL, DirectGithubAppBackend, GITHUB_HTTP_TIMEOUT_SECS,
-    GithubAppBackend, GithubErrorResponse, GithubRepositoryApi, decode_github_response,
-    github_api_url, github_clone_url, github_headers, normalize_github_api_get_path,
-    repository_packages_with_token,
+    GithubAppBackend, GithubErrorResponse, github_api_url, github_clone_url, github_headers,
+    normalize_github_api_get_path, repository_packages_with_token,
 };
 use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
 use projects::mcp::PROJECT_WORKSPACE_PATH;
@@ -239,15 +238,6 @@ struct AgentResourceBroker {
     project_mcp: Option<Arc<McpAgentManager>>,
     skills: SkillsListResponse,
     _project_skill_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
-}
-
-#[derive(Debug, Clone)]
-struct VerifiedGithubRepository {
-    id: u64,
-    owner: String,
-    name: String,
-    full_name: String,
-    default_branch: String,
 }
 
 impl AgentRuntime {
@@ -1015,7 +1005,9 @@ impl AgentRuntime {
                 RuntimeError::InvalidInput("repository_full_name is required".to_string())
             })?;
         let repository = self
-            .verified_git_account_repository(&account_id, &repository_ref)
+            .deps
+            .git_accounts
+            .verified_repository(&account_id, &repository_ref)
             .await?;
         let owner = repository.owner.clone();
         let repo = repository.name.clone();
@@ -4600,66 +4592,6 @@ impl AgentRuntime {
         let volume = project_review_workspace_volume(&project_id.to_string());
         self.deps.docker.delete_volume(&volume).await?;
         Ok(())
-    }
-
-    async fn verified_git_account_repository(
-        &self,
-        account_id: &str,
-        repository_full_name: &str,
-    ) -> Result<VerifiedGithubRepository> {
-        let token = self.deps.git_accounts.token(account_id).await?;
-        let account = self.deps.git_accounts.summary(account_id).await?;
-        let repository_full_name = repository_full_name.trim();
-        if !repository_full_name.contains('/') || repository_full_name.contains(char::is_whitespace)
-        {
-            return Err(RuntimeError::InvalidInput(
-                "repository_full_name must look like owner/repo".to_string(),
-            ));
-        }
-        if account.provider == mai_protocol::GitProvider::GithubAppRelay {
-            let installation_id = account.installation_id.ok_or_else(|| {
-                RuntimeError::InvalidInput(
-                    "relay git account installation_id is missing".to_string(),
-                )
-            })?;
-            let repository = self
-                .deps
-                .github_backend
-                .get_github_repository(installation_id, repository_full_name)
-                .await?;
-            return Ok(VerifiedGithubRepository {
-                id: repository.id,
-                owner: repository.owner,
-                name: repository.name,
-                full_name: repository.full_name,
-                default_branch: repository
-                    .default_branch
-                    .unwrap_or_else(|| "main".to_string()),
-            });
-        }
-        let url = github_api_url(
-            &self.github_api_base_url,
-            &format!("/repos/{repository_full_name}"),
-        );
-        let response = self
-            .deps
-            .github_http
-            .get(url)
-            .bearer_auth(&token)
-            .headers(github_headers())
-            .send()
-            .await?;
-        let repository: GithubRepositoryApi =
-            decode_github_response(response, "get repository").await?;
-        Ok(VerifiedGithubRepository {
-            id: repository.id,
-            owner: repository.owner.login,
-            name: repository.name,
-            full_name: repository.full_name,
-            default_branch: repository
-                .default_branch
-                .unwrap_or_else(|| "main".to_string()),
-        })
     }
 
     async fn project_git_token_for_agent(&self, agent: &AgentRecord) -> Result<Option<String>> {
