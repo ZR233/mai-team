@@ -66,8 +66,6 @@ use turn::tools::ToolExecution;
 
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 90;
 const PROJECT_REVIEW_FAILURE_RETRY_SECS: u64 = 600;
-const PROJECT_REVIEW_HISTORY_RETENTION_DAYS: i64 = 5;
-const PROJECT_REVIEW_CLEANUP_INTERVAL_SECS: u64 = 3600;
 const PROJECT_REVIEW_RUN_LIST_LIMIT: usize = 50;
 const PROJECT_REVIEW_SNAPSHOT_MESSAGE_LIMIT: usize = 40;
 const PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT: usize = 80;
@@ -341,7 +339,7 @@ impl AgentRuntime {
         });
         let cleanup_runtime = Arc::clone(&runtime);
         tokio::spawn(async move {
-            cleanup_runtime.run_project_review_cleanup_loop().await;
+            projects::review::cleanup::run_project_review_cleanup_loop(&cleanup_runtime).await;
         });
         runtime.reconcile_project_review_singletons().await;
         runtime.start_enabled_project_review_workers().await;
@@ -708,7 +706,7 @@ impl AgentRuntime {
         projects::review::runs::list_project_review_runs(
             &self.deps.store,
             project_id,
-            PROJECT_REVIEW_HISTORY_RETENTION_DAYS,
+            projects::review::cleanup::PROJECT_REVIEW_HISTORY_RETENTION_DAYS,
             offset,
             limit,
         )
@@ -2864,69 +2862,6 @@ impl AgentRuntime {
         .await
     }
 
-    async fn run_project_review_cleanup_loop(self: Arc<Self>) {
-        if let Err(err) = self.cleanup_project_review_history().await {
-            tracing::warn!("project review cleanup failed: {err}");
-        }
-        loop {
-            sleep(Duration::from_secs(PROJECT_REVIEW_CLEANUP_INTERVAL_SECS)).await;
-            if let Err(err) = self.cleanup_project_review_history().await {
-                tracing::warn!("project review cleanup failed: {err}");
-            }
-        }
-    }
-
-    async fn cleanup_project_review_history(&self) -> Result<()> {
-        let cutoff = Utc::now() - TimeDelta::days(PROJECT_REVIEW_HISTORY_RETENTION_DAYS);
-        let removed_runs = self
-            .deps
-            .store
-            .prune_project_review_runs_before(cutoff)
-            .await?;
-        let removed_events = self.deps.store.prune_service_events_before(cutoff).await?;
-        let removed_logs = self.deps.store.prune_agent_logs_before(cutoff).await?;
-        let removed_traces = self.deps.store.prune_tool_traces_before(cutoff).await?;
-        if removed_runs > 0 || removed_events > 0 || removed_logs > 0 || removed_traces > 0 {
-            tracing::info!(
-                removed_runs,
-                removed_events,
-                removed_logs,
-                removed_traces,
-                "pruned project review history"
-            );
-        }
-        self.events.retain_since(cutoff).await;
-        let projects = self.list_projects().await;
-        for project in projects {
-            if let Err(err) = self
-                .cleanup_project_review_workspace_history(project.id, cutoff)
-                .await
-            {
-                tracing::warn!(project_id = %project.id, "failed to clean project review workspace history: {err}");
-            }
-        }
-        Ok(())
-    }
-
-    async fn cleanup_project_review_workspace_history(
-        &self,
-        project_id: ProjectId,
-        cutoff: DateTime<Utc>,
-    ) -> Result<()> {
-        let active_reviewer = match self.project(project_id).await {
-            Ok(project) => project.summary.read().await.current_reviewer_agent_id,
-            Err(_) => None,
-        };
-        projects::review::workspace::cleanup_history(
-            &self.deps.docker,
-            &self.sidecar_image,
-            project_id,
-            active_reviewer,
-            cutoff,
-        )
-        .await
-    }
-
     async fn cleanup_project_review_worktree(
         &self,
         project_id: ProjectId,
@@ -3862,6 +3797,59 @@ impl projects::review::runs::ReviewRunSnapshotSource for AgentRuntime {
             .agent_recent_events(reviewer_agent_id, PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT)
             .await;
         (messages, events)
+    }
+}
+
+impl projects::review::cleanup::ProjectReviewCleanupOps for Arc<AgentRuntime> {
+    async fn prune_project_review_runs_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+        Ok(self
+            .deps
+            .store
+            .prune_project_review_runs_before(cutoff)
+            .await?)
+    }
+
+    async fn prune_service_events_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+        Ok(self.deps.store.prune_service_events_before(cutoff).await?)
+    }
+
+    async fn prune_agent_logs_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+        Ok(self.deps.store.prune_agent_logs_before(cutoff).await?)
+    }
+
+    async fn prune_tool_traces_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+        Ok(self.deps.store.prune_tool_traces_before(cutoff).await?)
+    }
+
+    async fn retain_events_since(&self, cutoff: DateTime<Utc>) {
+        self.events.retain_since(cutoff).await;
+    }
+
+    async fn list_projects(&self) -> Vec<ProjectSummary> {
+        AgentRuntime::list_projects(self.as_ref()).await
+    }
+
+    async fn active_reviewer(&self, project_id: ProjectId) -> Option<AgentId> {
+        match AgentRuntime::project(self.as_ref(), project_id).await {
+            Ok(project) => project.summary.read().await.current_reviewer_agent_id,
+            Err(_) => None,
+        }
+    }
+
+    async fn cleanup_project_review_workspace_history(
+        &self,
+        project_id: ProjectId,
+        active_reviewer: Option<AgentId>,
+        cutoff: DateTime<Utc>,
+    ) -> Result<()> {
+        projects::review::workspace::cleanup_history(
+            &self.deps.docker,
+            &self.sidecar_image,
+            project_id,
+            active_reviewer,
+            cutoff,
+        )
+        .await
     }
 }
 

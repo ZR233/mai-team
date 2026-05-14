@@ -4,6 +4,9 @@ use mai_protocol::{
     GitProvider, ModelConfig, ModelReasoningConfig, ModelReasoningVariant, ProviderConfig,
     ProviderKind, ProvidersConfigRequest,
 };
+use projects::review::cleanup::{
+    ProjectReviewCleanupOps, PROJECT_REVIEW_HISTORY_RETENTION_DAYS,
+};
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -6233,6 +6236,7 @@ esac
         runtime
             .cleanup_project_review_workspace_history(
                 project_id,
+                None,
                 now() - TimeDelta::days(PROJECT_REVIEW_HISTORY_RETENTION_DAYS),
             )
             .await

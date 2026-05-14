@@ -7,6 +7,7 @@ use tokio::time::Duration;
 
 use crate::{Result, RuntimeError};
 
+pub(crate) mod cleanup;
 pub(crate) mod runs;
 pub(crate) mod workspace;
 
