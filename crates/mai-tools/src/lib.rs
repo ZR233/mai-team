@@ -75,6 +75,39 @@ mod tests {
         assert!(names.contains(&TOOL_LIST_FILES));
         assert!(names.contains(&TOOL_SEARCH_FILES));
         assert!(names.contains(&TOOL_APPLY_PATCH));
+        assert!(names.contains(&TOOL_GIT_STATUS));
+        assert!(names.contains(&TOOL_GIT_PUSH));
+    }
+
+    #[test]
+    fn git_tool_schemas_do_not_expose_credentials_or_paths() {
+        let tools = build_tool_definitions(&[]);
+        for tool_name in [
+            TOOL_GIT_STATUS,
+            TOOL_GIT_DIFF,
+            TOOL_GIT_BRANCH,
+            TOOL_GIT_FETCH,
+            TOOL_GIT_COMMIT,
+            TOOL_GIT_PUSH,
+            TOOL_GIT_WORKTREE_INFO,
+            TOOL_GIT_SYNC_DEFAULT_BRANCH,
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == tool_name)
+                .expect("git tool");
+            let properties = tool
+                .parameters
+                .get("properties")
+                .and_then(Value::as_object)
+                .expect("properties");
+            for forbidden in ["token", "env", "cwd", "repo_path", "worktree_path"] {
+                assert!(
+                    !properties.contains_key(forbidden),
+                    "{tool_name} exposes forbidden field {forbidden}"
+                );
+            }
+        }
     }
 
     #[test]

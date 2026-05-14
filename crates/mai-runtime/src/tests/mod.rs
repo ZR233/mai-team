@@ -4,9 +4,6 @@ use mai_protocol::{
     GitProvider, ModelConfig, ModelReasoningConfig, ModelReasoningVariant, ProviderConfig,
     ProviderKind, ProvidersConfigRequest,
 };
-use projects::review::cleanup::{
-    ProjectReviewCleanupOps, PROJECT_REVIEW_HISTORY_RETENTION_DAYS,
-};
 use state::TurnControl;
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -508,6 +505,7 @@ use turn::completion::TurnResult;
     fn test_runtime_config(dir: &tempfile::TempDir, sidecar_image: &str) -> RuntimeConfig {
         RuntimeConfig {
             repo_root: dir.path().to_path_buf(),
+            projects_root: dir.path().join("data/projects"),
             cache_root: dir.path().join("cache"),
             artifact_files_root: dir.path().join("data/artifacts/files"),
             sidecar_image: sidecar_image.to_string(),
@@ -746,12 +744,36 @@ fi
 if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
   echo "token-present" >> "$LOG"
 fi
-last=""
-for arg in "$@"; do
-  last="$arg"
-done
-mkdir -p "$last"
-printf 'hello\n' > "$last/README.md"
+case "$1" in
+  clone)
+    last=""
+    for arg in "$@"; do
+      last="$arg"
+    done
+    mkdir -p "$last/.git"
+    printf 'hello\n' > "$last/README.md"
+    ;;
+  worktree)
+    if [ "$2" = "add" ]; then
+      prev=""
+      path=""
+      for arg in "$@"; do
+        path="$prev"
+        prev="$arg"
+      done
+      if [ -n "$path" ]; then
+        mkdir -p "$path/.git"
+        printf 'worktree\n' > "$path/README.md"
+      fi
+    elif [ "$2" = "remove" ]; then
+      path=""
+      for arg in "$@"; do
+        path="$arg"
+      done
+      rm -rf "$path"
+    fi
+    ;;
+esac
 exit 0
 "#,
             test_shell_quote(&log_path.to_string_lossy())
@@ -800,6 +822,34 @@ esac
                 .permissions();
             permissions.set_mode(0o755);
             std::fs::set_permissions(&path, permissions).expect("chmod docker");
+        }
+        path.to_string_lossy().to_string()
+    }
+
+    fn failing_git_path(dir: &tempfile::TempDir) -> String {
+        let path = dir.path().join("failing-git.sh");
+        let log_path = fake_git_log_path(dir);
+        let script = format!(
+            r#"#!/bin/sh
+LOG={}
+echo "$*" >> "$LOG"
+if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
+  echo "token-present" >> "$LOG"
+fi
+echo "git clone failed with secret-token" >&2
+exit 42
+"#,
+            test_shell_quote(&log_path.to_string_lossy())
+        );
+        std::fs::write(&path, script).expect("write failing git");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path)
+                .expect("failing git metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).expect("chmod failing git");
         }
         path.to_string_lossy().to_string()
     }
@@ -4996,17 +5046,7 @@ esac
             github.env.get("GITHUB_TOOLSETS").map(String::as_str),
             Some("context,repos,issues,pull_requests")
         );
-        let git = configs.get("git").expect("git");
-        assert_eq!(git.command.as_deref(), Some("uvx"));
-        assert_eq!(
-            git.args,
-            vec![
-                "mcp-server-git".to_string(),
-                "--repository".to_string(),
-                PROJECT_WORKSPACE_PATH.to_string(),
-            ]
-        );
-        assert!(!git.env.contains_key("GITHUB_TOKEN"));
+        assert!(!configs.contains_key("git"));
     }
 
     #[tokio::test]
@@ -5267,7 +5307,7 @@ esac
     }
 
     #[tokio::test]
-    async fn project_clone_uses_configured_sidecar_image_and_execs_inside_sidecar() {
+    async fn project_clone_uses_host_git_and_project_data_repo() {
         let dir = tempdir().expect("tempdir");
         let store = test_store(&dir).await;
         store
@@ -5307,23 +5347,16 @@ esac
             .await
             .expect("clone");
 
-        let docker_log = fake_docker_log(&dir);
-        assert!(docker_log.contains(&format!(
-            "create --name mai-team-project-sidecar-{project_id}"
-        )));
-        assert!(docker_log.contains("ghcr.io/example/mai-team-sidecar:test sleep infinity"));
-        assert!(docker_log.contains("exec -w / created-container /bin/sh -lc"));
-        assert!(docker_log.contains("rm -rf"));
-        assert!(docker_log.contains("/workspace/repo"));
-        assert!(docker_log.contains("git -c credential.helper= clone"));
-        assert!(docker_log.contains("sidecar-git-clone"));
-        assert!(docker_log.contains("chown -R"));
-        assert!(docker_log.contains("safe.directory"));
         let git_log = fake_git_log(&dir);
-        assert!(git_log.is_empty());
-        assert!(docker_log.contains("token-present"));
-        assert!(docker_log.contains("created-container"));
-        assert!(!docker_log.contains("unused-agent sleep infinity"));
+        assert!(git_log.contains("clone --branch main -- https://github.com/owner/repo.git"));
+        assert!(git_log.contains("token-present"));
+        assert!(
+            projects::workspace::project_repo_path(&runtime.projects_root, project_id)
+                .join("README.md")
+                .exists()
+        );
+        let docker_log = fake_docker_log(&dir);
+        assert!(!docker_log.contains("sidecar-git-clone"));
         assert!(!docker_log.contains("secret-token"));
         assert!(!git_log.contains("secret-token"));
     }
@@ -5379,9 +5412,16 @@ esac
         assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Ready);
         assert_eq!(detail.maintainer_agent.summary.status, AgentStatus::Idle);
         let docker_log = fake_docker_log(&dir);
-        assert!(docker_log.contains("git -c credential.helper= clone"));
-        assert!(docker_log.contains("https://github.com/owner/repo.git"));
-        assert!(fake_git_log(&dir).is_empty());
+        let worktree_path =
+            projects::workspace::agent_worktree_path(&runtime.projects_root, project_id, agent_id);
+        assert!(docker_log.contains(&format!(
+            "{}:/workspace/repo",
+            worktree_path.display()
+        )));
+        let git_log = fake_git_log(&dir);
+        assert!(git_log.contains("clone --branch main -- https://github.com/owner/repo.git"));
+        assert!(git_log.contains("worktree add -B"));
+        assert!(git_log.contains("token-present"));
 
         let mut saw_cloning = false;
         let mut saw_ready = false;
@@ -6218,7 +6258,7 @@ esac
     }
 
     #[tokio::test]
-    async fn project_review_retention_cleanup_preserves_repo_path() {
+    async fn project_review_retention_cleanup_does_not_touch_workspace_volume() {
         let dir = tempdir().expect("tempdir");
         let store = test_store(&dir).await;
         store
@@ -6244,18 +6284,13 @@ esac
             .expect("save project");
         let runtime = test_runtime(&dir, Arc::clone(&store)).await;
 
-        runtime
-            .cleanup_project_review_workspace_history(
-                project_id,
-                None,
-                now() - TimeDelta::days(PROJECT_REVIEW_HISTORY_RETENTION_DAYS),
-            )
+        projects::review::cleanup::cleanup_project_review_history(&runtime)
             .await
             .expect("cleanup");
 
         let docker_log = fake_docker_log(&dir);
-        assert!(docker_log.contains("git -C /workspace/repo worktree prune"));
-        assert!(docker_log.contains("/workspace/reviews"));
+        assert!(!docker_log.contains("git -C /workspace/repo worktree prune"));
+        assert!(!docker_log.contains("/workspace/reviews"));
         assert!(!docker_log.contains("rm -rf /workspace/repo"));
     }
 
@@ -6334,10 +6369,13 @@ esac
         let project = test_project_summary(project_id, agent_id, "account-1");
         store.save_project(&project).await.expect("save project");
         let runtime = AgentRuntime::new(
-            DockerClient::new_with_binary("unused-agent", failing_docker_path(&dir)),
+            DockerClient::new_with_binary("unused-agent", fake_docker_path(&dir)),
             ModelClient::new(),
             Arc::clone(&store),
-            test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
+            RuntimeConfig {
+                git_binary: Some(failing_git_path(&dir)),
+                ..test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE)
+            },
         )
         .await
         .expect("runtime");
@@ -6353,16 +6391,22 @@ esac
             .expect("detail");
         assert_eq!(detail.summary.status, ProjectStatus::Failed);
         assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Failed);
-        assert_eq!(detail.maintainer_agent.summary.status, AgentStatus::Failed);
+        assert_ne!(detail.maintainer_agent.summary.status, AgentStatus::Failed);
         assert!(
             detail
                 .summary
                 .last_error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("container startup failed")
+                .contains("git clone failed")
         );
-        assert!(!fake_docker_log(&dir).contains("exec -w / -e MAI_GITHUB_INSTALLATION_TOKEN"));
+        assert!(!detail
+            .summary
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("secret-token"));
+        assert!(fake_git_log(&dir).contains("token-present"));
     }
 
     #[tokio::test]
@@ -6412,11 +6456,9 @@ esac
             .expect("delete project");
 
         let docker_log = fake_docker_log(&dir);
-        assert!(docker_log.contains(&format!(
-            "create --name mai-team-project-sidecar-{project_id}"
-        )));
         assert!(docker_log.contains("rm -f created-container"));
         assert!(docker_log.contains(&format!("rm -f mai-team-{agent_id}")));
+        assert!(!runtime.projects_root.join(project_id.to_string()).exists());
     }
 
     #[tokio::test]

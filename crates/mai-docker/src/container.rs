@@ -4,8 +4,8 @@ use std::collections::HashSet;
 use tokio::process::Command;
 
 use crate::args::{
-    ContainerCreateOptions, create_agent_container_args, create_project_sidecar_container_args,
-    validate_image,
+    ContainerCreateOptions, create_agent_container_args_with_repo_mount,
+    create_project_sidecar_container_args, validate_image,
 };
 use crate::client::{DockerClient, stderr_or_stdout};
 use crate::error::{DockerError, Result};
@@ -158,6 +158,31 @@ impl DockerClient {
             .await
     }
 
+    pub async fn ensure_agent_container_from_image_with_workspace_and_repo_mount(
+        &self,
+        agent_id: &str,
+        preferred_container_id: Option<&str>,
+        image: &str,
+        workspace_volume: Option<&str>,
+        repo_mount: Option<&str>,
+    ) -> Result<ContainerHandle> {
+        let image = validate_image(image)?;
+        if let Some(container) = self
+            .reusable_agent_container(agent_id, preferred_container_id)
+            .await?
+        {
+            return self.prepare_existing_container(container).await;
+        }
+
+        self.create_agent_container_from_image_with_workspace_and_repo_mount(
+            agent_id,
+            image,
+            workspace_volume,
+            repo_mount,
+        )
+        .await
+    }
+
     pub async fn create_agent_container(&self, agent_id: &str) -> Result<ContainerHandle> {
         self.create_agent_container_from_image(agent_id, &self.image)
             .await
@@ -205,11 +230,57 @@ impl DockerClient {
             .await
     }
 
+    pub async fn create_agent_container_from_parent_with_workspace_and_repo_mount(
+        &self,
+        agent_id: &str,
+        parent_container_id: &str,
+        workspace_volume: Option<&str>,
+        repo_mount: Option<&str>,
+    ) -> Result<ContainerHandle> {
+        let image = snapshot_image_name(agent_id);
+        let commit = Command::new(&self.binary)
+            .args(["commit", parent_container_id, &image])
+            .output()
+            .await?;
+        if !commit.status.success() {
+            return Err(DockerError::CommandFailed(stderr_or_stdout(&commit)));
+        }
+
+        let result = self
+            .create_agent_container_from_image_with_workspace_and_repo_mount(
+                agent_id,
+                &image,
+                workspace_volume,
+                repo_mount,
+            )
+            .await;
+        if let Err(err) = self.delete_image(&image).await {
+            tracing::warn!(image = %image, "failed to remove temporary snapshot image: {err}");
+        }
+        result
+    }
+
     async fn create_agent_container_from_image_with_workspace(
         &self,
         agent_id: &str,
         image: &str,
         workspace_volume: Option<&str>,
+    ) -> Result<ContainerHandle> {
+        self.create_agent_container_from_image_with_workspace_and_repo_mount(
+            agent_id,
+            image,
+            workspace_volume,
+            None,
+        )
+        .await
+    }
+
+    async fn create_agent_container_from_image_with_workspace_and_repo_mount(
+        &self,
+        agent_id: &str,
+        image: &str,
+        workspace_volume: Option<&str>,
+        repo_mount: Option<&str>,
     ) -> Result<ContainerHandle> {
         let image = validate_image(image)?;
         let name = agent_container_name(agent_id);
@@ -222,7 +293,8 @@ impl DockerClient {
                 &default_workspace_volume
             }
         };
-        let args = create_agent_container_args(&name, &label, image, workspace_volume);
+        let args =
+            create_agent_container_args_with_repo_mount(&name, &label, image, workspace_volume, repo_mount);
         let create = Command::new(&self.binary)
             .args(args.iter().map(String::as_str))
             .output()
