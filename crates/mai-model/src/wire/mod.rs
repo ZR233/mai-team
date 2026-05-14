@@ -41,6 +41,7 @@ pub(crate) struct WireRequest<'a> {
 pub(crate) fn parse_usage(value: Option<&Value>) -> Option<mai_protocol::TokenUsage> {
     use mai_protocol::TokenUsage;
     let value = value?;
+    value.as_object()?;
     let input_tokens = value
         .get("input_tokens")
         .or_else(|| value.get("prompt_tokens"))

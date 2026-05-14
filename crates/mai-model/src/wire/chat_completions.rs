@@ -629,4 +629,29 @@ mod tests {
         assert_eq!(value["max_completion_tokens"].as_u64(), Some(64_000));
         assert!(value.get("max_tokens").is_none());
     }
+
+    #[test]
+    fn chat_chunk_with_null_usage_does_not_complete_stream() {
+        let events = parse_chat_stream_chunk(serde_json::json!({
+            "id": "chunk_1",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": null,
+                    "tool_calls": null
+                },
+                "finish_reason": null
+            }],
+            "usage": null
+        }));
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ModelStreamEvent::ResponseStarted { id } if id.as_deref() == Some("chunk_1")
+        ));
+    }
 }
