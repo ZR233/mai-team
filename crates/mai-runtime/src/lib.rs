@@ -2970,12 +2970,8 @@ impl AgentRuntime {
 
     async fn project_skills_from_cache(&self, project_id: ProjectId) -> Result<SkillsListResponse> {
         let lock = self.project_skill_lock(project_id).await;
-        let _guard = lock.read().await;
-        let config = self.deps.store.load_skills_config().await?;
-        let mut response =
-            SkillsManager::with_roots(self.project_skill_roots(project_id)).list(&config)?;
-        self.apply_project_skill_source_paths(project_id, &mut response);
-        Ok(response)
+        projects::skills::list_from_cache(&self.deps.store, &self.cache_root, &lock, project_id)
+            .await
     }
 
     fn skills_manager_with_project_roots(&self, project_id: ProjectId) -> SkillsManager {
@@ -3134,7 +3130,7 @@ impl AgentRuntime {
     }
 
     fn project_skill_roots(&self, project_id: ProjectId) -> Vec<(PathBuf, SkillScope)> {
-        projects::skills::roots(&self.project_skill_cache_dir(project_id))
+        projects::skills::roots_for_project(&self.cache_root, project_id)
     }
 
     fn apply_project_skill_source_paths(
@@ -3142,65 +3138,26 @@ impl AgentRuntime {
         project_id: ProjectId,
         response: &mut SkillsListResponse,
     ) {
-        projects::skills::apply_source_paths(&self.project_skill_cache_dir(project_id), response);
+        projects::skills::apply_project_source_paths(&self.cache_root, project_id, response);
     }
 
     async fn existing_project_skill_dirs(
         &self,
         container_id: &str,
     ) -> Result<Vec<ProjectSkillSourceDir>> {
-        let checks = projects::skills::source_detection_shell_checks();
-        let output = self
-            .deps
-            .docker
-            .exec_shell(container_id, &checks, Some("/"), Some(20))
-            .await?;
-        if output.status != 0 {
-            let combined = format!("{}\n{}", output.stderr, output.stdout);
-            let message = preview(combined.trim(), 500);
-            return Err(RuntimeError::InvalidInput(format!(
-                "project skill directory detection failed: {message}"
-            )));
-        }
-        Ok(output
-            .stdout
-            .lines()
-            .filter_map(ProjectSkillSourceDir::from_line)
-            .collect())
+        projects::skills::detect_existing_dirs_in_container(&self.deps.docker, container_id).await
     }
 
     async fn existing_project_skill_dirs_in_review_workspace(
         &self,
         project_id: ProjectId,
     ) -> Result<Vec<ProjectSkillSourceDir>> {
-        let checks = projects::skills::source_detection_shell_checks();
-        let volume = project_review_workspace_volume(&project_id.to_string());
-        let output = self
-            .deps
-            .docker
-            .run_sidecar_shell_env(&mai_docker::SidecarParams {
-                name: &format!("mai-review-skill-detect-{project_id}"),
-                image: &self.sidecar_image,
-                command: &checks,
-                args: &[],
-                cwd: Some("/"),
-                env: &[],
-                workspace_volume: Some(&volume),
-                timeout_secs: Some(20),
-            })
-            .await?;
-        if output.status != 0 {
-            let combined = format!("{}\n{}", output.stderr, output.stdout);
-            let message = preview(combined.trim(), 500);
-            return Err(RuntimeError::InvalidInput(format!(
-                "project review skill directory detection failed: {message}"
-            )));
-        }
-        Ok(output
-            .stdout
-            .lines()
-            .filter_map(ProjectSkillSourceDir::from_line)
-            .collect())
+        projects::skills::detect_existing_dirs_in_review_workspace(
+            &self.deps.docker,
+            &self.sidecar_image,
+            project_id,
+        )
+        .await
     }
 
     async fn refresh_project_skill_cache(
@@ -3211,51 +3168,17 @@ impl AgentRuntime {
         sources: &[ProjectSkillSourceDir],
     ) -> Result<()> {
         let lock = self.project_skill_lock(project_id).await;
-        let _guard = lock.write().await;
-        let cache_dir = self.project_skill_cache_dir(project_id);
-        if cache_dir.exists() {
-            fs::remove_dir_all(&cache_dir)?;
-        }
-        fs::create_dir_all(&cache_dir)?;
-        for project_source in sources {
-            let target = cache_dir.join(&project_source.cache_name);
-            match source {
-                ProjectSkillRefreshSource::ProjectSidecar => {
-                    let container_id = container_id.ok_or_else(|| {
-                        RuntimeError::InvalidInput(
-                            "project skill refresh requires a sidecar container".to_string(),
-                        )
-                    })?;
-                    self.deps
-                        .docker
-                        .copy_from_container_to_file(
-                            container_id,
-                            &project_source.container_path,
-                            &target,
-                        )
-                        .await?;
-                }
-                ProjectSkillRefreshSource::ReviewWorkspace => {
-                    let volume = project_review_workspace_volume(&project_id.to_string());
-                    self.deps
-                        .docker
-                        .copy_from_workspace_volume_to_file(
-                            &format!(
-                                "mai-review-skill-copy-{project_id}-{}-{}",
-                                project_source.cache_name,
-                                Uuid::new_v4()
-                            ),
-                            &self.sidecar_image,
-                            &volume,
-                            &project_source.container_path,
-                            &target,
-                        )
-                        .await?;
-                }
-            }
-            projects::skills::normalize_copied_dir(&target, &project_source.cache_name)?;
-        }
-        Ok(())
+        projects::skills::refresh_cache(
+            &self.deps.docker,
+            &self.sidecar_image,
+            &self.cache_root,
+            &lock,
+            project_id,
+            source,
+            container_id,
+            sources,
+        )
+        .await
     }
 
     async fn ensure_project_sidecar(&self, project_id: ProjectId) -> Result<ContainerHandle> {

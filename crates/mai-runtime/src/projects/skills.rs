@@ -1,10 +1,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use mai_protocol::{ProjectId, SkillScope, SkillsListResponse};
+use mai_docker::{DockerClient, SidecarParams, project_review_workspace_volume};
+use mai_protocol::{ProjectId, SkillScope, SkillsListResponse, preview};
+use mai_skills::SkillsManager;
+use mai_store::ConfigStore;
+use tokio::sync::RwLock;
+use uuid::Uuid;
 
-use crate::Result;
 use crate::projects::mcp::PROJECT_WORKSPACE_PATH;
+use crate::{Result, RuntimeError};
 
 pub(crate) const PROJECT_SKILLS_CACHE_DIR: &str = "project-skills";
 
@@ -55,6 +61,27 @@ pub(crate) fn roots(cache_dir: &Path) -> Vec<(PathBuf, SkillScope)> {
         .collect()
 }
 
+pub(crate) fn roots_for_project(
+    cache_root: &Path,
+    project_id: ProjectId,
+) -> Vec<(PathBuf, SkillScope)> {
+    roots(&cache_dir(cache_root, project_id))
+}
+
+pub(crate) async fn list_from_cache(
+    store: &ConfigStore,
+    cache_root: &Path,
+    lock: &Arc<RwLock<()>>,
+    project_id: ProjectId,
+) -> Result<SkillsListResponse> {
+    let _guard = lock.read().await;
+    let config = store.load_skills_config().await?;
+    let mut response =
+        SkillsManager::with_roots(roots_for_project(cache_root, project_id)).list(&config)?;
+    apply_project_source_paths(cache_root, project_id, &mut response);
+    Ok(response)
+}
+
 pub(crate) fn source_detection_shell_checks() -> String {
     PROJECT_SKILL_CANDIDATE_DIRS
         .iter()
@@ -69,6 +96,124 @@ pub(crate) fn source_detection_shell_checks() -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+pub(crate) async fn detect_existing_dirs_in_container(
+    docker: &DockerClient,
+    container_id: &str,
+) -> Result<Vec<ProjectSkillSourceDir>> {
+    let checks = source_detection_shell_checks();
+    let output = docker
+        .exec_shell(container_id, &checks, Some("/"), Some(20))
+        .await?;
+    if output.status != 0 {
+        let combined = format!("{}\n{}", output.stderr, output.stdout);
+        let message = preview(combined.trim(), 500);
+        return Err(RuntimeError::InvalidInput(format!(
+            "project skill directory detection failed: {message}"
+        )));
+    }
+    Ok(output
+        .stdout
+        .lines()
+        .filter_map(ProjectSkillSourceDir::from_line)
+        .collect())
+}
+
+pub(crate) async fn detect_existing_dirs_in_review_workspace(
+    docker: &DockerClient,
+    sidecar_image: &str,
+    project_id: ProjectId,
+) -> Result<Vec<ProjectSkillSourceDir>> {
+    let checks = source_detection_shell_checks();
+    let volume = project_review_workspace_volume(&project_id.to_string());
+    let output = docker
+        .run_sidecar_shell_env(&SidecarParams {
+            name: &format!("mai-review-skill-detect-{project_id}"),
+            image: sidecar_image,
+            command: &checks,
+            args: &[],
+            cwd: Some("/"),
+            env: &[],
+            workspace_volume: Some(&volume),
+            timeout_secs: Some(20),
+        })
+        .await?;
+    if output.status != 0 {
+        let combined = format!("{}\n{}", output.stderr, output.stdout);
+        let message = preview(combined.trim(), 500);
+        return Err(RuntimeError::InvalidInput(format!(
+            "project review skill directory detection failed: {message}"
+        )));
+    }
+    Ok(output
+        .stdout
+        .lines()
+        .filter_map(ProjectSkillSourceDir::from_line)
+        .collect())
+}
+
+pub(crate) async fn refresh_cache(
+    docker: &DockerClient,
+    sidecar_image: &str,
+    cache_root: &Path,
+    lock: &Arc<RwLock<()>>,
+    project_id: ProjectId,
+    source: ProjectSkillRefreshSource,
+    container_id: Option<&str>,
+    sources: &[ProjectSkillSourceDir],
+) -> Result<()> {
+    let _guard = lock.write().await;
+    let cache_dir = cache_dir(cache_root, project_id);
+    if cache_dir.exists() {
+        fs::remove_dir_all(&cache_dir)?;
+    }
+    fs::create_dir_all(&cache_dir)?;
+    for project_source in sources {
+        let target = cache_dir.join(&project_source.cache_name);
+        match source {
+            ProjectSkillRefreshSource::ProjectSidecar => {
+                let container_id = container_id.ok_or_else(|| {
+                    RuntimeError::InvalidInput(
+                        "project skill refresh requires a sidecar container".to_string(),
+                    )
+                })?;
+                docker
+                    .copy_from_container_to_file(
+                        container_id,
+                        &project_source.container_path,
+                        &target,
+                    )
+                    .await?;
+            }
+            ProjectSkillRefreshSource::ReviewWorkspace => {
+                let volume = project_review_workspace_volume(&project_id.to_string());
+                docker
+                    .copy_from_workspace_volume_to_file(
+                        &format!(
+                            "mai-review-skill-copy-{project_id}-{}-{}",
+                            project_source.cache_name,
+                            Uuid::new_v4()
+                        ),
+                        sidecar_image,
+                        &volume,
+                        &project_source.container_path,
+                        &target,
+                    )
+                    .await?;
+            }
+        }
+        normalize_copied_dir(&target, &project_source.cache_name)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_project_source_paths(
+    cache_root: &Path,
+    project_id: ProjectId,
+    response: &mut SkillsListResponse,
+) {
+    apply_source_paths(&cache_dir(cache_root, project_id), response);
 }
 
 pub(crate) fn apply_source_paths(cache_dir: &Path, response: &mut SkillsListResponse) {
