@@ -1012,92 +1012,11 @@ impl AgentRuntime {
         project_id: ProjectId,
         request: UpdateProjectRequest,
     ) -> Result<ProjectSummary> {
-        let project = self.project(project_id).await?;
-        let updated = {
-            let mut summary = project.summary.write().await;
-            if let Some(name) = request.name {
-                let name = name.trim();
-                if !name.is_empty() {
-                    summary.name = name.to_string();
-                }
-            }
-            if let Some(docker_image) = request.docker_image {
-                let docker_image = docker_image.trim();
-                if !docker_image.is_empty() {
-                    summary.docker_image = docker_image.to_string();
-                }
-            }
-            if let Some(enabled) = request.auto_review_enabled {
-                summary.auto_review_enabled = enabled;
-                if enabled && summary.review_status == ProjectReviewStatus::Disabled {
-                    summary.review_status = ProjectReviewStatus::Idle;
-                }
-                if !enabled {
-                    summary.review_status = ProjectReviewStatus::Disabled;
-                    summary.current_reviewer_agent_id = None;
-                    summary.next_review_at = None;
-                }
-            }
-            if request.reviewer_extra_prompt.is_some() {
-                summary.reviewer_extra_prompt =
-                    normalize_optional_text(request.reviewer_extra_prompt);
-            }
-            summary.updated_at = now();
-            summary.clone()
-        };
-        self.deps.store.save_project(&updated).await?;
-        self.events
-            .publish(ServiceEventKind::ProjectUpdated {
-                project: updated.clone(),
-            })
-            .await;
-        if updated.auto_review_enabled {
-            self.start_project_review_loop_if_ready(project_id).await?;
-        } else {
-            self.stop_project_review_loop(project_id).await;
-        }
-        Ok(updated)
+        projects::service::update_project(&self.state, self, project_id, request).await
     }
 
     pub async fn delete_project(self: &Arc<Self>, project_id: ProjectId) -> Result<()> {
-        let project = self.project(project_id).await?;
-        self.stop_project_review_loop(project_id).await;
-        let root_agents = self
-            .project_agents(project_id)
-            .await
-            .into_iter()
-            .filter(|agent| agent.parent_id.is_none())
-            .map(|agent| agent.id)
-            .collect::<Vec<_>>();
-        {
-            let mut summary = project.summary.write().await;
-            summary.status = ProjectStatus::Deleting;
-            summary.updated_at = now();
-            self.deps.store.save_project(&summary).await?;
-            self.events
-                .publish(ServiceEventKind::ProjectUpdated {
-                    project: summary.clone(),
-                })
-                .await;
-        }
-        for agent_id in root_agents {
-            let _ = self.delete_agent(agent_id).await;
-        }
-        self.shutdown_project_mcp_manager(project_id).await;
-        let _ = self.delete_project_sidecar(project_id).await;
-        let _ = self.delete_project_review_workspace(project_id).await;
-        self.deps.store.delete_project(project_id).await?;
-        self.state.projects.write().await.remove(&project_id);
-        self.state
-            .project_skill_locks
-            .write()
-            .await
-            .remove(&project_id);
-        self.events
-            .publish(ServiceEventKind::ProjectDeleted { project_id })
-            .await;
-        let _ = fs::remove_dir_all(self.project_skill_cache_dir(project_id));
-        Ok(())
+        projects::service::delete_project(&self.state, self, project_id).await
     }
 
     pub async fn cancel_project(self: &Arc<Self>, project_id: ProjectId) -> Result<()> {
@@ -4693,6 +4612,84 @@ impl projects::service::ProjectReadOps for AgentRuntime {
             .list_project_review_runs(project_id, 0, PROJECT_REVIEW_RUN_LIST_LIMIT)
             .await?
             .runs)
+    }
+}
+
+impl projects::service::ProjectLifecycleOps for Arc<AgentRuntime> {
+    async fn save_project(&self, project: &ProjectSummary) -> Result<()> {
+        self.deps.store.save_project(project).await?;
+        Ok(())
+    }
+
+    async fn delete_project_from_store(&self, project_id: ProjectId) -> Result<()> {
+        self.deps.store.delete_project(project_id).await?;
+        Ok(())
+    }
+
+    async fn publish_project_event(&self, event: ServiceEventKind) {
+        self.events.publish(event).await;
+    }
+
+    fn start_project_review_loop_if_ready(
+        &self,
+        project_id: ProjectId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::start_project_review_loop_if_ready(self, project_id)
+    }
+
+    fn stop_project_review_loop(
+        &self,
+        project_id: ProjectId,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        AgentRuntime::stop_project_review_loop(self, project_id)
+    }
+
+    fn delete_agent(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::delete_agent(self.as_ref(), agent_id)
+    }
+
+    fn shutdown_project_mcp_manager(
+        &self,
+        project_id: ProjectId,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        AgentRuntime::shutdown_project_mcp_manager(self, project_id)
+    }
+
+    fn delete_project_sidecar(
+        &self,
+        project_id: ProjectId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            AgentRuntime::delete_project_sidecar(self.as_ref(), project_id)
+                .await
+                .map(|_| ())
+        }
+    }
+
+    fn delete_project_review_workspace(
+        &self,
+        project_id: ProjectId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::delete_project_review_workspace(self.as_ref(), project_id)
+    }
+
+    async fn remove_project_from_memory(&self, project_id: ProjectId) {
+        self.state.projects.write().await.remove(&project_id);
+    }
+
+    async fn remove_project_skill_lock(&self, project_id: ProjectId) {
+        self.state
+            .project_skill_locks
+            .write()
+            .await
+            .remove(&project_id);
+    }
+
+    fn project_skill_cache_dir(&self, project_id: ProjectId) -> PathBuf {
+        AgentRuntime::project_skill_cache_dir(self.as_ref(), project_id)
     }
 }
 

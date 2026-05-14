@@ -1,10 +1,11 @@
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use mai_docker::DockerClient;
 use mai_protocol::{
-    AgentDetail, AgentId, AgentRole, AgentSummary, ProjectDetail, ProjectId, ProjectStatus,
-    ProjectSummary, SessionId, preview,
+    AgentDetail, AgentId, AgentRole, AgentSummary, ProjectDetail, ProjectId, ProjectReviewStatus,
+    ProjectStatus, ProjectSummary, ServiceEventKind, SessionId, UpdateProjectRequest, now, preview,
 };
 
 use super::mcp::PROJECT_WORKSPACE_PATH;
@@ -24,6 +25,37 @@ pub(crate) trait ProjectReadOps: Send + Sync {
         &self,
         project_id: ProjectId,
     ) -> impl Future<Output = Result<Vec<mai_protocol::ProjectReviewRunSummary>>> + Send;
+}
+
+/// Supplies side effects required by project update/delete lifecycle operations.
+pub(crate) trait ProjectLifecycleOps: Send + Sync {
+    fn save_project(&self, project: &ProjectSummary) -> impl Future<Output = Result<()>> + Send;
+    fn delete_project_from_store(
+        &self,
+        project_id: ProjectId,
+    ) -> impl Future<Output = Result<()>> + Send;
+    fn publish_project_event(&self, event: ServiceEventKind) -> impl Future<Output = ()> + Send;
+    fn start_project_review_loop_if_ready(
+        &self,
+        project_id: ProjectId,
+    ) -> impl Future<Output = Result<()>> + Send;
+    fn stop_project_review_loop(&self, project_id: ProjectId) -> impl Future<Output = ()> + Send;
+    fn delete_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<()>> + Send;
+    fn shutdown_project_mcp_manager(
+        &self,
+        project_id: ProjectId,
+    ) -> impl Future<Output = ()> + Send;
+    fn delete_project_sidecar(
+        &self,
+        project_id: ProjectId,
+    ) -> impl Future<Output = Result<()>> + Send;
+    fn delete_project_review_workspace(
+        &self,
+        project_id: ProjectId,
+    ) -> impl Future<Output = Result<()>> + Send;
+    fn remove_project_from_memory(&self, project_id: ProjectId) -> impl Future<Output = ()> + Send;
+    fn remove_project_skill_lock(&self, project_id: ProjectId) -> impl Future<Output = ()> + Send;
+    fn project_skill_cache_dir(&self, project_id: ProjectId) -> PathBuf;
 }
 
 pub(crate) async fn project(
@@ -160,6 +192,95 @@ pub(crate) async fn project_auto_reviewer_agents(
         .collect()
 }
 
+pub(crate) async fn update_project(
+    state: &RuntimeState,
+    ops: &impl ProjectLifecycleOps,
+    project_id: ProjectId,
+    request: UpdateProjectRequest,
+) -> Result<ProjectSummary> {
+    let project = project(state, project_id).await?;
+    let updated = {
+        let mut summary = project.summary.write().await;
+        if let Some(name) = request.name {
+            let name = name.trim();
+            if !name.is_empty() {
+                summary.name = name.to_string();
+            }
+        }
+        if let Some(docker_image) = request.docker_image {
+            let docker_image = docker_image.trim();
+            if !docker_image.is_empty() {
+                summary.docker_image = docker_image.to_string();
+            }
+        }
+        if let Some(enabled) = request.auto_review_enabled {
+            summary.auto_review_enabled = enabled;
+            if enabled && summary.review_status == ProjectReviewStatus::Disabled {
+                summary.review_status = ProjectReviewStatus::Idle;
+            }
+            if !enabled {
+                summary.review_status = ProjectReviewStatus::Disabled;
+                summary.current_reviewer_agent_id = None;
+                summary.next_review_at = None;
+            }
+        }
+        if request.reviewer_extra_prompt.is_some() {
+            summary.reviewer_extra_prompt = normalize_optional_text(request.reviewer_extra_prompt);
+        }
+        summary.updated_at = now();
+        summary.clone()
+    };
+    ops.save_project(&updated).await?;
+    ops.publish_project_event(ServiceEventKind::ProjectUpdated {
+        project: updated.clone(),
+    })
+    .await;
+    if updated.auto_review_enabled {
+        ops.start_project_review_loop_if_ready(project_id).await?;
+    } else {
+        ops.stop_project_review_loop(project_id).await;
+    }
+    Ok(updated)
+}
+
+pub(crate) async fn delete_project(
+    state: &RuntimeState,
+    ops: &impl ProjectLifecycleOps,
+    project_id: ProjectId,
+) -> Result<()> {
+    let project = project(state, project_id).await?;
+    ops.stop_project_review_loop(project_id).await;
+    let root_agents = project_agents(state, project_id)
+        .await
+        .into_iter()
+        .filter(|agent| agent.parent_id.is_none())
+        .map(|agent| agent.id)
+        .collect::<Vec<_>>();
+    {
+        let mut summary = project.summary.write().await;
+        summary.status = ProjectStatus::Deleting;
+        summary.updated_at = now();
+        ops.save_project(&summary).await?;
+        ops.publish_project_event(ServiceEventKind::ProjectUpdated {
+            project: summary.clone(),
+        })
+        .await;
+    }
+    for agent_id in root_agents {
+        let _ = ops.delete_agent(agent_id).await;
+    }
+    ops.shutdown_project_mcp_manager(project_id).await;
+    let _ = ops.delete_project_sidecar(project_id).await;
+    let _ = ops.delete_project_review_workspace(project_id).await;
+    ops.delete_project_from_store(project_id).await?;
+    ops.remove_project_from_memory(project_id).await;
+    ops.remove_project_skill_lock(project_id).await;
+    ops.publish_project_event(ServiceEventKind::ProjectDeleted { project_id })
+        .await;
+    let _ = std::fs::remove_dir_all(ops.project_skill_cache_dir(project_id));
+    Ok(())
+}
+
 pub(crate) async fn prepare_copied_workspace(
     docker: &DockerClient,
     container_id: &str,
@@ -247,4 +368,10 @@ fn redact_secret(value: &str, secret: &str) -> String {
     } else {
         value.replace(secret, "[redacted]")
     }
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }

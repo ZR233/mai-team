@@ -4,9 +4,7 @@ use std::sync::Arc;
 
 use mai_docker::ContainerHandle;
 use mai_mcp::McpAgentManager;
-use mai_protocol::{
-    AgentId, AgentStatus, McpServerConfig, McpStartupStatus, TurnId, now,
-};
+use mai_protocol::{AgentId, AgentStatus, McpServerConfig, McpStartupStatus, TurnId, now};
 use tokio_util::sync::CancellationToken;
 
 use crate::state::{AgentRecord, TurnGuard};
