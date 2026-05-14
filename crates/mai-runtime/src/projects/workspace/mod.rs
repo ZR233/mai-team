@@ -7,6 +7,7 @@ use crate::{Result, RuntimeError};
 
 pub(crate) mod manager;
 pub(crate) mod paths;
+pub(crate) mod policy;
 
 pub(crate) use manager::{
     cleanup_project_agent_clone, prepare_project_agent_clone, sync_project_repo_cache,
@@ -111,11 +112,26 @@ async fn run_git(
 
     let mut command = Command::new(git_binary);
     command.current_dir(cwd).args(args);
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "3")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .env("GIT_CONFIG_KEY_1", "safe.directory")
+        .env("GIT_CONFIG_VALUE_1", cwd)
+        .env("GIT_CONFIG_KEY_2", "credential.helper")
+        .env("GIT_CONFIG_VALUE_2", "")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS");
     if let Some(token) = token {
         command
-            .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", &askpass_path)
             .env("MAI_GITHUB_INSTALLATION_TOKEN", token);
+    } else {
+        command.env_remove("MAI_GITHUB_INSTALLATION_TOKEN");
     }
     let output = command.output().await?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -162,5 +178,45 @@ mod tests {
                 .join("worktrees")
                 .join(agent_id.to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn git_plain_uses_host_git_safety_environment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_path = dir.path().join("fake-git.sh");
+        let log_path = dir.path().join("git-env.log");
+        std::fs::write(
+            &git_path,
+            format!(
+                "#!/bin/sh\nprintf 'prompt=%s\\nno_system=%s\\nconfig_count=%s\\nhooks=%s\\nsafe=%s\\ncredential=%s\\n' \"$GIT_TERMINAL_PROMPT\" \"$GIT_CONFIG_NOSYSTEM\" \"$GIT_CONFIG_COUNT\" \"$GIT_CONFIG_VALUE_0\" \"$GIT_CONFIG_VALUE_1\" \"$GIT_CONFIG_VALUE_2\" > {}\n",
+                shell_quote(&log_path.to_string_lossy())
+            ),
+        )
+        .expect("write fake git");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&git_path)
+                .expect("fake git metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&git_path, permissions).expect("chmod fake git");
+        }
+
+        git_plain(&git_path.to_string_lossy(), dir.path(), ["status"])
+            .await
+            .expect("git status");
+
+        let log = std::fs::read_to_string(log_path).expect("log");
+        assert!(log.contains("prompt=0"));
+        assert!(log.contains("no_system=1"));
+        assert!(log.contains("config_count=3"));
+        assert!(log.contains("hooks=/dev/null"));
+        assert!(log.contains(&format!("safe={}", dir.path().display())));
+        assert!(log.contains("credential="));
+    }
+
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 }

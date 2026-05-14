@@ -3,7 +3,9 @@ use std::path::Path;
 use mai_protocol::{AgentId, ProjectSummary};
 use serde_json::{Value, json};
 
+use crate::github::github_clone_url;
 use crate::projects;
+use crate::projects::workspace::policy::GitPolicy;
 use crate::turn::tools::ToolExecution;
 use crate::{Result, RuntimeError};
 
@@ -30,6 +32,7 @@ pub(crate) async fn execute_git_tool(
             "project git workspace is not available".to_string(),
         ));
     }
+    let policy = GitPolicy::new(context.project.branch.clone());
     let output = match name {
         mai_tools::TOOL_GIT_STATUS => {
             git_plain(
@@ -39,18 +42,30 @@ pub(crate) async fn execute_git_tool(
             )
             .await?
         }
-        mai_tools::TOOL_GIT_DIFF => git_diff(context.git_binary, &clone, &arguments).await?,
-        mai_tools::TOOL_GIT_BRANCH => git_branch(context.git_binary, &clone, &arguments).await?,
+        mai_tools::TOOL_GIT_DIFF => {
+            git_diff(context.git_binary, &clone, &arguments, &policy).await?
+        }
+        mai_tools::TOOL_GIT_BRANCH => {
+            git_branch(context.git_binary, &clone, &arguments, &policy).await?
+        }
         mai_tools::TOOL_GIT_FETCH => {
             let token = required_token(context.token.as_deref())?;
-            git_fetch(context.git_binary, &clone, token, &arguments).await?
+            git_fetch(context.git_binary, &clone, token, &arguments, &policy).await?
         }
         mai_tools::TOOL_GIT_COMMIT => git_commit(context.git_binary, &clone, &arguments).await?,
         mai_tools::TOOL_GIT_PUSH => {
             let token = required_token(context.token.as_deref())?;
-            git_push(context.git_binary, &clone, token, &arguments).await?
+            git_push(
+                context.git_binary,
+                &clone,
+                token,
+                &arguments,
+                &policy,
+                context.agent_id,
+            )
+            .await?
         }
-        mai_tools::TOOL_GIT_WORKTREE_INFO => {
+        mai_tools::TOOL_GIT_WORKTREE_INFO | mai_tools::TOOL_GIT_WORKSPACE_INFO => {
             let repo_cache = projects::workspace::project_repo_cache_path(
                 context.projects_root,
                 context.project.id,
@@ -65,21 +80,17 @@ pub(crate) async fn execute_git_tool(
         }
         mai_tools::TOOL_GIT_SYNC_DEFAULT_BRANCH => {
             let token = required_token(context.token.as_deref())?;
-            projects::workspace::sync_project_repo_cache(
+            git_sync_default_branch(
                 context.git_binary,
                 context.projects_root,
-                &context.project,
-                token,
-            )
-            .await?;
-            let refreshed = projects::workspace::prepare_project_agent_clone(
-                context.git_binary,
-                context.projects_root,
+                &clone,
                 &context.project,
                 context.agent_id,
+                token,
+                &arguments,
+                &policy,
             )
-            .await?;
-            json!({ "clone": refreshed, "worktree": refreshed }).to_string()
+            .await?
         }
         _ => {
             return Err(RuntimeError::InvalidInput(format!(
@@ -90,12 +101,20 @@ pub(crate) async fn execute_git_tool(
     Ok(ToolExecution::new(true, output, false))
 }
 
-async fn git_diff(git_binary: &str, cwd: &Path, arguments: &Value) -> Result<String> {
+async fn git_diff(
+    git_binary: &str,
+    cwd: &Path,
+    arguments: &Value,
+    policy: &GitPolicy,
+) -> Result<String> {
     let staged = arguments
         .get("staged")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let path = optional_arg(arguments, "path")?;
+    if let Some(path) = path.as_deref() {
+        policy.validate_path(path)?;
+    }
     match (staged, path.as_deref()) {
         (true, Some(path)) => git_plain(git_binary, cwd, ["diff", "--staged", "--", path]).await,
         (true, None) => git_plain(git_binary, cwd, ["diff", "--staged"]).await,
@@ -104,17 +123,25 @@ async fn git_diff(git_binary: &str, cwd: &Path, arguments: &Value) -> Result<Str
     }
 }
 
-async fn git_branch(git_binary: &str, cwd: &Path, arguments: &Value) -> Result<String> {
+async fn git_branch(
+    git_binary: &str,
+    cwd: &Path,
+    arguments: &Value,
+    policy: &GitPolicy,
+) -> Result<String> {
     let action = optional_arg(arguments, "action")?.unwrap_or_else(|| "list".to_string());
     match action.as_str() {
         "list" => git_plain(git_binary, cwd, ["branch", "--list", "--all"]).await,
         "switch" => {
             let name = required_arg(arguments, "name")?;
+            policy.validate_branch(&name)?;
             git_plain(git_binary, cwd, ["switch", &name]).await
         }
         "create" => {
             let name = required_arg(arguments, "name")?;
+            policy.validate_branch(&name)?;
             if let Some(start_point) = optional_arg(arguments, "start_point")? {
+                policy.validate_branch(&start_point)?;
                 git_plain(git_binary, cwd, ["switch", "-c", &name, &start_point]).await
             } else {
                 git_plain(git_binary, cwd, ["switch", "-c", &name]).await
@@ -126,13 +153,22 @@ async fn git_branch(git_binary: &str, cwd: &Path, arguments: &Value) -> Result<S
     }
 }
 
-async fn git_fetch(git_binary: &str, cwd: &Path, token: &str, arguments: &Value) -> Result<String> {
+async fn git_fetch(
+    git_binary: &str,
+    cwd: &Path,
+    token: &str,
+    arguments: &Value,
+    policy: &GitPolicy,
+) -> Result<String> {
     let remote = optional_arg(arguments, "remote")?.unwrap_or_else(|| "origin".to_string());
+    policy.validate_remote(&remote)?;
     let prune = arguments
         .get("prune")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    if let Some(refspec) = optional_arg(arguments, "refspec")? {
+    let refspec = optional_arg(arguments, "refspec")?;
+    policy.validate_fetch_refspec(refspec.as_deref(), &policy.default_branch)?;
+    if let Some(refspec) = refspec {
         if prune {
             git_with_token(
                 git_binary,
@@ -158,31 +194,123 @@ async fn git_commit(git_binary: &str, cwd: &Path, arguments: &Value) -> Result<S
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        git_plain(git_binary, cwd, ["commit", "-am", &message]).await
+        git_plain(git_binary, cwd, ["commit", "--no-verify", "-am", &message]).await
     } else {
-        git_plain(git_binary, cwd, ["commit", "-m", &message]).await
+        git_plain(git_binary, cwd, ["commit", "--no-verify", "-m", &message]).await
     }
 }
 
-async fn git_push(git_binary: &str, cwd: &Path, token: &str, arguments: &Value) -> Result<String> {
+async fn git_push(
+    git_binary: &str,
+    cwd: &Path,
+    token: &str,
+    arguments: &Value,
+    policy: &GitPolicy,
+    agent_id: AgentId,
+) -> Result<String> {
     let remote = optional_arg(arguments, "remote")?.unwrap_or_else(|| "origin".to_string());
+    policy.validate_remote(&remote)?;
     let branch = optional_arg(arguments, "branch")?;
+    if let Some(branch) = branch.as_deref() {
+        policy.validate_branch(branch)?;
+    }
     let set_upstream = arguments
         .get("set_upstream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    match (set_upstream, branch.as_deref()) {
-        (true, Some(branch)) => {
-            git_with_token(git_binary, cwd, token, ["push", "-u", &remote, branch]).await
-        }
-        (false, Some(branch)) => {
-            git_with_token(git_binary, cwd, token, ["push", &remote, branch]).await
-        }
-        (true, None) => {
-            git_with_token(git_binary, cwd, token, ["push", "-u", &remote, "HEAD"]).await
-        }
-        (false, None) => git_with_token(git_binary, cwd, token, ["push"]).await,
+    let branch = branch.unwrap_or_else(|| format!("{}{agent_id}", policy.agent_branch_prefix));
+    let destination = format!("HEAD:refs/heads/{branch}");
+    if set_upstream {
+        git_with_token(
+            git_binary,
+            cwd,
+            token,
+            ["push", "--no-verify", "-u", &remote, &destination],
+        )
+        .await
+    } else {
+        git_with_token(
+            git_binary,
+            cwd,
+            token,
+            ["push", "--no-verify", &remote, &destination],
+        )
+        .await
     }
+}
+
+async fn git_sync_default_branch(
+    git_binary: &str,
+    projects_root: &Path,
+    clone: &Path,
+    project: &ProjectSummary,
+    agent_id: AgentId,
+    token: &str,
+    arguments: &Value,
+    policy: &GitPolicy,
+) -> Result<String> {
+    let force = arguments
+        .get("force")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let preserve_changes = arguments
+        .get("preserve_changes")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if force && preserve_changes {
+        return Err(RuntimeError::InvalidInput(
+            "force and preserve_changes cannot both be true".to_string(),
+        ));
+    }
+
+    let status = git_plain(git_binary, clone, ["status", "--porcelain"]).await?;
+    let dirty = !status.trim().is_empty();
+    if dirty && !force && !preserve_changes {
+        return Err(RuntimeError::InvalidInput(
+            "project git workspace has uncommitted changes; pass force=true to discard them or preserve_changes=true to stash them before sync".to_string(),
+        ));
+    }
+    if dirty && preserve_changes {
+        git_plain(
+            git_binary,
+            clone,
+            ["stash", "push", "-u", "-m", "mai sync default branch"],
+        )
+        .await?;
+    }
+
+    projects::workspace::sync_project_repo_cache(git_binary, projects_root, project, token).await?;
+    let repo_url = github_clone_url(&project.owner, &project.repo);
+    git_plain(
+        git_binary,
+        clone,
+        ["remote", "set-url", "origin", &repo_url],
+    )
+    .await?;
+    git_with_token(git_binary, clone, token, ["fetch", "--prune", "origin"]).await?;
+    let branch = format!("{}{agent_id}", policy.agent_branch_prefix);
+    let origin_branch = format!("origin/{}", project.branch);
+    git_plain(
+        git_binary,
+        clone,
+        ["checkout", "-B", &branch, &origin_branch],
+    )
+    .await?;
+    git_plain(git_binary, clone, ["reset", "--hard", &origin_branch]).await?;
+    if force {
+        git_plain(git_binary, clone, ["clean", "-fdx"]).await?;
+    }
+    if dirty && preserve_changes {
+        git_plain(git_binary, clone, ["stash", "pop"]).await?;
+    }
+
+    Ok(json!({
+        "clone": clone,
+        "worktree": clone,
+        "preserved_changes": dirty && preserve_changes,
+        "forced": force,
+    })
+    .to_string())
 }
 
 async fn git_plain<const N: usize>(
@@ -305,6 +433,185 @@ mod tests {
         assert_eq!(payload["clone"], json!(clone_path));
     }
 
+    #[tokio::test]
+    async fn git_workspace_info_matches_clone_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fake_git_path(dir.path());
+        let project_id = uuid::Uuid::new_v4();
+        let agent_id = uuid::Uuid::new_v4();
+        let clone_path = workspace::agent_clone_path(dir.path(), project_id, agent_id);
+        std::fs::create_dir_all(&clone_path).expect("clone");
+
+        let execution = execute_git_tool(
+            GitToolContext {
+                git_binary: &git,
+                projects_root: dir.path(),
+                agent_id,
+                project: test_project(project_id, agent_id),
+                token: None,
+            },
+            mai_tools::TOOL_GIT_WORKSPACE_INFO,
+            json!({}),
+        )
+        .await
+        .expect("execute workspace info");
+
+        let payload: Value = serde_json::from_str(&execution.output).expect("json payload");
+        assert_eq!(payload["clone"], json!(clone_path));
+    }
+
+    #[tokio::test]
+    async fn git_diff_rejects_unsafe_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fake_git_path(dir.path());
+        let project_id = uuid::Uuid::new_v4();
+        let agent_id = uuid::Uuid::new_v4();
+        let clone_path = workspace::agent_clone_path(dir.path(), project_id, agent_id);
+        std::fs::create_dir_all(&clone_path).expect("clone");
+
+        let err = execute_git_tool(
+            GitToolContext {
+                git_binary: &git,
+                projects_root: dir.path(),
+                agent_id,
+                project: test_project(project_id, agent_id),
+                token: None,
+            },
+            mai_tools::TOOL_GIT_DIFF,
+            json!({ "path": "../secret" }),
+        )
+        .await
+        .expect_err("unsafe path rejected");
+
+        assert!(err.to_string().contains("unsafe git path"));
+        assert_eq!(read_git_log(dir.path()), "");
+    }
+
+    #[tokio::test]
+    async fn git_branch_rejects_unsafe_branch_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fake_git_path(dir.path());
+        let project_id = uuid::Uuid::new_v4();
+        let agent_id = uuid::Uuid::new_v4();
+        let clone_path = workspace::agent_clone_path(dir.path(), project_id, agent_id);
+        std::fs::create_dir_all(&clone_path).expect("clone");
+
+        let err = execute_git_tool(
+            GitToolContext {
+                git_binary: &git,
+                projects_root: dir.path(),
+                agent_id,
+                project: test_project(project_id, agent_id),
+                token: None,
+            },
+            mai_tools::TOOL_GIT_BRANCH,
+            json!({ "action": "create", "name": "../escape" }),
+        )
+        .await
+        .expect_err("unsafe branch rejected");
+
+        assert!(err.to_string().contains("unsafe git branch"));
+        assert_eq!(read_git_log(dir.path()), "");
+    }
+
+    #[tokio::test]
+    async fn git_fetch_rejects_non_origin_remote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fake_git_path(dir.path());
+        let project_id = uuid::Uuid::new_v4();
+        let agent_id = uuid::Uuid::new_v4();
+        let clone_path = workspace::agent_clone_path(dir.path(), project_id, agent_id);
+        std::fs::create_dir_all(&clone_path).expect("clone");
+
+        let err = execute_git_tool(
+            GitToolContext {
+                git_binary: &git,
+                projects_root: dir.path(),
+                agent_id,
+                project: test_project(project_id, agent_id),
+                token: Some("secret-token".to_string()),
+            },
+            mai_tools::TOOL_GIT_FETCH,
+            json!({ "remote": "upstream" }),
+        )
+        .await
+        .expect_err("non-origin remote rejected");
+
+        assert!(err.to_string().contains("unsupported git remote"));
+        assert_eq!(read_git_log(dir.path()), "");
+    }
+
+    #[tokio::test]
+    async fn git_commit_and_push_disable_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fake_git_path(dir.path());
+        let project_id = uuid::Uuid::new_v4();
+        let agent_id = uuid::Uuid::new_v4();
+        let clone_path = workspace::agent_clone_path(dir.path(), project_id, agent_id);
+        std::fs::create_dir_all(&clone_path).expect("clone");
+
+        execute_git_tool(
+            GitToolContext {
+                git_binary: &git,
+                projects_root: dir.path(),
+                agent_id,
+                project: test_project(project_id, agent_id),
+                token: None,
+            },
+            mai_tools::TOOL_GIT_COMMIT,
+            json!({ "message": "save work" }),
+        )
+        .await
+        .expect("commit");
+        execute_git_tool(
+            GitToolContext {
+                git_binary: &git,
+                projects_root: dir.path(),
+                agent_id,
+                project: test_project(project_id, agent_id),
+                token: Some("secret-token".to_string()),
+            },
+            mai_tools::TOOL_GIT_PUSH,
+            json!({}),
+        )
+        .await
+        .expect("push");
+
+        let git_log = read_git_log(dir.path());
+        assert!(git_log.contains("commit --no-verify -m save work"));
+        assert!(git_log.contains(&format!(
+            "push --no-verify origin HEAD:refs/heads/mai-agent/{agent_id}"
+        )));
+    }
+
+    #[tokio::test]
+    async fn git_sync_default_branch_refuses_dirty_clone_by_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fake_git_path_with_status(dir.path(), " M README.md\n");
+        let project_id = uuid::Uuid::new_v4();
+        let agent_id = uuid::Uuid::new_v4();
+        let clone_path = workspace::agent_clone_path(dir.path(), project_id, agent_id);
+        std::fs::create_dir_all(&clone_path).expect("clone");
+        std::fs::create_dir_all(workspace::project_repo_cache_path(dir.path(), project_id))
+            .expect("repo cache");
+
+        let err = execute_git_tool(
+            GitToolContext {
+                git_binary: &git,
+                projects_root: dir.path(),
+                agent_id,
+                project: test_project(project_id, agent_id),
+                token: Some("secret-token".to_string()),
+            },
+            mai_tools::TOOL_GIT_SYNC_DEFAULT_BRANCH,
+            json!({}),
+        )
+        .await
+        .expect_err("dirty sync rejected");
+
+        assert!(err.to_string().contains("uncommitted changes"));
+    }
+
     fn test_project(project_id: uuid::Uuid, agent_id: uuid::Uuid) -> ProjectSummary {
         let timestamp = Utc::now();
         ProjectSummary {
@@ -338,15 +645,24 @@ mod tests {
     }
 
     fn fake_git_path(root: &Path) -> String {
+        fake_git_path_with_status(root, "")
+    }
+
+    fn fake_git_path_with_status(root: &Path, status_output: &str) -> String {
         let path = root.join("fake-git.sh");
         let log_path = git_log_path(root);
         let script = format!(
             r#"#!/bin/sh
 LOG={}
+if [ "$1" = "status" ] && [ "$2" = "--porcelain" ]; then
+  printf '{}'
+  exit 0
+fi
 printf '%s|%s\n' "$PWD" "$*" >> "$LOG"
 exit 0
 "#,
-            shell_quote(&log_path)
+            shell_quote(&log_path),
+            status_output.replace('\'', "'\\''")
         );
         std::fs::write(&path, script).expect("fake git");
         #[cfg(unix)]

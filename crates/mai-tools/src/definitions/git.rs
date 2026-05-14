@@ -1,6 +1,6 @@
 use crate::names::{
     TOOL_GIT_BRANCH, TOOL_GIT_COMMIT, TOOL_GIT_DIFF, TOOL_GIT_FETCH, TOOL_GIT_PUSH,
-    TOOL_GIT_STATUS, TOOL_GIT_SYNC_DEFAULT_BRANCH, TOOL_GIT_WORKTREE_INFO,
+    TOOL_GIT_STATUS, TOOL_GIT_SYNC_DEFAULT_BRANCH, TOOL_GIT_WORKSPACE_INFO, TOOL_GIT_WORKTREE_INFO,
 };
 use crate::schema::object_schema;
 use mai_protocol::ToolDefinition;
@@ -69,9 +69,17 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
             object_schema(vec![]),
         ),
         ToolDefinition::function(
+            TOOL_GIT_WORKSPACE_INFO,
+            "Show information about this project agent git workspace clone.",
+            object_schema(vec![]),
+        ),
+        ToolDefinition::function(
             TOOL_GIT_SYNC_DEFAULT_BRANCH,
             "Sync this project agent workspace clone with the project's latest default branch.",
-            object_schema(vec![]),
+            object_schema(vec![
+                ("force", json!({ "type": "boolean" }), false),
+                ("preserve_changes", json!({ "type": "boolean" }), false),
+            ]),
         ),
     ]
 }
