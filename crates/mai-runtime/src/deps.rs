@@ -7,6 +7,7 @@ use mai_skills::SkillsManager;
 use mai_store::ConfigStore;
 
 use crate::GithubAppBackend;
+use crate::github::GitAccountService;
 
 pub(crate) struct RuntimeDeps {
     pub(crate) docker: DockerClient,
@@ -16,4 +17,5 @@ pub(crate) struct RuntimeDeps {
     pub(crate) agent_profiles: AgentProfilesManager,
     pub(crate) github_http: reqwest::Client,
     pub(crate) github_backend: Arc<dyn GithubAppBackend>,
+    pub(crate) git_accounts: Arc<GitAccountService>,
 }

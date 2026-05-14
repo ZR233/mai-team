@@ -50,12 +50,12 @@ use events::{RECENT_EVENT_LIMIT, RuntimeEvents};
 use github::{
     GithubAccessTokenResponse, GithubErrorResponse, GithubInstallationApi, GithubJwtClaims,
     GithubManifestConversionResponse, GithubManifestState, GithubRepositoriesApi,
-    GithubRepositoryApi, GithubUserApi, decode_github_response, git_token_kind,
-    github_access_token_request, github_api_url, github_app_manifest, github_app_manifest_urls,
-    github_clone_url, github_headers, github_installation_summary,
-    github_installation_token_cache_key, github_manifest_owner_login, github_manifest_owner_type,
-    github_repository_summary, github_scopes, is_valid_github_manifest_code, is_valid_github_slug,
-    normalize_github_api_get_path, repository_packages_with_token, sanitize_origin,
+    GithubRepositoryApi, decode_github_response, github_access_token_request, github_api_url,
+    github_app_manifest, github_app_manifest_urls, github_clone_url, github_headers,
+    github_installation_summary, github_installation_token_cache_key, github_manifest_owner_login,
+    github_manifest_owner_type, github_repository_summary, is_valid_github_manifest_code,
+    is_valid_github_slug, normalize_github_api_get_path, repository_packages_with_token,
+    sanitize_origin,
 };
 use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
 use projects::mcp::PROJECT_WORKSPACE_PATH;
@@ -734,6 +734,12 @@ impl AgentRuntime {
                 github_api_base_url.clone(),
             ))
         });
+        let git_accounts = Arc::new(github::GitAccountService::new(
+            Arc::clone(&store),
+            github_http.clone(),
+            github_api_base_url.clone(),
+            Arc::clone(&github_backend),
+        ));
 
         let runtime = Arc::new(Self {
             deps: RuntimeDeps {
@@ -744,6 +750,7 @@ impl AgentRuntime {
                 agent_profiles,
                 github_http,
                 github_backend,
+                git_accounts,
             },
             state: RuntimeState::new(agents, tasks, projects),
             events: RuntimeEvents::new(
@@ -909,118 +916,33 @@ impl AgentRuntime {
     }
 
     pub async fn list_git_accounts(&self) -> Result<GitAccountsResponse> {
-        Ok(self.deps.store.list_git_accounts().await?)
+        self.deps.git_accounts.list().await
     }
 
     pub async fn save_git_account(
         self: &Arc<Self>,
         request: GitAccountRequest,
     ) -> Result<GitAccountResponse> {
-        let account = self.deps.store.upsert_git_account(request).await?;
-        let runtime = Arc::clone(self);
-        let account_id = account.id.clone();
-        tokio::spawn(async move {
-            if let Err(err) = runtime.verify_git_account(&account_id).await {
-                tracing::warn!(account_id = %account_id, "failed to verify git account in background: {err}");
-            }
-        });
-        Ok(GitAccountResponse { account })
+        self.deps.git_accounts.save(request).await
     }
 
     pub async fn verify_git_account(&self, account_id: &str) -> Result<GitAccountSummary> {
-        let token = self.git_account_token(account_id).await?;
-        self.deps
-            .store
-            .mark_git_account_verifying(account_id)
-            .await?;
-        let response = match self
-            .deps
-            .github_http
-            .get(github_api_url(&self.github_api_base_url, "/user"))
-            .bearer_auth(&token)
-            .headers(github_headers())
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                return Ok(self
-                    .deps
-                    .store
-                    .update_git_account_verification(
-                        account_id,
-                        None,
-                        GitTokenKind::Unknown,
-                        Vec::new(),
-                        GitAccountStatus::Failed,
-                        Some(redact_secret(&err.to_string(), &token)),
-                    )
-                    .await?);
-            }
-        };
-        let scopes = github_scopes(response.headers());
-        let token_kind = git_token_kind(&token, &scopes);
-        match decode_github_response::<GithubUserApi>(response, "verify token").await {
-            Ok(user) => Ok(self
-                .deps
-                .store
-                .update_git_account_verification(
-                    account_id,
-                    Some(user.login),
-                    token_kind,
-                    scopes,
-                    GitAccountStatus::Verified,
-                    None,
-                )
-                .await?),
-            Err(err) => Ok(self
-                .deps
-                .store
-                .update_git_account_verification(
-                    account_id,
-                    None,
-                    token_kind,
-                    scopes,
-                    GitAccountStatus::Failed,
-                    Some(redact_secret(&err.to_string(), &token)),
-                )
-                .await?),
-        }
+        self.deps.git_accounts.verify(account_id).await
     }
 
     pub async fn delete_git_account(&self, account_id: &str) -> Result<GitAccountsResponse> {
-        Ok(self.deps.store.delete_git_account(account_id).await?)
+        self.deps.git_accounts.delete(account_id).await
     }
 
     pub async fn set_default_git_account(&self, account_id: &str) -> Result<GitAccountsResponse> {
-        Ok(self.deps.store.set_default_git_account(account_id).await?)
+        self.deps.git_accounts.set_default(account_id).await
     }
 
     pub async fn list_git_account_repositories(
         &self,
         account_id: &str,
     ) -> Result<GithubRepositoriesResponse> {
-        let token = self.git_account_token(account_id).await?;
-        let url = github_api_url(
-            &self.github_api_base_url,
-            "/user/repos?per_page=100&affiliation=owner,collaborator,organization_member&sort=updated",
-        );
-        let response = self
-            .deps
-            .github_http
-            .get(url)
-            .bearer_auth(&token)
-            .headers(github_headers())
-            .send()
-            .await?;
-        let repositories: Vec<GithubRepositoryApi> =
-            decode_github_response(response, "list repositories").await?;
-        Ok(GithubRepositoriesResponse {
-            repositories: repositories
-                .into_iter()
-                .map(github_repository_summary)
-                .collect(),
-        })
+        self.deps.git_accounts.list_repositories(account_id).await
     }
 
     pub fn runtime_defaults(&self) -> RuntimeDefaultsResponse {
@@ -1035,15 +957,10 @@ impl AgentRuntime {
         owner: &str,
         repo: &str,
     ) -> Result<RepositoryPackagesResponse> {
-        let token = self.git_account_token(account_id).await?;
-        repository_packages_with_token(
-            &self.deps.github_http,
-            &self.github_api_base_url,
-            &token,
-            owner,
-            repo,
-        )
-        .await
+        self.deps
+            .git_accounts
+            .list_repository_packages(account_id, owner, repo)
+            .await
     }
 
     pub async fn list_github_installation_repository_packages(
@@ -1463,7 +1380,7 @@ impl AgentRuntime {
         } else {
             name
         };
-        let account = self.git_account_summary(&account_id).await?;
+        let account = self.deps.git_accounts.summary(&account_id).await?;
         let installation_id = account.installation_id.unwrap_or(relay_installation_id);
         let installation_account = account
             .installation_account
@@ -3916,7 +3833,7 @@ impl AgentRuntime {
         let Some(account_id) = summary.git_account_id else {
             return Ok(None);
         };
-        Ok(Some(self.git_account_token(&account_id).await?))
+        Ok(Some(self.deps.git_accounts.token(&account_id).await?))
     }
 
     async fn project_mcp_manager_for_agent(
@@ -5067,8 +4984,8 @@ impl AgentRuntime {
         account_id: &str,
         repository_full_name: &str,
     ) -> Result<VerifiedGithubRepository> {
-        let token = self.git_account_token(account_id).await?;
-        let account = self.git_account_summary(account_id).await?;
+        let token = self.deps.git_accounts.token(account_id).await?;
+        let account = self.deps.git_accounts.summary(account_id).await?;
         let repository_full_name = repository_full_name.trim();
         if !repository_full_name.contains('/') || repository_full_name.contains(char::is_whitespace)
         {
@@ -5120,37 +5037,6 @@ impl AgentRuntime {
                 .default_branch
                 .unwrap_or_else(|| "main".to_string()),
         })
-    }
-
-    async fn git_account_summary(&self, account_id: &str) -> Result<GitAccountSummary> {
-        self.deps
-            .store
-            .git_account(account_id)
-            .await?
-            .ok_or_else(|| RuntimeError::InvalidInput("git account not found".to_string()))
-    }
-
-    async fn git_account_token(&self, account_id: &str) -> Result<String> {
-        let account = self.git_account_summary(account_id).await?;
-        if account.provider == mai_protocol::GitProvider::GithubAppRelay {
-            let installation_id = account.installation_id.ok_or_else(|| {
-                RuntimeError::InvalidInput(
-                    "relay git account installation_id is missing".to_string(),
-                )
-            })?;
-            return Ok(self
-                .deps
-                .github_backend
-                .github_installation_token(installation_id, None, false)
-                .await?
-                .token);
-        }
-        self.deps
-            .store
-            .git_account_token(account_id)
-            .await?
-            .filter(|token| !token.trim().is_empty())
-            .ok_or_else(|| RuntimeError::InvalidInput("git account token not found".to_string()))
     }
 
     async fn project_git_token_for_agent(&self, agent: &AgentRecord) -> Result<Option<String>> {
@@ -5288,7 +5174,7 @@ impl AgentRuntime {
         let account_id = summary.git_account_id.clone().ok_or_else(|| {
             RuntimeError::InvalidInput("project git account is not configured".to_string())
         })?;
-        let token = self.git_account_token(&account_id).await?;
+        let token = self.deps.git_accounts.token(&account_id).await?;
         let repo_url = github_clone_url(&summary.owner, &summary.repo);
         let sidecar = self.ensure_project_sidecar(project_id).await?;
         self.clone_repository_in_sidecar(&sidecar.id, &repo_url, summary.branch.trim(), &token)
