@@ -6,8 +6,7 @@ use mai_model::ModelClient;
 use mai_skills::SkillsManager;
 use mai_store::ConfigStore;
 
-use crate::GithubAppBackend;
-use crate::github::GitAccountService;
+use crate::github::{GitAccountService, GithubAppBackend};
 
 pub(crate) struct RuntimeDeps {
     pub(crate) docker: DockerClient,
