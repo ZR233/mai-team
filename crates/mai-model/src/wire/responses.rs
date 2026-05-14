@@ -111,8 +111,12 @@ pub(crate) fn parse_stream_event_value(value: Value) -> Result<Vec<ModelStreamEv
             if let Some(delta) = value.get("delta").and_then(Value::as_str) {
                 events.push(ModelStreamEvent::ReasoningDelta {
                     output_index: output_index(&value),
-                    content_index: content_index(&value)
-                        .or_else(|| value.get("summary_index").and_then(Value::as_u64).map(|v| v as usize)),
+                    content_index: content_index(&value).or_else(|| {
+                        value
+                            .get("summary_index")
+                            .and_then(Value::as_u64)
+                            .map(|v| v as usize)
+                    }),
                     delta: delta.to_string(),
                 });
             }
@@ -158,21 +162,21 @@ pub(crate) fn parse_stream_event_value(value: Value) -> Result<Vec<ModelStreamEv
                     item,
                 });
             }
-            if let Some(item) = value.get("item") {
-                if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                    events.push(ModelStreamEvent::ToolCallStarted {
-                        output_index: output_index(&value),
-                        call_id: item
-                            .get("call_id")
-                            .or_else(|| item.get("id"))
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned),
-                        name: item
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned),
-                    });
-                }
+            if let Some(item) = value.get("item")
+                && item.get("type").and_then(Value::as_str) == Some("function_call")
+            {
+                events.push(ModelStreamEvent::ToolCallStarted {
+                    output_index: output_index(&value),
+                    call_id: item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    name: item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                });
             }
         }
         "response.output_item.done" => {

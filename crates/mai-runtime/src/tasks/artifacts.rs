@@ -40,9 +40,10 @@ pub(crate) async fn save_artifact(
     path: String,
     display_name: Option<String>,
 ) -> Result<ArtifactInfo> {
-    let task_id = ops.agent_task_id(agent_id).await?.ok_or_else(|| {
-        RuntimeError::InvalidInput("Agent has no task".to_string())
-    })?;
+    let task_id = ops
+        .agent_task_id(agent_id)
+        .await?
+        .ok_or_else(|| RuntimeError::InvalidInput("Agent has no task".to_string()))?;
     let container_id = ops.agent_container_id(agent_id).await?;
 
     let name = display_name.unwrap_or_else(|| {
@@ -61,7 +62,9 @@ pub(crate) async fn save_artifact(
     ops.copy_artifact_from_container(container_id, path.clone(), dest.clone())
         .await?;
 
-    let size_bytes = std::fs::metadata(&dest).map(|metadata| metadata.len()).unwrap_or(0);
+    let size_bytes = std::fs::metadata(&dest)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
 
     let info = ArtifactInfo {
         id: artifact_id,

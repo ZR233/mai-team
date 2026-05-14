@@ -65,9 +65,7 @@ pub(crate) async fn run_task_workflow(
         ),
     )
     .await?;
-    let mut executor_summary = ops
-        .wait_agent(executor.id, TASK_AGENT_WAIT_TIMEOUT)
-        .await?;
+    let mut executor_summary = ops.wait_agent(executor.id, TASK_AGENT_WAIT_TIMEOUT).await?;
     for round in 1..=REVIEW_ROUND_LIMIT {
         if matches!(
             executor_summary.status,
@@ -94,9 +92,7 @@ pub(crate) async fn run_task_workflow(
             ),
         )
         .await?;
-        let reviewer_summary = ops
-            .wait_agent(reviewer.id, TASK_AGENT_WAIT_TIMEOUT)
-            .await?;
+        let reviewer_summary = ops.wait_agent(reviewer.id, TASK_AGENT_WAIT_TIMEOUT).await?;
         if matches!(
             reviewer_summary.status,
             AgentStatus::Failed | AgentStatus::Cancelled
@@ -145,9 +141,7 @@ pub(crate) async fn run_task_workflow(
             ),
         )
         .await?;
-        executor_summary = ops
-            .wait_agent(executor.id, TASK_AGENT_WAIT_TIMEOUT)
-            .await?;
+        executor_summary = ops.wait_agent(executor.id, TASK_AGENT_WAIT_TIMEOUT).await?;
     }
     Ok(())
 }

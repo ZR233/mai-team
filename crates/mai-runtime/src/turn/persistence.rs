@@ -4,29 +4,30 @@ use mai_store::ConfigStore;
 use serde_json::Value;
 use uuid::Uuid;
 
-pub(crate) async fn record_agent_log(
-    store: &ConfigStore,
-    agent_id: AgentId,
-    session_id: Option<SessionId>,
-    turn_id: Option<TurnId>,
-    level: &str,
-    category: &str,
-    message: &str,
-    details: Value,
-) {
+pub(crate) struct AgentLogRecord {
+    pub(crate) agent_id: AgentId,
+    pub(crate) session_id: Option<SessionId>,
+    pub(crate) turn_id: Option<TurnId>,
+    pub(crate) level: &'static str,
+    pub(crate) category: &'static str,
+    pub(crate) message: &'static str,
+    pub(crate) details: Value,
+}
+
+pub(crate) async fn record_agent_log(store: &ConfigStore, record: AgentLogRecord) {
     let entry = AgentLogEntry {
         id: Uuid::new_v4(),
-        agent_id,
-        session_id,
-        turn_id,
-        level: level.to_string(),
-        category: category.to_string(),
-        message: message.to_string(),
-        details,
+        agent_id: record.agent_id,
+        session_id: record.session_id,
+        turn_id: record.turn_id,
+        level: record.level.to_string(),
+        category: record.category.to_string(),
+        message: record.message.to_string(),
+        details: record.details,
         timestamp: now(),
     };
     if let Err(err) = store.append_agent_log_entry(&entry).await {
-        tracing::warn!(agent_id = %agent_id, "failed to persist agent log entry: {err}");
+        tracing::warn!(agent_id = %record.agent_id, "failed to persist agent log entry: {err}");
     }
 }
 

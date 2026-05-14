@@ -2,8 +2,8 @@ use std::future::Future;
 
 use mai_protocol::{AgentId, TaskId, TaskStatus};
 
-use crate::state::RuntimeState;
 use crate::Result;
+use crate::state::RuntimeState;
 
 use super::{TaskUpdateOps, set_status, task, task_agents};
 

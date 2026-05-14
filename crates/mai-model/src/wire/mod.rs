@@ -66,10 +66,7 @@ pub(crate) fn parse_usage(value: Option<&Value>) -> Option<mai_protocol::TokenUs
 pub(crate) fn parse_sse_frames(buffer: &mut Vec<u8>, chunk: &[u8]) -> Result<Vec<SseFrame>> {
     buffer.extend_from_slice(chunk);
     let mut frames = Vec::new();
-    loop {
-        let Some(end) = find_frame_end(buffer) else {
-            break;
-        };
+    while let Some(end) = find_frame_end(buffer) {
         let raw = buffer[..end].to_vec();
         let drain_to = if buffer[end..].starts_with(b"\r\n\r\n") {
             end + 4
@@ -129,7 +126,11 @@ mod tests {
     #[test]
     fn parses_split_sse_frames_with_multiline_data_and_comments() {
         let mut buffer = Vec::new();
-        assert!(parse_sse_frames(&mut buffer, b": hi\n\nevent: a\ndata: one\n").unwrap().is_empty());
+        assert!(
+            parse_sse_frames(&mut buffer, b": hi\n\nevent: a\ndata: one\n")
+                .unwrap()
+                .is_empty()
+        );
         let frames = parse_sse_frames(&mut buffer, b"data: two\n\n").unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].event.as_deref(), Some("a"));
@@ -140,7 +141,11 @@ mod tests {
     fn parses_utf8_split_across_chunks_without_lossy_replacement() {
         let mut buffer = Vec::new();
         let bytes = "event: a\ndata: 你\n\n".as_bytes();
-        assert!(parse_sse_frames(&mut buffer, &bytes[..16]).unwrap().is_empty());
+        assert!(
+            parse_sse_frames(&mut buffer, &bytes[..16])
+                .unwrap()
+                .is_empty()
+        );
         let frames = parse_sse_frames(&mut buffer, &bytes[16..]).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, "你");

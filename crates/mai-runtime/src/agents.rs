@@ -39,7 +39,8 @@ pub(crate) use delete::{
 pub(crate) use files::{AgentFileOps, download_file_tar, upload_file};
 pub(crate) use fork::fork_agent_context;
 pub(crate) use input::{
-    send_input_to_agent, start_next_queued_input, start_next_queued_input_after_turn,
+    SendInputRequest, send_input_to_agent, start_next_queued_input,
+    start_next_queued_input_after_turn,
 };
 pub(crate) use model::normalize_reasoning_effort;
 pub(crate) use observability::{

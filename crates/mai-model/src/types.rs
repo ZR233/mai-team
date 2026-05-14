@@ -201,7 +201,10 @@ impl ModelStreamAccumulator {
         indices.dedup();
 
         for index in indices {
-            let content = self.text_parts.remove(&index).filter(|text| !text.is_empty());
+            let content = self
+                .text_parts
+                .remove(&index)
+                .filter(|text| !text.is_empty());
             let reasoning_content = self
                 .reasoning_parts
                 .remove(&index)

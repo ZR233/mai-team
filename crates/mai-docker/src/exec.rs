@@ -34,6 +34,13 @@ pub struct CapturedExecOutput {
     pub stderr_truncated: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ShellExecOptions<'a> {
+    pub cwd: Option<&'a str>,
+    pub timeout_secs: Option<u64>,
+    pub env: &'a [(String, String)],
+}
+
 #[derive(Debug, Clone)]
 pub struct SidecarParams<'a> {
     pub name: &'a str,
@@ -54,8 +61,17 @@ impl DockerClient {
         cwd: Option<&str>,
         timeout_secs: Option<u64>,
     ) -> Result<ExecOutput> {
-        self.exec_shell_env(container_id, command, cwd, timeout_secs, &[])
-            .await
+        self.exec_shell_env_with_cancel(
+            container_id,
+            command,
+            &ShellExecOptions {
+                cwd,
+                timeout_secs,
+                env: &[],
+            },
+            &CancellationToken::new(),
+        )
+        .await
     }
 
     pub async fn exec_shell_env(
@@ -69,9 +85,11 @@ impl DockerClient {
         self.exec_shell_env_with_cancel(
             container_id,
             command,
-            cwd,
-            timeout_secs,
-            env,
+            &ShellExecOptions {
+                cwd,
+                timeout_secs,
+                env,
+            },
             &CancellationToken::new(),
         )
         .await
@@ -88,9 +106,11 @@ impl DockerClient {
         self.exec_shell_env_with_cancel(
             container_id,
             command,
-            cwd,
-            timeout_secs,
-            &[],
+            &ShellExecOptions {
+                cwd,
+                timeout_secs,
+                env: &[],
+            },
             cancellation_token,
         )
         .await
@@ -108,9 +128,11 @@ impl DockerClient {
         self.exec_shell_env_captured_with_cancel(
             container_id,
             command,
-            cwd,
-            timeout_secs,
-            &[],
+            &ShellExecOptions {
+                cwd,
+                timeout_secs,
+                env: &[],
+            },
             capture,
             cancellation_token,
         )
@@ -121,19 +143,17 @@ impl DockerClient {
         &self,
         container_id: &str,
         command: &str,
-        cwd: Option<&str>,
-        timeout_secs: Option<u64>,
-        env: &[(String, String)],
+        opts: &ShellExecOptions<'_>,
         capture: ExecCaptureOptions<'_>,
         cancellation_token: &CancellationToken,
     ) -> Result<CapturedExecOutput> {
-        let shell_command = shell_command_with_optional_timeout(command, timeout_secs);
+        let shell_command = shell_command_with_optional_timeout(command, opts.timeout_secs);
         let mut cmd = Command::new(&self.binary);
         cmd.arg("exec");
-        if let Some(cwd) = cwd {
+        if let Some(cwd) = opts.cwd {
             cmd.args(["-w", cwd]);
         }
-        for (key, value) in env {
+        for (key, value) in opts.env {
             cmd.arg("-e").arg(key);
             cmd.env(key, value);
         }
@@ -190,18 +210,16 @@ impl DockerClient {
         &self,
         container_id: &str,
         command: &str,
-        cwd: Option<&str>,
-        timeout_secs: Option<u64>,
-        env: &[(String, String)],
+        opts: &ShellExecOptions<'_>,
         cancellation_token: &CancellationToken,
     ) -> Result<ExecOutput> {
-        let shell_command = shell_command_with_optional_timeout(command, timeout_secs);
+        let shell_command = shell_command_with_optional_timeout(command, opts.timeout_secs);
         let mut cmd = Command::new(&self.binary);
         cmd.arg("exec");
-        if let Some(cwd) = cwd {
+        if let Some(cwd) = opts.cwd {
             cmd.args(["-w", cwd]);
         }
-        for (key, value) in env {
+        for (key, value) in opts.env {
             cmd.arg("-e").arg(key);
             cmd.env(key, value);
         }

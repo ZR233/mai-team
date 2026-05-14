@@ -19,6 +19,7 @@ use crate::instructions::{self, ContainerSkillPaths};
 use crate::state::{AgentRecord, RuntimeState};
 use crate::turn::completion::TurnResult;
 use crate::turn::model_stream::TurnModelContext;
+use crate::turn::persistence::AgentLogRecord;
 use crate::turn::tools::ToolExecution;
 use crate::{Result, RuntimeError};
 
@@ -103,31 +104,26 @@ pub(crate) trait TurnOrchestratorOps: Send + Sync {
     async fn start_next_queued_input_after_turn(&self, agent_id: AgentId);
 }
 
+pub(crate) struct TurnRequest {
+    pub(crate) agent_id: AgentId,
+    pub(crate) session_id: SessionId,
+    pub(crate) turn_id: TurnId,
+    pub(crate) message: String,
+    pub(crate) skill_mentions: Vec<String>,
+    pub(crate) cancellation_token: CancellationToken,
+}
+
 pub(crate) async fn run_turn(
     deps: &RuntimeDeps,
     state: &RuntimeState,
     events: &RuntimeEvents,
     ops: &dyn TurnOrchestratorOps,
-    agent_id: AgentId,
-    session_id: SessionId,
-    turn_id: TurnId,
-    message: String,
-    skill_mentions: Vec<String>,
-    cancellation_token: CancellationToken,
+    request: TurnRequest,
 ) {
-    let result = run_turn_inner(
-        deps,
-        state,
-        events,
-        ops,
-        agent_id,
-        session_id,
-        turn_id,
-        message,
-        skill_mentions,
-        cancellation_token,
-    )
-    .await;
+    let agent_id = request.agent_id;
+    let session_id = request.session_id;
+    let turn_id = request.turn_id;
+    let result = run_turn_inner(deps, state, events, ops, request).await;
     if let Err(err) = result
         && let Ok(agent) = ops.agent(agent_id).await
     {
@@ -187,13 +183,16 @@ pub(crate) async fn run_turn_inner(
     state: &RuntimeState,
     events: &RuntimeEvents,
     ops: &dyn TurnOrchestratorOps,
-    agent_id: AgentId,
-    session_id: SessionId,
-    turn_id: TurnId,
-    message: String,
-    skill_mentions: Vec<String>,
-    cancellation_token: CancellationToken,
+    request: TurnRequest,
 ) -> Result<()> {
+    let TurnRequest {
+        agent_id,
+        session_id,
+        turn_id,
+        message,
+        skill_mentions,
+        cancellation_token,
+    } = request;
     let agent = ops.agent(agent_id).await?;
     let _turn_guard = agent.turn_lock.lock().await;
     let enforce_current_turn = agent.summary.read().await.current_turn == Some(turn_id);
@@ -219,13 +218,15 @@ pub(crate) async fn run_turn_inner(
         .await;
     super::persistence::record_agent_log(
         deps.store.as_ref(),
-        agent_id,
-        Some(session_id),
-        Some(turn_id),
-        "info",
-        "turn",
-        "turn started",
-        json!({}),
+        AgentLogRecord {
+            agent_id,
+            session_id: Some(session_id),
+            turn_id: Some(turn_id),
+            level: "info",
+            category: "turn",
+            message: "turn started",
+            details: json!({}),
+        },
     )
     .await;
 
@@ -236,13 +237,15 @@ pub(crate) async fn run_turn_inner(
         tracing::warn!(agent_id = %agent_id, "failed to refresh project skills before turn: {err}");
         super::persistence::record_agent_log(
             deps.store.as_ref(),
-            agent_id,
-            Some(session_id),
-            Some(turn_id),
-            "warn",
-            "skills",
-            "project skill refresh failed",
-            json!({ "error": err.to_string() }),
+            AgentLogRecord {
+                agent_id,
+                session_id: Some(session_id),
+                turn_id: Some(turn_id),
+                level: "warn",
+                category: "skills",
+                message: "project skill refresh failed",
+                details: json!({ "error": err.to_string() }),
+            },
         )
         .await;
     }
@@ -261,13 +264,15 @@ pub(crate) async fn run_turn_inner(
         tracing::warn!("auto context compaction failed before user message: {err}");
         super::persistence::record_agent_log(
             deps.store.as_ref(),
-            agent_id,
-            Some(session_id),
-            Some(turn_id),
-            "warn",
-            "context",
-            "auto context compaction failed",
-            json!({ "stage": "before_user_message", "error": err.to_string() }),
+            AgentLogRecord {
+                agent_id,
+                session_id: Some(session_id),
+                turn_id: Some(turn_id),
+                level: "warn",
+                category: "context",
+                message: "auto context compaction failed",
+                details: json!({ "stage": "before_user_message", "error": err.to_string() }),
+            },
         )
         .await;
     }
@@ -333,13 +338,15 @@ pub(crate) async fn run_turn_inner(
             .await;
         super::persistence::record_agent_log(
             deps.store.as_ref(),
-            agent_id,
-            Some(session_id),
-            Some(turn_id),
-            "info",
-            "skills",
-            "skills activated",
-            json!({ "count": skill_injections.items.len() }),
+            AgentLogRecord {
+                agent_id,
+                session_id: Some(session_id),
+                turn_id: Some(turn_id),
+                level: "info",
+                category: "skills",
+                message: "skills activated",
+                details: json!({ "count": skill_injections.items.len() }),
+            },
         )
         .await;
     }
@@ -373,20 +380,22 @@ pub(crate) async fn run_turn_inner(
             .await?;
         super::persistence::record_agent_log(
             deps.store.as_ref(),
-            agent_id,
-            Some(session_id),
-            Some(turn_id),
-            "info",
-            "runtime",
-            "turn model context prepared",
-            json!({
-                "provider_id": provider_id,
-                "model": model_name,
-                "tool_count": tools.len(),
-                "mcp_tool_count": mcp_tools.len(),
-                "instructions_bytes": instructions.len(),
-                "duration_ms": u128_to_u64(context_started.elapsed().as_millis()),
-            }),
+            AgentLogRecord {
+                agent_id,
+                session_id: Some(session_id),
+                turn_id: Some(turn_id),
+                level: "info",
+                category: "runtime",
+                message: "turn model context prepared",
+                details: json!({
+                    "provider_id": provider_id,
+                    "model": model_name,
+                    "tool_count": tools.len(),
+                    "mcp_tool_count": mcp_tools.len(),
+                    "instructions_bytes": instructions.len(),
+                    "duration_ms": u128_to_u64(context_started.elapsed().as_millis()),
+                }),
+            },
         )
         .await;
         TurnModelContext {
@@ -423,13 +432,15 @@ pub(crate) async fn run_turn_inner(
             tracing::warn!("auto context compaction failed before model request: {err}");
             super::persistence::record_agent_log(
                 deps.store.as_ref(),
-                agent_id,
-                Some(session_id),
-                Some(turn_id),
-                "warn",
-                "context",
-                "auto context compaction failed",
-                json!({ "stage": "before_model_request", "error": err.to_string() }),
+                AgentLogRecord {
+                    agent_id,
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    level: "warn",
+                    category: "context",
+                    message: "auto context compaction failed",
+                    details: json!({ "stage": "before_model_request", "error": err.to_string() }),
+                },
             )
             .await;
         }
@@ -447,12 +458,14 @@ pub(crate) async fn run_turn_inner(
         let model_started = Instant::now();
         let model_turn = super::model_stream::run_model_stream_turn(
             &deps.model,
-            deps.store.as_ref(),
-            events,
-            &agent,
-            agent_id,
-            session_id,
-            turn_id,
+            &super::model_stream::TurnStreamContext {
+                store: deps.store.as_ref(),
+                events,
+                agent: &agent,
+                agent_id,
+                session_id,
+                turn_id,
+            },
             &model_context,
             &history,
             &mut turn_model_state,
@@ -462,21 +475,23 @@ pub(crate) async fn run_turn_inner(
         let model_duration_ms = u128_to_u64(model_started.elapsed().as_millis());
         super::persistence::record_agent_log(
             deps.store.as_ref(),
-            agent_id,
-            Some(session_id),
-            Some(turn_id),
-            "info",
-            "model",
-            "model stream completed",
-            json!({
-                "provider_id": model_context.provider_id,
-                "model": model_context.model_name,
-                "output_items": model_turn.response.output.len(),
-                "history_items": history.len(),
-                "history_load_ms": history_duration_ms,
-                "duration_ms": model_duration_ms,
-                "usage": model_turn.response.usage,
-            }),
+            AgentLogRecord {
+                agent_id,
+                session_id: Some(session_id),
+                turn_id: Some(turn_id),
+                level: "info",
+                category: "model",
+                message: "model stream completed",
+                details: json!({
+                    "provider_id": model_context.provider_id,
+                    "model": model_context.model_name,
+                    "output_items": model_turn.response.output.len(),
+                    "history_items": history.len(),
+                    "history_load_ms": history_duration_ms,
+                    "duration_ms": model_duration_ms,
+                    "usage": model_turn.response.usage,
+                }),
+            },
         )
         .await;
 
@@ -558,15 +573,19 @@ pub(crate) async fn run_turn_inner(
             }
             let tool_agent = Arc::clone(&agent);
             let execution = super::tools::run_tool_call(
-                deps.store.as_ref(),
-                events,
-                &agent,
-                agent_id,
-                session_id,
-                turn_id,
-                &call_id,
-                &name,
-                arguments,
+                &super::tools::ToolCallContext {
+                    store: deps.store.as_ref(),
+                    events,
+                    agent: &agent,
+                    agent_id,
+                    session_id,
+                    turn_id,
+                },
+                super::tools::ToolCallInfo {
+                    call_id: &call_id,
+                    name: &name,
+                    arguments,
+                },
                 |arguments| {
                     let cancellation_token = cancellation_token.clone();
                     let name = name.clone();

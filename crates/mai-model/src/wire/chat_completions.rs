@@ -119,7 +119,10 @@ fn chat_options(req: &WireRequest<'_>) -> BTreeMap<String, Value> {
     } else {
         req.max_tokens_field
     };
-    options.insert(max_tokens_field.to_string(), Value::from(req.max_output_tokens));
+    options.insert(
+        max_tokens_field.to_string(),
+        Value::from(req.max_output_tokens),
+    );
     options
 }
 
@@ -256,23 +259,23 @@ pub(crate) fn parse_chat_stream_chunk(value: Value) -> Vec<ModelStreamEvent> {
             let Some(delta) = choice.get("delta") else {
                 continue;
             };
-            if let Some(content) = delta.get("content").and_then(Value::as_str) {
-                if !content.is_empty() {
-                    events.push(ModelStreamEvent::TextDelta {
-                        output_index,
-                        content_index: None,
-                        delta: content.to_string(),
-                    });
-                }
+            if let Some(content) = delta.get("content").and_then(Value::as_str)
+                && !content.is_empty()
+            {
+                events.push(ModelStreamEvent::TextDelta {
+                    output_index,
+                    content_index: None,
+                    delta: content.to_string(),
+                });
             }
-            if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
-                if !reasoning.is_empty() {
-                    events.push(ModelStreamEvent::ReasoningDelta {
-                        output_index,
-                        content_index: None,
-                        delta: reasoning.to_string(),
-                    });
-                }
+            if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str)
+                && !reasoning.is_empty()
+            {
+                events.push(ModelStreamEvent::ReasoningDelta {
+                    output_index,
+                    content_index: None,
+                    delta: reasoning.to_string(),
+                });
             }
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for tool_call in tool_calls {
@@ -296,20 +299,20 @@ pub(crate) fn parse_chat_stream_chunk(value: Value) -> Vec<ModelStreamEvent> {
                             name: name.clone(),
                         });
                     }
-                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                        if !arguments.is_empty() {
-                            events.push(ModelStreamEvent::ToolCallArgumentsDelta {
-                                output_index: index,
-                                delta: arguments.to_string(),
-                            });
-                            if finish_reason == Some("tool_calls") {
-                                tool_calls_completed.push((
-                                    index,
-                                    call_id.clone(),
-                                    name.clone(),
-                                    arguments.to_string(),
-                                ));
-                            }
+                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str)
+                        && !arguments.is_empty()
+                    {
+                        events.push(ModelStreamEvent::ToolCallArgumentsDelta {
+                            output_index: index,
+                            delta: arguments.to_string(),
+                        });
+                        if finish_reason == Some("tool_calls") {
+                            tool_calls_completed.push((
+                                index,
+                                call_id.clone(),
+                                name.clone(),
+                                arguments.to_string(),
+                            ));
                         }
                     }
                 }

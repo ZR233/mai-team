@@ -504,14 +504,18 @@ impl<'a> ModelStreamReducer<'a> {
     }
 }
 
+pub(crate) struct TurnStreamContext<'a> {
+    pub(crate) store: &'a ConfigStore,
+    pub(crate) events: &'a RuntimeEvents,
+    pub(crate) agent: &'a Arc<AgentRecord>,
+    pub(crate) agent_id: AgentId,
+    pub(crate) session_id: SessionId,
+    pub(crate) turn_id: TurnId,
+}
+
 pub(crate) async fn run_model_stream_turn(
     model: &ModelClient,
-    store: &ConfigStore,
-    events: &RuntimeEvents,
-    agent: &Arc<AgentRecord>,
-    agent_id: AgentId,
-    session_id: SessionId,
-    turn_id: TurnId,
+    ctx: &TurnStreamContext<'_>,
     model_context: &TurnModelContext,
     history: &[ModelInputItem],
     turn_model_state: &mut ModelTurnState,
@@ -533,19 +537,7 @@ pub(crate) async fn run_model_stream_turn(
         )
         .await
         .map_err(model_error_to_runtime)?;
-    consume_turn_stream(
-        model,
-        store,
-        events,
-        agent,
-        agent_id,
-        session_id,
-        turn_id,
-        turn_model_state,
-        stream,
-        cancellation_token,
-    )
-    .await
+    consume_turn_stream(model, ctx, turn_model_state, stream, cancellation_token).await
 }
 
 pub(crate) async fn consume_model_stream_to_response(
@@ -582,17 +574,19 @@ pub(crate) async fn consume_model_stream_to_response(
 
 async fn consume_turn_stream(
     model: &ModelClient,
-    store: &ConfigStore,
-    events: &RuntimeEvents,
-    agent: &Arc<AgentRecord>,
-    agent_id: AgentId,
-    session_id: SessionId,
-    turn_id: TurnId,
+    ctx: &TurnStreamContext<'_>,
     turn_model_state: &mut ModelTurnState,
     mut stream: ModelEventStream,
     cancellation_token: &CancellationToken,
 ) -> Result<ModelTurnResult> {
-    let mut reducer = ModelStreamReducer::new(store, events, agent, agent_id, session_id, turn_id);
+    let mut reducer = ModelStreamReducer::new(
+        ctx.store,
+        ctx.events,
+        ctx.agent,
+        ctx.agent_id,
+        ctx.session_id,
+        ctx.turn_id,
+    );
     while let Some(event) = stream.next().await {
         if cancellation_token.is_cancelled() {
             return Err(RuntimeError::TurnCancelled);
@@ -731,12 +725,14 @@ mod tests {
             let mut state = ModelTurnState::default();
             consume_turn_stream(
                 &ModelClient::new(),
-                self.store.as_ref(),
-                &self.events,
-                &self.agent,
-                self.agent_id,
-                self.session_id,
-                self.turn_id,
+                &TurnStreamContext {
+                    store: self.store.as_ref(),
+                    events: &self.events,
+                    agent: &self.agent,
+                    agent_id: self.agent_id,
+                    session_id: self.session_id,
+                    turn_id: self.turn_id,
+                },
                 &mut state,
                 event_stream(events),
                 &CancellationToken::new(),
