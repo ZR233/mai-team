@@ -14,9 +14,7 @@ impl GithubService {
         Self { runtime, relay }
     }
 
-    pub(crate) async fn app_settings(
-        &self,
-    ) -> Result<GithubAppSettingsResponse, RuntimeError> {
+    pub(crate) async fn app_settings(&self) -> Result<GithubAppSettingsResponse, RuntimeError> {
         match &self.relay {
             Some(relay) => relay.github_app_settings().await,
             None => self.runtime.github_app_settings().await,

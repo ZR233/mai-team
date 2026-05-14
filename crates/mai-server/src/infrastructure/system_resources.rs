@@ -1,17 +1,8 @@
 use std::io;
-use std::path::{Component, Path as FsPath, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 
-use axum::Json;
-use axum::body::Body;
-use axum::http::{StatusCode, Uri, header};
-use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
-use serde_json::json;
-
-#[derive(RustEmbed)]
-#[folder = "$OUT_DIR/static"]
-struct StaticAssets;
 
 #[derive(RustEmbed)]
 #[folder = "$OUT_DIR/system-skills"]
@@ -21,67 +12,34 @@ struct EmbeddedSystemSkills;
 #[folder = "$OUT_DIR/system-agents"]
 struct EmbeddedSystemAgents;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddedResourceRoot {
+    Skills,
+    Agents,
+}
+
+impl EmbeddedResourceRoot {
+    fn out_dir_name(self) -> &'static str {
+        match self {
+            Self::Skills => "system-skills",
+            Self::Agents => "system-agents",
+        }
+    }
+}
+
 static EMBEDDED_RESOURCE_RELEASE_LOCK: StdMutex<()> = StdMutex::new(());
 
-pub(crate) async fn index() -> Response {
-    embedded_asset_response("index.html", true)
+pub(crate) fn release_embedded_system_skills(target_dir: &Path) -> io::Result<()> {
+    release_embedded_resources::<EmbeddedSystemSkills>(target_dir, EmbeddedResourceRoot::Skills)
 }
 
-pub(crate) async fn static_fallback(uri: Uri) -> Response {
-    embedded_asset_response(uri.path().trim_start_matches('/'), true)
+pub(crate) fn release_embedded_system_agents(target_dir: &Path) -> io::Result<()> {
+    release_embedded_resources::<EmbeddedSystemAgents>(target_dir, EmbeddedResourceRoot::Agents)
 }
 
-pub(crate) async fn health() -> Json<serde_json::Value> {
-    Json(json!({ "ok": true }))
-}
-
-fn embedded_asset_response(path: &str, fallback_index: bool) -> Response {
-    let asset_path = if path.is_empty() { "index.html" } else { path };
-    let (served_path, asset) = match StaticAssets::get(asset_path) {
-        Some(asset) => (asset_path, asset),
-        None if fallback_index && !asset_path.contains('.') => {
-            match StaticAssets::get("index.html") {
-                Some(asset) => ("index.html", asset),
-                None => {
-                    return (StatusCode::NOT_FOUND, "embedded index.html not found")
-                        .into_response();
-                }
-            }
-        }
-        None => return (StatusCode::NOT_FOUND, "not found").into_response(),
-    };
-    let content_type = mime_guess::from_path(served_path)
-        .first_or_octet_stream()
-        .essence_str()
-        .to_string();
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
-        .body(Body::from(asset.data.into_owned()))
-        .expect("embedded static response")
-}
-
-pub(crate) fn release_embedded_system_skills(target_dir: &std::path::Path) -> io::Result<()> {
-    release_embedded_resources::<EmbeddedSystemSkills>(
-        target_dir,
-        safe_system_resource_target,
-        "system-skills",
-    )
-}
-
-pub(crate) fn release_embedded_system_agents(target_dir: &std::path::Path) -> io::Result<()> {
-    release_embedded_resources::<EmbeddedSystemAgents>(
-        target_dir,
-        safe_system_resource_target,
-        "system-agents",
-    )
-}
-
-pub(crate) fn release_embedded_resources<E>(
-    target_dir: &std::path::Path,
-    is_safe_target: fn(&std::path::Path) -> bool,
-    out_dir_name: &str,
+fn release_embedded_resources<E>(
+    target_dir: &Path,
+    resource_root: EmbeddedResourceRoot,
 ) -> io::Result<()>
 where
     E: RustEmbed,
@@ -89,7 +47,7 @@ where
     let _guard = EMBEDDED_RESOURCE_RELEASE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !is_safe_target(target_dir) {
+    if !safe_system_resource_target(target_dir) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unsafe system resource target: {}", target_dir.display()),
@@ -101,7 +59,7 @@ where
     std::fs::create_dir_all(target_dir)?;
     for path in E::iter() {
         let path = path.as_ref();
-        let Some(relative) = embedded_system_resource_relative_path(path, out_dir_name) else {
+        let Some(relative) = embedded_system_resource_relative_path(path, resource_root) else {
             continue;
         };
         let target = target_dir.join(relative);
@@ -115,7 +73,7 @@ where
     Ok(())
 }
 
-pub(crate) fn safe_system_resource_target(path: &std::path::Path) -> bool {
+fn safe_system_resource_target(path: &Path) -> bool {
     if path.as_os_str().is_empty() {
         return false;
     }
@@ -125,13 +83,14 @@ pub(crate) fn safe_system_resource_target(path: &std::path::Path) -> bool {
     )
 }
 
-pub(crate) fn embedded_system_resource_relative_path(
+fn embedded_system_resource_relative_path(
     path: &str,
-    out_dir_name: &str,
+    resource_root: EmbeddedResourceRoot,
 ) -> Option<PathBuf> {
-    let path = FsPath::new(path);
+    let path = Path::new(path);
+    let out_dir_name = resource_root.out_dir_name();
     let relative = if path.is_absolute() {
-        path.strip_prefix(FsPath::new(env!("OUT_DIR")).join(out_dir_name))
+        path.strip_prefix(Path::new(env!("OUT_DIR")).join(out_dir_name))
             .ok()?
     } else {
         path
@@ -140,31 +99,31 @@ pub(crate) fn embedded_system_resource_relative_path(
     safe_embedded_relative_path_from_path(relative)
 }
 
-pub(crate) fn safe_embedded_relative_path_from_path(path: &FsPath) -> Option<PathBuf> {
+fn safe_embedded_relative_path_from_path(path: &Path) -> Option<PathBuf> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
             Component::Normal(part) => normalized.push(part),
             Component::CurDir => {}
-            _ => return None,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
         }
     }
     (!normalized.as_os_str().is_empty()).then_some(normalized)
 }
 
 #[cfg(test)]
-pub(crate) fn embedded_system_skill_relative_path(path: &str) -> Option<PathBuf> {
-    embedded_system_resource_relative_path(path, "system-skills")
+fn embedded_system_skill_relative_path(path: &str) -> Option<PathBuf> {
+    embedded_system_resource_relative_path(path, EmbeddedResourceRoot::Skills)
 }
 
 #[cfg(test)]
-pub(crate) fn embedded_system_agent_relative_path(path: &str) -> Option<PathBuf> {
-    embedded_system_resource_relative_path(path, "system-agents")
+fn embedded_system_agent_relative_path(path: &str) -> Option<PathBuf> {
+    embedded_system_resource_relative_path(path, EmbeddedResourceRoot::Agents)
 }
 
 #[cfg(test)]
-pub(crate) fn safe_embedded_relative_path(path: &str) -> Option<PathBuf> {
-    safe_embedded_relative_path_from_path(FsPath::new(path))
+fn safe_embedded_relative_path(path: &str) -> Option<PathBuf> {
+    safe_embedded_relative_path_from_path(Path::new(path))
 }
 
 #[cfg(test)]
@@ -218,7 +177,7 @@ mod tests {
         );
     }
 
-    fn list_relative_files(root: &FsPath) -> Vec<PathBuf> {
+    fn list_relative_files(root: &Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
         if let Ok(entries) = fs::read_dir(root) {
             for entry in entries.flatten() {
@@ -229,7 +188,7 @@ mod tests {
         files
     }
 
-    fn collect_relative_files(root: &FsPath, path: &FsPath, files: &mut Vec<PathBuf>) {
+    fn collect_relative_files(root: &Path, path: &Path, files: &mut Vec<PathBuf>) {
         if path.is_dir() {
             if let Ok(entries) = fs::read_dir(path) {
                 for entry in entries.flatten() {
@@ -255,7 +214,7 @@ mod tests {
         assert_eq!(safe_embedded_relative_path("/tmp/SKILL.md"), None);
         assert_eq!(
             embedded_system_skill_relative_path(
-                &FsPath::new(env!("OUT_DIR"))
+                &Path::new(env!("OUT_DIR"))
                     .join("system-skills")
                     .join("reviewer-agent-review-pr")
                     .join("SKILL.md")
@@ -265,7 +224,7 @@ mod tests {
         );
         assert_eq!(
             embedded_system_agent_relative_path(
-                &FsPath::new(env!("OUT_DIR"))
+                &Path::new(env!("OUT_DIR"))
                     .join("system-agents")
                     .join("project-maintainer")
                     .join("AGENT.md")
@@ -277,10 +236,8 @@ mod tests {
 
     #[test]
     fn system_skills_release_rejects_root_target() {
-        assert!(!safe_system_resource_target(std::path::Path::new("")));
-        assert!(!safe_system_resource_target(std::path::Path::new("/")));
-        assert!(safe_system_resource_target(std::path::Path::new(
-            "/tmp/system-skills"
-        )));
+        assert!(!safe_system_resource_target(Path::new("")));
+        assert!(!safe_system_resource_target(Path::new("/")));
+        assert!(safe_system_resource_target(Path::new("/tmp/system-skills")));
     }
 }

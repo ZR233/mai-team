@@ -2,6 +2,7 @@ pub(crate) mod bootstrap;
 pub(crate) mod config;
 pub(crate) mod handlers;
 pub(crate) mod http;
+pub(crate) mod infrastructure;
 pub(crate) mod services;
 
 use anyhow::Result;

@@ -43,13 +43,13 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         .await?;
 
     let system_skills_root = paths.system_skills_root.clone();
-    crate::handlers::assets::release_embedded_system_skills(&system_skills_root)?;
+    crate::infrastructure::system_resources::release_embedded_system_skills(&system_skills_root)?;
     info!(
         path = %system_skills_root.display(),
         "released embedded system skills"
     );
     let system_agents_root = paths.system_agents_root.clone();
-    crate::handlers::assets::release_embedded_system_agents(&system_agents_root)?;
+    crate::infrastructure::system_resources::release_embedded_system_agents(&system_agents_root)?;
     info!(
         path = %system_agents_root.display(),
         "released embedded system agents"

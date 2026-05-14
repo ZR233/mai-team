@@ -7,11 +7,12 @@ use tower_http::trace::TraceLayer;
 
 use crate::handlers;
 use crate::handlers::state::AppState;
+use crate::http::routes;
 
 pub(crate) fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/", get(handlers::assets::index))
-        .route("/health", get(handlers::assets::health))
+        .route("/", get(routes::assets::index))
+        .route("/health", get(routes::health::health))
         .route(
             "/providers",
             get(handlers::providers::get_providers).put(handlers::providers::save_providers),
@@ -235,7 +236,7 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
             get(handlers::tasks::download_artifact),
         )
         .route("/agents/{id}/cancel", post(handlers::agents::cancel_agent))
-        .fallback(get(handlers::assets::static_fallback))
+        .fallback(get(routes::assets::static_fallback))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
