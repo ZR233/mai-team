@@ -61,8 +61,7 @@ use deps::RuntimeDeps;
 use events::{RECENT_EVENT_LIMIT, RuntimeEvents};
 use state::{
     AgentRecord, AgentSessionRecord, CollabInput, ProjectRecord, ProjectReviewWorker,
-    QueuedAgentInput, RuntimeState, TaskRecord, ToolExecution, ToolOutputCapture, TurnControl,
-    TurnGuard,
+    QueuedAgentInput, RuntimeState, TaskRecord, ToolExecution, TurnControl, TurnGuard,
 };
 use turn::completion::TurnResult;
 use turn::model_stream::TurnModelContext;
@@ -2734,7 +2733,7 @@ impl AgentRuntime {
             tool_name,
             arguments: arguments.unwrap_or_else(|| json!({})),
             success: event_success.unwrap_or(!output.is_empty()),
-            output_preview: trace_preview_output(&output, 500),
+            output_preview: turn::tools::trace_preview_output(&output, 500),
             output,
             duration_ms,
             started_at: None,
@@ -3212,77 +3211,13 @@ impl AgentRuntime {
         artifact_id: &str,
         name: &str,
     ) -> PathBuf {
-        self.tool_output_artifact_dir(agent_id, call_id, artifact_id)
-            .join(name)
-    }
-
-    async fn prepare_tool_output_capture(
-        &self,
-        agent_id: AgentId,
-        command: &str,
-    ) -> Result<ToolOutputCapture> {
-        let call_id = Uuid::new_v4().to_string();
-        let stdout_id = Uuid::new_v4().to_string();
-        let stderr_id = Uuid::new_v4().to_string();
-        let stdout_name = tool_output_file_name(command, "stdout");
-        let stderr_name = tool_output_file_name(command, "stderr");
-        let stdout_path =
-            self.tool_output_artifact_file_path(agent_id, &call_id, &stdout_id, &stdout_name);
-        let stderr_path =
-            self.tool_output_artifact_file_path(agent_id, &call_id, &stderr_id, &stderr_name);
-        if let Some(parent) = stdout_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        if let Some(parent) = stderr_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        Ok(ToolOutputCapture {
+        turn::tools::tool_output_artifact_file_path(
+            &self.artifact_files_root,
+            agent_id,
             call_id,
-            stdout_id,
-            stderr_id,
-            stdout_path,
-            stderr_path,
-            stdout_name,
-            stderr_name,
-        })
-    }
-
-    async fn tool_output_artifacts_from_capture(
-        &self,
-        agent_id: AgentId,
-        capture: &ToolOutputCapture,
-        stdout_bytes: u64,
-        stderr_bytes: u64,
-    ) -> Result<Vec<ToolOutputArtifactInfo>> {
-        let created_at = now();
-        let mut artifacts = Vec::new();
-        if stdout_bytes > 0 {
-            artifacts.push(ToolOutputArtifactInfo {
-                id: capture.stdout_id.clone(),
-                call_id: capture.call_id.clone(),
-                agent_id,
-                name: capture.stdout_name.clone(),
-                stream: "stdout".to_string(),
-                size_bytes: stdout_bytes,
-                created_at,
-            });
-        } else {
-            let _ = tokio::fs::remove_file(&capture.stdout_path).await;
-        }
-        if stderr_bytes > 0 {
-            artifacts.push(ToolOutputArtifactInfo {
-                id: capture.stderr_id.clone(),
-                call_id: capture.call_id.clone(),
-                agent_id,
-                name: capture.stderr_name.clone(),
-                stream: "stderr".to_string(),
-                size_bytes: stderr_bytes,
-                created_at,
-            });
-        } else {
-            let _ = tokio::fs::remove_file(&capture.stderr_path).await;
-        }
-        Ok(artifacts)
+            artifact_id,
+            name,
+        )
     }
 
     async fn run_turn(
@@ -3731,139 +3666,39 @@ impl AgentRuntime {
                 if cancellation_token.is_cancelled() {
                     return Err(RuntimeError::TurnCancelled);
                 }
-                let arguments_preview = trace_preview_value(&arguments, 500);
-                let inline_arguments = inline_event_arguments(&arguments);
-                let trace_arguments = arguments.clone();
-                let started_wall_time = now();
-                turn::persistence::record_agent_log(
+                let execution = turn::tools::run_tool_call(
                     self.deps.store.as_ref(),
-                    agent_id,
-                    Some(session_id),
-                    Some(turn_id),
-                    "info",
-                    "tool",
-                    "tool started",
-                    json!({
-                        "call_id": call_id.as_str(),
-                        "tool_name": name.as_str(),
-                        "arguments_preview": arguments_preview.as_str(),
-                    }),
-                )
-                .await;
-                turn::persistence::record_tool_trace_started(
-                    self.deps.store.as_ref(),
-                    ToolTraceDetail {
-                        agent_id,
-                        session_id: Some(session_id),
-                        turn_id: Some(turn_id),
-                        call_id: call_id.clone(),
-                        tool_name: name.clone(),
-                        arguments: trace_arguments.clone(),
-                        output: String::new(),
-                        success: false,
-                        duration_ms: None,
-                        started_at: Some(started_wall_time),
-                        completed_at: None,
-                        output_preview: String::new(),
-                        output_artifacts: Vec::new(),
-                    },
-                    started_wall_time,
-                )
-                .await;
-                self.events
-                    .publish(ServiceEventKind::ToolStarted {
-                        agent_id,
-                        session_id: Some(session_id),
-                        turn_id,
-                        call_id: call_id.clone(),
-                        tool_name: name.clone(),
-                        arguments_preview: Some(arguments_preview),
-                        arguments: inline_arguments,
-                    })
-                    .await;
-                let started_at = Instant::now();
-                let output = self
-                    .execute_tool(
-                        &agent,
-                        agent_id,
-                        turn_id,
-                        &name,
-                        arguments.clone(),
-                        cancellation_token.clone(),
-                    )
-                    .await;
-                let duration_ms = u128_to_u64(started_at.elapsed().as_millis());
-                let execution = match output {
-                    Ok(execution) => execution,
-                    Err(RuntimeError::TurnCancelled) => return Err(RuntimeError::TurnCancelled),
-                    Err(err) => ToolExecution::new(false, err.to_string(), false),
-                };
-                if execution.ends_turn {
-                    should_end_turn = true;
-                }
-                turn::history::record_history_item(
-                    self.deps.store.as_ref(),
+                    &self.events,
                     &agent,
                     agent_id,
                     session_id,
-                    ModelInputItem::FunctionCallOutput {
-                        call_id: call_id.clone(),
-                        output: execution.model_output.clone(),
+                    turn_id,
+                    &call_id,
+                    &name,
+                    arguments,
+                    |arguments| {
+                        let runtime = Arc::clone(self);
+                        let agent = Arc::clone(&agent);
+                        let name = name.clone();
+                        let cancellation_token = cancellation_token.clone();
+                        async move {
+                            runtime
+                                .execute_tool(
+                                    &agent,
+                                    agent_id,
+                                    turn_id,
+                                    &name,
+                                    arguments,
+                                    cancellation_token,
+                                )
+                                .await
+                        }
                     },
                 )
                 .await?;
-                let completed_wall_time = now();
-                let output_preview = trace_preview_output(&execution.output, 500);
-                turn::persistence::record_tool_trace_completed(
-                    self.deps.store.as_ref(),
-                    ToolTraceDetail {
-                        agent_id,
-                        session_id: Some(session_id),
-                        turn_id: Some(turn_id),
-                        call_id: call_id.clone(),
-                        tool_name: name.clone(),
-                        arguments: trace_arguments,
-                        output: execution.output.clone(),
-                        success: execution.success,
-                        duration_ms: Some(duration_ms),
-                        started_at: Some(started_wall_time),
-                        completed_at: Some(completed_wall_time),
-                        output_preview: output_preview.clone(),
-                        output_artifacts: execution.output_artifacts.clone(),
-                    },
-                    started_wall_time,
-                    completed_wall_time,
-                )
-                .await;
-                turn::persistence::record_agent_log(
-                    self.deps.store.as_ref(),
-                    agent_id,
-                    Some(session_id),
-                    Some(turn_id),
-                    if execution.success { "info" } else { "warn" },
-                    "tool",
-                    "tool completed",
-                    json!({
-                        "call_id": call_id.as_str(),
-                        "tool_name": name.as_str(),
-                        "success": execution.success,
-                        "duration_ms": duration_ms,
-                        "output_preview": output_preview.as_str(),
-                    }),
-                )
-                .await;
-                self.events
-                    .publish(ServiceEventKind::ToolCompleted {
-                        agent_id,
-                        session_id: Some(session_id),
-                        turn_id,
-                        call_id,
-                        tool_name: name,
-                        success: execution.success,
-                        output_preview,
-                        duration_ms: Some(duration_ms),
-                    })
-                    .await;
+                if execution.ends_turn {
+                    should_end_turn = true;
+                }
                 if cancellation_token.is_cancelled() {
                     return Err(RuntimeError::TurnCancelled);
                 }
@@ -3916,7 +3751,12 @@ impl AgentRuntime {
                     .unwrap_or(DEFAULT_EXEC_OUTPUT_BYTES_CAP)
                     .clamp(1, MAX_EXEC_OUTPUT_BYTES_CAP);
                 let container_id = self.container_id(agent_id).await?;
-                let capture = self.prepare_tool_output_capture(agent_id, &command).await?;
+                let capture = turn::tools::prepare_tool_output_capture(
+                    &self.artifact_files_root,
+                    agent_id,
+                    &command,
+                )
+                .await?;
                 let output = self
                     .deps
                     .docker
@@ -3933,14 +3773,13 @@ impl AgentRuntime {
                         &cancellation_token,
                     )
                     .await?;
-                let artifacts = self
-                    .tool_output_artifacts_from_capture(
-                        agent_id,
-                        &capture,
-                        output.stdout_bytes,
-                        output.stderr_bytes,
-                    )
-                    .await?;
+                let artifacts = turn::tools::tool_output_artifacts_from_capture(
+                    agent_id,
+                    &capture,
+                    output.stdout_bytes,
+                    output.stderr_bytes,
+                )
+                .await?;
                 Ok(ToolExecution::with_model_tokens(
                     output.output.status == 0,
                     serde_json::to_string(&json!({
@@ -5694,19 +5533,6 @@ impl AgentRuntime {
     fn artifact_file_dir(&self, task_id: TaskId, artifact_id: &str) -> PathBuf {
         self.artifact_files_root
             .join(task_id.to_string())
-            .join(artifact_id)
-    }
-
-    fn tool_output_artifact_dir(
-        &self,
-        agent_id: AgentId,
-        call_id: &str,
-        artifact_id: &str,
-    ) -> PathBuf {
-        self.artifact_files_root
-            .join("tool-output")
-            .join(agent_id.to_string())
-            .join(safe_path_component(call_id))
             .join(artifact_id)
     }
 
@@ -8849,31 +8675,6 @@ fn safe_artifact_name(raw: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
-fn tool_output_file_name(command: &str, stream: &str) -> String {
-    let command = command
-        .split_whitespace()
-        .next()
-        .map(safe_path_component)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "command".to_string());
-    format!("{command}-{stream}.txt")
-}
-
-fn safe_path_component(raw: &str) -> String {
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('.')
-        .trim_matches('_')
-        .to_string()
-}
-
 trait IfEmpty {
     fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str;
 }
@@ -9012,19 +8813,6 @@ fn parse_tool_arguments(raw_arguments: &str) -> Value {
     serde_json::from_str(raw_arguments).unwrap_or_else(|_| json!({ "raw": raw_arguments }))
 }
 
-fn trace_preview_value(value: &Value, max: usize) -> String {
-    let redacted = redacted_preview_value(value);
-    let serialized =
-        serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| redacted.to_string());
-    preview(&serialized, max)
-}
-
-fn trace_preview_output(output: &str, max: usize) -> String {
-    serde_json::from_str::<Value>(output)
-        .map(|value| trace_preview_value(&value, max))
-        .unwrap_or_else(|_| preview(&redact_preview_string(output), max))
-}
-
 fn bounded_model_tool_output_with_tokens(output: &str, max_output_tokens: usize) -> String {
     let max_bytes = max_output_tokens * TOKEN_ESTIMATE_BYTES;
     if output.len() <= max_bytes {
@@ -9108,70 +8896,6 @@ fn bounded_text(
     let text = value[..end].to_string();
     let omitted = value.len().saturating_sub(end);
     (text, true, omitted, Some(offset.saturating_add(end)))
-}
-
-fn inline_event_arguments(value: &Value) -> Option<Value> {
-    let redacted = redacted_preview_value(value);
-    let serialized = serde_json::to_string(&redacted).ok()?;
-    (serialized.len() <= 2_000).then_some(redacted)
-}
-
-fn redacted_preview_value(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            for (key, value) in map {
-                if is_sensitive_key(key) {
-                    out.insert(key.clone(), Value::String("<redacted>".to_string()));
-                } else {
-                    out.insert(key.clone(), redacted_preview_value(value));
-                }
-            }
-            Value::Object(out)
-        }
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .take(20)
-                .map(redacted_preview_value)
-                .chain(
-                    (items.len() > 20)
-                        .then(|| Value::String(format!("<{} more items>", items.len() - 20))),
-                )
-                .collect(),
-        ),
-        Value::String(value) => Value::String(redact_preview_string(value)),
-        _ => value.clone(),
-    }
-}
-
-fn redact_preview_string(value: &str) -> String {
-    if value.len() > 240 && looks_like_base64(value) {
-        return format!("<base64 elided: {} chars>", value.len());
-    }
-    if value.len() > 800 {
-        return format!("{}...", value.chars().take(800).collect::<String>());
-    }
-    value.to_string()
-}
-
-fn is_sensitive_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    key.contains("token")
-        || key.contains("secret")
-        || key.contains("password")
-        || key.contains("authorization")
-        || key.contains("api_key")
-        || key.ends_with("_key")
-        || key.contains("base64")
-}
-
-fn looks_like_base64(value: &str) -> bool {
-    let trimmed = value.trim();
-    trimmed.len() > 240
-        && trimmed.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'\n' | b'\r')
-        })
 }
 
 fn u128_to_u64(value: u128) -> u64 {
@@ -16678,7 +16402,7 @@ esac
             "content_base64": "a".repeat(320),
         });
 
-        let preview = trace_preview_value(&value, 1_000);
+        let preview = turn::tools::trace_preview_value(&value, 1_000);
 
         assert!(preview.contains("echo ok"));
         assert!(preview.contains("<redacted>"));
