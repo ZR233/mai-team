@@ -9,9 +9,10 @@ pub(crate) async fn process_event(
     client: &RelayClient,
     event: &RelayEvent,
 ) -> Result<RelayAckStatus, RuntimeError> {
-    let runtime = client.runtime.lock().await.clone().ok_or_else(|| {
-        RuntimeError::InvalidInput("relay runtime is not attached".to_string())
-    })?;
+    let runtime =
+        client.runtime.lock().await.clone().ok_or_else(|| {
+            RuntimeError::InvalidInput("relay runtime is not attached".to_string())
+        })?;
     let event_name = event.kind.as_github_event().to_string();
     let action = event
         .payload
@@ -115,9 +116,10 @@ async fn queue_review(
     pr: u64,
     reason: &str,
 ) -> Result<(), RuntimeError> {
-    let runtime = client.runtime.lock().await.clone().ok_or_else(|| {
-        RuntimeError::InvalidInput("relay runtime is not attached".to_string())
-    })?;
+    let runtime =
+        client.runtime.lock().await.clone().ok_or_else(|| {
+            RuntimeError::InvalidInput("relay runtime is not attached".to_string())
+        })?;
     runtime
         .publish_external_event(ServiceEventKind::ProjectReviewQueued {
             project_id,

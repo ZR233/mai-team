@@ -1,19 +1,19 @@
 use std::sync::Arc;
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::Response;
-use axum::Json;
 use serde::Deserialize;
 
+use super::helpers::content_disposition_filename;
+use super::state::{ApiError, AppState};
 use mai_protocol::{
-    AgentId, ArtifactInfo, ApproveTaskPlanResponse, CreateTaskRequest, CreateTaskResponse,
+    AgentId, ApproveTaskPlanResponse, ArtifactInfo, CreateTaskRequest, CreateTaskResponse,
     RequestPlanRevisionRequest, RequestPlanRevisionResponse, SendMessageRequest,
     SendMessageResponse, TaskId,
 };
-use super::helpers::content_disposition_filename;
-use super::state::{ApiError, AppState};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TaskDetailQuery {

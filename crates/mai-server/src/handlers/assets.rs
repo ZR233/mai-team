@@ -2,10 +2,10 @@ use std::io;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::Mutex as StdMutex;
 
+use axum::Json;
 use axum::body::Body;
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use rust_embed::RustEmbed;
 use serde_json::json;
 
@@ -133,7 +133,10 @@ pub(crate) fn safe_system_resource_target(path: &std::path::Path) -> bool {
     )
 }
 
-pub(crate) fn embedded_system_resource_relative_path(path: &str, out_dir_name: &str) -> Option<PathBuf> {
+pub(crate) fn embedded_system_resource_relative_path(
+    path: &str,
+    out_dir_name: &str,
+) -> Option<PathBuf> {
     let path = FsPath::new(path);
     let relative = if path.is_absolute() {
         path.strip_prefix(FsPath::new(env!("OUT_DIR")).join(out_dir_name))

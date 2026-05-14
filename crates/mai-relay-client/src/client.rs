@@ -7,11 +7,10 @@ use mai_protocol::{
     GithubAppInstallationStartResponse, GithubAppManifestStartRequest,
     GithubAppManifestStartResponse, GithubAppSettingsResponse, GithubInstallationsResponse,
     GithubRepositoriesResponse, GithubRepositorySummary, RelayAck, RelayAckStatus,
-    RelayClientHello, RelayEnvelope, RelayEvent,
-    RelayGithubInstallationTokenRequest, RelayGithubInstallationTokenResponse,
-    RelayGithubRepositoriesRequest, RelayGithubRepositoryGetRequest,
-    RelayGithubRepositoryPackagesRequest, RelayRequest, RelayResponse, RelayStatusResponse,
-    RepositoryPackagesResponse,
+    RelayClientHello, RelayEnvelope, RelayEvent, RelayGithubInstallationTokenRequest,
+    RelayGithubInstallationTokenResponse, RelayGithubRepositoriesRequest,
+    RelayGithubRepositoryGetRequest, RelayGithubRepositoryPackagesRequest, RelayRequest,
+    RelayResponse, RelayStatusResponse, RepositoryPackagesResponse,
 };
 use mai_runtime::{AgentRuntime, RuntimeError};
 use serde::{Serialize, de::DeserializeOwned};

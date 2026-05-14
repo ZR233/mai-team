@@ -4,7 +4,7 @@ use mai_protocol::{
     RelayGithubInstallationTokenResponse,
 };
 use mai_runtime::github::GithubAppBackend;
-use mai_runtime::{RuntimeError, Result};
+use mai_runtime::{Result, RuntimeError};
 
 use crate::client::RelayClient;
 

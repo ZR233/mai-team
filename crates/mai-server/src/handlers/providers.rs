@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use futures::StreamExt;
 use mai_model::{
     ModelClient, ModelError, ModelStreamAccumulator, ModelTurnState, ResolvedProvider,
@@ -278,7 +278,10 @@ pub(crate) fn provider_config(base_url: &str, api_key: Option<&str>) -> Provider
 
 #[cfg(test)]
 pub(crate) fn provider_test_model(id: &str) -> ModelConfig {
-    use mai_protocol::{ModelCapabilities, ModelReasoningConfig, ModelReasoningVariant, ModelRequestPolicy, ModelWireApi};
+    use mai_protocol::{
+        ModelCapabilities, ModelReasoningConfig, ModelReasoningVariant, ModelRequestPolicy,
+        ModelWireApi,
+    };
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
 

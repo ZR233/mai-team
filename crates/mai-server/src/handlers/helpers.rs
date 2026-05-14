@@ -53,7 +53,10 @@ pub(crate) fn relay_config_from_env() -> Option<RelayClientConfig> {
     })
 }
 
-pub(crate) fn relay_url_from_env_values(public_url: Option<&str>, legacy_url: Option<&str>) -> String {
+pub(crate) fn relay_url_from_env_values(
+    public_url: Option<&str>,
+    legacy_url: Option<&str>,
+) -> String {
     public_url
         .or(legacy_url)
         .map(str::trim)
@@ -63,7 +66,12 @@ pub(crate) fn relay_url_from_env_values(public_url: Option<&str>, legacy_url: Op
         .to_string()
 }
 
-pub(crate) fn github_callback_page(success: bool, title: &str, message: &str, next: &str) -> Response {
+pub(crate) fn github_callback_page(
+    success: bool,
+    title: &str,
+    message: &str,
+    next: &str,
+) -> Response {
     let status = if success {
         StatusCode::OK
     } else {

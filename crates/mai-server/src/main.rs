@@ -6,9 +6,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use axum::Router;
 use axum::routing::{get, post};
 use clap::Parser;
-use axum::Router;
 use mai_docker::DockerClient;
 use mai_model::ModelClient;
 use mai_runtime::RuntimeConfig;
@@ -134,7 +134,8 @@ async fn main() -> Result<()> {
         )
         .route(
             "/git/accounts",
-            get(handlers::git_accounts::list_git_accounts).post(handlers::git_accounts::save_git_account),
+            get(handlers::git_accounts::list_git_accounts)
+                .post(handlers::git_accounts::save_git_account),
         )
         .route(
             "/git/accounts/default",
@@ -163,11 +164,13 @@ async fn main() -> Result<()> {
         )
         .route(
             "/settings/github",
-            get(handlers::github_app::get_github_settings).put(handlers::github_app::save_github_settings),
+            get(handlers::github_app::get_github_settings)
+                .put(handlers::github_app::save_github_settings),
         )
         .route(
             "/settings/github-app",
-            get(handlers::github_app::get_github_app_settings).put(handlers::github_app::save_github_app_settings),
+            get(handlers::github_app::get_github_app_settings)
+                .put(handlers::github_app::save_github_app_settings),
         )
         .route(
             "/github/app-manifest/start",
@@ -211,7 +214,10 @@ async fn main() -> Result<()> {
             "/skills/config",
             axum::routing::put(handlers::config::save_skills_config),
         )
-        .route("/agent-profiles", get(handlers::config::list_agent_profiles))
+        .route(
+            "/agent-profiles",
+            get(handlers::config::list_agent_profiles),
+        )
         .route(
             "/agent-profiles:reload",
             post(handlers::config::list_agent_profiles),
@@ -336,10 +342,7 @@ async fn main() -> Result<()> {
             "/artifacts/{id}/download",
             get(handlers::tasks::download_artifact),
         )
-        .route(
-            "/agents/{id}/cancel",
-            post(handlers::agents::cancel_agent),
-        )
+        .route("/agents/{id}/cancel", post(handlers::agents::cancel_agent))
         .fallback(get(handlers::assets::static_fallback))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -356,22 +359,21 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use handlers::assets::{
-        release_embedded_system_skills, release_embedded_system_agents,
-        safe_system_resource_target,
-    };
-    use handlers::helpers::{
-        data_dir_path_with, cache_dir_path, artifact_files_root, artifact_index_root,
-        relay_url_from_env_values,
-    };
-    use handlers::assets::{
-        embedded_system_skill_relative_path, embedded_system_agent_relative_path,
+        embedded_system_agent_relative_path, embedded_system_skill_relative_path,
         safe_embedded_relative_path,
     };
-    use handlers::providers::{run_provider_test, provider_test_store, provider_config};
+    use handlers::assets::{
+        release_embedded_system_agents, release_embedded_system_skills, safe_system_resource_target,
+    };
     use handlers::events::event_name;
+    use handlers::helpers::{
+        artifact_files_root, artifact_index_root, cache_dir_path, data_dir_path_with,
+        relay_url_from_env_values,
+    };
+    use handlers::providers::{provider_config, provider_test_store, run_provider_test};
     use mai_protocol::{
-        AgentId, ServiceEvent, ServiceEventKind, SessionId, SkillActivationInfo, SkillScope, TurnId,
-        ProviderKind, ProviderTestRequest,
+        AgentId, ProviderKind, ProviderTestRequest, ServiceEvent, ServiceEventKind, SessionId,
+        SkillActivationInfo, SkillScope, TurnId,
     };
     use serde_json::{Value, json};
     use std::collections::VecDeque;

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use mai_protocol::*;
 
 use super::state::{ApiError, AppState};
