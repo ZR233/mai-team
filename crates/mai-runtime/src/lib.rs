@@ -42,8 +42,7 @@ use deps::RuntimeDeps;
 use events::{RECENT_EVENT_LIMIT, RuntimeEvents};
 use github::{
     DEFAULT_GITHUB_API_BASE_URL, DirectGithubAppBackend, GITHUB_HTTP_TIMEOUT_SECS,
-    GithubAppBackend, GithubErrorResponse, github_api_url, github_clone_url, github_headers,
-    normalize_github_api_get_path,
+    GithubAppBackend, github_clone_url,
 };
 use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
 #[cfg(test)]
@@ -2238,42 +2237,13 @@ impl AgentRuntime {
         agent: &AgentRecord,
         path: &str,
     ) -> Result<ToolExecution> {
-        let Some(token) = self.project_git_token_for_agent(agent).await? else {
-            return Err(RuntimeError::InvalidInput(
-                "agent is not attached to a project".to_string(),
-            ));
-        };
-        let path = normalize_github_api_get_path(path)?;
-        let url = github_api_url(&self.github_api_base_url, &path);
-        let response = self
-            .deps
-            .github_http
-            .get(url)
-            .bearer_auth(&token)
-            .headers(github_headers())
-            .send()
-            .await?;
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        let output = if status.is_success() {
-            serde_json::from_str::<Value>(&text)
-                .unwrap_or_else(|_| json!({ "status": status.as_u16(), "body": text }))
-        } else {
-            let message = serde_json::from_str::<GithubErrorResponse>(&text)
-                .ok()
-                .and_then(|error| error.message)
-                .filter(|message| !message.trim().is_empty())
-                .unwrap_or_else(|| preview(&text, 300));
-            json!({
-                "status": status.as_u16(),
-                "error": redact_secret(&message, &token),
-            })
-        };
-        Ok(ToolExecution::new(
-            status.is_success(),
-            redact_secret(&output.to_string(), &token),
-            false,
-        ))
+        github::execute_project_github_api_get(
+            &self.deps.github_http,
+            &self.github_api_base_url,
+            self.project_git_token_for_agent(agent).await?,
+            path,
+        )
+        .await
     }
 
     async fn clone_project_repository(

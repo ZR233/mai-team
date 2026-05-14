@@ -4,11 +4,15 @@ use mai_protocol::{
     GitAccountRequest, GitAccountResponse, GitAccountSummary, GitAccountsResponse,
     GithubAppManifestStartRequest, GithubAppManifestStartResponse, GithubAppSettingsRequest,
     GithubAppSettingsResponse, GithubInstallationsResponse, GithubRepositoriesResponse,
-    RepositoryPackagesResponse,
+    RepositoryPackagesResponse, preview,
 };
+use serde_json::{Value, json};
 
-use super::{GitAccountService, GithubAppBackend, repository_packages_with_token};
-use crate::Result;
+use super::{
+    GitAccountService, GithubAppBackend, GithubErrorResponse, github_api_url, github_headers,
+    normalize_github_api_get_path, repository_packages_with_token,
+};
+use crate::{Result, RuntimeError, turn::tools::ToolExecution};
 
 pub(crate) async fn list_git_accounts(
     git_accounts: &GitAccountService,
@@ -102,7 +106,9 @@ pub(crate) async fn complete_github_app_manifest(
     code: &str,
     state: &str,
 ) -> Result<GithubAppSettingsResponse> {
-    github_backend.complete_github_app_manifest(code, state).await
+    github_backend
+        .complete_github_app_manifest(code, state)
+        .await
 }
 
 pub(crate) async fn list_github_installations(
@@ -121,5 +127,56 @@ pub(crate) async fn list_github_repositories(
     github_backend: &dyn GithubAppBackend,
     installation_id: u64,
 ) -> Result<GithubRepositoriesResponse> {
-    github_backend.list_github_repositories(installation_id).await
+    github_backend
+        .list_github_repositories(installation_id)
+        .await
+}
+
+pub(crate) async fn execute_project_github_api_get(
+    github_http: &reqwest::Client,
+    github_api_base_url: &str,
+    token: Option<String>,
+    path: &str,
+) -> Result<ToolExecution> {
+    let Some(token) = token else {
+        return Err(RuntimeError::InvalidInput(
+            "agent is not attached to a project".to_string(),
+        ));
+    };
+    let path = normalize_github_api_get_path(path)?;
+    let url = github_api_url(github_api_base_url, &path);
+    let response = github_http
+        .get(url)
+        .bearer_auth(&token)
+        .headers(github_headers())
+        .send()
+        .await?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    let output = if status.is_success() {
+        serde_json::from_str::<Value>(&text)
+            .unwrap_or_else(|_| json!({ "status": status.as_u16(), "body": text }))
+    } else {
+        let message = serde_json::from_str::<GithubErrorResponse>(&text)
+            .ok()
+            .and_then(|error| error.message)
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| preview(&text, 300));
+        json!({
+            "status": status.as_u16(),
+            "error": redact_secret(&message, &token),
+        })
+    };
+    Ok(ToolExecution::new(
+        status.is_success(),
+        redact_secret(&output.to_string(), &token),
+        false,
+    ))
+}
+
+fn redact_secret(value: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return value.to_string();
+    }
+    value.replace(secret, "<redacted>")
 }
