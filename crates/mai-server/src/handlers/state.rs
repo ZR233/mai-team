@@ -62,8 +62,6 @@ impl From<mai_store::StoreError> for ApiError {
     }
 }
 
-
-
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         if self.status.is_server_error() {

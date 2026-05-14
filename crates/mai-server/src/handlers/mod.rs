@@ -1,5 +1,4 @@
 pub(crate) mod agents;
-pub(crate) mod assets;
 pub(crate) mod config;
 pub(crate) mod events;
 pub(crate) mod git_accounts;
