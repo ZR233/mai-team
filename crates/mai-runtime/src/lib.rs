@@ -6,41 +6,21 @@ use futures::future::{AbortHandle, Abortable};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use mai_agents::AgentProfilesManager;
 use mai_docker::{
-    ContainerCreateOptions, ContainerHandle, DockerClient, ExecCaptureOptions,
-    project_review_workspace_volume, project_workspace_volume,
+    ContainerCreateOptions, ContainerHandle, DockerClient, project_review_workspace_volume,
+    project_workspace_volume,
 };
 use mai_mcp::McpAgentManager;
 #[cfg(test)]
 use mai_mcp::McpTool;
 use mai_model::{ModelClient, ModelTurnState};
-use mai_protocol::{
-    AgentConfigRequest, AgentConfigResponse, AgentDetail, AgentId, AgentLogsResponse, AgentMessage,
-    AgentModelPreference, AgentProfilesResponse, AgentRole, AgentSessionSummary, AgentStatus,
-    AgentSummary, ArtifactInfo, ContextUsage, CreateAgentRequest, CreateProjectRequest,
-    GitAccountRequest, GitAccountResponse, GitAccountStatus, GitAccountSummary,
-    GitAccountsResponse, GitTokenKind, GithubAppManifestAccountType, GithubAppManifestStartRequest,
-    GithubAppManifestStartResponse, GithubAppSettingsRequest, GithubAppSettingsResponse,
-    GithubInstallationSummary, GithubInstallationsResponse, GithubRepositoriesResponse,
-    GithubRepositorySummary, McpServerConfig, McpServerScope, McpServerTransport, MessageRole,
-    ModelConfig, ModelInputItem, ModelOutputItem, PlanHistoryEntry, PlanStatus, ProjectCloneStatus,
-    ProjectDetail, ProjectId, ProjectReviewOutcome, ProjectReviewRunDetail, ProjectReviewRunStatus,
-    ProjectReviewRunSummary, ProjectReviewRunsResponse, ProjectReviewStatus, ProjectStatus,
-    ProjectSummary, RelayGithubInstallationTokenResponse, RepositoryPackageSummary,
-    RepositoryPackagesResponse, ResolvedAgentModelPreference, RuntimeDefaultsResponse,
-    SendMessageRequest, ServiceEvent, ServiceEventKind, SessionId, SkillScope, SkillsConfigRequest,
-    SkillsListResponse, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary,
-    TodoItem, TokenUsage, ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceListResponse, TurnId,
-    TurnStatus, UpdateAgentRequest, UpdateProjectRequest, UserInputOption, UserInputQuestion, now,
-    preview,
-};
+use mai_protocol::*;
 #[cfg(test)]
-use mai_protocol::{ModelContentItem, ModelToolCall};
-use mai_skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
+use mai_protocol::{MessageRole, ModelContentItem, ModelToolCall};
+use mai_skills::{SkillInjections, SkillsManager};
 use mai_store::{AgentLogFilter, ConfigStore, ProviderSelection, ToolTraceFilter};
-use mai_tools::{RoutedTool, build_tool_definitions_with_filter, route_tool};
-use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use mai_tools::build_tool_definitions_with_filter;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -55,44 +35,54 @@ use tokio::time::{Duration, Instant, sleep};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+mod agents;
 mod deps;
 mod events;
+mod github;
 mod instructions;
+mod projects;
 mod state;
 mod tools;
 mod turn;
 
 use deps::RuntimeDeps;
 use events::{RECENT_EVENT_LIMIT, RuntimeEvents};
+use github::{
+    GithubAccessTokenResponse, GithubErrorResponse, GithubInstallationApi, GithubJwtClaims,
+    GithubManifestConversionResponse, GithubManifestState, GithubPackageApi,
+    GithubPackageVersionApi, GithubRepositoriesApi, GithubRepositoryApi, GithubUserApi,
+    decode_github_response, dedupe_github_packages, git_token_kind, github_access_token_request,
+    github_api_url, github_app_manifest, github_app_manifest_urls, github_clone_url,
+    github_headers, github_installation_summary, github_installation_token_cache_key,
+    github_manifest_owner_login, github_manifest_owner_type, github_package_belongs_to_repo,
+    github_packages_read_error, github_path_segment, github_repository_summary, github_scopes,
+    is_valid_github_manifest_code, is_valid_github_slug, normalize_github_api_get_path,
+    repository_package_summary, sanitize_origin,
+};
+#[cfg(test)]
+use github::{
+    GithubPackageContainerMetadataApi, GithubPackageRepositoryApi, GithubPackageVersionMetadataApi,
+};
 use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
+use projects::mcp::PROJECT_WORKSPACE_PATH;
+#[cfg(test)]
+use projects::skills::PROJECT_SKILLS_CACHE_DIR;
+use projects::skills::{ProjectSkillRefreshSource, ProjectSkillSourceDir};
 use state::{
-    AgentRecord, AgentSessionRecord, CollabInput, ProjectRecord, ProjectReviewWorker,
-    QueuedAgentInput, RuntimeState, TaskRecord, TurnControl, TurnGuard,
+    AgentRecord, AgentSessionRecord, ProjectRecord, ProjectReviewWorker, QueuedAgentInput,
+    RuntimeState, TaskRecord, TurnControl, TurnGuard,
 };
 use turn::completion::TurnResult;
-use turn::model_stream::TurnModelContext;
 use turn::tools::ToolExecution;
 
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 90;
-const DEFAULT_MODEL_TOOL_OUTPUT_TOKENS: usize = turn::tools::DEFAULT_MODEL_TOOL_OUTPUT_TOKENS;
-const DEFAULT_EXEC_OUTPUT_BYTES_CAP: usize = 1024 * 1024;
-const MAX_EXEC_OUTPUT_BYTES_CAP: usize = 16 * 1024 * 1024;
-const MAX_MODEL_TOOL_OUTPUT_TOKENS: usize = 100_000;
 const REVIEW_ROUND_LIMIT: u64 = 5;
-const PROJECT_WORKSPACE_PATH: &str = "/workspace/repo";
-const PROJECT_SKILLS_CACHE_DIR: &str = "project-skills";
-const PROJECT_SKILL_CANDIDATE_DIRS: [(&str, &str); 3] = [
-    (".claude/skills", "claude"),
-    (".agents/skills", "agents"),
-    ("skills", "skills"),
-];
 const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const DEFAULT_GITHUB_WEB_BASE_URL: &str = "https://github.com";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 const GITHUB_TOKEN_REFRESH_SKEW_SECS: i64 = 120;
 const GITHUB_MANIFEST_STATE_TTL_SECS: u64 = 900;
 const GITHUB_HTTP_TIMEOUT_SECS: u64 = 10;
-const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;
 const PROJECT_REVIEW_FAILURE_RETRY_SECS: u64 = 600;
 const PROJECT_REVIEW_HISTORY_RETENTION_DAYS: i64 = 5;
 const PROJECT_REVIEW_CLEANUP_INTERVAL_SECS: u64 = 3600;
@@ -101,11 +91,6 @@ const PROJECT_REVIEW_SNAPSHOT_MESSAGE_LIMIT: usize = 40;
 const PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT: usize = 80;
 const PROJECT_REVIEW_REPO_COMMAND_MAX_ATTEMPTS: usize = 3;
 const PROJECT_REVIEW_REPO_COMMAND_RETRY_SECS: u64 = 5;
-const PROJECT_REVIEW_GIT_LOW_SPEED_LIMIT: u64 = 1;
-const PROJECT_REVIEW_GIT_LOW_SPEED_TIME_SECS: u64 = 300;
-const DEFAULT_WAIT_AGENT_OBSERVATION_SECS: u64 = 30;
-const PROJECT_GITHUB_MCP_SERVER: &str = "github";
-const PROJECT_GIT_MCP_SERVER: &str = "git";
 const SKILL_RESOURCE_SERVER: &str = "skill";
 const PROJECT_SKILL_RESOURCE_SERVER: &str = "project-skill";
 const SKILL_RESOURCE_SCHEME: &str = "skill:///";
@@ -250,11 +235,6 @@ pub trait GithubAppBackend: Send + Sync {
     ) -> Result<RelayGithubInstallationTokenResponse>;
 }
 
-enum ProjectSkillRefreshSource {
-    ProjectSidecar,
-    ReviewWorkspace,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct ProjectReviewCycleReport {
     outcome: ProjectReviewOutcome,
@@ -267,19 +247,19 @@ struct ProjectReviewCycleReport {
 }
 
 #[derive(Debug, Clone)]
-struct ProjectReviewCycleResult {
-    outcome: ProjectReviewOutcome,
-    pr: Option<u64>,
-    summary: Option<String>,
-    error: Option<String>,
+pub(crate) struct ProjectReviewCycleResult {
+    pub(crate) outcome: ProjectReviewOutcome,
+    pub(crate) pr: Option<u64>,
+    pub(crate) summary: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
-struct ProjectReviewLoopDecision {
-    delay: Duration,
-    status: ProjectReviewStatus,
-    outcome: Option<ProjectReviewOutcome>,
-    summary: Option<String>,
-    error: Option<String>,
+pub(crate) struct ProjectReviewLoopDecision {
+    pub(crate) delay: Duration,
+    pub(crate) status: ProjectReviewStatus,
+    pub(crate) outcome: Option<ProjectReviewOutcome>,
+    pub(crate) summary: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -305,13 +285,6 @@ enum ReviewRepoCommand {
 struct CachedGithubToken {
     token: String,
     expires_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone)]
-struct GithubManifestState {
-    created_at: Instant,
-    account_type: GithubAppManifestAccountType,
-    org: Option<String>,
 }
 
 struct DirectGithubAppBackend {
@@ -424,18 +397,8 @@ impl GithubAppBackend for DirectGithubAppBackend {
             GithubAppManifestAccountType::Personal => None,
         };
         let state = Uuid::new_v4().to_string();
-        let redirect_url = format!("{origin}/github/app-manifest/callback");
-        let setup_url = format!("{origin}/github/app-installation/callback");
-        let webhook_url = format!("{origin}/github/webhook-disabled");
-        let manifest = github_app_manifest(&redirect_url, &setup_url, &webhook_url);
-        let action_url = match (&request.account_type, &org) {
-            (GithubAppManifestAccountType::Organization, Some(org)) => {
-                format!(
-                    "{DEFAULT_GITHUB_WEB_BASE_URL}/organizations/{org}/settings/apps/new?state={state}"
-                )
-            }
-            _ => format!("{DEFAULT_GITHUB_WEB_BASE_URL}/settings/apps/new?state={state}"),
-        };
+        let urls = github_app_manifest_urls(&origin, &request.account_type, org.as_deref(), &state);
+        let manifest = github_app_manifest(&urls.redirect_url, &urls.setup_url, &urls.webhook_url);
 
         self.prune_github_manifest_states().await;
         self.github_manifest_states.lock().await.insert(
@@ -448,7 +411,7 @@ impl GithubAppBackend for DirectGithubAppBackend {
         );
         Ok(GithubAppManifestStartResponse {
             state,
-            action_url,
+            action_url: urls.action_url,
             manifest,
         })
     }
@@ -476,23 +439,8 @@ impl GithubAppBackend for DirectGithubAppBackend {
             .await?;
         let conversion: GithubManifestConversionResponse =
             decode_github_response(response, "create app from manifest").await?;
-        let owner_login = conversion
-            .owner
-            .as_ref()
-            .map(|owner| owner.login.clone())
-            .or_else(|| {
-                state_record.org.clone().filter(|_| {
-                    state_record.account_type == GithubAppManifestAccountType::Organization
-                })
-            });
-        let owner_type = conversion
-            .owner
-            .as_ref()
-            .map(|owner| owner.account_type.clone())
-            .or_else(|| match state_record.account_type {
-                GithubAppManifestAccountType::Organization => Some("Organization".to_string()),
-                GithubAppManifestAccountType::Personal => Some("User".to_string()),
-            });
+        let owner_login = github_manifest_owner_login(&conversion, &state_record);
+        let owner_type = github_manifest_owner_type(&conversion, &state_record);
         self.save_github_app_settings(GithubAppSettingsRequest {
             app_id: Some(conversion.id.to_string()),
             private_key: Some(conversion.pem),
@@ -520,12 +468,7 @@ impl GithubAppBackend for DirectGithubAppBackend {
         Ok(GithubInstallationsResponse {
             installations: installations
                 .into_iter()
-                .map(|installation| GithubInstallationSummary {
-                    id: installation.id,
-                    account_login: installation.account.login,
-                    account_type: installation.account.account_type,
-                    repository_selection: installation.repository_selection,
-                })
+                .map(github_installation_summary)
                 .collect(),
         })
     }
@@ -599,17 +542,8 @@ impl GithubAppBackend for DirectGithubAppBackend {
         repository_id: Option<u64>,
         include_packages: bool,
     ) -> Result<RelayGithubInstallationTokenResponse> {
-        let cache_key = format!(
-            "{installation_id}:{}:{}",
-            if include_packages {
-                "packages"
-            } else {
-                "default"
-            },
-            repository_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "all".to_string())
-        );
+        let cache_key =
+            github_installation_token_cache_key(installation_id, repository_id, include_packages);
         {
             let tokens = self.github_tokens.lock().await;
             if let Some(cached) = tokens.get(&cache_key)
@@ -628,15 +562,7 @@ impl GithubAppBackend for DirectGithubAppBackend {
             &base_url,
             &format!("/app/installations/{installation_id}/access_tokens"),
         );
-        let body = GithubAccessTokenRequest {
-            repository_ids: repository_id.map(|id| vec![id]),
-            permissions: GithubAccessTokenPermissions {
-                contents: "write",
-                pull_requests: "write",
-                issues: "write",
-                packages: include_packages.then_some("read"),
-            },
-        };
+        let body = github_access_token_request(repository_id, include_packages);
         let response = self
             .github_http
             .post(url)
@@ -666,92 +592,11 @@ struct ResolvedAgentModel {
     effective: ResolvedAgentModelPreference,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProjectSkillSourceDir {
-    relative: PathBuf,
-    cache_name: String,
-    container_path: String,
-}
-
 struct AgentResourceBroker {
     agent_mcp: Option<Arc<McpAgentManager>>,
     project_mcp: Option<Arc<McpAgentManager>>,
     skills: SkillsListResponse,
     _project_skill_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
-}
-
-#[derive(Debug, Serialize)]
-struct GithubJwtClaims {
-    iat: usize,
-    exp: usize,
-    iss: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubAccountApi {
-    login: String,
-    #[serde(rename = "type")]
-    account_type: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubUserApi {
-    login: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubInstallationApi {
-    id: u64,
-    account: GithubAccountApi,
-    repository_selection: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubRepositoriesApi {
-    repositories: Vec<GithubRepositoryApi>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubRepositoryApi {
-    id: u64,
-    name: String,
-    full_name: String,
-    private: bool,
-    clone_url: String,
-    html_url: String,
-    default_branch: Option<String>,
-    owner: GithubAccountApi,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubPackageApi {
-    name: String,
-    html_url: String,
-    #[serde(default)]
-    repository: Option<GithubPackageRepositoryApi>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubPackageRepositoryApi {
-    full_name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubPackageVersionApi {
-    #[serde(default)]
-    metadata: GithubPackageVersionMetadataApi,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct GithubPackageVersionMetadataApi {
-    #[serde(default)]
-    container: GithubPackageContainerMetadataApi,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct GithubPackageContainerMetadataApi {
-    #[serde(default)]
-    tags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -761,43 +606,6 @@ struct VerifiedGithubRepository {
     name: String,
     full_name: String,
     default_branch: String,
-}
-
-#[derive(Debug, Serialize)]
-struct GithubAccessTokenRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    repository_ids: Option<Vec<u64>>,
-    permissions: GithubAccessTokenPermissions,
-}
-
-#[derive(Debug, Serialize)]
-struct GithubAccessTokenPermissions {
-    contents: &'static str,
-    pull_requests: &'static str,
-    issues: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    packages: Option<&'static str>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubAccessTokenResponse {
-    token: String,
-    expires_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubManifestConversionResponse {
-    id: u64,
-    slug: String,
-    html_url: String,
-    pem: String,
-    #[serde(default)]
-    owner: Option<GithubAccountApi>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubErrorResponse {
-    message: Option<String>,
 }
 
 impl AgentRuntime {
@@ -846,7 +654,7 @@ impl AgentRuntime {
                 });
             }
             if sessions.is_empty() {
-                sessions.push(default_session_record());
+                sessions.push(agents::default_session_record());
             }
             let agent = Arc::new(AgentRecord {
                 summary: RwLock::new(summary.clone()),
@@ -1486,7 +1294,9 @@ impl AgentRuntime {
                     reasoning_effort: planner_model.preference.reasoning_effort,
                     docker_image,
                     parent_id: None,
-                    system_prompt: Some(task_role_system_prompt(AgentRole::Planner).to_string()),
+                    system_prompt: Some(
+                        agents::task_role_system_prompt(AgentRole::Planner).to_string(),
+                    ),
                 },
                 ContainerSource::FreshImage,
                 Some(task_id),
@@ -2127,8 +1937,10 @@ impl AgentRuntime {
                 .run_project_review_once(project_id, cancellation_token, Some(pr))
                 .await;
             let decision = match result {
-                Ok(result) => project_review_loop_decision_for_result(result),
-                Err(err) => project_review_loop_decision_for_error(err.to_string()),
+                Ok(result) => projects::review::project_review_loop_decision_for_result(result),
+                Err(err) => {
+                    projects::review::project_review_loop_decision_for_error(err.to_string())
+                }
             };
             let next_review_at = (decision.delay.as_secs() > 0)
                 .then(|| Utc::now() + TimeDelta::seconds(decision.delay.as_secs() as i64));
@@ -2404,11 +2216,7 @@ impl AgentRuntime {
             .store
             .save_agent(&summary, system_prompt.as_deref())
             .await?;
-        let session = if task_id.is_some() {
-            session_record_with_title("Task")
-        } else {
-            default_session_record()
-        };
+        let session = agents::initial_session_record(task_id.is_some());
         self.deps
             .store
             .save_agent_session(id, &session.summary)
@@ -2530,12 +2338,13 @@ impl AgentRuntime {
         let summary = agent.summary.read().await.clone();
         let (sessions, selected_session_id, context_tokens_used, messages) = {
             let sessions = agent.sessions.lock().await;
-            let selected_session = selected_session(&sessions, session_id).ok_or_else(|| {
-                RuntimeError::SessionNotFound {
-                    agent_id,
-                    session_id: session_id.unwrap_or_default(),
-                }
-            })?;
+            let selected_session =
+                agents::selected_session(&sessions, session_id).ok_or_else(|| {
+                    RuntimeError::SessionNotFound {
+                        agent_id,
+                        session_id: session_id.unwrap_or_default(),
+                    }
+                })?;
             (
                 sessions
                     .iter()
@@ -2577,19 +2386,7 @@ impl AgentRuntime {
         }
         let session = {
             let mut sessions = agent.sessions.lock().await;
-            let session = AgentSessionRecord {
-                summary: AgentSessionSummary {
-                    id: Uuid::new_v4(),
-                    title: format!("Chat {}", sessions.len() + 1),
-                    created_at: now(),
-                    updated_at: now(),
-                    message_count: 0,
-                },
-                messages: Vec::new(),
-                history: Vec::new(),
-                last_context_tokens: None,
-                last_turn_response: None,
-            };
+            let session = agents::next_chat_session_record(sessions.len());
             sessions.push(session.clone());
             session.summary
         };
@@ -2617,12 +2414,13 @@ impl AgentRuntime {
         let agent = self.agent(agent_id).await?;
         let (session_id, history) = {
             let sessions = agent.sessions.lock().await;
-            let selected_session = selected_session(&sessions, session_id).ok_or_else(|| {
-                RuntimeError::SessionNotFound {
-                    agent_id,
-                    session_id: session_id.unwrap_or_default(),
-                }
-            })?;
+            let selected_session =
+                agents::selected_session(&sessions, session_id).ok_or_else(|| {
+                    RuntimeError::SessionNotFound {
+                        agent_id,
+                        session_id: session_id.unwrap_or_default(),
+                    }
+                })?;
             (
                 selected_session.summary.id,
                 selected_session.history.clone(),
@@ -3054,7 +2852,9 @@ impl AgentRuntime {
             return Err(RuntimeError::AgentNotFound(root_id));
         }
 
-        Ok(descendant_delete_order_from_summaries(root_id, &summaries))
+        Ok(agents::descendant_delete_order_from_summaries(
+            root_id, &summaries,
+        ))
     }
 
     pub async fn upload_file(
@@ -3174,70 +2974,22 @@ impl AgentRuntime {
         skill_mentions: Vec<String>,
         cancellation_token: CancellationToken,
     ) {
-        let result = self
-            .run_turn_inner(
-                agent_id,
-                session_id,
-                turn_id,
-                message,
-                skill_mentions,
-                cancellation_token,
-            )
-            .await;
-        if let Err(err) = result
-            && let Ok(agent) = self.agent(agent_id).await
-        {
-            if matches!(err, RuntimeError::TurnCancelled) {
-                if let Ok(completed) = turn::completion::complete_turn_if_current(
-                    self.deps.store.as_ref(),
-                    &self.events,
-                    &agent,
-                    agent_id,
-                    TurnResult {
-                        turn_id,
-                        status: TurnStatus::Cancelled,
-                        agent_status: AgentStatus::Cancelled,
-                        final_text: None,
-                        error: None,
-                    },
-                )
-                .await
-                    && completed
-                {
-                    self.start_next_queued_input_after_turn(agent_id).await;
-                }
-                return;
-            }
-            let message = err.to_string();
-            let completed = turn::completion::complete_turn_if_current(
-                self.deps.store.as_ref(),
-                &self.events,
-                &agent,
-                agent_id,
-                TurnResult {
-                    turn_id,
-                    status: TurnStatus::Failed,
-                    agent_status: AgentStatus::Failed,
-                    final_text: None,
-                    error: Some(message.clone()),
-                },
-            )
-            .await
-            .unwrap_or(false);
-            if completed {
-                self.start_next_queued_input_after_turn(agent_id).await;
-                self.events
-                    .publish(ServiceEventKind::Error {
-                        agent_id: Some(agent_id),
-                        session_id: Some(session_id),
-                        turn_id: Some(turn_id),
-                        message,
-                    })
-                    .await;
-            }
-        }
+        turn::orchestrator::run_turn(
+            &self.deps,
+            &self.state,
+            &self.events,
+            &self,
+            agent_id,
+            session_id,
+            turn_id,
+            message,
+            skill_mentions,
+            cancellation_token,
+        )
+        .await;
     }
 
+    #[cfg(test)]
     async fn run_turn_inner(
         self: &Arc<Self>,
         agent_id: AgentId,
@@ -3247,910 +2999,50 @@ impl AgentRuntime {
         skill_mentions: Vec<String>,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
-        let agent = self.agent(agent_id).await?;
-        let _turn_guard = agent.turn_lock.lock().await;
-        let enforce_current_turn = agent.summary.read().await.current_turn == Some(turn_id);
-        if cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
-        self.ensure_agent_container_for_turn(
-            &agent,
-            AgentStatus::RunningTurn,
+        turn::orchestrator::run_turn_inner(
+            &self.deps,
+            &self.state,
+            &self.events,
+            self,
+            agent_id,
+            session_id,
             turn_id,
-            &cancellation_token,
+            message,
+            skill_mentions,
+            cancellation_token,
         )
-        .await?;
-        if cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
-        self.events
-            .publish(ServiceEventKind::TurnStarted {
-                agent_id,
-                session_id: Some(session_id),
-                turn_id,
-            })
-            .await;
-        turn::persistence::record_agent_log(
-            self.deps.store.as_ref(),
-            agent_id,
-            Some(session_id),
-            Some(turn_id),
-            "info",
-            "turn",
-            "turn started",
-            json!({}),
-        )
-        .await;
-
-        if let Err(err) = self.refresh_project_skills_for_agent(&agent).await {
-            if matches!(err, RuntimeError::TurnCancelled) {
-                return Err(err);
-            }
-            tracing::warn!(agent_id = %agent_id, "failed to refresh project skills before turn: {err}");
-            turn::persistence::record_agent_log(
-                self.deps.store.as_ref(),
-                agent_id,
-                Some(session_id),
-                Some(turn_id),
-                "warn",
-                "skills",
-                "project skill refresh failed",
-                json!({ "error": err.to_string() }),
-            )
-            .await;
-        }
-        let skills_config = self.deps.store.load_skills_config().await?;
-        let skills_manager = self.skills_manager_for_agent(&agent).await?;
-        let container_skill_paths = self
-            .sync_agent_skills_to_container(&agent, &skills_manager, &skills_config)
-            .await?;
-        if let Err(err) = self
-            .maybe_auto_compact(&agent, agent_id, session_id, turn_id, &cancellation_token)
-            .await
-        {
-            if matches!(err, RuntimeError::TurnCancelled) {
-                return Err(err);
-            }
-            tracing::warn!("auto context compaction failed before user message: {err}");
-            turn::persistence::record_agent_log(
-                self.deps.store.as_ref(),
-                agent_id,
-                Some(session_id),
-                Some(turn_id),
-                "warn",
-                "context",
-                "auto context compaction failed",
-                json!({ "stage": "before_user_message", "error": err.to_string() }),
-            )
-            .await;
-        }
-        turn::history::record_message(
-            self.deps.store.as_ref(),
-            &agent,
-            agent_id,
-            session_id,
-            MessageRole::User,
-            message.clone(),
-        )
-        .await?;
-        turn::history::record_history_item(
-            self.deps.store.as_ref(),
-            &agent,
-            agent_id,
-            session_id,
-            ModelInputItem::user_text(message.clone()),
-        )
-        .await?;
-        self.events
-            .publish(ServiceEventKind::AgentMessage {
-                agent_id,
-                session_id: Some(session_id),
-                turn_id: Some(turn_id),
-                role: MessageRole::User,
-                content: message.clone(),
-            })
-            .await;
-
-        let reserved_tool_names = {
-            let mcp_tools = self.agent_mcp_tools(&agent).await;
-            turn::tools::visible_tool_names(&self.state, &agent, &mcp_tools)
-                .await
-                .into_iter()
-                .collect()
-        };
-        let skill_injections = {
-            let _project_skill_guard = self.project_skill_read_guard(&agent).await;
-            skills_manager.build_injections_for_input(
-                SkillInput {
-                    text: Some(&message),
-                    selections: skill_mentions
-                        .iter()
-                        .map(|mention| SkillSelection::from_mention(mention.clone()))
-                        .collect(),
-                    reserved_names: reserved_tool_names,
-                },
-                &skills_config,
-            )?
-        };
-        if !skill_injections.items.is_empty() {
-            self.events
-                .publish(ServiceEventKind::SkillsActivated {
-                    agent_id,
-                    session_id: Some(session_id),
-                    turn_id,
-                    skills: instructions::skill_activation_info(
-                        &skill_injections,
-                        &container_skill_paths,
-                    ),
-                })
-                .await;
-            turn::persistence::record_agent_log(
-                self.deps.store.as_ref(),
-                agent_id,
-                Some(session_id),
-                Some(turn_id),
-                "info",
-                "skills",
-                "skills activated",
-                json!({ "count": skill_injections.items.len() }),
-            )
-            .await;
-        }
-        self.inject_project_mcp_tools(&agent, agent_id, session_id, &cancellation_token)
-            .await?;
-        let model_context = {
-            let context_started = Instant::now();
-            let mcp_tools = self.agent_mcp_tools(&agent).await;
-            let visible_tools =
-                turn::tools::visible_tool_names(&self.state, &agent, &mcp_tools).await;
-            let tools =
-                build_tool_definitions_with_filter(&mcp_tools, |name| visible_tools.contains(name));
-            let instructions = {
-                let _project_skill_guard = self.project_skill_read_guard(&agent).await;
-                self.build_instructions(
-                    &agent,
-                    &skills_manager,
-                    &skill_injections,
-                    &skills_config,
-                    &mcp_tools,
-                    &container_skill_paths,
-                )
-                .await?
-            };
-            let summary = agent.summary.read().await.clone();
-            let provider_id = summary.provider_id.clone();
-            let model_name = summary.model.clone();
-            let reasoning_effort = summary.reasoning_effort;
-            let provider_selection = self
-                .deps
-                .store
-                .resolve_provider(Some(&provider_id), Some(&model_name))
-                .await?;
-            turn::persistence::record_agent_log(
-                self.deps.store.as_ref(),
-                agent_id,
-                Some(session_id),
-                Some(turn_id),
-                "info",
-                "runtime",
-                "turn model context prepared",
-                json!({
-                    "provider_id": provider_id,
-                    "model": model_name,
-                    "tool_count": tools.len(),
-                    "mcp_tool_count": mcp_tools.len(),
-                    "instructions_bytes": instructions.len(),
-                    "duration_ms": u128_to_u64(context_started.elapsed().as_millis()),
-                }),
-            )
-            .await;
-            TurnModelContext {
-                provider_id,
-                model_name,
-                reasoning_effort,
-                provider_selection,
-                tools,
-                instructions,
-            }
-        };
-        let mut last_assistant_text: Option<String> = None;
-        let mut turn_model_state = ModelTurnState::default();
-        let mut empty_progress_count: usize = 0;
-        loop {
-            if cancellation_token.is_cancelled() {
-                return Err(RuntimeError::TurnCancelled);
-            }
-            self.set_turn_status(
-                &agent,
-                turn_id,
-                &cancellation_token,
-                enforce_current_turn,
-                AgentStatus::RunningTurn,
-            )
-            .await?;
-            if let Err(err) = self
-                .maybe_auto_compact(&agent, agent_id, session_id, turn_id, &cancellation_token)
-                .await
-            {
-                if matches!(err, RuntimeError::TurnCancelled) {
-                    return Err(err);
-                }
-                tracing::warn!("auto context compaction failed before model request: {err}");
-                turn::persistence::record_agent_log(
-                    self.deps.store.as_ref(),
-                    agent_id,
-                    Some(session_id),
-                    Some(turn_id),
-                    "warn",
-                    "context",
-                    "auto context compaction failed",
-                    json!({ "stage": "before_model_request", "error": err.to_string() }),
-                )
-                .await;
-            }
-            let history_started = Instant::now();
-            let mut history = turn::history::session_history(
-                self.deps.store.as_ref(),
-                &agent,
-                agent_id,
-                session_id,
-            )
-            .await?;
-            if turn_model_state.previous_response_id.is_none()
-                && let Some(skill_fragment) =
-                    instructions::skill_user_fragment(&skill_injections, &container_skill_paths)
-            {
-                history.push(skill_fragment);
-            }
-            let history_duration_ms = u128_to_u64(history_started.elapsed().as_millis());
-            let model_started = Instant::now();
-            let model_turn = turn::model_stream::run_model_stream_turn(
-                &self.deps.model,
-                self.deps.store.as_ref(),
-                &self.events,
-                &agent,
-                agent_id,
-                session_id,
-                turn_id,
-                &model_context,
-                &history,
-                &mut turn_model_state,
-                &cancellation_token,
-            )
-            .await?;
-            let model_duration_ms = u128_to_u64(model_started.elapsed().as_millis());
-            turn::persistence::record_agent_log(
-                self.deps.store.as_ref(),
-                agent_id,
-                Some(session_id),
-                Some(turn_id),
-                "info",
-                "model",
-                "model stream completed",
-                json!({
-                    "provider_id": model_context.provider_id,
-                    "model": model_context.model_name,
-                    "output_items": model_turn.response.output.len(),
-                    "history_items": history.len(),
-                    "history_load_ms": history_duration_ms,
-                    "duration_ms": model_duration_ms,
-                    "usage": model_turn.response.usage,
-                }),
-            )
-            .await;
-
-            if let Some(usage) = model_turn.response.usage.clone() {
-                {
-                    let mut summary = agent.summary.write().await;
-                    summary.token_usage.add(&usage);
-                    summary.updated_at = now();
-                }
-                self.persist_agent(&agent).await?;
-                turn::history::record_session_context_tokens(
-                    self.deps.store.as_ref(),
-                    &agent,
-                    agent_id,
-                    session_id,
-                    usage.total_tokens,
-                )
-                .await?;
-            }
-
-            let tool_calls = model_turn.tool_calls;
-            let made_progress = model_turn.made_progress;
-            if model_turn.last_assistant_text.is_some() {
-                last_assistant_text = model_turn.last_assistant_text;
-            }
-            let acknowledged_history_len =
-                turn::history::raw_session_history_len(&agent, agent_id, session_id).await?;
-            turn_model_state.acknowledge_history_len(acknowledged_history_len);
-
-            if !made_progress {
-                empty_progress_count = empty_progress_count.saturating_add(1);
-                let diagnostic = format!(
-                    "Runtime diagnostic: the previous model response produced no assistant text and no tool calls (empty_progress_count={empty_progress_count}). Decide whether to continue, ask the user for clarification, retry with a different approach, or explain the issue."
-                );
-                turn::history::record_history_item(
-                    self.deps.store.as_ref(),
-                    &agent,
-                    agent_id,
-                    session_id,
-                    ModelInputItem::user_text(diagnostic),
-                )
-                .await?;
-                continue;
-            }
-            empty_progress_count = 0;
-
-            if tool_calls.is_empty() {
-                turn::completion::finish_turn(
-                    self.deps.store.as_ref(),
-                    &self.events,
-                    &agent,
-                    agent_id,
-                    session_id,
-                    TurnResult {
-                        turn_id,
-                        status: TurnStatus::Completed,
-                        agent_status: AgentStatus::Completed,
-                        final_text: last_assistant_text,
-                        error: None,
-                    },
-                )
-                .await?;
-                self.start_next_queued_input_after_turn(agent_id).await;
-                return Ok(());
-            }
-
-            self.set_turn_status(
-                &agent,
-                turn_id,
-                &cancellation_token,
-                enforce_current_turn,
-                AgentStatus::WaitingTool,
-            )
-            .await?;
-            let mut should_end_turn = false;
-            for (call_id, name, arguments) in tool_calls {
-                if cancellation_token.is_cancelled() {
-                    return Err(RuntimeError::TurnCancelled);
-                }
-                let execution = turn::tools::run_tool_call(
-                    self.deps.store.as_ref(),
-                    &self.events,
-                    &agent,
-                    agent_id,
-                    session_id,
-                    turn_id,
-                    &call_id,
-                    &name,
-                    arguments,
-                    |arguments| {
-                        let runtime = Arc::clone(self);
-                        let agent = Arc::clone(&agent);
-                        let name = name.clone();
-                        let cancellation_token = cancellation_token.clone();
-                        async move {
-                            runtime
-                                .execute_tool(
-                                    &agent,
-                                    agent_id,
-                                    turn_id,
-                                    &name,
-                                    arguments,
-                                    cancellation_token,
-                                )
-                                .await
-                        }
-                    },
-                )
-                .await?;
-                if execution.ends_turn {
-                    should_end_turn = true;
-                }
-                if cancellation_token.is_cancelled() {
-                    return Err(RuntimeError::TurnCancelled);
-                }
-            }
-
-            if should_end_turn {
-                turn::completion::finish_turn(
-                    self.deps.store.as_ref(),
-                    &self.events,
-                    &agent,
-                    agent_id,
-                    session_id,
-                    TurnResult {
-                        turn_id,
-                        status: TurnStatus::Completed,
-                        agent_status: AgentStatus::Completed,
-                        final_text: last_assistant_text,
-                        error: None,
-                    },
-                )
-                .await?;
-                self.start_next_queued_input_after_turn(agent_id).await;
-                return Ok(());
-            }
-        }
+        .await
     }
 
     async fn execute_tool(
         self: &Arc<Self>,
         agent: &Arc<AgentRecord>,
         agent_id: AgentId,
-        _turn_id: TurnId,
+        turn_id: TurnId,
         name: &str,
         arguments: Value,
         cancellation_token: CancellationToken,
     ) -> Result<ToolExecution> {
-        if cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
-        turn::tools::check_tool_permission(&self.state, agent, name, &arguments).await?;
-        match route_tool(name) {
-            RoutedTool::ContainerExec => {
-                let command = required_string(&arguments, "command")?;
-                let cwd = optional_string(&arguments, "cwd");
-                let timeout = arguments.get("timeout_secs").and_then(Value::as_u64);
-                let max_output_tokens = optional_usize(&arguments, "max_output_tokens")?
-                    .unwrap_or(DEFAULT_MODEL_TOOL_OUTPUT_TOKENS)
-                    .clamp(1, MAX_MODEL_TOOL_OUTPUT_TOKENS);
-                let output_bytes_cap = optional_usize(&arguments, "output_bytes_cap")?
-                    .unwrap_or(DEFAULT_EXEC_OUTPUT_BYTES_CAP)
-                    .clamp(1, MAX_EXEC_OUTPUT_BYTES_CAP);
-                let container_id = self.container_id(agent_id).await?;
-                let capture = turn::tools::prepare_tool_output_capture(
-                    &self.artifact_files_root,
-                    agent_id,
-                    &command,
-                )
-                .await?;
-                let output = self
-                    .deps
-                    .docker
-                    .exec_shell_captured_with_cancel(
-                        &container_id,
-                        &command,
-                        cwd.as_deref(),
-                        timeout,
-                        ExecCaptureOptions {
-                            stdout_path: &capture.stdout_path,
-                            stderr_path: &capture.stderr_path,
-                            output_bytes_cap,
-                        },
-                        &cancellation_token,
-                    )
-                    .await?;
-                let artifacts = turn::tools::tool_output_artifacts_from_capture(
-                    agent_id,
-                    &capture,
-                    output.stdout_bytes,
-                    output.stderr_bytes,
-                )
-                .await?;
-                Ok(ToolExecution::with_model_tokens(
-                    output.output.status == 0,
-                    serde_json::to_string(&json!({
-                        "status": output.output.status,
-                        "stdout": output.output.stdout,
-                        "stderr": output.output.stderr,
-                        "stdout_truncated": output.stdout_truncated,
-                        "stderr_truncated": output.stderr_truncated,
-                        "stdout_bytes": output.stdout_bytes,
-                        "stderr_bytes": output.stderr_bytes,
-                        "output_artifacts": artifacts,
-                    }))
-                    .unwrap_or_else(|_| "{}".to_string()),
-                    false,
-                    max_output_tokens,
-                    artifacts,
-                ))
-            }
-            RoutedTool::ReadFile => {
-                let container_id = self.container_id(agent_id).await?;
-                let output =
-                    tools::files::ContainerFileTools::new(&self.deps.docker, &container_id)
-                        .read_file(&arguments)
-                        .await?;
-                Ok(ToolExecution::new(true, output.to_string(), false))
-            }
-            RoutedTool::ListFiles => {
-                let container_id = self.container_id(agent_id).await?;
-                let output =
-                    tools::files::ContainerFileTools::new(&self.deps.docker, &container_id)
-                        .list_files(&arguments)
-                        .await?;
-                Ok(ToolExecution::new(true, output.to_string(), false))
-            }
-            RoutedTool::SearchFiles => {
-                let container_id = self.container_id(agent_id).await?;
-                let output =
-                    tools::files::ContainerFileTools::new(&self.deps.docker, &container_id)
-                        .search_files(&arguments, &cancellation_token)
-                        .await?;
-                Ok(ToolExecution::new(true, output.to_string(), false))
-            }
-            RoutedTool::ApplyPatch => {
-                let container_id = self.container_id(agent_id).await?;
-                let output =
-                    tools::files::ContainerFileTools::new(&self.deps.docker, &container_id)
-                        .apply_patch(&arguments)
-                        .await?;
-                Ok(ToolExecution::new(true, output.to_string(), false))
-            }
-            RoutedTool::ContainerCpUpload => {
-                let path = required_string(&arguments, "path")?;
-                let content_base64 = required_string(&arguments, "content_base64")?;
-                let bytes = self
-                    .upload_file(agent_id, path.clone(), content_base64)
-                    .await?;
-                Ok(ToolExecution::new(
-                    true,
-                    json!({ "path": path, "bytes": bytes }).to_string(),
-                    false,
-                ))
-            }
-            RoutedTool::ContainerCpDownload => {
-                let path = required_string(&arguments, "path")?;
-                let bytes = self.download_file_tar(agent_id, path.clone()).await?;
-                Ok(ToolExecution::new(
-                    true,
-                    json!({
-                        "path": path,
-                        "tar_base64": BASE64.encode(bytes),
-                    })
-                    .to_string(),
-                    false,
-                ))
-            }
-            RoutedTool::SpawnAgent => {
-                let name = optional_string(&arguments, "name");
-                let collab_input = collab_input_from_args(&arguments)?;
-                let legacy_role = optional_string(&arguments, "role")
-                    .as_deref()
-                    .map(parse_agent_role)
-                    .transpose()?;
-                let role = legacy_role
-                    .or_else(|| {
-                        optional_string(&arguments, "agent_type")
-                            .and_then(|value| agent_type_role(&value))
-                    })
-                    .unwrap_or_default();
-                let parent = self.agent(agent_id).await?;
-                let parent_status = parent.summary.read().await.status.clone();
-                let parent_summary = parent.summary.read().await.clone();
-                let parent_container_id =
-                    self.ensure_agent_container(&parent, parent_status).await?;
-                let parent_docker_image = parent_summary.docker_image.clone();
-                let (provider_id, model, reasoning_effort) = if legacy_role.is_some() {
-                    let child_model = self.resolve_role_agent_model(role).await?;
-                    (
-                        child_model.preference.provider_id,
-                        child_model.preference.model,
-                        child_model.preference.reasoning_effort,
-                    )
-                } else {
-                    (
-                        parent_summary.provider_id.clone(),
-                        optional_string(&arguments, "model")
-                            .unwrap_or_else(|| parent_summary.model.clone()),
-                        optional_string(&arguments, "reasoning_effort")
-                            .or_else(|| parent_summary.reasoning_effort.clone()),
-                    )
-                };
-                let created = self
-                    .create_agent_with_container_source(
-                        CreateAgentRequest {
-                            name,
-                            provider_id: Some(provider_id),
-                            model: Some(model),
-                            reasoning_effort,
-                            docker_image: Some(parent_docker_image.clone()),
-                            parent_id: Some(agent_id),
-                            system_prompt: Some(task_role_system_prompt(role).to_string()),
-                        },
-                        ContainerSource::CloneFrom {
-                            parent_container_id,
-                            docker_image: parent_docker_image,
-                            workspace_volume: None,
-                        },
-                        parent_summary.task_id,
-                        parent_summary.project_id,
-                        Some(role),
-                    )
-                    .await?;
-                if arguments
-                    .get("fork_context")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    self.fork_agent_context(agent_id, created.id).await?;
-                }
-                let turn_id = if let Some(message) = collab_input.message {
-                    let session_id = self.resolve_session_id(created.id, None).await?;
-                    let (agent, turn_id) = self.prepare_turn(created.id).await?;
-                    self.spawn_turn(
-                        &agent,
-                        created.id,
-                        session_id,
-                        turn_id,
-                        message,
-                        collab_input.skill_mentions,
-                    );
-                    Some(turn_id)
-                } else {
-                    None
-                };
-                Ok(ToolExecution::new(
-                    true,
-                    json!({ "agent": created, "turn_id": turn_id }).to_string(),
-                    false,
-                ))
-            }
-            RoutedTool::SendInput => {
-                let target =
-                    parse_agent_id(&required_any_string(&arguments, &["target", "agent_id"])?)?;
-                let collab_input = collab_input_from_args(&arguments)?;
-                let message = collab_input.message.ok_or_else(|| {
-                    RuntimeError::InvalidInput(
-                        "send_input requires message or text items".to_string(),
-                    )
-                })?;
-                let interrupt = arguments
-                    .get("interrupt")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let output = self
-                    .send_input_to_agent(
-                        target,
-                        None,
-                        message,
-                        collab_input.skill_mentions,
-                        interrupt,
-                    )
-                    .await?;
-                Ok(ToolExecution::new(true, output.to_string(), false))
-            }
-            RoutedTool::SendMessage => {
-                let target = parse_agent_id(&required_string(&arguments, "agent_id")?)?;
-                let session_id = optional_string(&arguments, "session_id")
-                    .as_deref()
-                    .map(parse_session_id)
-                    .transpose()?;
-                let message = required_string(&arguments, "message")?;
-                let output = self
-                    .send_input_to_agent(target, session_id, message, Vec::new(), false)
-                    .await?;
-                Ok(ToolExecution::new(true, output.to_string(), false))
-            }
-            RoutedTool::WaitAgent => {
-                let legacy_single_target =
-                    arguments.get("targets").is_none() && arguments.get("agent_id").is_some();
-                let targets = wait_targets(&arguments)?;
-                let timeout = wait_timeout(&arguments);
-                if legacy_single_target && targets.len() == 1 {
-                    let output = self
-                        .wait_agents_output_with_cancel(targets, timeout, &cancellation_token)
-                        .await?;
-                    return Ok(ToolExecution::new(
-                        true,
-                        serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string()),
-                        false,
-                    ));
-                }
-                let output = self
-                    .wait_agents_output_with_cancel(targets, timeout, &cancellation_token)
-                    .await?;
-                Ok(ToolExecution::new(
-                    true,
-                    serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string()),
-                    false,
-                ))
-            }
-            RoutedTool::ListAgents => Ok(ToolExecution::new(
-                true,
-                serde_json::to_string(&self.list_agents().await)
-                    .unwrap_or_else(|_| "[]".to_string()),
-                false,
-            )),
-            RoutedTool::CloseAgent => {
-                let target =
-                    parse_agent_id(&required_any_string(&arguments, &["target", "agent_id"])?)?;
-                let previous = self.close_agent(target).await?;
-                Ok(ToolExecution::new(
-                    true,
-                    json!({ "closed": target, "previous_status": previous }).to_string(),
-                    false,
-                ))
-            }
-            RoutedTool::ResumeAgent => {
-                let target = parse_agent_id(&required_any_string(
-                    &arguments,
-                    &["id", "agent_id", "target"],
-                )?)?;
-                let resumed = self.resume_agent(target).await?;
-                Ok(ToolExecution::new(
-                    true,
-                    json!({ "agent": resumed }).to_string(),
-                    false,
-                ))
-            }
-            RoutedTool::ListMcpResources => {
-                let broker = self
-                    .agent_resource_broker(agent, agent_id, &cancellation_token)
-                    .await?;
-                let output = broker
-                    .list_resources(
-                        optional_string(&arguments, "server").as_deref(),
-                        optional_string(&arguments, "cursor"),
-                    )
-                    .await?;
-                Ok(ToolExecution::new(true, output.to_string(), false))
-            }
-            RoutedTool::ListMcpResourceTemplates => {
-                let broker = self
-                    .agent_resource_broker(agent, agent_id, &cancellation_token)
-                    .await?;
-                let output = broker
-                    .list_resource_templates(
-                        optional_string(&arguments, "server").as_deref(),
-                        optional_string(&arguments, "cursor"),
-                    )
-                    .await?;
-                Ok(ToolExecution::new(true, output.to_string(), false))
-            }
-            RoutedTool::ReadMcpResource => {
-                let broker = self
-                    .agent_resource_broker(agent, agent_id, &cancellation_token)
-                    .await?;
-                let server = required_string(&arguments, "server")?;
-                let uri = required_string(&arguments, "uri")?;
-                let output = broker.read_resource(&server, &uri).await?;
-                Ok(ToolExecution::new(true, output.to_string(), false))
-            }
-            RoutedTool::SaveTaskPlan => {
-                let title = required_string(&arguments, "title")?;
-                let markdown = required_string(&arguments, "markdown")?;
-                let task = self.save_task_plan(agent_id, title, markdown).await?;
-                Ok(ToolExecution::new(
-                    true,
-                    serde_json::to_string(&task).unwrap_or_else(|_| "{}".to_string()),
-                    false,
-                ))
-            }
-            RoutedTool::SubmitReviewResult => {
-                let passed = arguments
-                    .get("passed")
-                    .and_then(Value::as_bool)
-                    .ok_or_else(|| {
-                        RuntimeError::InvalidInput("missing boolean field `passed`".to_string())
-                    })?;
-                let findings = required_string(&arguments, "findings")?;
-                let summary = required_string(&arguments, "summary")?;
-                let review = self
-                    .submit_review_result(agent_id, passed, findings, summary)
-                    .await?;
-                Ok(ToolExecution::new(
-                    true,
-                    serde_json::to_string(&review).unwrap_or_else(|_| "{}".to_string()),
-                    false,
-                ))
-            }
-            RoutedTool::UpdateTodoList => {
-                let items = todo_items_from_arguments(&arguments)?;
-                self.events
-                    .publish(ServiceEventKind::TodoListUpdated {
-                        agent_id,
-                        session_id: None,
-                        turn_id: _turn_id,
-                        items,
-                    })
-                    .await;
-                Ok(ToolExecution::new(
-                    true,
-                    "Todo list updated".to_string(),
-                    false,
-                ))
-            }
-            RoutedTool::RequestUserInput => {
-                let header = required_string(&arguments, "header")?;
-                let questions_arg = arguments.get("questions").ok_or_else(|| {
-                    RuntimeError::InvalidInput("missing field `questions`".to_string())
-                })?;
-                let raw_questions: Vec<serde_json::Value> =
-                    serde_json::from_value(questions_arg.clone()).map_err(|e| {
-                        RuntimeError::InvalidInput(format!("invalid questions: {e}"))
-                    })?;
-                let mut questions = Vec::with_capacity(raw_questions.len());
-                for raw in &raw_questions {
-                    let id = raw
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let question = raw
-                        .get("question")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let options_raw = raw
-                        .get("options")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    let mut options = Vec::with_capacity(options_raw.len());
-                    for opt in &options_raw {
-                        let label = opt
-                            .get("label")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        let description = opt
-                            .get("description")
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
-                        options.push(UserInputOption { label, description });
-                    }
-                    questions.push(UserInputQuestion {
-                        id,
-                        question,
-                        options,
-                    });
-                }
-                self.events
-                    .publish(ServiceEventKind::UserInputRequested {
-                        agent_id,
-                        session_id: None,
-                        turn_id: _turn_id,
-                        header,
-                        questions,
-                    })
-                    .await;
-                Ok(ToolExecution::new(
-                    true,
-                    "Questions sent to user. Wait for their response in the next message."
-                        .to_string(),
-                    true,
-                ))
-            }
-            RoutedTool::SaveArtifact => {
-                let path = required_string(&arguments, "path")?;
-                let name = optional_string(&arguments, "name");
-                let artifact = self.save_artifact(agent_id, path, name).await?;
-                Ok(ToolExecution::new(
-                    true,
-                    serde_json::to_string(&artifact).unwrap_or_else(|_| "{}".to_string()),
-                    false,
-                ))
-            }
-            RoutedTool::GithubApiGet => {
-                let path = required_string(&arguments, "path")?;
-                self.execute_project_github_api_get(agent, &path).await
-            }
-            RoutedTool::Mcp(model_name) => {
-                if agent.summary.read().await.project_id.is_some() {
-                    return self
-                        .execute_project_mcp_tool(agent, &model_name, arguments, cancellation_token)
-                        .await;
-                }
-                let manager = agent.mcp.read().await.clone().ok_or_else(|| {
-                    RuntimeError::InvalidInput("MCP manager not initialized".to_string())
-                })?;
-                let output = tokio::select! {
-                    output = manager.call_model_tool(&model_name, arguments) => output?,
-                    _ = cancellation_token.cancelled() => {
-                        return Err(RuntimeError::TurnCancelled);
-                    }
-                };
-                Ok(ToolExecution::new(true, output.to_string(), false))
-            }
-            RoutedTool::Unknown(name) => Ok(ToolExecution::new(
-                false,
-                format!("unknown tool: {name}"),
-                false,
-            )),
-        }
+        let context = turn::tools::ToolDispatchContext {
+            state: &self.state,
+            container: turn::tools::ContainerToolContext {
+                docker: &self.deps.docker,
+                artifact_files_root: &self.artifact_files_root,
+                ops: self,
+            },
+            events: &self.events,
+            ops: self,
+        };
+        turn::tools::execute_tool(
+            &context,
+            agent,
+            agent_id,
+            turn_id,
+            name,
+            arguments,
+            cancellation_token,
+        )
+        .await
     }
 
     async fn save_task_plan(
@@ -4426,7 +3318,7 @@ impl AgentRuntime {
                 reasoning_effort: model.preference.reasoning_effort,
                 docker_image: Some(parent_summary.docker_image.clone()),
                 parent_id: Some(parent_agent_id),
-                system_prompt: Some(task_role_system_prompt(role).to_string()),
+                system_prompt: Some(agents::task_role_system_prompt(role).to_string()),
             },
             ContainerSource::CloneFrom {
                 parent_container_id,
@@ -4521,7 +3413,7 @@ impl AgentRuntime {
             }
             let agent = self.agent(agent_id).await?;
             let summary = agent.summary.read().await.clone();
-            if Self::is_agent_wait_complete(&summary) {
+            if agents::is_agent_wait_complete(&summary) {
                 return Ok(summary);
             }
             tokio::select! {
@@ -4531,18 +3423,6 @@ impl AgentRuntime {
         }
     }
 
-    fn is_agent_wait_complete(summary: &AgentSummary) -> bool {
-        summary.current_turn.is_none()
-            || matches!(
-                summary.status,
-                AgentStatus::Completed
-                    | AgentStatus::Failed
-                    | AgentStatus::Cancelled
-                    | AgentStatus::Deleted
-                    | AgentStatus::Idle
-            )
-    }
-
     async fn agent_wait_snapshot(&self, agent_id: AgentId) -> Result<Value> {
         let agent = self.agent(agent_id).await?;
         let summary = agent.summary.read().await.clone();
@@ -4550,26 +3430,13 @@ impl AgentRuntime {
         let last_message = recent_messages.last().cloned();
         let tracked_response = {
             let sessions = agent.sessions.lock().await;
-            sessions
-                .iter()
-                .filter_map(|s| s.last_turn_response.as_ref())
-                .next_back()
-                .cloned()
+            agents::last_turn_response(&sessions)
         };
-        let final_response = if Self::is_agent_wait_complete(&summary) {
-            tracked_response.or_else(|| {
-                recent_messages
-                    .iter()
-                    .rev()
-                    .find(|message| message.role == MessageRole::Assistant)
-                    .map(|message| message.content.clone())
-            })
-        } else {
-            None
-        };
+        let final_response =
+            agents::final_wait_response(&summary, &recent_messages, tracked_response);
         let recent_events = self.agent_recent_events(agent_id, 12).await;
-        let last_activity_at = last_activity_at(&summary, &recent_messages, &recent_events);
-        let active_tool = active_tool_snapshot(&recent_events);
+        let last_activity_at = agents::last_activity_at(&summary, &recent_messages, &recent_events);
+        let active_tool = agents::active_tool_snapshot(&recent_events);
         let idle_ms = (now() - last_activity_at).num_milliseconds().max(0) as u64;
         let diagnostics = json!({
             "current_turn": summary.current_turn,
@@ -4616,7 +3483,7 @@ impl AgentRuntime {
             let mut pending = Vec::new();
             for agent_id in &agent_ids {
                 let summary = self.agent(*agent_id).await?.summary.read().await.clone();
-                if Self::is_agent_wait_complete(&summary) {
+                if agents::is_agent_wait_complete(&summary) {
                     completed.push(*agent_id);
                 } else {
                     pending.push(*agent_id);
@@ -4723,7 +3590,7 @@ impl AgentRuntime {
         let child = self.agent(child_id).await?;
         let parent_session = {
             let sessions = parent.sessions.lock().await;
-            selected_session(&sessions, None).cloned()
+            agents::selected_session(&sessions, None).cloned()
         }
         .ok_or(RuntimeError::AgentNotFound(parent_id))?;
         let child_session_id = self.resolve_session_id(child_id, None).await?;
@@ -4788,12 +3655,7 @@ impl AgentRuntime {
     ) -> Result<(Option<SessionId>, Vec<AgentMessage>)> {
         let agent = self.agent(agent_id).await?;
         let sessions = agent.sessions.lock().await;
-        let Some(session) = selected_session(&sessions, None) else {
-            return Ok((None, Vec::new()));
-        };
-        let len = session.messages.len();
-        let start = len.saturating_sub(limit);
-        Ok((Some(session.summary.id), session.messages[start..].to_vec()))
+        Ok(agents::recent_messages(&sessions, limit))
     }
 
     async fn build_instructions(
@@ -5229,9 +4091,7 @@ impl AgentRuntime {
     }
 
     fn project_skill_cache_dir(&self, project_id: ProjectId) -> PathBuf {
-        self.cache_root
-            .join(PROJECT_SKILLS_CACHE_DIR)
-            .join(project_id.to_string())
+        projects::skills::cache_dir(&self.cache_root, project_id)
     }
 
     fn artifact_file_dir(&self, task_id: TaskId, artifact_id: &str) -> PathBuf {
@@ -5241,11 +4101,7 @@ impl AgentRuntime {
     }
 
     fn project_skill_roots(&self, project_id: ProjectId) -> Vec<(PathBuf, SkillScope)> {
-        let cache_dir = self.project_skill_cache_dir(project_id);
-        PROJECT_SKILL_CANDIDATE_DIRS
-            .iter()
-            .map(|(_, cache_name)| (cache_dir.join(cache_name), SkillScope::Project))
-            .collect()
+        projects::skills::roots(&self.project_skill_cache_dir(project_id))
     }
 
     fn apply_project_skill_source_paths(
@@ -5253,47 +4109,14 @@ impl AgentRuntime {
         project_id: ProjectId,
         response: &mut SkillsListResponse,
     ) {
-        let cache_dir = self.project_skill_cache_dir(project_id);
-        for skill in &mut response.skills {
-            if skill.scope != SkillScope::Project {
-                continue;
-            }
-            if let Some(source_path) = project_skill_source_path(&cache_dir, &skill.path) {
-                skill.source_path = Some(source_path);
-            }
-        }
-        for error in &mut response.errors {
-            if let Some(source_path) = project_skill_source_path(&cache_dir, &error.path) {
-                error.path = source_path;
-            }
-        }
-        response.roots = PROJECT_SKILL_CANDIDATE_DIRS
-            .iter()
-            .filter_map(|(relative, cache_name)| {
-                let root = cache_dir.join(cache_name);
-                root.exists()
-                    .then(|| PathBuf::from(PROJECT_WORKSPACE_PATH).join(relative))
-            })
-            .collect();
+        projects::skills::apply_source_paths(&self.project_skill_cache_dir(project_id), response);
     }
 
     async fn existing_project_skill_dirs(
         &self,
         container_id: &str,
     ) -> Result<Vec<ProjectSkillSourceDir>> {
-        let checks = PROJECT_SKILL_CANDIDATE_DIRS
-            .iter()
-            .map(|(relative, cache_name)| {
-                let container_path = format!("{PROJECT_WORKSPACE_PATH}/{relative}");
-                format!(
-                    "if [ -d {path} ]; then printf '%s\\t%s\\t%s\\n' {relative} {cache_name} {path}; fi",
-                    path = shell_quote(&container_path),
-                    relative = shell_quote(relative),
-                    cache_name = shell_quote(cache_name),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let checks = projects::skills::source_detection_shell_checks();
         let output = self
             .deps
             .docker
@@ -5317,19 +4140,7 @@ impl AgentRuntime {
         &self,
         project_id: ProjectId,
     ) -> Result<Vec<ProjectSkillSourceDir>> {
-        let checks = PROJECT_SKILL_CANDIDATE_DIRS
-            .iter()
-            .map(|(relative, cache_name)| {
-                let container_path = format!("{PROJECT_WORKSPACE_PATH}/{relative}");
-                format!(
-                    "if [ -d {path} ]; then printf '%s\\t%s\\t%s\\n' {relative} {cache_name} {path}; fi",
-                    path = shell_quote(&container_path),
-                    relative = shell_quote(relative),
-                    cache_name = shell_quote(cache_name),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let checks = projects::skills::source_detection_shell_checks();
         let volume = project_review_workspace_volume(&project_id.to_string());
         let output = self
             .deps
@@ -5409,7 +4220,7 @@ impl AgentRuntime {
                         .await?;
                 }
             }
-            normalize_copied_project_skill_dir(&target, &project_source.cache_name)?;
+            projects::skills::normalize_copied_dir(&target, &project_source.cache_name)?;
         }
         Ok(())
     }
@@ -5465,7 +4276,7 @@ impl AgentRuntime {
             return Ok(None);
         };
         let sidecar = self.ensure_project_sidecar(project_id).await?;
-        let configs = project_mcp_configs(&token);
+        let configs = projects::mcp::project_mcp_configs(&token);
         self.events
             .publish(ServiceEventKind::McpServerStatusChanged {
                 agent_id,
@@ -5856,9 +4667,11 @@ impl AgentRuntime {
                 .run_project_review_once(project_id, cancellation_token.clone(), None)
                 .await;
             let decision = match decision {
-                Ok(result) => project_review_loop_decision_for_result(result),
+                Ok(result) => projects::review::project_review_loop_decision_for_result(result),
                 Err(RuntimeError::TurnCancelled) if cancellation_token.is_cancelled() => break,
-                Err(err) => project_review_loop_decision_for_error(err.to_string()),
+                Err(err) => {
+                    projects::review::project_review_loop_decision_for_error(err.to_string())
+                }
             };
             let next_review_at = (decision.delay.as_secs() > 0)
                 .then(|| Utc::now() + TimeDelta::seconds(decision.delay.as_secs() as i64));
@@ -6042,7 +4855,9 @@ impl AgentRuntime {
             if summary.status == AgentStatus::Cancelled && cancellation_token.is_cancelled() {
                 return Err(RuntimeError::TurnCancelled);
             }
-            if let Some(result) = project_review_cycle_result_for_reviewer_status(&summary) {
+            if let Some(result) =
+                projects::review::project_review_cycle_result_for_reviewer_status(&summary)
+            {
                 return Ok(result);
             }
             let response = self.last_turn_response(reviewer_id).await?.ok_or_else(|| {
@@ -6442,16 +5257,16 @@ impl AgentRuntime {
         let (command_label, command_text) = match command {
             ReviewRepoCommand::Ensure => (
                 "ensure",
-                review_repo_ensure_command(&repo_url, &expected_remote, &branch),
+                projects::review::review_repo_ensure_command(&repo_url, &expected_remote, &branch),
             ),
             ReviewRepoCommand::Sync => (
                 "sync",
-                review_repo_sync_command(&repo_url, &expected_remote, &branch),
+                projects::review::review_repo_sync_command(&repo_url, &expected_remote, &branch),
             ),
         };
         let fallback_command_text = match command {
             ReviewRepoCommand::Ensure => None,
-            ReviewRepoCommand::Sync => Some(review_repo_reclone_command(
+            ReviewRepoCommand::Sync => Some(projects::review::review_repo_reclone_command(
                 &repo_url,
                 &expected_remote,
                 &branch,
@@ -6583,10 +5398,7 @@ impl AgentRuntime {
     async fn last_turn_response(&self, agent_id: AgentId) -> Result<Option<String>> {
         let agent = self.agent(agent_id).await?;
         let sessions = agent.sessions.lock().await;
-        Ok(sessions
-            .iter()
-            .filter_map(|session| session.last_turn_response.clone())
-            .next_back())
+        Ok(agents::last_turn_response(&sessions))
     }
 
     async fn start_agent_turn_with_skills(
@@ -7065,7 +5877,7 @@ EOF\n\
     ) -> Result<SessionId> {
         let agent = self.agent(agent_id).await?;
         let sessions = agent.sessions.lock().await;
-        selected_session(&sessions, session_id)
+        agents::selected_session(&sessions, session_id)
             .map(|session| session.summary.id)
             .ok_or_else(|| RuntimeError::SessionNotFound {
                 agent_id,
@@ -7484,218 +6296,407 @@ EOF\n\
     }
 }
 
-fn required_string(arguments: &Value, field: &str) -> Result<String> {
-    arguments
-        .get(field)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| RuntimeError::InvalidInput(format!("missing string field `{field}`")))
+#[async_trait]
+impl turn::orchestrator::TurnOrchestratorOps for Arc<AgentRuntime> {
+    async fn agent(&self, agent_id: AgentId) -> Result<Arc<AgentRecord>> {
+        AgentRuntime::agent(self.as_ref(), agent_id).await
+    }
+
+    async fn ensure_agent_container_for_turn(
+        &self,
+        agent: &Arc<AgentRecord>,
+        status: AgentStatus,
+        turn_id: TurnId,
+        cancellation_token: &CancellationToken,
+    ) -> Result<()> {
+        AgentRuntime::ensure_agent_container_for_turn(
+            self.as_ref(),
+            agent,
+            status,
+            turn_id,
+            cancellation_token,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn refresh_project_skills_for_agent(&self, agent: &AgentRecord) -> Result<()> {
+        AgentRuntime::refresh_project_skills_for_agent(self.as_ref(), agent).await
+    }
+
+    async fn skills_manager_for_agent(&self, agent: &AgentRecord) -> Result<SkillsManager> {
+        AgentRuntime::skills_manager_for_agent(self.as_ref(), agent).await
+    }
+
+    async fn sync_agent_skills_to_container(
+        &self,
+        agent: &Arc<AgentRecord>,
+        skills_manager: &SkillsManager,
+        skills_config: &SkillsConfigRequest,
+    ) -> Result<ContainerSkillPaths> {
+        AgentRuntime::sync_agent_skills_to_container(
+            self.as_ref(),
+            agent,
+            skills_manager,
+            skills_config,
+        )
+        .await
+    }
+
+    async fn maybe_auto_compact(
+        &self,
+        agent: &Arc<AgentRecord>,
+        agent_id: AgentId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        cancellation_token: &CancellationToken,
+    ) -> Result<()> {
+        AgentRuntime::maybe_auto_compact(
+            self,
+            agent,
+            agent_id,
+            session_id,
+            turn_id,
+            cancellation_token,
+        )
+        .await
+    }
+
+    async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<mai_mcp::McpTool> {
+        AgentRuntime::agent_mcp_tools(self.as_ref(), agent).await
+    }
+
+    async fn project_skill_read_guard(
+        &self,
+        agent: &AgentRecord,
+    ) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+        AgentRuntime::project_skill_read_guard(self.as_ref(), agent).await
+    }
+
+    async fn inject_project_mcp_tools(
+        &self,
+        agent: &AgentRecord,
+        agent_id: AgentId,
+        session_id: SessionId,
+        cancellation_token: &CancellationToken,
+    ) -> Result<()> {
+        AgentRuntime::inject_project_mcp_tools(
+            self.as_ref(),
+            agent,
+            agent_id,
+            session_id,
+            cancellation_token,
+        )
+        .await
+    }
+
+    async fn build_instructions(
+        &self,
+        agent: &AgentRecord,
+        skills_manager: &SkillsManager,
+        skill_injections: &SkillInjections,
+        skills_config: &SkillsConfigRequest,
+        mcp_tools: &[mai_mcp::McpTool],
+        container_skill_paths: &ContainerSkillPaths,
+    ) -> Result<String> {
+        AgentRuntime::build_instructions(
+            self.as_ref(),
+            agent,
+            skills_manager,
+            skill_injections,
+            skills_config,
+            mcp_tools,
+            container_skill_paths,
+        )
+        .await
+    }
+
+    async fn set_turn_status(
+        &self,
+        agent: &Arc<AgentRecord>,
+        turn_id: TurnId,
+        cancellation_token: &CancellationToken,
+        enforce_current_turn: bool,
+        status: AgentStatus,
+    ) -> Result<()> {
+        AgentRuntime::set_turn_status(
+            self.as_ref(),
+            agent,
+            turn_id,
+            cancellation_token,
+            enforce_current_turn,
+            status,
+        )
+        .await
+    }
+
+    async fn execute_tool(
+        &self,
+        agent: &Arc<AgentRecord>,
+        agent_id: AgentId,
+        turn_id: TurnId,
+        name: &str,
+        arguments: Value,
+        cancellation_token: CancellationToken,
+    ) -> Result<ToolExecution> {
+        AgentRuntime::execute_tool(
+            self,
+            agent,
+            agent_id,
+            turn_id,
+            name,
+            arguments,
+            cancellation_token,
+        )
+        .await
+    }
+
+    async fn persist_agent(&self, agent: &AgentRecord) -> Result<()> {
+        AgentRuntime::persist_agent(self.as_ref(), agent).await
+    }
+
+    async fn start_next_queued_input_after_turn(&self, agent_id: AgentId) {
+        AgentRuntime::start_next_queued_input_after_turn(self, agent_id).await;
+    }
 }
 
-fn required_any_string(arguments: &Value, fields: &[&str]) -> Result<String> {
-    for field in fields {
-        if let Some(value) = optional_string(arguments, field) {
-            return Ok(value);
+#[async_trait]
+impl turn::tools::ContainerToolOps for Arc<AgentRuntime> {
+    async fn container_id(&self, agent_id: AgentId) -> Result<String> {
+        AgentRuntime::container_id(self.as_ref(), agent_id).await
+    }
+}
+
+#[async_trait]
+impl turn::tools::ToolDispatchOps for Arc<AgentRuntime> {
+    async fn spawn_agent_from_tool(
+        &self,
+        parent_agent_id: AgentId,
+        request: turn::tools::SpawnAgentToolRequest,
+    ) -> Result<turn::tools::SpawnAgentToolResult> {
+        let parent = self.agent(parent_agent_id).await?;
+        let parent_status = parent.summary.read().await.status.clone();
+        let parent_summary = parent.summary.read().await.clone();
+        let parent_container_id = self.ensure_agent_container(&parent, parent_status).await?;
+        let parent_docker_image = parent_summary.docker_image.clone();
+        let (provider_id, model, reasoning_effort) = if request.legacy_role.is_some() {
+            let child_model = self.resolve_role_agent_model(request.role).await?;
+            (
+                child_model.preference.provider_id,
+                child_model.preference.model,
+                child_model.preference.reasoning_effort,
+            )
+        } else {
+            (
+                parent_summary.provider_id.clone(),
+                request
+                    .model
+                    .unwrap_or_else(|| parent_summary.model.clone()),
+                request
+                    .reasoning_effort
+                    .or_else(|| parent_summary.reasoning_effort.clone()),
+            )
+        };
+        let created = self
+            .create_agent_with_container_source(
+                CreateAgentRequest {
+                    name: request.name,
+                    provider_id: Some(provider_id),
+                    model: Some(model),
+                    reasoning_effort,
+                    docker_image: Some(parent_docker_image.clone()),
+                    parent_id: Some(parent_agent_id),
+                    system_prompt: Some(agents::task_role_system_prompt(request.role).to_string()),
+                },
+                ContainerSource::CloneFrom {
+                    parent_container_id,
+                    docker_image: parent_docker_image,
+                    workspace_volume: None,
+                },
+                parent_summary.task_id,
+                parent_summary.project_id,
+                Some(request.role),
+            )
+            .await?;
+        if request.fork_context {
+            self.fork_agent_context(parent_agent_id, created.id).await?;
         }
-    }
-    Err(RuntimeError::InvalidInput(format!(
-        "missing string field `{}`",
-        fields.join("` or `")
-    )))
-}
-
-fn optional_string(arguments: &Value, field: &str) -> Option<String> {
-    arguments
-        .get(field)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn optional_usize(arguments: &Value, field: &str) -> Result<Option<usize>> {
-    let Some(value) = arguments.get(field) else {
-        return Ok(None);
-    };
-    let raw = value
-        .as_u64()
-        .ok_or_else(|| RuntimeError::InvalidInput(format!("field `{field}` must be an integer")))?;
-    usize::try_from(raw)
-        .map(Some)
-        .map_err(|_| RuntimeError::InvalidInput(format!("field `{field}` is too large")))
-}
-
-fn todo_items_from_arguments(arguments: &Value) -> Result<Vec<TodoItem>> {
-    let Some(items_arg) = arguments.get("items").or_else(|| arguments.get("todos")) else {
-        return Err(RuntimeError::InvalidInput(
-            "missing field `items`".to_string(),
-        ));
-    };
-    let items_value = if let Some(raw) = items_arg.as_str() {
-        serde_json::from_str(raw)
-            .map_err(|e| RuntimeError::InvalidInput(format!("invalid items JSON string: {e}")))?
-    } else {
-        items_arg.clone()
-    };
-    serde_json::from_value(items_value)
-        .map_err(|e| RuntimeError::InvalidInput(format!("invalid items: {e}")))
-}
-
-fn collab_input_from_args(arguments: &Value) -> Result<CollabInput> {
-    let mut input = CollabInput::default();
-    if let Some(message) = optional_string(arguments, "message") {
-        input.message = Some(message);
-    }
-    let Some(items) = arguments.get("items").and_then(Value::as_array) else {
-        return Ok(input);
-    };
-    let mut parts = Vec::new();
-    for item in items {
-        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("text");
-        match item_type {
-            "text" => {
-                let text = item.get("text").and_then(Value::as_str).ok_or_else(|| {
-                    RuntimeError::InvalidInput("text collab items require `text`".to_string())
-                })?;
-                parts.push(text.to_string());
-            }
-            "skill" => {
-                let mention = item
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .or_else(|| item.get("name").and_then(Value::as_str))
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        RuntimeError::InvalidInput(
-                            "skill collab items require `name` or `path`".to_string(),
-                        )
-                    })?;
-                input.skill_mentions.push(mention.to_string());
-            }
-            _ => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "unsupported collab item type `{item_type}`; expected text or skill"
-                )));
-            }
-        }
-    }
-    if !parts.is_empty() {
-        input.message = Some(match input.message {
-            Some(existing) if !existing.is_empty() => format!("{existing}\n{}", parts.join("\n")),
-            _ => parts.join("\n"),
-        });
-    }
-    Ok(input)
-}
-
-fn agent_type_role(value: &str) -> Option<AgentRole> {
-    match value.trim().to_lowercase().as_str() {
-        "explorer" => Some(AgentRole::Explorer),
-        "worker" | "default" | "" => Some(AgentRole::Executor),
-        _ => None,
-    }
-}
-
-fn wait_targets(arguments: &Value) -> Result<Vec<AgentId>> {
-    if let Some(targets) = arguments.get("targets").and_then(Value::as_array) {
-        if targets.is_empty() {
-            return Err(RuntimeError::InvalidInput(
-                "targets must be non-empty".to_string(),
-            ));
-        }
-        return targets
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .ok_or_else(|| {
-                        RuntimeError::InvalidInput("targets must contain strings".to_string())
-                    })
-                    .and_then(parse_agent_id)
-            })
-            .collect();
-    }
-    Ok(vec![parse_agent_id(&required_string(
-        arguments, "agent_id",
-    )?)?])
-}
-
-fn wait_timeout(arguments: &Value) -> Duration {
-    if let Some(ms) = arguments.get("timeout_ms").and_then(Value::as_u64) {
-        return Duration::from_millis(ms);
-    }
-    Duration::from_secs(
-        arguments
-            .get("timeout_secs")
-            .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_WAIT_AGENT_OBSERVATION_SECS),
-    )
-}
-
-fn last_activity_at(
-    summary: &AgentSummary,
-    recent_messages: &[AgentMessage],
-    recent_events: &[ServiceEvent],
-) -> DateTime<Utc> {
-    let mut timestamp = summary.updated_at;
-    if let Some(message) = recent_messages.last() {
-        timestamp = timestamp.max(message.created_at);
-    }
-    if let Some(event) = recent_events.last() {
-        timestamp = timestamp.max(event.timestamp);
-    }
-    timestamp
-}
-
-fn active_tool_snapshot(recent_events: &[ServiceEvent]) -> Option<Value> {
-    let mut completed = HashSet::new();
-    for event in recent_events.iter().rev() {
-        match &event.kind {
-            ServiceEventKind::ToolCompleted { call_id, .. } => {
-                completed.insert(call_id.clone());
-            }
-            ServiceEventKind::ToolStarted {
+        let turn_id = if let Some(message) = request.collab_input.message {
+            let session_id = self.resolve_session_id(created.id, None).await?;
+            let (agent, turn_id) = self.prepare_turn(created.id).await?;
+            self.spawn_turn(
+                &agent,
+                created.id,
+                session_id,
                 turn_id,
-                call_id,
-                tool_name,
-                arguments_preview,
+                message,
+                request.collab_input.skill_mentions,
+            );
+            Some(turn_id)
+        } else {
+            None
+        };
+        Ok(turn::tools::SpawnAgentToolResult {
+            agent: created,
+            turn_id,
+        })
+    }
+
+    async fn send_input_to_agent(
+        &self,
+        target: AgentId,
+        session_id: Option<SessionId>,
+        message: String,
+        skill_mentions: Vec<String>,
+        interrupt: bool,
+    ) -> Result<Value> {
+        AgentRuntime::send_input_to_agent(
+            self,
+            target,
+            session_id,
+            message,
+            skill_mentions,
+            interrupt,
+        )
+        .await
+    }
+
+    async fn wait_agents_output_with_cancel(
+        &self,
+        agent_ids: Vec<AgentId>,
+        timeout: Duration,
+        cancellation_token: &CancellationToken,
+    ) -> Result<Value> {
+        AgentRuntime::wait_agents_output_with_cancel(
+            self.as_ref(),
+            agent_ids,
+            timeout,
+            cancellation_token,
+        )
+        .await
+    }
+
+    async fn list_agents(&self) -> Vec<AgentSummary> {
+        AgentRuntime::list_agents(self.as_ref()).await
+    }
+
+    async fn close_agent(&self, agent_id: AgentId) -> Result<AgentStatus> {
+        AgentRuntime::close_agent(self.as_ref(), agent_id).await
+    }
+
+    async fn resume_agent(&self, agent_id: AgentId) -> Result<AgentSummary> {
+        AgentRuntime::resume_agent(self.as_ref(), agent_id).await
+    }
+
+    async fn list_mcp_resources(
+        &self,
+        agent: &AgentRecord,
+        agent_id: AgentId,
+        cancellation_token: &CancellationToken,
+        server: Option<String>,
+        cursor: Option<String>,
+    ) -> Result<Value> {
+        let broker = self
+            .agent_resource_broker(agent, agent_id, cancellation_token)
+            .await?;
+        broker.list_resources(server.as_deref(), cursor).await
+    }
+
+    async fn list_mcp_resource_templates(
+        &self,
+        agent: &AgentRecord,
+        agent_id: AgentId,
+        cancellation_token: &CancellationToken,
+        server: Option<String>,
+        cursor: Option<String>,
+    ) -> Result<Value> {
+        let broker = self
+            .agent_resource_broker(agent, agent_id, cancellation_token)
+            .await?;
+        broker
+            .list_resource_templates(server.as_deref(), cursor)
+            .await
+    }
+
+    async fn read_mcp_resource(
+        &self,
+        agent: &AgentRecord,
+        agent_id: AgentId,
+        cancellation_token: &CancellationToken,
+        server: String,
+        uri: String,
+    ) -> Result<Value> {
+        let broker = self
+            .agent_resource_broker(agent, agent_id, cancellation_token)
+            .await?;
+        broker.read_resource(&server, &uri).await
+    }
+
+    async fn save_task_plan(
+        &self,
+        agent_id: AgentId,
+        title: String,
+        markdown: String,
+    ) -> Result<TaskSummary> {
+        AgentRuntime::save_task_plan(self, agent_id, title, markdown).await
+    }
+
+    async fn submit_review_result(
+        &self,
+        agent_id: AgentId,
+        passed: bool,
+        findings: String,
+        summary: String,
+    ) -> Result<TaskReview> {
+        AgentRuntime::submit_review_result(self, agent_id, passed, findings, summary).await
+    }
+
+    async fn save_artifact(
+        &self,
+        agent_id: AgentId,
+        path: String,
+        display_name: Option<String>,
+    ) -> Result<ArtifactInfo> {
+        AgentRuntime::save_artifact(self, agent_id, path, display_name).await
+    }
+
+    async fn execute_project_github_api_get(
+        &self,
+        agent: &AgentRecord,
+        path: String,
+    ) -> Result<ToolExecution> {
+        AgentRuntime::execute_project_github_api_get(self.as_ref(), agent, &path).await
+    }
+
+    async fn execute_mcp_tool(
+        &self,
+        agent: &AgentRecord,
+        model_name: String,
+        arguments: Value,
+        cancellation_token: CancellationToken,
+    ) -> Result<ToolExecution> {
+        if agent.summary.read().await.project_id.is_some() {
+            return AgentRuntime::execute_project_mcp_tool(
+                self.as_ref(),
+                agent,
+                &model_name,
                 arguments,
-                ..
-            } if !completed.contains(call_id) => {
-                return Some(json!({
-                    "turn_id": turn_id,
-                    "call_id": call_id,
-                    "tool_name": tool_name,
-                    "arguments_preview": arguments_preview,
-                    "arguments": arguments,
-                    "started_at": event.timestamp,
-                }));
-            }
-            _ => {}
+                cancellation_token,
+            )
+            .await;
         }
+        let manager =
+            agent.mcp.read().await.clone().ok_or_else(|| {
+                RuntimeError::InvalidInput("MCP manager not initialized".to_string())
+            })?;
+        let output = tokio::select! {
+            output = manager.call_model_tool(&model_name, arguments) => output?,
+            _ = cancellation_token.cancelled() => {
+                return Err(RuntimeError::TurnCancelled);
+            }
+        };
+        Ok(ToolExecution::new(true, output.to_string(), false))
     }
-    None
-}
-
-fn parse_agent_role(value: &str) -> Result<AgentRole> {
-    match value.trim().to_lowercase().as_str() {
-        "" | "executor" => Ok(AgentRole::Executor),
-        "planner" => Ok(AgentRole::Planner),
-        "explorer" => Ok(AgentRole::Explorer),
-        "reviewer" => Ok(AgentRole::Reviewer),
-        _ => Err(RuntimeError::InvalidInput(format!(
-            "invalid agent role `{value}`; expected planner, explorer, executor, or reviewer"
-        ))),
-    }
-}
-
-fn parse_agent_id(value: &str) -> Result<AgentId> {
-    Uuid::parse_str(value)
-        .map_err(|err| RuntimeError::InvalidInput(format!("invalid agent_id `{value}`: {err}")))
-}
-
-fn parse_session_id(value: &str) -> Result<SessionId> {
-    Uuid::parse_str(value)
-        .map_err(|err| RuntimeError::InvalidInput(format!("invalid session_id `{value}`: {err}")))
 }
 
 fn resolved_agent_model(
@@ -7806,156 +6807,8 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn review_repo_auth_prelude() -> &'static str {
-    "tmp=$(mktemp -d)\n\
-     askpass=\"$tmp/askpass.sh\"\n\
-     cleanup() { rm -rf \"$tmp\"; }\n\
-     trap cleanup EXIT HUP INT TERM\n\
-     cat >\"$askpass\" <<'EOF'\n\
-#!/bin/sh\n\
-case \"$1\" in\n\
-  *Username*) printf '%s\\n' x-access-token ;;\n\
-  *Password*) printf '%s\\n' \"$MAI_GITHUB_REVIEW_TOKEN\" ;;\n\
-  *) printf '\\n' ;;\n\
-esac\n\
-EOF\n\
-     chmod 700 \"$askpass\"\n\
-     export GIT_TERMINAL_PROMPT=0\n\
-     export GIT_ASKPASS=\"$askpass\"\n\
-     git config --global --add safe.directory /workspace/repo 2>/dev/null || true"
-}
-
-fn review_repo_ensure_command(repo_url: &str, expected_remote: &str, branch: &str) -> String {
-    let branch_arg = if branch.trim().is_empty() {
-        String::new()
-    } else {
-        format!(" --branch {}", shell_quote(branch))
-    };
-    format!(
-        "set -eu\n\
-         {prelude}\n\
-         mkdir -p /workspace\n\
-         if [ -d /workspace/repo/.git ]; then\n\
-           remote=$(git -C /workspace/repo remote get-url origin 2>/dev/null || true)\n\
-           if [ \"$remote\" != {expected_remote} ]; then\n\
-             rm -rf /workspace/repo\n\
-           fi\n\
-         fi\n\
-         if [ ! -d /workspace/repo/.git ]; then\n\
-           rm -rf /workspace/repo\n\
-           {git_network} clone{branch_arg} -- {repo_url} /workspace/repo\n\
-         fi",
-        prelude = review_repo_auth_prelude(),
-        expected_remote = shell_quote(expected_remote),
-        git_network = review_repo_git_network_command_prefix(),
-        repo_url = shell_quote(repo_url),
-    )
-}
-
-fn review_repo_sync_command(repo_url: &str, expected_remote: &str, branch: &str) -> String {
-    let branch_refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
-    let origin_branch = format!("origin/{branch}");
-    format!(
-        "set -eu\n\
-         {ensure}\n\
-         cd /workspace/repo\n\
-         git -c credential.helper= remote set-url origin {repo_url}\n\
-         git worktree prune\n\
-         git reset --hard HEAD\n\
-         git clean -fdx\n\
-         {git_network} fetch --prune --no-tags origin {branch_refspec}\n\
-         {git_network} fetch --prune --no-tags origin '+refs/pull/*/head:refs/remotes/origin/pr/*'\n\
-         git checkout -B {branch} {origin_branch}\n\
-         git reset --hard {origin_branch}\n\
-         git clean -fdx\n\
-         git worktree prune\n\
-         mkdir -p /workspace/reviews",
-        ensure = review_repo_ensure_command(repo_url, expected_remote, branch),
-        git_network = review_repo_git_network_command_prefix(),
-        repo_url = shell_quote(repo_url),
-        branch_refspec = shell_quote(&branch_refspec),
-        branch = shell_quote(branch),
-        origin_branch = shell_quote(&origin_branch),
-    )
-}
-
-fn review_repo_reclone_command(repo_url: &str, expected_remote: &str, branch: &str) -> String {
-    format!(
-        "set -eu\n\
-         rm -rf /workspace/repo\n\
-         {ensure}\n\
-         cd /workspace/repo\n\
-         {git_network} fetch --prune --no-tags origin '+refs/pull/*/head:refs/remotes/origin/pr/*'\n\
-         mkdir -p /workspace/reviews",
-        ensure = review_repo_ensure_command(repo_url, expected_remote, branch),
-        git_network = review_repo_git_network_command_prefix(),
-    )
-}
-
-fn review_repo_git_network_command_prefix() -> String {
-    format!(
-        "git -c credential.helper= -c http.version=HTTP/1.1 -c http.lowSpeedLimit={} -c http.lowSpeedTime={}",
-        PROJECT_REVIEW_GIT_LOW_SPEED_LIMIT, PROJECT_REVIEW_GIT_LOW_SPEED_TIME_SECS
-    )
-}
-
 fn project_reviewer_system_prompt() -> &'static str {
     "You are an autonomous project pull request reviewer. Review exactly one eligible GitHub pull request for this project, using only the GitHub MCP tools visible in the current tool list for GitHub reads/writes and local shell commands for git/test work. The repository has already been cloned and synced at /workspace/repo. Use an isolated git worktree under /workspace/reviews for the selected PR and clean it up before finishing. Do not look for GitHub tokens in the environment or write credentials. Finish with only the required JSON object so the project scheduler can decide the next cycle."
-}
-
-fn project_review_loop_decision_for_result(
-    result: ProjectReviewCycleResult,
-) -> ProjectReviewLoopDecision {
-    match result.outcome {
-        ProjectReviewOutcome::ReviewSubmitted => ProjectReviewLoopDecision {
-            delay: Duration::ZERO,
-            status: ProjectReviewStatus::Idle,
-            outcome: Some(ProjectReviewOutcome::ReviewSubmitted),
-            summary: result.summary,
-            error: None,
-        },
-        ProjectReviewOutcome::NoEligiblePr => ProjectReviewLoopDecision {
-            delay: Duration::from_secs(PROJECT_REVIEW_IDLE_RETRY_SECS),
-            status: ProjectReviewStatus::Waiting,
-            outcome: Some(ProjectReviewOutcome::NoEligiblePr),
-            summary: result.summary,
-            error: None,
-        },
-        ProjectReviewOutcome::Failed => ProjectReviewLoopDecision {
-            delay: Duration::from_secs(PROJECT_REVIEW_FAILURE_RETRY_SECS),
-            status: ProjectReviewStatus::Failed,
-            outcome: Some(ProjectReviewOutcome::Failed),
-            summary: result.summary,
-            error: result
-                .error
-                .or_else(|| Some("reviewer reported failure".to_string())),
-        },
-    }
-}
-
-fn project_review_loop_decision_for_error(error: String) -> ProjectReviewLoopDecision {
-    ProjectReviewLoopDecision {
-        delay: Duration::from_secs(PROJECT_REVIEW_FAILURE_RETRY_SECS),
-        status: ProjectReviewStatus::Failed,
-        outcome: Some(ProjectReviewOutcome::Failed),
-        summary: None,
-        error: Some(error),
-    }
-}
-
-fn project_review_cycle_result_for_reviewer_status(
-    summary: &AgentSummary,
-) -> Option<ProjectReviewCycleResult> {
-    if summary.status == AgentStatus::Completed {
-        return None;
-    }
-    let status_error = format!("reviewer ended with status {:?}", summary.status);
-    Some(ProjectReviewCycleResult {
-        outcome: ProjectReviewOutcome::Failed,
-        pr: None,
-        summary: Some("Review could not be completed.".to_string()),
-        error: Some(normalize_optional_text(summary.last_error.clone()).unwrap_or(status_error)),
-    })
 }
 
 fn parse_project_review_cycle_report(text: &str) -> Result<ProjectReviewCycleResult> {
@@ -8020,123 +6873,6 @@ fn extract_json_object(text: &str) -> Option<&str> {
     None
 }
 
-fn github_clone_url(owner: &str, repo: &str) -> String {
-    format!("https://github.com/{owner}/{repo}.git")
-}
-
-fn github_repository_summary(repository: GithubRepositoryApi) -> GithubRepositorySummary {
-    GithubRepositorySummary {
-        id: repository.id,
-        owner: repository.owner.login,
-        name: repository.name,
-        full_name: repository.full_name,
-        private: repository.private,
-        clone_url: repository.clone_url,
-        html_url: repository.html_url,
-        default_branch: repository.default_branch,
-    }
-}
-
-fn github_package_belongs_to_repo(package: &GithubPackageApi, repository_full_name: &str) -> bool {
-    package.repository.as_ref().is_some_and(|repository| {
-        repository
-            .full_name
-            .eq_ignore_ascii_case(repository_full_name)
-    })
-}
-
-fn repository_package_summary(
-    owner: &str,
-    package: GithubPackageApi,
-    versions: Vec<GithubPackageVersionApi>,
-) -> Option<RepositoryPackageSummary> {
-    let tag = preferred_container_tag(&versions)?;
-    let image = format!("ghcr.io/{}/{}:{}", owner, package.name, tag);
-    Some(RepositoryPackageSummary {
-        name: package.name,
-        image,
-        tag,
-        html_url: package.html_url,
-    })
-}
-
-fn dedupe_github_packages(packages: Vec<GithubPackageApi>) -> Vec<GithubPackageApi> {
-    let mut seen = HashMap::new();
-    let mut deduped = Vec::new();
-    for package in packages {
-        let key = github_package_key(&package);
-        if seen.insert(key, ()).is_none() {
-            deduped.push(package);
-        }
-    }
-    deduped
-}
-
-fn github_package_key(package: &GithubPackageApi) -> String {
-    let repository = package
-        .repository
-        .as_ref()
-        .map(|repository| repository.full_name.as_str())
-        .unwrap_or("");
-    format!(
-        "{}:{}",
-        repository.to_ascii_lowercase(),
-        package.name.to_ascii_lowercase()
-    )
-}
-
-fn github_packages_read_error(status: Option<reqwest::StatusCode>) -> bool {
-    matches!(
-        status,
-        Some(
-            reqwest::StatusCode::BAD_REQUEST
-                | reqwest::StatusCode::FORBIDDEN
-                | reqwest::StatusCode::NOT_FOUND
-        )
-    )
-}
-
-fn preferred_container_tag(versions: &[GithubPackageVersionApi]) -> Option<String> {
-    let mut first_tag = None;
-    for version in versions {
-        for tag in &version.metadata.container.tags {
-            let tag = tag.trim();
-            if tag.is_empty() {
-                continue;
-            }
-            if tag == "latest" {
-                return Some(tag.to_string());
-            }
-            if first_tag.is_none() {
-                first_tag = Some(tag.to_string());
-            }
-        }
-    }
-    first_tag
-}
-
-fn github_api_url(base_url: &str, path: &str) -> String {
-    let base = base_url
-        .trim()
-        .trim_end_matches('/')
-        .if_empty(DEFAULT_GITHUB_API_BASE_URL);
-    format!("{base}{path}")
-}
-
-fn normalize_github_api_get_path(path: &str) -> Result<String> {
-    let path = path.trim();
-    if !path.starts_with('/')
-        || path.starts_with("//")
-        || path.contains('#')
-        || path.contains(char::is_whitespace)
-    {
-        return Err(RuntimeError::InvalidInput(
-            "github_api_get path must be a GitHub API path beginning with `/`".to_string(),
-        ));
-    }
-    Ok(path.to_string())
-}
-
 fn project_review_mcp_arguments_with_model_footer(
     model_tool_name: &str,
     mut arguments: Value,
@@ -8169,167 +6905,6 @@ fn project_review_mcp_arguments_with_model_footer(
 fn is_github_pull_request_review_write_tool(model_tool_name: &str) -> bool {
     model_tool_name == PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL
         || model_tool_name == PROJECT_GITHUB_CREATE_PULL_REQUEST_REVIEW_TOOL
-}
-
-fn github_path_segment(value: &str) -> String {
-    percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
-}
-
-fn sanitize_origin(origin: &str) -> Result<String> {
-    let origin = origin.trim().trim_end_matches('/');
-    if origin.is_empty() {
-        return Err(RuntimeError::InvalidInput("origin is required".to_string()));
-    }
-    if !(origin.starts_with("http://") || origin.starts_with("https://")) {
-        return Err(RuntimeError::InvalidInput(
-            "origin must start with http:// or https://".to_string(),
-        ));
-    }
-    if origin.contains('#') || origin.contains('?') || origin.contains(char::is_whitespace) {
-        return Err(RuntimeError::InvalidInput(
-            "origin must be a plain browser origin".to_string(),
-        ));
-    }
-    Ok(origin.to_string())
-}
-
-fn is_valid_github_slug(value: &str) -> bool {
-    let value = value.trim();
-    !value.is_empty()
-        && value.len() <= 100
-        && !value.starts_with('-')
-        && !value.ends_with('-')
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-}
-
-fn is_valid_github_manifest_code(value: &str) -> bool {
-    !value.trim().is_empty()
-        && value.len() <= 256
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
-
-fn github_app_manifest(redirect_url: &str, setup_url: &str, webhook_url: &str) -> Value {
-    json!({
-        "name": format!("Mai Team {}", Uuid::new_v4().to_string().split('-').next().unwrap_or("project")),
-        "url": "https://github.com",
-        "redirect_url": redirect_url,
-        "callback_urls": [redirect_url],
-        "setup_url": setup_url,
-        "public": false,
-        "default_permissions": {
-            "contents": "write",
-            "pull_requests": "write",
-            "issues": "write"
-        },
-        "default_events": [],
-        "hook_attributes": {
-            "url": webhook_url,
-            "active": false
-        }
-    })
-}
-
-fn github_headers() -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        ACCEPT,
-        HeaderValue::from_static("application/vnd.github+json"),
-    );
-    headers.insert(USER_AGENT, HeaderValue::from_static("mai-team"));
-    headers.insert(
-        "X-GitHub-Api-Version",
-        HeaderValue::from_static(GITHUB_API_VERSION),
-    );
-    headers
-}
-
-fn github_scopes(headers: &HeaderMap) -> Vec<String> {
-    headers
-        .get("x-oauth-scopes")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn git_token_kind(token: &str, scopes: &[String]) -> GitTokenKind {
-    if token.starts_with("github_pat_") {
-        GitTokenKind::FineGrainedPat
-    } else if token.starts_with("ghp_") || !scopes.is_empty() {
-        GitTokenKind::Classic
-    } else {
-        GitTokenKind::Unknown
-    }
-}
-
-fn project_mcp_configs(token: &str) -> std::collections::BTreeMap<String, McpServerConfig> {
-    let mut configs = std::collections::BTreeMap::new();
-    configs.insert(
-        PROJECT_GITHUB_MCP_SERVER.to_string(),
-        McpServerConfig {
-            scope: McpServerScope::Project,
-            transport: McpServerTransport::Stdio,
-            command: Some("github-mcp-server".to_string()),
-            args: vec!["stdio".to_string()],
-            env: std::collections::BTreeMap::from([
-                (
-                    "GITHUB_PERSONAL_ACCESS_TOKEN".to_string(),
-                    token.to_string(),
-                ),
-                (
-                    "GITHUB_TOOLSETS".to_string(),
-                    "context,repos,issues,pull_requests".to_string(),
-                ),
-            ]),
-            enabled: true,
-            startup_timeout_secs: Some(20),
-            ..McpServerConfig::default()
-        },
-    );
-    configs.insert(
-        PROJECT_GIT_MCP_SERVER.to_string(),
-        McpServerConfig {
-            scope: McpServerScope::Project,
-            transport: McpServerTransport::Stdio,
-            command: Some("uvx".to_string()),
-            args: vec![
-                "mcp-server-git".to_string(),
-                "--repository".to_string(),
-                PROJECT_WORKSPACE_PATH.to_string(),
-            ],
-            env: std::collections::BTreeMap::new(),
-            enabled: true,
-            startup_timeout_secs: Some(20),
-            ..McpServerConfig::default()
-        },
-    );
-    configs
-}
-
-async fn decode_github_response<T: DeserializeOwned>(
-    response: reqwest::Response,
-    action: &str,
-) -> Result<T> {
-    let status = response.status();
-    if status.is_success() {
-        return Ok(response.json::<T>().await?);
-    }
-    let text = response.text().await.unwrap_or_default();
-    let message = serde_json::from_str::<GithubErrorResponse>(&text)
-        .ok()
-        .and_then(|error| error.message)
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or_else(|| preview(&text, 300));
-    Err(RuntimeError::InvalidInput(format!(
-        "GitHub {action} failed ({status}): {message}"
-    )))
 }
 
 fn shell_quote(value: &str) -> String {
@@ -8377,103 +6952,6 @@ fn safe_artifact_name(raw: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
-trait IfEmpty {
-    fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str;
-}
-
-impl IfEmpty for str {
-    fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str {
-        if self.is_empty() { fallback } else { self }
-    }
-}
-
-const PLANNER_SYSTEM_PROMPT: &str = r#"You are the Planner for a Mai task. Your job is to create a decision-complete implementation plan through a structured 3-phase process. A decision-complete plan can be handed to the Executor agent and implemented without any additional design decisions.
-
-## 3-Phase Planning Process
-
-### Phase 1 — Explore (discover facts, eliminate unknowns)
-- Use `spawn_agent` with role `explorer` to investigate code, docs, and relevant context.
-- Run read-only commands to understand the codebase structure, existing patterns, and constraints.
-- Do NOT ask the user questions that can be answered by exploring the code.
-- Only ask clarifying questions about the prompt if there are obvious ambiguities.
-
-### Phase 2 — Intent Chat (clarify what they want)
-- Use `request_user_input` to ask structured questions about: goal + success criteria, scope, constraints, and key preferences/tradeoffs.
-- Each question must materially change the plan, confirm an assumption, or choose between meaningful tradeoffs.
-- Offer 2-4 clear options with a recommended default.
-- Bias toward asking over guessing when high-impact ambiguity remains.
-
-### Phase 3 — Implementation Spec (produce the plan)
-- Create a complete implementation specification covering: approach, interfaces/data flow, edge cases, testing strategy, and assumptions.
-- The plan must be decision-complete — the Executor should not need to make any design decisions.
-
-## Rules
-
-- **No code modification**: Only explore and plan. Never edit files or make changes.
-- **Use `save_task_plan`** to save or update the plan with a clear title and complete Markdown content.
-- **Use `update_todo_list`** to show your planning progress to the user.
-- **Use `request_user_input`** for structured questions during planning.
-- When the user requests revision of the plan, address their feedback fully and save an updated plan.
-
-## Plan Format
-
-The plan should include:
-- A clear title
-- A brief summary
-- Key changes grouped by subsystem or behavior
-- Important API/interface changes
-- Test cases and scenarios
-- Explicit assumptions and defaults chosen
-
-Keep the plan concise and actionable. Prefer behavior-level descriptions over file-by-file inventories. Mention specific files only when needed to disambiguate a non-obvious change."#;
-
-fn task_role_system_prompt(role: AgentRole) -> &'static str {
-    match role {
-        AgentRole::Planner => PLANNER_SYSTEM_PROMPT,
-        AgentRole::Explorer => {
-            "You are an Explorer subagent for a task. Investigate code, docs, and relevant context using read-only exploration unless explicitly told otherwise. Return concise findings with concrete files, commands, or sources that help the planner decide."
-        }
-        AgentRole::Executor => {
-            "You are the Executor for an approved task plan. Implement the requested changes in your container, keep scope tight, run verification, and report changed files plus test results. If reviewer feedback arrives, fix the issues and rerun relevant checks.\n\nWhen you have produced deliverable files (reports, generated code, data exports, documents, etc.), use the `save_artifact` tool to register each file so the user can download it. Always call `save_artifact` for any final output the user would want to keep."
-        }
-        AgentRole::Reviewer => {
-            "You are the Reviewer for a task workflow. Review executor changes for bugs, regressions, missing tests, and unclear behavior. You must call submit_review_result with passed, findings, and summary before finishing. Set passed=true only when there are no blocking issues."
-        }
-    }
-}
-
-fn descendant_delete_order_from_summaries(
-    root_id: AgentId,
-    summaries: &[AgentSummary],
-) -> Vec<AgentId> {
-    let mut children: HashMap<AgentId, Vec<&AgentSummary>> = HashMap::new();
-    for summary in summaries {
-        if let Some(parent_id) = summary.parent_id {
-            children.entry(parent_id).or_default().push(summary);
-        }
-    }
-    for values in children.values_mut() {
-        values.sort_by_key(|summary| summary.created_at);
-    }
-
-    let mut order = Vec::new();
-    push_delete_order(root_id, &children, &mut order);
-    order
-}
-
-fn push_delete_order(
-    agent_id: AgentId,
-    children: &HashMap<AgentId, Vec<&AgentSummary>>,
-    order: &mut Vec<AgentId>,
-) {
-    if let Some(child_summaries) = children.get(&agent_id) {
-        for child in child_summaries {
-            push_delete_order(child.id, children, order);
-        }
-    }
-    order.push(agent_id);
-}
-
 fn normalize_reasoning_effort(
     model: &ModelConfig,
     effort: Option<&str>,
@@ -8515,10 +6993,6 @@ fn parse_tool_arguments(raw_arguments: &str) -> Value {
     serde_json::from_str(raw_arguments).unwrap_or_else(|_| json!({ "raw": raw_arguments }))
 }
 
-fn u128_to_u64(value: u128) -> u64 {
-    value.min(u64::MAX as u128) as u64
-}
-
 fn recovered_summary(mut summary: AgentSummary) -> (AgentSummary, bool) {
     let mut changed = false;
     if summary.current_turn.take().is_some() {
@@ -8538,47 +7012,6 @@ fn recovered_summary(mut summary: AgentSummary) -> (AgentSummary, bool) {
         changed = true;
     }
     (summary, changed)
-}
-
-fn default_session_record() -> AgentSessionRecord {
-    session_record_with_title("Chat 1")
-}
-
-fn session_record_with_title(title: &str) -> AgentSessionRecord {
-    let now = now();
-    AgentSessionRecord {
-        summary: AgentSessionSummary {
-            id: Uuid::new_v4(),
-            title: title.to_string(),
-            created_at: now,
-            updated_at: now,
-            message_count: 0,
-        },
-        messages: Vec::new(),
-        history: Vec::new(),
-        last_context_tokens: None,
-        last_turn_response: None,
-    }
-}
-
-fn selected_session(
-    sessions: &[AgentSessionRecord],
-    session_id: Option<SessionId>,
-) -> Option<&AgentSessionRecord> {
-    if let Some(session_id) = session_id {
-        return sessions
-            .iter()
-            .find(|session| session.summary.id == session_id);
-    }
-    sessions
-        .iter()
-        .max_by(|left, right| {
-            left.summary
-                .updated_at
-                .cmp(&right.summary.updated_at)
-                .then_with(|| left.summary.created_at.cmp(&right.summary.created_at))
-        })
-        .or_else(|| sessions.first())
 }
 
 fn short_id(id: AgentId) -> String {
@@ -8838,59 +7271,6 @@ fn resource_provider_not_found(server: &str) -> RuntimeError {
     RuntimeError::InvalidInput(format!("resource provider not found: {server}"))
 }
 
-impl ProjectSkillSourceDir {
-    fn from_line(line: &str) -> Option<Self> {
-        let mut parts = line.splitn(3, '\t');
-        let relative = parts.next()?.trim();
-        let cache_name = parts.next()?.trim();
-        let container_path = parts.next()?.trim();
-        if relative.is_empty() || cache_name.is_empty() || container_path.is_empty() {
-            return None;
-        }
-        Some(Self {
-            relative: PathBuf::from(relative),
-            cache_name: cache_name.to_string(),
-            container_path: container_path.to_string(),
-        })
-    }
-}
-
-fn normalize_copied_project_skill_dir(target: &Path, cache_name: &str) -> Result<()> {
-    let nested = target.join(cache_name);
-    if nested.is_dir() {
-        let temp = target.with_extension("tmp");
-        if temp.exists() {
-            fs::remove_dir_all(&temp)?;
-        }
-        fs::rename(&nested, &temp)?;
-        fs::remove_dir_all(target)?;
-        fs::rename(temp, target)?;
-    }
-    Ok(())
-}
-
-fn project_skill_source_path(cache_dir: &Path, path: &Path) -> Option<PathBuf> {
-    let relative = path.strip_prefix(cache_dir).ok()?;
-    let mut components = relative.components();
-    let cache_name = match components.next()? {
-        std::path::Component::Normal(name) => name.to_string_lossy(),
-        _ => return None,
-    };
-    let source_relative = PROJECT_SKILL_CANDIDATE_DIRS
-        .iter()
-        .find(|(_, name)| *name == cache_name.as_ref())
-        .map(|(relative, _)| *relative)?;
-    let mut source_path = PathBuf::from(PROJECT_WORKSPACE_PATH).join(source_relative);
-    for component in components {
-        match component {
-            std::path::Component::Normal(part) => source_path.push(part),
-            std::path::Component::CurDir => {}
-            _ => return None,
-        }
-    }
-    Some(source_path)
-}
-
 fn should_auto_compact(last_context_tokens: u64, context_tokens: u64) -> bool {
     if last_context_tokens == 0 || context_tokens == 0 {
         return false;
@@ -9043,12 +7423,13 @@ mod tests {
 
     #[test]
     fn project_review_submitted_continues_immediately() {
-        let decision = project_review_loop_decision_for_result(ProjectReviewCycleResult {
-            outcome: ProjectReviewOutcome::ReviewSubmitted,
-            pr: Some(123),
-            summary: Some("submitted".to_string()),
-            error: None,
-        });
+        let decision =
+            projects::review::project_review_loop_decision_for_result(ProjectReviewCycleResult {
+                outcome: ProjectReviewOutcome::ReviewSubmitted,
+                pr: Some(123),
+                summary: Some("submitted".to_string()),
+                error: None,
+            });
 
         assert_eq!(decision.delay, Duration::ZERO);
         assert_eq!(decision.status, ProjectReviewStatus::Idle);
@@ -9062,18 +7443,15 @@ mod tests {
 
     #[test]
     fn project_review_no_eligible_pr_waits_two_minutes() {
-        let decision = project_review_loop_decision_for_result(ProjectReviewCycleResult {
-            outcome: ProjectReviewOutcome::NoEligiblePr,
-            pr: None,
-            summary: Some("nothing to review".to_string()),
-            error: None,
-        });
+        let decision =
+            projects::review::project_review_loop_decision_for_result(ProjectReviewCycleResult {
+                outcome: ProjectReviewOutcome::NoEligiblePr,
+                pr: None,
+                summary: Some("nothing to review".to_string()),
+                error: None,
+            });
 
-        assert_eq!(
-            decision.delay,
-            Duration::from_secs(PROJECT_REVIEW_IDLE_RETRY_SECS)
-        );
-        assert_eq!(PROJECT_REVIEW_IDLE_RETRY_SECS, 120);
+        assert_eq!(decision.delay, Duration::from_secs(120));
         assert_eq!(decision.status, ProjectReviewStatus::Waiting);
         assert_eq!(decision.outcome, Some(ProjectReviewOutcome::NoEligiblePr));
         assert_eq!(decision.summary.as_deref(), Some("nothing to review"));
@@ -9082,17 +7460,15 @@ mod tests {
 
     #[test]
     fn project_review_failure_keeps_backoff() {
-        let decision = project_review_loop_decision_for_result(ProjectReviewCycleResult {
-            outcome: ProjectReviewOutcome::Failed,
-            pr: None,
-            summary: Some("failed".to_string()),
-            error: None,
-        });
+        let decision =
+            projects::review::project_review_loop_decision_for_result(ProjectReviewCycleResult {
+                outcome: ProjectReviewOutcome::Failed,
+                pr: None,
+                summary: Some("failed".to_string()),
+                error: None,
+            });
 
-        assert_eq!(
-            decision.delay,
-            Duration::from_secs(PROJECT_REVIEW_FAILURE_RETRY_SECS)
-        );
+        assert_eq!(decision.delay, Duration::from_secs(600));
         assert_eq!(decision.status, ProjectReviewStatus::Failed);
         assert_eq!(decision.outcome, Some(ProjectReviewOutcome::Failed));
         assert_eq!(decision.summary.as_deref(), Some("failed"));
@@ -10055,7 +8431,7 @@ esac
         summary.status = AgentStatus::Failed;
         summary.last_error = Some("container command timed out".to_string());
 
-        let result = project_review_cycle_result_for_reviewer_status(&summary)
+        let result = projects::review::project_review_cycle_result_for_reviewer_status(&summary)
             .expect("failed reviewer should produce failed review result");
 
         assert_eq!(result.outcome, ProjectReviewOutcome::Failed);
@@ -10072,12 +8448,14 @@ esac
         let mut summary = test_agent_summary(Uuid::new_v4(), None);
         summary.status = AgentStatus::Completed;
 
-        assert!(project_review_cycle_result_for_reviewer_status(&summary).is_none());
+        assert!(
+            projects::review::project_review_cycle_result_for_reviewer_status(&summary).is_none()
+        );
     }
 
     #[test]
     fn project_review_sync_command_fetches_pr_refs_without_token_literal() {
-        let command = review_repo_sync_command(
+        let command = projects::review::review_repo_sync_command(
             "https://github.com/owner/repo.git",
             "https://github.com/owner/repo.git",
             "main",
@@ -10098,7 +8476,7 @@ esac
 
     #[test]
     fn project_review_reclone_command_removes_stale_repo_before_ensure() {
-        let command = review_repo_reclone_command(
+        let command = projects::review::review_repo_reclone_command(
             "https://github.com/owner/repo.git",
             "https://github.com/owner/repo.git",
             "main",
@@ -10500,7 +8878,7 @@ esac
         ];
 
         assert_eq!(
-            descendant_delete_order_from_summaries(parent, &summaries),
+            agents::descendant_delete_order_from_summaries(parent, &summaries),
             vec![grandchild, older_child, younger_child, parent]
         );
     }
@@ -14143,8 +12521,8 @@ esac
 
     #[test]
     fn project_mcp_configs_use_official_defaults_without_git_token_env() {
-        let configs = project_mcp_configs("secret-token");
-        let github = configs.get(PROJECT_GITHUB_MCP_SERVER).expect("github");
+        let configs = projects::mcp::project_mcp_configs("secret-token");
+        let github = configs.get("github").expect("github");
         assert_eq!(
             github
                 .env
@@ -14156,7 +12534,7 @@ esac
             github.env.get("GITHUB_TOOLSETS").map(String::as_str),
             Some("context,repos,issues,pull_requests")
         );
-        let git = configs.get(PROJECT_GIT_MCP_SERVER).expect("git");
+        let git = configs.get("git").expect("git");
         assert_eq!(git.command.as_deref(), Some("uvx"));
         assert_eq!(
             git.args,
