@@ -97,11 +97,11 @@ pub(crate) fn relay_response(id: String, result: RelayResult<Value>) -> RelayRes
     }
 }
 
-pub(crate) fn parse_params<T>(params: Value) -> impl std::future::Future<Output = RelayResult<T>>
+pub(crate) async fn parse_params<T>(params: Value) -> RelayResult<T>
 where
     T: DeserializeOwned,
 {
-    async move { Ok(serde_json::from_value(params)?) }
+    Ok(serde_json::from_value(params)?)
 }
 
 pub(crate) fn to_value<T>(value: T) -> RelayResult<Value>
