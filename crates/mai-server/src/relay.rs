@@ -10,7 +10,8 @@ use mai_protocol::{
     RelayGithubRepositoryPackagesRequest, RelayRequest, RelayResponse, RelayStatusResponse,
     RepositoryPackagesResponse, ServiceEventKind,
 };
-use mai_runtime::{AgentRuntime, GithubAppBackend, RuntimeError};
+use mai_runtime::{AgentRuntime, RuntimeError};
+use mai_runtime::github::GithubAppBackend;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};

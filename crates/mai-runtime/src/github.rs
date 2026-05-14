@@ -14,7 +14,8 @@ mod app;
 mod packages;
 
 pub(crate) use accounts::GitAccountService;
-pub(crate) use app::{DirectGithubAppBackend, GithubAppBackend};
+pub use app::GithubAppBackend;
+pub(crate) use app::DirectGithubAppBackend;
 pub(crate) use packages::repository_packages_with_token;
 
 #[derive(Debug, Deserialize)]

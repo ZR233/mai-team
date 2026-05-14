@@ -36,7 +36,7 @@ use uuid::Uuid;
 mod agents;
 mod deps;
 mod events;
-mod github;
+pub mod github;
 mod instructions;
 mod projects;
 mod state;
