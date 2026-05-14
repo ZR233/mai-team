@@ -1,0 +1,64 @@
+use crate::names::*;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoutedTool {
+    ContainerExec,
+    ReadFile,
+    ListFiles,
+    ApplyPatch,
+    SearchFiles,
+    ContainerCpUpload,
+    ContainerCpDownload,
+    SpawnAgent,
+    SendInput,
+    SendMessage,
+    WaitAgent,
+    ListAgents,
+    CloseAgent,
+    ResumeAgent,
+    ListMcpResources,
+    ListMcpResourceTemplates,
+    ReadMcpResource,
+    SaveTaskPlan,
+    SubmitReviewResult,
+    UpdateTodoList,
+    RequestUserInput,
+    SaveArtifact,
+    GithubApiGet,
+    Mcp(String),
+    Unknown(String),
+}
+
+pub fn route_tool(name: &str) -> RoutedTool {
+    match normalize_name(name).as_str() {
+        TOOL_CONTAINER_EXEC => RoutedTool::ContainerExec,
+        TOOL_READ_FILE => RoutedTool::ReadFile,
+        TOOL_LIST_FILES => RoutedTool::ListFiles,
+        TOOL_APPLY_PATCH => RoutedTool::ApplyPatch,
+        TOOL_SEARCH_FILES => RoutedTool::SearchFiles,
+        TOOL_CONTAINER_CP_UPLOAD => RoutedTool::ContainerCpUpload,
+        TOOL_CONTAINER_CP_DOWNLOAD => RoutedTool::ContainerCpDownload,
+        TOOL_SPAWN_AGENT => RoutedTool::SpawnAgent,
+        TOOL_SEND_INPUT => RoutedTool::SendInput,
+        TOOL_SEND_MESSAGE => RoutedTool::SendMessage,
+        TOOL_WAIT_AGENT => RoutedTool::WaitAgent,
+        TOOL_LIST_AGENTS => RoutedTool::ListAgents,
+        TOOL_CLOSE_AGENT => RoutedTool::CloseAgent,
+        TOOL_RESUME_AGENT => RoutedTool::ResumeAgent,
+        TOOL_LIST_MCP_RESOURCES => RoutedTool::ListMcpResources,
+        TOOL_LIST_MCP_RESOURCE_TEMPLATES => RoutedTool::ListMcpResourceTemplates,
+        TOOL_READ_MCP_RESOURCE => RoutedTool::ReadMcpResource,
+        TOOL_SAVE_TASK_PLAN => RoutedTool::SaveTaskPlan,
+        TOOL_SUBMIT_REVIEW_RESULT => RoutedTool::SubmitReviewResult,
+        TOOL_UPDATE_TODO_LIST => RoutedTool::UpdateTodoList,
+        TOOL_REQUEST_USER_INPUT => RoutedTool::RequestUserInput,
+        TOOL_SAVE_ARTIFACT => RoutedTool::SaveArtifact,
+        TOOL_GITHUB_API_GET => RoutedTool::GithubApiGet,
+        normalized if normalized.starts_with("mcp__") => RoutedTool::Mcp(normalized.to_string()),
+        normalized => RoutedTool::Unknown(normalized.to_string()),
+    }
+}
+
+fn normalize_name(name: &str) -> String {
+    name.replace('.', "_")
+}
