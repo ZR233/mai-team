@@ -1671,6 +1671,7 @@ dependencies = [
  "mai-runtime",
  "mai-store",
  "mime_guess",
+ "reqwest",
  "rust-embed",
  "serde",
  "serde_json",
