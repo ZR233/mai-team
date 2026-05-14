@@ -352,48 +352,34 @@
             </div>
           </div>
 
-          <div class="git-accounts-layout">
-            <div class="git-account-list">
-              <article
-                v-for="installation in githubAppInstallations"
-                :key="installation.id"
-                class="git-account-card github-app-installation-card"
-              >
-                <span class="git-account-mark">APP</span>
-                <span class="git-account-main">
-                  <strong>{{ installation.account_login || installation.id }}</strong>
-                  <small>{{ installation.account_type || 'GitHub' }}</small>
-                  <span class="git-account-meta">{{ installation.repository_selection || 'repositories' }}</span>
-                </span>
-                <span class="mini-pill green">Installed</span>
-              </article>
-              <div v-if="!githubAppInstallationCount" class="quiet-empty skills-empty">
-                <strong>No GitHub App installations</strong>
-                <span>Install the app for your GitHub account or organization.</span>
-              </div>
-            </div>
-
-            <div class="git-account-form">
+          <div class="github-app-layout">
+            <div class="github-app-info-panel">
               <div class="integration-card-head">
-                <div>
-                  <h3>{{ githubAppName }}</h3>
-                  <p>{{ githubAppConfigured ? githubAppUrlLabel : 'GitHub App metadata is not available.' }}</p>
+                <div class="github-app-brand">
+                  <span class="github-app-brand-icon">
+                    <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+                  </span>
+                  <div>
+                    <h3>{{ githubAppName }}</h3>
+                    <p>{{ githubAppConfigured ? githubAppUrlLabel : 'GitHub App metadata is not available.' }}</p>
+                  </div>
                 </div>
                 <span class="section-status" :class="githubAppConfigured ? 'ready' : 'danger'">
                   {{ githubAppConfigured ? 'Configured' : 'Missing app' }}
                 </span>
               </div>
 
-              <div class="detected-token-row">
-                <span>Owner</span>
-                <strong>{{ githubAppOwnerLabel }}</strong>
-                <small>{{ githubAppSettings?.base_url || 'Relay will provide the GitHub API base URL.' }}</small>
-              </div>
-
-              <div class="agent-runtime-strip">
-                <span>Project runtime</span>
-                <strong>Installation token -> Git MCP + GitHub MCP</strong>
-                <small>Short-lived tokens are minted by mai-relay and never stored in the browser.</small>
+              <div class="github-app-detail-grid">
+                <div class="github-app-detail-item">
+                  <span class="github-app-detail-label">Owner</span>
+                  <strong>{{ githubAppOwnerLabel }}</strong>
+                  <small>{{ githubAppSettings?.base_url || 'Relay will provide the GitHub API base URL.' }}</small>
+                </div>
+                <div class="github-app-detail-item">
+                  <span class="github-app-detail-label">Project runtime</span>
+                  <strong>Git MCP + GitHub MCP</strong>
+                  <small>Short-lived tokens minted by mai-relay, never stored in browser.</small>
+                </div>
               </div>
 
               <p v-if="githubAppState.error" class="dialog-error">{{ githubAppState.error }}</p>
@@ -409,6 +395,36 @@
                   <span v-if="githubAppState.installing" class="spinner-sm"></span>
                   <template v-else>Install GitHub App</template>
                 </button>
+              </div>
+            </div>
+
+            <div class="github-app-installations">
+              <div class="github-app-installations-header">
+                <h3>Installations</h3>
+                <span class="mini-pill" :class="githubAppInstallationCount ? 'green' : ''">{{ githubAppInstallationCount || 0 }}</span>
+              </div>
+              <div class="github-app-installation-list">
+                <article
+                  v-for="installation in githubAppInstallations"
+                  :key="installation.id"
+                  class="github-app-installation-row"
+                >
+                  <span class="github-app-installation-icon">
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+                  </span>
+                  <span class="github-app-installation-main">
+                    <strong>{{ installation.account_login || installation.id }}</strong>
+                    <small>{{ installation.account_type || 'Account' }} &middot; {{ installation.repository_selection || 'All repositories' }}</small>
+                  </span>
+                  <span class="mini-pill green">Installed</span>
+                </article>
+                <div v-if="!githubAppInstallationCount" class="github-app-empty">
+                  <span class="github-app-empty-icon">
+                    <svg width="24" height="24" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+                  </span>
+                  <strong>No installations yet</strong>
+                  <span>Install the app for your GitHub account or organization to start creating projects.</span>
+                </div>
               </div>
             </div>
           </div>
