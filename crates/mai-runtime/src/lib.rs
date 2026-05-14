@@ -50,6 +50,7 @@ use projects::review::state::ReviewStateUpdate;
 #[cfg(test)]
 use projects::skills::PROJECT_SKILLS_CACHE_DIR;
 use projects::skills::ProjectSkillSourceDir;
+use projects::workspace::ProjectWorkspaceManager;
 use state::{AgentRecord, AgentSessionRecord, ProjectRecord, RuntimeState, TaskRecord};
 use turn::tools::ToolExecution;
 
@@ -149,6 +150,7 @@ pub struct AgentRuntime {
     sidecar_image: String,
     github_api_base_url: String,
     git_binary: String,
+    workspace_manager: projects::workspace::LocalProjectWorkspaceManager,
 }
 
 struct ResolvedAgentModel {
@@ -282,6 +284,11 @@ impl AgentRuntime {
             .git_binary
             .clone()
             .unwrap_or_else(|| "git".to_string());
+        let projects_root = config.projects_root;
+        let workspace_manager = projects::workspace::LocalProjectWorkspaceManager::new(
+            git_binary.clone(),
+            projects_root.clone(),
+        );
         let github_http = reqwest::Client::builder()
             .timeout(Duration::from_secs(GITHUB_HTTP_TIMEOUT_SECS))
             .build()?;
@@ -316,17 +323,19 @@ impl AgentRuntime {
                 snapshot.next_sequence,
                 snapshot.recent_events,
             ),
-            projects_root: config.projects_root,
+            projects_root,
             cache_root: config.cache_root,
             artifact_files_root: config.artifact_files_root,
             sidecar_image,
             github_api_base_url,
             git_binary,
+            workspace_manager,
         });
         let cleanup_runtime = Arc::clone(&runtime);
         tokio::spawn(async move {
             projects::review::cleanup::run_project_review_cleanup_loop(&cleanup_runtime).await;
         });
+        runtime.reconcile_project_workspaces().await?;
         runtime.reconcile_project_review_singletons().await;
         runtime.start_enabled_project_review_workers().await;
         Ok(runtime)
@@ -422,11 +431,9 @@ impl AgentRuntime {
             ));
         }
 
-        let repo_path = projects::workspace::agent_clone_path(
-            &self.projects_root,
-            project_id,
-            summary.maintainer_agent_id,
-        );
+        let repo_path = self
+            .workspace_manager
+            .agent_clone_path(project_id, summary.maintainer_agent_id);
         let existing = projects::skills::detect_existing_dirs_in_host_repo(&repo_path);
         self.refresh_project_skill_cache(project_id, &existing)
             .await?;
@@ -965,19 +972,20 @@ impl AgentRuntime {
         {
             return Ok(source);
         }
-        let git_binary = self.git_binary();
-        let clone =
-            projects::workspace::agent_clone_path(&self.projects_root, summary.id, agent_id);
+        let clone = self
+            .workspace_manager
+            .agent_clone_path(summary.id, agent_id);
         let clone = if clone.exists() {
             clone
         } else {
-            projects::workspace::prepare_project_agent_clone(
-                &git_binary,
-                &self.projects_root,
-                &summary,
-                agent_id,
-            )
-            .await?
+            self.workspace_manager
+                .prepare_agent_clone(
+                    &summary,
+                    agent_id,
+                    projects::workspace::CloneSeed::DefaultBranch,
+                )
+                .await?
+                .path
         };
         Ok(match source {
             agents::ContainerSource::FreshImage
@@ -1000,13 +1008,40 @@ impl AgentRuntime {
         })
     }
 
-    fn git_binary(&self) -> String {
-        self.git_binary.clone()
-    }
-
     pub async fn list_agents(&self) -> Vec<AgentSummary> {
         let agents = self.state.agents.read().await.values().cloned().collect();
         agents::list_agents(agents).await
+    }
+
+    async fn reconcile_project_workspaces(&self) -> Result<()> {
+        let projects = self.list_projects().await;
+        let agents = self.list_agents().await;
+        let report = self.workspace_manager.reconcile(&projects, &agents).await?;
+        if !report.orphan_clones_removed.is_empty() {
+            tracing::info!(
+                count = report.orphan_clones_removed.len(),
+                "removed orphan project clone directories during startup reconcile"
+            );
+        }
+        if !report.missing_repo_caches.is_empty() {
+            tracing::warn!(
+                count = report.missing_repo_caches.len(),
+                "found projects with missing repository caches during startup reconcile"
+            );
+        }
+        if !report.missing_agent_clones.is_empty() {
+            tracing::warn!(
+                count = report.missing_agent_clones.len(),
+                "found project agents with missing clones during startup reconcile"
+            );
+        }
+        if !report.invalid_clone_dirs.is_empty() {
+            tracing::warn!(
+                count = report.invalid_clone_dirs.len(),
+                "found invalid project clone directories during startup reconcile"
+            );
+        }
+        Ok(())
     }
 
     pub async fn update_agent(
@@ -1892,11 +1927,9 @@ impl AgentRuntime {
         {
             return Ok(());
         }
-        let repo_path = projects::workspace::agent_clone_path(
-            &self.projects_root,
-            project_id,
-            summary.maintainer_agent_id,
-        );
+        let repo_path = self
+            .workspace_manager
+            .agent_clone_path(project_id, summary.maintainer_agent_id);
         let existing = projects::skills::detect_existing_dirs_in_host_repo(&repo_path);
         self.refresh_project_skill_cache(project_id, &existing)
             .await
@@ -1908,11 +1941,9 @@ impl AgentRuntime {
     ) -> Result<()> {
         let project = self.project(project_id).await?;
         let summary = project.summary.read().await.clone();
-        let repo_path = projects::workspace::agent_clone_path(
-            &self.projects_root,
-            project_id,
-            summary.maintainer_agent_id,
-        );
+        let repo_path = self
+            .workspace_manager
+            .agent_clone_path(project_id, summary.maintainer_agent_id);
         let sources = projects::skills::detect_existing_dirs_in_host_repo(&repo_path);
         self.refresh_project_skill_cache(project_id, &sources).await
     }
@@ -2167,13 +2198,10 @@ impl AgentRuntime {
         let token = self.project_git_token(project_id).await?.ok_or_else(|| {
             RuntimeError::InvalidInput("project git account token is not configured".to_string())
         })?;
-        projects::workspace::sync_project_repo_cache(
-            &self.git_binary,
-            &self.projects_root,
-            &summary,
-            &token,
-        )
-        .await
+        self.workspace_manager
+            .sync_repo_cache(&summary, &token)
+            .await
+            .map(|_| ())
     }
 
     async fn cleanup_project_review_worktree(
@@ -2200,7 +2228,9 @@ impl AgentRuntime {
     }
 
     async fn delete_project_review_workspace(&self, project_id: ProjectId) -> Result<()> {
-        projects::workspace::delete_project_workspace(&self.projects_root, project_id)?;
+        self.workspace_manager
+            .delete_project_workspace(project_id)
+            .await?;
         let volume = project_review_workspace_volume(&project_id.to_string());
         self.deps.docker.delete_volume(&volume).await?;
         Ok(())
@@ -2290,20 +2320,21 @@ impl AgentRuntime {
             RuntimeError::InvalidInput("project git account is not configured".to_string())
         })?;
         let token = self.deps.git_accounts.token(&account_id).await?;
-        projects::workspace::sync_project_repo_cache(
-            &self.git_binary,
-            &self.projects_root,
-            &summary,
-            &token,
-        )
-        .await?;
-        let clone_path = projects::workspace::prepare_project_agent_clone(
-            &self.git_binary,
-            &self.projects_root,
-            &summary,
-            maintainer_agent_id,
-        )
-        .await?;
+        self.workspace_manager
+            .ensure_repo_cache(&summary, &token)
+            .await?;
+        self.workspace_manager
+            .sync_repo_cache(&summary, &token)
+            .await?;
+        let clone_path = self
+            .workspace_manager
+            .prepare_agent_clone(
+                &summary,
+                maintainer_agent_id,
+                projects::workspace::CloneSeed::DefaultBranch,
+            )
+            .await?
+            .path;
         let existing = projects::skills::detect_existing_dirs_in_host_repo(&clone_path);
         self.refresh_project_skill_cache(project_id, &existing)
             .await?;
@@ -2841,7 +2872,8 @@ impl agents::AgentDeleteOps for AgentRuntime {
         project_id: ProjectId,
         agent_id: AgentId,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        projects::workspace::cleanup_project_agent_clone(&self.projects_root, project_id, agent_id)
+        self.workspace_manager
+            .cleanup_agent_clone(project_id, agent_id)
     }
 
     async fn delete_agent_from_store(&self, agent_id: AgentId) -> Result<()> {

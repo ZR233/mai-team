@@ -5,12 +5,14 @@ use tokio::process::Command;
 
 use crate::{Result, RuntimeError};
 
+pub(crate) mod lease;
 pub(crate) mod manager;
 pub(crate) mod paths;
 pub(crate) mod policy;
+pub(crate) mod reconcile;
 
 pub(crate) use manager::{
-    cleanup_project_agent_clone, prepare_project_agent_clone, sync_project_repo_cache,
+    CloneSeed, LocalProjectWorkspaceManager, ProjectWorkspaceManager, sync_project_repo_cache,
 };
 pub(crate) use paths::{agent_clone_path, project_repo_cache_path};
 
