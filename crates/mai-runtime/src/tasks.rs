@@ -2,9 +2,11 @@ use std::future::Future;
 use std::sync::Arc;
 
 use mai_protocol::{
-    AgentDetail, AgentId, AgentSummary, PlanStatus, TaskDetail, TaskId, TaskPlan, TaskStatus,
-    TaskSummary, now,
+    AgentDetail, AgentId, AgentModelPreference, AgentSummary, PlanStatus, ServiceEventKind,
+    TaskDetail, TaskId, TaskPlan, TaskStatus, TaskSummary, TurnId, now,
 };
+use tokio::sync::{Mutex, RwLock};
+use uuid::Uuid;
 
 use crate::state::{RuntimeState, TaskRecord};
 use crate::{Result, RuntimeError};
@@ -29,6 +31,50 @@ pub(crate) trait TaskUpdateOps: Send + Sync {
     fn publish_task_updated(&self, task: TaskSummary) -> impl Future<Output = ()> + Send;
 }
 
+pub(crate) struct CreateTaskInput {
+    pub(crate) title: Option<String>,
+    pub(crate) initial_message: Option<String>,
+    pub(crate) docker_image: Option<String>,
+}
+
+pub(crate) struct CreateTaskPlannerAgentRequest {
+    pub(crate) task_id: TaskId,
+    pub(crate) title: String,
+    pub(crate) model: AgentModelPreference,
+    pub(crate) docker_image: Option<String>,
+}
+
+/// Supplies agent/model side effects needed by task creation.
+pub(crate) trait TaskCreateOps: Send + Sync {
+    fn planner_model(&self) -> impl Future<Output = Result<AgentModelPreference>> + Send;
+
+    fn create_task_planner_agent(
+        &self,
+        request: CreateTaskPlannerAgentRequest,
+    ) -> impl Future<Output = Result<AgentSummary>> + Send;
+
+    fn save_task(
+        &self,
+        summary: &TaskSummary,
+        plan: &TaskPlan,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    fn publish_task_event(&self, event: ServiceEventKind) -> impl Future<Output = ()> + Send;
+
+    fn send_task_message(
+        &self,
+        task_id: TaskId,
+        message: String,
+        skill_mentions: Vec<String>,
+    ) -> impl Future<Output = Result<TurnId>> + Send;
+
+    fn spawn_task_title_generation(
+        &self,
+        task_id: TaskId,
+        message: String,
+    ) -> impl Future<Output = ()> + Send;
+}
+
 pub(crate) async fn task(state: &RuntimeState, task_id: TaskId) -> Result<Arc<TaskRecord>> {
     state
         .tasks
@@ -37,6 +83,81 @@ pub(crate) async fn task(state: &RuntimeState, task_id: TaskId) -> Result<Arc<Ta
         .get(&task_id)
         .cloned()
         .ok_or(RuntimeError::TaskNotFound(task_id))
+}
+
+pub(crate) async fn create_task(
+    state: &RuntimeState,
+    ops: &impl TaskCreateOps,
+    input: CreateTaskInput,
+) -> Result<TaskSummary> {
+    let task_id = Uuid::new_v4();
+    let user_omitted_title = input
+        .title
+        .as_ref()
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true);
+    let title = input
+        .title
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "New Task".to_string());
+    let planner_model = ops.planner_model().await?;
+    let created_at = now();
+    let planner = ops
+        .create_task_planner_agent(CreateTaskPlannerAgentRequest {
+            task_id,
+            title: title.clone(),
+            model: planner_model,
+            docker_image: input.docker_image,
+        })
+        .await?;
+    let plan = TaskPlan::default();
+    let summary = TaskSummary {
+        id: task_id,
+        title,
+        status: TaskStatus::Planning,
+        plan_status: plan.status.clone(),
+        plan_version: plan.version,
+        planner_agent_id: planner.id,
+        current_agent_id: Some(planner.id),
+        agent_count: 1,
+        review_rounds: 0,
+        created_at,
+        updated_at: now(),
+        last_error: None,
+        final_report: None,
+    };
+    ops.save_task(&summary, &plan).await?;
+    state.tasks.write().await.insert(
+        task_id,
+        Arc::new(TaskRecord {
+            summary: RwLock::new(summary.clone()),
+            plan: RwLock::new(plan),
+            plan_history: RwLock::new(Vec::new()),
+            reviews: RwLock::new(Vec::new()),
+            artifacts: RwLock::new(Vec::new()),
+            workflow_lock: Mutex::new(()),
+        }),
+    );
+    ops.publish_task_event(ServiceEventKind::TaskCreated {
+        task: summary.clone(),
+    })
+    .await;
+    let message_for_title = input
+        .initial_message
+        .as_ref()
+        .filter(|message| !message.trim().is_empty())
+        .cloned();
+    if let Some(message) = input
+        .initial_message
+        .filter(|message| !message.trim().is_empty())
+    {
+        let _ = ops.send_task_message(task_id, message, Vec::new()).await?;
+    }
+    if user_omitted_title && let Some(message_text) = message_for_title {
+        ops.spawn_task_title_generation(task_id, message_text).await;
+    }
+    Ok(summary)
 }
 
 pub(crate) async fn list_tasks(state: &RuntimeState) -> Vec<TaskSummary> {

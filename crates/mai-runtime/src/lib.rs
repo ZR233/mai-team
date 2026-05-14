@@ -625,87 +625,16 @@ impl AgentRuntime {
         initial_message: Option<String>,
         docker_image: Option<String>,
     ) -> Result<TaskSummary> {
-        let task_id = Uuid::new_v4();
-        let user_omitted_title = title.as_ref().map(|v| v.trim().is_empty()).unwrap_or(true);
-        let title = title
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "New Task".to_string());
-        let planner_model = self.resolve_role_agent_model(AgentRole::Planner).await?;
-        let created_at = now();
-        let planner = self
-            .create_agent_with_container_source(
-                CreateAgentRequest {
-                    name: Some(format!("{title} Planner")),
-                    provider_id: Some(planner_model.preference.provider_id),
-                    model: Some(planner_model.preference.model),
-                    reasoning_effort: planner_model.preference.reasoning_effort,
-                    docker_image,
-                    parent_id: None,
-                    system_prompt: Some(
-                        agents::task_role_system_prompt(AgentRole::Planner).to_string(),
-                    ),
-                },
-                agents::ContainerSource::FreshImage,
-                Some(task_id),
-                None,
-                Some(AgentRole::Planner),
-            )
-            .await?;
-        let plan = TaskPlan::default();
-        let summary = TaskSummary {
-            id: task_id,
-            title,
-            status: TaskStatus::Planning,
-            plan_status: plan.status.clone(),
-            plan_version: plan.version,
-            planner_agent_id: planner.id,
-            current_agent_id: Some(planner.id),
-            agent_count: 1,
-            review_rounds: 0,
-            created_at,
-            updated_at: now(),
-            last_error: None,
-            final_report: None,
-        };
-        self.deps.store.save_task(&summary, &plan).await?;
-        let task = Arc::new(TaskRecord {
-            summary: RwLock::new(summary.clone()),
-            plan: RwLock::new(plan),
-            plan_history: RwLock::new(Vec::new()),
-            reviews: RwLock::new(Vec::new()),
-            artifacts: RwLock::new(Vec::new()),
-            workflow_lock: Mutex::new(()),
-        });
-        self.state.tasks.write().await.insert(task_id, task);
-        self.events
-            .publish(ServiceEventKind::TaskCreated {
-                task: summary.clone(),
-            })
-            .await;
-        let message_for_title = initial_message
-            .as_ref()
-            .filter(|m| !m.trim().is_empty())
-            .cloned();
-        if let Some(message) = initial_message.filter(|message| !message.trim().is_empty()) {
-            let _ = self.send_task_message(task_id, message, Vec::new()).await?;
-        }
-        if user_omitted_title && let Some(message_text) = message_for_title {
-            let runtime = Arc::clone(self);
-            tokio::spawn(async move {
-                match runtime.generate_task_title(&message_text).await {
-                    Ok(new_title) => {
-                        if let Err(err) = runtime.update_task_title(task_id, new_title).await {
-                            tracing::warn!("failed to update task title: {err}");
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!("failed to generate task title: {err}");
-                    }
-                }
-            });
-        }
-        Ok(summary)
+        tasks::create_task(
+            &self.state,
+            self,
+            tasks::CreateTaskInput {
+                title,
+                initial_message,
+                docker_image,
+            },
+        )
+        .await
     }
 
     async fn generate_task_title(self: &Arc<Self>, message: &str) -> Result<String> {
@@ -4425,6 +4354,73 @@ impl tasks::TaskUpdateOps for AgentRuntime {
         self.events
             .publish(ServiceEventKind::TaskUpdated { task })
             .await;
+    }
+}
+
+impl tasks::TaskCreateOps for Arc<AgentRuntime> {
+    async fn planner_model(&self) -> Result<AgentModelPreference> {
+        Ok(self
+            .resolve_role_agent_model(AgentRole::Planner)
+            .await?
+            .preference)
+    }
+
+    async fn create_task_planner_agent(
+        &self,
+        request: tasks::CreateTaskPlannerAgentRequest,
+    ) -> Result<AgentSummary> {
+        self.create_agent_with_container_source(
+            CreateAgentRequest {
+                name: Some(format!("{} Planner", request.title)),
+                provider_id: Some(request.model.provider_id),
+                model: Some(request.model.model),
+                reasoning_effort: request.model.reasoning_effort,
+                docker_image: request.docker_image,
+                parent_id: None,
+                system_prompt: Some(
+                    agents::task_role_system_prompt(AgentRole::Planner).to_string(),
+                ),
+            },
+            agents::ContainerSource::FreshImage,
+            Some(request.task_id),
+            None,
+            Some(AgentRole::Planner),
+        )
+        .await
+    }
+
+    async fn save_task(&self, summary: &TaskSummary, plan: &TaskPlan) -> Result<()> {
+        self.deps.store.save_task(summary, plan).await?;
+        Ok(())
+    }
+
+    async fn publish_task_event(&self, event: ServiceEventKind) {
+        self.events.publish(event).await;
+    }
+
+    fn send_task_message(
+        &self,
+        task_id: TaskId,
+        message: String,
+        skill_mentions: Vec<String>,
+    ) -> impl std::future::Future<Output = Result<TurnId>> + Send {
+        AgentRuntime::send_task_message(self, task_id, message, skill_mentions)
+    }
+
+    async fn spawn_task_title_generation(&self, task_id: TaskId, message: String) {
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            match runtime.generate_task_title(&message).await {
+                Ok(new_title) => {
+                    if let Err(err) = runtime.update_task_title(task_id, new_title).await {
+                        tracing::warn!("failed to update task title: {err}");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("failed to generate task title: {err}");
+                }
+            }
+        });
     }
 }
 
