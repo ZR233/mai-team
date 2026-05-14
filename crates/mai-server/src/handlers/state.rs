@@ -76,3 +76,62 @@ impl IntoResponse for ApiError {
             .into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mai_runtime::RuntimeError;
+    use pretty_assertions::assert_eq;
+
+    fn agent_id() -> mai_protocol::AgentId {
+        mai_protocol::AgentId::new_v4()
+    }
+
+    fn task_id() -> mai_protocol::TaskId {
+        mai_protocol::TaskId::new_v4()
+    }
+
+    #[test]
+    fn runtime_error_not_found_maps_to_404() {
+        let err = RuntimeError::AgentNotFound(agent_id());
+        let api: ApiError = err.into();
+        assert_eq!(api.status, StatusCode::NOT_FOUND);
+
+        let err = RuntimeError::TaskNotFound(task_id());
+        let api: ApiError = err.into();
+        assert_eq!(api.status, StatusCode::NOT_FOUND);
+
+        let err = RuntimeError::TurnNotFound {
+            agent_id: agent_id(),
+            turn_id: mai_protocol::TurnId::new_v4(),
+        };
+        let api: ApiError = err.into();
+        assert_eq!(api.status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn runtime_error_busy_maps_to_409() {
+        let err = RuntimeError::AgentBusy(agent_id());
+        let api: ApiError = err.into();
+        assert_eq!(api.status, StatusCode::CONFLICT);
+
+        let err = RuntimeError::TaskBusy(task_id());
+        let api: ApiError = err.into();
+        assert_eq!(api.status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn runtime_error_invalid_input_maps_to_400() {
+        let err = RuntimeError::InvalidInput("bad request".into());
+        let api: ApiError = err.into();
+        assert_eq!(api.status, StatusCode::BAD_REQUEST);
+        assert!(api.message.contains("bad request"));
+    }
+
+    #[test]
+    fn runtime_error_turn_cancelled_maps_to_409() {
+        let err = RuntimeError::TurnCancelled;
+        let api: ApiError = err.into();
+        assert_eq!(api.status, StatusCode::CONFLICT);
+    }
+}

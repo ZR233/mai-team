@@ -26,6 +26,7 @@ anyhow = "1"
 ctrlc = { version = "3", features = ["termination"] }
 fnv = "1"
 percent-encoding = "2"
+pretty_assertions = "1"
 schemars = "1"
 shell-words = "1"
 strum = { version = "0.28", features = ["derive"] }

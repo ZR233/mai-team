@@ -19,6 +19,37 @@ fn html_escape(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn html_escape_replaces_special_entities() {
+        assert_eq!(html_escape("a&b<c>d\"e"), "a&amp;b&lt;c&gt;d&quot;e");
+    }
+
+    #[test]
+    fn html_escape_leaves_plain_text_unchanged() {
+        assert_eq!(html_escape("hello world"), "hello world");
+    }
+
+    #[test]
+    fn callback_page_success_returns_ok_status() {
+        let resp = github_callback_page(true, "Title", "Msg", "/next");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn callback_page_failure_returns_bad_request_status() {
+        let resp = github_callback_page(false, "Title", "Msg", "/next");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
 fn github_callback_page(success: bool, title: &str, message: &str, next: &str) -> Response {
     let status = if success {
         StatusCode::OK
