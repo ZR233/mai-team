@@ -428,9 +428,8 @@ fn migrated_capabilities(
         }
         ProviderKind::Deepseek => {
             capabilities.continuation = false;
-            capabilities.reasoning_replay = capabilities.reasoning_replay
-                || model_id.contains("reasoner")
-                || model_id.contains("pro");
+            capabilities.reasoning_replay =
+                capabilities.reasoning_replay || is_deepseek_v4_model(model_id);
         }
         ProviderKind::Mimo => {
             capabilities.continuation = false;
@@ -525,10 +524,8 @@ fn builtin_provider(kind: ProviderKind) -> ProviderConfig {
             default_model: "deepseek-v4-flash".to_string(),
             enabled: true,
             models: vec![
-                deepseek_model("deepseek-v4-flash", false),
+                deepseek_model("deepseek-v4-flash", true),
                 deepseek_model("deepseek-v4-pro", true),
-                deepseek_model("deepseek-chat", false),
-                deepseek_model("deepseek-reasoner", true),
             ],
         },
         ProviderKind::Mimo => mimo_builtin_provider(
@@ -655,10 +652,7 @@ fn deepseek_output_tokens(id: &str) -> u64 {
 }
 
 fn is_deepseek_v4_model(id: &str) -> bool {
-    matches!(
-        id,
-        "deepseek-v4-flash" | "deepseek-v4-pro" | "deepseek-chat" | "deepseek-reasoner"
-    )
+    matches!(id, "deepseek-v4-flash" | "deepseek-v4-pro")
 }
 
 fn mimo_model(id: &str, with_reasoning: bool) -> ModelConfig {

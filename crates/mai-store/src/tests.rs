@@ -423,8 +423,6 @@ async fn provider_presets_include_builtin_metadata() {
     for id in [
         "deepseek-v4-flash",
         "deepseek-v4-pro",
-        "deepseek-chat",
-        "deepseek-reasoner",
     ] {
         let model = deepseek
             .models
@@ -434,12 +432,14 @@ async fn provider_presets_include_builtin_metadata() {
         assert_eq!(model.context_tokens, DEEPSEEK_V4_CONTEXT_TOKENS);
         assert_eq!(model.output_tokens, DEEPSEEK_V4_OUTPUT_TOKENS);
     }
-    assert!(
-        deepseek
-            .models
-            .iter()
-            .any(|model| model.id == "deepseek-reasoner")
-    );
+    let v4_flash = deepseek
+        .models
+        .iter()
+        .find(|model| model.id == "deepseek-v4-flash")
+        .expect("deepseek v4 flash");
+    assert!(v4_flash.reasoning.is_some());
+    assert!(v4_flash.capabilities.reasoning_replay);
+    assert_eq!(deepseek.models.len(), 2);
     let mimo_presets: Vec<_> = presets
         .providers
         .iter()
