@@ -2590,19 +2590,11 @@ impl AgentRuntime {
     }
 
     async fn ensure_project_review_workspace(&self, project_id: ProjectId) -> Result<()> {
-        self.run_project_review_repo_command(
-            project_id,
-            projects::review::workspace::ReviewRepoCommand::Ensure,
-        )
-        .await
+        projects::review::workspace::ensure_project_review_workspace(self, project_id).await
     }
 
     async fn sync_project_review_repo(&self, project_id: ProjectId) -> Result<()> {
-        self.run_project_review_repo_command(
-            project_id,
-            projects::review::workspace::ReviewRepoCommand::Sync,
-        )
-        .await
+        projects::review::workspace::sync_project_review_repo(self, project_id).await
     }
 
     async fn cleanup_project_review_worktree(
@@ -2610,33 +2602,8 @@ impl AgentRuntime {
         project_id: ProjectId,
         reviewer_id: AgentId,
     ) -> Result<()> {
-        projects::review::workspace::cleanup_worktree(
-            &self.deps.docker,
-            &self.sidecar_image,
-            project_id,
-            reviewer_id,
-        )
-        .await
-    }
-
-    async fn run_project_review_repo_command(
-        &self,
-        project_id: ProjectId,
-        command: projects::review::workspace::ReviewRepoCommand,
-    ) -> Result<()> {
-        let project = self.project(project_id).await?;
-        let summary = project.summary.read().await.clone();
-        let token = self.project_git_token(project_id).await?.ok_or_else(|| {
-            RuntimeError::InvalidInput("project git account token is not configured".to_string())
-        })?;
-        projects::review::workspace::run_repo_command(
-            &self.deps.docker,
-            &self.sidecar_image,
-            &summary,
-            &token,
-            command,
-        )
-        .await
+        projects::review::workspace::cleanup_project_review_worktree(self, project_id, reviewer_id)
+            .await
     }
 
     async fn spawn_project_reviewer_agent(
@@ -3760,6 +3727,59 @@ impl projects::review::cleanup::ProjectReviewCleanupOps for Arc<AgentRuntime> {
             cutoff,
         )
         .await
+    }
+}
+
+impl projects::review::workspace::ProjectReviewWorkspaceOps for AgentRuntime {
+    fn project_summary(
+        &self,
+        project_id: ProjectId,
+    ) -> impl std::future::Future<Output = Result<ProjectSummary>> + Send {
+        async move {
+            let project = AgentRuntime::project(self, project_id).await?;
+            Ok(project.summary.read().await.clone())
+        }
+    }
+
+    fn project_git_token(
+        &self,
+        project_id: ProjectId,
+    ) -> impl std::future::Future<Output = Result<Option<String>>> + Send {
+        AgentRuntime::project_git_token(self, project_id)
+    }
+
+    fn run_project_review_repo_command(
+        &self,
+        project: ProjectSummary,
+        token: String,
+        command: projects::review::workspace::ReviewRepoCommand,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            projects::review::workspace::run_repo_command(
+                &self.deps.docker,
+                &self.sidecar_image,
+                &project,
+                &token,
+                command,
+            )
+            .await
+        }
+    }
+
+    fn cleanup_project_review_worktree(
+        &self,
+        project_id: ProjectId,
+        reviewer_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            projects::review::workspace::cleanup_worktree(
+                &self.deps.docker,
+                &self.sidecar_image,
+                project_id,
+                reviewer_id,
+            )
+            .await
+        }
     }
 }
 

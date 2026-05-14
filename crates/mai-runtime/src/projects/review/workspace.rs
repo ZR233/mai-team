@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use chrono::{DateTime, Utc};
 use mai_docker::{DockerClient, SidecarParams, project_review_workspace_volume};
 use mai_protocol::{AgentId, ProjectId, ProjectSummary, preview};
@@ -15,6 +17,69 @@ const PROJECT_REVIEW_REPO_COMMAND_RETRY_SECS: u64 = 5;
 pub(crate) enum ReviewRepoCommand {
     Ensure,
     Sync,
+}
+
+/// Provides project lookup and review workspace infrastructure needed to
+/// prepare, sync, and clean project review repositories.
+pub(crate) trait ProjectReviewWorkspaceOps: Send + Sync {
+    fn project_summary(
+        &self,
+        project_id: ProjectId,
+    ) -> impl Future<Output = Result<ProjectSummary>> + Send;
+
+    fn project_git_token(
+        &self,
+        project_id: ProjectId,
+    ) -> impl Future<Output = Result<Option<String>>> + Send;
+
+    fn run_project_review_repo_command(
+        &self,
+        project: ProjectSummary,
+        token: String,
+        command: ReviewRepoCommand,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    fn cleanup_project_review_worktree(
+        &self,
+        project_id: ProjectId,
+        reviewer_id: AgentId,
+    ) -> impl Future<Output = Result<()>> + Send;
+}
+
+pub(crate) async fn ensure_project_review_workspace(
+    ops: &impl ProjectReviewWorkspaceOps,
+    project_id: ProjectId,
+) -> Result<()> {
+    run_project_review_repo_command(ops, project_id, ReviewRepoCommand::Ensure).await
+}
+
+pub(crate) async fn sync_project_review_repo(
+    ops: &impl ProjectReviewWorkspaceOps,
+    project_id: ProjectId,
+) -> Result<()> {
+    run_project_review_repo_command(ops, project_id, ReviewRepoCommand::Sync).await
+}
+
+pub(crate) async fn cleanup_project_review_worktree(
+    ops: &impl ProjectReviewWorkspaceOps,
+    project_id: ProjectId,
+    reviewer_id: AgentId,
+) -> Result<()> {
+    ops.cleanup_project_review_worktree(project_id, reviewer_id)
+        .await
+}
+
+pub(crate) async fn run_project_review_repo_command(
+    ops: &impl ProjectReviewWorkspaceOps,
+    project_id: ProjectId,
+    command: ReviewRepoCommand,
+) -> Result<()> {
+    let project = ops.project_summary(project_id).await?;
+    let token = ops.project_git_token(project_id).await?.ok_or_else(|| {
+        RuntimeError::InvalidInput("project git account token is not configured".to_string())
+    })?;
+    ops.run_project_review_repo_command(project, token, command)
+        .await
 }
 
 pub(crate) async fn cleanup_history(
