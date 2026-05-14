@@ -13,6 +13,7 @@ pub(crate) mod reviewer;
 pub(crate) mod runs;
 pub(crate) mod state;
 pub(crate) mod worker;
+#[allow(dead_code)]
 pub(crate) mod workspace;
 
 const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;

@@ -34,6 +34,7 @@ async fn main() -> Result<()> {
     let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
     let data_dir = handlers::helpers::data_dir_path(cli.data_path)?;
     let cache_dir = handlers::helpers::cache_dir_path(&data_dir);
+    let projects_root = data_dir.join("projects");
     let artifact_files_root = handlers::helpers::artifact_files_root(&data_dir);
     let artifact_index_root = handlers::helpers::artifact_index_root(&data_dir);
     let image = env::var("MAI_AGENT_BASE_IMAGE")
@@ -48,6 +49,7 @@ async fn main() -> Result<()> {
     info!("docker available: {docker_version}");
 
     fs::create_dir_all(&cache_dir)?;
+    fs::create_dir_all(&projects_root)?;
     fs::create_dir_all(&artifact_files_root)?;
     fs::create_dir_all(&artifact_index_root)?;
 
@@ -72,6 +74,7 @@ async fn main() -> Result<()> {
     let model_client = ModelClient::new();
     let runtime_config = RuntimeConfig {
         repo_root: env::current_dir()?,
+        projects_root: projects_root.clone(),
         cache_root: cache_dir.clone(),
         artifact_files_root: artifact_files_root.clone(),
         sidecar_image,
@@ -83,6 +86,7 @@ async fn main() -> Result<()> {
     info!(
         data_dir = %data_dir.display(),
         cache_dir = %cache_dir.display(),
+        projects_root = %projects_root.display(),
         artifact_files_root = %artifact_files_root.display(),
         artifact_index_root = %artifact_index_root.display(),
         "runtime storage paths"

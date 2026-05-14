@@ -24,12 +24,14 @@ const PROJECT_SKILL_CANDIDATE_DIRS: [(&str, &str); 3] = [
 pub(crate) enum ProjectSkillRefreshSource {
     ProjectSidecar,
     ReviewWorkspace,
+    HostRepo,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectSkillSourceDir {
     pub(crate) cache_name: String,
     pub(crate) container_path: String,
+    pub(crate) host_path: Option<PathBuf>,
 }
 
 impl ProjectSkillSourceDir {
@@ -44,6 +46,7 @@ impl ProjectSkillSourceDir {
         Some(Self {
             cache_name: cache_name.to_string(),
             container_path: container_path.to_string(),
+            host_path: None,
         })
     }
 }
@@ -153,6 +156,20 @@ pub(crate) async fn detect_existing_dirs_in_review_workspace(
         .collect())
 }
 
+pub(crate) fn detect_existing_dirs_in_host_repo(repo_path: &Path) -> Vec<ProjectSkillSourceDir> {
+    PROJECT_SKILL_CANDIDATE_DIRS
+        .iter()
+        .filter_map(|(relative, cache_name)| {
+            let host_path = repo_path.join(relative);
+            host_path.is_dir().then(|| ProjectSkillSourceDir {
+                cache_name: (*cache_name).to_string(),
+                container_path: format!("{PROJECT_WORKSPACE_PATH}/{relative}"),
+                host_path: Some(host_path),
+            })
+        })
+        .collect()
+}
+
 pub(crate) async fn refresh_cache(
     docker: &DockerClient,
     sidecar_image: &str,
@@ -202,8 +219,31 @@ pub(crate) async fn refresh_cache(
                     )
                     .await?;
             }
+            ProjectSkillRefreshSource::HostRepo => {
+                let host_source = project_source.host_path.as_ref().ok_or_else(|| {
+                        RuntimeError::InvalidInput(
+                            "project host skill source path is missing".to_string(),
+                        )
+                    })?;
+                copy_dir_all(host_source, &target)?;
+            }
         }
         normalize_copied_dir(&target, &project_source.cache_name)?;
+    }
+    Ok(())
+}
+
+fn copy_dir_all(source: &Path, target: &Path) -> Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dest = target.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dest)?;
+        } else if ty.is_file() {
+            fs::copy(entry.path(), dest)?;
+        }
     }
     Ok(())
 }

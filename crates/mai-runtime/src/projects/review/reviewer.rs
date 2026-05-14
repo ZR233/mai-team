@@ -1,6 +1,5 @@
 use std::future::Future;
 
-use mai_docker::project_review_workspace_volume;
 use mai_protocol::{
     AgentId, AgentModelPreference, AgentRole, AgentSummary, CreateAgentRequest, ProjectId,
     ProjectSummary, TurnId,
@@ -55,7 +54,6 @@ pub(crate) async fn spawn_project_reviewer_agent(
         .agent_summary(project_summary.maintainer_agent_id)
         .await?;
     let model = ops.reviewer_model().await?;
-    let workspace_volume = project_review_workspace_volume(&project_id.to_string());
     ops.create_agent_with_container_source(
         CreateAgentRequest {
             name: Some(format!("{} Auto Reviewer", project_summary.name)),
@@ -66,7 +64,7 @@ pub(crate) async fn spawn_project_reviewer_agent(
             parent_id: Some(project_summary.maintainer_agent_id),
             system_prompt: Some(super::project_reviewer_system_prompt().to_string()),
         },
-        ContainerSource::ImageWithWorkspace { workspace_volume },
+        ContainerSource::FreshImage,
         maintainer_summary.task_id,
         Some(project_id),
         Some(AgentRole::Reviewer),
@@ -128,7 +126,7 @@ fn project_reviewer_initial_message_from_summary(
                 .to_string()
         });
     format!(
-        "Run one automatic pull request review for project `{}`.\n\nRepository: {}/{}\nDefault branch: {}\nWorkspace repo: /workspace/repo\nReview worktree root: /workspace/reviews/{}\n{}\n\nExtra reviewer instructions:\n{}\n\nUse the $reviewer-agent-review-pr skill. At the end of the turn, return only one JSON object matching this schema exactly:\n{{\"outcome\":\"review_submitted|no_eligible_pr|failed\",\"pr\":123|null,\"summary\":\"short result\",\"error\":null|\"failure reason\"}}",
+        "Run one automatic pull request review for project `{}`.\n\nRepository: {}/{}\nDefault branch: {}\nWorkspace repo: /workspace/repo\nReview worktree root: /workspace/repo\nReviewer agent: {}\n{}\n\nExtra reviewer instructions:\n{}\n\nUse the $reviewer-agent-review-pr skill. At the end of the turn, return only one JSON object matching this schema exactly:\n{{\"outcome\":\"review_submitted|no_eligible_pr|failed\",\"pr\":123|null,\"summary\":\"short result\",\"error\":null|\"failure reason\"}}",
         summary.name, summary.owner, summary.repo, summary.branch, reviewer_id, target, extra
     )
 }

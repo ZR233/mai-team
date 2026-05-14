@@ -190,6 +190,12 @@ pub(crate) trait ToolDispatchOps: Send + Sync {
         agent: &AgentRecord,
         path: String,
     ) -> Result<ToolExecution>;
+    async fn execute_project_git_tool(
+        &self,
+        agent: &AgentRecord,
+        name: String,
+        arguments: Value,
+    ) -> Result<ToolExecution>;
     async fn execute_mcp_tool(
         &self,
         agent: &AgentRecord,
@@ -280,6 +286,14 @@ pub(crate) async fn visible_tool_names(
         mai_tools::TOOL_REQUEST_USER_INPUT.to_string(),
         mai_tools::TOOL_SAVE_ARTIFACT.to_string(),
         mai_tools::TOOL_GITHUB_API_GET.to_string(),
+        mai_tools::TOOL_GIT_STATUS.to_string(),
+        mai_tools::TOOL_GIT_DIFF.to_string(),
+        mai_tools::TOOL_GIT_BRANCH.to_string(),
+        mai_tools::TOOL_GIT_FETCH.to_string(),
+        mai_tools::TOOL_GIT_COMMIT.to_string(),
+        mai_tools::TOOL_GIT_PUSH.to_string(),
+        mai_tools::TOOL_GIT_WORKTREE_INFO.to_string(),
+        mai_tools::TOOL_GIT_SYNC_DEFAULT_BRANCH.to_string(),
     ]);
     if capability.can_spawn_agents {
         names.insert(mai_tools::TOOL_SPAWN_AGENT.to_string());
@@ -657,6 +671,19 @@ pub(crate) async fn execute_tool(
             context
                 .ops
                 .execute_project_github_api_get(agent, path)
+                .await
+        }
+        RoutedTool::GitStatus
+        | RoutedTool::GitDiff
+        | RoutedTool::GitBranch
+        | RoutedTool::GitFetch
+        | RoutedTool::GitCommit
+        | RoutedTool::GitPush
+        | RoutedTool::GitWorktreeInfo
+        | RoutedTool::GitSyncDefaultBranch => {
+            context
+                .ops
+                .execute_project_git_tool(agent, name.to_string(), arguments)
                 .await
         }
         RoutedTool::Mcp(model_name) => {

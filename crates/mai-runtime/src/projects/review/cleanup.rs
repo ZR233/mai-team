@@ -1,7 +1,7 @@
 use std::future::Future;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use mai_protocol::{AgentId, ProjectId, ProjectSummary};
+use mai_protocol::ProjectSummary;
 use tokio::time::{Duration, sleep};
 
 use crate::Result;
@@ -35,17 +35,6 @@ pub(crate) trait ProjectReviewCleanupOps: Send + Sync {
 
     fn list_projects(&self) -> impl Future<Output = Vec<ProjectSummary>> + Send;
 
-    fn active_reviewer(
-        &self,
-        project_id: ProjectId,
-    ) -> impl Future<Output = Option<AgentId>> + Send;
-
-    fn cleanup_project_review_workspace_history(
-        &self,
-        project_id: ProjectId,
-        active_reviewer: Option<AgentId>,
-        cutoff: DateTime<Utc>,
-    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 pub(crate) async fn run_project_review_cleanup_loop(ops: &impl ProjectReviewCleanupOps) {
@@ -78,14 +67,6 @@ pub(crate) async fn cleanup_project_review_history(
         );
     }
     ops.retain_events_since(cutoff).await;
-    for project in ops.list_projects().await {
-        let active_reviewer = ops.active_reviewer(project.id).await;
-        if let Err(err) = ops
-            .cleanup_project_review_workspace_history(project.id, active_reviewer, cutoff)
-            .await
-        {
-            tracing::warn!(project_id = %project.id, "failed to clean project review workspace history: {err}");
-        }
-    }
+    let _ = ops.list_projects().await;
     Ok(())
 }

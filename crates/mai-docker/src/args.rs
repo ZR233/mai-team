@@ -14,13 +14,24 @@ pub struct ContainerCreateOptions {
     pub network: Option<String>,
 }
 
+#[cfg(test)]
 pub(crate) fn create_agent_container_args(
     name: &str,
     agent_label: &str,
     image: &str,
     workspace_volume: &str,
 ) -> Vec<String> {
-    vec![
+    create_agent_container_args_with_repo_mount(name, agent_label, image, workspace_volume, None)
+}
+
+pub(crate) fn create_agent_container_args_with_repo_mount(
+    name: &str,
+    agent_label: &str,
+    image: &str,
+    workspace_volume: &str,
+    repo_mount: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![
         "create".to_string(),
         "--name".to_string(),
         name.to_string(),
@@ -30,12 +41,18 @@ pub(crate) fn create_agent_container_args(
         agent_label.to_string(),
         "-v".to_string(),
         format!("{workspace_volume}:/workspace"),
+    ];
+    if let Some(repo_mount) = repo_mount {
+        args.extend(["-v".to_string(), format!("{repo_mount}:/workspace/repo")]);
+    }
+    args.extend([
         "-w".to_string(),
         "/workspace".to_string(),
         image.to_string(),
         "sleep".to_string(),
         "infinity".to_string(),
-    ]
+    ]);
+    args
 }
 
 pub(crate) fn create_project_sidecar_container_args(
@@ -287,6 +304,30 @@ mod tests {
                 .windows(2)
                 .any(|window| window == ["-v", "mai-team-workspace-reviewer:/workspace"])
         );
+    }
+
+    #[test]
+    fn project_agent_container_args_can_bind_host_repo_worktree() {
+        let image = "ghcr.io/rcore-os/tgoskits-container:latest";
+        let args = create_agent_container_args_with_repo_mount(
+            "mai-team-maintainer",
+            "mai.team.agent=maintainer",
+            image,
+            "mai-team-workspace-maintainer",
+            Some("/data/projects/project-1/worktrees/agent-1"),
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-v", "mai-team-workspace-maintainer:/workspace"])
+        );
+        assert!(args.windows(2).any(|window| {
+            window == [
+                "-v",
+                "/data/projects/project-1/worktrees/agent-1:/workspace/repo",
+            ]
+        }));
+        assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
     }
 
     #[test]
