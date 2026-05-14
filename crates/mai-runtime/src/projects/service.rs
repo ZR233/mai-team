@@ -7,7 +7,7 @@ use mai_protocol::{
     AgentDetail, AgentId, AgentModelPreference, AgentRole, AgentSummary, CreateProjectRequest,
     GitAccountSummary, GithubInstallationsResponse, ProjectCloneStatus, ProjectDetail, ProjectId,
     ProjectReviewStatus, ProjectStatus, ProjectSummary, ServiceEventKind, SessionId,
-    UpdateProjectRequest, now, preview,
+    SendMessageRequest, TurnId, UpdateProjectRequest, now, preview,
 };
 use uuid::Uuid;
 
@@ -45,6 +45,10 @@ pub(crate) trait ProjectLifecycleOps: Send + Sync {
     ) -> impl Future<Output = Result<()>> + Send;
     fn stop_project_review_loop(&self, project_id: ProjectId) -> impl Future<Output = ()> + Send;
     fn delete_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<()>> + Send;
+    fn cancel_project_agent(
+        &self,
+        agent_id: AgentId,
+    ) -> impl Future<Output = Result<()>> + Send;
     fn shutdown_project_mcp_manager(
         &self,
         project_id: ProjectId,
@@ -60,6 +64,11 @@ pub(crate) trait ProjectLifecycleOps: Send + Sync {
     fn remove_project_from_memory(&self, project_id: ProjectId) -> impl Future<Output = ()> + Send;
     fn remove_project_skill_lock(&self, project_id: ProjectId) -> impl Future<Output = ()> + Send;
     fn project_skill_cache_dir(&self, project_id: ProjectId) -> PathBuf;
+    fn send_project_agent_message(
+        &self,
+        agent_id: AgentId,
+        request: SendMessageRequest,
+    ) -> impl Future<Output = Result<TurnId>> + Send;
 }
 
 pub(crate) struct ProjectMaintainerAgentRequest {
@@ -438,6 +447,44 @@ pub(crate) async fn delete_project(
         .await;
     let _ = std::fs::remove_dir_all(ops.project_skill_cache_dir(project_id));
     Ok(())
+}
+
+pub(crate) async fn cancel_project(
+    state: &RuntimeState,
+    ops: &impl ProjectLifecycleOps,
+    project_id: ProjectId,
+) -> Result<()> {
+    let project = project(state, project_id).await?;
+    ops.stop_project_review_loop(project_id).await;
+    for agent in project_agents(state, project_id).await {
+        let _ = ops.cancel_project_agent(agent.id).await;
+    }
+    let updated = {
+        let mut summary = project.summary.write().await;
+        if matches!(summary.status, ProjectStatus::Creating) {
+            summary.status = ProjectStatus::Failed;
+            summary.last_error = Some("cancelled".to_string());
+        }
+        summary.updated_at = now();
+        summary.clone()
+    };
+    ops.save_project(&updated).await?;
+    ops.publish_project_event(ServiceEventKind::ProjectUpdated { project: updated })
+        .await;
+    ops.shutdown_project_mcp_manager(project_id).await;
+    let _ = ops.delete_project_sidecar(project_id).await;
+    Ok(())
+}
+
+pub(crate) async fn send_project_message(
+    state: &RuntimeState,
+    ops: &impl ProjectLifecycleOps,
+    project_id: ProjectId,
+    request: SendMessageRequest,
+) -> Result<TurnId> {
+    let project = project(state, project_id).await?;
+    let maintainer_agent_id = project.summary.read().await.maintainer_agent_id;
+    ops.send_project_agent_message(maintainer_agent_id, request).await
 }
 
 pub(crate) async fn prepare_copied_workspace(

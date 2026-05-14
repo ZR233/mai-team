@@ -742,36 +742,7 @@ impl AgentRuntime {
     }
 
     pub async fn cancel_project(self: &Arc<Self>, project_id: ProjectId) -> Result<()> {
-        let project = self.project(project_id).await?;
-        self.stop_project_review_loop(project_id).await;
-        let agents = self.project_agents(project_id).await;
-        for agent in agents {
-            if let Ok(record) = self.agent(agent.id).await {
-                let current_turn = record.summary.read().await.current_turn;
-                if let Some(turn_id) = current_turn {
-                    let _ = self.cancel_agent_turn(agent.id, turn_id).await;
-                } else {
-                    record.cancel_requested.store(true, Ordering::SeqCst);
-                    let _ = self.set_status(&record, AgentStatus::Cancelled, None).await;
-                }
-            }
-        }
-        let updated = {
-            let mut summary = project.summary.write().await;
-            if matches!(summary.status, ProjectStatus::Creating) {
-                summary.status = ProjectStatus::Failed;
-                summary.last_error = Some("cancelled".to_string());
-            }
-            summary.updated_at = now();
-            summary.clone()
-        };
-        self.deps.store.save_project(&updated).await?;
-        self.events
-            .publish(ServiceEventKind::ProjectUpdated { project: updated })
-            .await;
-        self.shutdown_project_mcp_manager(project_id).await;
-        let _ = self.delete_project_sidecar(project_id).await;
-        Ok(())
+        projects::service::cancel_project(&self.state, self, project_id).await
     }
 
     pub async fn send_project_message(
@@ -779,15 +750,7 @@ impl AgentRuntime {
         project_id: ProjectId,
         request: SendMessageRequest,
     ) -> Result<TurnId> {
-        let project = self.project(project_id).await?;
-        let maintainer_agent_id = project.summary.read().await.maintainer_agent_id;
-        self.send_message(
-            maintainer_agent_id,
-            request.session_id,
-            request.message,
-            request.skill_mentions,
-        )
-        .await
+        projects::service::send_project_message(&self.state, self, project_id, request).await
     }
 
     pub async fn publish_external_event(&self, kind: ServiceEventKind) {
@@ -1945,10 +1908,6 @@ impl AgentRuntime {
             .entry(project_id)
             .or_insert_with(|| Arc::new(RwLock::new(())))
             .clone()
-    }
-
-    async fn project_agents(&self, project_id: ProjectId) -> Vec<AgentSummary> {
-        projects::service::project_agents(&self.state, project_id).await
     }
 
     async fn project_auto_reviewer_agents(&self, project_id: ProjectId) -> Vec<AgentSummary> {
@@ -4140,6 +4099,19 @@ impl projects::service::ProjectLifecycleOps for Arc<AgentRuntime> {
         AgentRuntime::delete_agent(self.as_ref(), agent_id)
     }
 
+    async fn cancel_project_agent(&self, agent_id: AgentId) -> Result<()> {
+        if let Ok(record) = self.agent(agent_id).await {
+            let current_turn = record.summary.read().await.current_turn;
+            if let Some(turn_id) = current_turn {
+                let _ = self.cancel_agent_turn(agent_id, turn_id).await;
+            } else {
+                record.cancel_requested.store(true, Ordering::SeqCst);
+                let _ = self.set_status(&record, AgentStatus::Cancelled, None).await;
+            }
+        }
+        Ok(())
+    }
+
     fn shutdown_project_mcp_manager(
         &self,
         project_id: ProjectId,
@@ -4179,6 +4151,21 @@ impl projects::service::ProjectLifecycleOps for Arc<AgentRuntime> {
 
     fn project_skill_cache_dir(&self, project_id: ProjectId) -> PathBuf {
         AgentRuntime::project_skill_cache_dir(self.as_ref(), project_id)
+    }
+
+    async fn send_project_agent_message(
+        &self,
+        agent_id: AgentId,
+        request: SendMessageRequest,
+    ) -> Result<TurnId> {
+        AgentRuntime::send_message(
+            self,
+            agent_id,
+            request.session_id,
+            request.message,
+            request.skill_mentions,
+        )
+        .await
     }
 }
 
