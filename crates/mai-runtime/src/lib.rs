@@ -2209,27 +2209,7 @@ impl AgentRuntime {
         agent_id: AgentId,
         cancellation_token: &CancellationToken,
     ) -> Result<AgentResourceBroker> {
-        let agent_mcp = agent.mcp.read().await.clone();
-        let project_mcp = if agent.summary.read().await.project_id.is_some() {
-            self.project_mcp_manager_for_agent(agent, agent_id, cancellation_token)
-                .await
-                .unwrap_or(None)
-        } else {
-            None
-        };
-        let project_skill_guard = self.project_skill_read_guard(agent).await;
-        let skills_config = self.deps.store.load_skills_config().await?;
-        let skills = {
-            self.skills_manager_for_agent(agent)
-                .await?
-                .list(&skills_config)?
-        };
-        Ok(AgentResourceBroker {
-            agent_mcp,
-            project_mcp,
-            skills,
-            _project_skill_guard: project_skill_guard,
-        })
+        agents::agent_resource_broker(self, agent, agent_id, cancellation_token).await
     }
 
     async fn execute_project_github_api_get(
@@ -2699,6 +2679,38 @@ impl agents::AgentObservabilityOps for AgentRuntime {
         name: &str,
     ) -> PathBuf {
         AgentRuntime::tool_output_artifact_file_path(self, agent_id, call_id, artifact_id, name)
+    }
+}
+
+impl agents::AgentResourceBrokerOps for AgentRuntime {
+    fn project_mcp_manager_for_agent(
+        &self,
+        agent: &AgentRecord,
+        agent_id: AgentId,
+        cancellation_token: &CancellationToken,
+    ) -> impl std::future::Future<Output = Result<Option<Arc<McpAgentManager>>>> + Send {
+        AgentRuntime::project_mcp_manager_for_agent(self, agent, agent_id, cancellation_token)
+    }
+
+    fn project_skill_read_guard(
+        &self,
+        agent: &AgentRecord,
+    ) -> impl std::future::Future<Output = Option<tokio::sync::OwnedRwLockReadGuard<()>>> + Send
+    {
+        AgentRuntime::project_skill_read_guard(self, agent)
+    }
+
+    fn skills_config(
+        &self,
+    ) -> impl std::future::Future<Output = Result<SkillsConfigRequest>> + Send {
+        async move { Ok(self.deps.store.load_skills_config().await?) }
+    }
+
+    fn skills_manager_for_agent(
+        &self,
+        agent: &AgentRecord,
+    ) -> impl std::future::Future<Output = Result<SkillsManager>> + Send {
+        AgentRuntime::skills_manager_for_agent(self, agent)
     }
 }
 

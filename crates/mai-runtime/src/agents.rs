@@ -45,7 +45,7 @@ pub(crate) use model::normalize_reasoning_effort;
 pub(crate) use observability::{
     AgentObservabilityOps, agent_logs, tool_output_artifact, tool_trace, tool_traces,
 };
-pub(crate) use resources::AgentResourceBroker;
+pub(crate) use resources::{AgentResourceBroker, AgentResourceBrokerOps, agent_resource_broker};
 pub(crate) use spawn::{
     AgentSpawnOps, SpawnChildAgentRequest, spawn_child_agent, spawn_task_role_agent,
 };

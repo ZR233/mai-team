@@ -1,12 +1,17 @@
 use std::borrow::Cow;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mai_mcp::McpAgentManager;
-use mai_protocol::{SkillScope, SkillsListResponse};
+use mai_protocol::{AgentId, SkillScope, SkillsConfigRequest, SkillsListResponse};
+use mai_skills::SkillsManager;
 use serde_json::{Value, json};
+use tokio::sync::OwnedRwLockReadGuard;
+use tokio_util::sync::CancellationToken;
 
+use crate::state::AgentRecord;
 use crate::{Result, RuntimeError};
 
 pub(crate) const SKILL_RESOURCE_SERVER: &str = "skill";
@@ -18,6 +23,57 @@ pub(crate) struct AgentResourceBroker {
     pub(crate) project_mcp: Option<Arc<McpAgentManager>>,
     pub(crate) skills: SkillsListResponse,
     pub(crate) _project_skill_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+/// Provides MCP and skill resources needed to build an agent resource broker
+/// without exposing the runtime facade to resource listing code.
+pub(crate) trait AgentResourceBrokerOps: Send + Sync {
+    fn project_mcp_manager_for_agent(
+        &self,
+        agent: &AgentRecord,
+        agent_id: AgentId,
+        cancellation_token: &CancellationToken,
+    ) -> impl Future<Output = Result<Option<Arc<McpAgentManager>>>> + Send;
+
+    fn project_skill_read_guard(
+        &self,
+        agent: &AgentRecord,
+    ) -> impl Future<Output = Option<OwnedRwLockReadGuard<()>>> + Send;
+
+    fn skills_config(&self) -> impl Future<Output = Result<SkillsConfigRequest>> + Send;
+
+    fn skills_manager_for_agent(
+        &self,
+        agent: &AgentRecord,
+    ) -> impl Future<Output = Result<SkillsManager>> + Send;
+}
+
+pub(crate) async fn agent_resource_broker(
+    ops: &impl AgentResourceBrokerOps,
+    agent: &AgentRecord,
+    agent_id: AgentId,
+    cancellation_token: &CancellationToken,
+) -> Result<AgentResourceBroker> {
+    let agent_mcp = agent.mcp.read().await.clone();
+    let project_mcp = if agent.summary.read().await.project_id.is_some() {
+        ops.project_mcp_manager_for_agent(agent, agent_id, cancellation_token)
+            .await
+            .unwrap_or(None)
+    } else {
+        None
+    };
+    let project_skill_guard = ops.project_skill_read_guard(agent).await;
+    let skills_config = ops.skills_config().await?;
+    let skills = ops
+        .skills_manager_for_agent(agent)
+        .await?
+        .list(&skills_config)?;
+    Ok(AgentResourceBroker {
+        agent_mcp,
+        project_mcp,
+        skills,
+        _project_skill_guard: project_skill_guard,
+    })
 }
 
 impl AgentResourceBroker {
