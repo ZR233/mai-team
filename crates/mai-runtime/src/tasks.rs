@@ -14,11 +14,13 @@ use crate::{Result, RuntimeError};
 
 mod lifecycle;
 mod planning;
+mod workflow;
 
 pub(crate) use lifecycle::{TaskLifecycleOps, cancel_task, delete_task};
 pub(crate) use planning::{
     TaskPlanningOps, approve_task_plan, request_plan_revision, send_task_message,
 };
+pub(crate) use workflow::{TaskWorkflowOps, run_task_workflow};
 
 /// Supplies agent read models needed to assemble task detail responses.
 pub(crate) trait TaskReadOps: Send + Sync {

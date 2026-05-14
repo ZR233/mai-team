@@ -63,7 +63,6 @@ use turn::completion::TurnResult;
 use turn::tools::ToolExecution;
 
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 90;
-const REVIEW_ROUND_LIMIT: u64 = 5;
 const PROJECT_REVIEW_FAILURE_RETRY_SECS: u64 = 600;
 const PROJECT_REVIEW_HISTORY_RETENTION_DAYS: i64 = 5;
 const PROJECT_REVIEW_CLEANUP_INTERVAL_SECS: u64 = 3600;
@@ -1552,7 +1551,7 @@ impl AgentRuntime {
     fn spawn_task_workflow(self: &Arc<Self>, task_id: TaskId) {
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(err) = runtime.clone().run_task_workflow(task_id).await
+            if let Err(err) = tasks::run_task_workflow(&runtime.state, &runtime, task_id).await
                 && let Ok(task) = runtime.task(task_id).await
             {
                 let _ = runtime
@@ -1560,123 +1559,6 @@ impl AgentRuntime {
                     .await;
             }
         });
-    }
-
-    async fn run_task_workflow(self: Arc<Self>, task_id: TaskId) -> Result<()> {
-        let task = self.task(task_id).await?;
-        let _workflow_guard = task.workflow_lock.lock().await;
-        let plan_markdown = task
-            .plan
-            .read()
-            .await
-            .markdown
-            .clone()
-            .filter(|plan| !plan.trim().is_empty())
-            .ok_or_else(|| RuntimeError::InvalidInput("approved plan is empty".to_string()))?;
-        let planner_agent_id = task.summary.read().await.planner_agent_id;
-        let executor = self
-            .spawn_task_role_agent(
-                planner_agent_id,
-                AgentRole::Executor,
-                Some("Task Executor".to_string()),
-            )
-            .await?;
-        self.set_task_current_agent(&task, executor.id, TaskStatus::Executing, None)
-            .await?;
-        self.start_agent_turn(
-            executor.id,
-            format!(
-                "Implement the approved task plan below. Keep changes scoped, run verification, and report touched files and test results.\n\n{}",
-                plan_markdown
-            ),
-        )
-        .await?;
-        let mut executor_summary = self
-            .wait_agent(executor.id, Duration::from_secs(3600))
-            .await?;
-        for round in 1..=REVIEW_ROUND_LIMIT {
-            if matches!(
-                executor_summary.status,
-                AgentStatus::Failed | AgentStatus::Cancelled
-            ) {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "executor ended with status {:?}",
-                    executor_summary.status
-                )));
-            }
-            let reviewer = self
-                .spawn_task_role_agent(
-                    executor.id,
-                    AgentRole::Reviewer,
-                    Some(format!("Task Reviewer {round}")),
-                )
-                .await?;
-            self.set_task_current_agent(&task, reviewer.id, TaskStatus::Reviewing, None)
-                .await?;
-            self.start_agent_turn(
-                reviewer.id,
-                format!(
-                    "Review the executor's changes for the approved task plan. Use submit_review_result with passed=true only when there are no blocking issues. Include concrete findings and a concise summary.\n\nApproved plan:\n{}",
-                    plan_markdown
-                ),
-            )
-            .await?;
-            let reviewer_summary = self
-                .wait_agent(reviewer.id, Duration::from_secs(3600))
-                .await?;
-            if matches!(
-                reviewer_summary.status,
-                AgentStatus::Failed | AgentStatus::Cancelled
-            ) {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "reviewer ended with status {:?}",
-                    reviewer_summary.status
-                )));
-            }
-            let latest_review = task.reviews.read().await.last().cloned();
-            let Some(review) = latest_review else {
-                return Err(RuntimeError::InvalidInput(
-                    "reviewer did not submit a review result".to_string(),
-                ));
-            };
-            if review.passed {
-                let report = if review.summary.trim().is_empty() {
-                    "Task completed and review passed.".to_string()
-                } else {
-                    review.summary.clone()
-                };
-                self.set_task_status(&task, TaskStatus::Completed, Some(report), None)
-                    .await?;
-                return Ok(());
-            }
-            if round == REVIEW_ROUND_LIMIT {
-                self.set_task_status(
-                    &task,
-                    TaskStatus::Failed,
-                    None,
-                    Some(format!(
-                        "review did not pass after {REVIEW_ROUND_LIMIT} rounds: {}",
-                        review.findings
-                    )),
-                )
-                .await?;
-                return Ok(());
-            }
-            self.set_task_current_agent(&task, executor.id, TaskStatus::Executing, None)
-                .await?;
-            self.start_agent_turn(
-                executor.id,
-                format!(
-                    "The reviewer found issues. Fix them, rerun verification, and report the changes.\n\nReview findings:\n{}\n\nReview summary:\n{}",
-                    review.findings, review.summary
-                ),
-            )
-            .await?;
-            executor_summary = self
-                .wait_agent(executor.id, Duration::from_secs(3600))
-                .await?;
-        }
-        Ok(())
     }
 
     async fn spawn_task_role_agent(
@@ -3414,16 +3296,6 @@ impl AgentRuntime {
         Ok(())
     }
 
-    async fn set_task_current_agent(
-        &self,
-        task: &Arc<TaskRecord>,
-        agent_id: AgentId,
-        status: TaskStatus,
-        error: Option<String>,
-    ) -> Result<()> {
-        tasks::set_current_agent(&self.state, self, task, agent_id, status, error).await
-    }
-
     async fn set_task_status(
         &self,
         task: &Arc<TaskRecord>,
@@ -4171,6 +4043,25 @@ impl tasks::TaskLifecycleOps for Arc<AgentRuntime> {
         self.events
             .publish(ServiceEventKind::TaskDeleted { task_id })
             .await;
+    }
+}
+
+impl tasks::TaskWorkflowOps for Arc<AgentRuntime> {
+    async fn spawn_task_role_agent(
+        &self,
+        parent_agent_id: AgentId,
+        role: AgentRole,
+        name: Option<String>,
+    ) -> Result<AgentSummary> {
+        AgentRuntime::spawn_task_role_agent(self, parent_agent_id, role, name).await
+    }
+
+    async fn start_agent_turn(&self, agent_id: AgentId, message: String) -> Result<TurnId> {
+        AgentRuntime::start_agent_turn(self, agent_id, message).await
+    }
+
+    async fn wait_agent(&self, agent_id: AgentId, timeout: Duration) -> Result<AgentSummary> {
+        AgentRuntime::wait_agent(self.as_ref(), agent_id, timeout).await
     }
 }
 
