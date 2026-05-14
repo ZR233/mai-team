@@ -1,5 +1,5 @@
 <template>
-  <div class="todo-list-row">
+  <div class="timeline-row-card todo-list-row">
     <div class="todo-list-header">
       <span class="process-dot todo-header-dot"></span>
       <span class="todo-list-title">Todo List</span>

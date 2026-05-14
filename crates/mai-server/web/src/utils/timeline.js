@@ -96,24 +96,29 @@ export function buildAgentTimeline(detail, liveEvents = []) {
       })
     } else if (event.type === 'context_compacted') {
       items.push({
-        type: 'process',
+        type: 'context_event',
         key: `context-compacted-${event.turn_id}-${event.sequence || event.timestamp}`,
         tone: 'done',
-        label: '已自动压缩上下文',
-        detail: event.tokens_before ? `${event.tokens_before} tokens` : '历史已整理',
+        title: 'Context compacted',
+        summary: contextCompactionSummary(event),
+        tokensBefore: event.tokens_before ?? null,
+        tokensAfter: event.tokens_after ?? null,
+        turnId: event.turn_id || null,
         timestamp: event.timestamp,
         sequence: event.sequence || 0
       })
     } else if (event.type === 'skills_activated') {
-      const skills = (event.skills || []).map(skillDisplayName).filter(Boolean)
+      const skills = (event.skills || []).map(skillInfo).filter((skill) => skill.name)
       if (skills.length) {
         const anchor = firstMessageByTurn.get(event.turn_id)
         items.push({
-          type: 'process',
+          type: 'skill_call',
           key: `skills-activated-${event.turn_id}-${event.sequence || event.timestamp}`,
-          tone: 'done',
-          label: 'Used skills',
-          detail: skills.join(', '),
+          tone: 'skill',
+          title: 'Skills activated',
+          summary: `${skills.length} ${skills.length === 1 ? 'skill' : 'skills'} loaded`,
+          skills,
+          turnId: event.turn_id || null,
           timestamp: anchor ? offsetTimestamp(anchor.timestamp, 0.5) : event.timestamp,
           sequence: (anchor?.sequence || event.sequence || 0) + 0.05
         })
@@ -204,7 +209,7 @@ export function buildAgentTimeline(detail, liveEvents = []) {
   for (const tool of tools.values()) {
     const summary = summarizeTool(tool)
     items.push({
-      type: 'tool',
+      type: 'tool_call',
       key: `tool-${tool.callId}`,
       callId: tool.callId,
       turnId: tool.turnId,
@@ -245,7 +250,7 @@ export function formatTraceValue(value) {
 }
 
 export function renderTraceValue(value) {
-  const formatted = formatTraceValue(value)
+  const formatted = cleanTerminalText(formatTraceValue(value))
   if (!formatted) return ''
 
   if (isJsonTraceValue(value, formatted)) {
@@ -326,9 +331,11 @@ function renderToolArguments(toolName, value) {
         value.timeout_secs ? renderMetaLine('timeout', `${value.timeout_secs}s`) : ''
       ].filter(Boolean).join('')
     }
+
+    return renderGenericTraceSections(value)
   }
 
-  return renderPrettyJson(value)
+  return renderGenericTraceSections(value)
 }
 
 function renderToolOutput(toolName, value) {
@@ -361,7 +368,7 @@ function renderToolOutput(toolName, value) {
     return renderTextBlock('output', decodeEscapedText(value))
   }
 
-  return renderPrettyJson(value)
+  return renderGenericTraceSections(value)
 }
 
 function renderCommandBlock(command) {
@@ -377,10 +384,11 @@ function renderStatusLine(status) {
   if (status === null || status === undefined || status === '') return ''
   const numericStatus = Number(status)
   const ok = numericStatus === 0
+  const label = cleanTerminalText(String(status))
   return `
     <div class="trace-status-line">
       <span class="trace-status-pill ${ok ? 'trace-status-ok' : 'trace-status-error'}">
-        exit ${escapeHtml(String(status))}
+        exit ${escapeHtml(label)}
       </span>
     </div>
   `
@@ -390,7 +398,7 @@ function renderMetaLine(label, value) {
   if (value === null || value === undefined || value === '') return ''
   return `
     <div class="trace-meta-line">
-      <span>${escapeHtml(label)}</span>
+      <span>${escapeHtml(cleanTerminalText(String(label)))}</span>
       <code>${escapeHtml(cleanTerminalText(String(value)))}</code>
     </div>
   `
@@ -402,14 +410,30 @@ function renderTextBlock(label, value, tone = '') {
   if (!text) return ''
   return `
     <div class="trace-text-block ${tone ? `trace-text-${tone}` : ''}">
-      <span>${escapeHtml(label)}</span>
+      <span>${escapeHtml(cleanTerminalText(String(label)))}</span>
       <pre>${escapeHtml(text)}</pre>
     </div>
   `
 }
 
-function renderPrettyJson(value) {
-  return `<pre class="trace-code trace-code-json"><code>${renderTraceValue(value)}</code></pre>`
+function renderGenericTraceSections(value) {
+  if (value === null || value === undefined || value === '') return ''
+  if (isPlainObject(value)) {
+    return Object.entries(value)
+      .map(([key, item]) => renderGenericTraceEntry(key, item))
+      .filter(Boolean)
+      .join('')
+  }
+  if (Array.isArray(value)) return renderMetaLine('items', summarizeTraceCollection(value))
+  return renderMetaLine('value', value)
+}
+
+function renderGenericTraceEntry(key, value) {
+  if (value === null || value === undefined || value === '') return ''
+  if (isTraceScalar(value)) return renderMetaLine(key, value)
+  if (Array.isArray(value)) return renderMetaLine(key, summarizeTraceCollection(value))
+  if (isPlainObject(value)) return renderMetaLine(key, summarizeTraceObject(value))
+  return renderMetaLine(key, String(value))
 }
 
 function parseTraceValue(value) {
@@ -450,6 +474,10 @@ function normalizeToolName(value) {
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isTraceScalar(value) {
+  return ['string', 'number', 'boolean', 'bigint'].includes(typeof value)
 }
 
 function hasExecOutputShape(value) {
@@ -580,8 +608,12 @@ function eventSessionId(event) {
   return event.session_id || null
 }
 
-function skillDisplayName(skill) {
-  return skill?.display_name || skill?.name || ''
+function skillInfo(skill) {
+  return {
+    name: cleanOneLine(skill?.display_name || skill?.name || ''),
+    scope: cleanOneLine(skill?.scope || ''),
+    path: cleanOneLine(skill?.path || '')
+  }
 }
 
 function baseTool(event) {
@@ -654,8 +686,40 @@ function outputText(value) {
   return cleanTerminalText(formatTraceValue(value))
 }
 
+function summarizeTraceCollection(value) {
+  const items = value.slice(0, 3).map(summarizeTraceValue).filter(Boolean)
+  const suffix = value.length > items.length ? `, +${value.length - items.length} more` : ''
+  return `[${items.join(', ')}${suffix}]`
+}
+
+function summarizeTraceObject(value) {
+  const keys = Object.keys(value)
+  if (!keys.length) return '{}'
+  const preview = keys.slice(0, 4).join(', ')
+  const suffix = keys.length > 4 ? `, +${keys.length - 4} more` : ''
+  return `{${preview}${suffix}}`
+}
+
+function summarizeTraceValue(value) {
+  if (value === null) return 'null'
+  if (value === undefined) return ''
+  if (isTraceScalar(value)) return cleanOneLine(String(value)).slice(0, 80)
+  if (Array.isArray(value)) return `${value.length} items`
+  if (isPlainObject(value)) return summarizeTraceObject(value)
+  return cleanOneLine(String(value)).slice(0, 80)
+}
+
 function cleanOneLine(value) {
   return cleanTerminalText(String(value || '')).replace(/\s+/g, ' ').trim()
+}
+
+function contextCompactionSummary(event) {
+  const before = event.tokens_before
+  const after = event.tokens_after
+  if (Number.isFinite(before) && Number.isFinite(after)) return `${before} to ${after} tokens`
+  if (Number.isFinite(before)) return `${before} tokens before compaction`
+  if (Number.isFinite(after)) return `${after} tokens after compaction`
+  return 'Conversation context summarized'
 }
 
 function statusProcessRow(event) {
