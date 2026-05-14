@@ -511,16 +511,7 @@ impl AgentRuntime {
     }
 
     pub async fn list_projects(&self) -> Vec<ProjectSummary> {
-        let project_records = {
-            let projects = self.state.projects.read().await;
-            projects.values().cloned().collect::<Vec<_>>()
-        };
-        let mut summaries = Vec::with_capacity(project_records.len());
-        for project in project_records {
-            summaries.push(project.summary.read().await.clone());
-        }
-        summaries.sort_by_key(|summary| summary.created_at);
-        summaries
+        projects::service::list_projects(&self.state).await
     }
 
     pub async fn list_git_accounts(&self) -> Result<GitAccountsResponse> {
@@ -851,45 +842,8 @@ impl AgentRuntime {
         selected_agent_id: Option<AgentId>,
         session_id: Option<SessionId>,
     ) -> Result<ProjectDetail> {
-        let project = self.project(project_id).await?;
-        let summary = project.summary.read().await.clone();
-        let agents = self.project_agents(project_id).await;
-        let requested_agent_id =
-            selected_agent_id.filter(|id| agents.iter().any(|agent| agent.id == *id));
-        let selected_session_id = if selected_agent_id.is_some() && requested_agent_id.is_none() {
-            None
-        } else {
-            session_id
-        };
-        let selected_agent_id = requested_agent_id.unwrap_or(summary.maintainer_agent_id);
-        let maintainer_session_id = (selected_agent_id == summary.maintainer_agent_id)
-            .then_some(selected_session_id)
-            .flatten();
-        let maintainer_agent = self
-            .get_agent(summary.maintainer_agent_id, maintainer_session_id)
-            .await?;
-        let selected_agent = self
-            .get_agent(selected_agent_id, selected_session_id)
-            .await?;
-        let status = if summary.status == ProjectStatus::Ready {
-            "ready"
-        } else {
-            "pending"
-        };
-        let review_runs = self
-            .list_project_review_runs(project_id, 0, PROJECT_REVIEW_RUN_LIST_LIMIT)
-            .await?
-            .runs;
-        Ok(ProjectDetail {
-            summary,
-            maintainer_agent,
-            agents,
-            selected_agent_id,
-            selected_agent,
-            auth_status: status.to_string(),
-            mcp_status: status.to_string(),
-            review_runs,
-        })
+        projects::service::get_project(&self.state, self, project_id, selected_agent_id, session_id)
+            .await
     }
 
     pub async fn list_project_review_runs(
@@ -1226,25 +1180,13 @@ impl AgentRuntime {
         repository_id: Option<u64>,
         repository_full_name: Option<&str>,
     ) -> Option<ProjectId> {
-        let repository_full_name = repository_full_name.map(str::to_ascii_lowercase);
-        let projects = self.state.projects.read().await;
-        for (project_id, project) in projects.iter() {
-            let summary = project.summary.read().await;
-            let installation_matches = installation_id
-                .filter(|id| *id != 0)
-                .is_none_or(|id| summary.installation_id == 0 || summary.installation_id == id);
-            let repository_id_matches = repository_id
-                .filter(|id| *id != 0)
-                .is_none_or(|id| summary.repository_id == 0 || summary.repository_id == id);
-            let full_name_matches = repository_full_name.as_ref().is_none_or(|full_name| {
-                summary.repository_full_name.eq_ignore_ascii_case(full_name)
-                    || format!("{}/{}", summary.owner, summary.repo).eq_ignore_ascii_case(full_name)
-            });
-            if installation_matches && repository_id_matches && full_name_matches {
-                return Some(*project_id);
-            }
-        }
-        None
+        projects::service::find_project_for_github_event(
+            &self.state,
+            installation_id,
+            repository_id,
+            repository_full_name,
+        )
+        .await
     }
 
     pub async fn handle_project_push_event(
@@ -3013,13 +2955,7 @@ impl AgentRuntime {
     }
 
     async fn project(&self, project_id: ProjectId) -> Result<Arc<ProjectRecord>> {
-        self.state
-            .projects
-            .read()
-            .await
-            .get(&project_id)
-            .cloned()
-            .ok_or(RuntimeError::ProjectNotFound(project_id))
+        projects::service::project(&self.state, project_id).await
     }
 
     async fn project_skill_lock(&self, project_id: ProjectId) -> Arc<RwLock<()>> {
@@ -3033,32 +2969,11 @@ impl AgentRuntime {
     }
 
     async fn project_agents(&self, project_id: ProjectId) -> Vec<AgentSummary> {
-        let agents = self.state.agents.read().await;
-        let mut summaries = Vec::new();
-        for agent in agents.values() {
-            let summary = agent.summary.read().await.clone();
-            if summary.project_id == Some(project_id) {
-                summaries.push(summary);
-            }
-        }
-        summaries.sort_by_key(|summary| summary.created_at);
-        summaries
+        projects::service::project_agents(&self.state, project_id).await
     }
 
     async fn project_auto_reviewer_agents(&self, project_id: ProjectId) -> Vec<AgentSummary> {
-        let maintainer_agent_id = match self.project(project_id).await {
-            Ok(project) => project.summary.read().await.maintainer_agent_id,
-            Err(_) => return Vec::new(),
-        };
-        self.project_agents(project_id)
-            .await
-            .into_iter()
-            .filter(|summary| {
-                summary.role == Some(AgentRole::Reviewer)
-                    && summary.parent_id == Some(maintainer_agent_id)
-                    && !summary.status.is_terminal()
-            })
-            .collect()
+        projects::service::project_auto_reviewer_agents(&self.state, project_id).await
     }
 
     async fn project_skills_from_cache(&self, project_id: ProjectId) -> Result<SkillsListResponse> {
@@ -5322,6 +5237,26 @@ impl projects::review::runs::ReviewRunSnapshotSource for AgentRuntime {
             .agent_recent_events(reviewer_agent_id, PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT)
             .await;
         (messages, events)
+    }
+}
+
+impl projects::service::ProjectReadOps for AgentRuntime {
+    fn get_agent(
+        &self,
+        agent_id: AgentId,
+        session_id: Option<SessionId>,
+    ) -> impl std::future::Future<Output = Result<AgentDetail>> + Send {
+        AgentRuntime::get_agent(self, agent_id, session_id)
+    }
+
+    async fn recent_review_runs(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<ProjectReviewRunSummary>> {
+        Ok(self
+            .list_project_review_runs(project_id, 0, PROJECT_REVIEW_RUN_LIST_LIMIT)
+            .await?
+            .runs)
     }
 }
 
