@@ -826,26 +826,6 @@ case "$1" in
     mkdir -p "$last/.git"
     printf 'hello\n' > "$last/README.md"
     ;;
-  worktree)
-    if [ "$2" = "add" ]; then
-      prev=""
-      path=""
-      for arg in "$@"; do
-        path="$prev"
-        prev="$arg"
-      done
-      if [ -n "$path" ]; then
-        mkdir -p "$path/.git"
-        printf 'worktree\n' > "$path/README.md"
-      fi
-    elif [ "$2" = "remove" ]; then
-      path=""
-      for arg in "$@"; do
-        path="$arg"
-      done
-      rm -rf "$path"
-    fi
-    ;;
 esac
 exit 0
 "#,
@@ -860,41 +840,6 @@ exit 0
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&path, permissions).expect("chmod fake git");
-    }
-    path.to_string_lossy().to_string()
-}
-
-fn failing_docker_path(dir: &tempfile::TempDir) -> String {
-    let path = dir.path().join("failing-docker.sh");
-    let log_path = fake_docker_log_path(dir);
-    let script = format!(
-        r#"#!/bin/sh
-LOG={}
-echo "$*" >> "$LOG"
-case "$1" in
-  create)
-    echo "container startup failed" >&2
-    exit 42
-    ;;
-  ps|rm|rmi|start|exec|commit)
-    exit 0
-    ;;
-  *)
-    exit 0
-    ;;
-esac
-"#,
-        test_shell_quote(&log_path.to_string_lossy())
-    );
-    std::fs::write(&path, script).expect("write fake docker");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&path)
-            .expect("fake docker metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&path, permissions).expect("chmod docker");
     }
     path.to_string_lossy().to_string()
 }

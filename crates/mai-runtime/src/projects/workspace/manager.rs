@@ -589,6 +589,7 @@ mod tests {
             report,
             WorkspaceReconcileReport {
                 orphan_clones_removed: vec![orphan_agent_id],
+                legacy_worktree_dirs_removed: Vec::new(),
                 missing_repo_caches: Vec::new(),
                 missing_agent_clones: Vec::new(),
                 invalid_clone_dirs: Vec::new(),
@@ -596,6 +597,40 @@ mod tests {
         );
         assert!(live_clone.exists());
         assert!(!orphan_clone.exists());
+    }
+
+    #[tokio::test]
+    async fn local_workspace_manager_reconcile_removes_legacy_worktree_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fake_git_path(dir.path());
+        let project_id = uuid::Uuid::new_v4();
+        let agent_id = uuid::Uuid::new_v4();
+        let project = test_project(project_id, agent_id);
+        let mut live_agent = test_agent(agent_id, project_id);
+        live_agent.status = AgentStatus::Deleted;
+        let legacy_worktrees = project_paths(dir.path(), project_id)
+            .project_dir
+            .join("worktrees");
+        std::fs::create_dir_all(legacy_worktrees.join(agent_id.to_string()))
+            .expect("legacy worktree dir");
+        let manager = LocalProjectWorkspaceManager::new(git, dir.path().to_path_buf());
+
+        let report = manager
+            .reconcile(&[project], &[live_agent])
+            .await
+            .expect("reconcile");
+
+        assert_eq!(
+            report,
+            WorkspaceReconcileReport {
+                orphan_clones_removed: Vec::new(),
+                legacy_worktree_dirs_removed: vec![project_id],
+                missing_repo_caches: Vec::new(),
+                missing_agent_clones: Vec::new(),
+                invalid_clone_dirs: Vec::new(),
+            }
+        );
+        assert!(!legacy_worktrees.exists());
     }
 
     #[test]

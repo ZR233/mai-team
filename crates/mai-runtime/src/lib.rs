@@ -988,10 +988,9 @@ impl AgentRuntime {
                 .path
         };
         Ok(match source {
-            agents::ContainerSource::FreshImage
-            | agents::ContainerSource::ProjectWorktree { .. } => {
-                agents::ContainerSource::ProjectWorktree {
-                    worktree_path: clone.to_string_lossy().to_string(),
+            agents::ContainerSource::FreshImage | agents::ContainerSource::ProjectClone { .. } => {
+                agents::ContainerSource::ProjectClone {
+                    clone_path: clone.to_string_lossy().to_string(),
                 }
             }
             agents::ContainerSource::CloneFrom {
@@ -1021,6 +1020,12 @@ impl AgentRuntime {
             tracing::info!(
                 count = report.orphan_clones_removed.len(),
                 "removed orphan project clone directories during startup reconcile"
+            );
+        }
+        if !report.legacy_worktree_dirs_removed.is_empty() {
+            tracing::info!(
+                count = report.legacy_worktree_dirs_removed.len(),
+                "removed legacy project worktree directories during startup reconcile"
             );
         }
         if !report.missing_repo_caches.is_empty() {
@@ -3029,7 +3034,7 @@ impl agents::AgentContainerOps for AgentRuntime {
                     &request.docker_image,
                 )
                 .await?),
-            agents::ContainerSource::ProjectWorktree { worktree_path } => Ok(self
+            agents::ContainerSource::ProjectClone { clone_path } => Ok(self
                 .deps
                 .docker
                 .ensure_agent_container_from_image_with_workspace_and_repo_mount(
@@ -3037,7 +3042,7 @@ impl agents::AgentContainerOps for AgentRuntime {
                     request.preferred_container_id.as_deref(),
                     &request.docker_image,
                     None,
-                    Some(&worktree_path),
+                    Some(&clone_path),
                 )
                 .await?),
             agents::ContainerSource::CloneFrom {

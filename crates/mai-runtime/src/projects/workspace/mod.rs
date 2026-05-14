@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use mai_protocol::{AgentId, ProjectId, preview};
+use mai_protocol::{ProjectId, preview};
 use tokio::process::Command;
 
 use crate::{Result, RuntimeError};
@@ -16,56 +16,8 @@ pub(crate) use manager::{
 };
 pub(crate) use paths::{agent_clone_path, project_repo_cache_path};
 
-pub(crate) const PROJECT_REPO_DIR: &str = "repo";
-pub(crate) const PROJECT_WORKTREES_DIR: &str = "worktrees";
-
-pub(crate) fn project_dir(projects_root: &Path, project_id: ProjectId) -> PathBuf {
-    projects_root.join(project_id.to_string())
-}
-
-pub(crate) fn project_repo_path(projects_root: &Path, project_id: ProjectId) -> PathBuf {
-    project_dir(projects_root, project_id).join(PROJECT_REPO_DIR)
-}
-
-pub(crate) fn agent_worktree_path(
-    projects_root: &Path,
-    project_id: ProjectId,
-    agent_id: AgentId,
-) -> PathBuf {
-    project_dir(projects_root, project_id)
-        .join(PROJECT_WORKTREES_DIR)
-        .join(agent_id.to_string())
-}
-
-#[allow(dead_code)]
-pub(crate) async fn cleanup_project_agent_worktree(
-    git_binary: &str,
-    projects_root: &Path,
-    project_id: ProjectId,
-    agent_id: AgentId,
-) -> Result<()> {
-    let repo_path = project_repo_path(projects_root, project_id);
-    let worktree_path = agent_worktree_path(projects_root, project_id, agent_id);
-    if repo_path.join(".git").exists() {
-        let _ = git_plain(
-            git_binary,
-            &repo_path,
-            [
-                "worktree",
-                "remove",
-                "--force",
-                &worktree_path.to_string_lossy(),
-            ],
-        )
-        .await;
-        let _ = git_plain(git_binary, &repo_path, ["worktree", "prune"]).await;
-    }
-    let _ = std::fs::remove_dir_all(worktree_path);
-    Ok(())
-}
-
 pub(crate) fn delete_project_workspace(projects_root: &Path, project_id: ProjectId) -> Result<()> {
-    let _ = std::fs::remove_dir_all(project_dir(projects_root, project_id));
+    let _ = std::fs::remove_dir_all(paths::project_dir(projects_root, project_id));
     Ok(())
 }
 
@@ -164,24 +116,6 @@ fn redact_secret(value: &str, secret: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn project_workspace_paths_use_host_project_layout() {
-        let root = PathBuf::from("/data/.mai-team/projects");
-        let project_id = uuid::Uuid::nil();
-        let agent_id = uuid::Uuid::nil();
-
-        assert_eq!(
-            project_repo_path(&root, project_id),
-            root.join(project_id.to_string()).join("repo")
-        );
-        assert_eq!(
-            agent_worktree_path(&root, project_id, agent_id),
-            root.join(project_id.to_string())
-                .join("worktrees")
-                .join(agent_id.to_string())
-        );
-    }
 
     #[tokio::test]
     async fn git_plain_uses_host_git_safety_environment() {

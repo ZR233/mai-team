@@ -12,6 +12,7 @@ use crate::Result;
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct WorkspaceReconcileReport {
     pub(crate) orphan_clones_removed: Vec<AgentId>,
+    pub(crate) legacy_worktree_dirs_removed: Vec<ProjectId>,
     pub(crate) missing_repo_caches: Vec<ProjectId>,
     pub(crate) missing_agent_clones: Vec<AgentId>,
     pub(crate) invalid_clone_dirs: Vec<PathBuf>,
@@ -36,6 +37,11 @@ pub(crate) fn reconcile_project_workspaces(
         let paths = project_paths(projects_root, project.id);
         if project_workspace_should_exist(project) && !paths.repo_cache_path.exists() {
             report.missing_repo_caches.push(project.id);
+        }
+        let legacy_worktrees = paths.project_dir.join("worktrees");
+        if legacy_worktrees.exists() {
+            std::fs::remove_dir_all(&legacy_worktrees)?;
+            report.legacy_worktree_dirs_removed.push(project.id);
         }
         if paths.clones_dir.exists() {
             for entry in std::fs::read_dir(&paths.clones_dir)? {
@@ -77,6 +83,7 @@ pub(crate) fn reconcile_project_workspaces(
     }
 
     report.orphan_clones_removed.sort();
+    report.legacy_worktree_dirs_removed.sort();
     report.missing_repo_caches.sort();
     report.missing_agent_clones.sort();
     report.invalid_clone_dirs.sort();
