@@ -73,6 +73,7 @@ impl ModelClient {
             store,
             previous_response_id,
             max_output_tokens: resolved.max_output_tokens,
+            max_tokens_field: &resolved.max_tokens_field,
             extra_body: resolved.extra_body.clone(),
             supports_tools: resolved.supports_tools,
         };
@@ -105,6 +106,7 @@ impl ModelClient {
                     store: Some(false),
                     previous_response_id: None,
                     max_output_tokens: resolved.max_output_tokens,
+                    max_tokens_field: &resolved.max_tokens_field,
                     extra_body: resolved.extra_body.clone(),
                     supports_tools: resolved.supports_tools,
                 };

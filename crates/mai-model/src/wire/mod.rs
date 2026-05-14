@@ -33,6 +33,7 @@ pub(crate) struct WireRequest<'a> {
     pub(crate) store: Option<bool>,
     pub(crate) previous_response_id: Option<&'a str>,
     pub(crate) max_output_tokens: u64,
+    pub(crate) max_tokens_field: &'a str,
     pub(crate) extra_body: BTreeMap<String, Value>,
     pub(crate) supports_tools: bool,
 }

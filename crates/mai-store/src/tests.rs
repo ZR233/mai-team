@@ -484,6 +484,10 @@ async fn provider_presets_include_builtin_metadata() {
         .find(|model| model.id == "mimo-v2.5-pro")
         .expect("mimo-v2.5-pro");
     assert!(mimo_pro.reasoning.is_some());
+    assert_eq!(
+        mimo_pro.request_policy.max_tokens_field,
+        "max_completion_tokens"
+    );
     let mimo_flash = mimo_api
         .models
         .iter()
@@ -563,6 +567,48 @@ async fn legacy_deepseek_models_migrate_to_chat_policy() {
     assert!(model.capabilities.reasoning_replay);
     assert_eq!(model.request_policy.store, None);
     assert_eq!(model.request_policy.max_tokens_field, "max_tokens");
+}
+
+#[tokio::test]
+async fn legacy_mimo_models_migrate_to_official_chat_policy() {
+    let dir = tempdir().expect("tempdir");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+            default_provider_id = "mimo-token-plan"
+
+            [providers.mimo-token-plan]
+            kind = "mimo"
+            name = "MiMo Token Plan"
+            base_url = "https://token-plan-cn.xiaomimimo.com/v1"
+            api_key = "secret"
+            default_model = "mimo-v2.5-pro"
+            enabled = true
+
+            [providers.mimo-token-plan.models."mimo-v2.5-pro"]
+            name = "mimo-v2.5-pro"
+            context_tokens = 1000000
+            output_tokens = 131072
+            supports_tools = true
+            wire_api = "chat_completions"
+
+            [providers.mimo-token-plan.models."mimo-v2.5-pro".request_policy]
+            max_tokens_field = "max_tokens"
+        "#,
+    )
+    .expect("write config");
+    let store = ConfigStore::open_with_config_path(dir.path().join("config.sqlite3"), &config_path)
+        .await
+        .expect("open");
+
+    let response = store.providers_response().await.expect("providers");
+    let model = response.providers[0].models.first().expect("model");
+    assert_eq!(model.wire_api, ModelWireApi::ChatCompletions);
+    assert_eq!(
+        model.request_policy.max_tokens_field,
+        "max_completion_tokens"
+    );
 }
 
 #[tokio::test]
