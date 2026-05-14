@@ -85,12 +85,6 @@ pub(crate) trait ProjectReviewCycleOps: Send + Sync {
         reviewer_id: AgentId,
     ) -> impl Future<Output = Result<String>> + Send;
 
-    fn cleanup_project_review_worktree(
-        &self,
-        project_id: ProjectId,
-        reviewer_id: AgentId,
-    ) -> impl Future<Output = Result<()>> + Send;
-
     fn delete_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -284,9 +278,6 @@ pub(crate) async fn run_project_review_once(
             summary_text: summary,
             error,
         })
-        .await;
-    let _ = ops
-        .cleanup_project_review_worktree(project_id, reviewer_id)
         .await;
     let _ = ops.delete_agent(reviewer_id).await;
     ops.set_project_review_state(

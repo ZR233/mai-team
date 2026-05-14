@@ -37,6 +37,7 @@ pub(crate) fn agent_worktree_path(
         .join(agent_id.to_string())
 }
 
+#[allow(dead_code)]
 pub(crate) async fn cleanup_project_agent_worktree(
     git_binary: &str,
     projects_root: &Path,

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use mai_agents::AgentProfilesManager;
-use mai_docker::{ContainerHandle, DockerClient, project_review_workspace_volume};
+use mai_docker::{ContainerHandle, DockerClient};
 use mai_mcp::McpAgentManager;
 #[cfg(test)]
 use mai_mcp::McpTool;
@@ -2204,20 +2204,6 @@ impl AgentRuntime {
             .map(|_| ())
     }
 
-    async fn cleanup_project_review_worktree(
-        &self,
-        project_id: ProjectId,
-        reviewer_id: AgentId,
-    ) -> Result<()> {
-        projects::workspace::cleanup_project_agent_worktree(
-            &self.git_binary,
-            &self.projects_root,
-            project_id,
-            reviewer_id,
-        )
-        .await
-    }
-
     async fn set_project_review_state(
         &self,
         project_id: ProjectId,
@@ -2231,8 +2217,6 @@ impl AgentRuntime {
         self.workspace_manager
             .delete_project_workspace(project_id)
             .await?;
-        let volume = project_review_workspace_volume(&project_id.to_string());
-        self.deps.docker.delete_volume(&volume).await?;
         Ok(())
     }
 
@@ -2859,14 +2843,6 @@ impl agents::AgentDeleteOps for AgentRuntime {
             .await?)
     }
 
-    fn cleanup_project_review_worktree(
-        &self,
-        project_id: ProjectId,
-        reviewer_id: AgentId,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        AgentRuntime::cleanup_project_review_worktree(self, project_id, reviewer_id)
-    }
-
     fn cleanup_project_agent_clone(
         &self,
         project_id: ProjectId,
@@ -3395,14 +3371,6 @@ impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
         reviewer_id: AgentId,
     ) -> impl std::future::Future<Output = Result<String>> + Send {
         projects::review::reviewer::last_turn_response(self, reviewer_id)
-    }
-
-    fn cleanup_project_review_worktree(
-        &self,
-        project_id: ProjectId,
-        reviewer_id: AgentId,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        AgentRuntime::cleanup_project_review_worktree(self.as_ref(), project_id, reviewer_id)
     }
 
     fn delete_agent(

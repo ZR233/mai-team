@@ -1074,40 +1074,6 @@ fn extracts_skill_mentions() {
 }
 
 #[test]
-fn project_review_sync_command_fetches_pr_refs_without_token_literal() {
-    let command = projects::review::review_repo_sync_command(
-        "https://github.com/owner/repo.git",
-        "https://github.com/owner/repo.git",
-        "main",
-    );
-    assert!(command.contains("'+refs/pull/*/head:refs/remotes/origin/pr/*'"));
-    assert!(command.contains("--no-tags origin +refs/heads/main:refs/remotes/origin/main"));
-    assert!(command.contains("--no-tags origin '+refs/pull/*/head:refs/remotes/origin/pr/*'"));
-    assert!(command.contains("-c http.version=HTTP/1.1"));
-    assert!(command.contains("-c http.lowSpeedLimit=1 -c http.lowSpeedTime=300"));
-    assert!(command.contains("git worktree prune"));
-    assert!(command.contains("git reset --hard HEAD"));
-    assert!(command.contains("git clean -fdx"));
-    assert!(command.contains("git checkout -B main origin/main"));
-    assert!(command.contains("git reset --hard origin/main"));
-    assert!(command.contains("MAI_GITHUB_REVIEW_TOKEN"));
-    assert!(!command.contains("ghp_"));
-}
-
-#[test]
-fn project_review_reclone_command_removes_stale_repo_before_ensure() {
-    let command = projects::review::review_repo_reclone_command(
-        "https://github.com/owner/repo.git",
-        "https://github.com/owner/repo.git",
-        "main",
-    );
-    assert!(command.contains("rm -rf /workspace/repo"));
-    assert!(command.contains("clone --branch main"));
-    assert!(command.contains("--no-tags origin '+refs/pull/*/head:refs/remotes/origin/pr/*'"));
-    assert!(command.contains("mkdir -p /workspace/reviews"));
-}
-
-#[test]
 fn agent_status_allows_new_turn_after_completion() {
     assert!(AgentStatus::Completed.can_start_turn());
     assert!(!AgentStatus::RunningTurn.can_start_turn());
@@ -5844,7 +5810,7 @@ async fn runtime_start_does_not_start_auto_review_for_not_ready_project() {
 }
 
 #[tokio::test]
-async fn project_reviewer_starts_from_image_with_review_workspace_without_snapshot() {
+async fn project_reviewer_starts_from_image_with_own_project_clone() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     store
@@ -5879,13 +5845,20 @@ async fn project_reviewer_starts_from_image_with_review_workspace_without_snapsh
     assert_eq!(reviewer.role, Some(AgentRole::Reviewer));
     assert_eq!(reviewer.parent_id, Some(maintainer_id));
     let docker_log = fake_docker_log(&dir);
+    let clone_path = projects::workspace::paths::agent_clone_path(
+        &runtime.projects_root,
+        project_id,
+        reviewer.id,
+    );
     assert!(!docker_log.contains("commit maintainer-container"));
     assert!(docker_log.contains(&format!("create --name mai-team-{}", reviewer.id)));
     assert!(docker_log.contains(&format!("mai-team-workspace-{}:/workspace", reviewer.id)));
+    assert!(docker_log.contains(&format!("{}:/workspace/repo", clone_path.display())));
+    assert!(!docker_log.contains("/workspace/reviews"));
 }
 
 #[tokio::test]
-async fn deleting_project_reviewer_cleans_review_worktree() {
+async fn deleting_project_reviewer_cleans_project_clone() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     store
@@ -5977,6 +5950,8 @@ async fn project_reviewer_initial_message_uses_latest_extra_prompt() {
     assert!(message.contains("new prompt"));
     assert!(!message.contains("old prompt"));
     assert!(message.contains("Target pull request: none."));
+    assert!(!message.contains("worktree"));
+    assert!(!message.contains("/workspace/reviews"));
 }
 
 #[tokio::test]

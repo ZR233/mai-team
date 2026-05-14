@@ -3,7 +3,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use mai_protocol::{AgentId, AgentRole, AgentStatus, AgentSummary, ProjectId};
+use mai_protocol::{AgentId, AgentStatus, AgentSummary, ProjectId};
 
 use crate::state::AgentRecord;
 use crate::{Result, RuntimeError};
@@ -37,12 +37,6 @@ pub(crate) trait AgentDeleteOps: Send + Sync {
         request: AgentContainerDeleteRequest,
     ) -> impl Future<Output = Result<Vec<String>>> + Send;
 
-    fn cleanup_project_review_worktree(
-        &self,
-        project_id: ProjectId,
-        reviewer_id: AgentId,
-    ) -> impl Future<Output = Result<()>> + Send;
-
     fn cleanup_project_agent_clone(
         &self,
         project_id: ProjectId,
@@ -67,14 +61,9 @@ pub(crate) async fn delete_agent(ops: &impl AgentDeleteOps, agent_id: AgentId) -
 
 async fn delete_agent_record(ops: &impl AgentDeleteOps, agent_id: AgentId) -> Result<()> {
     let agent = ops.agent(agent_id).await?;
-    let (project_id, reviewer_project_id) = {
+    let project_id = {
         let summary = agent.summary.read().await;
-        (
-            summary.project_id,
-            (summary.role == Some(AgentRole::Reviewer))
-                .then_some(summary.project_id)
-                .flatten(),
-        )
+        summary.project_id
     };
     agent.cancel_requested.store(true, Ordering::SeqCst);
     ops.set_agent_status(
@@ -113,17 +102,6 @@ async fn delete_agent_record(ops: &impl AgentDeleteOps, agent_id: AgentId) -> Re
             agent_id = %agent_id,
             count = deleted.len(),
             "removed agent containers"
-        );
-    }
-    if let Some(project_id) = reviewer_project_id
-        && let Err(err) = ops
-            .cleanup_project_review_worktree(project_id, agent_id)
-            .await
-    {
-        tracing::warn!(
-            project_id = %project_id,
-            reviewer_id = %agent_id,
-            "failed to clean project reviewer worktree during agent deletion: {err}"
         );
     }
     if let Some(project_id) = project_id
