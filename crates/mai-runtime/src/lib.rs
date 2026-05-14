@@ -47,7 +47,7 @@ use events::{RECENT_EVENT_LIMIT, RuntimeEvents};
 use github::{
     DEFAULT_GITHUB_API_BASE_URL, DirectGithubAppBackend, GITHUB_HTTP_TIMEOUT_SECS,
     GithubAppBackend, GithubErrorResponse, github_api_url, github_clone_url, github_headers,
-    normalize_github_api_get_path, repository_packages_with_token,
+    normalize_github_api_get_path,
 };
 use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
 #[cfg(test)]
@@ -470,33 +470,33 @@ impl AgentRuntime {
     }
 
     pub async fn list_git_accounts(&self) -> Result<GitAccountsResponse> {
-        self.deps.git_accounts.list().await
+        github::list_git_accounts(&self.deps.git_accounts).await
     }
 
     pub async fn save_git_account(
         self: &Arc<Self>,
         request: GitAccountRequest,
     ) -> Result<GitAccountResponse> {
-        self.deps.git_accounts.save(request).await
+        github::save_git_account(&self.deps.git_accounts, request).await
     }
 
     pub async fn verify_git_account(&self, account_id: &str) -> Result<GitAccountSummary> {
-        self.deps.git_accounts.verify(account_id).await
+        github::verify_git_account(&self.deps.git_accounts, account_id).await
     }
 
     pub async fn delete_git_account(&self, account_id: &str) -> Result<GitAccountsResponse> {
-        self.deps.git_accounts.delete(account_id).await
+        github::delete_git_account(&self.deps.git_accounts, account_id).await
     }
 
     pub async fn set_default_git_account(&self, account_id: &str) -> Result<GitAccountsResponse> {
-        self.deps.git_accounts.set_default(account_id).await
+        github::set_default_git_account(&self.deps.git_accounts, account_id).await
     }
 
     pub async fn list_git_account_repositories(
         &self,
         account_id: &str,
     ) -> Result<GithubRepositoriesResponse> {
-        self.deps.git_accounts.list_repositories(account_id).await
+        github::list_git_account_repositories(&self.deps.git_accounts, account_id).await
     }
 
     pub fn runtime_defaults(&self) -> RuntimeDefaultsResponse {
@@ -511,10 +511,13 @@ impl AgentRuntime {
         owner: &str,
         repo: &str,
     ) -> Result<RepositoryPackagesResponse> {
-        self.deps
-            .git_accounts
-            .list_repository_packages(account_id, owner, repo)
-            .await
+        github::list_git_account_repository_packages(
+            &self.deps.git_accounts,
+            account_id,
+            owner,
+            repo,
+        )
+        .await
     }
 
     pub async fn list_github_installation_repository_packages(
@@ -523,16 +526,11 @@ impl AgentRuntime {
         owner: &str,
         repo: &str,
     ) -> Result<RepositoryPackagesResponse> {
-        let token = self
-            .deps
-            .github_backend
-            .github_installation_token(installation_id, None, true)
-            .await?
-            .token;
-        repository_packages_with_token(
+        github::list_github_installation_repository_packages(
+            self.deps.github_backend.as_ref(),
             &self.deps.github_http,
             &self.github_api_base_url,
-            &token,
+            installation_id,
             owner,
             repo,
         )
@@ -540,27 +538,21 @@ impl AgentRuntime {
     }
 
     pub async fn github_app_settings(&self) -> Result<GithubAppSettingsResponse> {
-        self.deps.github_backend.github_app_settings().await
+        github::github_app_settings(self.deps.github_backend.as_ref()).await
     }
 
     pub async fn save_github_app_settings(
         &self,
         request: GithubAppSettingsRequest,
     ) -> Result<GithubAppSettingsResponse> {
-        self.deps
-            .github_backend
-            .save_github_app_settings(request)
-            .await
+        github::save_github_app_settings(self.deps.github_backend.as_ref(), request).await
     }
 
     pub async fn start_github_app_manifest(
         &self,
         request: GithubAppManifestStartRequest,
     ) -> Result<GithubAppManifestStartResponse> {
-        self.deps
-            .github_backend
-            .start_github_app_manifest(request)
-            .await
+        github::start_github_app_manifest(self.deps.github_backend.as_ref(), request).await
     }
 
     pub async fn complete_github_app_manifest(
@@ -568,31 +560,22 @@ impl AgentRuntime {
         code: &str,
         state: &str,
     ) -> Result<GithubAppSettingsResponse> {
-        self.deps
-            .github_backend
-            .complete_github_app_manifest(code, state)
-            .await
+        github::complete_github_app_manifest(self.deps.github_backend.as_ref(), code, state).await
     }
 
     pub async fn list_github_installations(&self) -> Result<GithubInstallationsResponse> {
-        self.deps.github_backend.list_github_installations().await
+        github::list_github_installations(self.deps.github_backend.as_ref()).await
     }
 
     pub async fn refresh_github_installations(&self) -> Result<GithubInstallationsResponse> {
-        self.deps
-            .github_backend
-            .refresh_github_installations()
-            .await
+        github::refresh_github_installations(self.deps.github_backend.as_ref()).await
     }
 
     pub async fn list_github_repositories(
         &self,
         installation_id: u64,
     ) -> Result<GithubRepositoriesResponse> {
-        self.deps
-            .github_backend
-            .list_github_repositories(installation_id)
-            .await
+        github::list_github_repositories(self.deps.github_backend.as_ref(), installation_id).await
     }
 
     pub async fn ensure_default_task(self: &Arc<Self>) -> Result<Option<TaskSummary>> {
