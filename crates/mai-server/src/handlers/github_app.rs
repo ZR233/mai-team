@@ -9,6 +9,7 @@ use mai_protocol::*;
 use serde::Deserialize;
 
 use super::state::{ApiError, AppState};
+use crate::services::github::GithubService;
 
 fn html_escape(value: &str) -> String {
     value
@@ -77,6 +78,10 @@ pub(crate) struct GithubInstallationCallbackQuery {
     installation_id: Option<u64>,
 }
 
+fn github_service(state: &AppState) -> GithubService {
+    GithubService::new(Arc::clone(&state.runtime), state.relay.clone())
+}
+
 pub(crate) async fn get_github_settings(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<GithubSettingsResponse>, ApiError> {
@@ -98,29 +103,24 @@ pub(crate) async fn save_github_settings(
 pub(crate) async fn get_github_app_settings(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<GithubAppSettingsResponse>, ApiError> {
-    if let Some(relay) = &state.relay {
-        return Ok(Json(relay.github_app_settings().await?));
-    }
-    Ok(Json(state.runtime.github_app_settings().await?))
+    let svc = github_service(&state);
+    Ok(Json(svc.app_settings().await?))
 }
 
 pub(crate) async fn save_github_app_settings(
     State(state): State<Arc<AppState>>,
     Json(request): Json<GithubAppSettingsRequest>,
 ) -> std::result::Result<Json<GithubAppSettingsResponse>, ApiError> {
-    Ok(Json(state.runtime.save_github_app_settings(request).await?))
+    let svc = github_service(&state);
+    Ok(Json(svc.save_app_settings(request).await?))
 }
 
 pub(crate) async fn start_github_app_manifest(
     State(state): State<Arc<AppState>>,
     Json(request): Json<GithubAppManifestStartRequest>,
 ) -> std::result::Result<Json<GithubAppManifestStartResponse>, ApiError> {
-    if let Some(relay) = &state.relay {
-        return Ok(Json(relay.start_github_app_manifest(request).await?));
-    }
-    Ok(Json(
-        state.runtime.start_github_app_manifest(request).await?,
-    ))
+    let svc = github_service(&state);
+    Ok(Json(svc.start_manifest(request).await?))
 }
 
 pub(crate) async fn complete_github_app_manifest(
@@ -138,11 +138,8 @@ pub(crate) async fn complete_github_app_manifest(
     }
     let code = query.code.unwrap_or_default();
     let state_value = query.state.unwrap_or_default();
-    match state
-        .runtime
-        .complete_github_app_manifest(&code, &state_value)
-        .await
-    {
+    let svc = github_service(&state);
+    match svc.complete_manifest(&code, &state_value).await {
         Ok(_) => github_callback_page(
             true,
             "GitHub App connected",
@@ -179,77 +176,43 @@ pub(crate) async fn start_github_app_installation(
     State(state): State<Arc<AppState>>,
     Json(request): Json<GithubAppInstallationStartRequest>,
 ) -> std::result::Result<Json<GithubAppInstallationStartResponse>, ApiError> {
-    let relay = state.relay.as_ref().ok_or_else(|| {
-        ApiError::bad_request("GitHub App installation requires relay mode".to_string())
-    })?;
-    Ok(Json(relay.start_github_app_installation(request).await?))
+    let svc = github_service(&state);
+    Ok(Json(svc.start_installation(request).await?))
 }
 
 pub(crate) async fn list_github_installations(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<GithubInstallationsResponse>, ApiError> {
-    if let Some(relay) = &state.relay {
-        return Ok(Json(relay.list_github_installations().await?));
-    }
-    Ok(Json(state.runtime.list_github_installations().await?))
+    let svc = github_service(&state);
+    Ok(Json(svc.list_installations().await?))
 }
 
 pub(crate) async fn refresh_github_installations(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<GithubInstallationsResponse>, ApiError> {
-    if let Some(relay) = &state.relay {
-        return Ok(Json(relay.list_github_installations().await?));
-    }
-    Ok(Json(state.runtime.refresh_github_installations().await?))
+    let svc = github_service(&state);
+    Ok(Json(svc.refresh_installations().await?))
 }
 
 pub(crate) async fn list_github_repositories(
     State(state): State<Arc<AppState>>,
     Path(id): Path<u64>,
 ) -> std::result::Result<Json<GithubRepositoriesResponse>, ApiError> {
-    if let Some(relay) = &state.relay {
-        return Ok(Json(relay.list_github_repositories(id).await?));
-    }
-    Ok(Json(state.runtime.list_github_repositories(id).await?))
+    let svc = github_service(&state);
+    Ok(Json(svc.list_repositories(id).await?))
 }
 
 pub(crate) async fn list_github_repository_packages(
     State(state): State<Arc<AppState>>,
     Path((id, owner, repo)): Path<(u64, String, String)>,
 ) -> std::result::Result<Json<RepositoryPackagesResponse>, ApiError> {
-    let request = GithubAppInstallationPackagesRequest {
-        installation_id: id,
-        owner,
-        repo,
-    };
-    if let Some(relay) = &state.relay {
-        return Ok(Json(relay.list_github_repository_packages(request).await?));
-    }
-    Ok(Json(
-        state
-            .runtime
-            .list_github_installation_repository_packages(
-                request.installation_id,
-                &request.owner,
-                &request.repo,
-            )
-            .await?,
-    ))
+    let svc = github_service(&state);
+    Ok(Json(svc.list_repository_packages(id, &owner, &repo).await?))
 }
 
 pub(crate) async fn get_relay_status(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<RelayStatusResponse>, ApiError> {
-    Ok(Json(match &state.relay {
-        Some(relay) => relay.status().await,
-        None => RelayStatusResponse {
-            enabled: false,
-            connected: false,
-            relay_url: None,
-            node_id: None,
-            last_heartbeat_at: None,
-            queued_deliveries: None,
-            message: Some("relay disabled".to_string()),
-        },
-    }))
+    let svc = github_service(&state);
+    Ok(Json(svc.relay_status().await))
 }
