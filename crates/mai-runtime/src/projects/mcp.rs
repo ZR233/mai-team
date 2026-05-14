@@ -1,6 +1,14 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient, project_workspace_volume};
+use mai_mcp::McpAgentManager;
+use mai_protocol::ProjectId;
 use mai_protocol::{McpServerConfig, McpServerScope, McpServerTransport};
+
+use crate::projects::service;
+use crate::state::RuntimeState;
+use crate::{Result, RuntimeError};
 
 pub(crate) const PROJECT_WORKSPACE_PATH: &str = "/workspace/repo";
 pub(crate) const PROJECT_GITHUB_MCP_SERVER: &str = "github";
@@ -48,4 +56,84 @@ pub(crate) fn project_mcp_configs(token: &str) -> BTreeMap<String, McpServerConf
         },
     );
     configs
+}
+
+pub(crate) async fn ensure_sidecar(
+    state: &RuntimeState,
+    docker: &DockerClient,
+    sidecar_image: &str,
+    project_id: ProjectId,
+) -> Result<ContainerHandle> {
+    let project = service::project(state, project_id).await?;
+    if let Some(container) = project.sidecar.read().await.clone() {
+        return Ok(container);
+    }
+
+    let mut sidecar_guard = project.sidecar.write().await;
+    if let Some(container) = sidecar_guard.clone() {
+        return Ok(container);
+    }
+
+    let workspace_volume = project_workspace_volume(&project_id.to_string());
+    let container = docker
+        .ensure_project_sidecar_container(
+            &project_id.to_string(),
+            None,
+            sidecar_image,
+            &workspace_volume,
+            &ContainerCreateOptions::default(),
+        )
+        .await?;
+    *sidecar_guard = Some(container.clone());
+    Ok(container)
+}
+
+pub(crate) async fn shutdown_manager(state: &RuntimeState, project_id: ProjectId) {
+    if let Some(manager) = state.project_mcp_managers.write().await.remove(&project_id) {
+        manager.shutdown().await;
+    }
+}
+
+pub(crate) async fn delete_sidecar(
+    state: &RuntimeState,
+    docker: &DockerClient,
+    project_id: ProjectId,
+) -> Result<Vec<String>> {
+    let project = match service::project(state, project_id).await {
+        Ok(project) => project,
+        Err(RuntimeError::ProjectNotFound(_)) => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let preferred_container_id = project
+        .sidecar
+        .write()
+        .await
+        .take()
+        .map(|container| container.id);
+    let deleted = docker
+        .delete_project_sidecar_containers(
+            &project_id.to_string(),
+            preferred_container_id.as_deref(),
+        )
+        .await?;
+    if !deleted.is_empty() {
+        tracing::info!(
+            project_id = %project_id,
+            count = deleted.len(),
+            "removed project sidecar containers"
+        );
+    }
+    Ok(deleted)
+}
+
+pub(crate) async fn cached_manager(
+    state: &RuntimeState,
+    project_id: ProjectId,
+) -> Option<Arc<McpAgentManager>> {
+    state
+        .project_mcp_managers
+        .read()
+        .await
+        .get(&project_id)
+        .cloned()
 }

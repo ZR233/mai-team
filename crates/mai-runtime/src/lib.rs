@@ -4,10 +4,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::{AbortHandle, Abortable};
 use mai_agents::AgentProfilesManager;
-use mai_docker::{
-    ContainerCreateOptions, ContainerHandle, DockerClient, project_review_workspace_volume,
-    project_workspace_volume,
-};
+use mai_docker::{ContainerHandle, DockerClient, project_review_workspace_volume};
 use mai_mcp::McpAgentManager;
 #[cfg(test)]
 use mai_mcp::McpTool;
@@ -3182,30 +3179,13 @@ impl AgentRuntime {
     }
 
     async fn ensure_project_sidecar(&self, project_id: ProjectId) -> Result<ContainerHandle> {
-        let project = self.project(project_id).await?;
-        if let Some(container) = project.sidecar.read().await.clone() {
-            return Ok(container);
-        }
-
-        let mut sidecar_guard = project.sidecar.write().await;
-        if let Some(container) = sidecar_guard.clone() {
-            return Ok(container);
-        }
-
-        let workspace_volume = project_workspace_volume(&project_id.to_string());
-        let container = self
-            .deps
-            .docker
-            .ensure_project_sidecar_container(
-                &project_id.to_string(),
-                None,
-                &self.sidecar_image,
-                &workspace_volume,
-                &ContainerCreateOptions::default(),
-            )
-            .await?;
-        *sidecar_guard = Some(container.clone());
-        Ok(container)
+        projects::mcp::ensure_sidecar(
+            &self.state,
+            &self.deps.docker,
+            &self.sidecar_image,
+            project_id,
+        )
+        .await
     }
 
     async fn ensure_project_mcp_manager(
@@ -3217,14 +3197,7 @@ impl AgentRuntime {
         if cancellation_token.is_cancelled() {
             return Err(RuntimeError::TurnCancelled);
         }
-        if let Some(manager) = self
-            .state
-            .project_mcp_managers
-            .read()
-            .await
-            .get(&project_id)
-            .cloned()
-        {
+        if let Some(manager) = projects::mcp::cached_manager(&self.state, project_id).await {
             return Ok(Some(manager));
         }
 
@@ -3290,45 +3263,11 @@ impl AgentRuntime {
     }
 
     async fn shutdown_project_mcp_manager(&self, project_id: ProjectId) {
-        if let Some(manager) = self
-            .state
-            .project_mcp_managers
-            .write()
-            .await
-            .remove(&project_id)
-        {
-            manager.shutdown().await;
-        }
+        projects::mcp::shutdown_manager(&self.state, project_id).await;
     }
 
     async fn delete_project_sidecar(&self, project_id: ProjectId) -> Result<Vec<String>> {
-        let project = match self.project(project_id).await {
-            Ok(project) => project,
-            Err(RuntimeError::ProjectNotFound(_)) => return Ok(Vec::new()),
-            Err(err) => return Err(err),
-        };
-        let preferred_container_id = project
-            .sidecar
-            .write()
-            .await
-            .take()
-            .map(|container| container.id);
-        let deleted = self
-            .deps
-            .docker
-            .delete_project_sidecar_containers(
-                &project_id.to_string(),
-                preferred_container_id.as_deref(),
-            )
-            .await?;
-        if !deleted.is_empty() {
-            tracing::info!(
-                project_id = %project_id,
-                count = deleted.len(),
-                "removed project sidecar containers"
-            );
-        }
-        Ok(deleted)
+        projects::mcp::delete_sidecar(&self.state, &self.deps.docker, project_id).await
     }
 
     async fn set_project_clone_result(
