@@ -7,13 +7,24 @@ use axum::http::{StatusCode, header};
 use axum::response::Response;
 use serde::Deserialize;
 
-use super::helpers::content_disposition_filename;
 use super::state::{ApiError, AppState};
 use mai_protocol::{
     AgentId, ApproveTaskPlanResponse, ArtifactInfo, CreateTaskRequest, CreateTaskResponse,
     RequestPlanRevisionRequest, RequestPlanRevisionResponse, SendMessageRequest,
     SendMessageResponse, TaskId,
 };
+
+fn content_disposition_filename(name: &str) -> String {
+    let escaped = name
+        .chars()
+        .map(|ch| match ch {
+            '"' | '\\' | '\r' | '\n' => '_',
+            ch if ch.is_control() || !ch.is_ascii() => '_',
+            ch => ch,
+        })
+        .collect::<String>();
+    format!("attachment; filename=\"{escaped}\"")
+}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TaskDetailQuery {

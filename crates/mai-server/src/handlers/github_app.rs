@@ -1,13 +1,67 @@
 use std::sync::Arc;
 
 use axum::Json;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
+use axum::http::{StatusCode, header};
 use axum::response::Response;
 use mai_protocol::*;
 use serde::Deserialize;
 
-use super::helpers::github_callback_page;
 use super::state::{ApiError, AppState};
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn github_callback_page(success: bool, title: &str, message: &str, next: &str) -> Response {
+    let status = if success {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    let accent = if success { "#0b7a53" } else { "#b42318" };
+    let title = html_escape(title);
+    let message = html_escape(message);
+    let next = html_escape(next);
+    let body = format!(
+        r#"<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="2;url={next}">
+    <title>{title}</title>
+    <style>
+      body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f3f6fa; color: #172033; }}
+      main {{ width: min(520px, calc(100vw - 32px)); border: 1px solid #d8e0ea; border-radius: 8px; padding: 28px; background: #fff; box-shadow: 0 16px 36px rgba(22, 32, 51, 0.08); }}
+      .mark {{ width: 42px; height: 42px; display: grid; place-items: center; border-radius: 8px; margin-bottom: 18px; background: color-mix(in srgb, {accent} 12%, white); color: {accent}; font-weight: 900; }}
+      h1 {{ margin: 0 0 8px; font-size: 22px; }}
+      p {{ margin: 0 0 20px; color: #526176; line-height: 1.5; }}
+      a {{ color: #1b66d2; font-weight: 800; }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="mark">{mark}</div>
+      <h1>{title}</h1>
+      <p>{message}</p>
+      <a href="{next}">Return to Mai settings</a>
+    </main>
+  </body>
+</html>"#,
+        mark = if success { "OK" } else { "!" }
+    );
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(body))
+        .expect("callback response")
+}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct GithubManifestCallbackQuery {

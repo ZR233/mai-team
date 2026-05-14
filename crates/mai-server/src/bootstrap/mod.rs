@@ -10,6 +10,7 @@ use mai_runtime::RuntimeConfig;
 use tracing::info;
 
 use crate::config::cli::Cli;
+use crate::config::{paths, relay};
 use crate::handlers;
 use crate::handlers::state::AppState;
 use crate::http::router;
@@ -26,11 +27,11 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     let base_url =
         env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
     let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
-    let data_dir = handlers::helpers::data_dir_path(cli.data_path)?;
-    let cache_dir = handlers::helpers::cache_dir_path(&data_dir);
+    let data_dir = paths::data_dir_path(cli.data_path)?;
+    let cache_dir = paths::cache_dir_path(&data_dir);
     let projects_root = data_dir.join("projects");
-    let artifact_files_root = handlers::helpers::artifact_files_root(&data_dir);
-    let artifact_index_root = handlers::helpers::artifact_index_root(&data_dir);
+    let artifact_files_root = paths::artifact_files_root(&data_dir);
+    let artifact_index_root = paths::artifact_index_root(&data_dir);
     let image = env::var("MAI_AGENT_BASE_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/zr233/mai-team-agent:latest".to_string());
     let sidecar_image = env::var("MAI_SIDECAR_IMAGE")
@@ -85,7 +86,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         artifact_index_root = %artifact_index_root.display(),
         "runtime storage paths"
     );
-    let relay = handlers::helpers::relay_config_from_env()
+    let relay = relay::relay_config_from_env()
         .map(|config| Arc::new(mai_relay_client::RelayClient::new(config)));
     let github_backend = relay
         .as_ref()
