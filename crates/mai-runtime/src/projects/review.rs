@@ -8,6 +8,7 @@ use tokio::time::Duration;
 use crate::{Result, RuntimeError};
 
 pub(crate) mod runs;
+pub(crate) mod workspace;
 
 const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;
 const PROJECT_REVIEW_FAILURE_RETRY_SECS: u64 = 600;

@@ -72,8 +72,6 @@ const PROJECT_REVIEW_CLEANUP_INTERVAL_SECS: u64 = 3600;
 const PROJECT_REVIEW_RUN_LIST_LIMIT: usize = 50;
 const PROJECT_REVIEW_SNAPSHOT_MESSAGE_LIMIT: usize = 40;
 const PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT: usize = 80;
-const PROJECT_REVIEW_REPO_COMMAND_MAX_ATTEMPTS: usize = 3;
-const PROJECT_REVIEW_REPO_COMMAND_RETRY_SECS: u64 = 5;
 const SKILL_RESOURCE_SERVER: &str = "skill";
 const PROJECT_SKILL_RESOURCE_SERVER: &str = "project-skill";
 const SKILL_RESOURCE_SCHEME: &str = "skill:///";
@@ -190,12 +188,6 @@ enum ContainerSource {
         docker_image: String,
         workspace_volume: Option<String>,
     },
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ReviewRepoCommand {
-    Ensure,
-    Sync,
 }
 
 struct ResolvedAgentModel {
@@ -4008,13 +4000,19 @@ impl AgentRuntime {
     }
 
     async fn ensure_project_review_workspace(&self, project_id: ProjectId) -> Result<()> {
-        self.run_project_review_repo_command(project_id, ReviewRepoCommand::Ensure)
-            .await
+        self.run_project_review_repo_command(
+            project_id,
+            projects::review::workspace::ReviewRepoCommand::Ensure,
+        )
+        .await
     }
 
     async fn sync_project_review_repo(&self, project_id: ProjectId) -> Result<()> {
-        self.run_project_review_repo_command(project_id, ReviewRepoCommand::Sync)
-            .await
+        self.run_project_review_repo_command(
+            project_id,
+            projects::review::workspace::ReviewRepoCommand::Sync,
+        )
+        .await
     }
 
     async fn run_project_review_cleanup_loop(self: Arc<Self>) {
@@ -4066,37 +4064,18 @@ impl AgentRuntime {
         project_id: ProjectId,
         cutoff: DateTime<Utc>,
     ) -> Result<()> {
-        let volume = project_review_workspace_volume(&project_id.to_string());
         let active_reviewer = match self.project(project_id).await {
             Ok(project) => project.summary.read().await.current_reviewer_agent_id,
             Err(_) => None,
         };
-        let spec = projects::review::retention_cleanup_spec(
+        projects::review::workspace::cleanup_history(
+            &self.deps.docker,
+            &self.sidecar_image,
             project_id,
             active_reviewer,
-            cutoff.timestamp(),
-        );
-        let output = self
-            .deps
-            .docker
-            .run_sidecar_shell_env(&mai_docker::SidecarParams {
-                name: &spec.sidecar_name,
-                image: &self.sidecar_image,
-                command: &spec.command,
-                args: &[],
-                cwd: Some(spec.cwd),
-                env: &[],
-                workspace_volume: Some(&volume),
-                timeout_secs: Some(spec.timeout_secs),
-            })
-            .await?;
-        if output.status != 0 {
-            return Err(RuntimeError::InvalidInput(format!(
-                "review retention cleanup failed: {}",
-                preview(format!("{}\n{}", output.stderr, output.stdout).trim(), 500)
-            )));
-        }
-        Ok(())
+            cutoff,
+        )
+        .await
     }
 
     async fn cleanup_project_review_worktree(
@@ -4104,126 +4083,33 @@ impl AgentRuntime {
         project_id: ProjectId,
         reviewer_id: AgentId,
     ) -> Result<()> {
-        let volume = project_review_workspace_volume(&project_id.to_string());
-        let spec = projects::review::reviewer_worktree_cleanup_spec(reviewer_id);
-        let output = self
-            .deps
-            .docker
-            .run_sidecar_shell_env(&mai_docker::SidecarParams {
-                name: &spec.sidecar_name,
-                image: &self.sidecar_image,
-                command: &spec.command,
-                args: &[],
-                cwd: Some(spec.cwd),
-                env: &[],
-                workspace_volume: Some(&volume),
-                timeout_secs: Some(spec.timeout_secs),
-            })
-            .await?;
-        if output.status != 0 {
-            return Err(RuntimeError::InvalidInput(format!(
-                "review workspace cleanup failed: {}",
-                preview(format!("{}\n{}", output.stderr, output.stdout).trim(), 500)
-            )));
-        }
-        Ok(())
+        projects::review::workspace::cleanup_worktree(
+            &self.deps.docker,
+            &self.sidecar_image,
+            project_id,
+            reviewer_id,
+        )
+        .await
     }
 
     async fn run_project_review_repo_command(
         &self,
         project_id: ProjectId,
-        command: ReviewRepoCommand,
+        command: projects::review::workspace::ReviewRepoCommand,
     ) -> Result<()> {
         let project = self.project(project_id).await?;
         let summary = project.summary.read().await.clone();
         let token = self.project_git_token(project_id).await?.ok_or_else(|| {
             RuntimeError::InvalidInput("project git account token is not configured".to_string())
         })?;
-        let volume = project_review_workspace_volume(&project_id.to_string());
-        let repo_url = github_clone_url(&summary.owner, &summary.repo);
-        let expected_remote = repo_url.clone();
-        let branch = if summary.branch.trim().is_empty() {
-            "main".to_string()
-        } else {
-            summary.branch.clone()
-        };
-        let action = match command {
-            ReviewRepoCommand::Ensure => projects::review::ReviewRepoAction::Ensure,
-            ReviewRepoCommand::Sync => projects::review::ReviewRepoAction::Sync,
-        };
-        let spec = projects::review::review_repo_command_spec(
-            action,
-            &repo_url,
-            &expected_remote,
-            &branch,
-        );
-        let env = [("MAI_GITHUB_REVIEW_TOKEN".to_string(), token.to_string())];
-        let mut last_message = String::new();
-        for attempt in 1..=PROJECT_REVIEW_REPO_COMMAND_MAX_ATTEMPTS {
-            let sidecar_name = format!("mai-review-sync-{project_id}-{attempt}");
-            let output = self
-                .deps
-                .docker
-                .run_sidecar_shell_env(&mai_docker::SidecarParams {
-                    name: &sidecar_name,
-                    image: &self.sidecar_image,
-                    command: &spec.command,
-                    args: &[],
-                    cwd: Some("/workspace"),
-                    env: &env,
-                    workspace_volume: Some(&volume),
-                    timeout_secs: Some(900),
-                })
-                .await?;
-            if output.status == 0 {
-                return Ok(());
-            }
-            let combined = format!("{}\n{}", output.stderr, output.stdout);
-            last_message = preview(redact_secret(combined.trim(), &token).trim(), 500);
-            if attempt < PROJECT_REVIEW_REPO_COMMAND_MAX_ATTEMPTS {
-                tracing::warn!(
-                    project_id = %project_id,
-                    command = spec.label,
-                    attempt,
-                    attempts = PROJECT_REVIEW_REPO_COMMAND_MAX_ATTEMPTS,
-                    error = %last_message,
-                    "project review workspace command failed; retrying"
-                );
-                sleep(Duration::from_secs(PROJECT_REVIEW_REPO_COMMAND_RETRY_SECS)).await;
-            }
-        }
-        if let Some(fallback_command_text) = spec.fallback_command {
-            tracing::warn!(
-                project_id = %project_id,
-                command = spec.label,
-                error = %last_message,
-                "project review workspace sync failed; recreating review repository"
-            );
-            let sidecar_name = format!("mai-review-sync-{project_id}-reclone");
-            let output = self
-                .deps
-                .docker
-                .run_sidecar_shell_env(&mai_docker::SidecarParams {
-                    name: &sidecar_name,
-                    image: &self.sidecar_image,
-                    command: &fallback_command_text,
-                    args: &[],
-                    cwd: Some("/workspace"),
-                    env: &env,
-                    workspace_volume: Some(&volume),
-                    timeout_secs: Some(900),
-                })
-                .await?;
-            if output.status == 0 {
-                return Ok(());
-            }
-            let combined = format!("{}\n{}", output.stderr, output.stdout);
-            last_message = preview(redact_secret(combined.trim(), &token).trim(), 500);
-        }
-        Err(RuntimeError::InvalidInput(format!(
-            "project review workspace {} failed after {} attempts: {last_message}",
-            spec.label, PROJECT_REVIEW_REPO_COMMAND_MAX_ATTEMPTS
-        )))
+        projects::review::workspace::run_repo_command(
+            &self.deps.docker,
+            &self.sidecar_image,
+            &summary,
+            &token,
+            command,
+        )
+        .await
     }
 
     async fn spawn_project_reviewer_agent(
