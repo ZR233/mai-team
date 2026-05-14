@@ -12,6 +12,7 @@ pub(crate) mod cycle;
 pub(crate) mod reviewer;
 pub(crate) mod runs;
 pub(crate) mod state;
+pub(crate) mod worker;
 pub(crate) mod workspace;
 
 const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;

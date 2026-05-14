@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
-use futures::future::{AbortHandle, Abortable};
 use mai_agents::AgentProfilesManager;
 use mai_docker::{ContainerHandle, DockerClient, project_review_workspace_volume};
 use mai_mcp::McpAgentManager;
@@ -55,13 +54,10 @@ use projects::review::state::ReviewStateUpdate;
 #[cfg(test)]
 use projects::skills::PROJECT_SKILLS_CACHE_DIR;
 use projects::skills::{ProjectSkillRefreshSource, ProjectSkillSourceDir};
-use state::{
-    AgentRecord, AgentSessionRecord, ProjectRecord, ProjectReviewWorker, RuntimeState, TaskRecord,
-};
+use state::{AgentRecord, AgentSessionRecord, ProjectRecord, RuntimeState, TaskRecord};
 use turn::tools::ToolExecution;
 
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 90;
-const PROJECT_REVIEW_FAILURE_RETRY_SECS: u64 = 600;
 const PROJECT_REVIEW_RUN_LIST_LIMIT: usize = 50;
 const PROJECT_REVIEW_SNAPSHOT_MESSAGE_LIMIT: usize = 40;
 const PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT: usize = 80;
@@ -2080,260 +2076,32 @@ impl AgentRuntime {
     }
 
     async fn start_enabled_project_review_workers(self: &Arc<Self>) {
-        let project_ids = {
-            let projects = self.state.projects.read().await;
-            projects.keys().copied().collect::<Vec<_>>()
-        };
-        for project_id in project_ids {
-            if let Err(err) = self.start_project_review_loop_if_ready(project_id).await {
-                tracing::warn!(project_id = %project_id, "failed to start project review loop: {err}");
-            }
-        }
+        projects::review::worker::start_enabled_project_review_workers(Arc::clone(self)).await
     }
 
     async fn reconcile_project_review_singletons(self: &Arc<Self>) {
-        let project_ids = {
-            let projects = self.state.projects.read().await;
-            projects.keys().copied().collect::<Vec<_>>()
-        };
-        for project_id in project_ids {
-            if let Err(err) = self.reconcile_project_review_singleton(project_id).await {
-                tracing::warn!(project_id = %project_id, "failed to reconcile project reviewer singleton: {err}");
-            }
-        }
-    }
-
-    async fn reconcile_project_review_singleton(
-        self: &Arc<Self>,
-        project_id: ProjectId,
-    ) -> Result<()> {
-        let project = self.project(project_id).await?;
-        let summary = project.summary.read().await.clone();
-        let mut stale_reviewer_ids = HashSet::new();
-        if let Some(reviewer_id) = summary.current_reviewer_agent_id {
-            stale_reviewer_ids.insert(reviewer_id);
-        }
-
-        let runs = self
-            .deps
-            .store
-            .load_project_review_runs(project_id, None, 0, PROJECT_REVIEW_RUN_LIST_LIMIT)
-            .await?;
-        let mut has_stale_activity = summary.current_reviewer_agent_id.is_some();
-        for run in runs {
-            if run.finished_at.is_some()
-                || !matches!(
-                    run.status,
-                    ProjectReviewRunStatus::Syncing | ProjectReviewRunStatus::Running
-                )
-            {
-                continue;
-            }
-            has_stale_activity = true;
-            if let Some(reviewer_id) = run.reviewer_agent_id {
-                stale_reviewer_ids.insert(reviewer_id);
-            }
-            let _ = projects::review::runs::finish_project_review_run(
-                &self.deps.store,
-                self.as_ref(),
-                FinishReviewRun {
-                    run_id: run.id,
-                    project_id,
-                    reviewer_agent_id: run.reviewer_agent_id,
-                    turn_id: run.turn_id,
-                    status: ProjectReviewRunStatus::Cancelled,
-                    outcome: None,
-                    pr: run.pr,
-                    summary_text: run.summary,
-                    error: Some("review interrupted by server restart".to_string()),
-                },
-            )
-            .await;
-        }
-
-        for agent in self.project_auto_reviewer_agents(project_id).await {
-            has_stale_activity = true;
-            stale_reviewer_ids.insert(agent.id);
-        }
-
-        for reviewer_id in stale_reviewer_ids {
-            if let Err(err) = self.delete_agent(reviewer_id).await {
-                tracing::warn!(
-                    project_id = %project_id,
-                    reviewer_id = %reviewer_id,
-                    "failed to delete stale project reviewer agent: {err}"
-                );
-            }
-        }
-
-        if has_stale_activity {
-            let status = if summary.auto_review_enabled {
-                ProjectReviewStatus::Idle
-            } else {
-                ProjectReviewStatus::Disabled
-            };
-            let _ = self
-                .set_project_review_state(project_id, status, ReviewStateUpdate::default())
-                .await?;
-        }
-        Ok(())
+        projects::review::worker::reconcile_project_review_singletons(
+            Arc::clone(self),
+            PROJECT_REVIEW_RUN_LIST_LIMIT,
+        )
+        .await
     }
 
     async fn start_project_review_loop_if_ready(
         self: &Arc<Self>,
         project_id: ProjectId,
     ) -> Result<()> {
-        let project = self.project(project_id).await?;
-        let should_start = {
-            let summary = project.summary.read().await;
-            summary.auto_review_enabled
-                && summary.status == ProjectStatus::Ready
-                && summary.clone_status == ProjectCloneStatus::Ready
-        };
-        if !should_start {
-            return Ok(());
-        }
-
-        let mut worker = project.review_worker.lock().await;
-        if worker.is_some() {
-            return Ok(());
-        }
-        let cancellation_token = CancellationToken::new();
-        let runtime = Arc::clone(self);
-        let token = cancellation_token.clone();
-        let (abort_handle, abort_registration) = AbortHandle::new_pair();
-        tokio::spawn(Abortable::new(
-            async move {
-                runtime.run_project_review_loop(project_id, token).await;
-            },
-            abort_registration,
-        ));
-        *worker = Some(ProjectReviewWorker {
-            cancellation_token,
-            abort_handle,
-        });
-        Ok(())
+        projects::review::worker::start_project_review_loop_if_ready(Arc::clone(self), project_id)
+            .await
     }
 
     async fn stop_project_review_loop(self: &Arc<Self>, project_id: ProjectId) {
-        let project = match self.project(project_id).await {
-            Ok(project) => project,
-            Err(_) => return,
-        };
-        let worker = project.review_worker.lock().await.take();
-        if let Some(worker) = worker {
-            worker.cancellation_token.cancel();
-            worker.abort_handle.abort();
-        }
-        let reviewer_id = project.summary.read().await.current_reviewer_agent_id;
-        let _ = projects::review::runs::cancel_active_project_review_runs(
-            &self.deps.store,
-            self.as_ref(),
+        projects::review::worker::stop_project_review_loop(
+            Arc::clone(self),
             project_id,
-            reviewer_id,
             PROJECT_REVIEW_RUN_LIST_LIMIT,
         )
-        .await;
-        if let Some(reviewer_id) = reviewer_id {
-            if let Ok(agent) = self.agent(reviewer_id).await {
-                let current_turn = agent.summary.read().await.current_turn;
-                if let Some(turn_id) = current_turn {
-                    let _ = self.cancel_agent_turn(reviewer_id, turn_id).await;
-                }
-            }
-            let _ = self.delete_agent(reviewer_id).await;
-        }
-        let _ = self
-            .set_project_review_state(
-                project_id,
-                ProjectReviewStatus::Disabled,
-                ReviewStateUpdate {
-                    force_disabled: true,
-                    ..Default::default()
-                },
-            )
-            .await;
-    }
-
-    async fn run_project_review_loop(
-        self: Arc<Self>,
-        project_id: ProjectId,
-        cancellation_token: CancellationToken,
-    ) {
-        if let Err(err) = self.ensure_project_review_workspace(project_id).await {
-            let _ = projects::review::runs::record_project_review_startup_failure(
-                &self.deps.store,
-                project_id,
-                err.to_string(),
-            )
-            .await;
-            let next = Utc::now() + TimeDelta::seconds(PROJECT_REVIEW_FAILURE_RETRY_SECS as i64);
-            let _ = self
-                .set_project_review_state(
-                    project_id,
-                    ProjectReviewStatus::Failed,
-                    ReviewStateUpdate {
-                        next_review_at: Some(next),
-                        error: Some(err.to_string()),
-                        ..Default::default()
-                    },
-                )
-                .await;
-        }
-        loop {
-            if cancellation_token.is_cancelled() {
-                break;
-            }
-            let should_continue = match self.project(project_id).await {
-                Ok(project) => {
-                    let summary = project.summary.read().await;
-                    summary.auto_review_enabled
-                        && summary.status == ProjectStatus::Ready
-                        && summary.clone_status == ProjectCloneStatus::Ready
-                }
-                Err(_) => false,
-            };
-            if !should_continue {
-                break;
-            }
-
-            let decision = self
-                .run_project_review_once(project_id, cancellation_token.clone(), None)
-                .await;
-            let decision = match decision {
-                Ok(result) => projects::review::project_review_loop_decision_for_result(result),
-                Err(RuntimeError::TurnCancelled) if cancellation_token.is_cancelled() => break,
-                Err(err) => {
-                    projects::review::project_review_loop_decision_for_error(err.to_string())
-                }
-            };
-            let next_review_at = (decision.delay.as_secs() > 0)
-                .then(|| Utc::now() + TimeDelta::seconds(decision.delay.as_secs() as i64));
-            let _ = self
-                .set_project_review_state(
-                    project_id,
-                    decision.status,
-                    ReviewStateUpdate {
-                        next_review_at,
-                        outcome: decision.outcome,
-                        summary_text: decision.summary,
-                        error: decision.error,
-                        ..Default::default()
-                    },
-                )
-                .await;
-            if decision.delay.is_zero() {
-                continue;
-            }
-            tokio::select! {
-                _ = sleep(decision.delay) => {}
-                _ = cancellation_token.cancelled() => break,
-            }
-        }
-        if let Ok(project) = self.project(project_id).await {
-            let mut worker = project.review_worker.lock().await;
-            *worker = None;
-        }
+        .await
     }
 
     async fn run_project_review_once(
@@ -3684,6 +3452,143 @@ impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
         reviewer_id: AgentId,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         AgentRuntime::cleanup_project_review_worktree(self.as_ref(), project_id, reviewer_id)
+    }
+
+    fn delete_agent(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::delete_agent(self.as_ref(), agent_id)
+    }
+}
+
+impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
+    fn project(
+        &self,
+        project_id: ProjectId,
+    ) -> impl std::future::Future<Output = Result<Arc<ProjectRecord>>> + Send {
+        AgentRuntime::project(self.as_ref(), project_id)
+    }
+
+    fn project_ids(&self) -> impl std::future::Future<Output = Vec<ProjectId>> + Send {
+        async move {
+            let projects = self.state.projects.read().await;
+            projects.keys().copied().collect()
+        }
+    }
+
+    fn project_auto_reviewer_agents(
+        &self,
+        project_id: ProjectId,
+    ) -> impl std::future::Future<Output = Vec<AgentSummary>> + Send {
+        AgentRuntime::project_auto_reviewer_agents(self.as_ref(), project_id)
+    }
+
+    fn load_project_review_runs(
+        &self,
+        project_id: ProjectId,
+        offset: usize,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<ProjectReviewRunSummary>>> + Send {
+        async move {
+            Ok(self
+                .deps
+                .store
+                .load_project_review_runs(project_id, None, offset, limit)
+                .await?)
+        }
+    }
+
+    fn finish_project_review_run(
+        &self,
+        request: FinishReviewRun,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            projects::review::runs::finish_project_review_run(
+                &self.deps.store,
+                self.as_ref(),
+                request,
+            )
+            .await
+        }
+    }
+
+    fn cancel_active_project_review_runs(
+        &self,
+        project_id: ProjectId,
+        reviewer_agent_id: Option<AgentId>,
+        run_list_limit: usize,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            projects::review::runs::cancel_active_project_review_runs(
+                &self.deps.store,
+                self.as_ref(),
+                project_id,
+                reviewer_agent_id,
+                run_list_limit,
+            )
+            .await
+        }
+    }
+
+    fn record_project_review_startup_failure(
+        &self,
+        project_id: ProjectId,
+        error: String,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            projects::review::runs::record_project_review_startup_failure(
+                &self.deps.store,
+                project_id,
+                error,
+            )
+            .await
+        }
+    }
+
+    fn set_project_review_state(
+        &self,
+        project_id: ProjectId,
+        status: ProjectReviewStatus,
+        update: ReviewStateUpdate,
+    ) -> impl std::future::Future<Output = Result<ProjectSummary>> + Send {
+        async move {
+            AgentRuntime::set_project_review_state(self.as_ref(), project_id, status, update).await
+        }
+    }
+
+    fn ensure_project_review_workspace(
+        &self,
+        project_id: ProjectId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::ensure_project_review_workspace(self.as_ref(), project_id)
+    }
+
+    fn run_project_review_once(
+        &self,
+        project_id: ProjectId,
+        cancellation_token: CancellationToken,
+        target_pr: Option<u64>,
+    ) -> impl std::future::Future<Output = Result<ProjectReviewCycleResult>> + Send {
+        AgentRuntime::run_project_review_once(self, project_id, cancellation_token, target_pr)
+    }
+
+    fn agent_current_turn(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<Option<TurnId>>> + Send {
+        async move {
+            let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
+            Ok(agent.summary.read().await.current_turn)
+        }
+    }
+
+    fn cancel_agent_turn(
+        &self,
+        agent_id: AgentId,
+        turn_id: TurnId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::cancel_agent_turn(self, agent_id, turn_id)
     }
 
     fn delete_agent(
