@@ -5011,26 +5011,6 @@ impl AgentRuntime {
                 instructions.push_str(&format!("\n- {warning}"));
             }
         }
-        if !skill_injections.suggestions.is_empty() {
-            instructions.push_str("\n\n## Skill Suggestions for This Turn\n");
-            instructions.push_str(
-                "The following skills look potentially relevant but were not injected. Use them only if they fit the current task; read the path before relying on one.",
-            );
-            for suggestion in &skill_injections.suggestions {
-                let display = suggestion
-                    .display_name
-                    .as_deref()
-                    .unwrap_or(&suggestion.name);
-                instructions.push_str(&format!(
-                    "\n- ${name} ({display}): {description} (reason: {reason}; path: {path})",
-                    name = suggestion.name,
-                    display = display,
-                    description = suggestion.description,
-                    reason = suggestion.reason,
-                    path = suggestion.path.display()
-                ));
-            }
-        }
         instructions.push_str("\n\n## MCP Tools\n");
         if mcp_tools.is_empty() {
             instructions.push_str("No MCP tools are currently available.");
@@ -10536,7 +10516,6 @@ esac
                     },
                     contents: "skill body".to_string(),
                 }],
-                suggestions: Vec::new(),
                 warnings: Vec::new(),
             },
             &ContainerSkillPaths::default(),
@@ -10577,7 +10556,6 @@ esac
                     },
                     contents: "skill body".to_string(),
                 }],
-                suggestions: Vec::new(),
                 warnings: Vec::new(),
             },
             &ContainerSkillPaths { paths },

@@ -6,9 +6,10 @@ license.workspace = true
 
 [dependencies]
 dirs.workspace = true
+gray_matter.workspace = true
 mai-protocol = { path = "../mai-protocol" }
 serde.workspace = true
-serde_yaml.workspace = true
+serde-saphyr.workspace = true
 thiserror.workspace = true
 walkdir.workspace = true
 
