@@ -32,35 +32,11 @@ pub(crate) struct WireRequest<'a> {
     pub(crate) stream: bool,
     pub(crate) store: Option<bool>,
     pub(crate) previous_response_id: Option<&'a str>,
+    pub(crate) prompt_cache_key: Option<&'a str>,
     pub(crate) max_output_tokens: u64,
     pub(crate) max_tokens_field: &'a str,
     pub(crate) extra_body: BTreeMap<String, Value>,
     pub(crate) supports_tools: bool,
-}
-
-pub(crate) fn parse_usage(value: Option<&Value>) -> Option<mai_protocol::TokenUsage> {
-    use mai_protocol::TokenUsage;
-    let value = value?;
-    value.as_object()?;
-    let input_tokens = value
-        .get("input_tokens")
-        .or_else(|| value.get("prompt_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let output_tokens = value
-        .get("output_tokens")
-        .or_else(|| value.get("completion_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let total_tokens = value
-        .get("total_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(input_tokens + output_tokens);
-    Some(TokenUsage {
-        input_tokens,
-        output_tokens,
-        total_tokens,
-    })
 }
 
 pub(crate) fn parse_sse_frames(buffer: &mut Vec<u8>, chunk: &[u8]) -> Result<Vec<SseFrame>> {

@@ -2555,7 +2555,13 @@ async fn user_turn_includes_selected_skill_as_user_fragment() {
             "type": "message",
             "content": [{ "type": "output_text", "text": "done" }]
         }],
-        "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+        "usage": {
+            "input_tokens": 10,
+            "input_tokens_details": { "cached_tokens": 7 },
+            "output_tokens": 2,
+            "output_tokens_details": { "reasoning_tokens": 1 },
+            "total_tokens": 12
+        }
     })])
     .await;
     let dir = tempdir().expect("tempdir");
@@ -2610,6 +2616,10 @@ async fn user_turn_includes_selected_skill_as_user_fragment() {
         .expect("turn");
 
     let requests = requests.lock().await.clone();
+    assert_eq!(
+        requests[0]["prompt_cache_key"],
+        format!("agent:{agent_id}:session:{session_id}")
+    );
     let input = requests[0]["input"].as_array().expect("input");
     assert!(input.iter().any(|item| {
         item["role"] == "user"
@@ -2640,6 +2650,17 @@ async fn user_turn_includes_selected_skill_as_user_fragment() {
     assert_eq!(activated.len(), 1);
     assert_eq!(activated[0].name, "demo");
     assert_eq!(activated[0].scope, mai_protocol::SkillScope::Repo);
+    let snapshot = store.load_runtime_snapshot(10).await.expect("snapshot");
+    assert_eq!(
+        snapshot.agents[0].summary.token_usage,
+        TokenUsage {
+            input_tokens: 10,
+            cached_input_tokens: 7,
+            output_tokens: 2,
+            reasoning_output_tokens: 1,
+            total_tokens: 12,
+        }
+    );
 }
 
 #[tokio::test]

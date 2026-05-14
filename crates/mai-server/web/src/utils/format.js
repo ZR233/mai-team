@@ -20,8 +20,28 @@ export function formatEventType(type) {
     .replace(/\b\w/g, (l) => l.toUpperCase())
 }
 
+function formatTokenCount(value) {
+  return Number(value || 0).toLocaleString()
+}
+
+export function tokenUsage(agent) {
+  const usage = agent.token_usage || {}
+  return {
+    input: formatTokenCount(usage.input_tokens),
+    cachedInput: formatTokenCount(usage.cached_input_tokens),
+    output: formatTokenCount(usage.output_tokens),
+    reasoningOutput: formatTokenCount(usage.reasoning_output_tokens),
+    total: formatTokenCount(usage.total_tokens)
+  }
+}
+
 export function totalTokens(agent) {
-  return Number(agent.token_usage?.total_tokens || 0).toLocaleString()
+  return tokenUsage(agent).total
+}
+
+export function tokenBreakdown(agent) {
+  const usage = tokenUsage(agent)
+  return `Input ${usage.input} · Cached ${usage.cachedInput} · Output ${usage.output} · Reasoning ${usage.reasoningOutput}`
 }
 
 export function shortContainer(value) {

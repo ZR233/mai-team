@@ -501,8 +501,8 @@ impl<'a> ModelStreamReducer<'a> {
             let name = preview.name.unwrap_or_default();
             let raw_arguments = preview.arguments;
             let arguments = mai_model::types::parse_arguments(&raw_arguments);
-            let reasoning_content = (!active.reasoning.trim().is_empty())
-                .then_some(active.reasoning.clone());
+            let reasoning_content =
+                (!active.reasoning.trim().is_empty()).then_some(active.reasoning.clone());
             if reasoning_content.is_some() {
                 self.last_reasoning_content = reasoning_content.clone();
             }
@@ -602,6 +602,8 @@ pub(crate) async fn run_model_stream_turn(
     turn_model_state: &mut ModelTurnState,
     cancellation_token: &CancellationToken,
 ) -> Result<ModelTurnResult> {
+    turn_model_state.prompt_cache_key =
+        Some(format!("agent:{}:session:{}", ctx.agent_id, ctx.session_id));
     let resolved = model.resolve(
         &model_context.provider_selection.provider,
         &model_context.provider_selection.model,
@@ -841,7 +843,9 @@ mod tests {
             id: Some("resp_1".to_string()),
             usage: Some(TokenUsage {
                 input_tokens: 3,
+                cached_input_tokens: 1,
                 output_tokens: 2,
+                reasoning_output_tokens: 1,
                 total_tokens: 5,
             }),
             end_turn: Some(true),

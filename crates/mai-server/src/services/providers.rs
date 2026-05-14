@@ -406,7 +406,9 @@ pub(crate) fn provider_test_model(id: &str) -> ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mai_protocol::{ProviderKind, ProviderTestRequest, ServiceEvent, ServiceEventKind};
+    use mai_protocol::{
+        ProviderKind, ProviderTestRequest, ServiceEvent, ServiceEventKind, TokenUsage,
+    };
     use serde_json::{Value, json};
     use std::collections::VecDeque;
     use std::sync::Arc;
@@ -425,7 +427,13 @@ mod tests {
                         "content": [{ "type": "output_text", "text": "ok" }]
                     }
                 ],
-                "usage": { "input_tokens": 3, "output_tokens": 2, "total_tokens": 5 }
+                "usage": {
+                    "input_tokens": 3,
+                    "input_tokens_details": { "cached_tokens": 1 },
+                    "output_tokens": 2,
+                    "output_tokens_details": { "reasoning_tokens": 1 },
+                    "total_tokens": 5
+                }
             }),
             json!({
                 "id": "resp_test_2",
@@ -435,7 +443,13 @@ mod tests {
                         "content": [{ "type": "output_text", "text": "ok" }]
                     }
                 ],
-                "usage": { "input_tokens": 4, "output_tokens": 2, "total_tokens": 6 }
+                "usage": {
+                    "input_tokens": 4,
+                    "input_tokens_details": { "cached_tokens": 3 },
+                    "output_tokens": 2,
+                    "output_tokens_details": { "reasoning_tokens": 2 },
+                    "total_tokens": 6
+                }
             }),
         ])
         .await;
@@ -461,7 +475,16 @@ mod tests {
         assert_eq!(response.model, "gpt-5.5");
         assert_eq!(response.base_url, base_url);
         assert_eq!(response.output_preview, "ok");
-        assert_eq!(response.usage.expect("usage").total_tokens, 6);
+        assert_eq!(
+            response.usage.expect("usage"),
+            TokenUsage {
+                input_tokens: 4,
+                cached_input_tokens: 3,
+                output_tokens: 2,
+                reasoning_output_tokens: 2,
+                total_tokens: 6,
+            }
+        );
         assert_eq!(response.error, None);
 
         let requests = requests.lock().await;

@@ -19,7 +19,7 @@
       </span>
       <span class="status-line-item">
         <span>Tokens</span>
-        <strong>{{ totalTokens(detail) }}</strong>
+        <strong :title="tokenBreakdown(detail)">{{ totalTokens(detail) }}</strong>
       </span>
       <span
         v-if="contextCapacity.visible"
@@ -37,7 +37,7 @@
 </template>
 
 <script setup>
-import { formatStatus, statusTone, totalTokens } from '../utils/format'
+import { formatStatus, statusTone, tokenBreakdown, totalTokens } from '../utils/format'
 import { reasoningLabel } from '../utils/reasoning'
 
 defineProps({

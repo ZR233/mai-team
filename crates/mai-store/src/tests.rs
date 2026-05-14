@@ -420,10 +420,7 @@ async fn provider_presets_include_builtin_metadata() {
             .collect::<Vec<_>>(),
         vec!["high", "max"]
     );
-    for id in [
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
-    ] {
+    for id in ["deepseek-v4-flash", "deepseek-v4-pro"] {
         let model = deepseek
             .models
             .iter()
@@ -698,7 +695,9 @@ async fn runtime_snapshot_survives_reopen() {
         last_error: None,
         token_usage: TokenUsage {
             input_tokens: 1,
+            cached_input_tokens: 4,
             output_tokens: 2,
+            reasoning_output_tokens: 5,
             total_tokens: 3,
         },
     };
@@ -773,6 +772,20 @@ async fn runtime_snapshot_survives_reopen() {
     assert_eq!(snapshot.next_sequence, 8);
     assert_eq!(snapshot.agents.len(), 1);
     assert_eq!(snapshot.agents[0].summary.name, "agent-test");
+    assert_eq!(snapshot.agents[0].summary.token_usage.input_tokens, 1);
+    assert_eq!(
+        snapshot.agents[0].summary.token_usage.cached_input_tokens,
+        4
+    );
+    assert_eq!(snapshot.agents[0].summary.token_usage.output_tokens, 2);
+    assert_eq!(
+        snapshot.agents[0]
+            .summary
+            .token_usage
+            .reasoning_output_tokens,
+        5
+    );
+    assert_eq!(snapshot.agents[0].summary.token_usage.total_tokens, 3);
     assert_eq!(
         snapshot.agents[0].summary.docker_image,
         "ghcr.io/rcore-os/tgoskits-container:latest"

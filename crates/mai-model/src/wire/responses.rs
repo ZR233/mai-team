@@ -1,6 +1,7 @@
 use crate::error::{ModelError, Result};
 use crate::types::{ModelStreamEvent, ModelStreamStatus};
-use crate::wire::{SseFrame, WireProtocol, WireRequest, parse_usage};
+use crate::usage::parse_responses_usage;
+use crate::wire::{SseFrame, WireProtocol, WireRequest};
 use mai_protocol::{ModelInputItem, ModelOutputItem, ToolDefinition};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -25,6 +26,8 @@ struct ResponsesRequest<'a> {
     store: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_response_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
     #[serde(skip_serializing_if = "u64_is_zero")]
     max_output_tokens: u64,
     #[serde(flatten)]
@@ -53,6 +56,7 @@ impl WireProtocol for ResponsesApi {
             include: &[],
             store: req.store,
             previous_response_id: req.previous_response_id,
+            prompt_cache_key: req.prompt_cache_key,
             max_output_tokens: req.max_output_tokens,
             options: req.extra_body.clone(),
         };
@@ -193,7 +197,7 @@ pub(crate) fn parse_stream_event_value(value: Value) -> Result<Vec<ModelStreamEv
                 id: response_id(&value),
                 usage: value
                     .get("response")
-                    .and_then(|response| parse_usage(response.get("usage"))),
+                    .and_then(|response| parse_responses_usage(response.get("usage"))),
                 end_turn: value
                     .get("response")
                     .and_then(|response| response.get("end_turn"))
@@ -267,7 +271,7 @@ fn parse_response(value: Value) -> mai_protocol::ModelResponse {
         .into_iter()
         .map(parse_output_item)
         .collect::<Vec<_>>();
-    let usage = parse_usage(value.get("usage"));
+    let usage = parse_responses_usage(value.get("usage"));
     mai_protocol::ModelResponse { id, output, usage }
 }
 
@@ -431,12 +435,17 @@ mod tests {
             include: &[],
             store: Some(true),
             previous_response_id,
+            prompt_cache_key: Some("agent:agent-1:session:session-1"),
             max_output_tokens: 384_000,
             options: request_options(&model, None),
         };
         let value = serde_json::to_value(&request).expect("request json");
 
         assert_eq!(value["previous_response_id"].as_str(), Some("resp_1"));
+        assert_eq!(
+            value["prompt_cache_key"].as_str(),
+            Some("agent:agent-1:session:session-1")
+        );
         assert_eq!(value["store"].as_bool(), Some(true));
         assert_eq!(value["input"].as_array().expect("input").len(), 1);
         assert_eq!(value["input"][0]["call_id"].as_str(), Some("call_1"));

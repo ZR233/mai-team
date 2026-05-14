@@ -211,17 +211,25 @@ pub struct AgentSessionSummary {
     pub message_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TokenUsage {
     pub input_tokens: u64,
+    pub cached_input_tokens: u64,
     pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
     pub total_tokens: u64,
 }
 
 impl TokenUsage {
     pub fn add(&mut self, other: &TokenUsage) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.reasoning_output_tokens = self
+            .reasoning_output_tokens
+            .saturating_add(other.reasoning_output_tokens);
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
     }
 }

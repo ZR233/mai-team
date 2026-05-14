@@ -40,7 +40,9 @@ pub(crate) struct AgentRecordRow {
     pub(crate) current_turn: Option<String>,
     pub(crate) last_error: Option<String>,
     pub(crate) input_tokens: i64,
+    pub(crate) cached_input_tokens: i64,
     pub(crate) output_tokens: i64,
+    pub(crate) reasoning_output_tokens: i64,
     pub(crate) total_tokens: i64,
     pub(crate) system_prompt: Option<String>,
 }
@@ -279,7 +281,9 @@ impl AgentRecordRow {
             last_error: self.last_error,
             token_usage: TokenUsage {
                 input_tokens: i64_to_u64(self.input_tokens),
+                cached_input_tokens: i64_to_u64(self.cached_input_tokens),
                 output_tokens: i64_to_u64(self.output_tokens),
+                reasoning_output_tokens: i64_to_u64(self.reasoning_output_tokens),
                 total_tokens: i64_to_u64(self.total_tokens),
             },
         })

@@ -72,6 +72,7 @@ impl ModelClient {
             stream: true,
             store,
             previous_response_id,
+            prompt_cache_key: state.prompt_cache_key.as_deref(),
             max_output_tokens: resolved.max_output_tokens,
             max_tokens_field: &resolved.max_tokens_field,
             extra_body: resolved.extra_body.clone(),
@@ -105,6 +106,7 @@ impl ModelClient {
                     stream: true,
                     store: Some(false),
                     previous_response_id: None,
+                    prompt_cache_key: state.prompt_cache_key.as_deref(),
                     max_output_tokens: resolved.max_output_tokens,
                     max_tokens_field: &resolved.max_tokens_field,
                     extra_body: resolved.extra_body.clone(),
@@ -595,7 +597,10 @@ mod tests {
         let model = openai_model();
         let client = ModelClient::new();
         let cancellation_token = CancellationToken::new();
-        let mut state = ModelTurnState::default();
+        let mut state = ModelTurnState {
+            prompt_cache_key: Some("agent:agent-1:session:session-1".to_string()),
+            ..Default::default()
+        };
 
         let first_input = vec![ModelInputItem::user_text("first")];
         let resolved = client.resolve(&provider, &model, None);
@@ -637,14 +642,26 @@ mod tests {
         let requests = requests.lock().await;
         assert_eq!(requests.len(), 3);
         assert!(requests[0].get("previous_response_id").is_none());
+        assert_eq!(
+            requests[0]["prompt_cache_key"],
+            "agent:agent-1:session:session-1"
+        );
         assert_eq!(requests[0]["store"], true);
         assert_eq!(requests[1]["previous_response_id"], "resp_1");
+        assert_eq!(
+            requests[1]["prompt_cache_key"],
+            "agent:agent-1:session:session-1"
+        );
         assert_eq!(
             requests[1]["input"].as_array().expect("delta input").len(),
             1
         );
         assert_eq!(requests[1]["input"][0]["role"], "user");
         assert!(requests[2].get("previous_response_id").is_none());
+        assert_eq!(
+            requests[2]["prompt_cache_key"],
+            "agent:agent-1:session:session-1"
+        );
         assert_eq!(requests[2]["store"], false);
         assert_eq!(
             requests[2]["input"].as_array().expect("full input").len(),

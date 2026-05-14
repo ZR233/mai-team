@@ -35,13 +35,15 @@ pub trait ProviderResolver: Debug + Send + Sync {
 pub(crate) struct DefaultProviderResolver {
     responses: Arc<ResponsesApi>,
     chat_completions: Arc<ChatCompletionsApi>,
+    deepseek_chat_completions: Arc<ChatCompletionsApi>,
 }
 
 impl DefaultProviderResolver {
     pub(crate) fn new() -> Self {
         Self {
             responses: Arc::new(ResponsesApi),
-            chat_completions: Arc::new(ChatCompletionsApi),
+            chat_completions: Arc::new(ChatCompletionsApi::openai_compatible()),
+            deepseek_chat_completions: Arc::new(ChatCompletionsApi::deepseek()),
         }
     }
 }
@@ -62,6 +64,9 @@ impl ProviderResolver for DefaultProviderResolver {
         let wire_api = effective_wire_api(provider, model);
         let wire_protocol: Arc<dyn WireProtocol> = match wire_api {
             ModelWireApi::Responses => Arc::clone(&self.responses) as Arc<dyn WireProtocol>,
+            ModelWireApi::ChatCompletions if provider.kind == ProviderKind::Deepseek => {
+                Arc::clone(&self.deepseek_chat_completions) as Arc<dyn WireProtocol>
+            }
             ModelWireApi::ChatCompletions => {
                 Arc::clone(&self.chat_completions) as Arc<dyn WireProtocol>
             }

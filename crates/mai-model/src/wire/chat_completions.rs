@@ -1,13 +1,36 @@
 use crate::error::Result;
 use crate::types::ModelStreamEvent;
-use crate::wire::{SseFrame, WireProtocol, WireRequest, parse_usage};
+use crate::usage::{parse_chat_usage, parse_deepseek_chat_usage};
+use crate::wire::{SseFrame, WireProtocol, WireRequest};
 use mai_protocol::{ModelContentItem, ModelInputItem, ModelOutputItem, ToolDefinition};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Debug)]
-pub(crate) struct ChatCompletionsApi;
+pub(crate) struct ChatCompletionsApi {
+    usage_parser: ChatUsageParser,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ChatUsageParser {
+    OpenAiCompatible,
+    Deepseek,
+}
+
+impl ChatCompletionsApi {
+    pub(crate) fn openai_compatible() -> Self {
+        Self {
+            usage_parser: ChatUsageParser::OpenAiCompatible,
+        }
+    }
+
+    pub(crate) fn deepseek() -> Self {
+        Self {
+            usage_parser: ChatUsageParser::Deepseek,
+        }
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct ChatRequest {
@@ -100,7 +123,10 @@ impl WireProtocol for ChatCompletionsApi {
             return Ok(Vec::new());
         }
         let value: Value = serde_json::from_str(&event.data)?;
-        Ok(parse_chat_stream_chunk(value))
+        Ok(parse_chat_stream_chunk_with_usage_parser(
+            value,
+            self.usage_parser,
+        ))
     }
 
     fn parse_stream_done(&self) -> Result<Vec<ModelStreamEvent>> {
@@ -233,7 +259,15 @@ fn assistant_chat_content(
         .or_else(|| (!tool_calls.is_empty() || reasoning_content.is_some()).then(String::new))
 }
 
-pub(crate) fn parse_chat_stream_chunk(value: Value) -> Vec<ModelStreamEvent> {
+#[cfg(test)]
+fn parse_chat_stream_chunk(value: Value) -> Vec<ModelStreamEvent> {
+    parse_chat_stream_chunk_with_usage_parser(value, ChatUsageParser::OpenAiCompatible)
+}
+
+fn parse_chat_stream_chunk_with_usage_parser(
+    value: Value,
+    usage_parser: ChatUsageParser,
+) -> Vec<ModelStreamEvent> {
     let mut events = Vec::new();
     let mut tool_calls_completed = Vec::new();
     let id = value
@@ -326,7 +360,10 @@ pub(crate) fn parse_chat_stream_chunk(value: Value) -> Vec<ModelStreamEvent> {
             },
         });
     }
-    let usage = parse_usage(value.get("usage"));
+    let usage = match usage_parser {
+        ChatUsageParser::OpenAiCompatible => parse_chat_usage(value.get("usage")),
+        ChatUsageParser::Deepseek => parse_deepseek_chat_usage(value.get("usage")),
+    };
     if usage.is_some() {
         events.push(ModelStreamEvent::Completed {
             id,
@@ -425,13 +462,16 @@ mod tests {
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[2].role, "assistant");
-        assert_eq!(messages[2].reasoning_content.as_deref(), Some("old thinking"));
+        assert_eq!(
+            messages[2].reasoning_content.as_deref(),
+            Some("old thinking")
+        );
     }
 
     #[test]
     fn deepseek_request_uses_current_thinking_param_and_clamps_max_tokens() {
         let model = deepseek_model();
-        let api = ChatCompletionsApi;
+        let api = ChatCompletionsApi::deepseek();
         let body = api
             .build_body(&WireRequest {
                 model_id: &model.id,
@@ -442,6 +482,7 @@ mod tests {
                 stream: false,
                 store: None,
                 previous_response_id: None,
+                prompt_cache_key: Some("agent:agent-1:session:session-1"),
                 max_output_tokens: 64_000,
                 max_tokens_field: &model.request_policy.max_tokens_field,
                 extra_body: crate::provider::request_options(&model, Some("high")),
@@ -459,12 +500,13 @@ mod tests {
             value.get("reasoning_effort").and_then(Value::as_str),
             Some("high")
         );
+        assert!(value.get("prompt_cache_key").is_none());
     }
 
     #[test]
     fn deepseek_reasoning_tool_call_messages_have_content_and_effort() {
         let model = deepseek_model();
-        let api = ChatCompletionsApi;
+        let api = ChatCompletionsApi::deepseek();
         let body = api
             .build_body(&WireRequest {
                 model_id: &model.id,
@@ -495,6 +537,7 @@ mod tests {
                 stream: false,
                 store: None,
                 previous_response_id: None,
+                prompt_cache_key: None,
                 max_output_tokens: 64_000,
                 max_tokens_field: &model.request_policy.max_tokens_field,
                 extra_body: crate::provider::request_options(&model, Some("max")),
@@ -577,7 +620,7 @@ mod tests {
         model.capabilities.reasoning_replay = false;
         model.request_policy.extra_body = serde_json::json!({ "mimo_only": true });
 
-        let api = ChatCompletionsApi;
+        let api = ChatCompletionsApi::openai_compatible();
         let body = api
             .build_body(&WireRequest {
                 model_id: &model.id,
@@ -588,6 +631,7 @@ mod tests {
                 stream: false,
                 store: None,
                 previous_response_id: None,
+                prompt_cache_key: Some("agent:agent-1:session:session-1"),
                 max_output_tokens: 131_072,
                 max_tokens_field: &model.request_policy.max_tokens_field,
                 extra_body: crate::provider::request_options(&model, None),
@@ -598,13 +642,14 @@ mod tests {
 
         assert_eq!(value.get("mimo_only").and_then(Value::as_bool), Some(true));
         assert!(value.get("thinking").is_none());
+        assert!(value.get("prompt_cache_key").is_none());
     }
 
     #[test]
     fn chat_request_uses_configured_max_token_field() {
         let mut model = deepseek_model();
         model.request_policy.max_tokens_field = "max_completion_tokens".to_string();
-        let api = ChatCompletionsApi;
+        let api = ChatCompletionsApi::deepseek();
         let body = api
             .build_body(&WireRequest {
                 model_id: &model.id,
@@ -615,6 +660,7 @@ mod tests {
                 stream: false,
                 store: None,
                 previous_response_id: None,
+                prompt_cache_key: None,
                 max_output_tokens: 64_000,
                 max_tokens_field: &model.request_policy.max_tokens_field,
                 extra_body: crate::provider::request_options(&model, Some("high")),

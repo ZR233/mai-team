@@ -30,7 +30,9 @@ impl ConfigStore {
             current_turn: summary.current_turn.map(|id| id.to_string()),
             last_error: summary.last_error.clone(),
             input_tokens: u64_to_i64(summary.token_usage.input_tokens),
+            cached_input_tokens: u64_to_i64(summary.token_usage.cached_input_tokens),
             output_tokens: u64_to_i64(summary.token_usage.output_tokens),
+            reasoning_output_tokens: u64_to_i64(summary.token_usage.reasoning_output_tokens),
             total_tokens: u64_to_i64(summary.token_usage.total_tokens),
             system_prompt: system_prompt.map(str::to_string),
         })

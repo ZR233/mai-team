@@ -2,6 +2,7 @@ pub mod client;
 pub mod error;
 pub mod provider;
 pub mod types;
+mod usage;
 pub mod wire;
 
 pub use client::ModelClient;

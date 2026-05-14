@@ -8,6 +8,7 @@ use std::pin::Pin;
 #[derive(Debug, Clone, Default)]
 pub struct ModelTurnState {
     pub previous_response_id: Option<String>,
+    pub prompt_cache_key: Option<String>,
     pub acknowledged_input_len: usize,
     pub(crate) continuation_disabled: bool,
 }
