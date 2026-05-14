@@ -67,3 +67,55 @@ impl DownloadFile {
             .expect("download response")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_disposition_escapes_special_characters() {
+        assert_eq!(
+            content_disposition_filename("report.pdf"),
+            r#"attachment; filename="report.pdf""#
+        );
+        assert_eq!(
+            content_disposition_filename(r#"file"name.txt"#),
+            r#"attachment; filename="file_name.txt""#
+        );
+        assert_eq!(
+            content_disposition_filename("file\\path.dat"),
+            r#"attachment; filename="file_path.dat""#
+        );
+    }
+
+    #[test]
+    fn content_disposition_replaces_control_and_non_ascii() {
+        assert_eq!(
+            content_disposition_filename("file\r\n.csv"),
+            r#"attachment; filename="file__.csv""#
+        );
+        assert_eq!(
+            content_disposition_filename("文件.zip"),
+            r#"attachment; filename="__.zip""#
+        );
+    }
+
+    #[test]
+    fn download_file_response_has_correct_headers() {
+        let file = DownloadFile {
+            bytes: vec![1, 2, 3],
+            filename: "data.bin".to_string(),
+        };
+        let resp = file.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers = resp.headers();
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            headers.get(header::CONTENT_DISPOSITION).unwrap(),
+            r#"attachment; filename="data.bin""#
+        );
+    }
+}

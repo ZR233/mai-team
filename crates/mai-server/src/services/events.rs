@@ -101,40 +101,135 @@ fn event_name(event: &ServiceEvent) -> &'static str {
 mod tests {
     use super::*;
     use mai_protocol::{
-        AgentId, ServiceEvent, ServiceEventKind, SessionId, SkillActivationInfo, SkillScope, TurnId,
+        AgentId, ProjectId, ServiceEvent, ServiceEventKind, SessionId, SkillActivationInfo,
+        SkillScope, TaskId, TurnId,
     };
+    use pretty_assertions::assert_eq;
+
+    fn make_event(kind: ServiceEventKind) -> ServiceEvent {
+        ServiceEvent {
+            sequence: 1,
+            timestamp: mai_protocol::now(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn agent_deleted_event_name() {
+        let event = make_event(ServiceEventKind::AgentDeleted {
+            agent_id: AgentId::new_v4(),
+        });
+        assert_eq!(event_name(&event), "agent_deleted");
+    }
+
+    #[test]
+    fn task_deleted_event_name() {
+        let event = make_event(ServiceEventKind::TaskDeleted {
+            task_id: TaskId::new_v4(),
+        });
+        assert_eq!(event_name(&event), "task_deleted");
+    }
+
+    #[test]
+    fn project_deleted_event_name() {
+        let event = make_event(ServiceEventKind::ProjectDeleted {
+            project_id: ProjectId::new_v4(),
+        });
+        assert_eq!(event_name(&event), "project_deleted");
+    }
+
+    #[test]
+    fn github_webhook_received_event_name() {
+        let event = make_event(ServiceEventKind::GithubWebhookReceived {
+            delivery_id: "d1".into(),
+            event: "push".into(),
+            action: None,
+            repository_full_name: None,
+            installation_id: None,
+        });
+        assert_eq!(event_name(&event), "github_webhook_received");
+    }
+
+    #[test]
+    fn turn_started_event_name() {
+        let event = make_event(ServiceEventKind::TurnStarted {
+            agent_id: AgentId::new_v4(),
+            session_id: None,
+            turn_id: TurnId::new_v4(),
+        });
+        assert_eq!(event_name(&event), "turn_started");
+    }
+
+    #[test]
+    fn turn_completed_event_name() {
+        let event = make_event(ServiceEventKind::TurnCompleted {
+            agent_id: AgentId::new_v4(),
+            session_id: None,
+            turn_id: TurnId::new_v4(),
+            status: mai_protocol::TurnStatus::Completed,
+        });
+        assert_eq!(event_name(&event), "turn_completed");
+    }
+
+    #[test]
+    fn tool_started_event_name() {
+        let event = make_event(ServiceEventKind::ToolStarted {
+            agent_id: AgentId::new_v4(),
+            session_id: None,
+            turn_id: TurnId::new_v4(),
+            call_id: "c1".into(),
+            tool_name: "bash".into(),
+            arguments_preview: None,
+            arguments: None,
+        });
+        assert_eq!(event_name(&event), "tool_started");
+    }
+
+    #[test]
+    fn error_event_name() {
+        let event = make_event(ServiceEventKind::Error {
+            agent_id: None,
+            session_id: None,
+            turn_id: None,
+            message: "oops".into(),
+        });
+        assert_eq!(event_name(&event), "error");
+    }
+
+    #[test]
+    fn mcp_server_status_changed_event_name() {
+        let event = make_event(ServiceEventKind::McpServerStatusChanged {
+            agent_id: AgentId::new_v4(),
+            server: "test".into(),
+            status: mai_protocol::McpStartupStatus::Ready,
+            error: None,
+        });
+        assert_eq!(event_name(&event), "mcp_server_status_changed");
+    }
 
     #[test]
     fn skills_activated_event_has_sse_name() {
-        let event = ServiceEvent {
-            sequence: 1,
-            timestamp: mai_protocol::now(),
-            kind: ServiceEventKind::SkillsActivated {
-                agent_id: AgentId::new_v4(),
-                session_id: Some(SessionId::new_v4()),
-                turn_id: TurnId::new_v4(),
-                skills: vec![SkillActivationInfo {
-                    name: "demo".to_string(),
-                    display_name: Some("Demo".to_string()),
-                    path: std::path::PathBuf::from("/tmp/demo/SKILL.md"),
-                    scope: SkillScope::Project,
-                }],
-            },
-        };
+        let event = make_event(ServiceEventKind::SkillsActivated {
+            agent_id: AgentId::new_v4(),
+            session_id: Some(SessionId::new_v4()),
+            turn_id: TurnId::new_v4(),
+            skills: vec![SkillActivationInfo {
+                name: "demo".to_string(),
+                display_name: Some("Demo".to_string()),
+                path: std::path::PathBuf::from("/tmp/demo/SKILL.md"),
+                scope: SkillScope::Project,
+            }],
+        });
 
         assert_eq!(event_name(&event), "skills_activated");
     }
 
     #[test]
     fn plan_updated_event_has_sse_name() {
-        let event = ServiceEvent {
-            sequence: 1,
-            timestamp: mai_protocol::now(),
-            kind: ServiceEventKind::PlanUpdated {
-                task_id: TurnId::new_v4(),
-                plan: mai_protocol::TaskPlan::default(),
-            },
-        };
+        let event = make_event(ServiceEventKind::PlanUpdated {
+            task_id: TaskId::new_v4(),
+            plan: mai_protocol::TaskPlan::default(),
+        });
 
         assert_eq!(event_name(&event), "plan_updated");
     }
