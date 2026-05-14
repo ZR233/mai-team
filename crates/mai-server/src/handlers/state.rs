@@ -62,14 +62,7 @@ impl From<mai_store::StoreError> for ApiError {
     }
 }
 
-impl ApiError {
-    pub(crate) fn bad_request(message: String) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message,
-        }
-    }
-}
+
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
