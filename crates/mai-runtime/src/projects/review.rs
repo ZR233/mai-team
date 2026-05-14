@@ -8,6 +8,7 @@ use tokio::time::Duration;
 use crate::{Result, RuntimeError};
 
 pub(crate) mod cleanup;
+pub(crate) mod reviewer;
 pub(crate) mod runs;
 pub(crate) mod state;
 pub(crate) mod workspace;

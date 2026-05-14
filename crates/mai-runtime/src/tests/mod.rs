@@ -4733,8 +4733,7 @@ esac
             "Review open PRs.",
             "Use the review workflow.",
         );
-        let reviewer = runtime
-            .spawn_project_reviewer_agent(project_id)
+        let reviewer = projects::review::reviewer::spawn_project_reviewer_agent(&runtime, project_id)
             .await
             .expect("spawn reviewer");
 
@@ -5702,8 +5701,7 @@ esac
             .expect("save project");
         let runtime = test_runtime(&dir, Arc::clone(&store)).await;
 
-        let reviewer = runtime
-            .spawn_project_reviewer_agent(project_id)
+        let reviewer = projects::review::reviewer::spawn_project_reviewer_agent(&runtime, project_id)
             .await
             .expect("spawn reviewer");
 
@@ -5741,8 +5739,7 @@ esac
             .await
             .expect("save project");
         let runtime = test_runtime(&dir, Arc::clone(&store)).await;
-        let reviewer = runtime
-            .spawn_project_reviewer_agent(project_id)
+        let reviewer = projects::review::reviewer::spawn_project_reviewer_agent(&runtime, project_id)
             .await
             .expect("spawn reviewer");
         let reviewer_id = reviewer.id;
@@ -5790,8 +5787,12 @@ esac
             )
             .await
             .expect("update project");
-        let message = runtime
-            .project_reviewer_initial_message(project_id, reviewer_id, None)
+        let message = projects::review::reviewer::project_reviewer_initial_message(
+            &runtime,
+            project_id,
+            reviewer_id,
+            None,
+        )
             .await
             .expect("message");
 
@@ -5814,8 +5815,12 @@ esac
         store.save_project(&project).await.expect("save project");
         let runtime = test_runtime(&dir, store).await;
 
-        let message = runtime
-            .project_reviewer_initial_message(project_id, reviewer_id, Some(42))
+        let message = projects::review::reviewer::project_reviewer_initial_message(
+            &runtime,
+            project_id,
+            reviewer_id,
+            Some(42),
+        )
             .await
             .expect("message");
 
@@ -5971,8 +5976,12 @@ esac
             "Review exactly one pull request with Chinese comments.",
             "Review single PR body.",
         );
-        let message = runtime
-            .project_reviewer_initial_message(project_id, reviewer_id, None)
+        let message = projects::review::reviewer::project_reviewer_initial_message(
+            &runtime,
+            project_id,
+            reviewer_id,
+            None,
+        )
             .await
             .expect("message");
         runtime

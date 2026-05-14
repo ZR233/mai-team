@@ -2430,7 +2430,11 @@ impl AgentRuntime {
             .await?;
             return Err(RuntimeError::TurnCancelled);
         }
-        let reviewer = match self.spawn_project_reviewer_agent(project_id).await {
+        let reviewer = match projects::review::reviewer::spawn_project_reviewer_agent(
+            self, project_id,
+        )
+        .await
+        {
             Ok(reviewer) => reviewer,
             Err(err) => {
                 projects::review::runs::finish_project_review_run(
@@ -2489,16 +2493,15 @@ impl AgentRuntime {
         )
         .await?;
         let cycle_result = async {
-            let message = self
-                .project_reviewer_initial_message(project_id, reviewer_id, target_pr)
-                .await?;
-            let turn_id = self
-                .start_agent_turn_with_skills(
-                    reviewer_id,
-                    message,
-                    vec!["reviewer-agent-review-pr".to_string()],
-                )
-                .await?;
+            let message = projects::review::reviewer::project_reviewer_initial_message(
+                self,
+                project_id,
+                reviewer_id,
+                target_pr,
+            )
+            .await?;
+            let turn_id =
+                projects::review::reviewer::start_reviewer_turn(self, reviewer_id, message).await?;
             projects::review::runs::update_project_review_run_turn(
                 &self.deps.store,
                 project_id,
@@ -2518,9 +2521,8 @@ impl AgentRuntime {
             {
                 return Ok(result);
             }
-            let response = self.last_turn_response(reviewer_id).await?.ok_or_else(|| {
-                RuntimeError::InvalidInput("reviewer did not return a final response".to_string())
-            })?;
+            let response =
+                projects::review::reviewer::last_turn_response(self, reviewer_id).await?;
             projects::review::parse_project_review_cycle_report(&response)
         }
         .await;
@@ -2604,75 +2606,6 @@ impl AgentRuntime {
     ) -> Result<()> {
         projects::review::workspace::cleanup_project_review_worktree(self, project_id, reviewer_id)
             .await
-    }
-
-    async fn spawn_project_reviewer_agent(
-        self: &Arc<Self>,
-        project_id: ProjectId,
-    ) -> Result<AgentSummary> {
-        let project = self.project(project_id).await?;
-        let project_summary = project.summary.read().await.clone();
-        let maintainer = self.agent(project_summary.maintainer_agent_id).await?;
-        let maintainer_summary = maintainer.summary.read().await.clone();
-        let model = self.resolve_role_agent_model(AgentRole::Reviewer).await?;
-        let workspace_volume = project_review_workspace_volume(&project_id.to_string());
-        self.create_agent_with_container_source(
-            CreateAgentRequest {
-                name: Some(format!("{} Auto Reviewer", project_summary.name)),
-                provider_id: Some(model.preference.provider_id),
-                model: Some(model.preference.model),
-                reasoning_effort: model.preference.reasoning_effort,
-                docker_image: Some(maintainer_summary.docker_image.clone()),
-                parent_id: Some(project_summary.maintainer_agent_id),
-                system_prompt: Some(projects::review::project_reviewer_system_prompt().to_string()),
-            },
-            agents::ContainerSource::ImageWithWorkspace { workspace_volume },
-            maintainer_summary.task_id,
-            Some(project_id),
-            Some(AgentRole::Reviewer),
-        )
-        .await
-    }
-
-    async fn project_reviewer_initial_message(
-        &self,
-        project_id: ProjectId,
-        reviewer_id: AgentId,
-        target_pr: Option<u64>,
-    ) -> Result<String> {
-        let project = self.project(project_id).await?;
-        let summary = project.summary.read().await.clone();
-        let extra = summary
-            .reviewer_extra_prompt
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("None");
-        let target = target_pr
-            .map(|pr| format!("Target pull request: review PR #{pr} only. Do not select another pull request. Use `select-pr --target-pr {pr}` when invoking the helper."))
-            .unwrap_or_else(|| {
-                "Target pull request: none. Select exactly one eligible pull request using the helper."
-                    .to_string()
-            });
-        Ok(format!(
-            "Run one automatic pull request review for project `{}`.\n\nRepository: {}/{}\nDefault branch: {}\nWorkspace repo: /workspace/repo\nReview worktree root: /workspace/reviews/{}\n{}\n\nExtra reviewer instructions:\n{}\n\nUse the $reviewer-agent-review-pr skill. At the end of the turn, return only one JSON object matching this schema exactly:\n{{\"outcome\":\"review_submitted|no_eligible_pr|failed\",\"pr\":123|null,\"summary\":\"short result\",\"error\":null|\"failure reason\"}}",
-            summary.name, summary.owner, summary.repo, summary.branch, reviewer_id, target, extra
-        ))
-    }
-
-    async fn last_turn_response(&self, agent_id: AgentId) -> Result<Option<String>> {
-        let agent = self.agent(agent_id).await?;
-        let sessions = agent.sessions.lock().await;
-        Ok(agents::last_turn_response(&sessions))
-    }
-
-    async fn start_agent_turn_with_skills(
-        self: &Arc<Self>,
-        agent_id: AgentId,
-        message: String,
-        skill_mentions: Vec<String>,
-    ) -> Result<TurnId> {
-        agents::start_agent_turn(self.as_ref(), self, agent_id, message, skill_mentions).await
     }
 
     async fn set_project_review_state(
@@ -3779,6 +3712,72 @@ impl projects::review::workspace::ProjectReviewWorkspaceOps for AgentRuntime {
                 reviewer_id,
             )
             .await
+        }
+    }
+}
+
+impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
+    fn project_summary(
+        &self,
+        project_id: ProjectId,
+    ) -> impl std::future::Future<Output = Result<ProjectSummary>> + Send {
+        async move {
+            let project = AgentRuntime::project(self.as_ref(), project_id).await?;
+            Ok(project.summary.read().await.clone())
+        }
+    }
+
+    fn agent_summary(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<AgentSummary>> + Send {
+        async move {
+            let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
+            Ok(agent.summary.read().await.clone())
+        }
+    }
+
+    fn reviewer_model(
+        &self,
+    ) -> impl std::future::Future<Output = Result<AgentModelPreference>> + Send {
+        async move {
+            Ok(self
+                .resolve_role_agent_model(AgentRole::Reviewer)
+                .await?
+                .preference)
+        }
+    }
+
+    fn create_agent_with_container_source(
+        &self,
+        request: CreateAgentRequest,
+        source: agents::ContainerSource,
+        task_id: Option<TaskId>,
+        project_id: Option<ProjectId>,
+        role: Option<AgentRole>,
+    ) -> impl std::future::Future<Output = Result<AgentSummary>> + Send {
+        AgentRuntime::create_agent_with_container_source(
+            self, request, source, task_id, project_id, role,
+        )
+    }
+
+    fn start_agent_turn(
+        &self,
+        agent_id: AgentId,
+        message: String,
+        skill_mentions: Vec<String>,
+    ) -> impl std::future::Future<Output = Result<TurnId>> + Send {
+        agents::start_agent_turn(self.as_ref(), self, agent_id, message, skill_mentions)
+    }
+
+    fn last_turn_response(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<Option<String>>> + Send {
+        async move {
+            let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
+            let sessions = agent.sessions.lock().await;
+            Ok(agents::last_turn_response(&sessions))
         }
     }
 }
