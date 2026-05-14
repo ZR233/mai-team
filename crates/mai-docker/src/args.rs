@@ -322,10 +322,11 @@ mod tests {
                 .any(|window| window == ["-v", "mai-team-workspace-maintainer:/workspace"])
         );
         assert!(args.windows(2).any(|window| {
-            window == [
-                "-v",
-                "/data/projects/project-1/worktrees/agent-1:/workspace/repo",
-            ]
+            window
+                == [
+                    "-v",
+                    "/data/projects/project-1/worktrees/agent-1:/workspace/repo",
+                ]
         }));
         assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
     }

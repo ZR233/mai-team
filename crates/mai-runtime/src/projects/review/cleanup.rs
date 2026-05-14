@@ -34,7 +34,6 @@ pub(crate) trait ProjectReviewCleanupOps: Send + Sync {
     fn retain_events_since(&self, cutoff: DateTime<Utc>) -> impl Future<Output = ()> + Send;
 
     fn list_projects(&self) -> impl Future<Output = Vec<ProjectSummary>> + Send;
-
 }
 
 pub(crate) async fn run_project_review_cleanup_loop(ops: &impl ProjectReviewCleanupOps) {

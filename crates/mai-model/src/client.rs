@@ -157,10 +157,13 @@ impl ModelClient {
                 continue;
             }
             if !status.is_success() {
-                let text = response.text().await.map_err(|source| ModelError::Request {
-                    endpoint: resolved.endpoint.clone(),
-                    source,
-                })?;
+                let text = response
+                    .text()
+                    .await
+                    .map_err(|source| ModelError::Request {
+                        endpoint: resolved.endpoint.clone(),
+                        source,
+                    })?;
                 return Err(ModelError::Api {
                     endpoint: resolved.endpoint.clone(),
                     status,
@@ -500,7 +503,10 @@ mod tests {
         events
             .into_iter()
             .map(|event| {
-                let kind = event.get("type").and_then(Value::as_str).unwrap_or("message");
+                let kind = event
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message");
                 format!("event: {kind}\ndata: {event}\n\n")
             })
             .collect()
@@ -602,8 +608,8 @@ mod tests {
             &mut state,
             &cancellation_token,
         )
-            .await
-            .expect("first response");
+        .await
+        .expect("first response");
         assert_eq!(first.id.as_deref(), Some("resp_1"));
         assert_eq!(state.previous_response_id.as_deref(), Some("resp_1"));
 
@@ -622,8 +628,8 @@ mod tests {
             &mut state,
             &cancellation_token,
         )
-            .await
-            .expect("fallback response");
+        .await
+        .expect("fallback response");
         assert_eq!(second.id.as_deref(), Some("resp_2"));
         assert_eq!(state.previous_response_id, None);
         assert!(state.continuation_disabled);
@@ -702,8 +708,8 @@ mod tests {
             &mut first_state,
             &cancellation_token,
         )
-            .await
-            .expect("first response");
+        .await
+        .expect("first response");
         first_state.acknowledge_history_len(1);
         let second_input = vec![
             ModelInputItem::user_text("first"),
@@ -719,8 +725,8 @@ mod tests {
             &mut first_state,
             &cancellation_token,
         )
-            .await
-            .expect("fallback response");
+        .await
+        .expect("fallback response");
 
         let mut next_state = ModelTurnState {
             previous_response_id: Some("resp_cached".to_string()),
@@ -736,8 +742,8 @@ mod tests {
             &mut next_state,
             &cancellation_token,
         )
-            .await
-            .expect("cached no-continuation response");
+        .await
+        .expect("cached no-continuation response");
 
         let requests = requests.lock().await;
         assert_eq!(requests.len(), 4);

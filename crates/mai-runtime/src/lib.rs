@@ -41,8 +41,7 @@ use agents::AgentResourceBroker;
 use deps::RuntimeDeps;
 use events::{RECENT_EVENT_LIMIT, RuntimeEvents};
 use github::{
-    DEFAULT_GITHUB_API_BASE_URL, DirectGithubAppBackend, GITHUB_HTTP_TIMEOUT_SECS,
-    GithubAppBackend,
+    DEFAULT_GITHUB_API_BASE_URL, DirectGithubAppBackend, GITHUB_HTTP_TIMEOUT_SECS, GithubAppBackend,
 };
 use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
 use projects::review::ProjectReviewCycleResult;
@@ -50,7 +49,7 @@ use projects::review::runs::FinishReviewRun;
 use projects::review::state::ReviewStateUpdate;
 #[cfg(test)]
 use projects::skills::PROJECT_SKILLS_CACHE_DIR;
-use projects::skills::{ProjectSkillRefreshSource, ProjectSkillSourceDir};
+use projects::skills::ProjectSkillSourceDir;
 use state::{AgentRecord, AgentSessionRecord, ProjectRecord, RuntimeState, TaskRecord};
 use turn::tools::ToolExecution;
 
@@ -425,13 +424,8 @@ impl AgentRuntime {
 
         let repo_path = projects::workspace::project_repo_path(&self.projects_root, project_id);
         let existing = projects::skills::detect_existing_dirs_in_host_repo(&repo_path);
-        self.refresh_project_skill_cache(
-            project_id,
-            ProjectSkillRefreshSource::HostRepo,
-            None,
-            &existing,
-        )
-        .await?;
+        self.refresh_project_skill_cache(project_id, &existing)
+            .await?;
         self.project_skills_from_cache(project_id).await
     }
 
@@ -912,7 +906,11 @@ impl AgentRuntime {
         )
         .await?;
         let container_source = self
-            .agent_container_source_for_project(agent.summary.read().await.id, project_id, container_source)
+            .agent_container_source_for_project(
+                agent.summary.read().await.id,
+                project_id,
+                container_source,
+            )
             .await?;
 
         match agents::ensure_agent_container_with_source(
@@ -958,7 +956,8 @@ impl AgentRuntime {
         };
         let project = self.project(project_id).await?;
         let summary = project.summary.read().await.clone();
-        if summary.status != ProjectStatus::Ready && summary.clone_status != ProjectCloneStatus::Ready
+        if summary.status != ProjectStatus::Ready
+            && summary.clone_status != ProjectCloneStatus::Ready
         {
             return Ok(source);
         }
@@ -971,7 +970,8 @@ impl AgentRuntime {
         )
         .await?;
         Ok(match source {
-            agents::ContainerSource::FreshImage | agents::ContainerSource::ProjectWorktree { .. } => {
+            agents::ContainerSource::FreshImage
+            | agents::ContainerSource::ProjectWorktree { .. } => {
                 agents::ContainerSource::ProjectWorktree {
                     worktree_path: worktree.to_string_lossy().to_string(),
                 }
@@ -1206,12 +1206,14 @@ impl AgentRuntime {
             &self.state,
             &self.events,
             &self,
-            agent_id,
-            session_id,
-            turn_id,
-            message,
-            skill_mentions,
-            cancellation_token,
+            turn::orchestrator::TurnRequest {
+                agent_id,
+                session_id,
+                turn_id,
+                message,
+                skill_mentions,
+                cancellation_token,
+            },
         )
         .await;
     }
@@ -1231,12 +1233,14 @@ impl AgentRuntime {
             &self.state,
             &self.events,
             self,
-            agent_id,
-            session_id,
-            turn_id,
-            message,
-            skill_mentions,
-            cancellation_token,
+            turn::orchestrator::TurnRequest {
+                agent_id,
+                session_id,
+                turn_id,
+                message,
+                skill_mentions,
+                cancellation_token,
+            },
         )
         .await
     }
@@ -1460,12 +1464,14 @@ impl AgentRuntime {
         agents::send_input_to_agent(
             self.as_ref(),
             self,
-            target,
-            session_id,
-            message,
-            skill_mentions,
-            interrupt,
-            TURN_CANCEL_GRACE,
+            agents::SendInputRequest {
+                target,
+                session_id,
+                message,
+                skill_mentions,
+                interrupt,
+                cancel_grace: TURN_CANCEL_GRACE,
+            },
         )
         .await
     }
@@ -1704,16 +1710,18 @@ impl AgentRuntime {
             .await;
         turn::persistence::record_agent_log(
             self.deps.store.as_ref(),
-            agent_id,
-            Some(session_id),
-            Some(turn_id),
-            "info",
-            "context",
-            "context compacted",
-            json!({
-                "tokens_before": tokens_before,
-                "summary_preview": preview(&summary_text, COMPACT_SUMMARY_PREVIEW_CHARS),
-            }),
+            turn::persistence::AgentLogRecord {
+                agent_id,
+                session_id: Some(session_id),
+                turn_id: Some(turn_id),
+                level: "info",
+                category: "context",
+                message: "context compacted",
+                details: json!({
+                    "tokens_before": tokens_before,
+                    "summary_preview": preview(&summary_text, COMPACT_SUMMARY_PREVIEW_CHARS),
+                }),
+            },
         )
         .await;
         Ok(())
@@ -1876,13 +1884,8 @@ impl AgentRuntime {
         }
         let repo_path = projects::workspace::project_repo_path(&self.projects_root, project_id);
         let existing = projects::skills::detect_existing_dirs_in_host_repo(&repo_path);
-        self.refresh_project_skill_cache(
-            project_id,
-            ProjectSkillRefreshSource::HostRepo,
-            None,
-            &existing,
-        )
-        .await
+        self.refresh_project_skill_cache(project_id, &existing)
+            .await
     }
 
     async fn refresh_project_skills_from_review_workspace(
@@ -1891,13 +1894,7 @@ impl AgentRuntime {
     ) -> Result<()> {
         let repo_path = projects::workspace::project_repo_path(&self.projects_root, project_id);
         let sources = projects::skills::detect_existing_dirs_in_host_repo(&repo_path);
-        self.refresh_project_skill_cache(
-            project_id,
-            ProjectSkillRefreshSource::HostRepo,
-            None,
-            &sources,
-        )
-        .await
+        self.refresh_project_skill_cache(project_id, &sources).await
     }
 
     fn project_skill_cache_dir(&self, project_id: ProjectId) -> PathBuf {
@@ -1919,22 +1916,10 @@ impl AgentRuntime {
     async fn refresh_project_skill_cache(
         &self,
         project_id: ProjectId,
-        source: ProjectSkillRefreshSource,
-        container_id: Option<&str>,
         sources: &[ProjectSkillSourceDir],
     ) -> Result<()> {
         let lock = self.project_skill_lock(project_id).await;
-        projects::skills::refresh_cache(
-            &self.deps.docker,
-            &self.sidecar_image,
-            &self.cache_root,
-            &lock,
-            project_id,
-            source,
-            container_id,
-            sources,
-        )
-        .await
+        projects::skills::refresh_cache(&self.cache_root, &lock, project_id, sources).await
     }
 
     async fn ensure_project_mcp_manager(
@@ -2294,13 +2279,8 @@ impl AgentRuntime {
         .await?;
         let repo_path = projects::workspace::project_repo_path(&self.projects_root, project_id);
         let existing = projects::skills::detect_existing_dirs_in_host_repo(&repo_path);
-        self.refresh_project_skill_cache(
-            project_id,
-            ProjectSkillRefreshSource::HostRepo,
-            None,
-            &existing,
-        )
-        .await?;
+        self.refresh_project_skill_cache(project_id, &existing)
+            .await?;
         Ok(())
     }
 
@@ -2584,14 +2564,9 @@ impl agents::AgentCancelOps for Arc<AgentRuntime> {
         )
     }
 
-    fn start_next_queued_input_after_turn(
-        &self,
-        agent_id: AgentId,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        async move {
-            if let Err(err) = agents::start_next_queued_input(self.as_ref(), self, agent_id).await {
-                tracing::warn!("failed to start queued agent input: {err}");
-            }
+    async fn start_next_queued_input_after_turn(&self, agent_id: AgentId) {
+        if let Err(err) = agents::start_next_queued_input(self.as_ref(), self, agent_id).await {
+            tracing::warn!("failed to start queued agent input: {err}");
         }
     }
 
@@ -2634,33 +2609,29 @@ impl agents::AgentFileOps for AgentRuntime {
         AgentRuntime::container_id(self, agent_id)
     }
 
-    fn copy_to_container(
+    async fn copy_to_container(
         &self,
         container_id: String,
         local_path: PathBuf,
         container_path: String,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move {
-            self.deps
-                .docker
-                .copy_to_container(&container_id, &local_path, &container_path)
-                .await?;
-            Ok(())
-        }
+    ) -> Result<()> {
+        self.deps
+            .docker
+            .copy_to_container(&container_id, &local_path, &container_path)
+            .await?;
+        Ok(())
     }
 
-    fn copy_from_container_tar(
+    async fn copy_from_container_tar(
         &self,
         container_id: String,
         container_path: String,
-    ) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send {
-        async move {
-            Ok(self
-                .deps
-                .docker
-                .copy_from_container_tar(&container_id, &container_path)
-                .await?)
-        }
+    ) -> Result<Vec<u8>> {
+        Ok(self
+            .deps
+            .docker
+            .copy_from_container_tar(&container_id, &container_path)
+            .await?)
     }
 }
 
@@ -2672,48 +2643,44 @@ impl agents::AgentObservabilityOps for AgentRuntime {
         AgentRuntime::agent(self, agent_id)
     }
 
-    fn load_tool_trace(
+    async fn load_tool_trace(
         &self,
         agent_id: AgentId,
         session_id: Option<SessionId>,
         call_id: String,
-    ) -> impl std::future::Future<Output = Result<Option<ToolTraceDetail>>> + Send {
-        async move {
-            Ok(self
-                .deps
-                .store
-                .load_tool_trace(agent_id, session_id, &call_id)
-                .await?)
-        }
+    ) -> Result<Option<ToolTraceDetail>> {
+        Ok(self
+            .deps
+            .store
+            .load_tool_trace(agent_id, session_id, &call_id)
+            .await?)
     }
 
-    fn tool_metadata(
+    async fn tool_metadata(
         &self,
         agent_id: AgentId,
         session_id: SessionId,
         call_id: String,
-    ) -> impl std::future::Future<Output = (Option<bool>, Option<u64>)> + Send {
-        async move {
-            self.events
-                .tool_metadata(agent_id, session_id, &call_id)
-                .await
-        }
+    ) -> (Option<bool>, Option<u64>) {
+        self.events
+            .tool_metadata(agent_id, session_id, &call_id)
+            .await
     }
 
-    fn list_agent_logs(
+    async fn list_agent_logs(
         &self,
         agent_id: AgentId,
         filter: AgentLogFilter,
-    ) -> impl std::future::Future<Output = Result<Vec<AgentLogEntry>>> + Send {
-        async move { Ok(self.deps.store.list_agent_logs(agent_id, filter).await?) }
+    ) -> Result<Vec<AgentLogEntry>> {
+        Ok(self.deps.store.list_agent_logs(agent_id, filter).await?)
     }
 
-    fn list_tool_traces(
+    async fn list_tool_traces(
         &self,
         agent_id: AgentId,
         filter: ToolTraceFilter,
-    ) -> impl std::future::Future<Output = Result<Vec<ToolTraceSummary>>> + Send {
-        async move { Ok(self.deps.store.list_tool_traces(agent_id, filter).await?) }
+    ) -> Result<Vec<ToolTraceSummary>> {
+        Ok(self.deps.store.list_tool_traces(agent_id, filter).await?)
     }
 
     fn tool_output_artifact_file_path(
@@ -2745,10 +2712,8 @@ impl agents::AgentResourceBrokerOps for AgentRuntime {
         AgentRuntime::project_skill_read_guard(self, agent)
     }
 
-    fn skills_config(
-        &self,
-    ) -> impl std::future::Future<Output = Result<SkillsConfigRequest>> + Send {
-        async move { Ok(self.deps.store.load_skills_config().await?) }
+    async fn skills_config(&self) -> Result<SkillsConfigRequest> {
+        Ok(self.deps.store.load_skills_config().await?)
     }
 
     fn skills_manager_for_agent(
@@ -2815,12 +2780,12 @@ impl agents::AgentDeleteOps for AgentRuntime {
         summaries
     }
 
-    fn set_agent_status(
+    async fn set_agent_status(
         &self,
         agent: Arc<AgentRecord>,
         change: agents::AgentDeleteStatusChange,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move { AgentRuntime::set_status(self, &agent, change.status, change.error).await }
+    ) -> Result<()> {
+        AgentRuntime::set_status(self, &agent, change.status, change.error).await
     }
 
     async fn delete_agent_containers(
@@ -2877,11 +2842,8 @@ impl agents::AgentUpdateOps for AgentRuntime {
         Ok(self.deps.store.resolve_provider(provider_id, model).await?)
     }
 
-    fn persist_agent(
-        &self,
-        agent: Arc<AgentRecord>,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move { AgentRuntime::persist_agent(self, &agent).await }
+    async fn persist_agent(&self, agent: Arc<AgentRecord>) -> Result<()> {
+        AgentRuntime::persist_agent(self, &agent).await
     }
 
     async fn publish_agent_updated(&self, agent: AgentSummary) {
@@ -3100,19 +3062,16 @@ impl agents::AgentContainerOps for AgentRuntime {
         McpAgentManager::start(self.deps.docker.clone(), container_id, configs).await
     }
 
-    fn set_agent_status(
+    async fn set_agent_status(
         &self,
         agent: Arc<AgentRecord>,
         change: agents::AgentContainerStatusChange,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move { AgentRuntime::set_status(self, &agent, change.status, change.error).await }
+    ) -> Result<()> {
+        AgentRuntime::set_status(self, &agent, change.status, change.error).await
     }
 
-    fn persist_agent(
-        &self,
-        agent: Arc<AgentRecord>,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move { AgentRuntime::persist_agent(self, &agent).await }
+    async fn persist_agent(&self, agent: Arc<AgentRecord>) -> Result<()> {
+        AgentRuntime::persist_agent(self, &agent).await
     }
 
     async fn publish_mcp_status(&self, change: agents::AgentMcpStatusChange) {
@@ -3149,25 +3108,15 @@ impl projects::review::state::ProjectReviewStateOps for AgentRuntime {
         AgentRuntime::project(self, project_id)
     }
 
-    fn save_project(
-        &self,
-        project: ProjectSummary,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move {
-            self.deps.store.save_project(&project).await?;
-            Ok(())
-        }
+    async fn save_project(&self, project: ProjectSummary) -> Result<()> {
+        self.deps.store.save_project(&project).await?;
+        Ok(())
     }
 
-    fn publish_project_updated(
-        &self,
-        project: ProjectSummary,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        async move {
-            self.events
-                .publish(ServiceEventKind::ProjectUpdated { project })
-                .await;
-        }
+    async fn publish_project_updated(&self, project: ProjectSummary) {
+        self.events
+            .publish(ServiceEventKind::ProjectUpdated { project })
+            .await;
     }
 }
 
@@ -3199,7 +3148,6 @@ impl projects::review::cleanup::ProjectReviewCleanupOps for Arc<AgentRuntime> {
     async fn list_projects(&self) -> Vec<ProjectSummary> {
         AgentRuntime::list_projects(self.as_ref()).await
     }
-
 }
 
 impl projects::mcp::ProjectMcpToolOps for AgentRuntime {
@@ -3221,35 +3169,21 @@ impl projects::mcp::ProjectMcpToolOps for AgentRuntime {
 }
 
 impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
-    fn project_summary(
-        &self,
-        project_id: ProjectId,
-    ) -> impl std::future::Future<Output = Result<ProjectSummary>> + Send {
-        async move {
-            let project = AgentRuntime::project(self.as_ref(), project_id).await?;
-            Ok(project.summary.read().await.clone())
-        }
+    async fn project_summary(&self, project_id: ProjectId) -> Result<ProjectSummary> {
+        let project = AgentRuntime::project(self.as_ref(), project_id).await?;
+        Ok(project.summary.read().await.clone())
     }
 
-    fn agent_summary(
-        &self,
-        agent_id: AgentId,
-    ) -> impl std::future::Future<Output = Result<AgentSummary>> + Send {
-        async move {
-            let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
-            Ok(agent.summary.read().await.clone())
-        }
+    async fn agent_summary(&self, agent_id: AgentId) -> Result<AgentSummary> {
+        let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
+        Ok(agent.summary.read().await.clone())
     }
 
-    fn reviewer_model(
-        &self,
-    ) -> impl std::future::Future<Output = Result<AgentModelPreference>> + Send {
-        async move {
-            Ok(self
-                .resolve_role_agent_model(AgentRole::Reviewer)
-                .await?
-                .preference)
-        }
+    async fn reviewer_model(&self) -> Result<AgentModelPreference> {
+        Ok(self
+            .resolve_role_agent_model(AgentRole::Reviewer)
+            .await?
+            .preference)
     }
 
     fn create_agent_with_container_source(
@@ -3274,90 +3208,65 @@ impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
         agents::start_agent_turn(self.as_ref(), self, agent_id, message, skill_mentions)
     }
 
-    fn last_turn_response(
-        &self,
-        agent_id: AgentId,
-    ) -> impl std::future::Future<Output = Result<Option<String>>> + Send {
-        async move {
-            let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
-            let sessions = agent.sessions.lock().await;
-            Ok(agents::last_turn_response(&sessions))
-        }
+    async fn last_turn_response(&self, agent_id: AgentId) -> Result<Option<String>> {
+        let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
+        let sessions = agent.sessions.lock().await;
+        Ok(agents::last_turn_response(&sessions))
     }
 }
 
 impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
-    fn set_project_review_state(
+    async fn set_project_review_state(
         &self,
         project_id: ProjectId,
         status: ProjectReviewStatus,
         update: ReviewStateUpdate,
-    ) -> impl std::future::Future<Output = Result<ProjectSummary>> + Send {
-        async move {
-            AgentRuntime::set_project_review_state(self.as_ref(), project_id, status, update).await
-        }
+    ) -> Result<ProjectSummary> {
+        AgentRuntime::set_project_review_state(self.as_ref(), project_id, status, update).await
     }
 
-    fn save_project_review_run_status(
-        &self,
-        summary: ProjectReviewRunSummary,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move {
-            projects::review::runs::save_project_review_run_status(
-                &self.deps.store,
-                summary,
-                Vec::new(),
-                Vec::new(),
-            )
-            .await
-        }
+    async fn save_project_review_run_status(&self, summary: ProjectReviewRunSummary) -> Result<()> {
+        projects::review::runs::save_project_review_run_status(
+            &self.deps.store,
+            summary,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
     }
 
-    fn load_project_review_run(
+    async fn load_project_review_run(
         &self,
         project_id: ProjectId,
         run_id: Uuid,
-    ) -> impl std::future::Future<Output = Result<Option<ProjectReviewRunDetail>>> + Send {
-        async move {
-            Ok(self
-                .deps
-                .store
-                .load_project_review_run(project_id, run_id)
-                .await?)
-        }
+    ) -> Result<Option<ProjectReviewRunDetail>> {
+        Ok(self
+            .deps
+            .store
+            .load_project_review_run(project_id, run_id)
+            .await?)
     }
 
-    fn update_project_review_run_turn(
+    async fn update_project_review_run_turn(
         &self,
         project_id: ProjectId,
         run_id: Uuid,
         reviewer_agent_id: AgentId,
         turn_id: TurnId,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move {
-            projects::review::runs::update_project_review_run_turn(
-                &self.deps.store,
-                project_id,
-                run_id,
-                reviewer_agent_id,
-                turn_id,
-            )
-            .await
-        }
+    ) -> Result<()> {
+        projects::review::runs::update_project_review_run_turn(
+            &self.deps.store,
+            project_id,
+            run_id,
+            reviewer_agent_id,
+            turn_id,
+        )
+        .await
     }
 
-    fn finish_project_review_run(
-        &self,
-        request: FinishReviewRun,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move {
-            projects::review::runs::finish_project_review_run(
-                &self.deps.store,
-                self.as_ref(),
-                request,
-            )
+    async fn finish_project_review_run(&self, request: FinishReviewRun) -> Result<()> {
+        projects::review::runs::finish_project_review_run(&self.deps.store, self.as_ref(), request)
             .await
-        }
     }
 
     fn sync_project_review_repo(
@@ -3446,11 +3355,9 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
         AgentRuntime::project(self.as_ref(), project_id)
     }
 
-    fn project_ids(&self) -> impl std::future::Future<Output = Vec<ProjectId>> + Send {
-        async move {
-            let projects = self.state.projects.read().await;
-            projects.keys().copied().collect()
-        }
+    async fn project_ids(&self) -> Vec<ProjectId> {
+        let projects = self.state.projects.read().await;
+        projects.keys().copied().collect()
     }
 
     fn project_auto_reviewer_agents(
@@ -3460,77 +3367,60 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
         AgentRuntime::project_auto_reviewer_agents(self.as_ref(), project_id)
     }
 
-    fn load_project_review_runs(
+    async fn load_project_review_runs(
         &self,
         project_id: ProjectId,
         offset: usize,
         limit: usize,
-    ) -> impl std::future::Future<Output = Result<Vec<ProjectReviewRunSummary>>> + Send {
-        async move {
-            Ok(self
-                .deps
-                .store
-                .load_project_review_runs(project_id, None, offset, limit)
-                .await?)
-        }
+    ) -> Result<Vec<ProjectReviewRunSummary>> {
+        Ok(self
+            .deps
+            .store
+            .load_project_review_runs(project_id, None, offset, limit)
+            .await?)
     }
 
-    fn finish_project_review_run(
-        &self,
-        request: FinishReviewRun,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move {
-            projects::review::runs::finish_project_review_run(
-                &self.deps.store,
-                self.as_ref(),
-                request,
-            )
+    async fn finish_project_review_run(&self, request: FinishReviewRun) -> Result<()> {
+        projects::review::runs::finish_project_review_run(&self.deps.store, self.as_ref(), request)
             .await
-        }
     }
 
-    fn cancel_active_project_review_runs(
+    async fn cancel_active_project_review_runs(
         &self,
         project_id: ProjectId,
         reviewer_agent_id: Option<AgentId>,
         run_list_limit: usize,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move {
-            projects::review::runs::cancel_active_project_review_runs(
-                &self.deps.store,
-                self.as_ref(),
-                project_id,
-                reviewer_agent_id,
-                run_list_limit,
-            )
-            .await
-        }
+    ) -> Result<()> {
+        projects::review::runs::cancel_active_project_review_runs(
+            &self.deps.store,
+            self.as_ref(),
+            project_id,
+            reviewer_agent_id,
+            run_list_limit,
+        )
+        .await
     }
 
-    fn record_project_review_startup_failure(
+    async fn record_project_review_startup_failure(
         &self,
         project_id: ProjectId,
         error: String,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move {
-            projects::review::runs::record_project_review_startup_failure(
-                &self.deps.store,
-                project_id,
-                error,
-            )
-            .await
-        }
+    ) -> Result<()> {
+        projects::review::runs::record_project_review_startup_failure(
+            &self.deps.store,
+            project_id,
+            error,
+        )
+        .await
     }
 
-    fn set_project_review_state(
+    async fn set_project_review_state(
         &self,
         project_id: ProjectId,
         status: ProjectReviewStatus,
         update: ReviewStateUpdate,
-    ) -> impl std::future::Future<Output = Result<ProjectSummary>> + Send {
-        async move {
-            AgentRuntime::set_project_review_state(self.as_ref(), project_id, status, update).await
-        }
+    ) -> Result<ProjectSummary> {
+        AgentRuntime::set_project_review_state(self.as_ref(), project_id, status, update).await
     }
 
     fn ensure_project_review_workspace(
@@ -3549,14 +3439,9 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
         AgentRuntime::run_project_review_once(self, project_id, cancellation_token, target_pr)
     }
 
-    fn agent_current_turn(
-        &self,
-        agent_id: AgentId,
-    ) -> impl std::future::Future<Output = Result<Option<TurnId>>> + Send {
-        async move {
-            let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
-            Ok(agent.summary.read().await.current_turn)
-        }
+    async fn agent_current_turn(&self, agent_id: AgentId) -> Result<Option<TurnId>> {
+        let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
+        Ok(agent.summary.read().await.current_turn)
     }
 
     fn cancel_agent_turn(
@@ -3882,15 +3767,10 @@ impl projects::service::ProjectLifecycleOps for Arc<AgentRuntime> {
         AgentRuntime::shutdown_project_mcp_manager(self, project_id)
     }
 
-    fn delete_project_sidecar(
-        &self,
-        project_id: ProjectId,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move {
-            AgentRuntime::delete_project_sidecar(self.as_ref(), project_id)
-                .await
-                .map(|_| ())
-        }
+    async fn delete_project_sidecar(&self, project_id: ProjectId) -> Result<()> {
+        AgentRuntime::delete_project_sidecar(self.as_ref(), project_id)
+            .await
+            .map(|_| ())
     }
 
     fn delete_project_review_workspace(

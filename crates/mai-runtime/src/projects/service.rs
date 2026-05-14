@@ -2,19 +2,16 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use mai_docker::DockerClient;
-use mai_protocol::{
-    AgentDetail, AgentId, AgentModelPreference, AgentRole, AgentSummary, CreateProjectRequest,
-    GitAccountSummary, GithubInstallationsResponse, ProjectCloneStatus, ProjectDetail, ProjectId,
-    ProjectReviewStatus, ProjectStatus, ProjectSummary, ServiceEventKind, SessionId,
-    SendMessageRequest, TurnId, UpdateProjectRequest, now, preview,
-};
-use uuid::Uuid;
-
-use super::mcp::PROJECT_WORKSPACE_PATH;
 use crate::github::{VerifiedGithubRepository, github_clone_url};
 use crate::state::{ProjectRecord, RuntimeState};
 use crate::{Result, RuntimeError};
+use mai_protocol::{
+    AgentDetail, AgentId, AgentModelPreference, AgentRole, AgentSummary, CreateProjectRequest,
+    GitAccountSummary, GithubInstallationsResponse, ProjectCloneStatus, ProjectDetail, ProjectId,
+    ProjectReviewStatus, ProjectStatus, ProjectSummary, SendMessageRequest, ServiceEventKind,
+    SessionId, TurnId, UpdateProjectRequest, now,
+};
+use uuid::Uuid;
 
 /// Supplies the agent details and review run summaries needed to assemble
 /// project read models without exposing the full runtime to project service
@@ -45,10 +42,7 @@ pub(crate) trait ProjectLifecycleOps: Send + Sync {
     ) -> impl Future<Output = Result<()>> + Send;
     fn stop_project_review_loop(&self, project_id: ProjectId) -> impl Future<Output = ()> + Send;
     fn delete_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<()>> + Send;
-    fn cancel_project_agent(
-        &self,
-        agent_id: AgentId,
-    ) -> impl Future<Output = Result<()>> + Send;
+    fn cancel_project_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<()>> + Send;
     fn shutdown_project_mcp_manager(
         &self,
         project_id: ProjectId,
@@ -484,96 +478,8 @@ pub(crate) async fn send_project_message(
 ) -> Result<TurnId> {
     let project = project(state, project_id).await?;
     let maintainer_agent_id = project.summary.read().await.maintainer_agent_id;
-    ops.send_project_agent_message(maintainer_agent_id, request).await
-}
-
-pub(crate) async fn prepare_copied_workspace(
-    docker: &DockerClient,
-    container_id: &str,
-) -> Result<()> {
-    let command = format!(
-        "set -eu\n\
-         owner=$(id -u):$(id -g)\n\
-         chown -R \"$owner\" {workspace} 2>/dev/null || git config --global --add safe.directory {workspace}",
-        workspace = shell_quote(PROJECT_WORKSPACE_PATH),
-    );
-    let output = docker
-        .exec_shell(container_id, &command, Some("/"), Some(60))
-        .await?;
-    if output.status != 0 {
-        let combined = format!("{}\n{}", output.stderr, output.stdout);
-        let message = preview(combined.trim(), 500);
-        return Err(RuntimeError::InvalidInput(format!(
-            "repository workspace ownership setup failed: {message}"
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) async fn clone_repository_in_sidecar(
-    docker: &DockerClient,
-    container_id: &str,
-    repo_url: &str,
-    branch: &str,
-    token: &str,
-) -> Result<()> {
-    let branch_arg = if branch.is_empty() {
-        String::new()
-    } else {
-        format!(" --branch {}", shell_quote(branch))
-    };
-    let command = format!(
-        "set -eu\n\
-         tmp=$(mktemp -d)\n\
-         askpass=\"$tmp/askpass.sh\"\n\
-         cleanup() {{ rm -rf \"$tmp\"; }}\n\
-         trap cleanup EXIT HUP INT TERM\n\
-         cat >\"$askpass\" <<'EOF'\n\
-#!/bin/sh\n\
-case \"$1\" in\n\
-  *Username*) printf '%s\\n' x-access-token ;;\n\
-  *Password*) printf '%s\\n' \"$MAI_GITHUB_INSTALLATION_TOKEN\" ;;\n\
-  *) printf '\\n' ;;\n\
-esac\n\
-EOF\n\
-         chmod 700 \"$askpass\"\n\
-         rm -rf {workspace}\n\
-         GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=\"$askpass\" git -c credential.helper= clone{branch_arg} -- {repo_url} {workspace}",
-        workspace = shell_quote(PROJECT_WORKSPACE_PATH),
-        repo_url = shell_quote(repo_url),
-    );
-    let output = docker
-        .exec_shell_env(
-            container_id,
-            &command,
-            Some("/"),
-            Some(600),
-            &[(
-                "MAI_GITHUB_INSTALLATION_TOKEN".to_string(),
-                token.to_string(),
-            )],
-        )
-        .await?;
-    if output.status != 0 {
-        let combined = format!("{}\n{}", output.stderr, output.stdout);
-        let message = preview(redact_secret(combined.trim(), token).trim(), 500);
-        return Err(RuntimeError::InvalidInput(format!(
-            "repository clone failed in project sidecar: {message}"
-        )));
-    }
-    Ok(())
-}
-
-fn shell_quote(value: &str) -> String {
-    shell_words::quote(value).into_owned()
-}
-
-fn redact_secret(value: &str, secret: &str) -> String {
-    if secret.is_empty() {
-        value.to_string()
-    } else {
-        value.replace(secret, "[redacted]")
-    }
+    ops.send_project_agent_message(maintainer_agent_id, request)
+        .await
 }
 
 fn normalize_optional_text(value: Option<String>) -> Option<String> {

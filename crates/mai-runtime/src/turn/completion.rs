@@ -6,7 +6,7 @@ use serde_json::json;
 
 use crate::events::RuntimeEvents;
 use crate::state::AgentRecord;
-use crate::turn::persistence;
+use crate::turn::persistence::{self, AgentLogRecord};
 use crate::{Result, RuntimeError};
 
 pub(crate) struct TurnResult {
@@ -99,13 +99,15 @@ pub(crate) async fn complete_turn_if_current(
         .await;
     persistence::record_agent_log(
         store,
-        agent_id,
-        Some(session_id),
-        Some(turn_id),
-        "info",
-        "turn",
-        "turn completed",
-        json!({ "status": turn_status }),
+        AgentLogRecord {
+            agent_id,
+            session_id: Some(session_id),
+            turn_id: Some(turn_id),
+            level: "info",
+            category: "turn",
+            message: "turn completed",
+            details: json!({ "status": turn_status }),
+        },
     )
     .await;
     events

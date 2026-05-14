@@ -145,7 +145,7 @@ pub(crate) async fn download_artifact(
     })?;
 
     let filename = content_disposition_filename(&artifact.name);
-    Ok(Response::builder()
+    Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_DISPOSITION, filename)
@@ -153,5 +153,5 @@ pub(crate) async fn download_artifact(
         .map_err(|error| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: error.to_string(),
-        })?)
+        })
 }

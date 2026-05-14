@@ -7,21 +7,25 @@ use super::{AgentInputOps, AgentServiceOps, prepare_turn, wait_agent};
 use crate::state::QueuedAgentInput;
 use crate::{Result, RuntimeError};
 
+pub(crate) struct SendInputRequest {
+    pub(crate) target: AgentId,
+    pub(crate) session_id: Option<SessionId>,
+    pub(crate) message: String,
+    pub(crate) skill_mentions: Vec<String>,
+    pub(crate) interrupt: bool,
+    pub(crate) cancel_grace: Duration,
+}
+
 pub(crate) async fn send_input_to_agent(
     service: &dyn AgentServiceOps,
     input_ops: &impl AgentInputOps,
-    target: AgentId,
-    session_id: Option<SessionId>,
-    message: String,
-    skill_mentions: Vec<String>,
-    interrupt: bool,
-    cancel_grace: Duration,
+    request: SendInputRequest,
 ) -> Result<Value> {
-    let agent = service.agent(target).await?;
-    if interrupt {
+    let agent = service.agent(request.target).await?;
+    if request.interrupt {
         let current_turn = agent.summary.read().await.current_turn;
         if let Some(turn_id) = current_turn {
-            input_ops.cancel_agent_turn(target, turn_id).await?;
+            input_ops.cancel_agent_turn(request.target, turn_id).await?;
         } else {
             agent
                 .cancel_requested
@@ -30,23 +34,32 @@ pub(crate) async fn send_input_to_agent(
                 .set_agent_status(&agent, AgentStatus::Cancelled, None)
                 .await?;
         }
-        wait_agent(service, target, cancel_grace).await?;
+        wait_agent(service, request.target, request.cancel_grace).await?;
     }
-    match prepare_turn(service, target).await {
+    match prepare_turn(service, request.target).await {
         Ok((agent, turn_id)) => {
-            let session_id = service.resolve_session_id(target, session_id).await?;
-            input_ops.spawn_turn(&agent, target, session_id, turn_id, message, skill_mentions);
+            let session_id = service
+                .resolve_session_id(request.target, request.session_id)
+                .await?;
+            input_ops.spawn_turn(
+                &agent,
+                request.target,
+                session_id,
+                turn_id,
+                request.message,
+                request.skill_mentions,
+            );
             Ok(json!({ "turn_id": turn_id, "queued": false }))
         }
-        Err(RuntimeError::AgentBusy(_)) if !interrupt => {
+        Err(RuntimeError::AgentBusy(_)) if !request.interrupt => {
             agent
                 .pending_inputs
                 .lock()
                 .await
                 .push_back(QueuedAgentInput {
-                    session_id,
-                    message,
-                    skill_mentions,
+                    session_id: request.session_id,
+                    message: request.message,
+                    skill_mentions: request.skill_mentions,
                 });
             Ok(json!({ "queued": true }))
         }

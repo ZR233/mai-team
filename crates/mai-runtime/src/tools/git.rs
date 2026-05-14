@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use mai_protocol::{AgentId, ProjectSummary};
 use serde_json::{Value, json};
@@ -32,7 +32,12 @@ pub(crate) async fn execute_git_tool(
     }
     let output = match name {
         mai_tools::TOOL_GIT_STATUS => {
-            git_plain(context.git_binary, &worktree, ["status", "--short", "--branch"]).await?
+            git_plain(
+                context.git_binary,
+                &worktree,
+                ["status", "--short", "--branch"],
+            )
+            .await?
         }
         mai_tools::TOOL_GIT_DIFF => git_diff(context.git_binary, &worktree, &arguments).await?,
         mai_tools::TOOL_GIT_BRANCH => git_branch(context.git_binary, &worktree, &arguments).await?,
@@ -46,7 +51,8 @@ pub(crate) async fn execute_git_tool(
             git_push(context.git_binary, &worktree, token, &arguments).await?
         }
         mai_tools::TOOL_GIT_WORKTREE_INFO => {
-            let repo = projects::workspace::project_repo_path(context.projects_root, context.project.id);
+            let repo =
+                projects::workspace::project_repo_path(context.projects_root, context.project.id);
             json!({
                 "project_id": context.project.id,
                 "repo": repo,
@@ -81,7 +87,7 @@ pub(crate) async fn execute_git_tool(
     Ok(ToolExecution::new(true, output, false))
 }
 
-async fn git_diff(git_binary: &str, cwd: &PathBuf, arguments: &Value) -> Result<String> {
+async fn git_diff(git_binary: &str, cwd: &Path, arguments: &Value) -> Result<String> {
     let staged = arguments
         .get("staged")
         .and_then(Value::as_bool)
@@ -95,7 +101,7 @@ async fn git_diff(git_binary: &str, cwd: &PathBuf, arguments: &Value) -> Result<
     }
 }
 
-async fn git_branch(git_binary: &str, cwd: &PathBuf, arguments: &Value) -> Result<String> {
+async fn git_branch(git_binary: &str, cwd: &Path, arguments: &Value) -> Result<String> {
     let action = optional_arg(arguments, "action")?.unwrap_or_else(|| "list".to_string());
     match action.as_str() {
         "list" => git_plain(git_binary, cwd, ["branch", "--list", "--all"]).await,
@@ -117,12 +123,21 @@ async fn git_branch(git_binary: &str, cwd: &PathBuf, arguments: &Value) -> Resul
     }
 }
 
-async fn git_fetch(git_binary: &str, cwd: &PathBuf, token: &str, arguments: &Value) -> Result<String> {
+async fn git_fetch(git_binary: &str, cwd: &Path, token: &str, arguments: &Value) -> Result<String> {
     let remote = optional_arg(arguments, "remote")?.unwrap_or_else(|| "origin".to_string());
-    let prune = arguments.get("prune").and_then(Value::as_bool).unwrap_or(true);
+    let prune = arguments
+        .get("prune")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     if let Some(refspec) = optional_arg(arguments, "refspec")? {
         if prune {
-            git_with_token(git_binary, cwd, token, ["fetch", "--prune", &remote, &refspec]).await
+            git_with_token(
+                git_binary,
+                cwd,
+                token,
+                ["fetch", "--prune", &remote, &refspec],
+            )
+            .await
         } else {
             git_with_token(git_binary, cwd, token, ["fetch", &remote, &refspec]).await
         }
@@ -133,16 +148,20 @@ async fn git_fetch(git_binary: &str, cwd: &PathBuf, token: &str, arguments: &Val
     }
 }
 
-async fn git_commit(git_binary: &str, cwd: &PathBuf, arguments: &Value) -> Result<String> {
+async fn git_commit(git_binary: &str, cwd: &Path, arguments: &Value) -> Result<String> {
     let message = required_arg(arguments, "message")?;
-    if arguments.get("all").and_then(Value::as_bool).unwrap_or(false) {
+    if arguments
+        .get("all")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         git_plain(git_binary, cwd, ["commit", "-am", &message]).await
     } else {
         git_plain(git_binary, cwd, ["commit", "-m", &message]).await
     }
 }
 
-async fn git_push(git_binary: &str, cwd: &PathBuf, token: &str, arguments: &Value) -> Result<String> {
+async fn git_push(git_binary: &str, cwd: &Path, token: &str, arguments: &Value) -> Result<String> {
     let remote = optional_arg(arguments, "remote")?.unwrap_or_else(|| "origin".to_string());
     let branch = optional_arg(arguments, "branch")?;
     let set_upstream = arguments
@@ -153,19 +172,27 @@ async fn git_push(git_binary: &str, cwd: &PathBuf, token: &str, arguments: &Valu
         (true, Some(branch)) => {
             git_with_token(git_binary, cwd, token, ["push", "-u", &remote, branch]).await
         }
-        (false, Some(branch)) => git_with_token(git_binary, cwd, token, ["push", &remote, branch]).await,
-        (true, None) => git_with_token(git_binary, cwd, token, ["push", "-u", &remote, "HEAD"]).await,
+        (false, Some(branch)) => {
+            git_with_token(git_binary, cwd, token, ["push", &remote, branch]).await
+        }
+        (true, None) => {
+            git_with_token(git_binary, cwd, token, ["push", "-u", &remote, "HEAD"]).await
+        }
         (false, None) => git_with_token(git_binary, cwd, token, ["push"]).await,
     }
 }
 
-async fn git_plain<const N: usize>(git_binary: &str, cwd: &PathBuf, args: [&str; N]) -> Result<String> {
+async fn git_plain<const N: usize>(
+    git_binary: &str,
+    cwd: &Path,
+    args: [&str; N],
+) -> Result<String> {
     projects::workspace::git_plain(git_binary, cwd, args).await
 }
 
 async fn git_with_token<const N: usize>(
     git_binary: &str,
-    cwd: &PathBuf,
+    cwd: &Path,
     token: &str,
     args: [&str; N],
 ) -> Result<String> {
@@ -175,15 +202,16 @@ async fn git_with_token<const N: usize>(
 }
 
 fn required_token(token: Option<&str>) -> Result<&str> {
-    token.filter(|token| !token.trim().is_empty()).ok_or_else(|| {
-        RuntimeError::InvalidInput("project git account token is not configured".to_string())
-    })
+    token
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput("project git account token is not configured".to_string())
+        })
 }
 
 fn required_arg(arguments: &Value, name: &str) -> Result<String> {
-    optional_arg(arguments, name)?.ok_or_else(|| {
-        RuntimeError::InvalidInput(format!("missing string field `{name}`"))
-    })
+    optional_arg(arguments, name)?
+        .ok_or_else(|| RuntimeError::InvalidInput(format!("missing string field `{name}`")))
 }
 
 fn optional_arg(arguments: &Value, name: &str) -> Result<Option<String>> {

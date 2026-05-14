@@ -43,9 +43,20 @@ pub(crate) async fn sync_project_repo(
     std::fs::create_dir_all(&tmp_path)?;
     let repo_url = github_clone_url(&project.owner, &project.repo);
     if repo_path.join(".git").exists() {
-        git_with_token(git_binary, &repo_path, token, ["remote", "set-url", "origin", &repo_url])
-            .await?;
-        git_with_token(git_binary, &repo_path, token, ["fetch", "--prune", "origin"]).await?;
+        git_with_token(
+            git_binary,
+            &repo_path,
+            token,
+            ["remote", "set-url", "origin", &repo_url],
+        )
+        .await?;
+        git_with_token(
+            git_binary,
+            &repo_path,
+            token,
+            ["fetch", "--prune", "origin"],
+        )
+        .await?;
         let origin_branch = format!("origin/{}", project.branch);
         git_with_token(
             git_binary,
@@ -54,7 +65,13 @@ pub(crate) async fn sync_project_repo(
             ["checkout", "-B", &project.branch, &origin_branch],
         )
         .await?;
-        git_with_token(git_binary, &repo_path, token, ["reset", "--hard", &origin_branch]).await?;
+        git_with_token(
+            git_binary,
+            &repo_path,
+            token,
+            ["reset", "--hard", &origin_branch],
+        )
+        .await?;
         git_plain(git_binary, &repo_path, ["clean", "-fdx"]).await?;
         git_plain(git_binary, &repo_path, ["worktree", "prune"]).await?;
         return Ok(());
@@ -166,7 +183,12 @@ pub(crate) async fn git_with_token<const N: usize>(
     run_git(git_binary, cwd, &args, Some(token)).await
 }
 
-async fn run_git(git_binary: &str, cwd: &Path, args: &[&str], token: Option<&str>) -> Result<String> {
+async fn run_git(
+    git_binary: &str,
+    cwd: &Path,
+    args: &[&str],
+    token: Option<&str>,
+) -> Result<String> {
     let tmp;
     let askpass_path;
     if token.is_some() {
@@ -202,7 +224,10 @@ async fn run_git(git_binary: &str, cwd: &Path, args: &[&str], token: Option<&str
     if output.status.success() {
         return Ok(stdout);
     }
-    let combined = redact_secret(format!("{stderr}\n{stdout}").trim(), token.unwrap_or_default());
+    let combined = redact_secret(
+        format!("{stderr}\n{stdout}").trim(),
+        token.unwrap_or_default(),
+    );
     Err(RuntimeError::InvalidInput(format!(
         "git {} failed: {}",
         args.first().copied().unwrap_or("command"),

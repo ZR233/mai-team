@@ -293,8 +293,13 @@ impl DockerClient {
                 &default_workspace_volume
             }
         };
-        let args =
-            create_agent_container_args_with_repo_mount(&name, &label, image, workspace_volume, repo_mount);
+        let args = create_agent_container_args_with_repo_mount(
+            &name,
+            &label,
+            image,
+            workspace_volume,
+            repo_mount,
+        );
         let create = Command::new(&self.binary)
             .args(args.iter().map(String::as_str))
             .output()

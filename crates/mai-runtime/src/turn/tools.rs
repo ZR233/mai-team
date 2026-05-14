@@ -22,6 +22,7 @@ use crate::agents;
 use crate::events::RuntimeEvents;
 use crate::state::{AgentRecord, CollabInput, RuntimeState};
 use crate::tools::files::ContainerFileTools;
+use crate::turn::persistence::AgentLogRecord;
 use crate::{Result, RuntimeError};
 
 const TOKEN_ESTIMATE_BYTES: usize = 4;
@@ -782,49 +783,59 @@ async fn download_file_tar(
         .await?)
 }
 
+pub(crate) struct ToolCallInfo<'a> {
+    pub(crate) call_id: &'a str,
+    pub(crate) name: &'a str,
+    pub(crate) arguments: Value,
+}
+
+pub(crate) struct ToolCallContext<'a> {
+    pub(crate) store: &'a ConfigStore,
+    pub(crate) events: &'a RuntimeEvents,
+    pub(crate) agent: &'a Arc<AgentRecord>,
+    pub(crate) agent_id: AgentId,
+    pub(crate) session_id: SessionId,
+    pub(crate) turn_id: TurnId,
+}
+
 pub(crate) async fn run_tool_call<F, Fut>(
-    store: &ConfigStore,
-    events: &RuntimeEvents,
-    agent: &Arc<AgentRecord>,
-    agent_id: AgentId,
-    session_id: SessionId,
-    turn_id: TurnId,
-    call_id: &str,
-    name: &str,
-    arguments: Value,
+    ctx: &ToolCallContext<'_>,
+    call: ToolCallInfo<'_>,
     execute: F,
 ) -> Result<ToolExecution>
 where
     F: FnOnce(Value) -> Fut,
     Fut: Future<Output = Result<ToolExecution>>,
 {
-    let arguments_preview = trace_preview_value(&arguments, 500);
-    let inline_arguments = inline_event_arguments(&arguments);
-    let trace_arguments = arguments.clone();
+    let arguments_preview = trace_preview_value(&call.arguments, 500);
+    let inline_arguments = inline_event_arguments(&call.arguments);
+    let trace_arguments = call.arguments.clone();
     let started_wall_time = now();
     super::persistence::record_agent_log(
-        store,
-        agent_id,
-        Some(session_id),
-        Some(turn_id),
-        "info",
-        "tool",
-        "tool started",
-        json!({
-            "call_id": call_id,
-            "tool_name": name,
-            "arguments_preview": arguments_preview.as_str(),
-        }),
+        ctx.store,
+        AgentLogRecord {
+            agent_id: ctx.agent_id,
+            session_id: Some(ctx.session_id),
+            turn_id: Some(ctx.turn_id),
+            level: "info",
+            category: "tool",
+            message: "tool started",
+            details: json!({
+                "call_id": call.call_id,
+                "tool_name": call.name,
+                "arguments_preview": arguments_preview.as_str(),
+            }),
+        },
     )
     .await;
     super::persistence::record_tool_trace_started(
-        store,
+        ctx.store,
         ToolTraceDetail {
-            agent_id,
-            session_id: Some(session_id),
-            turn_id: Some(turn_id),
-            call_id: call_id.to_string(),
-            tool_name: name.to_string(),
+            agent_id: ctx.agent_id,
+            session_id: Some(ctx.session_id),
+            turn_id: Some(ctx.turn_id),
+            call_id: call.call_id.to_string(),
+            tool_name: call.name.to_string(),
             arguments: trace_arguments.clone(),
             output: String::new(),
             success: false,
@@ -837,20 +848,20 @@ where
         started_wall_time,
     )
     .await;
-    events
+    ctx.events
         .publish(ServiceEventKind::ToolStarted {
-            agent_id,
-            session_id: Some(session_id),
-            turn_id,
-            call_id: call_id.to_string(),
-            tool_name: name.to_string(),
+            agent_id: ctx.agent_id,
+            session_id: Some(ctx.session_id),
+            turn_id: ctx.turn_id,
+            call_id: call.call_id.to_string(),
+            tool_name: call.name.to_string(),
             arguments_preview: Some(arguments_preview),
             arguments: inline_arguments,
         })
         .await;
 
     let started_at = Instant::now();
-    let output = execute(arguments).await;
+    let output = execute(call.arguments).await;
     let duration_ms = u128_to_u64(started_at.elapsed().as_millis());
     let execution = match output {
         Ok(execution) => execution,
@@ -859,12 +870,12 @@ where
     };
 
     super::history::record_history_item(
-        store,
-        agent,
-        agent_id,
-        session_id,
+        ctx.store,
+        ctx.agent,
+        ctx.agent_id,
+        ctx.session_id,
         ModelInputItem::FunctionCallOutput {
-            call_id: call_id.to_string(),
+            call_id: call.call_id.to_string(),
             output: execution.model_output.clone(),
         },
     )
@@ -873,13 +884,13 @@ where
     let completed_wall_time = now();
     let output_preview = trace_preview_output(&execution.output, 500);
     super::persistence::record_tool_trace_completed(
-        store,
+        ctx.store,
         ToolTraceDetail {
-            agent_id,
-            session_id: Some(session_id),
-            turn_id: Some(turn_id),
-            call_id: call_id.to_string(),
-            tool_name: name.to_string(),
+            agent_id: ctx.agent_id,
+            session_id: Some(ctx.session_id),
+            turn_id: Some(ctx.turn_id),
+            call_id: call.call_id.to_string(),
+            tool_name: call.name.to_string(),
             arguments: trace_arguments,
             output: execution.output.clone(),
             success: execution.success,
@@ -894,29 +905,31 @@ where
     )
     .await;
     super::persistence::record_agent_log(
-        store,
-        agent_id,
-        Some(session_id),
-        Some(turn_id),
-        if execution.success { "info" } else { "warn" },
-        "tool",
-        "tool completed",
-        json!({
-            "call_id": call_id,
-            "tool_name": name,
-            "success": execution.success,
-            "duration_ms": duration_ms,
-            "output_preview": output_preview.as_str(),
-        }),
+        ctx.store,
+        AgentLogRecord {
+            agent_id: ctx.agent_id,
+            session_id: Some(ctx.session_id),
+            turn_id: Some(ctx.turn_id),
+            level: if execution.success { "info" } else { "warn" },
+            category: "tool",
+            message: "tool completed",
+            details: json!({
+                "call_id": call.call_id,
+                "tool_name": call.name,
+                "success": execution.success,
+                "duration_ms": duration_ms,
+                "output_preview": output_preview.as_str(),
+            }),
+        },
     )
     .await;
-    events
+    ctx.events
         .publish(ServiceEventKind::ToolCompleted {
-            agent_id,
-            session_id: Some(session_id),
-            turn_id,
-            call_id: call_id.to_string(),
-            tool_name: name.to_string(),
+            agent_id: ctx.agent_id,
+            session_id: Some(ctx.session_id),
+            turn_id: ctx.turn_id,
+            call_id: call.call_id.to_string(),
+            tool_name: call.name.to_string(),
             success: execution.success,
             output_preview,
             duration_ms: Some(duration_ms),
@@ -1567,15 +1580,19 @@ mod tests {
     async fn tool_lifecycle_records_trace_event_and_function_call_output() {
         let harness = Harness::new().await;
         let execution = run_tool_call(
-            harness.store.as_ref(),
-            &harness.events,
-            &harness.agent,
-            harness.agent_id,
-            harness.session_id,
-            harness.turn_id,
-            "call_1",
-            "demo_tool",
-            json!({ "token": "secret", "path": "src/lib.rs" }),
+            &ToolCallContext {
+                store: harness.store.as_ref(),
+                events: &harness.events,
+                agent: &harness.agent,
+                agent_id: harness.agent_id,
+                session_id: harness.session_id,
+                turn_id: harness.turn_id,
+            },
+            ToolCallInfo {
+                call_id: "call_1",
+                name: "demo_tool",
+                arguments: json!({ "token": "secret", "path": "src/lib.rs" }),
+            },
             |_| async {
                 Ok(ToolExecution::new(
                     true,
@@ -1639,15 +1656,19 @@ mod tests {
     async fn tool_lifecycle_turn_cancelled_error_is_not_converted_to_tool_output() {
         let harness = Harness::new().await;
         let err = run_tool_call(
-            harness.store.as_ref(),
-            &harness.events,
-            &harness.agent,
-            harness.agent_id,
-            harness.session_id,
-            harness.turn_id,
-            "call_1",
-            "demo_tool",
-            json!({}),
+            &ToolCallContext {
+                store: harness.store.as_ref(),
+                events: &harness.events,
+                agent: &harness.agent,
+                agent_id: harness.agent_id,
+                session_id: harness.session_id,
+                turn_id: harness.turn_id,
+            },
+            ToolCallInfo {
+                call_id: "call_1",
+                name: "demo_tool",
+                arguments: json!({}),
+            },
             |_| async { Err(RuntimeError::TurnCancelled) },
         )
         .await

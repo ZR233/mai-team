@@ -677,7 +677,7 @@ impl Patch {
             // split_inclusive already keeps all lines.
         } else if let Some(last) = normalized.rsplit('\n').next()
             && !last.is_empty()
-            && !lines.last().is_some_and(|line| *line == last)
+            && lines.last().is_none_or(|line| *line != last)
         {
             lines.push(last);
         }
