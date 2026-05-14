@@ -43,10 +43,8 @@ pub(crate) trait AgentDeleteOps: Send + Sync {
         reviewer_id: AgentId,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    fn delete_agent_from_store(
-        &self,
-        agent_id: AgentId,
-    ) -> impl Future<Output = Result<()>> + Send;
+    fn delete_agent_from_store(&self, agent_id: AgentId)
+    -> impl Future<Output = Result<()>> + Send;
 
     fn remove_agent_from_memory(&self, agent_id: AgentId) -> impl Future<Output = ()> + Send;
 

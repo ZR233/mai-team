@@ -15,13 +15,15 @@ use uuid::Uuid;
 use crate::state::{AgentRecord, AgentSessionRecord};
 use crate::{Result, RuntimeError};
 
+mod create;
+mod delete;
 mod fork;
 mod input;
-mod wait;
-mod delete;
 mod model;
 mod update;
+mod wait;
 
+pub(crate) use create::{AgentCreateOps, CreateAgentRecordContext, create_agent_record};
 pub(crate) use delete::{
     AgentContainerDeleteRequest, AgentDeleteOps, AgentDeleteStatusChange, delete_agent,
 };
@@ -355,6 +357,10 @@ pub(crate) fn session_record_with_title(title: &str) -> AgentSessionRecord {
         last_context_tokens: None,
         last_turn_response: None,
     }
+}
+
+pub(crate) fn short_id(id: AgentId) -> String {
+    id.to_string().chars().take(8).collect()
 }
 
 pub(crate) fn selected_session(

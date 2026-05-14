@@ -942,22 +942,24 @@ impl AgentRuntime {
         let planner_model = self.resolve_role_agent_model(AgentRole::Planner).await?;
         let clone_url = github_clone_url(&owner, &repo);
         let system_prompt = project_maintainer_system_prompt(&owner, &repo, &clone_url, &branch);
-        let maintainer = self
-            .create_agent_record(
-                CreateAgentRequest {
-                    name: Some(format!("{name} Maintainer")),
-                    provider_id: Some(planner_model.preference.provider_id),
-                    model: Some(planner_model.preference.model),
-                    reasoning_effort: planner_model.preference.reasoning_effort,
-                    docker_image: request.docker_image.clone(),
-                    parent_id: None,
-                    system_prompt: Some(system_prompt),
-                },
-                None,
-                Some(project_id),
-                Some(AgentRole::Planner),
-            )
-            .await?;
+        let maintainer = agents::create_agent_record(
+            self.as_ref(),
+            CreateAgentRequest {
+                name: Some(format!("{name} Maintainer")),
+                provider_id: Some(planner_model.preference.provider_id),
+                model: Some(planner_model.preference.model),
+                reasoning_effort: planner_model.preference.reasoning_effort,
+                docker_image: request.docker_image.clone(),
+                parent_id: None,
+                system_prompt: Some(system_prompt),
+            },
+            agents::CreateAgentRecordContext {
+                task_id: None,
+                project_id: Some(project_id),
+                role: Some(AgentRole::Planner),
+            },
+        )
+        .await?;
         let maintainer_summary = maintainer.summary.read().await.clone();
         let created_at = now();
         let project = ProjectSummary {
@@ -1461,9 +1463,16 @@ impl AgentRuntime {
         project_id: Option<ProjectId>,
         role: Option<AgentRole>,
     ) -> Result<AgentSummary> {
-        let agent = self
-            .create_agent_record(request, task_id, project_id, role)
-            .await?;
+        let agent = agents::create_agent_record(
+            self.as_ref(),
+            request,
+            agents::CreateAgentRecordContext {
+                task_id,
+                project_id,
+                role,
+            },
+        )
+        .await?;
 
         match self
             .ensure_agent_container_with_source(&agent, AgentStatus::Idle, &container_source, None)
@@ -1490,85 +1499,6 @@ impl AgentRuntime {
                 Err(err)
             }
         }
-    }
-
-    async fn create_agent_record(
-        self: &Arc<Self>,
-        request: CreateAgentRequest,
-        task_id: Option<TaskId>,
-        project_id: Option<ProjectId>,
-        role: Option<AgentRole>,
-    ) -> Result<Arc<AgentRecord>> {
-        let id = Uuid::new_v4();
-        let created_at = Utc::now();
-        let name = request
-            .name
-            .unwrap_or_else(|| format!("agent-{}", short_id(id)));
-        let provider_selection = self
-            .deps
-            .store
-            .resolve_provider(request.provider_id.as_deref(), request.model.as_deref())
-            .await?;
-        let reasoning_effort = agents::normalize_reasoning_effort(
-            &provider_selection.model,
-            request.reasoning_effort.as_deref(),
-            true,
-        )?;
-        let docker_image = self.resolve_docker_image(request.docker_image.as_deref());
-        let system_prompt = request.system_prompt;
-        let summary = AgentSummary {
-            id,
-            parent_id: request.parent_id,
-            task_id,
-            project_id,
-            role,
-            name,
-            status: AgentStatus::Created,
-            container_id: None,
-            docker_image,
-            provider_id: provider_selection.provider.id.clone(),
-            provider_name: provider_selection.provider.name.clone(),
-            model: provider_selection.model.id.clone(),
-            reasoning_effort,
-            created_at,
-            updated_at: created_at,
-            current_turn: None,
-            last_error: None,
-            token_usage: TokenUsage::default(),
-        };
-        self.deps
-            .store
-            .save_agent(&summary, system_prompt.as_deref())
-            .await?;
-        let session = agents::initial_session_record(task_id.is_some());
-        self.deps
-            .store
-            .save_agent_session(id, &session.summary)
-            .await?;
-
-        let agent = Arc::new(AgentRecord {
-            summary: RwLock::new(summary.clone()),
-            sessions: Mutex::new(vec![session]),
-            container: RwLock::new(None),
-            mcp: RwLock::new(None),
-            system_prompt,
-            turn_lock: Mutex::new(()),
-            cancel_requested: AtomicBool::new(false),
-            active_turn: StdMutex::new(None),
-            pending_inputs: Mutex::new(VecDeque::new()),
-        });
-
-        self.state
-            .agents
-            .write()
-            .await
-            .insert(id, Arc::clone(&agent));
-        self.events
-            .publish(ServiceEventKind::AgentCreated {
-                agent: summary.clone(),
-            })
-            .await;
-        Ok(agent)
     }
 
     pub async fn list_agents(&self) -> Vec<AgentSummary> {
@@ -4594,14 +4524,6 @@ impl AgentRuntime {
         self.ensure_agent_container(&agent, ready_status).await
     }
 
-    fn resolve_docker_image(&self, requested: Option<&str>) -> String {
-        requested
-            .map(str::trim)
-            .filter(|image| !image.is_empty())
-            .unwrap_or_else(|| self.deps.docker.image())
-            .to_string()
-    }
-
     async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<mai_mcp::McpTool> {
         if let Some(project_id) = agent.summary.read().await.project_id {
             let Some(manager) = self
@@ -4800,9 +4722,7 @@ impl agents::AgentDeleteOps for AgentRuntime {
         agent: Arc<AgentRecord>,
         change: agents::AgentDeleteStatusChange,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move {
-            AgentRuntime::set_status(self, &agent, change.status, change.error).await
-        }
+        async move { AgentRuntime::set_status(self, &agent, change.status, change.error).await }
     }
 
     async fn delete_agent_containers(
@@ -4869,6 +4789,48 @@ impl agents::AgentUpdateOps for AgentRuntime {
     async fn publish_agent_updated(&self, agent: AgentSummary) {
         self.events
             .publish(ServiceEventKind::AgentUpdated { agent })
+            .await;
+    }
+}
+
+impl agents::AgentCreateOps for AgentRuntime {
+    fn default_docker_image(&self) -> String {
+        self.deps.docker.image().to_string()
+    }
+
+    async fn resolve_provider(
+        &self,
+        provider_id: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<ProviderSelection> {
+        Ok(self.deps.store.resolve_provider(provider_id, model).await?)
+    }
+
+    async fn save_agent(&self, summary: &AgentSummary, system_prompt: Option<&str>) -> Result<()> {
+        self.deps.store.save_agent(summary, system_prompt).await?;
+        Ok(())
+    }
+
+    async fn save_agent_session(
+        &self,
+        agent_id: AgentId,
+        session: &AgentSessionSummary,
+    ) -> Result<()> {
+        self.deps
+            .store
+            .save_agent_session(agent_id, session)
+            .await?;
+        Ok(())
+    }
+
+    async fn insert_agent(&self, agent: Arc<AgentRecord>) {
+        let id = agent.summary.read().await.id;
+        self.state.agents.write().await.insert(id, agent);
+    }
+
+    async fn publish_agent_created(&self, agent: AgentSummary) {
+        self.events
+            .publish(ServiceEventKind::AgentCreated { agent })
             .await;
     }
 }
@@ -5486,10 +5448,6 @@ fn recovered_summary(mut summary: AgentSummary) -> (AgentSummary, bool) {
         changed = true;
     }
     (summary, changed)
-}
-
-fn short_id(id: AgentId) -> String {
-    id.to_string().chars().take(8).collect()
 }
 
 #[cfg(test)]

@@ -36,7 +36,10 @@ pub(crate) async fn update_agent(
         }
     }
     let current = agent.summary.read().await.clone();
-    let provider_id = request.provider_id.as_deref().or(Some(&current.provider_id));
+    let provider_id = request
+        .provider_id
+        .as_deref()
+        .or(Some(&current.provider_id));
     let model = request.model.as_deref().or(Some(&current.model));
     let provider_selection = ops.resolve_provider(provider_id, model).await?;
     let requested_reasoning_effort = if request.reasoning_effort.is_some()
