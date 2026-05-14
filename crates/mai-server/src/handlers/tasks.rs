@@ -1,30 +1,18 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::StatusCode;
 use axum::response::Response;
 use serde::Deserialize;
 
 use super::state::{ApiError, AppState};
+use crate::services::artifacts::ArtifactService;
 use mai_protocol::{
-    AgentId, ApproveTaskPlanResponse, ArtifactInfo, CreateTaskRequest, CreateTaskResponse,
+    AgentId, ApproveTaskPlanResponse, CreateTaskRequest, CreateTaskResponse,
     RequestPlanRevisionRequest, RequestPlanRevisionResponse, SendMessageRequest,
     SendMessageResponse, TaskId,
 };
-
-fn content_disposition_filename(name: &str) -> String {
-    let escaped = name
-        .chars()
-        .map(|ch| match ch {
-            '"' | '\\' | '\r' | '\n' => '_',
-            ch if ch.is_control() || !ch.is_ascii() => '_',
-            ch => ch,
-        })
-        .collect::<String>();
-    format!("attachment; filename=\"{escaped}\"")
-}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TaskDetailQuery {
@@ -113,8 +101,9 @@ pub(crate) async fn delete_task(
 pub(crate) async fn list_artifacts(
     State(state): State<Arc<AppState>>,
     Path(id): Path<TaskId>,
-) -> std::result::Result<Json<Vec<ArtifactInfo>>, ApiError> {
-    let artifacts = state.store.load_artifacts(&id).map_err(|e| ApiError {
+) -> std::result::Result<Json<Vec<mai_protocol::ArtifactInfo>>, ApiError> {
+    let service = ArtifactService::new(Arc::clone(&state.store), Arc::clone(&state.runtime));
+    let artifacts = service.list_artifacts(&id).map_err(|e| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         message: e.to_string(),
     })?;
@@ -125,33 +114,19 @@ pub(crate) async fn download_artifact(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> std::result::Result<Response, ApiError> {
-    let artifacts = state.store.load_all_artifacts().map_err(|e| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: e.to_string(),
-    })?;
-    let artifact = artifacts
-        .into_iter()
-        .find(|a| a.id == id.as_str())
-        .ok_or_else(|| ApiError {
-            status: StatusCode::NOT_FOUND,
-            message: "Artifact not found".to_string(),
+    let service = ArtifactService::new(Arc::clone(&state.store), Arc::clone(&state.runtime));
+    let file = service
+        .download_artifact(&id)
+        .await
+        .map_err(|e| match e.to_string() {
+            msg if msg.contains("not found") => ApiError {
+                status: StatusCode::NOT_FOUND,
+                message: msg,
+            },
+            msg => ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: msg,
+            },
         })?;
-
-    let file_path = state.runtime.artifact_file_path(&artifact);
-
-    let bytes = tokio::fs::read(&file_path).await.map_err(|e| ApiError {
-        status: StatusCode::NOT_FOUND,
-        message: format!("File not found: {e}"),
-    })?;
-
-    let filename = content_disposition_filename(&artifact.name);
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_DISPOSITION, filename)
-        .body(Body::from(bytes))
-        .map_err(|error| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: error.to_string(),
-        })
+    Ok(file.into_response())
 }
