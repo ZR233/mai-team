@@ -1,17 +1,29 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use chrono::{DateTime, Utc};
 use mai_protocol::{
     AgentDetail, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary,
-    ContextUsage, MessageRole, ServiceEvent, ServiceEventKind, SessionId, TurnId, now,
+    ContextUsage, MessageRole, ModelInputItem, ServiceEvent, ServiceEventKind, SessionId, TurnId,
+    now,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::state::{AgentRecord, AgentSessionRecord};
 use crate::{Result, RuntimeError};
+
+mod fork;
+mod input;
+mod wait;
+
+pub(crate) use fork::fork_agent_context;
+#[cfg(test)]
+pub(crate) use input::start_next_queued_input;
+pub(crate) use input::{send_input_to_agent, start_next_queued_input_after_turn};
+pub(crate) use wait::{wait_agent, wait_agent_until_complete_with_cancel};
 
 #[async_trait::async_trait]
 pub(crate) trait AgentServiceOps: Send + Sync {
@@ -25,6 +37,24 @@ pub(crate) trait AgentServiceOps: Send + Sync {
     async fn publish(&self, event: ServiceEventKind);
     async fn recent_events_for_agent(&self, agent_id: AgentId) -> Vec<ServiceEvent>;
     async fn provider_context_tokens(&self, provider_id: &str, model: &str) -> Option<u64>;
+    async fn resolve_session_id(
+        &self,
+        agent_id: AgentId,
+        session_id: Option<SessionId>,
+    ) -> Result<SessionId>;
+    async fn replace_agent_history(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        history: &[ModelInputItem],
+    ) -> Result<()>;
+    async fn append_agent_message(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        position: usize,
+        message: &AgentMessage,
+    ) -> Result<()>;
     async fn delete_agent_containers(
         &self,
         agent_id: AgentId,
@@ -35,6 +65,31 @@ pub(crate) trait AgentServiceOps: Send + Sync {
         agent: &Arc<AgentRecord>,
         status: AgentStatus,
     ) -> Result<()>;
+}
+
+/// Supplies the turn-control operations needed to interrupt, queue, and start
+/// conversational input for an agent without exposing the full runtime.
+pub(crate) trait AgentInputOps: Send + Sync {
+    fn cancel_agent_turn(
+        &self,
+        agent_id: AgentId,
+        turn_id: TurnId,
+    ) -> impl Future<Output = Result<()>> + Send;
+    fn set_agent_status(
+        &self,
+        agent: &Arc<AgentRecord>,
+        status: AgentStatus,
+        error: Option<String>,
+    ) -> impl Future<Output = Result<()>> + Send;
+    fn spawn_turn(
+        &self,
+        agent: &Arc<AgentRecord>,
+        agent_id: AgentId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        message: String,
+        skill_mentions: Vec<String>,
+    );
 }
 
 pub(crate) async fn list_agents(agents: Vec<Arc<AgentRecord>>) -> Vec<AgentSummary> {

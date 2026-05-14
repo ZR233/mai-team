@@ -69,8 +69,8 @@ use projects::mcp::PROJECT_WORKSPACE_PATH;
 use projects::skills::PROJECT_SKILLS_CACHE_DIR;
 use projects::skills::{ProjectSkillRefreshSource, ProjectSkillSourceDir};
 use state::{
-    AgentRecord, AgentSessionRecord, ProjectRecord, ProjectReviewWorker, QueuedAgentInput,
-    RuntimeState, TaskRecord, TurnControl, TurnGuard,
+    AgentRecord, AgentSessionRecord, ProjectRecord, ProjectReviewWorker, RuntimeState, TaskRecord,
+    TurnControl, TurnGuard,
 };
 use turn::completion::TurnResult;
 use turn::tools::ToolExecution;
@@ -3231,43 +3231,7 @@ impl AgentRuntime {
     }
 
     async fn wait_agent(&self, agent_id: AgentId, timeout: Duration) -> Result<AgentSummary> {
-        self.wait_agent_with_cancel(agent_id, timeout, &CancellationToken::new())
-            .await
-    }
-
-    async fn wait_agent_with_cancel(
-        &self,
-        agent_id: AgentId,
-        timeout: Duration,
-        cancellation_token: &CancellationToken,
-    ) -> Result<AgentSummary> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if cancellation_token.is_cancelled() {
-                return Err(RuntimeError::TurnCancelled);
-            }
-            let agent = self.agent(agent_id).await?;
-            let summary = agent.summary.read().await.clone();
-            if summary.current_turn.is_none()
-                || matches!(
-                    summary.status,
-                    AgentStatus::Completed
-                        | AgentStatus::Failed
-                        | AgentStatus::Cancelled
-                        | AgentStatus::Deleted
-                        | AgentStatus::Idle
-                )
-            {
-                return Ok(summary);
-            }
-            if Instant::now() >= deadline {
-                return Ok(summary);
-            }
-            tokio::select! {
-                _ = sleep(Duration::from_millis(250)) => {},
-                _ = cancellation_token.cancelled() => return Err(RuntimeError::TurnCancelled),
-            }
-        }
+        agents::wait_agent(self, agent_id, timeout).await
     }
 
     async fn wait_agent_until_complete_with_cancel(
@@ -3275,20 +3239,7 @@ impl AgentRuntime {
         agent_id: AgentId,
         cancellation_token: &CancellationToken,
     ) -> Result<AgentSummary> {
-        loop {
-            if cancellation_token.is_cancelled() {
-                return Err(RuntimeError::TurnCancelled);
-            }
-            let agent = self.agent(agent_id).await?;
-            let summary = agent.summary.read().await.clone();
-            if agents::is_agent_wait_complete(&summary) {
-                return Ok(summary);
-            }
-            tokio::select! {
-                _ = sleep(Duration::from_millis(250)) => {},
-                _ = cancellation_token.cancelled() => return Err(RuntimeError::TurnCancelled),
-            }
-        }
+        agents::wait_agent_until_complete_with_cancel(self, agent_id, cancellation_token).await
     }
 
     async fn agent_wait_snapshot(&self, agent_id: AgentId) -> Result<Value> {
@@ -3388,110 +3339,25 @@ impl AgentRuntime {
         skill_mentions: Vec<String>,
         interrupt: bool,
     ) -> Result<Value> {
-        let agent = self.agent(target).await?;
-        if interrupt {
-            let current_turn = agent.summary.read().await.current_turn;
-            if let Some(turn_id) = current_turn {
-                self.cancel_agent_turn(target, turn_id).await?;
-            } else {
-                agent.cancel_requested.store(true, Ordering::SeqCst);
-                self.set_status(&agent, AgentStatus::Cancelled, None)
-                    .await?;
-            }
-            self.wait_agent(target, TURN_CANCEL_GRACE).await?;
-        }
-        match self.prepare_turn(target).await {
-            Ok((agent, turn_id)) => {
-                let session_id = self.resolve_session_id(target, session_id).await?;
-                self.spawn_turn(&agent, target, session_id, turn_id, message, skill_mentions);
-                Ok(json!({ "turn_id": turn_id, "queued": false }))
-            }
-            Err(RuntimeError::AgentBusy(_)) if !interrupt => {
-                agent
-                    .pending_inputs
-                    .lock()
-                    .await
-                    .push_back(QueuedAgentInput {
-                        session_id,
-                        message,
-                        skill_mentions,
-                    });
-                Ok(json!({ "queued": true }))
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    async fn start_next_queued_input(self: &Arc<Self>, agent_id: AgentId) -> Result<()> {
-        let agent = self.agent(agent_id).await?;
-        let Some(input) = agent.pending_inputs.lock().await.pop_front() else {
-            return Ok(());
-        };
-        let session_id = self.resolve_session_id(agent_id, input.session_id).await?;
-        let (agent, turn_id) = match self.prepare_turn(agent_id).await {
-            Ok(turn) => turn,
-            Err(RuntimeError::AgentBusy(_)) => {
-                agent.pending_inputs.lock().await.push_front(input);
-                return Ok(());
-            }
-            Err(err) => return Err(err),
-        };
-        self.spawn_turn(
-            &agent,
-            agent_id,
+        agents::send_input_to_agent(
+            self.as_ref(),
+            self,
+            target,
             session_id,
-            turn_id,
-            input.message,
-            input.skill_mentions,
-        );
-        Ok(())
+            message,
+            skill_mentions,
+            interrupt,
+            TURN_CANCEL_GRACE,
+        )
+        .await
     }
 
     async fn start_next_queued_input_after_turn(self: &Arc<Self>, agent_id: AgentId) {
-        if let Err(err) = self.start_next_queued_input(agent_id).await {
-            tracing::warn!("failed to start queued agent input: {err}");
-        }
+        agents::start_next_queued_input_after_turn(self.as_ref(), self, agent_id).await;
     }
 
     async fn fork_agent_context(&self, parent_id: AgentId, child_id: AgentId) -> Result<()> {
-        let parent = self.agent(parent_id).await?;
-        let child = self.agent(child_id).await?;
-        let parent_session = {
-            let sessions = parent.sessions.lock().await;
-            agents::selected_session(&sessions, None).cloned()
-        }
-        .ok_or(RuntimeError::AgentNotFound(parent_id))?;
-        let child_session_id = self.resolve_session_id(child_id, None).await?;
-        {
-            let mut child_sessions = child.sessions.lock().await;
-            let child_session = child_sessions
-                .iter_mut()
-                .find(|session| session.summary.id == child_session_id)
-                .ok_or(RuntimeError::SessionNotFound {
-                    agent_id: child_id,
-                    session_id: child_session_id,
-                })?;
-            child_session.messages = parent_session.messages.clone();
-            child_session.history = parent_session.history.clone();
-            child_session.summary.message_count = child_session.messages.len();
-            child_session.summary.updated_at = now();
-            let summary = child_session.summary.clone();
-            self.deps
-                .store
-                .save_agent_session(child_id, &summary)
-                .await?;
-        }
-        self.deps
-            .store
-            .replace_agent_history(child_id, child_session_id, &parent_session.history)
-            .await?;
-        for (position, message) in parent_session.messages.iter().enumerate() {
-            self.deps
-                .store
-                .append_agent_message(child_id, child_session_id, position, message)
-                .await?;
-        }
-        Ok(())
+        agents::fork_agent_context(self, parent_id, child_id).await
     }
 
     async fn cleanup_finished_explorer_agent(&self, agent_id: AgentId) -> Result<()> {
@@ -6203,6 +6069,41 @@ impl agents::AgentServiceOps for AgentRuntime {
             .map(|selection| selection.model.context_tokens)
     }
 
+    async fn resolve_session_id(
+        &self,
+        agent_id: AgentId,
+        session_id: Option<SessionId>,
+    ) -> Result<SessionId> {
+        AgentRuntime::resolve_session_id(self, agent_id, session_id).await
+    }
+
+    async fn replace_agent_history(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        history: &[ModelInputItem],
+    ) -> Result<()> {
+        self.deps
+            .store
+            .replace_agent_history(agent_id, session_id, history)
+            .await?;
+        Ok(())
+    }
+
+    async fn append_agent_message(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        position: usize,
+        message: &AgentMessage,
+    ) -> Result<()> {
+        self.deps
+            .store
+            .append_agent_message(agent_id, session_id, position, message)
+            .await?;
+        Ok(())
+    }
+
     async fn delete_agent_containers(
         &self,
         agent_id: AgentId,
@@ -6223,6 +6124,45 @@ impl agents::AgentServiceOps for AgentRuntime {
         AgentRuntime::ensure_agent_container(self, agent, status)
             .await
             .map(|_| ())
+    }
+}
+
+impl agents::AgentInputOps for Arc<AgentRuntime> {
+    fn cancel_agent_turn(
+        &self,
+        agent_id: AgentId,
+        turn_id: TurnId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::cancel_agent_turn(self, agent_id, turn_id)
+    }
+
+    fn set_agent_status(
+        &self,
+        agent: &Arc<AgentRecord>,
+        status: AgentStatus,
+        error: Option<String>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::set_status(self.as_ref(), agent, status, error)
+    }
+
+    fn spawn_turn(
+        &self,
+        agent: &Arc<AgentRecord>,
+        agent_id: AgentId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        message: String,
+        skill_mentions: Vec<String>,
+    ) {
+        AgentRuntime::spawn_turn(
+            self,
+            agent,
+            agent_id,
+            session_id,
+            turn_id,
+            message,
+            skill_mentions,
+        );
     }
 }
 
@@ -12653,8 +12593,7 @@ esac
             summary.status = AgentStatus::Idle;
             summary.current_turn = None;
         }
-        runtime
-            .start_next_queued_input(child_id)
+        agents::start_next_queued_input(runtime.as_ref(), &runtime, child_id)
             .await
             .expect("start queued");
 
