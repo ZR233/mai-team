@@ -1,19 +1,16 @@
 use std::collections::HashSet;
-use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use chrono::{DateTime, Utc};
 use mai_protocol::{
     AgentDetail, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary,
-    ContextUsage, MessageRole, ModelInputItem, ServiceEvent, ServiceEventKind, SessionId, TurnId,
-    TurnStatus, now,
+    ContextUsage, MessageRole, ModelInputItem, ServiceEvent, ServiceEventKind, SessionId, now,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::state::{AgentRecord, AgentSessionRecord};
-use crate::turn::completion::TurnResult;
 use crate::{Result, RuntimeError};
 
 mod container;
@@ -26,6 +23,7 @@ mod model;
 mod observability;
 mod resources;
 mod spawn;
+mod turn;
 mod update;
 mod wait;
 
@@ -51,35 +49,12 @@ pub(crate) use resources::AgentResourceBroker;
 pub(crate) use spawn::{
     AgentSpawnOps, SpawnChildAgentRequest, spawn_child_agent, spawn_task_role_agent,
 };
+pub(crate) use turn::{
+    AgentCancelOps, AgentInputOps, AgentTurnTaskOps, cancel_agent, cancel_agent_turn, prepare_turn,
+    send_message, spawn_turn, start_agent_turn,
+};
 pub(crate) use update::{AgentUpdateOps, update_agent};
 pub(crate) use wait::{wait_agent, wait_agent_until_complete_with_cancel};
-
-/// Provides the status, completion, and queue side effects needed to cancel an
-/// agent or one of its active turns.
-pub(crate) trait AgentCancelOps: Send + Sync {
-    fn agent(&self, agent_id: AgentId) -> impl Future<Output = Result<Arc<AgentRecord>>> + Send;
-
-    fn set_agent_status(
-        &self,
-        agent: &Arc<AgentRecord>,
-        status: AgentStatus,
-        error: Option<String>,
-    ) -> impl Future<Output = Result<()>> + Send;
-
-    fn complete_turn_if_current(
-        &self,
-        agent: &Arc<AgentRecord>,
-        agent_id: AgentId,
-        result: TurnResult,
-    ) -> impl Future<Output = Result<bool>> + Send;
-
-    fn start_next_queued_input_after_turn(
-        &self,
-        agent_id: AgentId,
-    ) -> impl Future<Output = ()> + Send;
-
-    fn turn_cancel_grace(&self) -> std::time::Duration;
-}
 
 #[async_trait::async_trait]
 pub(crate) trait AgentServiceOps: Send + Sync {
@@ -121,88 +96,6 @@ pub(crate) trait AgentServiceOps: Send + Sync {
         agent: &Arc<AgentRecord>,
         status: AgentStatus,
     ) -> Result<()>;
-}
-
-/// Supplies the turn-control operations needed to interrupt, queue, and start
-/// conversational input for an agent without exposing the full runtime.
-pub(crate) trait AgentInputOps: Send + Sync {
-    fn cancel_agent_turn(
-        &self,
-        agent_id: AgentId,
-        turn_id: TurnId,
-    ) -> impl Future<Output = Result<()>> + Send;
-    fn set_agent_status(
-        &self,
-        agent: &Arc<AgentRecord>,
-        status: AgentStatus,
-        error: Option<String>,
-    ) -> impl Future<Output = Result<()>> + Send;
-    fn spawn_turn(
-        &self,
-        agent: &Arc<AgentRecord>,
-        agent_id: AgentId,
-        session_id: SessionId,
-        turn_id: TurnId,
-        message: String,
-        skill_mentions: Vec<String>,
-    );
-}
-
-pub(crate) async fn cancel_agent(ops: &impl AgentCancelOps, agent_id: AgentId) -> Result<()> {
-    let agent = ops.agent(agent_id).await?;
-    let turn_id = agent.summary.read().await.current_turn;
-    match turn_id {
-        Some(turn_id) => cancel_agent_turn(ops, agent_id, turn_id).await,
-        None => {
-            agent.cancel_requested.store(true, Ordering::SeqCst);
-            ops.set_agent_status(&agent, AgentStatus::Cancelled, None)
-                .await
-        }
-    }
-}
-
-pub(crate) async fn cancel_agent_turn(
-    ops: &impl AgentCancelOps,
-    agent_id: AgentId,
-    turn_id: TurnId,
-) -> Result<()> {
-    let agent = ops.agent(agent_id).await?;
-    let control = agent.active_turn.lock().expect("active turn lock").clone();
-    let current_turn = agent.summary.read().await.current_turn;
-    if current_turn != Some(turn_id) && control.as_ref().map(|turn| turn.turn_id) != Some(turn_id) {
-        return Ok(());
-    }
-    agent.cancel_requested.store(true, Ordering::SeqCst);
-    if let Some(control) = control.filter(|turn| turn.turn_id == turn_id) {
-        control.cancellation_token.cancel();
-        if let Some(abort_handle) = control.abort_handle {
-            let token = control.cancellation_token.clone();
-            let cancel_grace = ops.turn_cancel_grace();
-            tokio::spawn(async move {
-                tokio::time::sleep(cancel_grace).await;
-                if token.is_cancelled() {
-                    abort_handle.abort();
-                }
-            });
-        }
-    }
-    let completed = ops
-        .complete_turn_if_current(
-            &agent,
-            agent_id,
-            TurnResult {
-                turn_id,
-                status: TurnStatus::Cancelled,
-                agent_status: AgentStatus::Cancelled,
-                final_text: None,
-                error: None,
-            },
-        )
-        .await?;
-    if completed {
-        ops.start_next_queued_input_after_turn(agent_id).await;
-    }
-    Ok(())
 }
 
 pub(crate) async fn list_agents(agents: Vec<Arc<AgentRecord>>) -> Vec<AgentSummary> {
@@ -277,37 +170,6 @@ pub(crate) async fn create_session(
     };
     ops.save_agent_session(agent_id, &session).await?;
     Ok(session)
-}
-
-pub(crate) async fn prepare_turn(
-    ops: &dyn AgentServiceOps,
-    agent_id: AgentId,
-) -> Result<(Arc<AgentRecord>, TurnId)> {
-    let agent = ops.agent(agent_id).await?;
-    let turn_id = Uuid::new_v4();
-    let should_start = {
-        let mut summary = agent.summary.write().await;
-        if !summary.status.can_start_turn() {
-            false
-        } else {
-            summary.status = AgentStatus::RunningTurn;
-            summary.current_turn = Some(turn_id);
-            summary.updated_at = now();
-            summary.last_error = None;
-            agent.cancel_requested.store(false, Ordering::SeqCst);
-            true
-        }
-    };
-    if !should_start {
-        return Err(RuntimeError::AgentBusy(agent_id));
-    }
-    ops.persist_agent(&agent).await?;
-    ops.publish(ServiceEventKind::AgentStatusChanged {
-        agent_id,
-        status: AgentStatus::RunningTurn,
-    })
-    .await;
-    Ok((agent, turn_id))
 }
 
 pub(crate) async fn close_agent(

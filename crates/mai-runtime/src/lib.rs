@@ -56,7 +56,6 @@ use projects::skills::PROJECT_SKILLS_CACHE_DIR;
 use projects::skills::{ProjectSkillRefreshSource, ProjectSkillSourceDir};
 use state::{
     AgentRecord, AgentSessionRecord, ProjectRecord, ProjectReviewWorker, RuntimeState, TaskRecord,
-    TurnControl,
 };
 use turn::tools::ToolExecution;
 
@@ -1042,17 +1041,15 @@ impl AgentRuntime {
         message: String,
         skill_mentions: Vec<String>,
     ) -> Result<TurnId> {
-        let session_id = self.resolve_session_id(agent_id, session_id).await?;
-        let (agent, turn_id) = self.prepare_turn(agent_id).await?;
-        self.spawn_turn(
-            &agent,
+        agents::send_message(
+            self.as_ref(),
+            self,
             agent_id,
             session_id,
-            turn_id,
             message,
             skill_mentions,
-        );
-        Ok(turn_id)
+        )
+        .await
     }
 
     async fn prepare_turn(&self, agent_id: AgentId) -> Result<(Arc<AgentRecord>, TurnId)> {
@@ -1068,32 +1065,15 @@ impl AgentRuntime {
         message: String,
         skill_mentions: Vec<String>,
     ) {
-        let runtime = Arc::clone(self);
-        let cancellation_token = CancellationToken::new();
-        let task_token = cancellation_token.clone();
-        let (abort_handle, abort_registration) = AbortHandle::new_pair();
-        let control = TurnControl {
-            turn_id,
+        agents::spawn_turn(
+            self,
+            agent,
+            agent_id,
             session_id,
-            cancellation_token,
-            abort_handle: Some(abort_handle),
-        };
-        *agent.active_turn.lock().expect("active turn lock") = Some(control);
-        tokio::spawn(Abortable::new(
-            async move {
-                runtime
-                    .run_turn(
-                        agent_id,
-                        session_id,
-                        turn_id,
-                        message,
-                        skill_mentions,
-                        task_token,
-                    )
-                    .await;
-            },
-            abort_registration,
-        ));
+            turn_id,
+            message,
+            skill_mentions,
+        );
     }
 
     pub async fn cancel_agent(self: &Arc<Self>, agent_id: AgentId) -> Result<()> {
@@ -1304,10 +1284,7 @@ impl AgentRuntime {
         agent_id: AgentId,
         message: String,
     ) -> Result<TurnId> {
-        let session_id = self.resolve_session_id(agent_id, None).await?;
-        let (agent, turn_id) = self.prepare_turn(agent_id).await?;
-        self.spawn_turn(&agent, agent_id, session_id, turn_id, message, Vec::new());
-        Ok(turn_id)
+        agents::start_agent_turn(self.as_ref(), self, agent_id, message, Vec::new()).await
     }
 
     #[cfg(test)]
@@ -2738,17 +2715,7 @@ impl AgentRuntime {
         message: String,
         skill_mentions: Vec<String>,
     ) -> Result<TurnId> {
-        let session_id = self.resolve_session_id(agent_id, None).await?;
-        let (agent, turn_id) = self.prepare_turn(agent_id).await?;
-        self.spawn_turn(
-            &agent,
-            agent_id,
-            session_id,
-            turn_id,
-            message,
-            skill_mentions,
-        );
-        Ok(turn_id)
+        agents::start_agent_turn(self.as_ref(), self, agent_id, message, skill_mentions).await
     }
 
     async fn set_project_review_state(
@@ -3245,6 +3212,32 @@ impl agents::AgentCancelOps for Arc<AgentRuntime> {
 
     fn turn_cancel_grace(&self) -> Duration {
         TURN_CANCEL_GRACE
+    }
+}
+
+impl agents::AgentTurnTaskOps for Arc<AgentRuntime> {
+    fn run_turn_task(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        message: String,
+        skill_mentions: Vec<String>,
+        cancellation_token: CancellationToken,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let runtime = Arc::clone(self);
+        async move {
+            runtime
+                .run_turn(
+                    agent_id,
+                    session_id,
+                    turn_id,
+                    message,
+                    skill_mentions,
+                    cancellation_token,
+                )
+                .await;
+        }
     }
 }
 
