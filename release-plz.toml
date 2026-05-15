@@ -9,6 +9,7 @@ git_tag_enable = false
 name = "mai-relay"
 release = true
 publish = false
+git_only = true
 changelog_update = true
 git_release_enable = true
 git_release_name = "{{ package }} v{{ version }}"
