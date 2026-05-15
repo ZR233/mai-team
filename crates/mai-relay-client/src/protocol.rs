@@ -20,7 +20,7 @@ pub(crate) fn relay_connect_url(url: &str) -> String {
     }
 }
 
-pub(crate) fn associated_pull_requests(payload: &Value) -> Vec<u64> {
+pub fn associated_pull_requests(payload: &Value) -> Vec<u64> {
     let mut prs = HashSet::new();
     for key in ["check_run", "check_suite"] {
         if let Some(items) = payload
@@ -36,6 +36,27 @@ pub(crate) fn associated_pull_requests(payload: &Value) -> Vec<u64> {
         }
     }
     prs.into_iter().collect()
+}
+
+pub fn head_sha(payload: &Value) -> Option<String> {
+    payload
+        .get("pull_request")
+        .and_then(|pr| pr.get("head"))
+        .and_then(|head| head.get("sha"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .get("check_run")
+                .and_then(|check_run| check_run.get("head_sha"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            payload
+                .get("check_suite")
+                .and_then(|check_suite| check_suite.get("head_sha"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
 }
 
 pub(crate) fn relay_response(id: String, result: Result<Value, RuntimeError>) -> RelayResponse {

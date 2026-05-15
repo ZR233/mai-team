@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use mai_agents::AgentProfilesManager;
 use mai_docker::{ContainerHandle, DockerClient};
 use mai_mcp::McpAgentManager;
@@ -45,6 +45,7 @@ use github::{
 };
 use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
 use projects::review::ProjectReviewCycleResult;
+use projects::review::pool::{ProjectReviewPoolEnqueueSummary, ProjectReviewSignalInput};
 use projects::review::runs::FinishReviewRun;
 use projects::review::state::ReviewStateUpdate;
 #[cfg(test)]
@@ -78,6 +79,33 @@ const AGENT_ROLES: [AgentRole; 4] = [
     AgentRole::Executor,
     AgentRole::Reviewer,
 ];
+
+#[derive(Debug, Clone)]
+pub struct ProjectReviewQueueRequest {
+    pub project_id: ProjectId,
+    pub pr: u64,
+    pub head_sha: Option<String>,
+    pub delivery_id: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectReviewQueueSummary {
+    pub queued: Vec<u64>,
+    pub deduped: Vec<u64>,
+    pub ignored: Vec<u64>,
+}
+
+impl From<ProjectReviewPoolEnqueueSummary> for ProjectReviewQueueSummary {
+    fn from(value: ProjectReviewPoolEnqueueSummary) -> Self {
+        Self {
+            queued: value.queued,
+            deduped: value.deduped,
+            ignored: value.ignored,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error("agent not found: {0}")]
@@ -265,14 +293,7 @@ impl AgentRuntime {
                 summary.last_error = Some("maintainer agent is missing".to_string());
                 store.save_project(&summary).await?;
             }
-            projects.insert(
-                summary.id,
-                Arc::new(ProjectRecord {
-                    summary: RwLock::new(summary),
-                    sidecar: RwLock::new(None),
-                    review_worker: Mutex::new(None),
-                }),
-            );
+            projects.insert(summary.id, Arc::new(ProjectRecord::new(summary)));
         }
         let sidecar_image = runtime_sidecar_image(config.sidecar_image);
         let github_api_base_url = config
@@ -844,92 +865,59 @@ impl AgentRuntime {
         Ok(())
     }
 
-    pub async fn trigger_project_review(
+    pub async fn enqueue_project_review(
         self: &Arc<Self>,
-        project_id: ProjectId,
-        pr: u64,
-        delivery_id: String,
-        reason: String,
-    ) -> Result<()> {
+        request: ProjectReviewQueueRequest,
+    ) -> Result<ProjectReviewQueueSummary> {
+        let project_id = request.project_id;
         let project = self.project(project_id).await?;
         {
             let summary = project.summary.read().await;
             if !summary.auto_review_enabled {
-                return Ok(());
-            }
-            if summary.status != ProjectStatus::Ready
-                || summary.clone_status != ProjectCloneStatus::Ready
-            {
-                return Ok(());
-            }
-            if matches!(
-                summary.review_status,
-                ProjectReviewStatus::Syncing | ProjectReviewStatus::Running
-            ) {
-                tracing::info!(
-                    project_id = %project_id,
-                    pr,
-                    delivery_id = %delivery_id,
-                    "project review already active; webhook review trigger recorded only"
-                );
-                return Ok(());
-            }
-        }
-        {
-            let mut worker = project.review_worker.lock().await;
-            if let Some(worker) = worker.take() {
-                worker.cancellation_token.cancel();
-                worker.abort_handle.abort();
-            }
-        }
-        let runtime = Arc::clone(self);
-        tokio::spawn(async move {
-            let cancellation_token = CancellationToken::new();
-            if let Err(err) = runtime.ensure_project_review_workspace(project_id).await {
-                let _ = projects::review::runs::record_project_review_startup_failure(
-                    &runtime.deps.store,
-                    project_id,
-                    err.to_string(),
-                )
-                .await;
-                return;
-            }
-            let result = runtime
-                .run_project_review_once(project_id, cancellation_token, Some(pr))
-                .await;
-            let decision = match result {
-                Ok(result) => projects::review::project_review_loop_decision_for_result(result),
-                Err(err) => {
-                    projects::review::project_review_loop_decision_for_error(err.to_string())
+                return Ok(ProjectReviewPoolEnqueueSummary {
+                    ignored: vec![request.pr],
+                    ..Default::default()
                 }
-            };
-            let next_review_at = (decision.delay.as_secs() > 0)
-                .then(|| Utc::now() + TimeDelta::seconds(decision.delay.as_secs() as i64));
-            let _ = runtime
-                .set_project_review_state(
-                    project_id,
-                    decision.status,
-                    ReviewStateUpdate {
-                        next_review_at,
-                        outcome: decision.outcome,
-                        summary_text: decision.summary,
-                        error: decision.error,
-                        ..Default::default()
-                    },
-                )
-                .await;
-            if let Err(err) = runtime.start_project_review_loop_if_ready(project_id).await {
-                tracing::warn!(project_id = %project_id, "failed to resume review loop after webhook trigger: {err}");
+                .into());
             }
-        });
+        }
+        let summary = {
+            let mut pool = project.review_pool.lock().await;
+            pool.enqueue_many([ProjectReviewSignalInput {
+                pr: request.pr,
+                head_sha: request.head_sha,
+                delivery_id: request.delivery_id.clone(),
+                reason: request.reason.clone(),
+            }])
+        };
+        if !summary.queued.is_empty() || !summary.deduped.is_empty() {
+            self.events
+                .publish(ServiceEventKind::ProjectReviewQueued {
+                    project_id,
+                    delivery_id: request.delivery_id.clone().unwrap_or_default(),
+                    pr: request.pr,
+                    reason: request.reason.clone(),
+                })
+                .await;
+            project.review_notify.notify_one();
+            if let Err(err) = self.start_project_review_loop_if_ready(project_id).await {
+                tracing::warn!(
+                    project_id = %project_id,
+                    "failed to start project review loop after queueing PR signal: {err}"
+                );
+            }
+        }
         tracing::info!(
             project_id = %project_id,
-            pr,
-            delivery_id = %delivery_id,
-            reason = %reason,
-            "queued targeted project review"
+            pr = request.pr,
+            delivery_id = request.delivery_id.as_deref().unwrap_or_default(),
+            reason = %request.reason,
+            queued = ?summary.queued,
+            deduped = ?summary.deduped,
+            ignored = ?summary.ignored,
+            "queued project review signal"
         );
-        Ok(())
+        Ok(summary.into())
     }
 
     pub async fn send_task_message(
@@ -3386,6 +3374,72 @@ impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
     }
 }
 
+impl projects::review::selector::ProjectReviewSelectorOps for Arc<AgentRuntime> {
+    async fn project_summary(&self, project_id: ProjectId) -> Result<ProjectSummary> {
+        let project = AgentRuntime::project(self.as_ref(), project_id).await?;
+        Ok(project.summary.read().await.clone())
+    }
+
+    async fn agent_summary(&self, agent_id: AgentId) -> Result<AgentSummary> {
+        let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
+        Ok(agent.summary.read().await.clone())
+    }
+
+    async fn selector_model(&self) -> Result<AgentModelPreference> {
+        Ok(self
+            .resolve_role_agent_model(AgentRole::Explorer)
+            .await?
+            .preference)
+    }
+
+    fn create_agent_with_container_source(
+        &self,
+        request: CreateAgentRequest,
+        source: agents::ContainerSource,
+        task_id: Option<TaskId>,
+        project_id: Option<ProjectId>,
+        role: Option<AgentRole>,
+    ) -> impl std::future::Future<Output = Result<AgentSummary>> + Send {
+        AgentRuntime::create_agent_with_container_source(
+            self, request, source, task_id, project_id, role,
+        )
+    }
+
+    fn start_agent_turn(
+        &self,
+        agent_id: AgentId,
+        message: String,
+        skill_mentions: Vec<String>,
+    ) -> impl std::future::Future<Output = Result<TurnId>> + Send {
+        agents::start_agent_turn(self.as_ref(), self, agent_id, message, skill_mentions)
+    }
+
+    fn wait_agent_until_complete_with_cancel(
+        &self,
+        agent_id: AgentId,
+        cancellation_token: &CancellationToken,
+    ) -> impl std::future::Future<Output = Result<AgentSummary>> + Send {
+        AgentRuntime::wait_agent_until_complete_with_cancel(
+            self.as_ref(),
+            agent_id,
+            cancellation_token,
+        )
+    }
+
+    async fn last_turn_response(&self, agent_id: AgentId) -> Result<Option<String>> {
+        let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
+        let sessions = agent.sessions.lock().await;
+        Ok(agents::last_turn_response(&sessions))
+    }
+
+    fn delete_agent(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::delete_agent(self.as_ref(), agent_id)
+    }
+}
+
 impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
     async fn set_project_review_state(
         &self,
@@ -3591,6 +3645,28 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
         project_id: ProjectId,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         AgentRuntime::ensure_project_review_workspace(self.as_ref(), project_id)
+    }
+
+    async fn project_git_provider(&self, project_id: ProjectId) -> Result<Option<GitProvider>> {
+        let project = AgentRuntime::project(self.as_ref(), project_id).await?;
+        let Some(account_id) = project.summary.read().await.git_account_id.clone() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.deps.git_accounts.summary(&account_id).await?.provider,
+        ))
+    }
+
+    fn run_project_review_selector(
+        &self,
+        project_id: ProjectId,
+        cancellation_token: CancellationToken,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        projects::review::selector::run_project_review_selector(
+            self,
+            project_id,
+            cancellation_token,
+        )
     }
 
     fn run_project_review_once(
@@ -4134,14 +4210,11 @@ impl projects::service::ProjectCreateOps for Arc<AgentRuntime> {
     }
 
     async fn insert_project(&self, project: ProjectSummary) {
-        self.state.projects.write().await.insert(
-            project.id,
-            Arc::new(ProjectRecord {
-                summary: RwLock::new(project),
-                sidecar: RwLock::new(None),
-                review_worker: Mutex::new(None),
-            }),
-        );
+        self.state
+            .projects
+            .write()
+            .await
+            .insert(project.id, Arc::new(ProjectRecord::new(project)));
     }
 
     async fn publish_project_event(&self, event: ServiceEventKind) {
@@ -4483,6 +4556,63 @@ impl turn::tools::ToolDispatchOps for Arc<AgentRuntime> {
         path: String,
     ) -> Result<ToolExecution> {
         AgentRuntime::execute_project_github_api_get(self.as_ref(), agent, &path).await
+    }
+
+    async fn queue_project_review_prs(
+        &self,
+        agent: &AgentRecord,
+        prs: Vec<turn::tools::QueueProjectReviewPr>,
+    ) -> Result<ToolExecution> {
+        let agent_summary = agent.summary.read().await.clone();
+        let project_id = agent_summary.project_id.ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "queue_project_review_prs is only available to project agents".to_string(),
+            )
+        })?;
+        if !matches!(
+            agent_summary.role,
+            Some(AgentRole::Explorer | AgentRole::Reviewer)
+        ) {
+            return Err(RuntimeError::InvalidInput(
+                "queue_project_review_prs is only available to project selector and reviewer agents"
+                    .to_string(),
+            ));
+        }
+
+        let mut queued = Vec::new();
+        let mut deduped = Vec::new();
+        let mut ignored = Vec::new();
+        for pr in prs {
+            let reason = pr
+                .reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("selector")
+                .to_string();
+            let summary = self
+                .enqueue_project_review(ProjectReviewQueueRequest {
+                    project_id,
+                    pr: pr.number,
+                    head_sha: pr.head_sha,
+                    delivery_id: None,
+                    reason,
+                })
+                .await?;
+            queued.extend(summary.queued);
+            deduped.extend(summary.deduped);
+            ignored.extend(summary.ignored);
+        }
+        Ok(ToolExecution::new(
+            true,
+            json!({
+                "queued": queued,
+                "deduped": deduped,
+                "ignored": ignored,
+            })
+            .to_string(),
+            false,
+        ))
     }
 
     async fn execute_project_git_tool(

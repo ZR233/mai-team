@@ -119,6 +119,13 @@ pub(crate) struct SpawnAgentToolResult {
     pub(crate) turn_id: Option<TurnId>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct QueueProjectReviewPr {
+    pub(crate) number: u64,
+    pub(crate) head_sha: Option<String>,
+    pub(crate) reason: Option<String>,
+}
+
 #[async_trait::async_trait]
 pub(crate) trait ToolDispatchOps: Send + Sync {
     async fn spawn_agent_from_tool(
@@ -190,6 +197,11 @@ pub(crate) trait ToolDispatchOps: Send + Sync {
         &self,
         agent: &AgentRecord,
         path: String,
+    ) -> Result<ToolExecution>;
+    async fn queue_project_review_prs(
+        &self,
+        agent: &AgentRecord,
+        prs: Vec<QueueProjectReviewPr>,
     ) -> Result<ToolExecution>;
     async fn execute_project_git_tool(
         &self,
@@ -297,6 +309,9 @@ pub(crate) async fn visible_tool_names(
         mai_tools::TOOL_GIT_WORKSPACE_INFO.to_string(),
         mai_tools::TOOL_GIT_SYNC_DEFAULT_BRANCH.to_string(),
     ]);
+    if project_review_queue_tool_visible(agent).await {
+        names.insert(mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS.to_string());
+    }
     if capability.can_spawn_agents {
         names.insert(mai_tools::TOOL_SPAWN_AGENT.to_string());
     }
@@ -675,6 +690,10 @@ pub(crate) async fn execute_tool(
                 .execute_project_github_api_get(agent, path)
                 .await
         }
+        RoutedTool::QueueProjectReviewPrs => {
+            let prs = queue_project_review_prs_from_arguments(&arguments)?;
+            context.ops.queue_project_review_prs(agent, prs).await
+        }
         RoutedTool::GitStatus
         | RoutedTool::GitDiff
         | RoutedTool::GitBranch
@@ -728,6 +747,15 @@ async fn agent_capability(state: &RuntimeState, agent: &AgentRecord) -> AgentCap
             communication: AgentCommunicationPolicy::ParentAndMaintainer,
         }
     }
+}
+
+async fn project_review_queue_tool_visible(agent: &AgentRecord) -> bool {
+    let summary = agent.summary.read().await;
+    summary.project_id.is_some()
+        && matches!(
+            summary.role,
+            Some(AgentRole::Explorer | AgentRole::Reviewer)
+        )
 }
 
 async fn agent_can_access_target(
@@ -1083,6 +1111,29 @@ fn optional_usize_argument(arguments: &Value, field: &str) -> Result<Option<usiz
     usize::try_from(raw)
         .map(Some)
         .map_err(|_| RuntimeError::InvalidInput(format!("field `{field}` is too large")))
+}
+
+fn queue_project_review_prs_from_arguments(arguments: &Value) -> Result<Vec<QueueProjectReviewPr>> {
+    let Some(items) = arguments.get("prs").and_then(Value::as_array) else {
+        return Err(RuntimeError::InvalidInput(
+            "missing array field `prs`".to_string(),
+        ));
+    };
+    items
+        .iter()
+        .map(|item| {
+            let number = item.get("number").and_then(Value::as_u64).ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "each `prs` item must include integer field `number`".to_string(),
+                )
+            })?;
+            Ok(QueueProjectReviewPr {
+                number,
+                head_sha: optional_string_argument(item, "head_sha"),
+                reason: optional_string_argument(item, "reason"),
+            })
+        })
+        .collect()
 }
 
 fn parse_agent_id(value: &str) -> Result<AgentId> {

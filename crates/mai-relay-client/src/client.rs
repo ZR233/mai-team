@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
@@ -12,7 +14,7 @@ use mai_protocol::{
     RelayGithubRepositoryGetRequest, RelayGithubRepositoryPackagesRequest, RelayRequest,
     RelayResponse, RelayStatusResponse, RepositoryPackagesResponse,
 };
-use mai_runtime::{AgentRuntime, RuntimeError};
+use mai_runtime::RuntimeError;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -23,17 +25,22 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::RelayClientConfig;
-use crate::event;
 use crate::protocol;
 
 const RELAY_RPC_TIMEOUT_SECS: u64 = 30;
 
 pub struct RelayClient {
     config: RelayClientConfig,
-    pub(crate) runtime: Arc<Mutex<Option<Arc<AgentRuntime>>>>,
     state: Arc<Mutex<RelayClientState>>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<RelayResponse>>>>,
+    event_handler: Arc<Mutex<Option<RelayEventHandler>>>,
 }
+
+type RelayEventHandler = Arc<
+    dyn Fn(RelayEvent) -> Pin<Box<dyn Future<Output = Result<RelayAckStatus, String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Default)]
 struct RelayClientState {
@@ -47,14 +54,22 @@ impl RelayClient {
     pub fn new(config: RelayClientConfig) -> Self {
         Self {
             config,
-            runtime: Arc::new(Mutex::new(None)),
             state: Arc::new(Mutex::new(RelayClientState::default())),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            event_handler: Arc::new(Mutex::new(None)),
         }
     }
 
-    pub async fn set_runtime(&self, runtime: Arc<AgentRuntime>) {
-        *self.runtime.lock().await = Some(runtime);
+    pub async fn set_event_handler<F, Fut>(&self, handler: F)
+    where
+        F: Fn(RelayEvent) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RelayAckStatus, String>> + Send + 'static,
+    {
+        let handler = Arc::new(move |event| {
+            Box::pin(handler(event))
+                as Pin<Box<dyn Future<Output = Result<RelayAckStatus, String>> + Send>>
+        });
+        *self.event_handler.lock().await = Some(handler);
     }
 
     pub fn start(self: Arc<Self>) {
@@ -334,16 +349,25 @@ impl RelayClient {
     }
 
     async fn handle_event(&self, event: RelayEvent) -> RelayAck {
-        match event::process_event(self, &event).await {
+        let delivery_id = event.delivery_id.clone();
+        let handler = self.event_handler.lock().await.clone();
+        let Some(handler) = handler else {
+            return RelayAck {
+                delivery_id,
+                status: RelayAckStatus::Ignored,
+                message: Some("relay event receiver is not running".to_string()),
+            };
+        };
+        match handler(event).await {
             Ok(status) => RelayAck {
-                delivery_id: event.delivery_id,
+                delivery_id,
                 status,
                 message: None,
             },
-            Err(err) => RelayAck {
-                delivery_id: event.delivery_id,
+            Err(message) => RelayAck {
+                delivery_id,
                 status: RelayAckStatus::Failed,
-                message: Some(err.to_string()),
+                message: Some(message),
             },
         }
     }

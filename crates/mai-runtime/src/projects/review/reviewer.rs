@@ -122,7 +122,7 @@ fn project_reviewer_initial_message_from_summary(
     let target = target_pr
         .map(|pr| format!("Target pull request: review PR #{pr} only. Do not select another pull request. Use `select-pr --target-pr {pr}` when invoking the helper."))
         .unwrap_or_else(|| {
-            "Target pull request: none. Select exactly one eligible pull request using the helper."
+            "Target pull request: none. Return a failed final JSON result because review invocations must be explicitly targeted."
                 .to_string()
         });
     format!(

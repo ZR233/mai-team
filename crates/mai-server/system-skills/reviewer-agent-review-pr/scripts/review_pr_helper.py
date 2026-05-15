@@ -42,6 +42,13 @@ def main() -> int:
     select.add_argument("--checks", help="optional checks/status JSON path")
     select.add_argument("--target-pr", type=int, help="only consider this PR number")
 
+    select_many = subparsers.add_parser("select-prs", help="select all eligible PRs")
+    select_many.add_argument("--prs", default="-", help="PR list JSON path, or - for stdin")
+    select_many.add_argument("--login", required=True, help="authenticated GitHub login")
+    select_many.add_argument("--details", help="optional PR details JSON path")
+    select_many.add_argument("--reviews", help="optional reviews JSON path")
+    select_many.add_argument("--checks", help="optional checks/status JSON path")
+
     prepare = subparsers.add_parser("prepare-review", help="check out the selected PR in this clone")
     prepare.add_argument("--repo", default="/workspace/repo")
     prepare.add_argument("--agent-id", required=True)
@@ -80,6 +87,16 @@ def main() -> int:
                 reviews=load_json_path(args.reviews) if args.reviews else None,
                 checks=load_json_path(args.checks) if args.checks else None,
                 target_pr=args.target_pr,
+            )
+        )
+    elif args.command == "select-prs":
+        write_json(
+            select_prs(
+                load_json_path(args.prs),
+                args.login,
+                details=load_json_path(args.details) if args.details else None,
+                reviews=load_json_path(args.reviews) if args.reviews else None,
+                checks=load_json_path(args.checks) if args.checks else None,
             )
         )
     elif args.command == "prepare-review":
@@ -138,6 +155,39 @@ def unwrap_mcp_json(value: Any) -> Any:
 
 
 def select_pr(
+    prs_json: Any,
+    login: str,
+    *,
+    details: Any = None,
+    reviews: Any = None,
+    checks: Any = None,
+    target_pr: int | None = None,
+) -> dict[str, Any]:
+    result = select_prs(
+        prs_json,
+        login,
+        details=details,
+        reviews=reviews,
+        checks=checks,
+        target_pr=target_pr,
+    )
+    selected = result["selected_prs"][0] if result["selected_prs"] else None
+    if selected is None:
+        return {
+            "outcome": "no_eligible_pr",
+            "selected_pr": None,
+            "target_pr": target_pr,
+            "skipped": result["skipped"],
+        }
+    return {
+        "outcome": "selected_pr",
+        "selected_pr": selected,
+        "target_pr": target_pr,
+        "skipped": result["skipped"],
+    }
+
+
+def select_prs(
     prs_json: Any,
     login: str,
     *,
@@ -219,11 +269,16 @@ def select_pr(
     if not eligible:
         return {
             "outcome": "no_eligible_pr",
-            "selected_pr": None,
+            "selected_prs": [],
             "target_pr": target_pr,
             "skipped": skipped,
         }
-    return {"outcome": "selected_pr", "selected_pr": eligible[0], "target_pr": target_pr, "skipped": skipped}
+    return {
+        "outcome": "selected_prs",
+        "selected_prs": eligible,
+        "target_pr": target_pr,
+        "skipped": skipped,
+    }
 
 
 def normalize_list(value: Any, list_keys: tuple[str, ...]) -> list[Any]:
@@ -736,6 +791,35 @@ class ReviewPrHelperTests(unittest.TestCase):
         )
         self.assertEqual(result["outcome"], "selected_pr")
         self.assertEqual(result["selected_pr"]["number"], 3)
+
+    def test_select_prs_returns_all_eligible_prs(self) -> None:
+        result = select_prs(
+            [
+                {
+                    "number": 5,
+                    "author": {"login": "alice"},
+                    "updated_at": "2026-01-05T00:00:00Z",
+                    "check_runs": [{"status": "completed", "conclusion": "success"}],
+                },
+                {
+                    "number": 2,
+                    "author": {"login": "bob"},
+                    "updated_at": "2026-01-02T00:00:00Z",
+                    "check_runs": [{"status": "completed", "conclusion": "success"}],
+                },
+                {
+                    "number": 7,
+                    "author": {"login": "me"},
+                    "updated_at": "2026-01-07T00:00:00Z",
+                    "check_runs": [{"status": "completed", "conclusion": "success"}],
+                },
+            ],
+            "me",
+        )
+
+        self.assertEqual(result["outcome"], "selected_prs")
+        self.assertEqual([item["number"] for item in result["selected_prs"]], [5, 2])
+        self.assertEqual(result["skipped"], [{"pr": 7, "reason": "self_authored"}])
 
     def test_select_pr_failed_ci_only_when_review_requested(self) -> None:
         result = select_pr(

@@ -32,7 +32,6 @@ python3 /tmp/review_pr_helper.py test
 The helper commands are:
 
 ```bash
-python3 scripts/review_pr_helper.py select-pr --prs prs.json --login "$LOGIN" --details details.json --reviews reviews.json --checks checks.json
 python3 scripts/review_pr_helper.py select-pr --prs prs.json --login "$LOGIN" --details details.json --reviews reviews.json --checks checks.json --target-pr "$PR"
 python3 scripts/review_pr_helper.py prepare-review --repo /workspace/repo --agent-id "$REVIEWER_AGENT_ID" --pr "$PR"
 python3 scripts/review_pr_helper.py changed-files --repo "$REVIEW_REPO" --files files.json
@@ -61,11 +60,12 @@ If GitHub MCP tools are unavailable, return only:
 {"outcome":"failed","pr":null,"summary":"Review could not be completed.","error":"GitHub MCP tools are unavailable."}
 ```
 
-### 2. Select One Eligible PR
+### 2. Confirm the Target PR
 
-List open PRs with a visible GitHub MCP pull request listing tool, sorted by `updated_at` descending. In the current GitHub MCP surface, this normally means:
+Mai's initial message must name a target pull request. Review only that PR. If no target pull request is present, return a failed JSON result instead of scanning for another PR.
 
-- `list_pull_requests(owner=..., repo=..., state="open", sort="updated", direction="desc")`
+Fetch the target PR with visible GitHub MCP read tools. In the current GitHub MCP surface, this normally means:
+
 - `pull_request_read(..., method="get")`
 - `pull_request_read(..., method="get_reviews")`
 - `pull_request_read(..., method="get_check_runs")`
@@ -74,17 +74,15 @@ Use the helper on the raw JSON files from those calls. The helper already unders
 
 - `requested_reviewers` as a list of login strings such as `["ZR233"]`
 - MCP text wrappers such as `content`, `contents`, or top-level `text`
-- GraphQL-style `nodes` / `edges`
 - re-review detection from review `commit_id` versus current PR head SHA when PR details do not expose a latest commit timestamp
 
-Save the MCP JSON outputs to files and run `select-pr`. If Mai's initial message names a target pull request, pass `--target-pr <number>` and review only that PR; if that target is ineligible, finish with `no_eligible_pr` instead of selecting another PR. The helper applies these fixed rules:
+Save the MCP JSON outputs to files and run `select-pr --target-pr <number>`; if that target is ineligible, finish with `no_eligible_pr`. The helper applies these fixed rules:
 
 - Skip self-authored PRs.
 - Skip draft PRs.
 - Accept PRs with completed passing CI.
 - If CI is pending or failed, accept only when the authenticated user is requested for review.
 - Re-review only if the latest commit is newer than this user's latest submitted review, or the current head SHA differs from the latest submitted review `commit_id`.
-- Prefer explicitly requested reviews, then most recently updated PR.
 
 Practical note: many PRs expose `mergeable_state: "unknown"` even when `get_check_runs` is available. Do not infer passing CI from `mergeable_state == "unknown"`; rely on actual check runs when possible and let the helper apply the fallback rules.
 
@@ -96,9 +94,9 @@ If `select-pr` returns `no_eligible_pr`, finish with:
 
 ### 3. Prepare the Reviewer Clone
 
-Run `prepare-review` for the selected PR. Work only inside `/workspace/repo`, which is this reviewer agent's isolated clone. Treat the returned `repo` value as `REVIEW_REPO`; in Mai it should be `/workspace/repo`.
+Run `prepare-review` for the target PR. Work only inside `/workspace/repo`, which is this reviewer agent's isolated clone. Treat the returned `repo` value as `REVIEW_REPO`; in Mai it should be `/workspace/repo`.
 
-Before submitting the review, confirm the PR head SHA still matches the checked-out clone SHA. If it changed, restart from PR selection.
+Before submitting the review, confirm the PR head SHA still matches the checked-out clone SHA. If it changed, finish with `no_eligible_pr`; the scheduler will queue a fresh signal.
 
 ### 4. Inspect and Validate
 
@@ -113,7 +111,7 @@ Run the commands in `rust-plan.json` when present. For Rust PRs, always run `car
 
 `rust-plan` is intentionally conservative. If it still falls back to broad workspace commands for a large repository, prefer the repository's established CI entry point for the changed area and record any broad-command failures separately from PR-local validation. For example, StarryOS syscall test changes in `tgoskits` should be validated with the StarryOS QEMU test command used by that repository, not only with workspace-wide `cargo test`.
 
-When the repository is large and the GitHub MCP list response is sparse, prefer fetching details only for the PRs that are plausible candidates after `list_pull_requests` ordering and explicit review-request checks. The helper is designed to select from a small set of recent open PRs; you do not need to exhaustively fetch every open PR in a busy repository.
+When the repository is large and GitHub MCP responses are sparse, fetch only the target PR details needed for validation and review context.
 
 Record exact validation failures. Treat these as blocking:
 

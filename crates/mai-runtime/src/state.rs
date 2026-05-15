@@ -9,8 +9,10 @@ use mai_protocol::{
     PlanHistoryEntry, ProjectId, ProjectSummary, SessionId, TaskId, TaskPlan, TaskReview,
     TaskSummary, TurnId,
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
+
+use crate::projects::review::pool::ProjectReviewPool;
 
 pub(crate) struct RuntimeState {
     pub(crate) agents: RwLock<HashMap<AgentId, Arc<AgentRecord>>>,
@@ -40,6 +42,20 @@ pub(crate) struct ProjectRecord {
     pub(crate) summary: RwLock<ProjectSummary>,
     pub(crate) sidecar: RwLock<Option<ContainerHandle>>,
     pub(crate) review_worker: Mutex<Option<ProjectReviewWorker>>,
+    pub(crate) review_pool: Mutex<ProjectReviewPool>,
+    pub(crate) review_notify: Arc<Notify>,
+}
+
+impl ProjectRecord {
+    pub(crate) fn new(summary: ProjectSummary) -> Self {
+        Self {
+            summary: RwLock::new(summary),
+            sidecar: RwLock::new(None),
+            review_worker: Mutex::new(None),
+            review_pool: Mutex::new(ProjectReviewPool::default()),
+            review_notify: Arc::new(Notify::new()),
+        }
+    }
 }
 
 pub(crate) struct ProjectReviewWorker {

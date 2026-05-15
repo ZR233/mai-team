@@ -91,7 +91,11 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     )
     .await?;
     if let Some(relay) = &relay {
-        relay.set_runtime(Arc::clone(&runtime)).await;
+        crate::services::relay_events::install_relay_event_handler(
+            Arc::clone(relay),
+            Arc::clone(&runtime),
+        )
+        .await;
         Arc::clone(relay).start();
     }
     let cleaned = runtime.cleanup_orphaned_containers().await?;

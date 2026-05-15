@@ -21,6 +21,7 @@ pub const TOOL_UPDATE_TODO_LIST: &str = "update_todo_list";
 pub const TOOL_REQUEST_USER_INPUT: &str = "request_user_input";
 pub const TOOL_SAVE_ARTIFACT: &str = "save_artifact";
 pub const TOOL_GITHUB_API_GET: &str = "github_api_get";
+pub const TOOL_QUEUE_PROJECT_REVIEW_PRS: &str = "queue_project_review_prs";
 pub const TOOL_GIT_STATUS: &str = "git_status";
 pub const TOOL_GIT_DIFF: &str = "git_diff";
 pub const TOOL_GIT_BRANCH: &str = "git_branch";

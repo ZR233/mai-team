@@ -1,4 +1,5 @@
 use super::*;
+use chrono::TimeDelta;
 use mai_protocol::{
     GitProvider, ModelConfig, ModelReasoningConfig, ModelReasoningVariant, ProviderConfig,
     ProviderKind, ProvidersConfigRequest,
@@ -2684,7 +2685,9 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
 
     let requests = requests.lock().await.clone();
     assert_eq!(requests.len(), 3);
-    let expected_tool_count = build_tool_definitions_with_filter(&[], |_| true).len();
+    let visible_tools = turn::tools::visible_tool_names(&runtime.state, &agent, &[]).await;
+    let expected_tool_count =
+        build_tool_definitions_with_filter(&[], |name| visible_tools.contains(name)).len();
     assert_eq!(
         requests[0]["tools"].as_array().expect("first tools").len(),
         expected_tool_count
@@ -4878,6 +4881,7 @@ async fn project_worker_cannot_spawn_agents_and_hidden_from_tools() {
     let visible = turn::tools::visible_tool_names(&runtime.state, &worker_record, &[]).await;
     assert!(!visible.contains(mai_tools::TOOL_SPAWN_AGENT));
     assert!(!visible.contains(mai_tools::TOOL_CLOSE_AGENT));
+    assert!(!visible.contains(mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS));
 
     let result = runtime
         .execute_tool_for_test(
@@ -4892,6 +4896,75 @@ async fn project_worker_cannot_spawn_agents_and_hidden_from_tools() {
     assert!(
         matches!(result, Err(RuntimeError::InvalidInput(message)) if message.contains("spawn_agent"))
     );
+}
+
+#[tokio::test]
+async fn project_selector_can_queue_review_prs() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            provider: GitProvider::Github,
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let selector_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    maintainer.role = Some(AgentRole::Planner);
+    let mut selector = test_agent_summary_with_parent(
+        selector_id,
+        Some(maintainer_id),
+        Some("selector-container"),
+    );
+    selector.project_id = Some(project_id);
+    selector.role = Some(AgentRole::Explorer);
+    save_agent_with_session(&store, &maintainer).await;
+    save_agent_with_session(&store, &selector).await;
+    let project = test_project_summary(project_id, maintainer_id, "account-1");
+    store.save_project(&project).await.expect("save project");
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let project_record = runtime.project(project_id).await.expect("project");
+    {
+        let mut summary = project_record.summary.write().await;
+        summary.status = ProjectStatus::Ready;
+        summary.clone_status = ProjectCloneStatus::Ready;
+        summary.auto_review_enabled = true;
+        summary.review_status = ProjectReviewStatus::Idle;
+    }
+    let selector_record = runtime.agent(selector_id).await.expect("selector");
+
+    let visible = turn::tools::visible_tool_names(&runtime.state, &selector_record, &[]).await;
+    assert!(visible.contains(mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS));
+
+    let result = runtime
+        .execute_tool_for_test(
+            selector_id,
+            "queue_project_review_prs",
+            json!({
+                "prs": [
+                    { "number": 9, "head_sha": "abc", "reason": "test" },
+                    { "number": 9, "head_sha": "def", "reason": "test-duplicate" },
+                    { "number": 4, "reason": "test" }
+                ]
+            }),
+        )
+        .await
+        .expect("queue prs");
+
+    assert!(result.success);
+    let output: Value = serde_json::from_str(&result.output).expect("json output");
+    assert_eq!(output["queued"], json!([9, 4]));
+    assert_eq!(output["deduped"], json!([9]));
+    assert_eq!(output["ignored"], json!([]));
+    runtime.stop_project_review_loop(project_id).await;
 }
 
 #[tokio::test]

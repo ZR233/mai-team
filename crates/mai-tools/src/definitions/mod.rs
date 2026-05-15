@@ -7,6 +7,7 @@ mod files;
 mod git;
 mod github;
 mod mcp;
+mod review;
 mod workflow;
 
 pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
@@ -18,5 +19,6 @@ pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     tools.extend(mcp::definitions());
     tools.extend(workflow::definitions());
     tools.extend(github::definitions());
+    tools.extend(review::definitions());
     tools
 }
