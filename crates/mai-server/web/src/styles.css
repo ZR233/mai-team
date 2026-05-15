@@ -4017,11 +4017,13 @@ p {
 
 .context-status-line {
   flex-shrink: 0;
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
+  overflow: hidden;
   min-height: 36px;
+  max-width: 100%;
   padding: 6px 18px;
   border-top: 1px solid #d8e0ea;
   color: #526176;
@@ -4039,10 +4041,12 @@ p {
 }
 
 .status-line-left {
+  overflow: hidden;
   gap: 10px;
 }
 
 .status-line-state {
+  flex: 0 0 auto;
   gap: 7px;
   color: #203047;
 }
@@ -4058,6 +4062,9 @@ p {
 }
 
 .status-line-activity {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
   overflow: hidden;
   color: #718096;
   text-overflow: ellipsis;
@@ -4065,9 +4072,10 @@ p {
 }
 
 .status-line-items {
+  max-width: 100%;
   justify-content: flex-end;
   gap: 6px;
-  overflow-x: auto;
+  overflow: hidden;
 }
 
 .status-line-item {
@@ -5278,7 +5286,7 @@ select:focus {
 
   .context-status-line {
     align-items: stretch;
-    flex-direction: column;
+    grid-template-columns: minmax(0, 1fr);
     gap: 7px;
     padding: 7px 12px;
   }
@@ -5286,7 +5294,7 @@ select:focus {
   .status-line-items {
     flex-wrap: wrap;
     justify-content: flex-start;
-    overflow-x: visible;
+    overflow: visible;
   }
 
   .status-line-item {

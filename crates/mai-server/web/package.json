@@ -9,6 +9,7 @@
   "scripts": {
     "build": "vite build",
     "dev": "vite --host 0.0.0.0",
+    "test:layout": "node src/utils/__tests__/contextStatusLineLayout.test.js",
     "test:timeline": "node src/utils/__tests__/timeline.test.js",
     "test:tree": "node src/utils/__tests__/tree.test.js"
   },
