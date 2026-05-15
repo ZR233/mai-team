@@ -175,7 +175,6 @@ fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessag
     for item in input.iter() {
         match item {
             ModelInputItem::Message { role, content } => {
-                assistant_replay.flush(&mut messages);
                 let text = content
                     .iter()
                     .map(|item| match item {
@@ -184,6 +183,11 @@ fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessag
                     })
                     .collect::<Vec<_>>()
                     .join("");
+                if role == "assistant" {
+                    assistant_replay.push_text(text);
+                    continue;
+                }
+                assistant_replay.flush(&mut messages);
                 messages.push(ChatMessage {
                     role: role.clone(),
                     content: Some(text),
@@ -228,6 +232,7 @@ fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessag
 #[derive(Default)]
 struct AssistantReplayBuilder {
     reasoning_content: Option<String>,
+    content: Option<String>,
     tool_calls: Vec<ChatToolCall>,
 }
 
@@ -246,13 +251,24 @@ impl AssistantReplayBuilder {
         self.tool_calls.push(tool_call);
     }
 
+    fn push_text(&mut self, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        match &mut self.content {
+            Some(existing) => existing.push_str(&text),
+            None => self.content = Some(text),
+        }
+    }
+
     fn flush(&mut self, messages: &mut Vec<ChatMessage>) {
-        if self.reasoning_content.is_none() && self.tool_calls.is_empty() {
+        if self.reasoning_content.is_none() && self.content.is_none() && self.tool_calls.is_empty()
+        {
             return;
         }
         messages.push(ChatMessage {
             role: "assistant".to_string(),
-            content: Some(String::new()),
+            content: Some(self.content.take().unwrap_or_default()),
             reasoning_content: self.reasoning_content.take(),
             tool_calls: std::mem::take(&mut self.tool_calls),
             tool_call_id: None,
@@ -479,6 +495,47 @@ mod tests {
         assert_eq!(messages[2].tool_calls[1].id, "call_2");
         assert_eq!(messages[3].role, "tool");
         assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn chat_messages_keep_reasoning_with_tool_calls_after_assistant_text_item() {
+        let messages = chat_messages(
+            "instructions",
+            &[
+                ModelInputItem::user_text("hello"),
+                ModelInputItem::Reasoning {
+                    content: "need repository facts".to_string(),
+                },
+                ModelInputItem::Message {
+                    role: "assistant".to_string(),
+                    content: vec![ModelContentItem::OutputText {
+                        text: "I will inspect the repo.".to_string(),
+                    }],
+                },
+                ModelInputItem::FunctionCall {
+                    call_id: "call_1".to_string(),
+                    name: "container_exec".to_string(),
+                    arguments: "{\"command\":\"find . -maxdepth 2 -type f\"}".to_string(),
+                },
+                ModelInputItem::FunctionCallOutput {
+                    call_id: "call_1".to_string(),
+                    output: "Cargo.toml".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(
+            messages[2].content.as_deref(),
+            Some("I will inspect the repo.")
+        );
+        assert_eq!(
+            messages[2].reasoning_content.as_deref(),
+            Some("need repository facts")
+        );
+        assert_eq!(messages[2].tool_calls.len(), 1);
+        assert_eq!(messages[3].role, "tool");
     }
 
     #[test]

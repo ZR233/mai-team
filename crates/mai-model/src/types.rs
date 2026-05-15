@@ -213,6 +213,12 @@ impl ModelStreamAccumulator {
             let tool_call = self.tool_calls.remove(&index);
             match tool_call {
                 Some(tool_call) => {
+                    if let Some(content) = reasoning_content {
+                        self.outputs.push(ModelOutputItem::Reasoning { content });
+                    }
+                    if let Some(text) = content {
+                        self.outputs.push(ModelOutputItem::Message { text });
+                    }
                     let raw_arguments = tool_call.raw_arguments;
                     let arguments = parse_arguments(&raw_arguments);
                     self.outputs.push(ModelOutputItem::FunctionCall {
@@ -247,4 +253,54 @@ impl ModelStreamAccumulator {
 
 pub fn parse_arguments(raw_arguments: &str) -> Value {
     serde_json::from_str(raw_arguments).unwrap_or_else(|_| json!({ "raw": raw_arguments }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accumulator_preserves_reasoning_before_pending_tool_call() {
+        let mut accumulator = ModelStreamAccumulator::default();
+        accumulator.push(&ModelStreamEvent::ResponseStarted {
+            id: Some("resp_1".to_string()),
+        });
+        accumulator.push(&ModelStreamEvent::ReasoningDelta {
+            output_index: 0,
+            content_index: None,
+            delta: "need repository facts".to_string(),
+        });
+        accumulator.push(&ModelStreamEvent::ToolCallStarted {
+            output_index: 0,
+            call_id: Some("call_1".to_string()),
+            name: Some("container_exec".to_string()),
+        });
+        accumulator.push(&ModelStreamEvent::ToolCallArgumentsDelta {
+            output_index: 0,
+            delta: "{\"command\":\"pwd\"}".to_string(),
+        });
+        accumulator.push(&ModelStreamEvent::Completed {
+            id: Some("resp_1".to_string()),
+            usage: None,
+            end_turn: Some(true),
+        });
+
+        let response = accumulator.finish().expect("finish");
+        assert_eq!(response.output.len(), 2);
+        assert!(matches!(
+            &response.output[0],
+            ModelOutputItem::Reasoning { content } if content == "need repository facts"
+        ));
+        assert!(matches!(
+            &response.output[1],
+            ModelOutputItem::FunctionCall {
+                call_id,
+                name,
+                raw_arguments,
+                ..
+            } if call_id == "call_1"
+                && name == "container_exec"
+                && raw_arguments == "{\"command\":\"pwd\"}"
+        ));
+    }
 }
