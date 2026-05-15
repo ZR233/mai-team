@@ -5,7 +5,7 @@ use mai_mcp::McpTool;
 use mai_protocol::{ModelInputItem, SkillActivationInfo, SkillScope, SkillsListResponse};
 use mai_skills::{SkillInjections, render_available_response};
 
-pub(crate) const CONTAINER_SKILLS_ROOT: &str = "/workspace/.mai-team/skills";
+pub(crate) const CONTAINER_SKILLS_ROOT: &str = "/tmp/.mai-team/skills";
 
 const BASE_INSTRUCTIONS: &str = r#"You are Mai, a coding agent running inside a Docker-backed multi-agent service.
 
@@ -210,7 +210,7 @@ mod tests {
     #[test]
     fn skill_user_fragment_uses_container_skill_path_when_synced() {
         let path = PathBuf::from("/tmp/system/demo/SKILL.md");
-        let container_path = PathBuf::from("/workspace/.mai-team/skills/system/demo/SKILL.md");
+        let container_path = PathBuf::from("/tmp/.mai-team/skills/system/demo/SKILL.md");
         let mut paths = HashMap::new();
         paths.insert(path.clone(), container_path.clone());
         let fragment = skill_user_fragment(
@@ -244,5 +244,26 @@ mod tests {
                         if text.contains(container_path.to_string_lossy().as_ref())
                             && !text.contains(path.to_string_lossy().as_ref()))
         ));
+    }
+
+    #[test]
+    fn container_skill_dir_uses_temp_root_outside_workspace() {
+        let skill = SkillMetadata {
+            name: "demo".to_string(),
+            description: "Demo skill".to_string(),
+            short_description: None,
+            path: PathBuf::from("/tmp/system/demo/SKILL.md"),
+            source_path: None,
+            scope: SkillScope::System,
+            enabled: true,
+            interface: None,
+            dependencies: None,
+            policy: None,
+        };
+
+        assert_eq!(
+            container_skill_dir(&skill),
+            PathBuf::from("/tmp/.mai-team/skills/system/demo")
+        );
     }
 }

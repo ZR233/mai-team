@@ -778,7 +778,7 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 	    elif [ "$2" = "${{container}}:/workspace/repo/skills" ]; then
 	      rm -rf "$3"
 	      cp -R "$WORKSPACE/skills" "$3"
-    elif printf '%s' "$3" | grep -q ':/workspace/.mai-team/skills'; then
+    elif printf '%s' "$3" | grep -q ':/tmp/.mai-team/skills'; then
       :
     elif printf '%s' "$3" | grep -q '^created-container:'; then
       dest="${{3#created-container:}}"
@@ -5000,7 +5000,7 @@ async fn project_subagent_turn_syncs_project_skill_to_container() {
     let docker_log = fake_docker_log(&dir);
     assert!(
         docker_log.contains("cp")
-            && docker_log.contains("/workspace/.mai-team/skills/project/fresh-child-skill")
+            && docker_log.contains("/tmp/.mai-team/skills/project/fresh-child-skill")
     );
 }
 
@@ -6709,10 +6709,9 @@ async fn project_reviewer_instructions_include_extra_prompt_project_skill() {
     assert!(request_text.contains("用中文评论, review-single-pr"));
     assert!(request_text.contains("$review-single-pr"));
     assert!(request_text.contains("Review exactly one pull request with Chinese comments."));
-    assert!(request_text.contains("/workspace/.mai-team/skills/project/review-single-pr/SKILL.md"));
+    assert!(request_text.contains("/tmp/.mai-team/skills/project/review-single-pr/SKILL.md"));
     assert!(
-        request_text
-            .contains("/workspace/.mai-team/skills/system/reviewer-agent-review-pr/SKILL.md")
+        request_text.contains("/tmp/.mai-team/skills/system/reviewer-agent-review-pr/SKILL.md")
     );
     assert!(!request_text.contains("/workspace/repo/.claude/skills/review-single-pr/SKILL.md"));
     assert!(request_text.contains("<name>reviewer-agent-review-pr</name>"));
@@ -6720,11 +6719,11 @@ async fn project_reviewer_instructions_include_extra_prompt_project_skill() {
     let docker_log = fake_docker_log(&dir);
     assert!(
         docker_log.contains("cp")
-            && docker_log.contains("/workspace/.mai-team/skills/system/reviewer-agent-review-pr")
+            && docker_log.contains("/tmp/.mai-team/skills/system/reviewer-agent-review-pr")
     );
     assert!(
         docker_log.contains("cp")
-            && docker_log.contains("/workspace/.mai-team/skills/project/review-single-pr")
+            && docker_log.contains("/tmp/.mai-team/skills/project/review-single-pr")
     );
 }
 
