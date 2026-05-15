@@ -2,7 +2,7 @@ use crate::error::{RelayErrorKind, RelayResult};
 use mai_protocol::{RelayUpdateReleaseInfo, RelayUpdateStatusResponse};
 use reqwest::Url;
 use reqwest::header::{ACCEPT, USER_AGENT};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::cmp::Ordering;
 
 use super::{
@@ -12,11 +12,11 @@ use super::{
 #[derive(Debug, Deserialize)]
 pub(super) struct GithubRelease {
     pub(super) tag_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "empty_string_from_null")]
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "empty_string_from_null")]
     body: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "empty_string_from_null")]
     published_at: String,
     html_url: String,
     #[serde(default)]
@@ -35,6 +35,13 @@ struct GithubReleaseAsset {
 pub(super) struct SelectedReleaseAssets {
     pub(super) archive_url: String,
     pub(super) checksum_url: String,
+}
+
+fn empty_string_from_null<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 pub(super) async fn fetch_latest_release(http: &reqwest::Client) -> RelayResult<GithubRelease> {
@@ -230,6 +237,21 @@ mod tests {
                 .unwrap_or_default()
                 .contains(RELAY_ASSET_NAME)
         );
+    }
+
+    #[test]
+    fn github_release_deserialization_accepts_null_body() {
+        let release: GithubRelease = serde_json::from_value(serde_json::json!({
+            "tag_name": "v0.2.0",
+            "name": "v0.2.0",
+            "body": null,
+            "published_at": "2026-05-15T00:00:00Z",
+            "html_url": "https://github.com/ZR233/mai-team/releases/tag/v0.2.0",
+            "assets": []
+        }))
+        .expect("deserialize release");
+
+        assert_eq!(release.body, "");
     }
 
     #[test]
