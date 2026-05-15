@@ -174,7 +174,8 @@ SERVICE
 )"
 
 if [[ "$DRY_RUN" != "true" ]]; then
-  printf '%s\n' "$service_content" > "$SERVICE_FILE"
+  printf '%s\n' "$service_content" > "$tmpdir/mai-relay.service"
+  install -m 0644 "$tmpdir/mai-relay.service" "$SERVICE_FILE"
   chown -R mai-relay:mai-relay "$DATA_DIR"
   systemctl daemon-reload
   systemctl enable --now mai-relay
@@ -182,6 +183,7 @@ if [[ "$DRY_RUN" != "true" ]]; then
 else
   echo "DRY RUN: write $SERVICE_FILE:"
   printf '%s\n' "$service_content"
+  echo "DRY RUN: systemctl daemon-reload"
   echo "DRY RUN: systemctl enable --now mai-relay"
   echo "DRY RUN: systemctl restart mai-relay"
 fi

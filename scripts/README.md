@@ -2,7 +2,7 @@
 
 `install-mai-relay-ubuntu-24.04.sh` 用于在 Ubuntu 24.04 x86_64 主机上安装 `mai-relay`，并注册为 systemd 服务。
 
-`update-mai-relay-ubuntu-24.04.sh` 用于更新已安装的 `mai-relay`。它和安装脚本使用同一组参数，默认保留已有 token、public URL、bind addr 和 sqlite 路径，只替换二进制并重启服务。
+`update-mai-relay-ubuntu-24.04.sh` 用于更新已安装的 `mai-relay`。它和安装脚本使用同一组参数，默认保留已有 token、public URL、bind addr 和 sqlite 路径，替换二进制、刷新 systemd service 文件并重启服务。
 
 ## 一键安装
 
@@ -83,7 +83,7 @@ journalctl -u mai-relay -n 100 --no-pager
 
 ## 更新
 
-推荐优先在 `mai-server` Settings > GitHub App 的 Relay Update 面板中检查并更新 relay。命令行一键更新脚本仍可用于首次迁移旧安装或手动恢复；默认会保留 `/etc/mai-relay/mai-relay.env` 里已有的 token 和 public URL。
+推荐优先在 `mai-server` Settings > GitHub App 的 Relay Update 面板中检查并更新 relay。命令行一键更新脚本仍可用于首次迁移旧安装、应用 systemd service 文件改动或手动恢复；默认会保留 `/etc/mai-relay/mai-relay.env` 里已有的 token 和 public URL。
 
 需要强制轮换 token 时：
 
