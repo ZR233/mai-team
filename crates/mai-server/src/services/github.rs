@@ -93,6 +93,55 @@ impl GithubService {
         self.relay.status().await
     }
 
+    pub(crate) async fn relay_update_status(
+        &self,
+    ) -> Result<RelayUpdateStatusResponse, RuntimeError> {
+        let relay = self.relay_client_for_update().await?;
+        relay
+            .check_relay_update(RelayUpdateCheckRequest { force: false })
+            .await
+    }
+
+    pub(crate) async fn check_relay_update(
+        &self,
+        request: RelayUpdateCheckRequest,
+    ) -> Result<RelayUpdateStatusResponse, RuntimeError> {
+        let relay = self.relay_client_for_update().await?;
+        relay.check_relay_update(request).await
+    }
+
+    pub(crate) async fn apply_relay_update(
+        &self,
+    ) -> Result<RelayUpdateActionResponse, RuntimeError> {
+        let relay = self.relay_client_for_update().await?;
+        let mut response = relay.apply_relay_update().await?;
+        match relay.restart_relay().await {
+            Ok(restart_response) => {
+                response.restart_scheduled = true;
+                response.status.restart_scheduled = true;
+                response.message = format!("{}; {}", response.message, restart_response.message);
+                Ok(response)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) async fn rollback_relay_update(
+        &self,
+    ) -> Result<RelayUpdateActionResponse, RuntimeError> {
+        let relay = self.relay_client_for_update().await?;
+        let mut response = relay.rollback_relay_update().await?;
+        match relay.restart_relay().await {
+            Ok(restart_response) => {
+                response.restart_scheduled = true;
+                response.status.restart_scheduled = true;
+                response.message = format!("{}; {}", response.message, restart_response.message);
+                Ok(response)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) async fn relay_settings(&self) -> Result<RelaySettingsResponse, RuntimeError> {
         Ok(self.relay.settings().await?)
     }
@@ -102,5 +151,14 @@ impl GithubService {
         request: RelaySettingsRequest,
     ) -> Result<RelaySettingsResponse, RuntimeError> {
         Ok(self.relay.save_settings(request).await?)
+    }
+
+    async fn relay_client_for_update(
+        &self,
+    ) -> Result<Arc<mai_relay_client::RelayClient>, RuntimeError> {
+        self.relay
+            .client()
+            .await
+            .ok_or_else(|| RuntimeError::InvalidInput("relay is not connected".to_string()))
     }
 }

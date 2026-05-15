@@ -12,7 +12,9 @@ use mai_protocol::{
     RelayClientHello, RelayEnvelope, RelayEvent, RelayGithubInstallationTokenRequest,
     RelayGithubInstallationTokenResponse, RelayGithubRepositoriesRequest,
     RelayGithubRepositoryGetRequest, RelayGithubRepositoryPackagesRequest, RelayRequest,
-    RelayResponse, RelayStatusResponse, RepositoryPackagesResponse,
+    RelayResponse, RelayStatusResponse, RelayUpdateActionResponse, RelayUpdateApplyRequest,
+    RelayUpdateCheckRequest, RelayUpdateRestartRequest, RelayUpdateRollbackRequest,
+    RelayUpdateStatusResponse, RepositoryPackagesResponse,
 };
 use mai_runtime::RuntimeError;
 use serde::{Serialize, de::DeserializeOwned};
@@ -184,6 +186,28 @@ impl RelayClient {
         request: mai_protocol::RelaySettingsRequest,
     ) -> Result<mai_protocol::RelaySettingsResponse, RuntimeError> {
         self.request("relay.config.save", request).await
+    }
+
+    pub async fn check_relay_update(
+        &self,
+        request: RelayUpdateCheckRequest,
+    ) -> Result<RelayUpdateStatusResponse, RuntimeError> {
+        self.request("relay.update.check", request).await
+    }
+
+    pub async fn apply_relay_update(&self) -> Result<RelayUpdateActionResponse, RuntimeError> {
+        self.request("relay.update.apply", RelayUpdateApplyRequest {})
+            .await
+    }
+
+    pub async fn rollback_relay_update(&self) -> Result<RelayUpdateActionResponse, RuntimeError> {
+        self.request("relay.update.rollback", RelayUpdateRollbackRequest {})
+            .await
+    }
+
+    pub async fn restart_relay(&self) -> Result<RelayUpdateActionResponse, RuntimeError> {
+        self.request("relay.update.restart", RelayUpdateRestartRequest {})
+            .await
     }
 
     pub async fn start_github_app_installation(

@@ -11,6 +11,8 @@ pub(crate) enum RelayErrorKind {
     Json(#[from] serde_json::Error),
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("jwt error: {0}")]
     Jwt(#[from] jsonwebtoken::errors::Error),
     #[error("invalid input: {0}")]
@@ -21,7 +23,11 @@ impl IntoResponse for RelayErrorKind {
     fn into_response(self) -> Response {
         let status = match self {
             RelayErrorKind::InvalidInput(_) => StatusCode::BAD_REQUEST,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
+            RelayErrorKind::Db(_)
+            | RelayErrorKind::Json(_)
+            | RelayErrorKind::Http(_)
+            | RelayErrorKind::Io(_)
+            | RelayErrorKind::Jwt(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }
@@ -35,6 +41,7 @@ pub(crate) fn error_code(error: &RelayErrorKind) -> &'static str {
         RelayErrorKind::Db(_) => "database",
         RelayErrorKind::Json(_) => "json",
         RelayErrorKind::Http(_) => "http",
+        RelayErrorKind::Io(_) => "io",
         RelayErrorKind::Jwt(_) => "jwt",
     }
 }
