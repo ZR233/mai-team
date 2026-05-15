@@ -9,6 +9,8 @@ struct GithubAppConfig {
     #[serde(default)]
     base_url: Option<String>,
     #[serde(default)]
+    public_url: Option<String>,
+    #[serde(default)]
     app_slug: Option<String>,
     #[serde(default)]
     app_html_url: Option<String>,
@@ -28,6 +30,7 @@ impl ConfigStore {
                 .clone()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_GITHUB_API_BASE_URL.to_string()),
+            public_url: config.public_url.clone(),
             has_private_key: config
                 .private_key
                 .as_deref()
@@ -71,6 +74,10 @@ impl ConfigStore {
         }
         if let Some(base_url) = request.base_url {
             current.base_url = Some(base_url.trim().trim_end_matches('/').to_string())
+                .filter(|value| !value.is_empty());
+        }
+        if let Some(public_url) = request.public_url {
+            current.public_url = Some(public_url.trim().trim_end_matches('/').to_string())
                 .filter(|value| !value.is_empty());
         }
         if let Some(app_slug) = request.app_slug {

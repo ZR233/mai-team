@@ -21,6 +21,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Duration, sleep};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -34,6 +35,7 @@ pub struct RelayClient {
     state: Arc<Mutex<RelayClientState>>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<RelayResponse>>>>,
     event_handler: Arc<Mutex<Option<RelayEventHandler>>>,
+    cancellation: CancellationToken,
 }
 
 type RelayEventHandler = Arc<
@@ -57,6 +59,7 @@ impl RelayClient {
             state: Arc::new(Mutex::new(RelayClientState::default())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             event_handler: Arc::new(Mutex::new(None)),
+            cancellation: CancellationToken::new(),
         }
     }
 
@@ -76,6 +79,10 @@ impl RelayClient {
         tokio::spawn(async move {
             self.run().await;
         });
+    }
+
+    pub fn stop(&self) {
+        self.cancellation.cancel();
     }
 
     pub async fn status(&self) -> RelayStatusResponse {
@@ -102,11 +109,18 @@ impl RelayClient {
         })?;
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id.clone(), tx);
-        let sender = {
+        let sender = match {
             let state = self.state.lock().await;
             state.sender.clone()
-        }
-        .ok_or_else(|| RuntimeError::InvalidInput("relay is not connected".to_string()))?;
+        } {
+            Some(sender) => sender,
+            None => {
+                self.pending.lock().await.remove(&id);
+                return Err(RuntimeError::InvalidInput(
+                    "relay is not connected".to_string(),
+                ));
+            }
+        };
         if sender
             .send(RelayEnvelope::Request(RelayRequest {
                 id: id.clone(),
@@ -120,10 +134,18 @@ impl RelayClient {
                 "relay is not connected".to_string(),
             ));
         }
-        let response = tokio::time::timeout(Duration::from_secs(RELAY_RPC_TIMEOUT_SECS), rx)
+        let response = match tokio::time::timeout(Duration::from_secs(RELAY_RPC_TIMEOUT_SECS), rx)
             .await
-            .map_err(|_| RuntimeError::InvalidInput("relay request timed out".to_string()))?
-            .map_err(|_| RuntimeError::InvalidInput("relay connection closed".to_string()))?;
+        {
+            Ok(response) => response
+                .map_err(|_| RuntimeError::InvalidInput("relay connection closed".to_string()))?,
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                return Err(RuntimeError::InvalidInput(
+                    "relay request timed out".to_string(),
+                ));
+            }
+        };
         if let Some(error) = response.error {
             return Err(RuntimeError::InvalidInput(format!(
                 "relay {} failed: {}",
@@ -144,6 +166,24 @@ impl RelayClient {
 
     pub async fn github_app_settings(&self) -> Result<GithubAppSettingsResponse, RuntimeError> {
         self.request("github.app.get", json!({})).await
+    }
+
+    pub async fn save_github_app_settings(
+        &self,
+        request: mai_protocol::GithubAppSettingsRequest,
+    ) -> Result<GithubAppSettingsResponse, RuntimeError> {
+        self.request("github.app.save", request).await
+    }
+
+    pub async fn relay_config(&self) -> Result<mai_protocol::RelaySettingsResponse, RuntimeError> {
+        self.request("relay.config.get", json!({})).await
+    }
+
+    pub async fn save_relay_config(
+        &self,
+        request: mai_protocol::RelaySettingsRequest,
+    ) -> Result<mai_protocol::RelaySettingsResponse, RuntimeError> {
+        self.request("relay.config.save", request).await
     }
 
     pub async fn start_github_app_installation(
@@ -220,7 +260,11 @@ impl RelayClient {
     async fn run(&self) {
         let mut delay = Duration::from_secs(1);
         loop {
-            match self.connect_once().await {
+            let result = tokio::select! {
+                _ = self.cancellation.cancelled() => break,
+                result = self.connect_once() => result,
+            };
+            match result {
                 Ok(()) => {
                     delay = Duration::from_secs(1);
                 }
@@ -229,9 +273,14 @@ impl RelayClient {
                     self.mark_disconnected(Some(err.to_string())).await;
                 }
             }
-            sleep(delay).await;
+            tokio::select! {
+                _ = self.cancellation.cancelled() => break,
+                _ = sleep(delay) => {}
+            }
             delay = (delay * 2).min(Duration::from_secs(60));
         }
+        self.mark_disconnected(Some("relay connection stopped".to_string()))
+            .await;
     }
 
     async fn connect_once(&self) -> Result<(), RuntimeError> {
@@ -277,7 +326,13 @@ impl RelayClient {
             }
         });
 
-        while let Some(message) = reader.next().await {
+        loop {
+            let Some(message) = (tokio::select! {
+                _ = self.cancellation.cancelled() => break,
+                message = reader.next() => message,
+            }) else {
+                break;
+            };
             let message = message
                 .map_err(|err| RuntimeError::InvalidInput(format!("relay read failed: {err}")))?;
             let text = match message {

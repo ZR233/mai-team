@@ -57,15 +57,9 @@ fn run_remote_relay() -> Result<()> {
             .arg(format!("mkdir -p {}", sh_quote(remote_dir))),
     )
     .context("creating remote relay directory")?;
-    let remote_private_key_path = maybe_upload_private_key(&remote, remote_dir)?;
     run_remote_cleanup(&remote, &cleanup_command).context("stopping previous remote relay")?;
-    upload_remote_env(
-        &remote,
-        &remote_env_file,
-        &remote_db_path,
-        remote_private_key_path.as_deref(),
-    )
-    .context("uploading remote relay environment")?;
+    upload_remote_env(&remote, &remote_env_file, &remote_db_path)
+        .context("uploading remote relay environment")?;
     upload_remote_binary(&remote, &relay_bin, &remote_bin)
         .context("copying relay binary to remote host")?;
 
@@ -82,7 +76,7 @@ fn workspace_root() -> Result<PathBuf> {
 }
 
 fn build_relay(workspace_root: &Path) -> Result<PathBuf> {
-    let plan = RelayBuildPlan::new(workspace_root);
+    let plan = RelayBuildPlan::remote_test(workspace_root, relay_compile_env()?);
     run_status(&mut plan.command()).context("building mai-relay")?;
 
     Ok(plan.binary_path)
@@ -91,6 +85,8 @@ fn build_relay(workspace_root: &Path) -> Result<PathBuf> {
 struct RelayBuildPlan {
     workspace_root: PathBuf,
     binary_path: PathBuf,
+    features: Vec<String>,
+    env: Vec<(String, String)>,
 }
 
 impl RelayBuildPlan {
@@ -98,6 +94,16 @@ impl RelayBuildPlan {
         Self {
             workspace_root: workspace_root.to_path_buf(),
             binary_path: workspace_root.join("target/release/mai-relay"),
+            features: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+
+    fn remote_test(workspace_root: &Path, env: Vec<(String, String)>) -> Self {
+        Self {
+            features: vec!["compiled-github-app-config".to_string()],
+            env,
+            ..Self::new(workspace_root)
         }
     }
 
@@ -111,8 +117,49 @@ impl RelayBuildPlan {
             .arg("mai-relay")
             .arg("--release")
             .current_dir(&self.workspace_root);
+        if !self.features.is_empty() {
+            command.arg("--features").arg(self.features.join(","));
+        }
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
         command
     }
+}
+
+fn relay_compile_env() -> Result<Vec<(String, String)>> {
+    let mut values = Vec::new();
+    let app_id = required_env("MAI_RELAY_GITHUB_APP_ID")?;
+    values.push(("MAI_RELAY_GITHUB_APP_ID".to_string(), app_id));
+    values.push((
+        "MAI_RELAY_GITHUB_APP_PRIVATE_KEY".to_string(),
+        relay_private_key_for_compile()?,
+    ));
+    for name in [
+        "MAI_RELAY_GITHUB_APP_SLUG",
+        "MAI_RELAY_GITHUB_APP_HTML_URL",
+        "MAI_RELAY_GITHUB_APP_OWNER_LOGIN",
+        "MAI_RELAY_GITHUB_APP_OWNER_TYPE",
+    ] {
+        if let Ok(value) = env::var(name)
+            && !is_placeholder_env(name, &value)
+            && !value.trim().is_empty()
+        {
+            values.push((name.to_string(), value));
+        }
+    }
+    Ok(values)
+}
+
+fn relay_private_key_for_compile() -> Result<String> {
+    if let Ok(value) = env::var("MAI_RELAY_GITHUB_APP_PRIVATE_KEY")
+        && !value.trim().is_empty()
+    {
+        return Ok(value);
+    }
+    let path = required_env("MAI_RELAY_GITHUB_APP_PRIVATE_KEY_PATH")?;
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("reading MAI_RELAY_GITHUB_APP_PRIVATE_KEY_PATH {path}"))
 }
 
 fn required_env(name: &str) -> Result<String> {
@@ -136,48 +183,13 @@ fn parent_str(path: &str) -> Result<&str> {
         .ok_or_else(|| anyhow!("remote path has no parent: {path}"))
 }
 
-fn maybe_upload_private_key(remote: &str, remote_dir: &str) -> Result<Option<String>> {
-    let Some(path) = env::var_os("MAI_RELAY_GITHUB_APP_PRIVATE_KEY_PATH") else {
-        return Ok(None);
-    };
-    let local_path = PathBuf::from(path);
-    if !local_path.exists() {
-        return Ok(None);
-    }
-    let remote_path = format!("{remote_dir}/github-app.private-key.pem");
-    run_status(
-        Command::new("scp")
-            .arg(&local_path)
-            .arg(format!("{remote}:{remote_path}")),
-    )
-    .context("copying GitHub App private key to remote host")?;
-    run_status(
-        Command::new("ssh")
-            .arg(remote)
-            .arg(format!("chmod 600 {}", sh_quote(&remote_path))),
-    )
-    .context("marking remote GitHub App private key private")?;
-    Ok(Some(remote_path))
-}
-
-fn upload_remote_env(
-    remote: &str,
-    remote_env_file: &str,
-    remote_db_path: &str,
-    remote_private_key_path: Option<&str>,
-) -> Result<()> {
+fn upload_remote_env(remote: &str, remote_env_file: &str, remote_db_path: &str) -> Result<()> {
     let mut env_file = String::new();
     for name in [
         "MAI_RELAY_TOKEN",
         "MAI_RELAY_PUBLIC_URL",
         "MAI_RELAY_BIND_ADDR",
         "MAI_RELAY_DB_PATH",
-        "MAI_RELAY_GITHUB_APP_ID",
-        "MAI_RELAY_GITHUB_APP_PRIVATE_KEY",
-        "MAI_RELAY_GITHUB_APP_SLUG",
-        "MAI_RELAY_GITHUB_APP_HTML_URL",
-        "MAI_RELAY_GITHUB_APP_OWNER_LOGIN",
-        "MAI_RELAY_GITHUB_APP_OWNER_TYPE",
         "GITHUB_API_BASE_URL",
         "GITHUB_WEB_BASE_URL",
     ] {
@@ -190,17 +202,6 @@ fn upload_remote_env(
             env_file.push_str(&sh_quote(&value));
             env_file.push('\n');
         }
-    }
-    if let Some(path) = remote_private_key_path {
-        env_file.push_str("MAI_RELAY_GITHUB_APP_PRIVATE_KEY_PATH=");
-        env_file.push_str(&sh_quote(path));
-        env_file.push('\n');
-    } else if let Ok(value) = env::var("MAI_RELAY_GITHUB_APP_PRIVATE_KEY_PATH")
-        && !is_placeholder_env("MAI_RELAY_GITHUB_APP_PRIVATE_KEY_PATH", &value)
-    {
-        env_file.push_str("MAI_RELAY_GITHUB_APP_PRIVATE_KEY_PATH=");
-        env_file.push_str(&sh_quote(&value));
-        env_file.push('\n');
     }
     if env::var_os("MAI_RELAY_BIND_ADDR").is_none() {
         env_file.push_str("MAI_RELAY_BIND_ADDR='0.0.0.0:8090'\n");
@@ -364,7 +365,10 @@ mod tests {
     #[test]
     fn relay_build_plan_uses_release_profile() {
         let workspace_root = PathBuf::from("/workspace");
-        let plan = RelayBuildPlan::new(&workspace_root);
+        let plan = RelayBuildPlan::remote_test(
+            &workspace_root,
+            vec![("MAI_RELAY_GITHUB_APP_ID".to_string(), "123".to_string())],
+        );
         let command = plan.command();
         let args = command
             .get_args()
@@ -380,7 +384,17 @@ mod tests {
                 "--bin".to_string(),
                 "mai-relay".to_string(),
                 "--release".to_string(),
+                "--features".to_string(),
+                "compiled-github-app-config".to_string(),
             ]
+        );
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "MAI_RELAY_GITHUB_APP_ID")
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned()),
+            Some("123".to_string())
         );
         assert_eq!(
             plan.binary_path,

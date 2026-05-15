@@ -1,24 +1,22 @@
 use std::sync::Arc;
 
 use mai_protocol::*;
-use mai_relay_client::RelayClient;
 use mai_runtime::{AgentRuntime, RuntimeError};
+
+use crate::services::relay_manager::{RelayManager, list_relay_repository_packages};
 
 pub(crate) struct GithubService {
     runtime: Arc<AgentRuntime>,
-    relay: Option<Arc<RelayClient>>,
+    relay: Arc<RelayManager>,
 }
 
 impl GithubService {
-    pub(crate) fn new(runtime: Arc<AgentRuntime>, relay: Option<Arc<RelayClient>>) -> Self {
+    pub(crate) fn new(runtime: Arc<AgentRuntime>, relay: Arc<RelayManager>) -> Self {
         Self { runtime, relay }
     }
 
     pub(crate) async fn app_settings(&self) -> Result<GithubAppSettingsResponse, RuntimeError> {
-        match &self.relay {
-            Some(relay) => relay.github_app_settings().await,
-            None => self.runtime.github_app_settings().await,
-        }
+        self.runtime.github_app_settings().await
     }
 
     pub(crate) async fn save_app_settings(
@@ -32,10 +30,7 @@ impl GithubService {
         &self,
         request: GithubAppManifestStartRequest,
     ) -> Result<GithubAppManifestStartResponse, RuntimeError> {
-        match &self.relay {
-            Some(relay) => relay.start_github_app_manifest(request).await,
-            None => self.runtime.start_github_app_manifest(request).await,
-        }
+        self.runtime.start_github_app_manifest(request).await
     }
 
     pub(crate) async fn complete_manifest(
@@ -50,7 +45,7 @@ impl GithubService {
         &self,
         request: GithubAppInstallationStartRequest,
     ) -> Result<GithubAppInstallationStartResponse, RuntimeError> {
-        let relay = self.relay.as_ref().ok_or_else(|| {
+        let relay = self.relay.client().await.ok_or_else(|| {
             RuntimeError::InvalidInput("GitHub App installation requires relay mode".into())
         })?;
         relay.start_github_app_installation(request).await
@@ -59,29 +54,20 @@ impl GithubService {
     pub(crate) async fn list_installations(
         &self,
     ) -> Result<GithubInstallationsResponse, RuntimeError> {
-        match &self.relay {
-            Some(relay) => relay.list_github_installations().await,
-            None => self.runtime.list_github_installations().await,
-        }
+        self.runtime.list_github_installations().await
     }
 
     pub(crate) async fn refresh_installations(
         &self,
     ) -> Result<GithubInstallationsResponse, RuntimeError> {
-        match &self.relay {
-            Some(relay) => relay.list_github_installations().await,
-            None => self.runtime.refresh_github_installations().await,
-        }
+        self.runtime.refresh_github_installations().await
     }
 
     pub(crate) async fn list_repositories(
         &self,
         installation_id: u64,
     ) -> Result<GithubRepositoriesResponse, RuntimeError> {
-        match &self.relay {
-            Some(relay) => relay.list_github_repositories(installation_id).await,
-            None => self.runtime.list_github_repositories(installation_id).await,
-        }
+        self.runtime.list_github_repositories(installation_id).await
     }
 
     pub(crate) async fn list_repository_packages(
@@ -90,35 +76,31 @@ impl GithubService {
         owner: &str,
         repo: &str,
     ) -> Result<RepositoryPackagesResponse, RuntimeError> {
-        match &self.relay {
-            Some(relay) => {
-                let request = GithubAppInstallationPackagesRequest {
-                    installation_id,
-                    owner: owner.to_string(),
-                    repo: repo.to_string(),
-                };
-                relay.list_github_repository_packages(request).await
-            }
-            None => {
-                self.runtime
-                    .list_github_installation_repository_packages(installation_id, owner, repo)
-                    .await
-            }
+        if let Some(relay) = self.relay.client().await {
+            list_relay_repository_packages(relay, installation_id, owner, repo).await
+        } else if self.relay.settings().await?.enabled {
+            Err(RuntimeError::InvalidInput(
+                "relay is enabled but not connected".to_string(),
+            ))
+        } else {
+            self.runtime
+                .list_github_installation_repository_packages(installation_id, owner, repo)
+                .await
         }
     }
 
     pub(crate) async fn relay_status(&self) -> RelayStatusResponse {
-        match &self.relay {
-            Some(relay) => relay.status().await,
-            None => RelayStatusResponse {
-                enabled: false,
-                connected: false,
-                relay_url: None,
-                node_id: None,
-                last_heartbeat_at: None,
-                queued_deliveries: None,
-                message: Some("relay disabled".to_string()),
-            },
-        }
+        self.relay.status().await
+    }
+
+    pub(crate) async fn relay_settings(&self) -> Result<RelaySettingsResponse, RuntimeError> {
+        Ok(self.relay.settings().await?)
+    }
+
+    pub(crate) async fn save_relay_settings(
+        &self,
+        request: RelaySettingsRequest,
+    ) -> Result<RelaySettingsResponse, RuntimeError> {
+        Ok(self.relay.save_settings(request).await?)
     }
 }

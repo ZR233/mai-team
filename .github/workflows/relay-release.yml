@@ -1,0 +1,36 @@
+name: Build Relay Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  relay-linux-x86-64:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build relay
+        run: cargo build --locked -p mai-relay --bin mai-relay --release
+
+      - name: Package relay
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/mai-relay dist/mai-relay
+          tar -C dist -czf mai-relay-x86_64-unknown-linux-gnu.tar.gz mai-relay
+          sha256sum mai-relay-x86_64-unknown-linux-gnu.tar.gz > mai-relay-x86_64-unknown-linux-gnu.tar.gz.sha256
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            mai-relay-x86_64-unknown-linux-gnu.tar.gz
+            mai-relay-x86_64-unknown-linux-gnu.tar.gz.sha256

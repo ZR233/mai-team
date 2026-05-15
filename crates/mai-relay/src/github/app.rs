@@ -2,7 +2,7 @@ use crate::error::{RelayErrorKind, RelayResult};
 use crate::state::AppState;
 use crate::store::RelayStore;
 use anyhow::{Context, Result};
-use mai_protocol::GithubAppSettingsResponse;
+use mai_protocol::{GithubAppSettingsRequest, GithubAppSettingsResponse};
 use serde_json::{Value, json};
 use std::env;
 use tracing::{info, warn};
@@ -14,14 +14,81 @@ use super::types::{
 };
 
 pub(crate) fn github_app_settings(state: &AppState) -> RelayResult<GithubAppSettingsResponse> {
-    let config = state
-        .store
-        .github_app_config()?
-        .ok_or_else(|| RelayErrorKind::InvalidInput("GitHub App is not configured".to_string()))?;
+    let Some(config) = state.store.github_app_config()? else {
+        return Ok(GithubAppSettingsResponse {
+            app_id: None,
+            base_url: state.github_api_base_url.clone(),
+            public_url: Some(state.public_url.clone()),
+            has_private_key: false,
+            app_slug: None,
+            app_html_url: None,
+            owner_login: None,
+            owner_type: None,
+            install_url: None,
+        });
+    };
     Ok(github_app_settings_response(
         &config,
         &state.github_api_base_url,
         &state.github_web_base_url,
+        &relay_public_url(state)?,
+        None,
+    ))
+}
+
+pub(crate) async fn save_github_app_settings(
+    state: &AppState,
+    request: GithubAppSettingsRequest,
+) -> RelayResult<GithubAppSettingsResponse> {
+    if compiled_github_app_config()?.is_some() {
+        return Err(RelayErrorKind::InvalidInput(
+            "compiled GitHub App config is read-only".to_string(),
+        ));
+    }
+    let app_id = required_setting(request.app_id, "GitHub App ID")?;
+    let private_key = required_setting(request.private_key, "GitHub App private key")?;
+    let public_url = required_setting(request.public_url, "relay public URL")?;
+    let mut config = GithubAppConfig {
+        app_id,
+        private_key,
+        webhook_secret: state
+            .store
+            .github_app_config()?
+            .map(|config| config.webhook_secret.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        app_slug: request
+            .app_slug
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        app_html_url: request
+            .app_html_url
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        owner_login: request
+            .owner_login
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        owner_type: request
+            .owner_type
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    };
+    hydrate_github_app_metadata(&state.http, &state.github_api_base_url, &mut config).await?;
+    update_github_app_hook_config(
+        &state.http,
+        &state.github_api_base_url,
+        &public_url,
+        &config,
+    )
+    .await?;
+    state.store.save_relay_config(&public_url)?;
+    state.store.save_github_app_config(&config)?;
+    Ok(github_app_settings_response(
+        &config,
+        &state.github_api_base_url,
+        &state.github_web_base_url,
+        &public_url,
         None,
     ))
 }
@@ -268,11 +335,70 @@ pub(crate) fn github_app_config_from_env() -> Result<Option<GithubAppConfig>> {
     }))
 }
 
+#[cfg(feature = "compiled-github-app-config")]
+pub(crate) fn compiled_github_app_config() -> RelayResult<Option<GithubAppConfig>> {
+    let app_id = option_env!("MAI_RELAY_GITHUB_APP_ID")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            RelayErrorKind::InvalidInput(
+                "MAI_RELAY_GITHUB_APP_ID must be set at compile time".to_string(),
+            )
+        })?;
+    let private_key = option_env!("MAI_RELAY_GITHUB_APP_PRIVATE_KEY")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            RelayErrorKind::InvalidInput(
+                "MAI_RELAY_GITHUB_APP_PRIVATE_KEY must be set at compile time".to_string(),
+            )
+        })?;
+    Ok(Some(GithubAppConfig {
+        app_id: app_id.to_string(),
+        private_key: private_key.to_string(),
+        webhook_secret: String::new(),
+        app_slug: compiled_optional_env("MAI_RELAY_GITHUB_APP_SLUG"),
+        app_html_url: compiled_optional_env("MAI_RELAY_GITHUB_APP_HTML_URL"),
+        owner_login: compiled_optional_env("MAI_RELAY_GITHUB_APP_OWNER_LOGIN"),
+        owner_type: compiled_optional_env("MAI_RELAY_GITHUB_APP_OWNER_TYPE"),
+    }))
+}
+
+#[cfg(not(feature = "compiled-github-app-config"))]
+pub(crate) fn compiled_github_app_config() -> RelayResult<Option<GithubAppConfig>> {
+    Ok(None)
+}
+
+#[cfg(feature = "compiled-github-app-config")]
+fn compiled_optional_env(name: &str) -> Option<String> {
+    match name {
+        "MAI_RELAY_GITHUB_APP_SLUG" => option_env!("MAI_RELAY_GITHUB_APP_SLUG"),
+        "MAI_RELAY_GITHUB_APP_HTML_URL" => option_env!("MAI_RELAY_GITHUB_APP_HTML_URL"),
+        "MAI_RELAY_GITHUB_APP_OWNER_LOGIN" => option_env!("MAI_RELAY_GITHUB_APP_OWNER_LOGIN"),
+        "MAI_RELAY_GITHUB_APP_OWNER_TYPE" => option_env!("MAI_RELAY_GITHUB_APP_OWNER_TYPE"),
+        _ => None,
+    }
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(str::to_string)
+}
+
 fn optional_env(name: &str) -> Option<String> {
     env::var(name)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn required_setting(value: Option<String>, label: &str) -> RelayResult<String> {
+    value
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RelayErrorKind::InvalidInput(format!("{label} is required")))
+}
+
+fn relay_public_url(state: &AppState) -> RelayResult<String> {
+    Ok(state.store.relay_config(&state.public_url)?.url)
 }
 
 pub(crate) fn is_placeholder_github_app_slug(value: &str) -> bool {
@@ -282,11 +408,13 @@ pub(crate) fn github_app_settings_response(
     config: &GithubAppConfig,
     api_base_url: &str,
     web_base_url: &str,
-    state: Option<&str>,
+    public_url: &str,
+    install_state: Option<&str>,
 ) -> GithubAppSettingsResponse {
     GithubAppSettingsResponse {
         app_id: Some(config.app_id.clone()),
         base_url: api_base_url.to_string(),
+        public_url: Some(public_url.to_string()),
         has_private_key: !config.private_key.trim().is_empty(),
         app_slug: config.app_slug.clone(),
         app_html_url: config.app_html_url.clone(),
@@ -295,7 +423,7 @@ pub(crate) fn github_app_settings_response(
         install_url: config
             .app_slug
             .as_deref()
-            .map(|slug| github_app_install_url(web_base_url, slug, state)),
+            .map(|slug| github_app_install_url(web_base_url, slug, install_state)),
     }
 }
 
@@ -390,9 +518,14 @@ mod tests {
             &config,
             "https://api.github.com",
             "https://github.com",
+            "https://relay.example",
             Some("state-1"),
         );
         assert_eq!(settings.app_id.as_deref(), Some("123"));
+        assert_eq!(
+            settings.public_url.as_deref(),
+            Some("https://relay.example")
+        );
         assert!(settings.has_private_key);
         assert_eq!(
             settings.install_url.as_deref(),

@@ -5,7 +5,7 @@ use crate::state::AppState;
 use mai_protocol::{
     GithubAppInstallationStartRequest, GithubAppManifestStartRequest, RelayAck, RelayError,
     RelayGithubInstallationTokenRequest, RelayGithubRepositoriesRequest,
-    RelayGithubRepositoryPackagesRequest, RelayRequest, RelayResponse,
+    RelayGithubRepositoryPackagesRequest, RelayRequest, RelayResponse, RelaySettingsRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -24,6 +24,27 @@ pub(crate) async fn handle_client_request(
             }
         }
         "github.app.get" => github::app::github_app_settings(state).and_then(to_value),
+        "github.app.save" => {
+            match parse_params::<mai_protocol::GithubAppSettingsRequest>(request.params).await {
+                Ok(request) => github::app::save_github_app_settings(state, request)
+                    .await
+                    .and_then(to_value),
+                Err(err) => Err(err),
+            }
+        }
+        "relay.config.get" => state
+            .store
+            .relay_config(&state.public_url)
+            .and_then(to_value),
+        "relay.config.save" => match parse_params::<RelaySettingsRequest>(request.params).await {
+            Ok(request) => match request.url {
+                Some(url) => state.store.save_relay_config(&url).and_then(to_value),
+                None => Err(RelayErrorKind::InvalidInput(
+                    "relay public URL is required".to_string(),
+                )),
+            },
+            Err(err) => Err(err),
+        },
         "github.app_installation.start" => {
             match parse_params::<GithubAppInstallationStartRequest>(request.params).await {
                 Ok(request) => github::flow::start_app_installation(state, request)

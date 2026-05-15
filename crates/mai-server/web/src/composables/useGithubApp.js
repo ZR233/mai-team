@@ -3,6 +3,7 @@ import { useApi } from './useApi'
 
 const githubAppState = reactive({
   relay: null,
+  relaySettings: null,
   app: null,
   installations: [],
   loading: false,
@@ -19,6 +20,11 @@ export function useGithubApp() {
     return githubAppState.relay
   }
 
+  async function loadRelaySettings() {
+    githubAppState.relaySettings = await api('/settings/relay')
+    return githubAppState.relaySettings
+  }
+
   async function loadGithubAppSettings() {
     githubAppState.app = await api('/settings/github-app')
     return githubAppState.app
@@ -28,10 +34,40 @@ export function useGithubApp() {
     githubAppState.loading = true
     githubAppState.error = ''
     try {
-      const [relay, app] = await Promise.allSettled([loadRelayStatus(), loadGithubAppSettings()])
+      const [relay, relaySettings, app] = await Promise.allSettled([loadRelayStatus(), loadRelaySettings(), loadGithubAppSettings()])
       if (relay.status === 'rejected') githubAppState.relay = { enabled: false, connected: false, message: relay.reason?.message || 'Relay unavailable' }
+      if (relaySettings.status === 'rejected') githubAppState.relaySettings = { enabled: false, url: '', has_token: false, node_id: 'mai-server' }
       if (app.status === 'rejected') githubAppState.app = null
       return { relay: githubAppState.relay, app: githubAppState.app }
+    } finally {
+      githubAppState.loading = false
+    }
+  }
+
+  async function saveRelaySettings(request) {
+    githubAppState.loading = true
+    githubAppState.error = ''
+    try {
+      githubAppState.relaySettings = await api('/settings/relay', {
+        method: 'PUT',
+        body: JSON.stringify(request)
+      })
+      await loadRelayStatus()
+      return githubAppState.relaySettings
+    } finally {
+      githubAppState.loading = false
+    }
+  }
+
+  async function saveGithubAppSettings(request) {
+    githubAppState.loading = true
+    githubAppState.error = ''
+    try {
+      githubAppState.app = await api('/settings/github-app', {
+        method: 'PUT',
+        body: JSON.stringify(request)
+      })
+      return githubAppState.app
     } finally {
       githubAppState.loading = false
     }
@@ -80,8 +116,11 @@ export function useGithubApp() {
   return {
     githubAppState,
     loadRelayStatus,
+    loadRelaySettings,
     loadGithubAppSettings,
     loadGithubAppContext,
+    saveRelaySettings,
+    saveGithubAppSettings,
     startGithubAppInstallation,
     loadInstallations,
     loadInstallationRepositories,

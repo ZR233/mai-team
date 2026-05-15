@@ -260,6 +260,87 @@ async fn github_app_relay_account_has_installation_metadata_without_token() {
 }
 
 #[tokio::test]
+async fn relay_settings_persist_without_exposing_token() {
+    let (_dir, store) = store().await;
+
+    let saved = store
+        .save_relay_settings(RelaySettingsRequest {
+            enabled: true,
+            url: Some(" https://relay.example/ ".to_string()),
+            token: Some(" relay-token ".to_string()),
+            node_id: Some(" node-a ".to_string()),
+        })
+        .await
+        .expect("save relay settings");
+
+    assert!(saved.enabled);
+    assert_eq!(saved.url, "https://relay.example");
+    assert!(saved.has_token);
+    assert_eq!(saved.node_id, "node-a");
+
+    let loaded = store.relay_settings().await.expect("load relay settings");
+    assert_eq!(loaded, saved);
+
+    let kept = store
+        .save_relay_settings(RelaySettingsRequest {
+            enabled: true,
+            url: Some("https://relay-two.example".to_string()),
+            token: None,
+            node_id: Some("node-b".to_string()),
+        })
+        .await
+        .expect("save relay settings keeping token");
+    assert!(kept.has_token);
+    assert_eq!(kept.url, "https://relay-two.example");
+    assert_eq!(kept.node_id, "node-b");
+
+    let cleared = store
+        .save_relay_settings(RelaySettingsRequest {
+            enabled: false,
+            url: None,
+            token: Some("   ".to_string()),
+            node_id: None,
+        })
+        .await
+        .expect("clear relay token");
+    assert!(!cleared.enabled);
+    assert!(!cleared.has_token);
+    assert_eq!(cleared.url, "http://127.0.0.1:8090");
+    assert_eq!(cleared.node_id, "mai-server");
+}
+
+#[tokio::test]
+async fn github_app_settings_persist_public_url() {
+    let (_dir, store) = store().await;
+
+    let saved = store
+        .save_github_app_settings(GithubAppSettingsRequest {
+            app_id: Some("123".to_string()),
+            private_key: Some("pem".to_string()),
+            base_url: Some("https://api.github.com/".to_string()),
+            public_url: Some(" https://relay.example/ ".to_string()),
+            app_slug: Some("mai".to_string()),
+            app_html_url: None,
+            owner_login: None,
+            owner_type: None,
+        })
+        .await
+        .expect("save github app");
+
+    assert_eq!(saved.public_url.as_deref(), Some("https://relay.example"));
+    assert!(saved.has_private_key);
+
+    let secret = store
+        .github_app_secret()
+        .await
+        .expect("secret")
+        .expect("configured");
+    assert_eq!(secret.0, "123");
+    assert_eq!(secret.1, "pem");
+    assert_eq!(secret.2, "https://api.github.com");
+}
+
+#[tokio::test]
 async fn git_account_delete_wins_over_late_verification_update() {
     let (_dir, store) = store().await;
     store

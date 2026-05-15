@@ -133,6 +133,8 @@
         @set-default-git-account="onSetDefaultGitAccount"
         @refresh-github-app="onRefreshGithubAppSettings"
         @install-github-app="onInstallGithubAppFromSettings"
+        @save-relay-settings="onSaveRelaySettings"
+        @save-github-app-settings="onSaveGithubAppSettings"
       />
     </main>
 
@@ -301,6 +303,8 @@ const {
 const {
   githubAppState,
   loadGithubAppContext,
+  saveRelaySettings,
+  saveGithubAppSettings,
   startGithubAppInstallation,
   loadInstallations,
   loadInstallationRepositories,
@@ -743,6 +747,28 @@ async function onInstallGithubAppFromSettings() {
 
 async function onRefreshGithubAppSettings() {
   await refreshGithubAppSettingsState(true)
+}
+
+async function onSaveRelaySettings(request) {
+  githubAppState.error = ''
+  try {
+    await saveRelaySettings(request)
+    await refreshGithubAppSettingsState(true)
+    showToast('Relay settings saved.')
+  } catch (error) {
+    githubAppState.error = error.message
+  }
+}
+
+async function onSaveGithubAppSettings(request) {
+  githubAppState.error = ''
+  try {
+    await saveGithubAppSettings(request)
+    await refreshGithubAppSettingsState(true)
+    showToast('GitHub App settings saved.')
+  } catch (error) {
+    githubAppState.error = error.message
+  }
 }
 
 async function refreshGithubAppSettingsState(refresh = false) {

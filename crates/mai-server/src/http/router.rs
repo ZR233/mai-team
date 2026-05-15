@@ -66,6 +66,11 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
                 .put(handlers::github_app::save_github_app_settings),
         )
         .route(
+            "/settings/relay",
+            get(handlers::github_app::get_relay_settings)
+                .put(handlers::github_app::save_relay_settings),
+        )
+        .route(
             "/github/app-manifest/start",
             post(handlers::github_app::start_github_app_manifest),
         )

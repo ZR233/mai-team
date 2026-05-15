@@ -7,9 +7,10 @@ pub(crate) use mai_protocol::{
     ModelReasoningConfig, ModelReasoningVariant, ModelRequestPolicy, ModelWireApi,
     PlanHistoryEntry, ProjectId, ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary,
     ProviderConfig, ProviderKind, ProviderPreset, ProviderPresetsResponse, ProviderSecret,
-    ProviderSummary, ProvidersConfigRequest, ProvidersResponse, ServiceEvent, ServiceEventKind,
-    SessionId, SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskSummary, TokenUsage,
-    ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceSummary, TurnId, default_true,
+    ProviderSummary, ProvidersConfigRequest, ProvidersResponse, RelaySettingsRequest,
+    RelaySettingsResponse, ServiceEvent, ServiceEventKind, SessionId, SkillsConfigRequest, TaskId,
+    TaskPlan, TaskReview, TaskSummary, TokenUsage, ToolOutputArtifactInfo, ToolTraceDetail,
+    ToolTraceSummary, TurnId, default_true,
 };
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use std::collections::{BTreeMap, BTreeSet};
@@ -31,6 +32,7 @@ mod logs;
 mod projects;
 mod providers;
 mod records;
+mod relay;
 mod runtime_state;
 mod schema;
 mod settings;
@@ -50,7 +52,10 @@ const SETTING_SKILLS_CONFIG: &str = "skills_config";
 const SETTING_GITHUB_TOKEN: &str = "github_token";
 const SETTING_GITHUB_APP_CONFIG: &str = "github_app_config";
 const SETTING_GIT_ACCOUNTS: &str = "git_accounts";
+const SETTING_RELAY_CONFIG: &str = "relay_config";
 const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
+const DEFAULT_RELAY_URL: &str = "http://127.0.0.1:8090";
+const DEFAULT_RELAY_NODE_ID: &str = "mai-server";
 const DEEPSEEK_V4_CONTEXT_TOKENS: u64 = 1_000_000;
 const DEEPSEEK_V4_OUTPUT_TOKENS: u64 = 384_000;
 

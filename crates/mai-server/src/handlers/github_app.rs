@@ -110,7 +110,7 @@ pub(crate) struct GithubInstallationCallbackQuery {
 }
 
 fn github_service(state: &AppState) -> GithubService {
-    GithubService::new(Arc::clone(&state.runtime), state.relay.clone())
+    GithubService::new(Arc::clone(&state.runtime), Arc::clone(&state.relay))
 }
 
 pub(crate) async fn get_github_settings(
@@ -246,4 +246,19 @@ pub(crate) async fn get_relay_status(
 ) -> std::result::Result<Json<RelayStatusResponse>, ApiError> {
     let svc = github_service(&state);
     Ok(Json(svc.relay_status().await))
+}
+
+pub(crate) async fn get_relay_settings(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<RelaySettingsResponse>, ApiError> {
+    let svc = github_service(&state);
+    Ok(Json(svc.relay_settings().await?))
+}
+
+pub(crate) async fn save_relay_settings(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RelaySettingsRequest>,
+) -> std::result::Result<Json<RelaySettingsResponse>, ApiError> {
+    let svc = github_service(&state);
+    Ok(Json(svc.save_relay_settings(request).await?))
 }

@@ -385,6 +385,54 @@
 
               <p v-if="githubAppState.error" class="dialog-error">{{ githubAppState.error }}</p>
 
+              <form class="github-app-config-form" @submit.prevent="saveRelayForm">
+                <label class="checkbox-row">
+                  <input v-model="relayForm.enabled" type="checkbox">
+                  <span>Enable relay connection</span>
+                </label>
+                <label>
+                  <span>Relay URL</span>
+                  <input v-model="relayForm.url" type="url" placeholder="https://relay.example">
+                </label>
+                <label>
+                  <span>Relay token</span>
+                  <input v-model="relayForm.token" type="password" :placeholder="props.githubAppState.relaySettings?.has_token ? 'Saved token retained' : 'Paste relay token'">
+                </label>
+                <label class="checkbox-row">
+                  <input v-model="relayForm.clear_token" type="checkbox">
+                  <span>Clear saved token</span>
+                </label>
+                <label>
+                  <span>Node ID</span>
+                  <input v-model="relayForm.node_id" type="text" placeholder="mai-server">
+                </label>
+                <button class="primary-button" type="submit" :disabled="githubAppState.loading">Save Relay</button>
+              </form>
+
+              <form class="github-app-config-form" @submit.prevent="saveGithubAppForm">
+                <label>
+                  <span>Relay public URL</span>
+                  <input v-model="githubAppForm.public_url" type="url" placeholder="https://relay.example">
+                </label>
+                <label>
+                  <span>GitHub App ID</span>
+                  <input v-model="githubAppForm.app_id" type="text" placeholder="123456">
+                </label>
+                <label>
+                  <span>GitHub App slug</span>
+                  <input v-model="githubAppForm.app_slug" type="text" placeholder="mai-team">
+                </label>
+                <label>
+                  <span>PEM private key</span>
+                  <textarea v-model="githubAppForm.private_key" rows="5" placeholder="Paste PEM private key"></textarea>
+                </label>
+                <label>
+                  <span>Upload PEM</span>
+                  <input type="file" accept=".pem,.key,text/plain" @change="onGithubPemFile">
+                </label>
+                <button class="primary-button" type="submit" :disabled="githubAppState.loading">Save GitHub App</button>
+              </form>
+
               <div class="settings-actions">
                 <div class="settings-actions-left">
                   <button class="ghost-button" type="button" :disabled="githubAppState.loading || githubAppState.loadingInstallations" @click="$emit('refresh-github-app')">
@@ -533,7 +581,9 @@ const emit = defineEmits([
   'delete-git-account',
   'set-default-git-account',
   'refresh-github-app',
-  'install-github-app'
+  'install-github-app',
+  'save-relay-settings',
+  'save-github-app-settings'
 ])
 
 const activeSettingsSection = ref('roles')
@@ -543,6 +593,19 @@ const gitForm = reactive({
   id: '',
   label: DEFAULT_GIT_ACCOUNT_LABEL,
   token: ''
+})
+const relayForm = reactive({
+  enabled: false,
+  url: '',
+  token: '',
+  clear_token: false,
+  node_id: 'mai-server'
+})
+const githubAppForm = reactive({
+  public_url: '',
+  app_id: '',
+  private_key: '',
+  app_slug: ''
 })
 
 const error = ref('')
@@ -662,6 +725,39 @@ function githubAppInstallationMeta(installation) {
   return [installation.account_type || 'Account', installation.repository_selection || 'All repositories', eventLabel].join(' · ')
 }
 
+function saveRelayForm() {
+  const token = relayForm.clear_token ? '' : relayForm.token.trim() || null
+  emit('save-relay-settings', {
+    enabled: relayForm.enabled,
+    url: relayForm.url.trim() || null,
+    token,
+    node_id: relayForm.node_id.trim() || null
+  })
+  relayForm.token = ''
+  relayForm.clear_token = false
+}
+
+function saveGithubAppForm() {
+  emit('save-github-app-settings', {
+    public_url: githubAppForm.public_url.trim() || null,
+    app_id: githubAppForm.app_id.trim() || null,
+    private_key: githubAppForm.private_key,
+    app_slug: githubAppForm.app_slug.trim() || null
+  })
+  githubAppForm.private_key = ''
+}
+
+function onGithubPemFile(event) {
+  const file = event.target.files?.[0]
+  if (!file) return
+  const reader = new FileReader()
+  reader.onload = () => {
+    githubAppForm.private_key = String(reader.result || '')
+  }
+  reader.readAsText(file)
+  event.target.value = ''
+}
+
 watch(
   () => [
     props.state.planner,
@@ -680,6 +776,29 @@ watch(
     if (SETTINGS_SECTIONS.some((item) => item.key === section)) {
       activeSettingsSection.value = section
     }
+  },
+  { immediate: true }
+)
+
+watch(
+  () => props.githubAppState.relaySettings,
+  (settings) => {
+    relayForm.enabled = Boolean(settings?.enabled)
+    relayForm.url = settings?.url || ''
+    relayForm.node_id = settings?.node_id || 'mai-server'
+    relayForm.token = ''
+    relayForm.clear_token = false
+  },
+  { immediate: true }
+)
+
+watch(
+  () => props.githubAppState.app,
+  (settings) => {
+    githubAppForm.public_url = settings?.public_url || ''
+    githubAppForm.app_id = settings?.app_id || ''
+    githubAppForm.app_slug = settings?.app_slug || ''
+    githubAppForm.private_key = ''
   },
   { immediate: true }
 )

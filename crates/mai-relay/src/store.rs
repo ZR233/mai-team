@@ -2,7 +2,9 @@ use crate::delivery::QueuedDelivery;
 use crate::error::{RelayErrorKind, RelayResult};
 use crate::github::types::{GithubAppConfig, InstallationState, ManifestState};
 use chrono::{DateTime, Utc};
-use mai_protocol::{GithubAppManifestAccountType, RelayGithubInstallationTokenResponse};
+use mai_protocol::{
+    GithubAppManifestAccountType, RelayGithubInstallationTokenResponse, RelaySettingsResponse,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -112,9 +114,52 @@ impl RelayStore {
     }
 
     pub(crate) fn github_app_config(&self) -> RelayResult<Option<GithubAppConfig>> {
+        if let Some(mut config) = crate::github::app::compiled_github_app_config()? {
+            if let Some(stored) = self
+                .get_setting("github_app_config")?
+                .map(|value| serde_json::from_str::<GithubAppConfig>(&value))
+                .transpose()?
+            {
+                config.webhook_secret = stored.webhook_secret;
+            }
+            return Ok(Some(config));
+        }
         self.get_setting("github_app_config")?
             .map(|value| Ok(serde_json::from_str(&value)?))
             .transpose()
+    }
+
+    pub(crate) fn save_relay_config(&self, public_url: &str) -> RelayResult<RelaySettingsResponse> {
+        let public_url = public_url.trim().trim_end_matches('/').to_string();
+        if public_url.is_empty() {
+            return Err(RelayErrorKind::InvalidInput(
+                "relay public_url is required".to_string(),
+            ));
+        }
+        self.set_setting("relay_public_url", &public_url)?;
+        Ok(RelaySettingsResponse {
+            enabled: true,
+            url: public_url,
+            has_token: true,
+            node_id: "mai-relay".to_string(),
+        })
+    }
+
+    pub(crate) fn relay_config(
+        &self,
+        fallback_public_url: &str,
+    ) -> RelayResult<RelaySettingsResponse> {
+        let public_url = self
+            .get_setting("relay_public_url")?
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| fallback_public_url.trim().trim_end_matches('/').to_string());
+        Ok(RelaySettingsResponse {
+            enabled: true,
+            url: public_url,
+            has_token: true,
+            node_id: "mai-relay".to_string(),
+        })
     }
 
     pub(crate) fn save_manifest_state(
@@ -452,5 +497,61 @@ mod tests {
         assert_eq!(state.state, "state-newer");
         assert!(store.take_installation_state("state-newer").is_err());
         assert!(store.take_installation_state("state-older").is_ok());
+    }
+
+    #[test]
+    fn relay_config_round_trips_public_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = RelayStore::open(dir.path().join("relay.sqlite3")).expect("store");
+
+        let default = store
+            .relay_config("https://fallback.example/")
+            .expect("default relay config");
+        assert_eq!(default.url, "https://fallback.example");
+        assert!(default.enabled);
+        assert!(default.has_token);
+
+        let saved = store
+            .save_relay_config(" https://relay.example/ ")
+            .expect("save relay config");
+        assert_eq!(saved.url, "https://relay.example");
+
+        let loaded = store
+            .relay_config("https://fallback.example")
+            .expect("load relay config");
+        assert_eq!(loaded, saved);
+    }
+
+    #[cfg(feature = "compiled-github-app-config")]
+    #[test]
+    fn compiled_github_app_config_ignores_persisted_app_fields() {
+        let Some(compiled_app_id) = option_env!("MAI_RELAY_GITHUB_APP_ID") else {
+            return;
+        };
+        let Some(compiled_private_key) = option_env!("MAI_RELAY_GITHUB_APP_PRIVATE_KEY") else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = RelayStore::open(dir.path().join("relay.sqlite3")).expect("store");
+        store
+            .save_github_app_config(&GithubAppConfig {
+                app_id: "persisted-app-id".to_string(),
+                private_key: "persisted-private-key".to_string(),
+                webhook_secret: "persisted-webhook-secret".to_string(),
+                app_slug: Some("persisted-slug".to_string()),
+                app_html_url: Some("https://github.com/apps/persisted".to_string()),
+                owner_login: Some("persisted-owner".to_string()),
+                owner_type: Some("Organization".to_string()),
+            })
+            .expect("save persisted app config");
+
+        let loaded = store
+            .github_app_config()
+            .expect("load app config")
+            .expect("compiled config");
+
+        assert_eq!(loaded.app_id, compiled_app_id);
+        assert_eq!(loaded.private_key, compiled_private_key);
+        assert_eq!(loaded.webhook_secret, "persisted-webhook-secret");
     }
 }

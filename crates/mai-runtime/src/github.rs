@@ -5,8 +5,8 @@ use serde::de::DeserializeOwned;
 
 use crate::{Result, RuntimeError};
 
-pub(crate) const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
-pub(crate) const GITHUB_HTTP_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
+pub const GITHUB_HTTP_TIMEOUT_SECS: u64 = 10;
 const GITHUB_API_VERSION: &str = "2022-11-28";
 
 mod accounts;
@@ -15,7 +15,7 @@ mod packages;
 mod service;
 
 pub(crate) use accounts::{GitAccountService, VerifiedGithubRepository};
-pub(crate) use app::DirectGithubAppBackend;
+pub use app::DirectGithubAppBackend;
 pub use app::GithubAppBackend;
 pub(crate) use packages::repository_packages_with_token;
 pub(crate) use service::*;

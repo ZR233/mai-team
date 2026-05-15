@@ -11,6 +11,7 @@ use tracing::info;
 use crate::config::{Cli, RelayMode, ServerConfig, ServerPaths, StdEnv};
 use crate::handlers::state::AppState;
 use crate::http::router;
+use crate::services::relay_manager::{DynamicGithubAppBackend, RelayManager};
 
 pub(crate) async fn run(cli: Cli) -> Result<()> {
     tracing_subscriber::fmt()
@@ -75,13 +76,22 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         artifact_index_root = %paths.artifact_index_root.display(),
         "runtime storage paths"
     );
-    let relay = match config.relay {
-        RelayMode::Disabled => None,
-        RelayMode::Enabled(config) => Some(Arc::new(mai_relay_client::RelayClient::new(config))),
-    };
-    let github_backend = relay
-        .as_ref()
-        .map(|client| Arc::clone(client) as Arc<dyn mai_runtime::github::GithubAppBackend>);
+    seed_relay_settings_from_env(&store, config.relay).await?;
+    let relay = RelayManager::new(Arc::clone(&store));
+    let github_http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            mai_runtime::github::GITHUB_HTTP_TIMEOUT_SECS,
+        ))
+        .build()?;
+    let direct_backend = Arc::new(mai_runtime::github::DirectGithubAppBackend::new(
+        Arc::clone(&store),
+        github_http,
+        mai_runtime::github::DEFAULT_GITHUB_API_BASE_URL.to_string(),
+    )) as Arc<dyn mai_runtime::github::GithubAppBackend>;
+    let github_backend = Some(Arc::new(DynamicGithubAppBackend::new(
+        direct_backend,
+        Arc::clone(&relay),
+    )) as Arc<dyn mai_runtime::github::GithubAppBackend>);
     let runtime = mai_runtime::AgentRuntime::new_with_github_backend(
         docker,
         model_client,
@@ -90,14 +100,8 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         github_backend,
     )
     .await?;
-    if let Some(relay) = &relay {
-        crate::services::relay_events::install_relay_event_handler(
-            Arc::clone(relay),
-            Arc::clone(&runtime),
-        )
-        .await;
-        Arc::clone(relay).start();
-    }
+    relay.set_runtime(Arc::clone(&runtime)).await;
+    relay.configure_from_store().await?;
     let cleaned = runtime.cleanup_orphaned_containers().await?;
     if !cleaned.is_empty() {
         info!(
@@ -118,6 +122,27 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     info!("mai-team listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn seed_relay_settings_from_env(
+    store: &Arc<mai_store::ConfigStore>,
+    mode: RelayMode,
+) -> mai_store::Result<()> {
+    if store.relay_settings().await?.has_token {
+        return Ok(());
+    }
+    let RelayMode::Enabled(config) = mode else {
+        return Ok(());
+    };
+    store
+        .save_relay_settings(mai_protocol::RelaySettingsRequest {
+            enabled: true,
+            url: Some(config.url),
+            token: Some(config.token),
+            node_id: Some(config.node_id),
+        })
+        .await?;
     Ok(())
 }
 

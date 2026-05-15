@@ -69,7 +69,7 @@ struct CachedGithubToken {
     expires_at: DateTime<Utc>,
 }
 
-pub(crate) struct DirectGithubAppBackend {
+pub struct DirectGithubAppBackend {
     store: Arc<ConfigStore>,
     github_http: reqwest::Client,
     github_api_base_url: String,
@@ -78,7 +78,7 @@ pub(crate) struct DirectGithubAppBackend {
 }
 
 impl DirectGithubAppBackend {
-    pub(crate) fn new(
+    pub fn new(
         store: Arc<ConfigStore>,
         github_http: reqwest::Client,
         github_api_base_url: String,
@@ -227,6 +227,7 @@ impl GithubAppBackend for DirectGithubAppBackend {
             app_id: Some(conversion.id.to_string()),
             private_key: Some(conversion.pem),
             base_url: Some(DEFAULT_GITHUB_API_BASE_URL.to_string()),
+            public_url: None,
             app_slug: Some(conversion.slug),
             app_html_url: Some(conversion.html_url),
             owner_login,

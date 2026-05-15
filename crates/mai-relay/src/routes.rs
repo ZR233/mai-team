@@ -41,10 +41,11 @@ pub(crate) async fn status(
 ) -> RelayResult<Json<RelayStatusResponse>> {
     let connection = state.connection.lock().await.clone();
     let queued = state.store.queued_count()?;
+    let relay_url = state.store.relay_config(&state.public_url)?.url;
     Ok(Json(RelayStatusResponse {
         enabled: true,
         connected: connection.is_some(),
-        relay_url: Some(state.public_url.clone()),
+        relay_url: Some(relay_url),
         node_id: connection
             .as_ref()
             .map(|connection| connection.node_id.clone()),

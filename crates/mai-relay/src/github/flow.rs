@@ -171,6 +171,7 @@ pub(crate) async fn start_app_installation(
             &config,
             &state.github_api_base_url,
             &state.github_web_base_url,
+            &state.store.relay_config(&state.public_url)?.url,
             Some(&state_id),
         ),
     })

@@ -1651,6 +1651,8 @@ pub struct GithubSettingsRequest {
 pub struct GithubAppSettingsResponse {
     pub app_id: Option<String>,
     pub base_url: String,
+    #[serde(default)]
+    pub public_url: Option<String>,
     pub has_private_key: bool,
     #[serde(default)]
     pub app_slug: Option<String>,
@@ -1687,6 +1689,8 @@ pub struct GithubAppSettingsRequest {
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
+    pub public_url: Option<String>,
+    #[serde(default)]
     pub app_slug: Option<String>,
     #[serde(default)]
     pub app_html_url: Option<String>,
@@ -1694,6 +1698,26 @@ pub struct GithubAppSettingsRequest {
     pub owner_login: Option<String>,
     #[serde(default)]
     pub owner_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RelaySettingsRequest {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub node_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RelaySettingsResponse {
+    pub enabled: bool,
+    pub url: String,
+    pub has_token: bool,
+    pub node_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2170,6 +2194,7 @@ mod tests {
             app: GithubAppSettingsResponse {
                 app_id: Some("123".to_string()),
                 base_url: "https://api.github.com".to_string(),
+                public_url: Some("https://relay.example".to_string()),
                 has_private_key: true,
                 app_slug: Some("mai".to_string()),
                 app_html_url: None,
@@ -2183,6 +2208,40 @@ mod tests {
             serde_json::from_value(value).expect("deserialize");
         assert_eq!(decoded.state, "state-1");
         assert!(decoded.app.has_private_key);
+        assert_eq!(
+            decoded.app.public_url.as_deref(),
+            Some("https://relay.example")
+        );
+    }
+
+    #[test]
+    fn relay_settings_request_and_response_round_trip_without_token_secret() {
+        let request = RelaySettingsRequest {
+            enabled: true,
+            url: Some("https://relay.example".to_string()),
+            token: Some("secret".to_string()),
+            node_id: Some("mai-server-a".to_string()),
+        };
+        let value = serde_json::to_value(&request).expect("serialize");
+        let decoded: RelaySettingsRequest = serde_json::from_value(value).expect("deserialize");
+        assert!(decoded.enabled);
+        assert_eq!(decoded.url.as_deref(), Some("https://relay.example"));
+        assert_eq!(decoded.token.as_deref(), Some("secret"));
+        assert_eq!(decoded.node_id.as_deref(), Some("mai-server-a"));
+
+        let response = RelaySettingsResponse {
+            enabled: true,
+            url: "https://relay.example".to_string(),
+            has_token: true,
+            node_id: "mai-server-a".to_string(),
+        };
+        let value = serde_json::to_value(&response).expect("serialize");
+        assert!(value.get("token").is_none());
+        let decoded: RelaySettingsResponse = serde_json::from_value(value).expect("deserialize");
+        assert!(decoded.enabled);
+        assert_eq!(decoded.url, "https://relay.example");
+        assert!(decoded.has_token);
+        assert_eq!(decoded.node_id, "mai-server-a");
     }
 
     #[test]

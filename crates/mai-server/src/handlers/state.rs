@@ -5,13 +5,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use mai_protocol::ErrorResponse;
 
-use mai_relay_client::RelayClient;
+use crate::services::relay_manager::RelayManager;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) runtime: Arc<mai_runtime::AgentRuntime>,
     pub(crate) store: Arc<mai_store::ConfigStore>,
-    pub(crate) relay: Option<Arc<RelayClient>>,
+    pub(crate) relay: Arc<RelayManager>,
 }
 
 #[derive(Debug)]
