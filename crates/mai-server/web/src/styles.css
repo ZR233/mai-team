@@ -1513,6 +1513,27 @@ p {
   background: #f8fafc;
 }
 
+.model-picker-empty-state {
+  display: grid;
+  gap: 4px;
+  border: 1px solid #dfe6ef;
+  border-radius: 8px;
+  padding: 12px;
+  background: #f8fafc;
+}
+
+.model-picker-empty-state strong {
+  color: #172033;
+  font-size: 13px;
+}
+
+.model-picker-empty-state span {
+  color: #66758a;
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1.35;
+}
+
 .model-depth-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

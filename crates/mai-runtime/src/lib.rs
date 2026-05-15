@@ -59,6 +59,9 @@ const PROJECT_REVIEW_RUN_LIST_LIMIT: usize = 50;
 const PROJECT_REVIEW_SNAPSHOT_MESSAGE_LIMIT: usize = 40;
 const PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT: usize = 80;
 const DEFAULT_SIDECAR_IMAGE: &str = "ghcr.io/zr233/mai-team-sidecar:latest";
+const UNCONFIGURED_PROVIDER_ID: &str = "unconfigured";
+const UNCONFIGURED_PROVIDER_NAME: &str = "No provider configured";
+const UNCONFIGURED_MODEL_ID: &str = "unconfigured";
 const COMPACT_USER_MESSAGE_MAX_CHARS: usize = 80_000;
 const COMPACT_SUMMARY_PREVIEW_CHARS: usize = 240;
 const COMPACT_SUMMARY_PREFIX: &str = "Context checkpoint summary from earlier conversation history. This is background for continuity, not a new user request.";
@@ -593,17 +596,12 @@ impl AgentRuntime {
         if let Some(environment) = environments.first() {
             return Ok(Some(environment.clone()));
         }
-        match self
-            .create_environment(
-                tasks::DEFAULT_ENVIRONMENT_NAME.to_string(),
-                Some(self.deps.docker.image().to_string()),
-            )
-            .await
-        {
-            Ok(environment) => Ok(Some(environment)),
-            Err(RuntimeError::Store(mai_store::StoreError::InvalidConfig(_))) => Ok(None),
-            Err(err) => Err(err),
-        }
+        self.create_environment(
+            tasks::DEFAULT_ENVIRONMENT_NAME.to_string(),
+            Some(self.deps.docker.image().to_string()),
+        )
+        .await
+        .map(Some)
     }
 
     pub async fn create_environment(
@@ -3875,35 +3873,90 @@ impl tasks::TaskCreateOps for Arc<AgentRuntime> {
 }
 
 impl tasks::EnvironmentOps for Arc<AgentRuntime> {
-    async fn planner_model(&self) -> Result<AgentModelPreference> {
-        Ok(self
-            .resolve_role_agent_model(AgentRole::Planner)
-            .await?
-            .preference)
+    async fn environment_model(&self) -> Result<Option<AgentModelPreference>> {
+        match self.resolve_role_agent_model(AgentRole::Planner).await {
+            Ok(model) => Ok(Some(model.preference)),
+            Err(RuntimeError::Store(mai_store::StoreError::InvalidConfig(_))) => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 
     async fn create_environment_root_agent(
         &self,
-        request: tasks::CreateTaskPlannerAgentRequest,
+        request: tasks::CreateEnvironmentRootAgentRequest,
     ) -> Result<AgentSummary> {
-        let agent = agents::create_agent_record(
-            self.as_ref(),
-            CreateAgentRequest {
-                name: Some(request.title),
-                provider_id: Some(request.model.provider_id),
-                model: Some(request.model.model),
-                reasoning_effort: request.model.reasoning_effort,
-                docker_image: request.docker_image,
-                parent_id: None,
-                system_prompt: None,
-            },
-            agents::CreateAgentRecordContext {
-                task_id: Some(request.task_id),
-                project_id: None,
-                role: Some(AgentRole::Planner),
-            },
-        )
-        .await?;
+        let agent = match request.model {
+            Some(model) => {
+                agents::create_agent_record(
+                    self.as_ref(),
+                    CreateAgentRequest {
+                        name: Some(request.name),
+                        provider_id: Some(model.provider_id),
+                        model: Some(model.model),
+                        reasoning_effort: model.reasoning_effort,
+                        docker_image: request.docker_image,
+                        parent_id: None,
+                        system_prompt: None,
+                    },
+                    agents::CreateAgentRecordContext {
+                        task_id: Some(request.environment_id),
+                        project_id: None,
+                        role: Some(AgentRole::Planner),
+                    },
+                )
+                .await?
+            }
+            None => self.create_unconfigured_environment_root_agent(request).await?,
+        };
+        let summary = agent.summary.read().await.clone();
+        self.start_environment_container_in_background(agent).await;
+        Ok(summary)
+    }
+
+    fn get_agent(
+        &self,
+        agent_id: AgentId,
+        session_id: Option<SessionId>,
+    ) -> impl std::future::Future<Output = Result<AgentDetail>> + Send {
+        AgentRuntime::get_agent(self.as_ref(), agent_id, session_id)
+    }
+
+    fn create_agent_session(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<AgentSessionSummary>> + Send {
+        AgentRuntime::create_session(self.as_ref(), agent_id)
+    }
+
+    fn send_agent_message(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        message: String,
+        skill_mentions: Vec<String>,
+    ) -> impl std::future::Future<Output = Result<TurnId>> + Send {
+        AgentRuntime::send_message(self, agent_id, Some(session_id), message, skill_mentions)
+    }
+}
+
+impl AgentRuntime {
+    async fn start_environment_container_in_background(self: &Arc<Self>, agent: Arc<AgentRecord>) {
+        if let Err(err) = self
+            .set_status(&agent, AgentStatus::StartingContainer, None)
+            .await
+        {
+            tracing::warn!("failed to persist environment container startup status: {err}");
+            return;
+        }
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(err) = runtime.start_environment_container(agent).await {
+                tracing::warn!("failed to start environment container: {err}");
+            }
+        });
+    }
+
+    async fn start_environment_container(self: Arc<Self>, agent: Arc<AgentRecord>) -> Result<()> {
         match agents::ensure_agent_container_with_source(
             self.as_ref(),
             &agent,
@@ -3934,31 +3987,61 @@ impl tasks::EnvironmentOps for Arc<AgentRuntime> {
                 Err(err)
             }
         }
+        .map(|_| ())
     }
 
-    fn get_agent(
+    async fn create_unconfigured_environment_root_agent(
         &self,
-        agent_id: AgentId,
-        session_id: Option<SessionId>,
-    ) -> impl std::future::Future<Output = Result<AgentDetail>> + Send {
-        AgentRuntime::get_agent(self.as_ref(), agent_id, session_id)
-    }
-
-    fn create_agent_session(
-        &self,
-        agent_id: AgentId,
-    ) -> impl std::future::Future<Output = Result<AgentSessionSummary>> + Send {
-        AgentRuntime::create_session(self.as_ref(), agent_id)
-    }
-
-    fn send_agent_message(
-        &self,
-        agent_id: AgentId,
-        session_id: SessionId,
-        message: String,
-        skill_mentions: Vec<String>,
-    ) -> impl std::future::Future<Output = Result<TurnId>> + Send {
-        AgentRuntime::send_message(self, agent_id, Some(session_id), message, skill_mentions)
+        request: tasks::CreateEnvironmentRootAgentRequest,
+    ) -> Result<Arc<AgentRecord>> {
+        let id = Uuid::new_v4();
+        let created_at = now();
+        let docker_image = request
+            .docker_image
+            .as_deref()
+            .map(str::trim)
+            .filter(|image| !image.is_empty())
+            .unwrap_or_else(|| self.deps.docker.image())
+            .to_string();
+        let summary = AgentSummary {
+            id,
+            parent_id: None,
+            task_id: Some(request.environment_id),
+            project_id: None,
+            role: Some(AgentRole::Planner),
+            name: request.name,
+            status: AgentStatus::Created,
+            container_id: None,
+            docker_image,
+            provider_id: UNCONFIGURED_PROVIDER_ID.to_string(),
+            provider_name: UNCONFIGURED_PROVIDER_NAME.to_string(),
+            model: UNCONFIGURED_MODEL_ID.to_string(),
+            reasoning_effort: None,
+            created_at,
+            updated_at: created_at,
+            current_turn: None,
+            last_error: None,
+            token_usage: TokenUsage::default(),
+        };
+        self.deps.store.save_agent(&summary, None).await?;
+        let session = agents::default_session_record();
+        self.deps.store.save_agent_session(id, &session.summary).await?;
+        let agent = Arc::new(AgentRecord {
+            summary: RwLock::new(summary.clone()),
+            sessions: Mutex::new(vec![session]),
+            container: RwLock::new(None),
+            mcp: RwLock::new(None),
+            system_prompt: None,
+            turn_lock: Mutex::new(()),
+            cancel_requested: AtomicBool::new(false),
+            active_turn: StdMutex::new(None),
+            pending_inputs: Mutex::new(VecDeque::new()),
+        });
+        self.state.agents.write().await.insert(id, Arc::clone(&agent));
+        self.events
+            .publish(ServiceEventKind::AgentCreated { agent: summary })
+            .await;
+        Ok(agent)
     }
 }
 

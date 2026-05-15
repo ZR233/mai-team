@@ -11,7 +11,7 @@
     <div class="status-line-items">
       <span class="status-line-item">
         <span>Model</span>
-        <strong>{{ detail.model }}</strong>
+        <strong>{{ detail.provider_id === 'unconfigured' ? 'Not configured' : detail.model }}</strong>
       </span>
       <span v-if="detail.reasoning_effort" class="status-line-item">
         <span>Reasoning</span>

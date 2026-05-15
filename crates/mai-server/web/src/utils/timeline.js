@@ -730,7 +730,7 @@ function statusProcessRow(event) {
   return {
     type: 'process',
     key: `status-${event.sequence || event.timestamp}`,
-    tone: status.includes('fail') ? 'error' : status.includes('cancel') ? 'warning' : 'muted',
+    tone: status.includes('fail') ? 'error' : status.includes('cancel') ? 'warning' : status.includes('start') ? 'active' : 'muted',
     label: status.replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase()),
     detail: 'Status changed',
     timestamp: event.timestamp,

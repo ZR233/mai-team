@@ -116,6 +116,13 @@ pub(crate) struct CreateTaskPlannerAgentRequest {
     pub(crate) docker_image: Option<String>,
 }
 
+pub(crate) struct CreateEnvironmentRootAgentRequest {
+    pub(crate) environment_id: EnvironmentId,
+    pub(crate) name: String,
+    pub(crate) model: Option<AgentModelPreference>,
+    pub(crate) docker_image: Option<String>,
+}
+
 /// Supplies agent/model side effects needed by task creation.
 pub(crate) trait TaskCreateOps: Send + Sync {
     fn planner_model(&self) -> impl Future<Output = Result<AgentModelPreference>> + Send;
@@ -149,11 +156,11 @@ pub(crate) trait TaskCreateOps: Send + Sync {
 
 /// Supplies root agent creation and turn side effects for chat environments.
 pub(crate) trait EnvironmentOps: TaskUpdateOps {
-    fn planner_model(&self) -> impl Future<Output = Result<AgentModelPreference>> + Send;
+    fn environment_model(&self) -> impl Future<Output = Result<Option<AgentModelPreference>>> + Send;
 
     fn create_environment_root_agent(
         &self,
-        request: CreateTaskPlannerAgentRequest,
+        request: CreateEnvironmentRootAgentRequest,
     ) -> impl Future<Output = Result<AgentSummary>> + Send;
 
     fn get_agent(
@@ -304,12 +311,12 @@ pub(crate) async fn create_environment(
     } else {
         name.to_string()
     };
-    let model = ops.planner_model().await?;
+    let model = ops.environment_model().await?;
     let created_at = now();
     let root_agent = ops
-        .create_environment_root_agent(CreateTaskPlannerAgentRequest {
-            task_id: environment_id,
-            title: name.clone(),
+        .create_environment_root_agent(CreateEnvironmentRootAgentRequest {
+            environment_id,
+            name: name.clone(),
             model,
             docker_image: input.docker_image,
         })

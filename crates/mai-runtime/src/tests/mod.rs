@@ -1135,6 +1135,159 @@ async fn ensure_default_environment_creates_root_chat_environment() {
 }
 
 #[tokio::test]
+async fn ensure_default_environment_does_not_require_provider_config() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let environment = runtime
+        .ensure_default_environment()
+        .await
+        .expect("ensure default")
+        .expect("default environment");
+
+    assert_eq!(environment.name, "默认环境");
+    assert_eq!(environment.conversation_count, 1);
+    let detail = runtime
+        .get_environment(environment.id, None)
+        .await
+        .expect("environment detail");
+    assert_eq!(
+        detail.root_agent.summary.provider_id,
+        UNCONFIGURED_PROVIDER_ID
+    );
+    assert_eq!(detail.root_agent.summary.model, UNCONFIGURED_MODEL_ID);
+    assert_eq!(detail.root_agent.sessions[0].title, "Chat 1");
+
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    wait_until(
+        || {
+            let runtime = Arc::clone(&runtime);
+            let agent_id = environment.root_agent_id;
+            async move {
+                runtime
+                    .get_agent(agent_id, None)
+                    .await
+                    .map(|agent| agent.summary.status == AgentStatus::Idle)
+                    .unwrap_or(false)
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    let updated = runtime
+        .update_agent(
+            environment.root_agent_id,
+            UpdateAgentRequest {
+                provider_id: Some("openai".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                reasoning_effort: Some("high".to_string()),
+            },
+        )
+        .await
+        .expect("update unconfigured environment model");
+    assert_eq!(updated.provider_id, "openai");
+    assert_eq!(updated.model, "gpt-5.5");
+}
+
+#[tokio::test]
+async fn create_environment_returns_before_container_is_ready() {
+    let dir = tempdir().expect("tempdir");
+    let docker = dir.path().join("slow-docker.sh");
+    let log_path = fake_docker_log_path(&dir);
+    fs::write(
+        &docker,
+        format!(
+            r#"#!/bin/sh
+LOG={}
+case "$1" in
+  ps)
+    exit 0
+    ;;
+  create)
+    echo "$*" >> "$LOG"
+    sleep 2
+    echo "created-container"
+    exit 0
+    ;;
+  start)
+    echo "$*" >> "$LOG"
+    exit 0
+    ;;
+  rm|rmi)
+    echo "$*" >> "$LOG"
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+            log_path.display()
+        ),
+    )
+    .expect("write slow docker");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&docker).expect("slow docker metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&docker, permissions).expect("chmod slow docker");
+    }
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let runtime = AgentRuntime::new(
+        DockerClient::new_with_binary("slow-agent", docker.to_string_lossy().to_string()),
+        ModelClient::new(),
+        Arc::clone(&store),
+        test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
+    )
+    .await
+    .expect("runtime");
+
+    let started = Instant::now();
+    let environment = runtime
+        .create_environment("Chat".to_string(), Some("slow-agent".to_string()))
+        .await
+        .expect("create environment");
+
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "environment creation waited for container startup"
+    );
+    let detail = runtime
+        .get_environment(environment.id, None)
+        .await
+        .expect("environment detail");
+    assert_eq!(detail.root_agent.summary.status, AgentStatus::StartingContainer);
+    wait_until(
+        || {
+            let runtime = Arc::clone(&runtime);
+            let agent_id = environment.root_agent_id;
+            async move {
+                runtime
+                    .get_agent(agent_id, None)
+                    .await
+                    .map(|detail| detail.summary.status == AgentStatus::Idle)
+                    .unwrap_or(false)
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn create_environment_uses_name_docker_image_and_allows_multiple_conversations() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
