@@ -5,8 +5,13 @@
       <span>Loading messages...</span>
     </div>
     <div v-else-if="!timelineItems.length" class="quiet-empty">
-      <strong>No messages yet</strong>
-      <span>Send the first instruction to start a turn.</span>
+      <template v-if="statusItem">
+        <ProcessRow :item="statusItem" />
+      </template>
+      <template v-else>
+        <strong>No messages yet</strong>
+        <span>Send the first instruction to start a turn.</span>
+      </template>
     </div>
     <template v-else>
       <article
@@ -36,7 +41,7 @@
 </template>
 
 <script setup>
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import ArtifactRow from './ArtifactRow.vue'
 import ChatMessage from './ChatMessage.vue'
 import ContextEventRow from './ContextEventRow.vue'
@@ -47,12 +52,15 @@ import ToolCallRow from './ToolCallRow.vue'
 import TodoListRow from './TodoListRow.vue'
 import UserInputRow from './UserInputRow.vue'
 
-defineProps({
+const props = defineProps({
   timelineItems: { type: Array, default: () => [] },
   loading: { type: Boolean, default: false },
+  statusItem: { type: Object, default: null },
   isToolExpanded: { type: Function, required: true },
   traceState: { type: Function, required: true }
 })
+
+const statusItem = computed(() => props.statusItem)
 
 defineEmits(['toggle-tool'])
 

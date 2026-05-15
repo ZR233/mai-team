@@ -105,6 +105,7 @@
           v-if="agent"
           v-model:conversation-ref="conversationRef"
           :timeline-items="timelineItems"
+          :status-item="containerStatusItem"
           :loading="loading"
           :is-tool-expanded="isToolExpanded"
           :trace-state="traceState"
@@ -144,6 +145,7 @@
         :skills-error="skillsError"
         :stoppable="canStopTurn"
         :stopping="stopping"
+        :disabled="composerDisabled"
         @send="$emit('send', $event)"
         @stop="$emit('stop', agent)"
         @update:draft="$emit('update:draft', $event)"
@@ -231,6 +233,39 @@ const currentProvider = computed(() => props.providers.find((provider) => provid
 const currentModel = computed(() => currentProvider.value?.models?.find((model) => model.id === agent.value?.model))
 const currentReasoningOptions = computed(() => reasoningOptionsFor(currentProvider.value, currentModel.value))
 const modelBusy = computed(() => props.updatingModel || ['running_turn', 'waiting_tool', 'starting_container'].includes(agent.value?.status))
+const containerStarting = computed(() => agent.value?.status === 'starting_container' || agent.value?.status === 'created')
+const composerDisabled = computed(() => props.sending || containerStarting.value)
+const containerStatusItem = computed(() => {
+  if (!agent.value) return null
+  if (agent.value.status === 'starting_container') {
+    return {
+      type: 'process',
+      key: `container-starting-${agent.value.id}`,
+      tone: 'active',
+      label: 'Starting Container',
+      detail: agent.value.docker_image ? `Preparing ${agent.value.docker_image}` : 'Preparing environment container'
+    }
+  }
+  if (agent.value.status === 'created') {
+    return {
+      type: 'process',
+      key: `container-created-${agent.value.id}`,
+      tone: 'muted',
+      label: 'Preparing Environment',
+      detail: 'Container startup will begin shortly'
+    }
+  }
+  if (agent.value.status === 'failed') {
+    return {
+      type: 'process',
+      key: `container-failed-${agent.value.id}`,
+      tone: 'error',
+      label: 'Container Failed',
+      detail: agent.value.last_error || 'Environment container failed to start'
+    }
+  }
+  return null
+})
 const canStopTurn = computed(() => {
   if (!agent.value?.current_turn) return false
   return ['running_turn', 'waiting_tool', 'starting_container'].includes(agent.value.status)
@@ -247,6 +282,9 @@ const pendingUserInput = computed(() => {
 const planApprovalPending = computed(() => Boolean(props.detail?.plan_approval_pending || props.detail?.plan?.status === 'ready'))
 const planVersion = computed(() => Number(props.detail?.plan?.version || props.detail?.plan_version || 0))
 const latestActivity = computed(() => {
+  if (agent.value?.status === 'starting_container') {
+    return agent.value?.docker_image ? `Preparing ${agent.value.docker_image}` : 'Preparing environment container'
+  }
   const activeTool = [...timelineItems.value].reverse().find((item) => isToolTimelineItem(item) && item.status === 'running')
   if (activeTool) return `${activeTool.toolActionLabel || 'Running'} ${activeTool.toolName}`
   const activeProcess = [...timelineItems.value].reverse().find((item) => item.type === 'process' && item.tone === 'active')

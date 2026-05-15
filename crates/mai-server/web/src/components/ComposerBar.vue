@@ -18,6 +18,7 @@
         :value="draft"
         rows="2"
         placeholder="Send a command or message... (Enter to send, Shift+Enter for new line)"
+        :disabled="disabled"
         @input="$emit('update:draft', $event.target.value)"
         @keydown.enter.exact="handleEnter"
       />
@@ -29,7 +30,7 @@
           class="icon-button skill-picker-button"
           type="button"
           title="Skills"
-          :disabled="sending || skillsLoading"
+          :disabled="disabled || sending || skillsLoading"
           @click="togglePicker"
         >
           @
@@ -62,7 +63,7 @@
           </button>
         </div>
       </div>
-      <button class="primary-button" type="submit" :disabled="!draft.trim() || sending || stoppable">
+      <button class="primary-button" type="submit" :disabled="disabled || !draft.trim() || sending || stoppable">
         <span v-if="sending" class="spinner-sm"></span>
         <template v-else>Send</template>
       </button>
@@ -91,7 +92,8 @@ const props = defineProps({
   skillsLoading: { type: Boolean, default: false },
   skillsError: { type: String, default: '' },
   stoppable: { type: Boolean, default: false },
-  stopping: { type: Boolean, default: false }
+  stopping: { type: Boolean, default: false },
+  disabled: { type: Boolean, default: false }
 })
 
 const emit = defineEmits(['send', 'update:draft', 'update:selectedSkills', 'load-skills', 'stop'])
@@ -129,7 +131,7 @@ function handleEnter(event) {
 }
 
 function send() {
-  if (props.draft.trim()) {
+  if (!props.disabled && props.draft.trim()) {
     emit('send', {
       message: props.draft.trim(),
       skillMentions: [...props.selectedSkills]

@@ -3,7 +3,7 @@
     <button
       class="agent-model-chip"
       type="button"
-      :disabled="controlsDisabled || !providers.length"
+      :disabled="controlsDisabled"
       :aria-expanded="open ? 'true' : 'false'"
       @click="toggleOpen"
     >
@@ -17,12 +17,17 @@
       <div class="model-popover-head">
         <div>
           <h3>Model for next turn</h3>
-          <p>One control owns provider, model, depth, and save state.</p>
+          <p>{{ providers.length ? 'One control owns provider, model, depth, and save state.' : 'Add a provider to enable chat responses.' }}</p>
         </div>
         <span class="mini-pill" :class="dirty ? 'amber' : 'green'">{{ statusLabel }}</span>
       </div>
 
-      <div class="model-picker-field">
+      <div v-if="!providers.length" class="model-picker-empty-state">
+        <strong>No providers configured</strong>
+        <span>Set up a provider before sending model-backed messages.</span>
+      </div>
+
+      <div v-else class="model-picker-field">
         <span class="model-picker-label">Provider</span>
         <button class="model-picker-trigger" type="button" :disabled="controlsDisabled" @click="toggleDropdown('provider')">
           <span>{{ editorProvider?.name || editorProvider?.id || 'Select provider' }}</span>
@@ -43,7 +48,7 @@
         </div>
       </div>
 
-      <div class="model-picker-field">
+      <div v-if="providers.length" class="model-picker-field">
         <span class="model-picker-label">Model</span>
         <button class="model-picker-trigger" type="button" :disabled="controlsDisabled || !editorModels.length" @click="toggleDropdown('model')">
           <span>{{ editorModelLabel }}<template v-if="editorModelSummary"> · {{ editorModelSummary }}</template></span>
@@ -73,7 +78,7 @@
         </div>
       </div>
 
-      <div v-if="reasoningOptions.length" class="model-picker-field">
+      <div v-if="providers.length && reasoningOptions.length" class="model-picker-field">
         <span class="model-picker-label">Thinking depth</span>
         <div class="model-depth-row">
           <button class="model-picker-trigger" type="button" :disabled="controlsDisabled" @click="toggleDropdown('reasoning')">
@@ -189,7 +194,7 @@ watch(
 )
 
 function toggleOpen() {
-  if (controlsDisabled.value || !props.providers.length) return
+  if (controlsDisabled.value) return
   if (open.value) {
     close()
     return

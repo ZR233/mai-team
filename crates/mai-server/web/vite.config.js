@@ -9,6 +9,7 @@ export default defineConfig({
     proxy: {
       '/agent-config': apiTarget,
       '/agents': apiTarget,
+      '/environments': apiTarget,
       '/events': apiTarget,
       '/git': apiTarget,
       '/github': apiTarget,

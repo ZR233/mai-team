@@ -387,25 +387,63 @@ onUnmounted(() => disconnect())
 async function refreshAll() {
   isEnvironmentsLoading.value = true
   isProjectsLoading.value = true
+  const errors = []
   try {
-    await Promise.all([loadProviders(), loadAgentConfig(), loadSkills(), loadMcpServers(), loadGitAccounts(), refreshGithubAppSettingsState(), refreshEnvironments(), refreshProjects()])
-    if (providersState.providers.length && !environments.value.length) {
-      await ensureDefaultEnvironment()
-    } else if (selectedEnvironmentId.value) {
-      await refreshEnvironmentDetail()
-    } else if (environments.value[0]?.id) {
-      await selectEnvironment(environments.value[0].id)
+    const results = await Promise.allSettled([
+      loadProviders(),
+      loadAgentConfig(),
+      loadSkills(),
+      loadMcpServers(),
+      loadGitAccounts(),
+      refreshGithubAppSettingsState(),
+      refreshEnvironments(),
+      refreshProjects()
+    ])
+    for (const result of results) {
+      if (result.status === 'rejected') errors.push(result.reason)
     }
-    if (selectedProjectId.value) {
-      await refreshProjectDetail()
-    } else if (projects.value[0]?.id) {
-      await selectProject(projects.value[0].id)
+
+    try {
+      await ensureChatWorkspaceSelection()
+    } catch (error) {
+      errors.push(error)
     }
-  } catch (error) {
-    showToast(error.message)
+
+    try {
+      await ensureProjectWorkspaceSelection()
+    } catch (error) {
+      errors.push(error)
+    }
+
+    const firstError = errors.find(Boolean)
+    if (firstError) showToast(firstError.message || String(firstError))
   } finally {
     isEnvironmentsLoading.value = false
     isProjectsLoading.value = false
+  }
+}
+
+async function ensureChatWorkspaceSelection() {
+  if (!environments.value.length) {
+      await ensureDefaultEnvironment()
+    return
+  }
+  if (selectedEnvironmentId.value) {
+    await refreshEnvironmentDetail()
+    return
+  }
+  if (environments.value[0]?.id) {
+    await selectEnvironment(environments.value[0].id)
+  }
+}
+
+async function ensureProjectWorkspaceSelection() {
+  if (selectedProjectId.value) {
+    await refreshProjectDetail()
+    return
+  }
+  if (projects.value[0]?.id) {
+    await selectProject(projects.value[0].id)
   }
 }
 
