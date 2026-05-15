@@ -345,12 +345,13 @@
               <strong>{{ githubAppName }}</strong>
               <small>{{ githubAppOwnerLabel }}</small>
             </div>
-            <div class="settings-summary-item" :class="githubAppInstallationCount ? 'ready' : ''">
+            <div class="settings-summary-item" :class="githubAppInstallationsSummaryClass">
               <span>Installations</span>
-              <strong>{{ githubAppInstallationCount }}</strong>
-              <small>{{ githubAppInstallationCount ? 'Available for project creation.' : 'Install the app before creating projects.' }}</small>
+              <strong>{{ githubAppInstallationsSummaryLabel }}</strong>
+              <small>{{ githubAppInstallationsSummaryMessage }}</small>
             </div>
           </div>
+          <p v-if="githubAppEventWarning" class="dialog-error">{{ githubAppEventWarning }}</p>
 
           <div class="github-app-layout">
             <div class="github-app-info-panel">
@@ -414,9 +415,11 @@
                   </span>
                   <span class="github-app-installation-main">
                     <strong>{{ installation.account_login || installation.id }}</strong>
-                    <small>{{ installation.account_type || 'Account' }} &middot; {{ installation.repository_selection || 'All repositories' }}</small>
+                    <small>{{ githubAppInstallationMeta(installation) }}</small>
                   </span>
-                  <span class="mini-pill green">Installed</span>
+                  <span class="mini-pill" :class="githubAppInstallationHasPullRequestEvents(installation) ? 'green' : 'red'">
+                    {{ githubAppInstallationHasPullRequestEvents(installation) ? 'Installed' : 'Events missing' }}
+                  </span>
                 </article>
                 <div v-if="!githubAppInstallationCount" class="github-app-empty">
                   <span class="github-app-empty-icon">
@@ -602,6 +605,22 @@ const githubAppSettings = computed(() => props.githubAppState.app || null)
 const githubAppConfigured = computed(() => Boolean(githubAppSettings.value?.app_slug || githubAppSettings.value?.install_url))
 const githubAppInstallations = computed(() => props.githubAppState.installations || [])
 const githubAppInstallationCount = computed(() => githubAppInstallations.value.length)
+const githubAppInstallationsMissingPullRequestEvents = computed(() => {
+  return githubAppInstallations.value.filter((installation) => !githubAppInstallationHasPullRequestEvents(installation))
+})
+const githubAppHasEventConfigurationProblem = computed(() => githubAppInstallationsMissingPullRequestEvents.value.length > 0)
+const githubAppInstallationsSummaryClass = computed(() => {
+  if (githubAppHasEventConfigurationProblem.value) return 'danger'
+  return githubAppInstallationCount.value ? 'ready' : ''
+})
+const githubAppInstallationsSummaryLabel = computed(() => {
+  if (githubAppHasEventConfigurationProblem.value) return 'Needs admin'
+  return String(githubAppInstallationCount.value)
+})
+const githubAppInstallationsSummaryMessage = computed(() => {
+  if (githubAppHasEventConfigurationProblem.value) return 'Missing pull_request event; contact the app administrator.'
+  return githubAppInstallationCount.value ? 'Available for project creation.' : 'Install the app before creating projects.'
+})
 const canInstallGithubApp = computed(() => githubAppRelayReady.value && githubAppConfigured.value)
 const githubAppName = computed(() => githubAppSettings.value?.app_slug || 'GitHub App')
 const githubAppUrlLabel = computed(() => githubAppSettings.value?.app_html_url || githubAppSettings.value?.install_url || 'Install URL available from relay.')
@@ -619,13 +638,29 @@ const githubAppStatusLabel = computed(() => {
   if (!githubAppRelayReady.value) return 'Relay unavailable'
   if (!githubAppConfigured.value) return 'App missing'
   if (!githubAppInstallationCount.value) return 'Not installed'
+  if (githubAppHasEventConfigurationProblem.value) return 'Needs admin'
   return `${githubAppInstallationCount.value} installed`
 })
 const githubAppStatusClass = computed(() => {
   if (!githubAppRelayReady.value || !githubAppConfigured.value) return 'danger'
+  if (githubAppHasEventConfigurationProblem.value) return 'danger'
   if (githubAppInstallationCount.value) return 'ready'
   return ''
 })
+const githubAppEventWarning = computed(() => {
+  if (!githubAppHasEventConfigurationProblem.value) return ''
+  return 'This GitHub App installation is missing the pull_request webhook event. New PRs will not trigger review messages. Contact the GitHub App administrator to update the app event subscription, then reinstall or refresh the installation.'
+})
+
+function githubAppInstallationHasPullRequestEvents(installation) {
+  return (installation.events || []).includes('pull_request')
+}
+
+function githubAppInstallationMeta(installation) {
+  const eventCount = installation.events?.length || 0
+  const eventLabel = `${eventCount} webhook event${eventCount === 1 ? '' : 's'}`
+  return [installation.account_type || 'Account', installation.repository_selection || 'All repositories', eventLabel].join(' · ')
+}
 
 watch(
   () => [

@@ -24,12 +24,31 @@ pub(crate) fn create_agent_container_args(
     create_agent_container_args_with_repo_mount(name, agent_label, image, workspace_volume, None)
 }
 
-pub(crate) fn create_agent_container_args_with_repo_mount(
+#[cfg(test)]
+fn create_agent_container_args_with_repo_mount(
     name: &str,
     agent_label: &str,
     image: &str,
     workspace_volume: &str,
     repo_mount: Option<&str>,
+) -> Vec<String> {
+    create_agent_container_args_with_repo_mount_and_user(
+        name,
+        agent_label,
+        image,
+        workspace_volume,
+        repo_mount,
+        None,
+    )
+}
+
+pub(crate) fn create_agent_container_args_with_repo_mount_and_user(
+    name: &str,
+    agent_label: &str,
+    image: &str,
+    workspace_volume: &str,
+    repo_mount: Option<&str>,
+    user: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec![
         "create".to_string(),
@@ -44,6 +63,9 @@ pub(crate) fn create_agent_container_args_with_repo_mount(
     ];
     if let Some(repo_mount) = repo_mount {
         args.extend(["-v".to_string(), format!("{repo_mount}:/workspace/repo")]);
+    }
+    if let Some(user) = user {
+        args.extend(["--user".to_string(), user.to_string()]);
     }
     args.extend([
         "-w".to_string(),
@@ -329,6 +351,31 @@ mod tests {
                 ]
         }));
         assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
+    }
+
+    #[test]
+    fn project_agent_container_args_can_run_as_host_user_for_repo_mount() {
+        let image = "ghcr.io/rcore-os/tgoskits-container:latest";
+        let args = create_agent_container_args_with_repo_mount_and_user(
+            "mai-team-maintainer",
+            "mai.team.agent=maintainer",
+            image,
+            "mai-team-workspace-maintainer",
+            Some("/data/projects/project-1/clones/agent-1/repo"),
+            Some("1000:1000"),
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--user", "1000:1000"])
+        );
+        assert!(args.windows(2).any(|window| {
+            window
+                == [
+                    "-v",
+                    "/data/projects/project-1/clones/agent-1/repo:/workspace/repo",
+                ]
+        }));
     }
 
     #[test]

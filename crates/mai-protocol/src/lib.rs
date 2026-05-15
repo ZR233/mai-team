@@ -1725,6 +1725,8 @@ pub struct GithubInstallationSummary {
     pub account_type: String,
     #[serde(default)]
     pub repository_selection: Option<String>,
+    #[serde(default)]
+    pub events: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2181,6 +2183,23 @@ mod tests {
             serde_json::from_value(value).expect("deserialize");
         assert_eq!(decoded.state, "state-1");
         assert!(decoded.app.has_private_key);
+    }
+
+    #[test]
+    fn github_installation_summary_exposes_subscribed_events() {
+        let summary: GithubInstallationSummary = serde_json::from_value(json!({
+            "id": 42,
+            "account_login": "ZR233",
+            "account_type": "User",
+            "repository_selection": "all",
+            "events": ["pull_request", "check_run"]
+        }))
+        .expect("summary");
+
+        assert_eq!(
+            summary.events,
+            vec!["pull_request".to_string(), "check_run".to_string()]
+        );
     }
 
     #[test]

@@ -1079,6 +1079,12 @@ impl AgentRuntime {
                 "removed orphan project clone directories during startup reconcile"
             );
         }
+        if !report.orphan_clone_removal_failed.is_empty() {
+            tracing::warn!(
+                count = report.orphan_clone_removal_failed.len(),
+                "failed to remove orphan project clone directories during startup reconcile"
+            );
+        }
         if !report.orphan_project_dirs_archived.is_empty() {
             tracing::info!(
                 count = report.orphan_project_dirs_archived.len(),

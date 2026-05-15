@@ -6236,6 +6236,12 @@ async fn project_reviewer_starts_from_image_with_own_project_clone() {
     assert!(docker_log.contains(&format!("create --name mai-team-{}", reviewer.id)));
     assert!(docker_log.contains(&format!("mai-team-workspace-{}:/workspace", reviewer.id)));
     assert!(docker_log.contains(&format!("{}:/workspace/repo", clone_path.display())));
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        assert!(docker_log.contains(&format!("--user {uid}:{gid}")));
+    }
     assert!(!docker_log.contains("/workspace/reviews"));
 }
 

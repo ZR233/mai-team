@@ -12,6 +12,7 @@ use crate::Result;
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct WorkspaceReconcileReport {
     pub(crate) orphan_clones_removed: Vec<AgentId>,
+    pub(crate) orphan_clone_removal_failed: Vec<PathBuf>,
     pub(crate) orphan_project_dirs_archived: Vec<ProjectId>,
     pub(crate) legacy_worktree_dirs_archived: Vec<ProjectId>,
     pub(crate) missing_repo_caches: Vec<ProjectId>,
@@ -59,8 +60,17 @@ pub(crate) fn reconcile_project_workspaces(
                     continue;
                 };
                 if live_agent_projects.get(&agent_id) != Some(&project.id) {
-                    std::fs::remove_dir_all(entry.path())?;
-                    report.orphan_clones_removed.push(agent_id);
+                    let path = entry.path();
+                    match std::fs::remove_dir_all(&path) {
+                        Ok(()) => report.orphan_clones_removed.push(agent_id),
+                        Err(err) => {
+                            tracing::warn!(
+                                path = %path.display(),
+                                "failed to remove orphan project clone during startup reconcile: {err}"
+                            );
+                            report.orphan_clone_removal_failed.push(path);
+                        }
+                    }
                 }
             }
         }
@@ -108,6 +118,7 @@ pub(crate) fn reconcile_project_workspaces(
     }
 
     report.orphan_clones_removed.sort();
+    report.orphan_clone_removal_failed.sort();
     report.orphan_project_dirs_archived.sort();
     report.legacy_worktree_dirs_archived.sort();
     report.missing_repo_caches.sort();

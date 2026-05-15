@@ -1532,6 +1532,7 @@ dependencies = [
 name = "mai-docker"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "shell-words",
@@ -1638,6 +1639,7 @@ dependencies = [
  "chrono",
  "futures",
  "jsonwebtoken",
+ "libc",
  "mai-agents",
  "mai-docker",
  "mai-mcp",

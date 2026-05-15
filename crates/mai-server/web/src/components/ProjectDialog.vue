@@ -68,17 +68,20 @@
 
             <div v-else class="project-field-row">
               <span>GitHub App</span>
-              <div class="project-control-with-action">
-                <select v-model="dialog.form.installation_id" :disabled="!githubAppReady || dialog.loadingInstallations" required @change="onInstallationChanged">
-                  <option value="" disabled>{{ installationSelectPlaceholder }}</option>
-                  <option v-for="installation in dialog.installations" :key="installation.id" :value="String(installation.id)">
-                    {{ installationLabel(installation) }}
-                  </option>
-                </select>
-                <button class="ghost-button" type="button" :disabled="!githubAppReady || dialog.loadingInstallations" @click="$emit('refresh-installations')">
-                  <span v-if="dialog.loadingInstallations" class="spinner-sm"></span>
-                  <template v-else>Refresh</template>
-                </button>
+              <div class="project-runtime-picker">
+                <div class="project-control-with-action">
+                  <select v-model="dialog.form.installation_id" :disabled="!githubAppReady || dialog.loadingInstallations" required @change="onInstallationChanged">
+                    <option value="" disabled>{{ installationSelectPlaceholder }}</option>
+                    <option v-for="installation in dialog.installations" :key="installation.id" :value="String(installation.id)">
+                      {{ installationLabel(installation) }}
+                    </option>
+                  </select>
+                  <button class="ghost-button" type="button" :disabled="!githubAppReady || dialog.loadingInstallations" @click="$emit('refresh-installations')">
+                    <span v-if="dialog.loadingInstallations" class="spinner-sm"></span>
+                    <template v-else>Refresh</template>
+                  </button>
+                </div>
+                <small v-if="selectedInstallationEventWarning" class="project-runtime-note danger">{{ selectedInstallationEventWarning }}</small>
               </div>
             </div>
 
@@ -233,12 +236,21 @@ const modes = [
 const hasAccounts = computed(() => props.dialog.gitAccounts.length > 0)
 const selectedAccount = computed(() => props.dialog.gitAccounts.find((account) => account.id === props.dialog.form.git_account_id) || null)
 const selectedInstallation = computed(() => props.dialog.installations.find((installation) => String(installation.id) === String(props.dialog.form.installation_id)) || null)
+const selectedInstallationEventWarning = computed(() => {
+  if (!selectedInstallation.value || installationHasPullRequestEvents(selectedInstallation.value)) return ''
+  return 'This installation is missing the pull_request webhook event. New PRs will not trigger review messages; contact the GitHub App administrator to update the event subscription.'
+})
 const accountCountLabel = computed(() => `${props.dialog.gitAccounts.length} account${props.dialog.gitAccounts.length === 1 ? '' : 's'}`)
 const installationCountLabel = computed(() => `${props.dialog.installations.length} installation${props.dialog.installations.length === 1 ? '' : 's'}`)
 const relayConnected = computed(() => props.dialog.relay?.enabled && props.dialog.relay?.connected)
 const githubAppReady = computed(() => relayConnected.value && Boolean(props.dialog.githubApp?.app_slug || props.dialog.githubApp?.install_url))
 const canLoadRepositories = computed(() => props.dialog.mode === 'github_app' ? Boolean(props.dialog.form.installation_id) : Boolean(props.dialog.form.git_account_id))
-const sourceSelected = computed(() => props.dialog.mode === 'github_app' ? Boolean(selectedInstallation.value) : Boolean(selectedAccount.value))
+const sourceSelected = computed(() => {
+  if (props.dialog.mode === 'github_app') {
+    return Boolean(selectedInstallation.value) && !selectedInstallationEventWarning.value
+  }
+  return Boolean(selectedAccount.value)
+})
 const showProjectForm = computed(() => props.dialog.mode !== 'github_app' || (githubAppReady.value && props.dialog.installations.length > 0))
 
 const filteredRepositories = computed(() => {
@@ -404,6 +416,10 @@ function installationLabel(installation) {
   const type = installation.account_type || 'GitHub'
   const selection = installation.repository_selection ? ` · ${installation.repository_selection}` : ''
   return `${account} · ${type}${selection}`
+}
+
+function installationHasPullRequestEvents(installation) {
+  return (installation.events || []).includes('pull_request')
 }
 
 function repositoryLabel(repository) {

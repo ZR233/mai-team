@@ -31,4 +31,5 @@ uuid.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]
+libc = "0.2"
 pretty_assertions.workspace = true

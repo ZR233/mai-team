@@ -1223,6 +1223,11 @@ p {
   background: #fff0c2;
 }
 
+.mini-pill.red {
+  color: #991b1b;
+  background: #fee2e2;
+}
+
 .error-text,
 .dialog-error {
   color: #b42318;

@@ -41,6 +41,7 @@ pub(crate) async fn list_installations(
                 account_login: installation.account.login,
                 account_type: installation.account.account_type,
                 repository_selection: installation.repository_selection,
+                events: installation.events,
             })
             .collect(),
     })

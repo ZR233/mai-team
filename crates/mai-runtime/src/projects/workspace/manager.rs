@@ -589,6 +589,7 @@ mod tests {
             report,
             WorkspaceReconcileReport {
                 orphan_clones_removed: vec![orphan_agent_id],
+                orphan_clone_removal_failed: Vec::new(),
                 orphan_project_dirs_archived: Vec::new(),
                 legacy_worktree_dirs_archived: Vec::new(),
                 missing_repo_caches: Vec::new(),
@@ -598,6 +599,39 @@ mod tests {
         );
         assert!(live_clone.exists());
         assert!(!orphan_clone.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_workspace_manager_reconcile_keeps_running_when_orphan_clone_removal_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fake_git_path(dir.path());
+        let project_id = uuid::Uuid::new_v4();
+        let live_agent_id = uuid::Uuid::new_v4();
+        let orphan_agent_id = uuid::Uuid::new_v4();
+        let project = test_project(project_id, live_agent_id);
+        let live_agent = test_agent(live_agent_id, project_id);
+        let orphan_clone = agent_clone_path(dir.path(), project_id, orphan_agent_id);
+        std::fs::create_dir_all(&orphan_clone).expect("orphan clone");
+        let clones_dir = project_paths(dir.path(), project_id).clones_dir;
+        std::fs::set_permissions(&clones_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("readonly clones dir");
+        let manager = LocalProjectWorkspaceManager::new(git, dir.path().to_path_buf());
+
+        let result = manager.reconcile(&[project], &[live_agent]).await;
+
+        std::fs::set_permissions(&clones_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore clones dir permissions");
+        let report = result.expect("reconcile");
+        assert!(report.orphan_clones_removed.is_empty());
+        let orphan_agent_clone = orphan_clone
+            .parent()
+            .expect("orphan agent clone")
+            .to_path_buf();
+        assert_eq!(report.orphan_clone_removal_failed, vec![orphan_agent_clone]);
+        assert!(orphan_clone.parent().expect("orphan agent clone").exists());
     }
 
     #[tokio::test]
@@ -625,6 +659,7 @@ mod tests {
             report,
             WorkspaceReconcileReport {
                 orphan_clones_removed: Vec::new(),
+                orphan_clone_removal_failed: Vec::new(),
                 orphan_project_dirs_archived: Vec::new(),
                 legacy_worktree_dirs_archived: vec![project_id],
                 missing_repo_caches: Vec::new(),
@@ -658,6 +693,7 @@ mod tests {
             report,
             WorkspaceReconcileReport {
                 orphan_clones_removed: Vec::new(),
+                orphan_clone_removal_failed: Vec::new(),
                 orphan_project_dirs_archived: vec![orphan_project_id],
                 legacy_worktree_dirs_archived: Vec::new(),
                 missing_repo_caches: Vec::new(),

@@ -64,6 +64,8 @@ pub(crate) struct GithubInstallationApi {
     pub(crate) id: u64,
     pub(crate) account: GithubAccountApi,
     pub(crate) repository_selection: Option<String>,
+    #[serde(default)]
+    pub(crate) events: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

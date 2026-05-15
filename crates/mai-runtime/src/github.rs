@@ -37,6 +37,8 @@ pub(crate) struct GithubInstallationApi {
     pub(crate) id: u64,
     pub(crate) account: GithubAccountApi,
     pub(crate) repository_selection: Option<String>,
+    #[serde(default)]
+    pub(crate) events: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +90,7 @@ pub(crate) fn github_installation_summary(
         account_login: installation.account.login,
         account_type: installation.account.account_type,
         repository_selection: installation.repository_selection,
+        events: installation.events,
     }
 }
 
@@ -141,6 +144,35 @@ pub(crate) fn github_scopes(headers: &HeaderMap) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn github_installation_summary_preserves_webhook_events() {
+        let installation: GithubInstallationApi = serde_json::from_value(json!({
+            "id": 42,
+            "account": {
+                "login": "ZR233",
+                "type": "User"
+            },
+            "repository_selection": "all",
+            "events": ["pull_request", "check_suite"]
+        }))
+        .expect("installation");
+
+        let summary = github_installation_summary(installation);
+
+        assert_eq!(
+            summary.events,
+            vec!["pull_request".to_string(), "check_suite".to_string()]
+        );
+    }
 }
 
 pub(crate) fn git_token_kind(token: &str, scopes: &[String]) -> GitTokenKind {
