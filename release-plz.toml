@@ -4,6 +4,7 @@ publish = false
 changelog_update = false
 git_release_enable = false
 git_tag_enable = false
+semver_check = false
 
 [[package]]
 name = "mai-relay"
@@ -11,8 +12,7 @@ release = true
 publish = false
 git_only = true
 changelog_update = true
+semver_check = false
 git_release_enable = true
-git_release_name = "{{ package }} v{{ version }}"
 git_release_latest = true
 git_tag_enable = true
-git_tag_name = "{{ package }}-v{{ version }}"

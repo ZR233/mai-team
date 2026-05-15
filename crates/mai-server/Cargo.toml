@@ -3,7 +3,6 @@ name = "mai-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
 
 [dependencies]
 anyhow.workspace = true
@@ -14,12 +13,12 @@ clap.workspace = true
 futures.workspace = true
 http.workspace = true
 mime_guess.workspace = true
-mai-docker = { path = "../mai-docker" }
-mai-model = { path = "../mai-model" }
-mai-protocol = { path = "../mai-protocol" }
-mai-relay-client = { path = "../mai-relay-client" }
-mai-runtime = { path = "../mai-runtime" }
-mai-store = { path = "../mai-store" }
+mai-docker = { path = "../mai-docker", version = "0.1.2" }
+mai-model = { path = "../mai-model", version = "0.1.2" }
+mai-protocol = { path = "../mai-protocol", version = "0.1.2" }
+mai-relay-client = { path = "../mai-relay-client", version = "0.1.2" }
+mai-runtime = { path = "../mai-runtime", version = "0.1.2" }
+mai-store = { path = "../mai-store", version = "0.1.2" }
 reqwest.workspace = true
 rust-embed.workspace = true
 serde.workspace = true

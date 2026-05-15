@@ -3,11 +3,10 @@ name = "mai-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
 
 [dependencies]
 chrono.workspace = true
-mai-protocol = { path = "../mai-protocol" }
+mai-protocol = { path = "../mai-protocol", version = "0.1.2" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

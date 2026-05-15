@@ -3,11 +3,10 @@ name = "mai-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
 
 [dependencies]
-mai-docker = { path = "../mai-docker" }
-mai-protocol = { path = "../mai-protocol" }
+mai-docker = { path = "../mai-docker", version = "0.1.2" }
+mai-protocol = { path = "../mai-protocol", version = "0.1.2" }
 fnv.workspace = true
 futures.workspace = true
 reqwest.workspace = true

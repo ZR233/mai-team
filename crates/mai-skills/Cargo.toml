@@ -3,12 +3,11 @@ name = "mai-skills"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
 
 [dependencies]
 dirs.workspace = true
 gray_matter.workspace = true
-mai-protocol = { path = "../mai-protocol" }
+mai-protocol = { path = "../mai-protocol", version = "0.1.2" }
 serde.workspace = true
 serde-saphyr.workspace = true
 thiserror.workspace = true
