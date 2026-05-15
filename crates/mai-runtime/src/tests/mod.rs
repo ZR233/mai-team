@@ -1644,6 +1644,54 @@ fn repair_inserts_partial_before_user_message() {
 }
 
 #[test]
+fn repair_keeps_consecutive_function_calls_in_one_batch() {
+    let mut history = vec![
+        ModelInputItem::Reasoning {
+            content: "thinking".to_string(),
+        },
+        ModelInputItem::FunctionCall {
+            call_id: "call_1".to_string(),
+            name: "exec".to_string(),
+            arguments: "{}".to_string(),
+        },
+        ModelInputItem::FunctionCall {
+            call_id: "call_2".to_string(),
+            name: "read".to_string(),
+            arguments: "{}".to_string(),
+        },
+        ModelInputItem::FunctionCallOutput {
+            call_id: "call_2".to_string(),
+            output: "ok".to_string(),
+        },
+        ModelInputItem::user_text("继续"),
+    ];
+    turn::history::repair_incomplete_tool_history(&mut history);
+
+    assert_eq!(history.len(), 6);
+    assert!(matches!(
+        &history[1],
+        ModelInputItem::FunctionCall { call_id, .. } if call_id == "call_1"
+    ));
+    assert!(matches!(
+        &history[2],
+        ModelInputItem::FunctionCall { call_id, .. } if call_id == "call_2"
+    ));
+    assert!(matches!(
+        &history[3],
+        ModelInputItem::FunctionCallOutput { call_id, output }
+            if call_id == "call_2" && output == "ok"
+    ));
+    assert!(matches!(
+        &history[4],
+        ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_1"
+    ));
+    assert!(matches!(
+        &history[5],
+        ModelInputItem::Message { role, .. } if role == "user"
+    ));
+}
+
+#[test]
 fn compacted_history_keeps_recent_user_messages_and_summary_only() {
     let history = vec![
         ModelInputItem::user_text("first user"),

@@ -172,8 +172,9 @@ fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessag
         tool_call_id: None,
     }];
     let mut assistant_replay = AssistantReplayBuilder::default();
-    for item in input.iter() {
-        match item {
+    let mut index = 0;
+    while index < input.len() {
+        match &input[index] {
             ModelInputItem::Message { role, content } => {
                 let text = content
                     .iter()
@@ -185,6 +186,7 @@ fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessag
                     .join("");
                 if role == "assistant" {
                     assistant_replay.push_text(text);
+                    index += 1;
                     continue;
                 }
                 assistant_replay.flush(&mut messages);
@@ -204,14 +206,7 @@ fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessag
                 name,
                 arguments,
             } => {
-                assistant_replay.push_tool_call(ChatToolCall {
-                    id: call_id.clone(),
-                    kind: "function",
-                    function: ChatFunctionCall {
-                        name: name.clone(),
-                        arguments: arguments.clone(),
-                    },
-                });
+                assistant_replay.push_tool_call(chat_tool_call(call_id, name, arguments));
             }
             ModelInputItem::FunctionCallOutput { call_id, output } => {
                 assistant_replay.flush(&mut messages);
@@ -224,9 +219,21 @@ fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessag
                 });
             }
         }
+        index += 1;
     }
     assistant_replay.flush(&mut messages);
     messages
+}
+
+fn chat_tool_call(call_id: &str, name: &str, arguments: &str) -> ChatToolCall {
+    ChatToolCall {
+        id: call_id.to_string(),
+        kind: "function",
+        function: ChatFunctionCall {
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        },
+    }
 }
 
 #[derive(Default)]
@@ -733,6 +740,92 @@ mod tests {
         assert_eq!(value.get("mimo_only").and_then(Value::as_bool), Some(true));
         assert!(value.get("thinking").is_none());
         assert!(value.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn mimo_reasoning_parallel_tool_replay_keeps_one_assistant_message() {
+        let mut model = model_with_reasoning("mimo-v2.5-pro", &["high"], "high", |_| {
+            serde_json::json!({
+                "thinking": {
+                    "type": "enabled",
+                },
+            })
+        });
+        model.request_policy.max_tokens_field = "max_completion_tokens".to_string();
+        let api = ChatCompletionsApi::openai_compatible();
+        let body = api
+            .build_body(&WireRequest {
+                model_id: &model.id,
+                instructions: "instructions",
+                input: &[
+                    ModelInputItem::user_text("介绍项目"),
+                    ModelInputItem::Reasoning {
+                        content: "need repository facts".to_string(),
+                    },
+                    ModelInputItem::assistant_text("Let me inspect the repository."),
+                    ModelInputItem::FunctionCall {
+                        call_id: "call_1".to_string(),
+                        name: "container_exec".to_string(),
+                        arguments: "{\"command\":\"cat README.md\"}".to_string(),
+                    },
+                    ModelInputItem::FunctionCall {
+                        call_id: "call_2".to_string(),
+                        name: "container_exec".to_string(),
+                        arguments: "{\"command\":\"find . -maxdepth 2 -type f\"}".to_string(),
+                    },
+                    ModelInputItem::FunctionCallOutput {
+                        call_id: "call_1".to_string(),
+                        output: "README".to_string(),
+                    },
+                    ModelInputItem::FunctionCallOutput {
+                        call_id: "call_2".to_string(),
+                        output: "Cargo.toml".to_string(),
+                    },
+                ],
+                tools: &[ToolDefinition::function(
+                    "container_exec",
+                    "run a command",
+                    serde_json::json!({ "type": "object" }),
+                )],
+                tool_choice: Some("auto"),
+                stream: false,
+                store: None,
+                previous_response_id: None,
+                prompt_cache_key: None,
+                max_output_tokens: 131_072,
+                max_tokens_field: &model.request_policy.max_tokens_field,
+                extra_body: crate::provider::request_options(&model, Some("high")),
+                supports_tools: true,
+            })
+            .expect("build");
+        let value: Value = serde_json::from_slice(&body).expect("parse");
+        let messages = value
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages");
+
+        assert_eq!(messages.len(), 5);
+        let assistant_msg = &messages[2];
+        assert_eq!(assistant_msg["role"].as_str(), Some("assistant"));
+        assert_eq!(
+            assistant_msg["content"].as_str(),
+            Some("Let me inspect the repository.")
+        );
+        assert_eq!(
+            assistant_msg["reasoning_content"].as_str(),
+            Some("need repository facts")
+        );
+        let tool_calls = assistant_msg
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .expect("tool_calls");
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0]["id"].as_str(), Some("call_1"));
+        assert_eq!(tool_calls[1]["id"].as_str(), Some("call_2"));
+        assert_eq!(messages[3]["role"].as_str(), Some("tool"));
+        assert_eq!(messages[3]["tool_call_id"].as_str(), Some("call_1"));
+        assert_eq!(messages[4]["role"].as_str(), Some("tool"));
+        assert_eq!(messages[4]["tool_call_id"].as_str(), Some("call_2"));
     }
 
     #[test]

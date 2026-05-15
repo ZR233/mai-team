@@ -82,18 +82,37 @@ fn workspace_root() -> Result<PathBuf> {
 }
 
 fn build_relay(workspace_root: &Path) -> Result<PathBuf> {
-    run_status(
-        Command::new("cargo")
+    let plan = RelayBuildPlan::new(workspace_root);
+    run_status(&mut plan.command()).context("building mai-relay")?;
+
+    Ok(plan.binary_path)
+}
+
+struct RelayBuildPlan {
+    workspace_root: PathBuf,
+    binary_path: PathBuf,
+}
+
+impl RelayBuildPlan {
+    fn new(workspace_root: &Path) -> Self {
+        Self {
+            workspace_root: workspace_root.to_path_buf(),
+            binary_path: workspace_root.join("target/release/mai-relay"),
+        }
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new("cargo");
+        command
             .arg("build")
             .arg("-p")
             .arg("mai-relay")
             .arg("--bin")
             .arg("mai-relay")
-            .current_dir(workspace_root),
-    )
-    .context("building mai-relay")?;
-
-    Ok(workspace_root.join("target/debug/mai-relay"))
+            .arg("--release")
+            .current_dir(&self.workspace_root);
+        command
+    }
 }
 
 fn required_env(name: &str) -> Result<String> {
@@ -336,4 +355,36 @@ fn is_placeholder_env(name: &str, value: &str) -> bool {
             )
             | ("MAI_RELAY_GITHUB_APP_SLUG", "github-app-slug")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_build_plan_uses_release_profile() {
+        let workspace_root = PathBuf::from("/workspace");
+        let plan = RelayBuildPlan::new(&workspace_root);
+        let command = plan.command();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "build".to_string(),
+                "-p".to_string(),
+                "mai-relay".to_string(),
+                "--bin".to_string(),
+                "mai-relay".to_string(),
+                "--release".to_string(),
+            ]
+        );
+        assert_eq!(
+            plan.binary_path,
+            workspace_root.join("target/release/mai-relay")
+        );
+    }
 }

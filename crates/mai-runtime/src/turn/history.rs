@@ -186,52 +186,54 @@ pub(crate) fn compact_summary_from_output(output: &[ModelOutputItem]) -> Option<
 }
 
 pub(crate) fn repair_incomplete_tool_history(history: &mut Vec<ModelInputItem>) -> bool {
-    let mut insertions: Vec<(usize, ModelInputItem)> = Vec::new();
+    let mut insertions: Vec<(usize, Vec<ModelInputItem>)> = Vec::new();
     let mut i = 0;
     while i < history.len() {
-        let call_ids: Vec<String> = match &history[i] {
-            ModelInputItem::FunctionCall { call_id, .. } => {
-                vec![call_id.clone()]
+        let mut call_ids = Vec::new();
+        while i < history.len() {
+            match &history[i] {
+                ModelInputItem::FunctionCall { call_id, .. } => {
+                    call_ids.push(call_id.clone());
+                    i += 1;
+                }
+                _ => break,
             }
-            _ => {
-                i += 1;
-                continue;
-            }
-        };
+        }
         if call_ids.is_empty() {
             i += 1;
             continue;
         }
+
         let mut answered = HashSet::new();
-        let mut last_output_pos = i;
-        let mut j = i + 1;
-        while j < history.len() {
-            if let ModelInputItem::FunctionCallOutput { call_id, .. } = &history[j] {
-                if call_ids.iter().any(|id| id == call_id) {
+        while i < history.len() {
+            match &history[i] {
+                ModelInputItem::FunctionCallOutput { call_id, .. }
+                    if call_ids.iter().any(|id| id == call_id) =>
+                {
                     answered.insert(call_id.clone());
+                    i += 1;
                 }
-                last_output_pos = j;
-                j += 1;
-            } else {
-                break;
+                _ => break,
             }
         }
-        for call_id in call_ids {
-            if !answered.contains(&call_id) {
-                insertions.push((
-                    last_output_pos + 1,
-                    ModelInputItem::FunctionCallOutput {
-                        call_id,
-                        output: "error: tool execution interrupted".to_string(),
-                    },
-                ));
-            }
+
+        let missing_outputs = call_ids
+            .into_iter()
+            .filter(|call_id| !answered.contains(call_id))
+            .map(|call_id| ModelInputItem::FunctionCallOutput {
+                call_id,
+                output: "error: tool execution interrupted".to_string(),
+            })
+            .collect::<Vec<_>>();
+        if !missing_outputs.is_empty() {
+            insertions.push((i, missing_outputs));
         }
-        i = j;
     }
     let changed = !insertions.is_empty();
-    for (pos, item) in insertions.into_iter().rev() {
-        history.insert(pos, item);
+    for (pos, items) in insertions.into_iter().rev() {
+        for item in items.into_iter().rev() {
+            history.insert(pos, item);
+        }
     }
     changed
 }
