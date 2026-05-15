@@ -1,0 +1,101 @@
+name: Release-plz
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      relay_released: ${{ steps.relay-release.outputs.released }}
+      relay_tag: ${{ steps.relay-release.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read relay release output
+        id: relay-release
+        env:
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          relay_release="$(jq -c 'map(select(.package_name == "mai-relay")) | first // empty' <<<"${RELEASES:-[]}")"
+          if [[ -z "$relay_release" ]]; then
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "released=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$(jq -r '.tag' <<<"$relay_release")" >> "$GITHUB_OUTPUT"
+
+      - name: Build relay
+        if: steps.relay-release.outputs.released == 'true'
+        run: cargo build --locked -p mai-relay --bin mai-relay --release
+
+      - name: Package relay
+        if: steps.relay-release.outputs.released == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/mai-relay dist/mai-relay
+          tar -C dist -czf mai-relay-x86_64-unknown-linux-gnu.tar.gz mai-relay
+          sha256sum mai-relay-x86_64-unknown-linux-gnu.tar.gz > mai-relay-x86_64-unknown-linux-gnu.tar.gz.sha256
+
+      - name: Upload relay release assets
+        if: steps.relay-release.outputs.released == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.relay-release.outputs.tag }}
+          fail_on_unmatched_files: true
+          files: |
+            mai-relay-x86_64-unknown-linux-gnu.tar.gz
+            mai-relay-x86_64-unknown-linux-gnu.tar.gz.sha256
+
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

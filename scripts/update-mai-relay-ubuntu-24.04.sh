@@ -9,7 +9,7 @@ PUBLIC_URL=""
 
 usage() {
   cat <<'USAGE'
-Usage: update-mai-relay-ubuntu-24.04.sh [--version vX.Y.Z] [--public-url URL] [--rotate-token] [--dry-run]
+Usage: update-mai-relay-ubuntu-24.04.sh [--version mai-relay-vX.Y.Z] [--public-url URL] [--rotate-token] [--dry-run]
 USAGE
 }
 

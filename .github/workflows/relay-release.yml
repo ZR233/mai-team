@@ -1,10 +1,12 @@
 name: Build Relay Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "GitHub release tag to upload relay assets to, for example mai-relay-v0.1.2"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -15,6 +17,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build relay
         run: cargo build --locked -p mai-relay --bin mai-relay --release
@@ -31,6 +38,8 @@ jobs:
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag }}
+          fail_on_unmatched_files: true
           files: |
             mai-relay-x86_64-unknown-linux-gnu.tar.gz
             mai-relay-x86_64-unknown-linux-gnu.tar.gz.sha256

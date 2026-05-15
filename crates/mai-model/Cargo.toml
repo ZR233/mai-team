@@ -3,6 +3,7 @@ name = "mai-model"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 mai-protocol = { path = "../mai-protocol" }

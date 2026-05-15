@@ -3,6 +3,7 @@ name = "mai-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 mai-docker = { path = "../mai-docker" }

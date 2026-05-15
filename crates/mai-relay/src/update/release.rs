@@ -91,7 +91,22 @@ pub(super) fn self_update_supported() -> bool {
 }
 
 pub(super) fn normalize_version(value: &str) -> String {
-    value.trim().trim_start_matches('v').to_string()
+    let trimmed = value.trim();
+    let without_v = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    if without_v
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_digit())
+    {
+        return without_v.to_string();
+    }
+    if let Some((index, _)) = trimmed
+        .char_indices()
+        .find(|(_, character)| character.is_ascii_digit())
+    {
+        return trimmed[index..].to_string();
+    }
+    without_v.to_string()
 }
 
 pub(super) fn select_release_assets(release: &GithubRelease) -> RelayResult<SelectedReleaseAssets> {
@@ -184,6 +199,11 @@ mod tests {
     fn compare_versions_uses_numeric_segments() {
         assert_eq!(compare_versions("0.10.0", "0.2.0"), Ordering::Greater);
         assert_eq!(compare_versions("v1.2.0", "1.2.0"), Ordering::Equal);
+        assert_eq!(compare_versions("0.1.2", "v0.1.2"), Ordering::Equal);
+        assert_eq!(
+            compare_versions("0.1.2", "mai-relay-v0.1.2"),
+            Ordering::Equal
+        );
         assert_eq!(compare_versions("1.2.0", "1.2.1"), Ordering::Less);
         assert_eq!(compare_versions("1.2.3", "1.2"), Ordering::Greater);
     }
@@ -193,17 +213,17 @@ mod tests {
         let release = release_with_assets(vec![
             asset(
                 "notes.txt",
-                "https://github.com/ZR233/mai-team/releases/download/v0.1.0/notes.txt",
+                "https://github.com/ZR233/mai-team/releases/download/mai-relay-v0.1.0/notes.txt",
                 10,
             ),
             asset(
                 RELAY_ASSET_NAME,
-                "https://github.com/ZR233/mai-team/releases/download/v0.1.0/mai-relay.tar.gz",
+                "https://github.com/ZR233/mai-team/releases/download/mai-relay-v0.1.0/mai-relay.tar.gz",
                 100,
             ),
             asset(
                 RELAY_CHECKSUM_NAME,
-                "https://github.com/ZR233/mai-team/releases/download/v0.1.0/mai-relay.tar.gz.sha256",
+                "https://github.com/ZR233/mai-team/releases/download/mai-relay-v0.1.0/mai-relay.tar.gz.sha256",
                 64,
             ),
         ]);
@@ -214,10 +234,10 @@ mod tests {
             selected,
             SelectedReleaseAssets {
                 archive_url:
-                    "https://github.com/ZR233/mai-team/releases/download/v0.1.0/mai-relay.tar.gz"
+                    "https://github.com/ZR233/mai-team/releases/download/mai-relay-v0.1.0/mai-relay.tar.gz"
                         .to_string(),
                 checksum_url:
-                    "https://github.com/ZR233/mai-team/releases/download/v0.1.0/mai-relay.tar.gz.sha256"
+                    "https://github.com/ZR233/mai-team/releases/download/mai-relay-v0.1.0/mai-relay.tar.gz.sha256"
                         .to_string(),
             }
         );
@@ -242,11 +262,11 @@ mod tests {
     #[test]
     fn github_release_deserialization_accepts_null_body() {
         let release: GithubRelease = serde_json::from_value(serde_json::json!({
-            "tag_name": "v0.2.0",
-            "name": "v0.2.0",
+            "tag_name": "mai-relay-v0.2.0",
+            "name": "mai-relay v0.2.0",
             "body": null,
             "published_at": "2026-05-15T00:00:00Z",
-            "html_url": "https://github.com/ZR233/mai-team/releases/tag/v0.2.0",
+            "html_url": "https://github.com/ZR233/mai-team/releases/tag/mai-relay-v0.2.0",
             "assets": []
         }))
         .expect("deserialize release");
@@ -258,7 +278,7 @@ mod tests {
     fn validate_download_url_accepts_only_trusted_https_hosts() {
         assert!(
             validate_download_url(
-                "https://github.com/ZR233/mai-team/releases/download/v0.1.0/mai-relay.tar.gz"
+                "https://github.com/ZR233/mai-team/releases/download/mai-relay-v0.1.0/mai-relay.tar.gz"
             )
             .is_ok()
         );
@@ -274,11 +294,11 @@ mod tests {
 
     fn release_with_assets(assets: Vec<GithubReleaseAsset>) -> GithubRelease {
         GithubRelease {
-            tag_name: "v0.2.0".to_string(),
-            name: "v0.2.0".to_string(),
+            tag_name: "mai-relay-v0.2.0".to_string(),
+            name: "mai-relay v0.2.0".to_string(),
             body: "release".to_string(),
             published_at: "2026-05-15T00:00:00Z".to_string(),
-            html_url: "https://github.com/ZR233/mai-team/releases/tag/v0.2.0".to_string(),
+            html_url: "https://github.com/ZR233/mai-team/releases/tag/mai-relay-v0.2.0".to_string(),
             assets,
         }
     }

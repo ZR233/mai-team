@@ -3,6 +3,7 @@ name = "mai-docker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 shell-words.workspace = true

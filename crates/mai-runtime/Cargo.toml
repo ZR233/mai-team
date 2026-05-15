@@ -3,6 +3,7 @@ name = "mai-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 base64.workspace = true

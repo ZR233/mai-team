@@ -3,6 +3,7 @@ name = "mai-tools"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 mai-mcp = { path = "../mai-mcp" }
