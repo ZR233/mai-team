@@ -3,7 +3,6 @@ name = "mai-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
 
 [dependencies]
 base64.workspace = true
@@ -12,14 +11,14 @@ shell-words.workspace = true
 chrono.workspace = true
 futures.workspace = true
 jsonwebtoken.workspace = true
-mai-docker = { path = "../mai-docker" }
-mai-agents = { path = "../mai-agents" }
-mai-mcp = { path = "../mai-mcp" }
-mai-model = { path = "../mai-model" }
-mai-protocol = { path = "../mai-protocol" }
-mai-skills = { path = "../mai-skills" }
-mai-store = { path = "../mai-store" }
-mai-tools = { path = "../mai-tools" }
+mai-docker = { path = "../mai-docker", version = "0.1.2" }
+mai-agents = { path = "../mai-agents", version = "0.1.2" }
+mai-mcp = { path = "../mai-mcp", version = "0.1.2" }
+mai-model = { path = "../mai-model", version = "0.1.2" }
+mai-protocol = { path = "../mai-protocol", version = "0.1.2" }
+mai-skills = { path = "../mai-skills", version = "0.1.2" }
+mai-store = { path = "../mai-store", version = "0.1.2" }
+mai-tools = { path = "../mai-tools", version = "0.1.2" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

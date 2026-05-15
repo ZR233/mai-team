@@ -17,6 +17,7 @@ fn main() {
     let system_agents_dir = manifest_dir.join("system-agents");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let static_dir = out_dir.join("static");
+    let frontend_build_dir = out_dir.join("web");
     let embedded_system_skills_dir = out_dir.join("system-skills");
     let embedded_system_agents_dir = out_dir.join("system-agents");
     let anthropic_skills_repo_dir = out_dir.join("anthropic-skills");
@@ -33,11 +34,12 @@ fn main() {
     prepare_system_agents_dir(&system_agents_dir, &embedded_system_agents_dir);
 
     watch_frontend(&web_dir);
-    ensure_npm(&web_dir, &npm_cache_dir);
+    prepare_frontend_build_dir(&web_dir, &frontend_build_dir);
+    ensure_npm(&frontend_build_dir, &npm_cache_dir);
 
     let static_arg = static_dir.to_string_lossy().to_string();
     run_npm(
-        &web_dir,
+        &frontend_build_dir,
         &npm_cache_dir,
         [
             "run",
@@ -285,6 +287,49 @@ fn watch_frontend(web_dir: &Path) {
     watch_dir(&web_dir.join("public"));
 }
 
+fn prepare_frontend_build_dir(source_dir: &Path, target_dir: &Path) {
+    fs::create_dir_all(target_dir).unwrap_or_else(|err| {
+        panic!(
+            "failed to create frontend build dir {}: {err}",
+            target_dir.display()
+        )
+    });
+    remove_frontend_build_inputs(target_dir);
+    copy_dir(source_dir, target_dir, should_skip_frontend_build_entry);
+}
+
+fn remove_frontend_build_inputs(target_dir: &Path) {
+    for entry in fs::read_dir(target_dir).unwrap_or_else(|err| {
+        panic!(
+            "failed to read frontend build dir {}: {err}",
+            target_dir.display()
+        )
+    }) {
+        let entry =
+            entry.unwrap_or_else(|err| panic!("failed to read frontend build entry: {err}"));
+        let file_name = entry.file_name();
+        if matches!(file_name.to_str(), Some("node_modules")) {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            fs::remove_dir_all(&path).unwrap_or_else(|err| {
+                panic!(
+                    "failed to remove frontend build dir {}: {err}",
+                    path.display()
+                )
+            });
+        } else {
+            fs::remove_file(&path).unwrap_or_else(|err| {
+                panic!(
+                    "failed to remove frontend build file {}: {err}",
+                    path.display()
+                )
+            });
+        }
+    }
+}
+
 fn watch_dir(path: &Path) {
     if !path.exists() {
         return;
@@ -419,6 +464,13 @@ fn should_skip_anthropic_skill_entry(file_name: &OsStr) -> bool {
         return false;
     };
     name == ".DS_Store" || name.starts_with('.')
+}
+
+fn should_skip_frontend_build_entry(file_name: &OsStr) -> bool {
+    matches!(
+        file_name.to_str(),
+        Some(".DS_Store" | "dist" | "node_modules")
+    )
 }
 
 fn env_flag_enabled(name: &str) -> bool {
