@@ -2,7 +2,7 @@ use super::*;
 use crate::events::event_session_id;
 use crate::schema::{SCHEMA_VERSION, SETTING_SCHEMA_VERSION};
 use mai_protocol::{
-    AgentStatus, McpServerScope, McpServerTransport, MessageRole, ModelContentItem, ModelToolCall,
+    AgentStatus, McpServerScope, McpServerTransport, MessageRole, ModelContentItem,
     ProjectCloneStatus, ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus,
     ProjectStatus, ServiceEventKind, TurnStatus,
 };
@@ -720,14 +720,13 @@ async fn runtime_snapshot_survives_reopen() {
                 text: "hello".to_string(),
             }],
         },
-        ModelInputItem::AssistantTurn {
-            content: None,
-            reasoning_content: Some("thinking".to_string()),
-            tool_calls: vec![ModelToolCall {
-                call_id: "call_1".to_string(),
-                name: "container_exec".to_string(),
-                arguments: "{\"command\":\"pwd\"}".to_string(),
-            }],
+        ModelInputItem::Reasoning {
+            content: "thinking".to_string(),
+        },
+        ModelInputItem::FunctionCall {
+            call_id: "call_1".to_string(),
+            name: "container_exec".to_string(),
+            arguments: "{\"command\":\"pwd\"}".to_string(),
         },
     ];
     let event = ServiceEvent {
@@ -762,6 +761,10 @@ async fn runtime_snapshot_survives_reopen() {
         .append_agent_history_item(agent_id, session_id, 1, &history[1])
         .await
         .expect("history");
+    store
+        .append_agent_history_item(agent_id, session_id, 2, &history[2])
+        .await
+        .expect("history");
     store.append_service_event(&event).await.expect("event");
     drop(store);
 
@@ -794,17 +797,21 @@ async fn runtime_snapshot_survives_reopen() {
     assert_eq!(snapshot.agents[0].sessions.len(), 1);
     assert_eq!(snapshot.agents[0].sessions[0].summary.title, "Chat 1");
     assert_eq!(snapshot.agents[0].sessions[0].summary.message_count, 1);
-    assert_eq!(snapshot.agents[0].sessions[0].history.len(), 2);
+    assert_eq!(snapshot.agents[0].sessions[0].history.len(), 3);
     assert_eq!(snapshot.agents[0].sessions[0].last_context_tokens, None);
     assert!(matches!(
         &snapshot.agents[0].sessions[0].history[1],
-        ModelInputItem::AssistantTurn {
-            reasoning_content: Some(reasoning),
-            tool_calls,
-            ..
-        } if reasoning == "thinking"
-            && tool_calls.len() == 1
-            && tool_calls[0].call_id == "call_1"
+        ModelInputItem::Reasoning { content } if content == "thinking"
+    ));
+    assert!(matches!(
+        &snapshot.agents[0].sessions[0].history[2],
+        ModelInputItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+        } if call_id == "call_1"
+            && name == "container_exec"
+            && arguments == "{\"command\":\"pwd\"}"
     ));
     assert_eq!(snapshot.recent_events.len(), 1);
     assert_eq!(

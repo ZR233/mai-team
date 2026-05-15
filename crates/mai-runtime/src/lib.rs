@@ -8,7 +8,7 @@ use mai_mcp::McpTool;
 use mai_model::{ModelClient, ModelTurnState};
 use mai_protocol::*;
 #[cfg(test)]
-use mai_protocol::{MessageRole, ModelContentItem, ModelToolCall};
+use mai_protocol::{MessageRole, ModelContentItem};
 use mai_skills::{SkillInjections, SkillsManager};
 use mai_store::{AgentLogFilter, ConfigStore, ProviderSelection, ToolTraceFilter};
 #[cfg(test)]
@@ -631,7 +631,6 @@ impl AgentRuntime {
             .into_iter()
             .filter_map(|item| match item {
                 ModelOutputItem::Message { text } => Some(text),
-                ModelOutputItem::AssistantTurn { content, .. } => content,
                 _ => None,
             })
             .collect::<Vec<_>>()

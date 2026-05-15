@@ -171,9 +171,11 @@ fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessag
         tool_calls: Vec::new(),
         tool_call_id: None,
     }];
+    let mut assistant_replay = AssistantReplayBuilder::default();
     for item in input.iter() {
         match item {
             ModelInputItem::Message { role, content } => {
+                assistant_replay.flush(&mut messages);
                 let text = content
                     .iter()
                     .map(|item| match item {
@@ -190,73 +192,72 @@ fn chat_messages(instructions: &str, input: &[ModelInputItem]) -> Vec<ChatMessag
                     tool_call_id: None,
                 });
             }
-            ModelInputItem::AssistantTurn {
-                content,
-                reasoning_content,
-                tool_calls,
-            } => {
-                let tool_calls = tool_calls
-                    .iter()
-                    .map(|tool_call| ChatToolCall {
-                        id: tool_call.call_id.clone(),
-                        kind: "function",
-                        function: ChatFunctionCall {
-                            name: tool_call.name.clone(),
-                            arguments: tool_call.arguments.clone(),
-                        },
-                    })
-                    .collect::<Vec<_>>();
-                let reasoning_content = reasoning_content.clone();
-                messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: assistant_chat_content(
-                        content,
-                        &tool_calls,
-                        reasoning_content.as_deref(),
-                    ),
-                    reasoning_content,
-                    tool_calls,
-                    tool_call_id: None,
-                });
+            ModelInputItem::Reasoning { content } => {
+                assistant_replay.push_reasoning(content);
             }
             ModelInputItem::FunctionCall {
                 call_id,
                 name,
                 arguments,
-            } => messages.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: Some(String::new()),
-                reasoning_content: None,
-                tool_calls: vec![ChatToolCall {
+            } => {
+                assistant_replay.push_tool_call(ChatToolCall {
                     id: call_id.clone(),
                     kind: "function",
                     function: ChatFunctionCall {
                         name: name.clone(),
                         arguments: arguments.clone(),
                     },
-                }],
-                tool_call_id: None,
-            }),
-            ModelInputItem::FunctionCallOutput { call_id, output } => messages.push(ChatMessage {
-                role: "tool".to_string(),
-                content: Some(output.clone()),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                tool_call_id: Some(call_id.clone()),
-            }),
+                });
+            }
+            ModelInputItem::FunctionCallOutput { call_id, output } => {
+                assistant_replay.flush(&mut messages);
+                messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(output.clone()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some(call_id.clone()),
+                });
+            }
         }
     }
+    assistant_replay.flush(&mut messages);
     messages
 }
 
-fn assistant_chat_content(
-    content: &Option<String>,
-    tool_calls: &[ChatToolCall],
-    reasoning_content: Option<&str>,
-) -> Option<String> {
-    content
-        .clone()
-        .or_else(|| (!tool_calls.is_empty() || reasoning_content.is_some()).then(String::new))
+#[derive(Default)]
+struct AssistantReplayBuilder {
+    reasoning_content: Option<String>,
+    tool_calls: Vec<ChatToolCall>,
+}
+
+impl AssistantReplayBuilder {
+    fn push_reasoning(&mut self, content: &str) {
+        if content.trim().is_empty() {
+            return;
+        }
+        match &mut self.reasoning_content {
+            Some(existing) => existing.push_str(content),
+            None => self.reasoning_content = Some(content.to_string()),
+        }
+    }
+
+    fn push_tool_call(&mut self, tool_call: ChatToolCall) {
+        self.tool_calls.push(tool_call);
+    }
+
+    fn flush(&mut self, messages: &mut Vec<ChatMessage>) {
+        if self.reasoning_content.is_none() && self.tool_calls.is_empty() {
+            return;
+        }
+        messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(String::new()),
+            reasoning_content: self.reasoning_content.take(),
+            tool_calls: std::mem::take(&mut self.tool_calls),
+            tool_call_id: None,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -377,7 +378,7 @@ fn parse_chat_stream_chunk_with_usage_parser(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mai_protocol::{ModelReasoningConfig, ModelReasoningVariant, ModelToolCall, ModelWireApi};
+    use mai_protocol::{ModelReasoningConfig, ModelReasoningVariant, ModelWireApi};
 
     fn model_with_reasoning(
         id: &str,
@@ -422,19 +423,18 @@ mod tests {
     }
 
     #[test]
-    fn chat_messages_preserve_reasoning_content_for_assistant_turns() {
+    fn chat_messages_fold_reasoning_and_function_call_into_assistant_message() {
         let messages = chat_messages(
             "instructions",
             &[
                 ModelInputItem::user_text("hello"),
-                ModelInputItem::AssistantTurn {
-                    content: None,
-                    reasoning_content: Some("thinking".to_string()),
-                    tool_calls: vec![ModelToolCall {
-                        call_id: "call_1".to_string(),
-                        name: "container_exec".to_string(),
-                        arguments: "{\"command\":\"pwd\"}".to_string(),
-                    }],
+                ModelInputItem::Reasoning {
+                    content: "thinking".to_string(),
+                },
+                ModelInputItem::FunctionCall {
+                    call_id: "call_1".to_string(),
+                    name: "container_exec".to_string(),
+                    arguments: "{\"command\":\"pwd\"}".to_string(),
                 },
             ],
         );
@@ -446,15 +446,49 @@ mod tests {
     }
 
     #[test]
-    fn chat_messages_preserve_reasoning_content_for_all_assistant_turns() {
+    fn chat_messages_fold_consecutive_function_calls_into_one_assistant_message() {
+        let messages = chat_messages(
+            "instructions",
+            &[
+                ModelInputItem::user_text("hello"),
+                ModelInputItem::Reasoning {
+                    content: "thinking".to_string(),
+                },
+                ModelInputItem::FunctionCall {
+                    call_id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: "{\"path\":\"Cargo.toml\"}".to_string(),
+                },
+                ModelInputItem::FunctionCall {
+                    call_id: "call_2".to_string(),
+                    name: "list_files".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                ModelInputItem::FunctionCallOutput {
+                    call_id: "call_1".to_string(),
+                    output: "done".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[2].reasoning_content.as_deref(), Some("thinking"));
+        assert_eq!(messages[2].tool_calls.len(), 2);
+        assert_eq!(messages[2].tool_calls[0].id, "call_1");
+        assert_eq!(messages[2].tool_calls[1].id, "call_2");
+        assert_eq!(messages[3].role, "tool");
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn chat_messages_flush_reasoning_without_tool_call_as_assistant_message() {
         let messages = chat_messages(
             "instructions",
             &[
                 ModelInputItem::user_text("first"),
-                ModelInputItem::AssistantTurn {
-                    content: None,
-                    reasoning_content: Some("old thinking".to_string()),
-                    tool_calls: Vec::new(),
+                ModelInputItem::Reasoning {
+                    content: "old thinking".to_string(),
                 },
                 ModelInputItem::user_text("second"),
             ],
@@ -513,14 +547,13 @@ mod tests {
                 instructions: "instructions",
                 input: &[
                     ModelInputItem::user_text("continue"),
-                    ModelInputItem::AssistantTurn {
-                        content: None,
-                        reasoning_content: Some("need a tool".to_string()),
-                        tool_calls: vec![ModelToolCall {
-                            call_id: "call_1".to_string(),
-                            name: "container_exec".to_string(),
-                            arguments: "{\"command\":\"pwd\"}".to_string(),
-                        }],
+                    ModelInputItem::Reasoning {
+                        content: "need a tool".to_string(),
+                    },
+                    ModelInputItem::FunctionCall {
+                        call_id: "call_1".to_string(),
+                        name: "container_exec".to_string(),
+                        arguments: "{\"command\":\"pwd\"}".to_string(),
                     },
                     ModelInputItem::FunctionCallOutput {
                         call_id: "call_1".to_string(),

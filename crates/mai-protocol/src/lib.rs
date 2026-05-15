@@ -1427,13 +1427,8 @@ pub enum ModelInputItem {
         role: String,
         content: Vec<ModelContentItem>,
     },
-    AssistantTurn {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        content: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reasoning_content: Option<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        tool_calls: Vec<ModelToolCall>,
+    Reasoning {
+        content: String,
     },
     FunctionCall {
         call_id: String,
@@ -1469,13 +1464,6 @@ pub enum ModelContentItem {
     OutputText { text: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ModelToolCall {
-    pub call_id: String,
-    pub name: String,
-    pub arguments: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     #[serde(rename = "type")]
@@ -1506,11 +1494,8 @@ pub enum ModelOutputItem {
     Message {
         text: String,
     },
-    AssistantTurn {
-        content: Option<String>,
-        reasoning_content: Option<String>,
-        #[serde(default)]
-        tool_calls: Vec<ModelOutputToolCall>,
+    Reasoning {
+        content: String,
     },
     FunctionCall {
         call_id: String,
@@ -1521,14 +1506,6 @@ pub enum ModelOutputItem {
     Other {
         raw: Value,
     },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelOutputToolCall {
-    pub call_id: String,
-    pub name: String,
-    pub arguments: Value,
-    pub raw_arguments: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2061,6 +2038,42 @@ mod tests {
         assert_eq!(request.model, None);
         assert_eq!(request.reasoning_effort, None);
         assert!(request.deep);
+    }
+
+    #[test]
+    fn model_ledger_items_round_trip_as_independent_entries() {
+        let items = vec![
+            ModelInputItem::Reasoning {
+                content: "thinking".to_string(),
+            },
+            ModelInputItem::FunctionCall {
+                call_id: "call_1".to_string(),
+                name: "container_exec".to_string(),
+                arguments: "{\"command\":\"pwd\"}".to_string(),
+            },
+            ModelInputItem::FunctionCallOutput {
+                call_id: "call_1".to_string(),
+                output: "{\"status\":0}".to_string(),
+            },
+        ];
+
+        let value = serde_json::to_value(&items).expect("serialize");
+        assert_eq!(value[0]["type"], "reasoning");
+        assert_eq!(value[1]["type"], "function_call");
+        assert_eq!(value[2]["type"], "function_call_output");
+        let decoded: Vec<ModelInputItem> = serde_json::from_value(value).expect("deserialize");
+        assert!(matches!(
+            &decoded[0],
+            ModelInputItem::Reasoning { content } if content == "thinking"
+        ));
+        assert!(matches!(
+            &decoded[1],
+            ModelInputItem::FunctionCall { call_id, .. } if call_id == "call_1"
+        ));
+        assert!(matches!(
+            &decoded[2],
+            ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_1"
+        ));
     }
 
     #[test]

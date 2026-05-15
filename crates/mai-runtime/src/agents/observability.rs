@@ -93,22 +93,15 @@ pub(crate) async fn tool_trace(
                 tool_name = Some(name);
                 arguments = Some(parse_tool_arguments(&raw_arguments));
             }
-            ModelInputItem::AssistantTurn { tool_calls, .. } => {
-                for tool_call in tool_calls {
-                    if tool_call.call_id == call_id {
-                        tool_name = Some(tool_call.name);
-                        arguments = Some(parse_tool_arguments(&tool_call.arguments));
-                        break;
-                    }
-                }
-            }
             ModelInputItem::FunctionCallOutput {
                 call_id: item_call_id,
                 output: item_output,
             } if item_call_id == call_id => {
                 output = Some(item_output);
             }
-            ModelInputItem::Message { .. } | ModelInputItem::FunctionCall { .. } => {}
+            ModelInputItem::Message { .. }
+            | ModelInputItem::Reasoning { .. }
+            | ModelInputItem::FunctionCall { .. } => {}
             ModelInputItem::FunctionCallOutput { .. } => {}
         }
     }

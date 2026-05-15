@@ -6,8 +6,8 @@ use mai_model::{
     ModelClient, ModelEventStream, ModelStreamAccumulator, ModelStreamEvent, ModelTurnState,
 };
 use mai_protocol::{
-    AgentId, MessageRole, ModelInputItem, ModelOutputItem, ModelResponse, ModelToolCall,
-    ServiceEventKind, SessionId, TokenUsage, ToolDefinition, TurnId,
+    AgentId, MessageRole, ModelInputItem, ModelOutputItem, ModelResponse, ServiceEventKind,
+    SessionId, TokenUsage, ToolDefinition, TurnId,
 };
 use mai_store::{ConfigStore, ProviderSelection};
 use serde_json::Value;
@@ -65,7 +65,6 @@ struct ModelStreamReducer<'a> {
     usage: Option<TokenUsage>,
     completed: bool,
     last_assistant_text: Option<String>,
-    last_reasoning_content: Option<String>,
     fallback_text: String,
     fallback_reasoning: String,
     tool_calls: Vec<(String, String, Value)>,
@@ -97,7 +96,6 @@ impl<'a> ModelStreamReducer<'a> {
             usage: None,
             completed: false,
             last_assistant_text: None,
-            last_reasoning_content: None,
             fallback_text: String::new(),
             fallback_reasoning: String::new(),
             tool_calls: Vec::new(),
@@ -247,44 +245,31 @@ impl<'a> ModelStreamReducer<'a> {
                 } else {
                     text
                 };
-                let reasoning_content =
-                    (!active.reasoning.trim().is_empty()).then_some(active.reasoning);
-                if reasoning_content.is_some() {
-                    self.final_output_items
-                        .push(ModelOutputItem::AssistantTurn {
-                            content: (!text.trim().is_empty()).then_some(text.clone()),
-                            reasoning_content: reasoning_content.clone(),
-                            tool_calls: Vec::new(),
-                        });
-                } else {
+                if !active.reasoning.trim().is_empty() {
+                    self.record_reasoning_item(active.reasoning).await?;
+                }
+                if !text.trim().is_empty() {
+                    self.made_progress = true;
                     self.final_output_items
                         .push(ModelOutputItem::Message { text: text.clone() });
-                }
-                if !text.trim().is_empty() || reasoning_content.is_some() {
-                    self.made_progress = true;
-                    if let Some(reasoning) = &reasoning_content {
-                        self.last_reasoning_content = Some(reasoning.clone());
-                    }
-                    if !text.trim().is_empty() {
-                        self.record_assistant_message(text.clone()).await?;
-                    }
+                    self.record_assistant_message(text.clone()).await?;
                     super::history::record_history_item(
                         self.store,
                         self.agent,
                         self.agent_id,
                         self.session_id,
-                        if reasoning_content.is_some() {
-                            ModelInputItem::AssistantTurn {
-                                content: (!text.trim().is_empty()).then_some(text),
-                                reasoning_content,
-                                tool_calls: Vec::new(),
-                            }
-                        } else {
-                            ModelInputItem::assistant_text(text)
-                        },
+                        ModelInputItem::assistant_text(text),
                     )
                     .await?;
                 }
+            }
+            ModelOutputItem::Reasoning { content } => {
+                let content = if content.trim().is_empty() {
+                    active.reasoning
+                } else {
+                    content
+                };
+                self.record_reasoning_item(content).await?;
             }
             ModelOutputItem::FunctionCall {
                 call_id,
@@ -294,6 +279,23 @@ impl<'a> ModelStreamReducer<'a> {
             } => {
                 self.made_progress = true;
                 let call_id = normalized_call_id(call_id);
+                if !active.reasoning.trim().is_empty() {
+                    self.record_reasoning_item(active.reasoning).await?;
+                }
+                if !active.text.trim().is_empty() {
+                    let text = active.text;
+                    self.final_output_items
+                        .push(ModelOutputItem::Message { text: text.clone() });
+                    self.record_assistant_message(text.clone()).await?;
+                    super::history::record_history_item(
+                        self.store,
+                        self.agent,
+                        self.agent_id,
+                        self.session_id,
+                        ModelInputItem::assistant_text(text),
+                    )
+                    .await?;
+                }
                 self.final_output_items.push(ModelOutputItem::FunctionCall {
                     call_id: call_id.clone(),
                     name: name.clone(),
@@ -314,70 +316,6 @@ impl<'a> ModelStreamReducer<'a> {
                 .await?;
                 self.tool_calls.push((call_id, name, arguments));
             }
-            ModelOutputItem::AssistantTurn {
-                content,
-                reasoning_content,
-                tool_calls,
-            } => {
-                let mut output_tool_calls = Vec::new();
-                let assistant_tool_calls = tool_calls
-                    .into_iter()
-                    .map(|tool_call| {
-                        let call_id = normalized_call_id(tool_call.call_id);
-                        let name = tool_call.name;
-                        let arguments = tool_call.arguments;
-                        let raw_arguments = tool_call.raw_arguments;
-                        self.tool_calls
-                            .push((call_id.clone(), name.clone(), arguments.clone()));
-                        output_tool_calls.push(mai_protocol::ModelOutputToolCall {
-                            call_id: call_id.clone(),
-                            name: name.clone(),
-                            arguments,
-                            raw_arguments: raw_arguments.clone(),
-                        });
-                        ModelToolCall {
-                            call_id,
-                            name,
-                            arguments: raw_arguments,
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let content = content
-                    .or_else(|| (!active.text.trim().is_empty()).then_some(active.text))
-                    .filter(|text| !text.trim().is_empty());
-                let reasoning_content = reasoning_content
-                    .or_else(|| (!active.reasoning.trim().is_empty()).then_some(active.reasoning))
-                    .filter(|reasoning| !reasoning.trim().is_empty());
-                let has_content = content.is_some();
-                let has_reasoning = reasoning_content.is_some();
-                self.final_output_items
-                    .push(ModelOutputItem::AssistantTurn {
-                        content: content.clone(),
-                        reasoning_content: reasoning_content.clone(),
-                        tool_calls: output_tool_calls,
-                    });
-                if has_content || has_reasoning || !assistant_tool_calls.is_empty() {
-                    self.made_progress = true;
-                    if let Some(reasoning) = &reasoning_content {
-                        self.last_reasoning_content = Some(reasoning.clone());
-                    }
-                    super::history::record_history_item(
-                        self.store,
-                        self.agent,
-                        self.agent_id,
-                        self.session_id,
-                        ModelInputItem::AssistantTurn {
-                            content: content.clone(),
-                            reasoning_content: reasoning_content.clone(),
-                            tool_calls: assistant_tool_calls,
-                        },
-                    )
-                    .await?;
-                }
-                if let Some(text) = content {
-                    self.record_assistant_message(text).await?;
-                }
-            }
             ModelOutputItem::Other { raw } => {
                 self.final_output_items.push(ModelOutputItem::Other { raw });
             }
@@ -393,17 +331,6 @@ impl<'a> ModelStreamReducer<'a> {
         }
         self.persist_legacy_delta_fallback().await?;
         self.finalize_pending_tool_calls().await?;
-        if let Some(reasoning) = self.completed_reasoning_content() {
-            self.events
-                .publish(ServiceEventKind::ReasoningCompleted {
-                    agent_id: self.agent_id,
-                    session_id: Some(self.session_id),
-                    turn_id: self.turn_id,
-                    message_id: self.reasoning_id,
-                    content: reasoning,
-                })
-                .await;
-        }
         Ok(ModelTurnResult {
             response: ModelResponse {
                 id: self.response_id,
@@ -426,24 +353,16 @@ impl<'a> ModelStreamReducer<'a> {
             self.made_progress = true;
             let text = self.fallback_text.clone();
             let reasoning = self.fallback_reasoning.clone();
-            self.last_reasoning_content = Some(reasoning.clone());
+            self.record_reasoning_item(reasoning).await?;
             self.final_output_items
-                .push(ModelOutputItem::AssistantTurn {
-                    content: Some(text.clone()),
-                    reasoning_content: Some(reasoning.clone()),
-                    tool_calls: Vec::new(),
-                });
+                .push(ModelOutputItem::Message { text: text.clone() });
             self.record_assistant_message(text.clone()).await?;
             super::history::record_history_item(
                 self.store,
                 self.agent,
                 self.agent_id,
                 self.session_id,
-                ModelInputItem::AssistantTurn {
-                    content: Some(text),
-                    reasoning_content: Some(reasoning),
-                    tool_calls: Vec::new(),
-                },
+                ModelInputItem::assistant_text(text),
             )
             .await?;
         } else if has_text {
@@ -463,25 +382,7 @@ impl<'a> ModelStreamReducer<'a> {
         } else if has_reasoning {
             self.made_progress = true;
             let reasoning = self.fallback_reasoning.clone();
-            self.last_reasoning_content = Some(reasoning.clone());
-            self.final_output_items
-                .push(ModelOutputItem::AssistantTurn {
-                    content: None,
-                    reasoning_content: Some(reasoning.clone()),
-                    tool_calls: Vec::new(),
-                });
-            super::history::record_history_item(
-                self.store,
-                self.agent,
-                self.agent_id,
-                self.session_id,
-                ModelInputItem::AssistantTurn {
-                    content: None,
-                    reasoning_content: Some(reasoning),
-                    tool_calls: Vec::new(),
-                },
-            )
-            .await?;
+            self.record_reasoning_item(reasoning).await?;
         }
         Ok(())
     }
@@ -501,37 +402,39 @@ impl<'a> ModelStreamReducer<'a> {
             let name = preview.name.unwrap_or_default();
             let raw_arguments = preview.arguments;
             let arguments = mai_model::types::parse_arguments(&raw_arguments);
-            let reasoning_content =
-                (!active.reasoning.trim().is_empty()).then_some(active.reasoning.clone());
-            if reasoning_content.is_some() {
-                self.last_reasoning_content = reasoning_content.clone();
+            if !active.reasoning.trim().is_empty() {
+                self.record_reasoning_item(active.reasoning).await?;
+            }
+            if !active.text.trim().is_empty() {
+                let text = active.text;
+                self.final_output_items
+                    .push(ModelOutputItem::Message { text: text.clone() });
+                self.record_assistant_message(text.clone()).await?;
+                super::history::record_history_item(
+                    self.store,
+                    self.agent,
+                    self.agent_id,
+                    self.session_id,
+                    ModelInputItem::assistant_text(text),
+                )
+                .await?;
             }
             self.made_progress = true;
-            let output_tool_call = mai_protocol::ModelOutputToolCall {
+            self.final_output_items.push(ModelOutputItem::FunctionCall {
                 call_id: call_id.clone(),
                 name: name.clone(),
                 arguments: arguments.clone(),
                 raw_arguments: raw_arguments.clone(),
-            };
-            self.final_output_items
-                .push(ModelOutputItem::AssistantTurn {
-                    content: None,
-                    reasoning_content: reasoning_content.clone(),
-                    tool_calls: vec![output_tool_call],
-                });
+            });
             super::history::record_history_item(
                 self.store,
                 self.agent,
                 self.agent_id,
                 self.session_id,
-                ModelInputItem::AssistantTurn {
-                    content: None,
-                    reasoning_content,
-                    tool_calls: vec![ModelToolCall {
-                        call_id: call_id.clone(),
-                        name: name.clone(),
-                        arguments: raw_arguments,
-                    }],
+                ModelInputItem::FunctionCall {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: raw_arguments,
                 },
             )
             .await?;
@@ -540,14 +443,34 @@ impl<'a> ModelStreamReducer<'a> {
         Ok(())
     }
 
-    fn completed_reasoning_content(&self) -> Option<String> {
-        self.last_reasoning_content
-            .clone()
-            .or_else(|| {
-                (!self.fallback_reasoning.trim().is_empty())
-                    .then(|| self.fallback_reasoning.clone())
+    async fn record_reasoning_item(&mut self, content: String) -> Result<()> {
+        if content.trim().is_empty() {
+            return Ok(());
+        }
+        self.made_progress = true;
+        self.final_output_items.push(ModelOutputItem::Reasoning {
+            content: content.clone(),
+        });
+        super::history::record_history_item(
+            self.store,
+            self.agent,
+            self.agent_id,
+            self.session_id,
+            ModelInputItem::Reasoning {
+                content: content.clone(),
+            },
+        )
+        .await?;
+        self.events
+            .publish(ServiceEventKind::ReasoningCompleted {
+                agent_id: self.agent_id,
+                session_id: Some(self.session_id),
+                turn_id: self.turn_id,
+                message_id: self.reasoning_id.clone(),
+                content,
             })
-            .filter(|reasoning| !reasoning.trim().is_empty())
+            .await;
+        Ok(())
     }
 
     async fn record_assistant_message(&mut self, text: String) -> Result<()> {
@@ -702,9 +625,7 @@ fn normalized_call_id(call_id: String) -> String {
 mod tests {
     use super::*;
     use futures::stream;
-    use mai_protocol::{
-        AgentSessionSummary, AgentStatus, AgentSummary, ModelContentItem, ModelOutputToolCall, now,
-    };
+    use mai_protocol::{AgentSessionSummary, AgentStatus, AgentSummary, ModelContentItem, now};
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicBool;
@@ -926,7 +847,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reasoning_delta_and_message_done_write_assistant_turn() {
+    async fn reasoning_delta_and_message_done_write_ledger_items() {
         let harness = Harness::new().await;
         let result = harness
             .consume(vec![
@@ -957,23 +878,31 @@ mod tests {
             .await
             .expect("consume");
 
+        assert_eq!(result.last_assistant_text.as_deref(), Some("answer"));
+        assert_eq!(result.response.output.len(), 2);
         assert!(matches!(
             &result.response.output[0],
-            ModelOutputItem::AssistantTurn {
-                content: Some(content),
-                reasoning_content: Some(reasoning),
-                tool_calls,
-            } if content == "answer" && reasoning == "thinking" && tool_calls.is_empty()
+            ModelOutputItem::Reasoning { content } if content == "thinking"
+        ));
+        assert!(matches!(
+            &result.response.output[1],
+            ModelOutputItem::Message { text } if text == "answer"
         ));
         let history = harness.history().await;
+        assert_eq!(history.len(), 2);
         assert!(matches!(
             &history[0],
-            ModelInputItem::AssistantTurn {
-                content: Some(content),
-                reasoning_content: Some(reasoning),
-                tool_calls,
-            } if content == "answer" && reasoning == "thinking" && tool_calls.is_empty()
+            ModelInputItem::Reasoning { content } if content == "thinking"
         ));
+        assert!(matches!(
+            &history[1],
+            ModelInputItem::Message { role, content }
+                if role == "assistant"
+                    && matches!(&content[0], ModelContentItem::OutputText { text } if text == "answer")
+        ));
+        let messages = harness.messages().await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "answer");
         let event_snapshot = harness.events.snapshot().await;
         assert!(event_snapshot.iter().any(|event| matches!(
             &event.kind,
@@ -1044,21 +973,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assistant_turn_done_enqueues_each_tool_call_once() {
+    async fn reasoning_delta_before_function_call_done_is_replayed_with_tool_call() {
+        let harness = Harness::new().await;
+        let result = harness
+            .consume(vec![
+                ModelStreamEvent::OutputItemAdded {
+                    output_index: 0,
+                    item: ModelOutputItem::FunctionCall {
+                        call_id: "call_1".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({}),
+                        raw_arguments: String::new(),
+                    },
+                },
+                ModelStreamEvent::ReasoningDelta {
+                    output_index: 0,
+                    content_index: Some(0),
+                    delta: "Need to inspect the file.".to_string(),
+                },
+                ModelStreamEvent::ToolCallArgumentsDelta {
+                    output_index: 0,
+                    delta: "{\"path\":\"Cargo.toml\"}".to_string(),
+                },
+                ModelStreamEvent::OutputItemDone {
+                    output_index: 0,
+                    item: ModelOutputItem::FunctionCall {
+                        call_id: "call_1".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({ "path": "Cargo.toml" }),
+                        raw_arguments: "{\"path\":\"Cargo.toml\"}".to_string(),
+                    },
+                },
+                completed(),
+            ])
+            .await
+            .expect("consume");
+
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.response.output.len(), 2);
+        assert!(matches!(
+            &result.response.output[0],
+            ModelOutputItem::Reasoning { content } if content == "Need to inspect the file."
+        ));
+        assert!(matches!(
+            &result.response.output[1],
+            ModelOutputItem::FunctionCall {
+                call_id,
+                name,
+                raw_arguments,
+                ..
+            } if call_id == "call_1"
+                && name == "read_file"
+                && raw_arguments == "{\"path\":\"Cargo.toml\"}"
+        ));
+        let history = harness.history().await;
+        assert_eq!(history.len(), 2);
+        assert!(matches!(
+            &history[0],
+            ModelInputItem::Reasoning { content } if content == "Need to inspect the file."
+        ));
+        assert!(matches!(
+            &history[1],
+            ModelInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } if call_id == "call_1"
+                && name == "read_file"
+                && arguments == "{\"path\":\"Cargo.toml\"}"
+        ));
+    }
+
+    #[tokio::test]
+    async fn message_then_function_call_items_are_persisted_separately() {
         let harness = Harness::new().await;
         let result = harness
             .consume(vec![
                 ModelStreamEvent::OutputItemDone {
                     output_index: 0,
-                    item: ModelOutputItem::AssistantTurn {
-                        content: Some("I'll inspect that.".to_string()),
-                        reasoning_content: Some("Need file contents.".to_string()),
-                        tool_calls: vec![ModelOutputToolCall {
-                            call_id: "call_1".to_string(),
-                            name: "read_file".to_string(),
-                            arguments: serde_json::json!({ "path": "src/lib.rs" }),
-                            raw_arguments: "{\"path\":\"src/lib.rs\"}".to_string(),
-                        }],
+                    item: ModelOutputItem::Reasoning {
+                        content: "Need file contents.".to_string(),
+                    },
+                },
+                ModelStreamEvent::OutputItemDone {
+                    output_index: 1,
+                    item: ModelOutputItem::Message {
+                        text: "I'll inspect that.".to_string(),
+                    },
+                },
+                ModelStreamEvent::OutputItemDone {
+                    output_index: 2,
+                    item: ModelOutputItem::FunctionCall {
+                        call_id: "call_1".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({ "path": "src/lib.rs" }),
+                        raw_arguments: "{\"path\":\"src/lib.rs\"}".to_string(),
                     },
                 },
                 completed(),
@@ -1068,17 +1077,26 @@ mod tests {
 
         assert_eq!(result.tool_calls.len(), 1);
         let history = harness.history().await;
-        assert_eq!(history.len(), 1);
+        assert_eq!(history.len(), 3);
         assert!(matches!(
             &history[0],
-            ModelInputItem::AssistantTurn {
-                content: Some(content),
-                reasoning_content: Some(reasoning),
-                tool_calls,
-            } if content == "I'll inspect that."
-                && reasoning == "Need file contents."
-                && tool_calls.len() == 1
-                && tool_calls[0].call_id == "call_1"
+            ModelInputItem::Reasoning { content } if content == "Need file contents."
+        ));
+        assert!(matches!(
+            &history[1],
+            ModelInputItem::Message { role, content }
+                if role == "assistant"
+                    && matches!(&content[0], ModelContentItem::OutputText { text } if text == "I'll inspect that.")
+        ));
+        assert!(matches!(
+            &history[2],
+            ModelInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } if call_id == "call_1"
+                && name == "read_file"
+                && arguments == "{\"path\":\"src/lib.rs\"}"
         ));
     }
 
@@ -1162,14 +1180,13 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert!(matches!(
             &history[0],
-            ModelInputItem::AssistantTurn {
-                content: None,
-                reasoning_content: None,
-                tool_calls,
-            } if tool_calls.len() == 1
-                && tool_calls[0].call_id == "call_1"
-                && tool_calls[0].name == "list_files"
-                && tool_calls[0].arguments == "{\"max_files\":3}"
+            ModelInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } if call_id == "call_1"
+                && name == "list_files"
+                && arguments == "{\"max_files\":3}"
         ));
     }
 }

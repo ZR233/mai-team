@@ -28,7 +28,7 @@ fn model_output_preview(response: &ModelResponse) -> String {
 fn model_output_item_text(item: &ModelOutputItem) -> Option<String> {
     match item {
         ModelOutputItem::Message { text } => Some(text.clone()),
-        ModelOutputItem::AssistantTurn { content, .. } => content.clone(),
+        ModelOutputItem::Reasoning { content } => Some(content.clone()),
         ModelOutputItem::FunctionCall {
             call_id,
             name,

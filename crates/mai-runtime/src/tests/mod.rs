@@ -1482,10 +1482,8 @@ fn compact_summary_uses_last_non_empty_assistant_output() {
         ModelOutputItem::Message {
             text: "first".to_string(),
         },
-        ModelOutputItem::AssistantTurn {
-            content: Some("  second  ".to_string()),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
+        ModelOutputItem::Reasoning {
+            content: "  second  ".to_string(),
         },
     ];
 
@@ -1497,23 +1495,22 @@ fn compact_summary_uses_last_non_empty_assistant_output() {
 }
 
 #[test]
-fn repair_adds_missing_tool_outputs_for_assistant_turn() {
+fn repair_adds_missing_tool_outputs_for_function_call_after_reasoning() {
     let mut history = vec![
         ModelInputItem::user_text("do something"),
-        ModelInputItem::AssistantTurn {
-            content: None,
-            reasoning_content: None,
-            tool_calls: vec![ModelToolCall {
-                call_id: "call_1".to_string(),
-                name: "container_exec".to_string(),
-                arguments: "{}".to_string(),
-            }],
+        ModelInputItem::Reasoning {
+            content: "thinking".to_string(),
+        },
+        ModelInputItem::FunctionCall {
+            call_id: "call_1".to_string(),
+            name: "container_exec".to_string(),
+            arguments: "{}".to_string(),
         },
     ];
     turn::history::repair_incomplete_tool_history(&mut history);
-    assert_eq!(history.len(), 3);
+    assert_eq!(history.len(), 4);
     assert!(matches!(
-        &history[2],
+        &history[3],
         ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_1"
     ));
 }
@@ -1521,31 +1518,25 @@ fn repair_adds_missing_tool_outputs_for_assistant_turn() {
 #[test]
 fn repair_adds_missing_tool_outputs_for_partial_results() {
     let mut history = vec![
-        ModelInputItem::AssistantTurn {
-            content: None,
-            reasoning_content: None,
-            tool_calls: vec![
-                ModelToolCall {
-                    call_id: "call_1".to_string(),
-                    name: "container_exec".to_string(),
-                    arguments: "{}".to_string(),
-                },
-                ModelToolCall {
-                    call_id: "call_2".to_string(),
-                    name: "wait_agent".to_string(),
-                    arguments: "{}".to_string(),
-                },
-            ],
+        ModelInputItem::FunctionCall {
+            call_id: "call_1".to_string(),
+            name: "container_exec".to_string(),
+            arguments: "{}".to_string(),
         },
         ModelInputItem::FunctionCallOutput {
             call_id: "call_1".to_string(),
             output: "done".to_string(),
         },
+        ModelInputItem::FunctionCall {
+            call_id: "call_2".to_string(),
+            name: "wait_agent".to_string(),
+            arguments: "{}".to_string(),
+        },
     ];
     turn::history::repair_incomplete_tool_history(&mut history);
-    assert_eq!(history.len(), 3);
+    assert_eq!(history.len(), 4);
     assert!(matches!(
-        &history[2],
+        &history[3],
         ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_2"
     ));
 }
@@ -1600,19 +1591,15 @@ fn repair_does_nothing_for_empty_history() {
 fn repair_inserts_before_user_message() {
     let mut history = vec![
         ModelInputItem::user_text("do something"),
-        ModelInputItem::AssistantTurn {
-            content: None,
-            reasoning_content: None,
-            tool_calls: vec![ModelToolCall {
-                call_id: "call_1".to_string(),
-                name: "container_exec".to_string(),
-                arguments: "{}".to_string(),
-            }],
+        ModelInputItem::FunctionCall {
+            call_id: "call_1".to_string(),
+            name: "container_exec".to_string(),
+            arguments: "{}".to_string(),
         },
         ModelInputItem::user_text("继续"),
     ];
     turn::history::repair_incomplete_tool_history(&mut history);
-    // Should be: user, AssistantTurn, FunctionCallOutput, user("继续")
+    // Should be: user, FunctionCall, FunctionCallOutput, user("继续")
     assert_eq!(history.len(), 4);
     assert!(matches!(
         &history[2],
@@ -1627,37 +1614,31 @@ fn repair_inserts_before_user_message() {
 #[test]
 fn repair_inserts_partial_before_user_message() {
     let mut history = vec![
-        ModelInputItem::AssistantTurn {
-            content: None,
-            reasoning_content: None,
-            tool_calls: vec![
-                ModelToolCall {
-                    call_id: "call_1".to_string(),
-                    name: "exec".to_string(),
-                    arguments: "{}".to_string(),
-                },
-                ModelToolCall {
-                    call_id: "call_2".to_string(),
-                    name: "read".to_string(),
-                    arguments: "{}".to_string(),
-                },
-            ],
+        ModelInputItem::FunctionCall {
+            call_id: "call_1".to_string(),
+            name: "exec".to_string(),
+            arguments: "{}".to_string(),
         },
         ModelInputItem::FunctionCallOutput {
             call_id: "call_1".to_string(),
             output: "ok".to_string(),
         },
+        ModelInputItem::FunctionCall {
+            call_id: "call_2".to_string(),
+            name: "read".to_string(),
+            arguments: "{}".to_string(),
+        },
         ModelInputItem::user_text("继续"),
     ];
     turn::history::repair_incomplete_tool_history(&mut history);
-    // Should be: AssistantTurn, FCO(call_1), FCO(call_2), user("继续")
-    assert_eq!(history.len(), 4);
+    // Should be: FunctionCall(call_1), FCO(call_1), FunctionCall(call_2), FCO(call_2), user("继续")
+    assert_eq!(history.len(), 5);
     assert!(matches!(
-        &history[2],
+        &history[3],
         ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_2"
     ));
     assert!(matches!(
-        &history[3],
+        &history[4],
         ModelInputItem::Message { role, .. } if role == "user"
     ));
 }
@@ -2142,7 +2123,7 @@ async fn tool_trace_prefers_persisted_trace_records() {
 }
 
 #[tokio::test]
-async fn tool_trace_finds_calls_stored_inside_assistant_turns() {
+async fn tool_trace_finds_calls_stored_in_function_call_items() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("runtime.sqlite3");
     let config_path = dir.path().join("config.toml");
@@ -2191,18 +2172,14 @@ async fn tool_trace_finds_calls_stored_inside_assistant_turns() {
             agent_id,
             session_id,
             0,
-            &ModelInputItem::AssistantTurn {
-                content: None,
-                reasoning_content: None,
-                tool_calls: vec![ModelToolCall {
-                    call_id: "call_nested".to_string(),
-                    name: "container_exec".to_string(),
-                    arguments: r#"{"command":"pwd"}"#.to_string(),
-                }],
+            &ModelInputItem::FunctionCall {
+                call_id: "call_nested".to_string(),
+                name: "container_exec".to_string(),
+                arguments: r#"{"command":"pwd"}"#.to_string(),
             },
         )
         .await
-        .expect("save assistant turn");
+        .expect("save function call");
     store
         .append_agent_history_item(
             agent_id,

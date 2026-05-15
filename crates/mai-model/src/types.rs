@@ -1,6 +1,6 @@
 use crate::error::{ModelError, Result};
 use futures::Stream;
-use mai_protocol::{ModelOutputItem, ModelOutputToolCall, ModelResponse, TokenUsage};
+use mai_protocol::{ModelOutputItem, ModelResponse, TokenUsage};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
@@ -215,24 +215,20 @@ impl ModelStreamAccumulator {
                 Some(tool_call) => {
                     let raw_arguments = tool_call.raw_arguments;
                     let arguments = parse_arguments(&raw_arguments);
-                    let output_tool_call = ModelOutputToolCall {
+                    self.outputs.push(ModelOutputItem::FunctionCall {
                         call_id: tool_call.call_id.unwrap_or_default(),
                         name: tool_call.name.unwrap_or_default(),
-                        arguments,
                         raw_arguments,
-                    };
-                    self.outputs.push(ModelOutputItem::AssistantTurn {
-                        content,
-                        reasoning_content,
-                        tool_calls: vec![output_tool_call],
+                        arguments,
                     });
                 }
                 None if reasoning_content.is_some() => {
-                    self.outputs.push(ModelOutputItem::AssistantTurn {
-                        content,
-                        reasoning_content,
-                        tool_calls: Vec::new(),
-                    });
+                    if let Some(content) = reasoning_content {
+                        self.outputs.push(ModelOutputItem::Reasoning { content });
+                    }
+                    if let Some(text) = content {
+                        self.outputs.push(ModelOutputItem::Message { text });
+                    }
                 }
                 None if let Some(text) = content => {
                     self.outputs.push(ModelOutputItem::Message { text });

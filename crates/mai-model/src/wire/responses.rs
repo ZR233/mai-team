@@ -295,6 +295,24 @@ fn parse_output_item(value: Value) -> ModelOutputItem {
                 .unwrap_or_default();
             ModelOutputItem::Message { text }
         }
+        Some("reasoning") => {
+            let content = value
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            item.get("text")
+                                .or_else(|| item.get("reasoning_text"))
+                                .and_then(Value::as_str)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default();
+            ModelOutputItem::Reasoning { content }
+        }
         Some("function_call") => {
             let call_id = value
                 .get("call_id")
@@ -401,6 +419,28 @@ mod tests {
         }));
         assert_eq!(response.output.len(), 2);
         assert_eq!(response.usage.expect("usage").total_tokens, 3);
+    }
+
+    #[test]
+    fn parses_reasoning_as_independent_output_item() {
+        let response = parse_response(json!({
+            "id": "resp_1",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "content": [
+                        { "type": "reasoning_text", "text": "think " },
+                        { "type": "reasoning_text", "reasoning_text": "more" }
+                    ]
+                }
+            ]
+        }));
+
+        assert_eq!(response.output.len(), 1);
+        assert!(matches!(
+            &response.output[0],
+            ModelOutputItem::Reasoning { content } if content == "think more"
+        ));
     }
 
     #[test]

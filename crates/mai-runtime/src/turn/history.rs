@@ -177,15 +177,7 @@ pub(crate) fn compact_summary_from_output(output: &[ModelOutputItem]) -> Option<
     output.iter().rev().find_map(|item| {
         let text = match item {
             ModelOutputItem::Message { text } => text,
-            ModelOutputItem::AssistantTurn {
-                content: Some(text),
-                ..
-            } => text,
-            ModelOutputItem::AssistantTurn {
-                content: None,
-                reasoning_content: Some(text),
-                ..
-            } => text,
+            ModelOutputItem::Reasoning { content } => content,
             _ => return None,
         };
         let text = text.trim();
@@ -198,9 +190,6 @@ pub(crate) fn repair_incomplete_tool_history(history: &mut Vec<ModelInputItem>) 
     let mut i = 0;
     while i < history.len() {
         let call_ids: Vec<String> = match &history[i] {
-            ModelInputItem::AssistantTurn { tool_calls, .. } => {
-                tool_calls.iter().map(|tc| tc.call_id.clone()).collect()
-            }
             ModelInputItem::FunctionCall { call_id, .. } => {
                 vec![call_id.clone()]
             }
