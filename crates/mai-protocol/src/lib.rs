@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 pub type AgentId = Uuid;
+pub type EnvironmentId = Uuid;
 pub type ProjectId = Uuid;
 pub type SessionId = Uuid;
 pub type TaskId = Uuid;
@@ -371,6 +372,31 @@ pub struct TaskDetail {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentSummary {
+    pub id: EnvironmentId,
+    pub name: String,
+    pub status: TaskStatus,
+    pub root_agent_id: AgentId,
+    pub conversation_count: usize,
+    pub docker_image: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentDetail {
+    #[serde(flatten)]
+    pub summary: EnvironmentSummary,
+    pub root_agent: AgentDetail,
+    pub current_conversation_id: SessionId,
+    #[serde(default)]
+    pub selected_conversation_id: Option<SessionId>,
+    pub conversations: Vec<AgentSessionSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectSummary {
     pub id: ProjectId,
     pub name: String,
@@ -496,6 +522,19 @@ pub struct CreateTaskRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTaskResponse {
     pub task: TaskSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CreateEnvironmentRequest {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub docker_image: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateEnvironmentResponse {
+    pub environment: EnvironmentSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

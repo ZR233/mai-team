@@ -5,11 +5,11 @@
         <div class="brand-mark">M</div>
         <div>
           <h1>Mai Team</h1>
-          <p>Task-oriented multi-agent console</p>
+          <p>Chat environment workspace</p>
         </div>
       </div>
       <nav class="tabs" aria-label="Views">
-        <button :class="{ active: activeTab === 'tasks' }" @click="activeTab = 'tasks'">Tasks</button>
+        <button :class="{ active: activeTab === 'chat' }" @click="activeTab = 'chat'">Chat</button>
         <button :class="{ active: activeTab === 'projects' }" @click="activeTab = 'projects'">Projects</button>
         <button :class="{ active: activeTab === 'providers' }" @click="activeTab = 'providers'">Providers</button>
         <button :class="{ active: activeTab === 'settings' }" @click="activeTab = 'settings'">Settings</button>
@@ -27,17 +27,6 @@
     </header>
 
     <main class="workspace">
-      <TaskRail
-        :tasks="tasks"
-        :detail="selectedTaskDetail"
-        :selected-task-id="selectedTaskId"
-        :selected-agent-id="selectedAgentId"
-        :visible="activeTab === 'tasks'"
-        @select-task="selectTask"
-        @select-agent="selectTaskAgent"
-        @create="openCreateTaskDialog"
-      />
-
       <ProjectWorkspace
         v-if="activeTab === 'projects'"
         v-model:conversation-ref="projectConversationRef"
@@ -77,45 +66,36 @@
         @select-session="selectProjectSession"
       />
 
-      <section v-else-if="activeTab === 'tasks'" class="agent-stage">
-        <div v-if="!selectedTaskDetail" class="empty-stage">
-          <div class="empty-mark">+</div>
-          <h2>No task selected</h2>
-          <p>Create a task or choose one from the left rail.</p>
-          <button class="primary-button" @click="openCreateTaskDialog">Create Task</button>
-        </div>
-
-        <TaskDetail
-          v-else
-          :detail="selectedTaskDetail"
-          :events="timelineEvents"
-          :draft="messageDraft"
-          :loading="isDetailLoading"
-          :sending="isSending"
-          :stopping="isStopping"
-          :approving-plan="isApprovingPlan"
-          :providers="providersState.providers"
-          :skills="enabledSkills"
-          :selected-skills="selectedSkills"
-          :skills-loading="skillsState.loading"
-          :skills-error="skillsError"
-          :updating-model="isUpdatingAgentModel"
-          v-model:conversation-ref="conversationRef"
-          @approve-plan="onApprovePlan"
-          @request-plan-revision="onRequestPlanRevision"
-          @cancel="confirmCancelTask"
-          @cancel-agent="onCancelSelectedAgent"
-          @delete="confirmDeleteTask"
-          @delete-agent="confirmDeleteTaskAgent"
-          @send="onSendMessage"
-          @stop="onStopTaskAgentTurn"
-          @update-model="onUpdateAgentModel"
-          @open-providers="activeTab = 'providers'"
-          @update:draft="messageDraft = $event"
-          @update:selected-skills="selectedSkills = $event"
-          @load-skills="onLoadSkills"
-        />
-      </section>
+      <ChatEnvironmentWorkspace
+        v-else-if="activeTab === 'chat'"
+        v-model:conversation-ref="environmentConversationRef"
+        :environments="environments"
+        :detail="selectedEnvironmentDetail"
+        :selected-environment-id="selectedEnvironmentId"
+        :selected-conversation-id="selectedConversationId"
+        :events="timelineEvents"
+        :draft="messageDraft"
+        :loading="isEnvironmentDetailLoading"
+        :sending="isEnvironmentSending"
+        :stopping="isEnvironmentStopping"
+        :updating-model="isUpdatingAgentModel"
+        :providers="providersState.providers"
+        :skills="enabledSkills"
+        :selected-skills="selectedSkills"
+        :skills-loading="skillsState.loading"
+        :skills-error="skillsError"
+        @create-environment="openCreateEnvironmentDialog"
+        @select-environment="selectEnvironment"
+        @select-conversation="selectConversation"
+        @create-conversation="onCreateConversation"
+        @send="onSendEnvironmentMessage"
+        @stop="onStopEnvironmentAgentTurn"
+        @update-model="onUpdateEnvironmentAgentModel"
+        @open-providers="activeTab = 'providers'"
+        @update:draft="messageDraft = $event"
+        @update:selected-skills="selectedSkills = $event"
+        @load-skills="onLoadSkills"
+      />
 
       <ProviderGrid
         v-else-if="activeTab === 'providers'"
@@ -163,10 +143,10 @@
       @kind-changed="fillFromPreset"
     />
 
-    <TaskDialog
-      :dialog="taskDialog"
-      @close="taskDialog.open = false"
-      @create="onCreateTask"
+    <EnvironmentDialog
+      :dialog="environmentDialog"
+      @close="environmentDialog.open = false"
+      @create="onCreateEnvironment"
     />
 
     <ProjectDialog
@@ -206,20 +186,19 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { highlightCodeBlocks } from './utils/markdown'
 
-import TaskRail from './components/TaskRail.vue'
-import TaskDetail from './components/TaskDetail.vue'
+import ChatEnvironmentWorkspace from './components/ChatEnvironmentWorkspace.vue'
 import ProjectWorkspace from './components/ProjectWorkspace.vue'
 import ProviderGrid from './components/ProviderGrid.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import ProviderDialog from './components/ProviderDialog.vue'
-import TaskDialog from './components/TaskDialog.vue'
+import EnvironmentDialog from './components/EnvironmentDialog.vue'
 import ProjectDialog from './components/ProjectDialog.vue'
 import ResearchAgentConfigPanel from './components/ResearchAgentConfigPanel.vue'
 import McpServersDialog from './components/McpServersDialog.vue'
 
 import { useApi } from './composables/useApi'
 import { useSSE } from './composables/useSSE'
-import { useTasks } from './composables/useTasks'
+import { useEnvironments } from './composables/useEnvironments'
 import { useProjects } from './composables/useProjects'
 import { useProviders } from './composables/useProviders'
 import { useAgentConfig } from './composables/useAgentConfig'
@@ -232,33 +211,28 @@ const { toast, showToast } = useApi()
 const { eventFeed, streamingEvents, connectionState, connectEvents, disconnect } = useSSE()
 const timelineEvents = computed(() => [...streamingEvents.value, ...eventFeed.value])
 const {
-  tasks,
-  selectedTaskId,
-  selectedAgentId,
-  selectedTaskDetail,
-  isLoading,
-  isSending,
-  isStopping,
-  isDetailLoading,
-  isApprovingPlan,
-  conversationRef,
-  taskDialog,
-  refreshTasks,
-  ensureDefaultTask,
-  refreshDetail,
-  selectTask,
-  selectTaskAgent,
-  createTask,
-  sendTaskMessage,
-  approveTaskPlan,
-  requestPlanRevision,
-  cancelTask,
-  cancelTaskAgent,
-  stopTaskAgentTurn,
-  deleteTask,
+  environments,
+  selectedEnvironmentId,
+  selectedConversationId,
+  selectedEnvironmentDetail,
+  isEnvironmentsLoading,
+  isEnvironmentSending,
+  isEnvironmentStopping,
+  isEnvironmentDetailLoading,
+  environmentConversationRef,
+  environmentDialog,
+  refreshEnvironments,
+  ensureDefaultEnvironment,
+  refreshEnvironmentDetail,
+  selectEnvironment,
+  selectConversation,
+  createEnvironment,
+  createConversation,
+  sendEnvironmentMessage,
+  stopEnvironmentAgentTurn,
   updateAgent,
-  scrollConversationToBottom
-} = useTasks()
+  scrollEnvironmentConversationToBottom
+} = useEnvironments()
 const {
   projects,
   selectedProjectId,
@@ -333,7 +307,7 @@ const {
   loadInstallationRepositoryPackages
 } = useGithubApp()
 
-const activeTab = ref('tasks')
+const activeTab = ref('chat')
 const messageDraft = ref('')
 const projectMessageDraft = ref('')
 const selectedSkills = ref([])
@@ -372,18 +346,19 @@ const projectComposerSkills = computed(() => {
 
 const projectSkillsLoading = computed(() => skillsState.loading || projectSkillsState.loading || projectSkillsState.refreshing)
 const projectSkillsCombinedError = computed(() => skillsError.value || projectSkillsState.error || '')
+const isLoading = computed(() => isEnvironmentsLoading.value || isProjectsLoading.value)
 
 watch(
   () => [
-    selectedTaskDetail.value?.selected_agent?.messages?.length,
-    selectedTaskDetail.value?.selected_agent?.recent_events?.length,
-    selectedTaskDetail.value?.plan?.version,
+    selectedEnvironmentDetail.value?.root_agent?.messages?.length,
+    selectedEnvironmentDetail.value?.root_agent?.recent_events?.length,
+    selectedEnvironmentDetail.value?.root_agent?.selected_session_id,
     eventFeed.value.length
   ],
   async () => {
     await nextTick()
-    highlightCodeBlocks(conversationRef.value)
-    await scrollConversationToBottom()
+    highlightCodeBlocks(environmentConversationRef.value)
+    await scrollEnvironmentConversationToBottom()
   }
 )
 
@@ -410,16 +385,16 @@ onMounted(async () => {
 onUnmounted(() => disconnect())
 
 async function refreshAll() {
-  isLoading.value = true
+  isEnvironmentsLoading.value = true
   isProjectsLoading.value = true
   try {
-    await Promise.all([loadProviders(), loadAgentConfig(), loadSkills(), loadMcpServers(), loadGitAccounts(), refreshGithubAppSettingsState(), refreshTasks(), refreshProjects()])
-    if (providersState.providers.length && !tasks.value.length) {
-      await ensureDefaultTask()
-    } else if (selectedTaskId.value) {
-      await refreshDetail()
-    } else if (tasks.value[0]?.id) {
-      await selectTask(tasks.value[0].id)
+    await Promise.all([loadProviders(), loadAgentConfig(), loadSkills(), loadMcpServers(), loadGitAccounts(), refreshGithubAppSettingsState(), refreshEnvironments(), refreshProjects()])
+    if (providersState.providers.length && !environments.value.length) {
+      await ensureDefaultEnvironment()
+    } else if (selectedEnvironmentId.value) {
+      await refreshEnvironmentDetail()
+    } else if (environments.value[0]?.id) {
+      await selectEnvironment(environments.value[0].id)
     }
     if (selectedProjectId.value) {
       await refreshProjectDetail()
@@ -429,7 +404,7 @@ async function refreshAll() {
   } catch (error) {
     showToast(error.message)
   } finally {
-    isLoading.value = false
+    isEnvironmentsLoading.value = false
     isProjectsLoading.value = false
   }
 }
@@ -471,9 +446,9 @@ async function openGithubAppSettings() {
 
 async function handleSSEEvent(event) {
   if (isLiveOnlyEvent(event)) return
-  await refreshTasks()
+  await refreshEnvironments()
   await refreshProjects()
-  if (selectedTaskId.value) await refreshDetail()
+  if (selectedEnvironmentId.value) await refreshEnvironmentDetail()
   if (selectedProjectId.value) await refreshProjectDetail()
 }
 
@@ -487,39 +462,39 @@ function isLiveOnlyEvent(event) {
   ].includes(event?.type)
 }
 
-function openCreateTaskDialog() {
+function openCreateEnvironmentDialog() {
   if (!providersState.providers.length) {
     activeTab.value = 'providers'
-    showToast('Add a provider before creating a task.')
+    showToast('Add a provider before creating an environment.')
     return
   }
-  taskDialog.open = true
-  taskDialog.message = ''
-  taskDialog.docker_image = ''
-  taskDialog.error = ''
+  environmentDialog.open = true
+  environmentDialog.name = ''
+  environmentDialog.docker_image = ''
+  environmentDialog.error = ''
 }
 
-async function onCreateTask() {
-  if (taskDialog.submitting) return
-  taskDialog.error = ''
-  taskDialog.submitting = true
+async function onCreateEnvironment() {
+  if (environmentDialog.submitting) return
+  environmentDialog.error = ''
+  environmentDialog.submitting = true
   try {
-    await createTask(taskDialog.message, taskDialog.docker_image)
-    taskDialog.open = false
-    activeTab.value = 'tasks'
+    await createEnvironment(environmentDialog.name, environmentDialog.docker_image)
+    environmentDialog.open = false
+    activeTab.value = 'chat'
   } catch (error) {
-    taskDialog.error = error.message
+    environmentDialog.error = error.message
   } finally {
-    taskDialog.submitting = false
+    environmentDialog.submitting = false
   }
 }
 
-async function onSendMessage(payload) {
+async function onSendEnvironmentMessage(payload) {
   const message = typeof payload === 'string' ? payload : payload?.message
   const skillMentions = typeof payload === 'string' ? selectedSkills.value : (payload?.skillMentions || [])
   try {
     messageDraft.value = ''
-    await sendTaskMessage(message, skillMentions)
+    await sendEnvironmentMessage(message, skillMentions)
     selectedSkills.value = []
     await loadSkills()
   } catch (error) {
@@ -587,28 +562,19 @@ async function onCreateProjectSession(agent) {
   }
 }
 
-async function onApprovePlan() {
+async function onCreateConversation() {
   try {
-    await approveTaskPlan()
-    showToast('Plan approved. Executor and reviewer workflow started.')
+    await createConversation()
   } catch (error) {
     showToast(error.message)
   }
 }
 
-async function onRequestPlanRevision(feedback) {
-  try {
-    await requestPlanRevision(feedback)
-    showToast('Revision requested. The planner will update the plan.')
-  } catch (error) {
-    showToast(error.message)
-  }
-}
-
-async function onUpdateAgentModel(payload) {
+async function onUpdateEnvironmentAgentModel(payload) {
   isUpdatingAgentModel.value = true
   try {
-    const agentId = payload.agent_id || selectedTaskDetail.value.selected_agent.id
+    const agentId = payload.agent_id || selectedEnvironmentDetail.value?.root_agent?.id
+    if (!agentId) return
     await updateAgent(agentId, payload.provider_id, payload.model, payload.reasoning_effort)
     showToast('Agent model updated.')
   } catch (error) {
@@ -632,17 +598,9 @@ async function onUpdateProjectAgentModel(payload) {
   }
 }
 
-async function onCancelSelectedAgent(id) {
+async function onStopEnvironmentAgentTurn(agent) {
   try {
-    await cancelTaskAgent(id)
-  } catch (error) {
-    showToast(error.message)
-  }
-}
-
-async function onStopTaskAgentTurn(agent) {
-  try {
-    await stopTaskAgentTurn(agent)
+    await stopEnvironmentAgentTurn(agent)
   } catch (error) {
     showToast(error.message)
   }
@@ -975,38 +933,6 @@ async function onSetDefaultGitAccount(id) {
   }
 }
 
-function confirmCancelTask(id) {
-  confirmDialog.title = 'Cancel Task'
-  confirmDialog.message = 'Cancel this task and all running task agents?'
-  confirmDialog.onConfirm = async () => {
-    confirmDialog.open = false
-    try {
-      await cancelTask(id)
-    } catch (error) {
-      showToast(error.message)
-    }
-  }
-  confirmDialog.open = true
-}
-
-function confirmDeleteTask(id, title) {
-  confirmDialog.title = 'Delete Task'
-  confirmDialog.message = `Delete "${title || id}" and all task agents? This action cannot be undone.`
-  confirmDialog.onConfirm = async () => {
-    confirmDialog.open = false
-    try {
-      await deleteTask(id)
-    } catch (error) {
-      showToast(error.message)
-    }
-  }
-  confirmDialog.open = true
-}
-
-function confirmDeleteTaskAgent() {
-  showToast('Delete the task to remove task-owned agents.')
-}
-
 function confirmDeleteProject(id, name) {
   confirmDialog.title = 'Delete Project'
   confirmDialog.message = `Delete "${name || id}" and all project agents, review runs, and workspaces? This action cannot be undone.`
@@ -1028,7 +954,7 @@ function confirmDeleteProjectAgent() {
 
 function confirmDeleteProvider(index, name) {
   confirmDialog.title = 'Delete Provider'
-  confirmDialog.message = `Are you sure you want to delete "${name}"? Task agents using this provider may stop working.`
+  confirmDialog.message = `Are you sure you want to delete "${name}"? Chat environments and project agents using this provider may stop working.`
   confirmDialog.onConfirm = async () => {
     confirmDialog.open = false
     try {

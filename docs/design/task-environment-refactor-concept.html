@@ -1,0 +1,1710 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mai Team Task Environment Refactor Concept</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #182234;
+      --muted: #66758a;
+      --subtle: #8a97a8;
+      --line: #d8e0ea;
+      --line-strong: #c8d3df;
+      --soft: #f5f7fa;
+      --panel: #ffffff;
+      --blue: #1f6feb;
+      --blue-dark: #174ea6;
+      --teal: #11a683;
+      --green-soft: #daf4ea;
+      --green-ink: #0b684f;
+      --amber-soft: #fff0c2;
+      --amber-ink: #7a4c00;
+      --red-soft: #ffe3e3;
+      --red-ink: #9d1c1c;
+      --shadow: 0 18px 44px rgba(22, 32, 51, 0.16);
+      --shadow-soft: 0 12px 28px rgba(22, 32, 51, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background: #eef2f7;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+
+    button,
+    input,
+    select,
+    textarea {
+      font: inherit;
+    }
+
+    button {
+      cursor: default;
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin: 0;
+    }
+
+    .frame {
+      width: 1440px;
+      height: 960px;
+      position: relative;
+      display: grid;
+      grid-template-rows: 68px minmax(0, 1fr);
+      overflow: hidden;
+      background: #f8fafc;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 0 24px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.94);
+    }
+
+    .brand,
+    .tabs,
+    .topbar-actions,
+    .env-meta,
+    .env-row-main,
+    .thread-stat,
+    .composer-actions,
+    .message-meta,
+    .drawer-title-row,
+    .image-chip,
+    .summary-row,
+    .status-pill,
+    .context-line,
+    .input-help {
+      display: flex;
+      align-items: center;
+    }
+
+    .brand {
+      gap: 12px;
+      min-width: 250px;
+    }
+
+    .brand-mark,
+    .env-avatar,
+    .large-avatar,
+    .mini-avatar {
+      display: grid;
+      place-items: center;
+      color: #fff;
+      background: linear-gradient(135deg, var(--blue), var(--teal));
+      font-weight: 900;
+    }
+
+    .brand-mark {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      font-size: 16px;
+    }
+
+    .brand h1 {
+      font-size: 18px;
+      line-height: 1.2;
+    }
+
+    .brand p,
+    .small,
+    .rail-meta,
+    .env-row-sub,
+    .thread-meta,
+    .message-meta,
+    .context-line,
+    .drawer-subtitle,
+    .field-note,
+    .composer-note,
+    .timeline-date {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .tabs {
+      gap: 6px;
+      padding: 4px;
+      border: 1px solid #dfe6ef;
+      border-radius: 8px;
+      background: #f3f6fa;
+    }
+
+    .tabs button {
+      min-height: 32px;
+      border: 0;
+      border-radius: 6px;
+      padding: 0 12px;
+      color: #526176;
+      background: transparent;
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .tabs .active {
+      color: #174ea6;
+      background: #fff;
+      box-shadow: 0 1px 2px rgba(22, 32, 51, 0.08);
+    }
+
+    .topbar-actions {
+      justify-content: flex-end;
+      gap: 10px;
+      min-width: 250px;
+    }
+
+    .connection {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--green-ink);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .connection-dot,
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--teal);
+      box-shadow: 0 0 0 3px rgba(17, 166, 131, 0.13);
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      min-height: 0;
+    }
+
+    .rail {
+      min-height: 0;
+      border-right: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .rail.collapsed {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+    }
+
+    .rail-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 18px 18px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .rail-head h2 {
+      font-size: 17px;
+    }
+
+    .rail.collapsed .rail-head {
+      min-height: 84px;
+      flex-direction: column;
+      justify-content: center;
+      gap: 8px;
+      padding: 12px 10px;
+      text-align: center;
+    }
+
+    .rail.collapsed .rail-head h2 {
+      font-size: 13px;
+      line-height: 1.2;
+    }
+
+    .collapse-button {
+      width: 36px;
+      height: 32px;
+      display: grid;
+      place-items: center;
+      border: 1px solid #ccd6e3;
+      border-radius: 7px;
+      color: #334155;
+      background: #fff;
+      font-size: 16px;
+      font-weight: 900;
+    }
+
+    .small-button,
+    .primary-button,
+    .ghost-button,
+    .icon-button,
+    .model-chip,
+    .send-button,
+    .segmented button,
+    .history-row,
+    .env-row {
+      border: 0;
+      border-radius: 7px;
+      font-weight: 850;
+    }
+
+    .small-button {
+      min-height: 32px;
+      padding: 0 10px;
+      color: #fff;
+      background: var(--blue);
+      font-size: 12px;
+    }
+
+    .ghost-button,
+    .primary-button,
+    .send-button,
+    .icon-button {
+      min-height: 36px;
+      padding: 0 14px;
+      font-size: 13px;
+    }
+
+    .primary-button,
+    .send-button {
+      color: #fff;
+      background: var(--blue);
+    }
+
+    .ghost-button,
+    .icon-button {
+      border: 1px solid #ccd6e3;
+      color: #334155;
+      background: #fff;
+    }
+
+    .icon-button {
+      width: 36px;
+      padding: 0;
+      display: grid;
+      place-items: center;
+    }
+
+    .rail-search {
+      padding: 12px;
+      border-bottom: 1px solid #edf1f6;
+    }
+
+    .rail-search input,
+    .field input,
+    .field select {
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid #ccd6e3;
+      border-radius: 7px;
+      padding: 0 11px;
+      color: var(--ink);
+      background: #fff;
+      outline: none;
+      font-size: 13px;
+    }
+
+    .rail-search input::placeholder,
+    .field input::placeholder {
+      color: #9aa6b5;
+    }
+
+    .env-list {
+      display: grid;
+      gap: 8px;
+      padding: 12px;
+    }
+
+    .env-row {
+      display: grid;
+      grid-template-columns: 36px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 10px;
+      min-height: 76px;
+      padding: 10px;
+      border: 1px solid transparent;
+      color: inherit;
+      background: transparent;
+      text-align: left;
+    }
+
+    .env-row.active {
+      border-color: #b9d4ff;
+      background: linear-gradient(180deg, #f8fbff, #eef6ff);
+      box-shadow: inset 3px 0 0 var(--blue);
+    }
+
+    .env-row-main {
+      min-width: 0;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 3px;
+    }
+
+    .env-name {
+      max-width: 180px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 13px;
+      font-weight: 900;
+    }
+
+    .env-row-sub {
+      max-width: 180px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .env-avatar {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+
+    .env-avatar.slate {
+      background: linear-gradient(135deg, #42526b, #6f7f96);
+    }
+
+    .env-avatar.green {
+      background: linear-gradient(135deg, #0f8b6f, #27b79a);
+    }
+
+    .env-avatar.amber {
+      background: linear-gradient(135deg, #c87d13, #f0ad35);
+    }
+
+    .env-avatar.violet {
+      background: linear-gradient(135deg, #6957d7, #8c7cf0);
+    }
+
+    .collapsed-env-list {
+      display: grid;
+      align-content: start;
+      justify-items: center;
+      gap: 12px;
+      padding: 14px 10px;
+    }
+
+    .collapsed-env-button {
+      width: 54px;
+      min-height: 60px;
+      display: grid;
+      place-items: center;
+      gap: 4px;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      background: transparent;
+      color: inherit;
+    }
+
+    .collapsed-env-button.active {
+      border-color: #a8c9ff;
+      background: #f6f9ff;
+      box-shadow: inset 3px 0 0 var(--blue);
+    }
+
+    .collapsed-env-button .count-pill {
+      min-width: 22px;
+      height: 20px;
+      font-size: 11px;
+    }
+
+    .collapsed-caption {
+      max-width: 62px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: #526176;
+      font-size: 11px;
+      font-weight: 850;
+      line-height: 1.1;
+      text-align: center;
+    }
+
+    .collapsed-create {
+      display: grid;
+      justify-items: center;
+      gap: 7px;
+      padding: 12px 10px 14px;
+      border-top: 1px solid #edf1f6;
+      color: #526176;
+      font-size: 11px;
+      font-weight: 850;
+      text-align: center;
+    }
+
+    .env-meta {
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 6px;
+    }
+
+    .count-pill {
+      min-width: 24px;
+      height: 22px;
+      display: grid;
+      place-items: center;
+      border-radius: 999px;
+      color: #1b3b6f;
+      background: #e7f0ff;
+      font-size: 12px;
+      font-weight: 900;
+    }
+
+    .rail-section {
+      margin: 10px 12px 0;
+      padding: 12px;
+      border: 1px solid #e4eaf2;
+      border-radius: 8px;
+      background: #f8fafc;
+    }
+
+    .rail-section h3 {
+      margin-bottom: 7px;
+      font-size: 12px;
+      text-transform: uppercase;
+      color: #526176;
+      letter-spacing: 0;
+    }
+
+    .image-chip-list {
+      display: grid;
+      gap: 7px;
+    }
+
+    .image-chip {
+      justify-content: space-between;
+      gap: 8px;
+      min-height: 30px;
+      border-radius: 7px;
+      padding: 0 8px;
+      color: #334155;
+      background: #fff;
+      border: 1px solid #e1e8f0;
+      font-size: 12px;
+      font-weight: 750;
+    }
+
+    .stage {
+      min-width: 0;
+      min-height: 0;
+      position: relative;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      background: #f8fafc;
+    }
+
+    .stage-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      min-height: 104px;
+      padding: 18px 22px 16px;
+      border-bottom: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .identity {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 0;
+    }
+
+    .large-avatar {
+      width: 56px;
+      height: 56px;
+      border-radius: 12px;
+      font-size: 20px;
+      flex: 0 0 auto;
+    }
+
+    .title-block {
+      min-width: 0;
+    }
+
+    .title-row {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+    }
+
+    .title-row h2 {
+      font-size: 24px;
+      line-height: 1.2;
+    }
+
+    .title-picker {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      border: 0;
+      border-radius: 8px;
+      padding: 0;
+      color: var(--ink);
+      background: transparent;
+      font-size: 24px;
+      line-height: 1.2;
+      font-weight: 900;
+    }
+
+    .title-picker .chevron {
+      color: #66758a;
+      font-size: 17px;
+      line-height: 1;
+    }
+
+    .status-pill {
+      min-height: 24px;
+      border-radius: 999px;
+      padding: 0 9px;
+      color: var(--green-ink);
+      background: var(--green-soft);
+      font-size: 12px;
+      font-weight: 900;
+    }
+
+    .status-pill.default {
+      color: #174ea6;
+      background: #e7f0ff;
+    }
+
+    .context-line {
+      gap: 8px;
+      margin-top: 5px;
+      flex-wrap: wrap;
+    }
+
+    .context-line strong {
+      color: #334155;
+      font-weight: 850;
+    }
+
+    .session-picker,
+    .environment-picker {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 28px;
+      border: 1px solid #cbd7e6;
+      border-radius: 7px;
+      padding: 0 9px;
+      color: #243247;
+      background: #fff;
+      box-shadow: 0 1px 2px rgba(22, 32, 51, 0.04);
+      font-size: 12px;
+      font-weight: 900;
+    }
+
+    .session-picker .chevron,
+    .environment-picker .chevron {
+      color: #66758a;
+      font-size: 13px;
+      line-height: 1;
+    }
+
+    .session-menu,
+    .environment-menu {
+      position: absolute;
+      z-index: 4;
+      width: 380px;
+      border: 1px solid #cbd7e6;
+      border-radius: 9px;
+      background: #fff;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .session-menu {
+      top: 86px;
+      left: 104px;
+      display: none;
+    }
+
+    .environment-menu {
+      top: 94px;
+      left: 128px;
+      width: 360px;
+      display: none;
+    }
+
+    .session-menu-head,
+    .environment-menu-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 12px 10px;
+      border-bottom: 1px solid #edf1f6;
+      background: #fbfcfe;
+    }
+
+    .session-menu-head strong,
+    .environment-menu-head strong {
+      color: #243247;
+      font-size: 13px;
+    }
+
+    .session-menu-head span,
+    .environment-menu-head span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 750;
+    }
+
+    .session-list,
+    .environment-list {
+      display: grid;
+      gap: 0;
+      padding: 6px;
+    }
+
+    .session-row,
+    .environment-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 10px;
+      min-height: 56px;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      padding: 9px 10px;
+      color: inherit;
+      background: transparent;
+      text-align: left;
+    }
+
+    .session-row.active,
+    .environment-row.active {
+      border-color: #a8c9ff;
+      background: #f6f9ff;
+    }
+
+    .session-title,
+    .environment-title {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: #243247;
+      font-size: 13px;
+      font-weight: 900;
+    }
+
+    .environment-create-row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      min-height: 42px;
+      margin: 4px 6px 8px;
+      border: 1px dashed #a8c9ff;
+      border-radius: 8px;
+      color: #174ea6;
+      background: #f6f9ff;
+      font-size: 13px;
+      font-weight: 900;
+    }
+
+    .stage-actions {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      flex: 0 0 auto;
+    }
+
+    .model-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 38px;
+      max-width: 360px;
+      border: 1px solid #bcd4f6;
+      border-radius: 8px;
+      padding: 0 11px;
+      color: #183b68;
+      background: #fff;
+      box-shadow: 0 1px 2px rgba(22, 32, 51, 0.06);
+      font-size: 13px;
+      font-weight: 850;
+    }
+
+    .model-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      background: var(--blue);
+      box-shadow: 0 0 0 4px #e7f0ff;
+      flex: 0 0 auto;
+    }
+
+    .model-chip strong,
+    .model-chip span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .model-chip span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .model-popover {
+      position: absolute;
+      top: 92px;
+      right: 22px;
+      z-index: 5;
+      width: 390px;
+      border: 1px solid #ccd6e3;
+      border-radius: 8px;
+      padding: 12px;
+      background: #fff;
+      box-shadow: var(--shadow);
+    }
+
+    .popover-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+
+    .popover-head h3 {
+      font-size: 14px;
+    }
+
+    .option-group {
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .option-label {
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
+
+    .option-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      width: 100%;
+      border: 1px solid #e1e7ef;
+      border-radius: 7px;
+      padding: 10px;
+      color: inherit;
+      background: #fff;
+      text-align: left;
+    }
+
+    .option-row.active {
+      border-color: var(--blue);
+      background: #e7f0ff;
+    }
+
+    .option-row strong {
+      display: block;
+      font-size: 13px;
+    }
+
+    .option-row small {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .option-mark {
+      display: grid;
+      place-items: center;
+      width: 22px;
+      height: 22px;
+      border-radius: 999px;
+      color: #fff;
+      background: var(--blue);
+      font-size: 12px;
+      font-weight: 900;
+    }
+
+    .select-field {
+      position: relative;
+    }
+
+    .select-trigger {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid #ccd6e3;
+      border-radius: 7px;
+      padding: 0 10px;
+      color: #27364a;
+      background: #fff;
+      font-size: 13px;
+      font-weight: 850;
+    }
+
+    .select-trigger span:first-child {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .select-menu {
+      display: grid;
+      gap: 4px;
+      margin-top: 6px;
+      border: 1px solid #dfe6ef;
+      border-radius: 8px;
+      padding: 5px;
+      background: #fff;
+      box-shadow: 0 10px 28px rgba(22, 32, 51, 0.12);
+    }
+
+    .select-menu.model-menu {
+      max-height: 172px;
+      overflow: auto;
+    }
+
+    .model-search {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 8px;
+      align-items: center;
+      min-height: 34px;
+      border: 1px solid #dfe6ef;
+      border-radius: 7px;
+      padding: 0 8px;
+      color: #66758a;
+      background: #f8fafc;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .model-search span:last-child {
+      overflow: hidden;
+      color: #27364a;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .model-result-count {
+      padding: 2px 4px 0;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 800;
+    }
+
+    .select-item {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      min-height: 30px;
+      border-radius: 6px;
+      padding: 0 8px;
+      color: #526176;
+      font-size: 12px;
+      font-weight: 850;
+    }
+
+    .select-item.active {
+      color: #174ea6;
+      background: #e7f0ff;
+    }
+
+    .select-item small {
+      overflow: hidden;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 750;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .select-item.model-item {
+      min-height: 44px;
+    }
+
+    .select-item.model-item span:first-child {
+      display: grid;
+      gap: 2px;
+      min-width: 0;
+    }
+
+    .select-item.model-item strong {
+      overflow: hidden;
+      color: var(--ink);
+      font-size: 13px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .select-item.model-item.active strong {
+      color: #174ea6;
+    }
+
+    .depth-select-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: start;
+    }
+
+    .popover-actions {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 8px;
+      align-items: center;
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid #e6ecf3;
+    }
+
+    .save-state {
+      color: var(--green-ink);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .conversation {
+      min-height: 0;
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: minmax(0, 1fr);
+      padding: 18px 22px;
+    }
+
+    .conversation-card {
+      min-height: 0;
+      overflow: hidden;
+      border: 1px solid #e1e8f0;
+      border-radius: 8px;
+      background: #fff;
+      box-shadow: var(--shadow-soft);
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+    }
+
+    .conversation-summary {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1px;
+      border-bottom: 1px solid #e6ecf4;
+      background: #e6ecf4;
+    }
+
+    .summary-row {
+      min-height: 62px;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      background: #fbfcfe;
+    }
+
+    .summary-row span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 750;
+    }
+
+    .summary-row strong {
+      color: #243247;
+      font-size: 13px;
+      line-height: 1.2;
+      text-align: right;
+      overflow-wrap: anywhere;
+    }
+
+    .messages {
+      min-height: 0;
+      overflow: hidden;
+      padding: 20px 22px 24px;
+      background:
+        linear-gradient(180deg, rgba(248, 250, 252, 0.78), rgba(255, 255, 255, 0) 180px),
+        #fff;
+    }
+
+    .timeline-date {
+      display: grid;
+      place-items: center;
+      margin-bottom: 16px;
+      font-weight: 800;
+    }
+
+    .message {
+      display: grid;
+      grid-template-columns: 34px minmax(0, 1fr);
+      gap: 11px;
+      margin-bottom: 18px;
+    }
+
+    .mini-avatar {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      font-size: 12px;
+    }
+
+    .mini-avatar.user {
+      color: #1d2a3d;
+      background: #e6ecf4;
+    }
+
+    .bubble {
+      max-width: 960px;
+      border: 1px solid #e1e8f0;
+      border-radius: 8px;
+      padding: 12px 14px;
+      background: #fff;
+      box-shadow: 0 1px 2px rgba(22, 32, 51, 0.04);
+    }
+
+    .message.user .bubble {
+      background: #f6f9ff;
+      border-color: #cfe0ff;
+    }
+
+    .message-meta {
+      gap: 8px;
+      margin-bottom: 6px;
+      font-weight: 850;
+    }
+
+    .bubble p {
+      color: #26354a;
+      font-size: 14px;
+      line-height: 1.62;
+    }
+
+    .bubble code,
+    .mono {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+
+    .callout {
+      margin-top: 10px;
+      border: 1px solid #d7efe7;
+      border-radius: 8px;
+      padding: 10px 12px;
+      color: #0b684f;
+      background: #f0fbf7;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .composer {
+      border-top: 1px solid var(--line);
+      padding: 14px 22px 18px;
+      background: #fff;
+    }
+
+    .composer-box {
+      border: 1px solid #cfd9e6;
+      border-radius: 8px;
+      background: #fff;
+      box-shadow: 0 8px 20px rgba(22, 32, 51, 0.06);
+      overflow: hidden;
+    }
+
+    .composer-box textarea {
+      width: 100%;
+      min-height: 72px;
+      resize: none;
+      border: 0;
+      outline: none;
+      padding: 13px 14px 6px;
+      color: var(--ink);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .composer-actions {
+      justify-content: space-between;
+      gap: 12px;
+      padding: 9px 10px 10px 14px;
+      border-top: 1px solid #edf1f6;
+      background: #fbfcfe;
+    }
+
+    .composer-note {
+      gap: 7px;
+      min-width: 0;
+    }
+
+    .composer-note strong {
+      color: #334155;
+    }
+
+    .drawer {
+      min-width: 0;
+      min-height: 0;
+      border-left: 1px solid var(--line);
+      background: #fff;
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr);
+    }
+
+    .drawer-head {
+      padding: 18px 18px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .drawer-title-row {
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .drawer-title-row h2 {
+      font-size: 17px;
+    }
+
+    .drawer-subtitle {
+      margin-top: 5px;
+    }
+
+    .segmented {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4px;
+      padding: 12px;
+      border-bottom: 1px solid #edf1f6;
+      background: #f8fafc;
+    }
+
+    .segmented button {
+      min-height: 34px;
+      color: #526176;
+      background: transparent;
+      font-size: 13px;
+    }
+
+    .segmented .active {
+      color: var(--blue-dark);
+      background: #fff;
+      box-shadow: 0 1px 2px rgba(22, 32, 51, 0.08);
+    }
+
+    .drawer-body {
+      min-height: 0;
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+    }
+
+    .create-panel {
+      margin: 14px 14px 12px;
+      padding: 14px;
+      border: 1px solid #dbe4ee;
+      border-radius: 8px;
+      background: #fbfcfe;
+    }
+
+    .create-panel h3 {
+      margin-bottom: 10px;
+      font-size: 14px;
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+
+    .field label {
+      color: #42526b;
+      font-size: 12px;
+      font-weight: 850;
+    }
+
+    .field-note {
+      margin-top: -4px;
+    }
+
+    .input-help {
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 5px;
+      color: #526176;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .create-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 13px;
+    }
+
+    .history {
+      min-height: 0;
+      overflow: hidden;
+      padding: 0 14px 16px;
+    }
+
+    .history h3 {
+      margin: 3px 0 10px;
+      color: #334155;
+      font-size: 13px;
+    }
+
+    .history-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .history-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 9px;
+      min-height: 58px;
+      padding: 10px;
+      border: 1px solid #e1e8f0;
+      color: inherit;
+      background: #fff;
+      text-align: left;
+    }
+
+    .history-row.active {
+      border-color: #a8c9ff;
+      background: #f6f9ff;
+    }
+
+    .history-title {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: #243247;
+      font-size: 13px;
+      font-weight: 900;
+    }
+
+    .thread-meta {
+      margin-top: 3px;
+    }
+
+    .history-tag {
+      border-radius: 999px;
+      padding: 4px 7px;
+      color: var(--green-ink);
+      background: var(--green-soft);
+      font-size: 11px;
+      font-weight: 900;
+    }
+
+    .history-tag.paused {
+      color: var(--amber-ink);
+      background: var(--amber-soft);
+    }
+
+    .history-tag.failed {
+      color: var(--red-ink);
+      background: var(--red-soft);
+    }
+
+    .docker-preview {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .docker-line {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-height: 34px;
+      border-radius: 7px;
+      padding: 0 9px;
+      background: #fff;
+      border: 1px solid #e1e8f0;
+      color: #334155;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .docker-line span {
+      color: var(--muted);
+      font-weight: 750;
+    }
+
+    .modal-backdrop {
+      position: absolute;
+      inset: 68px 0 0;
+      display: none;
+      place-items: start center;
+      padding-top: 96px;
+      background: rgba(24, 34, 52, 0.18);
+    }
+
+    .modal-backdrop.open {
+      display: grid;
+    }
+
+    .modal {
+      width: 520px;
+      border: 1px solid #cbd7e6;
+      border-radius: 10px;
+      background: #fff;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .modal-title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 18px 18px 14px;
+      border-bottom: 1px solid #e6ecf4;
+    }
+
+    .modal-title-row h2 {
+      font-size: 18px;
+      line-height: 1.2;
+    }
+
+    .modal-title-row p {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .modal-body {
+      padding: 16px 18px 18px;
+    }
+
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 16px;
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">M</div>
+        <div>
+          <h1>Mai Team</h1>
+          <p>Chat environments console</p>
+        </div>
+      </div>
+
+      <nav class="tabs" aria-label="Views">
+        <button class="active">Chat</button>
+        <button>Projects</button>
+        <button>Providers</button>
+        <button>Settings</button>
+      </nav>
+
+      <div class="topbar-actions">
+        <span class="connection"><span class="connection-dot"></span>Connected</span>
+        <button class="primary-button">Refresh</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="stage">
+        <div>
+          <header class="stage-head">
+            <div class="identity">
+              <div class="large-avatar">P</div>
+              <div class="title-block">
+                <div class="title-row">
+                  <button class="title-picker">Provider smoke 调试 <span class="chevron">⌄</span></button>
+                  <span class="status-pill">Ready</span>
+                </div>
+                <p class="context-line">
+                  <strong>环境:</strong>
+                  <span class="environment-picker">默认环境 <span class="chevron">⌄</span></span>
+                  <span>/</span>
+                  <span class="mono">ghcr.io/mai/default:latest</span>
+                  <span>/</span>
+                  <span>8 conversations</span>
+                </p>
+              </div>
+            </div>
+            <div class="stage-actions">
+              <button class="model-chip">
+                <span class="model-dot"></span>
+                <strong>GPT-5.2</strong>
+                <span>high</span>
+                <span class="chevron">⌄</span>
+              </button>
+              <button class="primary-button">New Conversation</button>
+            </div>
+          </header>
+
+          <div class="session-menu">
+            <div class="session-menu-head">
+              <strong>切换会话</strong>
+              <span>8 conversations</span>
+            </div>
+            <div class="session-list">
+              <button class="session-row active">
+                <span>
+                  <span class="session-title">Provider smoke 调试</span>
+                  <span class="thread-meta">14 messages / active now</span>
+                </span>
+                <span class="history-tag">active</span>
+              </button>
+              <button class="session-row">
+                <span>
+                  <span class="session-title">事件流断线复现</span>
+                  <span class="thread-meta">9 messages / yesterday</span>
+                </span>
+                <span class="history-tag paused">paused</span>
+              </button>
+              <button class="session-row">
+                <span>
+                  <span class="session-title">Docker API 草稿</span>
+                  <span class="thread-meta">21 messages / May 14</span>
+                </span>
+                <span class="history-tag">done</span>
+              </button>
+              <button class="session-row">
+                <span>
+                  <span class="session-title">模型切换验收</span>
+                  <span class="thread-meta">6 messages / May 13</span>
+                </span>
+                <span class="history-tag failed">failed</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="environment-menu">
+            <div class="environment-menu-head">
+              <strong>切换环境</strong>
+              <span>4 environments</span>
+            </div>
+            <div class="environment-list">
+              <button class="environment-row active">
+                <span>
+                  <span class="environment-title">默认环境</span>
+                  <span class="thread-meta mono">ghcr.io/mai/default:latest</span>
+                </span>
+                <span class="count-pill">8</span>
+              </button>
+              <button class="environment-row">
+                <span>
+                  <span class="environment-title">Rust Review</span>
+                  <span class="thread-meta mono">rust:1.87-bookworm</span>
+                </span>
+                <span class="count-pill">3</span>
+              </button>
+              <button class="environment-row">
+                <span>
+                  <span class="environment-title">CI Repro</span>
+                  <span class="thread-meta mono">ubuntu:24.04</span>
+                </span>
+                <span class="count-pill">5</span>
+              </button>
+            </div>
+            <button class="environment-create-row">+ 创建环境</button>
+          </div>
+
+          <aside class="model-popover">
+            <div class="popover-head">
+              <div>
+                <h3>Model for next turn</h3>
+                <p class="popover-hint">Provider, model, thinking depth, and save state.</p>
+              </div>
+              <span class="status-pill">Saved</span>
+            </div>
+
+            <div class="option-group">
+              <span class="option-label">Provider</span>
+              <button class="option-row active">
+                <span>
+                  <strong>OpenAI</strong>
+                  <small>3 models available</small>
+                </span>
+                <span class="option-mark">✓</span>
+              </button>
+            </div>
+
+            <div class="option-group">
+              <span class="option-label">Model</span>
+              <div class="select-field">
+                <div class="select-trigger">
+                  <span>GPT-5.2 · strong coding and planning</span>
+                  <span class="chevron">⌄</span>
+                </div>
+                <div class="select-menu model-menu">
+                  <div class="model-search">
+                    <span>⌕</span>
+                    <span>Search models... gpt</span>
+                  </div>
+                  <div class="model-result-count">3 matching models</div>
+                  <div class="select-item model-item active">
+                    <span>
+                      <strong>GPT-5.2</strong>
+                      <small>Balanced professional coding model</small>
+                    </span>
+                    <span>✓</span>
+                  </div>
+                  <div class="select-item model-item">
+                    <span>
+                      <strong>GPT-5.4</strong>
+                      <small>Everyday coding with deeper reasoning</small>
+                    </span>
+                  </div>
+                  <div class="select-item model-item">
+                    <span>
+                      <strong>GPT-5.4 Mini</strong>
+                      <small>Fast, cost-efficient model</small>
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="option-group">
+              <span class="option-label">Thinking depth</span>
+              <div class="depth-select-row">
+                <div class="select-trigger">
+                  <span>High</span>
+                  <span class="chevron">⌄</span>
+                </div>
+                <span class="popover-hint">Only shown when supported.</span>
+              </div>
+            </div>
+
+            <div class="popover-actions">
+              <span class="save-state">Saved for this conversation</span>
+              <button class="ghost-button">Reset</button>
+              <button class="primary-button">Apply</button>
+            </div>
+          </aside>
+        </div>
+
+        <div class="conversation">
+          <div class="conversation-card">
+            <div class="conversation-summary">
+              <div class="summary-row"><span>Docker image</span><strong class="mono">ghcr.io/mai/default:latest</strong></div>
+              <div class="summary-row"><span>Working directory</span><strong class="mono">/workspace/mai-team-pr</strong></div>
+              <div class="summary-row"><span>Session state</span><strong>Default environment conversation</strong></div>
+            </div>
+
+            <div class="messages">
+              <div class="timeline-date">Today / 默认环境打开后的首屏对话</div>
+
+              <article class="message user">
+                <div class="mini-avatar user">U</div>
+                <div class="bubble">
+                  <div class="message-meta"><span>User</span><span>09:18</span></div>
+                  <p>帮我检查 <code>provider_smoke.rs</code> 最近失败的原因，先看默认环境里的日志和当前配置。</p>
+                </div>
+              </article>
+
+              <article class="message">
+                <div class="mini-avatar">M</div>
+                <div class="bubble">
+                  <div class="message-meta"><span>Mai Agent</span><span>09:19</span></div>
+                  <p>我会在默认环境中读取测试配置、provider 设置和事件流日志。这个环境已经绑定默认 Docker 镜像，不需要为这次对话重新填写初始 prompt。</p>
+                  <div class="callout">环境负责运行上下文；对话负责一次具体协作。你可以在同一环境中新开对话，也可以从历史中回到旧对话。</div>
+                </div>
+              </article>
+
+              <article class="message user">
+                <div class="mini-avatar user">U</div>
+                <div class="bubble">
+                  <div class="message-meta"><span>User</span><span>09:23</span></div>
+                  <p>如果要复现 CI，再创建一个单独环境，用 <code>ubuntu:24.04</code>。</p>
+                </div>
+              </article>
+
+            </div>
+          </div>
+        </div>
+
+        <footer class="composer">
+          <div class="composer-box">
+            <textarea>Ask inside 默认环境...</textarea>
+            <div class="composer-actions">
+              <div class="composer-note">
+                <strong>默认环境</strong>
+                <span>/</span>
+                <span class="mono">ghcr.io/mai/default:latest</span>
+              </div>
+              <button class="send-button">Send</button>
+            </div>
+          </div>
+        </footer>
+      </section>
+
+    </main>
+
+    <div class="modal-backdrop">
+      <form class="modal">
+        <div class="modal-title-row">
+          <div>
+            <h2>创建环境</h2>
+            <p>填写环境名称和 Docker 镜像。新环境创建后会自动打开一条空白对话。</p>
+          </div>
+          <button class="icon-button" type="button">×</button>
+        </div>
+
+        <div class="modal-body">
+          <div class="field">
+            <label>Environment Name</label>
+            <input value="CI Repro">
+          </div>
+          <div class="field">
+            <label>Docker Image</label>
+            <select>
+              <option>ubuntu:24.04</option>
+              <option>rust:1.87-bookworm</option>
+              <option>node:22-slim</option>
+              <option>ghcr.io/mai/default:latest</option>
+            </select>
+            <p class="field-note">No initial prompt field. The first conversation starts empty.</p>
+          </div>
+          <div class="docker-preview">
+            <div class="docker-line"><strong class="mono">ubuntu:24.04</strong><span>selected</span></div>
+            <div class="docker-line"><strong>Auto-open</strong><span>new conversation</span></div>
+          </div>
+          <div class="modal-actions">
+            <button class="ghost-button" type="button">Cancel</button>
+            <button class="primary-button" type="submit">Create</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+</body>
+</html>

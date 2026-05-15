@@ -457,6 +457,10 @@ impl AgentRuntime {
         tasks::list_tasks(&self.state).await
     }
 
+    pub async fn list_environments(&self) -> Vec<EnvironmentSummary> {
+        tasks::list_environments(&self.state).await
+    }
+
     pub async fn list_projects(&self) -> Vec<ProjectSummary> {
         projects::service::list_projects(&self.state).await
     }
@@ -580,6 +584,72 @@ impl AgentRuntime {
             Err(RuntimeError::Store(mai_store::StoreError::InvalidConfig(_))) => Ok(None),
             Err(err) => Err(err),
         }
+    }
+
+    pub async fn ensure_default_environment(
+        self: &Arc<Self>,
+    ) -> Result<Option<EnvironmentSummary>> {
+        let environments = self.list_environments().await;
+        if let Some(environment) = environments.first() {
+            return Ok(Some(environment.clone()));
+        }
+        match self
+            .create_environment(
+                tasks::DEFAULT_ENVIRONMENT_NAME.to_string(),
+                Some(self.deps.docker.image().to_string()),
+            )
+            .await
+        {
+            Ok(environment) => Ok(Some(environment)),
+            Err(RuntimeError::Store(mai_store::StoreError::InvalidConfig(_))) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub async fn create_environment(
+        self: &Arc<Self>,
+        name: String,
+        docker_image: Option<String>,
+    ) -> Result<EnvironmentSummary> {
+        tasks::create_environment(
+            &self.state,
+            self,
+            tasks::CreateEnvironmentInput { name, docker_image },
+        )
+        .await
+    }
+
+    pub async fn get_environment(
+        self: &Arc<Self>,
+        environment_id: EnvironmentId,
+        session_id: Option<SessionId>,
+    ) -> Result<EnvironmentDetail> {
+        tasks::get_environment(&self.state, self, environment_id, session_id).await
+    }
+
+    pub async fn create_environment_conversation(
+        self: &Arc<Self>,
+        environment_id: EnvironmentId,
+    ) -> Result<AgentSessionSummary> {
+        tasks::create_environment_conversation(&self.state, self, environment_id).await
+    }
+
+    pub async fn send_environment_message(
+        self: &Arc<Self>,
+        environment_id: EnvironmentId,
+        session_id: SessionId,
+        message: String,
+        skill_mentions: Vec<String>,
+    ) -> Result<TurnId> {
+        tasks::send_environment_message(
+            &self.state,
+            self,
+            environment_id,
+            session_id,
+            message,
+            skill_mentions,
+        )
+        .await
     }
 
     pub async fn create_task(
@@ -3802,6 +3872,94 @@ impl tasks::TaskCreateOps for Arc<AgentRuntime> {
                 }
             }
         });
+    }
+}
+
+impl tasks::EnvironmentOps for Arc<AgentRuntime> {
+    async fn planner_model(&self) -> Result<AgentModelPreference> {
+        Ok(self
+            .resolve_role_agent_model(AgentRole::Planner)
+            .await?
+            .preference)
+    }
+
+    async fn create_environment_root_agent(
+        &self,
+        request: tasks::CreateTaskPlannerAgentRequest,
+    ) -> Result<AgentSummary> {
+        let agent = agents::create_agent_record(
+            self.as_ref(),
+            CreateAgentRequest {
+                name: Some(request.title),
+                provider_id: Some(request.model.provider_id),
+                model: Some(request.model.model),
+                reasoning_effort: request.model.reasoning_effort,
+                docker_image: request.docker_image,
+                parent_id: None,
+                system_prompt: None,
+            },
+            agents::CreateAgentRecordContext {
+                task_id: Some(request.task_id),
+                project_id: None,
+                role: Some(AgentRole::Planner),
+            },
+        )
+        .await?;
+        match agents::ensure_agent_container_with_source(
+            self.as_ref(),
+            &agent,
+            AgentStatus::Idle,
+            &agents::ContainerSource::FreshImage,
+            None,
+        )
+        .await
+        {
+            Ok(_) => Ok(agent.summary.read().await.clone()),
+            Err(err) => {
+                let message = err.to_string();
+                let agent_id = agent.summary.read().await.id;
+                if let Err(store_err) = self
+                    .set_status(&agent, AgentStatus::Failed, Some(message.clone()))
+                    .await
+                {
+                    tracing::warn!("failed to persist environment root agent failure: {store_err}");
+                }
+                self.events
+                    .publish(ServiceEventKind::Error {
+                        agent_id: Some(agent_id),
+                        session_id: None,
+                        turn_id: None,
+                        message,
+                    })
+                    .await;
+                Err(err)
+            }
+        }
+    }
+
+    fn get_agent(
+        &self,
+        agent_id: AgentId,
+        session_id: Option<SessionId>,
+    ) -> impl std::future::Future<Output = Result<AgentDetail>> + Send {
+        AgentRuntime::get_agent(self.as_ref(), agent_id, session_id)
+    }
+
+    fn create_agent_session(
+        &self,
+        agent_id: AgentId,
+    ) -> impl std::future::Future<Output = Result<AgentSessionSummary>> + Send {
+        AgentRuntime::create_session(self.as_ref(), agent_id)
+    }
+
+    fn send_agent_message(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        message: String,
+        skill_mentions: Vec<String>,
+    ) -> impl std::future::Future<Output = Result<TurnId>> + Send {
+        AgentRuntime::send_message(self, agent_id, Some(session_id), message, skill_mentions)
     }
 }
 

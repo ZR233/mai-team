@@ -297,12 +297,212 @@ p {
 
 /* ─── Workspace ─── */
 .workspace {
-  display: grid;
-  grid-template-columns: 330px minmax(0, 1fr);
+  display: flex;
   flex: 1;
   min-height: 0;
   height: auto;
   overflow: hidden;
+}
+
+.chat-workspace {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #f8fafc;
+}
+
+.chat-workspace-head {
+  position: relative;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  min-height: 86px;
+  border-bottom: 1px solid #dce4ee;
+  padding: 14px 22px;
+  background: rgba(255, 255, 255, 0.94);
+}
+
+.chat-title-stack {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.workspace-menu-wrap {
+  position: relative;
+  min-width: 0;
+  width: fit-content;
+  max-width: min(680px, 58vw);
+}
+
+.workspace-title-trigger,
+.workspace-subtitle-trigger {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+}
+
+.workspace-title-trigger {
+  gap: 8px;
+  min-height: 34px;
+  font-size: 24px;
+  font-weight: 900;
+}
+
+.workspace-subtitle-trigger {
+  gap: 7px;
+  min-height: 24px;
+  color: #66758a;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.workspace-title-main,
+.workspace-subtitle-trigger span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-chevron {
+  flex-shrink: 0;
+  color: #8090a4;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.workspace-meta-dot {
+  color: #a3afbf;
+}
+
+.workspace-menu {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 8px);
+  z-index: 30;
+  width: min(440px, calc(100vw - 36px));
+  max-height: min(430px, calc(100vh - 170px));
+  overflow: auto;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  padding: 6px;
+  background: #fff;
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.16);
+}
+
+.environment-menu {
+  width: min(500px, calc(100vw - 36px));
+}
+
+.workspace-menu-option,
+.workspace-menu-create {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-height: 52px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 8px 10px;
+  color: #26354a;
+  background: transparent;
+  text-align: left;
+}
+
+.workspace-menu-option:hover,
+.workspace-menu-option.active {
+  border-color: #d7e5fb;
+  background: #f6f9fe;
+}
+
+.workspace-menu-option > span:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.workspace-menu-option strong,
+.workspace-menu-create strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #182338;
+  font-size: 13px;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-menu-option small {
+  min-width: 0;
+  overflow: hidden;
+  color: #718096;
+  font-size: 11px;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-check {
+  color: #0b684f;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.workspace-menu-empty {
+  padding: 12px 10px;
+  color: #718096;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.workspace-menu-create {
+  justify-content: flex-start;
+  margin-top: 6px;
+  border-top-color: #e5ebf3;
+  color: #1f6feb;
+}
+
+.workspace-menu-create span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  color: #fff;
+  background: #1f6feb;
+  font-weight: 900;
+}
+
+.chat-head-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  min-width: 0;
+}
+
+.chat-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.chat-body .chat-timeline {
+  flex: 1;
 }
 
 .agent-rail {
@@ -476,6 +676,7 @@ p {
 
 .agent-stage,
 .providers-stage {
+  flex: 1;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -487,7 +688,7 @@ p {
 }
 
 .projects-stage {
-  grid-column: 1 / -1;
+  flex: 1;
   display: grid;
   grid-template-columns: 300px 250px minmax(0, 1fr);
   min-width: 0;
@@ -909,7 +1110,7 @@ p {
 
 .providers-stage,
 .settings-stage {
-  grid-column: 1 / -1;
+  flex: 1;
   overflow: auto;
   overscroll-behavior: contain;
 }
@@ -1339,7 +1540,6 @@ p {
 }
 
 .settings-stage {
-  grid-column: 1 / -1;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -5031,12 +5231,35 @@ select:focus {
   }
 
   .workspace {
-    grid-template-columns: 1fr;
-    grid-template-rows: auto minmax(0, 1fr);
+    min-height: 0;
   }
 
-  .agent-stage {
-    overflow-y: auto;
+  .chat-workspace-head {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 12px;
+    min-height: auto;
+    padding: 14px;
+  }
+
+  .workspace-menu-wrap {
+    max-width: 100%;
+  }
+
+  .workspace-title-trigger {
+    font-size: 20px;
+  }
+
+  .chat-head-actions,
+  .chat-head-actions .agent-model-picker,
+  .chat-head-actions .agent-model-chip,
+  .chat-head-actions .primary-button {
+    width: 100%;
+  }
+
+  .chat-head-actions {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .projects-stage {

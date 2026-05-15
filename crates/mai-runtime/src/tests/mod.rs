@@ -3,6 +3,7 @@ use mai_protocol::{
     GitProvider, ModelConfig, ModelReasoningConfig, ModelReasoningVariant, ProviderConfig,
     ProviderKind, ProvidersConfigRequest,
 };
+use pretty_assertions::assert_eq;
 use state::TurnControl;
 use std::fs;
 use tempfile::tempdir;
@@ -190,6 +191,23 @@ where
         assert!(Instant::now() < deadline, "timed out waiting for condition");
         sleep(Duration::from_millis(20)).await;
     }
+}
+
+async fn wait_for_agent_idle(runtime: Arc<AgentRuntime>, agent_id: AgentId, timeout: Duration) {
+    wait_until(
+        || {
+            let runtime = Arc::clone(&runtime);
+            async move {
+                runtime
+                    .get_agent(agent_id, None)
+                    .await
+                    .map(|agent| agent.summary.current_turn.is_none())
+                    .unwrap_or(false)
+            }
+        },
+        timeout,
+    )
+    .await;
 }
 
 async fn read_mock_request(stream: &mut tokio::net::TcpStream) -> Value {
@@ -1025,7 +1043,7 @@ fn agent_status_allows_new_turn_after_completion() {
 }
 
 #[tokio::test]
-async fn create_task_persists_planner_metadata_and_rejects_extra_sessions() {
+async fn create_task_persists_planner_metadata_and_allows_root_sessions() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     store
@@ -1053,13 +1071,22 @@ async fn create_task_persists_planner_metadata_and_rejects_extra_sessions() {
     assert_eq!(detail.selected_agent.summary.role, Some(AgentRole::Planner));
     assert_eq!(detail.selected_agent.summary.task_id, Some(task.id));
     assert_eq!(detail.selected_agent.sessions.len(), 1);
-    assert_eq!(detail.selected_agent.sessions[0].title, "Task");
-    assert!(
-        runtime
-            .create_session(detail.selected_agent.summary.id)
-            .await
-            .is_err()
-    );
+    assert_eq!(detail.selected_agent.sessions[0].title, "Chat 1");
+    let second = runtime
+        .create_session(detail.selected_agent.summary.id)
+        .await
+        .expect("root task session");
+    assert_eq!(second.title, "Chat 2");
+
+    let explorer = runtime
+        .spawn_task_role_agent(
+            task.planner_agent_id,
+            AgentRole::Explorer,
+            Some("Explorer".to_string()),
+        )
+        .await
+        .expect("explorer");
+    assert!(runtime.create_session(explorer.id).await.is_err());
 
     let snapshot = store.load_runtime_snapshot(20).await.expect("snapshot");
     assert_eq!(snapshot.tasks.len(), 1);
@@ -1071,6 +1098,217 @@ async fn create_task_persists_planner_metadata_and_rejects_extra_sessions() {
         .expect("planner");
     assert_eq!(planner.summary.task_id, Some(task.id));
     assert_eq!(planner.summary.role, Some(AgentRole::Planner));
+}
+
+#[tokio::test]
+async fn ensure_default_environment_creates_root_chat_environment() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let environment = runtime
+        .ensure_default_environment()
+        .await
+        .expect("ensure default")
+        .expect("default environment");
+
+    assert_eq!(environment.name, "默认环境");
+    assert_eq!(environment.conversation_count, 1);
+    assert_eq!(environment.docker_image, "unused");
+    let detail = runtime
+        .get_environment(environment.id, None)
+        .await
+        .expect("environment detail");
+    assert_eq!(detail.root_agent.sessions.len(), 1);
+    assert_eq!(detail.root_agent.sessions[0].title, "Chat 1");
+    assert_eq!(
+        detail.current_conversation_id,
+        detail.root_agent.sessions[0].id
+    );
+}
+
+#[tokio::test]
+async fn create_environment_uses_name_docker_image_and_allows_multiple_conversations() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let environment = runtime
+        .create_environment(" Research ".to_string(), Some(" ubuntu:24.04 ".to_string()))
+        .await
+        .expect("create environment");
+    let second = runtime
+        .create_environment_conversation(environment.id)
+        .await
+        .expect("second conversation");
+
+    assert_eq!(environment.name, "Research");
+    assert_eq!(environment.docker_image, "ubuntu:24.04");
+    assert_eq!(second.title, "Chat 2");
+    let summaries = runtime.list_environments().await;
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].conversation_count, 2);
+    assert_eq!(summaries[0].docker_image, "ubuntu:24.04");
+    let detail = runtime
+        .get_environment(environment.id, Some(second.id))
+        .await
+        .expect("environment detail");
+    assert_eq!(detail.root_agent.sessions.len(), 2);
+    assert_eq!(detail.current_conversation_id, second.id);
+}
+
+#[tokio::test]
+async fn send_environment_message_targets_selected_conversation_without_plan_transition() {
+    let (base_url, requests) = start_mock_responses(vec![json!({
+        "id": "resp-1",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "hello from selected chat"
+                    }
+                ]
+            }
+        ]
+    })])
+    .await;
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![compact_test_provider(base_url)],
+            default_provider_id: Some("mock".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let environment = runtime
+        .create_environment("Chat".to_string(), Some("ubuntu:latest".to_string()))
+        .await
+        .expect("create environment");
+    let second = runtime
+        .create_environment_conversation(environment.id)
+        .await
+        .expect("second conversation");
+
+    runtime
+        .send_environment_message(environment.id, second.id, "hello".to_string(), Vec::new())
+        .await
+        .expect("send message");
+    wait_for_agent_idle(
+        Arc::clone(&runtime),
+        environment.root_agent_id,
+        std::time::Duration::from_secs(3),
+    )
+    .await;
+
+    let detail = runtime
+        .get_environment(environment.id, Some(second.id))
+        .await
+        .expect("environment detail");
+    assert_eq!(detail.current_conversation_id, second.id);
+    assert_eq!(detail.root_agent.messages.len(), 2);
+    assert_eq!(detail.root_agent.messages[0].content, "hello");
+    let first = detail
+        .root_agent
+        .sessions
+        .iter()
+        .find(|session| session.title == "Chat 1")
+        .expect("first session");
+    assert_eq!(first.message_count, 0);
+    let task_detail = runtime
+        .get_task(environment.id, None)
+        .await
+        .expect("internal backing record");
+    assert_eq!(task_detail.summary.status, TaskStatus::Planning);
+    assert_eq!(task_detail.plan.status, PlanStatus::Missing);
+    assert_eq!(requests.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn environment_root_model_update_before_send_and_busy_rejection_remain() {
+    let (base_url, _requests) = start_mock_responses(vec![json!({
+        "__close_without_response": true
+    })])
+    .await;
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let mut provider = compact_test_provider(base_url);
+    provider.models.push(test_model("mock-alt"));
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![provider],
+            default_provider_id: Some("mock".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let environment = runtime
+        .create_environment("Chat".to_string(), Some("ubuntu:latest".to_string()))
+        .await
+        .expect("create environment");
+
+    let updated = runtime
+        .update_agent(
+            environment.root_agent_id,
+            UpdateAgentRequest {
+                provider_id: None,
+                model: Some("mock-alt".to_string()),
+                reasoning_effort: Some("high".to_string()),
+            },
+        )
+        .await
+        .expect("update model");
+
+    assert_eq!(updated.model, "mock-alt");
+    let detail = runtime
+        .get_environment(environment.id, None)
+        .await
+        .expect("environment detail");
+    let turn_id = runtime
+        .send_environment_message(
+            environment.id,
+            detail.current_conversation_id,
+            "hello".to_string(),
+            Vec::new(),
+        )
+        .await
+        .expect("send message");
+    let busy = runtime
+        .update_agent(
+            environment.root_agent_id,
+            UpdateAgentRequest {
+                provider_id: None,
+                model: Some("mock-model".to_string()),
+                reasoning_effort: None,
+            },
+        )
+        .await;
+    assert!(matches!(
+        busy,
+        Err(RuntimeError::AgentBusy(id)) if id == environment.root_agent_id
+    ));
+    runtime
+        .cancel_agent_turn(environment.root_agent_id, turn_id)
+        .await
+        .expect("cancel hung turn");
 }
 
 #[tokio::test]

@@ -121,30 +121,26 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/events", get(handlers::events::events))
         .route(
-            "/tasks",
-            get(handlers::tasks::list_tasks).post(handlers::tasks::create_task),
+            "/environments",
+            get(handlers::environments::list_environments)
+                .post(handlers::environments::create_environment),
         )
         .route(
-            "/tasks:ensure-default",
-            post(handlers::tasks::ensure_default_task),
+            "/environments:ensure-default",
+            post(handlers::environments::ensure_default_environment),
         )
         .route(
-            "/tasks/{id}",
-            get(handlers::tasks::get_task).delete(handlers::tasks::delete_task),
+            "/environments/{id}",
+            get(handlers::environments::get_environment),
         )
         .route(
-            "/tasks/{id}/messages",
-            post(handlers::tasks::send_task_message),
+            "/environments/{id}/conversations",
+            post(handlers::environments::create_conversation),
         )
         .route(
-            "/tasks/{id}/plan:approve",
-            post(handlers::tasks::approve_task_plan),
+            "/environments/{id}/conversations/{session_id}/messages",
+            post(handlers::environments::send_conversation_message),
         )
-        .route(
-            "/tasks/{id}/plan:request-revision",
-            post(handlers::tasks::request_plan_revision),
-        )
-        .route("/tasks/{id}/cancel", post(handlers::tasks::cancel_task))
         .route(
             "/projects",
             get(handlers::projects::list_projects).post(handlers::projects::create_project),
@@ -228,12 +224,12 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
             get(handlers::agents::download_file),
         )
         .route(
-            "/tasks/{id}/artifacts",
-            get(handlers::tasks::list_artifacts),
+            "/environments/{id}/artifacts",
+            get(handlers::environments::list_artifacts),
         )
         .route(
             "/artifacts/{id}/download",
-            get(handlers::tasks::download_artifact),
+            get(handlers::environments::download_artifact),
         )
         .route("/agents/{id}/cancel", post(handlers::agents::cancel_agent))
         .fallback(get(routes::assets::static_fallback))
