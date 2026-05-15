@@ -1,12 +1,44 @@
 use std::sync::Arc;
 
-use anyhow::Result;
 use axum::body::Body;
 use axum::http::{StatusCode, header};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use mai_protocol::{ArtifactInfo, TaskId};
 use mai_runtime::AgentRuntime;
 use mai_store::ConfigStore;
+
+#[derive(Debug)]
+pub(crate) enum ArtifactError {
+    NotFound(String),
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for ArtifactError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArtifactError::NotFound(msg) => write!(f, "{msg}"),
+            ArtifactError::Other(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl From<anyhow::Error> for ArtifactError {
+    fn from(err: anyhow::Error) -> Self {
+        ArtifactError::Other(err)
+    }
+}
+
+impl From<std::io::Error> for ArtifactError {
+    fn from(err: std::io::Error) -> Self {
+        ArtifactError::Other(err.into())
+    }
+}
+
+impl From<mai_store::StoreError> for ArtifactError {
+    fn from(err: mai_store::StoreError) -> Self {
+        ArtifactError::Other(err.into())
+    }
+}
 
 pub(crate) struct ArtifactService {
     store: Arc<ConfigStore>,
@@ -18,20 +50,23 @@ impl ArtifactService {
         Self { store, runtime }
     }
 
-    pub(crate) fn list_artifacts(&self, task_id: &TaskId) -> Result<Vec<ArtifactInfo>> {
+    pub(crate) fn list_artifacts(&self, task_id: &TaskId) -> anyhow::Result<Vec<ArtifactInfo>> {
         self.store.load_artifacts(task_id).map_err(Into::into)
     }
 
-    pub(crate) async fn download_artifact(&self, artifact_id: &str) -> Result<DownloadFile> {
-        let artifacts = self.store.load_all_artifacts()?;
-        let artifact = artifacts
-            .into_iter()
-            .find(|a| a.id == artifact_id)
-            .ok_or_else(|| anyhow::anyhow!("Artifact not found"))?;
+    pub(crate) async fn download_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Result<DownloadFile, ArtifactError> {
+        let artifact = self
+            .store
+            .load_artifact_by_id(artifact_id)?
+            .ok_or_else(|| {
+                ArtifactError::NotFound(format!("artifact not found: {artifact_id}"))
+            })?;
 
         let file_path = self.runtime.artifact_file_path(&artifact);
         let bytes = tokio::fs::read(&file_path).await?;
-
         Ok(DownloadFile {
             bytes,
             filename: artifact.name,
@@ -59,12 +94,15 @@ fn content_disposition_filename(name: &str) -> String {
 impl DownloadFile {
     pub(crate) fn into_response(self) -> Response {
         let filename = content_disposition_filename(&self.filename);
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(header::CONTENT_DISPOSITION, filename)
-            .body(Body::from(self.bytes))
-            .expect("download response")
+        (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                (header::CONTENT_DISPOSITION, filename),
+            ],
+            Body::from(self.bytes),
+        )
+            .into_response()
     }
 }
 

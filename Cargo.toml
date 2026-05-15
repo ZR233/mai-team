@@ -58,7 +58,7 @@ tokio-util = "0.7"
 toml = "1"
 toasty = { version = "0.5.0", features = ["sqlite"] }
 toasty-driver-sqlite = "0.5.0"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "propagate-header"] }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -7,7 +7,7 @@ use axum::response::Response;
 use serde::Deserialize;
 
 use super::state::{ApiError, AppState};
-use crate::services::artifacts::ArtifactService;
+use crate::services::artifacts::{ArtifactError, ArtifactService};
 use mai_protocol::{
     CreateEnvironmentRequest, CreateEnvironmentResponse, CreateSessionResponse, EnvironmentId,
     SendMessageRequest, SendMessageResponse, SessionId,
@@ -88,19 +88,15 @@ pub(crate) async fn download_artifact(
     Path(id): Path<String>,
 ) -> std::result::Result<Response, ApiError> {
     let service = ArtifactService::new(Arc::clone(&state.store), Arc::clone(&state.runtime));
-    let file = service.download_artifact(&id).await.map_err(|e| {
-        let message = e.to_string();
-        if message.contains("not found") {
-            ApiError {
-                status: StatusCode::NOT_FOUND,
-                message,
-            }
-        } else {
-            ApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message,
-            }
-        }
+    let file = service.download_artifact(&id).await.map_err(|e| match e {
+        ArtifactError::NotFound(msg) => ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: msg,
+        },
+        ArtifactError::Other(err) => ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: err.to_string(),
+        },
     })?;
     Ok(file.into_response())
 }

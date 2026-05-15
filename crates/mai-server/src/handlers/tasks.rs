@@ -7,7 +7,7 @@ use axum::response::Response;
 use serde::Deserialize;
 
 use super::state::{ApiError, AppState};
-use crate::services::artifacts::ArtifactService;
+use crate::services::artifacts::{ArtifactError, ArtifactService};
 use mai_protocol::{
     AgentId, ApproveTaskPlanResponse, CreateTaskRequest, CreateTaskResponse,
     RequestPlanRevisionRequest, RequestPlanRevisionResponse, SendMessageRequest,
@@ -118,14 +118,14 @@ pub(crate) async fn download_artifact(
     let file = service
         .download_artifact(&id)
         .await
-        .map_err(|e| match e.to_string() {
-            msg if msg.contains("not found") => ApiError {
+        .map_err(|e| match e {
+            ArtifactError::NotFound(msg) => ApiError {
                 status: StatusCode::NOT_FOUND,
                 message: msg,
             },
-            msg => ApiError {
+            ArtifactError::Other(err) => ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: msg,
+                message: err.to_string(),
             },
         })?;
     Ok(file.into_response())

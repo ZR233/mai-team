@@ -10,6 +10,17 @@ impl ConfigStore {
         Ok(())
     }
 
+    pub fn load_artifact_by_id(&self, artifact_id: &str) -> Result<Option<ArtifactInfo>> {
+        let dir = self.artifact_index_dir();
+        let file = dir.join(format!("{artifact_id}.json"));
+        if !file.exists() {
+            return Ok(None);
+        }
+        let data = std::fs::read_to_string(&file)?;
+        let info: ArtifactInfo = serde_json::from_str(&data)?;
+        Ok(Some(info))
+    }
+
     pub fn load_artifacts(&self, task_id: &TaskId) -> Result<Vec<ArtifactInfo>> {
         let dir = self.artifact_index_dir();
         if !dir.exists() {

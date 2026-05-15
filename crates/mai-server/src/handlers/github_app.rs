@@ -88,11 +88,13 @@ fn github_callback_page(success: bool, title: &str, message: &str, next: &str) -
 </html>"#,
         mark = if success { "OK" } else { "!" }
     );
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .body(Body::from(body))
-        .expect("callback response")
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "text/html; charset=utf-8".parse().unwrap(),
+    );
+    *response.status_mut() = status;
+    response
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,8 +169,28 @@ pub(crate) async fn complete_github_app_manifest(
             "/#settings=integrations&github-app=error",
         );
     }
-    let code = query.code.unwrap_or_default();
-    let state_value = query.state.unwrap_or_default();
+    let code = match query.code {
+        Some(code) if !code.is_empty() => code,
+        _ => {
+            return github_callback_page(
+                false,
+                "GitHub App setup failed",
+                "Missing authorization code from GitHub.",
+                "/#settings=integrations&github-app=error",
+            );
+        }
+    };
+    let state_value = match query.state {
+        Some(state) if !state.is_empty() => state,
+        _ => {
+            return github_callback_page(
+                false,
+                "GitHub App setup failed",
+                "Missing state parameter from GitHub.",
+                "/#settings=integrations&github-app=error",
+            );
+        }
+    };
     let svc = github_service(&state);
     match svc.complete_manifest(&code, &state_value).await {
         Ok(_) => github_callback_page(

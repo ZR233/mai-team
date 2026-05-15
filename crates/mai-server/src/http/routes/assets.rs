@@ -48,9 +48,11 @@ fn embedded_asset_response(path: &str, fallback: SpaFallback) -> Response {
         .essence_str()
         .to_string();
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
-        .body(Body::from(asset.data.into_owned()))
-        .expect("embedded static response")
+    let mut response = Response::new(Body::from(asset.data.into_owned()));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        content_type.parse().unwrap(),
+    );
+    *response.status_mut() = StatusCode::OK;
+    response
 }

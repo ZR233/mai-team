@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::http::header::HeaderName;
 use axum::routing::{get, post};
 use tower_http::cors::CorsLayer;
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::handlers;
@@ -251,7 +253,13 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/agents/{id}/cancel", post(handlers::agents::cancel_agent))
         .fallback(get(routes::assets::static_fallback))
-        .layer(CorsLayer::permissive())
+        .layer(PropagateRequestIdLayer::new(HeaderName::from_static("x-request-id")))
         .layer(TraceLayer::new_for_http())
+        .layer(SetRequestIdLayer::new(
+            HeaderName::from_static("x-request-id"),
+            MakeRequestUuid,
+        ))
+        // Permissive CORS is acceptable for single-user desktop deployment.
+        .layer(CorsLayer::permissive())
         .with_state(state)
 }

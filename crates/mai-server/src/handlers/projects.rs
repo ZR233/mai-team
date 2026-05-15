@@ -13,6 +13,8 @@ use mai_protocol::{
 
 use super::state::{ApiError, AppState};
 
+const DEFAULT_REVIEW_RUNS_PAGE_SIZE: usize = 50;
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProjectDetailQuery {
     agent_id: Option<AgentId>,
@@ -78,7 +80,7 @@ pub(crate) async fn list_project_review_runs(
     Ok(Json(
         state
             .runtime
-            .list_project_review_runs(id, query.offset.unwrap_or(0), query.limit.unwrap_or(50))
+            .list_project_review_runs(id, query.offset.unwrap_or(0), query.limit.unwrap_or(DEFAULT_REVIEW_RUNS_PAGE_SIZE))
             .await?,
     ))
 }

@@ -53,11 +53,19 @@ impl EventStreamService {
 }
 
 fn sse_event(event: ServiceEvent) -> Event {
+    let sequence = event.sequence;
     Event::default()
-        .id(event.sequence.to_string())
+        .id(sequence.to_string())
         .event(event_name(&event))
         .json_data(event)
-        .unwrap_or_else(|_| Event::default().data("{}"))
+        .unwrap_or_else(|err| {
+            tracing::error!(
+                sequence,
+                error = %err,
+                "failed to serialize SSE event"
+            );
+            Event::default().data("{}")
+        })
 }
 
 fn event_name(event: &ServiceEvent) -> &'static str {

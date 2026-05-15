@@ -19,6 +19,7 @@ pub(crate) async fn events(
     Query(query): Query<EventsQuery>,
     headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+    tracing::debug!(last_event_id = ?query.last_event_id, "SSE connection opened");
     let service = EventStreamService::new(Arc::clone(&state.store), Arc::clone(&state.runtime));
     let stream = service
         .stream_after(last_event_id_from_request(query, &headers))

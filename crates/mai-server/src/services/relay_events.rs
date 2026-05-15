@@ -25,6 +25,11 @@ async fn process_event(
     runtime: &Arc<AgentRuntime>,
     event: &RelayEvent,
 ) -> Result<RelayAckStatus, RuntimeError> {
+    tracing::debug!(
+        delivery_id = %event.delivery_id,
+        kind = %event.kind.as_github_event(),
+        "processing relay event"
+    );
     let event_name = event.kind.as_github_event().to_string();
     let action = event
         .payload

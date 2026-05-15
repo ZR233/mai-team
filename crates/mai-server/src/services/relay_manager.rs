@@ -81,6 +81,7 @@ impl RelayManager {
 
     async fn start(self: &Arc<Self>, config: RelayClientConfig) {
         self.stop().await;
+        tracing::info!(url = %config.url, node_id = %config.node_id, "starting relay client");
         let relay = Arc::new(RelayClient::new(config));
         if let Some(runtime) = self.runtime.read().await.clone() {
             relay_events::install_relay_event_handler(Arc::clone(&relay), runtime).await;
@@ -91,6 +92,7 @@ impl RelayManager {
 
     async fn stop(&self) {
         if let Some(relay) = self.relay.write().await.take() {
+            tracing::info!("stopping relay client");
             relay.stop();
         }
     }

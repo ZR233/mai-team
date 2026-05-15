@@ -17,7 +17,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "mai_server=info,mai_runtime=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "mai_server=debug,mai_runtime=info,tower_http=info".into()),
         )
         .init();
 
@@ -149,7 +149,7 @@ async fn seed_relay_settings_from_env(
 async fn ensure_startup_chat_environment(
     runtime: &Arc<mai_runtime::AgentRuntime>,
 ) -> mai_runtime::Result<()> {
-    let _ = runtime.ensure_default_environment().await?;
+    runtime.ensure_default_environment().await?;
     Ok(())
 }
 

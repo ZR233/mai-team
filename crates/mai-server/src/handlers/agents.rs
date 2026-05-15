@@ -4,7 +4,7 @@ use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
@@ -17,6 +17,9 @@ use mai_store::AgentLogFilter;
 use mai_store::ToolTraceFilter;
 
 use super::state::{ApiError, AppState};
+
+const DEFAULT_PAGE_SIZE: usize = 100;
+const MAX_PAGE_SIZE: usize = 500;
 
 fn bounded_api_limit(limit: Option<usize>, default: usize, max: usize) -> usize {
     limit.unwrap_or(default).clamp(1, max)
@@ -125,7 +128,7 @@ pub(crate) async fn list_agent_logs(
     Path(id): Path<AgentId>,
     Query(query): Query<AgentLogsQuery>,
 ) -> std::result::Result<Json<AgentLogsResponse>, ApiError> {
-    let limit = bounded_api_limit(query.limit, 100, 500);
+    let limit = bounded_api_limit(query.limit, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
     Ok(Json(
         state
             .runtime
@@ -151,7 +154,7 @@ pub(crate) async fn list_tool_traces(
     Path(id): Path<AgentId>,
     Query(query): Query<ToolTraceListQuery>,
 ) -> std::result::Result<Json<ToolTraceListResponse>, ApiError> {
-    let limit = bounded_api_limit(query.limit, 100, 500);
+    let limit = bounded_api_limit(query.limit, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
     Ok(Json(
         state
             .runtime
@@ -208,11 +211,12 @@ pub(crate) async fn download_file(
     Query(query): Query<DownloadQuery>,
 ) -> std::result::Result<Response, ApiError> {
     let bytes = state.runtime.download_file_tar(id, query.path).await?;
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-tar")
-        .body(Body::from(bytes))
-        .expect("response builder"))
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/x-tar")],
+        Body::from(bytes),
+    )
+        .into_response())
 }
 
 pub(crate) async fn cancel_agent(

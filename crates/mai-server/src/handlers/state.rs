@@ -66,6 +66,8 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         if self.status.is_server_error() {
             tracing::error!(status = %self.status, error = %self.message, "request failed");
+        } else if self.status.is_client_error() {
+            tracing::warn!(status = %self.status, error = %self.message, "client error");
         }
         (
             self.status,
