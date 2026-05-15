@@ -17,6 +17,7 @@ pub(crate) mod state;
 pub(crate) mod worker;
 
 const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;
+const PROJECT_REVIEW_RELAY_RETRY_SECS: u64 = 1;
 const PROJECT_REVIEW_FAILURE_RETRY_SECS: u64 = 600;
 const PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL: &str =
     "mcp__github__pull_request_review_write";
@@ -148,6 +149,15 @@ pub(crate) fn project_review_loop_decision_for_result(
 }
 
 pub(crate) fn project_review_loop_decision_for_error(error: String) -> ProjectReviewLoopDecision {
+    if project_review_error_is_retryable(&error) {
+        return ProjectReviewLoopDecision {
+            delay: Duration::from_secs(PROJECT_REVIEW_RELAY_RETRY_SECS),
+            status: ProjectReviewStatus::Waiting,
+            outcome: None,
+            summary: None,
+            error: Some(error),
+        };
+    }
     ProjectReviewLoopDecision {
         delay: Duration::from_secs(PROJECT_REVIEW_FAILURE_RETRY_SECS),
         status: ProjectReviewStatus::Failed,
@@ -155,6 +165,15 @@ pub(crate) fn project_review_loop_decision_for_error(error: String) -> ProjectRe
         summary: None,
         error: Some(error),
     }
+}
+
+pub(crate) fn project_review_error_is_retryable(error: &str) -> bool {
+    let error = error.trim();
+    let error = error.strip_prefix("invalid input: ").unwrap_or(error);
+    matches!(
+        error,
+        "relay is not connected" | "relay is enabled but not connected" | "relay connection closed"
+    )
 }
 
 pub(crate) fn project_review_cycle_result_for_reviewer_status(
@@ -404,6 +423,21 @@ mod tests {
         assert_eq!(decision.outcome, Some(ProjectReviewOutcome::Failed));
         assert_eq!(decision.summary.as_deref(), Some("failed"));
         assert_eq!(decision.error.as_deref(), Some("reviewer reported failure"));
+    }
+
+    #[test]
+    fn relay_disconnect_retries_after_one_second_without_failing_project() {
+        let decision =
+            project_review_loop_decision_for_error("invalid input: relay is not connected".into());
+
+        assert_eq!(decision.delay, Duration::from_secs(1));
+        assert_eq!(decision.status, ProjectReviewStatus::Waiting);
+        assert_eq!(decision.outcome, None);
+        assert_eq!(decision.summary, None);
+        assert_eq!(
+            decision.error.as_deref(),
+            Some("invalid input: relay is not connected")
+        );
     }
 
     #[test]

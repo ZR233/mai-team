@@ -273,17 +273,23 @@ pub(crate) async fn run_project_review_loop(
     cancellation_token: CancellationToken,
 ) {
     if let Err(err) = ops.ensure_project_review_workspace(project_id).await {
-        let _ = ops
-            .record_project_review_startup_failure(project_id, err.to_string())
-            .await;
-        let next = Utc::now() + TimeDelta::seconds(super::PROJECT_REVIEW_FAILURE_RETRY_SECS as i64);
+        let error = err.to_string();
+        if !super::project_review_error_is_retryable(&error) {
+            let _ = ops
+                .record_project_review_startup_failure(project_id, error.clone())
+                .await;
+        }
+        let decision = super::project_review_loop_decision_for_error(error);
+        let next = Utc::now() + TimeDelta::seconds(decision.delay.as_secs() as i64);
         let _ = ops
             .set_project_review_state(
                 project_id,
-                ProjectReviewStatus::Failed,
+                decision.status,
                 ReviewStateUpdate {
                     next_review_at: Some(next),
-                    error: Some(err.to_string()),
+                    outcome: decision.outcome,
+                    summary_text: decision.summary,
+                    error: decision.error,
                     ..Default::default()
                 },
             )
@@ -355,7 +361,13 @@ pub(crate) async fn run_project_review_loop(
         let mut decision = match decision {
             Ok(result) => super::project_review_loop_decision_for_result(result),
             Err(RuntimeError::TurnCancelled) if cancellation_token.is_cancelled() => break,
-            Err(err) => super::project_review_loop_decision_for_error(err.to_string()),
+            Err(err) => {
+                let error = err.to_string();
+                if super::project_review_error_is_retryable(&error) {
+                    requeue_project_review_signal(&ops, project_id, signal).await;
+                }
+                super::project_review_loop_decision_for_error(error)
+            }
         };
         if matches!(decision.outcome, Some(ProjectReviewOutcome::NoEligiblePr)) {
             decision.delay = Duration::ZERO;
@@ -423,6 +435,17 @@ async fn next_project_review_signal(
 ) -> Result<Option<PendingProjectReview>> {
     let project = ops.project(project_id).await?;
     Ok(project.review_pool.lock().await.next())
+}
+
+async fn requeue_project_review_signal(
+    ops: &impl ProjectReviewWorkerOps,
+    project_id: ProjectId,
+    signal: PendingProjectReview,
+) {
+    if let Ok(project) = ops.project(project_id).await {
+        project.review_pool.lock().await.requeue(signal);
+        project.review_notify.notify_waiters();
+    }
 }
 
 async fn wait_for_project_review_signal(

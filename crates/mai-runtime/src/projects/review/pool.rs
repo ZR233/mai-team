@@ -51,6 +51,10 @@ impl ProjectReviewPool {
         self.pending.remove(&pr)
     }
 
+    pub(crate) fn requeue(&mut self, pending: PendingProjectReview) {
+        self.pending.entry(pending.pr).or_insert(pending);
+    }
+
     pub(crate) fn clear(&mut self) {
         self.pending.clear();
     }
@@ -172,6 +176,21 @@ mod tests {
 
         pool.clear();
 
+        assert_eq!(None, pool.next());
+    }
+
+    #[test]
+    fn requeue_restores_claimed_pr_without_overwriting_newer_signal() {
+        let mut pool = ProjectReviewPool::default();
+        pool.enqueue_many([signal(9, Some("old"), "webhook")]);
+        let pending = pool.next().expect("queued pr");
+
+        pool.enqueue_many([signal(9, Some("new"), "webhook")]);
+        pool.requeue(pending);
+
+        let restored = pool.next().expect("requeued pr");
+        assert_eq!(9, restored.pr);
+        assert_eq!(Some("new".to_string()), restored.head_sha);
         assert_eq!(None, pool.next());
     }
 
