@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -59,6 +59,7 @@ struct ModelStreamReducer<'a> {
     message_id: String,
     reasoning_id: String,
     active_items: HashMap<usize, ActiveItem>,
+    completed_output_indices: HashSet<usize>,
     final_output_items: Vec<ModelOutputItem>,
     pending_tool_previews: HashMap<usize, ToolPreview>,
     response_id: Option<String>,
@@ -90,6 +91,7 @@ impl<'a> ModelStreamReducer<'a> {
             message_id: format!("msg_{}", Uuid::new_v4()),
             reasoning_id: format!("reasoning_{}", Uuid::new_v4()),
             active_items: HashMap::new(),
+            completed_output_indices: HashSet::new(),
             final_output_items: Vec::new(),
             pending_tool_previews: HashMap::new(),
             response_id: None,
@@ -111,6 +113,9 @@ impl<'a> ModelStreamReducer<'a> {
                 }
             }
             ModelStreamEvent::OutputItemAdded { output_index, item } => {
+                if self.completed_output_indices.contains(&output_index) {
+                    return Ok(());
+                }
                 self.active_items.entry(output_index).or_default();
                 if let ModelOutputItem::FunctionCall { call_id, name, .. } = item {
                     self.update_tool_preview(output_index, Some(call_id), Some(name));
@@ -121,7 +126,7 @@ impl<'a> ModelStreamReducer<'a> {
                 delta,
                 ..
             } => {
-                if delta.is_empty() {
+                if delta.is_empty() || self.completed_output_indices.contains(&output_index) {
                     return Ok(());
                 }
                 self.active_items
@@ -147,7 +152,7 @@ impl<'a> ModelStreamReducer<'a> {
                 delta,
                 ..
             } => {
-                if delta.is_empty() {
+                if delta.is_empty() || self.completed_output_indices.contains(&output_index) {
                     return Ok(());
                 }
                 self.active_items
@@ -171,6 +176,9 @@ impl<'a> ModelStreamReducer<'a> {
                 call_id,
                 name,
             } => {
+                if self.completed_output_indices.contains(&output_index) {
+                    return Ok(());
+                }
                 self.active_items.entry(output_index).or_default();
                 self.update_tool_preview(output_index, call_id, name);
             }
@@ -178,7 +186,7 @@ impl<'a> ModelStreamReducer<'a> {
                 output_index,
                 delta,
             } => {
-                if delta.is_empty() {
+                if delta.is_empty() || self.completed_output_indices.contains(&output_index) {
                     return Ok(());
                 }
                 let preview = {
@@ -200,6 +208,9 @@ impl<'a> ModelStreamReducer<'a> {
                 }
             }
             ModelStreamEvent::OutputItemDone { output_index, item } => {
+                if !self.completed_output_indices.insert(output_index) {
+                    return Ok(());
+                }
                 self.finalize_output_item(output_index, item).await?;
             }
             ModelStreamEvent::Completed { id, usage, .. } => {
@@ -1042,6 +1053,127 @@ mod tests {
                 && name == "read_file"
                 && arguments == "{\"path\":\"Cargo.toml\"}"
         ));
+    }
+
+    #[tokio::test]
+    async fn chat_assistant_done_before_parallel_tool_calls_is_persisted_once() {
+        let harness = Harness::new().await;
+        let result = harness
+            .consume(vec![
+                ModelStreamEvent::ReasoningDelta {
+                    output_index: 0,
+                    content_index: None,
+                    delta: "need repository facts".to_string(),
+                },
+                ModelStreamEvent::TextDelta {
+                    output_index: 0,
+                    content_index: None,
+                    delta: "I will inspect the repo.".to_string(),
+                },
+                ModelStreamEvent::ToolCallStarted {
+                    output_index: 1,
+                    call_id: Some("call_1".to_string()),
+                    name: Some("read_file".to_string()),
+                },
+                ModelStreamEvent::ToolCallArgumentsDelta {
+                    output_index: 1,
+                    delta: "{\"path\":\"Cargo.toml\"}".to_string(),
+                },
+                ModelStreamEvent::ToolCallStarted {
+                    output_index: 2,
+                    call_id: Some("call_2".to_string()),
+                    name: Some("list_files".to_string()),
+                },
+                ModelStreamEvent::ToolCallArgumentsDelta {
+                    output_index: 2,
+                    delta: "{}".to_string(),
+                },
+                ModelStreamEvent::OutputItemDone {
+                    output_index: 0,
+                    item: ModelOutputItem::Message {
+                        text: String::new(),
+                    },
+                },
+                ModelStreamEvent::OutputItemDone {
+                    output_index: 0,
+                    item: ModelOutputItem::Message {
+                        text: String::new(),
+                    },
+                },
+                ModelStreamEvent::OutputItemDone {
+                    output_index: 1,
+                    item: ModelOutputItem::FunctionCall {
+                        call_id: "call_1".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({ "path": "Cargo.toml" }),
+                        raw_arguments: "{\"path\":\"Cargo.toml\"}".to_string(),
+                    },
+                },
+                ModelStreamEvent::OutputItemDone {
+                    output_index: 2,
+                    item: ModelOutputItem::FunctionCall {
+                        call_id: "call_2".to_string(),
+                        name: "list_files".to_string(),
+                        arguments: serde_json::json!({}),
+                        raw_arguments: "{}".to_string(),
+                    },
+                },
+                completed(),
+            ])
+            .await
+            .expect("consume");
+
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.response.output.len(), 4);
+        assert!(matches!(
+            &result.response.output[0],
+            ModelOutputItem::Reasoning { content } if content == "need repository facts"
+        ));
+        assert!(matches!(
+            &result.response.output[1],
+            ModelOutputItem::Message { text } if text == "I will inspect the repo."
+        ));
+        assert!(matches!(
+            &result.response.output[2],
+            ModelOutputItem::FunctionCall { call_id, .. } if call_id == "call_1"
+        ));
+        assert!(matches!(
+            &result.response.output[3],
+            ModelOutputItem::FunctionCall { call_id, .. } if call_id == "call_2"
+        ));
+        let history = harness.history().await;
+        assert_eq!(history.len(), 4);
+        assert!(matches!(
+            &history[0],
+            ModelInputItem::Reasoning { content } if content == "need repository facts"
+        ));
+        assert!(matches!(
+            &history[1],
+            ModelInputItem::Message { role, content }
+                if role == "assistant"
+                    && matches!(&content[0], ModelContentItem::OutputText { text } if text == "I will inspect the repo.")
+        ));
+        assert!(matches!(
+            &history[2],
+            ModelInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } if call_id == "call_1"
+                && name == "read_file"
+                && arguments == "{\"path\":\"Cargo.toml\"}"
+        ));
+        assert!(matches!(
+            &history[3],
+            ModelInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } if call_id == "call_2" && name == "list_files" && arguments == "{}"
+        ));
+        let messages = harness.messages().await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "I will inspect the repo.");
     }
 
     #[tokio::test]

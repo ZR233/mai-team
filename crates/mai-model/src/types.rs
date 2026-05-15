@@ -171,13 +171,72 @@ impl ModelStreamAccumulator {
             }
             ModelStreamEvent::OutputItemAdded { .. } => {}
             ModelStreamEvent::OutputItemDone { output_index, item } => {
-                self.done_output_indices.insert(*output_index);
-                self.text_parts.remove(output_index);
-                self.reasoning_parts.remove(output_index);
-                self.tool_calls.remove(output_index);
-                self.outputs.push(item.clone());
+                if !self.done_output_indices.insert(*output_index) {
+                    return;
+                }
+                self.push_completed_output(*output_index, item.clone());
             }
             ModelStreamEvent::CustomToolInputDelta { .. } | ModelStreamEvent::Status { .. } => {}
+        }
+    }
+
+    fn push_completed_output(&mut self, output_index: usize, item: ModelOutputItem) {
+        let active_text = self
+            .text_parts
+            .remove(&output_index)
+            .filter(|text| !text.trim().is_empty());
+        let active_reasoning = self
+            .reasoning_parts
+            .remove(&output_index)
+            .filter(|text| !text.trim().is_empty());
+        self.tool_calls.remove(&output_index);
+
+        match item {
+            ModelOutputItem::Message { text } => {
+                if let Some(content) = active_reasoning {
+                    self.outputs.push(ModelOutputItem::Reasoning { content });
+                }
+                let text = if text.trim().is_empty() {
+                    active_text
+                } else {
+                    Some(text)
+                };
+                if let Some(text) = text {
+                    self.outputs.push(ModelOutputItem::Message { text });
+                }
+            }
+            ModelOutputItem::Reasoning { content } => {
+                let content = if content.trim().is_empty() {
+                    active_reasoning
+                } else {
+                    Some(content)
+                };
+                if let Some(content) = content {
+                    self.outputs.push(ModelOutputItem::Reasoning { content });
+                }
+            }
+            ModelOutputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                raw_arguments,
+            } => {
+                if let Some(content) = active_reasoning {
+                    self.outputs.push(ModelOutputItem::Reasoning { content });
+                }
+                if let Some(text) = active_text {
+                    self.outputs.push(ModelOutputItem::Message { text });
+                }
+                self.outputs.push(ModelOutputItem::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                    raw_arguments,
+                });
+            }
+            ModelOutputItem::Other { raw } => {
+                self.outputs.push(ModelOutputItem::Other { raw });
+            }
         }
     }
 
@@ -301,6 +360,76 @@ mod tests {
             } if call_id == "call_1"
                 && name == "container_exec"
                 && raw_arguments == "{\"command\":\"pwd\"}"
+        ));
+    }
+
+    #[test]
+    fn accumulator_finalizes_streamed_assistant_content_before_tool_calls() {
+        let mut accumulator = ModelStreamAccumulator::default();
+        accumulator.push(&ModelStreamEvent::ResponseStarted {
+            id: Some("resp_1".to_string()),
+        });
+        accumulator.push(&ModelStreamEvent::ReasoningDelta {
+            output_index: 0,
+            content_index: None,
+            delta: "need repository facts".to_string(),
+        });
+        accumulator.push(&ModelStreamEvent::TextDelta {
+            output_index: 0,
+            content_index: None,
+            delta: "I will inspect the repo.".to_string(),
+        });
+        accumulator.push(&ModelStreamEvent::ToolCallStarted {
+            output_index: 1,
+            call_id: Some("call_1".to_string()),
+            name: Some("read_file".to_string()),
+        });
+        accumulator.push(&ModelStreamEvent::ToolCallArgumentsDelta {
+            output_index: 1,
+            delta: "{\"path\":\"Cargo.toml\"}".to_string(),
+        });
+        accumulator.push(&ModelStreamEvent::OutputItemDone {
+            output_index: 0,
+            item: ModelOutputItem::Message {
+                text: String::new(),
+            },
+        });
+        accumulator.push(&ModelStreamEvent::OutputItemDone {
+            output_index: 1,
+            item: ModelOutputItem::FunctionCall {
+                call_id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "Cargo.toml" }),
+                raw_arguments: "{\"path\":\"Cargo.toml\"}".to_string(),
+            },
+        });
+        accumulator.push(&ModelStreamEvent::Completed {
+            id: Some("resp_1".to_string()),
+            usage: None,
+            end_turn: Some(true),
+        });
+
+        let response = accumulator.finish().expect("finish");
+
+        assert_eq!(response.output.len(), 3);
+        assert!(matches!(
+            &response.output[0],
+            ModelOutputItem::Reasoning { content } if content == "need repository facts"
+        ));
+        assert!(matches!(
+            &response.output[1],
+            ModelOutputItem::Message { text } if text == "I will inspect the repo."
+        ));
+        assert!(matches!(
+            &response.output[2],
+            ModelOutputItem::FunctionCall {
+                call_id,
+                name,
+                raw_arguments,
+                ..
+            } if call_id == "call_1"
+                && name == "read_file"
+                && raw_arguments == "{\"path\":\"Cargo.toml\"}"
         ));
     }
 }

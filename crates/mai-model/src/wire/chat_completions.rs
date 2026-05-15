@@ -18,6 +18,8 @@ enum ChatUsageParser {
     Deepseek,
 }
 
+const CHAT_OUTPUT_INDEX_STRIDE: usize = 10_000;
+
 impl ChatCompletionsApi {
     pub(crate) fn openai_compatible() -> Self {
         Self {
@@ -293,7 +295,7 @@ fn parse_chat_stream_chunk_with_usage_parser(
     usage_parser: ChatUsageParser,
 ) -> Vec<ModelStreamEvent> {
     let mut events = Vec::new();
-    let mut tool_calls_completed = Vec::new();
+    let mut assistant_items_completed = Vec::new();
     let id = value
         .get("id")
         .and_then(Value::as_str)
@@ -303,11 +305,15 @@ fn parse_chat_stream_chunk_with_usage_parser(
     }
     if let Some(choices) = value.get("choices").and_then(Value::as_array) {
         for choice in choices {
-            let output_index = choice
+            let choice_index = choice
                 .get("index")
                 .and_then(Value::as_u64)
                 .unwrap_or_default() as usize;
+            let assistant_output_index = chat_assistant_output_index(choice_index);
             let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+            if finish_reason == Some("tool_calls") {
+                assistant_items_completed.push(assistant_output_index);
+            }
             let Some(delta) = choice.get("delta") else {
                 continue;
             };
@@ -315,7 +321,7 @@ fn parse_chat_stream_chunk_with_usage_parser(
                 && !content.is_empty()
             {
                 events.push(ModelStreamEvent::TextDelta {
-                    output_index,
+                    output_index: assistant_output_index,
                     content_index: None,
                     delta: content.to_string(),
                 });
@@ -324,17 +330,19 @@ fn parse_chat_stream_chunk_with_usage_parser(
                 && !reasoning.is_empty()
             {
                 events.push(ModelStreamEvent::ReasoningDelta {
-                    output_index,
+                    output_index: assistant_output_index,
                     content_index: None,
                     delta: reasoning.to_string(),
                 });
             }
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-                for tool_call in tool_calls {
-                    let index = tool_call
+                for (fallback_tool_index, tool_call) in tool_calls.iter().enumerate() {
+                    let tool_index = tool_call
                         .get("index")
                         .and_then(Value::as_u64)
-                        .unwrap_or(output_index as u64) as usize;
+                        .unwrap_or(fallback_tool_index as u64)
+                        as usize;
+                    let output_index = chat_tool_output_index(choice_index, tool_index);
                     let function = tool_call.get("function").unwrap_or(&Value::Null);
                     let call_id = tool_call
                         .get("id")
@@ -346,7 +354,7 @@ fn parse_chat_stream_chunk_with_usage_parser(
                         .map(ToOwned::to_owned);
                     if call_id.is_some() || name.is_some() {
                         events.push(ModelStreamEvent::ToolCallStarted {
-                            output_index: index,
+                            output_index,
                             call_id: call_id.clone(),
                             name: name.clone(),
                         });
@@ -355,32 +363,21 @@ fn parse_chat_stream_chunk_with_usage_parser(
                         && !arguments.is_empty()
                     {
                         events.push(ModelStreamEvent::ToolCallArgumentsDelta {
-                            output_index: index,
+                            output_index,
                             delta: arguments.to_string(),
                         });
-                        if finish_reason == Some("tool_calls") {
-                            tool_calls_completed.push((
-                                index,
-                                call_id.clone(),
-                                name.clone(),
-                                arguments.to_string(),
-                            ));
-                        }
                     }
                 }
             }
         }
     }
-    for (output_index, call_id, name, raw_arguments) in tool_calls_completed {
-        let arguments = serde_json::from_str(&raw_arguments)
-            .unwrap_or_else(|_| serde_json::json!({ "raw": raw_arguments.clone() }));
+    assistant_items_completed.sort_unstable();
+    assistant_items_completed.dedup();
+    for output_index in assistant_items_completed {
         events.push(ModelStreamEvent::OutputItemDone {
             output_index,
-            item: ModelOutputItem::FunctionCall {
-                call_id: call_id.unwrap_or_default(),
-                name: name.unwrap_or_default(),
-                arguments,
-                raw_arguments,
+            item: ModelOutputItem::Message {
+                text: String::new(),
             },
         });
     }
@@ -396,6 +393,17 @@ fn parse_chat_stream_chunk_with_usage_parser(
         });
     }
     events
+}
+
+fn chat_assistant_output_index(choice_index: usize) -> usize {
+    choice_index.saturating_mul(CHAT_OUTPUT_INDEX_STRIDE)
+}
+
+fn chat_tool_output_index(choice_index: usize, tool_index: usize) -> usize {
+    choice_index
+        .saturating_mul(CHAT_OUTPUT_INDEX_STRIDE)
+        .saturating_add(1)
+        .saturating_add(tool_index)
 }
 
 #[cfg(test)]
@@ -670,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_stream_emits_function_call_output_item_done_on_tool_finish() {
+    fn chat_stream_keeps_tool_calls_as_deltas_on_tool_finish() {
         let events = parse_chat_stream_chunk(serde_json::json!({
             "id": "chatcmpl_123",
             "choices": [{
@@ -691,11 +699,147 @@ mod tests {
 
         assert!(events.iter().any(|event| matches!(
             event,
-            ModelStreamEvent::OutputItemDone {
-                item: ModelOutputItem::FunctionCall { call_id, name, .. },
-                ..
-            } if call_id == "call_123" && name == "read_file"
+            ModelStreamEvent::ToolCallStarted {
+                output_index: 1,
+                call_id,
+                name,
+            } if call_id.as_deref() == Some("call_123") && name.as_deref() == Some("read_file")
         )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::ToolCallArgumentsDelta {
+                output_index: 1,
+                delta,
+            } if delta == "{\"path\":\"src/main.rs\"}"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::OutputItemDone {
+                output_index: 0,
+                item: ModelOutputItem::Message { text },
+            } if text.is_empty()
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::OutputItemDone {
+                item: ModelOutputItem::FunctionCall { .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn chat_stream_uses_distinct_indices_for_assistant_content_and_parallel_tool_calls() {
+        let events = parse_chat_stream_chunk(serde_json::json!({
+            "id": "chatcmpl_123",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "delta": {
+                    "reasoning_content": "need repository facts",
+                    "content": "I will inspect the repo.",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\"Cargo.toml\"}"
+                            }
+                        },
+                        {
+                            "index": 1,
+                            "id": "call_2",
+                            "function": {
+                                "name": "list_files",
+                                "arguments": "{}"
+                            }
+                        }
+                    ]
+                }
+            }]
+        }));
+
+        let assistant_done_position = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ModelStreamEvent::OutputItemDone {
+                        output_index: 0,
+                        item: ModelOutputItem::Message { text },
+                    } if text.is_empty()
+                )
+            })
+            .expect("assistant content done");
+        let tool_call_events = events
+            .iter()
+            .enumerate()
+            .filter_map(|(position, event)| match event {
+                ModelStreamEvent::ToolCallStarted {
+                    output_index,
+                    call_id: Some(call_id),
+                    ..
+                } => Some((position, *output_index, call_id.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(assistant_done_position > 0);
+        assert_eq!(tool_call_events.len(), 2);
+        assert!(
+            tool_call_events
+                .iter()
+                .all(|(_, output_index, _)| *output_index != 0)
+        );
+        assert_eq!(tool_call_events[0].2, "call_1");
+        assert_eq!(tool_call_events[1].2, "call_2");
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::OutputItemDone {
+                item: ModelOutputItem::FunctionCall { .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn chat_stream_uses_array_position_when_tool_call_index_is_missing() {
+        let events = parse_chat_stream_chunk(serde_json::json!({
+            "id": "chatcmpl_123",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\"Cargo.toml\"}"
+                            }
+                        },
+                        {
+                            "id": "call_2",
+                            "function": {
+                                "name": "list_files",
+                                "arguments": "{}"
+                            }
+                        }
+                    ]
+                }
+            }]
+        }));
+
+        let tool_indices = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelStreamEvent::ToolCallStarted { output_index, .. } => Some(*output_index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(tool_indices, vec![1, 2]);
     }
 
     #[test]
