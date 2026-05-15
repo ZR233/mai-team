@@ -459,6 +459,7 @@ pub(crate) fn github_app_manifest(
             "contents": "write",
             "pull_requests": "write",
             "issues": "write",
+            "packages": "read",
             "checks": "read",
             "statuses": "read",
             "metadata": "read"
@@ -499,6 +500,7 @@ mod tests {
             "https://relay.example/github/webhook"
         );
         assert_eq!(manifest["default_permissions"]["contents"], "write");
+        assert_eq!(manifest["default_permissions"]["packages"], "read");
         assert_eq!(manifest["default_events"][0], "pull_request");
         assert_eq!(manifest["public"], true);
         assert_eq!(manifest["webhook_secret"], "secret");

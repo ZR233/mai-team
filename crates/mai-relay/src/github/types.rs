@@ -85,7 +85,7 @@ pub(crate) struct GithubRepositoryApi {
     pub(crate) owner: GithubAccountApi,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct GithubPackageApi {
     pub(crate) name: String,
     pub(crate) html_url: String,
@@ -93,7 +93,7 @@ pub(crate) struct GithubPackageApi {
     pub(crate) repository: Option<GithubPackageRepositoryApi>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct GithubPackageRepositoryApi {
     pub(crate) full_name: String,
 }
