@@ -91,7 +91,9 @@ pub(crate) async fn create_agent_record(
         token_usage: TokenUsage::default(),
     };
     ops.save_agent(&summary, system_prompt.as_deref()).await?;
-    let session = initial_session_record(context.task_id.is_some());
+    let internal_task_session =
+        context.task_id.is_some() && !matches!(context.role, Some(AgentRole::Planner));
+    let session = initial_session_record(internal_task_session);
     ops.save_agent_session(id, &session.summary).await?;
 
     let agent = Arc::new(AgentRecord {

@@ -158,11 +158,13 @@ pub(crate) async fn create_session(
     agent_id: AgentId,
 ) -> Result<AgentSessionSummary> {
     let agent = ops.agent(agent_id).await?;
-    if agent.summary.read().await.task_id.is_some() {
+    let summary = agent.summary.read().await;
+    if is_internal_workflow_agent(&summary) {
         return Err(RuntimeError::InvalidInput(
-            "task-owned agents use a single internal task session".to_string(),
+            "workflow child agents use a single internal task session".to_string(),
         ));
     }
+    drop(summary);
     let session = {
         let mut sessions = agent.sessions.lock().await;
         let session = next_chat_session_record(sessions.len());
@@ -171,6 +173,14 @@ pub(crate) async fn create_session(
     };
     ops.save_agent_session(agent_id, &session).await?;
     Ok(session)
+}
+
+fn is_internal_workflow_agent(summary: &AgentSummary) -> bool {
+    summary.task_id.is_some()
+        && matches!(
+            summary.role,
+            Some(AgentRole::Explorer | AgentRole::Executor | AgentRole::Reviewer)
+        )
 }
 
 pub(crate) async fn close_agent(
