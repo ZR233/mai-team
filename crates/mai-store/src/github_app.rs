@@ -112,5 +112,5 @@ fn github_app_install_url(app_slug: Option<&str>) -> Option<String> {
     app_slug
         .map(str::trim)
         .filter(|slug| !slug.is_empty())
-        .map(|slug| format!("https://github.com/apps/{slug}/installations/new"))
+        .map(|slug| format!("https://github.com/apps/{slug}/installations/select_target"))
 }

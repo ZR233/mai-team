@@ -433,7 +433,7 @@ pub(crate) fn github_app_install_url(
     state: Option<&str>,
 ) -> String {
     let base = format!(
-        "{}/apps/{}/installations/new",
+        "{}/apps/{}/installations/select_target",
         web_base_url.trim_end_matches('/'),
         app_slug
     );
@@ -454,7 +454,7 @@ pub(crate) fn github_app_manifest(
         "redirect_url": redirect_url,
         "callback_urls": [redirect_url],
         "setup_url": setup_url,
-        "public": false,
+        "public": true,
         "default_permissions": {
             "contents": "write",
             "pull_requests": "write",
@@ -500,6 +500,7 @@ mod tests {
         );
         assert_eq!(manifest["default_permissions"]["contents"], "write");
         assert_eq!(manifest["default_events"][0], "pull_request");
+        assert_eq!(manifest["public"], true);
         assert_eq!(manifest["webhook_secret"], "secret");
     }
 
@@ -529,7 +530,7 @@ mod tests {
         assert!(settings.has_private_key);
         assert_eq!(
             settings.install_url.as_deref(),
-            Some("https://github.com/apps/mai-test/installations/new?state=state-1")
+            Some("https://github.com/apps/mai-test/installations/select_target?state=state-1")
         );
     }
 

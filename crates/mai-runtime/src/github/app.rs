@@ -493,7 +493,7 @@ fn github_app_manifest(redirect_url: &str, setup_url: &str, webhook_url: &str) -
         "redirect_url": redirect_url,
         "callback_urls": [redirect_url],
         "setup_url": setup_url,
-        "public": false,
+        "public": true,
         "default_permissions": {
             "contents": "write",
             "pull_requests": "write",
@@ -628,6 +628,7 @@ mod tests {
             "write"
         );
         assert_eq!(response.manifest["default_permissions"]["issues"], "write");
+        assert_eq!(response.manifest["public"], true);
         assert_eq!(response.manifest["hook_attributes"]["active"], false);
     }
 

@@ -2237,7 +2237,8 @@ mod tests {
 
         let response = GithubAppInstallationStartResponse {
             state: "state-1".to_string(),
-            install_url: "https://github.com/apps/mai/installations/new?state=state-1".to_string(),
+            install_url: "https://github.com/apps/mai/installations/select_target?state=state-1"
+                .to_string(),
             app: GithubAppSettingsResponse {
                 app_id: Some("123".to_string()),
                 base_url: "https://api.github.com".to_string(),
@@ -2247,7 +2248,9 @@ mod tests {
                 app_html_url: None,
                 owner_login: None,
                 owner_type: None,
-                install_url: Some("https://github.com/apps/mai/installations/new".to_string()),
+                install_url: Some(
+                    "https://github.com/apps/mai/installations/select_target".to_string(),
+                ),
             },
         };
         let value = serde_json::to_value(&response).expect("serialize");

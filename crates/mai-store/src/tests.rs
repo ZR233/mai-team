@@ -329,6 +329,10 @@ async fn github_app_settings_persist_public_url() {
 
     assert_eq!(saved.public_url.as_deref(), Some("https://relay.example"));
     assert!(saved.has_private_key);
+    assert_eq!(
+        saved.install_url.as_deref(),
+        Some("https://github.com/apps/mai/installations/select_target")
+    );
 
     let secret = store
         .github_app_secret()
