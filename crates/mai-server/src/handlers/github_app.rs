@@ -248,6 +248,35 @@ pub(crate) async fn get_relay_status(
     Ok(Json(svc.relay_status().await))
 }
 
+pub(crate) async fn get_relay_update(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<RelayUpdateStatusResponse>, ApiError> {
+    let svc = github_service(&state);
+    Ok(Json(svc.relay_update_status().await?))
+}
+
+pub(crate) async fn check_relay_update(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RelayUpdateCheckRequest>,
+) -> std::result::Result<Json<RelayUpdateStatusResponse>, ApiError> {
+    let svc = github_service(&state);
+    Ok(Json(svc.check_relay_update(request).await?))
+}
+
+pub(crate) async fn apply_relay_update(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<RelayUpdateActionResponse>, ApiError> {
+    let svc = github_service(&state);
+    Ok(Json(svc.apply_relay_update().await?))
+}
+
+pub(crate) async fn rollback_relay_update(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<RelayUpdateActionResponse>, ApiError> {
+    let svc = github_service(&state);
+    Ok(Json(svc.rollback_relay_update().await?))
+}
+
 pub(crate) async fn get_relay_settings(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<RelaySettingsResponse>, ApiError> {

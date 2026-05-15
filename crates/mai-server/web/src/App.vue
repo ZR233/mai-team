@@ -134,6 +134,9 @@
         @refresh-github-app="onRefreshGithubAppSettings"
         @install-github-app="onInstallGithubAppFromSettings"
         @save-relay-settings="onSaveRelaySettings"
+        @check-relay-update="onCheckRelayUpdate"
+        @apply-relay-update="onApplyRelayUpdate"
+        @rollback-relay-update="onRollbackRelayUpdate"
         @save-github-app-settings="onSaveGithubAppSettings"
       />
     </main>
@@ -304,6 +307,10 @@ const {
   githubAppState,
   loadGithubAppContext,
   saveRelaySettings,
+  checkRelayUpdate,
+  applyRelayUpdate,
+  rollbackRelayUpdate,
+  waitForRelayReconnect,
   saveGithubAppSettings,
   startGithubAppInstallation,
   loadInstallations,
@@ -755,6 +762,42 @@ async function onSaveRelaySettings(request) {
     await saveRelaySettings(request)
     await refreshGithubAppSettingsState(true)
     showToast('Relay settings saved.')
+  } catch (error) {
+    githubAppState.error = error.message
+  }
+}
+
+async function onCheckRelayUpdate() {
+  githubAppState.error = ''
+  try {
+    const update = await checkRelayUpdate(true)
+    showToast(update?.has_update ? 'Relay update is available.' : 'Relay is up to date.')
+  } catch (error) {
+    githubAppState.error = error.message
+  }
+}
+
+async function onApplyRelayUpdate() {
+  githubAppState.error = ''
+  try {
+    await applyRelayUpdate()
+    showToast('Relay update started. Waiting for reconnect.')
+    await waitForRelayReconnect()
+    await refreshGithubAppSettingsState(true)
+    showToast('Relay reconnected.')
+  } catch (error) {
+    githubAppState.error = error.message
+  }
+}
+
+async function onRollbackRelayUpdate() {
+  githubAppState.error = ''
+  try {
+    await rollbackRelayUpdate()
+    showToast('Relay rollback started. Waiting for reconnect.')
+    await waitForRelayReconnect()
+    await refreshGithubAppSettingsState(true)
+    showToast('Relay reconnected.')
   } catch (error) {
     githubAppState.error = error.message
   }

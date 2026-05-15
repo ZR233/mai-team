@@ -67,8 +67,10 @@ fi
 
 ENV_DIR="/etc/mai-relay"
 DATA_DIR="/var/lib/mai-relay"
+BIN_DIR="/opt/mai-relay"
 ENV_FILE="$ENV_DIR/mai-relay.env"
-BIN_PATH="/usr/local/bin/mai-relay"
+BIN_PATH="$BIN_DIR/mai-relay"
+LEGACY_BIN_PATH="/usr/local/bin/mai-relay"
 SERVICE_FILE="/etc/systemd/system/mai-relay.service"
 ASSET="mai-relay-x86_64-unknown-linux-gnu.tar.gz"
 if [[ "$RELAY_VERSION" == "latest" ]]; then
@@ -105,15 +107,20 @@ fi
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-run install -d -m 0755 "$ENV_DIR" "$DATA_DIR"
 run useradd --system --home "$DATA_DIR" --shell /usr/sbin/nologin mai-relay 2>/dev/null || true
+run install -d -m 0755 "$ENV_DIR" "$DATA_DIR" "$BIN_DIR"
 
 if [[ "$DRY_RUN" != "true" ]]; then
   curl -fsSL "$DOWNLOAD_URL" -o "$tmpdir/$ASSET"
   tar -xzf "$tmpdir/$ASSET" -C "$tmpdir"
   install -m 0755 "$tmpdir/mai-relay" "$BIN_PATH"
+  chown -R mai-relay:mai-relay "$BIN_DIR"
+  ln -sfn "$BIN_PATH" "$LEGACY_BIN_PATH"
 else
   echo "DRY RUN: download $DOWNLOAD_URL"
+  echo "DRY RUN: install extracted mai-relay to $BIN_PATH"
+  echo "DRY RUN: chown -R mai-relay:mai-relay $BIN_DIR"
+  echo "DRY RUN: ln -sfn $BIN_PATH $LEGACY_BIN_PATH"
 fi
 
 env_content="$(cat <<ENV

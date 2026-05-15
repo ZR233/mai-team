@@ -2016,6 +2016,52 @@ pub struct RelayStatusResponse {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RelayUpdateReleaseInfo {
+    pub name: String,
+    pub body: String,
+    pub published_at: String,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RelayUpdateStatusResponse {
+    pub current_version: String,
+    pub latest_version: String,
+    pub has_update: bool,
+    pub can_update: bool,
+    #[serde(default)]
+    pub release: Option<RelayUpdateReleaseInfo>,
+    #[serde(default)]
+    pub cached: bool,
+    #[serde(default)]
+    pub warning: Option<String>,
+    #[serde(default)]
+    pub restart_scheduled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RelayUpdateActionResponse {
+    pub status: RelayUpdateStatusResponse,
+    pub message: String,
+    pub restart_scheduled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RelayUpdateCheckRequest {
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RelayUpdateApplyRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RelayUpdateRollbackRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RelayUpdateRestartRequest {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayGithubRepositoriesRequest {
     pub installation_id: u64,
@@ -2082,6 +2128,7 @@ pub fn preview(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     #[test]
@@ -2242,6 +2289,45 @@ mod tests {
         assert_eq!(decoded.url, "https://relay.example");
         assert!(decoded.has_token);
         assert_eq!(decoded.node_id, "mai-server-a");
+    }
+
+    #[test]
+    fn relay_update_dtos_round_trip() {
+        let status = RelayUpdateStatusResponse {
+            current_version: "0.1.0".to_string(),
+            latest_version: "0.2.0".to_string(),
+            has_update: true,
+            can_update: true,
+            release: Some(RelayUpdateReleaseInfo {
+                name: "v0.2.0".to_string(),
+                body: "Relay update".to_string(),
+                published_at: "2026-05-15T00:00:00Z".to_string(),
+                html_url: "https://github.com/ZR233/mai-team/releases/tag/v0.2.0".to_string(),
+            }),
+            cached: false,
+            warning: Some("download ready".to_string()),
+            restart_scheduled: false,
+        };
+        let decoded: RelayUpdateStatusResponse =
+            serde_json::from_value(serde_json::to_value(&status).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(decoded, status);
+
+        let action = RelayUpdateActionResponse {
+            status,
+            message: "updated".to_string(),
+            restart_scheduled: true,
+        };
+        let decoded: RelayUpdateActionResponse =
+            serde_json::from_value(serde_json::to_value(&action).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(decoded, action);
+
+        let request = RelayUpdateCheckRequest { force: true };
+        let decoded: RelayUpdateCheckRequest =
+            serde_json::from_value(serde_json::to_value(&request).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(decoded, request);
     }
 
     #[test]

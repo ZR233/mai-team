@@ -42,10 +42,13 @@ curl -fsSL https://raw.githubusercontent.com/ZR233/mai-team/main/scripts/update-
 
 脚本会安装或更新：
 
-- `/usr/local/bin/mai-relay`
+- `/opt/mai-relay/mai-relay`
+- `/usr/local/bin/mai-relay`（指向 `/opt/mai-relay/mai-relay` 的兼容 symlink）
 - `/etc/mai-relay/mai-relay.env`
 - `/var/lib/mai-relay/mai-relay.sqlite3`
 - `/etc/systemd/system/mai-relay.service`
+
+`mai-relay` 服务会以 `mai-relay` 用户运行，并拥有 `/opt/mai-relay`。这样 Settings 页面触发自更新时，relay 可以下载最新 release、校验 sha256、替换自身二进制，然后退出并由 systemd `Restart=always` 自动拉起新版本，不需要 sudo/root helper。
 
 安装完成后会执行：
 
@@ -80,7 +83,7 @@ journalctl -u mai-relay -n 100 --no-pager
 
 ## 更新
 
-推荐使用一键更新脚本更新二进制。默认会保留 `/etc/mai-relay/mai-relay.env` 里已有的 token 和 public URL。
+推荐优先在 `mai-server` Settings > GitHub App 的 Relay Update 面板中检查并更新 relay。命令行一键更新脚本仍可用于首次迁移旧安装或手动恢复；默认会保留 `/etc/mai-relay/mai-relay.env` 里已有的 token 和 public URL。
 
 需要强制轮换 token 时：
 

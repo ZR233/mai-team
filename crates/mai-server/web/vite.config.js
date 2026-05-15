@@ -17,6 +17,7 @@ export default defineConfig({
       '/provider-presets': apiTarget,
       '/providers': apiTarget,
       '/projects': apiTarget,
+      '/relay': apiTarget,
       '/settings': apiTarget,
       '/skills': apiTarget,
       '/tasks': apiTarget

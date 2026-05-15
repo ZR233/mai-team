@@ -87,6 +87,19 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
             post(handlers::github_app::start_github_app_installation),
         )
         .route("/relay/status", get(handlers::github_app::get_relay_status))
+        .route("/relay/update", get(handlers::github_app::get_relay_update))
+        .route(
+            "/relay/update:check",
+            post(handlers::github_app::check_relay_update),
+        )
+        .route(
+            "/relay/update:apply",
+            post(handlers::github_app::apply_relay_update),
+        )
+        .route(
+            "/relay/update:rollback",
+            post(handlers::github_app::rollback_relay_update),
+        )
         .route(
             "/github/installations",
             get(handlers::github_app::list_github_installations),

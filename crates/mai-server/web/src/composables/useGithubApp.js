@@ -4,11 +4,16 @@ import { useApi } from './useApi'
 const githubAppState = reactive({
   relay: null,
   relaySettings: null,
+  relayUpdate: null,
   app: null,
   installations: [],
   loading: false,
+  checkingRelayUpdate: false,
+  updatingRelay: false,
+  rollingBackRelay: false,
   installing: false,
   loadingInstallations: false,
+  relayUpdateError: '',
   error: ''
 })
 
@@ -25,6 +30,12 @@ export function useGithubApp() {
     return githubAppState.relaySettings
   }
 
+  async function loadRelayUpdateStatus() {
+    githubAppState.relayUpdate = await api('/relay/update')
+    githubAppState.relayUpdateError = githubAppState.relayUpdate?.warning || ''
+    return githubAppState.relayUpdate
+  }
+
   async function loadGithubAppSettings() {
     githubAppState.app = await api('/settings/github-app')
     return githubAppState.app
@@ -34,10 +45,14 @@ export function useGithubApp() {
     githubAppState.loading = true
     githubAppState.error = ''
     try {
-      const [relay, relaySettings, app] = await Promise.allSettled([loadRelayStatus(), loadRelaySettings(), loadGithubAppSettings()])
+      const [relay, relaySettings, app, relayUpdate] = await Promise.allSettled([loadRelayStatus(), loadRelaySettings(), loadGithubAppSettings(), loadRelayUpdateStatus()])
       if (relay.status === 'rejected') githubAppState.relay = { enabled: false, connected: false, message: relay.reason?.message || 'Relay unavailable' }
       if (relaySettings.status === 'rejected') githubAppState.relaySettings = { enabled: false, url: '', has_token: false, node_id: 'mai-server' }
       if (app.status === 'rejected') githubAppState.app = null
+      if (relayUpdate.status === 'rejected') {
+        githubAppState.relayUpdate = null
+        githubAppState.relayUpdateError = relayUpdate.reason?.message || ''
+      }
       return { relay: githubAppState.relay, app: githubAppState.app }
     } finally {
       githubAppState.loading = false
@@ -53,10 +68,76 @@ export function useGithubApp() {
         body: JSON.stringify(request)
       })
       await loadRelayStatus()
+      if (githubAppState.relay?.connected) await loadRelayUpdateStatus()
       return githubAppState.relaySettings
     } finally {
       githubAppState.loading = false
     }
+  }
+
+  async function checkRelayUpdate(force = true) {
+    githubAppState.checkingRelayUpdate = true
+    githubAppState.relayUpdateError = ''
+    try {
+      githubAppState.relayUpdate = await api('/relay/update:check', {
+        method: 'POST',
+        body: JSON.stringify({ force })
+      })
+      githubAppState.relayUpdateError = githubAppState.relayUpdate?.warning || ''
+      return githubAppState.relayUpdate
+    } catch (error) {
+      githubAppState.relayUpdateError = error.message
+      throw error
+    } finally {
+      githubAppState.checkingRelayUpdate = false
+    }
+  }
+
+  async function applyRelayUpdate() {
+    githubAppState.updatingRelay = true
+    githubAppState.relayUpdateError = ''
+    try {
+      const response = await api('/relay/update:apply', { method: 'POST' })
+      githubAppState.relayUpdate = response?.status || githubAppState.relayUpdate
+      return response
+    } catch (error) {
+      githubAppState.relayUpdateError = error.message
+      throw error
+    } finally {
+      githubAppState.updatingRelay = false
+    }
+  }
+
+  async function rollbackRelayUpdate() {
+    githubAppState.rollingBackRelay = true
+    githubAppState.relayUpdateError = ''
+    try {
+      const response = await api('/relay/update:rollback', { method: 'POST' })
+      githubAppState.relayUpdate = response?.status || githubAppState.relayUpdate
+      return response
+    } catch (error) {
+      githubAppState.relayUpdateError = error.message
+      throw error
+    } finally {
+      githubAppState.rollingBackRelay = false
+    }
+  }
+
+  async function waitForRelayReconnect(timeoutMs = 30000) {
+    const deadline = Date.now() + timeoutMs
+    const startedAt = Date.now()
+    let sawDisconnect = false
+    while (Date.now() < deadline) {
+      try {
+        const status = await loadRelayStatus()
+        if (status?.connected && (sawDisconnect || Date.now() - startedAt > 2500)) return status
+        if (!status?.connected) sawDisconnect = true
+      } catch (_error) {
+        sawDisconnect = true
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+    }
+    throw new Error('Timed out waiting for mai-relay to reconnect.')
   }
 
   async function saveGithubAppSettings(request) {
@@ -117,9 +198,14 @@ export function useGithubApp() {
     githubAppState,
     loadRelayStatus,
     loadRelaySettings,
+    loadRelayUpdateStatus,
     loadGithubAppSettings,
     loadGithubAppContext,
     saveRelaySettings,
+    checkRelayUpdate,
+    applyRelayUpdate,
+    rollbackRelayUpdate,
+    waitForRelayReconnect,
     saveGithubAppSettings,
     startGithubAppInstallation,
     loadInstallations,

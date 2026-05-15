@@ -409,6 +409,48 @@
                 <button class="primary-button" type="submit" :disabled="githubAppState.loading">Save Relay</button>
               </form>
 
+              <section class="relay-update-panel">
+                <div class="integration-card-head">
+                  <div>
+                    <h3>Relay Update</h3>
+                    <p>{{ relayUpdateMessage }}</p>
+                  </div>
+                  <span class="section-status" :class="relayUpdateStatusClass">{{ relayUpdateStatusLabel }}</span>
+                </div>
+
+                <div class="github-app-detail-grid relay-update-grid">
+                  <div class="github-app-detail-item">
+                    <span class="github-app-detail-label">Current</span>
+                    <strong>{{ relayUpdateCurrentVersion }}</strong>
+                    <small>{{ githubAppRelayReady ? 'Running relay version.' : 'Connect relay before checking.' }}</small>
+                  </div>
+                  <div class="github-app-detail-item">
+                    <span class="github-app-detail-label">Latest</span>
+                    <strong>{{ relayUpdateLatestVersion }}</strong>
+                    <small>{{ relayUpdate?.release?.published_at || 'GitHub latest release.' }}</small>
+                  </div>
+                </div>
+
+                <p v-if="relayUpdateError" class="dialog-error">{{ relayUpdateError }}</p>
+
+                <div class="settings-actions relay-update-actions">
+                  <div class="settings-actions-left">
+                    <button class="ghost-button" type="button" :disabled="!githubAppRelayReady || relayUpdateBusy" @click="$emit('check-relay-update')">
+                      <span v-if="githubAppState.checkingRelayUpdate" class="spinner-sm"></span>
+                      <template v-else>Check</template>
+                    </button>
+                    <button class="ghost-button" type="button" :disabled="!canRollbackRelayUpdate" @click="$emit('rollback-relay-update')">
+                      <span v-if="githubAppState.rollingBackRelay" class="spinner-sm"></span>
+                      <template v-else>Rollback</template>
+                    </button>
+                  </div>
+                  <button class="primary-button" type="button" :disabled="!canApplyRelayUpdate" @click="$emit('apply-relay-update')">
+                    <span v-if="githubAppState.updatingRelay" class="spinner-sm"></span>
+                    <template v-else>Update Relay</template>
+                  </button>
+                </div>
+              </section>
+
               <form class="github-app-config-form" @submit.prevent="saveGithubAppForm">
                 <label>
                   <span>Relay public URL</span>
@@ -583,6 +625,9 @@ const emit = defineEmits([
   'refresh-github-app',
   'install-github-app',
   'save-relay-settings',
+  'check-relay-update',
+  'apply-relay-update',
+  'rollback-relay-update',
   'save-github-app-settings'
 ])
 
@@ -664,6 +709,35 @@ const canSaveGitAccount = computed(() => {
   return Boolean(gitForm.label.trim() && (gitForm.id || gitForm.token.trim()))
 })
 const githubAppRelayReady = computed(() => props.githubAppState.relay?.enabled && props.githubAppState.relay?.connected)
+const relayUpdate = computed(() => props.githubAppState.relayUpdate || null)
+const relayUpdateBusy = computed(() => props.githubAppState.checkingRelayUpdate || props.githubAppState.updatingRelay || props.githubAppState.rollingBackRelay)
+const relayUpdateError = computed(() => props.githubAppState.relayUpdateError || relayUpdate.value?.warning || '')
+const relayUpdateStatusLabel = computed(() => {
+  if (!githubAppRelayReady.value) return 'Offline'
+  if (props.githubAppState.updatingRelay) return 'Updating'
+  if (props.githubAppState.rollingBackRelay) return 'Rolling back'
+  if (relayUpdate.value?.restart_scheduled) return 'Restarting'
+  if (relayUpdate.value?.has_update) return 'Update available'
+  if (relayUpdate.value) return 'Current'
+  return 'Unknown'
+})
+const relayUpdateStatusClass = computed(() => {
+  if (!githubAppRelayReady.value || relayUpdateError.value) return 'danger'
+  if (relayUpdate.value?.has_update) return ''
+  if (relayUpdate.value && !relayUpdate.value?.has_update) return 'ready'
+  return ''
+})
+const relayUpdateCurrentVersion = computed(() => relayUpdate.value?.current_version || 'Unknown')
+const relayUpdateLatestVersion = computed(() => relayUpdate.value?.latest_version || 'Unknown')
+const relayUpdateMessage = computed(() => {
+  if (!githubAppRelayReady.value) return githubAppRelayMessage.value
+  if (relayUpdate.value?.has_update) return relayUpdate.value?.release?.name || 'A new relay release is available.'
+  if (relayUpdate.value?.warning) return relayUpdate.value.warning
+  if (relayUpdate.value) return 'Installed relay matches the latest release.'
+  return 'Check GitHub release metadata from mai-relay.'
+})
+const canApplyRelayUpdate = computed(() => githubAppRelayReady.value && relayUpdate.value?.has_update && relayUpdate.value?.can_update && !relayUpdateBusy.value)
+const canRollbackRelayUpdate = computed(() => githubAppRelayReady.value && !relayUpdateBusy.value)
 const githubAppSettings = computed(() => props.githubAppState.app || null)
 const githubAppConfigured = computed(() => Boolean(githubAppSettings.value?.app_slug || githubAppSettings.value?.install_url))
 const githubAppInstallations = computed(() => props.githubAppState.installations || [])

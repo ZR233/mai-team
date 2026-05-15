@@ -7,6 +7,7 @@ mod rpc;
 mod session;
 mod state;
 mod store;
+mod update;
 
 use anyhow::{Context, Result};
 use github::{DEFAULT_GITHUB_API_BASE_URL, DEFAULT_GITHUB_WEB_BASE_URL};
