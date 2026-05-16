@@ -79,6 +79,7 @@ pub enum ProjectReviewStatus {
     #[strum(serialize = "disabled", serialize = "")]
     Disabled,
     Idle,
+    Selecting,
     Syncing,
     Running,
     Waiting,

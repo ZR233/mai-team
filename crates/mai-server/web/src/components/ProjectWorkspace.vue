@@ -528,6 +528,7 @@ const reviewSettingsHint = computed(() => (
 ))
 const nextReviewLabel = computed(() => {
   if (!props.detail?.auto_review_enabled) return 'Not scheduled'
+  if (props.detail?.review_status === 'selecting') return 'Selecting now'
   return props.detail?.next_review_at ? formatDateTime(props.detail.next_review_at) : 'As soon as possible'
 })
 const reviewLastFinishedLabel = computed(() => (
@@ -536,9 +537,11 @@ const reviewLastFinishedLabel = computed(() => (
     : 'No review cycle completed yet'
 ))
 const currentReviewerLabel = computed(() => (
-  props.detail?.current_reviewer_agent_id
-    ? `Reviewer ${props.detail.current_reviewer_agent_id}`
-    : 'No reviewer running'
+  props.detail?.review_status === 'selecting'
+    ? 'Scanning open pull requests'
+    : props.detail?.current_reviewer_agent_id
+      ? `Reviewer ${props.detail.current_reviewer_agent_id}`
+      : 'No reviewer running'
 ))
 const projectProgressMessage = computed(() => {
   if (!props.detail) return ''

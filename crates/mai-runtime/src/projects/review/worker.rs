@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use super::ProjectReviewCycleResult;
 use super::pool::PendingProjectReview;
 use super::runs::FinishReviewRun;
+use super::selector::ProjectReviewSelectorRunResult;
 use super::state::ReviewStateUpdate;
 use crate::state::{ProjectRecord, ProjectReviewWorker};
 use crate::{Result, RuntimeError};
@@ -79,7 +80,7 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         &self,
         project_id: ProjectId,
         cancellation_token: CancellationToken,
-    ) -> impl Future<Output = Result<()>> + Send;
+    ) -> impl Future<Output = Result<ProjectReviewSelectorRunResult>> + Send;
 
     fn run_project_review_once(
         &self,
@@ -407,8 +408,66 @@ async fn run_selector(
     project_id: ProjectId,
     cancellation_token: &CancellationToken,
 ) -> Result<()> {
-    ops.run_project_review_selector(project_id, cancellation_token.clone())
-        .await
+    let _ = ops
+        .set_project_review_state(
+            project_id,
+            ProjectReviewStatus::Selecting,
+            ReviewStateUpdate::default(),
+        )
+        .await;
+    let result = ops
+        .run_project_review_selector(project_id, cancellation_token.clone())
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(err) => {
+            let error = err.to_string();
+            let decision = super::project_review_loop_decision_for_error(error);
+            let next_review_at = (decision.delay.as_secs() > 0)
+                .then(|| Utc::now() + TimeDelta::seconds(decision.delay.as_secs() as i64));
+            let _ = ops
+                .set_project_review_state(
+                    project_id,
+                    decision.status,
+                    ReviewStateUpdate {
+                        next_review_at,
+                        outcome: decision.outcome,
+                        summary_text: decision.summary,
+                        error: decision.error,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            return Err(err);
+        }
+    };
+    match result {
+        ProjectReviewSelectorRunResult::Queued(_) => {
+            let _ = ops
+                .set_project_review_state(
+                    project_id,
+                    ProjectReviewStatus::Idle,
+                    ReviewStateUpdate::default(),
+                )
+                .await;
+        }
+        ProjectReviewSelectorRunResult::NoEligiblePr => {
+            let next_review_at =
+                Some(Utc::now() + TimeDelta::seconds(super::PROJECT_REVIEW_IDLE_RETRY_SECS as i64));
+            let _ = ops
+                .set_project_review_state(
+                    project_id,
+                    ProjectReviewStatus::Waiting,
+                    ReviewStateUpdate {
+                        next_review_at,
+                        outcome: Some(ProjectReviewOutcome::NoEligiblePr),
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
+    }
+    Ok(())
 }
 
 async fn should_poll_selector(
@@ -467,4 +526,238 @@ fn project_ready_for_review(summary: &ProjectSummary) -> bool {
     summary.auto_review_enabled
         && summary.status == ProjectStatus::Ready
         && summary.clone_status == ProjectCloneStatus::Ready
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use mai_protocol::{
+        ProjectCloneStatus, ProjectReviewOutcome, ProjectReviewRunSummary, ProjectReviewStatus,
+        ProjectStatus, ProjectSummary, now,
+    };
+    use pretty_assertions::assert_eq;
+    use tokio::sync::{Mutex, Notify};
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use crate::state::ProjectRecord;
+
+    use super::{
+        FinishReviewRun, ProjectReviewCycleResult, ProjectReviewSelectorRunResult,
+        ProjectReviewWorkerOps, ReviewStateUpdate, run_selector,
+    };
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ReviewStateSnapshot {
+        status: ProjectReviewStatus,
+        next_review_at_set: bool,
+        outcome: Option<ProjectReviewOutcome>,
+        error: Option<String>,
+    }
+
+    #[derive(Clone)]
+    struct FakeWorkerOps {
+        project: Arc<ProjectRecord>,
+        states: Arc<Mutex<Vec<ReviewStateSnapshot>>>,
+        selector_started: Arc<Notify>,
+        release_selector: Arc<Notify>,
+    }
+
+    impl FakeWorkerOps {
+        fn new(project_id: Uuid) -> Self {
+            Self {
+                project: Arc::new(ProjectRecord::new(test_project_summary(project_id))),
+                states: Arc::new(Mutex::new(Vec::new())),
+                selector_started: Arc::new(Notify::new()),
+                release_selector: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    impl ProjectReviewWorkerOps for FakeWorkerOps {
+        async fn project(&self, _project_id: Uuid) -> crate::Result<Arc<ProjectRecord>> {
+            Ok(Arc::clone(&self.project))
+        }
+
+        async fn project_ids(&self) -> Vec<Uuid> {
+            vec![]
+        }
+
+        async fn project_auto_reviewer_agents(
+            &self,
+            _project_id: Uuid,
+        ) -> Vec<mai_protocol::AgentSummary> {
+            vec![]
+        }
+
+        async fn load_project_review_runs(
+            &self,
+            _project_id: Uuid,
+            _offset: usize,
+            _limit: usize,
+        ) -> crate::Result<Vec<ProjectReviewRunSummary>> {
+            Ok(vec![])
+        }
+
+        async fn finish_project_review_run(&self, _request: FinishReviewRun) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn cancel_active_project_review_runs(
+            &self,
+            _project_id: Uuid,
+            _reviewer_agent_id: Option<Uuid>,
+            _run_list_limit: usize,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn record_project_review_startup_failure(
+            &self,
+            _project_id: Uuid,
+            _error: String,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn set_project_review_state(
+            &self,
+            _project_id: Uuid,
+            status: ProjectReviewStatus,
+            update: ReviewStateUpdate,
+        ) -> crate::Result<ProjectSummary> {
+            self.states.lock().await.push(ReviewStateSnapshot {
+                status: status.clone(),
+                next_review_at_set: update.next_review_at.is_some(),
+                outcome: update.outcome.clone(),
+                error: update.error.clone(),
+            });
+            let mut summary = self.project.summary.write().await;
+            summary.review_status = status;
+            summary.next_review_at = update.next_review_at;
+            if let Some(outcome) = update.outcome {
+                summary.last_review_outcome = Some(outcome);
+            }
+            summary.review_last_error = update.error;
+            Ok(summary.clone())
+        }
+
+        async fn ensure_project_review_workspace(&self, _project_id: Uuid) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn project_git_provider(
+            &self,
+            _project_id: Uuid,
+        ) -> crate::Result<Option<mai_protocol::GitProvider>> {
+            Ok(Some(mai_protocol::GitProvider::Github))
+        }
+
+        async fn run_project_review_selector(
+            &self,
+            _project_id: Uuid,
+            _cancellation_token: CancellationToken,
+        ) -> crate::Result<ProjectReviewSelectorRunResult> {
+            self.selector_started.notify_waiters();
+            self.release_selector.notified().await;
+            Ok(ProjectReviewSelectorRunResult::NoEligiblePr)
+        }
+
+        async fn run_project_review_once(
+            &self,
+            _project_id: Uuid,
+            _cancellation_token: CancellationToken,
+            _target_pr: Option<u64>,
+        ) -> crate::Result<ProjectReviewCycleResult> {
+            panic!("selector state test must not run reviewer cycle");
+        }
+
+        async fn agent_current_turn(&self, _agent_id: Uuid) -> crate::Result<Option<Uuid>> {
+            Ok(None)
+        }
+
+        async fn cancel_agent_turn(&self, _agent_id: Uuid, _turn_id: Uuid) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn delete_agent(&self, _agent_id: Uuid) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn selector_status_is_visible_while_selecting_and_waiting_when_empty() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        let task_ops = ops.clone();
+        let selector_task = tokio::spawn(async move {
+            run_selector(&task_ops, project_id, &CancellationToken::new())
+                .await
+                .expect("run selector")
+        });
+
+        ops.selector_started.notified().await;
+        assert_eq!(
+            Some(ProjectReviewStatus::Selecting),
+            ops.states
+                .lock()
+                .await
+                .last()
+                .map(|state| state.status.clone())
+        );
+
+        ops.release_selector.notify_waiters();
+        selector_task.await.expect("selector task");
+
+        let states = ops.states.lock().await.clone();
+        assert_eq!(
+            vec![
+                ReviewStateSnapshot {
+                    status: ProjectReviewStatus::Selecting,
+                    next_review_at_set: false,
+                    outcome: None,
+                    error: None,
+                },
+                ReviewStateSnapshot {
+                    status: ProjectReviewStatus::Waiting,
+                    next_review_at_set: true,
+                    outcome: Some(ProjectReviewOutcome::NoEligiblePr),
+                    error: None,
+                },
+            ],
+            states
+        );
+    }
+
+    fn test_project_summary(project_id: Uuid) -> ProjectSummary {
+        ProjectSummary {
+            id: project_id,
+            name: "owner/repo".to_string(),
+            status: ProjectStatus::Ready,
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            repository_full_name: "owner/repo".to_string(),
+            git_account_id: Some("account-1".to_string()),
+            repository_id: 42,
+            installation_id: 0,
+            installation_account: "owner".to_string(),
+            branch: "main".to_string(),
+            docker_image: "unused".to_string(),
+            clone_status: ProjectCloneStatus::Ready,
+            maintainer_agent_id: Uuid::new_v4(),
+            created_at: now(),
+            updated_at: now(),
+            last_error: None,
+            auto_review_enabled: true,
+            reviewer_extra_prompt: None,
+            review_status: ProjectReviewStatus::Idle,
+            current_reviewer_agent_id: None,
+            last_review_started_at: None,
+            last_review_finished_at: None,
+            next_review_at: None,
+            last_review_outcome: None,
+            review_last_error: None,
+        }
+    }
 }

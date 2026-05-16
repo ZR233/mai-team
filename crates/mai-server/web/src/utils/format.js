@@ -70,7 +70,12 @@ export function roleLabel(role) {
 
 export function statusTone(status) {
   const value = String(status || '').toLowerCase()
-  if (value.includes('run') || value.includes('wait') || value.includes('start')) return 'green'
+  if (
+    value.includes('run') ||
+    value.includes('wait') ||
+    value.includes('start') ||
+    value.includes('select')
+  ) return 'green'
   if (value.includes('fail') || value.includes('error') || value.includes('cancel')) return 'red'
   if (value.includes('creat') || value.includes('delet')) return 'amber'
   if (value.includes('complet')) return 'blue'

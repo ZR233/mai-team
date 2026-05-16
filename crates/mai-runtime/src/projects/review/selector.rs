@@ -25,6 +25,12 @@ pub(crate) struct SelectedProjectReviewPr {
     pub(crate) head_sha: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProjectReviewSelectorRunResult {
+    Queued(SelectedProjectReviewPr),
+    NoEligiblePr,
+}
+
 /// Provides GitHub read and review queue operations for deterministic PR selection.
 ///
 /// Implementations must perform read-only GitHub calls for selector data gathering
@@ -57,25 +63,33 @@ pub(crate) async fn run_project_review_selector(
     ops: &impl ProjectReviewSelectorOps,
     project_id: ProjectId,
     cancellation_token: CancellationToken,
-) -> Result<()> {
+) -> Result<ProjectReviewSelectorRunResult> {
     if cancellation_token.is_cancelled() {
         return Err(RuntimeError::TurnCancelled);
     }
+    tracing::info!(project_id = %project_id, "project review selector started");
     let Some(selection) = select_project_review_candidate(ops, project_id).await? else {
-        return Ok(());
+        tracing::info!(project_id = %project_id, "project review selector found no eligible PR");
+        return Ok(ProjectReviewSelectorRunResult::NoEligiblePr);
     };
     if cancellation_token.is_cancelled() {
         return Err(RuntimeError::TurnCancelled);
     }
+    tracing::info!(
+        project_id = %project_id,
+        pr = selection.pr,
+        head_sha = selection.head_sha.as_deref().unwrap_or(""),
+        "project review selector queued PR"
+    );
     ops.enqueue_project_review(ProjectReviewQueueRequest {
         project_id,
         pr: selection.pr,
-        head_sha: selection.head_sha,
+        head_sha: selection.head_sha.clone(),
         delivery_id: None,
         reason: "selector".to_string(),
     })
     .await?;
-    Ok(())
+    Ok(ProjectReviewSelectorRunResult::Queued(selection))
 }
 
 pub(crate) async fn select_project_review_candidate(
@@ -89,6 +103,12 @@ pub(crate) async fn select_project_review_candidate(
     let mut page = 1_u64;
     loop {
         let pull_requests = list_open_pull_requests(ops, project_id, &owner, &repo, page).await?;
+        tracing::debug!(
+            project_id = %project_id,
+            page,
+            count = pull_requests.len(),
+            "project review selector fetched open PR page"
+        );
         if pull_requests.is_empty() {
             return Ok(None);
         }

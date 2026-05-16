@@ -3711,7 +3711,9 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
         &self,
         project_id: ProjectId,
         cancellation_token: CancellationToken,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
+    ) -> impl std::future::Future<
+        Output = Result<projects::review::selector::ProjectReviewSelectorRunResult>,
+    > + Send {
         projects::review::selector::run_project_review_selector(
             self,
             project_id,
