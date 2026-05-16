@@ -71,17 +71,17 @@ fn already_reviewed_current_head(reviewer_login: &str, candidate: &PullRequestCa
     let Some(latest_review) = latest_reviewer_review(reviewer_login, &candidate.reviews) else {
         return false;
     };
+    if let (Some(reviewed_at), Some(latest_commit_at)) =
+        (latest_review.submitted_at, candidate.latest_commit_at)
+    {
+        return latest_commit_at <= reviewed_at;
+    }
     if let (Some(review_commit), Some(head_sha)) = (
         latest_review.commit_id.as_deref(),
         candidate.head_sha.as_deref(),
     ) && review_commit == head_sha
     {
         return true;
-    }
-    if let (Some(reviewed_at), Some(latest_commit_at)) =
-        (latest_review.submitted_at, candidate.latest_commit_at)
-    {
-        return latest_commit_at <= reviewed_at;
     }
     false
 }
@@ -233,10 +233,12 @@ mod tests {
 
     #[test]
     fn suppresses_pr_already_reviewed_at_current_head() {
+        let review_time = Utc::now();
         let mut reviewed = candidate(6);
+        reviewed.latest_commit_at = Some(review_time - TimeDelta::minutes(1));
         reviewed.reviews = vec![PullRequestReview {
             author_login: Some("mai-bot".to_string()),
-            submitted_at: Some(Utc::now() - TimeDelta::minutes(5)),
+            submitted_at: Some(review_time),
             commit_id: Some("head-6".to_string()),
         }];
         let next = candidate(7);
@@ -247,6 +249,28 @@ mod tests {
             vec![ReviewSelection {
                 pr: 7,
                 head_sha: Some("head-7".to_string()),
+            }],
+            selected
+        );
+    }
+
+    #[test]
+    fn allows_rereview_when_matching_review_commit_is_older_than_latest_commit_time() {
+        let review_time = Utc::now() - TimeDelta::hours(1);
+        let mut candidate = candidate(15);
+        candidate.latest_commit_at = Some(review_time + TimeDelta::minutes(10));
+        candidate.reviews = vec![PullRequestReview {
+            author_login: Some("mai-bot".to_string()),
+            submitted_at: Some(review_time),
+            commit_id: Some("head-15".to_string()),
+        }];
+
+        let selected = select_review_prs("mai-bot", vec![candidate]);
+
+        assert_eq!(
+            vec![ReviewSelection {
+                pr: 15,
+                head_sha: Some("head-15".to_string()),
             }],
             selected
         );

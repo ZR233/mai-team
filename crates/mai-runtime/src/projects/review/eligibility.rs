@@ -510,6 +510,52 @@ mod tests {
         assert_eq!(None, selected);
     }
 
+    #[tokio::test]
+    async fn single_pr_eligibility_allows_rereview_when_matching_review_commit_is_older_than_head()
+    {
+        let project_id = Uuid::new_v4();
+        let ops = FakeEligibilityOps::new(vec![
+            (
+                "/repos/owner/repo/pulls/616".to_string(),
+                pr_detail(616, false, "head-616"),
+            ),
+            (
+                "/repos/owner/repo/pulls/616/reviews?per_page=100".to_string(),
+                json!([
+                    {
+                        "user": { "login": "mai-bot" },
+                        "submitted_at": "2026-05-16T07:25:36Z",
+                        "commit_id": "head-616"
+                    }
+                ]),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D616".to_string(),
+                commit("2026-05-16T08:00:39Z"),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D616/check-runs?per_page=100".to_string(),
+                json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D616/status".to_string(),
+                json!({"state": "success"}),
+            ),
+        ]);
+
+        let selected = select_project_review_pr(&ops, project_id, 616, None)
+            .await
+            .expect("select pr");
+
+        assert_eq!(
+            Some(SelectedProjectReviewPr {
+                pr: 616,
+                head_sha: Some("head-616".to_string()),
+            }),
+            selected
+        );
+    }
+
     fn test_project_summary(project_id: Uuid) -> ProjectSummary {
         ProjectSummary {
             id: project_id,

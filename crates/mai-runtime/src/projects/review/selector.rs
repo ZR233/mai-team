@@ -540,6 +540,14 @@ mod tests {
             return format!("ci_pending [{}]", pending_ci.join(", "));
         }
         if let Some(review) = latest_reviewer_review(reviewer_login, &candidate.reviews) {
+            if let (Some(submitted_at), Some(latest_commit_at)) =
+                (review.submitted_at, candidate.latest_commit_at)
+                && latest_commit_at <= submitted_at
+            {
+                return format!(
+                    "reviewed_after_latest_commit submitted_at={submitted_at} latest_commit_at={latest_commit_at}"
+                );
+            }
             if let (Some(commit_id), Some(head_sha)) =
                 (review.commit_id.as_deref(), candidate.head_sha.as_deref())
                 && commit_id == head_sha
@@ -547,14 +555,6 @@ mod tests {
                 return format!(
                     "reviewed_current_head submitted_at={:?} head={}",
                     review.submitted_at, head_sha
-                );
-            }
-            if let (Some(submitted_at), Some(latest_commit_at)) =
-                (review.submitted_at, candidate.latest_commit_at)
-                && latest_commit_at <= submitted_at
-            {
-                return format!(
-                    "reviewed_after_latest_commit submitted_at={submitted_at} latest_commit_at={latest_commit_at}"
                 );
             }
         }
