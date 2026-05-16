@@ -5163,6 +5163,45 @@ async fn project_selector_can_queue_review_prs() {
 }
 
 #[tokio::test]
+async fn relay_signal_queues_relay_pr_without_touching_review_pool() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut project = test_project_summary(project_id, maintainer_id, "account-1");
+    project.auto_review_enabled = true;
+    store.save_project(&project).await.expect("save project");
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let summary = runtime
+        .enqueue_project_review_relay_signal(ProjectReviewQueueRequest {
+            project_id,
+            pr: 9,
+            head_sha: Some("head-9".to_string()),
+            delivery_id: Some("delivery-9".to_string()),
+            reason: "check_run".to_string(),
+        })
+        .await
+        .expect("queue relay signal");
+
+    assert_eq!(summary.queued, vec![9]);
+    assert_eq!(summary.deduped, Vec::<u64>::new());
+    assert_eq!(summary.ignored, Vec::<u64>::new());
+    let project_record = runtime.project(project_id).await.expect("project");
+    assert_eq!(None, project_record.review_pool.lock().await.next());
+    let relay_signal = project_record
+        .relay_review_queue
+        .lock()
+        .await
+        .next()
+        .expect("relay signal queued");
+    assert_eq!(9, relay_signal.pr);
+    assert_eq!(Some("head-9".to_string()), relay_signal.head_sha);
+    assert_eq!(Some("delivery-9".to_string()), relay_signal.delivery_id);
+    assert_eq!("check_run", relay_signal.reason);
+}
+
+#[tokio::test]
 async fn project_review_selector_pages_and_queues_all_eligible_prs_without_model_request() {
     let mut page_one = vec![github_pr(1, false, "head-1")];
     page_one.extend((2..=20).map(|number| github_pr(number, true, &format!("head-{number}"))));

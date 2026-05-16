@@ -1,30 +1,12 @@
 use std::future::Future;
 
-use chrono::{DateTime, Utc};
-use mai_protocol::{ProjectId, ProjectSummary};
-use serde::Deserialize;
-use serde_json::Value;
+use mai_protocol::ProjectId;
 use tokio_util::sync::CancellationToken;
 
-use super::selection::{
-    CheckSignal, PullRequestCandidate, PullRequestReview, ReviewSelection, select_review_prs,
-};
-use crate::github::github_path_segment;
+use super::eligibility::{ProjectReviewEligibilityOps, select_project_review_candidates};
+pub(crate) use super::eligibility::{ProjectReviewIdentity, SelectedProjectReviewPr};
 use crate::projects::review::pool::ProjectReviewSignalInput;
 use crate::{ProjectReviewQueueSummary, Result, RuntimeError};
-
-const SELECTOR_PAGE_SIZE: u64 = 20;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProjectReviewIdentity {
-    pub(crate) login: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SelectedProjectReviewPr {
-    pub(crate) pr: u64,
-    pub(crate) head_sha: Option<String>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProjectReviewSelectorRunResult {
@@ -40,23 +22,7 @@ pub(crate) enum ProjectReviewSelectorRunResult {
 /// Implementations must perform read-only GitHub calls for selector data gathering
 /// and must only enqueue through `enqueue_project_review`; selection itself must
 /// not create agents, submit reviews, or mutate repositories.
-pub(crate) trait ProjectReviewSelectorOps: Send + Sync {
-    fn project_summary(
-        &self,
-        project_id: ProjectId,
-    ) -> impl Future<Output = Result<ProjectSummary>> + Send;
-
-    fn project_review_identity(
-        &self,
-        project_id: ProjectId,
-    ) -> impl Future<Output = Result<ProjectReviewIdentity>> + Send;
-
-    fn github_api_get_json(
-        &self,
-        project_id: ProjectId,
-        path: String,
-    ) -> impl Future<Output = Result<Value>> + Send;
-
+pub(crate) trait ProjectReviewSelectorOps: ProjectReviewEligibilityOps {
     fn enqueue_project_reviews(
         &self,
         project_id: ProjectId,
@@ -100,309 +66,6 @@ pub(crate) async fn run_project_review_selector(
     Ok(ProjectReviewSelectorRunResult::Queued { selected, queue })
 }
 
-pub(crate) async fn select_project_review_candidates(
-    ops: &impl ProjectReviewSelectorOps,
-    project_id: ProjectId,
-) -> Result<Vec<SelectedProjectReviewPr>> {
-    let summary = ops.project_summary(project_id).await?;
-    let identity = ops.project_review_identity(project_id).await?;
-    let owner = github_path_segment(&summary.owner);
-    let repo = github_path_segment(&summary.repo);
-    let mut page = 1_u64;
-    let mut selected = Vec::new();
-    loop {
-        let pull_requests = list_open_pull_requests(ops, project_id, &owner, &repo, page).await?;
-        tracing::debug!(
-            project_id = %project_id,
-            page,
-            count = pull_requests.len(),
-            "project review selector fetched open PR page"
-        );
-        if pull_requests.is_empty() {
-            return Ok(selected);
-        }
-        let mut pull_requests = pull_requests;
-        pull_requests.sort_by_key(|pull_request| pull_request.number);
-        for pull_request in pull_requests.iter() {
-            let candidate =
-                pull_request_candidate(ops, project_id, &owner, &repo, pull_request).await?;
-            selected.extend(
-                select_review_prs(&identity.login, vec![candidate])
-                    .into_iter()
-                    .map(selected_project_review_pr),
-            );
-        }
-        if pull_requests.len() < SELECTOR_PAGE_SIZE as usize {
-            return Ok(selected);
-        }
-        page += 1;
-    }
-}
-
-async fn list_open_pull_requests(
-    ops: &impl ProjectReviewSelectorOps,
-    project_id: ProjectId,
-    owner: &str,
-    repo: &str,
-    page: u64,
-) -> Result<Vec<GithubPullRequest>> {
-    let path = format!(
-        "/repos/{owner}/{repo}/pulls?state=open&sort=created&direction=asc&per_page={SELECTOR_PAGE_SIZE}&page={page}"
-    );
-    let value = ops.github_api_get_json(project_id, path).await?;
-    decode_github_json(value, "list open pull requests")
-}
-
-async fn pull_request_candidate(
-    ops: &impl ProjectReviewSelectorOps,
-    project_id: ProjectId,
-    owner: &str,
-    repo: &str,
-    pull_request: &GithubPullRequest,
-) -> Result<PullRequestCandidate> {
-    let detail = pull_request_detail(ops, project_id, owner, repo, pull_request.number).await?;
-    let number = detail.number;
-    let head_sha = detail.head_sha().or_else(|| pull_request.head_sha());
-    if detail.draft {
-        return Ok(PullRequestCandidate {
-            number,
-            author_login: detail.author_login(),
-            draft: true,
-            head_sha,
-            latest_commit_at: None,
-            reviews: Vec::new(),
-            check_signals: Vec::new(),
-            combined_status_state: None,
-        });
-    }
-    let reviews = pull_request_reviews(ops, project_id, owner, repo, number).await?;
-    let latest_commit_at = match head_sha.as_deref() {
-        Some(head_sha) => commit_time(ops, project_id, owner, repo, head_sha).await?,
-        None => None,
-    };
-    let checks = match head_sha.as_deref() {
-        Some(head_sha) => check_signals(ops, project_id, owner, repo, head_sha).await,
-        None => CandidateChecks::default(),
-    };
-    Ok(PullRequestCandidate {
-        number,
-        author_login: detail.author_login(),
-        draft: false,
-        head_sha,
-        latest_commit_at,
-        reviews,
-        check_signals: checks.signals,
-        combined_status_state: checks.combined_status_state,
-    })
-}
-
-async fn pull_request_detail(
-    ops: &impl ProjectReviewSelectorOps,
-    project_id: ProjectId,
-    owner: &str,
-    repo: &str,
-    pr: u64,
-) -> Result<GithubPullRequest> {
-    let path = format!("/repos/{owner}/{repo}/pulls/{pr}");
-    let value = ops.github_api_get_json(project_id, path).await?;
-    decode_github_json(value, "get pull request")
-}
-
-async fn pull_request_reviews(
-    ops: &impl ProjectReviewSelectorOps,
-    project_id: ProjectId,
-    owner: &str,
-    repo: &str,
-    pr: u64,
-) -> Result<Vec<PullRequestReview>> {
-    let path = format!("/repos/{owner}/{repo}/pulls/{pr}/reviews?per_page=100");
-    let value = ops.github_api_get_json(project_id, path).await?;
-    let reviews: Vec<GithubPullRequestReview> =
-        decode_github_json(value, "list pull request reviews")?;
-    Ok(reviews
-        .into_iter()
-        .map(|review| PullRequestReview {
-            author_login: review.user.map(|user| user.login),
-            submitted_at: review.submitted_at,
-            commit_id: review.commit_id,
-        })
-        .collect())
-}
-
-async fn commit_time(
-    ops: &impl ProjectReviewSelectorOps,
-    project_id: ProjectId,
-    owner: &str,
-    repo: &str,
-    head_sha: &str,
-) -> Result<Option<DateTime<Utc>>> {
-    let path = format!(
-        "/repos/{owner}/{repo}/commits/{}",
-        github_path_segment(head_sha)
-    );
-    let value = match ops.github_api_get_json(project_id, path).await {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
-    let commit: GithubCommit = decode_github_json(value, "get commit")?;
-    Ok(commit
-        .commit
-        .and_then(|commit| commit.committer.or(commit.author))
-        .and_then(|person| person.date))
-}
-
-async fn check_signals(
-    ops: &impl ProjectReviewSelectorOps,
-    project_id: ProjectId,
-    owner: &str,
-    repo: &str,
-    head_sha: &str,
-) -> CandidateChecks {
-    let checks_path = format!(
-        "/repos/{owner}/{repo}/commits/{}/check-runs?per_page=100",
-        github_path_segment(head_sha)
-    );
-    let check_runs = match ops.github_api_get_json(project_id, checks_path).await {
-        Ok(value) => decode_github_json::<GithubCheckRunResponse>(value, "list check runs")
-            .map(|response| response.check_runs)
-            .unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
-    let status_path = format!(
-        "/repos/{owner}/{repo}/commits/{}/status",
-        github_path_segment(head_sha)
-    );
-    let combined_status = match ops.github_api_get_json(project_id, status_path).await {
-        Ok(value) => decode_github_json::<GithubCombinedStatus>(value, "get combined status").ok(),
-        Err(_) => None,
-    };
-    let mut signals = check_runs
-        .into_iter()
-        .map(|run| CheckSignal {
-            status: run.status,
-            conclusion: run.conclusion,
-        })
-        .collect::<Vec<_>>();
-    if let Some(status) = combined_status.as_ref() {
-        signals.extend(status.statuses.iter().map(|status| CheckSignal {
-            status: status.state.clone(),
-            conclusion: None,
-        }));
-    }
-    CandidateChecks {
-        signals,
-        combined_status_state: combined_status.and_then(|status| status.state),
-    }
-}
-
-fn selected_project_review_pr(selection: ReviewSelection) -> SelectedProjectReviewPr {
-    SelectedProjectReviewPr {
-        pr: selection.pr,
-        head_sha: selection.head_sha,
-    }
-}
-
-fn decode_github_json<T: for<'de> Deserialize<'de>>(value: Value, action: &str) -> Result<T> {
-    serde_json::from_value(value).map_err(|err| {
-        RuntimeError::InvalidInput(format!("invalid GitHub response for {action}: {err}"))
-    })
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GithubPullRequest {
-    number: u64,
-    #[serde(default)]
-    draft: bool,
-    #[serde(default)]
-    user: Option<GithubUser>,
-    #[serde(default)]
-    head: Option<GithubPullRequestHead>,
-}
-
-impl GithubPullRequest {
-    fn head_sha(&self) -> Option<String> {
-        self.head.as_ref().and_then(|head| head.sha.clone())
-    }
-
-    fn author_login(&self) -> Option<String> {
-        self.user.as_ref().map(|user| user.login.clone())
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GithubPullRequestHead {
-    sha: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GithubPullRequestReview {
-    #[serde(default)]
-    user: Option<GithubUser>,
-    #[serde(default)]
-    submitted_at: Option<DateTime<Utc>>,
-    #[serde(default)]
-    commit_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GithubUser {
-    login: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GithubCommit {
-    #[serde(default)]
-    commit: Option<GithubCommitDetail>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GithubCommitDetail {
-    #[serde(default)]
-    committer: Option<GithubCommitPerson>,
-    #[serde(default)]
-    author: Option<GithubCommitPerson>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GithubCommitPerson {
-    #[serde(default)]
-    date: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct CandidateChecks {
-    signals: Vec<CheckSignal>,
-    combined_status_state: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GithubCheckRunResponse {
-    #[serde(default)]
-    check_runs: Vec<GithubCheckRun>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GithubCheckRun {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    conclusion: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GithubCombinedStatus {
-    #[serde(default)]
-    state: Option<String>,
-    #[serde(default)]
-    statuses: Vec<GithubStatusContext>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GithubStatusContext {
-    #[serde(default)]
-    state: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use std::{env, process::Command, sync::Arc, time::Duration};
@@ -419,11 +82,12 @@ mod tests {
     use crate::ProjectReviewQueueSummary;
     use crate::projects::review::pool::ProjectReviewSignalInput;
 
-    use super::{
-        ProjectReviewIdentity, ProjectReviewSelectorOps, SelectedProjectReviewPr,
-        list_open_pull_requests, pull_request_candidate, select_project_review_candidates,
-        selected_project_review_pr,
+    use super::super::eligibility::{
+        ProjectReviewEligibilityOps, ProjectReviewIdentity, SELECTOR_PAGE_SIZE,
+        SelectedProjectReviewPr, list_open_pull_requests, pull_request_candidate,
+        select_project_review_candidates, selected_project_review_pr,
     };
+    use super::ProjectReviewSelectorOps;
 
     #[derive(Default)]
     struct FakeSelectorOps {
@@ -440,7 +104,7 @@ mod tests {
         }
     }
 
-    impl ProjectReviewSelectorOps for FakeSelectorOps {
+    impl ProjectReviewEligibilityOps for FakeSelectorOps {
         async fn project_summary(
             &self,
             project_id: mai_protocol::ProjectId,
@@ -471,7 +135,9 @@ mod tests {
             responses.remove(0);
             Ok(response)
         }
+    }
 
+    impl ProjectReviewSelectorOps for FakeSelectorOps {
         async fn enqueue_project_reviews(
             &self,
             _project_id: mai_protocol::ProjectId,
@@ -512,7 +178,7 @@ mod tests {
         }
     }
 
-    impl ProjectReviewSelectorOps for LiveSelectorOps {
+    impl ProjectReviewEligibilityOps for LiveSelectorOps {
         async fn project_summary(
             &self,
             project_id: mai_protocol::ProjectId,
@@ -578,7 +244,9 @@ mod tests {
                 ))
             })
         }
+    }
 
+    impl ProjectReviewSelectorOps for LiveSelectorOps {
         async fn enqueue_project_reviews(
             &self,
             _project_id: mai_protocol::ProjectId,
@@ -845,7 +513,7 @@ mod tests {
                     skip_reason(reviewer_login, &candidate)
                 );
             }
-            if pull_requests.len() < super::SELECTOR_PAGE_SIZE as usize {
+            if pull_requests.len() < SELECTOR_PAGE_SIZE as usize {
                 return Ok(selected);
             }
             page += 1;

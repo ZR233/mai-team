@@ -9,7 +9,10 @@ use crate::{Result, RuntimeError};
 
 pub(crate) mod cleanup;
 pub(crate) mod cycle;
+pub(crate) mod eligibility;
 pub(crate) mod pool;
+pub(crate) mod relay_queue;
+pub(crate) mod relay_selector;
 pub(crate) mod reviewer;
 pub(crate) mod runs;
 pub(crate) mod selection;

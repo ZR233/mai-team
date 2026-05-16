@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::projects::mcp::ProjectMcpManagerHandle;
 use crate::projects::review::pool::ProjectReviewPool;
+use crate::projects::review::relay_queue::ProjectReviewRelayQueue;
 
 pub(crate) struct RuntimeState {
     pub(crate) agents: RwLock<HashMap<AgentId, Arc<AgentRecord>>>,
@@ -45,6 +46,8 @@ pub(crate) struct ProjectRecord {
     pub(crate) review_worker: Mutex<Option<ProjectReviewWorker>>,
     pub(crate) review_pool: Mutex<ProjectReviewPool>,
     pub(crate) review_notify: Arc<Notify>,
+    pub(crate) relay_review_queue: Mutex<ProjectReviewRelayQueue>,
+    pub(crate) relay_review_notify: Arc<Notify>,
 }
 
 impl ProjectRecord {
@@ -55,6 +58,8 @@ impl ProjectRecord {
             review_worker: Mutex::new(None),
             review_pool: Mutex::new(ProjectReviewPool::default()),
             review_notify: Arc::new(Notify::new()),
+            relay_review_queue: Mutex::new(ProjectReviewRelayQueue::default()),
+            relay_review_notify: Arc::new(Notify::new()),
         }
     }
 }
@@ -63,6 +68,7 @@ pub(crate) struct ProjectReviewWorker {
     pub(crate) cancellation_token: CancellationToken,
     pub(crate) pool_abort_handle: futures::future::AbortHandle,
     pub(crate) selector_abort_handle: Option<futures::future::AbortHandle>,
+    pub(crate) relay_selector_abort_handle: futures::future::AbortHandle,
 }
 
 pub(crate) struct TaskRecord {

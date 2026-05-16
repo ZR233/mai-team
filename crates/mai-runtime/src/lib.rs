@@ -47,6 +47,9 @@ use github::{
 use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
 use projects::review::ProjectReviewCycleResult;
 use projects::review::pool::{ProjectReviewPoolEnqueueSummary, ProjectReviewSignalInput};
+use projects::review::relay_queue::{
+    ProjectReviewRelayQueueEnqueueSummary, ProjectReviewRelaySignalInput,
+};
 use projects::review::runs::FinishReviewRun;
 use projects::review::state::ReviewStateUpdate;
 #[cfg(test)]
@@ -102,6 +105,16 @@ pub struct ProjectReviewQueueSummary {
 
 impl From<ProjectReviewPoolEnqueueSummary> for ProjectReviewQueueSummary {
     fn from(value: ProjectReviewPoolEnqueueSummary) -> Self {
+        Self {
+            queued: value.queued,
+            deduped: value.deduped,
+            ignored: value.ignored,
+        }
+    }
+}
+
+impl From<ProjectReviewRelayQueueEnqueueSummary> for ProjectReviewQueueSummary {
+    fn from(value: ProjectReviewRelayQueueEnqueueSummary) -> Self {
         Self {
             queued: value.queued,
             deduped: value.deduped,
@@ -892,6 +905,70 @@ impl AgentRuntime {
             "queued project review signal"
         );
         Ok(summary)
+    }
+
+    pub async fn enqueue_project_review_relay_signal(
+        self: &Arc<Self>,
+        request: ProjectReviewQueueRequest,
+    ) -> Result<ProjectReviewQueueSummary> {
+        let project_id = request.project_id;
+        let summary = self
+            .enqueue_project_review_relay_signals(
+                project_id,
+                vec![ProjectReviewRelaySignalInput {
+                    pr: request.pr,
+                    head_sha: request.head_sha.clone(),
+                    delivery_id: request.delivery_id.clone(),
+                    reason: request.reason.clone(),
+                }],
+                true,
+            )
+            .await?;
+        tracing::info!(
+            project_id = %project_id,
+            pr = request.pr,
+            delivery_id = request.delivery_id.as_deref().unwrap_or_default(),
+            reason = %request.reason,
+            queued = ?summary.queued,
+            deduped = ?summary.deduped,
+            ignored = ?summary.ignored,
+            "queued project review relay signal"
+        );
+        Ok(summary)
+    }
+
+    async fn enqueue_project_review_relay_signals(
+        self: &Arc<Self>,
+        project_id: ProjectId,
+        signals: Vec<ProjectReviewRelaySignalInput>,
+        start_worker: bool,
+    ) -> Result<ProjectReviewQueueSummary> {
+        let project = self.project(project_id).await?;
+        {
+            let summary = project.summary.read().await;
+            if !summary.auto_review_enabled {
+                return Ok(ProjectReviewQueueSummary {
+                    ignored: signals.iter().map(|signal| signal.pr).collect(),
+                    ..Default::default()
+                });
+            }
+        }
+        let summary = {
+            let mut queue = project.relay_review_queue.lock().await;
+            queue.enqueue_many(signals)
+        };
+        if !summary.queued.is_empty() || !summary.deduped.is_empty() {
+            project.relay_review_notify.notify_one();
+            if start_worker
+                && let Err(err) = self.start_project_review_loop_if_ready(project_id).await
+            {
+                tracing::warn!(
+                    project_id = %project_id,
+                    "failed to start project review loop after queueing relay PR signal: {err}"
+                );
+            }
+        }
+        Ok(summary.into())
     }
 
     async fn enqueue_project_review_signals(
@@ -3440,7 +3517,7 @@ impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
     }
 }
 
-impl projects::review::selector::ProjectReviewSelectorOps for Arc<AgentRuntime> {
+impl projects::review::eligibility::ProjectReviewEligibilityOps for Arc<AgentRuntime> {
     async fn project_summary(&self, project_id: ProjectId) -> Result<ProjectSummary> {
         let project = AgentRuntime::project(self.as_ref(), project_id).await?;
         Ok(project.summary.read().await.clone())
@@ -3503,7 +3580,9 @@ impl projects::review::selector::ProjectReviewSelectorOps for Arc<AgentRuntime> 
         )
         .await
     }
+}
 
+impl projects::review::selector::ProjectReviewSelectorOps for Arc<AgentRuntime> {
     fn enqueue_project_reviews(
         &self,
         project_id: ProjectId,
@@ -3742,6 +3821,25 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
             project_id,
             cancellation_token,
         )
+    }
+
+    fn select_project_review_pr(
+        &self,
+        project_id: ProjectId,
+        pr: u64,
+        head_sha_hint: Option<String>,
+    ) -> impl std::future::Future<
+        Output = Result<Option<projects::review::eligibility::SelectedProjectReviewPr>>,
+    > + Send {
+        projects::review::eligibility::select_project_review_pr(self, project_id, pr, head_sha_hint)
+    }
+
+    fn enqueue_project_review_signals(
+        &self,
+        project_id: ProjectId,
+        signals: Vec<ProjectReviewSignalInput>,
+    ) -> impl std::future::Future<Output = Result<ProjectReviewQueueSummary>> + Send {
+        AgentRuntime::enqueue_project_review_signals(self, project_id, signals, false)
     }
 
     fn run_project_review_once(

@@ -12,6 +12,7 @@ use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
 use super::ProjectReviewCycleResult;
+use super::eligibility::SelectedProjectReviewPr;
 use super::pool::PendingProjectReview;
 use super::runs::FinishReviewRun;
 use super::selector::ProjectReviewSelectorRunResult;
@@ -81,6 +82,19 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         project_id: ProjectId,
         cancellation_token: CancellationToken,
     ) -> impl Future<Output = Result<ProjectReviewSelectorRunResult>> + Send;
+
+    fn select_project_review_pr(
+        &self,
+        project_id: ProjectId,
+        pr: u64,
+        head_sha_hint: Option<String>,
+    ) -> impl Future<Output = Result<Option<SelectedProjectReviewPr>>> + Send;
+
+    fn enqueue_project_review_signals(
+        &self,
+        project_id: ProjectId,
+        signals: Vec<crate::projects::review::pool::ProjectReviewSignalInput>,
+    ) -> impl Future<Output = Result<crate::ProjectReviewQueueSummary>> + Send;
 
     fn run_project_review_once(
         &self,
@@ -228,6 +242,13 @@ pub(crate) async fn start_project_review_loop_if_ready(
     };
     let pool_abort_handle =
         spawn_project_review_child(run_project_review_pool_worker(context.clone()));
+    let relay_selector_abort_handle = spawn_project_review_child(
+        super::relay_selector::run_project_review_relay_selector_loop(
+            context.ops.clone(),
+            context.project_id,
+            context.cancellation_token.clone(),
+        ),
+    );
     let selector_abort_handle = match git_provider {
         Some(GitProvider::GithubAppRelay) => Some(spawn_project_review_child(
             run_github_app_selector_until_success(context.clone()),
@@ -241,6 +262,7 @@ pub(crate) async fn start_project_review_loop_if_ready(
         cancellation_token,
         pool_abort_handle,
         selector_abort_handle,
+        relay_selector_abort_handle,
     });
     Ok(())
 }
@@ -261,9 +283,12 @@ pub(crate) async fn stop_project_review_loop(
         if let Some(selector_abort_handle) = worker.selector_abort_handle {
             selector_abort_handle.abort();
         }
+        worker.relay_selector_abort_handle.abort();
     }
     project.review_pool.lock().await.clear();
+    project.relay_review_queue.lock().await.clear();
     project.review_notify.notify_waiters();
+    project.relay_review_notify.notify_waiters();
     let reviewer_id = project.summary.read().await.current_reviewer_agent_id;
     let _ = ops
         .cancel_active_project_review_runs(project_id, reviewer_id, run_list_limit)
@@ -298,6 +323,20 @@ pub(crate) async fn run_project_review_loop(
         cancellation_token,
     };
     run_project_review_pool_worker(context).await;
+}
+
+#[cfg(test)]
+pub(crate) async fn run_project_review_relay_selector_loop_for_test(
+    ops: impl ProjectReviewWorkerOps,
+    project_id: ProjectId,
+    cancellation_token: CancellationToken,
+) {
+    super::relay_selector::run_project_review_relay_selector_loop(
+        ops,
+        project_id,
+        cancellation_token,
+    )
+    .await;
 }
 
 #[derive(Clone)]
@@ -671,7 +710,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
+    use crate::projects::review::eligibility::SelectedProjectReviewPr;
     use crate::projects::review::pool::ProjectReviewSignalInput;
+    use crate::projects::review::relay_queue::ProjectReviewRelaySignalInput;
     use crate::state::ProjectRecord;
 
     use super::{
@@ -694,6 +735,8 @@ mod tests {
         selector_started: Arc<Notify>,
         release_selector: Arc<Notify>,
         selector_calls: Arc<Mutex<u64>>,
+        relay_selection_calls: Arc<Mutex<Vec<u64>>>,
+        failed_relay_prs: Arc<Mutex<Vec<u64>>>,
         reviewed_prs: Arc<Mutex<Vec<Option<u64>>>>,
         git_provider: mai_protocol::GitProvider,
     }
@@ -706,6 +749,8 @@ mod tests {
                 selector_started: Arc::new(Notify::new()),
                 release_selector: Arc::new(Notify::new()),
                 selector_calls: Arc::new(Mutex::new(0)),
+                relay_selection_calls: Arc::new(Mutex::new(Vec::new())),
+                failed_relay_prs: Arc::new(Mutex::new(Vec::new())),
                 reviewed_prs: Arc::new(Mutex::new(Vec::new())),
                 git_provider: mai_protocol::GitProvider::Github,
             }
@@ -805,6 +850,34 @@ mod tests {
             self.selector_started.notify_waiters();
             self.release_selector.notified().await;
             Ok(ProjectReviewSelectorRunResult::NoEligiblePr)
+        }
+
+        async fn select_project_review_pr(
+            &self,
+            _project_id: Uuid,
+            pr: u64,
+            head_sha_hint: Option<String>,
+        ) -> crate::Result<Option<SelectedProjectReviewPr>> {
+            self.relay_selection_calls.lock().await.push(pr);
+            if self.failed_relay_prs.lock().await.contains(&pr) {
+                return Err(crate::RuntimeError::InvalidInput(format!(
+                    "failed relay pr {pr}"
+                )));
+            }
+            Ok(Some(SelectedProjectReviewPr {
+                pr,
+                head_sha: head_sha_hint,
+            }))
+        }
+
+        async fn enqueue_project_review_signals(
+            &self,
+            _project_id: Uuid,
+            signals: Vec<ProjectReviewSignalInput>,
+        ) -> crate::Result<crate::ProjectReviewQueueSummary> {
+            let summary = self.project.review_pool.lock().await.enqueue_many(signals);
+            self.project.review_notify.notify_waiters();
+            Ok(summary.into())
         }
 
         async fn run_project_review_once(
@@ -921,6 +994,108 @@ mod tests {
 
         token.cancel();
         worker_task.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn relay_selector_moves_eligible_relay_signal_to_pr_pool() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        let token = CancellationToken::new();
+        let task_ops = ops.clone();
+        let task_token = token.clone();
+        let relay_task = tokio::spawn(async move {
+            super::run_project_review_relay_selector_loop_for_test(
+                task_ops, project_id, task_token,
+            )
+            .await;
+        });
+
+        {
+            let mut queue = ops.project.relay_review_queue.lock().await;
+            queue.enqueue_many([ProjectReviewRelaySignalInput {
+                pr: 33,
+                head_sha: Some("head-33".to_string()),
+                delivery_id: Some("delivery-33".to_string()),
+                reason: "check_run".to_string(),
+            }]);
+        }
+        ops.project.relay_review_notify.notify_waiters();
+
+        for _ in 0..20 {
+            if !ops.relay_selection_calls.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(vec![33], *ops.relay_selection_calls.lock().await);
+        let pending = ops
+            .project
+            .review_pool
+            .lock()
+            .await
+            .next()
+            .expect("eligible relay signal entered review pool");
+        assert_eq!(33, pending.pr);
+        assert_eq!(Some("head-33".to_string()), pending.head_sha);
+        assert_eq!(Some("delivery-33".to_string()), pending.delivery_id);
+        assert_eq!("check_run", pending.reason);
+
+        token.cancel();
+        relay_task.await.expect("relay selector task");
+    }
+
+    #[tokio::test]
+    async fn relay_selector_drops_failed_signal_and_continues() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        ops.failed_relay_prs.lock().await.push(11);
+        let token = CancellationToken::new();
+        let task_ops = ops.clone();
+        let task_token = token.clone();
+        let relay_task = tokio::spawn(async move {
+            super::run_project_review_relay_selector_loop_for_test(
+                task_ops, project_id, task_token,
+            )
+            .await;
+        });
+
+        {
+            let mut queue = ops.project.relay_review_queue.lock().await;
+            queue.enqueue_many([
+                ProjectReviewRelaySignalInput {
+                    pr: 11,
+                    head_sha: Some("head-11".to_string()),
+                    delivery_id: Some("delivery-11".to_string()),
+                    reason: "check_run".to_string(),
+                },
+                ProjectReviewRelaySignalInput {
+                    pr: 12,
+                    head_sha: Some("head-12".to_string()),
+                    delivery_id: Some("delivery-12".to_string()),
+                    reason: "check_run".to_string(),
+                },
+            ]);
+        }
+        ops.project.relay_review_notify.notify_waiters();
+
+        for _ in 0..20 {
+            if ops.relay_selection_calls.lock().await.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(vec![11, 12], *ops.relay_selection_calls.lock().await);
+        let mut pool = ops.project.review_pool.lock().await;
+        let pending = pool
+            .next()
+            .expect("second relay signal entered review pool");
+        assert_eq!(12, pending.pr);
+        assert_eq!(None, pool.next());
+
+        token.cancel();
+        relay_task.await.expect("relay selector task");
     }
 
     #[tokio::test]
