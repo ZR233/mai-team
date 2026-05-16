@@ -297,6 +297,13 @@ impl GitAccountService {
     }
 }
 
+fn redact_secret(value: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return value.to_string();
+    }
+    value.replace(secret, "<redacted>")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,9 +574,3 @@ mod tests {
     }
 }
 
-fn redact_secret(value: &str, secret: &str) -> String {
-    if secret.is_empty() {
-        return value.to_string();
-    }
-    value.replace(secret, "<redacted>")
-}
