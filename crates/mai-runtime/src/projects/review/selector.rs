@@ -7,10 +7,11 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::selection::{
-    CheckSignal, PullRequestCandidate, PullRequestReview, ReviewSelection, select_review_pr,
+    CheckSignal, PullRequestCandidate, PullRequestReview, ReviewSelection, select_review_prs,
 };
 use crate::github::github_path_segment;
-use crate::{ProjectReviewQueueRequest, ProjectReviewQueueSummary, Result, RuntimeError};
+use crate::projects::review::pool::ProjectReviewSignalInput;
+use crate::{ProjectReviewQueueSummary, Result, RuntimeError};
 
 const SELECTOR_PAGE_SIZE: u64 = 20;
 
@@ -27,7 +28,10 @@ pub(crate) struct SelectedProjectReviewPr {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProjectReviewSelectorRunResult {
-    Queued(SelectedProjectReviewPr),
+    Queued {
+        selected: Vec<SelectedProjectReviewPr>,
+        queue: ProjectReviewQueueSummary,
+    },
     NoEligiblePr,
 }
 
@@ -53,9 +57,10 @@ pub(crate) trait ProjectReviewSelectorOps: Send + Sync {
         path: String,
     ) -> impl Future<Output = Result<Value>> + Send;
 
-    fn enqueue_project_review(
+    fn enqueue_project_reviews(
         &self,
-        request: ProjectReviewQueueRequest,
+        project_id: ProjectId,
+        signals: Vec<ProjectReviewSignalInput>,
     ) -> impl Future<Output = Result<ProjectReviewQueueSummary>> + Send;
 }
 
@@ -68,39 +73,43 @@ pub(crate) async fn run_project_review_selector(
         return Err(RuntimeError::TurnCancelled);
     }
     tracing::info!(project_id = %project_id, "project review selector started");
-    let Some(selection) = select_project_review_candidate(ops, project_id).await? else {
+    let selected = select_project_review_candidates(ops, project_id).await?;
+    if selected.is_empty() {
         tracing::info!(project_id = %project_id, "project review selector found no eligible PR");
         return Ok(ProjectReviewSelectorRunResult::NoEligiblePr);
-    };
+    }
     if cancellation_token.is_cancelled() {
         return Err(RuntimeError::TurnCancelled);
     }
     tracing::info!(
         project_id = %project_id,
-        pr = selection.pr,
-        head_sha = selection.head_sha.as_deref().unwrap_or(""),
-        "project review selector queued PR"
+        count = selected.len(),
+        prs = ?selected.iter().map(|selection| selection.pr).collect::<Vec<_>>(),
+        "project review selector queued PRs"
     );
-    ops.enqueue_project_review(ProjectReviewQueueRequest {
-        project_id,
-        pr: selection.pr,
-        head_sha: selection.head_sha.clone(),
-        delivery_id: None,
-        reason: "selector".to_string(),
-    })
-    .await?;
-    Ok(ProjectReviewSelectorRunResult::Queued(selection))
+    let signals = selected
+        .iter()
+        .map(|selection| ProjectReviewSignalInput {
+            pr: selection.pr,
+            head_sha: selection.head_sha.clone(),
+            delivery_id: None,
+            reason: "selector".to_string(),
+        })
+        .collect::<Vec<_>>();
+    let queue = ops.enqueue_project_reviews(project_id, signals).await?;
+    Ok(ProjectReviewSelectorRunResult::Queued { selected, queue })
 }
 
-pub(crate) async fn select_project_review_candidate(
+pub(crate) async fn select_project_review_candidates(
     ops: &impl ProjectReviewSelectorOps,
     project_id: ProjectId,
-) -> Result<Option<SelectedProjectReviewPr>> {
+) -> Result<Vec<SelectedProjectReviewPr>> {
     let summary = ops.project_summary(project_id).await?;
     let identity = ops.project_review_identity(project_id).await?;
     let owner = github_path_segment(&summary.owner);
     let repo = github_path_segment(&summary.repo);
     let mut page = 1_u64;
+    let mut selected = Vec::new();
     loop {
         let pull_requests = list_open_pull_requests(ops, project_id, &owner, &repo, page).await?;
         tracing::debug!(
@@ -110,19 +119,21 @@ pub(crate) async fn select_project_review_candidate(
             "project review selector fetched open PR page"
         );
         if pull_requests.is_empty() {
-            return Ok(None);
+            return Ok(selected);
         }
         let mut pull_requests = pull_requests;
         pull_requests.sort_by_key(|pull_request| pull_request.number);
         for pull_request in pull_requests.iter() {
             let candidate =
                 pull_request_candidate(ops, project_id, &owner, &repo, pull_request).await?;
-            if let Some(selection) = select_review_pr(&identity.login, vec![candidate]) {
-                return Ok(Some(selected_project_review_pr(selection)));
-            }
+            selected.extend(
+                select_review_prs(&identity.login, vec![candidate])
+                    .into_iter()
+                    .map(selected_project_review_pr),
+            );
         }
         if pull_requests.len() < SELECTOR_PAGE_SIZE as usize {
-            return Ok(None);
+            return Ok(selected);
         }
         page += 1;
     }
@@ -405,11 +416,12 @@ mod tests {
     use tokio::sync::Mutex;
     use uuid::Uuid;
 
-    use crate::{ProjectReviewQueueRequest, ProjectReviewQueueSummary};
+    use crate::ProjectReviewQueueSummary;
+    use crate::projects::review::pool::ProjectReviewSignalInput;
 
     use super::{
         ProjectReviewIdentity, ProjectReviewSelectorOps, SelectedProjectReviewPr,
-        list_open_pull_requests, pull_request_candidate, select_project_review_candidate,
+        list_open_pull_requests, pull_request_candidate, select_project_review_candidates,
         selected_project_review_pr,
     };
 
@@ -460,9 +472,10 @@ mod tests {
             Ok(response)
         }
 
-        async fn enqueue_project_review(
+        async fn enqueue_project_reviews(
             &self,
-            _request: ProjectReviewQueueRequest,
+            _project_id: mai_protocol::ProjectId,
+            _signals: Vec<ProjectReviewSignalInput>,
         ) -> crate::Result<ProjectReviewQueueSummary> {
             panic!("read-only candidate selection must not enqueue");
         }
@@ -566,9 +579,10 @@ mod tests {
             })
         }
 
-        async fn enqueue_project_review(
+        async fn enqueue_project_reviews(
             &self,
-            _request: ProjectReviewQueueRequest,
+            _project_id: mai_protocol::ProjectId,
+            _signals: Vec<ProjectReviewSignalInput>,
         ) -> crate::Result<ProjectReviewQueueSummary> {
             panic!("live read-only selector verification must not enqueue");
         }
@@ -642,11 +656,11 @@ mod tests {
         ]);
         let ops = Arc::new(FakeSelectorOps::new(responses));
 
-        let selected = select_project_review_candidate(ops.as_ref(), project_id)
+        let selected = select_project_review_candidates(ops.as_ref(), project_id)
             .await
             .expect("select candidate");
 
-        assert_eq!(Some(21), selected.map(|selection| selection.pr));
+        assert_eq!(vec![21], selected_pr_numbers(&selected));
         let requested_paths = ops.requested_paths.lock().await;
         assert!(requested_paths.iter().any(|path| path
             == "/repos/owner/repo/pulls?state=open&sort=created&direction=asc&per_page=20&page=2"));
@@ -655,7 +669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn candidate_selection_stops_after_first_eligible_pr() {
+    async fn candidate_selection_collects_all_eligible_prs() {
         let project_id = Uuid::new_v4();
         let ops = Arc::new(FakeSelectorOps::new(vec![
             (
@@ -686,13 +700,33 @@ mod tests {
                 "/repos/owner/repo/commits/head%2D4/status".to_string(),
                 json!({"state": "failure"}),
             ),
+            (
+                "/repos/owner/repo/pulls/5".to_string(),
+                pr_detail(5, false, "head-5"),
+            ),
+            (
+                "/repos/owner/repo/pulls/5/reviews?per_page=100".to_string(),
+                json!([]),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D5".to_string(),
+                commit("2026-01-05T00:00:00Z"),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D5/check-runs?per_page=100".to_string(),
+                json!({"check_runs": []}),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D5/status".to_string(),
+                json!({"state": "success"}),
+            ),
         ]));
 
-        let selected = select_project_review_candidate(ops.as_ref(), project_id)
+        let selected = select_project_review_candidates(ops.as_ref(), project_id)
             .await
             .expect("select candidate");
 
-        assert_eq!(Some(4), selected.map(|selection| selection.pr));
+        assert_eq!(vec![4, 5], selected_pr_numbers(&selected));
         assert_eq!(0, ops.responses.lock().await.len());
     }
 
@@ -701,23 +735,22 @@ mod tests {
     async fn live_selector_reads_rcore_os_tgoskits_without_enqueueing() {
         let ops = Arc::new(LiveSelectorOps::new(live_reviewer_login()));
 
-        let selected = select_project_review_candidate(ops.as_ref(), Uuid::new_v4())
+        let selected = select_project_review_candidates(ops.as_ref(), Uuid::new_v4())
             .await
             .expect("select live candidate");
 
         let requested_paths = ops.requested_paths.lock().await;
-        match selected.as_ref() {
-            Some(selection) => {
+        if selected.is_empty() {
+            println!(
+                "no eligible rcore-os/tgoskits PR after {} GitHub requests",
+                requested_paths.len()
+            );
+        } else {
+            for selection in selected.iter() {
                 println!(
                     "selected rcore-os/tgoskits PR #{} at {:?} after {} GitHub requests",
                     selection.pr,
                     selection.head_sha,
-                    requested_paths.len()
-                );
-            }
-            None => {
-                println!(
-                    "no eligible rcore-os/tgoskits PR after {} GitHub requests",
                     requested_paths.len()
                 );
             }
@@ -735,12 +768,7 @@ mod tests {
                 .iter()
                 .all(|path| !path.contains("/responses"))
         );
-        assert!(
-            selected
-                .as_ref()
-                .map(|selection| selection.pr > 0)
-                .unwrap_or(true)
-        );
+        assert!(selected.iter().all(|selection| selection.pr > 0));
     }
 
     #[tokio::test]
@@ -761,15 +789,14 @@ mod tests {
             requested_paths.len(),
             reviewer_login
         );
-        match selected {
-            Some(selection) => {
+        if selected.is_empty() {
+            println!("diagnostic found no eligible rcore-os/tgoskits PR");
+        } else {
+            for selection in selected {
                 println!(
                     "diagnostic selected rcore-os/tgoskits PR #{} at {:?}",
                     selection.pr, selection.head_sha
                 );
-            }
-            None => {
-                println!("diagnostic found no eligible rcore-os/tgoskits PR");
             }
         }
         assert!(
@@ -783,31 +810,34 @@ mod tests {
         ops: &impl ProjectReviewSelectorOps,
         project_id: mai_protocol::ProjectId,
         reviewer_login: &str,
-    ) -> crate::Result<Option<SelectedProjectReviewPr>> {
+    ) -> crate::Result<Vec<SelectedProjectReviewPr>> {
         let owner = crate::github::github_path_segment("rcore-os");
         let repo = crate::github::github_path_segment("tgoskits");
         let mut page = 1_u64;
+        let mut selected = Vec::new();
         loop {
             let mut pull_requests =
                 list_open_pull_requests(ops, project_id, &owner, &repo, page).await?;
             println!("page {page}: {} open PRs", pull_requests.len());
             if pull_requests.is_empty() {
-                return Ok(None);
+                return Ok(selected);
             }
             pull_requests.sort_by_key(|pull_request| pull_request.number);
             for pull_request in pull_requests.iter() {
                 let candidate =
                     pull_request_candidate(ops, project_id, &owner, &repo, pull_request).await?;
-                if let Some(selection) = super::super::selection::select_review_pr(
+                let selections = super::super::selection::select_review_prs(
                     reviewer_login,
                     vec![candidate.clone()],
-                ) {
+                );
+                if let Some(selection) = selections.first() {
                     println!(
                         "#{} eligible head={:?}",
                         selection.pr,
                         selection.head_sha.as_deref()
                     );
-                    return Ok(Some(selected_project_review_pr(selection)));
+                    selected.extend(selections.into_iter().map(selected_project_review_pr));
+                    continue;
                 }
                 println!(
                     "#{} skip {}",
@@ -816,10 +846,14 @@ mod tests {
                 );
             }
             if pull_requests.len() < super::SELECTOR_PAGE_SIZE as usize {
-                return Ok(None);
+                return Ok(selected);
             }
             page += 1;
         }
+    }
+
+    fn selected_pr_numbers(selected: &[SelectedProjectReviewPr]) -> Vec<u64> {
+        selected.iter().map(|selection| selection.pr).collect()
     }
 
     fn skip_reason(

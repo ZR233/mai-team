@@ -869,43 +869,18 @@ impl AgentRuntime {
         request: ProjectReviewQueueRequest,
     ) -> Result<ProjectReviewQueueSummary> {
         let project_id = request.project_id;
-        let project = self.project(project_id).await?;
-        {
-            let summary = project.summary.read().await;
-            if !summary.auto_review_enabled {
-                return Ok(ProjectReviewPoolEnqueueSummary {
-                    ignored: vec![request.pr],
-                    ..Default::default()
-                }
-                .into());
-            }
-        }
-        let summary = {
-            let mut pool = project.review_pool.lock().await;
-            pool.enqueue_many([ProjectReviewSignalInput {
-                pr: request.pr,
-                head_sha: request.head_sha,
-                delivery_id: request.delivery_id.clone(),
-                reason: request.reason.clone(),
-            }])
-        };
-        if !summary.queued.is_empty() || !summary.deduped.is_empty() {
-            self.events
-                .publish(ServiceEventKind::ProjectReviewQueued {
-                    project_id,
-                    delivery_id: request.delivery_id.clone().unwrap_or_default(),
+        let summary = self
+            .enqueue_project_review_signals(
+                project_id,
+                vec![ProjectReviewSignalInput {
                     pr: request.pr,
+                    head_sha: request.head_sha.clone(),
+                    delivery_id: request.delivery_id.clone(),
                     reason: request.reason.clone(),
-                })
-                .await;
-            project.review_notify.notify_one();
-            if let Err(err) = self.start_project_review_loop_if_ready(project_id).await {
-                tracing::warn!(
-                    project_id = %project_id,
-                    "failed to start project review loop after queueing PR signal: {err}"
-                );
-            }
-        }
+                }],
+                true,
+            )
+            .await?;
         tracing::info!(
             project_id = %project_id,
             pr = request.pr,
@@ -916,6 +891,53 @@ impl AgentRuntime {
             ignored = ?summary.ignored,
             "queued project review signal"
         );
+        Ok(summary)
+    }
+
+    async fn enqueue_project_review_signals(
+        self: &Arc<Self>,
+        project_id: ProjectId,
+        signals: Vec<ProjectReviewSignalInput>,
+        start_worker: bool,
+    ) -> Result<ProjectReviewQueueSummary> {
+        let project = self.project(project_id).await?;
+        {
+            let summary = project.summary.read().await;
+            if !summary.auto_review_enabled {
+                return Ok(ProjectReviewQueueSummary {
+                    ignored: signals.iter().map(|signal| signal.pr).collect(),
+                    ..Default::default()
+                });
+            }
+        }
+        let signals_for_events = signals.clone();
+        let summary = {
+            let mut pool = project.review_pool.lock().await;
+            pool.enqueue_many(signals)
+        };
+        if !summary.queued.is_empty() || !summary.deduped.is_empty() {
+            for signal in signals_for_events.iter().filter(|signal| {
+                summary.queued.contains(&signal.pr) || summary.deduped.contains(&signal.pr)
+            }) {
+                self.events
+                    .publish(ServiceEventKind::ProjectReviewQueued {
+                        project_id,
+                        delivery_id: signal.delivery_id.clone().unwrap_or_default(),
+                        pr: signal.pr,
+                        reason: signal.reason.clone(),
+                    })
+                    .await;
+            }
+            project.review_notify.notify_one();
+            if start_worker
+                && let Err(err) = self.start_project_review_loop_if_ready(project_id).await
+            {
+                tracing::warn!(
+                    project_id = %project_id,
+                    "failed to start project review loop after queueing PR signal: {err}"
+                );
+            }
+        }
         Ok(summary.into())
     }
 
@@ -3482,11 +3504,12 @@ impl projects::review::selector::ProjectReviewSelectorOps for Arc<AgentRuntime> 
         .await
     }
 
-    fn enqueue_project_review(
+    fn enqueue_project_reviews(
         &self,
-        request: ProjectReviewQueueRequest,
+        project_id: ProjectId,
+        signals: Vec<ProjectReviewSignalInput>,
     ) -> impl std::future::Future<Output = Result<ProjectReviewQueueSummary>> + Send {
-        AgentRuntime::enqueue_project_review(self, request)
+        AgentRuntime::enqueue_project_review_signals(self, project_id, signals, false)
     }
 }
 

@@ -5163,7 +5163,7 @@ async fn project_selector_can_queue_review_prs() {
 }
 
 #[tokio::test]
-async fn project_review_selector_pages_and_queues_one_pr_without_model_request() {
+async fn project_review_selector_pages_and_queues_all_eligible_prs_without_model_request() {
     let mut page_one = vec![github_pr(1, false, "head-1")];
     page_one.extend((2..=20).map(|number| github_pr(number, true, &format!("head-{number}"))));
     let mut responses = vec![
@@ -5176,12 +5176,20 @@ async fn project_review_selector_pages_and_queues_one_pr_without_model_request()
     ];
     responses.extend((2..=20).map(|number| github_pr(number, true, &format!("head-{number}"))));
     responses.extend([
-        json!([github_pr(21, false, "head-21")]),
+        json!([
+            github_pr(21, false, "head-21"),
+            github_pr(22, false, "head-22")
+        ]),
         github_pr(21, false, "head-21"),
         json!([]),
         github_commit("2026-01-21T00:00:00Z"),
         json!({"check_runs": [{"status": "completed", "conclusion": "failure"}]}),
         json!({"state": "failure"}),
+        github_pr(22, false, "head-22"),
+        json!([]),
+        github_commit("2026-01-22T00:00:00Z"),
+        json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}),
+        json!({"state": "success"}),
     ]);
     let (base_url, requests) = start_mock_responses(responses).await;
     let dir = tempdir().expect("tempdir");
@@ -5215,14 +5223,14 @@ async fn project_review_selector_pages_and_queues_one_pr_without_model_request()
     .expect("run selector");
 
     let project_record = runtime.project(project_id).await.expect("project");
-    let pending = project_record
-        .review_pool
-        .lock()
-        .await
-        .next()
-        .expect("queued pr");
-    assert_eq!(pending.pr, 21);
-    assert_eq!(pending.head_sha.as_deref(), Some("head-21"));
+    let mut pool = project_record.review_pool.lock().await;
+    let first = pool.next().expect("first queued pr");
+    let second = pool.next().expect("second queued pr");
+    assert_eq!(first.pr, 21);
+    assert_eq!(first.head_sha.as_deref(), Some("head-21"));
+    assert_eq!(second.pr, 22);
+    assert_eq!(second.head_sha.as_deref(), Some("head-22"));
+    assert_eq!(None, pool.next());
     let request_lines = requests
         .lock()
         .await

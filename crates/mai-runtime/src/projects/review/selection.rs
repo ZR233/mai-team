@@ -31,23 +31,26 @@ pub(crate) struct CheckSignal {
     pub(crate) conclusion: Option<String>,
 }
 
-pub(crate) fn select_review_pr(
+pub(crate) fn select_review_prs(
     reviewer_login: &str,
     mut candidates: Vec<PullRequestCandidate>,
-) -> Option<ReviewSelection> {
+) -> Vec<ReviewSelection> {
     candidates.sort_by_key(|candidate| candidate.number);
-    candidates.into_iter().find_map(|candidate| {
-        if candidate.draft
-            || has_running_ci(&candidate)
-            || already_reviewed_current_head(reviewer_login, &candidate)
-        {
-            return None;
-        }
-        Some(ReviewSelection {
-            pr: candidate.number,
-            head_sha: candidate.head_sha,
+    candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            if candidate.draft
+                || has_running_ci(&candidate)
+                || already_reviewed_current_head(reviewer_login, &candidate)
+            {
+                return None;
+            }
+            Some(ReviewSelection {
+                pr: candidate.number,
+                head_sha: candidate.head_sha,
+            })
         })
-    })
+        .collect()
 }
 
 fn has_running_ci(candidate: &PullRequestCandidate) -> bool {
@@ -100,7 +103,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::{
-        CheckSignal, PullRequestCandidate, PullRequestReview, ReviewSelection, select_review_pr,
+        CheckSignal, PullRequestCandidate, PullRequestReview, ReviewSelection, select_review_prs,
     };
 
     fn candidate(number: u64) -> PullRequestCandidate {
@@ -117,7 +120,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_first_eligible_candidate_by_number() {
+    fn selects_all_eligible_candidates_by_number() {
         let mut first = candidate(1);
         first.draft = true;
         let mut second = candidate(2);
@@ -131,13 +134,19 @@ mod tests {
             conclusion: Some("success".to_string()),
         }];
 
-        let selected = select_review_pr("mai-bot", vec![third, second, first]);
+        let selected = select_review_prs("mai-bot", vec![third, second, first]);
 
         assert_eq!(
-            Some(ReviewSelection {
-                pr: 2,
-                head_sha: Some("head-2".to_string()),
-            }),
+            vec![
+                ReviewSelection {
+                    pr: 2,
+                    head_sha: Some("head-2".to_string()),
+                },
+                ReviewSelection {
+                    pr: 3,
+                    head_sha: Some("head-3".to_string()),
+                },
+            ],
             selected
         );
     }
@@ -155,13 +164,13 @@ mod tests {
             conclusion: Some("failure".to_string()),
         }];
 
-        let selected = select_review_pr("mai-bot", vec![pending, failed]);
+        let selected = select_review_prs("mai-bot", vec![pending, failed]);
 
         assert_eq!(
-            Some(ReviewSelection {
+            vec![ReviewSelection {
                 pr: 5,
                 head_sha: Some("head-5".to_string()),
-            }),
+            }],
             selected
         );
     }
@@ -171,13 +180,13 @@ mod tests {
         let mut candidate = candidate(9);
         candidate.author_login = Some("mai-bot".to_string());
 
-        let selected = select_review_pr("mai-bot", vec![candidate]);
+        let selected = select_review_prs("mai-bot", vec![candidate]);
 
         assert_eq!(
-            Some(ReviewSelection {
+            vec![ReviewSelection {
                 pr: 9,
                 head_sha: Some("head-9".to_string()),
-            }),
+            }],
             selected
         );
     }
@@ -191,13 +200,13 @@ mod tests {
         }];
         let next = candidate(11);
 
-        let selected = select_review_pr("mai-bot", vec![pending, next]);
+        let selected = select_review_prs("mai-bot", vec![pending, next]);
 
         assert_eq!(
-            Some(ReviewSelection {
+            vec![ReviewSelection {
                 pr: 11,
                 head_sha: Some("head-11".to_string()),
-            }),
+            }],
             selected
         );
     }
@@ -211,13 +220,13 @@ mod tests {
             conclusion: Some("success".to_string()),
         }];
 
-        let selected = select_review_pr("mai-bot", vec![candidate]);
+        let selected = select_review_prs("mai-bot", vec![candidate]);
 
         assert_eq!(
-            Some(ReviewSelection {
+            vec![ReviewSelection {
                 pr: 14,
                 head_sha: Some("head-14".to_string()),
-            }),
+            }],
             selected
         );
     }
@@ -232,13 +241,13 @@ mod tests {
         }];
         let next = candidate(7);
 
-        let selected = select_review_pr("mai-bot", vec![reviewed, next]);
+        let selected = select_review_prs("mai-bot", vec![reviewed, next]);
 
         assert_eq!(
-            Some(ReviewSelection {
+            vec![ReviewSelection {
                 pr: 7,
                 head_sha: Some("head-7".to_string()),
-            }),
+            }],
             selected
         );
     }
@@ -255,13 +264,13 @@ mod tests {
         }];
         let next = candidate(13);
 
-        let selected = select_review_pr("mai-bot", vec![reviewed, next]);
+        let selected = select_review_prs("mai-bot", vec![reviewed, next]);
 
         assert_eq!(
-            Some(ReviewSelection {
+            vec![ReviewSelection {
                 pr: 13,
                 head_sha: Some("head-13".to_string()),
-            }),
+            }],
             selected
         );
     }
@@ -277,13 +286,13 @@ mod tests {
             commit_id: Some("old-head".to_string()),
         }];
 
-        let selected = select_review_pr("mai-bot", vec![candidate]);
+        let selected = select_review_prs("mai-bot", vec![candidate]);
 
         assert_eq!(
-            Some(ReviewSelection {
+            vec![ReviewSelection {
                 pr: 8,
                 head_sha: Some("head-8".to_string()),
-            }),
+            }],
             selected
         );
     }

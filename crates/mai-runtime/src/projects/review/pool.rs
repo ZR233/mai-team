@@ -59,10 +59,6 @@ impl ProjectReviewPool {
         self.pending.clear();
     }
 
-    pub(crate) fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-
     fn enqueue(
         &mut self,
         signal: ProjectReviewSignalInput,

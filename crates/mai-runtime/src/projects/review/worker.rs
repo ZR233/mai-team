@@ -209,23 +209,38 @@ pub(crate) async fn start_project_review_loop_if_ready(
         return Ok(());
     }
 
+    let git_provider = match ops.project_git_provider(project_id).await {
+        Ok(provider) => provider,
+        Err(err) => {
+            tracing::warn!(project_id = %project_id, "failed to read project git provider: {err}");
+            None
+        }
+    };
     let mut worker = project.review_worker.lock().await;
     if worker.is_some() {
         return Ok(());
     }
     let cancellation_token = CancellationToken::new();
-    let token = cancellation_token.clone();
-    let loop_ops = ops.clone();
-    let (abort_handle, abort_registration) = AbortHandle::new_pair();
-    tokio::spawn(Abortable::new(
-        async move {
-            run_project_review_loop(loop_ops, project_id, token).await;
-        },
-        abort_registration,
-    ));
+    let context = ProjectReviewTaskContext {
+        ops: ops.clone(),
+        project_id,
+        cancellation_token: cancellation_token.clone(),
+    };
+    let pool_abort_handle =
+        spawn_project_review_child(run_project_review_pool_worker(context.clone()));
+    let selector_abort_handle = match git_provider {
+        Some(GitProvider::GithubAppRelay) => Some(spawn_project_review_child(
+            run_github_app_selector_until_success(context.clone()),
+        )),
+        Some(GitProvider::Github) => Some(spawn_project_review_child(
+            run_github_token_selector_loop(context.clone()),
+        )),
+        None => None,
+    };
     *worker = Some(ProjectReviewWorker {
         cancellation_token,
-        abort_handle,
+        pool_abort_handle,
+        selector_abort_handle,
     });
     Ok(())
 }
@@ -242,7 +257,10 @@ pub(crate) async fn stop_project_review_loop(
     let worker = project.review_worker.lock().await.take();
     if let Some(worker) = worker {
         worker.cancellation_token.cancel();
-        worker.abort_handle.abort();
+        worker.pool_abort_handle.abort();
+        if let Some(selector_abort_handle) = worker.selector_abort_handle {
+            selector_abort_handle.abort();
+        }
     }
     project.review_pool.lock().await.clear();
     project.review_notify.notify_waiters();
@@ -268,106 +286,121 @@ pub(crate) async fn stop_project_review_loop(
         .await;
 }
 
+#[cfg(test)]
 pub(crate) async fn run_project_review_loop(
     ops: impl ProjectReviewWorkerOps,
     project_id: ProjectId,
     cancellation_token: CancellationToken,
 ) {
-    if let Err(err) = ops.ensure_project_review_workspace(project_id).await {
-        let error = err.to_string();
-        if !super::project_review_error_is_retryable(&error) {
-            let _ = ops
-                .record_project_review_startup_failure(project_id, error.clone())
-                .await;
-        }
-        let decision = super::project_review_loop_decision_for_error(error);
-        let next = Utc::now() + TimeDelta::seconds(decision.delay.as_secs() as i64);
-        let _ = ops
-            .set_project_review_state(
-                project_id,
-                decision.status,
-                ReviewStateUpdate {
-                    next_review_at: Some(next),
-                    outcome: decision.outcome,
-                    summary_text: decision.summary,
-                    error: decision.error,
-                    ..Default::default()
-                },
-            )
-            .await;
-    }
-    let mut startup_selector_ran = match ops.project(project_id).await {
-        Ok(project) => project.review_pool.lock().await.has_pending(),
-        Err(_) => false,
+    let context = ProjectReviewTaskContext {
+        ops,
+        project_id,
+        cancellation_token,
     };
-    let mut next_poll_selector_at = Utc::now();
-    loop {
-        if cancellation_token.is_cancelled() {
+    run_project_review_pool_worker(context).await;
+}
+
+#[derive(Clone)]
+struct ProjectReviewTaskContext<Ops> {
+    ops: Ops,
+    project_id: ProjectId,
+    cancellation_token: CancellationToken,
+}
+
+fn spawn_project_review_child(future: impl Future<Output = ()> + Send + 'static) -> AbortHandle {
+    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    tokio::spawn(Abortable::new(future, abort_registration));
+    abort_handle
+}
+
+async fn run_project_review_pool_worker(
+    ops: ProjectReviewTaskContext<impl ProjectReviewWorkerOps>,
+) {
+    while !ops.cancellation_token.is_cancelled() {
+        if !project_still_ready(&ops).await {
             break;
         }
-        let should_continue = match ops.project(project_id).await {
-            Ok(project) => {
-                let summary = project.summary.read().await;
-                project_ready_for_review(&summary)
+        match ops
+            .ops
+            .ensure_project_review_workspace(ops.project_id)
+            .await
+        {
+            Ok(()) => break,
+            Err(err) => {
+                let error = err.to_string();
+                if !super::project_review_error_is_retryable(&error) {
+                    let _ = ops
+                        .ops
+                        .record_project_review_startup_failure(ops.project_id, error.clone())
+                        .await;
+                }
+                let decision = super::project_review_loop_decision_for_error(error);
+                let next = Utc::now() + TimeDelta::seconds(decision.delay.as_secs() as i64);
+                let _ = ops
+                    .ops
+                    .set_project_review_state(
+                        ops.project_id,
+                        decision.status,
+                        ReviewStateUpdate {
+                            next_review_at: Some(next),
+                            outcome: decision.outcome,
+                            summary_text: decision.summary,
+                            error: decision.error,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                if !wait_or_cancel(&ops.cancellation_token, decision.delay).await {
+                    break;
+                }
             }
-            Err(_) => false,
-        };
-        if !should_continue {
+        }
+    }
+    loop {
+        if ops.cancellation_token.is_cancelled() {
+            break;
+        }
+        if !project_still_ready(&ops).await {
             break;
         }
 
-        let signal = match next_project_review_signal(&ops, project_id).await {
+        let signal = match next_project_review_signal(&ops.ops, ops.project_id).await {
             Ok(Some(signal)) => signal,
             Ok(None) => {
-                if !startup_selector_ran {
-                    startup_selector_ran = true;
-                    if let Err(err) = run_selector(&ops, project_id, &cancellation_token).await {
-                        if matches!(err, RuntimeError::TurnCancelled)
-                            && cancellation_token.is_cancelled()
-                        {
-                            break;
-                        }
-                        tracing::warn!(project_id = %project_id, "project review selector failed: {err}");
-                    }
-                    next_poll_selector_at = Utc::now()
-                        + TimeDelta::seconds(super::PROJECT_REVIEW_IDLE_RETRY_SECS as i64);
-                    continue;
-                }
-                if should_poll_selector(&ops, project_id, next_poll_selector_at).await {
-                    next_poll_selector_at = Utc::now()
-                        + TimeDelta::seconds(super::PROJECT_REVIEW_IDLE_RETRY_SECS as i64);
-                    if let Err(err) = run_selector(&ops, project_id, &cancellation_token).await {
-                        if matches!(err, RuntimeError::TurnCancelled)
-                            && cancellation_token.is_cancelled()
-                        {
-                            break;
-                        }
-                        tracing::warn!(project_id = %project_id, "project review selector failed: {err}");
-                    }
-                    continue;
-                }
-                wait_for_project_review_signal(&ops, project_id, &cancellation_token).await;
+                wait_for_project_review_signal(&ops.ops, ops.project_id, &ops.cancellation_token)
+                    .await;
                 continue;
             }
             Err(err) => {
-                tracing::warn!(project_id = %project_id, "failed to read project review pool: {err}");
-                sleep(Duration::from_secs(1)).await;
+                tracing::warn!(project_id = %ops.project_id, "failed to read project review pool: {err}");
+                if !wait_or_cancel(&ops.cancellation_token, Duration::from_secs(1)).await {
+                    break;
+                }
                 continue;
             }
         };
 
         let decision = ops
-            .run_project_review_once(project_id, cancellation_token.clone(), Some(signal.pr))
+            .ops
+            .run_project_review_once(
+                ops.project_id,
+                ops.cancellation_token.clone(),
+                Some(signal.pr),
+            )
             .await;
         let mut decision = match decision {
             Ok(result) => super::project_review_loop_decision_for_result(result),
-            Err(RuntimeError::TurnCancelled) if cancellation_token.is_cancelled() => break,
+            Err(RuntimeError::TurnCancelled) if ops.cancellation_token.is_cancelled() => break,
             Err(err) => {
                 let error = err.to_string();
                 if super::project_review_error_is_retryable(&error) {
-                    requeue_project_review_signal(&ops, project_id, signal).await;
+                    requeue_project_review_signal(&ops.ops, ops.project_id, signal).await;
+                    super::project_review_loop_decision_for_error(error)
+                } else {
+                    let mut decision = super::project_review_loop_decision_for_error(error);
+                    decision.delay = Duration::ZERO;
+                    decision
                 }
-                super::project_review_loop_decision_for_error(error)
             }
         };
         if matches!(decision.outcome, Some(ProjectReviewOutcome::NoEligiblePr)) {
@@ -377,8 +410,9 @@ pub(crate) async fn run_project_review_loop(
         let next_review_at = (decision.delay.as_secs() > 0)
             .then(|| Utc::now() + TimeDelta::seconds(decision.delay.as_secs() as i64));
         let _ = ops
+            .ops
             .set_project_review_state(
-                project_id,
+                ops.project_id,
                 decision.status,
                 ReviewStateUpdate {
                     next_review_at,
@@ -389,101 +423,197 @@ pub(crate) async fn run_project_review_loop(
                 },
             )
             .await;
-        if decision.delay.is_zero() {
-            continue;
-        }
-        tokio::select! {
-            _ = sleep(decision.delay) => {}
-            _ = cancellation_token.cancelled() => break,
+        if !decision.delay.is_zero()
+            && !wait_or_cancel(&ops.cancellation_token, decision.delay).await
+        {
+            break;
         }
     }
-    if let Ok(project) = ops.project(project_id).await {
+    ops.cancellation_token.cancel();
+    if let Ok(project) = ops.ops.project(ops.project_id).await {
         let mut worker = project.review_worker.lock().await;
         *worker = None;
     }
 }
 
-async fn run_selector(
-    ops: &impl ProjectReviewWorkerOps,
-    project_id: ProjectId,
-    cancellation_token: &CancellationToken,
-) -> Result<()> {
-    let _ = ops
-        .set_project_review_state(
-            project_id,
-            ProjectReviewStatus::Selecting,
-            ReviewStateUpdate::default(),
+async fn run_github_app_selector_until_success(
+    ops: ProjectReviewTaskContext<impl ProjectReviewWorkerOps>,
+) {
+    loop {
+        if ops.cancellation_token.is_cancelled() || !project_still_ready(&ops).await {
+            break;
+        }
+        match run_selector_attempt(&ops, None).await {
+            Ok(_) => break,
+            Err(RuntimeError::TurnCancelled) if ops.cancellation_token.is_cancelled() => break,
+            Err(err) => {
+                tracing::warn!(project_id = %ops.project_id, "project review selector failed: {err}");
+                if !wait_or_cancel(
+                    &ops.cancellation_token,
+                    Duration::from_secs(super::PROJECT_REVIEW_SELECTOR_ERROR_RETRY_SECS),
+                )
+                .await
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn run_github_token_selector_loop(
+    ops: ProjectReviewTaskContext<impl ProjectReviewWorkerOps>,
+) {
+    loop {
+        if ops.cancellation_token.is_cancelled() || !project_still_ready(&ops).await {
+            break;
+        }
+        match run_selector_attempt(
+            &ops,
+            Some(Duration::from_secs(
+                super::PROJECT_REVIEW_GITHUB_TOKEN_SELECTOR_INTERVAL_SECS,
+            )),
         )
-        .await;
+        .await
+        {
+            Ok(_) => {
+                if !wait_or_cancel(
+                    &ops.cancellation_token,
+                    Duration::from_secs(super::PROJECT_REVIEW_GITHUB_TOKEN_SELECTOR_INTERVAL_SECS),
+                )
+                .await
+                {
+                    break;
+                }
+            }
+            Err(RuntimeError::TurnCancelled) if ops.cancellation_token.is_cancelled() => break,
+            Err(err) => {
+                tracing::warn!(project_id = %ops.project_id, "project review selector failed: {err}");
+                if !wait_or_cancel(
+                    &ops.cancellation_token,
+                    Duration::from_secs(super::PROJECT_REVIEW_SELECTOR_ERROR_RETRY_SECS),
+                )
+                .await
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn run_selector_attempt(
+    ops: &ProjectReviewTaskContext<impl ProjectReviewWorkerOps>,
+    next_success_scan_after: Option<Duration>,
+) -> Result<ProjectReviewSelectorRunResult> {
+    set_selector_state_if_visible(
+        ops,
+        ProjectReviewStatus::Selecting,
+        ReviewStateUpdate::default(),
+    )
+    .await;
     let result = ops
-        .run_project_review_selector(project_id, cancellation_token.clone())
+        .ops
+        .run_project_review_selector(ops.project_id, ops.cancellation_token.clone())
         .await;
-    let result = match result {
-        Ok(result) => result,
-        Err(err) => {
-            let error = err.to_string();
-            let decision = super::project_review_loop_decision_for_error(error);
-            let next_review_at = (decision.delay.as_secs() > 0)
-                .then(|| Utc::now() + TimeDelta::seconds(decision.delay.as_secs() as i64));
-            let _ = ops
-                .set_project_review_state(
-                    project_id,
-                    decision.status,
-                    ReviewStateUpdate {
-                        next_review_at,
-                        outcome: decision.outcome,
-                        summary_text: decision.summary,
-                        error: decision.error,
-                        ..Default::default()
-                    },
-                )
-                .await;
-            return Err(err);
-        }
-    };
     match result {
-        ProjectReviewSelectorRunResult::Queued(_) => {
-            let _ = ops
-                .set_project_review_state(
-                    project_id,
-                    ProjectReviewStatus::Idle,
-                    ReviewStateUpdate::default(),
-                )
-                .await;
+        Ok(result) => {
+            match &result {
+                ProjectReviewSelectorRunResult::Queued { .. } => {
+                    set_selector_state_if_visible(
+                        ops,
+                        ProjectReviewStatus::Idle,
+                        ReviewStateUpdate::default(),
+                    )
+                    .await;
+                }
+                ProjectReviewSelectorRunResult::NoEligiblePr => {
+                    let next_review_at = next_success_scan_after
+                        .map(|delay| Utc::now() + TimeDelta::seconds(delay.as_secs() as i64));
+                    set_selector_state_if_visible(
+                        ops,
+                        ProjectReviewStatus::Waiting,
+                        ReviewStateUpdate {
+                            next_review_at,
+                            outcome: Some(ProjectReviewOutcome::NoEligiblePr),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                }
+            }
+            Ok(result)
         }
-        ProjectReviewSelectorRunResult::NoEligiblePr => {
-            let next_review_at =
-                Some(Utc::now() + TimeDelta::seconds(super::PROJECT_REVIEW_IDLE_RETRY_SECS as i64));
-            let _ = ops
-                .set_project_review_state(
-                    project_id,
+        Err(err) => {
+            if !(matches!(err, RuntimeError::TurnCancelled)
+                && ops.cancellation_token.is_cancelled())
+            {
+                let next_review_at = Some(
+                    Utc::now()
+                        + TimeDelta::seconds(
+                            super::PROJECT_REVIEW_SELECTOR_ERROR_RETRY_SECS as i64,
+                        ),
+                );
+                set_selector_state_if_visible(
+                    ops,
                     ProjectReviewStatus::Waiting,
                     ReviewStateUpdate {
                         next_review_at,
-                        outcome: Some(ProjectReviewOutcome::NoEligiblePr),
+                        error: Some(err.to_string()),
                         ..Default::default()
                     },
                 )
                 .await;
+            }
+            Err(err)
         }
     }
-    Ok(())
 }
 
-async fn should_poll_selector(
-    ops: &impl ProjectReviewWorkerOps,
-    project_id: ProjectId,
-    next_poll_selector_at: chrono::DateTime<Utc>,
-) -> bool {
-    if Utc::now() < next_poll_selector_at {
-        return false;
+async fn set_selector_state_if_visible(
+    ops: &ProjectReviewTaskContext<impl ProjectReviewWorkerOps>,
+    status: ProjectReviewStatus,
+    update: ReviewStateUpdate,
+) {
+    if selector_state_visible(ops).await {
+        let _ = ops
+            .ops
+            .set_project_review_state(ops.project_id, status, update)
+            .await;
     }
-    match ops.project_git_provider(project_id).await {
-        Ok(Some(GitProvider::Github | GitProvider::GithubAppRelay)) | Ok(None) => true,
-        Err(err) => {
-            tracing::warn!(project_id = %project_id, "failed to read project git provider: {err}");
-            true
+}
+
+async fn selector_state_visible(
+    ops: &ProjectReviewTaskContext<impl ProjectReviewWorkerOps>,
+) -> bool {
+    let Ok(project) = ops.ops.project(ops.project_id).await else {
+        return false;
+    };
+    let summary = project.summary.read().await;
+    summary.current_reviewer_agent_id.is_none()
+        && !matches!(
+            summary.review_status,
+            ProjectReviewStatus::Syncing | ProjectReviewStatus::Running
+        )
+}
+
+async fn project_still_ready(ops: &ProjectReviewTaskContext<impl ProjectReviewWorkerOps>) -> bool {
+    match ops.ops.project(ops.project_id).await {
+        Ok(project) => {
+            let summary = project.summary.read().await;
+            project_ready_for_review(&summary)
         }
+        Err(_) => false,
+    }
+}
+
+async fn wait_or_cancel(cancellation_token: &CancellationToken, delay: Duration) -> bool {
+    if delay.is_zero() {
+        return true;
+    }
+    tokio::select! {
+        _ = sleep(delay) => true,
+        _ = cancellation_token.cancelled() => false,
     }
 }
 
@@ -541,11 +671,12 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
+    use crate::projects::review::pool::ProjectReviewSignalInput;
     use crate::state::ProjectRecord;
 
     use super::{
         FinishReviewRun, ProjectReviewCycleResult, ProjectReviewSelectorRunResult,
-        ProjectReviewWorkerOps, ReviewStateUpdate, run_selector,
+        ProjectReviewTaskContext, ProjectReviewWorkerOps, ReviewStateUpdate, run_selector_attempt,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -562,6 +693,9 @@ mod tests {
         states: Arc<Mutex<Vec<ReviewStateSnapshot>>>,
         selector_started: Arc<Notify>,
         release_selector: Arc<Notify>,
+        selector_calls: Arc<Mutex<u64>>,
+        reviewed_prs: Arc<Mutex<Vec<Option<u64>>>>,
+        git_provider: mai_protocol::GitProvider,
     }
 
     impl FakeWorkerOps {
@@ -571,7 +705,15 @@ mod tests {
                 states: Arc::new(Mutex::new(Vec::new())),
                 selector_started: Arc::new(Notify::new()),
                 release_selector: Arc::new(Notify::new()),
+                selector_calls: Arc::new(Mutex::new(0)),
+                reviewed_prs: Arc::new(Mutex::new(Vec::new())),
+                git_provider: mai_protocol::GitProvider::Github,
             }
+        }
+
+        fn with_git_provider(mut self, git_provider: mai_protocol::GitProvider) -> Self {
+            self.git_provider = git_provider;
+            self
         }
     }
 
@@ -651,7 +793,7 @@ mod tests {
             &self,
             _project_id: Uuid,
         ) -> crate::Result<Option<mai_protocol::GitProvider>> {
-            Ok(Some(mai_protocol::GitProvider::Github))
+            Ok(Some(self.git_provider.clone()))
         }
 
         async fn run_project_review_selector(
@@ -659,6 +801,7 @@ mod tests {
             _project_id: Uuid,
             _cancellation_token: CancellationToken,
         ) -> crate::Result<ProjectReviewSelectorRunResult> {
+            *self.selector_calls.lock().await += 1;
             self.selector_started.notify_waiters();
             self.release_selector.notified().await;
             Ok(ProjectReviewSelectorRunResult::NoEligiblePr)
@@ -668,9 +811,15 @@ mod tests {
             &self,
             _project_id: Uuid,
             _cancellation_token: CancellationToken,
-            _target_pr: Option<u64>,
+            target_pr: Option<u64>,
         ) -> crate::Result<ProjectReviewCycleResult> {
-            panic!("selector state test must not run reviewer cycle");
+            self.reviewed_prs.lock().await.push(target_pr);
+            Ok(ProjectReviewCycleResult {
+                outcome: ProjectReviewOutcome::ReviewSubmitted,
+                pr: target_pr,
+                summary: None,
+                error: None,
+            })
         }
 
         async fn agent_current_turn(&self, _agent_id: Uuid) -> crate::Result<Option<Uuid>> {
@@ -687,14 +836,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selector_status_is_visible_while_selecting_and_waiting_when_empty() {
+    async fn app_selector_status_is_visible_while_selecting_and_waiting_when_empty() {
         let project_id = Uuid::new_v4();
         let ops = FakeWorkerOps::new(project_id);
         let task_ops = ops.clone();
         let selector_task = tokio::spawn(async move {
-            run_selector(&task_ops, project_id, &CancellationToken::new())
+            let context = ProjectReviewTaskContext {
+                ops: task_ops,
+                project_id,
+                cancellation_token: CancellationToken::new(),
+            };
+            run_selector_attempt(&context, None)
                 .await
-                .expect("run selector")
+                .expect("run selector");
         });
 
         ops.selector_started.notified().await;
@@ -721,13 +875,99 @@ mod tests {
                 },
                 ReviewStateSnapshot {
                     status: ProjectReviewStatus::Waiting,
-                    next_review_at_set: true,
+                    next_review_at_set: false,
                     outcome: Some(ProjectReviewOutcome::NoEligiblePr),
                     error: None,
                 },
             ],
             states
         );
+    }
+
+    #[tokio::test]
+    async fn pool_worker_waits_for_pool_and_does_not_run_selector() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        let token = CancellationToken::new();
+        let task_ops = ops.clone();
+        let task_token = token.clone();
+        let worker_task = tokio::spawn(async move {
+            super::run_project_review_loop(task_ops, project_id, task_token).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(0, *ops.selector_calls.lock().await);
+        assert_eq!(Vec::<Option<u64>>::new(), *ops.reviewed_prs.lock().await);
+
+        {
+            let mut pool = ops.project.review_pool.lock().await;
+            pool.enqueue_many([ProjectReviewSignalInput {
+                pr: 42,
+                head_sha: Some("head-42".to_string()),
+                delivery_id: None,
+                reason: "test".to_string(),
+            }]);
+        }
+        ops.project.review_notify.notify_waiters();
+
+        for _ in 0..20 {
+            if !ops.reviewed_prs.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(vec![Some(42)], *ops.reviewed_prs.lock().await);
+        assert_eq!(0, *ops.selector_calls.lock().await);
+
+        token.cancel();
+        worker_task.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn github_app_selector_started_with_project_tasks_runs_once_after_success() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id)
+            .with_git_provider(mai_protocol::GitProvider::GithubAppRelay);
+
+        super::start_project_review_loop_if_ready(ops.clone(), project_id)
+            .await
+            .expect("start review tasks");
+
+        ops.selector_started.notified().await;
+        assert_eq!(1, *ops.selector_calls.lock().await);
+        ops.release_selector.notify_waiters();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(1, *ops.selector_calls.lock().await);
+
+        super::stop_project_review_loop(ops, project_id, 10).await;
+    }
+
+    #[tokio::test]
+    async fn selector_status_does_not_override_active_review() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        {
+            let mut summary = ops.project.summary.write().await;
+            summary.review_status = ProjectReviewStatus::Running;
+            summary.current_reviewer_agent_id = Some(Uuid::new_v4());
+        }
+        let task_ops = ops.clone();
+        let selector_task = tokio::spawn(async move {
+            let context = ProjectReviewTaskContext {
+                ops: task_ops,
+                project_id,
+                cancellation_token: CancellationToken::new(),
+            };
+            run_selector_attempt(&context, None)
+                .await
+                .expect("run selector");
+        });
+
+        ops.selector_started.notified().await;
+        ops.release_selector.notify_waiters();
+        selector_task.await.expect("selector task");
+
+        assert_eq!(Vec::<ReviewStateSnapshot>::new(), *ops.states.lock().await);
     }
 
     fn test_project_summary(project_id: Uuid) -> ProjectSummary {

@@ -61,7 +61,8 @@ impl ProjectRecord {
 
 pub(crate) struct ProjectReviewWorker {
     pub(crate) cancellation_token: CancellationToken,
-    pub(crate) abort_handle: futures::future::AbortHandle,
+    pub(crate) pool_abort_handle: futures::future::AbortHandle,
+    pub(crate) selector_abort_handle: Option<futures::future::AbortHandle>,
 }
 
 pub(crate) struct TaskRecord {
