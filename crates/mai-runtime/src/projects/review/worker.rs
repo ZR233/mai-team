@@ -12,6 +12,7 @@ use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
 use super::ProjectReviewCycleResult;
+use super::backoff::{ProjectReviewRetryBackoff, ProjectReviewRetryBackoffConfig};
 use super::eligibility::SelectedProjectReviewPr;
 use super::pool::PendingProjectReview;
 use super::runs::FinishReviewRun;
@@ -355,6 +356,7 @@ fn spawn_project_review_child(future: impl Future<Output = ()> + Send + 'static)
 async fn run_project_review_pool_worker(
     ops: ProjectReviewTaskContext<impl ProjectReviewWorkerOps>,
 ) {
+    let mut workspace_backoff = project_review_retry_backoff();
     while !ops.cancellation_token.is_cancelled() {
         if !project_still_ready(&ops).await {
             break;
@@ -367,14 +369,21 @@ async fn run_project_review_pool_worker(
             Ok(()) => break,
             Err(err) => {
                 let error = err.to_string();
-                if !super::project_review_error_is_retryable(&error) {
+                let retryable = super::project_review_error_is_retryable(&error);
+                if !retryable {
                     let _ = ops
                         .ops
                         .record_project_review_startup_failure(ops.project_id, error.clone())
                         .await;
                 }
                 let decision = super::project_review_loop_decision_for_error(error);
-                let next = Utc::now() + TimeDelta::seconds(decision.delay.as_secs() as i64);
+                let delay = if retryable {
+                    workspace_backoff.next_delay()
+                } else {
+                    workspace_backoff.reset();
+                    decision.delay
+                };
+                let next = Utc::now() + TimeDelta::seconds(delay.as_secs() as i64);
                 let _ = ops
                     .ops
                     .set_project_review_state(
@@ -389,12 +398,13 @@ async fn run_project_review_pool_worker(
                         },
                     )
                     .await;
-                if !wait_or_cancel(&ops.cancellation_token, decision.delay).await {
+                if !wait_or_cancel(&ops.cancellation_token, delay).await {
                     break;
                 }
             }
         }
     }
+    let mut review_backoff = project_review_retry_backoff();
     loop {
         if ops.cancellation_token.is_cancelled() {
             break;
@@ -428,14 +438,21 @@ async fn run_project_review_pool_worker(
             )
             .await;
         let mut decision = match decision {
-            Ok(result) => super::project_review_loop_decision_for_result(result),
+            Ok(result) => {
+                review_backoff.reset();
+                super::project_review_loop_decision_for_result(result)
+            }
             Err(RuntimeError::TurnCancelled) if ops.cancellation_token.is_cancelled() => break,
             Err(err) => {
                 let error = err.to_string();
-                if super::project_review_error_is_retryable(&error) {
+                let retryable = super::project_review_error_is_retryable(&error);
+                if retryable {
                     requeue_project_review_signal(&ops.ops, ops.project_id, signal).await;
-                    super::project_review_loop_decision_for_error(error)
+                    let mut decision = super::project_review_loop_decision_for_error(error);
+                    decision.delay = review_backoff.next_delay();
+                    decision
                 } else {
+                    review_backoff.reset();
                     let mut decision = super::project_review_loop_decision_for_error(error);
                     decision.delay = Duration::ZERO;
                     decision
@@ -654,6 +671,13 @@ async fn wait_or_cancel(cancellation_token: &CancellationToken, delay: Duration)
         _ = sleep(delay) => true,
         _ = cancellation_token.cancelled() => false,
     }
+}
+
+fn project_review_retry_backoff() -> ProjectReviewRetryBackoff {
+    ProjectReviewRetryBackoff::new(ProjectReviewRetryBackoffConfig {
+        initial_delay: Duration::from_secs(super::PROJECT_REVIEW_RETRY_INITIAL_SECS),
+        max_delay: Duration::from_secs(super::PROJECT_REVIEW_FAILURE_RETRY_SECS),
+    })
 }
 
 async fn next_project_review_signal(
