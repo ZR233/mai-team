@@ -52,13 +52,9 @@ pub(crate) fn select_review_pr(
 
 fn has_running_ci(candidate: &PullRequestCandidate) -> bool {
     candidate
-        .combined_status_state
-        .as_deref()
-        .is_some_and(is_pending_ci_state)
-        || candidate
-            .check_signals
-            .iter()
-            .any(|signal| signal.status.as_deref().is_some_and(is_pending_ci_state))
+        .check_signals
+        .iter()
+        .any(|signal| signal.status.as_deref().is_some_and(is_pending_ci_state))
 }
 
 fn is_pending_ci_state(value: &str) -> bool {
@@ -187,9 +183,12 @@ mod tests {
     }
 
     #[test]
-    fn combined_status_pending_blocks_selection() {
+    fn legacy_status_pending_context_blocks_selection() {
         let mut pending = candidate(10);
-        pending.combined_status_state = Some("pending".to_string());
+        pending.check_signals = vec![CheckSignal {
+            status: Some("pending".to_string()),
+            conclusion: None,
+        }];
         let next = candidate(11);
 
         let selected = select_review_pr("mai-bot", vec![pending, next]);
@@ -198,6 +197,26 @@ mod tests {
             Some(ReviewSelection {
                 pr: 11,
                 head_sha: Some("head-11".to_string()),
+            }),
+            selected
+        );
+    }
+
+    #[test]
+    fn empty_legacy_combined_status_pending_does_not_block_completed_check_runs() {
+        let mut candidate = candidate(14);
+        candidate.combined_status_state = Some("pending".to_string());
+        candidate.check_signals = vec![CheckSignal {
+            status: Some("completed".to_string()),
+            conclusion: Some("success".to_string()),
+        }];
+
+        let selected = select_review_pr("mai-bot", vec![candidate]);
+
+        assert_eq!(
+            Some(ReviewSelection {
+                pr: 14,
+                head_sha: Some("head-14".to_string()),
             }),
             selected
         );

@@ -394,7 +394,7 @@ struct GithubStatusContext {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, sync::Arc};
+    use std::{env, process::Command, sync::Arc, time::Duration};
 
     use mai_protocol::{
         ProjectCloneStatus, ProjectReviewOutcome, ProjectReviewStatus, ProjectStatus, now,
@@ -407,7 +407,11 @@ mod tests {
 
     use crate::{ProjectReviewQueueRequest, ProjectReviewQueueSummary};
 
-    use super::{ProjectReviewIdentity, ProjectReviewSelectorOps, select_project_review_candidate};
+    use super::{
+        ProjectReviewIdentity, ProjectReviewSelectorOps, SelectedProjectReviewPr,
+        list_open_pull_requests, pull_request_candidate, select_project_review_candidate,
+        selected_project_review_pr,
+    };
 
     #[derive(Default)]
     struct FakeSelectorOps {
@@ -467,19 +471,31 @@ mod tests {
     struct LiveSelectorOps {
         client: reqwest::Client,
         token: Option<String>,
+        reviewer_login: String,
         requested_paths: Mutex<Vec<String>>,
     }
 
     impl LiveSelectorOps {
-        fn new() -> Self {
+        fn new(reviewer_login: impl Into<String>) -> Self {
             Self {
-                client: reqwest::Client::new(),
-                token: env::var("MAI_LIVE_GITHUB_TOKEN")
-                    .or_else(|_| env::var("GITHUB_TOKEN"))
-                    .or_else(|_| env::var("GH_TOKEN"))
-                    .ok(),
+                client: reqwest::Client::builder()
+                    .timeout(Duration::from_secs(20))
+                    .build()
+                    .expect("build reqwest client"),
+                token: local_github_token(),
+                reviewer_login: reviewer_login.into(),
                 requested_paths: Mutex::new(Vec::new()),
             }
+        }
+
+        fn new_with_required_local_token(reviewer_login: impl Into<String>) -> Self {
+            let ops = Self::new(reviewer_login);
+            if ops.token.is_none() {
+                panic!(
+                    "live selector test requires MAI_LIVE_GITHUB_TOKEN/GITHUB_TOKEN/GH_TOKEN or `gh auth token`"
+                );
+            }
+            ops
         }
     }
 
@@ -501,7 +517,7 @@ mod tests {
             _project_id: mai_protocol::ProjectId,
         ) -> crate::Result<ProjectReviewIdentity> {
             Ok(ProjectReviewIdentity {
-                login: "mai-live-selector".to_string(),
+                login: self.reviewer_login.clone(),
             })
         }
 
@@ -683,7 +699,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "reads live GitHub data from rcore-os/tgoskits"]
     async fn live_selector_reads_rcore_os_tgoskits_without_enqueueing() {
-        let ops = Arc::new(LiveSelectorOps::new());
+        let ops = Arc::new(LiveSelectorOps::new(live_reviewer_login()));
 
         let selected = select_project_review_candidate(ops.as_ref(), Uuid::new_v4())
             .await
@@ -725,6 +741,161 @@ mod tests {
                 .map(|selection| selection.pr > 0)
                 .unwrap_or(true)
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "uses local GitHub token and reads live rcore-os/tgoskits data"]
+    async fn live_selector_diagnoses_rcore_os_tgoskits_with_local_github_token() {
+        let reviewer_login = live_reviewer_login();
+        let ops = Arc::new(LiveSelectorOps::new_with_required_local_token(
+            reviewer_login.clone(),
+        ));
+
+        let selected = diagnose_live_selection(ops.as_ref(), Uuid::new_v4(), &reviewer_login)
+            .await
+            .expect("diagnose live selection");
+
+        let requested_paths = ops.requested_paths.lock().await;
+        println!(
+            "diagnostic requested {} GitHub API paths for reviewer {}",
+            requested_paths.len(),
+            reviewer_login
+        );
+        match selected {
+            Some(selection) => {
+                println!(
+                    "diagnostic selected rcore-os/tgoskits PR #{} at {:?}",
+                    selection.pr, selection.head_sha
+                );
+            }
+            None => {
+                println!("diagnostic found no eligible rcore-os/tgoskits PR");
+            }
+        }
+        assert!(
+            requested_paths
+                .iter()
+                .all(|path| !path.contains("/responses"))
+        );
+    }
+
+    async fn diagnose_live_selection(
+        ops: &impl ProjectReviewSelectorOps,
+        project_id: mai_protocol::ProjectId,
+        reviewer_login: &str,
+    ) -> crate::Result<Option<SelectedProjectReviewPr>> {
+        let owner = crate::github::github_path_segment("rcore-os");
+        let repo = crate::github::github_path_segment("tgoskits");
+        let mut page = 1_u64;
+        loop {
+            let mut pull_requests =
+                list_open_pull_requests(ops, project_id, &owner, &repo, page).await?;
+            println!("page {page}: {} open PRs", pull_requests.len());
+            if pull_requests.is_empty() {
+                return Ok(None);
+            }
+            pull_requests.sort_by_key(|pull_request| pull_request.number);
+            for pull_request in pull_requests.iter() {
+                let candidate =
+                    pull_request_candidate(ops, project_id, &owner, &repo, pull_request).await?;
+                if let Some(selection) = super::super::selection::select_review_pr(
+                    reviewer_login,
+                    vec![candidate.clone()],
+                ) {
+                    println!(
+                        "#{} eligible head={:?}",
+                        selection.pr,
+                        selection.head_sha.as_deref()
+                    );
+                    return Ok(Some(selected_project_review_pr(selection)));
+                }
+                println!(
+                    "#{} skip {}",
+                    candidate.number,
+                    skip_reason(reviewer_login, &candidate)
+                );
+            }
+            if pull_requests.len() < super::SELECTOR_PAGE_SIZE as usize {
+                return Ok(None);
+            }
+            page += 1;
+        }
+    }
+
+    fn skip_reason(
+        reviewer_login: &str,
+        candidate: &super::super::selection::PullRequestCandidate,
+    ) -> String {
+        if candidate.draft {
+            return "draft".to_string();
+        }
+        let mut pending_ci = Vec::new();
+        pending_ci.extend(candidate.check_signals.iter().filter_map(|signal| {
+            let status = signal.status.as_deref()?;
+            is_pending_ci_state(status).then(|| format!("check_status={status}"))
+        }));
+        if !pending_ci.is_empty() {
+            return format!("ci_pending [{}]", pending_ci.join(", "));
+        }
+        if let Some(review) = latest_reviewer_review(reviewer_login, &candidate.reviews) {
+            if let (Some(commit_id), Some(head_sha)) =
+                (review.commit_id.as_deref(), candidate.head_sha.as_deref())
+                && commit_id == head_sha
+            {
+                return format!(
+                    "reviewed_current_head submitted_at={:?} head={}",
+                    review.submitted_at, head_sha
+                );
+            }
+            if let (Some(submitted_at), Some(latest_commit_at)) =
+                (review.submitted_at, candidate.latest_commit_at)
+                && latest_commit_at <= submitted_at
+            {
+                return format!(
+                    "reviewed_after_latest_commit submitted_at={submitted_at} latest_commit_at={latest_commit_at}"
+                );
+            }
+        }
+        "not selected by unknown rule".to_string()
+    }
+
+    fn latest_reviewer_review<'a>(
+        reviewer_login: &str,
+        reviews: &'a [super::super::selection::PullRequestReview],
+    ) -> Option<&'a super::super::selection::PullRequestReview> {
+        reviews
+            .iter()
+            .filter(|review| review.author_login.as_deref() == Some(reviewer_login))
+            .filter(|review| review.submitted_at.is_some())
+            .max_by_key(|review| review.submitted_at)
+    }
+
+    fn is_pending_ci_state(value: &str) -> bool {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "queued" | "requested" | "waiting" | "pending" | "in_progress"
+        )
+    }
+
+    fn live_reviewer_login() -> String {
+        env::var("MAI_LIVE_REVIEWER_LOGIN").unwrap_or_else(|_| "mai-team-app[bot]".to_string())
+    }
+
+    fn local_github_token() -> Option<String> {
+        env::var("MAI_LIVE_GITHUB_TOKEN")
+            .or_else(|_| env::var("GITHUB_TOKEN"))
+            .or_else(|_| env::var("GH_TOKEN"))
+            .ok()
+            .filter(|token| !token.trim().is_empty())
+            .or_else(|| {
+                let output = Command::new("gh").args(["auth", "token"]).output().ok()?;
+                if !output.status.success() {
+                    return None;
+                }
+                let token = String::from_utf8(output.stdout).ok()?;
+                let token = token.trim().to_string();
+                (!token.is_empty()).then_some(token)
+            })
     }
 
     fn test_project_summary(project_id: mai_protocol::ProjectId) -> mai_protocol::ProjectSummary {
