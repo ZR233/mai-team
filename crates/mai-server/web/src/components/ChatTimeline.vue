@@ -18,7 +18,7 @@
         v-for="item in timelineItems"
         :key="item.key"
         class="timeline-item"
-        :class="`timeline-${item.type}-item`"
+        :class="timelineItemClasses(item)"
       >
         <ChatMessage v-if="item.type === 'message'" :item="item" />
         <SkillCallRow v-else-if="item.type === 'skill_call'" :item="item" />
@@ -51,6 +51,7 @@ import SkillCallRow from './SkillCallRow.vue'
 import ToolCallRow from './ToolCallRow.vue'
 import TodoListRow from './TodoListRow.vue'
 import UserInputRow from './UserInputRow.vue'
+import { timelineItemClasses } from '../utils/timeline'
 
 const props = defineProps({
   timelineItems: { type: Array, default: () => [] },

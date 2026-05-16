@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 
-import { buildAgentTimeline, renderToolTrace } from '../timeline.js'
+import { buildAgentTimeline, renderToolTrace, timelineItemClasses } from '../timeline.js'
 
 const detail = {
   id: 'agent-1',
@@ -54,6 +54,114 @@ assert.equal(skillRow?.title, 'Skills activated')
 assert.equal(skillRow?.summary, '1 skill loaded')
 assert.deepEqual(skillRow?.skills.map((skill) => skill.name), ['Demo Skill'])
 assert.ok(skillRow.sequence < thinkingRow.sequence)
+
+assert.deepEqual(
+  timelineItemClasses({ type: 'message', role: 'assistant' }),
+  ['timeline-message-item', 'timeline-role-assistant']
+)
+assert.deepEqual(
+  timelineItemClasses({ type: 'tool_call', status: 'failed', tone: 'error' }),
+  ['timeline-tool_call-item', 'timeline-status-failed', 'timeline-tone-error']
+)
+
+const streamedTimeline = buildAgentTimeline({
+  id: 'agent-1',
+  selected_session_id: 'session-1',
+  messages: [],
+  recent_events: [
+    {
+      type: 'agent_message_delta',
+      sequence: 1,
+      timestamp: '2026-05-10T00:00:00.000Z',
+      agent_id: 'agent-1',
+      session_id: 'session-1',
+      turn_id: 'turn-1',
+      message_id: 'message-1',
+      role: 'assistant',
+      channel: 'final',
+      delta: 'hello '
+    },
+    {
+      type: 'agent_message_delta',
+      sequence: 2,
+      timestamp: '2026-05-10T00:00:00.050Z',
+      agent_id: 'agent-1',
+      session_id: 'session-1',
+      turn_id: 'turn-1',
+      message_id: 'message-1',
+      role: 'assistant',
+      channel: 'final',
+      delta: 'world'
+    },
+    {
+      type: 'agent_message_completed',
+      sequence: 3,
+      timestamp: '2026-05-10T00:00:00.100Z',
+      agent_id: 'agent-1',
+      session_id: 'session-1',
+      turn_id: 'turn-1',
+      message_id: 'message-1',
+      role: 'assistant',
+      channel: 'final',
+      content: 'hello world'
+    }
+  ]
+})
+const streamedMessage = streamedTimeline.find((item) => item.type === 'message')
+
+assert.equal(streamedMessage?.content, 'hello world')
+assert.equal(streamedMessage?.streaming, false)
+
+const liveStreamingTimeline = buildAgentTimeline(
+  {
+    id: 'agent-1',
+    selected_session_id: 'session-1',
+    messages: [],
+    recent_events: []
+  },
+  [
+    {
+      type: 'agent_message_delta',
+      sequence: 2,
+      timestamp: '2026-05-10T00:00:00.050Z',
+      agent_id: 'agent-1',
+      session_id: 'session-1',
+      turn_id: 'turn-1',
+      message_id: 'message-2',
+      role: 'assistant',
+      channel: 'final',
+      delta: 'hello world'
+    },
+    {
+      type: 'agent_message_delta',
+      sequence: 2,
+      timestamp: '2026-05-10T00:00:00.050Z',
+      agent_id: 'agent-1',
+      session_id: 'session-1',
+      turn_id: 'turn-1',
+      message_id: 'message-2',
+      role: 'assistant',
+      channel: 'final',
+      delta: 'world'
+    },
+    {
+      type: 'agent_message_delta',
+      sequence: 1,
+      timestamp: '2026-05-10T00:00:00.000Z',
+      agent_id: 'agent-1',
+      session_id: 'session-1',
+      turn_id: 'turn-1',
+      message_id: 'message-2',
+      role: 'assistant',
+      channel: 'final',
+      delta: 'hello '
+    }
+  ]
+)
+const liveStreamingMessage = liveStreamingTimeline.find((item) => item.type === 'message')
+
+assert.equal(liveStreamingMessage?.content, 'hello world')
+assert.equal(liveStreamingMessage?.streaming, true)
 
 const contextTimeline = buildAgentTimeline({
   id: 'agent-1',

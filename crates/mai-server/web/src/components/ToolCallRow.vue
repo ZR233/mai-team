@@ -1,6 +1,11 @@
 <template>
-  <div class="tool-row" :class="[`tool-${item.status}`, { open: expanded }]">
-    <button class="tool-row-toggle" type="button" @click="$emit('toggle')">
+  <div class="timeline-row-card tool-row" :class="[`tool-${item.status}`, { open: expanded }]">
+    <button
+      class="tool-row-toggle"
+      type="button"
+      :aria-expanded="expanded"
+      @click="$emit('toggle')"
+    >
       <svg class="tool-chevron" :class="{ open: expanded }" viewBox="0 0 16 16" aria-hidden="true">
         <path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
       </svg>

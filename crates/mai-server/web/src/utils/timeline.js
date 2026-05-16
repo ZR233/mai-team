@@ -231,6 +231,19 @@ export function buildAgentTimeline(detail, liveEvents = []) {
   return items.sort(compareTimelineItems)
 }
 
+export function timelineItemClasses(item) {
+  const classes = [`timeline-${safeClassToken(item?.type || 'event')}-item`]
+  const role = safeClassToken(item?.role)
+  const status = safeClassToken(item?.status)
+  const tone = safeClassToken(item?.tone)
+
+  if (role) classes.push(`timeline-role-${role}`)
+  if (status) classes.push(`timeline-status-${status}`)
+  if (tone) classes.push(`timeline-tone-${tone}`)
+
+  return classes
+}
+
 export function formatDuration(ms) {
   if (ms === null || ms === undefined) return ''
   if (ms < 1000) return `${ms} ms`
@@ -526,8 +539,20 @@ function escapeHtml(value) {
 function mergeEvents(events) {
   const seen = new Set()
   const merged = []
-  for (const event of events) {
-    if (!event) continue
+  const streamIndexes = new Map()
+  for (const event of events.filter(Boolean).sort(compareTimelineItems)) {
+    const streamKey = streamingEventMergeKey(event)
+    if (streamKey) {
+      const existingIndex = streamIndexes.get(streamKey)
+      if (existingIndex !== undefined) {
+        merged[existingIndex] = mergeStreamingTimelineEvent(merged[existingIndex], event)
+      } else {
+        streamIndexes.set(streamKey, merged.length)
+        merged.push({ ...event })
+      }
+      continue
+    }
+
     const key = streamingEventMergeKey(event) || (event.sequence
       ? `seq:${event.sequence}`
       : `${event.type}:${event.call_id || event.turn_id || event.agent_id || ''}:${event.timestamp || ''}`)
@@ -536,6 +561,59 @@ function mergeEvents(events) {
     merged.push(event)
   }
   return merged
+}
+
+function mergeStreamingTimelineEvent(existing, event) {
+  if (!existing) return { ...event }
+  const existingSequence = Number(existing.sequence || 0)
+  const eventSequence = Number(event.sequence || 0)
+  if (eventSequence && existingSequence && eventSequence <= existingSequence && streamingText(existing)) {
+    return existing
+  }
+
+  if (event.type === 'tool_call_delta') {
+    const argumentsDelta = mergeStreamingText(existing.arguments_delta || '', event.arguments_delta || '')
+    return {
+      ...existing,
+      ...event,
+      arguments_delta: argumentsDelta,
+      timestamp: event.timestamp || existing.timestamp,
+      sequence: event.sequence || existing.sequence
+    }
+  }
+
+  const completedType = completedStreamingType(existing, event)
+  const text = event.type.endsWith('_completed')
+    ? (event.content || event.delta || existing.content || existing.delta || '')
+    : mergeStreamingText(existing.delta || existing.content || '', event.delta || '')
+
+  return {
+    ...existing,
+    ...event,
+    type: completedType || event.type,
+    content: event.content || (completedType ? text : existing.content),
+    delta: text,
+    timestamp: event.timestamp || existing.timestamp,
+    sequence: event.sequence || existing.sequence
+  }
+}
+
+function completedStreamingType(existing, event) {
+  if (event.type.endsWith('_completed')) return event.type
+  if (existing.type.endsWith('_completed')) return existing.type
+  return ''
+}
+
+function streamingText(event) {
+  return event.content || event.delta || event.arguments_delta || ''
+}
+
+function mergeStreamingText(existing, next) {
+  if (!next) return existing
+  if (!existing) return next
+  if (next.startsWith(existing)) return next
+  if (existing.endsWith(next)) return existing
+  return `${existing}${next}`
 }
 
 function streamingEventMergeKey(event) {
@@ -577,7 +655,7 @@ function buildStreamingMessages(events) {
       stream.content = `${stream.content || ''}${event.delta || ''}`
       stream.detail = stream.content
     } else {
-      stream.content = event.content || stream.content || ''
+      stream.content = event.content || event.delta || stream.content || ''
       stream.detail = stream.content
       stream.streaming = false
       if (channel === 'final') {
@@ -791,4 +869,12 @@ function hashText(value) {
     hash = ((hash << 5) - hash + String(value).charCodeAt(index)) | 0
   }
   return Math.abs(hash).toString(36)
+}
+
+function safeClassToken(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
 }

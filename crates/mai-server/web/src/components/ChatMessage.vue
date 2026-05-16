@@ -1,9 +1,12 @@
 <template>
-  <div class="timeline-message" :class="messageClass(item.role)">
-    <div class="message-marker" aria-hidden="true">{{ marker }}</div>
+  <div class="timeline-row-card timeline-message" :class="messageClass(item.role)">
+    <span class="message-marker" aria-hidden="true">{{ marker }}</span>
     <div class="message-content">
-      <span>{{ roleLabel(item.role) }}</span>
-      <div class="markdown-body" v-html="renderMarkdown(item.content)"></div>
+      <div class="message-header">
+        <strong>{{ roleLabel(item.role) }}</strong>
+        <span v-if="item.streaming">Streaming</span>
+      </div>
+      <div class="markdown-body timeline-message-body" v-html="renderMarkdown(item.content)"></div>
     </div>
   </div>
 </template>
