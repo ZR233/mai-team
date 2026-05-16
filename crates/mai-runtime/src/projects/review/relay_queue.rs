@@ -51,6 +51,10 @@ impl ProjectReviewRelayQueue {
         self.pending.remove(&pr)
     }
 
+    pub(crate) fn requeue(&mut self, pending: PendingProjectReviewRelaySignal) {
+        self.pending.entry(pending.pr).or_insert(pending);
+    }
+
     pub(crate) fn clear(&mut self) {
         self.pending.clear();
     }

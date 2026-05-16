@@ -22,14 +22,20 @@ pub(crate) mod state;
 pub(crate) mod worker;
 
 const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;
-const PROJECT_REVIEW_SELECTOR_ERROR_RETRY_SECS: u64 = 10;
-const PROJECT_REVIEW_GITHUB_TOKEN_SELECTOR_INTERVAL_SECS: u64 = 1800;
+const PROJECT_REVIEW_SELECTOR_INTERVAL_SECS: u64 = 1800;
 const PROJECT_REVIEW_RETRY_INITIAL_SECS: u64 = 1;
 const PROJECT_REVIEW_FAILURE_RETRY_SECS: u64 = 600;
 const PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL: &str =
     "mcp__github__pull_request_review_write";
 const PROJECT_GITHUB_CREATE_PULL_REQUEST_REVIEW_TOOL: &str =
     "mcp__github__create_pull_request_review";
+
+fn project_review_retry_backoff() -> backoff::ProjectReviewRetryBackoff {
+    backoff::ProjectReviewRetryBackoff::new(backoff::ProjectReviewRetryBackoffConfig {
+        initial_delay: Duration::from_secs(PROJECT_REVIEW_RETRY_INITIAL_SECS),
+        max_delay: Duration::from_secs(PROJECT_REVIEW_FAILURE_RETRY_SECS),
+    })
+}
 
 #[derive(Debug, Clone, Deserialize)]
 struct ProjectReviewCycleReport {

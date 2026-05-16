@@ -5,6 +5,7 @@ use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
 use super::eligibility::SelectedProjectReviewPr;
+use super::project_review_retry_backoff;
 use super::relay_queue::PendingProjectReviewRelaySignal;
 use super::worker::ProjectReviewWorkerOps;
 use crate::{Result, RuntimeError};
@@ -14,6 +15,7 @@ pub(crate) async fn run_project_review_relay_selector_loop(
     project_id: ProjectId,
     cancellation_token: CancellationToken,
 ) {
+    let mut retry_backoff = project_review_retry_backoff();
     loop {
         if cancellation_token.is_cancelled() || !project_still_ready(&ops, project_id).await {
             break;
@@ -45,24 +47,39 @@ pub(crate) async fn run_project_review_relay_selector_loop(
                     pr = signal.pr,
                     "relay PR signal did not satisfy review eligibility"
                 );
+                retry_backoff.reset();
                 continue;
             }
             Err(err) => {
+                let retry_delay = retry_backoff.next_delay();
                 tracing::warn!(
                     project_id = %project_id,
                     pr = signal.pr,
-                    "failed to evaluate relay PR signal; dropping relay signal: {err}"
+                    "failed to evaluate relay PR signal; requeueing relay signal: {err}"
                 );
+                requeue_project_review_relay_signal(&ops, project_id, signal).await;
+                if !wait_for_relay_retry(&cancellation_token, retry_delay).await {
+                    break;
+                }
                 continue;
             }
         };
 
-        if let Err(err) = enqueue_selected_relay_signal(&ops, project_id, signal, selected).await {
+        if let Err(err) =
+            enqueue_selected_relay_signal(&ops, project_id, signal.clone(), selected).await
+        {
+            let retry_delay = retry_backoff.next_delay();
             tracing::warn!(
                 project_id = %project_id,
-                "failed to enqueue eligible relay PR signal; dropping relay signal: {err}"
+                "failed to enqueue eligible relay PR signal; requeueing relay signal: {err}"
             );
+            requeue_project_review_relay_signal(&ops, project_id, signal).await;
+            if !wait_for_relay_retry(&cancellation_token, retry_delay).await {
+                break;
+            }
+            continue;
         }
+        retry_backoff.reset();
     }
 }
 
@@ -94,6 +111,17 @@ async fn next_project_review_relay_signal(
     Ok(project.relay_review_queue.lock().await.next())
 }
 
+async fn requeue_project_review_relay_signal(
+    ops: &impl ProjectReviewWorkerOps,
+    project_id: ProjectId,
+    signal: PendingProjectReviewRelaySignal,
+) {
+    if let Ok(project) = ops.project(project_id).await {
+        project.relay_review_queue.lock().await.requeue(signal);
+        project.relay_review_notify.notify_waiters();
+    }
+}
+
 async fn wait_for_project_review_relay_signal(
     ops: &impl ProjectReviewWorkerOps,
     project_id: ProjectId,
@@ -111,6 +139,10 @@ async fn wait_for_project_review_relay_signal(
         _ = sleep(Duration::from_secs(1)) => {}
         _ = cancellation_token.cancelled() => {}
     }
+}
+
+async fn wait_for_relay_retry(cancellation_token: &CancellationToken, delay: Duration) -> bool {
+    wait_or_cancel(cancellation_token, delay).await
 }
 
 async fn project_still_ready(ops: &impl ProjectReviewWorkerOps, project_id: ProjectId) -> bool {

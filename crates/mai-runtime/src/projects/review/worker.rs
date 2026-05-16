@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::{AbortHandle, Abortable};
 use mai_protocol::{
     AgentId, AgentSummary, GitProvider, ProjectCloneStatus, ProjectId, ProjectReviewOutcome,
@@ -12,9 +12,9 @@ use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
 use super::ProjectReviewCycleResult;
-use super::backoff::{ProjectReviewRetryBackoff, ProjectReviewRetryBackoffConfig};
 use super::eligibility::SelectedProjectReviewPr;
 use super::pool::PendingProjectReview;
+use super::project_review_retry_backoff;
 use super::runs::FinishReviewRun;
 use super::selector::ProjectReviewSelectorRunResult;
 use super::state::ReviewStateUpdate;
@@ -251,12 +251,9 @@ pub(crate) async fn start_project_review_loop_if_ready(
         ),
     );
     let selector_abort_handle = match git_provider {
-        Some(GitProvider::GithubAppRelay) => Some(spawn_project_review_child(
-            run_github_app_selector_until_success(context.clone()),
-        )),
-        Some(GitProvider::Github) => Some(spawn_project_review_child(
-            run_github_token_selector_loop(context.clone()),
-        )),
+        Some(GitProvider::Github) | Some(GitProvider::GithubAppRelay) => Some(
+            spawn_project_review_child(run_project_review_selector_loop(context.clone())),
+        ),
         None => None,
     };
     *worker = Some(ProjectReviewWorker {
@@ -492,24 +489,42 @@ async fn run_project_review_pool_worker(
     }
 }
 
-async fn run_github_app_selector_until_success(
+async fn run_project_review_selector_loop(
     ops: ProjectReviewTaskContext<impl ProjectReviewWorkerOps>,
 ) {
+    run_project_review_selector_loop_with_interval(
+        ops,
+        Duration::from_secs(super::PROJECT_REVIEW_SELECTOR_INTERVAL_SECS),
+    )
+    .await;
+}
+
+async fn run_project_review_selector_loop_with_interval(
+    ops: ProjectReviewTaskContext<impl ProjectReviewWorkerOps>,
+    scan_interval: Duration,
+) {
+    let mut selector_backoff = project_review_retry_backoff();
     loop {
         if ops.cancellation_token.is_cancelled() || !project_still_ready(&ops).await {
             break;
         }
-        match run_selector_attempt(&ops, None).await {
-            Ok(_) => break,
+
+        let retry_delay = selector_backoff.next_delay();
+        let schedule = ProjectReviewSelectorAttemptSchedule {
+            normal_delay: scan_interval,
+            retry_delay,
+        };
+        match run_selector_attempt(&ops, schedule).await {
+            Ok(_) => {
+                selector_backoff.reset();
+                if !wait_or_cancel(&ops.cancellation_token, scan_interval).await {
+                    break;
+                }
+            }
             Err(RuntimeError::TurnCancelled) if ops.cancellation_token.is_cancelled() => break,
             Err(err) => {
                 tracing::warn!(project_id = %ops.project_id, "project review selector failed: {err}");
-                if !wait_or_cancel(
-                    &ops.cancellation_token,
-                    Duration::from_secs(super::PROJECT_REVIEW_SELECTOR_ERROR_RETRY_SECS),
-                )
-                .await
-                {
+                if !wait_or_cancel(&ops.cancellation_token, retry_delay).await {
                     break;
                 }
             }
@@ -517,51 +532,26 @@ async fn run_github_app_selector_until_success(
     }
 }
 
-async fn run_github_token_selector_loop(
-    ops: ProjectReviewTaskContext<impl ProjectReviewWorkerOps>,
-) {
-    loop {
-        if ops.cancellation_token.is_cancelled() || !project_still_ready(&ops).await {
-            break;
-        }
-        match run_selector_attempt(
-            &ops,
-            Some(Duration::from_secs(
-                super::PROJECT_REVIEW_GITHUB_TOKEN_SELECTOR_INTERVAL_SECS,
-            )),
-        )
-        .await
-        {
-            Ok(_) => {
-                if !wait_or_cancel(
-                    &ops.cancellation_token,
-                    Duration::from_secs(super::PROJECT_REVIEW_GITHUB_TOKEN_SELECTOR_INTERVAL_SECS),
-                )
-                .await
-                {
-                    break;
-                }
-            }
-            Err(RuntimeError::TurnCancelled) if ops.cancellation_token.is_cancelled() => break,
-            Err(err) => {
-                tracing::warn!(project_id = %ops.project_id, "project review selector failed: {err}");
-                if !wait_or_cancel(
-                    &ops.cancellation_token,
-                    Duration::from_secs(super::PROJECT_REVIEW_SELECTOR_ERROR_RETRY_SECS),
-                )
-                .await
-                {
-                    break;
-                }
-            }
+#[derive(Debug, Clone, Copy)]
+struct ProjectReviewSelectorAttemptSchedule {
+    normal_delay: Duration,
+    retry_delay: Duration,
+}
+
+impl From<Duration> for ProjectReviewSelectorAttemptSchedule {
+    fn from(delay: Duration) -> Self {
+        Self {
+            normal_delay: delay,
+            retry_delay: delay,
         }
     }
 }
 
 async fn run_selector_attempt(
     ops: &ProjectReviewTaskContext<impl ProjectReviewWorkerOps>,
-    next_success_scan_after: Option<Duration>,
+    schedule: impl Into<ProjectReviewSelectorAttemptSchedule>,
 ) -> Result<ProjectReviewSelectorRunResult> {
+    let schedule = schedule.into();
     set_selector_state_if_visible(
         ops,
         ProjectReviewStatus::Selecting,
@@ -584,13 +574,11 @@ async fn run_selector_attempt(
                     .await;
                 }
                 ProjectReviewSelectorRunResult::NoEligiblePr => {
-                    let next_review_at = next_success_scan_after
-                        .map(|delay| Utc::now() + TimeDelta::seconds(delay.as_secs() as i64));
                     set_selector_state_if_visible(
                         ops,
                         ProjectReviewStatus::Waiting,
                         ReviewStateUpdate {
-                            next_review_at,
+                            next_review_at: next_review_at_after(schedule.normal_delay),
                             outcome: Some(ProjectReviewOutcome::NoEligiblePr),
                             ..Default::default()
                         },
@@ -604,17 +592,11 @@ async fn run_selector_attempt(
             if !(matches!(err, RuntimeError::TurnCancelled)
                 && ops.cancellation_token.is_cancelled())
             {
-                let next_review_at = Some(
-                    Utc::now()
-                        + TimeDelta::seconds(
-                            super::PROJECT_REVIEW_SELECTOR_ERROR_RETRY_SECS as i64,
-                        ),
-                );
                 set_selector_state_if_visible(
                     ops,
                     ProjectReviewStatus::Waiting,
                     ReviewStateUpdate {
-                        next_review_at,
+                        next_review_at: next_review_at_after(schedule.retry_delay),
                         error: Some(err.to_string()),
                         ..Default::default()
                     },
@@ -624,6 +606,10 @@ async fn run_selector_attempt(
             Err(err)
         }
     }
+}
+
+fn next_review_at_after(delay: Duration) -> Option<DateTime<Utc>> {
+    (!delay.is_zero()).then(|| Utc::now() + TimeDelta::seconds(delay.as_secs() as i64))
 }
 
 async fn set_selector_state_if_visible(
@@ -671,13 +657,6 @@ async fn wait_or_cancel(cancellation_token: &CancellationToken, delay: Duration)
         _ = sleep(delay) => true,
         _ = cancellation_token.cancelled() => false,
     }
-}
-
-fn project_review_retry_backoff() -> ProjectReviewRetryBackoff {
-    ProjectReviewRetryBackoff::new(ProjectReviewRetryBackoffConfig {
-        initial_delay: Duration::from_secs(super::PROJECT_REVIEW_RETRY_INITIAL_SECS),
-        max_delay: Duration::from_secs(super::PROJECT_REVIEW_FAILURE_RETRY_SECS),
-    })
 }
 
 async fn next_project_review_signal(
@@ -748,8 +727,16 @@ mod tests {
     struct ReviewStateSnapshot {
         status: ProjectReviewStatus,
         next_review_at_set: bool,
+        next_review_after_secs: Option<i64>,
         outcome: Option<ProjectReviewOutcome>,
         error: Option<String>,
+    }
+
+    #[derive(Clone)]
+    enum FakeSelectorBehavior {
+        NoEligiblePr,
+        Queued,
+        Error(&'static str),
     }
 
     #[derive(Clone)]
@@ -759,8 +746,11 @@ mod tests {
         selector_started: Arc<Notify>,
         release_selector: Arc<Notify>,
         selector_calls: Arc<Mutex<u64>>,
+        selector_behaviors: Arc<Mutex<Vec<FakeSelectorBehavior>>>,
         relay_selection_calls: Arc<Mutex<Vec<u64>>>,
         failed_relay_prs: Arc<Mutex<Vec<u64>>>,
+        ineligible_relay_prs: Arc<Mutex<Vec<u64>>>,
+        failed_enqueue_prs: Arc<Mutex<Vec<u64>>>,
         reviewed_prs: Arc<Mutex<Vec<Option<u64>>>>,
         git_provider: mai_protocol::GitProvider,
     }
@@ -773,8 +763,11 @@ mod tests {
                 selector_started: Arc::new(Notify::new()),
                 release_selector: Arc::new(Notify::new()),
                 selector_calls: Arc::new(Mutex::new(0)),
+                selector_behaviors: Arc::new(Mutex::new(Vec::new())),
                 relay_selection_calls: Arc::new(Mutex::new(Vec::new())),
                 failed_relay_prs: Arc::new(Mutex::new(Vec::new())),
+                ineligible_relay_prs: Arc::new(Mutex::new(Vec::new())),
+                failed_enqueue_prs: Arc::new(Mutex::new(Vec::new())),
                 reviewed_prs: Arc::new(Mutex::new(Vec::new())),
                 git_provider: mai_protocol::GitProvider::Github,
             }
@@ -783,6 +776,10 @@ mod tests {
         fn with_git_provider(mut self, git_provider: mai_protocol::GitProvider) -> Self {
             self.git_provider = git_provider;
             self
+        }
+
+        async fn push_selector_behavior(&self, behavior: FakeSelectorBehavior) {
+            self.selector_behaviors.lock().await.push(behavior);
         }
     }
 
@@ -838,9 +835,13 @@ mod tests {
             status: ProjectReviewStatus,
             update: ReviewStateUpdate,
         ) -> crate::Result<ProjectSummary> {
+            let next_review_after_secs = update
+                .next_review_at
+                .map(|next| (next - chrono::Utc::now()).num_seconds());
             self.states.lock().await.push(ReviewStateSnapshot {
                 status: status.clone(),
                 next_review_at_set: update.next_review_at.is_some(),
+                next_review_after_secs,
                 outcome: update.outcome.clone(),
                 error: update.error.clone(),
             });
@@ -872,6 +873,24 @@ mod tests {
         ) -> crate::Result<ProjectReviewSelectorRunResult> {
             *self.selector_calls.lock().await += 1;
             self.selector_started.notify_waiters();
+            let behavior = {
+                let mut behaviors = self.selector_behaviors.lock().await;
+                (!behaviors.is_empty()).then(|| behaviors.remove(0))
+            };
+            if let Some(behavior) = behavior {
+                return match behavior {
+                    FakeSelectorBehavior::NoEligiblePr => {
+                        Ok(ProjectReviewSelectorRunResult::NoEligiblePr)
+                    }
+                    FakeSelectorBehavior::Queued => Ok(ProjectReviewSelectorRunResult::Queued {
+                        selected: Vec::new(),
+                        queue: crate::ProjectReviewQueueSummary::default(),
+                    }),
+                    FakeSelectorBehavior::Error(message) => {
+                        Err(crate::RuntimeError::InvalidInput(message.to_string()))
+                    }
+                };
+            }
             self.release_selector.notified().await;
             Ok(ProjectReviewSelectorRunResult::NoEligiblePr)
         }
@@ -888,6 +907,9 @@ mod tests {
                     "failed relay pr {pr}"
                 )));
             }
+            if self.ineligible_relay_prs.lock().await.contains(&pr) {
+                return Ok(None);
+            }
             Ok(Some(SelectedProjectReviewPr {
                 pr,
                 head_sha: head_sha_hint,
@@ -899,6 +921,15 @@ mod tests {
             _project_id: Uuid,
             signals: Vec<ProjectReviewSignalInput>,
         ) -> crate::Result<crate::ProjectReviewQueueSummary> {
+            let failed_enqueue_prs = self.failed_enqueue_prs.lock().await;
+            if signals
+                .iter()
+                .any(|signal| failed_enqueue_prs.contains(&signal.pr))
+            {
+                return Err(crate::RuntimeError::InvalidInput(
+                    "failed to enqueue review signal".to_string(),
+                ));
+            }
             let summary = self.project.review_pool.lock().await.enqueue_many(signals);
             self.project.review_notify.notify_waiters();
             Ok(summary.into())
@@ -943,7 +974,7 @@ mod tests {
                 project_id,
                 cancellation_token: CancellationToken::new(),
             };
-            run_selector_attempt(&context, None)
+            run_selector_attempt(&context, std::time::Duration::ZERO)
                 .await
                 .expect("run selector");
         });
@@ -967,18 +998,149 @@ mod tests {
                 ReviewStateSnapshot {
                     status: ProjectReviewStatus::Selecting,
                     next_review_at_set: false,
+                    next_review_after_secs: None,
                     outcome: None,
                     error: None,
                 },
                 ReviewStateSnapshot {
                     status: ProjectReviewStatus::Waiting,
                     next_review_at_set: false,
+                    next_review_after_secs: None,
                     outcome: Some(ProjectReviewOutcome::NoEligiblePr),
                     error: None,
                 },
             ],
             states
         );
+    }
+
+    #[tokio::test]
+    async fn selector_attempt_uses_caller_retry_delay_for_errors() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        ops.push_selector_behavior(FakeSelectorBehavior::Error("selector boom"))
+            .await;
+
+        let context = ProjectReviewTaskContext {
+            ops: ops.clone(),
+            project_id,
+            cancellation_token: CancellationToken::new(),
+        };
+        let result = run_selector_attempt(&context, std::time::Duration::from_secs(1)).await;
+
+        assert!(result.is_err());
+        let states = ops.states.lock().await.clone();
+        assert_eq!(ProjectReviewStatus::Selecting, states[0].status);
+        assert_eq!(ProjectReviewStatus::Waiting, states[1].status);
+        assert_eq!(
+            Some("invalid input: selector boom".to_string()),
+            states[1].error
+        );
+        assert_delay_near(states[1].next_review_after_secs, 1);
+    }
+
+    #[test]
+    fn selector_retry_backoff_starts_at_one_second_and_doubles() {
+        let mut backoff = super::super::project_review_retry_backoff();
+
+        assert_eq!(std::time::Duration::from_secs(1), backoff.next_delay());
+        assert_eq!(std::time::Duration::from_secs(2), backoff.next_delay());
+        assert_eq!(std::time::Duration::from_secs(4), backoff.next_delay());
+    }
+
+    #[tokio::test]
+    async fn selector_attempt_uses_scan_interval_after_no_eligible_pr() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        ops.push_selector_behavior(FakeSelectorBehavior::NoEligiblePr)
+            .await;
+
+        let context = ProjectReviewTaskContext {
+            ops: ops.clone(),
+            project_id,
+            cancellation_token: CancellationToken::new(),
+        };
+        run_selector_attempt(&context, std::time::Duration::from_secs(1800))
+            .await
+            .expect("selector attempt");
+
+        let states = ops.states.lock().await.clone();
+        assert_eq!(ProjectReviewStatus::Waiting, states[1].status);
+        assert_eq!(Some(ProjectReviewOutcome::NoEligiblePr), states[1].outcome);
+        assert_delay_near(states[1].next_review_after_secs, 1800);
+    }
+
+    #[tokio::test]
+    async fn selector_attempt_sets_idle_after_queued_result() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        ops.push_selector_behavior(FakeSelectorBehavior::Queued)
+            .await;
+
+        let context = ProjectReviewTaskContext {
+            ops: ops.clone(),
+            project_id,
+            cancellation_token: CancellationToken::new(),
+        };
+        run_selector_attempt(&context, std::time::Duration::from_secs(1800))
+            .await
+            .expect("selector attempt");
+
+        let states = ops.states.lock().await.clone();
+        assert_eq!(
+            vec![
+                ReviewStateSnapshot {
+                    status: ProjectReviewStatus::Selecting,
+                    next_review_at_set: false,
+                    next_review_after_secs: None,
+                    outcome: None,
+                    error: None,
+                },
+                ReviewStateSnapshot {
+                    status: ProjectReviewStatus::Idle,
+                    next_review_at_set: false,
+                    next_review_after_secs: None,
+                    outcome: None,
+                    error: None,
+                },
+            ],
+            states
+        );
+    }
+
+    #[tokio::test]
+    async fn selector_loop_continues_after_app_no_eligible_pr_success() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id)
+            .with_git_provider(mai_protocol::GitProvider::GithubAppRelay);
+        ops.push_selector_behavior(FakeSelectorBehavior::NoEligiblePr)
+            .await;
+        ops.push_selector_behavior(FakeSelectorBehavior::NoEligiblePr)
+            .await;
+        let token = CancellationToken::new();
+        let context = ProjectReviewTaskContext {
+            ops: ops.clone(),
+            project_id,
+            cancellation_token: token.clone(),
+        };
+        let selector_task = tokio::spawn(async move {
+            super::run_project_review_selector_loop_with_interval(
+                context,
+                std::time::Duration::from_millis(5),
+            )
+            .await;
+        });
+
+        for _ in 0..20 {
+            if *ops.selector_calls.lock().await >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(2, *ops.selector_calls.lock().await);
+        token.cancel();
+        selector_task.await.expect("selector loop task");
     }
 
     #[tokio::test]
@@ -1070,7 +1232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_selector_drops_failed_signal_and_continues() {
+    async fn relay_selector_requeues_failed_signal_and_waits() {
         let project_id = Uuid::new_v4();
         let ops = FakeWorkerOps::new(project_id);
         ops.failed_relay_prs.lock().await.push(11);
@@ -1104,41 +1266,135 @@ mod tests {
         ops.project.relay_review_notify.notify_waiters();
 
         for _ in 0..20 {
-            if ops.relay_selection_calls.lock().await.len() >= 2 {
+            if !ops.relay_selection_calls.lock().await.is_empty() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        assert_eq!(vec![11, 12], *ops.relay_selection_calls.lock().await);
-        let mut pool = ops.project.review_pool.lock().await;
-        let pending = pool
-            .next()
-            .expect("second relay signal entered review pool");
-        assert_eq!(12, pending.pr);
-        assert_eq!(None, pool.next());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(vec![11], *ops.relay_selection_calls.lock().await);
+        assert_eq!(None, ops.project.review_pool.lock().await.next());
+        let mut queue = ops.project.relay_review_queue.lock().await;
+        assert_eq!(Some(11), queue.next().map(|signal| signal.pr));
+        assert_eq!(Some(12), queue.next().map(|signal| signal.pr));
 
         token.cancel();
         relay_task.await.expect("relay selector task");
     }
 
     #[tokio::test]
-    async fn github_app_selector_started_with_project_tasks_runs_once_after_success() {
+    async fn relay_selector_drops_ineligible_signal_without_retry() {
         let project_id = Uuid::new_v4();
-        let ops = FakeWorkerOps::new(project_id)
-            .with_git_provider(mai_protocol::GitProvider::GithubAppRelay);
+        let ops = FakeWorkerOps::new(project_id);
+        ops.ineligible_relay_prs.lock().await.push(21);
+        let token = CancellationToken::new();
+        let task_ops = ops.clone();
+        let task_token = token.clone();
+        let relay_task = tokio::spawn(async move {
+            super::run_project_review_relay_selector_loop_for_test(
+                task_ops, project_id, task_token,
+            )
+            .await;
+        });
 
-        super::start_project_review_loop_if_ready(ops.clone(), project_id)
-            .await
-            .expect("start review tasks");
+        {
+            let mut queue = ops.project.relay_review_queue.lock().await;
+            queue.enqueue_many([ProjectReviewRelaySignalInput {
+                pr: 21,
+                head_sha: Some("head-21".to_string()),
+                delivery_id: Some("delivery-21".to_string()),
+                reason: "check_run".to_string(),
+            }]);
+        }
+        ops.project.relay_review_notify.notify_waiters();
 
-        ops.selector_started.notified().await;
-        assert_eq!(1, *ops.selector_calls.lock().await);
-        ops.release_selector.notify_waiters();
+        for _ in 0..20 {
+            if !ops.relay_selection_calls.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(vec![21], *ops.relay_selection_calls.lock().await);
+        assert_eq!(None, ops.project.review_pool.lock().await.next());
+        assert_eq!(None, ops.project.relay_review_queue.lock().await.next());
+
+        token.cancel();
+        relay_task.await.expect("relay selector task");
+    }
+
+    #[tokio::test]
+    async fn relay_selector_requeues_when_pool_enqueue_fails() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        ops.failed_enqueue_prs.lock().await.push(22);
+        let token = CancellationToken::new();
+        let task_ops = ops.clone();
+        let task_token = token.clone();
+        let relay_task = tokio::spawn(async move {
+            super::run_project_review_relay_selector_loop_for_test(
+                task_ops, project_id, task_token,
+            )
+            .await;
+        });
+
+        {
+            let mut queue = ops.project.relay_review_queue.lock().await;
+            queue.enqueue_many([ProjectReviewRelaySignalInput {
+                pr: 22,
+                head_sha: Some("head-22".to_string()),
+                delivery_id: Some("delivery-22".to_string()),
+                reason: "check_run".to_string(),
+            }]);
+        }
+        ops.project.relay_review_notify.notify_waiters();
+
+        for _ in 0..20 {
+            if !ops.relay_selection_calls.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(1, *ops.selector_calls.lock().await);
+        assert_eq!(vec![22], *ops.relay_selection_calls.lock().await);
+        assert_eq!(None, ops.project.review_pool.lock().await.next());
+        let requeued = ops
+            .project
+            .relay_review_queue
+            .lock()
+            .await
+            .next()
+            .expect("failed enqueue signal was requeued");
+        assert_eq!(22, requeued.pr);
+        assert_eq!(Some("delivery-22".to_string()), requeued.delivery_id);
+        assert_eq!(Some("head-22".to_string()), requeued.head_sha);
+        assert_eq!("check_run", requeued.reason);
 
-        super::stop_project_review_loop(ops, project_id, 10).await;
+        token.cancel();
+        relay_task.await.expect("relay selector task");
+    }
+
+    #[tokio::test]
+    async fn selector_worker_starts_for_github_token_and_github_app_providers() {
+        for git_provider in [
+            mai_protocol::GitProvider::Github,
+            mai_protocol::GitProvider::GithubAppRelay,
+        ] {
+            let project_id = Uuid::new_v4();
+            let ops = FakeWorkerOps::new(project_id).with_git_provider(git_provider);
+
+            super::start_project_review_loop_if_ready(ops.clone(), project_id)
+                .await
+                .expect("start review tasks");
+
+            ops.selector_started.notified().await;
+            assert_eq!(1, *ops.selector_calls.lock().await);
+            ops.release_selector.notify_waiters();
+
+            super::stop_project_review_loop(ops, project_id, 10).await;
+        }
     }
 
     #[tokio::test]
@@ -1157,7 +1413,7 @@ mod tests {
                 project_id,
                 cancellation_token: CancellationToken::new(),
             };
-            run_selector_attempt(&context, None)
+            run_selector_attempt(&context, std::time::Duration::ZERO)
                 .await
                 .expect("run selector");
         });
@@ -1167,6 +1423,14 @@ mod tests {
         selector_task.await.expect("selector task");
 
         assert_eq!(Vec::<ReviewStateSnapshot>::new(), *ops.states.lock().await);
+    }
+
+    fn assert_delay_near(actual: Option<i64>, expected: i64) {
+        let actual = actual.expect("next review delay");
+        assert!(
+            (expected - 2..=expected).contains(&actual),
+            "expected next review delay near {expected}s, got {actual}s"
+        );
     }
 
     fn test_project_summary(project_id: Uuid) -> ProjectSummary {
