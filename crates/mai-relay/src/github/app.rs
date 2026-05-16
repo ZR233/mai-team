@@ -501,6 +501,8 @@ mod tests {
         );
         assert_eq!(manifest["default_permissions"]["contents"], "write");
         assert_eq!(manifest["default_permissions"]["packages"], "read");
+        assert_eq!(manifest["default_permissions"]["checks"], "read");
+        assert_eq!(manifest["default_permissions"]["statuses"], "read");
         assert_eq!(manifest["default_events"][0], "pull_request");
         assert_eq!(manifest["public"], true);
         assert_eq!(manifest["webhook_secret"], "secret");

@@ -14,7 +14,7 @@ mod app;
 mod packages;
 mod service;
 
-pub(crate) use accounts::{GitAccountService, VerifiedGithubRepository};
+pub(crate) use accounts::{GitAccountService, GitAccountToken, VerifiedGithubRepository};
 pub use app::DirectGithubAppBackend;
 pub use app::GithubAppBackend;
 pub(crate) use packages::repository_packages_with_token;

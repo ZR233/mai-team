@@ -202,7 +202,10 @@ async fn wait_for_agent_idle(runtime: Arc<AgentRuntime>, agent_id: AgentId, time
                 runtime
                     .get_agent(agent_id, None)
                     .await
-                    .map(|agent| agent.summary.current_turn.is_none())
+                    .map(|agent| {
+                        agent.summary.current_turn.is_none()
+                            && agent.summary.status.can_start_turn()
+                    })
                     .unwrap_or(false)
             }
         },
@@ -653,6 +656,26 @@ fn ready_test_project_summary(
     summary.status = ProjectStatus::Ready;
     summary.clone_status = ProjectCloneStatus::Ready;
     summary
+}
+
+fn github_pr(number: u64, draft: bool, head_sha: &str) -> Value {
+    json!({
+        "number": number,
+        "draft": draft,
+        "head": {
+            "sha": head_sha,
+        },
+    })
+}
+
+fn github_commit(date: &str) -> Value {
+    json!({
+        "commit": {
+            "committer": {
+                "date": date,
+            }
+        }
+    })
 }
 
 fn test_mcp_tool(server: &str, name: &str) -> McpTool {
@@ -1235,7 +1258,9 @@ exit 0
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&docker).expect("slow docker metadata").permissions();
+        let mut permissions = fs::metadata(&docker)
+            .expect("slow docker metadata")
+            .permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&docker, permissions).expect("chmod slow docker");
     }
@@ -1270,7 +1295,10 @@ exit 0
         .get_environment(environment.id, None)
         .await
         .expect("environment detail");
-    assert_eq!(detail.root_agent.summary.status, AgentStatus::StartingContainer);
+    assert_eq!(
+        detail.root_agent.summary.status,
+        AgentStatus::StartingContainer
+    );
     wait_until(
         || {
             let runtime = Arc::clone(&runtime);
@@ -1357,6 +1385,12 @@ async fn send_environment_message_targets_selected_conversation_without_plan_tra
         .create_environment("Chat".to_string(), Some("ubuntu:latest".to_string()))
         .await
         .expect("create environment");
+    wait_for_agent_idle(
+        Arc::clone(&runtime),
+        environment.root_agent_id,
+        std::time::Duration::from_secs(3),
+    )
+    .await;
     let second = runtime
         .create_environment_conversation(environment.id)
         .await
@@ -1418,6 +1452,12 @@ async fn environment_root_model_update_before_send_and_busy_rejection_remain() {
         .create_environment("Chat".to_string(), Some("ubuntu:latest".to_string()))
         .await
         .expect("create environment");
+    wait_for_agent_idle(
+        Arc::clone(&runtime),
+        environment.root_agent_id,
+        std::time::Duration::from_secs(3),
+    )
+    .await;
 
     let updated = runtime
         .update_agent(
@@ -4961,7 +5001,9 @@ async fn project_subagent_turn_syncs_project_skill_to_container() {
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     runtime.state.project_mcp_managers.write().await.insert(
         project_id,
-        Arc::new(McpAgentManager::from_tools_for_test(Vec::new())),
+        projects::mcp::ProjectMcpManagerHandle::without_token_expiry(Arc::new(
+            McpAgentManager::from_tools_for_test(Vec::new()),
+        )),
     );
     let project = runtime.project(project_id).await.expect("project");
     *project.sidecar.write().await = Some(ContainerHandle {
@@ -5121,6 +5163,83 @@ async fn project_selector_can_queue_review_prs() {
 }
 
 #[tokio::test]
+async fn project_review_selector_pages_and_queues_one_pr_without_model_request() {
+    let mut page_one = vec![github_pr(1, false, "head-1")];
+    page_one.extend((2..=20).map(|number| github_pr(number, true, &format!("head-{number}"))));
+    let mut responses = vec![
+        Value::Array(page_one),
+        github_pr(1, false, "head-1"),
+        json!([]),
+        github_commit("2026-01-01T00:00:00Z"),
+        json!({"check_runs": [{"status": "in_progress", "conclusion": null}]}),
+        json!({"state": "success"}),
+    ];
+    responses.extend((2..=20).map(|number| github_pr(number, true, &format!("head-{number}"))));
+    responses.extend([
+        json!([github_pr(21, false, "head-21")]),
+        github_pr(21, false, "head-21"),
+        json!([]),
+        github_commit("2026-01-21T00:00:00Z"),
+        json!({"check_runs": [{"status": "completed", "conclusion": "failure"}]}),
+        json!({"state": "failure"}),
+    ]);
+    let (base_url, requests) = start_mock_responses(responses).await;
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            provider: GitProvider::Github,
+            label: "GitHub".to_string(),
+            login: Some("mai-bot".to_string()),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut project = test_project_summary(project_id, maintainer_id, "account-1");
+    project.auto_review_enabled = true;
+    project.review_status = ProjectReviewStatus::Idle;
+    store.save_project(&project).await.expect("save project");
+    let runtime = test_runtime_with_github_api(&dir, Arc::clone(&store), base_url).await;
+
+    projects::review::selector::run_project_review_selector(
+        &runtime,
+        project_id,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("run selector");
+
+    let project_record = runtime.project(project_id).await.expect("project");
+    let pending = project_record
+        .review_pool
+        .lock()
+        .await
+        .next()
+        .expect("queued pr");
+    assert_eq!(pending.pr, 21);
+    assert_eq!(pending.head_sha.as_deref(), Some("head-21"));
+    let request_lines = requests
+        .lock()
+        .await
+        .iter()
+        .filter_map(|request| request.get("request_line").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    assert!(request_lines.iter().any(|line| line.contains(
+        "GET /repos/owner/repo/pulls?state=open&sort=created&direction=asc&per_page=20&page=1 "
+    )));
+    assert!(request_lines.iter().any(|line| line.contains(
+        "GET /repos/owner/repo/pulls?state=open&sort=created&direction=asc&per_page=20&page=2 "
+    )));
+    assert!(!request_lines.iter().any(|line| line.contains("/responses")));
+}
+
+#[tokio::test]
 async fn project_maintainer_can_spawn_agent() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
@@ -5224,7 +5343,9 @@ async fn project_agent_mcp_tools_match_project_manager_discovery() {
     ];
     runtime.state.project_mcp_managers.write().await.insert(
         project_id,
-        Arc::new(McpAgentManager::from_tools_for_test(discovered.clone())),
+        projects::mcp::ProjectMcpManagerHandle::without_token_expiry(Arc::new(
+            McpAgentManager::from_tools_for_test(discovered.clone()),
+        )),
     );
     let maintainer_record = runtime.agent(maintainer_id).await.expect("maintainer");
 
@@ -5446,14 +5567,16 @@ async fn project_agent_lists_project_mcp_and_skill_resources() {
     );
     runtime.state.project_mcp_managers.write().await.insert(
         project_id,
-        Arc::new(McpAgentManager::from_resources_for_test(vec![(
-            "github",
-            vec![json!({
-                "uri": "github://pulls",
-                "name": "pulls",
-                "mimeType": "application/json"
-            })],
-        )])),
+        projects::mcp::ProjectMcpManagerHandle::without_token_expiry(Arc::new(
+            McpAgentManager::from_resources_for_test(vec![(
+                "github",
+                vec![json!({
+                    "uri": "github://pulls",
+                    "name": "pulls",
+                    "mimeType": "application/json"
+                })],
+            )]),
+        )),
     );
 
     let result = runtime
@@ -6666,7 +6789,9 @@ async fn project_reviewer_instructions_include_extra_prompt_project_skill() {
     });
     runtime.state.project_mcp_managers.write().await.insert(
         project_id,
-        Arc::new(McpAgentManager::from_tools_for_test(Vec::new())),
+        projects::mcp::ProjectMcpManagerHandle::without_token_expiry(Arc::new(
+            McpAgentManager::from_tools_for_test(Vec::new()),
+        )),
     );
     write_project_skill(
         &runtime,
@@ -6985,9 +7110,9 @@ async fn delete_project_removes_project_mcp_manager() {
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     runtime.state.project_mcp_managers.write().await.insert(
         project_id,
-        Arc::new(McpAgentManager::from_tools_for_test(vec![test_mcp_tool(
-            "github", "get_me",
-        )])),
+        projects::mcp::ProjectMcpManagerHandle::without_token_expiry(Arc::new(
+            McpAgentManager::from_tools_for_test(vec![test_mcp_tool("github", "get_me")]),
+        )),
     );
 
     runtime.delete_project(project_id).await.expect("delete");

@@ -156,7 +156,9 @@ pub(crate) trait TaskCreateOps: Send + Sync {
 
 /// Supplies root agent creation and turn side effects for chat environments.
 pub(crate) trait EnvironmentOps: TaskUpdateOps {
-    fn environment_model(&self) -> impl Future<Output = Result<Option<AgentModelPreference>>> + Send;
+    fn environment_model(
+        &self,
+    ) -> impl Future<Output = Result<Option<AgentModelPreference>>> + Send;
 
     fn create_environment_root_agent(
         &self,

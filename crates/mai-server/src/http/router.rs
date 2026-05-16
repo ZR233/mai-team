@@ -253,7 +253,9 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/agents/{id}/cancel", post(handlers::agents::cancel_agent))
         .fallback(get(routes::assets::static_fallback))
-        .layer(PropagateRequestIdLayer::new(HeaderName::from_static("x-request-id")))
+        .layer(PropagateRequestIdLayer::new(HeaderName::from_static(
+            "x-request-id",
+        )))
         .layer(TraceLayer::new_for_http())
         .layer(SetRequestIdLayer::new(
             HeaderName::from_static("x-request-id"),

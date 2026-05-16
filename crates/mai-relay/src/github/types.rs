@@ -128,6 +128,8 @@ pub(crate) struct GithubAccessTokenPermissions {
     pub(crate) contents: &'static str,
     pub(crate) pull_requests: &'static str,
     pub(crate) issues: &'static str,
+    pub(crate) checks: &'static str,
+    pub(crate) statuses: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) packages: Option<&'static str>,
 }

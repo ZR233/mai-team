@@ -12,6 +12,7 @@ pub(crate) mod cycle;
 pub(crate) mod pool;
 pub(crate) mod reviewer;
 pub(crate) mod runs;
+pub(crate) mod selection;
 pub(crate) mod selector;
 pub(crate) mod state;
 pub(crate) mod worker;
@@ -53,10 +54,6 @@ pub(crate) struct ProjectReviewLoopDecision {
 
 pub(crate) fn project_reviewer_system_prompt() -> &'static str {
     "You are an autonomous project pull request reviewer. Review exactly one eligible GitHub pull request for this project, using only the GitHub MCP tools visible in the current tool list for GitHub reads/writes and local shell commands for git/test work. The repository has already been cloned and synced at /workspace/repo, and this reviewer owns that isolated clone. Do not look for GitHub tokens in the environment or write credentials. Finish with only the required JSON object so the project scheduler can decide the next cycle."
-}
-
-pub(crate) fn project_review_selector_system_prompt() -> &'static str {
-    "You are an autonomous project pull request selector. Find eligible open GitHub pull requests for this project, queue them with the queue_project_review_prs tool, and never submit reviews or modify repositories. Use only visible GitHub MCP read tools, read-only github_api_get if needed, and the bundled selector helper. Finish with only the required JSON object."
 }
 
 pub(crate) fn parse_project_review_cycle_report(text: &str) -> Result<ProjectReviewCycleResult> {

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use mai_protocol::{
     GitAccountRequest, GitAccountResponse, GitAccountStatus, GitAccountSummary,
     GitAccountsResponse, GitProvider, GitTokenKind, GithubRepositoriesResponse,
@@ -20,6 +21,12 @@ pub(crate) struct VerifiedGithubRepository {
     pub(crate) name: String,
     pub(crate) full_name: String,
     pub(crate) default_branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitAccountToken {
+    pub(crate) token: String,
+    pub(crate) expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -244,11 +251,23 @@ impl GitAccountService {
     }
 
     pub(crate) async fn token(&self, account_id: &str) -> Result<String> {
-        self.token_for(account_id, GitAccountTokenUse::Default)
-            .await
+        Ok(self.token_details(account_id).await?.token)
     }
 
     async fn token_for(&self, account_id: &str, token_use: GitAccountTokenUse) -> Result<String> {
+        Ok(self.token_details_for(account_id, token_use).await?.token)
+    }
+
+    pub(crate) async fn token_details(&self, account_id: &str) -> Result<GitAccountToken> {
+        self.token_details_for(account_id, GitAccountTokenUse::Default)
+            .await
+    }
+
+    async fn token_details_for(
+        &self,
+        account_id: &str,
+        token_use: GitAccountTokenUse,
+    ) -> Result<GitAccountToken> {
         let account = self.summary(account_id).await?;
         if account.provider == GitProvider::GithubAppRelay {
             let installation_id = account.installation_id.ok_or_else(|| {
@@ -256,17 +275,25 @@ impl GitAccountService {
                     "relay git account installation_id is missing".to_string(),
                 )
             })?;
-            return Ok(self
+            let response = self
                 .github_backend
                 .github_installation_token(installation_id, None, token_use.include_packages())
-                .await?
-                .token);
+                .await?;
+            return Ok(GitAccountToken {
+                token: response.token,
+                expires_at: Some(response.expires_at),
+            });
         }
-        self.store
+        let token = self
+            .store
             .git_account_token(account_id)
             .await?
             .filter(|token| !token.trim().is_empty())
-            .ok_or_else(|| RuntimeError::InvalidInput("git account token not found".to_string()))
+            .ok_or_else(|| RuntimeError::InvalidInput("git account token not found".to_string()))?;
+        Ok(GitAccountToken {
+            token,
+            expires_at: None,
+        })
     }
 }
 
@@ -288,9 +315,18 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Mutex;
 
-    #[derive(Default)]
     struct MockGithubAppBackend {
         token_requests: Mutex<Vec<(u64, Option<u64>, bool)>>,
+        token_expires_at: chrono::DateTime<Utc>,
+    }
+
+    impl Default for MockGithubAppBackend {
+        fn default() -> Self {
+            Self {
+                token_requests: Mutex::new(Vec::new()),
+                token_expires_at: Utc::now() + TimeDelta::hours(1),
+            }
+        }
     }
 
     #[async_trait]
@@ -363,7 +399,7 @@ mod tests {
                 } else {
                     "default-token".to_string()
                 },
-                expires_at: Utc::now() + TimeDelta::hours(1),
+                expires_at: self.token_expires_at,
             })
         }
     }
@@ -492,6 +528,42 @@ mod tests {
             }]
         );
         assert_eq!(response.warning, None);
+    }
+
+    #[tokio::test]
+    async fn relay_git_account_token_details_preserves_expires_at() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("relay-account".to_string()),
+                provider: GitProvider::GithubAppRelay,
+                label: "Relay".to_string(),
+                installation_id: Some(42),
+                installation_account: Some("octo".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        let github_backend = Arc::new(MockGithubAppBackend::default());
+        let service = GitAccountService::new(
+            Arc::clone(&store),
+            reqwest::Client::new(),
+            "http://127.0.0.1".to_string(),
+            github_backend.clone(),
+        );
+
+        let token = service
+            .token_details("relay-account")
+            .await
+            .expect("token details");
+
+        assert_eq!(token.token, "default-token");
+        assert_eq!(token.expires_at, Some(github_backend.token_expires_at));
+        assert_eq!(
+            github_backend.token_requests.lock().await.as_slice(),
+            &[(42, None, false)]
+        );
     }
 }
 

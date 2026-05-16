@@ -9,8 +9,8 @@ use mai_protocol::{
 use serde_json::{Value, json};
 
 use super::{
-    GitAccountService, GithubAppBackend, GithubErrorResponse, github_api_url, github_headers,
-    normalize_github_api_get_path, repository_packages_with_token,
+    GitAccountService, GithubAppBackend, GithubErrorResponse, decode_github_response,
+    github_api_url, github_headers, normalize_github_api_get_path, repository_packages_with_token,
 };
 use crate::{Result, RuntimeError, turn::tools::ToolExecution};
 
@@ -172,6 +172,28 @@ pub(crate) async fn execute_project_github_api_get(
         redact_secret(&output.to_string(), &token),
         false,
     ))
+}
+
+pub(crate) async fn project_github_api_get_json(
+    github_http: &reqwest::Client,
+    github_api_base_url: &str,
+    token: Option<String>,
+    path: &str,
+) -> Result<Value> {
+    let Some(token) = token else {
+        return Err(RuntimeError::InvalidInput(
+            "agent is not attached to a project".to_string(),
+        ));
+    };
+    let path = normalize_github_api_get_path(path)?;
+    let url = github_api_url(github_api_base_url, &path);
+    let response = github_http
+        .get(url)
+        .bearer_auth(&token)
+        .headers(github_headers())
+        .send()
+        .await?;
+    decode_github_response(response, "read project GitHub API").await
 }
 
 fn redact_secret(value: &str, secret: &str) -> String {

@@ -420,8 +420,7 @@ async fn should_poll_selector(
         return false;
     }
     match ops.project_git_provider(project_id).await {
-        Ok(Some(GitProvider::GithubAppRelay)) => false,
-        Ok(Some(GitProvider::Github)) | Ok(None) => true,
+        Ok(Some(GitProvider::Github | GitProvider::GithubAppRelay)) | Ok(None) => true,
         Err(err) => {
             tracing::warn!(project_id = %project_id, "failed to read project git provider: {err}");
             true

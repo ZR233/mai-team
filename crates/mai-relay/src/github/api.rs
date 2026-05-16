@@ -155,6 +155,8 @@ pub(crate) async fn create_installation_token(
             contents: "write",
             pull_requests: "write",
             issues: "write",
+            checks: "read",
+            statuses: "read",
             packages: request.include_packages.then_some("read"),
         },
     };

@@ -404,6 +404,8 @@ struct GithubAccessTokenPermissions {
     contents: &'static str,
     pull_requests: &'static str,
     issues: &'static str,
+    checks: &'static str,
+    statuses: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     packages: Option<&'static str>,
 }
@@ -498,7 +500,9 @@ fn github_app_manifest(redirect_url: &str, setup_url: &str, webhook_url: &str) -
             "contents": "write",
             "pull_requests": "write",
             "issues": "write",
-            "packages": "read"
+            "packages": "read",
+            "checks": "read",
+            "statuses": "read"
         },
         "default_events": [],
         "hook_attributes": {
@@ -566,6 +570,8 @@ fn github_access_token_request(
             contents: "write",
             pull_requests: "write",
             issues: "write",
+            checks: "read",
+            statuses: "read",
             packages: include_packages.then_some("read"),
         },
     }
@@ -630,6 +636,8 @@ mod tests {
         );
         assert_eq!(response.manifest["default_permissions"]["issues"], "write");
         assert_eq!(response.manifest["default_permissions"]["packages"], "read");
+        assert_eq!(response.manifest["default_permissions"]["checks"], "read");
+        assert_eq!(response.manifest["default_permissions"]["statuses"], "read");
         assert_eq!(response.manifest["public"], true);
         assert_eq!(response.manifest["hook_attributes"]["active"], false);
     }
@@ -648,5 +656,14 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(RuntimeError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn installation_token_request_includes_status_read_permissions() {
+        let request = github_access_token_request(Some(42), false);
+
+        assert_eq!(request.permissions.checks, "read");
+        assert_eq!(request.permissions.statuses, "read");
+        assert_eq!(request.permissions.packages, None);
     }
 }

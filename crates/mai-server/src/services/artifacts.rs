@@ -61,9 +61,7 @@ impl ArtifactService {
         let artifact = self
             .store
             .load_artifact_by_id(artifact_id)?
-            .ok_or_else(|| {
-                ArtifactError::NotFound(format!("artifact not found: {artifact_id}"))
-            })?;
+            .ok_or_else(|| ArtifactError::NotFound(format!("artifact not found: {artifact_id}")))?;
 
         let file_path = self.runtime.artifact_file_path(&artifact);
         let bytes = tokio::fs::read(&file_path).await?;

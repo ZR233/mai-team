@@ -49,10 +49,9 @@ fn embedded_asset_response(path: &str, fallback: SpaFallback) -> Response {
         .to_string();
 
     let mut response = Response::new(Body::from(asset.data.into_owned()));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        content_type.parse().unwrap(),
-    );
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type.parse().unwrap());
     *response.status_mut() = StatusCode::OK;
     response
 }

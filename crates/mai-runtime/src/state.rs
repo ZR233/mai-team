@@ -12,6 +12,7 @@ use mai_protocol::{
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use crate::projects::mcp::ProjectMcpManagerHandle;
 use crate::projects::review::pool::ProjectReviewPool;
 
 pub(crate) struct RuntimeState {
@@ -19,7 +20,7 @@ pub(crate) struct RuntimeState {
     pub(crate) tasks: RwLock<HashMap<TaskId, Arc<TaskRecord>>>,
     pub(crate) projects: RwLock<HashMap<ProjectId, Arc<ProjectRecord>>>,
     pub(crate) project_skill_locks: RwLock<HashMap<ProjectId, Arc<RwLock<()>>>>,
-    pub(crate) project_mcp_managers: RwLock<HashMap<ProjectId, Arc<McpAgentManager>>>,
+    pub(crate) project_mcp_managers: RwLock<HashMap<ProjectId, ProjectMcpManagerHandle>>,
 }
 
 impl RuntimeState {

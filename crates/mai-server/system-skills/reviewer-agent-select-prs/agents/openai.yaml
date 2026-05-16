@@ -1,6 +1,0 @@
-interface:
-  display_name: Reviewer Agent - Select PRs
-  short_description: Finds eligible open PRs and queues them into the project review pool
-  default_prompt: As a project PR selector, use GitHub read tools and the bundled helper to find eligible open pull requests, then call queue_project_review_prs for each selected PR. Do not submit reviews or modify repositories.
-policy:
-  allow_implicit_invocation: false

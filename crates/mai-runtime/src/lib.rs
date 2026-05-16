@@ -41,7 +41,8 @@ use agents::AgentResourceBroker;
 use deps::RuntimeDeps;
 use events::{RECENT_EVENT_LIMIT, RuntimeEvents};
 use github::{
-    DEFAULT_GITHUB_API_BASE_URL, DirectGithubAppBackend, GITHUB_HTTP_TIMEOUT_SECS, GithubAppBackend,
+    DEFAULT_GITHUB_API_BASE_URL, DirectGithubAppBackend, GITHUB_HTTP_TIMEOUT_SECS, GitAccountToken,
+    GithubAppBackend,
 };
 use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
 use projects::review::ProjectReviewCycleResult;
@@ -2107,10 +2108,10 @@ impl AgentRuntime {
             return Ok(Some(manager));
         }
 
-        let token = self.project_git_token(project_id).await?;
-        if token.is_none() {
+        let Some(token) = self.project_git_token_details(project_id).await? else {
             return Ok(None);
-        }
+        };
+        let token_secret = token.token.clone();
         self.events
             .publish(ServiceEventKind::McpServerStatusChanged {
                 agent_id,
@@ -2124,35 +2125,52 @@ impl AgentRuntime {
             &self.deps.docker,
             &self.sidecar_image,
             project_id,
-            token.as_deref(),
+            projects::mcp::ProjectMcpCredential {
+                token: token.token,
+                expires_at: token.expires_at,
+            },
             cancellation_token,
         )
-        .await?;
-        if let Some(manager) = manager.as_ref() {
-            for status in manager.statuses().await {
-                let error = status
-                    .error
-                    .map(|error| redact_secret(&error, token.as_deref().unwrap_or_default()));
-                self.events
-                    .publish(ServiceEventKind::McpServerStatusChanged {
-                        agent_id,
-                        server: status.server,
-                        status: status.status,
-                        error,
-                    })
-                    .await;
-            }
+        .await
+        .map_err(|err| match err {
+            RuntimeError::TurnCancelled => RuntimeError::TurnCancelled,
+            other => RuntimeError::InvalidInput(redact_secret(&other.to_string(), &token_secret)),
+        })?;
+        for status in manager.statuses().await {
+            let error = status
+                .error
+                .map(|error| redact_secret(&error, &token_secret));
+            self.events
+                .publish(ServiceEventKind::McpServerStatusChanged {
+                    agent_id,
+                    server: status.server,
+                    status: status.status,
+                    error,
+                })
+                .await;
         }
-        Ok(manager)
+        Ok(Some(manager))
     }
 
     async fn project_git_token(&self, project_id: ProjectId) -> Result<Option<String>> {
+        Ok(self
+            .project_git_token_details(project_id)
+            .await?
+            .map(|token| token.token))
+    }
+
+    async fn project_git_token_details(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Option<GitAccountToken>> {
         let project = self.project(project_id).await?;
         let summary = project.summary.read().await.clone();
         let Some(account_id) = summary.git_account_id else {
             return Ok(None);
         };
-        Ok(Some(self.deps.git_accounts.token(&account_id).await?))
+        Ok(Some(
+            self.deps.git_accounts.token_details(&account_id).await?,
+        ))
     }
 
     async fn project_mcp_manager_for_agent(
@@ -2559,14 +2577,14 @@ impl AgentRuntime {
 
     async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<mai_mcp::McpTool> {
         if let Some(project_id) = agent.summary.read().await.project_id {
-            let Some(manager) = self
+            let manager = self
                 .state
                 .project_mcp_managers
                 .read()
                 .await
                 .get(&project_id)
-                .cloned()
-            else {
+                .map(projects::mcp::ProjectMcpManagerHandle::manager);
+            let Some(manager) = manager else {
                 return Vec::new();
             };
             return manager.tools().await;
@@ -3329,6 +3347,28 @@ impl projects::mcp::ProjectMcpToolOps for AgentRuntime {
     ) -> impl std::future::Future<Output = Result<Option<String>>> + Send {
         AgentRuntime::project_git_token_for_agent(self, agent)
     }
+
+    fn invalidate_project_mcp_manager(
+        &self,
+        agent: &AgentRecord,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            if let Some(project_id) = agent.summary.read().await.project_id {
+                AgentRuntime::shutdown_project_mcp_manager(self, project_id).await;
+            }
+            Ok(())
+        }
+    }
+
+    fn call_project_mcp_tool(
+        &self,
+        manager: Arc<McpAgentManager>,
+        model_name: String,
+        arguments: Value,
+    ) -> impl std::future::Future<Output = std::result::Result<Value, mai_mcp::McpError>> + Send
+    {
+        async move { manager.call_model_tool(&model_name, arguments).await }
+    }
 }
 
 impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
@@ -3384,63 +3424,69 @@ impl projects::review::selector::ProjectReviewSelectorOps for Arc<AgentRuntime> 
         Ok(project.summary.read().await.clone())
     }
 
-    async fn agent_summary(&self, agent_id: AgentId) -> Result<AgentSummary> {
-        let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
-        Ok(agent.summary.read().await.clone())
-    }
-
-    async fn selector_model(&self) -> Result<AgentModelPreference> {
-        Ok(self
-            .resolve_role_agent_model(AgentRole::Explorer)
-            .await?
-            .preference)
-    }
-
-    fn create_agent_with_container_source(
+    async fn project_review_identity(
         &self,
-        request: CreateAgentRequest,
-        source: agents::ContainerSource,
-        task_id: Option<TaskId>,
-        project_id: Option<ProjectId>,
-        role: Option<AgentRole>,
-    ) -> impl std::future::Future<Output = Result<AgentSummary>> + Send {
-        AgentRuntime::create_agent_with_container_source(
-            self, request, source, task_id, project_id, role,
+        project_id: ProjectId,
+    ) -> Result<projects::review::selector::ProjectReviewIdentity> {
+        let project = AgentRuntime::project(self.as_ref(), project_id).await?;
+        let summary = project.summary.read().await.clone();
+        let account_id = summary.git_account_id.ok_or_else(|| {
+            RuntimeError::InvalidInput("project git account is not configured".to_string())
+        })?;
+        let account = self.deps.git_accounts.summary(&account_id).await?;
+        let login = match account.provider {
+            GitProvider::Github => match normalized_text(account.login) {
+                Some(login) => login,
+                None => {
+                    let value = github::project_github_api_get_json(
+                        &self.deps.github_http,
+                        &self.github_api_base_url,
+                        self.project_git_token(project_id).await?,
+                        "/user",
+                    )
+                    .await?;
+                    value
+                        .get("login")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .ok_or_else(|| {
+                            RuntimeError::InvalidInput(
+                                "GitHub /user response missing login".to_string(),
+                            )
+                        })?
+                }
+            },
+            GitProvider::GithubAppRelay => {
+                let settings = self.deps.github_backend.github_app_settings().await?;
+                normalized_text(settings.app_slug)
+                    .map(|slug| format!("{slug}[bot]"))
+                    .or_else(|| normalized_text(account.login))
+                    .or_else(|| normalized_text(account.installation_account))
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidInput(
+                            "GitHub App reviewer identity is not configured".to_string(),
+                        )
+                    })?
+            }
+        };
+        Ok(projects::review::selector::ProjectReviewIdentity { login })
+    }
+
+    async fn github_api_get_json(&self, project_id: ProjectId, path: String) -> Result<Value> {
+        github::project_github_api_get_json(
+            &self.deps.github_http,
+            &self.github_api_base_url,
+            self.project_git_token(project_id).await?,
+            &path,
         )
+        .await
     }
 
-    fn start_agent_turn(
+    fn enqueue_project_review(
         &self,
-        agent_id: AgentId,
-        message: String,
-        skill_mentions: Vec<String>,
-    ) -> impl std::future::Future<Output = Result<TurnId>> + Send {
-        agents::start_agent_turn(self.as_ref(), self, agent_id, message, skill_mentions)
-    }
-
-    fn wait_agent_until_complete_with_cancel(
-        &self,
-        agent_id: AgentId,
-        cancellation_token: &CancellationToken,
-    ) -> impl std::future::Future<Output = Result<AgentSummary>> + Send {
-        AgentRuntime::wait_agent_until_complete_with_cancel(
-            self.as_ref(),
-            agent_id,
-            cancellation_token,
-        )
-    }
-
-    async fn last_turn_response(&self, agent_id: AgentId) -> Result<Option<String>> {
-        let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
-        let sessions = agent.sessions.lock().await;
-        Ok(agents::last_turn_response(&sessions))
-    }
-
-    fn delete_agent(
-        &self,
-        agent_id: AgentId,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        AgentRuntime::delete_agent(self.as_ref(), agent_id)
+        request: ProjectReviewQueueRequest,
+    ) -> impl std::future::Future<Output = Result<ProjectReviewQueueSummary>> + Send {
+        AgentRuntime::enqueue_project_review(self, request)
     }
 }
 
@@ -3988,7 +4034,10 @@ impl tasks::EnvironmentOps for Arc<AgentRuntime> {
                 )
                 .await?
             }
-            None => self.create_unconfigured_environment_root_agent(request).await?,
+            None => {
+                self.create_unconfigured_environment_root_agent(request)
+                    .await?
+            }
         };
         let summary = agent.summary.read().await.clone();
         self.start_environment_container_in_background(agent).await;
@@ -4107,7 +4156,10 @@ impl AgentRuntime {
         };
         self.deps.store.save_agent(&summary, None).await?;
         let session = agents::default_session_record();
-        self.deps.store.save_agent_session(id, &session.summary).await?;
+        self.deps
+            .store
+            .save_agent_session(id, &session.summary)
+            .await?;
         let agent = Arc::new(AgentRecord {
             summary: RwLock::new(summary.clone()),
             sessions: Mutex::new(vec![session]),
@@ -4119,7 +4171,11 @@ impl AgentRuntime {
             active_turn: StdMutex::new(None),
             pending_inputs: Mutex::new(VecDeque::new()),
         });
-        self.state.agents.write().await.insert(id, Arc::clone(&agent));
+        self.state
+            .agents
+            .write()
+            .await
+            .insert(id, Arc::clone(&agent));
         self.events
             .publish(ServiceEventKind::AgentCreated { agent: summary })
             .await;
@@ -4811,6 +4867,12 @@ fn redact_secret(value: &str, secret: &str) -> String {
         return value.to_string();
     }
     value.replace(secret, "<redacted>")
+}
+
+fn normalized_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn runtime_sidecar_image(image: String) -> String {

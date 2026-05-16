@@ -80,7 +80,11 @@ pub(crate) async fn list_project_review_runs(
     Ok(Json(
         state
             .runtime
-            .list_project_review_runs(id, query.offset.unwrap_or(0), query.limit.unwrap_or(DEFAULT_REVIEW_RUNS_PAGE_SIZE))
+            .list_project_review_runs(
+                id,
+                query.offset.unwrap_or(0),
+                query.limit.unwrap_or(DEFAULT_REVIEW_RUNS_PAGE_SIZE),
+            )
             .await?,
     ))
 }
