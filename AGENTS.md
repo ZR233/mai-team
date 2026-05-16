@@ -22,6 +22,8 @@
 
 ### 核心 crate 约束
 
+
+- 文档，计划，注释等，都用中文。保持一致的语言环境有助于团队沟通和知识共享。
 - 抵制向 mai-runtime 添加代码。引入新功能前，先评估：
   1. 是否有其他 crate 更合适（如 mai-agents、mai-tools、mai-mcp）？
   2. 是否该拆出新 crate（如 mai-github、mai-review）？
