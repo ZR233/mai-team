@@ -4715,6 +4715,13 @@ p {
   line-height: 1.5;
 }
 
+.composer-disabled-reason {
+  margin: 0;
+  color: #66758a;
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .composer-actions {
   display: flex;
   align-items: flex-end;

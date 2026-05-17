@@ -15,6 +15,14 @@
     </div>
     <template v-else>
       <article
+        v-if="statusItem"
+        :key="statusItem.key"
+        class="timeline-item"
+        :class="timelineItemClasses(statusItem)"
+      >
+        <ProcessRow :item="statusItem" />
+      </article>
+      <article
         v-for="item in timelineItems"
         :key="item.key"
         class="timeline-item"

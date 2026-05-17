@@ -22,6 +22,7 @@
         @input="$emit('update:draft', $event.target.value)"
         @keydown.enter.exact="handleEnter"
       />
+      <p v-if="disabledReason" class="composer-disabled-reason">{{ disabledReason }}</p>
     </div>
 
     <div class="composer-actions">
@@ -93,7 +94,8 @@ const props = defineProps({
   skillsError: { type: String, default: '' },
   stoppable: { type: Boolean, default: false },
   stopping: { type: Boolean, default: false },
-  disabled: { type: Boolean, default: false }
+  disabled: { type: Boolean, default: false },
+  disabledReason: { type: String, default: '' }
 })
 
 const emit = defineEmits(['send', 'update:draft', 'update:selectedSkills', 'load-skills', 'stop'])
