@@ -2,7 +2,7 @@
 """Deterministic helpers for Mai reviewer-agent-review-pr.
 
 The helper intentionally avoids GitHub credentials and network access. Feed it
-JSON captured from visible GitHub MCP tools and local git state; it returns
+JSON captured from visible Mai GitHub API tools and local git state; it returns
 small JSON objects that the reviewer can rely on for repetitive rules.
 """
 

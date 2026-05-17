@@ -3841,18 +3841,6 @@ impl projects::mcp::ProjectMcpToolOps for AgentRuntime {
         AgentRuntime::project_git_token_for_agent(self, agent)
     }
 
-    fn invalidate_project_mcp_manager(
-        &self,
-        agent: &AgentRecord,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move {
-            if let Some(project_id) = agent.summary.read().await.project_id {
-                AgentRuntime::shutdown_project_mcp_manager(self, project_id).await;
-            }
-            Ok(())
-        }
-    }
-
     fn call_project_mcp_tool(
         &self,
         manager: Arc<McpAgentManager>,
