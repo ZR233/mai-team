@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use mai_docker::project_agent_workspace_volume;
 use mai_protocol::{AgentId, AgentSummary, ProjectId, ProjectSummary};
 
 use super::lease::ProjectWorkspaceLocks;
@@ -23,11 +24,14 @@ pub(crate) struct RepoSyncReport {
     pub(crate) cache: RepoCacheHandle,
 }
 
+pub(crate) const AGENT_WORKSPACE_REPO_PATH: &str = "/workspace/repo";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AgentCloneHandle {
+pub(crate) struct AgentWorkspaceHandle {
     pub(crate) project_id: ProjectId,
     pub(crate) agent_id: AgentId,
-    pub(crate) path: PathBuf,
+    pub(crate) volume: String,
+    pub(crate) repo_path: String,
     pub(crate) branch: String,
 }
 
@@ -51,12 +55,10 @@ pub(crate) enum CloneSeed {
     },
 }
 
-/// Owns host-side project workspace lifecycle for repository caches,
-/// per-agent clones, cleanup, and filesystem reconciliation.
+/// 管理项目仓库缓存、agent workspace 准备、清理和启动时 reconcile。
 ///
-/// Implementations must keep GitHub tokens in host execution only, serialize
-/// project-scoped mutations, and return handles that describe managed paths
-/// without exposing token material.
+/// 实现方必须保证 GitHub token 只在受控执行边界内使用，序列化同一项目的
+/// workspace 变更，并返回不包含 secret 的 workspace handle。
 pub(crate) trait ProjectWorkspaceManager: Send + Sync {
     fn ensure_repo_cache(
         &self,
@@ -70,14 +72,14 @@ pub(crate) trait ProjectWorkspaceManager: Send + Sync {
         token: &str,
     ) -> impl std::future::Future<Output = Result<RepoSyncReport>> + Send;
 
-    fn prepare_agent_clone(
+    fn prepare_agent_workspace(
         &self,
         project: &ProjectSummary,
         agent_id: AgentId,
         seed: CloneSeed,
-    ) -> impl std::future::Future<Output = Result<AgentCloneHandle>> + Send;
+    ) -> impl std::future::Future<Output = Result<AgentWorkspaceHandle>> + Send;
 
-    fn cleanup_agent_clone(
+    fn cleanup_agent_workspace(
         &self,
         project_id: ProjectId,
         agent_id: AgentId,
@@ -153,12 +155,12 @@ impl ProjectWorkspaceManager for LocalProjectWorkspaceManager {
         Ok(RepoSyncReport { cache })
     }
 
-    async fn prepare_agent_clone(
+    async fn prepare_agent_workspace(
         &self,
         project: &ProjectSummary,
         agent_id: AgentId,
         seed: CloneSeed,
-    ) -> Result<AgentCloneHandle> {
+    ) -> Result<AgentWorkspaceHandle> {
         let _lease = self.locks.lock(project.id).await;
         prepare_project_agent_clone_unlocked(
             &self.git_binary,
@@ -170,7 +172,11 @@ impl ProjectWorkspaceManager for LocalProjectWorkspaceManager {
         .await
     }
 
-    async fn cleanup_agent_clone(&self, project_id: ProjectId, agent_id: AgentId) -> Result<()> {
+    async fn cleanup_agent_workspace(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+    ) -> Result<()> {
         let _lease = self.locks.lock(project_id).await;
         cleanup_project_agent_clone_unlocked(&self.projects_root, project_id, agent_id)
     }
@@ -189,6 +195,7 @@ impl ProjectWorkspaceManager for LocalProjectWorkspaceManager {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn sync_project_repo_cache(
     git_binary: &str,
     projects_root: &Path,
@@ -258,10 +265,10 @@ pub(crate) async fn prepare_project_agent_clone(
 ) -> Result<PathBuf> {
     let manager =
         LocalProjectWorkspaceManager::new(git_binary.to_string(), projects_root.to_path_buf());
-    Ok(manager
-        .prepare_agent_clone(project, agent_id, CloneSeed::DefaultBranch)
-        .await?
-        .path)
+    manager
+        .prepare_agent_workspace(project, agent_id, CloneSeed::DefaultBranch)
+        .await?;
+    Ok(agent_clone_path(projects_root, project.id, agent_id))
 }
 
 async fn prepare_project_agent_clone_unlocked(
@@ -270,7 +277,7 @@ async fn prepare_project_agent_clone_unlocked(
     project: &ProjectSummary,
     agent_id: AgentId,
     seed: CloneSeed,
-) -> Result<AgentCloneHandle> {
+) -> Result<AgentWorkspaceHandle> {
     let repo_cache_path = project_repo_cache_path(projects_root, project.id);
     if !repo_cache_path.exists() {
         return Err(RuntimeError::InvalidInput(
@@ -316,10 +323,11 @@ async fn prepare_project_agent_clone_unlocked(
         ["checkout", "-B", &branch, &start_point],
     )
     .await?;
-    Ok(AgentCloneHandle {
+    Ok(AgentWorkspaceHandle {
         project_id: project.id,
         agent_id,
-        path: clone_path,
+        volume: project_agent_workspace_volume(&project.id.to_string(), &agent_id.to_string()),
+        repo_path: AGENT_WORKSPACE_REPO_PATH.to_string(),
         branch,
     })
 }
@@ -360,7 +368,7 @@ pub(crate) async fn cleanup_project_agent_clone(
     agent_id: AgentId,
 ) -> Result<()> {
     let manager = LocalProjectWorkspaceManager::new("git".to_string(), projects_root.to_path_buf());
-    manager.cleanup_agent_clone(project_id, agent_id).await
+    manager.cleanup_agent_workspace(project_id, agent_id).await
 }
 
 fn cleanup_project_agent_clone_unlocked(
@@ -444,7 +452,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_workspace_manager_prepares_clone_handle_from_default_branch() {
+    async fn local_workspace_manager_prepares_workspace_handle_from_default_branch() {
         let dir = tempfile::tempdir().expect("tempdir");
         let git = fake_git_path(dir.path());
         let project_id = uuid::Uuid::new_v4();
@@ -454,17 +462,21 @@ mod tests {
             .expect("repo cache");
         let manager = LocalProjectWorkspaceManager::new(git, dir.path().to_path_buf());
 
-        let clone = manager
-            .prepare_agent_clone(&project, agent_id, CloneSeed::DefaultBranch)
+        let workspace = manager
+            .prepare_agent_workspace(&project, agent_id, CloneSeed::DefaultBranch)
             .await
-            .expect("prepare clone");
+            .expect("prepare workspace");
 
         assert_eq!(
-            clone,
-            AgentCloneHandle {
+            workspace,
+            AgentWorkspaceHandle {
                 project_id,
                 agent_id,
-                path: agent_clone_path(dir.path(), project_id, agent_id),
+                volume: project_agent_workspace_volume(
+                    &project_id.to_string(),
+                    &agent_id.to_string()
+                ),
+                repo_path: AGENT_WORKSPACE_REPO_PATH.to_string(),
                 branch: format!("mai-agent/{agent_id}"),
             }
         );
@@ -504,8 +516,8 @@ mod tests {
             .expect("repo cache");
         let manager = LocalProjectWorkspaceManager::new(git, dir.path().to_path_buf());
 
-        let clone = manager
-            .prepare_agent_clone(
+        let workspace = manager
+            .prepare_agent_workspace(
                 &project,
                 agent_id,
                 CloneSeed::AgentBranch {
@@ -513,9 +525,9 @@ mod tests {
                 },
             )
             .await
-            .expect("prepare clone");
+            .expect("prepare workspace");
 
-        assert_eq!(clone.branch, "feature/demo");
+        assert_eq!(workspace.branch, "feature/demo");
         assert!(read_git_log(dir.path()).contains("checkout -B feature/demo origin/feature/demo"));
     }
 
@@ -544,11 +556,13 @@ mod tests {
 
         let mut errors = Vec::new();
         for seed in seeds {
-            let result = manager.prepare_agent_clone(&project, agent_id, seed).await;
+            let result = manager
+                .prepare_agent_workspace(&project, agent_id, seed)
+                .await;
             if let Err(err) = result {
                 errors.push(err.to_string());
             }
-            let _ = manager.cleanup_agent_clone(project_id, agent_id).await;
+            let _ = manager.cleanup_agent_workspace(project_id, agent_id).await;
         }
 
         assert_eq!(

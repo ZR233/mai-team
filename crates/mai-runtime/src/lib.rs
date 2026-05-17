@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use mai_agents::AgentProfilesManager;
-use mai_docker::{ContainerHandle, DockerClient};
+use mai_docker::{
+    ContainerHandle, DockerClient, SidecarParams, project_agent_workspace_volume,
+    project_cache_volume,
+};
 use mai_mcp::McpAgentManager;
 #[cfg(test)]
 use mai_mcp::McpTool;
@@ -189,12 +192,12 @@ pub struct AgentRuntime {
     deps: RuntimeDeps,
     state: RuntimeState,
     events: RuntimeEvents,
+    #[cfg(test)]
     projects_root: PathBuf,
     cache_root: PathBuf,
     artifact_files_root: PathBuf,
     sidecar_image: String,
     github_api_base_url: String,
-    git_binary: String,
     workspace_manager: projects::workspace::LocalProjectWorkspaceManager,
 }
 
@@ -361,12 +364,12 @@ impl AgentRuntime {
                 snapshot.next_sequence,
                 snapshot.recent_events,
             ),
+            #[cfg(test)]
             projects_root,
             cache_root: config.cache_root,
             artifact_files_root: config.artifact_files_root,
             sidecar_image,
             github_api_base_url,
-            git_binary,
             workspace_manager,
         });
         let cleanup_runtime = Arc::clone(&runtime);
@@ -866,9 +869,9 @@ impl AgentRuntime {
             && summary.clone_status == ProjectCloneStatus::Ready
         {
             self.shutdown_project_mcp_manager(project_id).await;
-            self.sync_project_review_repo(project_id).await?;
+            self.sync_project_cache_repo(project_id).await?;
             let _ = self
-                .refresh_project_skills_from_review_workspace(project_id)
+                .refresh_project_skills_from_agent_workspace(project_id)
                 .await;
             self.events
                 .publish(ServiceEventKind::ProjectUpdated { project: summary })
@@ -1130,34 +1133,41 @@ impl AgentRuntime {
         let clone = self
             .workspace_manager
             .agent_clone_path(summary.id, agent_id);
-        let clone = if clone.exists() {
-            clone
-        } else {
+        if !clone.exists() {
             self.workspace_manager
-                .prepare_agent_clone(
+                .prepare_agent_workspace(
                     &summary,
                     agent_id,
                     projects::workspace::CloneSeed::DefaultBranch,
                 )
-                .await?
-                .path
-        };
+                .await?;
+            let token = self.project_git_token(summary.id).await?.ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "project git account token is not configured".to_string(),
+                )
+            })?;
+            self.sync_agent_workspace_volume_repo(&summary, agent_id, &token)
+                .await?;
+        }
+        let workspace_volume =
+            project_agent_workspace_volume(&summary.id.to_string(), &agent_id.to_string());
+        let repo_path = projects::workspace::AGENT_WORKSPACE_REPO_PATH.to_string();
         Ok(match source {
-            agents::ContainerSource::FreshImage | agents::ContainerSource::ProjectClone { .. } => {
-                agents::ContainerSource::ProjectClone {
-                    clone_path: clone.to_string_lossy().to_string(),
+            agents::ContainerSource::FreshImage
+            | agents::ContainerSource::ProjectWorkspace { .. } => {
+                agents::ContainerSource::ProjectWorkspace {
+                    workspace_volume,
+                    repo_path,
                 }
             }
             agents::ContainerSource::CloneFrom {
                 parent_container_id,
                 docker_image,
-                workspace_volume,
-                repo_mount: _,
+                workspace_volume: _,
             } => agents::ContainerSource::CloneFrom {
                 parent_container_id,
                 docker_image,
-                workspace_volume,
-                repo_mount: Some(clone.to_string_lossy().to_string()),
+                workspace_volume: Some(workspace_volume),
             },
         })
     }
@@ -1237,7 +1247,7 @@ impl AgentRuntime {
                 };
                 if let Err(err) = self
                     .workspace_manager
-                    .prepare_agent_clone(
+                    .prepare_agent_workspace(
                         project,
                         *agent_id,
                         projects::workspace::CloneSeed::DefaultBranch,
@@ -2156,7 +2166,7 @@ impl AgentRuntime {
             .await
     }
 
-    async fn refresh_project_skills_from_review_workspace(
+    async fn refresh_project_skills_from_agent_workspace(
         &self,
         project_id: ProjectId,
     ) -> Result<()> {
@@ -2426,20 +2436,170 @@ impl AgentRuntime {
         .await
     }
 
-    async fn ensure_project_review_workspace(&self, project_id: ProjectId) -> Result<()> {
-        self.sync_project_review_repo(project_id).await
+    async fn ensure_project_cache_ready(&self, project_id: ProjectId) -> Result<()> {
+        self.sync_project_cache_repo(project_id).await
     }
 
-    async fn sync_project_review_repo(&self, project_id: ProjectId) -> Result<()> {
+    async fn sync_project_cache_repo(&self, project_id: ProjectId) -> Result<()> {
         let project = self.project(project_id).await?;
         let summary = project.summary.read().await.clone();
         let token = self.project_git_token(project_id).await?.ok_or_else(|| {
             RuntimeError::InvalidInput("project git account token is not configured".to_string())
         })?;
+        self.ensure_project_cache_volume(project_id).await?;
         self.workspace_manager
             .sync_repo_cache(&summary, &token)
-            .await
-            .map(|_| ())
+            .await?;
+        self.sync_project_cache_volume_repo(&summary, &token).await
+    }
+
+    async fn ensure_agent_workspace_volume(
+        &self,
+        agent_id: AgentId,
+        volume: &str,
+        role_override: Option<AgentRole>,
+    ) -> Result<()> {
+        let agent = self.agent(agent_id).await?;
+        let summary = agent.summary.read().await.clone();
+        let Some(project_id) = summary.project_id else {
+            return Ok(());
+        };
+        let role = role_override.or(summary.role).unwrap_or_default();
+        self.deps
+            .docker
+            .ensure_volume(
+                volume,
+                &[
+                    ("mai.team.managed", "true".to_string()),
+                    ("mai.team.kind", "agent-workspace".to_string()),
+                    ("mai.team.project", project_id.to_string()),
+                    ("mai.team.agent", agent_id.to_string()),
+                    ("mai.team.role", role.to_string()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn ensure_project_cache_volume(&self, project_id: ProjectId) -> Result<()> {
+        let volume = project_cache_volume(&project_id.to_string());
+        self.deps
+            .docker
+            .ensure_volume(
+                &volume,
+                &[
+                    ("mai.team.managed", "true".to_string()),
+                    ("mai.team.kind", "project-cache".to_string()),
+                    ("mai.team.project", project_id.to_string()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn sync_agent_workspace_volume_repo(
+        &self,
+        project: &ProjectSummary,
+        agent_id: AgentId,
+        token: &str,
+    ) -> Result<()> {
+        self.sync_project_cache_volume_repo(project, token).await?;
+        let volume = project_agent_workspace_volume(&project.id.to_string(), &agent_id.to_string());
+        let cache_volume = project_cache_volume(&project.id.to_string());
+        self.ensure_agent_workspace_volume(agent_id, &volume, None)
+            .await?;
+        let repo_url = github::github_clone_url(&project.owner, &project.repo);
+        let branch = format!("mai-agent/{agent_id}");
+        let origin_branch = format!("origin/{}", project.branch);
+        let command = format!(
+            "set -eu\n\
+             rm -rf /workspace/repo\n\
+             mkdir -p /workspace /workspace/.mai/install-log /workspace/.mai/tool-state /workspace/tmp\n\
+             git -c credential.helper= clone --no-checkout -- /cache/repo.git /workspace/repo\n\
+             cd /workspace/repo\n\
+             git remote set-url origin {}\n\
+             git checkout -B {} {}",
+            shell_quote(&repo_url),
+            shell_quote(&branch),
+            shell_quote(&origin_branch),
+        );
+        let env = [(
+            "MAI_GITHUB_INSTALLATION_TOKEN".to_string(),
+            token.to_string(),
+        )];
+        let sidecar_name = format!("mai-tool-git-clone-{agent_id}");
+        let cache_mounts = [(cache_volume.as_str(), "/cache")];
+        let output = self
+            .deps
+            .docker
+            .run_sidecar_shell_env(&SidecarParams {
+                name: &sidecar_name,
+                image: &self.sidecar_image,
+                command: &command,
+                args: &[],
+                cwd: None,
+                env: &env,
+                workspace_volume: Some(&volume),
+                mounts: &cache_mounts,
+                timeout_secs: Some(600),
+            })
+            .await?;
+        if output.status != 0 {
+            let message = redact_secret(&format!("{}{}", output.stdout, output.stderr), token);
+            return Err(RuntimeError::InvalidInput(format!(
+                "project agent workspace volume clone failed: {message}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn sync_project_cache_volume_repo(
+        &self,
+        project: &ProjectSummary,
+        token: &str,
+    ) -> Result<()> {
+        let volume = project_cache_volume(&project.id.to_string());
+        self.ensure_project_cache_volume(project.id).await?;
+        let repo_url = github::github_clone_url(&project.owner, &project.repo);
+        let command = format!(
+            "set -eu\n\
+             mkdir -p /workspace\n\
+             if [ -d /workspace/repo.git ]; then\n\
+               git -C /workspace/repo.git remote set-url origin {repo_url}\n\
+               git -c credential.helper= -c http.https://github.com/.extraheader=\"AUTHORIZATION: bearer $MAI_GITHUB_INSTALLATION_TOKEN\" -C /workspace/repo.git fetch --prune origin\n\
+             else\n\
+               rm -rf /workspace/repo.git\n\
+               git -c credential.helper= -c http.https://github.com/.extraheader=\"AUTHORIZATION: bearer $MAI_GITHUB_INSTALLATION_TOKEN\" clone --mirror -- {repo_url} /workspace/repo.git\n\
+             fi",
+            repo_url = shell_quote(&repo_url),
+        );
+        let env = [(
+            "MAI_GITHUB_INSTALLATION_TOKEN".to_string(),
+            token.to_string(),
+        )];
+        let sidecar_name = format!("mai-tool-git-cache-{}", project.id);
+        let output = self
+            .deps
+            .docker
+            .run_sidecar_shell_env(&SidecarParams {
+                name: &sidecar_name,
+                image: &self.sidecar_image,
+                command: &command,
+                args: &[],
+                cwd: None,
+                env: &env,
+                workspace_volume: Some(&volume),
+                mounts: &[],
+                timeout_secs: Some(600),
+            })
+            .await?;
+        if output.status != 0 {
+            let message = redact_secret(&format!("{}{}", output.stdout, output.stderr), token);
+            return Err(RuntimeError::InvalidInput(format!(
+                "project cache volume sync failed: {message}"
+            )));
+        }
+        Ok(())
     }
 
     async fn set_project_review_state(
@@ -2451,10 +2611,12 @@ impl AgentRuntime {
         projects::review::state::set_project_review_state(self, project_id, status, update).await
     }
 
-    async fn delete_project_review_workspace(&self, project_id: ProjectId) -> Result<()> {
+    async fn delete_project_workspace(&self, project_id: ProjectId) -> Result<()> {
         self.workspace_manager
             .delete_project_workspace(project_id)
             .await?;
+        let cache_volume = project_cache_volume(&project_id.to_string());
+        self.deps.docker.delete_volume(&cache_volume).await?;
         Ok(())
     }
 
@@ -2496,13 +2658,46 @@ impl AgentRuntime {
         agent: &AgentRecord,
         path: &str,
     ) -> Result<ToolExecution> {
-        github::execute_project_github_api_get(
-            &self.deps.github_http,
-            &self.github_api_base_url,
-            self.project_git_token_for_agent(agent).await?,
-            path,
-        )
-        .await
+        let path = github::normalize_github_api_get_path(path)?;
+        let token = self
+            .project_git_token_for_agent(agent)
+            .await?
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "project git account token is not configured".to_string(),
+                )
+            })?;
+        let summary = agent.summary.read().await.clone();
+        let project_id = summary.project_id.ok_or_else(|| {
+            RuntimeError::InvalidInput("agent is not attached to a project".to_string())
+        })?;
+        let workspace_volume =
+            project_agent_workspace_volume(&project_id.to_string(), &summary.id.to_string());
+        let env = [("GH_TOKEN".to_string(), token.clone())];
+        let sidecar_name = format!("mai-tool-gh-api-{}-{}", summary.id, Uuid::new_v4());
+        let command = format!("gh api {}", shell_quote(&path));
+        let output = self
+            .deps
+            .docker
+            .run_sidecar_shell_env(&SidecarParams {
+                name: &sidecar_name,
+                image: &self.sidecar_image,
+                command: &command,
+                args: &[],
+                cwd: Some(projects::workspace::AGENT_WORKSPACE_REPO_PATH),
+                env: &env,
+                workspace_volume: Some(&workspace_volume),
+                mounts: &[],
+                timeout_secs: Some(120),
+            })
+            .await?;
+        if output.status != 0 {
+            let message = redact_secret(&format!("{}{}", output.stdout, output.stderr), &token);
+            return Err(RuntimeError::InvalidInput(format!(
+                "gh api sidecar failed: {message}"
+            )));
+        }
+        Ok(ToolExecution::new(true, output.stdout, false))
     }
 
     async fn execute_project_git_tool(
@@ -2517,10 +2712,16 @@ impl AgentRuntime {
         })?;
         let project = self.project(project_id).await?;
         let project_summary = project.summary.read().await.clone();
+        let workspace_volume =
+            project_agent_workspace_volume(&project_id.to_string(), &summary.id.to_string());
         tools::git::execute_git_tool(
             tools::git::GitToolContext {
-                git_binary: &self.git_binary,
-                projects_root: &self.projects_root,
+                backend: tools::git::GitToolBackend::Sidecar {
+                    docker: &self.deps.docker,
+                    sidecar_image: &self.sidecar_image,
+                    workspace_volume,
+                    repo_path: projects::workspace::AGENT_WORKSPACE_REPO_PATH,
+                },
                 agent_id: summary.id,
                 project: project_summary,
                 token: self.project_git_token(project_id).await?,
@@ -2542,21 +2743,25 @@ impl AgentRuntime {
             RuntimeError::InvalidInput("project git account is not configured".to_string())
         })?;
         let token = self.deps.git_accounts.token(&account_id).await?;
+        self.ensure_project_cache_volume(project_id).await?;
         self.workspace_manager
             .ensure_repo_cache(&summary, &token)
             .await?;
         self.workspace_manager
             .sync_repo_cache(&summary, &token)
             .await?;
-        let clone_path = self
-            .workspace_manager
-            .prepare_agent_clone(
+        self.workspace_manager
+            .prepare_agent_workspace(
                 &summary,
                 maintainer_agent_id,
                 projects::workspace::CloneSeed::DefaultBranch,
             )
-            .await?
-            .path;
+            .await?;
+        self.sync_agent_workspace_volume_repo(&summary, maintainer_agent_id, &token)
+            .await?;
+        let clone_path = self
+            .workspace_manager
+            .agent_clone_path(summary.id, maintainer_agent_id);
         let existing = projects::skills::detect_existing_dirs_in_host_repo(&clone_path);
         self.refresh_project_skill_cache(project_id, &existing)
             .await?;
@@ -3081,13 +3286,17 @@ impl agents::AgentDeleteOps for AgentRuntime {
             .await?)
     }
 
-    fn cleanup_project_agent_clone(
+    async fn cleanup_project_agent_workspace(
         &self,
         project_id: ProjectId,
         agent_id: AgentId,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
+    ) -> Result<()> {
         self.workspace_manager
-            .cleanup_agent_clone(project_id, agent_id)
+            .cleanup_agent_workspace(project_id, agent_id)
+            .await?;
+        let volume = project_agent_workspace_volume(&project_id.to_string(), &agent_id.to_string());
+        self.deps.docker.delete_volume(&volume).await?;
+        Ok(())
     }
 
     async fn delete_agent_from_store(&self, agent_id: AgentId) -> Result<()> {
@@ -3267,27 +3476,39 @@ impl agents::AgentContainerOps for AgentRuntime {
                     &request.docker_image,
                 )
                 .await?),
-            agents::ContainerSource::ProjectClone { clone_path } => Ok(self
-                .deps
-                .docker
-                .ensure_agent_container_from_image_with_workspace_and_repo_mount(
-                    &request.agent_id.to_string(),
-                    request.preferred_container_id.as_deref(),
-                    &request.docker_image,
+            agents::ContainerSource::ProjectWorkspace {
+                workspace_volume,
+                repo_path,
+            } => {
+                if repo_path != projects::workspace::AGENT_WORKSPACE_REPO_PATH {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "unsupported project repo path `{repo_path}`"
+                    )));
+                }
+                self.ensure_agent_workspace_volume(
+                    request.agent_id,
+                    workspace_volume.as_str(),
                     None,
-                    Some(&clone_path),
                 )
-                .await?),
+                .await?;
+                Ok(self
+                    .deps
+                    .docker
+                    .ensure_agent_container_from_image_with_workspace_and_repo_mount(
+                        &request.agent_id.to_string(),
+                        request.preferred_container_id.as_deref(),
+                        &request.docker_image,
+                        Some(&workspace_volume),
+                        None,
+                    )
+                    .await?)
+            }
             agents::ContainerSource::CloneFrom {
                 parent_container_id,
                 docker_image,
                 workspace_volume,
-                repo_mount,
             } => {
-                if request.preferred_container_id.is_some()
-                    && workspace_volume.is_none()
-                    && repo_mount.is_none()
-                {
+                if request.preferred_container_id.is_some() && workspace_volume.is_none() {
                     Ok(self
                         .deps
                         .docker
@@ -3298,6 +3519,14 @@ impl agents::AgentContainerOps for AgentRuntime {
                         )
                         .await?)
                 } else {
+                    if let Some(workspace_volume) = workspace_volume.as_deref() {
+                        self.ensure_agent_workspace_volume(
+                            request.agent_id,
+                            workspace_volume,
+                            None,
+                        )
+                        .await?;
+                    }
                     Ok(self
                         .deps
                         .docker
@@ -3305,7 +3534,7 @@ impl agents::AgentContainerOps for AgentRuntime {
                             &request.agent_id.to_string(),
                             &parent_container_id,
                             workspace_volume.as_deref(),
-                            repo_mount.as_deref(),
+                            None,
                         )
                         .await?)
                 }
@@ -3646,18 +3875,18 @@ impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
             .await
     }
 
-    fn sync_project_review_repo(
+    fn sync_project_cache_repo(
         &self,
         project_id: ProjectId,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        AgentRuntime::sync_project_review_repo(self.as_ref(), project_id)
+        AgentRuntime::sync_project_cache_repo(self.as_ref(), project_id)
     }
 
-    fn refresh_project_skills_from_review_workspace(
+    fn refresh_project_skills_from_agent_workspace(
         &self,
         project_id: ProjectId,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        AgentRuntime::refresh_project_skills_from_review_workspace(self.as_ref(), project_id)
+        AgentRuntime::refresh_project_skills_from_agent_workspace(self.as_ref(), project_id)
     }
 
     fn spawn_project_reviewer_agent(
@@ -3792,11 +4021,11 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
         AgentRuntime::set_project_review_state(self.as_ref(), project_id, status, update).await
     }
 
-    fn ensure_project_review_workspace(
+    fn ensure_project_cache_ready(
         &self,
         project_id: ProjectId,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        AgentRuntime::ensure_project_review_workspace(self.as_ref(), project_id)
+        AgentRuntime::ensure_project_cache_ready(self.as_ref(), project_id)
     }
 
     async fn project_git_provider(&self, project_id: ProjectId) -> Result<Option<GitProvider>> {
@@ -4368,11 +4597,11 @@ impl projects::service::ProjectLifecycleOps for Arc<AgentRuntime> {
             .map(|_| ())
     }
 
-    fn delete_project_review_workspace(
+    fn delete_project_workspace(
         &self,
         project_id: ProjectId,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        AgentRuntime::delete_project_review_workspace(self.as_ref(), project_id)
+        AgentRuntime::delete_project_workspace(self.as_ref(), project_id)
     }
 
     async fn remove_project_from_memory(&self, project_id: ProjectId) {

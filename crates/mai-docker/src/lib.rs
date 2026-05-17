@@ -15,6 +15,4 @@ pub use container::ContainerHandle;
 pub use error::{DockerError, Result};
 pub use exec::{CapturedExecOutput, ExecCaptureOptions, ExecOutput, SidecarParams};
 pub use inspect::ManagedContainer;
-pub use naming::{
-    agent_workspace_volume, project_review_workspace_volume, project_workspace_volume,
-};
+pub use naming::{agent_workspace_volume, project_agent_workspace_volume, project_cache_volume};

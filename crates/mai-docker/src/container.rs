@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use tokio::process::Command;
 
 use crate::args::{
-    ContainerCreateOptions, create_agent_container_args_with_repo_mount_and_user,
+    ContainerCreateOptions, create_agent_container_args_with_workspace,
     create_project_sidecar_container_args, validate_image,
 };
 use crate::client::{DockerClient, stderr_or_stdout};
@@ -293,15 +293,14 @@ impl DockerClient {
                 &default_workspace_volume
             }
         };
-        let repo_mount_user = repo_mount.and_then(|_| host_user_spec());
-        let args = create_agent_container_args_with_repo_mount_and_user(
-            &name,
-            &label,
-            image,
-            workspace_volume,
-            repo_mount,
-            repo_mount_user.as_deref(),
-        );
+        if let Some(repo_mount) = repo_mount {
+            tracing::warn!(
+                repo_mount,
+                "ignoring host repo bind mount; project agents use workspace volumes"
+            );
+        }
+        let args =
+            create_agent_container_args_with_workspace(&name, &label, image, workspace_volume);
         let create = Command::new(&self.binary)
             .args(args.iter().map(String::as_str))
             .output()
@@ -462,6 +461,20 @@ impl DockerClient {
         Ok(())
     }
 
+    pub async fn ensure_volume(&self, volume: &str, labels: &[(&str, String)]) -> Result<()> {
+        let mut args = vec!["volume".to_string(), "create".to_string()];
+        for (key, value) in labels {
+            args.push("--label".to_string());
+            args.push(format!("{key}={value}"));
+        }
+        args.push(volume.to_string());
+        let output = Command::new(&self.binary).args(&args).output().await?;
+        if !output.status.success() {
+            return Err(DockerError::CommandFailed(stderr_or_stdout(&output)));
+        }
+        Ok(())
+    }
+
     async fn reusable_agent_container(
         &self,
         agent_id: &str,
@@ -529,18 +542,6 @@ impl DockerClient {
         }
         Ok(())
     }
-}
-
-#[cfg(unix)]
-fn host_user_spec() -> Option<String> {
-    let uid = unsafe { libc::geteuid() };
-    let gid = unsafe { libc::getegid() };
-    Some(format!("{uid}:{gid}"))
-}
-
-#[cfg(not(unix))]
-fn host_user_spec() -> Option<String> {
-    None
 }
 
 fn is_missing_container_error(message: &str) -> bool {

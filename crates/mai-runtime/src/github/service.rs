@@ -4,15 +4,15 @@ use mai_protocol::{
     GitAccountRequest, GitAccountResponse, GitAccountSummary, GitAccountsResponse,
     GithubAppManifestStartRequest, GithubAppManifestStartResponse, GithubAppSettingsRequest,
     GithubAppSettingsResponse, GithubInstallationsResponse, GithubRepositoriesResponse,
-    RepositoryPackagesResponse, preview,
+    RepositoryPackagesResponse,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::{
-    GitAccountService, GithubAppBackend, GithubErrorResponse, decode_github_response,
-    github_api_url, github_headers, normalize_github_api_get_path, repository_packages_with_token,
+    GitAccountService, GithubAppBackend, decode_github_response, github_api_url, github_headers,
+    normalize_github_api_get_path, repository_packages_with_token,
 };
-use crate::{Result, RuntimeError, turn::tools::ToolExecution};
+use crate::{Result, RuntimeError};
 
 pub(crate) async fn list_git_accounts(
     git_accounts: &GitAccountService,
@@ -132,48 +132,6 @@ pub(crate) async fn list_github_repositories(
         .await
 }
 
-pub(crate) async fn execute_project_github_api_get(
-    github_http: &reqwest::Client,
-    github_api_base_url: &str,
-    token: Option<String>,
-    path: &str,
-) -> Result<ToolExecution> {
-    let Some(token) = token else {
-        return Err(RuntimeError::InvalidInput(
-            "agent is not attached to a project".to_string(),
-        ));
-    };
-    let path = normalize_github_api_get_path(path)?;
-    let url = github_api_url(github_api_base_url, &path);
-    let response = github_http
-        .get(url)
-        .bearer_auth(&token)
-        .headers(github_headers())
-        .send()
-        .await?;
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    let output = if status.is_success() {
-        serde_json::from_str::<Value>(&text)
-            .unwrap_or_else(|_| json!({ "status": status.as_u16(), "body": text }))
-    } else {
-        let message = serde_json::from_str::<GithubErrorResponse>(&text)
-            .ok()
-            .and_then(|error| error.message)
-            .filter(|message| !message.trim().is_empty())
-            .unwrap_or_else(|| preview(&text, 300));
-        json!({
-            "status": status.as_u16(),
-            "error": redact_secret(&message, &token),
-        })
-    };
-    Ok(ToolExecution::new(
-        status.is_success(),
-        redact_secret(&output.to_string(), &token),
-        false,
-    ))
-}
-
 pub(crate) async fn project_github_api_get_json(
     github_http: &reqwest::Client,
     github_api_base_url: &str,
@@ -194,11 +152,4 @@ pub(crate) async fn project_github_api_get_json(
         .send()
         .await?;
     decode_github_response(response, "read project GitHub API").await
-}
-
-fn redact_secret(value: &str, secret: &str) -> String {
-    if secret.is_empty() {
-        return value.to_string();
-    }
-    value.replace(secret, "<redacted>")
 }

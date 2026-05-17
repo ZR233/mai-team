@@ -11,9 +11,12 @@ pub(crate) mod paths;
 pub(crate) mod policy;
 pub(crate) mod reconcile;
 
+#[cfg(test)]
+pub(crate) use manager::sync_project_repo_cache;
 pub(crate) use manager::{
-    CloneSeed, LocalProjectWorkspaceManager, ProjectWorkspaceManager, sync_project_repo_cache,
+    AGENT_WORKSPACE_REPO_PATH, CloneSeed, LocalProjectWorkspaceManager, ProjectWorkspaceManager,
 };
+#[cfg(test)]
 pub(crate) use paths::{agent_clone_path, project_repo_cache_path};
 
 pub(crate) fn delete_project_workspace(projects_root: &Path, project_id: ProjectId) -> Result<()> {

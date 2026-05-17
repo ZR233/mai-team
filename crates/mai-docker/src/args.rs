@@ -21,34 +21,14 @@ pub(crate) fn create_agent_container_args(
     image: &str,
     workspace_volume: &str,
 ) -> Vec<String> {
-    create_agent_container_args_with_repo_mount(name, agent_label, image, workspace_volume, None)
+    create_agent_container_args_with_workspace(name, agent_label, image, workspace_volume)
 }
 
-#[cfg(test)]
-fn create_agent_container_args_with_repo_mount(
+pub(crate) fn create_agent_container_args_with_workspace(
     name: &str,
     agent_label: &str,
     image: &str,
     workspace_volume: &str,
-    repo_mount: Option<&str>,
-) -> Vec<String> {
-    create_agent_container_args_with_repo_mount_and_user(
-        name,
-        agent_label,
-        image,
-        workspace_volume,
-        repo_mount,
-        None,
-    )
-}
-
-pub(crate) fn create_agent_container_args_with_repo_mount_and_user(
-    name: &str,
-    agent_label: &str,
-    image: &str,
-    workspace_volume: &str,
-    repo_mount: Option<&str>,
-    user: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec![
         "create".to_string(),
@@ -60,16 +40,12 @@ pub(crate) fn create_agent_container_args_with_repo_mount_and_user(
         agent_label.to_string(),
         "-v".to_string(),
         format!("{workspace_volume}:/workspace"),
+        "--user".to_string(),
+        "root".to_string(),
     ];
-    if let Some(repo_mount) = repo_mount {
-        args.extend(["-v".to_string(), format!("{repo_mount}:/workspace/repo")]);
-    }
-    if let Some(user) = user {
-        args.extend(["--user".to_string(), user.to_string()]);
-    }
     args.extend([
         "-w".to_string(),
-        "/workspace".to_string(),
+        "/workspace/repo".to_string(),
         image.to_string(),
         "sleep".to_string(),
         "infinity".to_string(),
@@ -197,7 +173,7 @@ pub(crate) fn validate_image(image: &str) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::naming::{MANAGED_LABEL, project_review_workspace_volume};
+    use crate::naming::MANAGED_LABEL;
 
     #[test]
     fn create_agent_container_args_include_labels_workspace_and_image() {
@@ -226,7 +202,16 @@ mod tests {
             args.windows(2)
                 .any(|window| window == ["-v", "mai-team-workspace-child:/workspace"])
         );
-        assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-w", "/workspace/repo"])
+        );
+        assert!(args.windows(2).any(|window| window == ["--user", "root"]));
+        assert!(
+            !args
+                .windows(2)
+                .any(|window| { window[0] == "-v" && window[1].ends_with(":/workspace/repo") })
+        );
         assert!(
             args.windows(3)
                 .any(|window| { window == [image, "sleep", "infinity"] })
@@ -307,75 +292,60 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_agent_container_args_can_use_project_review_volume() {
+    fn reviewer_agent_container_args_use_agent_workspace_volume() {
         let image = "ghcr.io/rcore-os/tgoskits-container:latest";
-        let review_volume = project_review_workspace_volume("project-1");
         let args = create_agent_container_args(
             "mai-team-reviewer",
             "mai.team.agent=reviewer",
             image,
-            &review_volume,
+            "mai-team-project-project-1-agent-reviewer",
         );
 
         assert!(
             args.windows(2)
-                .any(|window| window == ["-v", "mai-team-project-review-project-1:/workspace"])
+                .any(|window| window
+                    == ["-v", "mai-team-project-project-1-agent-reviewer:/workspace"])
         );
         assert!(
             !args
                 .windows(2)
-                .any(|window| window == ["-v", "mai-team-workspace-reviewer:/workspace"])
+                .any(|window| window == ["-v", "mai-team-project-review-project-1:/workspace"])
         );
     }
 
     #[test]
-    fn project_agent_container_args_can_bind_host_repo_worktree() {
+    fn project_agent_container_args_do_not_bind_host_repo_worktree() {
         let image = "ghcr.io/rcore-os/tgoskits-container:latest";
-        let args = create_agent_container_args_with_repo_mount(
+        let args = create_agent_container_args_with_workspace(
             "mai-team-maintainer",
             "mai.team.agent=maintainer",
             image,
-            "mai-team-workspace-maintainer",
-            Some("/data/projects/project-1/worktrees/agent-1"),
+            "mai-team-project-project-1-agent-maintainer",
         );
 
+        assert!(args.windows(2).any(|window| window
+            == [
+                "-v",
+                "mai-team-project-project-1-agent-maintainer:/workspace"
+            ]));
+        assert!(!args.iter().any(|arg| arg.contains("/data/projects")));
         assert!(
             args.windows(2)
-                .any(|window| window == ["-v", "mai-team-workspace-maintainer:/workspace"])
+                .any(|window| window == ["-w", "/workspace/repo"])
         );
-        assert!(args.windows(2).any(|window| {
-            window
-                == [
-                    "-v",
-                    "/data/projects/project-1/worktrees/agent-1:/workspace/repo",
-                ]
-        }));
-        assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
     }
 
     #[test]
-    fn project_agent_container_args_can_run_as_host_user_for_repo_mount() {
+    fn project_agent_container_args_run_as_root() {
         let image = "ghcr.io/rcore-os/tgoskits-container:latest";
-        let args = create_agent_container_args_with_repo_mount_and_user(
+        let args = create_agent_container_args_with_workspace(
             "mai-team-maintainer",
             "mai.team.agent=maintainer",
             image,
-            "mai-team-workspace-maintainer",
-            Some("/data/projects/project-1/clones/agent-1/repo"),
-            Some("1000:1000"),
+            "mai-team-project-project-1-agent-maintainer",
         );
 
-        assert!(
-            args.windows(2)
-                .any(|window| window == ["--user", "1000:1000"])
-        );
-        assert!(args.windows(2).any(|window| {
-            window
-                == [
-                    "-v",
-                    "/data/projects/project-1/clones/agent-1/repo:/workspace/repo",
-                ]
-        }));
+        assert!(args.windows(2).any(|window| window == ["--user", "root"]));
     }
 
     #[test]

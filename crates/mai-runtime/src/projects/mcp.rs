@@ -3,7 +3,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient, project_workspace_volume};
+use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient, project_cache_volume};
 use mai_mcp::McpAgentManager;
 use mai_protocol::{AgentId, ProjectId};
 use mai_protocol::{McpServerConfig, McpServerScope, McpServerTransport};
@@ -103,7 +103,7 @@ pub(crate) async fn ensure_sidecar(
         return Ok(container);
     }
 
-    let workspace_volume = project_workspace_volume(&project_id.to_string());
+    let workspace_volume = project_cache_volume(&project_id.to_string());
     let container = docker
         .ensure_project_sidecar_container(
             &project_id.to_string(),

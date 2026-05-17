@@ -740,6 +740,21 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 	    if printf '%s' "$command" | grep -q "fetch --prune origin"; then
 	      echo "review-sync" >> "$LOG"
 	    fi
+	    if printf '%s' "$command" | grep -q "clone --no-checkout"; then
+	      echo "sidecar-git-clone" >> "$LOG"
+	      if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
+	        echo "token-present" >> "$LOG"
+	      fi
+	      mkdir -p "$WORKSPACE/repo/.git" "$WORKSPACE/.mai/install-log" "$WORKSPACE/.mai/tool-state" "$WORKSPACE/tmp"
+	      printf 'hello\n' > "$WORKSPACE/repo/README.md"
+	    fi
+	    if printf '%s' "$command" | grep -q "gh api"; then
+	      echo "sidecar-gh-api" >> "$LOG"
+	      if [ -n "$GH_TOKEN" ]; then
+	        echo "token-present" >> "$LOG"
+	      fi
+	      printf '{{"ok":true}}\n'
+	    fi
 	    exit 0
 	    ;;
   rm|rmi|start)
@@ -1135,6 +1150,16 @@ async fn ensure_default_environment_creates_root_chat_environment() {
         })
         .await
         .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
 
     let environment = runtime
@@ -1190,6 +1215,16 @@ async fn ensure_default_environment_does_not_require_provider_config() {
         })
         .await
         .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
     wait_until(
         || {
             let runtime = Arc::clone(&runtime);
@@ -5297,6 +5332,16 @@ async fn project_maintainer_can_spawn_agent() {
         })
         .await
         .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
     let project_id = Uuid::new_v4();
     let maintainer_id = Uuid::new_v4();
     let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
@@ -5428,6 +5473,16 @@ async fn project_reviewer_reads_project_skill_resource_without_mcp_session() {
         })
         .await
         .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
     let project_id = Uuid::new_v4();
     let maintainer_id = Uuid::new_v4();
     let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
@@ -6042,7 +6097,15 @@ async fn project_clone_uses_host_git_and_project_data_repo() {
         "maintainer agent clone should be created"
     );
     let docker_log = fake_docker_log(&dir);
-    assert!(!docker_log.contains("sidecar-git-clone"));
+    let workspace_volume =
+        mai_docker::project_agent_workspace_volume(&project_id.to_string(), &agent_id.to_string());
+    let cache_volume = mai_docker::project_cache_volume(&project_id.to_string());
+    assert!(docker_log.contains(&format!(
+        "volume create --label mai.team.managed=true --label mai.team.kind=project-cache --label mai.team.project={project_id} {cache_volume}"
+    )));
+    assert!(docker_log.contains(&format!("{workspace_volume}:/workspace")));
+    assert!(docker_log.contains("sidecar-git-clone"));
+    assert!(docker_log.contains("token-present"));
     assert!(!docker_log.contains("secret-token"));
     assert!(!git_log.contains("secret-token"));
 }
@@ -6098,12 +6161,24 @@ async fn project_workspace_setup_moves_from_pending_to_ready() {
     assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Ready);
     assert_eq!(detail.maintainer_agent.summary.status, AgentStatus::Idle);
     let docker_log = fake_docker_log(&dir);
-    let clone_path =
-        projects::workspace::paths::agent_clone_path(&runtime.projects_root, project_id, agent_id);
-    assert!(docker_log.contains(&format!("{}:/workspace/repo", clone_path.display())));
+    let workspace_volume =
+        mai_docker::project_agent_workspace_volume(&project_id.to_string(), &agent_id.to_string());
+    let cache_volume = mai_docker::project_cache_volume(&project_id.to_string());
+    assert!(docker_log.contains(&format!("volume create --label mai.team.managed=true --label mai.team.kind=project-cache --label mai.team.project={project_id} {cache_volume}")));
+    assert!(docker_log.contains(&format!("{workspace_volume}:/workspace")));
+    assert!(docker_log.contains("-w /workspace/repo"));
+    assert!(!docker_log.contains(&format!(
+            "{}:/workspace/repo",
+            runtime
+                .workspace_manager
+                .agent_clone_path(project_id, agent_id)
+                .display()
+        )));
     let git_log = fake_git_log(&dir);
     let repo_cache_path =
         projects::workspace::paths::project_repo_cache_path(&runtime.projects_root, project_id);
+    let clone_path =
+        projects::workspace::paths::agent_clone_path(&runtime.projects_root, project_id, agent_id);
     assert!(git_log.contains(&format!(
         "clone --mirror -- https://github.com/owner/repo.git {}",
         repo_cache_path.display()
@@ -6149,6 +6224,16 @@ async fn runtime_start_reconciles_orphan_project_clone_dirs() {
         })
         .await
         .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
     let project_id = Uuid::new_v4();
     let maintainer_id = Uuid::new_v4();
     let orphan_agent_id = Uuid::new_v4();
@@ -6525,6 +6610,16 @@ async fn project_reviewer_starts_from_image_with_own_project_clone() {
         })
         .await
         .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
     let project_id = Uuid::new_v4();
     let maintainer_id = Uuid::new_v4();
     let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
@@ -6550,21 +6645,19 @@ async fn project_reviewer_starts_from_image_with_own_project_clone() {
     assert_eq!(reviewer.role, Some(AgentRole::Reviewer));
     assert_eq!(reviewer.parent_id, Some(maintainer_id));
     let docker_log = fake_docker_log(&dir);
-    let clone_path = projects::workspace::paths::agent_clone_path(
-        &runtime.projects_root,
-        project_id,
-        reviewer.id,
+    let workspace_volume = mai_docker::project_agent_workspace_volume(
+        &project_id.to_string(),
+        &reviewer.id.to_string(),
     );
+    let clone_path = runtime
+        .workspace_manager
+        .agent_clone_path(project_id, reviewer.id);
     assert!(!docker_log.contains("commit maintainer-container"));
     assert!(docker_log.contains(&format!("create --name mai-team-{}", reviewer.id)));
-    assert!(docker_log.contains(&format!("mai-team-workspace-{}:/workspace", reviewer.id)));
-    assert!(docker_log.contains(&format!("{}:/workspace/repo", clone_path.display())));
-    #[cfg(unix)]
-    {
-        let uid = unsafe { libc::geteuid() };
-        let gid = unsafe { libc::getegid() };
-        assert!(docker_log.contains(&format!("--user {uid}:{gid}")));
-    }
+    assert!(docker_log.contains(&format!("{workspace_volume}:/workspace")));
+    assert!(!docker_log.contains(&format!("mai-team-workspace-{}:/workspace", reviewer.id)));
+    assert!(!docker_log.contains(&format!("{}:/workspace/repo", clone_path.display())));
+    assert!(docker_log.contains("--user root"));
     assert!(!docker_log.contains("/workspace/reviews"));
 }
 
@@ -6579,6 +6672,16 @@ async fn deleting_project_reviewer_cleans_project_clone() {
         })
         .await
         .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
     let project_id = Uuid::new_v4();
     let maintainer_id = Uuid::new_v4();
     let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
@@ -6599,12 +6702,14 @@ async fn deleting_project_reviewer_cleans_project_clone() {
         .await
         .expect("spawn reviewer");
     let reviewer_id = reviewer.id;
-    let clone_path = projects::workspace::paths::agent_clone_path(
-        &runtime.projects_root,
-        project_id,
-        reviewer_id,
-    );
+    let clone_path = runtime
+        .workspace_manager
+        .agent_clone_path(project_id, reviewer_id);
     std::fs::create_dir_all(&clone_path).expect("reviewer clone");
+    let workspace_volume = mai_docker::project_agent_workspace_volume(
+        &project_id.to_string(),
+        &reviewer_id.to_string(),
+    );
 
     runtime
         .delete_agent(reviewer_id)
@@ -6613,6 +6718,7 @@ async fn deleting_project_reviewer_cleans_project_clone() {
 
     let docker_log = fake_docker_log(&dir);
     assert!(docker_log.contains("rm -f created-container"));
+    assert!(docker_log.contains(&format!("volume rm -f {workspace_volume}")));
     assert!(!clone_path.exists());
 }
 
@@ -6740,7 +6846,7 @@ async fn auto_review_refreshes_project_skills_from_synced_default_branch() {
     );
 
     runtime
-        .sync_project_review_repo(project_id)
+        .sync_project_cache_repo(project_id)
         .await
         .expect("sync review repo");
 
@@ -6754,7 +6860,7 @@ async fn auto_review_refreshes_project_skills_from_synced_default_branch() {
         "New review body.",
     );
     runtime
-        .refresh_project_skills_from_review_workspace(project_id)
+        .refresh_project_skills_from_agent_workspace(project_id)
         .await
         .expect("refresh review skills");
 

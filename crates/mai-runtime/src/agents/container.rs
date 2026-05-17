@@ -13,14 +13,14 @@ use crate::{Result, RuntimeError};
 #[derive(Debug, Clone)]
 pub(crate) enum ContainerSource {
     FreshImage,
-    ProjectClone {
-        clone_path: String,
+    ProjectWorkspace {
+        workspace_volume: String,
+        repo_path: String,
     },
     CloneFrom {
         parent_container_id: String,
         docker_image: String,
         workspace_volume: Option<String>,
-        repo_mount: Option<String>,
     },
 }
 
