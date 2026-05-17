@@ -126,6 +126,13 @@ pub(crate) struct QueueProjectReviewPr {
     pub(crate) reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct GithubApiRequest {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) body: Option<Value>,
+}
+
 #[async_trait::async_trait]
 pub(crate) trait ToolDispatchOps: Send + Sync {
     async fn spawn_agent_from_tool(
@@ -197,6 +204,11 @@ pub(crate) trait ToolDispatchOps: Send + Sync {
         &self,
         agent: &AgentRecord,
         path: String,
+    ) -> Result<ToolExecution>;
+    async fn execute_project_github_api_request(
+        &self,
+        agent: &AgentRecord,
+        request: GithubApiRequest,
     ) -> Result<ToolExecution>;
     async fn queue_project_review_prs(
         &self,
@@ -299,6 +311,7 @@ pub(crate) async fn visible_tool_names(
         mai_tools::TOOL_REQUEST_USER_INPUT.to_string(),
         mai_tools::TOOL_SAVE_ARTIFACT.to_string(),
         mai_tools::TOOL_GITHUB_API_GET.to_string(),
+        mai_tools::TOOL_GITHUB_API_REQUEST.to_string(),
         mai_tools::TOOL_GIT_STATUS.to_string(),
         mai_tools::TOOL_GIT_DIFF.to_string(),
         mai_tools::TOOL_GIT_BRANCH.to_string(),
@@ -688,6 +701,13 @@ pub(crate) async fn execute_tool(
             context
                 .ops
                 .execute_project_github_api_get(agent, path)
+                .await
+        }
+        RoutedTool::GithubApiRequest => {
+            let request = github_api_request_from_arguments(&arguments)?;
+            context
+                .ops
+                .execute_project_github_api_request(agent, request)
                 .await
         }
         RoutedTool::QueueProjectReviewPrs => {
@@ -1134,6 +1154,14 @@ fn queue_project_review_prs_from_arguments(arguments: &Value) -> Result<Vec<Queu
             })
         })
         .collect()
+}
+
+fn github_api_request_from_arguments(arguments: &Value) -> Result<GithubApiRequest> {
+    Ok(GithubApiRequest {
+        method: required_string_argument(arguments, "method")?,
+        path: required_string_argument(arguments, "path")?,
+        body: arguments.get("body").cloned(),
+    })
 }
 
 fn parse_agent_id(value: &str) -> Result<AgentId> {

@@ -18,9 +18,7 @@ use mai_store::{AgentLogFilter, ConfigStore, ProviderSelection, ToolTraceFilter}
 use mai_tools::build_tool_definitions_with_filter;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use thiserror::Error;
@@ -472,12 +470,11 @@ impl AgentRuntime {
             ));
         }
 
-        let repo_path = self
-            .workspace_manager
-            .agent_clone_path(project_id, summary.maintainer_agent_id);
-        let existing = projects::skills::detect_existing_dirs_in_host_repo(&repo_path);
-        self.refresh_project_skill_cache(project_id, &existing)
-            .await?;
+        self.refresh_project_skill_cache_from_agent_workspace(
+            project_id,
+            summary.maintainer_agent_id,
+        )
+        .await?;
         self.project_skills_from_cache(project_id).await
     }
 
@@ -1130,17 +1127,9 @@ impl AgentRuntime {
         {
             return Ok(source);
         }
-        let clone = self
-            .workspace_manager
-            .agent_clone_path(summary.id, agent_id);
-        if !clone.exists() {
-            self.workspace_manager
-                .prepare_agent_workspace(
-                    &summary,
-                    agent_id,
-                    projects::workspace::CloneSeed::DefaultBranch,
-                )
-                .await?;
+        let workspace_volume =
+            project_agent_workspace_volume(&summary.id.to_string(), &agent_id.to_string());
+        if !self.deps.docker.volume_exists(&workspace_volume).await? {
             let token = self.project_git_token(summary.id).await?.ok_or_else(|| {
                 RuntimeError::InvalidInput(
                     "project git account token is not configured".to_string(),
@@ -1149,8 +1138,6 @@ impl AgentRuntime {
             self.sync_agent_workspace_volume_repo(&summary, agent_id, &token)
                 .await?;
         }
-        let workspace_volume =
-            project_agent_workspace_volume(&summary.id.to_string(), &agent_id.to_string());
         let repo_path = projects::workspace::AGENT_WORKSPACE_REPO_PATH.to_string();
         Ok(match source {
             agents::ContainerSource::FreshImage
@@ -1204,67 +1191,6 @@ impl AgentRuntime {
                 count = report.legacy_worktree_dirs_archived.len(),
                 "archived legacy project worktree directories during startup reconcile"
             );
-        }
-        if !report.missing_repo_caches.is_empty() {
-            tracing::warn!(
-                count = report.missing_repo_caches.len(),
-                "found projects with missing repository caches during startup reconcile"
-            );
-            for project_id in &report.missing_repo_caches {
-                let repo_cache_path = self.workspace_manager.repo_cache_path(*project_id);
-                let project_dir_exists = repo_cache_path
-                    .parent()
-                    .is_some_and(|project_dir| project_dir.exists());
-                if !project_dir_exists {
-                    continue;
-                }
-                self.set_project_clone_result(
-                    *project_id,
-                    ProjectStatus::Failed,
-                    ProjectCloneStatus::Failed,
-                    Some("project repository cache is missing after startup reconcile".to_string()),
-                )
-                .await?;
-            }
-        }
-        if !report.missing_agent_clones.is_empty() {
-            tracing::warn!(
-                count = report.missing_agent_clones.len(),
-                "found project agents with missing clones during startup reconcile"
-            );
-            for agent_id in &report.missing_agent_clones {
-                let Some(agent_summary) = agents.iter().find(|agent| agent.id == *agent_id) else {
-                    continue;
-                };
-                let Some(project_id) = agent_summary.project_id else {
-                    continue;
-                };
-                if report.missing_repo_caches.contains(&project_id) {
-                    continue;
-                }
-                let Some(project) = projects.iter().find(|project| project.id == project_id) else {
-                    continue;
-                };
-                if let Err(err) = self
-                    .workspace_manager
-                    .prepare_agent_workspace(
-                        project,
-                        *agent_id,
-                        projects::workspace::CloneSeed::DefaultBranch,
-                    )
-                    .await
-                {
-                    let agent = self.agent(*agent_id).await?;
-                    self.set_status(
-                        &agent,
-                        AgentStatus::Failed,
-                        Some(format!(
-                            "project clone could not be restored after startup reconcile: {err}"
-                        )),
-                    )
-                    .await?;
-                }
-            }
         }
         if !report.invalid_clone_dirs.is_empty() {
             tracing::warn!(
@@ -1325,9 +1251,6 @@ impl AgentRuntime {
                 "found projects with missing project cache volumes during startup reconcile"
             );
             for project_id in &volume_report.missing_project_cache_volumes {
-                if report.missing_repo_caches.contains(project_id) {
-                    continue;
-                }
                 self.set_project_clone_result(
                     *project_id,
                     ProjectStatus::Failed,
@@ -1349,10 +1272,9 @@ impl AgentRuntime {
                 let Some(project_id) = agent_summary.project_id else {
                     continue;
                 };
-                if report.missing_repo_caches.contains(&project_id)
-                    || volume_report
-                        .missing_project_cache_volumes
-                        .contains(&project_id)
+                if volume_report
+                    .missing_project_cache_volumes
+                    .contains(&project_id)
                 {
                     continue;
                 }
@@ -2254,12 +2176,11 @@ impl AgentRuntime {
         {
             return Ok(());
         }
-        let repo_path = self
-            .workspace_manager
-            .agent_clone_path(project_id, summary.maintainer_agent_id);
-        let existing = projects::skills::detect_existing_dirs_in_host_repo(&repo_path);
-        self.refresh_project_skill_cache(project_id, &existing)
-            .await
+        self.refresh_project_skill_cache_from_agent_workspace(
+            project_id,
+            summary.maintainer_agent_id,
+        )
+        .await
     }
 
     async fn refresh_project_skills_from_agent_workspace(
@@ -2268,11 +2189,11 @@ impl AgentRuntime {
     ) -> Result<()> {
         let project = self.project(project_id).await?;
         let summary = project.summary.read().await.clone();
-        let repo_path = self
-            .workspace_manager
-            .agent_clone_path(project_id, summary.maintainer_agent_id);
-        let sources = projects::skills::detect_existing_dirs_in_host_repo(&repo_path);
-        self.refresh_project_skill_cache(project_id, &sources).await
+        self.refresh_project_skill_cache_from_agent_workspace(
+            project_id,
+            summary.maintainer_agent_id,
+        )
+        .await
     }
 
     fn project_skill_cache_dir(&self, project_id: ProjectId) -> PathBuf {
@@ -2300,6 +2221,93 @@ impl AgentRuntime {
         projects::skills::refresh_cache(&self.cache_root, &lock, project_id, sources).await
     }
 
+    async fn refresh_project_skill_cache_from_agent_workspace(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+    ) -> Result<()> {
+        let stage_root = self
+            .cache_root
+            .join("project-skill-stage")
+            .join(project_id.to_string())
+            .join(Uuid::new_v4().to_string());
+        let result = async {
+            let sources = self
+                .project_skill_sources_from_agent_workspace(project_id, agent_id, &stage_root)
+                .await?;
+            self.refresh_project_skill_cache(project_id, &sources).await
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&stage_root);
+        result
+    }
+
+    async fn project_skill_sources_from_agent_workspace(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        stage_root: &Path,
+    ) -> Result<Vec<ProjectSkillSourceDir>> {
+        let workspace_volume =
+            project_agent_workspace_volume(&project_id.to_string(), &agent_id.to_string());
+        let command = projects::skills::detect_existing_dirs_command();
+        let sidecar_name = format!("mai-tool-skill-detect-{project_id}-{}", Uuid::new_v4());
+        let output = self
+            .deps
+            .docker
+            .run_sidecar_shell_env(&SidecarParams {
+                name: &sidecar_name,
+                image: &self.sidecar_image,
+                command: &command,
+                args: &[],
+                cwd: None,
+                env: &[],
+                workspace_volume: Some(&workspace_volume),
+                mounts: &[],
+                timeout_secs: Some(120),
+            })
+            .await?;
+        if output.status != 0 {
+            let message = preview(format!("{}{}", output.stdout, output.stderr).trim(), 500);
+            return Err(RuntimeError::InvalidInput(format!(
+                "project skill discovery sidecar failed: {message}"
+            )));
+        }
+
+        let mut sources = projects::skills::detected_dirs_from_stdout(&output.stdout)?;
+        if sources.is_empty() {
+            return Ok(sources);
+        }
+
+        std::fs::create_dir_all(stage_root)?;
+        for source in &mut sources {
+            let target = stage_root.join(&source.cache_name);
+            let _ = std::fs::remove_dir_all(&target);
+            let copy_name = format!(
+                "mai-tool-skill-copy-{project_id}-{}-{}",
+                source.cache_name,
+                Uuid::new_v4()
+            );
+            self.deps
+                .docker
+                .copy_from_workspace_volume_to_file(
+                    &copy_name,
+                    &self.sidecar_image,
+                    &workspace_volume,
+                    &source.container_path,
+                    &target,
+                )
+                .await
+                .map_err(|err| {
+                    RuntimeError::InvalidInput(format!(
+                        "failed to copy project skill source from workspace volume: {err}"
+                    ))
+                })?;
+            source.host_path = Some(target);
+        }
+        Ok(sources)
+    }
+
     async fn ensure_project_mcp_manager(
         &self,
         project_id: ProjectId,
@@ -2311,6 +2319,9 @@ impl AgentRuntime {
         }
         if let Some(manager) = projects::mcp::cached_manager(&self.state, project_id).await {
             return Ok(Some(manager));
+        }
+        if projects::mcp::project_mcp_configs("").is_empty() {
+            return Ok(None);
         }
 
         let Some(token) = self.project_git_token_details(project_id).await? else {
@@ -2543,10 +2554,14 @@ impl AgentRuntime {
             RuntimeError::InvalidInput("project git account token is not configured".to_string())
         })?;
         self.ensure_project_cache_volume(project_id).await?;
-        self.workspace_manager
-            .sync_repo_cache(&summary, &token)
+        self.sync_project_cache_volume_repo(&summary, &token)
             .await?;
-        self.sync_project_cache_volume_repo(&summary, &token).await
+        self.sync_agent_workspace_volume_from_cache_repo(
+            &summary,
+            summary.maintainer_agent_id,
+            &token,
+        )
+        .await
     }
 
     async fn ensure_agent_workspace_volume(
@@ -2600,6 +2615,16 @@ impl AgentRuntime {
         token: &str,
     ) -> Result<()> {
         self.sync_project_cache_volume_repo(project, token).await?;
+        self.sync_agent_workspace_volume_from_cache_repo(project, agent_id, token)
+            .await
+    }
+
+    async fn sync_agent_workspace_volume_from_cache_repo(
+        &self,
+        project: &ProjectSummary,
+        agent_id: AgentId,
+        token: &str,
+    ) -> Result<()> {
         let volume = project_agent_workspace_volume(&project.id.to_string(), &agent_id.to_string());
         let cache_volume = project_cache_volume(&project.id.to_string());
         self.ensure_agent_workspace_volume(agent_id, &volume, None)
@@ -2613,6 +2638,7 @@ impl AgentRuntime {
              mkdir -p /workspace /workspace/.mai/install-log /workspace/.mai/tool-state /workspace/tmp\n\
              git -c credential.helper= clone --no-checkout -- /cache/repo.git /workspace/repo\n\
              cd /workspace/repo\n\
+             git fetch /cache/repo.git '+refs/pull/*/head:refs/remotes/origin/pr/*'\n\
              git remote set-url origin {}\n\
              git checkout -B {} {}",
             shell_quote(&repo_url),
@@ -2769,7 +2795,24 @@ impl AgentRuntime {
         agent: &AgentRecord,
         path: &str,
     ) -> Result<ToolExecution> {
-        let path = github::normalize_github_api_get_path(path)?;
+        self.execute_project_github_api_request(
+            agent,
+            &turn::tools::GithubApiRequest {
+                method: "GET".to_string(),
+                path: path.to_string(),
+                body: None,
+            },
+        )
+        .await
+    }
+
+    async fn execute_project_github_api_request(
+        &self,
+        agent: &AgentRecord,
+        request: &turn::tools::GithubApiRequest,
+    ) -> Result<ToolExecution> {
+        let method = github::normalize_github_api_method(&request.method)?;
+        let path = github::normalize_github_api_get_path(&request.path)?;
         let token = self
             .project_git_token_for_agent(agent)
             .await?
@@ -2784,9 +2827,32 @@ impl AgentRuntime {
         })?;
         let workspace_volume =
             project_agent_workspace_volume(&project_id.to_string(), &summary.id.to_string());
-        let env = [("GH_TOKEN".to_string(), token.clone())];
+        let mut env = vec![("GH_TOKEN".to_string(), token.clone())];
         let sidecar_name = format!("mai-tool-gh-api-{}-{}", summary.id, Uuid::new_v4());
-        let command = format!("gh api {}", shell_quote(&path));
+        let body = projects::review::project_review_github_api_body_with_model_footer(
+            &method,
+            &path,
+            request.body.clone(),
+            summary.role.as_ref(),
+            &summary.model,
+        );
+        let command = if let Some(body) = &body {
+            let body = serde_json::to_string(body).map_err(|err| {
+                RuntimeError::InvalidInput(format!("invalid GitHub API JSON body: {err}"))
+            })?;
+            env.push(("MAI_GH_API_BODY".to_string(), body));
+            format!(
+                "printf '%s' \"$MAI_GH_API_BODY\" | gh api --method {} --input - {}",
+                shell_quote(&method),
+                shell_quote(&path)
+            )
+        } else {
+            format!(
+                "gh api --method {} {}",
+                shell_quote(&method),
+                shell_quote(&path)
+            )
+        };
         let output = self
             .deps
             .docker
@@ -2855,26 +2921,9 @@ impl AgentRuntime {
         })?;
         let token = self.deps.git_accounts.token(&account_id).await?;
         self.ensure_project_cache_volume(project_id).await?;
-        self.workspace_manager
-            .ensure_repo_cache(&summary, &token)
-            .await?;
-        self.workspace_manager
-            .sync_repo_cache(&summary, &token)
-            .await?;
-        self.workspace_manager
-            .prepare_agent_workspace(
-                &summary,
-                maintainer_agent_id,
-                projects::workspace::CloneSeed::DefaultBranch,
-            )
-            .await?;
         self.sync_agent_workspace_volume_repo(&summary, maintainer_agent_id, &token)
             .await?;
-        let clone_path = self
-            .workspace_manager
-            .agent_clone_path(summary.id, maintainer_agent_id);
-        let existing = projects::skills::detect_existing_dirs_in_host_repo(&clone_path);
-        self.refresh_project_skill_cache(project_id, &existing)
+        self.refresh_project_skill_cache_from_agent_workspace(project_id, maintainer_agent_id)
             .await?;
         Ok(())
     }
@@ -3002,7 +3051,12 @@ impl AgentRuntime {
             let Some(manager) = manager else {
                 return Vec::new();
             };
-            return manager.tools().await;
+            return manager
+                .tools()
+                .await
+                .into_iter()
+                .filter(|tool| !projects::mcp::is_github_mcp_tool(tool))
+                .collect();
         }
         let Some(manager) = agent.mcp.read().await.clone() else {
             return Vec::new();
@@ -5164,6 +5218,14 @@ impl turn::tools::ToolDispatchOps for Arc<AgentRuntime> {
         path: String,
     ) -> Result<ToolExecution> {
         AgentRuntime::execute_project_github_api_get(self.as_ref(), agent, &path).await
+    }
+
+    async fn execute_project_github_api_request(
+        &self,
+        agent: &AgentRecord,
+        request: turn::tools::GithubApiRequest,
+    ) -> Result<ToolExecution> {
+        AgentRuntime::execute_project_github_api_request(self.as_ref(), agent, &request).await
     }
 
     async fn queue_project_review_prs(

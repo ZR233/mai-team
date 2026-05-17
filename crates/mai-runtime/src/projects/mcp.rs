@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient, project_cache_volume};
-use mai_mcp::McpAgentManager;
+use mai_mcp::{McpAgentManager, McpTool};
 use mai_protocol::{AgentId, ProjectId};
-use mai_protocol::{McpServerConfig, McpServerScope, McpServerTransport};
+use mai_protocol::McpServerConfig;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -60,31 +60,12 @@ impl ProjectMcpManagerHandle {
     }
 }
 
-pub(crate) fn project_mcp_configs(token: &str) -> BTreeMap<String, McpServerConfig> {
-    let mut configs = BTreeMap::new();
-    configs.insert(
-        PROJECT_GITHUB_MCP_SERVER.to_string(),
-        McpServerConfig {
-            scope: McpServerScope::Project,
-            transport: McpServerTransport::Stdio,
-            command: Some("github-mcp-server".to_string()),
-            args: vec!["stdio".to_string()],
-            env: BTreeMap::from([
-                (
-                    "GITHUB_PERSONAL_ACCESS_TOKEN".to_string(),
-                    token.to_string(),
-                ),
-                (
-                    "GITHUB_TOOLSETS".to_string(),
-                    "context,repos,issues,pull_requests".to_string(),
-                ),
-            ]),
-            enabled: true,
-            startup_timeout_secs: Some(20),
-            ..McpServerConfig::default()
-        },
-    );
-    configs
+pub(crate) fn project_mcp_configs(_token: &str) -> BTreeMap<String, McpServerConfig> {
+    BTreeMap::new()
+}
+
+pub(crate) fn is_github_mcp_tool(tool: &McpTool) -> bool {
+    tool.server == PROJECT_GITHUB_MCP_SERVER || tool.model_name.starts_with("mcp__github__")
 }
 
 pub(crate) async fn ensure_sidecar(
@@ -259,7 +240,6 @@ pub(crate) async fn execute_project_mcp_tool(
     cancellation_token: CancellationToken,
 ) -> Result<ToolExecution> {
     let agent_id = agent.summary.read().await.id;
-    let summary = agent.summary.read().await.clone();
     let mut retried_auth_failure = false;
     loop {
         let Some(manager) = ops
@@ -274,14 +254,8 @@ pub(crate) async fn execute_project_mcp_tool(
             .project_git_token_for_agent(agent)
             .await?
             .unwrap_or_default();
-        let call_arguments = super::review::project_review_mcp_arguments_with_model_footer(
-            model_name,
-            arguments.clone(),
-            summary.role.as_ref(),
-            &summary.model,
-        );
         let output = tokio::select! {
-            output = ops.call_project_mcp_tool(manager, model_name.to_string(), call_arguments) => output,
+            output = ops.call_project_mcp_tool(manager, model_name.to_string(), arguments.clone()) => output,
             _ = cancellation_token.cancelled() => {
                 return Err(RuntimeError::TurnCancelled);
             }

@@ -1,9 +1,14 @@
 use std::path::Path;
 
-use mai_protocol::{ProjectId, preview};
+use mai_protocol::ProjectId;
+#[cfg(test)]
+use mai_protocol::preview;
+#[cfg(test)]
 use tokio::process::Command;
 
-use crate::{Result, RuntimeError};
+use crate::Result;
+#[cfg(test)]
+use crate::RuntimeError;
 
 pub(crate) mod docker_reconcile;
 pub(crate) mod lease;
@@ -15,7 +20,7 @@ pub(crate) mod reconcile;
 #[cfg(test)]
 pub(crate) use manager::sync_project_repo_cache;
 pub(crate) use manager::{
-    AGENT_WORKSPACE_REPO_PATH, CloneSeed, LocalProjectWorkspaceManager, ProjectWorkspaceManager,
+    AGENT_WORKSPACE_REPO_PATH, LocalProjectWorkspaceManager, ProjectWorkspaceManager,
 };
 #[cfg(test)]
 pub(crate) use paths::{agent_clone_path, project_repo_cache_path};
@@ -25,6 +30,7 @@ pub(crate) fn delete_project_workspace(projects_root: &Path, project_id: Project
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn git_plain<const N: usize>(
     git_binary: &str,
     cwd: &Path,
@@ -33,6 +39,7 @@ pub(crate) async fn git_plain<const N: usize>(
     run_git(git_binary, cwd, &args, None).await
 }
 
+#[cfg(test)]
 pub(crate) async fn git_with_token<const N: usize>(
     git_binary: &str,
     cwd: &Path,
@@ -42,6 +49,7 @@ pub(crate) async fn git_with_token<const N: usize>(
     run_git(git_binary, cwd, &args, Some(token)).await
 }
 
+#[cfg(test)]
 async fn run_git(
     git_binary: &str,
     cwd: &Path,
@@ -109,6 +117,7 @@ async fn run_git(
     )))
 }
 
+#[cfg(test)]
 fn redact_secret(value: &str, secret: &str) -> String {
     if secret.is_empty() {
         value.to_string()

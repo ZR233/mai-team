@@ -471,7 +471,14 @@ fn write_workspace_project_skill(
     body: &str,
 ) -> PathBuf {
     let repo_path = ensure_project_clone(dir, project_id, agent_id);
-    write_skill_at(repo_path.join(root), name, description, body)
+    let skill = write_skill_at(repo_path.join(root), name, description, body);
+    write_skill_at(
+        fake_sidecar_workspace_path(dir).join(root),
+        name,
+        description,
+        body,
+    );
+    skill
 }
 
 fn seed_project_workspace_volumes(
@@ -957,7 +964,7 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
       src=$(printf '%s' "$src" | sed "s#/workspace/repo#$WORKSPACE#g")
       mkdir -p "$(dirname "$3")"
       if [ -e "$src" ]; then
-        cp "$src" "$3"
+        cp -R "$src" "$3"
       else
         printf 'artifact\n' > "$3"
       fi
@@ -1027,34 +1034,6 @@ exit 0
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&path, permissions).expect("chmod fake git");
-    }
-    path.to_string_lossy().to_string()
-}
-
-fn failing_git_path(dir: &tempfile::TempDir) -> String {
-    let path = dir.path().join("failing-git.sh");
-    let log_path = fake_git_log_path(dir);
-    let script = format!(
-        r#"#!/bin/sh
-LOG={}
-echo "$*" >> "$LOG"
-if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
-  echo "token-present" >> "$LOG"
-fi
-echo "git clone failed with secret-token" >&2
-exit 42
-"#,
-        test_shell_quote(&log_path.to_string_lossy())
-    );
-    std::fs::write(&path, script).expect("write failing git");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&path)
-            .expect("failing git metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&path, permissions).expect("chmod failing git");
     }
     path.to_string_lossy().to_string()
 }
@@ -3836,10 +3815,10 @@ async fn detects_project_skills_from_sidecar_candidate_dirs() {
     let claude_skill = workspace.join(".claude/skills/claude-demo");
     let agents_skill = workspace.join(".agents/skills/agents-demo");
     let root_skill = workspace.join("skills/root-demo");
-    for (path, name) in [
-        (&claude_skill, "claude-demo"),
-        (&agents_skill, "agents-demo"),
-        (&root_skill, "root-demo"),
+    for (path, relative, name) in [
+        (&claude_skill, ".claude/skills", "claude-demo"),
+        (&agents_skill, ".agents/skills", "agents-demo"),
+        (&root_skill, "skills", "root-demo"),
     ] {
         fs::create_dir_all(path).expect("mkdir skill");
         fs::write(
@@ -3847,6 +3826,12 @@ async fn detects_project_skills_from_sidecar_candidate_dirs() {
             format!("---\nname: {name}\ndescription: {name}\n---\nBody."),
         )
         .expect("write skill");
+        write_skill_at(
+            fake_sidecar_workspace_path(&dir).join(relative),
+            name,
+            name,
+            "Body.",
+        );
     }
     fs::create_dir_all(workspace.join("template/ignored")).expect("mkdir ignored");
     fs::write(
@@ -5567,7 +5552,7 @@ async fn project_agent_without_discovered_mcp_tools_has_no_static_fallback() {
 }
 
 #[tokio::test]
-async fn project_agent_mcp_tools_match_project_manager_discovery() {
+async fn project_github_mcp_tools_are_not_visible_even_if_discovered() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     let project_id = Uuid::new_v4();
@@ -5602,17 +5587,10 @@ async fn project_agent_mcp_tools_match_project_manager_discovery() {
         .iter()
         .map(|tool| tool.model_name.as_str())
         .collect::<HashSet<_>>();
-    assert_eq!(
-        names,
-        HashSet::from([
-            "mcp__github__pull_request_review_write",
-            "mcp__git__git_diff_unstaged",
-        ])
-    );
-    assert_eq!(tools.len(), discovered.len());
+    assert_eq!(names, HashSet::from(["mcp__git__git_diff_unstaged"]));
     let visible = turn::tools::visible_tool_names(&runtime.state, &maintainer_record, &tools).await;
-    assert!(visible.contains("mcp__github__pull_request_review_write"));
     assert!(visible.contains("mcp__git__git_diff_unstaged"));
+    assert!(!visible.contains("mcp__github__pull_request_review_write"));
     assert!(!visible.contains("mcp__github__create_pull_request_review"));
     assert!(!visible.contains("mcp__git__git_status"));
 }
@@ -5911,20 +5889,11 @@ async fn task_agent_reads_agent_mcp_resources() {
 }
 
 #[test]
-fn project_mcp_configs_use_official_defaults_without_git_token_env() {
+fn project_mcp_configs_do_not_start_github_mcp_server() {
     let configs = projects::mcp::project_mcp_configs("secret-token");
-    let github = configs.get("github").expect("github");
-    assert_eq!(
-        github
-            .env
-            .get("GITHUB_PERSONAL_ACCESS_TOKEN")
-            .map(String::as_str),
-        Some("secret-token")
-    );
-    assert_eq!(
-        github.env.get("GITHUB_TOOLSETS").map(String::as_str),
-        Some("context,repos,issues,pull_requests")
-    );
+    assert!(configs.is_empty());
+    assert!(!format!("{configs:?}").contains("secret-token"));
+    assert!(!format!("{configs:?}").contains("github-mcp-server"));
     assert!(!configs.contains_key("git"));
 }
 
@@ -6186,7 +6155,7 @@ fn project_maintainer_prompt_includes_clone_url_and_workspace() {
 }
 
 #[tokio::test]
-async fn project_clone_uses_host_git_and_project_data_repo() {
+async fn project_clone_uses_sidecar_git_and_workspace_volumes() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     store
@@ -6226,32 +6195,8 @@ async fn project_clone_uses_host_git_and_project_data_repo() {
         .await
         .expect("clone");
 
-    let git_log = fake_git_log(&dir);
-    let repo_cache_path =
-        projects::workspace::paths::project_repo_cache_path(&runtime.projects_root, project_id);
-    let clone_path =
-        projects::workspace::paths::agent_clone_path(&runtime.projects_root, project_id, agent_id);
-    assert!(git_log.contains(&format!(
-        "clone --mirror -- https://github.com/owner/repo.git {}",
-        repo_cache_path.display()
-    )));
-    assert!(git_log.contains(&format!(
-        "clone --local --no-checkout {} {}",
-        repo_cache_path.display(),
-        clone_path.display()
-    )));
-    assert!(git_log.contains("remote set-url origin https://github.com/owner/repo.git"));
-    assert!(git_log.contains(&format!("checkout -B mai-agent/{agent_id} origin/main")));
-    assert!(git_log.contains("token-present"));
-    assert!(
-        repo_cache_path.exists(),
-        "project repo cache should be created"
-    );
-    assert!(
-        clone_path.join(".git").exists(),
-        "maintainer agent clone should be created"
-    );
     let docker_log = fake_docker_log(&dir);
+    let git_log = fake_git_log(&dir);
     let workspace_volume =
         mai_docker::project_agent_workspace_volume(&project_id.to_string(), &agent_id.to_string());
     let cache_volume = mai_docker::project_cache_volume(&project_id.to_string());
@@ -6259,10 +6204,72 @@ async fn project_clone_uses_host_git_and_project_data_repo() {
         "volume create --label mai.team.managed=true --label mai.team.kind=project-cache --label mai.team.project={project_id} {cache_volume}"
     )));
     assert!(docker_log.contains(&format!("{workspace_volume}:/workspace")));
+    assert!(docker_log.contains(&format!("{cache_volume}:/workspace")));
     assert!(docker_log.contains("sidecar-git-clone"));
+    assert!(docker_log.contains("+refs/pull/*/head:refs/remotes/origin/pr/*"));
     assert!(docker_log.contains("token-present"));
     assert!(!docker_log.contains("secret-token"));
     assert!(!git_log.contains("secret-token"));
+    assert!(git_log.is_empty());
+}
+
+#[tokio::test]
+async fn github_api_request_runs_via_gh_sidecar_without_token_leak() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    save_agent_with_session(&store, &maintainer).await;
+    store
+        .save_project(&ready_test_project_summary(
+            project_id,
+            maintainer_id,
+            "account-1",
+        ))
+        .await
+        .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(maintainer_id, "planner")]);
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let result = runtime
+        .execute_tool_for_test(
+            maintainer_id,
+            "github_api_request",
+            json!({
+                "method": "POST",
+                "path": "/repos/owner/repo/pulls/123/reviews",
+                "body": {
+                    "event": "COMMENT",
+                    "body": "Looks good."
+                }
+            }),
+        )
+        .await
+        .expect("github api request");
+
+    assert!(result.success);
+    assert_eq!(
+        serde_json::from_str::<Value>(&result.output).expect("json output"),
+        json!({"ok": true})
+    );
+    let docker_log = fake_docker_log(&dir);
+    assert!(docker_log.contains("sidecar-gh-api"));
+    assert!(docker_log.contains("--method POST"));
+    assert!(docker_log.contains("MAI_GH_API_BODY"));
+    assert!(docker_log.contains("token-present"));
+    assert!(!docker_log.contains("secret-token"));
 }
 
 #[tokio::test]
@@ -6330,20 +6337,7 @@ async fn project_workspace_setup_moves_from_pending_to_ready() {
                 .display()
         )));
     let git_log = fake_git_log(&dir);
-    let repo_cache_path =
-        projects::workspace::paths::project_repo_cache_path(&runtime.projects_root, project_id);
-    let clone_path =
-        projects::workspace::paths::agent_clone_path(&runtime.projects_root, project_id, agent_id);
-    assert!(git_log.contains(&format!(
-        "clone --mirror -- https://github.com/owner/repo.git {}",
-        repo_cache_path.display()
-    )));
-    assert!(git_log.contains(&format!(
-        "clone --local --no-checkout {} {}",
-        repo_cache_path.display(),
-        clone_path.display()
-    )));
-    assert!(git_log.contains("token-present"));
+    assert!(git_log.is_empty());
 
     let mut saw_cloning = false;
     let mut saw_ready = false;
@@ -6408,7 +6402,7 @@ async fn runtime_start_reconciles_orphan_project_clone_dirs() {
 }
 
 #[tokio::test]
-async fn runtime_start_marks_missing_project_repo_cache_failed() {
+async fn runtime_start_marks_missing_project_cache_volume_failed() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     store
@@ -6448,12 +6442,12 @@ async fn runtime_start_marks_missing_project_repo_cache_failed() {
             .summary
             .last_error
             .as_deref()
-            .is_some_and(|error| error.contains("repository cache"))
+            .is_some_and(|error| error.contains("cache volume"))
     );
 }
 
 #[tokio::test]
-async fn runtime_start_restores_missing_project_agent_clone() {
+async fn runtime_start_accepts_missing_legacy_project_agent_clone_when_volume_exists() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     store
@@ -6479,7 +6473,7 @@ async fn runtime_start_restores_missing_project_agent_clone() {
     let agent = runtime.get_agent(maintainer_id, None).await.expect("agent");
     assert_eq!(agent.summary.status, AgentStatus::Idle);
     assert!(
-        projects::workspace::paths::agent_clone_path(
+        !projects::workspace::paths::agent_clone_path(
             &runtime.projects_root,
             project_id,
             maintainer_id,
@@ -7017,6 +7011,7 @@ async fn auto_review_refreshes_project_skills_from_synced_default_branch() {
         .sync_project_cache_repo(project_id)
         .await
         .expect("sync review repo");
+    assert!(fake_docker_log(&dir).contains("sidecar-git-clone"));
 
     write_workspace_project_skill(
         &dir,
@@ -7483,7 +7478,7 @@ async fn project_workspace_setup_failure_marks_project_failed() {
         ModelClient::new(),
         Arc::clone(&store),
         RuntimeConfig {
-            git_binary: Some(failing_git_path(&dir)),
+            sidecar_image: "bad image".to_string(),
             ..test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE)
         },
     )
@@ -7508,7 +7503,7 @@ async fn project_workspace_setup_failure_marks_project_failed() {
             .last_error
             .as_deref()
             .unwrap_or_default()
-            .contains("git clone failed")
+            .contains("invalid docker image")
     );
     assert!(
         !detail
@@ -7518,7 +7513,7 @@ async fn project_workspace_setup_failure_marks_project_failed() {
             .unwrap_or_default()
             .contains("secret-token")
     );
-    assert!(fake_git_log(&dir).contains("token-present"));
+    assert!(fake_git_log(&dir).is_empty());
 }
 
 #[tokio::test]

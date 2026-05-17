@@ -14,6 +14,17 @@ pub struct ContainerCreateOptions {
     pub network: Option<String>,
 }
 
+pub(crate) fn default_agent_container_options() -> ContainerCreateOptions {
+    ContainerCreateOptions {
+        memory: Some("8g".to_string()),
+        cpus: Some("4".to_string()),
+        pids_limit: Some(2048),
+        cap_drop_all: false,
+        no_new_privileges: false,
+        network: None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn create_agent_container_args(
     name: &str,
@@ -30,6 +41,22 @@ pub(crate) fn create_agent_container_args_with_workspace(
     image: &str,
     workspace_volume: &str,
 ) -> Vec<String> {
+    create_agent_container_args_with_workspace_options(
+        name,
+        agent_label,
+        image,
+        workspace_volume,
+        &default_agent_container_options(),
+    )
+}
+
+pub(crate) fn create_agent_container_args_with_workspace_options(
+    name: &str,
+    agent_label: &str,
+    image: &str,
+    workspace_volume: &str,
+    options: &ContainerCreateOptions,
+) -> Vec<String> {
     let mut args = vec![
         "create".to_string(),
         "--name".to_string(),
@@ -43,6 +70,7 @@ pub(crate) fn create_agent_container_args_with_workspace(
         "--user".to_string(),
         "root".to_string(),
     ];
+    apply_container_create_options(&mut args, options);
     args.extend([
         "-w".to_string(),
         "/workspace/repo".to_string(),
@@ -207,6 +235,13 @@ mod tests {
                 .any(|window| window == ["-w", "/workspace/repo"])
         );
         assert!(args.windows(2).any(|window| window == ["--user", "root"]));
+        assert!(!args.windows(2).any(|window| window[0] == "--network"));
+        assert!(args.windows(2).any(|window| window == ["--memory", "8g"]));
+        assert!(args.windows(2).any(|window| window == ["--cpus", "4"]));
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--pids-limit", "2048"])
+        );
         assert!(
             !args
                 .windows(2)
@@ -268,7 +303,7 @@ mod tests {
         let args = create_workspace_copy_container_args(
             "mai-team-project-skill-copy-project-1",
             image,
-            "mai-team-project-review-project-1",
+            "mai-team-project-project-1-agent-reviewer-1",
         );
 
         assert_eq!(args[0], "create");
@@ -280,10 +315,11 @@ mod tests {
             args.windows(2)
                 .any(|window| window == ["--label", MANAGED_LABEL])
         );
-        assert!(
-            args.windows(2)
-                .any(|window| window == ["-v", "mai-team-project-review-project-1:/workspace"])
-        );
+        assert!(args.windows(2).any(|window| window
+            == [
+                "-v",
+                "mai-team-project-project-1-agent-reviewer-1:/workspace"
+            ]));
         assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
         assert!(
             args.windows(3)
@@ -309,7 +345,7 @@ mod tests {
         assert!(
             !args
                 .windows(2)
-                .any(|window| window == ["-v", "mai-team-project-review-project-1:/workspace"])
+                .any(|window| window[0] == "-v" && window[1].contains("-project-review-"))
         );
     }
 

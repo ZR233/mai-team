@@ -1,24 +1,34 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(test)]
 use mai_docker::project_agent_workspace_volume;
 use mai_protocol::{AgentId, AgentSummary, ProjectId, ProjectSummary};
 
+use super::delete_project_workspace;
+#[cfg(test)]
+use super::git_plain;
+#[cfg(test)]
+use super::git_with_token;
 use super::lease::ProjectWorkspaceLocks;
 use super::reconcile::{WorkspaceReconcileReport, reconcile_project_workspaces};
-use super::{delete_project_workspace, git_plain, git_with_token};
+use crate::Result;
+#[cfg(test)]
+use crate::RuntimeError;
+#[cfg(test)]
 use crate::github::github_clone_url;
-use crate::projects::workspace::paths::{
-    agent_clone_path, project_paths, project_repo_cache_path, project_tmp_path,
-};
-use crate::{Result, RuntimeError};
+use crate::projects::workspace::paths::agent_clone_path;
+#[cfg(test)]
+use crate::projects::workspace::paths::{project_paths, project_repo_cache_path, project_tmp_path};
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RepoCacheHandle {
     pub(crate) project_id: ProjectId,
     pub(crate) path: PathBuf,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RepoSyncReport {
     pub(crate) cache: RepoCacheHandle,
@@ -26,6 +36,7 @@ pub(crate) struct RepoSyncReport {
 
 pub(crate) const AGENT_WORKSPACE_REPO_PATH: &str = "/workspace/repo";
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AgentWorkspaceHandle {
     pub(crate) project_id: ProjectId,
@@ -35,8 +46,8 @@ pub(crate) struct AgentWorkspaceHandle {
     pub(crate) branch: String,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum CloneSeed {
     DefaultBranch,
     AgentBranch {
@@ -60,18 +71,21 @@ pub(crate) enum CloneSeed {
 /// 实现方必须保证 GitHub token 只在受控执行边界内使用，序列化同一项目的
 /// workspace 变更，并返回不包含 secret 的 workspace handle。
 pub(crate) trait ProjectWorkspaceManager: Send + Sync {
+    #[cfg(test)]
     fn ensure_repo_cache(
         &self,
         project: &ProjectSummary,
         token: &str,
     ) -> impl std::future::Future<Output = Result<RepoCacheHandle>> + Send;
 
+    #[cfg(test)]
     fn sync_repo_cache(
         &self,
         project: &ProjectSummary,
         token: &str,
     ) -> impl std::future::Future<Output = Result<RepoSyncReport>> + Send;
 
+    #[cfg(test)]
     fn prepare_agent_workspace(
         &self,
         project: &ProjectSummary,
@@ -99,28 +113,33 @@ pub(crate) trait ProjectWorkspaceManager: Send + Sync {
 
 #[derive(Clone)]
 pub(crate) struct LocalProjectWorkspaceManager {
+    #[cfg(test)]
     git_binary: String,
     projects_root: PathBuf,
     locks: Arc<ProjectWorkspaceLocks>,
 }
 
 impl LocalProjectWorkspaceManager {
-    pub(crate) fn new(git_binary: String, projects_root: PathBuf) -> Self {
+    pub(crate) fn new(_git_binary: String, projects_root: PathBuf) -> Self {
         Self {
-            git_binary,
+            #[cfg(test)]
+            git_binary: _git_binary,
             projects_root,
             locks: Arc::new(ProjectWorkspaceLocks::default()),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn repo_cache_path(&self, project_id: ProjectId) -> PathBuf {
         project_repo_cache_path(&self.projects_root, project_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn agent_clone_path(&self, project_id: ProjectId, agent_id: AgentId) -> PathBuf {
         agent_clone_path(&self.projects_root, project_id, agent_id)
     }
 
+    #[cfg(test)]
     fn repo_cache_handle(&self, project_id: ProjectId) -> RepoCacheHandle {
         RepoCacheHandle {
             project_id,
@@ -130,6 +149,7 @@ impl LocalProjectWorkspaceManager {
 }
 
 impl ProjectWorkspaceManager for LocalProjectWorkspaceManager {
+    #[cfg(test)]
     async fn ensure_repo_cache(
         &self,
         project: &ProjectSummary,
@@ -143,6 +163,7 @@ impl ProjectWorkspaceManager for LocalProjectWorkspaceManager {
         Ok(self.repo_cache_handle(project.id))
     }
 
+    #[cfg(test)]
     async fn sync_repo_cache(
         &self,
         project: &ProjectSummary,
@@ -155,6 +176,7 @@ impl ProjectWorkspaceManager for LocalProjectWorkspaceManager {
         Ok(RepoSyncReport { cache })
     }
 
+    #[cfg(test)]
     async fn prepare_agent_workspace(
         &self,
         project: &ProjectSummary,
@@ -208,6 +230,7 @@ pub(crate) async fn sync_project_repo_cache(
     Ok(())
 }
 
+#[cfg(test)]
 async fn sync_project_repo_cache_unlocked(
     git_binary: &str,
     projects_root: &Path,
@@ -256,7 +279,7 @@ async fn sync_project_repo_cache_unlocked(
     })
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) async fn prepare_project_agent_clone(
     git_binary: &str,
     projects_root: &Path,
@@ -271,6 +294,7 @@ pub(crate) async fn prepare_project_agent_clone(
     Ok(agent_clone_path(projects_root, project.id, agent_id))
 }
 
+#[cfg(test)]
 async fn prepare_project_agent_clone_unlocked(
     git_binary: &str,
     projects_root: &Path,
@@ -332,6 +356,7 @@ async fn prepare_project_agent_clone_unlocked(
     })
 }
 
+#[cfg(test)]
 fn clone_checkout_target(
     project: &ProjectSummary,
     agent_id: AgentId,
@@ -361,7 +386,7 @@ fn clone_checkout_target(
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) async fn cleanup_project_agent_clone(
     projects_root: &Path,
     project_id: ProjectId,
@@ -606,8 +631,6 @@ mod tests {
                 orphan_clone_removal_failed: Vec::new(),
                 orphan_project_dirs_archived: Vec::new(),
                 legacy_worktree_dirs_archived: Vec::new(),
-                missing_repo_caches: Vec::new(),
-                missing_agent_clones: Vec::new(),
                 invalid_clone_dirs: Vec::new(),
             }
         );
@@ -676,8 +699,6 @@ mod tests {
                 orphan_clone_removal_failed: Vec::new(),
                 orphan_project_dirs_archived: Vec::new(),
                 legacy_worktree_dirs_archived: vec![project_id],
-                missing_repo_caches: Vec::new(),
-                missing_agent_clones: Vec::new(),
                 invalid_clone_dirs: Vec::new(),
             }
         );
@@ -710,8 +731,6 @@ mod tests {
                 orphan_clone_removal_failed: Vec::new(),
                 orphan_project_dirs_archived: vec![orphan_project_id],
                 legacy_worktree_dirs_archived: Vec::new(),
-                missing_repo_caches: Vec::new(),
-                missing_agent_clones: Vec::new(),
                 invalid_clone_dirs: Vec::new(),
             }
         );

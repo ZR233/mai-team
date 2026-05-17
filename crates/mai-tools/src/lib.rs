@@ -112,6 +112,39 @@ mod tests {
     }
 
     #[test]
+    fn github_tool_schemas_cover_gh_read_write_without_credentials() {
+        let tools = build_tool_definitions(&[]);
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"github_api_get"));
+        assert!(names.contains(&"github_api_request"));
+
+        let request = tools
+            .iter()
+            .find(|tool| tool.name == "github_api_request")
+            .expect("github_api_request");
+        assert_eq!(
+            request.parameters.get("required"),
+            Some(&json!(["method", "path"]))
+        );
+        let properties = request
+            .parameters
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("properties");
+        assert!(properties.contains_key("body"));
+        for forbidden in ["token", "env", "cwd", "repo_path", "worktree_path"] {
+            assert!(
+                !properties.contains_key(forbidden),
+                "github_api_request exposes forbidden field {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn file_tool_schemas_include_expected_fields() {
         let tools = build_tool_definitions(&[]);
         let search = tools
@@ -260,6 +293,10 @@ mod tests {
         assert_eq!(route_tool("send_input"), RoutedTool::SendInput);
         assert_eq!(route_tool("resume_agent"), RoutedTool::ResumeAgent);
         assert_eq!(route_tool("github_api_get"), RoutedTool::GithubApiGet);
+        assert_eq!(
+            route_tool("github_api_request"),
+            RoutedTool::GithubApiRequest
+        );
         assert_eq!(
             route_tool("git_workspace_info"),
             RoutedTool::GitWorkspaceInfo
