@@ -2,7 +2,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const MANAGED_LABEL: &str = "mai.team.managed=true";
 pub(crate) const AGENT_LABEL_KEY: &str = "mai.team.agent";
+pub(crate) const KIND_LABEL_KEY: &str = "mai.team.kind";
 pub(crate) const PROJECT_LABEL_KEY: &str = "mai.team.project";
+pub(crate) const ROLE_LABEL_KEY: &str = "mai.team.role";
 pub(crate) const SIDECAR_LABEL_KEY: &str = "mai.team.sidecar";
 pub(crate) const SIDECAR_KIND_LABEL_KEY: &str = "mai.team.sidecar.kind";
 pub(crate) const PROJECT_SIDECAR_KIND: &str = "project";

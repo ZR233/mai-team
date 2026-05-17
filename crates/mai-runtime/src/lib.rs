@@ -1272,6 +1272,102 @@ impl AgentRuntime {
                 "found invalid project clone directories during startup reconcile"
             );
         }
+
+        let volume_report = projects::workspace::docker_reconcile::reconcile_project_volumes(
+            &self.deps.docker,
+            &projects,
+            &agents,
+        )
+        .await?;
+        if !volume_report
+            .orphan_agent_workspace_volumes_removed
+            .is_empty()
+        {
+            tracing::info!(
+                count = volume_report.orphan_agent_workspace_volumes_removed.len(),
+                "removed orphan project agent workspace volumes during startup reconcile"
+            );
+        }
+        if !volume_report
+            .orphan_agent_workspace_volume_removal_failed
+            .is_empty()
+        {
+            tracing::warn!(
+                count = volume_report
+                    .orphan_agent_workspace_volume_removal_failed
+                    .len(),
+                "failed to remove orphan project agent workspace volumes during startup reconcile"
+            );
+        }
+        if !volume_report
+            .orphan_project_cache_volumes_removed
+            .is_empty()
+        {
+            tracing::info!(
+                count = volume_report.orphan_project_cache_volumes_removed.len(),
+                "removed orphan project cache volumes during startup reconcile"
+            );
+        }
+        if !volume_report
+            .orphan_project_cache_volume_removal_failed
+            .is_empty()
+        {
+            tracing::warn!(
+                count = volume_report
+                    .orphan_project_cache_volume_removal_failed
+                    .len(),
+                "failed to remove orphan project cache volumes during startup reconcile"
+            );
+        }
+        if !volume_report.missing_project_cache_volumes.is_empty() {
+            tracing::warn!(
+                count = volume_report.missing_project_cache_volumes.len(),
+                "found projects with missing project cache volumes during startup reconcile"
+            );
+            for project_id in &volume_report.missing_project_cache_volumes {
+                if report.missing_repo_caches.contains(project_id) {
+                    continue;
+                }
+                self.set_project_clone_result(
+                    *project_id,
+                    ProjectStatus::Failed,
+                    ProjectCloneStatus::Failed,
+                    Some("project cache volume is missing after startup reconcile".to_string()),
+                )
+                .await?;
+            }
+        }
+        if !volume_report.missing_agent_workspace_volumes.is_empty() {
+            tracing::warn!(
+                count = volume_report.missing_agent_workspace_volumes.len(),
+                "found project agents with missing workspace volumes during startup reconcile"
+            );
+            for agent_id in &volume_report.missing_agent_workspace_volumes {
+                let Some(agent_summary) = agents.iter().find(|agent| agent.id == *agent_id) else {
+                    continue;
+                };
+                let Some(project_id) = agent_summary.project_id else {
+                    continue;
+                };
+                if report.missing_repo_caches.contains(&project_id)
+                    || volume_report
+                        .missing_project_cache_volumes
+                        .contains(&project_id)
+                {
+                    continue;
+                }
+                let agent = self.agent(*agent_id).await?;
+                self.set_status(
+                    &agent,
+                    AgentStatus::Failed,
+                    Some(
+                        "project agent workspace volume is missing after startup reconcile"
+                            .to_string(),
+                    ),
+                )
+                .await?;
+            }
+        }
         Ok(())
     }
 
@@ -2615,8 +2711,23 @@ impl AgentRuntime {
         self.workspace_manager
             .delete_project_workspace(project_id)
             .await?;
+        self.delete_project_agent_workspace_volumes(project_id)
+            .await?;
         let cache_volume = project_cache_volume(&project_id.to_string());
         self.deps.docker.delete_volume(&cache_volume).await?;
+        Ok(())
+    }
+
+    async fn delete_project_agent_workspace_volumes(&self, project_id: ProjectId) -> Result<()> {
+        let project_id_label = project_id.to_string();
+        let volumes = self.deps.docker.list_managed_volumes().await?;
+        for volume in volumes {
+            if volume.kind.as_deref() == Some("agent-workspace")
+                && volume.project_id.as_deref() == Some(project_id_label.as_str())
+            {
+                self.deps.docker.delete_volume(&volume.name).await?;
+            }
+        }
         Ok(())
     }
 

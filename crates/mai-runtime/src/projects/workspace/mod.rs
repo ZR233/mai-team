@@ -5,6 +5,7 @@ use tokio::process::Command;
 
 use crate::{Result, RuntimeError};
 
+pub(crate) mod docker_reconcile;
 pub(crate) mod lease;
 pub(crate) mod manager;
 pub(crate) mod paths;

@@ -474,7 +474,61 @@ fn write_workspace_project_skill(
     write_skill_at(repo_path.join(root), name, description, body)
 }
 
+fn seed_project_workspace_volumes(
+    dir: &tempfile::TempDir,
+    project_id: ProjectId,
+    agents: &[(AgentId, &str)],
+) {
+    seed_project_cache_volume(dir, project_id);
+    for (agent_id, role) in agents {
+        seed_project_agent_workspace_volume(dir, project_id, *agent_id, role);
+    }
+}
+
+fn seed_project_cache_volume(dir: &tempfile::TempDir, project_id: ProjectId) {
+    seed_fake_docker_volume(
+        dir,
+        &mai_docker::project_cache_volume(&project_id.to_string()),
+        &[
+            ("mai.team.kind", "project-cache"),
+            ("mai.team.project", &project_id.to_string()),
+        ],
+    );
+}
+
+fn seed_project_agent_workspace_volume(
+    dir: &tempfile::TempDir,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    role: &str,
+) {
+    seed_fake_docker_volume(
+        dir,
+        &mai_docker::project_agent_workspace_volume(&project_id.to_string(), &agent_id.to_string()),
+        &[
+            ("mai.team.kind", "agent-workspace"),
+            ("mai.team.project", &project_id.to_string()),
+            ("mai.team.agent", &agent_id.to_string()),
+            ("mai.team.role", role),
+        ],
+    );
+}
+
+fn seed_fake_docker_volume(dir: &tempfile::TempDir, name: &str, labels: &[(&str, &str)]) {
+    let volume_root = dir.path().join("fake-docker-volumes");
+    fs::create_dir_all(&volume_root).expect("mkdir fake docker volumes");
+    let mut contents = String::from("mai.team.managed=true\n");
+    for (key, value) in labels {
+        contents.push_str(key);
+        contents.push('=');
+        contents.push_str(value);
+        contents.push('\n');
+    }
+    fs::write(volume_root.join(name), contents).expect("seed fake docker volume");
+}
+
 fn ensure_project_repo(dir: &tempfile::TempDir, project_id: ProjectId) -> PathBuf {
+    seed_project_cache_volume(dir, project_id);
     let repo_path = dir
         .path()
         .join("data/projects")
@@ -530,6 +584,7 @@ fn ensure_project_clone(
     agent_id: AgentId,
 ) -> PathBuf {
     ensure_project_repo(dir, project_id);
+    seed_project_agent_workspace_volume(dir, project_id, agent_id, "worker");
     let projects_root = dir.path().join("data/projects");
     let repo_cache_path = projects_root.join(project_id.to_string()).join("repo.git");
     let clone_path =
@@ -699,10 +754,13 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
     let path = dir.path().join("fake-docker.sh");
     let log_path = fake_docker_log_path(dir);
     let workspace_root = dir.path().join("fake-sidecar-workspace");
+    let volume_root = dir.path().join("fake-docker-volumes");
     let script = format!(
         r#"#!/bin/sh
 	LOG={}
 	WORKSPACE={}
+	VOLUMES={}
+	mkdir -p "$VOLUMES"
 	last_created="created-container"
 	case "$1" in
   ps)
@@ -759,6 +817,77 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 	    ;;
   rm|rmi|start)
     echo "$*" >> "$LOG"
+    exit 0
+    ;;
+  volume)
+    echo "$*" >> "$LOG"
+    sub="$2"
+    case "$sub" in
+      create)
+        labels=""
+        last=""
+        name=""
+        for arg in "$@"; do
+          if [ "$last" = "--label" ]; then
+            labels="$labels$arg
+"
+          fi
+          last="$arg"
+          name="$arg"
+        done
+        printf '%s' "$labels" > "$VOLUMES/$name"
+        echo "$name"
+        exit 0
+        ;;
+      ls)
+        for file in "$VOLUMES"/*; do
+          [ -f "$file" ] || continue
+          if grep -q '^mai.team.managed=true$' "$file"; then
+            basename "$file"
+          fi
+        done
+        exit 0
+        ;;
+      inspect)
+        shift 2
+        first_volume=1
+        printf '['
+        for name in "$@"; do
+          file="$VOLUMES/$name"
+          if [ ! -f "$file" ]; then
+            printf 'Error response from daemon: no such volume: %s\n' "$name" >&2
+            exit 1
+          fi
+          if [ "$first_volume" -eq 0 ]; then
+            printf ','
+          fi
+          first_volume=0
+          printf '{{"Name":"%s","Labels":{{' "$name"
+          first_label=1
+          while IFS= read -r label; do
+            [ -n "$label" ] || continue
+            key="${{label%%=*}}"
+            value="${{label#*=}}"
+            if [ "$first_label" -eq 0 ]; then
+              printf ','
+            fi
+            first_label=0
+            printf '"%s":"%s"' "$key" "$value"
+          done < "$file"
+          printf '}}}}'
+        done
+        printf ']\n'
+        exit 0
+        ;;
+      rm)
+        shift 2
+        for name in "$@"; do
+          [ "$name" = "-f" ] && continue
+          rm -f "$VOLUMES/$name"
+        done
+        exit 0
+        ;;
+    esac
     exit 0
     ;;
   exec)
@@ -842,7 +971,8 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 esac
 "#,
         test_shell_quote(&log_path.to_string_lossy()),
-        test_shell_quote(&workspace_root.to_string_lossy())
+        test_shell_quote(&workspace_root.to_string_lossy()),
+        test_shell_quote(&volume_root.to_string_lossy())
     );
     std::fs::write(&path, script).expect("write fake docker");
     #[cfg(unix)]
@@ -3654,6 +3784,7 @@ async fn project_skill_cache_lists_project_scope_with_source_paths() {
     save_agent_with_session(&store, &agent).await;
     let project = ready_test_project_summary(project_id, agent_id, "account-1");
     store.save_project(&project).await.expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(agent_id, "worker")]);
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     let cache_dir = runtime.project_skill_cache_dir(project_id);
     assert_eq!(
@@ -3769,6 +3900,7 @@ async fn project_skill_refresh_serializes_cache_replacement() {
     save_agent_with_session(&store, &agent).await;
     let project = ready_test_project_summary(project_id, agent_id, "account-1");
     store.save_project(&project).await.expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(agent_id, "worker")]);
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     let project = runtime.project(project_id).await.expect("project");
     *project.sidecar.write().await = Some(ContainerHandle {
@@ -3972,6 +4104,7 @@ async fn project_turn_refreshes_stale_project_skill_cache_before_injection() {
     save_test_session(&store, agent_id, session_id).await;
     let project = ready_test_project_summary(project_id, agent_id, "account-1");
     store.save_project(&project).await.expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(agent_id, "worker")]);
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     let agent_record = runtime.agent(agent_id).await.expect("agent");
     *agent_record.container.write().await = Some(ContainerHandle {
@@ -4493,6 +4626,11 @@ async fn project_detail_selects_live_reviewer_without_replacing_maintainer() {
         ))
         .await
         .expect("save project");
+    seed_project_workspace_volumes(
+        &dir,
+        project_id,
+        &[(maintainer_id, "planner"), (reviewer_id, "reviewer")],
+    );
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
 
     let detail = runtime
@@ -4535,6 +4673,7 @@ async fn project_detail_falls_back_to_maintainer_when_selected_reviewer_is_gone(
         ))
         .await
         .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(maintainer_id, "planner")]);
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
 
     let detail = runtime
@@ -4950,6 +5089,11 @@ async fn project_subagent_refreshes_and_reads_new_project_skill_resource() {
         ))
         .await
         .expect("save project");
+    seed_project_workspace_volumes(
+        &dir,
+        project_id,
+        &[(maintainer_id, "planner"), (child_id, "explorer")],
+    );
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     let project = runtime.project(project_id).await.expect("project");
     *project.sidecar.write().await = Some(ContainerHandle {
@@ -5033,6 +5177,11 @@ async fn project_subagent_turn_syncs_project_skill_to_container() {
         ))
         .await
         .expect("save project");
+    seed_project_workspace_volumes(
+        &dir,
+        project_id,
+        &[(maintainer_id, "planner"), (child_id, "explorer")],
+    );
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     runtime.state.project_mcp_managers.write().await.insert(
         project_id,
@@ -5105,6 +5254,11 @@ async fn project_worker_cannot_spawn_agents_and_hidden_from_tools() {
         ))
         .await
         .expect("save project");
+    seed_project_workspace_volumes(
+        &dir,
+        project_id,
+        &[(maintainer_id, "planner"), (worker_id, "executor")],
+    );
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     let worker_record = runtime.agent(worker_id).await.expect("worker");
 
@@ -5356,6 +5510,7 @@ async fn project_maintainer_can_spawn_agent() {
         ))
         .await
         .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(maintainer_id, "planner")]);
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     ensure_project_repo(&dir, project_id);
     let maintainer_record = runtime.agent(maintainer_id).await.expect("maintainer");
@@ -6317,6 +6472,7 @@ async fn runtime_start_restores_missing_project_agent_clone() {
     let project = ready_test_project_summary(project_id, maintainer_id, "account-1");
     store.save_project(&project).await.expect("save project");
     ensure_project_repo(&dir, project_id);
+    seed_project_agent_workspace_volume(&dir, project_id, maintainer_id, "planner");
 
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
 
@@ -6364,6 +6520,7 @@ async fn runtime_start_starts_auto_review_worker_immediately() {
     project.review_status = ProjectReviewStatus::Waiting;
     project.next_review_at = Some(now() + TimeDelta::minutes(30));
     store.save_project(&project).await.expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(agent_id, "planner")]);
 
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     let project_record = runtime.project(project_id).await.expect("project");
@@ -6424,6 +6581,11 @@ async fn runtime_start_cleans_stale_project_reviewer_before_new_worker() {
     project.review_status = ProjectReviewStatus::Running;
     project.current_reviewer_agent_id = Some(reviewer_id);
     store.save_project(&project).await.expect("save project");
+    seed_project_workspace_volumes(
+        &dir,
+        project_id,
+        &[(maintainer_id, "planner"), (reviewer_id, "reviewer")],
+    );
     store
         .save_project_review_run(&ProjectReviewRunDetail {
             summary: ProjectReviewRunSummary {
@@ -6518,6 +6680,11 @@ async fn runtime_start_deletes_orphan_project_reviewer() {
     project.auto_review_enabled = true;
     project.review_status = ProjectReviewStatus::Idle;
     store.save_project(&project).await.expect("save project");
+    seed_project_workspace_volumes(
+        &dir,
+        project_id,
+        &[(maintainer_id, "planner"), (orphan_reviewer_id, "reviewer")],
+    );
 
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
 
@@ -6635,6 +6802,7 @@ async fn project_reviewer_starts_from_image_with_own_project_clone() {
         ))
         .await
         .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(maintainer_id, "planner")]);
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     ensure_project_repo(&dir, project_id);
 
@@ -7394,6 +7562,8 @@ async fn project_sidecar_is_removed_when_project_is_deleted() {
         .clone_project_repository(project_id, agent_id)
         .await
         .expect("clone");
+    let stale_reviewer_id = Uuid::new_v4();
+    seed_project_agent_workspace_volume(&dir, project_id, stale_reviewer_id, "reviewer");
     let project = runtime.project(project_id).await.expect("project");
     *project.sidecar.write().await = Some(ContainerHandle {
         id: "created-container".to_string(),
@@ -7406,8 +7576,18 @@ async fn project_sidecar_is_removed_when_project_is_deleted() {
         .expect("delete project");
 
     let docker_log = fake_docker_log(&dir);
+    let agent_volume =
+        mai_docker::project_agent_workspace_volume(&project_id.to_string(), &agent_id.to_string());
+    let stale_reviewer_volume = mai_docker::project_agent_workspace_volume(
+        &project_id.to_string(),
+        &stale_reviewer_id.to_string(),
+    );
+    let cache_volume = mai_docker::project_cache_volume(&project_id.to_string());
     assert!(docker_log.contains("rm -f created-container"));
     assert!(docker_log.contains(&format!("rm -f mai-team-{agent_id}")));
+    assert!(docker_log.contains(&format!("volume rm -f {agent_volume}")));
+    assert!(docker_log.contains(&format!("volume rm -f {stale_reviewer_volume}")));
+    assert!(docker_log.contains(&format!("volume rm -f {cache_volume}")));
     assert!(!runtime.projects_root.join(project_id.to_string()).exists());
 }
 
