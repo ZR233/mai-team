@@ -68,7 +68,7 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         update: ReviewStateUpdate,
     ) -> impl Future<Output = Result<ProjectSummary>> + Send;
 
-    fn ensure_project_review_workspace(
+    fn ensure_project_cache_ready(
         &self,
         project_id: ProjectId,
     ) -> impl Future<Output = Result<()>> + Send;
@@ -358,11 +358,7 @@ async fn run_project_review_pool_worker(
         if !project_still_ready(&ops).await {
             break;
         }
-        match ops
-            .ops
-            .ensure_project_review_workspace(ops.project_id)
-            .await
-        {
+        match ops.ops.ensure_project_cache_ready(ops.project_id).await {
             Ok(()) => break,
             Err(err) => {
                 let error = err.to_string();
@@ -855,7 +851,7 @@ mod tests {
             Ok(summary.clone())
         }
 
-        async fn ensure_project_review_workspace(&self, _project_id: Uuid) -> crate::Result<()> {
+        async fn ensure_project_cache_ready(&self, _project_id: Uuid) -> crate::Result<()> {
             Ok(())
         }
 

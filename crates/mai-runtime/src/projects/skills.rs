@@ -59,18 +59,59 @@ pub(crate) async fn list_from_cache(
     Ok(response)
 }
 
-pub(crate) fn detect_existing_dirs_in_host_repo(repo_path: &Path) -> Vec<ProjectSkillSourceDir> {
+pub(crate) fn detect_existing_dirs_command() -> String {
     PROJECT_SKILL_CANDIDATE_DIRS
         .iter()
-        .filter_map(|(relative, cache_name)| {
-            let host_path = repo_path.join(relative);
-            host_path.is_dir().then(|| ProjectSkillSourceDir {
-                cache_name: (*cache_name).to_string(),
-                container_path: format!("{PROJECT_WORKSPACE_PATH}/{relative}"),
-                host_path: Some(host_path),
-            })
+        .map(|(relative, cache_name)| {
+            let container_path = format!("{PROJECT_WORKSPACE_PATH}/{relative}");
+            format!(
+                "if [ -d {path} ]; then printf '%s\\t%s\\t%s\\n' {relative} {cache_name} {path}; fi",
+                relative = shell_word(relative),
+                cache_name = shell_word(cache_name),
+                path = shell_word(&container_path),
+            )
         })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn detected_dirs_from_stdout(stdout: &str) -> Result<Vec<ProjectSkillSourceDir>> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(detected_dir_from_line)
         .collect()
+}
+
+fn detected_dir_from_line(line: &str) -> Result<ProjectSkillSourceDir> {
+    let parts = line.split('\t').collect::<Vec<_>>();
+    let [relative, cache_name, container_path] = parts.as_slice() else {
+        return Err(RuntimeError::InvalidInput(format!(
+            "invalid project skill source listing: {line}"
+        )));
+    };
+    if !PROJECT_SKILL_CANDIDATE_DIRS
+        .iter()
+        .any(|(candidate_relative, candidate_cache_name)| {
+            candidate_relative == relative && candidate_cache_name == cache_name
+        })
+    {
+        return Err(RuntimeError::InvalidInput(format!(
+            "unsupported project skill source listing: {line}"
+        )));
+    }
+    let expected_path = format!("{PROJECT_WORKSPACE_PATH}/{relative}");
+    if *container_path != expected_path {
+        return Err(RuntimeError::InvalidInput(format!(
+            "unexpected project skill source path: {container_path}"
+        )));
+    }
+    Ok(ProjectSkillSourceDir {
+        cache_name: (*cache_name).to_string(),
+        container_path: (*container_path).to_string(),
+        host_path: None,
+    })
 }
 
 pub(crate) async fn refresh_cache(
@@ -177,4 +218,47 @@ fn source_path(cache_dir: &Path, path: &Path) -> Option<PathBuf> {
         }
     }
     Some(source_path)
+}
+
+fn shell_word(value: &str) -> String {
+    shell_words::quote(value).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn parses_detected_dirs_from_sidecar_stdout() {
+        let sources = detected_dirs_from_stdout(
+            ".claude/skills\tclaude\t/workspace/repo/.claude/skills\n\
+             skills\tskills\t/workspace/repo/skills\n",
+        )
+        .expect("parse sources");
+
+        assert_eq!(
+            sources,
+            vec![
+                ProjectSkillSourceDir {
+                    cache_name: "claude".to_string(),
+                    container_path: "/workspace/repo/.claude/skills".to_string(),
+                    host_path: None,
+                },
+                ProjectSkillSourceDir {
+                    cache_name: "skills".to_string(),
+                    container_path: "/workspace/repo/skills".to_string(),
+                    host_path: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_detected_dir() {
+        let err = detected_dirs_from_stdout(".ssh\tssh\t/workspace/repo/.ssh\n")
+            .expect_err("reject source");
+
+        assert!(err.to_string().contains("unsupported project skill source"));
+    }
 }

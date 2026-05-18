@@ -46,12 +46,12 @@ pub(crate) trait ProjectReviewCycleOps: Send + Sync {
         request: FinishReviewRun,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    fn sync_project_review_repo(
+    fn sync_project_cache_repo(
         &self,
         project_id: ProjectId,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    fn refresh_project_skills_from_review_workspace(
+    fn refresh_project_skills_from_agent_workspace(
         &self,
         project_id: ProjectId,
     ) -> impl Future<Output = Result<()>> + Send;
@@ -115,7 +115,7 @@ pub(crate) async fn run_project_review_once(
         error: None,
     })
     .await?;
-    if let Err(err) = ops.sync_project_review_repo(project_id).await {
+    if let Err(err) = ops.sync_project_cache_repo(project_id).await {
         let error = err.to_string();
         ops.finish_project_review_run(FinishReviewRun {
             run_id,
@@ -132,7 +132,7 @@ pub(crate) async fn run_project_review_once(
         return Err(err);
     }
     if let Err(err) = ops
-        .refresh_project_skills_from_review_workspace(project_id)
+        .refresh_project_skills_from_agent_workspace(project_id)
         .await
     {
         let error = err.to_string();

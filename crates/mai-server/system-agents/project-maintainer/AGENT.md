@@ -8,7 +8,6 @@ default_model_role: executor
 default_skills: []
 mcp_servers:
   - git
-  - github
 capabilities:
   spawn_agents: true
   close_agents: true

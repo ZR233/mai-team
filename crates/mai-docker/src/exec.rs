@@ -50,6 +50,7 @@ pub struct SidecarParams<'a> {
     pub cwd: Option<&'a str>,
     pub env: &'a [(String, String)],
     pub workspace_volume: Option<&'a str>,
+    pub mounts: &'a [(&'a str, &'a str)],
     pub timeout_secs: Option<u64>,
 }
 
@@ -254,6 +255,9 @@ impl DockerClient {
             let mount = format!("{volume}:/workspace");
             cmd.args(["-v", &mount]);
         }
+        for (volume, target) in params.mounts {
+            cmd.args(["-v", &format!("{volume}:{target}")]);
+        }
         if let Some(cwd) = params.cwd {
             cmd.args(["-w", cwd]);
         }
@@ -305,6 +309,9 @@ impl DockerClient {
             .args(["--label", MANAGED_LABEL]);
         if let Some(volume) = params.workspace_volume {
             cmd.args(["-v", &format!("{volume}:/workspace")]);
+        }
+        for (volume, target) in params.mounts {
+            cmd.args(["-v", &format!("{volume}:{target}")]);
         }
         if let Some(cwd) = params.cwd {
             cmd.args(["-w", cwd]);

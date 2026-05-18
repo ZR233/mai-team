@@ -1,20 +1,33 @@
-use std::path::Path;
-
+use mai_docker::{DockerClient, SidecarParams};
 use mai_protocol::{AgentId, ProjectSummary};
 use serde_json::{Value, json};
 
 use crate::github::github_clone_url;
+#[cfg(test)]
 use crate::projects;
 use crate::projects::workspace::policy::GitPolicy;
 use crate::turn::tools::ToolExecution;
 use crate::{Result, RuntimeError};
 
 pub(crate) struct GitToolContext<'a> {
-    pub(crate) git_binary: &'a str,
-    pub(crate) projects_root: &'a std::path::Path,
+    pub(crate) backend: GitToolBackend<'a>,
     pub(crate) agent_id: AgentId,
     pub(crate) project: ProjectSummary,
     pub(crate) token: Option<String>,
+}
+
+pub(crate) enum GitToolBackend<'a> {
+    Sidecar {
+        docker: &'a DockerClient,
+        sidecar_image: &'a str,
+        workspace_volume: String,
+        repo_path: &'a str,
+    },
+    #[cfg(test)]
+    Host {
+        git_binary: &'a str,
+        projects_root: &'a std::path::Path,
+    },
 }
 
 pub(crate) async fn execute_git_tool(
@@ -22,75 +35,41 @@ pub(crate) async fn execute_git_tool(
     name: &str,
     arguments: Value,
 ) -> Result<ToolExecution> {
-    let clone = projects::workspace::agent_clone_path(
-        context.projects_root,
-        context.project.id,
-        context.agent_id,
-    );
-    if !clone.exists() {
-        return Err(RuntimeError::InvalidInput(
-            "project git workspace is not available".to_string(),
-        ));
+    #[cfg(test)]
+    if let GitToolBackend::Host { projects_root, .. } = &context.backend {
+        let clone = projects::workspace::agent_clone_path(
+            projects_root,
+            context.project.id,
+            context.agent_id,
+        );
+        if !clone.exists() {
+            return Err(RuntimeError::InvalidInput(
+                "project git workspace is not available".to_string(),
+            ));
+        }
     }
     let policy = GitPolicy::new(context.project.branch.clone());
     let output = match name {
         mai_tools::TOOL_GIT_STATUS => {
-            git_plain(
-                context.git_binary,
-                &clone,
-                ["status", "--short", "--branch"],
-            )
-            .await?
+            git_plain(&context, ["status", "--short", "--branch"]).await?
         }
-        mai_tools::TOOL_GIT_DIFF => {
-            git_diff(context.git_binary, &clone, &arguments, &policy).await?
-        }
-        mai_tools::TOOL_GIT_BRANCH => {
-            git_branch(context.git_binary, &clone, &arguments, &policy).await?
-        }
+        mai_tools::TOOL_GIT_DIFF => git_diff(&context, &arguments, &policy).await?,
+        mai_tools::TOOL_GIT_BRANCH => git_branch(&context, &arguments, &policy).await?,
         mai_tools::TOOL_GIT_FETCH => {
             let token = required_token(context.token.as_deref())?;
-            git_fetch(context.git_binary, &clone, token, &arguments, &policy).await?
+            git_fetch(&context, token, &arguments, &policy).await?
         }
-        mai_tools::TOOL_GIT_COMMIT => git_commit(context.git_binary, &clone, &arguments).await?,
+        mai_tools::TOOL_GIT_COMMIT => git_commit(&context, &arguments).await?,
         mai_tools::TOOL_GIT_PUSH => {
             let token = required_token(context.token.as_deref())?;
-            git_push(
-                context.git_binary,
-                &clone,
-                token,
-                &arguments,
-                &policy,
-                context.agent_id,
-            )
-            .await?
+            git_push(&context, token, &arguments, &policy).await?
         }
         mai_tools::TOOL_GIT_WORKTREE_INFO | mai_tools::TOOL_GIT_WORKSPACE_INFO => {
-            let repo_cache = projects::workspace::project_repo_cache_path(
-                context.projects_root,
-                context.project.id,
-            );
-            json!({
-                "project_id": context.project.id,
-                "repo_cache": repo_cache,
-                "clone": clone,
-                "worktree": clone,
-            })
-            .to_string()
+            git_workspace_info(&context)
         }
         mai_tools::TOOL_GIT_SYNC_DEFAULT_BRANCH => {
             let token = required_token(context.token.as_deref())?;
-            git_sync_default_branch(
-                context.git_binary,
-                context.projects_root,
-                &clone,
-                &context.project,
-                context.agent_id,
-                token,
-                &arguments,
-                &policy,
-            )
-            .await?
+            git_sync_default_branch(&context, token, &arguments, &policy).await?
         }
         _ => {
             return Err(RuntimeError::InvalidInput(format!(
@@ -102,8 +81,7 @@ pub(crate) async fn execute_git_tool(
 }
 
 async fn git_diff(
-    git_binary: &str,
-    cwd: &Path,
+    context: &GitToolContext<'_>,
     arguments: &Value,
     policy: &GitPolicy,
 ) -> Result<String> {
@@ -116,35 +94,34 @@ async fn git_diff(
         policy.validate_path(path)?;
     }
     match (staged, path.as_deref()) {
-        (true, Some(path)) => git_plain(git_binary, cwd, ["diff", "--staged", "--", path]).await,
-        (true, None) => git_plain(git_binary, cwd, ["diff", "--staged"]).await,
-        (false, Some(path)) => git_plain(git_binary, cwd, ["diff", "--", path]).await,
-        (false, None) => git_plain(git_binary, cwd, ["diff"]).await,
+        (true, Some(path)) => git_plain(context, ["diff", "--staged", "--", path]).await,
+        (true, None) => git_plain(context, ["diff", "--staged"]).await,
+        (false, Some(path)) => git_plain(context, ["diff", "--", path]).await,
+        (false, None) => git_plain(context, ["diff"]).await,
     }
 }
 
 async fn git_branch(
-    git_binary: &str,
-    cwd: &Path,
+    context: &GitToolContext<'_>,
     arguments: &Value,
     policy: &GitPolicy,
 ) -> Result<String> {
     let action = optional_arg(arguments, "action")?.unwrap_or_else(|| "list".to_string());
     match action.as_str() {
-        "list" => git_plain(git_binary, cwd, ["branch", "--list", "--all"]).await,
+        "list" => git_plain(context, ["branch", "--list", "--all"]).await,
         "switch" => {
             let name = required_arg(arguments, "name")?;
             policy.validate_branch(&name)?;
-            git_plain(git_binary, cwd, ["switch", &name]).await
+            git_plain(context, ["switch", &name]).await
         }
         "create" => {
             let name = required_arg(arguments, "name")?;
             policy.validate_branch(&name)?;
             if let Some(start_point) = optional_arg(arguments, "start_point")? {
                 policy.validate_branch(&start_point)?;
-                git_plain(git_binary, cwd, ["switch", "-c", &name, &start_point]).await
+                git_plain(context, ["switch", "-c", &name, &start_point]).await
             } else {
-                git_plain(git_binary, cwd, ["switch", "-c", &name]).await
+                git_plain(context, ["switch", "-c", &name]).await
             }
         }
         other => Err(RuntimeError::InvalidInput(format!(
@@ -154,8 +131,7 @@ async fn git_branch(
 }
 
 async fn git_fetch(
-    git_binary: &str,
-    cwd: &Path,
+    context: &GitToolContext<'_>,
     token: &str,
     arguments: &Value,
     policy: &GitPolicy,
@@ -170,43 +146,35 @@ async fn git_fetch(
     policy.validate_fetch_refspec(refspec.as_deref(), &policy.default_branch)?;
     if let Some(refspec) = refspec {
         if prune {
-            git_with_token(
-                git_binary,
-                cwd,
-                token,
-                ["fetch", "--prune", &remote, &refspec],
-            )
-            .await
+            git_with_token(context, token, ["fetch", "--prune", &remote, &refspec]).await
         } else {
-            git_with_token(git_binary, cwd, token, ["fetch", &remote, &refspec]).await
+            git_with_token(context, token, ["fetch", &remote, &refspec]).await
         }
     } else if prune {
-        git_with_token(git_binary, cwd, token, ["fetch", "--prune", &remote]).await
+        git_with_token(context, token, ["fetch", "--prune", &remote]).await
     } else {
-        git_with_token(git_binary, cwd, token, ["fetch", &remote]).await
+        git_with_token(context, token, ["fetch", &remote]).await
     }
 }
 
-async fn git_commit(git_binary: &str, cwd: &Path, arguments: &Value) -> Result<String> {
+async fn git_commit(context: &GitToolContext<'_>, arguments: &Value) -> Result<String> {
     let message = required_arg(arguments, "message")?;
     if arguments
         .get("all")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        git_plain(git_binary, cwd, ["commit", "--no-verify", "-am", &message]).await
+        git_plain(context, ["commit", "--no-verify", "-am", &message]).await
     } else {
-        git_plain(git_binary, cwd, ["commit", "--no-verify", "-m", &message]).await
+        git_plain(context, ["commit", "--no-verify", "-m", &message]).await
     }
 }
 
 async fn git_push(
-    git_binary: &str,
-    cwd: &Path,
+    context: &GitToolContext<'_>,
     token: &str,
     arguments: &Value,
     policy: &GitPolicy,
-    agent_id: AgentId,
 ) -> Result<String> {
     let remote = optional_arg(arguments, "remote")?.unwrap_or_else(|| "origin".to_string());
     policy.validate_remote(&remote)?;
@@ -218,20 +186,19 @@ async fn git_push(
         .get("set_upstream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let branch = branch.unwrap_or_else(|| format!("{}{agent_id}", policy.agent_branch_prefix));
+    let branch =
+        branch.unwrap_or_else(|| format!("{}{}", policy.agent_branch_prefix, context.agent_id));
     let destination = format!("HEAD:refs/heads/{branch}");
     if set_upstream {
         git_with_token(
-            git_binary,
-            cwd,
+            context,
             token,
             ["push", "--no-verify", "-u", &remote, &destination],
         )
         .await
     } else {
         git_with_token(
-            git_binary,
-            cwd,
+            context,
             token,
             ["push", "--no-verify", &remote, &destination],
         )
@@ -240,11 +207,7 @@ async fn git_push(
 }
 
 async fn git_sync_default_branch(
-    git_binary: &str,
-    projects_root: &Path,
-    clone: &Path,
-    project: &ProjectSummary,
-    agent_id: AgentId,
+    context: &GitToolContext<'_>,
     token: &str,
     arguments: &Value,
     policy: &GitPolicy,
@@ -263,7 +226,7 @@ async fn git_sync_default_branch(
         ));
     }
 
-    let status = git_plain(git_binary, clone, ["status", "--porcelain"]).await?;
+    let status = git_plain(context, ["status", "--porcelain"]).await?;
     let dirty = !status.trim().is_empty();
     if dirty && !force && !preserve_changes {
         return Err(RuntimeError::InvalidInput(
@@ -272,64 +235,217 @@ async fn git_sync_default_branch(
     }
     if dirty && preserve_changes {
         git_plain(
-            git_binary,
-            clone,
+            context,
             ["stash", "push", "-u", "-m", "mai sync default branch"],
         )
         .await?;
     }
 
-    projects::workspace::sync_project_repo_cache(git_binary, projects_root, project, token).await?;
-    let repo_url = github_clone_url(&project.owner, &project.repo);
-    git_plain(
+    #[cfg(test)]
+    if let GitToolBackend::Host {
         git_binary,
-        clone,
-        ["remote", "set-url", "origin", &repo_url],
-    )
-    .await?;
-    git_with_token(git_binary, clone, token, ["fetch", "--prune", "origin"]).await?;
-    let branch = format!("{}{agent_id}", policy.agent_branch_prefix);
-    let origin_branch = format!("origin/{}", project.branch);
-    git_plain(
-        git_binary,
-        clone,
-        ["checkout", "-B", &branch, &origin_branch],
-    )
-    .await?;
-    git_plain(git_binary, clone, ["reset", "--hard", &origin_branch]).await?;
+        projects_root,
+    } = &context.backend
+    {
+        projects::workspace::sync_project_repo_cache(
+            git_binary,
+            projects_root,
+            &context.project,
+            token,
+        )
+        .await?;
+    }
+    let repo_url = github_clone_url(&context.project.owner, &context.project.repo);
+    git_plain(context, ["remote", "set-url", "origin", &repo_url]).await?;
+    git_with_token(context, token, ["fetch", "--prune", "origin"]).await?;
+    let branch = format!("{}{}", policy.agent_branch_prefix, context.agent_id);
+    let origin_branch = format!("origin/{}", context.project.branch);
+    git_plain(context, ["checkout", "-B", &branch, &origin_branch]).await?;
+    git_plain(context, ["reset", "--hard", &origin_branch]).await?;
     if force {
-        git_plain(git_binary, clone, ["clean", "-fdx"]).await?;
+        git_plain(context, ["clean", "-fdx"]).await?;
     }
     if dirty && preserve_changes {
-        git_plain(git_binary, clone, ["stash", "pop"]).await?;
+        git_plain(context, ["stash", "pop"]).await?;
     }
 
     Ok(json!({
-        "clone": clone,
-        "worktree": clone,
+        "clone": repo_path(context),
+        "worktree": repo_path(context),
         "preserved_changes": dirty && preserve_changes,
         "forced": force,
     })
     .to_string())
 }
 
+fn git_workspace_info(context: &GitToolContext<'_>) -> String {
+    match &context.backend {
+        GitToolBackend::Sidecar {
+            workspace_volume,
+            repo_path,
+            ..
+        } => json!({
+            "project_id": context.project.id,
+            "workspace_volume": workspace_volume,
+            "clone": repo_path,
+            "worktree": repo_path,
+        })
+        .to_string(),
+        #[cfg(test)]
+        GitToolBackend::Host { projects_root, .. } => {
+            let repo_cache =
+                projects::workspace::project_repo_cache_path(projects_root, context.project.id);
+            let clone = projects::workspace::agent_clone_path(
+                projects_root,
+                context.project.id,
+                context.agent_id,
+            );
+            json!({
+                "project_id": context.project.id,
+                "repo_cache": repo_cache,
+                "clone": clone,
+                "worktree": clone,
+            })
+            .to_string()
+        }
+    }
+}
+
+fn repo_path(context: &GitToolContext<'_>) -> String {
+    match &context.backend {
+        GitToolBackend::Sidecar { repo_path, .. } => (*repo_path).to_string(),
+        #[cfg(test)]
+        GitToolBackend::Host { projects_root, .. } => projects::workspace::agent_clone_path(
+            projects_root,
+            context.project.id,
+            context.agent_id,
+        )
+        .to_string_lossy()
+        .to_string(),
+    }
+}
+
 async fn git_plain<const N: usize>(
-    git_binary: &str,
-    cwd: &Path,
+    context: &GitToolContext<'_>,
     args: [&str; N],
 ) -> Result<String> {
-    projects::workspace::git_plain(git_binary, cwd, args).await
+    run_git(context, None, args).await
 }
 
 async fn git_with_token<const N: usize>(
-    git_binary: &str,
-    cwd: &Path,
+    context: &GitToolContext<'_>,
     token: &str,
     args: [&str; N],
 ) -> Result<String> {
-    projects::workspace::git_with_token(git_binary, cwd, token, args)
+    run_git(context, Some(token), args)
         .await
         .map(|output| output.replace(token, "[redacted]"))
+}
+
+async fn run_git<const N: usize>(
+    context: &GitToolContext<'_>,
+    token: Option<&str>,
+    args: [&str; N],
+) -> Result<String> {
+    match &context.backend {
+        GitToolBackend::Sidecar {
+            docker,
+            sidecar_image,
+            workspace_volume,
+            repo_path,
+        } => {
+            run_sidecar_git(
+                docker,
+                sidecar_image,
+                workspace_volume,
+                repo_path,
+                context.agent_id,
+                token,
+                &args,
+            )
+            .await
+        }
+        #[cfg(test)]
+        GitToolBackend::Host {
+            git_binary,
+            projects_root,
+        } => {
+            let clone = projects::workspace::agent_clone_path(
+                projects_root,
+                context.project.id,
+                context.agent_id,
+            );
+            match token {
+                Some(token) => projects::workspace::git_with_token(git_binary, &clone, token, args)
+                    .await
+                    .map(|output| output.replace(token, "[redacted]")),
+                None => projects::workspace::git_plain(git_binary, &clone, args).await,
+            }
+        }
+    }
+}
+
+async fn run_sidecar_git(
+    docker: &DockerClient,
+    sidecar_image: &str,
+    workspace_volume: &str,
+    repo_path: &str,
+    agent_id: AgentId,
+    token: Option<&str>,
+    args: &[&str],
+) -> Result<String> {
+    let mut command_parts = vec![
+        "git".to_string(),
+        "-c".to_string(),
+        shell_quote("core.hooksPath=/dev/null"),
+        "-c".to_string(),
+        shell_quote(&format!("safe.directory={repo_path}")),
+        "-c".to_string(),
+        shell_quote("credential.helper="),
+    ];
+    if token.is_some() {
+        command_parts.extend([
+            "-c".to_string(),
+            shell_quote(
+                "http.https://github.com/.extraheader=AUTHORIZATION: bearer $MAI_GITHUB_INSTALLATION_TOKEN",
+            ),
+        ]);
+    }
+    command_parts.extend(args.iter().map(|arg| shell_quote(arg)));
+    let command = command_parts.join(" ");
+    let env = token
+        .map(|token| {
+            vec![(
+                "MAI_GITHUB_INSTALLATION_TOKEN".to_string(),
+                token.to_string(),
+            )]
+        })
+        .unwrap_or_default();
+    let sidecar_name = format!("mai-tool-git-{agent_id}-{}", uuid::Uuid::new_v4());
+    let output = docker
+        .run_sidecar_shell_env(&SidecarParams {
+            name: &sidecar_name,
+            image: sidecar_image,
+            command: &command,
+            args: &[],
+            cwd: Some(repo_path),
+            env: &env,
+            workspace_volume: Some(workspace_volume),
+            mounts: &[],
+            timeout_secs: Some(600),
+        })
+        .await?;
+    if output.status == 0 {
+        return Ok(output.stdout);
+    }
+    let combined = format!("{}\n{}", output.stderr, output.stdout);
+    let redacted = token
+        .map(|token| combined.replace(token, "[redacted]"))
+        .unwrap_or(combined);
+    Err(RuntimeError::InvalidInput(format!(
+        "git sidecar failed: {}",
+        redacted.trim()
+    )))
 }
 
 fn required_token(token: Option<&str>) -> Result<&str> {
@@ -357,6 +473,10 @@ fn optional_arg(arguments: &Value, name: &str) -> Result<Option<String>> {
         .filter(|value| !value.trim().is_empty()))
 }
 
+fn shell_quote(value: &str) -> String {
+    shell_words::quote(value).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -380,8 +500,10 @@ mod tests {
 
         execute_git_tool(
             GitToolContext {
-                git_binary: &git,
-                projects_root: dir.path(),
+                backend: GitToolBackend::Host {
+                    git_binary: &git,
+                    projects_root: dir.path(),
+                },
                 agent_id,
                 project: test_project(project_id, agent_id),
                 token: None,
@@ -409,8 +531,10 @@ mod tests {
 
         let execution = execute_git_tool(
             GitToolContext {
-                git_binary: &git,
-                projects_root: dir.path(),
+                backend: GitToolBackend::Host {
+                    git_binary: &git,
+                    projects_root: dir.path(),
+                },
                 agent_id,
                 project: test_project(project_id, agent_id),
                 token: None,
@@ -444,8 +568,10 @@ mod tests {
 
         let execution = execute_git_tool(
             GitToolContext {
-                git_binary: &git,
-                projects_root: dir.path(),
+                backend: GitToolBackend::Host {
+                    git_binary: &git,
+                    projects_root: dir.path(),
+                },
                 agent_id,
                 project: test_project(project_id, agent_id),
                 token: None,
@@ -471,8 +597,10 @@ mod tests {
 
         let err = execute_git_tool(
             GitToolContext {
-                git_binary: &git,
-                projects_root: dir.path(),
+                backend: GitToolBackend::Host {
+                    git_binary: &git,
+                    projects_root: dir.path(),
+                },
                 agent_id,
                 project: test_project(project_id, agent_id),
                 token: None,
@@ -498,8 +626,10 @@ mod tests {
 
         let err = execute_git_tool(
             GitToolContext {
-                git_binary: &git,
-                projects_root: dir.path(),
+                backend: GitToolBackend::Host {
+                    git_binary: &git,
+                    projects_root: dir.path(),
+                },
                 agent_id,
                 project: test_project(project_id, agent_id),
                 token: None,
@@ -525,8 +655,10 @@ mod tests {
 
         let err = execute_git_tool(
             GitToolContext {
-                git_binary: &git,
-                projects_root: dir.path(),
+                backend: GitToolBackend::Host {
+                    git_binary: &git,
+                    projects_root: dir.path(),
+                },
                 agent_id,
                 project: test_project(project_id, agent_id),
                 token: Some("secret-token".to_string()),
@@ -552,8 +684,10 @@ mod tests {
 
         execute_git_tool(
             GitToolContext {
-                git_binary: &git,
-                projects_root: dir.path(),
+                backend: GitToolBackend::Host {
+                    git_binary: &git,
+                    projects_root: dir.path(),
+                },
                 agent_id,
                 project: test_project(project_id, agent_id),
                 token: None,
@@ -565,8 +699,10 @@ mod tests {
         .expect("commit");
         execute_git_tool(
             GitToolContext {
-                git_binary: &git,
-                projects_root: dir.path(),
+                backend: GitToolBackend::Host {
+                    git_binary: &git,
+                    projects_root: dir.path(),
+                },
                 agent_id,
                 project: test_project(project_id, agent_id),
                 token: Some("secret-token".to_string()),
@@ -597,8 +733,10 @@ mod tests {
 
         let err = execute_git_tool(
             GitToolContext {
-                git_binary: &git,
-                projects_root: dir.path(),
+                backend: GitToolBackend::Host {
+                    git_binary: &git,
+                    projects_root: dir.path(),
+                },
                 agent_id,
                 project: test_project(project_id, agent_id),
                 token: Some("secret-token".to_string()),

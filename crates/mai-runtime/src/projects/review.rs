@@ -25,10 +25,6 @@ const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;
 const PROJECT_REVIEW_SELECTOR_INTERVAL_SECS: u64 = 1800;
 const PROJECT_REVIEW_RETRY_INITIAL_SECS: u64 = 1;
 const PROJECT_REVIEW_FAILURE_RETRY_SECS: u64 = 600;
-const PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL: &str =
-    "mcp__github__pull_request_review_write";
-const PROJECT_GITHUB_CREATE_PULL_REQUEST_REVIEW_TOOL: &str =
-    "mcp__github__create_pull_request_review";
 
 fn project_review_retry_backoff() -> backoff::ProjectReviewRetryBackoff {
     backoff::ProjectReviewRetryBackoff::new(backoff::ProjectReviewRetryBackoffConfig {
@@ -65,7 +61,7 @@ pub(crate) struct ProjectReviewLoopDecision {
 }
 
 pub(crate) fn project_reviewer_system_prompt() -> &'static str {
-    "You are an autonomous project pull request reviewer. Review exactly one eligible GitHub pull request for this project, using only the GitHub MCP tools visible in the current tool list for GitHub reads/writes and local shell commands for git/test work. The repository has already been cloned and synced at /workspace/repo, and this reviewer owns that isolated clone. Do not look for GitHub tokens in the environment or write credentials. Finish with only the required JSON object so the project scheduler can decide the next cycle."
+    "You are an autonomous project pull request reviewer. Review exactly one eligible GitHub pull request for this project, using only the Mai GitHub API tools visible in the current tool list for GitHub reads/writes and local shell commands for git/test work. The repository has already been cloned and synced at /workspace/repo, and this reviewer owns that isolated clone. Do not look for GitHub tokens in the environment or write credentials. Finish with only the required JSON object so the project scheduler can decide the next cycle."
 }
 
 pub(crate) fn parse_project_review_cycle_report(text: &str) -> Result<ProjectReviewCycleResult> {
@@ -98,33 +94,38 @@ pub(crate) fn parse_project_review_cycle_report(text: &str) -> Result<ProjectRev
     })
 }
 
-pub(crate) fn project_review_mcp_arguments_with_model_footer(
-    model_tool_name: &str,
-    mut arguments: Value,
+pub(crate) fn project_review_github_api_body_with_model_footer(
+    method: &str,
+    path: &str,
+    mut body: Option<Value>,
     role: Option<&AgentRole>,
     model_id: &str,
-) -> Value {
+) -> Option<Value> {
     if !matches!(role, Some(AgentRole::Reviewer))
-        || !is_github_pull_request_review_write_tool(model_tool_name)
+        || !is_github_pull_request_review_path(method, path)
     {
-        return arguments;
+        return body;
     }
-    let Some(body) = arguments.get("body").and_then(Value::as_str) else {
-        return arguments;
+    let Some(review_body) = body
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .and_then(|object| object.get_mut("body"))
+    else {
+        return body;
+    };
+    let Some(text) = review_body.as_str() else {
+        return body;
     };
     let model_id = model_id.trim();
     if model_id.is_empty() {
-        return arguments;
+        return body;
     }
     let footer = format!("Powered by {model_id}");
-    if body.contains(&footer) {
-        return arguments;
+    if text.contains(&footer) {
+        return body;
     }
-    let body = format!("{}\n\n{}", body.trim_end(), footer);
-    if let Some(value) = arguments.get_mut("body") {
-        *value = Value::String(body);
-    }
-    arguments
+    *review_body = Value::String(format!("{}\n\n{}", text.trim_end(), footer));
+    body
 }
 
 pub(crate) fn project_review_loop_decision_for_result(
@@ -241,9 +242,8 @@ fn extract_json_object(text: &str) -> Option<&str> {
     None
 }
 
-fn is_github_pull_request_review_write_tool(model_tool_name: &str) -> bool {
-    model_tool_name == PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL
-        || model_tool_name == PROJECT_GITHUB_CREATE_PULL_REQUEST_REVIEW_TOOL
+fn is_github_pull_request_review_path(method: &str, path: &str) -> bool {
+    method.eq_ignore_ascii_case("POST") && path.contains("/pulls/") && path.ends_with("/reviews")
 }
 
 #[cfg(test)]
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn review_body_gets_model_footer() {
-        let arguments = json!({
+        let body = Some(json!({
             "body": "Looks good after local validation.",
             "comments": [
                 {
@@ -266,14 +266,16 @@ mod tests {
                     "body": "Please cover this edge case."
                 }
             ]
-        });
+        }));
 
-        let updated = project_review_mcp_arguments_with_model_footer(
-            PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL,
-            arguments,
+        let updated = project_review_github_api_body_with_model_footer(
+            "POST",
+            "/repos/owner/repo/pulls/42/reviews",
+            body,
             Some(&AgentRole::Reviewer),
             "gpt-5.4",
-        );
+        )
+        .expect("body");
 
         assert_eq!(
             updated.get("body").and_then(Value::as_str),
@@ -287,16 +289,18 @@ mod tests {
 
     #[test]
     fn review_body_footer_is_not_duplicated() {
-        let arguments = json!({
+        let body = Some(json!({
             "body": "Looks good.\n\nPowered by gpt-5.4"
-        });
+        }));
 
-        let updated = project_review_mcp_arguments_with_model_footer(
-            PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL,
-            arguments,
+        let updated = project_review_github_api_body_with_model_footer(
+            "POST",
+            "/repos/owner/repo/pulls/42/reviews",
+            body,
             Some(&AgentRole::Reviewer),
             "gpt-5.4",
-        );
+        )
+        .expect("body");
 
         assert_eq!(
             updated.get("body").and_then(Value::as_str),
@@ -305,36 +309,40 @@ mod tests {
     }
 
     #[test]
-    fn review_body_footer_supports_legacy_tool_name() {
-        let arguments = json!({
+    fn review_body_footer_ignores_non_review_paths() {
+        let body = Some(json!({
             "body": "Review submitted."
-        });
+        }));
 
-        let updated = project_review_mcp_arguments_with_model_footer(
-            PROJECT_GITHUB_CREATE_PULL_REQUEST_REVIEW_TOOL,
-            arguments,
+        let updated = project_review_github_api_body_with_model_footer(
+            "POST",
+            "/repos/owner/repo/issues/42/comments",
+            body,
             Some(&AgentRole::Reviewer),
             "gpt-5.4",
-        );
+        )
+        .expect("body");
 
         assert_eq!(
             updated.get("body").and_then(Value::as_str),
-            Some("Review submitted.\n\nPowered by gpt-5.4")
+            Some("Review submitted.")
         );
     }
 
     #[test]
-    fn model_footer_leaves_non_review_tools_unchanged() {
-        let arguments = json!({
+    fn model_footer_leaves_get_requests_unchanged() {
+        let body = Some(json!({
             "body": "A regular issue comment."
-        });
+        }));
 
-        let updated = project_review_mcp_arguments_with_model_footer(
-            "mcp__github__add_issue_comment",
-            arguments,
+        let updated = project_review_github_api_body_with_model_footer(
+            "GET",
+            "/repos/owner/repo/pulls/42/reviews",
+            body,
             Some(&AgentRole::Reviewer),
             "gpt-5.4",
-        );
+        )
+        .expect("body");
 
         assert_eq!(
             updated.get("body").and_then(Value::as_str),
@@ -344,16 +352,18 @@ mod tests {
 
     #[test]
     fn model_footer_leaves_non_reviewer_agents_unchanged() {
-        let arguments = json!({
+        let body = Some(json!({
             "body": "Maintainer review body."
-        });
+        }));
 
-        let updated = project_review_mcp_arguments_with_model_footer(
-            PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL,
-            arguments,
+        let updated = project_review_github_api_body_with_model_footer(
+            "POST",
+            "/repos/owner/repo/pulls/42/reviews",
+            body,
             Some(&AgentRole::Planner),
             "gpt-5.4",
-        );
+        )
+        .expect("body");
 
         assert_eq!(
             updated.get("body").and_then(Value::as_str),
@@ -363,26 +373,30 @@ mod tests {
 
     #[test]
     fn model_footer_leaves_missing_or_non_string_body_unchanged() {
-        let missing = json!({
+        let missing = Some(json!({
             "event": "APPROVE"
-        });
-        let updated_missing = project_review_mcp_arguments_with_model_footer(
-            PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL,
+        }));
+        let updated_missing = project_review_github_api_body_with_model_footer(
+            "POST",
+            "/repos/owner/repo/pulls/42/reviews",
             missing,
             Some(&AgentRole::Reviewer),
             "gpt-5.4",
-        );
+        )
+        .expect("body");
         assert_eq!(updated_missing, json!({ "event": "APPROVE" }));
 
-        let non_string = json!({
+        let non_string = Some(json!({
             "body": null
-        });
-        let updated_non_string = project_review_mcp_arguments_with_model_footer(
-            PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL,
+        }));
+        let updated_non_string = project_review_github_api_body_with_model_footer(
+            "POST",
+            "/repos/owner/repo/pulls/42/reviews",
             non_string,
             Some(&AgentRole::Reviewer),
             "gpt-5.4",
-        );
+        )
+        .expect("body");
         assert_eq!(updated_non_string, json!({ "body": null }));
     }
 

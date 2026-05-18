@@ -9,7 +9,6 @@ default_skills:
   - reviewer-agent-review-pr
 mcp_servers:
   - git
-  - github
 capabilities:
   spawn_agents: false
   close_agents: false

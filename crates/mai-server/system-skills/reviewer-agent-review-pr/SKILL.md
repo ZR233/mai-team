@@ -7,7 +7,7 @@ metadata:
 
 # Reviewer Agent - Review PR
 
-Review exactly one eligible GitHub pull request for the current project. Use GitHub MCP tools for GitHub reads/writes, local shell commands for git/test work, and the bundled helper for fixed rules.
+Review exactly one eligible GitHub pull request for the current project. Use Mai's visible `github_api_get` and `github_api_request` tools for GitHub reads/writes, local shell commands for git/test work, and the bundled helper for fixed rules.
 
 Mai refreshes the reviewer-owned clone at `/workspace/repo` before this skill starts. PR refs are available in the local clone, commonly as `refs/remotes/origin/pr/<number>` or `refs/pull/<number>/head`. Do not fetch credentials, read `GITHUB_TOKEN`, write credential files, or add model footers. Mai appends the model footer to submitted project reviews.
 
@@ -15,7 +15,7 @@ Mai refreshes the reviewer-owned clone at `/workspace/repo` before this skill st
 
 Use `scripts/review_pr_helper.py` for deterministic steps before doing review judgment. The script has no third-party dependencies and does not access the network.
 
-Important: save the raw GitHub MCP JSON responses exactly as returned and feed those files directly to the helper. Do not hand-normalize fields such as `requested_reviewers`, review `commit_id`, GraphQL `nodes`/`edges`, or MCP `content`/`contents` wrappers before invoking the helper.
+Important: save the raw JSON responses from `github_api_get` or `github_api_request` exactly as returned and feed those files directly to the helper. Do not hand-normalize fields such as `requested_reviewers`, review `commit_id`, GraphQL `nodes`/`edges`, or response wrappers before invoking the helper.
 
 Preferred invocation:
 
@@ -52,31 +52,32 @@ python3 scripts/review_pr_helper.py prepare-review --repo /path/to/repo --agent-
 
 ### 1. Identify Repository and Account
 
-Use the visible GitHub MCP account tool, usually `mcp__github__get_me`, to get the authenticated user login. Identify `owner` and `repo` from the project context or `/workspace/repo` remote.
+Use `github_api_get` with path `/user` to get the authenticated user login. Identify `owner` and `repo` from the project context or `/workspace/repo` remote.
 
-If GitHub MCP tools are unavailable, return only:
+If `github_api_get` or `github_api_request` is unavailable, return only:
 
 ```json
-{"outcome":"failed","pr":null,"summary":"Review could not be completed.","error":"GitHub MCP tools are unavailable."}
+{"outcome":"failed","pr":null,"summary":"Review could not be completed.","error":"Mai GitHub API tools are unavailable."}
 ```
 
 ### 2. Confirm the Target PR
 
 Mai's initial message must name a target pull request. Review only that PR. If no target pull request is present, return a failed JSON result instead of scanning for another PR.
 
-Fetch the target PR with visible GitHub MCP read tools. In the current GitHub MCP surface, this normally means:
+Fetch the target PR with visible Mai GitHub API tools. Use `github_api_get` with these REST paths:
 
-- `pull_request_read(..., method="get")`
-- `pull_request_read(..., method="get_reviews")`
-- `pull_request_read(..., method="get_check_runs")`
+- `/repos/OWNER/REPO/pulls/PR`
+- `/repos/OWNER/REPO/pulls/PR/reviews`
+- `/repos/OWNER/REPO/commits/HEAD_SHA/check-runs`
+- `/repos/OWNER/REPO/commits/HEAD_SHA/status`
 
-Use the helper on the raw JSON files from those calls. The helper already understands the common GitHub MCP response shapes that matter in practice, including:
+Use the helper on the raw JSON files from those calls. The helper already understands the common GitHub response shapes that matter in practice, including:
 
 - `requested_reviewers` as a list of login strings such as `["ZR233"]`
-- MCP text wrappers such as `content`, `contents`, or top-level `text`
+- response wrappers such as `content`, `contents`, or top-level `text`
 - re-review detection from review `commit_id` versus current PR head SHA when PR details do not expose a latest commit timestamp
 
-Save the MCP JSON outputs to files and run `select-pr --target-pr <number>`; if that target is ineligible, finish with `no_eligible_pr`. The helper applies these fixed rules:
+Save the GitHub JSON outputs to files and run `select-pr --target-pr <number>`; if that target is ineligible, finish with `no_eligible_pr`. The helper applies these fixed rules:
 
 - Skip self-authored PRs.
 - Skip draft PRs.
@@ -100,7 +101,7 @@ Before submitting the review, confirm the PR head SHA still matches the checked-
 
 ### 4. Inspect and Validate
 
-Use visible GitHub MCP tools to inspect PR metadata, changed files, diff, existing comments, review threads, and checks context. Save changed files JSON and run:
+Use visible Mai GitHub API tools to inspect PR metadata, changed files, diff, existing comments, review threads, and checks context. Save changed files JSON and run:
 
 ```bash
 python3 scripts/review_pr_helper.py changed-files --repo "$REVIEW_REPO" --files files.json > changed.json
@@ -111,7 +112,7 @@ Run the commands in `rust-plan.json` when present. For Rust PRs, always run `car
 
 `rust-plan` is intentionally conservative. If it still falls back to broad workspace commands for a large repository, prefer the repository's established CI entry point for the changed area and record any broad-command failures separately from PR-local validation. For example, StarryOS syscall test changes in `tgoskits` should be validated with the StarryOS QEMU test command used by that repository, not only with workspace-wide `cargo test`.
 
-When the repository is large and GitHub MCP responses are sparse, fetch only the target PR details needed for validation and review context.
+When the repository is large, fetch only the target PR details needed for validation and review context.
 
 Record exact validation failures. Treat these as blocking:
 
@@ -147,11 +148,30 @@ Keep the review body concise. Include validation results, similar-PR notes, and 
 
 ### 7. Submit the GitHub Review
 
-Submit through a visible GitHub MCP review-writing tool and follow its current schema exactly. Do not assume parameter names beyond the visible schema.
+Submit through `github_api_request`.
 
-In the current GitHub MCP surface, the review submission path is usually `pull_request_review_write`, with inline comments created through `add_comment_to_pending_review` after creating a pending review and before `submit_pending`. If the visible tool schema differs, follow the visible schema instead of these names.
+Use a single REST request when possible:
 
-If no visible MCP tool can submit a pull request review, return a `failed` JSON result. If submission fails because the account is the PR author or GitHub rejects the event, leave a normal PR comment only when a visible comment tool is available; otherwise report the failure.
+```json
+{
+  "method": "POST",
+  "path": "/repos/OWNER/REPO/pulls/PR/reviews",
+  "body": {
+    "event": "REQUEST_CHANGES",
+    "body": "Review body with validation results.",
+    "comments": [
+      {
+        "path": "src/lib.rs",
+        "line": 123,
+        "side": "RIGHT",
+        "body": "Inline finding."
+      }
+    ]
+  }
+}
+```
+
+Set `event` to `REQUEST_CHANGES`, `APPROVE`, or `COMMENT`. If submission fails because the account is the PR author or GitHub rejects the event, leave a normal PR comment with `github_api_request` to `POST /repos/OWNER/REPO/issues/PR/comments` when appropriate; otherwise report the failure.
 
 ### 8. Final Response
 
@@ -172,7 +192,7 @@ No eligible PR:
 Failed:
 
 ```json
-{"outcome":"failed","pr":123,"summary":"Review could not be completed.","error":"GitHub MCP did not expose a review-writing tool."}
+{"outcome":"failed","pr":123,"summary":"Review could not be completed.","error":"GitHub rejected the review submission."}
 ```
 
 ## Constraints
@@ -180,5 +200,5 @@ Failed:
 - Review exactly one PR per invocation.
 - Always work in the reviewer-owned clone at `/workspace/repo`.
 - Use helper scripts for fixed rules; use reviewer judgment for code review.
-- Use only visible GitHub MCP tools for GitHub reads/writes.
+- Use only visible Mai GitHub API tools for GitHub reads/writes.
 - Leave cleanup to Mai; reviewer agent deletion removes the clone.
