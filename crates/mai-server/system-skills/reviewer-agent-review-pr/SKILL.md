@@ -123,13 +123,13 @@ Mention overlapping or duplicate PRs in the review body when relevant.
 
 Use `REQUEST_CHANGES` when any blocking finding exists, `APPROVE` when safe to merge, and `COMMENT` only for advisory-only reviews.
 
-For each line-specific finding, submit an inline comment on the changed line with `side: "RIGHT"`. Each comment should state the problem, why it matters, and a concrete fix or alternative. Put non-line-specific findings in the review body.
+For each line-specific finding, prepare an inline comment on the changed line with `side: "RIGHT"`. Do not submit inline comments individually. Collect every inline comment into the final review request's `comments` array. Each comment should state the problem, why it matters, and a concrete fix or alternative. Put non-line-specific findings in the review body.
 
 Keep the review body concise. Include validation results, similar-PR notes, and any non-inline findings.
 
 ### 7. Submit the GitHub Review
 
-Submit through `github_api_request`. Use exactly one final review request. Do not create a pending review, do not create an empty review first, and do not submit `/pulls/PR/reviews/REVIEW_ID/events`; GitHub allows only one pending review per user and that path easily leaves stale pending state.
+Submit through `github_api_request`. Use exactly one final review request. Do not create a pending review, do not create an empty review first, do not submit `/pulls/PR/reviews/REVIEW_ID/events`, and never call `POST /repos/OWNER/REPO/pulls/PR/comments` for reviewer inline comments. GitHub's direct review-comment endpoint has a different schema and is not used by the Mai reviewer flow.
 
 Use this single REST request shape:
 

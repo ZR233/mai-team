@@ -144,6 +144,12 @@ pub(crate) fn validate_project_reviewer_github_api_request(
                 .to_string(),
         ));
     }
+    if is_github_pull_request_review_comment_path(method, path) {
+        return Err(RuntimeError::InvalidInput(
+            "reviewer inline comments must be submitted in one single POST to `/pulls/PR/reviews` using the `comments` array; do not POST `/pulls/PR/comments` directly"
+                .to_string(),
+        ));
+    }
     if !is_github_pull_request_review_path(method, path) {
         return Ok(());
     }
@@ -291,15 +297,41 @@ fn extract_json_object(text: &str) -> Option<&str> {
     None
 }
 
+fn github_api_path_without_query(path: &str) -> &str {
+    path.split_once('?')
+        .map(|(path_without_query, _query)| path_without_query)
+        .unwrap_or(path)
+}
+
 fn is_github_pull_request_review_path(method: &str, path: &str) -> bool {
+    let path = github_api_path_without_query(path);
     method.eq_ignore_ascii_case("POST") && path.contains("/pulls/") && path.ends_with("/reviews")
 }
 
 fn is_github_pending_review_event_path(method: &str, path: &str) -> bool {
+    let path = github_api_path_without_query(path);
     method.eq_ignore_ascii_case("POST")
         && path.contains("/pulls/")
         && path.contains("/reviews/")
         && path.ends_with("/events")
+}
+
+fn is_github_pull_request_review_comment_path(method: &str, path: &str) -> bool {
+    if !method.eq_ignore_ascii_case("POST") {
+        return false;
+    }
+    let path = github_api_path_without_query(path);
+    let Some((_prefix, suffix)) = path.split_once("/pulls/") else {
+        return false;
+    };
+    let mut segments = suffix.split('/');
+    let Some(pr_number) = segments.next() else {
+        return false;
+    };
+    let Some("comments") = segments.next() else {
+        return false;
+    };
+    pr_number.parse::<u64>().is_ok() && segments.next().is_none()
 }
 
 #[cfg(test)]
@@ -510,6 +542,25 @@ mod tests {
 
         assert!(err.to_string().contains("one single POST"));
         assert!(err.to_string().contains("pending review state"));
+    }
+
+    #[test]
+    fn reviewer_pr_review_submission_rejects_direct_inline_comment_path() {
+        let err = validate_project_reviewer_github_api_request(
+            "POST",
+            "/repos/owner/repo/pulls/42/comments",
+            Some(&json!({
+                "path": "src/lib.rs",
+                "line": 12,
+                "side": "RIGHT",
+                "body": "Please cover this edge case.",
+            })),
+            Some(&AgentRole::Reviewer),
+        )
+        .expect_err("direct inline review comment creation should be rejected");
+
+        assert!(err.to_string().contains("one single POST"));
+        assert!(err.to_string().contains("comments` array"));
     }
 
     #[test]
