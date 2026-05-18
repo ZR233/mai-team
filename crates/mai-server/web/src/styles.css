@@ -857,6 +857,8 @@ p {
 
 .review-run-summary {
   width: 100%;
+  flex-wrap: wrap;
+  align-items: flex-start;
   border: 0;
   padding: 12px;
   color: inherit;
@@ -868,7 +870,7 @@ p {
 .review-run-main {
   display: grid;
   gap: 3px;
-  flex: 1;
+  flex: 1 1 260px;
   min-width: 0;
 }
 
@@ -893,7 +895,10 @@ p {
 
 .review-run-status,
 .review-run-outcome {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  max-width: min(240px, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
   border-radius: 999px;
   padding: 5px 8px;
   color: #35506f;
@@ -901,6 +906,11 @@ p {
   font-size: 10px;
   font-weight: 900;
   text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.review-run-outcome {
+  margin-left: auto;
 }
 
 .review-run-status.ready {
