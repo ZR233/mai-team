@@ -11,7 +11,6 @@ RUN sed -i 's|http://archive.ubuntu.com|http://repo.huaweicloud.com|g' /etc/apt/
     && sed -i 's|http://security.ubuntu.com|http://repo.huaweicloud.com|g' /etc/apt/sources.list.d/ubuntu.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
     && sed -i 's|http://repo.huaweicloud.com|https://repo.huaweicloud.com|g' /etc/apt/sources.list.d/ubuntu.sources \
     && rm -rf /var/lib/apt/lists/*
 
@@ -40,4 +39,3 @@ RUN apt-get update \
 
 RUN mkdir -p /workspace
 WORKDIR /workspace
-
