@@ -7272,7 +7272,8 @@ async fn project_reviewer_initial_message_can_target_pr() {
     .expect("message");
 
     assert!(message.contains("review PR #42 only"));
-    assert!(message.contains("select-pr --target-pr 42"));
+    assert!(message.contains("system selector has already chosen this PR"));
+    assert!(!message.contains("select-pr"));
 }
 
 #[tokio::test]

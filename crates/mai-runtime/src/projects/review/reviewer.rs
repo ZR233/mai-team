@@ -120,13 +120,71 @@ fn project_reviewer_initial_message_from_summary(
         .filter(|value| !value.is_empty())
         .unwrap_or("None");
     let target = target_pr
-        .map(|pr| format!("Target pull request: review PR #{pr} only. Do not select another pull request. Use `select-pr --target-pr {pr}` when invoking the helper."))
+        .map(|pr| format!("Target pull request: review PR #{pr} only. Do not select another pull request. The system selector has already chosen this PR; continue directly with review preparation."))
         .unwrap_or_else(|| {
             "Target pull request: none. Return a failed final JSON result because review invocations must be explicitly targeted."
                 .to_string()
         });
     format!(
-        "Run one automatic pull request review for project `{}`.\n\nRepository: {}/{}\nDefault branch: {}\nReviewer clone: /workspace/repo\nReviewer agent: {}\n{}\n\nExtra reviewer instructions:\n{}\n\nUse the $reviewer-agent-review-pr skill. At the end of the turn, return only one JSON object matching this schema exactly:\n{{\"outcome\":\"review_submitted|no_eligible_pr|failed\",\"pr\":123|null,\"summary\":\"short result\",\"error\":null|\"failure reason\"}}",
+        "Run one automatic pull request review for project `{}`.\n\nRepository: {}/{}\nDefault branch: {}\nReviewer clone: /workspace/repo\nReviewer agent: {}\n{}\n\nExtra reviewer instructions:\n{}\n\nUse the $reviewer-agent-review-pr skill. At the end of the turn, return only one JSON object matching this schema exactly:\n{{\"outcome\":\"review_submitted|failed\",\"pr\":123|null,\"summary\":\"short result\",\"error\":null|\"failure reason\"}}",
         summary.name, summary.owner, summary.repo, summary.branch, reviewer_id, target, extra
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use mai_protocol::{
+        ProjectCloneStatus, ProjectReviewOutcome, ProjectReviewStatus, ProjectStatus,
+        ProjectSummary, now,
+    };
+    use uuid::Uuid;
+
+    use super::project_reviewer_initial_message_from_summary;
+
+    #[test]
+    fn target_pr_message_delegates_selection_to_system_selector() {
+        let reviewer_id = Uuid::new_v4();
+        let message = project_reviewer_initial_message_from_summary(
+            &test_project_summary(),
+            reviewer_id,
+            Some(24),
+        );
+
+        assert!(message.contains("review PR #24 only"));
+        assert!(message.contains("system selector has already chosen this PR"));
+        assert!(!message.contains("select-pr"));
+        assert!(!message.contains("eligibility"));
+        assert!(!message.contains("filtering"));
+    }
+
+    fn test_project_summary() -> ProjectSummary {
+        ProjectSummary {
+            id: Uuid::new_v4(),
+            name: "owner/repo".to_string(),
+            status: ProjectStatus::Ready,
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            repository_full_name: "owner/repo".to_string(),
+            git_account_id: Some("account-1".to_string()),
+            repository_id: 42,
+            installation_id: 0,
+            installation_account: "owner".to_string(),
+            branch: "main".to_string(),
+            docker_image: "mai-sidecar:local".to_string(),
+            clone_status: ProjectCloneStatus::Ready,
+            maintainer_agent_id: Uuid::new_v4(),
+            created_at: now(),
+            updated_at: now(),
+            last_error: None,
+            auto_review_enabled: true,
+            reviewer_extra_prompt: None,
+            review_status: ProjectReviewStatus::Idle,
+            current_reviewer_agent_id: None,
+            last_review_started_at: None,
+            last_review_finished_at: None,
+            next_review_at: None,
+            last_review_outcome: Some(ProjectReviewOutcome::NoEligiblePr),
+            review_last_error: None,
+        }
+    }
 }

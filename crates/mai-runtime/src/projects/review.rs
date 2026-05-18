@@ -61,7 +61,7 @@ pub(crate) struct ProjectReviewLoopDecision {
 }
 
 pub(crate) fn project_reviewer_system_prompt() -> &'static str {
-    "You are an autonomous project pull request reviewer. Review exactly one eligible GitHub pull request for this project, using only the Mai GitHub API tools visible in the current tool list for GitHub reads/writes and local shell commands for git/test work. The repository has already been cloned and synced at /workspace/repo, and this reviewer owns that isolated clone. Do not look for GitHub tokens in the environment or write credentials. Finish with only the required JSON object so the project scheduler can decide the next cycle."
+    "You are an autonomous project pull request reviewer. Review exactly one target GitHub pull request for this project, using only the Mai GitHub API tools visible in the current tool list for GitHub reads/writes and local shell commands for git/test work. The repository has already been cloned and synced at /workspace/repo, and this reviewer owns that isolated clone. Do not look for GitHub tokens in the environment or write credentials. Finish with only the required JSON object so the project scheduler can decide the next cycle."
 }
 
 pub(crate) fn parse_project_review_cycle_report(text: &str) -> Result<ProjectReviewCycleResult> {

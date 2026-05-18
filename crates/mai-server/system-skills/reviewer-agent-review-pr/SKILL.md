@@ -1,21 +1,21 @@
 ---
 name: reviewer-agent-review-pr
-description: Reviewer agent skill for performing a script-assisted, deep, single GitHub pull request review. The reviewer agent uses bundled helper scripts for deterministic PR eligibility, reviewer clone checkout, changed-file/crate detection, Rust validation command planning, and final scheduler JSON, then performs human-quality code review and submits a GitHub review with inline comments. Trigger when the reviewer agent is invoked to review PRs, or when tasks are assigned for PR code review.
+description: Reviewer agent skill for performing a script-assisted, deep, single GitHub pull request review. The reviewer agent reviews the target PR already selected by Mai, uses bundled helper scripts for reviewer clone checkout, changed-file/crate detection, Rust validation command planning, and final scheduler JSON, then performs human-quality code review and submits a GitHub review with inline comments. Trigger when the reviewer agent is invoked to review PRs, or when tasks are assigned for PR code review.
 metadata:
   short-description: Script-assisted reviewer agent single-PR review
 ---
 
 # Reviewer Agent - Review PR
 
-Review exactly one eligible GitHub pull request for the current project. Use Mai's visible `github_api_get` and `github_api_request` tools for GitHub reads/writes, local shell commands for git/test work, and the bundled helper for fixed rules.
+Review exactly one target GitHub pull request for the current project. Mai's system selector is responsible for choosing the PR before this skill starts. Use Mai's visible `github_api_get` and `github_api_request` tools for GitHub reads/writes, local shell commands for git/test work, and the bundled helper for deterministic local preparation.
 
 Mai refreshes the reviewer-owned clone at `/workspace/repo` before this skill starts. PR refs are available in the local clone, commonly as `refs/remotes/origin/pr/<number>` or `refs/pull/<number>/head`. Do not fetch credentials, read `GITHUB_TOKEN`, write credential files, or add model footers. Mai appends the model footer to submitted project reviews.
 
 ## Use Bundled Scripts First
 
-Use `scripts/review_pr_helper.py` for deterministic steps before doing review judgment. The script has no third-party dependencies and does not access the network.
+Use `scripts/review_pr_helper.py` for deterministic local steps before doing review judgment. The script has no third-party dependencies and does not access the network.
 
-Important: save the raw JSON responses from `github_api_get` or `github_api_request` exactly as returned and feed those files directly to the helper. Do not hand-normalize fields such as `requested_reviewers`, review `commit_id`, GraphQL `nodes`/`edges`, or response wrappers before invoking the helper.
+Important: save changed-file JSON responses from `github_api_get` or `github_api_request` exactly as returned and feed those files directly to the helper. Do not hand-normalize file lists, GraphQL `nodes`/`edges`, or response wrappers before invoking the helper.
 
 Preferred invocation:
 
@@ -32,7 +32,6 @@ python3 /tmp/review_pr_helper.py test
 The helper commands are:
 
 ```bash
-python3 scripts/review_pr_helper.py select-pr --prs prs.json --login "$LOGIN" --details details.json --reviews reviews.json --checks checks.json --target-pr "$PR"
 python3 scripts/review_pr_helper.py prepare-review --repo /workspace/repo --agent-id "$REVIEWER_AGENT_ID" --pr "$PR"
 python3 scripts/review_pr_helper.py changed-files --repo "$REVIEW_REPO" --files files.json
 python3 scripts/review_pr_helper.py rust-plan --repo "$REVIEW_REPO" --changed changed.json
@@ -64,40 +63,22 @@ If `github_api_get` or `github_api_request` is unavailable, return only:
 
 Mai's initial message must name a target pull request. Review only that PR. If no target pull request is present, return a failed JSON result instead of scanning for another PR.
 
-Fetch the target PR with visible Mai GitHub API tools. Use `github_api_get` with these REST paths:
+Fetch the target PR with visible Mai GitHub API tools. Use `github_api_get` with these REST paths as needed for review context:
 
 - `/repos/OWNER/REPO/pulls/PR`
 - `/repos/OWNER/REPO/pulls/PR/reviews`
 - `/repos/OWNER/REPO/commits/HEAD_SHA/check-runs`
 - `/repos/OWNER/REPO/commits/HEAD_SHA/status`
 
-Use the helper on the raw JSON files from those calls. The helper already understands the common GitHub response shapes that matter in practice, including:
+Do not scan for another PR, do not replace the target PR, and do not skip the target PR because of draft state, author identity, existing reviews, or CI status. Treat those facts as review context only.
 
-- `requested_reviewers` as a list of login strings such as `["ZR233"]`
-- response wrappers such as `content`, `contents`, or top-level `text`
-- re-review detection from review `commit_id` versus current PR head SHA when PR details do not expose a latest commit timestamp
-
-Save the GitHub JSON outputs to files and run `select-pr --target-pr <number>`; if that target is ineligible, finish with `no_eligible_pr`. The helper applies these fixed rules:
-
-- Skip self-authored PRs.
-- Skip draft PRs.
-- Accept PRs with completed passing CI.
-- If CI is pending or failed, accept only when the authenticated user is requested for review.
-- Re-review only if the latest commit is newer than this user's latest submitted review, or the current head SHA differs from the latest submitted review `commit_id`.
-
-Practical note: many PRs expose `mergeable_state: "unknown"` even when `get_check_runs` is available. Do not infer passing CI from `mergeable_state == "unknown"`; rely on actual check runs when possible and let the helper apply the fallback rules.
-
-If `select-pr` returns `no_eligible_pr`, finish with:
-
-```json
-{"outcome":"no_eligible_pr","pr":null,"summary":"No eligible pull request found.","error":null}
-```
+Practical note: many PRs expose `mergeable_state: "unknown"` even when `get_check_runs` is available. Do not infer passing CI from `mergeable_state == "unknown"`; rely on actual check runs when describing validation context.
 
 ### 3. Prepare the Reviewer Clone
 
 Run `prepare-review` for the target PR. Work only inside `/workspace/repo`, which is this reviewer agent's isolated clone. Treat the returned `repo` value as `REVIEW_REPO`; in Mai it should be `/workspace/repo`.
 
-Before submitting the review, confirm the PR head SHA still matches the checked-out clone SHA. If it changed, finish with `no_eligible_pr`; the scheduler will queue a fresh signal.
+Before submitting the review, confirm the PR head SHA still matches the checked-out clone SHA. If it changed, return a failed final JSON result; the scheduler will queue a fresh signal.
 
 ### 4. Inspect and Validate
 
@@ -183,12 +164,6 @@ Submitted:
 {"outcome":"review_submitted","pr":123,"summary":"Submitted APPROVE for owner/repo#123 after cargo fmt --check and cargo test passed.","error":null}
 ```
 
-No eligible PR:
-
-```json
-{"outcome":"no_eligible_pr","pr":null,"summary":"No eligible pull request found.","error":null}
-```
-
 Failed:
 
 ```json
@@ -199,6 +174,6 @@ Failed:
 
 - Review exactly one PR per invocation.
 - Always work in the reviewer-owned clone at `/workspace/repo`.
-- Use helper scripts for fixed rules; use reviewer judgment for code review.
+- Use helper scripts for local preparation and final scheduler JSON; use reviewer judgment for code review.
 - Use only visible Mai GitHub API tools for GitHub reads/writes.
 - Leave cleanup to Mai; reviewer agent deletion removes the clone.
