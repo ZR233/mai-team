@@ -5558,7 +5558,7 @@ async fn project_agent_without_discovered_mcp_tools_has_no_static_fallback() {
 }
 
 #[tokio::test]
-async fn project_github_mcp_tools_are_not_visible_even_if_discovered() {
+async fn project_mcp_tools_are_not_visible_even_if_cached() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     let project_id = Uuid::new_v4();
@@ -5593,9 +5593,9 @@ async fn project_github_mcp_tools_are_not_visible_even_if_discovered() {
         .iter()
         .map(|tool| tool.model_name.as_str())
         .collect::<HashSet<_>>();
-    assert_eq!(names, HashSet::from(["mcp__git__git_diff_unstaged"]));
+    assert_eq!(names, HashSet::new());
     let visible = turn::tools::visible_tool_names(&runtime.state, &maintainer_record, &tools).await;
-    assert!(visible.contains("mcp__git__git_diff_unstaged"));
+    assert!(!visible.contains("mcp__git__git_diff_unstaged"));
     assert!(!visible.contains("mcp__github__pull_request_review_write"));
     assert!(!visible.contains("mcp__github__create_pull_request_review"));
     assert!(!visible.contains("mcp__git__git_status"));
@@ -5782,7 +5782,7 @@ async fn project_subagent_inherits_project_skill_resources() {
 }
 
 #[tokio::test]
-async fn project_agent_lists_project_mcp_and_skill_resources() {
+async fn project_agent_lists_project_skill_resources_without_project_mcp() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     let project_id = Uuid::new_v4();
@@ -5833,7 +5833,7 @@ async fn project_agent_lists_project_mcp_and_skill_resources() {
         .filter_map(|item| item.get("uri").and_then(Value::as_str))
         .collect::<HashSet<_>>();
     assert!(uris.contains("skill:///review-open-prs"));
-    assert!(uris.contains("github://pulls"));
+    assert!(!uris.contains("github://pulls"));
 }
 
 #[tokio::test]

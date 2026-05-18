@@ -2317,11 +2317,11 @@ impl AgentRuntime {
         if cancellation_token.is_cancelled() {
             return Err(RuntimeError::TurnCancelled);
         }
-        if let Some(manager) = projects::mcp::cached_manager(&self.state, project_id).await {
-            return Ok(Some(manager));
-        }
         if projects::mcp::project_mcp_configs("").is_empty() {
             return Ok(None);
+        }
+        if let Some(manager) = projects::mcp::cached_manager(&self.state, project_id).await {
+            return Ok(Some(manager));
         }
 
         let Some(token) = self.project_git_token_details(project_id).await? else {
@@ -3046,7 +3046,11 @@ impl AgentRuntime {
     }
 
     async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<mai_mcp::McpTool> {
-        if let Some(project_id) = agent.summary.read().await.project_id {
+        let project_id = agent.summary.read().await.project_id;
+        if let Some(project_id) = project_id {
+            if projects::mcp::project_mcp_configs("").is_empty() {
+                return Vec::new();
+            }
             let manager = self
                 .state
                 .project_mcp_managers
