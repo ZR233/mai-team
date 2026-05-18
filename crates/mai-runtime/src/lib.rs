@@ -2827,13 +2827,7 @@ impl AgentRuntime {
         })?;
         let workspace_volume =
             project_agent_workspace_volume(&project_id.to_string(), &summary.id.to_string());
-        let mut env = Vec::new();
-        if let Some(host) = github::github_cli_host(&self.github_api_base_url)? {
-            env.push(("GH_HOST".to_string(), host));
-            env.push(("GH_ENTERPRISE_TOKEN".to_string(), token.clone()));
-        } else {
-            env.push(("GH_TOKEN".to_string(), token.clone()));
-        }
+        let mut env = vec![("GH_TOKEN".to_string(), token.clone())];
         let sidecar_name = format!("mai-tool-gh-api-{}-{}", summary.id, Uuid::new_v4());
         let body = projects::review::project_review_github_api_body_with_model_footer(
             &method,

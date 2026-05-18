@@ -815,14 +815,8 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 	    fi
 	    if printf '%s' "$command" | grep -q "gh api"; then
 	      echo "sidecar-gh-api" >> "$LOG"
-	      if [ -n "$GH_TOKEN" ] || [ -n "$GH_ENTERPRISE_TOKEN" ]; then
+	      if [ -n "$GH_TOKEN" ]; then
 	        echo "token-present" >> "$LOG"
-	      fi
-	      if [ -n "$GH_ENTERPRISE_TOKEN" ]; then
-	        echo "enterprise-token-present" >> "$LOG"
-	      fi
-	      if [ -n "$GH_HOST" ]; then
-	        echo "gh-host=$GH_HOST" >> "$LOG"
 	      fi
 	      printf '{{"ok":true}}\n'
 	    fi
@@ -6274,21 +6268,19 @@ async fn github_api_request_runs_via_gh_sidecar_without_token_leak() {
     assert!(docker_log.contains("sidecar-gh-api"));
     assert!(docker_log.contains("--method POST"));
     assert!(docker_log.contains("MAI_GH_API_BODY"));
+    assert!(docker_log.contains("-e GH_TOKEN"));
     assert!(docker_log.contains("token-present"));
-    assert!(!docker_log.contains("-e GH_ENTERPRISE_TOKEN"));
-    assert!(!docker_log.contains("GH_HOST"));
-    assert!(!docker_log.contains("gh-host="));
     assert!(!docker_log.contains("secret-token"));
 }
 
 #[tokio::test]
-async fn github_api_request_sets_gh_host_for_enterprise_api_base_url() {
+async fn github_api_request_uses_standard_token_env_with_custom_api_base_url() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     store
         .upsert_git_account(GitAccountRequest {
             id: Some("account-1".to_string()),
-            label: "GitHub Enterprise".to_string(),
+            label: "GitHub".to_string(),
             token: Some("secret-token".to_string()),
             is_default: true,
             ..Default::default()
@@ -6330,7 +6322,7 @@ async fn github_api_request_sets_gh_host_for_enterprise_api_base_url() {
             }),
         )
         .await
-        .expect("github enterprise api request");
+        .expect("github api request");
 
     assert!(result.success);
     assert_eq!(
@@ -6339,13 +6331,9 @@ async fn github_api_request_sets_gh_host_for_enterprise_api_base_url() {
     );
     let docker_log = fake_docker_log(&dir);
     assert!(docker_log.contains("sidecar-gh-api"));
-    assert!(docker_log.contains("-e GH_HOST"));
-    assert!(docker_log.contains("-e GH_ENTERPRISE_TOKEN"));
-    assert!(!docker_log.contains("-e GH_TOKEN"));
-    assert!(docker_log.contains("gh-host=ghe.example.com"));
+    assert!(docker_log.contains("-e GH_TOKEN"));
     assert!(docker_log.contains("/repos/owner/repo/pulls/123/reviews"));
     assert!(docker_log.contains("token-present"));
-    assert!(docker_log.contains("enterprise-token-present"));
     assert!(!docker_log.contains("secret-token"));
 }
 
