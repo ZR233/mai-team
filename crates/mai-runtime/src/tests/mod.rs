@@ -6349,6 +6349,107 @@ async fn github_api_request_runs_via_gh_sidecar_without_token_leak() {
 }
 
 #[tokio::test]
+async fn reviewer_github_api_request_rejects_pending_pr_review_creation() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let reviewer_id = Uuid::new_v4();
+    let mut reviewer = test_agent_summary(reviewer_id, Some("reviewer-container"));
+    reviewer.project_id = Some(project_id);
+    reviewer.role = Some(AgentRole::Reviewer);
+    save_agent_with_session(&store, &reviewer).await;
+    store
+        .save_project(&ready_test_project_summary(
+            project_id,
+            reviewer_id,
+            "account-1",
+        ))
+        .await
+        .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(reviewer_id, "reviewer")]);
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let err = runtime
+        .execute_tool_for_test(
+            reviewer_id,
+            "github_api_request",
+            json!({
+                "method": "POST",
+                "path": "/repos/owner/repo/pulls/123/reviews",
+                "body": {
+                    "event": "APPROVE"
+                }
+            }),
+        )
+        .await
+        .expect_err("pending review creation should be rejected before gh sidecar");
+
+    assert!(err.to_string().contains("non-empty `body`"));
+    assert!(!fake_docker_log(&dir).contains("sidecar-gh-api"));
+}
+
+#[tokio::test]
+async fn reviewer_github_api_request_rejects_pending_review_event_submission() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let reviewer_id = Uuid::new_v4();
+    let mut reviewer = test_agent_summary(reviewer_id, Some("reviewer-container"));
+    reviewer.project_id = Some(project_id);
+    reviewer.role = Some(AgentRole::Reviewer);
+    save_agent_with_session(&store, &reviewer).await;
+    store
+        .save_project(&ready_test_project_summary(
+            project_id,
+            reviewer_id,
+            "account-1",
+        ))
+        .await
+        .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(reviewer_id, "reviewer")]);
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let err = runtime
+        .execute_tool_for_test(
+            reviewer_id,
+            "github_api_request",
+            json!({
+                "method": "POST",
+                "path": "/repos/owner/repo/pulls/123/reviews/456/events",
+                "body": {
+                    "event": "APPROVE",
+                    "body": "Looks good after validation."
+                }
+            }),
+        )
+        .await
+        .expect_err("pending review event submission should be rejected before gh sidecar");
+
+    assert!(err.to_string().contains("one single POST"));
+    assert!(!fake_docker_log(&dir).contains("sidecar-gh-api"));
+}
+
+#[tokio::test]
 async fn github_api_request_accepts_json_string_body() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;

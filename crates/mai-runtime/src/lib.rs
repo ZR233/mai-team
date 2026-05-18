@@ -2858,7 +2858,7 @@ impl AgentRuntime {
             request.body.clone(),
             summary.role.as_ref(),
             &summary.model,
-        );
+        )?;
         let command = if let Some(body) = &body {
             let body = serde_json::to_string(body).map_err(|err| {
                 RuntimeError::InvalidInput(format!("invalid GitHub API JSON body: {err}"))

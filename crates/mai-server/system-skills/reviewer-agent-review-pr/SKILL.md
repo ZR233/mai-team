@@ -129,9 +129,9 @@ Keep the review body concise. Include validation results, similar-PR notes, and 
 
 ### 7. Submit the GitHub Review
 
-Submit through `github_api_request`.
+Submit through `github_api_request`. Use exactly one final review request. Do not create a pending review, do not create an empty review first, and do not submit `/pulls/PR/reviews/REVIEW_ID/events`; GitHub allows only one pending review per user and that path easily leaves stale pending state.
 
-Use a single REST request when possible:
+Use this single REST request shape:
 
 ```json
 {

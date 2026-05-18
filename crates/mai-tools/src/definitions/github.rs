@@ -22,6 +22,7 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
             TOOL_GITHUB_API_REQUEST,
             "Call the current Mai project's GitHub REST API through the managed gh sidecar. \
              Use this for PR review submission, comments, labels, and other GitHub reads or writes. \
+             For pull request reviews, submit the final review in one single POST to `/repos/OWNER/REPO/pulls/PR/reviews` with `event` and non-empty `body`; do not create pending reviews or submit `/reviews/ID/events`. \
              Credentials are supplied server-side and are not available to the agent container.",
             object_schema(vec![
                 (

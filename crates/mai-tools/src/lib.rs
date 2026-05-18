@@ -139,6 +139,10 @@ mod tests {
             properties.get("body").and_then(|schema| schema.get("type")),
             Some(&json!("object"))
         );
+        let description = request.description.as_str();
+        assert!(description.contains("single POST"));
+        assert!(description.contains("event"));
+        assert!(description.contains("pending review"));
         for forbidden in ["token", "env", "cwd", "repo_path", "worktree_path"] {
             assert!(
                 !properties.contains_key(forbidden),
