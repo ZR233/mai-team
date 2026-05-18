@@ -45,7 +45,7 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
                     "body",
                     json!({
                         "type": "object",
-                        "description": "Optional JSON object request body passed to gh api via stdin."
+                        "description": "Optional JSON object request body passed to gh api via stdin. Do not provide this field as a JSON-encoded string."
                     }),
                     false,
                 ),

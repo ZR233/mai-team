@@ -1168,12 +1168,19 @@ fn optional_json_body_argument(arguments: &Value, field: &str) -> Result<Option<
     let Some(value) = arguments.get(field) else {
         return Ok(None);
     };
-    if let Some(raw) = value.as_str() {
-        return serde_json::from_str(raw).map(Some).map_err(|err| {
+    let parsed = if let Some(raw) = value.as_str() {
+        serde_json::from_str(raw).map_err(|err| {
             RuntimeError::InvalidInput(format!("field `{field}` must be JSON: {err}"))
-        });
+        })?
+    } else {
+        value.clone()
+    };
+    if parsed.is_object() || parsed.is_null() {
+        return Ok(Some(parsed));
     }
-    Ok(Some(value.clone()))
+    Err(RuntimeError::InvalidInput(format!(
+        "field `{field}` must be a JSON object or null"
+    )))
 }
 
 fn parse_agent_id(value: &str) -> Result<AgentId> {
@@ -1835,6 +1842,21 @@ mod tests {
                 "event": "COMMENT",
                 "body": "Looks good."
             }))
+        );
+    }
+
+    #[test]
+    fn github_api_request_from_arguments_rejects_non_object_body() {
+        let err = github_api_request_from_arguments(&json!({
+            "method": "POST",
+            "path": "/repos/owner/repo/issues/42/comments",
+            "body": "[\"not\", \"an\", \"object\"]"
+        }))
+        .expect_err("body array should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("field `body` must be a JSON object or null")
         );
     }
 

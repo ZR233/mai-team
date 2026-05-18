@@ -833,6 +833,9 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 	      if [ -n "$GH_TOKEN" ]; then
 	        echo "token-present" >> "$LOG"
 	      fi
+	      if [ -n "$MAI_GH_API_BODY" ]; then
+	        printf 'gh-body=%s\n' "$MAI_GH_API_BODY" >> "$LOG"
+	      fi
 	      printf '{{"ok":true}}\n'
 	    fi
 	    exit 0
@@ -6392,6 +6395,8 @@ async fn github_api_request_accepts_json_string_body() {
     let docker_log = fake_docker_log(&dir);
     assert!(docker_log.contains("sidecar-gh-api"));
     assert!(docker_log.contains("MAI_GH_API_BODY"));
+    assert!(docker_log.contains(r#"gh-body={"body":"Looks good.","event":"COMMENT"}"#));
+    assert!(!docker_log.contains(r#"gh-body="{\"event\":\"COMMENT\""#));
 }
 
 #[tokio::test]
