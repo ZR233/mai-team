@@ -2633,7 +2633,7 @@ impl AgentRuntime {
         let branch = format!("mai-agent/{agent_id}");
         let origin_branch = format!("origin/{}", project.branch);
         let command = format!(
-            "set -eu\n\
+            "{}\
              rm -rf /workspace/repo\n\
              mkdir -p /workspace /workspace/.mai/install-log /workspace/.mai/tool-state /workspace/tmp\n\
              git -c credential.helper= clone --no-checkout -- /cache/repo.git /workspace/repo\n\
@@ -2641,6 +2641,7 @@ impl AgentRuntime {
              git fetch /cache/repo.git '+refs/pull/*/head:refs/remotes/origin/pr/*'\n\
              git remote set-url origin {}\n\
              git checkout -B {} {}",
+            sidecar_git_askpass_script(),
             shell_quote(&repo_url),
             shell_quote(&branch),
             shell_quote(&origin_branch),
@@ -2684,15 +2685,16 @@ impl AgentRuntime {
         self.ensure_project_cache_volume(project.id).await?;
         let repo_url = github::github_clone_url(&project.owner, &project.repo);
         let command = format!(
-            "set -eu\n\
+            "{}\
              mkdir -p /workspace\n\
-             if [ -d /workspace/repo.git ]; then\n\
+             if [ -d /workspace/repo.git ] && git -C /workspace/repo.git rev-parse --is-bare-repository >/dev/null 2>&1; then\n\
                git -C /workspace/repo.git remote set-url origin {repo_url}\n\
-               git -c credential.helper= -c http.https://github.com/.extraheader=\"AUTHORIZATION: bearer $MAI_GITHUB_INSTALLATION_TOKEN\" -C /workspace/repo.git fetch --prune origin\n\
+               git -c credential.helper= -C /workspace/repo.git fetch --prune origin\n\
              else\n\
                rm -rf /workspace/repo.git\n\
-               git -c credential.helper= -c http.https://github.com/.extraheader=\"AUTHORIZATION: bearer $MAI_GITHUB_INSTALLATION_TOKEN\" clone --mirror -- {repo_url} /workspace/repo.git\n\
+               git -c credential.helper= clone --mirror -- {repo_url} /workspace/repo.git\n\
              fi",
+            sidecar_git_askpass_script(),
             repo_url = shell_quote(&repo_url),
         );
         let env = [(
@@ -5377,6 +5379,23 @@ fn is_stale_agent_model_preference_error(err: &RuntimeError) -> bool {
 
 fn shell_quote(value: &str) -> String {
     shell_words::quote(value).into_owned()
+}
+
+fn sidecar_git_askpass_script() -> &'static str {
+    "set -eu\n\
+     askpass=/tmp/mai-git-askpass-$$.sh\n\
+     trap 'rm -f \"$askpass\"' EXIT\n\
+     cat > \"$askpass\" <<'EOF'\n\
+     #!/bin/sh\n\
+     case \"$1\" in\n\
+       *Username*) printf '%s\\n' x-access-token ;;\n\
+       *Password*) printf '%s\\n' \"$MAI_GITHUB_INSTALLATION_TOKEN\" ;;\n\
+       *) printf '\\n' ;;\n\
+     esac\n\
+     EOF\n\
+     chmod 700 \"$askpass\"\n\
+     export GIT_ASKPASS=\"$askpass\"\n\
+     export GIT_TERMINAL_PROMPT=0\n"
 }
 
 fn redact_secret(value: &str, secret: &str) -> String {

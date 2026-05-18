@@ -6206,6 +6206,9 @@ async fn project_clone_uses_sidecar_git_and_workspace_volumes() {
     assert!(docker_log.contains(&format!("{workspace_volume}:/workspace")));
     assert!(docker_log.contains(&format!("{cache_volume}:/workspace")));
     assert!(docker_log.contains("sidecar-git-clone"));
+    assert!(docker_log.contains("GIT_ASKPASS"));
+    assert!(docker_log.contains("rev-parse --is-bare-repository"));
+    assert!(!docker_log.contains("extraheader=AUTHORIZATION: bearer"));
     assert!(docker_log.contains("+refs/pull/*/head:refs/remotes/origin/pr/*"));
     assert!(docker_log.contains("token-present"));
     assert!(!docker_log.contains("secret-token"));
