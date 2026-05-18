@@ -6346,6 +6346,55 @@ async fn github_api_request_runs_via_gh_sidecar_without_token_leak() {
 }
 
 #[tokio::test]
+async fn github_api_request_accepts_json_string_body() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    save_agent_with_session(&store, &maintainer).await;
+    store
+        .save_project(&ready_test_project_summary(
+            project_id,
+            maintainer_id,
+            "account-1",
+        ))
+        .await
+        .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(maintainer_id, "planner")]);
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let result = runtime
+        .execute_tool_for_test(
+            maintainer_id,
+            "github_api_request",
+            json!({
+                "method": "POST",
+                "path": "/repos/owner/repo/pulls/123/reviews",
+                "body": r#"{"event":"COMMENT","body":"Looks good."}"#
+            }),
+        )
+        .await
+        .expect("github api request");
+
+    assert!(result.success);
+    let docker_log = fake_docker_log(&dir);
+    assert!(docker_log.contains("sidecar-gh-api"));
+    assert!(docker_log.contains("MAI_GH_API_BODY"));
+}
+
+#[tokio::test]
 async fn github_api_request_uses_standard_token_env_with_custom_api_base_url() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;

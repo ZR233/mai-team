@@ -1160,8 +1160,20 @@ fn github_api_request_from_arguments(arguments: &Value) -> Result<GithubApiReque
     Ok(GithubApiRequest {
         method: required_string_argument(arguments, "method")?,
         path: required_string_argument(arguments, "path")?,
-        body: arguments.get("body").cloned(),
+        body: optional_json_body_argument(arguments, "body")?,
     })
+}
+
+fn optional_json_body_argument(arguments: &Value, field: &str) -> Result<Option<Value>> {
+    let Some(value) = arguments.get(field) else {
+        return Ok(None);
+    };
+    if let Some(raw) = value.as_str() {
+        return serde_json::from_str(raw).map(Some).map_err(|err| {
+            RuntimeError::InvalidInput(format!("field `{field}` must be JSON: {err}"))
+        });
+    }
+    Ok(Some(value.clone()))
 }
 
 fn parse_agent_id(value: &str) -> Result<AgentId> {
@@ -1804,6 +1816,26 @@ mod tests {
         assert!(preview.contains("visible"));
         assert!(!preview.contains("secret-token"));
         assert!(!preview.contains("secret-key"));
+    }
+
+    #[test]
+    fn github_api_request_from_arguments_parses_json_string_body() {
+        let request = github_api_request_from_arguments(&json!({
+            "method": "POST",
+            "path": "/repos/owner/repo/pulls/42/reviews",
+            "body": r#"{"event":"COMMENT","body":"Looks good."}"#
+        }))
+        .expect("request");
+
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/repos/owner/repo/pulls/42/reviews");
+        assert_eq!(
+            request.body,
+            Some(json!({
+                "event": "COMMENT",
+                "body": "Looks good."
+            }))
+        );
     }
 
     #[test]

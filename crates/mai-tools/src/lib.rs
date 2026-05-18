@@ -135,7 +135,10 @@ mod tests {
             .get("properties")
             .and_then(Value::as_object)
             .expect("properties");
-        assert!(properties.contains_key("body"));
+        assert_eq!(
+            properties.get("body").and_then(|schema| schema.get("type")),
+            Some(&json!("object"))
+        );
         for forbidden in ["token", "env", "cwd", "repo_path", "worktree_path"] {
             assert!(
                 !properties.contains_key(forbidden),
