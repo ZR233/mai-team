@@ -102,6 +102,28 @@ pub(crate) fn github_api_url(base_url: &str, path: &str) -> String {
     format!("{base}{path}")
 }
 
+pub(crate) fn github_cli_host(base_url: &str) -> Result<Option<String>> {
+    let base = base_url
+        .trim()
+        .trim_end_matches('/')
+        .if_empty(DEFAULT_GITHUB_API_BASE_URL);
+    let url = reqwest::Url::parse(&base).map_err(|err| {
+        RuntimeError::InvalidInput(format!("invalid GitHub API base URL `{base}`: {err}"))
+    })?;
+    let host = url.host_str().ok_or_else(|| {
+        RuntimeError::InvalidInput(format!(
+            "invalid GitHub API base URL `{base}`: missing host"
+        ))
+    })?;
+    if host.eq_ignore_ascii_case("api.github.com") {
+        return Ok(None);
+    }
+    Ok(Some(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    }))
+}
+
 pub(crate) fn normalize_github_api_get_path(path: &str) -> Result<String> {
     let path = path.trim();
     if !path.starts_with('/')
@@ -181,6 +203,23 @@ mod tests {
         assert_eq!(
             summary.events,
             vec!["pull_request".to_string(), "check_suite".to_string()]
+        );
+    }
+
+    #[test]
+    fn github_cli_host_omits_default_github_com_host() {
+        assert_eq!(github_cli_host("").expect("blank base url"), None);
+        assert_eq!(
+            github_cli_host(" https://api.github.com/ ").expect("github.com base url"),
+            None
+        );
+    }
+
+    #[test]
+    fn github_cli_host_uses_enterprise_api_hostname() {
+        assert_eq!(
+            github_cli_host("https://ghe.example.com/api/v3").expect("enterprise base url"),
+            Some("ghe.example.com".to_string())
         );
     }
 }

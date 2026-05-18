@@ -815,8 +815,14 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 	    fi
 	    if printf '%s' "$command" | grep -q "gh api"; then
 	      echo "sidecar-gh-api" >> "$LOG"
-	      if [ -n "$GH_TOKEN" ]; then
+	      if [ -n "$GH_TOKEN" ] || [ -n "$GH_ENTERPRISE_TOKEN" ]; then
 	        echo "token-present" >> "$LOG"
+	      fi
+	      if [ -n "$GH_ENTERPRISE_TOKEN" ]; then
+	        echo "enterprise-token-present" >> "$LOG"
+	      fi
+	      if [ -n "$GH_HOST" ]; then
+	        echo "gh-host=$GH_HOST" >> "$LOG"
 	      fi
 	      printf '{{"ok":true}}\n'
 	    fi
@@ -6269,6 +6275,77 @@ async fn github_api_request_runs_via_gh_sidecar_without_token_leak() {
     assert!(docker_log.contains("--method POST"));
     assert!(docker_log.contains("MAI_GH_API_BODY"));
     assert!(docker_log.contains("token-present"));
+    assert!(!docker_log.contains("-e GH_ENTERPRISE_TOKEN"));
+    assert!(!docker_log.contains("GH_HOST"));
+    assert!(!docker_log.contains("gh-host="));
+    assert!(!docker_log.contains("secret-token"));
+}
+
+#[tokio::test]
+async fn github_api_request_sets_gh_host_for_enterprise_api_base_url() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub Enterprise".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    save_agent_with_session(&store, &maintainer).await;
+    store
+        .save_project(&ready_test_project_summary(
+            project_id,
+            maintainer_id,
+            "account-1",
+        ))
+        .await
+        .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(maintainer_id, "planner")]);
+    let runtime = test_runtime_with_github_api(
+        &dir,
+        Arc::clone(&store),
+        "https://ghe.example.com/api/v3".to_string(),
+    )
+    .await;
+
+    let result = runtime
+        .execute_tool_for_test(
+            maintainer_id,
+            "github_api_request",
+            json!({
+                "method": "POST",
+                "path": "/repos/owner/repo/pulls/123/reviews",
+                "body": {
+                    "event": "COMMENT",
+                    "body": "Looks good."
+                }
+            }),
+        )
+        .await
+        .expect("github enterprise api request");
+
+    assert!(result.success);
+    assert_eq!(
+        serde_json::from_str::<Value>(&result.output).expect("json output"),
+        json!({"ok": true})
+    );
+    let docker_log = fake_docker_log(&dir);
+    assert!(docker_log.contains("sidecar-gh-api"));
+    assert!(docker_log.contains("-e GH_HOST"));
+    assert!(docker_log.contains("-e GH_ENTERPRISE_TOKEN"));
+    assert!(!docker_log.contains("-e GH_TOKEN"));
+    assert!(docker_log.contains("gh-host=ghe.example.com"));
+    assert!(docker_log.contains("/repos/owner/repo/pulls/123/reviews"));
+    assert!(docker_log.contains("token-present"));
+    assert!(docker_log.contains("enterprise-token-present"));
     assert!(!docker_log.contains("secret-token"));
 }
 
