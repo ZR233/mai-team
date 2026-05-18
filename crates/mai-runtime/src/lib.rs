@@ -68,6 +68,10 @@ const DEFAULT_SIDECAR_IMAGE: &str = "ghcr.io/zr233/mai-team-sidecar:latest";
 const UNCONFIGURED_PROVIDER_ID: &str = "unconfigured";
 const UNCONFIGURED_PROVIDER_NAME: &str = "No provider configured";
 const UNCONFIGURED_MODEL_ID: &str = "unconfigured";
+const PROJECT_CACHE_VOLUME_MISSING_AFTER_STARTUP_RECONCILE: &str =
+    "project cache volume is missing after startup reconcile";
+const RELAY_ENABLED_BUT_NOT_CONNECTED: &str = "relay is enabled but not connected";
+const RELAY_NOT_CONNECTED: &str = "relay is not connected";
 const COMPACT_USER_MESSAGE_MAX_CHARS: usize = 80_000;
 const COMPACT_SUMMARY_PREVIEW_CHARS: usize = 240;
 const COMPACT_SUMMARY_PREFIX: &str = "Context checkpoint summary from earlier conversation history. This is background for continuity, not a new user request.";
@@ -1245,12 +1249,32 @@ impl AgentRuntime {
                 "failed to remove orphan project cache volumes during startup reconcile"
             );
         }
+        let recoverable_workspace_projects = projects
+            .iter()
+            .filter(|project| project_failed_by_recoverable_workspace_start_error(project))
+            .map(|project| project.id)
+            .collect::<HashSet<_>>();
+        let project_cache_rebuilds = volume_report
+            .missing_project_cache_volumes
+            .iter()
+            .copied()
+            .chain(recoverable_workspace_projects.iter().copied())
+            .collect::<HashSet<_>>();
+
         if !volume_report.missing_project_cache_volumes.is_empty() {
             tracing::warn!(
                 count = volume_report.missing_project_cache_volumes.len(),
                 "found projects with missing project cache volumes during startup reconcile"
             );
-            for project_id in &volume_report.missing_project_cache_volumes {
+        }
+        if !recoverable_workspace_projects.is_empty() {
+            tracing::warn!(
+                count = recoverable_workspace_projects.len(),
+                "found projects failed by recoverable workspace startup error during startup reconcile"
+            );
+        }
+        if !project_cache_rebuilds.is_empty() {
+            for project_id in &project_cache_rebuilds {
                 let Some(project_summary) =
                     projects.iter().find(|project| project.id == *project_id)
                 else {
@@ -1272,10 +1296,7 @@ impl AgentRuntime {
                 let Some(project_id) = agent_summary.project_id else {
                     continue;
                 };
-                if volume_report
-                    .missing_project_cache_volumes
-                    .contains(&project_id)
-                {
+                if project_cache_rebuilds.contains(&project_id) {
                     continue;
                 }
                 let agent = self.agent(*agent_id).await?;
@@ -5375,6 +5396,26 @@ fn is_stale_agent_model_preference_error(err: &RuntimeError) -> bool {
     (message.starts_with("provider `") && message.ends_with("` not found"))
         || (message.starts_with("model `")
             && message.contains("` is not configured for provider `"))
+}
+
+fn project_failed_by_recoverable_workspace_start_error(project: &ProjectSummary) -> bool {
+    project.status == ProjectStatus::Failed
+        && project.clone_status == ProjectCloneStatus::Failed
+        && project
+            .last_error
+            .as_deref()
+            .is_some_and(project_workspace_start_error_is_recoverable)
+}
+
+fn project_workspace_start_error_is_recoverable(error: &str) -> bool {
+    let error = error.trim();
+    let error = error.strip_prefix("invalid input: ").unwrap_or(error);
+    matches!(
+        error,
+        PROJECT_CACHE_VOLUME_MISSING_AFTER_STARTUP_RECONCILE
+            | RELAY_ENABLED_BUT_NOT_CONNECTED
+            | RELAY_NOT_CONNECTED
+    )
 }
 
 fn shell_quote(value: &str) -> String {

@@ -6654,6 +6654,113 @@ async fn runtime_start_recreates_missing_project_cache_volume() {
 }
 
 #[tokio::test]
+async fn runtime_start_recovers_project_failed_by_missing_cache_reconcile() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    maintainer.role = Some(AgentRole::Planner);
+    save_agent_with_session(&store, &maintainer).await;
+    let mut project = ready_test_project_summary(project_id, maintainer_id, "account-1");
+    project.status = ProjectStatus::Failed;
+    project.clone_status = ProjectCloneStatus::Failed;
+    project.last_error =
+        Some("project cache volume is missing after startup reconcile".to_string());
+    store.save_project(&project).await.expect("save project");
+    seed_project_agent_workspace_volume(&dir, project_id, maintainer_id, "planner");
+
+    let runtime = test_runtime_with_sidecar_image_and_git(
+        &dir,
+        Arc::clone(&store),
+        "ghcr.io/example/mai-team-sidecar:test",
+    )
+    .await;
+
+    let detail = runtime
+        .get_project(project_id, None, None)
+        .await
+        .expect("project");
+    assert_eq!(detail.summary.status, ProjectStatus::Ready);
+    assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Ready);
+    assert_eq!(detail.summary.last_error, None);
+    let cache_volume = mai_docker::project_cache_volume(&project_id.to_string());
+    let docker_log = fake_docker_log(&dir);
+    assert!(docker_log.contains(&format!("volume create --label mai.team.managed=true --label mai.team.kind=project-cache --label mai.team.project={project_id} {cache_volume}")));
+}
+
+#[tokio::test]
+async fn runtime_start_recovers_project_failed_by_startup_relay_reconcile() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    maintainer.role = Some(AgentRole::Planner);
+    save_agent_with_session(&store, &maintainer).await;
+    let mut project = ready_test_project_summary(project_id, maintainer_id, "account-1");
+    project.status = ProjectStatus::Failed;
+    project.clone_status = ProjectCloneStatus::Failed;
+    project.last_error = Some("invalid input: relay is enabled but not connected".to_string());
+    store.save_project(&project).await.expect("save project");
+    seed_project_agent_workspace_volume(&dir, project_id, maintainer_id, "planner");
+
+    let runtime = test_runtime_with_sidecar_image_and_git(
+        &dir,
+        Arc::clone(&store),
+        "ghcr.io/example/mai-team-sidecar:test",
+    )
+    .await;
+
+    let detail = runtime
+        .get_project(project_id, None, None)
+        .await
+        .expect("project");
+    assert_eq!(detail.summary.status, ProjectStatus::Ready);
+    assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Ready);
+    assert_eq!(detail.summary.last_error, None);
+    let cache_volume = mai_docker::project_cache_volume(&project_id.to_string());
+    let docker_log = fake_docker_log(&dir);
+    assert!(docker_log.contains(&format!("volume create --label mai.team.managed=true --label mai.team.kind=project-cache --label mai.team.project={project_id} {cache_volume}")));
+}
+
+#[tokio::test]
 async fn runtime_start_accepts_missing_legacy_project_agent_clone_when_volume_exists() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;

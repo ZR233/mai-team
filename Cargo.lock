@@ -1661,6 +1661,7 @@ dependencies = [
  "futures",
  "mai-protocol",
  "mai-runtime",
+ "pretty_assertions",
  "serde",
  "serde_json",
  "tokio",

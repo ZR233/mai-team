@@ -92,6 +92,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         direct_backend,
         Arc::clone(&relay),
     )) as Arc<dyn mai_runtime::github::GithubAppBackend>);
+    relay.configure_from_store().await?;
     let runtime = mai_runtime::AgentRuntime::new_with_github_backend(
         docker,
         model_client,
@@ -101,7 +102,6 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     )
     .await?;
     relay.set_runtime(Arc::clone(&runtime)).await;
-    relay.configure_from_store().await?;
     let cleaned = runtime.cleanup_orphaned_containers().await?;
     if !cleaned.is_empty() {
         info!(
