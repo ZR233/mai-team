@@ -70,12 +70,16 @@ pub(crate) async fn select_project_review_candidates(
         let mut pull_requests = pull_requests;
         pull_requests.sort_by_key(|pull_request| pull_request.number);
         for pull_request in pull_requests.iter() {
-            let candidate =
-                pull_request_candidate(ops, project_id, &owner, &repo, pull_request).await?;
             selected.extend(
-                select_review_prs(&identity.login, vec![candidate])
-                    .into_iter()
-                    .map(selected_project_review_pr),
+                select_project_review_pull_request(
+                    ops,
+                    project_id,
+                    &owner,
+                    &repo,
+                    &identity.login,
+                    pull_request,
+                )
+                .await?,
             );
         }
         if pull_requests.len() < SELECTOR_PAGE_SIZE as usize {
@@ -166,6 +170,21 @@ pub(super) async fn pull_request_candidate(
         check_signals: checks.signals,
         combined_status_state: checks.combined_status_state,
     })
+}
+
+pub(super) async fn select_project_review_pull_request(
+    ops: &impl ProjectReviewEligibilityOps,
+    project_id: ProjectId,
+    owner: &str,
+    repo: &str,
+    reviewer_login: &str,
+    pull_request: &GithubPullRequest,
+) -> Result<Vec<SelectedProjectReviewPr>> {
+    let candidate = pull_request_candidate(ops, project_id, owner, repo, pull_request).await?;
+    Ok(select_review_prs(reviewer_login, vec![candidate])
+        .into_iter()
+        .map(selected_project_review_pr)
+        .collect())
 }
 
 async fn pull_request_detail(

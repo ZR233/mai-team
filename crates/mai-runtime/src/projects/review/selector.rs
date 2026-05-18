@@ -3,8 +3,12 @@ use std::future::Future;
 use mai_protocol::ProjectId;
 use tokio_util::sync::CancellationToken;
 
-use super::eligibility::{ProjectReviewEligibilityOps, select_project_review_candidates};
+use super::eligibility::{
+    ProjectReviewEligibilityOps, SELECTOR_PAGE_SIZE, list_open_pull_requests,
+    select_project_review_pull_request,
+};
 pub(crate) use super::eligibility::{ProjectReviewIdentity, SelectedProjectReviewPr};
+use crate::github::github_path_segment;
 use crate::projects::review::pool::ProjectReviewSignalInput;
 use crate::{ProjectReviewQueueSummary, Result, RuntimeError};
 
@@ -39,31 +43,90 @@ pub(crate) async fn run_project_review_selector(
         return Err(RuntimeError::TurnCancelled);
     }
     tracing::info!(project_id = %project_id, "project review selector started");
-    let selected = select_project_review_candidates(ops, project_id).await?;
+    let summary = ops.project_summary(project_id).await?;
+    let identity = ops.project_review_identity(project_id).await?;
+    let owner = github_path_segment(&summary.owner);
+    let repo = github_path_segment(&summary.repo);
+    let mut page = 1_u64;
+    let mut selected = Vec::new();
+    let mut queue = ProjectReviewQueueSummary::default();
+    loop {
+        if cancellation_token.is_cancelled() {
+            return Err(RuntimeError::TurnCancelled);
+        }
+        let mut pull_requests =
+            list_open_pull_requests(ops, project_id, &owner, &repo, page).await?;
+        tracing::debug!(
+            project_id = %project_id,
+            page,
+            count = pull_requests.len(),
+            "project review selector fetched open PR page"
+        );
+        if pull_requests.is_empty() {
+            break;
+        }
+        pull_requests.sort_by_key(|pull_request| pull_request.number);
+        for pull_request in pull_requests.iter() {
+            if cancellation_token.is_cancelled() {
+                return Err(RuntimeError::TurnCancelled);
+            }
+            for selection in select_project_review_pull_request(
+                ops,
+                project_id,
+                &owner,
+                &repo,
+                &identity.login,
+                pull_request,
+            )
+            .await?
+            {
+                if cancellation_token.is_cancelled() {
+                    return Err(RuntimeError::TurnCancelled);
+                }
+                let signal = project_review_selector_signal(&selection);
+                let enqueue_summary = ops
+                    .enqueue_project_reviews(project_id, vec![signal])
+                    .await?;
+                extend_queue_summary(&mut queue, enqueue_summary);
+                tracing::info!(
+                    project_id = %project_id,
+                    pr = selection.pr,
+                    "project review selector queued PR"
+                );
+                selected.push(selection);
+            }
+        }
+        if pull_requests.len() < SELECTOR_PAGE_SIZE as usize {
+            break;
+        }
+        page += 1;
+    }
     if selected.is_empty() {
         tracing::info!(project_id = %project_id, "project review selector found no eligible PR");
         return Ok(ProjectReviewSelectorRunResult::NoEligiblePr);
-    }
-    if cancellation_token.is_cancelled() {
-        return Err(RuntimeError::TurnCancelled);
     }
     tracing::info!(
         project_id = %project_id,
         count = selected.len(),
         prs = ?selected.iter().map(|selection| selection.pr).collect::<Vec<_>>(),
-        "project review selector queued PRs"
+        "project review selector finished queueing PRs"
     );
-    let signals = selected
-        .iter()
-        .map(|selection| ProjectReviewSignalInput {
-            pr: selection.pr,
-            head_sha: selection.head_sha.clone(),
-            delivery_id: None,
-            reason: "selector".to_string(),
-        })
-        .collect::<Vec<_>>();
-    let queue = ops.enqueue_project_reviews(project_id, signals).await?;
     Ok(ProjectReviewSelectorRunResult::Queued { selected, queue })
+}
+
+fn project_review_selector_signal(selection: &SelectedProjectReviewPr) -> ProjectReviewSignalInput {
+    ProjectReviewSignalInput {
+        pr: selection.pr,
+        head_sha: selection.head_sha.clone(),
+        delivery_id: None,
+        reason: "selector".to_string(),
+    }
+}
+
+fn extend_queue_summary(target: &mut ProjectReviewQueueSummary, update: ProjectReviewQueueSummary) {
+    target.queued.extend(update.queued);
+    target.deduped.extend(update.deduped);
+    target.ignored.extend(update.ignored);
 }
 
 #[cfg(test)]
@@ -77,6 +140,7 @@ mod tests {
     use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
     use serde_json::{Value, json};
     use tokio::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     use crate::ProjectReviewQueueSummary;
@@ -89,17 +153,33 @@ mod tests {
     };
     use super::ProjectReviewSelectorOps;
 
+    enum FakeGithubResponse {
+        Json(Value),
+        Error(&'static str),
+    }
+
     #[derive(Default)]
     struct FakeSelectorOps {
-        responses: Mutex<Vec<(String, Value)>>,
+        responses: Mutex<Vec<(String, FakeGithubResponse)>>,
         requested_paths: Mutex<Vec<String>>,
+        enqueued_signals: Mutex<Vec<ProjectReviewSignalInput>>,
     }
 
     impl FakeSelectorOps {
         fn new(responses: Vec<(String, Value)>) -> Self {
+            Self::new_with_responses(
+                responses
+                    .into_iter()
+                    .map(|(path, value)| (path, FakeGithubResponse::Json(value)))
+                    .collect(),
+            )
+        }
+
+        fn new_with_responses(responses: Vec<(String, FakeGithubResponse)>) -> Self {
             Self {
                 responses: Mutex::new(responses),
                 requested_paths: Mutex::new(Vec::new()),
+                enqueued_signals: Mutex::new(Vec::new()),
             }
         }
     }
@@ -128,12 +208,17 @@ mod tests {
         ) -> crate::Result<Value> {
             self.requested_paths.lock().await.push(path.clone());
             let mut responses = self.responses.lock().await;
-            let Some((expected, response)) = responses.first().cloned() else {
+            if responses.is_empty() {
                 panic!("unexpected GitHub API request: {path}");
-            };
+            }
+            let (expected, response) = responses.remove(0);
             assert_eq!(expected, path);
-            responses.remove(0);
-            Ok(response)
+            match response {
+                FakeGithubResponse::Json(value) => Ok(value),
+                FakeGithubResponse::Error(message) => {
+                    Err(crate::RuntimeError::InvalidInput(message.to_string()))
+                }
+            }
         }
     }
 
@@ -141,9 +226,14 @@ mod tests {
         async fn enqueue_project_reviews(
             &self,
             _project_id: mai_protocol::ProjectId,
-            _signals: Vec<ProjectReviewSignalInput>,
+            signals: Vec<ProjectReviewSignalInput>,
         ) -> crate::Result<ProjectReviewQueueSummary> {
-            panic!("read-only candidate selection must not enqueue");
+            let queued = signals.iter().map(|signal| signal.pr).collect();
+            self.enqueued_signals.lock().await.extend(signals);
+            Ok(ProjectReviewQueueSummary {
+                queued,
+                ..Default::default()
+            })
         }
     }
 
@@ -396,6 +486,64 @@ mod tests {
 
         assert_eq!(vec![4, 5], selected_pr_numbers(&selected));
         assert_eq!(0, ops.responses.lock().await.len());
+    }
+
+    #[tokio::test]
+    async fn selector_enqueues_each_selected_pr_before_reading_later_candidates() {
+        let project_id = Uuid::new_v4();
+        let ops = Arc::new(FakeSelectorOps::new_with_responses(vec![
+            (
+                "/repos/owner/repo/pulls?state=open&sort=created&direction=asc&per_page=20&page=1"
+                    .to_string(),
+                FakeGithubResponse::Json(json!([
+                    pr_list_item(4, false, "head-4"),
+                    pr_list_item(5, false, "head-5")
+                ])),
+            ),
+            (
+                "/repos/owner/repo/pulls/4".to_string(),
+                FakeGithubResponse::Json(pr_detail(4, false, "head-4")),
+            ),
+            (
+                "/repos/owner/repo/pulls/4/reviews?per_page=100".to_string(),
+                FakeGithubResponse::Json(json!([])),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D4".to_string(),
+                FakeGithubResponse::Json(commit("2026-01-04T00:00:00Z")),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D4/check-runs?per_page=100".to_string(),
+                FakeGithubResponse::Json(json!({"check_runs": []})),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D4/status".to_string(),
+                FakeGithubResponse::Json(json!({"state": "failure"})),
+            ),
+            (
+                "/repos/owner/repo/pulls/5".to_string(),
+                FakeGithubResponse::Error("stop after first queued PR"),
+            ),
+        ]));
+
+        let result =
+            super::run_project_review_selector(ops.as_ref(), project_id, CancellationToken::new())
+                .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::RuntimeError::InvalidInput(message))
+                if message == "stop after first queued PR"
+        ));
+        assert_eq!(
+            vec![ProjectReviewSignalInput {
+                pr: 4,
+                head_sha: Some("head-4".to_string()),
+                delivery_id: None,
+                reason: "selector".to_string(),
+            }],
+            *ops.enqueued_signals.lock().await
+        );
     }
 
     #[tokio::test]
