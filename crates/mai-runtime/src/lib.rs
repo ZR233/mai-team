@@ -1164,7 +1164,7 @@ impl AgentRuntime {
         agents::list_agents(agents).await
     }
 
-    async fn reconcile_project_workspaces(&self) -> Result<()> {
+    async fn reconcile_project_workspaces(self: &Arc<Self>) -> Result<()> {
         let projects = self.list_projects().await;
         let agents = self.list_agents().await;
         let report = self.workspace_manager.reconcile(&projects, &agents).await?;
@@ -1251,13 +1251,13 @@ impl AgentRuntime {
                 "found projects with missing project cache volumes during startup reconcile"
             );
             for project_id in &volume_report.missing_project_cache_volumes {
-                self.set_project_clone_result(
-                    *project_id,
-                    ProjectStatus::Failed,
-                    ProjectCloneStatus::Failed,
-                    Some("project cache volume is missing after startup reconcile".to_string()),
-                )
-                .await?;
+                let Some(project_summary) =
+                    projects.iter().find(|project| project.id == *project_id)
+                else {
+                    continue;
+                };
+                self.start_project_workspace(*project_id, project_summary.maintainer_agent_id)
+                    .await?;
             }
         }
         if !volume_report.missing_agent_workspace_volumes.is_empty() {

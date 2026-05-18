@@ -6595,7 +6595,7 @@ async fn runtime_start_reconciles_orphan_project_clone_dirs() {
 }
 
 #[tokio::test]
-async fn runtime_start_marks_missing_project_cache_volume_failed() {
+async fn runtime_start_recreates_missing_project_cache_volume() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     store
@@ -6622,21 +6622,35 @@ async fn runtime_start_marks_missing_project_cache_volume_failed() {
         .join("repo");
     fs::create_dir_all(&clone_path).expect("mkdir clone");
 
-    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+
+    let runtime = test_runtime_with_sidecar_image_and_git(
+        &dir,
+        Arc::clone(&store),
+        "ghcr.io/example/mai-team-sidecar:test",
+    )
+    .await;
 
     let detail = runtime
         .get_project(project_id, None, None)
         .await
         .expect("project");
-    assert_eq!(detail.summary.status, ProjectStatus::Failed);
-    assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Failed);
-    assert!(
-        detail
-            .summary
-            .last_error
-            .as_deref()
-            .is_some_and(|error| error.contains("cache volume"))
-    );
+    assert_eq!(detail.summary.status, ProjectStatus::Ready);
+    assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Ready);
+    assert_eq!(detail.summary.last_error, None);
+    let cache_volume = mai_docker::project_cache_volume(&project_id.to_string());
+    let docker_log = fake_docker_log(&dir);
+    assert!(docker_log.contains(&format!("volume create --label mai.team.managed=true --label mai.team.kind=project-cache --label mai.team.project={project_id} {cache_volume}")));
+    assert!(fake_git_log(&dir).is_empty());
 }
 
 #[tokio::test]
