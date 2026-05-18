@@ -149,6 +149,18 @@ impl GitAccountService {
         &self,
         account_id: &str,
     ) -> Result<GithubRepositoriesResponse> {
+        let account = self.summary(account_id).await?;
+        if account.provider == GitProvider::GithubAppRelay {
+            let installation_id = account.installation_id.ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "relay git account installation_id is missing".to_string(),
+                )
+            })?;
+            return self
+                .github_backend
+                .list_github_repositories(installation_id)
+                .await;
+        }
         let token = self.token(account_id).await?;
         let url = github_api_url(
             &self.api_base_url,
@@ -324,6 +336,7 @@ mod tests {
 
     struct MockGithubAppBackend {
         token_requests: Mutex<Vec<(u64, Option<u64>, bool)>>,
+        repository_requests: Mutex<Vec<u64>>,
         token_expires_at: chrono::DateTime<Utc>,
     }
 
@@ -331,6 +344,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 token_requests: Mutex::new(Vec::new()),
+                repository_requests: Mutex::new(Vec::new()),
                 token_expires_at: Utc::now() + TimeDelta::hours(1),
             }
         }
@@ -376,9 +390,21 @@ mod tests {
 
         async fn list_github_repositories(
             &self,
-            _installation_id: u64,
+            installation_id: u64,
         ) -> Result<GithubRepositoriesResponse> {
-            unimplemented!("not needed by this test")
+            self.repository_requests.lock().await.push(installation_id);
+            Ok(GithubRepositoriesResponse {
+                repositories: vec![GithubRepositorySummary {
+                    id: 100,
+                    owner: "octo".to_string(),
+                    name: "repo".to_string(),
+                    full_name: "octo/repo".to_string(),
+                    private: false,
+                    clone_url: "https://github.com/octo/repo.git".to_string(),
+                    html_url: "https://github.com/octo/repo".to_string(),
+                    default_branch: Some("main".to_string()),
+                }],
+            })
         }
 
         async fn get_github_repository(
@@ -535,6 +561,54 @@ mod tests {
             }]
         );
         assert_eq!(response.warning, None);
+    }
+
+    #[tokio::test]
+    async fn relay_git_account_repositories_use_installation_repository_api() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("relay-account".to_string()),
+                provider: GitProvider::GithubAppRelay,
+                label: "Relay".to_string(),
+                installation_id: Some(42),
+                installation_account: Some("octo".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        let github_backend = Arc::new(MockGithubAppBackend::default());
+        let service = GitAccountService::new(
+            Arc::clone(&store),
+            reqwest::Client::new(),
+            "http://127.0.0.1".to_string(),
+            github_backend.clone(),
+        );
+
+        let response = service
+            .list_repositories("relay-account")
+            .await
+            .expect("list repositories");
+
+        assert_eq!(
+            github_backend.repository_requests.lock().await.as_slice(),
+            &[42]
+        );
+        assert_eq!(
+            serde_json::to_value(&response.repositories).expect("repositories json"),
+            json!([{
+                "id": 100,
+                "owner": "octo",
+                "name": "repo",
+                "full_name": "octo/repo",
+                "private": false,
+                "clone_url": "https://github.com/octo/repo.git",
+                "html_url": "https://github.com/octo/repo",
+                "default_branch": "main",
+            }])
+        );
+        assert_eq!(github_backend.token_requests.lock().await.as_slice(), &[]);
     }
 
     #[tokio::test]

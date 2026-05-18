@@ -2636,9 +2636,9 @@ impl AgentRuntime {
             "{}\
              rm -rf /workspace/repo\n\
              mkdir -p /workspace /workspace/.mai/install-log /workspace/.mai/tool-state /workspace/tmp\n\
-             git -c credential.helper= clone --no-checkout -- /cache/repo.git /workspace/repo\n\
+             git_with_retry clone --no-checkout -- /cache/repo.git /workspace/repo\n\
              cd /workspace/repo\n\
-             git fetch /cache/repo.git '+refs/pull/*/head:refs/remotes/origin/pr/*'\n\
+             git_with_retry fetch /cache/repo.git '+refs/pull/*/head:refs/remotes/origin/pr/*'\n\
              git remote set-url origin {}\n\
              git checkout -B {} {}",
             sidecar_git_askpass_script(),
@@ -2689,10 +2689,10 @@ impl AgentRuntime {
              mkdir -p /workspace\n\
              if [ -d /workspace/repo.git ] && git -C /workspace/repo.git rev-parse --is-bare-repository >/dev/null 2>&1; then\n\
                git -C /workspace/repo.git remote set-url origin {repo_url}\n\
-               git -c credential.helper= -C /workspace/repo.git fetch --prune origin\n\
+               git_with_retry -C /workspace/repo.git fetch --prune origin\n\
              else\n\
                rm -rf /workspace/repo.git\n\
-               git -c credential.helper= clone --mirror -- {repo_url} /workspace/repo.git\n\
+               git_with_retry clone --mirror -- {repo_url} /workspace/repo.git\n\
              fi",
             sidecar_git_askpass_script(),
             repo_url = shell_quote(&repo_url),
@@ -5395,7 +5395,19 @@ fn sidecar_git_askpass_script() -> &'static str {
      EOF\n\
      chmod 700 \"$askpass\"\n\
      export GIT_ASKPASS=\"$askpass\"\n\
-     export GIT_TERMINAL_PROMPT=0\n"
+     export GIT_TERMINAL_PROMPT=0\n\
+     git_with_retry() {\n\
+       attempts=0\n\
+       while :; do\n\
+         attempts=$((attempts + 1))\n\
+         git -c credential.helper= -c http.version=HTTP/1.1 \"$@\" && return 0\n\
+         status=$?\n\
+         if [ \"$attempts\" -ge 3 ]; then\n\
+           return \"$status\"\n\
+         fi\n\
+         sleep $((attempts * 2))\n\
+       done\n\
+     }\n"
 }
 
 fn redact_secret(value: &str, secret: &str) -> String {

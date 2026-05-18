@@ -805,6 +805,21 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 	    if printf '%s' "$command" | grep -q "fetch --prune origin"; then
 	      echo "review-sync" >> "$LOG"
 	    fi
+	    if printf '%s' "$command" | grep -q "clone --mirror"; then
+	      echo "sidecar-git-cache" >> "$LOG"
+	      if [ -f "$VOLUMES/fail-cache-clone-once" ]; then
+	        rm -f "$VOLUMES/fail-cache-clone-once"
+	        echo "simulated transient cache clone failure" >&2
+	        if ! printf '%s' "$command" | grep -q "git_with_retry"; then
+	          exit 28
+	        fi
+	        echo "sidecar-git-cache" >> "$LOG"
+	      fi
+	      if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
+	        echo "token-present" >> "$LOG"
+	      fi
+	      mkdir -p "$WORKSPACE/repo.git"
+	    fi
 	    if printf '%s' "$command" | grep -q "clone --no-checkout"; then
 	      echo "sidecar-git-clone" >> "$LOG"
 	      if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
@@ -6214,6 +6229,57 @@ async fn project_clone_uses_sidecar_git_and_workspace_volumes() {
     assert!(!docker_log.contains("secret-token"));
     assert!(!git_log.contains("secret-token"));
     assert!(git_log.is_empty());
+}
+
+#[tokio::test]
+async fn project_clone_retries_transient_cache_git_failure() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let mut agent = test_agent_summary(agent_id, None);
+    agent.project_id = Some(project_id);
+    agent.role = Some(AgentRole::Planner);
+    save_agent_with_session(&store, &agent).await;
+    let project = test_project_summary(project_id, agent_id, "account-1");
+    store.save_project(&project).await.expect("save project");
+    let volume_marker_dir = dir.path().join("fake-docker-volumes");
+    fs::create_dir_all(&volume_marker_dir).expect("mkdir fake docker volumes");
+    fs::write(volume_marker_dir.join("fail-cache-clone-once"), "").expect("write failure marker");
+    let runtime = test_runtime_with_sidecar_image_and_git(
+        &dir,
+        Arc::clone(&store),
+        "ghcr.io/example/mai-team-sidecar:test",
+    )
+    .await;
+
+    runtime
+        .clone_project_repository(project_id, agent_id)
+        .await
+        .expect("clone retries transient cache failure");
+
+    let docker_log = fake_docker_log(&dir);
+    assert_eq!(docker_log.matches("sidecar-git-cache").count(), 2);
+    assert!(docker_log.contains("git_with_retry"));
+    assert!(docker_log.contains("http.version=HTTP/1.1"));
+    assert!(docker_log.contains("sleep $((attempts * 2))"));
 }
 
 #[tokio::test]
