@@ -179,6 +179,51 @@ async fn start_mock_responses(responses: Vec<Value>) -> (String, Arc<Mutex<Vec<V
     (format!("http://{addr}"), requests)
 }
 
+async fn start_mock_responses_by_path(
+    responses: Vec<(String, Value)>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock server");
+    let addr = listener.local_addr().expect("mock server addr");
+    let responses = Arc::new(Mutex::new(
+        responses.into_iter().collect::<HashMap<String, Value>>(),
+    ));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_responses = Arc::clone(&responses);
+    let server_requests = Arc::clone(&requests);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let responses = Arc::clone(&server_responses);
+            let requests = Arc::clone(&server_requests);
+            tokio::spawn(async move {
+                let request = read_mock_request(&mut stream).await;
+                let response_key = request
+                    .get("request_line")
+                    .and_then(Value::as_str)
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_default();
+                requests.lock().await.push(request);
+                let response = responses
+                    .lock()
+                    .await
+                    .remove(&response_key)
+                    .unwrap_or_else(|| {
+                        json!({
+                            "message": format!("missing mock response for {response_key}")
+                        })
+                    });
+                write_mock_response(&mut stream, response, false).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 async fn wait_until<F, Fut>(mut condition: F, timeout: Duration)
 where
     F: FnMut() -> Fut,
@@ -5398,31 +5443,89 @@ async fn project_review_selector_pages_and_queues_all_eligible_prs_without_model
     let mut page_one = vec![github_pr(1, false, "head-1")];
     page_one.extend((2..=20).map(|number| github_pr(number, true, &format!("head-{number}"))));
     let mut responses = vec![
-        Value::Array(page_one),
-        github_pr(1, false, "head-1"),
-        json!([]),
-        github_commit("2026-01-01T00:00:00Z"),
-        json!({"check_runs": [{"status": "in_progress", "conclusion": null}]}),
-        json!({"state": "success"}),
+        (
+            "/repos/owner/repo/pulls?state=open&sort=created&direction=asc&per_page=20&page=1"
+                .to_string(),
+            Value::Array(page_one),
+        ),
+        (
+            "/repos/owner/repo/pulls/1".to_string(),
+            github_pr(1, false, "head-1"),
+        ),
+        (
+            "/repos/owner/repo/pulls/1/reviews?per_page=100".to_string(),
+            json!([]),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D1".to_string(),
+            github_commit("2026-01-01T00:00:00Z"),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D1/check-runs?per_page=100".to_string(),
+            json!({"check_runs": [{"status": "in_progress", "conclusion": null}]}),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D1/status".to_string(),
+            json!({"state": "success"}),
+        ),
     ];
-    responses.extend((2..=20).map(|number| github_pr(number, true, &format!("head-{number}"))));
+    responses.extend((2..=20).map(|number| {
+        (
+            format!("/repos/owner/repo/pulls/{number}"),
+            github_pr(number, true, &format!("head-{number}")),
+        )
+    }));
     responses.extend([
-        json!([
+        (
+            "/repos/owner/repo/pulls?state=open&sort=created&direction=asc&per_page=20&page=2"
+                .to_string(),
+            json!([
+                github_pr(21, false, "head-21"),
+                github_pr(22, false, "head-22")
+            ]),
+        ),
+        (
+            "/repos/owner/repo/pulls/21".to_string(),
             github_pr(21, false, "head-21"),
-            github_pr(22, false, "head-22")
-        ]),
-        github_pr(21, false, "head-21"),
-        json!([]),
-        github_commit("2026-01-21T00:00:00Z"),
-        json!({"check_runs": [{"status": "completed", "conclusion": "failure"}]}),
-        json!({"state": "failure"}),
-        github_pr(22, false, "head-22"),
-        json!([]),
-        github_commit("2026-01-22T00:00:00Z"),
-        json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}),
-        json!({"state": "success"}),
+        ),
+        (
+            "/repos/owner/repo/pulls/21/reviews?per_page=100".to_string(),
+            json!([]),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D21".to_string(),
+            github_commit("2026-01-21T00:00:00Z"),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D21/check-runs?per_page=100".to_string(),
+            json!({"check_runs": [{"status": "completed", "conclusion": "failure"}]}),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D21/status".to_string(),
+            json!({"state": "failure"}),
+        ),
+        (
+            "/repos/owner/repo/pulls/22".to_string(),
+            github_pr(22, false, "head-22"),
+        ),
+        (
+            "/repos/owner/repo/pulls/22/reviews?per_page=100".to_string(),
+            json!([]),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D22".to_string(),
+            github_commit("2026-01-22T00:00:00Z"),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D22/check-runs?per_page=100".to_string(),
+            json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D22/status".to_string(),
+            json!({"state": "success"}),
+        ),
     ]);
-    let (base_url, requests) = start_mock_responses(responses).await;
+    let (base_url, requests) = start_mock_responses_by_path(responses).await;
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     store
