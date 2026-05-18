@@ -394,25 +394,7 @@ async fn run_sidecar_git(
     token: Option<&str>,
     args: &[&str],
 ) -> Result<String> {
-    let mut command_parts = vec![
-        "git".to_string(),
-        "-c".to_string(),
-        shell_quote("core.hooksPath=/dev/null"),
-        "-c".to_string(),
-        shell_quote(&format!("safe.directory={repo_path}")),
-        "-c".to_string(),
-        shell_quote("credential.helper="),
-    ];
-    if token.is_some() {
-        command_parts.extend([
-            "-c".to_string(),
-            shell_quote(
-                "http.https://github.com/.extraheader=AUTHORIZATION: bearer $MAI_GITHUB_INSTALLATION_TOKEN",
-            ),
-        ]);
-    }
-    command_parts.extend(args.iter().map(|arg| shell_quote(arg)));
-    let command = command_parts.join(" ");
+    let command = sidecar_git_command(repo_path, token.is_some(), args);
     let env = token
         .map(|token| {
             vec![(
@@ -448,6 +430,41 @@ async fn run_sidecar_git(
     )))
 }
 
+fn sidecar_git_command(repo_path: &str, with_token: bool, args: &[&str]) -> String {
+    let mut command_parts = vec![
+        "git".to_string(),
+        "-c".to_string(),
+        shell_quote("core.hooksPath=/dev/null"),
+        "-c".to_string(),
+        shell_quote(&format!("safe.directory={repo_path}")),
+        "-c".to_string(),
+        shell_quote("credential.helper="),
+    ];
+    if with_token {
+        let git_command = command_parts
+            .iter()
+            .chain(
+                args.iter()
+                    .map(|arg| shell_quote(arg))
+                    .collect::<Vec<_>>()
+                    .iter(),
+            )
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+        return sidecar_git_command_with_askpass(&git_command);
+    }
+    command_parts.extend(args.iter().map(|arg| shell_quote(arg)));
+    command_parts.join(" ")
+}
+
+fn sidecar_git_command_with_askpass(git_command: &str) -> String {
+    format!(
+        "askpass=$(mktemp) && cat > \"$askpass\" <<'MAI_GIT_ASKPASS'\n#!/bin/sh\n{}\nMAI_GIT_ASKPASS\nchmod 700 \"$askpass\" && GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=\"$askpass\" {git_command}; status=$?; rm -f \"$askpass\"; exit $status",
+        git_askpass_script()
+    )
+}
+
 fn required_token(token: Option<&str>) -> Result<&str> {
     token
         .filter(|token| !token.trim().is_empty())
@@ -475,6 +492,11 @@ fn optional_arg(arguments: &Value, name: &str) -> Result<Option<String>> {
 
 fn shell_quote(value: &str) -> String {
     shell_words::quote(value).into_owned()
+}
+
+fn git_askpass_script() -> String {
+    "case \"$1\" in\n  *Username*) printf '%s\\n' x-access-token ;;\n  *Password*) printf '%s\\n' \"$MAI_GITHUB_INSTALLATION_TOKEN\" ;;\n  *) printf '\\n' ;;\nesac"
+        .to_string()
 }
 
 #[cfg(test)]
@@ -671,6 +693,58 @@ mod tests {
 
         assert!(err.to_string().contains("unsupported git remote"));
         assert_eq!(read_git_log(dir.path()), "");
+    }
+
+    #[tokio::test]
+    async fn git_fetch_allows_pull_request_refspec_destination() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fake_git_path(dir.path());
+        let project_id = uuid::Uuid::new_v4();
+        let agent_id = uuid::Uuid::new_v4();
+        let clone_path = workspace::agent_clone_path(dir.path(), project_id, agent_id);
+        std::fs::create_dir_all(&clone_path).expect("clone");
+
+        execute_git_tool(
+            GitToolContext {
+                backend: GitToolBackend::Host {
+                    git_binary: &git,
+                    projects_root: dir.path(),
+                },
+                agent_id,
+                project: test_project(project_id, agent_id),
+                token: Some("secret-token".to_string()),
+            },
+            mai_tools::TOOL_GIT_FETCH,
+            json!({ "refspec": "pull/679/head:refs/pull/679/head" }),
+        )
+        .await
+        .expect("fetch pull request refspec");
+
+        assert_eq!(
+            read_git_log(dir.path()),
+            format!(
+                "{}|fetch --prune origin pull/679/head:refs/pull/679/head\n",
+                clone_path.to_string_lossy()
+            )
+        );
+    }
+
+    #[test]
+    fn git_askpass_script_uses_installation_token_for_password_prompt() {
+        let script = git_askpass_script();
+
+        assert!(script.contains("x-access-token"));
+        assert!(script.contains("$MAI_GITHUB_INSTALLATION_TOKEN"));
+    }
+
+    #[test]
+    fn sidecar_git_command_uses_askpass_instead_of_literal_extraheader() {
+        let command = sidecar_git_command("/workspace/repo", true, &["fetch", "origin"]);
+
+        assert!(command.contains("GIT_ASKPASS="));
+        assert!(command.contains("x-access-token"));
+        assert!(command.contains("$MAI_GITHUB_INSTALLATION_TOKEN"));
+        assert!(!command.contains("extraheader"));
     }
 
     #[tokio::test]
