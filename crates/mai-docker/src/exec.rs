@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
-use crate::args::validate_image;
+use crate::args::{HOST_NETWORK, validate_image};
 use crate::capture::{await_capture_task, capture_stream};
 use crate::client::DockerClient;
 use crate::error::{DockerError, Result};
@@ -50,6 +50,7 @@ pub struct SidecarParams<'a> {
     pub cwd: Option<&'a str>,
     pub env: &'a [(String, String)],
     pub workspace_volume: Option<&'a str>,
+    pub mounts: &'a [(&'a str, &'a str)],
     pub timeout_secs: Option<u64>,
 }
 
@@ -248,11 +249,15 @@ impl DockerClient {
         let mut cmd = Command::new(&self.binary);
         cmd.arg("run")
             .arg("--rm")
+            .args(["--network", HOST_NETWORK])
             .args(["--name", params.name])
             .args(["--label", MANAGED_LABEL]);
         if let Some(volume) = params.workspace_volume {
             let mount = format!("{volume}:/workspace");
             cmd.args(["-v", &mount]);
+        }
+        for (volume, target) in params.mounts {
+            cmd.args(["-v", &format!("{volume}:{target}")]);
         }
         if let Some(cwd) = params.cwd {
             cmd.args(["-w", cwd]);
@@ -301,10 +306,14 @@ impl DockerClient {
         cmd.arg("run")
             .arg("--rm")
             .arg("-i")
+            .args(["--network", HOST_NETWORK])
             .args(["--name", params.name])
             .args(["--label", MANAGED_LABEL]);
         if let Some(volume) = params.workspace_volume {
             cmd.args(["-v", &format!("{volume}:/workspace")]);
+        }
+        for (volume, target) in params.mounts {
+            cmd.args(["-v", &format!("{volume}:{target}")]);
         }
         if let Some(cwd) = params.cwd {
             cmd.args(["-w", cwd]);

@@ -94,14 +94,35 @@ impl GitPolicy {
 }
 
 fn is_pull_request_head_ref(refspec: &str) -> bool {
+    let (source, destination) = match refspec.split_once(':') {
+        Some((source, destination)) => (source, Some(destination)),
+        None => (refspec, None),
+    };
+    let source = source.strip_prefix("refs/").unwrap_or(source);
+    let Some(number) = pull_request_head_number(source) else {
+        return false;
+    };
+    match destination {
+        Some(destination) => is_pull_request_head_destination(destination, number),
+        None => true,
+    }
+}
+
+fn pull_request_head_number(refspec: &str) -> Option<&str> {
     let refspec = refspec.strip_prefix("refs/").unwrap_or(refspec);
     let Some(rest) = refspec.strip_prefix("pull/") else {
-        return false;
+        return None;
     };
     let Some(number) = rest.strip_suffix("/head") else {
-        return false;
+        return None;
     };
-    !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit())
+    (!number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit())).then_some(number)
+}
+
+fn is_pull_request_head_destination(destination: &str, number: &str) -> bool {
+    destination == format!("pr/{number}")
+        || destination == format!("refs/pull/{number}/head")
+        || destination == format!("refs/remotes/origin/pr/{number}")
 }
 
 #[cfg(test)]
@@ -154,6 +175,26 @@ mod tests {
             policy
                 .validate_fetch_refspec(Some("pull/42/head"), "main")
                 .is_ok()
+        );
+        assert!(
+            policy
+                .validate_fetch_refspec(Some("pull/42/head:pr/42"), "main")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .validate_fetch_refspec(Some("pull/42/head:refs/pull/42/head"), "main")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .validate_fetch_refspec(Some("refs/pull/42/head:refs/remotes/origin/pr/42"), "main")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .validate_fetch_refspec(Some("pull/42/head:refs/pull/43/head"), "main")
+                .is_err()
         );
         assert!(
             policy

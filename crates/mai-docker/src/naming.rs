@@ -2,7 +2,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const MANAGED_LABEL: &str = "mai.team.managed=true";
 pub(crate) const AGENT_LABEL_KEY: &str = "mai.team.agent";
+pub(crate) const KIND_LABEL_KEY: &str = "mai.team.kind";
 pub(crate) const PROJECT_LABEL_KEY: &str = "mai.team.project";
+pub(crate) const ROLE_LABEL_KEY: &str = "mai.team.role";
 pub(crate) const SIDECAR_LABEL_KEY: &str = "mai.team.sidecar";
 pub(crate) const SIDECAR_KIND_LABEL_KEY: &str = "mai.team.sidecar.kind";
 pub(crate) const PROJECT_SIDECAR_KIND: &str = "project";
@@ -11,12 +13,12 @@ pub fn agent_workspace_volume(agent_id: &str) -> String {
     format!("mai-team-workspace-{agent_id}")
 }
 
-pub fn project_workspace_volume(project_id: &str) -> String {
-    format!("mai-team-project-{project_id}")
+pub fn project_agent_workspace_volume(project_id: &str, agent_id: &str) -> String {
+    format!("mai-team-project-{project_id}-agent-{agent_id}")
 }
 
-pub fn project_review_workspace_volume(project_id: &str) -> String {
-    format!("mai-team-project-review-{project_id}")
+pub fn project_cache_volume(project_id: &str) -> String {
+    format!("mai-team-project-{project_id}-cache")
 }
 
 pub(crate) fn agent_container_name(agent_id: &str) -> String {
@@ -44,18 +46,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn project_workspace_volume_uses_project_id() {
+    fn project_cache_volume_uses_project_id() {
         assert_eq!(
-            project_workspace_volume("project-1"),
-            "mai-team-project-project-1"
+            project_cache_volume("project-1"),
+            "mai-team-project-project-1-cache"
         );
     }
 
     #[test]
-    fn project_review_workspace_volume_uses_project_id() {
+    fn project_agent_workspace_volume_uses_project_and_agent_id() {
         assert_eq!(
-            project_review_workspace_volume("project-1"),
-            "mai-team-project-review-project-1"
+            project_agent_workspace_volume("project-1", "agent-1"),
+            "mai-team-project-project-1-agent-agent-1"
         );
     }
 

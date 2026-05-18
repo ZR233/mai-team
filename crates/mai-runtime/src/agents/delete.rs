@@ -37,7 +37,7 @@ pub(crate) trait AgentDeleteOps: Send + Sync {
         request: AgentContainerDeleteRequest,
     ) -> impl Future<Output = Result<Vec<String>>> + Send;
 
-    fn cleanup_project_agent_clone(
+    fn cleanup_project_agent_workspace(
         &self,
         project_id: ProjectId,
         agent_id: AgentId,
@@ -105,12 +105,14 @@ async fn delete_agent_record(ops: &impl AgentDeleteOps, agent_id: AgentId) -> Re
         );
     }
     if let Some(project_id) = project_id
-        && let Err(err) = ops.cleanup_project_agent_clone(project_id, agent_id).await
+        && let Err(err) = ops
+            .cleanup_project_agent_workspace(project_id, agent_id)
+            .await
     {
         tracing::warn!(
             project_id = %project_id,
             agent_id = %agent_id,
-            "failed to clean project agent clone during agent deletion: {err}"
+            "failed to clean project agent workspace during agent deletion: {err}"
         );
     }
     let _turn_guard = agent.turn_lock.lock().await;

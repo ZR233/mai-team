@@ -479,7 +479,7 @@ mod tests {
         fs::create_dir_all(&agent_dir).expect("mkdir");
         fs::write(
             agent_dir.join(AGENT_FILE),
-            "---\nid: project-reviewer\nname: Project Reviewer\ndescription: Reviews pull requests.\nslot: project.reviewer\nversion: 1\ndefault_model_role: reviewer\ndefault_skills:\n  - reviewer-agent-review-pr\nmcp_servers:\n  - github\ncapabilities:\n  communication: parent_and_maintainer\n---\n\nYou review PRs.\n",
+            "---\nid: project-reviewer\nname: Project Reviewer\ndescription: Reviews pull requests.\nslot: project.reviewer\nversion: 1\ndefault_model_role: reviewer\ndefault_skills:\n  - reviewer-agent-review-pr\nmcp_servers:\n  - git\ncapabilities:\n  communication: parent_and_maintainer\n---\n\nYou review PRs.\n",
         )
         .expect("write agent");
 
@@ -498,7 +498,7 @@ mod tests {
         assert_eq!(profile.prompt, "You review PRs.");
         assert_eq!(profile.default_model_role.as_deref(), Some("reviewer"));
         assert_eq!(profile.default_skills, vec!["reviewer-agent-review-pr"]);
-        assert_eq!(profile.mcp_servers, vec!["github"]);
+        assert_eq!(profile.mcp_servers, vec!["git"]);
         assert_eq!(
             profile.capabilities.communication.as_deref(),
             Some("parent_and_maintainer")

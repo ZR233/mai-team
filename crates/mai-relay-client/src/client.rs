@@ -30,6 +30,7 @@ use uuid::Uuid;
 use crate::config::RelayClientConfig;
 use crate::protocol;
 
+const RELAY_CONNECT_WAIT_SECS: u64 = 10;
 const RELAY_RPC_TIMEOUT_SECS: u64 = 30;
 
 pub struct RelayClient {
@@ -111,10 +112,7 @@ impl RelayClient {
         })?;
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id.clone(), tx);
-        let sender = match {
-            let state = self.state.lock().await;
-            state.sender.clone()
-        } {
+        let sender = match self.wait_for_sender().await {
             Some(sender) => sender,
             None => {
                 self.pending.lock().await.remove(&id);
@@ -157,6 +155,27 @@ impl RelayClient {
         serde_json::from_value(response.result.unwrap_or(Value::Null)).map_err(|err| {
             RuntimeError::InvalidInput(format!("relay response deserialization failed: {err}"))
         })
+    }
+
+    async fn wait_for_sender(&self) -> Option<mpsc::UnboundedSender<RelayEnvelope>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(RELAY_CONNECT_WAIT_SECS);
+        loop {
+            if let Some(sender) = {
+                let state = self.state.lock().await;
+                state.sender.clone()
+            } {
+                return Some(sender);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let sleep_for = (deadline - now).min(Duration::from_millis(50));
+            tokio::select! {
+                _ = self.cancellation.cancelled() => return None,
+                _ = sleep(sleep_for) => {}
+            }
+        }
     }
 
     pub async fn start_github_app_manifest(
@@ -449,5 +468,82 @@ impl RelayClient {
                 message: Some(message),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mai_protocol::RelayEnvelope;
+    use pretty_assertions::assert_eq;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+
+    #[tokio::test]
+    async fn request_waits_for_connection_started_in_background() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+        let addr = listener.local_addr().expect("relay addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept relay");
+            let mut websocket = accept_async(stream).await.expect("websocket");
+            let hello = websocket
+                .next()
+                .await
+                .expect("hello")
+                .expect("hello message");
+            let RelayEnvelope::Hello(_) =
+                serde_json::from_str::<RelayEnvelope>(&hello.into_text().expect("hello text"))
+                    .expect("decode hello")
+            else {
+                panic!("first relay message should be hello");
+            };
+            let request = websocket
+                .next()
+                .await
+                .expect("request")
+                .expect("request message");
+            let RelayEnvelope::Request(request) =
+                serde_json::from_str::<RelayEnvelope>(&request.into_text().expect("request text"))
+                    .expect("decode request")
+            else {
+                panic!("second relay message should be request");
+            };
+            assert_eq!(request.method, "github.installation_token.create");
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&RelayEnvelope::Response(RelayResponse {
+                        id: request.id,
+                        result: Some(json!({
+                            "token": "relay-token",
+                            "expires_at": "2026-05-18T00:00:00Z"
+                        })),
+                        error: None,
+                    }))
+                    .expect("encode response")
+                    .into(),
+                ))
+                .await
+                .expect("send response");
+        });
+        let client = Arc::new(RelayClient::new(RelayClientConfig {
+            url: format!("http://{addr}"),
+            token: "secret".to_string(),
+            node_id: "node-1".to_string(),
+        }));
+
+        Arc::clone(&client).start();
+        let response = client
+            .create_installation_token(42, None, false)
+            .await
+            .expect("relay token");
+
+        assert_eq!(response.token, "relay-token");
+        assert_eq!(
+            response.expires_at,
+            "2026-05-18T00:00:00Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .expect("expires")
+        );
+        server.await.expect("server");
     }
 }

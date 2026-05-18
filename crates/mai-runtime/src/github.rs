@@ -116,6 +116,16 @@ pub(crate) fn normalize_github_api_get_path(path: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
+pub(crate) fn normalize_github_api_method(method: &str) -> Result<String> {
+    let method = method.trim().to_ascii_uppercase();
+    match method.as_str() {
+        "GET" | "POST" | "PATCH" | "PUT" | "DELETE" => Ok(method),
+        other => Err(RuntimeError::InvalidInput(format!(
+            "unsupported GitHub API method `{other}`"
+        ))),
+    }
+}
+
 pub(crate) fn github_path_segment(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }

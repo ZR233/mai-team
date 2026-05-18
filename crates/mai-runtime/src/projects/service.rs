@@ -51,7 +51,7 @@ pub(crate) trait ProjectLifecycleOps: Send + Sync {
         &self,
         project_id: ProjectId,
     ) -> impl Future<Output = Result<()>> + Send;
-    fn delete_project_review_workspace(
+    fn delete_project_workspace(
         &self,
         project_id: ProjectId,
     ) -> impl Future<Output = Result<()>> + Send;
@@ -433,7 +433,7 @@ pub(crate) async fn delete_project(
     }
     ops.shutdown_project_mcp_manager(project_id).await;
     let _ = ops.delete_project_sidecar(project_id).await;
-    let _ = ops.delete_project_review_workspace(project_id).await;
+    let _ = ops.delete_project_workspace(project_id).await;
     ops.delete_project_from_store(project_id).await?;
     ops.remove_project_from_memory(project_id).await;
     ops.remove_project_skill_lock(project_id).await;

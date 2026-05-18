@@ -30,11 +30,28 @@ impl EmbeddedResourceRoot {
 static EMBEDDED_RESOURCE_RELEASE_LOCK: StdMutex<()> = StdMutex::new(());
 
 pub(crate) fn release_embedded_system_skills(target_dir: &Path) -> io::Result<()> {
-    release_embedded_resources::<EmbeddedSystemSkills>(target_dir, EmbeddedResourceRoot::Skills)
+    release_embedded_resources::<EmbeddedSystemSkills>(target_dir, EmbeddedResourceRoot::Skills)?;
+    if let Some(source_dir) = development_system_resource_source(EmbeddedResourceRoot::Skills) {
+        overlay_system_resource_directory(&source_dir, target_dir)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn release_embedded_system_agents(target_dir: &Path) -> io::Result<()> {
-    release_embedded_resources::<EmbeddedSystemAgents>(target_dir, EmbeddedResourceRoot::Agents)
+    release_embedded_resources::<EmbeddedSystemAgents>(target_dir, EmbeddedResourceRoot::Agents)?;
+    if let Some(source_dir) = development_system_resource_source(EmbeddedResourceRoot::Agents) {
+        overlay_system_resource_directory(&source_dir, target_dir)?;
+    }
+    Ok(())
+}
+
+fn development_system_resource_source(resource_root: EmbeddedResourceRoot) -> Option<PathBuf> {
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(resource_root.out_dir_name());
+    if cfg!(debug_assertions) && source_dir.is_dir() {
+        Some(source_dir)
+    } else {
+        None
+    }
 }
 
 fn release_embedded_resources<E>(
@@ -53,10 +70,7 @@ where
             format!("unsafe system resource target: {}", target_dir.display()),
         ));
     }
-    if target_dir.exists() {
-        std::fs::remove_dir_all(target_dir)?;
-    }
-    std::fs::create_dir_all(target_dir)?;
+    reset_system_resource_target(target_dir)?;
     for path in E::iter() {
         let path = path.as_ref();
         let Some(relative) = embedded_system_resource_relative_path(path, resource_root) else {
@@ -68,6 +82,62 @@ where
         }
         if let Some(asset) = E::get(path) {
             std::fs::write(target, asset.data.as_ref())?;
+        }
+    }
+    Ok(())
+}
+
+fn reset_system_resource_target(target_dir: &Path) -> io::Result<()> {
+    if !safe_system_resource_target(target_dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsafe system resource target: {}", target_dir.display()),
+        ));
+    }
+    if target_dir.exists() {
+        std::fs::remove_dir_all(target_dir)?;
+    }
+    std::fs::create_dir_all(target_dir)
+}
+
+fn overlay_system_resource_directory(source_dir: &Path, target_dir: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(source_dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        if matches!(file_name.to_str(), Some(".DS_Store")) {
+            continue;
+        }
+        let target = target_dir.join(&file_name);
+        if target.is_dir() {
+            std::fs::remove_dir_all(&target)?;
+        } else if target.exists() {
+            std::fs::remove_file(&target)?;
+        }
+        let source = entry.path();
+        if source.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            copy_system_resource_directory(&source, &target)?;
+        } else {
+            std::fs::copy(&source, &target)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_system_resource_directory(source_dir: &Path, target_dir: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(source_dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        if matches!(file_name.to_str(), Some(".DS_Store")) {
+            continue;
+        }
+        let source = entry.path();
+        let target = target_dir.join(file_name);
+        if source.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            copy_system_resource_directory(&source, &target)?;
+        } else {
+            std::fs::copy(&source, &target)?;
         }
     }
     Ok(())
@@ -175,6 +245,32 @@ mod tests {
             expected.display(),
             list_relative_files(&target)
         );
+    }
+
+    #[test]
+    fn debug_system_skills_release_overlays_source_tree() {
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("system-skills");
+
+        release_embedded_system_skills(&target).expect("release skills");
+
+        let skill_path = target.join("reviewer-agent-review-pr").join("SKILL.md");
+        let contents = fs::read_to_string(skill_path).expect("skill contents");
+        assert!(contents.contains("system selector is responsible for choosing the PR"));
+        assert!(!contents.contains("select-pr --prs"));
+    }
+
+    #[test]
+    fn debug_system_agents_release_overlays_source_tree() {
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("system-agents");
+
+        release_embedded_system_agents(&target).expect("release agents");
+
+        let reviewer_path = target.join("project-reviewer").join("AGENT.md");
+        let contents = fs::read_to_string(reviewer_path).expect("agent contents");
+        assert!(contents.contains("review the one pull request selected by Mai"));
+        assert!(!contents.contains("one eligible pull request"));
     }
 
     fn list_relative_files(root: &Path) -> Vec<PathBuf> {

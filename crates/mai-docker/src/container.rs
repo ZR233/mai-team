@@ -4,12 +4,14 @@ use std::collections::HashSet;
 use tokio::process::Command;
 
 use crate::args::{
-    ContainerCreateOptions, create_agent_container_args_with_repo_mount_and_user,
+    ContainerCreateOptions, create_agent_container_args_with_workspace,
     create_project_sidecar_container_args, validate_image,
 };
 use crate::client::{DockerClient, stderr_or_stdout};
 use crate::error::{DockerError, Result};
-use crate::inspect::{ManagedContainer, managed_containers_from_inspect};
+use crate::inspect::{
+    ManagedContainer, ManagedVolume, managed_containers_from_inspect, managed_volumes_from_inspect,
+};
 use crate::naming::{
     MANAGED_LABEL, agent_container_name, agent_label, agent_workspace_volume,
     project_sidecar_container_name, snapshot_image_name,
@@ -113,6 +115,70 @@ impl DockerClient {
         }
 
         Ok(containers)
+    }
+
+    pub async fn list_managed_volumes(&self) -> Result<Vec<ManagedVolume>> {
+        let output = Command::new(&self.binary)
+            .args([
+                "volume",
+                "ls",
+                "-q",
+                "--filter",
+                &format!("label={MANAGED_LABEL}"),
+            ])
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(DockerError::CommandFailed(stderr_or_stdout(&output)));
+        }
+
+        let names = String::from_utf8(output.stdout)?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.inspect_managed_volumes(&names).await
+    }
+
+    async fn inspect_managed_volumes(&self, names: &[String]) -> Result<Vec<ManagedVolume>> {
+        let inspect = Command::new(&self.binary)
+            .args(["volume", "inspect"])
+            .args(names)
+            .output()
+            .await?;
+        if inspect.status.success() {
+            return managed_volumes_from_inspect(&String::from_utf8(inspect.stdout)?);
+        }
+
+        let message = stderr_or_stdout(&inspect);
+        if !is_missing_volume_error(&message) {
+            return Err(DockerError::CommandFailed(message));
+        }
+
+        let mut volumes = Vec::new();
+        for name in names {
+            let inspect = Command::new(&self.binary)
+                .args(["volume", "inspect", name])
+                .output()
+                .await?;
+            if !inspect.status.success() {
+                let message = stderr_or_stdout(&inspect);
+                if is_missing_volume_error(&message) {
+                    continue;
+                }
+                return Err(DockerError::CommandFailed(message));
+            }
+            volumes.extend(managed_volumes_from_inspect(&String::from_utf8(
+                inspect.stdout,
+            )?)?);
+        }
+
+        Ok(volumes)
     }
 
     pub async fn ensure_agent_container(
@@ -293,15 +359,14 @@ impl DockerClient {
                 &default_workspace_volume
             }
         };
-        let repo_mount_user = repo_mount.and_then(|_| host_user_spec());
-        let args = create_agent_container_args_with_repo_mount_and_user(
-            &name,
-            &label,
-            image,
-            workspace_volume,
-            repo_mount,
-            repo_mount_user.as_deref(),
-        );
+        if let Some(repo_mount) = repo_mount {
+            tracing::warn!(
+                repo_mount,
+                "ignoring host repo bind mount; project agents use workspace volumes"
+            );
+        }
+        let args =
+            create_agent_container_args_with_workspace(&name, &label, image, workspace_volume);
         let create = Command::new(&self.binary)
             .args(args.iter().map(String::as_str))
             .output()
@@ -454,10 +519,39 @@ impl DockerClient {
             .await?;
         if !output.status.success() {
             let message = stderr_or_stdout(&output);
-            if message.to_ascii_lowercase().contains("no such volume") {
+            if is_missing_volume_error(&message) {
                 return Ok(());
             }
             return Err(DockerError::CommandFailed(message));
+        }
+        Ok(())
+    }
+
+    pub async fn volume_exists(&self, volume: &str) -> Result<bool> {
+        let output = Command::new(&self.binary)
+            .args(["volume", "inspect", volume])
+            .output()
+            .await?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        let message = stderr_or_stdout(&output);
+        if is_missing_volume_error(&message) {
+            return Ok(false);
+        }
+        Err(DockerError::CommandFailed(message))
+    }
+
+    pub async fn ensure_volume(&self, volume: &str, labels: &[(&str, String)]) -> Result<()> {
+        let mut args = vec!["volume".to_string(), "create".to_string()];
+        for (key, value) in labels {
+            args.push("--label".to_string());
+            args.push(format!("{key}={value}"));
+        }
+        args.push(volume.to_string());
+        let output = Command::new(&self.binary).args(&args).output().await?;
+        if !output.status.success() {
+            return Err(DockerError::CommandFailed(stderr_or_stdout(&output)));
         }
         Ok(())
     }
@@ -531,18 +625,6 @@ impl DockerClient {
     }
 }
 
-#[cfg(unix)]
-fn host_user_spec() -> Option<String> {
-    let uid = unsafe { libc::geteuid() };
-    let gid = unsafe { libc::getegid() };
-    Some(format!("{uid}:{gid}"))
-}
-
-#[cfg(not(unix))]
-fn host_user_spec() -> Option<String> {
-    None
-}
-
 fn is_missing_container_error(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("no such container")
@@ -553,6 +635,11 @@ fn is_missing_container_error(message: &str) -> bool {
 fn is_missing_image_error(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("no such image") || message.contains("no such object")
+}
+
+fn is_missing_volume_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("no such volume") || message.contains("no such object")
 }
 
 #[cfg(test)]
@@ -570,6 +657,13 @@ mod tests {
     fn missing_object_during_inspect_is_idempotent() {
         assert!(is_missing_container_error(
             "Error response from daemon: no such object: 6d80b0090847"
+        ));
+    }
+
+    #[test]
+    fn missing_object_during_volume_inspect_is_idempotent() {
+        assert!(is_missing_volume_error(
+            "Error response from daemon: no such object: mai-team-project-1-cache"
         ));
     }
 }

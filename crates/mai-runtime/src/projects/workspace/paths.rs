@@ -28,6 +28,7 @@ pub(crate) fn project_paths(projects_root: &Path, project_id: ProjectId) -> Proj
     }
 }
 
+#[cfg(test)]
 pub(crate) fn project_repo_cache_path(projects_root: &Path, project_id: ProjectId) -> PathBuf {
     project_paths(projects_root, project_id).repo_cache_path
 }
@@ -43,6 +44,7 @@ pub(crate) fn agent_clone_path(
         .join("repo")
 }
 
+#[cfg(test)]
 pub(crate) fn project_tmp_path(projects_root: &Path, project_id: ProjectId) -> PathBuf {
     project_paths(projects_root, project_id).tmp_dir
 }

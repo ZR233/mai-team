@@ -30,7 +30,10 @@ impl RelayManager {
     }
 
     pub(crate) async fn set_runtime(&self, runtime: Arc<AgentRuntime>) {
-        *self.runtime.write().await = Some(runtime);
+        *self.runtime.write().await = Some(Arc::clone(&runtime));
+        if let Some(relay) = self.relay.read().await.clone() {
+            relay_events::install_relay_event_handler(relay, runtime).await;
+        }
     }
 
     pub(crate) async fn configure_from_store(self: &Arc<Self>) -> mai_store::Result<()> {

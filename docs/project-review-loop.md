@@ -10,6 +10,8 @@
 - provider selector：按 Git provider 的节奏扫描 GitHub open PR。
 - relay select-pr loop：消费 relay PR 队列，复用 selector 条件过滤单个 PR。
 
+reviewer 是普通 project agent：由项目 agent 机制创建，使用 FreeRootSandbox、agent workspace volume 和 gh sidecar 执行一次 PR 审查。它不拥有独立于 project agent 生命周期的特殊运行时通道。
+
 禁用、取消和删除项目审查时，运行时会取消该上下文、终止子任务、清空 relay PR 队列和现有 PR 池，并清理活跃 reviewer agent。
 
 ## 队列契约
@@ -26,7 +28,7 @@ relay handler 只处理 PR 相关事件：
 
 这些事件能解析出 PR id 时进入 relay PR 队列；重复 PR 保留最新的 `head_sha`、`delivery_id`、`reason` 和更新时间。relay handler 在成功入队或去重后立即 ack `Processed`，不会等待 GitHub API 读取或 selector 过滤。无法解析 PR、非目标事件、未匹配项目或自动审查关闭时 ack `Ignored`。
 
-`push` 不进入 relay PR 队列，仍按现有逻辑同步项目默认分支和审查工作区。
+`push` 不进入 relay PR 队列，仍按现有逻辑同步项目默认分支和 project cache volume。
 
 ## Selector 契约
 
@@ -66,13 +68,21 @@ relay select-pr loop 与 PR 池 worker 独立运行：
 
 relay select-pr loop 不直接审查 PR，也不阻塞 PR 池 worker。它只是把异步 relay 事件转换成经过 selector 过滤的 PR 池信号。
 
+## 工作区与 Volume 契约
+
+project cache volume 保存项目级仓库缓存和默认分支同步结果。它属于项目运行时的共享缓存，不是 reviewer 的工作目录，也不承载单次 PR 审查中的文件修改。
+
+reviewer agent workspace volume 是单个 reviewer agent 的隔离工作区。审查开始时，reviewer 通过 helper 在自己的 workspace volume 中准备 `/workspace/repo` 克隆和目标 PR checkout；本地验证、diff 检查和审查脚本都只在这个 agent workspace volume 内执行。
+
+gh sidecar 提供 GitHub CLI 访问能力。reviewer 通过 helper 和 gh sidecar 读取 PR 元数据、提交 inline review comments 和最终 review；不依赖旧 MCP 响应形状作为运行时契约。
+
 ## PR 池 Worker 契约
 
-PR 池 worker 启动时先确保 review workspace 可用，然后循环：
+PR 池 worker 启动时先确保 project cache volume 可用，然后循环：
 
 1. 从 PR 池 claim 最小 PR number。
 2. PR 池为空时等待 `review_notify` 或取消信号。
-3. 对 claimed PR 运行一次 review cycle。
+3. 对 claimed PR 创建普通 reviewer project agent，并在该 agent 的 workspace volume 中运行一次 review cycle。
 4. 仅在可重试审查错误时把 claimed PR 放回 PR 池。
 5. 返回 PR 池继续处理。
 

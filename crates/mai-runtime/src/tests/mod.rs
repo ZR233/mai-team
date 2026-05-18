@@ -179,6 +179,51 @@ async fn start_mock_responses(responses: Vec<Value>) -> (String, Arc<Mutex<Vec<V
     (format!("http://{addr}"), requests)
 }
 
+async fn start_mock_responses_by_path(
+    responses: Vec<(String, Value)>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock server");
+    let addr = listener.local_addr().expect("mock server addr");
+    let responses = Arc::new(Mutex::new(
+        responses.into_iter().collect::<HashMap<String, Value>>(),
+    ));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_responses = Arc::clone(&responses);
+    let server_requests = Arc::clone(&requests);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let responses = Arc::clone(&server_responses);
+            let requests = Arc::clone(&server_requests);
+            tokio::spawn(async move {
+                let request = read_mock_request(&mut stream).await;
+                let response_key = request
+                    .get("request_line")
+                    .and_then(Value::as_str)
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_default();
+                requests.lock().await.push(request);
+                let response = responses
+                    .lock()
+                    .await
+                    .remove(&response_key)
+                    .unwrap_or_else(|| {
+                        json!({
+                            "message": format!("missing mock response for {response_key}")
+                        })
+                    });
+                write_mock_response(&mut stream, response, false).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 async fn wait_until<F, Fut>(mut condition: F, timeout: Duration)
 where
     F: FnMut() -> Fut,
@@ -471,10 +516,71 @@ fn write_workspace_project_skill(
     body: &str,
 ) -> PathBuf {
     let repo_path = ensure_project_clone(dir, project_id, agent_id);
-    write_skill_at(repo_path.join(root), name, description, body)
+    let skill = write_skill_at(repo_path.join(root), name, description, body);
+    write_skill_at(
+        fake_sidecar_workspace_path(dir).join(root),
+        name,
+        description,
+        body,
+    );
+    skill
+}
+
+fn seed_project_workspace_volumes(
+    dir: &tempfile::TempDir,
+    project_id: ProjectId,
+    agents: &[(AgentId, &str)],
+) {
+    seed_project_cache_volume(dir, project_id);
+    for (agent_id, role) in agents {
+        seed_project_agent_workspace_volume(dir, project_id, *agent_id, role);
+    }
+}
+
+fn seed_project_cache_volume(dir: &tempfile::TempDir, project_id: ProjectId) {
+    seed_fake_docker_volume(
+        dir,
+        &mai_docker::project_cache_volume(&project_id.to_string()),
+        &[
+            ("mai.team.kind", "project-cache"),
+            ("mai.team.project", &project_id.to_string()),
+        ],
+    );
+}
+
+fn seed_project_agent_workspace_volume(
+    dir: &tempfile::TempDir,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    role: &str,
+) {
+    seed_fake_docker_volume(
+        dir,
+        &mai_docker::project_agent_workspace_volume(&project_id.to_string(), &agent_id.to_string()),
+        &[
+            ("mai.team.kind", "agent-workspace"),
+            ("mai.team.project", &project_id.to_string()),
+            ("mai.team.agent", &agent_id.to_string()),
+            ("mai.team.role", role),
+        ],
+    );
+}
+
+fn seed_fake_docker_volume(dir: &tempfile::TempDir, name: &str, labels: &[(&str, &str)]) {
+    let volume_root = dir.path().join("fake-docker-volumes");
+    fs::create_dir_all(&volume_root).expect("mkdir fake docker volumes");
+    let mut contents = String::from("mai.team.managed=true\n");
+    for (key, value) in labels {
+        contents.push_str(key);
+        contents.push('=');
+        contents.push_str(value);
+        contents.push('\n');
+    }
+    fs::write(volume_root.join(name), contents).expect("seed fake docker volume");
 }
 
 fn ensure_project_repo(dir: &tempfile::TempDir, project_id: ProjectId) -> PathBuf {
+    seed_project_cache_volume(dir, project_id);
     let repo_path = dir
         .path()
         .join("data/projects")
@@ -530,6 +636,7 @@ fn ensure_project_clone(
     agent_id: AgentId,
 ) -> PathBuf {
     ensure_project_repo(dir, project_id);
+    seed_project_agent_workspace_volume(dir, project_id, agent_id, "worker");
     let projects_root = dir.path().join("data/projects");
     let repo_cache_path = projects_root.join(project_id.to_string()).join("repo.git");
     let clone_path =
@@ -699,10 +806,13 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
     let path = dir.path().join("fake-docker.sh");
     let log_path = fake_docker_log_path(dir);
     let workspace_root = dir.path().join("fake-sidecar-workspace");
+    let volume_root = dir.path().join("fake-docker-volumes");
     let script = format!(
         r#"#!/bin/sh
 	LOG={}
 	WORKSPACE={}
+	VOLUMES={}
+	mkdir -p "$VOLUMES"
 	last_created="created-container"
 	case "$1" in
   ps)
@@ -740,10 +850,114 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 	    if printf '%s' "$command" | grep -q "fetch --prune origin"; then
 	      echo "review-sync" >> "$LOG"
 	    fi
+	    if printf '%s' "$command" | grep -q "clone --mirror"; then
+	      echo "sidecar-git-cache" >> "$LOG"
+	      if [ -f "$VOLUMES/fail-cache-clone-once" ]; then
+	        rm -f "$VOLUMES/fail-cache-clone-once"
+	        echo "simulated transient cache clone failure" >&2
+	        if ! printf '%s' "$command" | grep -q "git_with_retry"; then
+	          exit 28
+	        fi
+	        echo "sidecar-git-cache" >> "$LOG"
+	      fi
+	      if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
+	        echo "token-present" >> "$LOG"
+	      fi
+	      mkdir -p "$WORKSPACE/repo.git"
+	    fi
+	    if printf '%s' "$command" | grep -q "clone --no-checkout"; then
+	      echo "sidecar-git-clone" >> "$LOG"
+	      if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
+	        echo "token-present" >> "$LOG"
+	      fi
+	      mkdir -p "$WORKSPACE/repo/.git" "$WORKSPACE/.mai/install-log" "$WORKSPACE/.mai/tool-state" "$WORKSPACE/tmp"
+	      printf 'hello\n' > "$WORKSPACE/repo/README.md"
+	    fi
+	    if printf '%s' "$command" | grep -q "gh api"; then
+	      echo "sidecar-gh-api" >> "$LOG"
+	      if [ -n "$GH_TOKEN" ]; then
+	        echo "token-present" >> "$LOG"
+	      fi
+	      if [ -n "$MAI_GH_API_BODY" ]; then
+	        printf 'gh-body=%s\n' "$MAI_GH_API_BODY" >> "$LOG"
+	      fi
+	      printf '{{"ok":true}}\n'
+	    fi
 	    exit 0
 	    ;;
   rm|rmi|start)
     echo "$*" >> "$LOG"
+    exit 0
+    ;;
+  volume)
+    echo "$*" >> "$LOG"
+    sub="$2"
+    case "$sub" in
+      create)
+        labels=""
+        last=""
+        name=""
+        for arg in "$@"; do
+          if [ "$last" = "--label" ]; then
+            labels="$labels$arg
+"
+          fi
+          last="$arg"
+          name="$arg"
+        done
+        printf '%s' "$labels" > "$VOLUMES/$name"
+        echo "$name"
+        exit 0
+        ;;
+      ls)
+        for file in "$VOLUMES"/*; do
+          [ -f "$file" ] || continue
+          if grep -q '^mai.team.managed=true$' "$file"; then
+            basename "$file"
+          fi
+        done
+        exit 0
+        ;;
+      inspect)
+        shift 2
+        first_volume=1
+        printf '['
+        for name in "$@"; do
+          file="$VOLUMES/$name"
+          if [ ! -f "$file" ]; then
+            printf 'Error response from daemon: no such volume: %s\n' "$name" >&2
+            exit 1
+          fi
+          if [ "$first_volume" -eq 0 ]; then
+            printf ','
+          fi
+          first_volume=0
+          printf '{{"Name":"%s","Labels":{{' "$name"
+          first_label=1
+          while IFS= read -r label; do
+            [ -n "$label" ] || continue
+            key="${{label%%=*}}"
+            value="${{label#*=}}"
+            if [ "$first_label" -eq 0 ]; then
+              printf ','
+            fi
+            first_label=0
+            printf '"%s":"%s"' "$key" "$value"
+          done < "$file"
+          printf '}}}}'
+        done
+        printf ']\n'
+        exit 0
+        ;;
+      rm)
+        shift 2
+        for name in "$@"; do
+          [ "$name" = "-f" ] && continue
+          rm -f "$VOLUMES/$name"
+        done
+        exit 0
+        ;;
+    esac
     exit 0
     ;;
   exec)
@@ -813,7 +1027,7 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
       src=$(printf '%s' "$src" | sed "s#/workspace/repo#$WORKSPACE#g")
       mkdir -p "$(dirname "$3")"
       if [ -e "$src" ]; then
-        cp "$src" "$3"
+        cp -R "$src" "$3"
       else
         printf 'artifact\n' > "$3"
       fi
@@ -827,7 +1041,8 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 esac
 "#,
         test_shell_quote(&log_path.to_string_lossy()),
-        test_shell_quote(&workspace_root.to_string_lossy())
+        test_shell_quote(&workspace_root.to_string_lossy()),
+        test_shell_quote(&volume_root.to_string_lossy())
     );
     std::fs::write(&path, script).expect("write fake docker");
     #[cfg(unix)]
@@ -882,34 +1097,6 @@ exit 0
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&path, permissions).expect("chmod fake git");
-    }
-    path.to_string_lossy().to_string()
-}
-
-fn failing_git_path(dir: &tempfile::TempDir) -> String {
-    let path = dir.path().join("failing-git.sh");
-    let log_path = fake_git_log_path(dir);
-    let script = format!(
-        r#"#!/bin/sh
-LOG={}
-echo "$*" >> "$LOG"
-if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
-  echo "token-present" >> "$LOG"
-fi
-echo "git clone failed with secret-token" >&2
-exit 42
-"#,
-        test_shell_quote(&log_path.to_string_lossy())
-    );
-    std::fs::write(&path, script).expect("write failing git");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&path)
-            .expect("failing git metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&path, permissions).expect("chmod failing git");
     }
     path.to_string_lossy().to_string()
 }
@@ -1135,6 +1322,16 @@ async fn ensure_default_environment_creates_root_chat_environment() {
         })
         .await
         .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
 
     let environment = runtime
@@ -1190,6 +1387,16 @@ async fn ensure_default_environment_does_not_require_provider_config() {
         })
         .await
         .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
     wait_until(
         || {
             let runtime = Arc::clone(&runtime);
@@ -3619,6 +3826,7 @@ async fn project_skill_cache_lists_project_scope_with_source_paths() {
     save_agent_with_session(&store, &agent).await;
     let project = ready_test_project_summary(project_id, agent_id, "account-1");
     store.save_project(&project).await.expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(agent_id, "worker")]);
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     let cache_dir = runtime.project_skill_cache_dir(project_id);
     assert_eq!(
@@ -3670,10 +3878,10 @@ async fn detects_project_skills_from_sidecar_candidate_dirs() {
     let claude_skill = workspace.join(".claude/skills/claude-demo");
     let agents_skill = workspace.join(".agents/skills/agents-demo");
     let root_skill = workspace.join("skills/root-demo");
-    for (path, name) in [
-        (&claude_skill, "claude-demo"),
-        (&agents_skill, "agents-demo"),
-        (&root_skill, "root-demo"),
+    for (path, relative, name) in [
+        (&claude_skill, ".claude/skills", "claude-demo"),
+        (&agents_skill, ".agents/skills", "agents-demo"),
+        (&root_skill, "skills", "root-demo"),
     ] {
         fs::create_dir_all(path).expect("mkdir skill");
         fs::write(
@@ -3681,6 +3889,12 @@ async fn detects_project_skills_from_sidecar_candidate_dirs() {
             format!("---\nname: {name}\ndescription: {name}\n---\nBody."),
         )
         .expect("write skill");
+        write_skill_at(
+            fake_sidecar_workspace_path(&dir).join(relative),
+            name,
+            name,
+            "Body.",
+        );
     }
     fs::create_dir_all(workspace.join("template/ignored")).expect("mkdir ignored");
     fs::write(
@@ -3734,6 +3948,7 @@ async fn project_skill_refresh_serializes_cache_replacement() {
     save_agent_with_session(&store, &agent).await;
     let project = ready_test_project_summary(project_id, agent_id, "account-1");
     store.save_project(&project).await.expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(agent_id, "worker")]);
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     let project = runtime.project(project_id).await.expect("project");
     *project.sidecar.write().await = Some(ContainerHandle {
@@ -3937,6 +4152,7 @@ async fn project_turn_refreshes_stale_project_skill_cache_before_injection() {
     save_test_session(&store, agent_id, session_id).await;
     let project = ready_test_project_summary(project_id, agent_id, "account-1");
     store.save_project(&project).await.expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(agent_id, "worker")]);
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     let agent_record = runtime.agent(agent_id).await.expect("agent");
     *agent_record.container.write().await = Some(ContainerHandle {
@@ -4458,6 +4674,11 @@ async fn project_detail_selects_live_reviewer_without_replacing_maintainer() {
         ))
         .await
         .expect("save project");
+    seed_project_workspace_volumes(
+        &dir,
+        project_id,
+        &[(maintainer_id, "planner"), (reviewer_id, "reviewer")],
+    );
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
 
     let detail = runtime
@@ -4500,6 +4721,7 @@ async fn project_detail_falls_back_to_maintainer_when_selected_reviewer_is_gone(
         ))
         .await
         .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(maintainer_id, "planner")]);
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
 
     let detail = runtime
@@ -4915,6 +5137,11 @@ async fn project_subagent_refreshes_and_reads_new_project_skill_resource() {
         ))
         .await
         .expect("save project");
+    seed_project_workspace_volumes(
+        &dir,
+        project_id,
+        &[(maintainer_id, "planner"), (child_id, "explorer")],
+    );
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     let project = runtime.project(project_id).await.expect("project");
     *project.sidecar.write().await = Some(ContainerHandle {
@@ -4998,6 +5225,11 @@ async fn project_subagent_turn_syncs_project_skill_to_container() {
         ))
         .await
         .expect("save project");
+    seed_project_workspace_volumes(
+        &dir,
+        project_id,
+        &[(maintainer_id, "planner"), (child_id, "explorer")],
+    );
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     runtime.state.project_mcp_managers.write().await.insert(
         project_id,
@@ -5070,6 +5302,11 @@ async fn project_worker_cannot_spawn_agents_and_hidden_from_tools() {
         ))
         .await
         .expect("save project");
+    seed_project_workspace_volumes(
+        &dir,
+        project_id,
+        &[(maintainer_id, "planner"), (worker_id, "executor")],
+    );
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     let worker_record = runtime.agent(worker_id).await.expect("worker");
 
@@ -5206,31 +5443,89 @@ async fn project_review_selector_pages_and_queues_all_eligible_prs_without_model
     let mut page_one = vec![github_pr(1, false, "head-1")];
     page_one.extend((2..=20).map(|number| github_pr(number, true, &format!("head-{number}"))));
     let mut responses = vec![
-        Value::Array(page_one),
-        github_pr(1, false, "head-1"),
-        json!([]),
-        github_commit("2026-01-01T00:00:00Z"),
-        json!({"check_runs": [{"status": "in_progress", "conclusion": null}]}),
-        json!({"state": "success"}),
+        (
+            "/repos/owner/repo/pulls?state=open&sort=created&direction=asc&per_page=20&page=1"
+                .to_string(),
+            Value::Array(page_one),
+        ),
+        (
+            "/repos/owner/repo/pulls/1".to_string(),
+            github_pr(1, false, "head-1"),
+        ),
+        (
+            "/repos/owner/repo/pulls/1/reviews?per_page=100".to_string(),
+            json!([]),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D1".to_string(),
+            github_commit("2026-01-01T00:00:00Z"),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D1/check-runs?per_page=100".to_string(),
+            json!({"check_runs": [{"status": "in_progress", "conclusion": null}]}),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D1/status".to_string(),
+            json!({"state": "success"}),
+        ),
     ];
-    responses.extend((2..=20).map(|number| github_pr(number, true, &format!("head-{number}"))));
+    responses.extend((2..=20).map(|number| {
+        (
+            format!("/repos/owner/repo/pulls/{number}"),
+            github_pr(number, true, &format!("head-{number}")),
+        )
+    }));
     responses.extend([
-        json!([
+        (
+            "/repos/owner/repo/pulls?state=open&sort=created&direction=asc&per_page=20&page=2"
+                .to_string(),
+            json!([
+                github_pr(21, false, "head-21"),
+                github_pr(22, false, "head-22")
+            ]),
+        ),
+        (
+            "/repos/owner/repo/pulls/21".to_string(),
             github_pr(21, false, "head-21"),
-            github_pr(22, false, "head-22")
-        ]),
-        github_pr(21, false, "head-21"),
-        json!([]),
-        github_commit("2026-01-21T00:00:00Z"),
-        json!({"check_runs": [{"status": "completed", "conclusion": "failure"}]}),
-        json!({"state": "failure"}),
-        github_pr(22, false, "head-22"),
-        json!([]),
-        github_commit("2026-01-22T00:00:00Z"),
-        json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}),
-        json!({"state": "success"}),
+        ),
+        (
+            "/repos/owner/repo/pulls/21/reviews?per_page=100".to_string(),
+            json!([]),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D21".to_string(),
+            github_commit("2026-01-21T00:00:00Z"),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D21/check-runs?per_page=100".to_string(),
+            json!({"check_runs": [{"status": "completed", "conclusion": "failure"}]}),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D21/status".to_string(),
+            json!({"state": "failure"}),
+        ),
+        (
+            "/repos/owner/repo/pulls/22".to_string(),
+            github_pr(22, false, "head-22"),
+        ),
+        (
+            "/repos/owner/repo/pulls/22/reviews?per_page=100".to_string(),
+            json!([]),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D22".to_string(),
+            github_commit("2026-01-22T00:00:00Z"),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D22/check-runs?per_page=100".to_string(),
+            json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}),
+        ),
+        (
+            "/repos/owner/repo/commits/head%2D22/status".to_string(),
+            json!({"state": "success"}),
+        ),
     ]);
-    let (base_url, requests) = start_mock_responses(responses).await;
+    let (base_url, requests) = start_mock_responses_by_path(responses).await;
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     store
@@ -5297,6 +5592,16 @@ async fn project_maintainer_can_spawn_agent() {
         })
         .await
         .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
     let project_id = Uuid::new_v4();
     let maintainer_id = Uuid::new_v4();
     let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
@@ -5311,6 +5616,7 @@ async fn project_maintainer_can_spawn_agent() {
         ))
         .await
         .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(maintainer_id, "planner")]);
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     ensure_project_repo(&dir, project_id);
     let maintainer_record = runtime.agent(maintainer_id).await.expect("maintainer");
@@ -5367,7 +5673,7 @@ async fn project_agent_without_discovered_mcp_tools_has_no_static_fallback() {
 }
 
 #[tokio::test]
-async fn project_agent_mcp_tools_match_project_manager_discovery() {
+async fn project_mcp_tools_are_not_visible_even_if_cached() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     let project_id = Uuid::new_v4();
@@ -5402,17 +5708,10 @@ async fn project_agent_mcp_tools_match_project_manager_discovery() {
         .iter()
         .map(|tool| tool.model_name.as_str())
         .collect::<HashSet<_>>();
-    assert_eq!(
-        names,
-        HashSet::from([
-            "mcp__github__pull_request_review_write",
-            "mcp__git__git_diff_unstaged",
-        ])
-    );
-    assert_eq!(tools.len(), discovered.len());
+    assert_eq!(names, HashSet::new());
     let visible = turn::tools::visible_tool_names(&runtime.state, &maintainer_record, &tools).await;
-    assert!(visible.contains("mcp__github__pull_request_review_write"));
-    assert!(visible.contains("mcp__git__git_diff_unstaged"));
+    assert!(!visible.contains("mcp__git__git_diff_unstaged"));
+    assert!(!visible.contains("mcp__github__pull_request_review_write"));
     assert!(!visible.contains("mcp__github__create_pull_request_review"));
     assert!(!visible.contains("mcp__git__git_status"));
 }
@@ -5428,6 +5727,16 @@ async fn project_reviewer_reads_project_skill_resource_without_mcp_session() {
         })
         .await
         .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
     let project_id = Uuid::new_v4();
     let maintainer_id = Uuid::new_v4();
     let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
@@ -5588,7 +5897,7 @@ async fn project_subagent_inherits_project_skill_resources() {
 }
 
 #[tokio::test]
-async fn project_agent_lists_project_mcp_and_skill_resources() {
+async fn project_agent_lists_project_skill_resources_without_project_mcp() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     let project_id = Uuid::new_v4();
@@ -5639,7 +5948,7 @@ async fn project_agent_lists_project_mcp_and_skill_resources() {
         .filter_map(|item| item.get("uri").and_then(Value::as_str))
         .collect::<HashSet<_>>();
     assert!(uris.contains("skill:///review-open-prs"));
-    assert!(uris.contains("github://pulls"));
+    assert!(!uris.contains("github://pulls"));
 }
 
 #[tokio::test]
@@ -5701,20 +6010,11 @@ async fn task_agent_reads_agent_mcp_resources() {
 }
 
 #[test]
-fn project_mcp_configs_use_official_defaults_without_git_token_env() {
+fn project_mcp_configs_do_not_start_github_mcp_server() {
     let configs = projects::mcp::project_mcp_configs("secret-token");
-    let github = configs.get("github").expect("github");
-    assert_eq!(
-        github
-            .env
-            .get("GITHUB_PERSONAL_ACCESS_TOKEN")
-            .map(String::as_str),
-        Some("secret-token")
-    );
-    assert_eq!(
-        github.env.get("GITHUB_TOOLSETS").map(String::as_str),
-        Some("context,repos,issues,pull_requests")
-    );
+    assert!(configs.is_empty());
+    assert!(!format!("{configs:?}").contains("secret-token"));
+    assert!(!format!("{configs:?}").contains("github-mcp-server"));
     assert!(!configs.contains_key("git"));
 }
 
@@ -5976,7 +6276,7 @@ fn project_maintainer_prompt_includes_clone_url_and_workspace() {
 }
 
 #[tokio::test]
-async fn project_clone_uses_host_git_and_project_data_repo() {
+async fn project_clone_uses_sidecar_git_and_workspace_volumes() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     store
@@ -6016,35 +6316,410 @@ async fn project_clone_uses_host_git_and_project_data_repo() {
         .await
         .expect("clone");
 
-    let git_log = fake_git_log(&dir);
-    let repo_cache_path =
-        projects::workspace::paths::project_repo_cache_path(&runtime.projects_root, project_id);
-    let clone_path =
-        projects::workspace::paths::agent_clone_path(&runtime.projects_root, project_id, agent_id);
-    assert!(git_log.contains(&format!(
-        "clone --mirror -- https://github.com/owner/repo.git {}",
-        repo_cache_path.display()
-    )));
-    assert!(git_log.contains(&format!(
-        "clone --local --no-checkout {} {}",
-        repo_cache_path.display(),
-        clone_path.display()
-    )));
-    assert!(git_log.contains("remote set-url origin https://github.com/owner/repo.git"));
-    assert!(git_log.contains(&format!("checkout -B mai-agent/{agent_id} origin/main")));
-    assert!(git_log.contains("token-present"));
-    assert!(
-        repo_cache_path.exists(),
-        "project repo cache should be created"
-    );
-    assert!(
-        clone_path.join(".git").exists(),
-        "maintainer agent clone should be created"
-    );
     let docker_log = fake_docker_log(&dir);
-    assert!(!docker_log.contains("sidecar-git-clone"));
+    let git_log = fake_git_log(&dir);
+    let workspace_volume =
+        mai_docker::project_agent_workspace_volume(&project_id.to_string(), &agent_id.to_string());
+    let cache_volume = mai_docker::project_cache_volume(&project_id.to_string());
+    assert!(docker_log.contains(&format!(
+        "volume create --label mai.team.managed=true --label mai.team.kind=project-cache --label mai.team.project={project_id} {cache_volume}"
+    )));
+    assert!(docker_log.contains(&format!("{workspace_volume}:/workspace")));
+    assert!(docker_log.contains(&format!("{cache_volume}:/workspace")));
+    assert!(docker_log.contains("--network host"));
+    assert!(docker_log.contains("sidecar-git-clone"));
+    assert!(docker_log.contains("GIT_ASKPASS"));
+    assert!(docker_log.contains("rev-parse --is-bare-repository"));
+    assert!(!docker_log.contains("extraheader=AUTHORIZATION: bearer"));
+    assert!(docker_log.contains("+refs/pull/*/head:refs/remotes/origin/pr/*"));
+    assert!(docker_log.contains("token-present"));
     assert!(!docker_log.contains("secret-token"));
     assert!(!git_log.contains("secret-token"));
+    assert!(git_log.is_empty());
+}
+
+#[tokio::test]
+async fn project_clone_retries_transient_cache_git_failure() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let mut agent = test_agent_summary(agent_id, None);
+    agent.project_id = Some(project_id);
+    agent.role = Some(AgentRole::Planner);
+    save_agent_with_session(&store, &agent).await;
+    let project = test_project_summary(project_id, agent_id, "account-1");
+    store.save_project(&project).await.expect("save project");
+    let volume_marker_dir = dir.path().join("fake-docker-volumes");
+    fs::create_dir_all(&volume_marker_dir).expect("mkdir fake docker volumes");
+    fs::write(volume_marker_dir.join("fail-cache-clone-once"), "").expect("write failure marker");
+    let runtime = test_runtime_with_sidecar_image_and_git(
+        &dir,
+        Arc::clone(&store),
+        "ghcr.io/example/mai-team-sidecar:test",
+    )
+    .await;
+
+    runtime
+        .clone_project_repository(project_id, agent_id)
+        .await
+        .expect("clone retries transient cache failure");
+
+    let docker_log = fake_docker_log(&dir);
+    assert_eq!(docker_log.matches("sidecar-git-cache").count(), 2);
+    assert!(docker_log.contains("--network host"));
+    assert!(docker_log.contains("git_with_retry"));
+    assert!(docker_log.contains("http.version=HTTP/1.1"));
+    assert!(docker_log.contains("sleep $((attempts * 2))"));
+}
+
+#[tokio::test]
+async fn github_api_request_runs_via_gh_sidecar_without_token_leak() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    save_agent_with_session(&store, &maintainer).await;
+    store
+        .save_project(&ready_test_project_summary(
+            project_id,
+            maintainer_id,
+            "account-1",
+        ))
+        .await
+        .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(maintainer_id, "planner")]);
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let result = runtime
+        .execute_tool_for_test(
+            maintainer_id,
+            "github_api_request",
+            json!({
+                "method": "POST",
+                "path": "/repos/owner/repo/pulls/123/reviews",
+                "body": {
+                    "event": "COMMENT",
+                    "body": "Looks good."
+                }
+            }),
+        )
+        .await
+        .expect("github api request");
+
+    assert!(result.success);
+    assert_eq!(
+        serde_json::from_str::<Value>(&result.output).expect("json output"),
+        json!({"ok": true})
+    );
+    let docker_log = fake_docker_log(&dir);
+    assert!(docker_log.contains("sidecar-gh-api"));
+    assert!(docker_log.contains("--network host"));
+    assert!(docker_log.contains("--method POST"));
+    assert!(docker_log.contains("MAI_GH_API_BODY"));
+    assert!(docker_log.contains("-e GH_TOKEN"));
+    assert!(docker_log.contains("token-present"));
+    assert!(!docker_log.contains("secret-token"));
+}
+
+#[tokio::test]
+async fn reviewer_github_api_request_rejects_pending_pr_review_creation() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let reviewer_id = Uuid::new_v4();
+    let mut reviewer = test_agent_summary(reviewer_id, Some("reviewer-container"));
+    reviewer.project_id = Some(project_id);
+    reviewer.role = Some(AgentRole::Reviewer);
+    save_agent_with_session(&store, &reviewer).await;
+    store
+        .save_project(&ready_test_project_summary(
+            project_id,
+            reviewer_id,
+            "account-1",
+        ))
+        .await
+        .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(reviewer_id, "reviewer")]);
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let err = runtime
+        .execute_tool_for_test(
+            reviewer_id,
+            "github_api_request",
+            json!({
+                "method": "POST",
+                "path": "/repos/owner/repo/pulls/123/reviews",
+                "body": {
+                    "event": "APPROVE"
+                }
+            }),
+        )
+        .await
+        .expect_err("pending review creation should be rejected before gh sidecar");
+
+    assert!(err.to_string().contains("non-empty `body`"));
+    assert!(!fake_docker_log(&dir).contains("sidecar-gh-api"));
+}
+
+#[tokio::test]
+async fn reviewer_github_api_request_rejects_pending_review_event_submission() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let reviewer_id = Uuid::new_v4();
+    let mut reviewer = test_agent_summary(reviewer_id, Some("reviewer-container"));
+    reviewer.project_id = Some(project_id);
+    reviewer.role = Some(AgentRole::Reviewer);
+    save_agent_with_session(&store, &reviewer).await;
+    store
+        .save_project(&ready_test_project_summary(
+            project_id,
+            reviewer_id,
+            "account-1",
+        ))
+        .await
+        .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(reviewer_id, "reviewer")]);
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let err = runtime
+        .execute_tool_for_test(
+            reviewer_id,
+            "github_api_request",
+            json!({
+                "method": "POST",
+                "path": "/repos/owner/repo/pulls/123/reviews/456/events",
+                "body": {
+                    "event": "APPROVE",
+                    "body": "Looks good after validation."
+                }
+            }),
+        )
+        .await
+        .expect_err("pending review event submission should be rejected before gh sidecar");
+
+    assert!(err.to_string().contains("one single POST"));
+    assert!(!fake_docker_log(&dir).contains("sidecar-gh-api"));
+}
+
+#[tokio::test]
+async fn reviewer_github_api_request_rejects_direct_inline_comment_creation() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let reviewer_id = Uuid::new_v4();
+    let mut reviewer = test_agent_summary(reviewer_id, Some("reviewer-container"));
+    reviewer.project_id = Some(project_id);
+    reviewer.role = Some(AgentRole::Reviewer);
+    save_agent_with_session(&store, &reviewer).await;
+    store
+        .save_project(&ready_test_project_summary(
+            project_id,
+            reviewer_id,
+            "account-1",
+        ))
+        .await
+        .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(reviewer_id, "reviewer")]);
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let err = runtime
+        .execute_tool_for_test(
+            reviewer_id,
+            "github_api_request",
+            json!({
+                "method": "POST",
+                "path": "/repos/owner/repo/pulls/123/comments",
+                "body": {
+                    "path": "src/lib.rs",
+                    "line": 12,
+                    "side": "RIGHT",
+                    "body": "Please cover this edge case."
+                }
+            }),
+        )
+        .await
+        .expect_err("direct inline review comment creation should be rejected before gh sidecar");
+
+    assert!(err.to_string().contains("one single POST"));
+    assert!(err.to_string().contains("comments` array"));
+    assert!(!fake_docker_log(&dir).contains("sidecar-gh-api"));
+}
+
+#[tokio::test]
+async fn github_api_request_accepts_json_string_body() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    save_agent_with_session(&store, &maintainer).await;
+    store
+        .save_project(&ready_test_project_summary(
+            project_id,
+            maintainer_id,
+            "account-1",
+        ))
+        .await
+        .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(maintainer_id, "planner")]);
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let result = runtime
+        .execute_tool_for_test(
+            maintainer_id,
+            "github_api_request",
+            json!({
+                "method": "POST",
+                "path": "/repos/owner/repo/pulls/123/reviews",
+                "body": r#"{"event":"COMMENT","body":"Looks good."}"#
+            }),
+        )
+        .await
+        .expect("github api request");
+
+    assert!(result.success);
+    let docker_log = fake_docker_log(&dir);
+    assert!(docker_log.contains("sidecar-gh-api"));
+    assert!(docker_log.contains("MAI_GH_API_BODY"));
+    assert!(docker_log.contains(r#"gh-body={"body":"Looks good.","event":"COMMENT"}"#));
+    assert!(!docker_log.contains(r#"gh-body="{\"event\":\"COMMENT\""#));
+}
+
+#[tokio::test]
+async fn github_api_request_uses_standard_token_env_with_custom_api_base_url() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    save_agent_with_session(&store, &maintainer).await;
+    store
+        .save_project(&ready_test_project_summary(
+            project_id,
+            maintainer_id,
+            "account-1",
+        ))
+        .await
+        .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(maintainer_id, "planner")]);
+    let runtime = test_runtime_with_github_api(
+        &dir,
+        Arc::clone(&store),
+        "https://ghe.example.com/api/v3".to_string(),
+    )
+    .await;
+
+    let result = runtime
+        .execute_tool_for_test(
+            maintainer_id,
+            "github_api_request",
+            json!({
+                "method": "POST",
+                "path": "/repos/owner/repo/pulls/123/reviews",
+                "body": {
+                    "event": "COMMENT",
+                    "body": "Looks good."
+                }
+            }),
+        )
+        .await
+        .expect("github api request");
+
+    assert!(result.success);
+    assert_eq!(
+        serde_json::from_str::<Value>(&result.output).expect("json output"),
+        json!({"ok": true})
+    );
+    let docker_log = fake_docker_log(&dir);
+    assert!(docker_log.contains("sidecar-gh-api"));
+    assert!(docker_log.contains("--network host"));
+    assert!(docker_log.contains("-e GH_TOKEN"));
+    assert!(docker_log.contains("/repos/owner/repo/pulls/123/reviews"));
+    assert!(docker_log.contains("token-present"));
+    assert!(!docker_log.contains("secret-token"));
 }
 
 #[tokio::test]
@@ -6098,22 +6773,22 @@ async fn project_workspace_setup_moves_from_pending_to_ready() {
     assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Ready);
     assert_eq!(detail.maintainer_agent.summary.status, AgentStatus::Idle);
     let docker_log = fake_docker_log(&dir);
-    let clone_path =
-        projects::workspace::paths::agent_clone_path(&runtime.projects_root, project_id, agent_id);
-    assert!(docker_log.contains(&format!("{}:/workspace/repo", clone_path.display())));
+    let workspace_volume =
+        mai_docker::project_agent_workspace_volume(&project_id.to_string(), &agent_id.to_string());
+    let cache_volume = mai_docker::project_cache_volume(&project_id.to_string());
+    assert!(docker_log.contains(&format!("volume create --label mai.team.managed=true --label mai.team.kind=project-cache --label mai.team.project={project_id} {cache_volume}")));
+    assert!(docker_log.contains(&format!("{workspace_volume}:/workspace")));
+    assert!(docker_log.contains("--network host"));
+    assert!(docker_log.contains("-w /workspace/repo"));
+    assert!(!docker_log.contains(&format!(
+            "{}:/workspace/repo",
+            runtime
+                .workspace_manager
+                .agent_clone_path(project_id, agent_id)
+                .display()
+        )));
     let git_log = fake_git_log(&dir);
-    let repo_cache_path =
-        projects::workspace::paths::project_repo_cache_path(&runtime.projects_root, project_id);
-    assert!(git_log.contains(&format!(
-        "clone --mirror -- https://github.com/owner/repo.git {}",
-        repo_cache_path.display()
-    )));
-    assert!(git_log.contains(&format!(
-        "clone --local --no-checkout {} {}",
-        repo_cache_path.display(),
-        clone_path.display()
-    )));
-    assert!(git_log.contains("token-present"));
+    assert!(git_log.is_empty());
 
     let mut saw_cloning = false;
     let mut saw_ready = false;
@@ -6149,6 +6824,16 @@ async fn runtime_start_reconciles_orphan_project_clone_dirs() {
         })
         .await
         .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
     let project_id = Uuid::new_v4();
     let maintainer_id = Uuid::new_v4();
     let orphan_agent_id = Uuid::new_v4();
@@ -6168,7 +6853,7 @@ async fn runtime_start_reconciles_orphan_project_clone_dirs() {
 }
 
 #[tokio::test]
-async fn runtime_start_marks_missing_project_repo_cache_failed() {
+async fn runtime_start_recreates_missing_project_cache_volume() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     store
@@ -6195,25 +6880,146 @@ async fn runtime_start_marks_missing_project_repo_cache_failed() {
         .join("repo");
     fs::create_dir_all(&clone_path).expect("mkdir clone");
 
-    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+
+    let runtime = test_runtime_with_sidecar_image_and_git(
+        &dir,
+        Arc::clone(&store),
+        "ghcr.io/example/mai-team-sidecar:test",
+    )
+    .await;
 
     let detail = runtime
         .get_project(project_id, None, None)
         .await
         .expect("project");
-    assert_eq!(detail.summary.status, ProjectStatus::Failed);
-    assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Failed);
-    assert!(
-        detail
-            .summary
-            .last_error
-            .as_deref()
-            .is_some_and(|error| error.contains("repository cache"))
-    );
+    assert_eq!(detail.summary.status, ProjectStatus::Ready);
+    assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Ready);
+    assert_eq!(detail.summary.last_error, None);
+    let cache_volume = mai_docker::project_cache_volume(&project_id.to_string());
+    let docker_log = fake_docker_log(&dir);
+    assert!(docker_log.contains(&format!("volume create --label mai.team.managed=true --label mai.team.kind=project-cache --label mai.team.project={project_id} {cache_volume}")));
+    assert!(fake_git_log(&dir).is_empty());
 }
 
 #[tokio::test]
-async fn runtime_start_restores_missing_project_agent_clone() {
+async fn runtime_start_recovers_project_failed_by_missing_cache_reconcile() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    maintainer.role = Some(AgentRole::Planner);
+    save_agent_with_session(&store, &maintainer).await;
+    let mut project = ready_test_project_summary(project_id, maintainer_id, "account-1");
+    project.status = ProjectStatus::Failed;
+    project.clone_status = ProjectCloneStatus::Failed;
+    project.last_error =
+        Some("project cache volume is missing after startup reconcile".to_string());
+    store.save_project(&project).await.expect("save project");
+    seed_project_agent_workspace_volume(&dir, project_id, maintainer_id, "planner");
+
+    let runtime = test_runtime_with_sidecar_image_and_git(
+        &dir,
+        Arc::clone(&store),
+        "ghcr.io/example/mai-team-sidecar:test",
+    )
+    .await;
+
+    let detail = runtime
+        .get_project(project_id, None, None)
+        .await
+        .expect("project");
+    assert_eq!(detail.summary.status, ProjectStatus::Ready);
+    assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Ready);
+    assert_eq!(detail.summary.last_error, None);
+    let cache_volume = mai_docker::project_cache_volume(&project_id.to_string());
+    let docker_log = fake_docker_log(&dir);
+    assert!(docker_log.contains(&format!("volume create --label mai.team.managed=true --label mai.team.kind=project-cache --label mai.team.project={project_id} {cache_volume}")));
+}
+
+#[tokio::test]
+async fn runtime_start_recovers_project_failed_by_startup_relay_reconcile() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    maintainer.role = Some(AgentRole::Planner);
+    save_agent_with_session(&store, &maintainer).await;
+    let mut project = ready_test_project_summary(project_id, maintainer_id, "account-1");
+    project.status = ProjectStatus::Failed;
+    project.clone_status = ProjectCloneStatus::Failed;
+    project.last_error = Some("invalid input: relay is enabled but not connected".to_string());
+    store.save_project(&project).await.expect("save project");
+    seed_project_agent_workspace_volume(&dir, project_id, maintainer_id, "planner");
+
+    let runtime = test_runtime_with_sidecar_image_and_git(
+        &dir,
+        Arc::clone(&store),
+        "ghcr.io/example/mai-team-sidecar:test",
+    )
+    .await;
+
+    let detail = runtime
+        .get_project(project_id, None, None)
+        .await
+        .expect("project");
+    assert_eq!(detail.summary.status, ProjectStatus::Ready);
+    assert_eq!(detail.summary.clone_status, ProjectCloneStatus::Ready);
+    assert_eq!(detail.summary.last_error, None);
+    let cache_volume = mai_docker::project_cache_volume(&project_id.to_string());
+    let docker_log = fake_docker_log(&dir);
+    assert!(docker_log.contains(&format!("volume create --label mai.team.managed=true --label mai.team.kind=project-cache --label mai.team.project={project_id} {cache_volume}")));
+}
+
+#[tokio::test]
+async fn runtime_start_accepts_missing_legacy_project_agent_clone_when_volume_exists() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     store
@@ -6232,13 +7038,14 @@ async fn runtime_start_restores_missing_project_agent_clone() {
     let project = ready_test_project_summary(project_id, maintainer_id, "account-1");
     store.save_project(&project).await.expect("save project");
     ensure_project_repo(&dir, project_id);
+    seed_project_agent_workspace_volume(&dir, project_id, maintainer_id, "planner");
 
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
 
     let agent = runtime.get_agent(maintainer_id, None).await.expect("agent");
     assert_eq!(agent.summary.status, AgentStatus::Idle);
     assert!(
-        projects::workspace::paths::agent_clone_path(
+        !projects::workspace::paths::agent_clone_path(
             &runtime.projects_root,
             project_id,
             maintainer_id,
@@ -6279,6 +7086,7 @@ async fn runtime_start_starts_auto_review_worker_immediately() {
     project.review_status = ProjectReviewStatus::Waiting;
     project.next_review_at = Some(now() + TimeDelta::minutes(30));
     store.save_project(&project).await.expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(agent_id, "planner")]);
 
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     let project_record = runtime.project(project_id).await.expect("project");
@@ -6339,6 +7147,11 @@ async fn runtime_start_cleans_stale_project_reviewer_before_new_worker() {
     project.review_status = ProjectReviewStatus::Running;
     project.current_reviewer_agent_id = Some(reviewer_id);
     store.save_project(&project).await.expect("save project");
+    seed_project_workspace_volumes(
+        &dir,
+        project_id,
+        &[(maintainer_id, "planner"), (reviewer_id, "reviewer")],
+    );
     store
         .save_project_review_run(&ProjectReviewRunDetail {
             summary: ProjectReviewRunSummary {
@@ -6433,6 +7246,11 @@ async fn runtime_start_deletes_orphan_project_reviewer() {
     project.auto_review_enabled = true;
     project.review_status = ProjectReviewStatus::Idle;
     store.save_project(&project).await.expect("save project");
+    seed_project_workspace_volumes(
+        &dir,
+        project_id,
+        &[(maintainer_id, "planner"), (orphan_reviewer_id, "reviewer")],
+    );
 
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
 
@@ -6525,6 +7343,16 @@ async fn project_reviewer_starts_from_image_with_own_project_clone() {
         })
         .await
         .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
     let project_id = Uuid::new_v4();
     let maintainer_id = Uuid::new_v4();
     let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
@@ -6540,6 +7368,7 @@ async fn project_reviewer_starts_from_image_with_own_project_clone() {
         ))
         .await
         .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(maintainer_id, "planner")]);
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     ensure_project_repo(&dir, project_id);
 
@@ -6550,21 +7379,20 @@ async fn project_reviewer_starts_from_image_with_own_project_clone() {
     assert_eq!(reviewer.role, Some(AgentRole::Reviewer));
     assert_eq!(reviewer.parent_id, Some(maintainer_id));
     let docker_log = fake_docker_log(&dir);
-    let clone_path = projects::workspace::paths::agent_clone_path(
-        &runtime.projects_root,
-        project_id,
-        reviewer.id,
+    let workspace_volume = mai_docker::project_agent_workspace_volume(
+        &project_id.to_string(),
+        &reviewer.id.to_string(),
     );
+    let clone_path = runtime
+        .workspace_manager
+        .agent_clone_path(project_id, reviewer.id);
     assert!(!docker_log.contains("commit maintainer-container"));
     assert!(docker_log.contains(&format!("create --name mai-team-{}", reviewer.id)));
-    assert!(docker_log.contains(&format!("mai-team-workspace-{}:/workspace", reviewer.id)));
-    assert!(docker_log.contains(&format!("{}:/workspace/repo", clone_path.display())));
-    #[cfg(unix)]
-    {
-        let uid = unsafe { libc::geteuid() };
-        let gid = unsafe { libc::getegid() };
-        assert!(docker_log.contains(&format!("--user {uid}:{gid}")));
-    }
+    assert!(docker_log.contains(&format!("{workspace_volume}:/workspace")));
+    assert!(docker_log.contains("--network host"));
+    assert!(!docker_log.contains(&format!("mai-team-workspace-{}:/workspace", reviewer.id)));
+    assert!(!docker_log.contains(&format!("{}:/workspace/repo", clone_path.display())));
+    assert!(docker_log.contains("--user root"));
     assert!(!docker_log.contains("/workspace/reviews"));
 }
 
@@ -6579,6 +7407,16 @@ async fn deleting_project_reviewer_cleans_project_clone() {
         })
         .await
         .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
     let project_id = Uuid::new_v4();
     let maintainer_id = Uuid::new_v4();
     let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
@@ -6599,12 +7437,14 @@ async fn deleting_project_reviewer_cleans_project_clone() {
         .await
         .expect("spawn reviewer");
     let reviewer_id = reviewer.id;
-    let clone_path = projects::workspace::paths::agent_clone_path(
-        &runtime.projects_root,
-        project_id,
-        reviewer_id,
-    );
+    let clone_path = runtime
+        .workspace_manager
+        .agent_clone_path(project_id, reviewer_id);
     std::fs::create_dir_all(&clone_path).expect("reviewer clone");
+    let workspace_volume = mai_docker::project_agent_workspace_volume(
+        &project_id.to_string(),
+        &reviewer_id.to_string(),
+    );
 
     runtime
         .delete_agent(reviewer_id)
@@ -6613,6 +7453,7 @@ async fn deleting_project_reviewer_cleans_project_clone() {
 
     let docker_log = fake_docker_log(&dir);
     assert!(docker_log.contains("rm -f created-container"));
+    assert!(docker_log.contains(&format!("volume rm -f {workspace_volume}")));
     assert!(!clone_path.exists());
 }
 
@@ -6689,7 +7530,8 @@ async fn project_reviewer_initial_message_can_target_pr() {
     .expect("message");
 
     assert!(message.contains("review PR #42 only"));
-    assert!(message.contains("select-pr --target-pr 42"));
+    assert!(message.contains("system selector has already chosen this PR"));
+    assert!(!message.contains("select-pr"));
 }
 
 #[tokio::test]
@@ -6740,9 +7582,10 @@ async fn auto_review_refreshes_project_skills_from_synced_default_branch() {
     );
 
     runtime
-        .sync_project_review_repo(project_id)
+        .sync_project_cache_repo(project_id)
         .await
         .expect("sync review repo");
+    assert!(fake_docker_log(&dir).contains("sidecar-git-clone"));
 
     write_workspace_project_skill(
         &dir,
@@ -6754,7 +7597,7 @@ async fn auto_review_refreshes_project_skills_from_synced_default_branch() {
         "New review body.",
     );
     runtime
-        .refresh_project_skills_from_review_workspace(project_id)
+        .refresh_project_skills_from_agent_workspace(project_id)
         .await
         .expect("refresh review skills");
 
@@ -7209,7 +8052,7 @@ async fn project_workspace_setup_failure_marks_project_failed() {
         ModelClient::new(),
         Arc::clone(&store),
         RuntimeConfig {
-            git_binary: Some(failing_git_path(&dir)),
+            sidecar_image: "bad image".to_string(),
             ..test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE)
         },
     )
@@ -7234,7 +8077,7 @@ async fn project_workspace_setup_failure_marks_project_failed() {
             .last_error
             .as_deref()
             .unwrap_or_default()
-            .contains("git clone failed")
+            .contains("invalid docker image")
     );
     assert!(
         !detail
@@ -7244,7 +8087,7 @@ async fn project_workspace_setup_failure_marks_project_failed() {
             .unwrap_or_default()
             .contains("secret-token")
     );
-    assert!(fake_git_log(&dir).contains("token-present"));
+    assert!(fake_git_log(&dir).is_empty());
 }
 
 #[tokio::test]
@@ -7288,6 +8131,8 @@ async fn project_sidecar_is_removed_when_project_is_deleted() {
         .clone_project_repository(project_id, agent_id)
         .await
         .expect("clone");
+    let stale_reviewer_id = Uuid::new_v4();
+    seed_project_agent_workspace_volume(&dir, project_id, stale_reviewer_id, "reviewer");
     let project = runtime.project(project_id).await.expect("project");
     *project.sidecar.write().await = Some(ContainerHandle {
         id: "created-container".to_string(),
@@ -7300,8 +8145,18 @@ async fn project_sidecar_is_removed_when_project_is_deleted() {
         .expect("delete project");
 
     let docker_log = fake_docker_log(&dir);
+    let agent_volume =
+        mai_docker::project_agent_workspace_volume(&project_id.to_string(), &agent_id.to_string());
+    let stale_reviewer_volume = mai_docker::project_agent_workspace_volume(
+        &project_id.to_string(),
+        &stale_reviewer_id.to_string(),
+    );
+    let cache_volume = mai_docker::project_cache_volume(&project_id.to_string());
     assert!(docker_log.contains("rm -f created-container"));
     assert!(docker_log.contains(&format!("rm -f mai-team-{agent_id}")));
+    assert!(docker_log.contains(&format!("volume rm -f {agent_volume}")));
+    assert!(docker_log.contains(&format!("volume rm -f {stale_reviewer_volume}")));
+    assert!(docker_log.contains(&format!("volume rm -f {cache_volume}")));
     assert!(!runtime.projects_root.join(project_id.to_string()).exists());
 }
 

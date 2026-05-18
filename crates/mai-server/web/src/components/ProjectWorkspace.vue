@@ -276,10 +276,10 @@
           </div>
           <div class="project-fact">
             <span>Agent Tools</span>
-            <strong>Git MCP + GitHub MCP</strong>
+            <strong>Git sidecar + GitHub API</strong>
           </div>
           <div class="project-fact">
-            <span>MCP Status</span>
+            <span>Tooling Status</span>
             <strong>{{ formatStatus(detail.mcp_status || detail.mcp_auth_status || 'unknown') }}</strong>
           </div>
           <div class="project-fact">

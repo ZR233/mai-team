@@ -93,6 +93,7 @@ impl StdioMcpSession {
             cwd: config.cwd.as_deref(),
             env: &env,
             workspace_volume: Some(workspace_volume),
+            mounts: &[],
             timeout_secs: None,
         })?;
         let stdin = child.stdin.take().ok_or(McpError::MissingStdio)?;

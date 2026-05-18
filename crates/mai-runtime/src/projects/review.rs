@@ -25,10 +25,6 @@ const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;
 const PROJECT_REVIEW_SELECTOR_INTERVAL_SECS: u64 = 1800;
 const PROJECT_REVIEW_RETRY_INITIAL_SECS: u64 = 1;
 const PROJECT_REVIEW_FAILURE_RETRY_SECS: u64 = 600;
-const PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL: &str =
-    "mcp__github__pull_request_review_write";
-const PROJECT_GITHUB_CREATE_PULL_REQUEST_REVIEW_TOOL: &str =
-    "mcp__github__create_pull_request_review";
 
 fn project_review_retry_backoff() -> backoff::ProjectReviewRetryBackoff {
     backoff::ProjectReviewRetryBackoff::new(backoff::ProjectReviewRetryBackoffConfig {
@@ -65,7 +61,7 @@ pub(crate) struct ProjectReviewLoopDecision {
 }
 
 pub(crate) fn project_reviewer_system_prompt() -> &'static str {
-    "You are an autonomous project pull request reviewer. Review exactly one eligible GitHub pull request for this project, using only the GitHub MCP tools visible in the current tool list for GitHub reads/writes and local shell commands for git/test work. The repository has already been cloned and synced at /workspace/repo, and this reviewer owns that isolated clone. Do not look for GitHub tokens in the environment or write credentials. Finish with only the required JSON object so the project scheduler can decide the next cycle."
+    "You are an autonomous project pull request reviewer. Review exactly one target GitHub pull request for this project, using only the Mai GitHub API tools visible in the current tool list for GitHub reads/writes and local shell commands for git/test work. The repository has already been cloned and synced at /workspace/repo, and this reviewer owns that isolated clone. Do not look for GitHub tokens in the environment or write credentials. Finish with only the required JSON object so the project scheduler can decide the next cycle."
 }
 
 pub(crate) fn parse_project_review_cycle_report(text: &str) -> Result<ProjectReviewCycleResult> {
@@ -98,33 +94,93 @@ pub(crate) fn parse_project_review_cycle_report(text: &str) -> Result<ProjectRev
     })
 }
 
-pub(crate) fn project_review_mcp_arguments_with_model_footer(
-    model_tool_name: &str,
-    mut arguments: Value,
+pub(crate) fn project_review_github_api_body_with_model_footer(
+    method: &str,
+    path: &str,
+    mut body: Option<Value>,
     role: Option<&AgentRole>,
     model_id: &str,
-) -> Value {
+) -> Result<Option<Value>> {
+    validate_project_reviewer_github_api_request(method, path, body.as_ref(), role)?;
     if !matches!(role, Some(AgentRole::Reviewer))
-        || !is_github_pull_request_review_write_tool(model_tool_name)
+        || !is_github_pull_request_review_path(method, path)
     {
-        return arguments;
+        return Ok(body);
     }
-    let Some(body) = arguments.get("body").and_then(Value::as_str) else {
-        return arguments;
+    let Some(review_body) = body
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .and_then(|object| object.get_mut("body"))
+    else {
+        return Ok(body);
+    };
+    let Some(text) = review_body.as_str() else {
+        return Ok(body);
     };
     let model_id = model_id.trim();
     if model_id.is_empty() {
-        return arguments;
+        return Ok(body);
     }
     let footer = format!("Powered by {model_id}");
-    if body.contains(&footer) {
-        return arguments;
+    if text.contains(&footer) {
+        return Ok(body);
     }
-    let body = format!("{}\n\n{}", body.trim_end(), footer);
-    if let Some(value) = arguments.get_mut("body") {
-        *value = Value::String(body);
+    *review_body = Value::String(format!("{}\n\n{}", text.trim_end(), footer));
+    Ok(body)
+}
+
+pub(crate) fn validate_project_reviewer_github_api_request(
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    role: Option<&AgentRole>,
+) -> Result<()> {
+    if !matches!(role, Some(AgentRole::Reviewer)) {
+        return Ok(());
     }
-    arguments
+    if is_github_pending_review_event_path(method, path) {
+        return Err(RuntimeError::InvalidInput(
+            "reviewer PR review submission must use one single POST to `/pulls/PR/reviews` with `event` and a non-empty `body`; submitting `/pulls/PR/reviews/REVIEW_ID/events` depends on pending review state"
+                .to_string(),
+        ));
+    }
+    if is_github_pull_request_review_comment_path(method, path) {
+        return Err(RuntimeError::InvalidInput(
+            "reviewer inline comments must be submitted in one single POST to `/pulls/PR/reviews` using the `comments` array; do not POST `/pulls/PR/comments` directly"
+                .to_string(),
+        ));
+    }
+    if !is_github_pull_request_review_path(method, path) {
+        return Ok(());
+    }
+    let body = body.and_then(Value::as_object).ok_or_else(|| {
+        RuntimeError::InvalidInput(
+            "reviewer PR review submission must include `event` and a non-empty `body`; otherwise GitHub creates a pending review"
+                .to_string(),
+        )
+    })?;
+    let event = body
+        .get("event")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !matches!(event, "REQUEST_CHANGES" | "APPROVE" | "COMMENT") {
+        return Err(RuntimeError::InvalidInput(
+            "reviewer PR review submission must include `event` as REQUEST_CHANGES, APPROVE, or COMMENT to avoid creating a pending review"
+                .to_string(),
+        ));
+    }
+    let review_body = body
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if review_body.is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "reviewer PR review submission must include a non-empty `body`".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn project_review_loop_decision_for_result(
@@ -241,9 +297,41 @@ fn extract_json_object(text: &str) -> Option<&str> {
     None
 }
 
-fn is_github_pull_request_review_write_tool(model_tool_name: &str) -> bool {
-    model_tool_name == PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL
-        || model_tool_name == PROJECT_GITHUB_CREATE_PULL_REQUEST_REVIEW_TOOL
+fn github_api_path_without_query(path: &str) -> &str {
+    path.split_once('?')
+        .map(|(path_without_query, _query)| path_without_query)
+        .unwrap_or(path)
+}
+
+fn is_github_pull_request_review_path(method: &str, path: &str) -> bool {
+    let path = github_api_path_without_query(path);
+    method.eq_ignore_ascii_case("POST") && path.contains("/pulls/") && path.ends_with("/reviews")
+}
+
+fn is_github_pending_review_event_path(method: &str, path: &str) -> bool {
+    let path = github_api_path_without_query(path);
+    method.eq_ignore_ascii_case("POST")
+        && path.contains("/pulls/")
+        && path.contains("/reviews/")
+        && path.ends_with("/events")
+}
+
+fn is_github_pull_request_review_comment_path(method: &str, path: &str) -> bool {
+    if !method.eq_ignore_ascii_case("POST") {
+        return false;
+    }
+    let path = github_api_path_without_query(path);
+    let Some((_prefix, suffix)) = path.split_once("/pulls/") else {
+        return false;
+    };
+    let mut segments = suffix.split('/');
+    let Some(pr_number) = segments.next() else {
+        return false;
+    };
+    let Some("comments") = segments.next() else {
+        return false;
+    };
+    pr_number.parse::<u64>().is_ok() && segments.next().is_none()
 }
 
 #[cfg(test)]
@@ -256,7 +344,8 @@ mod tests {
 
     #[test]
     fn review_body_gets_model_footer() {
-        let arguments = json!({
+        let body = Some(json!({
+            "event": "COMMENT",
             "body": "Looks good after local validation.",
             "comments": [
                 {
@@ -266,14 +355,17 @@ mod tests {
                     "body": "Please cover this edge case."
                 }
             ]
-        });
+        }));
 
-        let updated = project_review_mcp_arguments_with_model_footer(
-            PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL,
-            arguments,
+        let updated = project_review_github_api_body_with_model_footer(
+            "POST",
+            "/repos/owner/repo/pulls/42/reviews",
+            body,
             Some(&AgentRole::Reviewer),
             "gpt-5.4",
-        );
+        )
+        .expect("valid reviewer review")
+        .expect("body");
 
         assert_eq!(
             updated.get("body").and_then(Value::as_str),
@@ -287,16 +379,20 @@ mod tests {
 
     #[test]
     fn review_body_footer_is_not_duplicated() {
-        let arguments = json!({
+        let body = Some(json!({
+            "event": "COMMENT",
             "body": "Looks good.\n\nPowered by gpt-5.4"
-        });
+        }));
 
-        let updated = project_review_mcp_arguments_with_model_footer(
-            PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL,
-            arguments,
+        let updated = project_review_github_api_body_with_model_footer(
+            "POST",
+            "/repos/owner/repo/pulls/42/reviews",
+            body,
             Some(&AgentRole::Reviewer),
             "gpt-5.4",
-        );
+        )
+        .expect("valid reviewer review")
+        .expect("body");
 
         assert_eq!(
             updated.get("body").and_then(Value::as_str),
@@ -305,36 +401,42 @@ mod tests {
     }
 
     #[test]
-    fn review_body_footer_supports_legacy_tool_name() {
-        let arguments = json!({
+    fn review_body_footer_ignores_non_review_paths() {
+        let body = Some(json!({
             "body": "Review submitted."
-        });
+        }));
 
-        let updated = project_review_mcp_arguments_with_model_footer(
-            PROJECT_GITHUB_CREATE_PULL_REQUEST_REVIEW_TOOL,
-            arguments,
+        let updated = project_review_github_api_body_with_model_footer(
+            "POST",
+            "/repos/owner/repo/issues/42/comments",
+            body,
             Some(&AgentRole::Reviewer),
             "gpt-5.4",
-        );
+        )
+        .expect("valid issue comment")
+        .expect("body");
 
         assert_eq!(
             updated.get("body").and_then(Value::as_str),
-            Some("Review submitted.\n\nPowered by gpt-5.4")
+            Some("Review submitted.")
         );
     }
 
     #[test]
-    fn model_footer_leaves_non_review_tools_unchanged() {
-        let arguments = json!({
+    fn model_footer_leaves_get_requests_unchanged() {
+        let body = Some(json!({
             "body": "A regular issue comment."
-        });
+        }));
 
-        let updated = project_review_mcp_arguments_with_model_footer(
-            "mcp__github__add_issue_comment",
-            arguments,
+        let updated = project_review_github_api_body_with_model_footer(
+            "GET",
+            "/repos/owner/repo/pulls/42/reviews",
+            body,
             Some(&AgentRole::Reviewer),
             "gpt-5.4",
-        );
+        )
+        .expect("valid get request")
+        .expect("body");
 
         assert_eq!(
             updated.get("body").and_then(Value::as_str),
@@ -344,16 +446,19 @@ mod tests {
 
     #[test]
     fn model_footer_leaves_non_reviewer_agents_unchanged() {
-        let arguments = json!({
+        let body = Some(json!({
             "body": "Maintainer review body."
-        });
+        }));
 
-        let updated = project_review_mcp_arguments_with_model_footer(
-            PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL,
-            arguments,
+        let updated = project_review_github_api_body_with_model_footer(
+            "POST",
+            "/repos/owner/repo/pulls/42/reviews",
+            body,
             Some(&AgentRole::Planner),
             "gpt-5.4",
-        );
+        )
+        .expect("valid non-reviewer request")
+        .expect("body");
 
         assert_eq!(
             updated.get("body").and_then(Value::as_str),
@@ -362,28 +467,125 @@ mod tests {
     }
 
     #[test]
-    fn model_footer_leaves_missing_or_non_string_body_unchanged() {
-        let missing = json!({
+    fn model_footer_rejects_reviewer_reviews_that_could_create_pending_review() {
+        let missing = Some(json!({
             "event": "APPROVE"
-        });
-        let updated_missing = project_review_mcp_arguments_with_model_footer(
-            PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL,
+        }));
+        let missing_err = project_review_github_api_body_with_model_footer(
+            "POST",
+            "/repos/owner/repo/pulls/42/reviews",
             missing,
             Some(&AgentRole::Reviewer),
             "gpt-5.4",
-        );
-        assert_eq!(updated_missing, json!({ "event": "APPROVE" }));
+        )
+        .expect_err("missing body should be rejected");
+        assert!(missing_err.to_string().contains("non-empty `body`"));
 
-        let non_string = json!({
+        let non_string = Some(json!({
+            "event": "APPROVE",
             "body": null
-        });
-        let updated_non_string = project_review_mcp_arguments_with_model_footer(
-            PROJECT_GITHUB_PULL_REQUEST_REVIEW_WRITE_TOOL,
+        }));
+        let non_string_err = project_review_github_api_body_with_model_footer(
+            "POST",
+            "/repos/owner/repo/pulls/42/reviews",
             non_string,
             Some(&AgentRole::Reviewer),
             "gpt-5.4",
-        );
-        assert_eq!(updated_non_string, json!({ "body": null }));
+        )
+        .expect_err("non-string body should be rejected");
+        assert!(non_string_err.to_string().contains("non-empty `body`"));
+    }
+
+    #[test]
+    fn reviewer_pr_review_submission_requires_event_to_avoid_pending_review() {
+        let err = validate_project_reviewer_github_api_request(
+            "POST",
+            "/repos/owner/repo/pulls/42/reviews",
+            Some(&json!({
+                "body": "Looks good after validation.",
+            })),
+            Some(&AgentRole::Reviewer),
+        )
+        .expect_err("missing event should be rejected");
+
+        assert!(err.to_string().contains("include `event`"));
+        assert!(err.to_string().contains("pending review"));
+    }
+
+    #[test]
+    fn reviewer_pr_review_submission_requires_body_to_avoid_empty_review() {
+        let err = validate_project_reviewer_github_api_request(
+            "POST",
+            "/repos/owner/repo/pulls/42/reviews",
+            Some(&json!({
+                "event": "APPROVE",
+            })),
+            Some(&AgentRole::Reviewer),
+        )
+        .expect_err("missing review body should be rejected");
+
+        assert!(err.to_string().contains("non-empty `body`"));
+    }
+
+    #[test]
+    fn reviewer_pr_review_submission_rejects_pending_review_event_path() {
+        let err = validate_project_reviewer_github_api_request(
+            "POST",
+            "/repos/owner/repo/pulls/42/reviews/123/events",
+            Some(&json!({
+                "event": "APPROVE",
+                "body": "Looks good after validation.",
+            })),
+            Some(&AgentRole::Reviewer),
+        )
+        .expect_err("pending review event path should be rejected");
+
+        assert!(err.to_string().contains("one single POST"));
+        assert!(err.to_string().contains("pending review state"));
+    }
+
+    #[test]
+    fn reviewer_pr_review_submission_rejects_direct_inline_comment_path() {
+        let err = validate_project_reviewer_github_api_request(
+            "POST",
+            "/repos/owner/repo/pulls/42/comments",
+            Some(&json!({
+                "path": "src/lib.rs",
+                "line": 12,
+                "side": "RIGHT",
+                "body": "Please cover this edge case.",
+            })),
+            Some(&AgentRole::Reviewer),
+        )
+        .expect_err("direct inline review comment creation should be rejected");
+
+        assert!(err.to_string().contains("one single POST"));
+        assert!(err.to_string().contains("comments` array"));
+    }
+
+    #[test]
+    fn reviewer_pr_review_submission_ignores_other_event_paths() {
+        validate_project_reviewer_github_api_request(
+            "POST",
+            "/repos/owner/repo/issues/42/events",
+            None,
+            Some(&AgentRole::Reviewer),
+        )
+        .expect("non-review event path is outside reviewer review submission guard");
+    }
+
+    #[test]
+    fn reviewer_pr_review_submission_accepts_single_complete_request() {
+        validate_project_reviewer_github_api_request(
+            "POST",
+            "/repos/owner/repo/pulls/42/reviews",
+            Some(&json!({
+                "event": "APPROVE",
+                "body": "Looks good after validation.",
+            })),
+            Some(&AgentRole::Reviewer),
+        )
+        .expect("complete reviewer review submission is accepted");
     }
 
     #[test]

@@ -88,10 +88,9 @@
             <div class="project-field-row">
               <span>Agent Tools</span>
               <div class="permission-summary compact" aria-label="Agent tools">
-                <span>Git MCP</span>
-                <span>GitHub MCP</span>
-                <span>Same token</span>
-                <span>Server-side</span>
+                <span>Git sidecar</span>
+                <span>GitHub API</span>
+                <span>Server-side token</span>
               </div>
             </div>
 

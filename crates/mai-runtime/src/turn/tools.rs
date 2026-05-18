@@ -126,6 +126,13 @@ pub(crate) struct QueueProjectReviewPr {
     pub(crate) reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct GithubApiRequest {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) body: Option<Value>,
+}
+
 #[async_trait::async_trait]
 pub(crate) trait ToolDispatchOps: Send + Sync {
     async fn spawn_agent_from_tool(
@@ -197,6 +204,11 @@ pub(crate) trait ToolDispatchOps: Send + Sync {
         &self,
         agent: &AgentRecord,
         path: String,
+    ) -> Result<ToolExecution>;
+    async fn execute_project_github_api_request(
+        &self,
+        agent: &AgentRecord,
+        request: GithubApiRequest,
     ) -> Result<ToolExecution>;
     async fn queue_project_review_prs(
         &self,
@@ -299,6 +311,7 @@ pub(crate) async fn visible_tool_names(
         mai_tools::TOOL_REQUEST_USER_INPUT.to_string(),
         mai_tools::TOOL_SAVE_ARTIFACT.to_string(),
         mai_tools::TOOL_GITHUB_API_GET.to_string(),
+        mai_tools::TOOL_GITHUB_API_REQUEST.to_string(),
         mai_tools::TOOL_GIT_STATUS.to_string(),
         mai_tools::TOOL_GIT_DIFF.to_string(),
         mai_tools::TOOL_GIT_BRANCH.to_string(),
@@ -688,6 +701,13 @@ pub(crate) async fn execute_tool(
             context
                 .ops
                 .execute_project_github_api_get(agent, path)
+                .await
+        }
+        RoutedTool::GithubApiRequest => {
+            let request = github_api_request_from_arguments(&arguments)?;
+            context
+                .ops
+                .execute_project_github_api_request(agent, request)
                 .await
         }
         RoutedTool::QueueProjectReviewPrs => {
@@ -1134,6 +1154,33 @@ fn queue_project_review_prs_from_arguments(arguments: &Value) -> Result<Vec<Queu
             })
         })
         .collect()
+}
+
+fn github_api_request_from_arguments(arguments: &Value) -> Result<GithubApiRequest> {
+    Ok(GithubApiRequest {
+        method: required_string_argument(arguments, "method")?,
+        path: required_string_argument(arguments, "path")?,
+        body: optional_json_body_argument(arguments, "body")?,
+    })
+}
+
+fn optional_json_body_argument(arguments: &Value, field: &str) -> Result<Option<Value>> {
+    let Some(value) = arguments.get(field) else {
+        return Ok(None);
+    };
+    let parsed = if let Some(raw) = value.as_str() {
+        serde_json::from_str(raw).map_err(|err| {
+            RuntimeError::InvalidInput(format!("field `{field}` must be JSON: {err}"))
+        })?
+    } else {
+        value.clone()
+    };
+    if parsed.is_object() || parsed.is_null() {
+        return Ok(Some(parsed));
+    }
+    Err(RuntimeError::InvalidInput(format!(
+        "field `{field}` must be a JSON object or null"
+    )))
 }
 
 fn parse_agent_id(value: &str) -> Result<AgentId> {
@@ -1776,6 +1823,41 @@ mod tests {
         assert!(preview.contains("visible"));
         assert!(!preview.contains("secret-token"));
         assert!(!preview.contains("secret-key"));
+    }
+
+    #[test]
+    fn github_api_request_from_arguments_parses_json_string_body() {
+        let request = github_api_request_from_arguments(&json!({
+            "method": "POST",
+            "path": "/repos/owner/repo/pulls/42/reviews",
+            "body": r#"{"event":"COMMENT","body":"Looks good."}"#
+        }))
+        .expect("request");
+
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/repos/owner/repo/pulls/42/reviews");
+        assert_eq!(
+            request.body,
+            Some(json!({
+                "event": "COMMENT",
+                "body": "Looks good."
+            }))
+        );
+    }
+
+    #[test]
+    fn github_api_request_from_arguments_rejects_non_object_body() {
+        let err = github_api_request_from_arguments(&json!({
+            "method": "POST",
+            "path": "/repos/owner/repo/issues/42/comments",
+            "body": "[\"not\", \"an\", \"object\"]"
+        }))
+        .expect_err("body array should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("field `body` must be a JSON object or null")
+        );
     }
 
     #[test]
