@@ -4,6 +4,8 @@ use crate::naming::{
     SIDECAR_LABEL_KEY,
 };
 
+pub(crate) const HOST_NETWORK: &str = "host";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContainerCreateOptions {
     pub memory: Option<String>,
@@ -11,7 +13,6 @@ pub struct ContainerCreateOptions {
     pub pids_limit: Option<u32>,
     pub cap_drop_all: bool,
     pub no_new_privileges: bool,
-    pub network: Option<String>,
 }
 
 pub(crate) fn default_agent_container_options() -> ContainerCreateOptions {
@@ -21,7 +22,6 @@ pub(crate) fn default_agent_container_options() -> ContainerCreateOptions {
         pids_limit: Some(2048),
         cap_drop_all: false,
         no_new_privileges: false,
-        network: None,
     }
 }
 
@@ -129,6 +129,8 @@ pub(crate) fn create_workspace_copy_container_args(
         format!("{workspace_volume}:/workspace"),
         "-w".to_string(),
         "/workspace".to_string(),
+        "--network".to_string(),
+        HOST_NETWORK.to_string(),
         image.to_string(),
         "sleep".to_string(),
         "infinity".to_string(),
@@ -164,14 +166,7 @@ fn apply_container_create_options(args: &mut Vec<String>, options: &ContainerCre
             "no-new-privileges".to_string(),
         ]);
     }
-    if let Some(network) = options
-        .network
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        args.extend(["--network".to_string(), network.to_string()]);
-    }
+    args.extend(["--network".to_string(), HOST_NETWORK.to_string()]);
 }
 
 pub(crate) fn validate_image(image: &str) -> Result<&str> {
@@ -235,7 +230,10 @@ mod tests {
                 .any(|window| window == ["-w", "/workspace/repo"])
         );
         assert!(args.windows(2).any(|window| window == ["--user", "root"]));
-        assert!(!args.windows(2).any(|window| window[0] == "--network"));
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--network", "host"])
+        );
         assert!(args.windows(2).any(|window| window == ["--memory", "8g"]));
         assert!(args.windows(2).any(|window| window == ["--cpus", "4"]));
         assert!(
@@ -290,6 +288,10 @@ mod tests {
                 .any(|window| window == ["-v", "mai-team-project-project-1:/workspace"])
         );
         assert!(!args.windows(2).any(|window| window[0] == "-e"));
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--network", "host"])
+        );
         assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
         assert!(
             args.windows(3)
@@ -320,6 +322,10 @@ mod tests {
                 "-v",
                 "mai-team-project-project-1-agent-reviewer-1:/workspace"
             ]));
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--network", "host"])
+        );
         assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
         assert!(
             args.windows(3)
@@ -398,7 +404,6 @@ mod tests {
                 pids_limit: Some(100),
                 cap_drop_all: true,
                 no_new_privileges: true,
-                network: Some("mai-team".to_string()),
             },
         );
 
@@ -418,7 +423,7 @@ mod tests {
         );
         assert!(
             args.windows(2)
-                .any(|window| window == ["--network", "mai-team"])
+                .any(|window| window == ["--network", "host"])
         );
         assert!(
             args.windows(3)

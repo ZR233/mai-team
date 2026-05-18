@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
-use crate::args::validate_image;
+use crate::args::{HOST_NETWORK, validate_image};
 use crate::capture::{await_capture_task, capture_stream};
 use crate::client::DockerClient;
 use crate::error::{DockerError, Result};
@@ -249,6 +249,7 @@ impl DockerClient {
         let mut cmd = Command::new(&self.binary);
         cmd.arg("run")
             .arg("--rm")
+            .args(["--network", HOST_NETWORK])
             .args(["--name", params.name])
             .args(["--label", MANAGED_LABEL]);
         if let Some(volume) = params.workspace_volume {
@@ -305,6 +306,7 @@ impl DockerClient {
         cmd.arg("run")
             .arg("--rm")
             .arg("-i")
+            .args(["--network", HOST_NETWORK])
             .args(["--name", params.name])
             .args(["--label", MANAGED_LABEL]);
         if let Some(volume) = params.workspace_volume {

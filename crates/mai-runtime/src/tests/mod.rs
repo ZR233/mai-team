@@ -6220,6 +6220,7 @@ async fn project_clone_uses_sidecar_git_and_workspace_volumes() {
     )));
     assert!(docker_log.contains(&format!("{workspace_volume}:/workspace")));
     assert!(docker_log.contains(&format!("{cache_volume}:/workspace")));
+    assert!(docker_log.contains("--network host"));
     assert!(docker_log.contains("sidecar-git-clone"));
     assert!(docker_log.contains("GIT_ASKPASS"));
     assert!(docker_log.contains("rev-parse --is-bare-repository"));
@@ -6277,6 +6278,7 @@ async fn project_clone_retries_transient_cache_git_failure() {
 
     let docker_log = fake_docker_log(&dir);
     assert_eq!(docker_log.matches("sidecar-git-cache").count(), 2);
+    assert!(docker_log.contains("--network host"));
     assert!(docker_log.contains("git_with_retry"));
     assert!(docker_log.contains("http.version=HTTP/1.1"));
     assert!(docker_log.contains("sleep $((attempts * 2))"));
@@ -6335,6 +6337,7 @@ async fn github_api_request_runs_via_gh_sidecar_without_token_leak() {
     );
     let docker_log = fake_docker_log(&dir);
     assert!(docker_log.contains("sidecar-gh-api"));
+    assert!(docker_log.contains("--network host"));
     assert!(docker_log.contains("--method POST"));
     assert!(docker_log.contains("MAI_GH_API_BODY"));
     assert!(docker_log.contains("-e GH_TOKEN"));
@@ -6400,6 +6403,7 @@ async fn github_api_request_uses_standard_token_env_with_custom_api_base_url() {
     );
     let docker_log = fake_docker_log(&dir);
     assert!(docker_log.contains("sidecar-gh-api"));
+    assert!(docker_log.contains("--network host"));
     assert!(docker_log.contains("-e GH_TOKEN"));
     assert!(docker_log.contains("/repos/owner/repo/pulls/123/reviews"));
     assert!(docker_log.contains("token-present"));
@@ -6462,6 +6466,7 @@ async fn project_workspace_setup_moves_from_pending_to_ready() {
     let cache_volume = mai_docker::project_cache_volume(&project_id.to_string());
     assert!(docker_log.contains(&format!("volume create --label mai.team.managed=true --label mai.team.kind=project-cache --label mai.team.project={project_id} {cache_volume}")));
     assert!(docker_log.contains(&format!("{workspace_volume}:/workspace")));
+    assert!(docker_log.contains("--network host"));
     assert!(docker_log.contains("-w /workspace/repo"));
     assert!(!docker_log.contains(&format!(
             "{}:/workspace/repo",
@@ -6951,6 +6956,7 @@ async fn project_reviewer_starts_from_image_with_own_project_clone() {
     assert!(!docker_log.contains("commit maintainer-container"));
     assert!(docker_log.contains(&format!("create --name mai-team-{}", reviewer.id)));
     assert!(docker_log.contains(&format!("{workspace_volume}:/workspace")));
+    assert!(docker_log.contains("--network host"));
     assert!(!docker_log.contains(&format!("mai-team-workspace-{}:/workspace", reviewer.id)));
     assert!(!docker_log.contains(&format!("{}:/workspace/repo", clone_path.display())));
     assert!(docker_log.contains("--user root"));
