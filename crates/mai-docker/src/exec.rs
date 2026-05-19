@@ -3,6 +3,7 @@ use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
+use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::args::{HOST_NETWORK, validate_image};
@@ -268,7 +269,16 @@ impl DockerClient {
         }
         cmd.arg(image).args(["/bin/sh", "-lc", &shell_command]);
 
-        let output = cmd.output().await?;
+        let output = match params.timeout_secs.filter(|seconds| *seconds > 0) {
+            Some(seconds) => timeout(Duration::from_secs(seconds + 5), cmd.output())
+                .await
+                .map_err(|_| {
+                    DockerError::CommandFailed(format!(
+                        "docker sidecar command timed out after {seconds}s"
+                    ))
+                })??,
+            None => cmd.output().await?,
+        };
         Ok(ExecOutput {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8(output.stdout)?,
@@ -351,6 +361,10 @@ pub(crate) fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
     #[test]
@@ -367,5 +381,42 @@ mod tests {
             shell_command_with_optional_timeout("sleep 1000", Some(5))
                 .starts_with("timeout --preserve-status 5s /bin/sh -lc ")
         );
+    }
+
+    #[tokio::test]
+    async fn sidecar_shell_env_times_out_stuck_docker_process() {
+        let script = fake_docker_script("sleep 30\n");
+        let client = DockerClient::new_with_binary("unused-image", script.to_string_lossy());
+
+        let result = client
+            .run_sidecar_shell_env(&SidecarParams {
+                name: "mai-test-sidecar-timeout",
+                image: "unused-image",
+                command: "true",
+                args: &[],
+                cwd: None,
+                env: &[],
+                workspace_volume: None,
+                mounts: &[],
+                timeout_secs: Some(1),
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(DockerError::CommandFailed(message)) if message.contains("timed out"))
+        );
+    }
+
+    fn fake_docker_script(body: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("mai-docker-test-{unique}"));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("docker");
+        fs::write(&path, format!("#!/bin/sh\n{body}")).expect("write script");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
     }
 }

@@ -8,6 +8,7 @@ use mai_protocol::{
 };
 use serde_json::json;
 use tempfile::{TempDir, tempdir};
+use tokio::time::{Duration, timeout};
 
 async fn store() -> (TempDir, ConfigStore) {
     let dir = tempdir().expect("tempdir");
@@ -1246,6 +1247,28 @@ async fn agent_logs_round_trip_filter_and_prune() {
         .expect("remaining logs");
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].category, "tool");
+}
+
+#[tokio::test]
+async fn agent_log_reads_do_not_wait_for_unrelated_busy_store_operation() {
+    let (_dir, store) = store().await;
+    let _busy_connection = store.db.connection().await.expect("busy connection");
+
+    let logs = timeout(
+        Duration::from_millis(200),
+        store.list_agent_logs(
+            Uuid::new_v4(),
+            AgentLogFilter {
+                limit: 10,
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("log read should not wait behind an unrelated store operation")
+    .expect("list logs");
+
+    assert!(logs.is_empty());
 }
 
 #[tokio::test]
