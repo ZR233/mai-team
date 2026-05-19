@@ -20,11 +20,11 @@ export function formatEventType(type) {
     .replace(/\b\w/g, (l) => l.toUpperCase())
 }
 
-function formatTokenCount(value) {
+export function formatTokenCount(value) {
   return Number(value || 0).toLocaleString()
 }
 
-function numericTokenUsage(value = {}) {
+export function numericTokenUsage(value = {}) {
   return {
     input_tokens: Number(value.input_tokens || 0),
     cached_input_tokens: Number(value.cached_input_tokens || 0),

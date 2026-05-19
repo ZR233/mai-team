@@ -113,6 +113,7 @@ pub(crate) async fn run_project_review_once(
         pr: target_pr,
         summary: None,
         error: None,
+        token_usage: Default::default(),
     })
     .await?;
     if let Err(err) = ops.sync_project_cache_repo(project_id).await {
@@ -210,6 +211,7 @@ pub(crate) async fn run_project_review_once(
         pr: target_pr,
         summary: None,
         error: None,
+        token_usage: Default::default(),
     })
     .await?;
     let cycle_result = async {

@@ -103,6 +103,11 @@ impl ConfigStore {
             pr: run.summary.pr.map(u64_to_i64),
             summary: run.summary.summary.clone(),
             error: run.summary.error.clone(),
+            input_tokens: u64_to_i64(run.summary.token_usage.input_tokens),
+            cached_input_tokens: u64_to_i64(run.summary.token_usage.cached_input_tokens),
+            output_tokens: u64_to_i64(run.summary.token_usage.output_tokens),
+            reasoning_output_tokens: u64_to_i64(run.summary.token_usage.reasoning_output_tokens),
+            total_tokens: u64_to_i64(run.summary.token_usage.total_tokens),
             messages_json: serde_json::to_string(&run.messages)?,
             events_json: serde_json::to_string(&run.events)?,
         })

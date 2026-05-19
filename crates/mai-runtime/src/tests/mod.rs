@@ -7167,6 +7167,7 @@ async fn runtime_start_cleans_stale_project_reviewer_before_new_worker() {
                 pr: None,
                 summary: Some("in progress".to_string()),
                 error: None,
+                token_usage: TokenUsage::default(),
             },
             messages: Vec::new(),
             events: Vec::new(),
@@ -7784,6 +7785,7 @@ async fn project_detail_includes_recent_review_runs() {
                 pr: Some(7),
                 summary: Some("submitted review".to_string()),
                 error: None,
+                token_usage: TokenUsage::default(),
             },
             messages: vec![AgentMessage {
                 role: MessageRole::Assistant,
@@ -7836,6 +7838,13 @@ async fn finishing_project_review_run_captures_reviewer_snapshot() {
     reviewer.parent_id = Some(maintainer_id);
     reviewer.role = Some(AgentRole::Reviewer);
     reviewer.status = AgentStatus::Completed;
+    reviewer.token_usage = TokenUsage {
+        input_tokens: 12_000,
+        cached_input_tokens: 8_000,
+        output_tokens: 900,
+        reasoning_output_tokens: 300,
+        total_tokens: 12_900,
+    };
     store
         .save_agent(&reviewer, None)
         .await
@@ -7890,6 +7899,7 @@ async fn finishing_project_review_run_captures_reviewer_snapshot() {
                 pr: None,
                 summary: None,
                 error: None,
+                token_usage: TokenUsage::default(),
             },
             messages: Vec::new(),
             events: Vec::new(),
@@ -7929,6 +7939,7 @@ async fn finishing_project_review_run_captures_reviewer_snapshot() {
         .await
         .expect("run");
     assert_eq!(run.summary.pr, Some(12));
+    assert_eq!(run.summary.token_usage, reviewer.token_usage);
     assert_eq!(run.messages[0].content, "snapshot summary");
     assert!(run.events.iter().any(|event| {
         matches!(

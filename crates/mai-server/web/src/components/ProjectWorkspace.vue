@@ -111,7 +111,7 @@
         </div>
       </div>
 
-      <div v-else-if="activeSection === 'review'" class="project-panel">
+      <div v-else-if="activeSection === 'review'" class="project-panel review-status-panel">
         <header class="settings-section-header">
           <div>
             <h2>Review Status</h2>
@@ -155,7 +155,7 @@
             </button>
           </div>
         </div>
-        <div class="settings-summary">
+        <div class="settings-summary review-status-summary">
           <div class="settings-summary-item">
             <span>Auto Review</span>
             <strong>{{ detail.auto_review_enabled ? 'Enabled' : 'Disabled' }}</strong>
@@ -187,22 +187,68 @@
               class="review-run-card"
               :class="{ open: expandedReviewRunId === run.id }"
             >
-              <button type="button" class="review-run-summary" @click="toggleReviewRun(run)">
-                <span class="review-run-status" :class="reviewRunTone(run.status)">
-                  {{ formatStatus(run.status) }}
-                </span>
-                <span class="review-run-main">
-                  <strong>{{ reviewRunTitle(run) }}</strong>
-                  <small>{{ formatDateTime(run.started_at) }} · {{ reviewRunDuration(run) }}</small>
-                </span>
-                <span class="review-run-outcome">{{ formatStatus(run.outcome || 'pending') }}</span>
-              </button>
+              <div class="review-run-summary">
+                <button type="button" class="review-run-main-action" @click="toggleReviewRun(run)">
+                  <span class="review-run-pr">{{ reviewRunPrLabel(run) }}</span>
+                  <span class="review-run-main">
+                    <strong>{{ reviewRunTitle(run) }}</strong>
+                    <small>{{ formatDateTime(run.started_at) }} · {{ reviewRunDuration(run) }}</small>
+                  </span>
+                </button>
+                <div class="review-run-chip-row">
+                  <span class="review-run-status" :class="reviewRunTone(run.status)">
+                    {{ formatStatus(run.status) }}
+                  </span>
+                  <span class="review-run-outcome">{{ formatStatus(run.outcome || 'pending') }}</span>
+                </div>
+                <div class="review-run-token-row" :aria-label="reviewRunTokenLabel(run)">
+                  <span>
+                    <strong>{{ reviewRunTokens(run).total }}</strong>
+                    <small>Tokens</small>
+                  </span>
+                  <span>
+                    <strong>{{ reviewRunTokens(run).cachedInput }}</strong>
+                    <small>Cache hit</small>
+                  </span>
+                  <span>
+                    <strong>{{ reviewRunTokens(run).hitRate }}</strong>
+                    <small>Hit rate</small>
+                  </span>
+                </div>
+                <a
+                  v-if="reviewRunPrUrl(run)"
+                  class="review-run-pr-link"
+                  :href="reviewRunPrUrl(run)"
+                  target="_blank"
+                  rel="noreferrer"
+                  @click.stop
+                >
+                  Open PR
+                </a>
+                <button
+                  v-else
+                  type="button"
+                  class="review-run-pr-link"
+                  @click="toggleReviewRun(run)"
+                >
+                  Details
+                </button>
+                <button
+                  type="button"
+                  class="review-run-expand"
+                  :aria-expanded="expandedReviewRunId === run.id"
+                  @click="toggleReviewRun(run)"
+                >
+                  {{ expandedReviewRunId === run.id ? 'Hide' : 'Details' }}
+                </button>
+              </div>
               <div v-if="expandedReviewRunId === run.id" class="review-run-detail">
                 <p v-if="run.summary">{{ run.summary }}</p>
                 <p v-if="run.error" class="review-run-error">{{ run.error }}</p>
                 <div class="review-run-meta">
                   <span>Reviewer {{ shortId(run.reviewer_agent_id) }}</span>
                   <span>Turn {{ shortId(run.turn_id) }}</span>
+                  <span>Started {{ formatDateTime(run.started_at) }}</span>
                   <span>{{ run.finished_at ? `Finished ${formatDateTime(run.finished_at)}` : 'Still running' }}</span>
                 </div>
                 <div v-if="reviewRunLoading && !run.detail_loaded" class="review-run-loading">
@@ -435,7 +481,13 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import AgentDetail from './AgentDetail.vue'
-import { formatStatus, initial, statusTone } from '../utils/format'
+import {
+  formatStatus,
+  formatTokenCount,
+  initial,
+  numericTokenUsage,
+  statusTone
+} from '../utils/format'
 
 const props = defineProps({
   projects: { type: Array, required: true },
@@ -659,16 +711,36 @@ function toggleReviewRun(run) {
 }
 
 function reviewRunTitle(run) {
-  if (run?.pr) {
-    const pr = `PR #${run.pr}`
-    if (run?.summary) return `${pr}: ${run.summary}`
-    if (run?.error) return `${pr}: ${run.error}`
-    return pr
-  }
   if (run?.summary) return run.summary
   if (run?.error) return run.error
   if (run?.status === 'failed') return 'Review setup failed'
   return 'No PR selected'
+}
+
+function reviewRunPrLabel(run) {
+  return run?.pr ? `PR #${run.pr}` : 'No PR'
+}
+
+function reviewRunPrUrl(run) {
+  if (!run?.pr || !props.detail?.repository_full_name) return ''
+  return `https://github.com/${props.detail.repository_full_name}/pull/${run.pr}`
+}
+
+function reviewRunTokens(run) {
+  const usage = numericTokenUsage(run?.token_usage || {})
+  const hitRate = usage.input_tokens > 0
+    ? Math.round((usage.cached_input_tokens / usage.input_tokens) * 100)
+    : 0
+  return {
+    total: formatTokenCount(usage.total_tokens),
+    cachedInput: formatTokenCount(usage.cached_input_tokens),
+    hitRate: `${hitRate}%`
+  }
+}
+
+function reviewRunTokenLabel(run) {
+  const usage = reviewRunTokens(run)
+  return `Tokens ${usage.total}, cache hit ${usage.cachedInput}, hit rate ${usage.hitRate}`
 }
 
 function reviewRunTone(status) {

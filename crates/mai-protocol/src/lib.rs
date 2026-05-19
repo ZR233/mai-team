@@ -462,6 +462,8 @@ pub struct ProjectReviewRunSummary {
     pub summary: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub token_usage: TokenUsage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -135,6 +135,11 @@ pub(crate) struct ProjectReviewRunRecord {
     pub(crate) pr: Option<i64>,
     pub(crate) summary: Option<String>,
     pub(crate) error: Option<String>,
+    pub(crate) input_tokens: i64,
+    pub(crate) cached_input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) reasoning_output_tokens: i64,
+    pub(crate) total_tokens: i64,
     pub(crate) messages_json: String,
     pub(crate) events_json: String,
 }
@@ -445,6 +450,13 @@ impl ProjectReviewRunRecord {
             pr: self.pr.map(i64_to_u64),
             summary: self.summary,
             error: self.error,
+            token_usage: TokenUsage {
+                input_tokens: i64_to_u64(self.input_tokens),
+                cached_input_tokens: i64_to_u64(self.cached_input_tokens),
+                output_tokens: i64_to_u64(self.output_tokens),
+                reasoning_output_tokens: i64_to_u64(self.reasoning_output_tokens),
+                total_tokens: i64_to_u64(self.total_tokens),
+            },
         })
     }
 

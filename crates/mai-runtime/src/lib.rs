@@ -3791,7 +3791,14 @@ impl agents::AgentContainerOps for AgentRuntime {
 }
 
 impl projects::review::runs::ReviewRunSnapshotSource for AgentRuntime {
-    async fn snapshot(&self, reviewer_agent_id: AgentId) -> (Vec<AgentMessage>, Vec<ServiceEvent>) {
+    async fn snapshot(
+        &self,
+        reviewer_agent_id: AgentId,
+    ) -> projects::review::runs::ReviewRunSnapshot {
+        let token_usage = match self.agent(reviewer_agent_id).await {
+            Ok(agent) => agent.summary.read().await.token_usage.clone(),
+            Err(_) => Default::default(),
+        };
         let messages = self
             .agent_recent_messages(reviewer_agent_id, PROJECT_REVIEW_SNAPSHOT_MESSAGE_LIMIT)
             .await
@@ -3800,7 +3807,11 @@ impl projects::review::runs::ReviewRunSnapshotSource for AgentRuntime {
         let events = self
             .agent_recent_events(reviewer_agent_id, PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT)
             .await;
-        (messages, events)
+        projects::review::runs::ReviewRunSnapshot {
+            token_usage,
+            messages,
+            events,
+        }
     }
 }
 

@@ -1248,6 +1248,13 @@ async fn project_review_runs_round_trip_and_prune() {
                 pr: Some(42),
                 summary: Some("approved".to_string()),
                 error: None,
+                token_usage: TokenUsage {
+                    input_tokens: 100,
+                    cached_input_tokens: 60,
+                    output_tokens: 20,
+                    reasoning_output_tokens: 5,
+                    total_tokens: 120,
+                },
             },
             messages: vec![AgentMessage {
                 role: MessageRole::Assistant,
@@ -1275,6 +1282,16 @@ async fn project_review_runs_round_trip_and_prune() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].pr, Some(42));
     assert_eq!(runs[0].outcome, Some(ProjectReviewOutcome::ReviewSubmitted));
+    assert_eq!(
+        runs[0].token_usage,
+        TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 60,
+            output_tokens: 20,
+            reasoning_output_tokens: 5,
+            total_tokens: 120,
+        }
+    );
     let detail = store
         .load_project_review_run(project_id, run_id)
         .await
@@ -1602,6 +1619,7 @@ async fn delete_project_removes_review_runs() {
                 pr: None,
                 summary: None,
                 error: None,
+                token_usage: TokenUsage::default(),
             },
             messages: Vec::new(),
             events: Vec::new(),

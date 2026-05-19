@@ -4,7 +4,7 @@ use chrono::{TimeDelta, Utc};
 use mai_protocol::{
     AgentId, AgentMessage, ProjectId, ProjectReviewOutcome, ProjectReviewRunDetail,
     ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewRunsResponse, ServiceEvent,
-    TurnId, now,
+    TokenUsage, TurnId, now,
 };
 use mai_store::ConfigStore;
 use uuid::Uuid;
@@ -17,7 +17,14 @@ pub(crate) trait ReviewRunSnapshotSource: Send + Sync {
     fn snapshot(
         &self,
         reviewer_agent_id: AgentId,
-    ) -> impl Future<Output = (Vec<AgentMessage>, Vec<ServiceEvent>)> + Send;
+    ) -> impl Future<Output = ReviewRunSnapshot> + Send;
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReviewRunSnapshot {
+    pub(crate) token_usage: TokenUsage,
+    pub(crate) messages: Vec<AgentMessage>,
+    pub(crate) events: Vec<ServiceEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +85,7 @@ pub(crate) async fn record_project_review_startup_failure(
             pr: None,
             summary: None,
             error: Some(error),
+            token_usage: TokenUsage::default(),
         },
         Vec::new(),
         Vec::new(),
@@ -173,10 +181,10 @@ pub(crate) async fn finish_project_review_run(
         .reviewer_agent_id
         .or(existing.summary.reviewer_agent_id);
     let turn_id = request.turn_id.or(existing.summary.turn_id);
-    let (messages, events) = if let Some(reviewer_agent_id) = reviewer_agent_id {
+    let snapshot = if let Some(reviewer_agent_id) = reviewer_agent_id {
         snapshot_source.snapshot(reviewer_agent_id).await
     } else {
-        (Vec::new(), Vec::new())
+        ReviewRunSnapshot::default()
     };
     store
         .save_project_review_run(&ProjectReviewRunDetail {
@@ -192,9 +200,10 @@ pub(crate) async fn finish_project_review_run(
                 pr: request.pr,
                 summary: request.summary_text,
                 error: request.error,
+                token_usage: snapshot.token_usage,
             },
-            messages,
-            events,
+            messages: snapshot.messages,
+            events: snapshot.events,
         })
         .await?;
     Ok(())
