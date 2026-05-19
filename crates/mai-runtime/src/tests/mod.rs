@@ -1000,6 +1000,7 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 	      /bin/sh -lc "$command"
 	    elif printf '%s' "$command" | grep -q "test -f"; then
 	      /bin/sh -lc "$command"
+	      exit $?
 	    fi
 	    exit 0
 	    ;;

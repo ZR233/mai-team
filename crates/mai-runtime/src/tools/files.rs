@@ -475,7 +475,7 @@ impl<'a> ContainerFileTools<'a> {
     }
 
     async fn read_container_text(&self, container_path: &str) -> Result<String> {
-        let command = format!("test -f -- {}", shell_quote(container_path));
+        let command = format!("test -f {}", shell_quote(container_path));
         let output = self
             .docker
             .exec_shell(self.container_id, &command, Some("/"), Some(10))
