@@ -40,17 +40,38 @@ selector 是确定性的 Rust 代码。它不创建 agent、不提交 GitHub rev
 state=open&sort=created&direction=asc&per_page=20&page=N
 ```
 
-每页按 PR number 升序处理。全量 selector 会持续扫描到 GitHub 返回空页或短页，并且只在完整扫描成功后批量入 PR 池，避免失败扫描留下半批结果。
+全量 selector 会持续扫描到 GitHub 返回空页或短页。每页先按 PR number 升序排列，再以最多 4 个候选 PR 并发评估；合格 PR 在评估完成后立即入 PR 池，入池信号使用 `reason = "selector"` 且没有 `delivery_id`。由于页内并发，入池完成顺序不作为排序契约；PR 池自身按最小 PR number 消费。
 
-单 PR selector 由 relay select-pr loop 调用。它只读取 relay 队列给出的目标 PR，复用同一套 eligibility 规则；合格后用 relay 信号的 `delivery_id` 和 `reason` 放入 PR 池。
+单 PR selector 由 relay select-pr loop 调用。`pr = 0` 时直接判定不合格；其他 PR 会读取 GitHub PR 详情，relay 信号中的 `head_sha` 只在 PR 详情缺少 `head.sha` 时作为 fallback。单 PR selector 复用同一套 eligibility 规则；合格后由 relay select-pr loop 用 relay 信号的 `delivery_id` 和 `reason` 放入 PR 池。
 
-eligibility 规则位于 `selection.rs`：跳过 draft，跳过仍在运行或排队中的 CI，并在当前 reviewer 已审查当前 head 时抑制重复审查。reviewer 自己创建的 PR 与其他 PR 使用同一套规则。
+### Select PR 完整规则
+
+候选数据由 `eligibility.rs` 从 GitHub 读取：
+
+1. 先读取 PR 详情 `/repos/{owner}/{repo}/pulls/{pr}`。如果详情显示 `draft = true`，不再读取 review、commit 或 CI 信息，直接交给选择规则跳过。
+2. 非 draft PR 会读取最近最多 100 条 PR review：`/repos/{owner}/{repo}/pulls/{pr}/reviews?per_page=100`。
+3. 如果有 head sha，会读取该 commit 的 author/committer 时间，作为当前 head 的提交时间。这个请求失败时不阻断 selector，后续改用 review `commit_id` 与 head sha 的匹配关系兜底。
+4. 如果有 head sha，会读取 check runs 和 legacy combined status contexts。读取失败或响应无法解析时按没有对应信号处理，不把未知 CI 当成 pending。
+
+选择规则位于 `selection.rs`，按 PR number 升序对候选排序后逐个判断：
+
+1. draft PR 跳过。
+2. CI 中仍有 pending 状态时跳过。pending 状态只看 check run 的 `status` 和 legacy status context 的 `state`，大小写和首尾空白不敏感；以下值会阻塞：`queued`、`requested`、`waiting`、`pending`、`in_progress`。
+3. CI conclusion 不参与阻塞判断。`failure`、`success`、`skipped` 等已完成结果都不会阻止入池，失败的 CI 由 reviewer 在审查中判断影响。
+4. legacy combined status 的顶层 `state` 只持久到候选对象中用于观察；如果没有具体 status contexts，即使顶层 `state = "pending"` 也不会阻塞入池。
+5. 查找当前 reviewer login 提交过且带 `submitted_at` 的最新 PR review。review 的 `state` 不参与去重判断，`APPROVED`、`CHANGES_REQUESTED`、`COMMENTED` 等都表示 reviewer 已在某个时间点审过。
+6. 如果当前 reviewer 没有提交过 review，则在 draft 和 pending CI 规则通过后可入池。
+7. 如果能读取到当前 head 的提交时间，则只用时间判断是否需要重审：`latest_commit_at <= latest_reviewer_review.submitted_at` 时跳过；只有 `latest_commit_at > latest_reviewer_review.submitted_at` 才重新入池。
+8. 如果读取不到当前 head 的提交时间，则用 review `commit_id` 兜底：最新 reviewer review 的 `commit_id` 等于当前 head sha 时跳过；否则允许入池。
+9. 后续其他人的 review、comment 或 `CHANGES_REQUESTED` 不会让同一个 head 重新入池；只有当前 reviewer review 之后出现新 commit 才会重新入池。
+10. PR 作者不参与过滤。reviewer 自己创建的 PR 与其他 PR 使用同一套规则。
+11. 当前 selector 不读取也不按 `mergeable_state` 过滤。合并冲突、分支落后或受保护分支状态不是入池条件，属于 reviewer 审查阶段需要报告的问题。
 
 ## Provider 节奏
 
-GitHub App relay 项目会运行一次启动 selector。它在 server 启动或启用审查时启动；如果扫描出错，每 10 秒重试，直到一次扫描完成。扫描成功后退出，即使没有合格 PR。
+GitHub token 项目和 GitHub App relay 项目都会运行周期性 selector。server 启动、启用审查或入队信号启动 worker 后，selector loop 会开始运行；Git provider 为空时不启动 provider selector。
 
-GitHub token 项目会运行周期性 selector。失败扫描每 10 秒重试；成功扫描后等待 30 分钟再进行下一次扫描。
+selector 失败时使用指数退避重试，初始 1 秒，之后翻倍，最高 600 秒。一次 selector 成功后等待 30 分钟再进行下一次扫描；成功但没有合格 PR 时状态显示 `Waiting` 并设置下一次扫描时间，成功且有 PR 入池时状态回到 `Idle`。
 
 selector 状态更新只是尽力而为的 UI 信号，不能覆盖活跃审查。当项目正在 syncing 或 running reviewer 时，selector 状态更新会被跳过，Web UI 继续显示活跃审查。
 
@@ -63,7 +84,7 @@ relay select-pr loop 与 PR 池 worker 独立运行：
 3. 对 claimed PR 运行单 PR selector。
 4. 合格时放入 PR 池，并发布现有 `ProjectReviewQueued` 事件。
 5. 不合格时丢弃该 relay 信号。
-6. GitHub API、鉴权或网络失败时记录 warn 并丢弃该 relay 信号，等待后续 relay 事件或 provider selector 补偿。
+6. GitHub API、鉴权、网络失败或 PR 池入队失败时记录 warn，将 relay 信号放回 relay PR 队列，并按 1 秒起步、最高 600 秒的指数退避重试。
 7. 返回 relay PR 队列继续处理。
 
 relay select-pr loop 不直接审查 PR，也不阻塞 PR 池 worker。它只是把异步 relay 事件转换成经过 selector 过滤的 PR 池信号。
