@@ -75,29 +75,6 @@ fn already_reviewed_current_head(reviewer_login: &str, candidate: &PullRequestCa
     let Some(reviewed_at) = latest_review.submitted_at else {
         return false;
     };
-    let has_later_changes_requested = candidate.reviews.iter().any(|review| {
-        let Some(submitted_at) = review.submitted_at else {
-            return false;
-        };
-        if submitted_at <= reviewed_at
-            || !review
-                .state
-                .as_deref()
-                .is_some_and(|state| state.trim().eq_ignore_ascii_case("CHANGES_REQUESTED"))
-        {
-            return false;
-        }
-        if let Some(review_commit) = review.commit_id.as_deref() {
-            let Some(head_sha) = candidate.head_sha.as_deref() else {
-                return false;
-            };
-            return review_commit == head_sha;
-        }
-        true
-    });
-    if has_later_changes_requested {
-        return false;
-    }
     if let Some(latest_commit_at) = candidate.latest_commit_at {
         return latest_commit_at <= reviewed_at;
     }
@@ -351,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn allows_rereview_after_later_changes_requested_review_on_same_head() {
+    fn suppresses_rereview_after_later_changes_requested_review_on_same_head() {
         let review_time = Utc::now() - TimeDelta::hours(1);
         let mut candidate = candidate(16);
         candidate.latest_commit_at = Some(review_time - TimeDelta::minutes(10));
@@ -372,12 +349,6 @@ mod tests {
 
         let selected = select_review_prs("mai-bot", vec![candidate]);
 
-        assert_eq!(
-            vec![ReviewSelection {
-                pr: 16,
-                head_sha: Some("head-16".to_string()),
-            }],
-            selected
-        );
+        assert_eq!(Vec::<ReviewSelection>::new(), selected);
     }
 }

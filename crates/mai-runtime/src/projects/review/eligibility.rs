@@ -579,55 +579,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_pr_eligibility_reselects_after_later_changes_requested_review() {
+    async fn single_pr_eligibility_ignores_later_review_without_new_commit() {
         let project_id = Uuid::new_v4();
         let ops = FakeEligibilityOps::new(vec![
             (
-                "/repos/owner/repo/pulls/718".to_string(),
-                pr_detail(718, false, "head-718"),
+                "/repos/owner/repo/pulls/520".to_string(),
+                pr_detail(520, false, "head-520"),
             ),
             (
-                "/repos/owner/repo/pulls/718/reviews?per_page=100".to_string(),
+                "/repos/owner/repo/pulls/520/reviews?per_page=100".to_string(),
                 json!([
                     {
                         "user": { "login": "mai-bot" },
-                        "state": "APPROVED",
-                        "submitted_at": "2026-05-18T09:44:36Z",
-                        "commit_id": "head-718"
+                        "state": "CHANGES_REQUESTED",
+                        "submitted_at": "2026-05-16T06:42:14Z",
+                        "commit_id": "head-520"
                     },
                     {
                         "user": { "login": "human-reviewer" },
                         "state": "CHANGES_REQUESTED",
-                        "submitted_at": "2026-05-19T06:52:54Z",
-                        "commit_id": "head-718"
+                        "submitted_at": "2026-05-19T07:17:18Z",
+                        "commit_id": "head-520"
                     }
                 ]),
             ),
             (
-                "/repos/owner/repo/commits/head%2D718".to_string(),
-                commit("2026-05-18T08:00:39Z"),
+                "/repos/owner/repo/commits/head%2D520".to_string(),
+                commit("2026-05-16T06:00:00Z"),
             ),
             (
-                "/repos/owner/repo/commits/head%2D718/check-runs?per_page=100".to_string(),
+                "/repos/owner/repo/commits/head%2D520/check-runs?per_page=100".to_string(),
                 json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}),
             ),
             (
-                "/repos/owner/repo/commits/head%2D718/status".to_string(),
+                "/repos/owner/repo/commits/head%2D520/status".to_string(),
                 json!({"state": "success"}),
             ),
         ]);
 
-        let selected = select_project_review_pr(&ops, project_id, 718, None)
+        let selected = select_project_review_pr(&ops, project_id, 520, None)
             .await
             .expect("select pr");
 
-        assert_eq!(
-            Some(SelectedProjectReviewPr {
-                pr: 718,
-                head_sha: Some("head-718".to_string()),
-            }),
-            selected
-        );
+        assert_eq!(None, selected);
     }
 
     fn test_project_summary(project_id: Uuid) -> ProjectSummary {
