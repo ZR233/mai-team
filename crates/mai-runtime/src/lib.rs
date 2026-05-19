@@ -1988,12 +1988,15 @@ impl AgentRuntime {
         }
 
         if let Some(usage) = response.usage {
-            {
-                let mut summary = agent.summary.write().await;
-                summary.token_usage.add(&usage);
-                summary.updated_at = now();
-            }
-            self.persist_agent(agent).await?;
+            turn::accounting::record_model_usage(
+                self.deps.store.as_ref(),
+                &self.events,
+                agent,
+                agent_id,
+                session_id,
+                &usage,
+            )
+            .await?;
         }
 
         let summary_text = turn::history::compact_summary_from_output(&response.output)
@@ -5064,10 +5067,6 @@ impl turn::orchestrator::TurnOrchestratorOps for Arc<AgentRuntime> {
             cancellation_token,
         )
         .await
-    }
-
-    async fn persist_agent(&self, agent: &AgentRecord) -> Result<()> {
-        AgentRuntime::persist_agent(self.as_ref(), agent).await
     }
 
     async fn start_next_queued_input_after_turn(&self, agent_id: AgentId) {

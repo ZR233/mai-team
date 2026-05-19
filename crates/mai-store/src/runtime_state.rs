@@ -106,6 +106,11 @@ impl ConfigStore {
             title: session.title.clone(),
             created_at: session.created_at.to_rfc3339(),
             updated_at: session.updated_at.to_rfc3339(),
+            input_tokens: u64_to_i64(session.token_usage.input_tokens),
+            cached_input_tokens: u64_to_i64(session.token_usage.cached_input_tokens),
+            output_tokens: u64_to_i64(session.token_usage.output_tokens),
+            reasoning_output_tokens: u64_to_i64(session.token_usage.reasoning_output_tokens),
+            total_tokens: u64_to_i64(session.token_usage.total_tokens),
         })
         .exec(&mut db)
         .await?;
@@ -306,6 +311,13 @@ impl ConfigStore {
                     created_at: parse_utc(&row.created_at)?,
                     updated_at: parse_utc(&row.updated_at)?,
                     message_count: messages.len(),
+                    token_usage: TokenUsage {
+                        input_tokens: i64_to_u64(row.input_tokens),
+                        cached_input_tokens: i64_to_u64(row.cached_input_tokens),
+                        output_tokens: i64_to_u64(row.output_tokens),
+                        reasoning_output_tokens: i64_to_u64(row.reasoning_output_tokens),
+                        total_tokens: i64_to_u64(row.total_tokens),
+                    },
                 },
                 history,
                 last_context_tokens,

@@ -211,6 +211,8 @@ pub struct AgentSessionSummary {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub message_count: usize,
+    #[serde(default)]
+    pub token_usage: TokenUsage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use mai_model::ModelTurnState;
 use mai_protocol::{
     AgentId, AgentStatus, MessageRole, ModelInputItem, ServiceEventKind, SessionId,
-    SkillsConfigRequest, TurnId, TurnStatus, now,
+    SkillsConfigRequest, TurnId, TurnStatus,
 };
 use mai_skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
 use mai_tools::build_tool_definitions_with_filter;
@@ -98,8 +98,6 @@ pub(crate) trait TurnOrchestratorOps: Send + Sync {
         arguments: Value,
         cancellation_token: CancellationToken,
     ) -> Result<ToolExecution>;
-
-    async fn persist_agent(&self, agent: &AgentRecord) -> Result<()>;
 
     async fn start_next_queued_input_after_turn(&self, agent_id: AgentId);
 }
@@ -496,12 +494,15 @@ pub(crate) async fn run_turn_inner(
         .await;
 
         if let Some(usage) = model_turn.response.usage.clone() {
-            {
-                let mut summary = agent.summary.write().await;
-                summary.token_usage.add(&usage);
-                summary.updated_at = now();
-            }
-            ops.persist_agent(&agent).await?;
+            super::accounting::record_model_usage(
+                deps.store.as_ref(),
+                events,
+                &agent,
+                agent_id,
+                session_id,
+                &usage,
+            )
+            .await?;
             super::history::record_session_context_tokens(
                 deps.store.as_ref(),
                 &agent,

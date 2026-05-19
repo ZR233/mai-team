@@ -5,7 +5,8 @@ use std::sync::atomic::Ordering;
 use chrono::{DateTime, Utc};
 use mai_protocol::{
     AgentDetail, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary,
-    ContextUsage, MessageRole, ModelInputItem, ServiceEvent, ServiceEventKind, SessionId, now,
+    ContextUsage, MessageRole, ModelInputItem, ServiceEvent, ServiceEventKind, SessionId,
+    TokenUsage, now,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -327,6 +328,7 @@ pub(crate) fn session_record_with_title(title: &str) -> AgentSessionRecord {
             created_at: now,
             updated_at: now,
             message_count: 0,
+            token_usage: TokenUsage::default(),
         },
         messages: Vec::new(),
         history: Vec::new(),

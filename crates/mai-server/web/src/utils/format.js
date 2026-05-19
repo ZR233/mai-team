@@ -24,8 +24,24 @@ function formatTokenCount(value) {
   return Number(value || 0).toLocaleString()
 }
 
+function numericTokenUsage(value = {}) {
+  return {
+    input_tokens: Number(value.input_tokens || 0),
+    cached_input_tokens: Number(value.cached_input_tokens || 0),
+    output_tokens: Number(value.output_tokens || 0),
+    reasoning_output_tokens: Number(value.reasoning_output_tokens || 0),
+    total_tokens: Number(value.total_tokens || 0)
+  }
+}
+
+export function sessionTokenUsage(agent) {
+  const selectedSessionId = agent?.selected_session_id
+  const session = (agent?.sessions || []).find((item) => item.id === selectedSessionId)
+  return numericTokenUsage(session?.token_usage || agent?.token_usage || {})
+}
+
 export function tokenUsage(agent) {
-  const usage = agent.token_usage || {}
+  const usage = sessionTokenUsage(agent)
   return {
     input: formatTokenCount(usage.input_tokens),
     cachedInput: formatTokenCount(usage.cached_input_tokens),
@@ -37,6 +53,30 @@ export function tokenUsage(agent) {
 
 export function totalTokens(agent) {
   return tokenUsage(agent).total
+}
+
+export function tokenCacheTooltipRows(agent) {
+  const usage = sessionTokenUsage(agent)
+  const cacheMiss = Math.max(usage.input_tokens - usage.cached_input_tokens, 0)
+  const hitRate = usage.input_tokens > 0
+    ? Math.round((usage.cached_input_tokens / usage.input_tokens) * 100)
+    : 0
+  return [
+    { label: 'Input', value: formatTokenCount(usage.input_tokens) },
+    { label: 'Cache hit', value: formatTokenCount(usage.cached_input_tokens) },
+    { label: 'Cache miss', value: formatTokenCount(cacheMiss) },
+    { label: 'Hit rate', value: `${hitRate}%` },
+    { label: 'Output', value: formatTokenCount(usage.output_tokens) },
+    { label: 'Reasoning', value: formatTokenCount(usage.reasoning_output_tokens) },
+    { label: 'Total', value: formatTokenCount(usage.total_tokens) }
+  ]
+}
+
+export function tokenCacheTooltipLabel(agent) {
+  const rows = tokenCacheTooltipRows(agent)
+  return rows
+    .map((row) => `${row.label} ${row.value}`)
+    .join(', ')
 }
 
 export function tokenBreakdown(agent) {

@@ -7,6 +7,7 @@ use mai_protocol::{
     ProjectStatus, ServiceEventKind, TurnStatus,
 };
 use serde_json::json;
+use std::collections::BTreeMap;
 use tempfile::{TempDir, tempdir};
 use tokio::time::{Duration, timeout};
 
@@ -793,6 +794,13 @@ async fn runtime_snapshot_survives_reopen() {
         created_at: now,
         updated_at: now,
         message_count: 0,
+        token_usage: TokenUsage {
+            input_tokens: 10,
+            cached_input_tokens: 6,
+            output_tokens: 4,
+            reasoning_output_tokens: 2,
+            total_tokens: 14,
+        },
     };
     let message = AgentMessage {
         role: MessageRole::User,
@@ -883,6 +891,16 @@ async fn runtime_snapshot_survives_reopen() {
     assert_eq!(snapshot.agents[0].sessions.len(), 1);
     assert_eq!(snapshot.agents[0].sessions[0].summary.title, "Chat 1");
     assert_eq!(snapshot.agents[0].sessions[0].summary.message_count, 1);
+    assert_eq!(
+        snapshot.agents[0].sessions[0].summary.token_usage,
+        TokenUsage {
+            input_tokens: 10,
+            cached_input_tokens: 6,
+            output_tokens: 4,
+            reasoning_output_tokens: 2,
+            total_tokens: 14,
+        }
+    );
     assert_eq!(snapshot.agents[0].sessions[0].history.len(), 3);
     assert_eq!(snapshot.agents[0].sessions[0].last_context_tokens, None);
     assert!(matches!(
@@ -932,6 +950,114 @@ async fn runtime_snapshot_survives_reopen() {
 }
 
 #[tokio::test]
+async fn session_token_usage_is_isolated_per_session() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("config.sqlite3");
+    let config_path = dir.path().join("config.toml");
+    let store = ConfigStore::open_with_config_path(&db_path, &config_path)
+        .await
+        .expect("open");
+    let agent_id = Uuid::new_v4();
+    let first_session_id = Uuid::new_v4();
+    let second_session_id = Uuid::new_v4();
+    let now = Utc::now();
+    store
+        .save_agent(
+            &AgentSummary {
+                id: agent_id,
+                parent_id: None,
+                task_id: None,
+                project_id: None,
+                role: None,
+                name: "agent-test".to_string(),
+                status: AgentStatus::Completed,
+                container_id: None,
+                docker_image: "ubuntu:latest".to_string(),
+                provider_id: "openai".to_string(),
+                provider_name: "OpenAI".to_string(),
+                model: "gpt-5.2".to_string(),
+                reasoning_effort: None,
+                created_at: now,
+                updated_at: now,
+                current_turn: None,
+                last_error: None,
+                token_usage: TokenUsage::default(),
+            },
+            None,
+        )
+        .await
+        .expect("save agent");
+    store
+        .save_agent_session(
+            agent_id,
+            &AgentSessionSummary {
+                id: first_session_id,
+                title: "Chat 1".to_string(),
+                created_at: now,
+                updated_at: now,
+                message_count: 0,
+                token_usage: TokenUsage {
+                    input_tokens: 100,
+                    cached_input_tokens: 40,
+                    output_tokens: 20,
+                    reasoning_output_tokens: 5,
+                    total_tokens: 120,
+                },
+            },
+        )
+        .await
+        .expect("save first session");
+    store
+        .save_agent_session(
+            agent_id,
+            &AgentSessionSummary {
+                id: second_session_id,
+                title: "Chat 2".to_string(),
+                created_at: now,
+                updated_at: now,
+                message_count: 0,
+                token_usage: TokenUsage {
+                    input_tokens: 7,
+                    cached_input_tokens: 0,
+                    output_tokens: 3,
+                    reasoning_output_tokens: 1,
+                    total_tokens: 10,
+                },
+            },
+        )
+        .await
+        .expect("save second session");
+
+    let snapshot = store.load_runtime_snapshot(10).await.expect("snapshot");
+
+    let sessions = snapshot.agents[0]
+        .sessions
+        .iter()
+        .map(|session| (session.summary.id, session.summary.token_usage.clone()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        sessions.get(&first_session_id),
+        Some(&TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 40,
+            output_tokens: 20,
+            reasoning_output_tokens: 5,
+            total_tokens: 120,
+        })
+    );
+    assert_eq!(
+        sessions.get(&second_session_id),
+        Some(&TokenUsage {
+            input_tokens: 7,
+            cached_input_tokens: 0,
+            output_tokens: 3,
+            reasoning_output_tokens: 1,
+            total_tokens: 10,
+        })
+    );
+}
+
+#[tokio::test]
 async fn replace_agent_history_only_replaces_target_session() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("config.sqlite3");
@@ -973,6 +1099,7 @@ async fn replace_agent_history_only_replaces_target_session() {
                     created_at: now,
                     updated_at: now,
                     message_count: 0,
+                    token_usage: TokenUsage::default(),
                 },
             )
             .await
@@ -1071,6 +1198,7 @@ async fn session_context_tokens_survive_reopen_and_clear() {
                 created_at: now,
                 updated_at: now,
                 message_count: 0,
+                token_usage: TokenUsage::default(),
             },
         )
         .await

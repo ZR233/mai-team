@@ -1132,6 +1132,7 @@ async fn save_test_session(store: &ConfigStore, agent_id: AgentId, session_id: S
                 created_at: timestamp,
                 updated_at: timestamp,
                 message_count: 0,
+                token_usage: TokenUsage::default(),
             },
         )
         .await
@@ -1639,10 +1640,7 @@ async fn send_environment_message_targets_selected_conversation_without_plan_tra
 
 #[tokio::test]
 async fn environment_root_model_update_before_send_and_busy_rejection_remain() {
-    let (base_url, _requests) = start_mock_responses(vec![json!({
-        "__close_without_response": true
-    })])
-    .await;
+    let (base_url, _requests) = start_mock_responses(Vec::new()).await;
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     let mut provider = compact_test_provider(base_url);
@@ -1679,19 +1677,16 @@ async fn environment_root_model_update_before_send_and_busy_rejection_remain() {
         .expect("update model");
 
     assert_eq!(updated.model, "mock-alt");
-    let detail = runtime
-        .get_environment(environment.id, None)
+    let turn_id = Uuid::new_v4();
+    let agent = runtime
+        .agent(environment.root_agent_id)
         .await
-        .expect("environment detail");
-    let turn_id = runtime
-        .send_environment_message(
-            environment.id,
-            detail.current_conversation_id,
-            "hello".to_string(),
-            Vec::new(),
-        )
-        .await
-        .expect("send message");
+        .expect("root agent");
+    {
+        let mut summary = agent.summary.write().await;
+        summary.status = AgentStatus::RunningTurn;
+        summary.current_turn = Some(turn_id);
+    }
     let busy = runtime
         .update_agent(
             environment.root_agent_id,
@@ -1706,10 +1701,6 @@ async fn environment_root_model_update_before_send_and_busy_rejection_remain() {
         busy,
         Err(RuntimeError::AgentBusy(id)) if id == environment.root_agent_id
     ));
-    runtime
-        .cancel_agent_turn(environment.root_agent_id, turn_id)
-        .await
-        .expect("cancel hung turn");
 }
 
 #[tokio::test]
@@ -2438,6 +2429,7 @@ async fn restores_persisted_agents_and_continues_event_sequence() {
                 created_at: timestamp,
                 updated_at: timestamp,
                 message_count: 0,
+                token_usage: TokenUsage::default(),
             },
         )
         .await
@@ -2551,6 +2543,7 @@ async fn wait_agent_tool_returns_final_assistant_response() {
                 created_at: timestamp,
                 updated_at: timestamp,
                 message_count: 0,
+                token_usage: TokenUsage::default(),
             },
         )
         .await
@@ -2670,6 +2663,7 @@ async fn tool_trace_returns_full_history_with_event_metadata() {
                 created_at: timestamp,
                 updated_at: timestamp,
                 message_count: 0,
+                token_usage: TokenUsage::default(),
             },
         )
         .await
@@ -2850,6 +2844,7 @@ async fn tool_trace_finds_calls_stored_in_function_call_items() {
                 created_at: timestamp,
                 updated_at: timestamp,
                 message_count: 0,
+                token_usage: TokenUsage::default(),
             },
         )
         .await
@@ -4499,6 +4494,7 @@ async fn agent_detail_uses_deepseek_v4_context_tokens() {
                 created_at: timestamp,
                 updated_at: timestamp,
                 message_count: 0,
+                token_usage: TokenUsage::default(),
             },
         )
         .await
@@ -4788,6 +4784,7 @@ async fn spawn_agent_uses_executor_default_when_role_omitted() {
                 created_at: timestamp,
                 updated_at: timestamp,
                 message_count: 0,
+                token_usage: TokenUsage::default(),
             },
         )
         .await
@@ -4910,6 +4907,7 @@ async fn spawn_agent_uses_role_config_over_parent_defaults() {
                 created_at: timestamp,
                 updated_at: timestamp,
                 message_count: 0,
+                token_usage: TokenUsage::default(),
             },
         )
         .await
@@ -6051,6 +6049,7 @@ async fn wait_agent_accepts_targets_and_send_input_queues_busy_target() {
                 created_at: timestamp,
                 updated_at: timestamp,
                 message_count: 0,
+                token_usage: TokenUsage::default(),
             },
         )
         .await
@@ -6156,6 +6155,7 @@ async fn send_input_queued_skill_item_is_preserved_for_next_turn() {
                 created_at: timestamp,
                 updated_at: timestamp,
                 message_count: 0,
+                token_usage: TokenUsage::default(),
             },
         )
         .await
@@ -7848,6 +7848,7 @@ async fn finishing_project_review_run_captures_reviewer_snapshot() {
                 created_at: now(),
                 updated_at: now(),
                 message_count: 0,
+                token_usage: TokenUsage::default(),
             },
         )
         .await

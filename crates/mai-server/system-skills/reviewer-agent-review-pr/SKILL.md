@@ -49,9 +49,9 @@ python3 scripts/review_pr_helper.py prepare-review --repo /path/to/repo --agent-
 
 ## Workflow
 
-### 1. Identify Repository and Account
+### 1. Identify Repository
 
-Use `github_api_get` with path `/user` to get the authenticated user login. Identify `owner` and `repo` from the project context or `/workspace/repo` remote.
+Identify `owner` and `repo` from the project context or `/workspace/repo` remote. Do not look up the authenticated user login before review submission; rely on GitHub's review submission result and use the fallback path if GitHub rejects the review.
 
 If `github_api_get` or `github_api_request` is unavailable, return only:
 
@@ -67,12 +67,18 @@ Fetch the target PR with visible Mai GitHub API tools. Use `github_api_get` with
 
 - `/repos/OWNER/REPO/pulls/PR`
 - `/repos/OWNER/REPO/pulls/PR/reviews`
+- `/repos/OWNER/REPO/pulls/PR/comments`
+- `/repos/OWNER/REPO/issues/PR/comments`
 - `/repos/OWNER/REPO/commits/HEAD_SHA/check-runs`
 - `/repos/OWNER/REPO/commits/HEAD_SHA/status`
 
 Do not scan for another PR, do not replace the target PR, and do not skip the target PR because of draft state, author identity, existing reviews, or CI status. Treat those facts as review context only.
 
 Practical note: many PRs expose `mergeable_state: "unknown"` even when `get_check_runs` is available. Do not infer passing CI from `mergeable_state == "unknown"`; rely on actual check runs when describing validation context.
+
+Read previous review comments and PR comments before making a decision. Check whether each earlier actionable comment is technically reasonable, whether the current PR revision resolves it, and whether any unresolved reasonable comment should remain blocking or be mentioned in the review body.
+
+Check CI status and check runs before submitting. If CI is failing, inspect the failing checks enough to decide whether the failure is caused by this PR's changes. Do not approve when a current CI failure is caused by the PR; request changes or comment with the failure context instead.
 
 ### 3. Prepare the Reviewer Clone
 
@@ -110,6 +116,12 @@ Prioritize bugs, regressions, security risks, data-loss risks, missing tests, br
 
 Compare changed code with 2-3 similar existing files in the clone. For Rust, check module boundaries, trait usage, error handling style, serde compatibility, dependency direction, `unwrap()`/`expect()` in production paths, lock ordering, and RAII cleanup.
 
+Analyze the impact on existing behavior, not only the changed lines. Identify which existing features, APIs, workflows, data formats, persistence paths, background jobs, and tests could be affected. Decide whether the PR is truly isolated or whether it changes shared contracts or cross-cutting behavior.
+
+Assess concurrency and liveness risks. For code involving async work, locks, channels, callbacks, transactions, or shared mutable state, analyze whether the PR can introduce deadlocks, lock-order inversions, missed wakeups, starvation, blocking-in-async, or resource leaks.
+
+Assess design quality and maintainability. Check whether responsibilities are placed in the right module, whether abstractions match existing patterns, and whether the PR introduces overly large functions, overly large structs, catch-all facades, duplicated logic, or unclear ownership boundaries. Treat design issues as blocking when they create real correctness, maintenance, or architecture risk.
+
 Search similar PRs before submission:
 
 ```text
@@ -126,6 +138,14 @@ Use `REQUEST_CHANGES` when any blocking finding exists, `APPROVE` when safe to m
 For each line-specific finding, prepare an inline comment on the changed line with `side: "RIGHT"`. Do not submit inline comments individually. Collect every inline comment into the final review request's `comments` array. Each comment should state the problem, why it matters, and a concrete fix or alternative. Put non-line-specific findings in the review body.
 
 Keep the review body concise. Include validation results, similar-PR notes, and any non-inline findings.
+
+The review body must explicitly cover:
+
+- What the PR changes and which problems it solves.
+- Which existing features or contracts may be affected, including whether the change appears isolated.
+- CI status, local validation results, and whether any failing CI appears caused by this PR.
+- Previous review comments considered, whether they are reasonable, and whether they are resolved.
+- Remaining unresolved issues, risks, or test gaps. If none remain, say so clearly.
 
 ### 7. Submit the GitHub Review
 
@@ -152,7 +172,7 @@ Use this single REST request shape:
 }
 ```
 
-Set `event` to `REQUEST_CHANGES`, `APPROVE`, or `COMMENT`. If submission fails because the account is the PR author or GitHub rejects the event, leave a normal PR comment with `github_api_request` to `POST /repos/OWNER/REPO/issues/PR/comments` when appropriate; otherwise report the failure.
+Set `event` to `REQUEST_CHANGES`, `APPROVE`, or `COMMENT`. If GitHub rejects the review submission for any reason where a normal PR comment is still appropriate, leave that comment with `github_api_request` to `POST /repos/OWNER/REPO/issues/PR/comments`; otherwise report the failure.
 
 ### 8. Final Response
 

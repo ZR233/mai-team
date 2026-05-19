@@ -4350,12 +4350,14 @@ p {
 }
 
 .context-status-line {
+  position: relative;
+  z-index: 3;
   flex-shrink: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 12px;
-  overflow: hidden;
+  overflow: visible;
   min-height: 36px;
   max-width: 100%;
   padding: 6px 18px;
@@ -4409,10 +4411,11 @@ p {
   max-width: 100%;
   justify-content: flex-end;
   gap: 6px;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .status-line-item {
+  position: relative;
   gap: 6px;
   min-height: 24px;
   max-width: 220px;
@@ -4436,6 +4439,79 @@ p {
   font-size: 11px;
   font-weight: 800;
   text-overflow: ellipsis;
+}
+
+.token-status-chip {
+  cursor: help;
+  outline: none;
+}
+
+.token-status-chip:focus-visible {
+  border-color: #1f6feb;
+  box-shadow: 0 0 0 3px rgba(31, 111, 235, 0.16);
+}
+
+.token-cache-tooltip {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 20;
+  display: grid;
+  gap: 5px;
+  width: max-content;
+  min-width: 180px;
+  max-width: min(280px, calc(100vw - 32px));
+  padding: 10px 12px;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  background: #172033;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.24);
+  color: #d8e0ea;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(4px);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+
+.token-cache-tooltip::after {
+  position: absolute;
+  right: 18px;
+  bottom: -5px;
+  width: 10px;
+  height: 10px;
+  border-right: 1px solid #d8e0ea;
+  border-bottom: 1px solid #d8e0ea;
+  background: #172033;
+  content: '';
+  transform: rotate(45deg);
+}
+
+.token-status-chip:hover .token-cache-tooltip,
+.token-status-chip:focus-visible .token-cache-tooltip,
+.token-status-chip:focus-within .token-cache-tooltip {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.token-cache-tooltip-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 18px;
+  min-width: 0;
+}
+
+.token-cache-tooltip-row > span {
+  color: #aeb9c9;
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.token-cache-tooltip-row > strong {
+  color: #fff;
+  font-size: 11px;
+  font-weight: 850;
+  text-align: right;
 }
 
 .context-status-chip {
@@ -5663,6 +5739,16 @@ select:focus {
 
   .status-line-item {
     max-width: calc(50% - 3px);
+  }
+
+  .token-cache-tooltip {
+    right: auto;
+    left: 0;
+  }
+
+  .token-cache-tooltip::after {
+    right: auto;
+    left: 18px;
   }
 
   .context-status-chip {

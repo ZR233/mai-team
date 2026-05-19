@@ -14,14 +14,19 @@ const longActivity = [
 
 const statusItems = [
   ['CTX', '128k'],
-  ['USED', '118k'],
+  ['Tokens', '<strong>118k</strong><span class="token-cache-tooltip"><span class="token-cache-tooltip-row"><span>Input</span><strong>128k</strong></span><span class="token-cache-tooltip-row"><span>Cache hit</span><strong>64k</strong></span></span>'],
   ['LEFT', '10k'],
   ['MODEL', 'deepseek-reasoner']
 ]
 
 function statusFixture() {
   const itemMarkup = statusItems
-    .map(([label, value]) => `<div class="status-line-item"><span>${label}</span><strong>${value}</strong></div>`)
+    .map(([label, value]) => {
+      if (label === 'Tokens') {
+        return `<div class="status-line-item token-status-chip" tabindex="0"><span>${label}</span>${value}</div>`
+      }
+      return `<div class="status-line-item"><span>${label}</span><strong>${value}</strong></div>`
+    })
     .join('')
 
   return `<!doctype html>
@@ -37,6 +42,9 @@ function statusFixture() {
             overflow: auto;
             width: 100vw;
           }
+          .chat-harness {
+            height: 82px;
+          }
           .composer-shell {
             border-top: 1px solid #d8e0ea;
           }
@@ -49,6 +57,7 @@ function statusFixture() {
       </head>
       <body>
         <main class="layout-harness">
+          <section class="chat-harness"></section>
           <section class="context-status-line">
             <div class="status-line-left">
               <span class="status-line-state">
@@ -78,9 +87,13 @@ try {
       const status = document.querySelector('.context-status-line')
       const activity = document.querySelector('.status-line-activity')
       const items = document.querySelector('.status-line-items')
+      const tokenChip = document.querySelector('.token-status-chip')
+      const tooltip = document.querySelector('.token-cache-tooltip')
       const statusStyle = getComputedStyle(status)
       const activityStyle = getComputedStyle(activity)
       const itemsStyle = getComputedStyle(items)
+      const tokenChipStyle = getComputedStyle(tokenChip)
+      const tooltipStyle = getComputedStyle(tooltip)
 
       return {
         activityClientWidth: activity.clientWidth,
@@ -93,15 +106,23 @@ try {
         itemsOverflowX: itemsStyle.overflowX,
         statusClientWidth: status.clientWidth,
         statusDisplay: statusStyle.display,
-        statusScrollWidth: status.scrollWidth
+        statusOverflowX: statusStyle.overflowX,
+        statusScrollWidth: status.scrollWidth,
+        tokenChipPosition: tokenChipStyle.position,
+        tooltipPosition: tooltipStyle.position,
+        tooltipOpacity: tooltipStyle.opacity
       }
     })
 
     assert.equal(metrics.statusDisplay, 'grid')
+    assert.equal(metrics.tokenChipPosition, 'relative')
+    assert.equal(metrics.tooltipPosition, 'absolute')
+    assert.equal(metrics.tooltipOpacity, '0')
     assert.equal(metrics.activityMinWidth, '0px')
     assert.equal(metrics.activityFlexGrow, '1')
     assert.equal(metrics.activityFlexShrink, '1')
-    assert.notEqual(metrics.itemsOverflowX, 'auto')
+    assert.equal(metrics.statusOverflowX, 'visible')
+    assert.equal(metrics.itemsOverflowX, 'visible')
     assert.ok(
       metrics.documentScrollWidth <= metrics.documentClientWidth,
       `status line should not create document overflow at ${width}px: ${JSON.stringify(metrics)}`
@@ -114,6 +135,55 @@ try {
       metrics.activityScrollWidth > metrics.activityClientWidth,
       `long activity should be visually ellipsized at ${width}px: ${JSON.stringify(metrics)}`
     )
+
+    await page.hover('.token-status-chip')
+    await page.waitForFunction(() => {
+      const tooltip = document.querySelector('.token-cache-tooltip')
+      return getComputedStyle(tooltip).opacity === '1'
+    })
+
+    const hoverMetrics = await page.evaluate(() => {
+      const tooltip = document.querySelector('.token-cache-tooltip')
+      const tooltipStyle = getComputedStyle(tooltip)
+      const tooltipRect = tooltip.getBoundingClientRect()
+
+      return {
+        tooltipBottom: tooltipRect.bottom,
+        tooltipHeight: tooltipRect.height,
+        tooltipLeft: tooltipRect.left,
+        tooltipOpacity: tooltipStyle.opacity,
+        tooltipRight: tooltipRect.right,
+        tooltipTop: tooltipRect.top,
+        tooltipTransform: tooltipStyle.transform,
+        viewportWidth: window.innerWidth
+      }
+    })
+
+    assert.equal(hoverMetrics.tooltipOpacity, '1')
+    assert.equal(hoverMetrics.tooltipTransform, 'matrix(1, 0, 0, 1, 0, 0)')
+    assert.ok(
+      hoverMetrics.tooltipHeight > 0,
+      `token tooltip should have visible height at ${width}px: ${JSON.stringify(hoverMetrics)}`
+    )
+    assert.ok(
+      hoverMetrics.tooltipTop >= 0,
+      `token tooltip should fit inside the viewport vertically at ${width}px: ${JSON.stringify(hoverMetrics)}`
+    )
+    assert.ok(
+      hoverMetrics.tooltipLeft >= 0 && hoverMetrics.tooltipRight <= hoverMetrics.viewportWidth,
+      `token tooltip should fit inside the viewport horizontally at ${width}px: ${JSON.stringify(hoverMetrics)}`
+    )
+
+    await page.mouse.move(0, 0)
+    await page.waitForFunction(() => {
+      const tooltip = document.querySelector('.token-cache-tooltip')
+      return getComputedStyle(tooltip).opacity === '0'
+    })
+    await page.focus('.token-status-chip')
+    await page.waitForFunction(() => {
+      const tooltip = document.querySelector('.token-cache-tooltip')
+      return getComputedStyle(tooltip).opacity === '1'
+    })
 
     await page.close()
   }

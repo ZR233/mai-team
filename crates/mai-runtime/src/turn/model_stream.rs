@@ -696,6 +696,7 @@ mod tests {
                 created_at,
                 updated_at: created_at,
                 message_count: 0,
+                token_usage: TokenUsage::default(),
             };
             let agent = Arc::new(AgentRecord {
                 summary: RwLock::new(summary.clone()),

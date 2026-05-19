@@ -165,6 +165,11 @@ pub(crate) struct AgentSessionRecord {
     pub(crate) title: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
+    pub(crate) input_tokens: i64,
+    pub(crate) cached_input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) reasoning_output_tokens: i64,
+    pub(crate) total_tokens: i64,
 }
 
 #[derive(Debug, Clone, toasty::Model)]

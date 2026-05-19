@@ -17,9 +17,19 @@
         <span>Reasoning</span>
         <strong>{{ reasoningLabel(detail.reasoning_effort) }}</strong>
       </span>
-      <span class="status-line-item">
+      <span class="status-line-item token-status-chip" tabindex="0" :aria-label="tokenCacheTooltipLabel(detail)">
         <span>Tokens</span>
-        <strong :title="tokenBreakdown(detail)">{{ totalTokens(detail) }}</strong>
+        <strong>{{ totalTokens(detail) }}</strong>
+        <span class="token-cache-tooltip" role="tooltip" aria-hidden="true">
+          <span
+            v-for="row in tokenCacheTooltipRows(detail)"
+            :key="row.label"
+            class="token-cache-tooltip-row"
+          >
+            <span>{{ row.label }}</span>
+            <strong>{{ row.value }}</strong>
+          </span>
+        </span>
       </span>
       <span
         v-if="contextCapacity.visible"
@@ -37,7 +47,7 @@
 </template>
 
 <script setup>
-import { formatStatus, statusTone, tokenBreakdown, totalTokens } from '../utils/format'
+import { formatStatus, statusTone, tokenCacheTooltipLabel, tokenCacheTooltipRows, totalTokens } from '../utils/format'
 import { reasoningLabel } from '../utils/reasoning'
 
 defineProps({
