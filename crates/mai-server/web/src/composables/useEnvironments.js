@@ -63,7 +63,6 @@ export function useEnvironments() {
         || null
       await nextTick()
       highlightCodeBlocks(environmentConversationRef.value)
-      await scrollEnvironmentConversationToBottom()
     } finally {
       if (isFirstLoad) isEnvironmentDetailLoading.value = false
     }

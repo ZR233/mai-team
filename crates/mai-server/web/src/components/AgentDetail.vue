@@ -36,6 +36,16 @@
         :trace-state="traceState"
         @toggle-tool="toggleTool"
       />
+      <Transition name="scroll-btn">
+        <button
+          v-if="!userAtBottom"
+          class="scroll-to-latest-btn"
+          type="button"
+          @click="forceScrollToBottom"
+        >
+          ↓ Latest
+        </button>
+      </Transition>
     </div>
 
     <ContextStatusLine
@@ -79,7 +89,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import AgentHeader from './AgentHeader.vue'
 import AgentModelPicker from './AgentModelPicker.vue'
 import ChatTimeline from './ChatTimeline.vue'
@@ -135,6 +145,7 @@ const emit = defineEmits([
 const { api, showToast } = useApi()
 const expandedTools = reactive({})
 const traces = reactive({})
+const userAtBottom = ref(true)
 const answeredInputKeys = reactive(new Set())
 const emptyTrace = { loading: false, error: '', detail: null }
 const currentReasoningEffort = ref('')
@@ -309,4 +320,24 @@ async function scrollTimelineToBottom() {
     conversationRef.value.scrollTop = conversationRef.value.scrollHeight
   }
 }
+
+async function forceScrollToBottom() {
+  await scrollTimelineToBottom()
+  userAtBottom.value = true
+}
+
+function onTimelineScroll() {
+  userAtBottom.value = isNearTimelineBottom()
+}
+
+watch(conversationRef, (element, prev) => {
+  if (prev) prev.removeEventListener('scroll', onTimelineScroll)
+  if (element) element.addEventListener('scroll', onTimelineScroll, { passive: true })
+}, { immediate: true })
+
+onBeforeUnmount(() => {
+  if (conversationRef.value) conversationRef.value.removeEventListener('scroll', onTimelineScroll)
+})
+
+defineExpose({ userAtBottom, forceScrollToBottom })
 </script>

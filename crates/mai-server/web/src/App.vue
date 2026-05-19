@@ -28,6 +28,7 @@
 
     <main class="workspace">
       <ProjectWorkspace
+        ref="projectWorkspaceRef"
         v-if="activeTab === 'projects'"
         v-model:conversation-ref="projectConversationRef"
         :projects="projects"
@@ -67,6 +68,7 @@
       />
 
       <ChatEnvironmentWorkspace
+        ref="chatWorkspaceRef"
         v-else-if="activeTab === 'chat'"
         v-model:conversation-ref="environmentConversationRef"
         :environments="environments"
@@ -319,12 +321,16 @@ const {
 } = useGithubApp()
 
 const activeTab = ref('chat')
+const chatWorkspaceRef = ref(null)
+const projectWorkspaceRef = ref(null)
 const messageDraft = ref('')
 const projectMessageDraft = ref('')
 const selectedSkills = ref([])
 const selectedProjectSkills = ref([])
 const isUpdatingAgentModel = ref(false)
 const isUpdatingProjectAgentModel = ref(false)
+const previousSessionId = ref(null)
+const previousProjectSessionId = ref(null)
 const skillsError = ref('')
 const mcpDialogOpen = ref(false)
 const settingsInitialSection = ref('roles')
@@ -367,9 +373,29 @@ watch(
     eventFeed.value.length
   ],
   async () => {
+    const currentSessionId = selectedEnvironmentDetail.value?.root_agent?.selected_session_id
+    const sessionChanged = currentSessionId !== previousSessionId.value
+    previousSessionId.value = currentSessionId
+
     await nextTick()
     highlightCodeBlocks(environmentConversationRef.value)
-    await scrollEnvironmentConversationToBottom()
+
+    if (sessionChanged) {
+      await scrollEnvironmentConversationToBottom()
+      if (chatWorkspaceRef.value) chatWorkspaceRef.value.userAtBottom = true
+    } else {
+      const atBottom = chatWorkspaceRef.value?.userAtBottom ?? true
+      if (atBottom) {
+        await scrollEnvironmentConversationToBottom()
+      }
+    }
+  }
+)
+
+watch(
+  () => selectedEnvironmentDetail.value,
+  (detail) => {
+    if (!detail) previousSessionId.value = null
   }
 )
 
@@ -381,9 +407,31 @@ watch(
     eventFeed.value.length
   ],
   async () => {
+    const currentSessionId = selectedProjectDetail.value?.selected_agent?.selected_session_id
+    const sessionChanged = currentSessionId !== previousProjectSessionId.value
+    previousProjectSessionId.value = currentSessionId
+
     await nextTick()
     highlightCodeBlocks(projectConversationRef.value)
-    await scrollProjectConversationToBottom()
+
+    if (sessionChanged) {
+      await scrollProjectConversationToBottom()
+      const agentRef = projectWorkspaceRef.value?.agentDetailRef
+      if (agentRef) agentRef.userAtBottom = true
+    } else {
+      const agentRef = projectWorkspaceRef.value?.agentDetailRef
+      const atBottom = agentRef?.userAtBottom ?? true
+      if (atBottom) {
+        await scrollProjectConversationToBottom()
+      }
+    }
+  }
+)
+
+watch(
+  () => selectedProjectDetail.value,
+  (detail) => {
+    if (!detail) previousProjectSessionId.value = null
   }
 )
 

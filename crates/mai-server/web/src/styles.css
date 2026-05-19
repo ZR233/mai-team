@@ -495,6 +495,7 @@ p {
 }
 
 .chat-body {
+  position: relative;
   display: flex;
   flex: 1;
   min-height: 0;
@@ -503,6 +504,50 @@ p {
 
 .chat-body .chat-timeline {
   flex: 1;
+}
+
+.scroll-to-latest-btn {
+  position: absolute;
+  bottom: 12px;
+  right: 20px;
+  z-index: 10;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #d8e0ea;
+  border-radius: 20px;
+  padding: 6px 14px;
+  color: #3b4a5e;
+  background: rgba(255, 255, 255, 0.95);
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.12);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s, box-shadow 0.15s;
+}
+
+.scroll-to-latest-btn:hover {
+  background: #fff;
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.18);
+}
+
+.scroll-btn-enter-active {
+  animation: scrollBtnIn 0.2s ease;
+}
+
+.scroll-btn-leave-active {
+  animation: scrollBtnIn 0.15s ease reverse;
+}
+
+@keyframes scrollBtnIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .agent-rail {
@@ -3201,6 +3246,7 @@ p {
 }
 
 .agent-body {
+  position: relative;
   display: flex;
   flex: 1;
   min-height: 0;

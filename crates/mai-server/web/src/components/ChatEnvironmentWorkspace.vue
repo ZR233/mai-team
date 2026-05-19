@@ -103,6 +103,16 @@
         :trace-state="traceState"
         @toggle-tool="toggleTool"
       />
+      <Transition name="scroll-btn">
+        <button
+          v-if="!userAtBottom"
+          class="scroll-to-latest-btn"
+          type="button"
+          @click="forceScrollToBottom"
+        >
+          ↓ Latest
+        </button>
+      </Transition>
     </div>
 
     <ContextStatusLine
@@ -203,6 +213,7 @@ const conversationMenuOpen = ref(false)
 const environmentMenuOpen = ref(false)
 const expandedTools = reactive({})
 const traces = reactive({})
+const userAtBottom = ref(true)
 const answeredInputKeys = reactive(new Set())
 const emptyTrace = { loading: false, error: '', detail: null }
 const currentReasoningEffort = ref('')
@@ -431,6 +442,22 @@ async function scrollTimelineToBottom() {
   }
 }
 
+async function forceScrollToBottom() {
+  await scrollTimelineToBottom()
+  userAtBottom.value = true
+}
+
+function onTimelineScroll() {
+  userAtBottom.value = isNearTimelineBottom()
+}
+
+watch(conversationRef, (element, prev) => {
+  if (prev) prev.removeEventListener('scroll', onTimelineScroll)
+  if (element) element.addEventListener('scroll', onTimelineScroll, { passive: true })
+}, { immediate: true })
+
+defineExpose({ userAtBottom, forceScrollToBottom })
+
 function isToolTimelineItem(item) {
   return item?.type === 'tool_call' || item?.type === 'tool'
 }
@@ -462,5 +489,6 @@ function onDocumentPointerDown(event) {
 
 onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', onDocumentPointerDown)
+  if (conversationRef.value) conversationRef.value.removeEventListener('scroll', onTimelineScroll)
 })
 </script>

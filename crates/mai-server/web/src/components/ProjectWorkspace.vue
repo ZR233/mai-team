@@ -396,6 +396,7 @@
           </button>
         </div>
         <AgentDetail
+          ref="agentDetailRef"
           v-if="detail.selected_agent"
           :detail="detail.selected_agent"
           :events="events"
@@ -456,6 +457,12 @@ const props = defineProps({
 })
 
 const conversationRef = defineModel('conversationRef', { default: null })
+
+const agentDetailRef = ref(null)
+
+defineExpose({
+  agentDetailRef
+})
 
 const emit = defineEmits([
   'create',

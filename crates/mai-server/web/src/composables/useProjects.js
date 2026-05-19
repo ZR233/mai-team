@@ -78,7 +78,6 @@ export function useProjects() {
       }
       await nextTick()
       highlightCodeBlocks(projectConversationRef.value)
-      await scrollProjectConversationToBottom()
     } finally {
       if (isFirstLoad) isProjectDetailLoading.value = false
     }
