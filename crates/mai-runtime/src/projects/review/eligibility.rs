@@ -214,6 +214,7 @@ async fn pull_request_reviews(
         .into_iter()
         .map(|review| PullRequestReview {
             author_login: review.user.map(|user| user.login),
+            state: review.state,
             submitted_at: review.submitted_at,
             commit_id: review.commit_id,
         })
@@ -338,6 +339,8 @@ struct GithubPullRequestHead {
 struct GithubPullRequestReview {
     #[serde(default)]
     user: Option<GithubUser>,
+    #[serde(default)]
+    state: Option<String>,
     #[serde(default)]
     submitted_at: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -570,6 +573,58 @@ mod tests {
             Some(SelectedProjectReviewPr {
                 pr: 616,
                 head_sha: Some("head-616".to_string()),
+            }),
+            selected
+        );
+    }
+
+    #[tokio::test]
+    async fn single_pr_eligibility_reselects_after_later_changes_requested_review() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeEligibilityOps::new(vec![
+            (
+                "/repos/owner/repo/pulls/718".to_string(),
+                pr_detail(718, false, "head-718"),
+            ),
+            (
+                "/repos/owner/repo/pulls/718/reviews?per_page=100".to_string(),
+                json!([
+                    {
+                        "user": { "login": "mai-bot" },
+                        "state": "APPROVED",
+                        "submitted_at": "2026-05-18T09:44:36Z",
+                        "commit_id": "head-718"
+                    },
+                    {
+                        "user": { "login": "human-reviewer" },
+                        "state": "CHANGES_REQUESTED",
+                        "submitted_at": "2026-05-19T06:52:54Z",
+                        "commit_id": "head-718"
+                    }
+                ]),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D718".to_string(),
+                commit("2026-05-18T08:00:39Z"),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D718/check-runs?per_page=100".to_string(),
+                json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D718/status".to_string(),
+                json!({"state": "success"}),
+            ),
+        ]);
+
+        let selected = select_project_review_pr(&ops, project_id, 718, None)
+            .await
+            .expect("select pr");
+
+        assert_eq!(
+            Some(SelectedProjectReviewPr {
+                pr: 718,
+                head_sha: Some("head-718".to_string()),
             }),
             selected
         );

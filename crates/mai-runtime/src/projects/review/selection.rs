@@ -21,6 +21,7 @@ pub(crate) struct PullRequestCandidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PullRequestReview {
     pub(crate) author_login: Option<String>,
+    pub(crate) state: Option<String>,
     pub(crate) submitted_at: Option<DateTime<Utc>>,
     pub(crate) commit_id: Option<String>,
 }
@@ -71,9 +72,33 @@ fn already_reviewed_current_head(reviewer_login: &str, candidate: &PullRequestCa
     let Some(latest_review) = latest_reviewer_review(reviewer_login, &candidate.reviews) else {
         return false;
     };
-    if let (Some(reviewed_at), Some(latest_commit_at)) =
-        (latest_review.submitted_at, candidate.latest_commit_at)
-    {
+    let Some(reviewed_at) = latest_review.submitted_at else {
+        return false;
+    };
+    let has_later_changes_requested = candidate.reviews.iter().any(|review| {
+        let Some(submitted_at) = review.submitted_at else {
+            return false;
+        };
+        if submitted_at <= reviewed_at
+            || !review
+                .state
+                .as_deref()
+                .is_some_and(|state| state.trim().eq_ignore_ascii_case("CHANGES_REQUESTED"))
+        {
+            return false;
+        }
+        if let Some(review_commit) = review.commit_id.as_deref() {
+            let Some(head_sha) = candidate.head_sha.as_deref() else {
+                return false;
+            };
+            return review_commit == head_sha;
+        }
+        true
+    });
+    if has_later_changes_requested {
+        return false;
+    }
+    if let Some(latest_commit_at) = candidate.latest_commit_at {
         return latest_commit_at <= reviewed_at;
     }
     if let (Some(review_commit), Some(head_sha)) = (
@@ -238,6 +263,7 @@ mod tests {
         reviewed.latest_commit_at = Some(review_time - TimeDelta::minutes(1));
         reviewed.reviews = vec![PullRequestReview {
             author_login: Some("mai-bot".to_string()),
+            state: Some("APPROVED".to_string()),
             submitted_at: Some(review_time),
             commit_id: Some("head-6".to_string()),
         }];
@@ -261,6 +287,7 @@ mod tests {
         candidate.latest_commit_at = Some(review_time + TimeDelta::minutes(10));
         candidate.reviews = vec![PullRequestReview {
             author_login: Some("mai-bot".to_string()),
+            state: Some("APPROVED".to_string()),
             submitted_at: Some(review_time),
             commit_id: Some("head-15".to_string()),
         }];
@@ -283,6 +310,7 @@ mod tests {
         reviewed.latest_commit_at = Some(review_time - TimeDelta::minutes(1));
         reviewed.reviews = vec![PullRequestReview {
             author_login: Some("mai-bot".to_string()),
+            state: Some("APPROVED".to_string()),
             submitted_at: Some(review_time),
             commit_id: Some("old-head".to_string()),
         }];
@@ -306,6 +334,7 @@ mod tests {
         candidate.latest_commit_at = Some(review_time + TimeDelta::minutes(10));
         candidate.reviews = vec![PullRequestReview {
             author_login: Some("mai-bot".to_string()),
+            state: Some("APPROVED".to_string()),
             submitted_at: Some(review_time),
             commit_id: Some("old-head".to_string()),
         }];
@@ -316,6 +345,37 @@ mod tests {
             vec![ReviewSelection {
                 pr: 8,
                 head_sha: Some("head-8".to_string()),
+            }],
+            selected
+        );
+    }
+
+    #[test]
+    fn allows_rereview_after_later_changes_requested_review_on_same_head() {
+        let review_time = Utc::now() - TimeDelta::hours(1);
+        let mut candidate = candidate(16);
+        candidate.latest_commit_at = Some(review_time - TimeDelta::minutes(10));
+        candidate.reviews = vec![
+            PullRequestReview {
+                author_login: Some("mai-bot".to_string()),
+                state: Some("APPROVED".to_string()),
+                submitted_at: Some(review_time),
+                commit_id: Some("head-16".to_string()),
+            },
+            PullRequestReview {
+                author_login: Some("human-reviewer".to_string()),
+                state: Some("CHANGES_REQUESTED".to_string()),
+                submitted_at: Some(review_time + TimeDelta::minutes(10)),
+                commit_id: Some("head-16".to_string()),
+            },
+        ];
+
+        let selected = select_review_prs("mai-bot", vec![candidate]);
+
+        assert_eq!(
+            vec![ReviewSelection {
+                pr: 16,
+                head_sha: Some("head-16".to_string()),
             }],
             selected
         );
