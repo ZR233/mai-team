@@ -2,9 +2,9 @@ use std::future::Future;
 
 use chrono::{TimeDelta, Utc};
 use mai_protocol::{
-    AgentId, AgentMessage, ProjectId, ProjectReviewOutcome, ProjectReviewRunDetail,
-    ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewRunsResponse, ServiceEvent,
-    TokenUsage, TurnId, now,
+    AgentId, AgentMessage, ProjectId, ProjectReviewDecision, ProjectReviewOutcome,
+    ProjectReviewRunDetail, ProjectReviewRunStatus, ProjectReviewRunSummary,
+    ProjectReviewRunsResponse, ServiceEvent, TokenUsage, TurnId, now,
 };
 use mai_store::ConfigStore;
 use uuid::Uuid;
@@ -35,6 +35,7 @@ pub(crate) struct FinishReviewRun {
     pub(crate) turn_id: Option<TurnId>,
     pub(crate) status: ProjectReviewRunStatus,
     pub(crate) outcome: Option<ProjectReviewOutcome>,
+    pub(crate) review_event: Option<ProjectReviewDecision>,
     pub(crate) pr: Option<u64>,
     pub(crate) summary_text: Option<String>,
     pub(crate) error: Option<String>,
@@ -82,6 +83,7 @@ pub(crate) async fn record_project_review_startup_failure(
             finished_at: Some(now()),
             status: ProjectReviewRunStatus::Failed,
             outcome: Some(ProjectReviewOutcome::Failed),
+            review_event: None,
             pr: None,
             summary: None,
             error: Some(error),
@@ -123,6 +125,7 @@ pub(crate) async fn cancel_active_project_review_runs(
                 turn_id: run.turn_id,
                 status: ProjectReviewRunStatus::Cancelled,
                 outcome: None,
+                review_event: None,
                 pr: run.pr,
                 summary_text: run.summary,
                 error: Some("review cancelled".to_string()),
@@ -197,6 +200,7 @@ pub(crate) async fn finish_project_review_run(
                 finished_at: Some(now()),
                 status: request.status,
                 outcome: request.outcome,
+                review_event: request.review_event,
                 pr: request.pr,
                 summary: request.summary_text,
                 error: request.error,

@@ -4,6 +4,22 @@ export function formatStatus(status) {
     .replace(/\b\w/g, (letter) => letter.toUpperCase())
 }
 
+export function projectReviewRunOutcomeLabel(run = {}) {
+  const event = String(run.review_event || '').toLowerCase()
+  if (event === 'approve') return 'Approved'
+  if (event === 'request_changes') return 'Changes Requested'
+  if (event === 'comment') return 'Commented'
+  return formatStatus(run.outcome || 'pending')
+}
+
+export function projectReviewRunOutcomeTone(run = {}) {
+  const event = String(run.review_event || '').toLowerCase()
+  if (event === 'approve') return 'approve'
+  if (event === 'request_changes') return 'request-changes'
+  if (event === 'comment') return 'comment'
+  return ''
+}
+
 export function formatDate(value) {
   if (!value) return '-'
   return new Date(value).toLocaleString()

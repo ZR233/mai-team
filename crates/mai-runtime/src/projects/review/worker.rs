@@ -176,6 +176,7 @@ pub(crate) async fn reconcile_project_review_singleton(
                 turn_id: run.turn_id,
                 status: ProjectReviewRunStatus::Cancelled,
                 outcome: None,
+                review_event: None,
                 pr: run.pr,
                 summary_text: run.summary,
                 error: Some("review interrupted by server restart".to_string()),
@@ -701,8 +702,8 @@ mod tests {
     use std::sync::Arc;
 
     use mai_protocol::{
-        ProjectCloneStatus, ProjectReviewOutcome, ProjectReviewRunSummary, ProjectReviewStatus,
-        ProjectStatus, ProjectSummary, now,
+        ProjectCloneStatus, ProjectReviewDecision, ProjectReviewOutcome, ProjectReviewRunSummary,
+        ProjectReviewStatus, ProjectStatus, ProjectSummary, now,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::{Mutex, Notify};
@@ -940,6 +941,7 @@ mod tests {
             self.reviewed_prs.lock().await.push(target_pr);
             Ok(ProjectReviewCycleResult {
                 outcome: ProjectReviewOutcome::ReviewSubmitted,
+                review_event: Some(ProjectReviewDecision::Approve),
                 pr: target_pr,
                 summary: None,
                 error: None,

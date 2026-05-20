@@ -132,6 +132,7 @@ pub(crate) struct ProjectReviewRunRecord {
     pub(crate) finished_at: Option<String>,
     pub(crate) status: String,
     pub(crate) outcome: Option<String>,
+    pub(crate) review_event: Option<String>,
     pub(crate) pr: Option<i64>,
     pub(crate) summary: Option<String>,
     pub(crate) error: Option<String>,
@@ -447,6 +448,11 @@ impl ProjectReviewRunRecord {
             finished_at: self.finished_at.as_deref().map(parse_utc).transpose()?,
             status: parse_store_enum(&self.status)?,
             outcome: self.outcome.as_deref().map(parse_store_enum).transpose()?,
+            review_event: self
+                .review_event
+                .as_deref()
+                .map(parse_store_enum)
+                .transpose()?,
             pr: self.pr.map(i64_to_u64),
             summary: self.summary,
             error: self.error,

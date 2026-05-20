@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 
 import {
+  projectReviewRunOutcomeLabel,
+  projectReviewRunOutcomeTone,
   sessionTokenUsage,
   tokenCacheTooltipLabel,
   tokenCacheTooltipRows,
@@ -80,3 +82,14 @@ assert.deepEqual(
     { label: 'Total', value: '0' }
   ]
 )
+
+assert.equal(projectReviewRunOutcomeLabel({ outcome: 'review_submitted', review_event: 'approve' }), 'Approved')
+assert.equal(
+  projectReviewRunOutcomeLabel({ outcome: 'review_submitted', review_event: 'request_changes' }),
+  'Changes Requested'
+)
+assert.equal(projectReviewRunOutcomeLabel({ outcome: 'review_submitted', review_event: 'comment' }), 'Commented')
+assert.equal(projectReviewRunOutcomeLabel({ outcome: 'review_submitted' }), 'Review Submitted')
+assert.equal(projectReviewRunOutcomeTone({ review_event: 'approve' }), 'approve')
+assert.equal(projectReviewRunOutcomeTone({ review_event: 'request_changes' }), 'request-changes')
+assert.equal(projectReviewRunOutcomeTone({ review_event: 'comment' }), 'comment')

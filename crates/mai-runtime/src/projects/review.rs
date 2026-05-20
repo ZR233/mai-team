@@ -1,5 +1,6 @@
 use mai_protocol::{
-    AgentRole, AgentStatus, AgentSummary, ProjectReviewOutcome, ProjectReviewStatus,
+    AgentRole, AgentStatus, AgentSummary, ProjectReviewDecision, ProjectReviewOutcome,
+    ProjectReviewStatus,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -37,6 +38,8 @@ fn project_review_retry_backoff() -> backoff::ProjectReviewRetryBackoff {
 struct ProjectReviewCycleReport {
     outcome: ProjectReviewOutcome,
     #[serde(default)]
+    review_event: Option<ProjectReviewDecision>,
+    #[serde(default)]
     pr: Option<u64>,
     #[serde(default)]
     summary: Option<String>,
@@ -47,6 +50,7 @@ struct ProjectReviewCycleReport {
 #[derive(Debug, Clone)]
 pub(crate) struct ProjectReviewCycleResult {
     pub(crate) outcome: ProjectReviewOutcome,
+    pub(crate) review_event: Option<ProjectReviewDecision>,
     pub(crate) pr: Option<u64>,
     pub(crate) summary: Option<String>,
     pub(crate) error: Option<String>,
@@ -78,6 +82,22 @@ pub(crate) fn parse_project_review_cycle_report(text: &str) -> Result<ProjectRev
             })?
         }
     };
+    let review_event = match (value.outcome.clone(), value.review_event) {
+        (ProjectReviewOutcome::ReviewSubmitted, Some(review_event)) => Some(review_event),
+        (ProjectReviewOutcome::ReviewSubmitted, None) => {
+            return Err(RuntimeError::InvalidInput(
+                "invalid project review final JSON: review_event is required for review_submitted"
+                    .to_string(),
+            ));
+        }
+        (ProjectReviewOutcome::NoEligiblePr | ProjectReviewOutcome::Failed, None) => None,
+        (ProjectReviewOutcome::NoEligiblePr | ProjectReviewOutcome::Failed, Some(_)) => {
+            return Err(RuntimeError::InvalidInput(
+                "invalid project review final JSON: review_event must be null unless review_submitted"
+                    .to_string(),
+            ));
+        }
+    };
     let summary = value
         .summary
         .map(|value| value.trim().to_string())
@@ -85,6 +105,7 @@ pub(crate) fn parse_project_review_cycle_report(text: &str) -> Result<ProjectRev
     let pr_summary = value.pr.map(|pr| format!("PR #{pr}"));
     Ok(ProjectReviewCycleResult {
         outcome: value.outcome,
+        review_event,
         pr: value.pr,
         summary: summary.or(pr_summary),
         error: value
@@ -253,6 +274,7 @@ pub(crate) fn project_review_cycle_result_for_reviewer_status(
     let status_error = format!("reviewer ended with status {:?}", summary.status);
     Some(ProjectReviewCycleResult {
         outcome: ProjectReviewOutcome::Failed,
+        review_event: None,
         pr: None,
         summary: Some("Review could not be completed.".to_string()),
         error: Some(normalize_optional_text(summary.last_error.clone()).unwrap_or(status_error)),
@@ -592,6 +614,7 @@ mod tests {
     fn submitted_review_continues_immediately() {
         let decision = project_review_loop_decision_for_result(ProjectReviewCycleResult {
             outcome: ProjectReviewOutcome::ReviewSubmitted,
+            review_event: Some(ProjectReviewDecision::Approve),
             pr: Some(123),
             summary: Some("submitted".to_string()),
             error: None,
@@ -611,6 +634,7 @@ mod tests {
     fn no_eligible_pr_waits_two_minutes() {
         let decision = project_review_loop_decision_for_result(ProjectReviewCycleResult {
             outcome: ProjectReviewOutcome::NoEligiblePr,
+            review_event: None,
             pr: None,
             summary: Some("nothing to review".to_string()),
             error: None,
@@ -627,6 +651,7 @@ mod tests {
     fn failure_keeps_backoff() {
         let decision = project_review_loop_decision_for_result(ProjectReviewCycleResult {
             outcome: ProjectReviewOutcome::Failed,
+            review_event: None,
             pr: None,
             summary: Some("failed".to_string()),
             error: None,
@@ -679,6 +704,35 @@ mod tests {
         assert_eq!(report.outcome, ProjectReviewOutcome::NoEligiblePr);
         assert_eq!(report.summary.as_deref(), Some("Nothing to review."));
         assert_eq!(report.error, None);
+    }
+
+    #[test]
+    fn parses_review_submitted_events() {
+        let cases = [
+            ("approve", ProjectReviewDecision::Approve),
+            ("request_changes", ProjectReviewDecision::RequestChanges),
+            ("comment", ProjectReviewDecision::Comment),
+        ];
+        for (raw_event, expected_event) in cases {
+            let report = parse_project_review_cycle_report(&format!(
+                r#"{{"outcome":"review_submitted","review_event":"{raw_event}","pr":42,"summary":"Submitted review.","error":null}}"#
+            ))
+            .expect("parse submitted review");
+
+            assert_eq!(report.outcome, ProjectReviewOutcome::ReviewSubmitted);
+            assert_eq!(report.review_event, Some(expected_event));
+            assert_eq!(report.pr, Some(42));
+        }
+    }
+
+    #[test]
+    fn review_submitted_requires_review_event() {
+        let err = parse_project_review_cycle_report(
+            r#"{"outcome":"review_submitted","pr":42,"summary":"Submitted review.","error":null}"#,
+        )
+        .expect_err("submitted review without event should be rejected");
+
+        assert!(err.to_string().contains("review_event"));
     }
 
     #[test]

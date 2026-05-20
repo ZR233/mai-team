@@ -35,7 +35,7 @@ The helper commands are:
 python3 scripts/review_pr_helper.py prepare-review --repo /workspace/repo --agent-id "$REVIEWER_AGENT_ID" --pr "$PR"
 python3 scripts/review_pr_helper.py changed-files --repo "$REVIEW_REPO" --files files.json
 python3 scripts/review_pr_helper.py rust-plan --repo "$REVIEW_REPO" --changed changed.json
-python3 scripts/review_pr_helper.py final-json --outcome review_submitted --pr "$PR" --summary "Submitted APPROVE for owner/repo#$PR after validation passed."
+python3 scripts/review_pr_helper.py final-json --outcome review_submitted --review-event approve --pr "$PR" --summary "Submitted APPROVE for owner/repo#$PR after validation passed."
 ```
 
 Treat helper output as structured facts and command suggestions. You still own code understanding, finding severity, inline comment wording, and the final GitHub review decision.
@@ -181,13 +181,15 @@ The final response is consumed by the Mai project review scheduler. Return only 
 Submitted:
 
 ```json
-{"outcome":"review_submitted","pr":123,"summary":"Submitted APPROVE for owner/repo#123 after cargo fmt --check and cargo test passed.","error":null}
+{"outcome":"review_submitted","review_event":"approve","pr":123,"summary":"Submitted APPROVE for owner/repo#123 after cargo fmt --check and cargo test passed.","error":null}
 ```
+
+Set `review_event` to `approve`, `request_changes`, or `comment` to match the submitted GitHub review event.
 
 Failed:
 
 ```json
-{"outcome":"failed","pr":123,"summary":"Review could not be completed.","error":"GitHub rejected the review submission."}
+{"outcome":"failed","review_event":null,"pr":123,"summary":"Review could not be completed.","error":"GitHub rejected the review submission."}
 ```
 
 ## Constraints

@@ -3,8 +3,8 @@ use crate::events::event_session_id;
 use crate::schema::{SCHEMA_VERSION, SETTING_SCHEMA_VERSION};
 use mai_protocol::{
     AgentStatus, McpServerScope, McpServerTransport, MessageRole, ModelContentItem,
-    ProjectCloneStatus, ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus,
-    ProjectStatus, ServiceEventKind, TurnStatus,
+    ProjectCloneStatus, ProjectReviewDecision, ProjectReviewOutcome, ProjectReviewRunStatus,
+    ProjectReviewStatus, ProjectStatus, ServiceEventKind, TurnStatus,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -1245,6 +1245,7 @@ async fn project_review_runs_round_trip_and_prune() {
                 finished_at: Some(finished_at),
                 status: ProjectReviewRunStatus::Completed,
                 outcome: Some(ProjectReviewOutcome::ReviewSubmitted),
+                review_event: Some(ProjectReviewDecision::Approve),
                 pr: Some(42),
                 summary: Some("approved".to_string()),
                 error: None,
@@ -1282,6 +1283,7 @@ async fn project_review_runs_round_trip_and_prune() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].pr, Some(42));
     assert_eq!(runs[0].outcome, Some(ProjectReviewOutcome::ReviewSubmitted));
+    assert_eq!(runs[0].review_event, Some(ProjectReviewDecision::Approve));
     assert_eq!(
         runs[0].token_usage,
         TokenUsage {
@@ -1616,6 +1618,7 @@ async fn delete_project_removes_review_runs() {
                 finished_at: None,
                 status: ProjectReviewRunStatus::Syncing,
                 outcome: None,
+                review_event: None,
                 pr: None,
                 summary: None,
                 error: None,

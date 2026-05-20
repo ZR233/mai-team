@@ -1,8 +1,8 @@
 use super::*;
 use chrono::TimeDelta;
 use mai_protocol::{
-    GitProvider, ModelConfig, ModelReasoningConfig, ModelReasoningVariant, ProviderConfig,
-    ProviderKind, ProvidersConfigRequest,
+    GitProvider, ModelConfig, ModelReasoningConfig, ModelReasoningVariant, ProjectReviewDecision,
+    ProviderConfig, ProviderKind, ProvidersConfigRequest,
 };
 use pretty_assertions::assert_eq;
 use state::TurnControl;
@@ -7164,6 +7164,7 @@ async fn runtime_start_cleans_stale_project_reviewer_before_new_worker() {
                 finished_at: None,
                 status: ProjectReviewRunStatus::Running,
                 outcome: None,
+                review_event: None,
                 pr: None,
                 summary: Some("in progress".to_string()),
                 error: None,
@@ -7782,6 +7783,7 @@ async fn project_detail_includes_recent_review_runs() {
                 finished_at: Some(started_at + TimeDelta::minutes(1)),
                 status: ProjectReviewRunStatus::Completed,
                 outcome: Some(ProjectReviewOutcome::ReviewSubmitted),
+                review_event: Some(ProjectReviewDecision::Approve),
                 pr: Some(7),
                 summary: Some("submitted review".to_string()),
                 error: None,
@@ -7896,6 +7898,7 @@ async fn finishing_project_review_run_captures_reviewer_snapshot() {
                 finished_at: None,
                 status: ProjectReviewRunStatus::Running,
                 outcome: None,
+                review_event: None,
                 pr: None,
                 summary: None,
                 error: None,
@@ -7926,6 +7929,7 @@ async fn finishing_project_review_run_captures_reviewer_snapshot() {
             turn_id: Some(turn_id),
             status: ProjectReviewRunStatus::Completed,
             outcome: Some(ProjectReviewOutcome::ReviewSubmitted),
+            review_event: Some(ProjectReviewDecision::RequestChanges),
             pr: Some(12),
             summary_text: Some("submitted".to_string()),
             error: None,
@@ -7939,6 +7943,10 @@ async fn finishing_project_review_run_captures_reviewer_snapshot() {
         .await
         .expect("run");
     assert_eq!(run.summary.pr, Some(12));
+    assert_eq!(
+        run.summary.review_event,
+        Some(ProjectReviewDecision::RequestChanges)
+    );
     assert_eq!(run.summary.token_usage, reviewer.token_usage);
     assert_eq!(run.messages[0].content, "snapshot summary");
     assert!(run.events.iter().any(|event| {

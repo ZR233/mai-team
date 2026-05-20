@@ -1007,6 +1007,21 @@ p {
   background: #fff2cc;
 }
 
+.review-run-outcome.approve {
+  color: #0b684f;
+  background: #daf4ea;
+}
+
+.review-run-outcome.request-changes {
+  color: #b42318;
+  background: #fee4e2;
+}
+
+.review-run-outcome.comment {
+  color: #07539d;
+  background: #deedff;
+}
+
 .review-run-status.ready {
   color: #0b684f;
   background: #daf4ea;

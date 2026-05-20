@@ -100,6 +100,11 @@ impl ConfigStore {
                 .outcome
                 .as_ref()
                 .map(|outcome| outcome.to_string()),
+            review_event: run
+                .summary
+                .review_event
+                .as_ref()
+                .map(|event| event.to_string()),
             pr: run.summary.pr.map(u64_to_i64),
             summary: run.summary.summary.clone(),
             error: run.summary.error.clone(),

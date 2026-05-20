@@ -12,7 +12,7 @@ use super::runs::FinishReviewRun;
 use super::state::ReviewStateUpdate;
 use crate::{Result, RuntimeError};
 
-const REVIEWER_FINAL_JSON_REPAIR_PROMPT: &str = "The previous response did not include the required final JSON object, so the project review scheduler could not record the result. Continue from the existing review state. If the GitHub review has already been submitted, do not submit a duplicate review. If it has not been submitted yet, submit it now using the available GitHub API tool. Then reply with only one JSON object matching this schema exactly and no surrounding text: {\"outcome\":\"review_submitted|failed\",\"pr\":123|null,\"summary\":\"short result\",\"error\":null|\"failure reason\"}";
+const REVIEWER_FINAL_JSON_REPAIR_PROMPT: &str = "The previous response did not include the required final JSON object, so the project review scheduler could not record the result. Continue from the existing review state. If the GitHub review has already been submitted, do not submit a duplicate review. If it has not been submitted yet, submit it now using the available GitHub API tool. Then reply with only one JSON object matching this schema exactly and no surrounding text: {\"outcome\":\"review_submitted|failed\",\"review_event\":\"approve|request_changes|comment\"|null,\"pr\":123|null,\"summary\":\"short result\",\"error\":null|\"failure reason\"}";
 
 /// Provides the review cycle dependencies needed to sync a project workspace,
 /// run a reviewer agent turn, persist run state, and clean up afterwards.
@@ -112,6 +112,7 @@ pub(crate) async fn run_project_review_once(
         finished_at: None,
         status: ProjectReviewRunStatus::Syncing,
         outcome: None,
+        review_event: None,
         pr: target_pr,
         summary: None,
         error: None,
@@ -127,6 +128,7 @@ pub(crate) async fn run_project_review_once(
             turn_id: None,
             status: ProjectReviewRunStatus::Failed,
             outcome: Some(ProjectReviewOutcome::Failed),
+            review_event: None,
             pr: target_pr,
             summary_text: None,
             error: Some(error),
@@ -146,6 +148,7 @@ pub(crate) async fn run_project_review_once(
             turn_id: None,
             status: ProjectReviewRunStatus::Failed,
             outcome: Some(ProjectReviewOutcome::Failed),
+            review_event: None,
             pr: target_pr,
             summary_text: None,
             error: Some(error),
@@ -161,6 +164,7 @@ pub(crate) async fn run_project_review_once(
             turn_id: None,
             status: ProjectReviewRunStatus::Cancelled,
             outcome: None,
+            review_event: None,
             pr: target_pr,
             summary_text: None,
             error: Some("review cancelled".to_string()),
@@ -178,6 +182,7 @@ pub(crate) async fn run_project_review_once(
                 turn_id: None,
                 status: ProjectReviewRunStatus::Failed,
                 outcome: Some(ProjectReviewOutcome::Failed),
+                review_event: None,
                 pr: target_pr,
                 summary_text: None,
                 error: Some(err.to_string()),
@@ -210,6 +215,7 @@ pub(crate) async fn run_project_review_once(
         finished_at: None,
         status: ProjectReviewRunStatus::Running,
         outcome: None,
+        review_event: None,
         pr: target_pr,
         summary: None,
         error: None,
@@ -239,7 +245,7 @@ pub(crate) async fn run_project_review_once(
         .load_project_review_run(project_id, run_id)
         .await?
         .and_then(|run| run.summary.turn_id);
-    let (status, outcome, pr, summary, error) = match &cycle_result {
+    let (status, outcome, review_event, pr, summary, error) = match &cycle_result {
         Ok(result) => {
             let status = if result.outcome == ProjectReviewOutcome::Failed {
                 ProjectReviewRunStatus::Failed
@@ -249,6 +255,7 @@ pub(crate) async fn run_project_review_once(
             (
                 status,
                 Some(result.outcome.clone()),
+                result.review_event.clone(),
                 result.pr,
                 result.summary.clone(),
                 result.error.clone(),
@@ -259,11 +266,13 @@ pub(crate) async fn run_project_review_once(
             None,
             None,
             None,
+            None,
             Some("review cancelled".to_string()),
         ),
         Err(err) => (
             ProjectReviewRunStatus::Failed,
             Some(ProjectReviewOutcome::Failed),
+            None,
             None,
             None,
             Some(err.to_string()),
@@ -277,6 +286,7 @@ pub(crate) async fn run_project_review_once(
             turn_id,
             status,
             outcome,
+            review_event,
             pr,
             summary_text: summary,
             error,
@@ -330,7 +340,7 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::Utc;
-    use mai_protocol::{ProjectCloneStatus, ProjectStatus, TokenUsage};
+    use mai_protocol::{ProjectCloneStatus, ProjectReviewDecision, ProjectStatus, TokenUsage};
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
 
@@ -478,7 +488,7 @@ mod tests {
             reviewer_id,
             vec![
                 "Now let me submit the review.".to_string(),
-                r#"{"outcome":"review_submitted","pr":726,"summary":"已提交 review","error":null}"#
+                r#"{"outcome":"review_submitted","review_event":"request_changes","pr":726,"summary":"已提交 review","error":null}"#
                     .to_string(),
             ],
         );
@@ -488,6 +498,10 @@ mod tests {
             .expect("review result");
 
         assert_eq!(ProjectReviewOutcome::ReviewSubmitted, result.outcome);
+        assert_eq!(
+            Some(ProjectReviewDecision::RequestChanges),
+            result.review_event
+        );
         assert_eq!(Some(726), result.pr);
         assert_eq!(Some("已提交 review"), result.summary.as_deref());
         let messages = ops.started_messages.lock().await.clone();
@@ -500,6 +514,10 @@ mod tests {
         assert_eq!(
             Some(ProjectReviewOutcome::ReviewSubmitted),
             finished[0].outcome
+        );
+        assert_eq!(
+            Some(ProjectReviewDecision::RequestChanges),
+            finished[0].review_event
         );
         assert_eq!(Some(726), finished[0].pr);
     }

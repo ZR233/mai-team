@@ -45,6 +45,7 @@ def main() -> int:
         required=True,
         choices=["review_submitted", "failed"],
     )
+    final_json.add_argument("--review-event", choices=["approve", "request_changes", "comment"])
     final_json.add_argument("--pr", type=int)
     final_json.add_argument("--summary", required=True)
     final_json.add_argument("--error")
@@ -59,7 +60,7 @@ def main() -> int:
     elif args.command == "rust-plan":
         write_json(rust_plan_summary(args.repo, changed=args.changed, files=args.files))
     elif args.command == "final-json":
-        write_json(final_result(args.outcome, args.pr, args.summary, args.error))
+        write_json(final_result(args.outcome, args.review_event, args.pr, args.summary, args.error))
     elif args.command == "test":
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(ReviewPrHelperTests)
         result = unittest.TextTestRunner(verbosity=2).run(suite)
@@ -323,12 +324,28 @@ def rust_plan_summary(repo: str, *, changed: str | None = None, files: str | Non
     return {"is_rust_workspace": is_rust, "changed_crates": crates, "commands": commands}
 
 
-def final_result(outcome: str, pr: int | None, summary: str, error: str | None) -> dict[str, Any]:
+def final_result(
+    outcome: str,
+    review_event: str | None,
+    pr: int | None,
+    summary: str,
+    error: str | None,
+) -> dict[str, Any]:
     if outcome == "review_submitted" and pr is None:
         raise SystemExit("review_submitted requires --pr")
+    if outcome == "review_submitted" and review_event is None:
+        raise SystemExit("review_submitted requires --review-event")
+    if outcome != "review_submitted" and review_event is not None:
+        raise SystemExit("--review-event is only valid for review_submitted")
     if outcome == "failed" and not error:
         raise SystemExit("failed requires --error")
-    return {"outcome": outcome, "pr": pr, "summary": summary, "error": error}
+    return {
+        "outcome": outcome,
+        "review_event": review_event,
+        "pr": pr,
+        "summary": summary,
+        "error": error,
+    }
 
 
 class ReviewPrHelperTests(unittest.TestCase):
@@ -414,10 +431,15 @@ class ReviewPrHelperTests(unittest.TestCase):
         self.assertEqual(result["action"], "checked_out")
 
     def test_final_json_shape(self) -> None:
-        result = final_result("review_submitted", 9, "Submitted APPROVE.", None)
-        self.assertEqual(set(result.keys()), {"outcome", "pr", "summary", "error"})
+        result = final_result("review_submitted", "approve", 9, "Submitted APPROVE.", None)
+        self.assertEqual(set(result.keys()), {"outcome", "review_event", "pr", "summary", "error"})
+        self.assertEqual(result["review_event"], "approve")
         self.assertEqual(result["pr"], 9)
         self.assertIsNone(result["error"])
+
+    def test_final_json_requires_review_event_for_submitted_review(self) -> None:
+        with self.assertRaises(SystemExit):
+            final_result("review_submitted", None, 9, "Submitted review.", None)
 
 
 if __name__ == "__main__":

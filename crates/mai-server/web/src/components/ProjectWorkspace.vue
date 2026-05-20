@@ -199,7 +199,9 @@
                   <span class="review-run-status" :class="reviewRunTone(run.status)">
                     {{ formatStatus(run.status) }}
                   </span>
-                  <span class="review-run-outcome">{{ formatStatus(run.outcome || 'pending') }}</span>
+                  <span class="review-run-outcome" :class="projectReviewRunOutcomeTone(run)">
+                    {{ projectReviewRunOutcomeLabel(run) }}
+                  </span>
                 </div>
                 <div class="review-run-token-row" :aria-label="reviewRunTokenLabel(run)">
                   <span>
@@ -486,6 +488,8 @@ import {
   formatTokenCount,
   initial,
   numericTokenUsage,
+  projectReviewRunOutcomeLabel,
+  projectReviewRunOutcomeTone,
   statusTone
 } from '../utils/format'
 

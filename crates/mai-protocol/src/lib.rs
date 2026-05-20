@@ -102,6 +102,17 @@ pub enum ProjectReviewOutcome {
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
+pub enum ProjectReviewDecision {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum ProjectReviewRunStatus {
     Syncing,
     Running,
@@ -456,6 +467,8 @@ pub struct ProjectReviewRunSummary {
     pub status: ProjectReviewRunStatus,
     #[serde(default)]
     pub outcome: Option<ProjectReviewOutcome>,
+    #[serde(default)]
+    pub review_event: Option<ProjectReviewDecision>,
     #[serde(default)]
     pub pr: Option<u64>,
     #[serde(default)]

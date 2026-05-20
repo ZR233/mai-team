@@ -6,7 +6,7 @@ import { chromium } from 'playwright'
 const styles = await readFile(new URL('../../styles.css', import.meta.url), 'utf8')
 
 const longStatus = 'SyncingReviewerWorkspaceAndWaitingForRequiredPullRequestStatusChecks'
-const longOutcome = 'ReviewSubmittedAfterAllRequiredStatusChecksCompletedSuccessfully'
+const longOutcome = 'ChangesRequestedAfterAllRequiredStatusChecksCompletedSuccessfully'
 const longSummary = [
   'PR #128: validate project review with a large status set',
   'ci/linux-x86_64, ci/linux-aarch64, clippy, docs, integration, container build, security audit'
@@ -25,7 +25,7 @@ function reviewRunsFixture() {
         </button>
         <div class="review-run-chip-row">
           <span class="review-run-status active">${longStatus}-${index}</span>
-          <span class="review-run-outcome">${longOutcome}-${index}</span>
+          <span class="review-run-outcome request-changes">${longOutcome}-${index}</span>
         </div>
         <div class="review-run-token-row">
           <span><strong>${120_000 + index}</strong><small>Tokens</small></span>
