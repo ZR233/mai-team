@@ -112,10 +112,6 @@ fn prepare_anthropic_skills(repo_dir: &Path, target_dir: &Path) {
                 "cargo:warning=failed to refresh Anthropic system skills from {ANTHROPIC_SKILLS_REPO}; using cached copy if available: {err}"
             );
         }
-    } else if !source_dir.is_dir() {
-        println!(
-            "cargo:warning=Anthropic system skills cache is not present; set {REFRESH_ANTHROPIC_SKILLS_ENV}=1 to fetch them during the build"
-        );
     }
 
     if source_dir.is_dir() {
@@ -353,9 +349,6 @@ fn watch_dir(path: &Path) {
 fn ensure_npm(web_dir: &Path, npm_cache_dir: &Path) {
     run_npm(web_dir, npm_cache_dir, ["--version"]);
     if frontend_dependencies_missing(web_dir, npm_cache_dir) {
-        println!(
-            "cargo:warning=frontend npm dependencies are missing or incomplete; installing them"
-        );
         install_frontend_dependencies(web_dir, npm_cache_dir);
     }
 }

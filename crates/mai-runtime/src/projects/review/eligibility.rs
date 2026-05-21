@@ -46,6 +46,7 @@ pub(crate) trait ProjectReviewEligibilityOps: Send + Sync {
     ) -> impl Future<Output = Result<Value>> + Send;
 }
 
+#[cfg(test)]
 pub(crate) async fn select_project_review_candidates(
     ops: &impl ProjectReviewEligibilityOps,
     project_id: ProjectId,

@@ -228,7 +228,7 @@ impl McpAgentManager {
     }
 
     pub async fn resource_servers(&self) -> Vec<String> {
-        let mut servers = self
+        let servers = self
             .sessions
             .read()
             .await
@@ -237,13 +237,18 @@ impl McpAgentManager {
             .collect::<Vec<_>>();
         #[cfg(debug_assertions)]
         {
+            let mut servers = servers;
             for server in self.test_resources.read().await.keys() {
                 if !servers.iter().any(|existing| existing == server) {
                     servers.push(server.clone());
                 }
             }
+            servers
         }
-        servers
+        #[cfg(not(debug_assertions))]
+        {
+            servers
+        }
     }
 
     pub async fn call_model_tool(&self, model_name: &str, arguments: Value) -> Result<Value> {
