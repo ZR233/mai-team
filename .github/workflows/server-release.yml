@@ -1,0 +1,45 @@
+name: Build Server Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "GitHub release tag to upload server assets to, for example mai-server-v0.1.2"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  server-linux-x86-64:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build server
+        run: cargo build --locked -p mai-server --bin mai-server --release
+
+      - name: Package server
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/mai-server dist/mai-server
+          tar -C dist -czf mai-server-x86_64-unknown-linux-gnu.tar.gz mai-server
+          sha256sum mai-server-x86_64-unknown-linux-gnu.tar.gz > mai-server-x86_64-unknown-linux-gnu.tar.gz.sha256
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag }}
+          fail_on_unmatched_files: true
+          files: |
+            mai-server-x86_64-unknown-linux-gnu.tar.gz
+            mai-server-x86_64-unknown-linux-gnu.tar.gz.sha256

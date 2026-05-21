@@ -105,3 +105,119 @@ curl -fsSL https://raw.githubusercontent.com/ZR233/mai-team/main/scripts/update-
 - Node ID：通常为 `mai-server`
 
 保存后 `mai-server` 会立即应用 relay 连接设置。
+
+# Mai Server 安装说明
+
+`install-mai-server-ubuntu-24.04.sh` 用于在 Ubuntu 24.04 x86_64 主机上安装 `mai-server`，并注册为 systemd 服务。
+
+`update-mai-server-ubuntu-24.04.sh` 用于更新已安装的 `mai-server`。更新脚本会替换二进制、刷新 systemd service 文件、执行 `systemctl daemon-reload`，并重启服务。
+
+更新脚本会管理 `MAI_BIND_ADDR` 和 `RUST_LOG`，并保留 `/etc/mai-server/mai-server.env` 中其他自定义环境变量。
+
+`mai-server` release 由 GitHub release 提供。Release tag 使用包名前缀形态，固定为 `mai-server-vX.Y.Z`，脚本的 `--version` 参数也应传入对应 GitHub tag，例如 `--version mai-server-v0.1.2`。release asset 名固定为 `mai-server-x86_64-unknown-linux-gnu.tar.gz`。
+
+## Mai Server 一键安装
+
+在 `mai-server` 主机上执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ZR233/mai-team/main/scripts/install-mai-server-ubuntu-24.04.sh | sudo bash -s -- --bind-addr 0.0.0.0:8080
+```
+
+如果直接使用最新 release，脚本会下载：
+
+```text
+https://github.com/ZR233/mai-team/releases/latest/download/mai-server-x86_64-unknown-linux-gnu.tar.gz
+```
+
+release 发布流程需要为该 release 上传同名二进制包和 `.sha256` 校验文件。不要改动 asset 名称，否则安装脚本和更新脚本都需要同步调整。
+
+## Mai Server 指定版本安装
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ZR233/mai-team/main/scripts/install-mai-server-ubuntu-24.04.sh | sudo bash -s -- --version mai-server-vX.Y.Z
+```
+
+## Mai Server 更新
+
+在已安装 `mai-server` 的服务器上执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ZR233/mai-team/main/scripts/update-mai-server-ubuntu-24.04.sh | sudo bash
+```
+
+指定版本更新：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ZR233/mai-team/main/scripts/update-mai-server-ubuntu-24.04.sh | sudo bash -s -- --version mai-server-vX.Y.Z
+```
+
+## Mai Server 安装内容
+
+脚本会安装或更新：
+
+- `/opt/mai-server/mai-server`
+- `/usr/local/bin/mai-server`（指向 `/opt/mai-server/mai-server` 的兼容 symlink）
+- `/etc/mai-server/mai-server.env`
+- `/var/lib/mai-server`
+- `/etc/systemd/system/mai-server.service`
+
+systemd service 会通过 `/etc/mai-server/mai-server.env` 读取环境变量，并使用固定数据目录启动：
+
+```text
+ExecStart=/opt/mai-server/mai-server --data-path /var/lib/mai-server
+```
+
+安装完成后会执行：
+
+```bash
+systemctl enable --now mai-server
+```
+
+## Mai Server 参数
+
+```text
+--version mai-server-vX.Y.Z
+                     安装或更新指定 release 版本；默认 latest
+--bind-addr HOST:PORT
+                     设置服务监听地址；安装默认 0.0.0.0:8080，更新默认保留已有 MAI_BIND_ADDR
+--dry-run             只打印将要执行的安装或更新动作，不写入系统
+```
+
+需要调整监听地址、模型 provider、默认 Docker 镜像或 relay 连接时，修改 `/etc/mai-server/mai-server.env` 后重启服务。常用环境变量包括：
+
+```text
+MAI_BIND_ADDR=0.0.0.0:8080
+OPENAI_API_KEY=
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-5.5
+MAI_AGENT_BASE_IMAGE=ghcr.io/zr233/mai-team-agent:latest
+MAI_SIDECAR_IMAGE=ghcr.io/zr233/mai-team-sidecar:latest
+```
+
+## Docker 前置条件
+
+安装脚本不安装 Docker。运行 `mai-server` 前需要主机上的 Docker daemon 可用，并且 `mai-server` 用户可以访问 Docker socket。
+
+可用以下命令检查：
+
+```bash
+docker version
+sudo -u mai-server docker version
+```
+
+如果 `mai-server` 用户还不能访问 Docker socket，请先按服务器安全策略配置用户组或 socket 权限，再启动服务。
+
+## Mai Server 状态检查
+
+```bash
+systemctl is-enabled mai-server
+systemctl is-active mai-server
+journalctl -u mai-server -n 100 --no-pager
+```
+
+## Mai Server 健康检查
+
+```bash
+curl -fsS http://127.0.0.1:8080/health
+```
