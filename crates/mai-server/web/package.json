@@ -14,6 +14,7 @@
     "test:layout": "node src/utils/__tests__/contextStatusLineLayout.test.js",
     "test:providers": "node src/composables/__tests__/useProviders.test.js",
     "test:review-layout": "node src/utils/__tests__/projectReviewRunLayout.test.js",
+    "test:sse": "node src/composables/__tests__/useSSE.test.js",
     "test:timeline": "node src/utils/__tests__/timeline.test.js",
     "test:tree": "node src/utils/__tests__/tree.test.js"
   },

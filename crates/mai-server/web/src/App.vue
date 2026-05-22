@@ -335,6 +335,7 @@ const isUpdatingProjectAgentModel = ref(false)
 const rereviewingProjectPrs = ref([])
 const previousSessionId = ref(null)
 const previousProjectSessionId = ref(null)
+let sseDetailRefreshTimer = null
 const skillsError = ref('')
 const mcpDialogOpen = ref(false)
 const settingsInitialSection = ref('roles')
@@ -445,7 +446,13 @@ onMounted(async () => {
   await refreshAll()
 })
 
-onUnmounted(() => disconnect())
+onUnmounted(() => {
+  disconnect()
+  if (sseDetailRefreshTimer) {
+    window.clearTimeout(sseDetailRefreshTimer)
+    sseDetailRefreshTimer = null
+  }
+})
 
 async function refreshAll() {
   isEnvironmentsLoading.value = true
@@ -546,20 +553,59 @@ async function openGithubAppSettings() {
 }
 
 async function handleSSEEvent(event) {
-  if (isLiveOnlyEvent(event)) return
+  if (isLiveOnlyEvent(event)) {
+    scheduleSSEDetailRefresh(event)
+    return
+  }
   await refreshEnvironments()
   await refreshProjects()
   if (selectedEnvironmentId.value) await refreshEnvironmentDetail()
   if (selectedProjectId.value) await refreshProjectDetail()
 }
 
+function scheduleSSEDetailRefresh(event) {
+  if (!shouldRefreshDetailsAfterLiveEvent(event)) return
+  if (sseDetailRefreshTimer) window.clearTimeout(sseDetailRefreshTimer)
+  sseDetailRefreshTimer = window.setTimeout(async () => {
+    sseDetailRefreshTimer = null
+    try {
+      if (selectedEnvironmentId.value) await refreshEnvironmentDetail()
+      if (selectedProjectId.value) await refreshProjectDetail()
+    } catch (error) {
+      showToast(error.message)
+    }
+  }, 600)
+}
+
+function shouldRefreshDetailsAfterLiveEvent(event) {
+  return [
+    'turn_completed',
+    'agent_message_completed',
+    'reasoning_completed',
+    'context_compacted',
+    'user_input_requested',
+    'artifact_created'
+  ].includes(event?.type)
+}
+
 function isLiveOnlyEvent(event) {
   return [
+    'turn_started',
+    'turn_completed',
+    'tool_started',
+    'tool_completed',
+    'context_compacted',
+    'agent_message',
     'agent_message_delta',
     'agent_message_completed',
     'reasoning_delta',
     'reasoning_completed',
-    'tool_call_delta'
+    'tool_call_delta',
+    'skills_activated',
+    'error',
+    'todo_list_updated',
+    'user_input_requested',
+    'artifact_created'
   ].includes(event?.type)
 }
 

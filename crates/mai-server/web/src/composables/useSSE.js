@@ -100,6 +100,10 @@ function updateStreamingEvents(event) {
   const key = streamingKey(event)
   const events = streamingEvents.value.filter((item) => streamingKey(item) !== key)
   const existing = streamingEvents.value.find((item) => streamingKey(item) === key)
+  if (event.type.endsWith('_completed')) {
+    streamingEvents.value = events
+    return
+  }
   const merged = mergeStreamingEvent(existing, event)
   streamingEvents.value = [merged, ...events].slice(0, 100)
 }
@@ -150,3 +154,5 @@ function mergeStreamingEvent(existing, event) {
     sequence: event.sequence || existing.sequence
   }
 }
+
+export const __testOnlyUpdateStreamingEvents = updateStreamingEvents
