@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/ZR233/mai-team/compare/mai-relay-v0.1.5...mai-relay-v0.1.6) - 2026-05-22
+
+### Added
+
+- 更新 GitHub 发布 API URL，优化最新版本获取逻辑和测试用例
+
 ## [0.1.5](https://github.com/ZR233/mai-team/compare/v0.1.4...v0.1.5) - 2026-05-16
 
 ### Other
