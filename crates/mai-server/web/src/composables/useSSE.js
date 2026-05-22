@@ -9,7 +9,7 @@ let sseRetryTimer = null
 let lastEventId = null
 
 export function useSSE() {
-  function connectEvents(onEvent, onReconnect) {
+  function connectEvents(onEvent, onReconnect, onError) {
     disconnect()
     connectionState.value = 'connecting'
     const query = lastEventId ? `?last_event_id=${encodeURIComponent(lastEventId)}` : ''
@@ -18,7 +18,7 @@ export function useSSE() {
       const wasRetrying = sseRetryCount > 0
       connectionState.value = 'online'
       sseRetryCount = 0
-      if (wasRetrying && onReconnect) onReconnect()
+      if (wasRetrying && onReconnect) runCallback(onReconnect, onError)
     }
     eventSource.onerror = () => {
       connectionState.value = 'offline'
@@ -27,7 +27,7 @@ export function useSSE() {
       sseRetryCount++
       const delay = Math.min(1000 * Math.pow(2, sseRetryCount - 1), 30000)
       const jitter = Math.floor(Math.random() * 500)
-      sseRetryTimer = setTimeout(() => connectEvents(onEvent, onReconnect), delay + jitter)
+      sseRetryTimer = setTimeout(() => connectEvents(onEvent, onReconnect, onError), delay + jitter)
     }
     const names = [
       'agent_created',
@@ -66,7 +66,7 @@ export function useSSE() {
           if (parsed.sequence) lastEventId = parsed.sequence
           updateStreamingEvents(parsed)
           eventFeed.value = [parsed, ...eventFeed.value].slice(0, 150)
-          if (onEvent) onEvent(parsed)
+          if (onEvent) runCallback(() => onEvent(parsed), onError)
         } catch {
           const fallback = { sequence: Date.now(), type: 'event', timestamp: new Date().toISOString(), message: event.data }
           eventFeed.value = [fallback, ...eventFeed.value].slice(0, 150)
@@ -156,3 +156,19 @@ function mergeStreamingEvent(existing, event) {
 }
 
 export const __testOnlyUpdateStreamingEvents = updateStreamingEvents
+
+function runCallback(callback, onError) {
+  try {
+    Promise.resolve(callback()).catch((error) => reportCallbackError(error, onError))
+  } catch (error) {
+    reportCallbackError(error, onError)
+  }
+}
+
+function reportCallbackError(error, onError) {
+  if (onError) {
+    onError(error)
+    return
+  }
+  console.error(error)
+}

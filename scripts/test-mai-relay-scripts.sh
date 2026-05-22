@@ -34,9 +34,14 @@ assert_line_before() {
   fi
 }
 
+install_output="$("$ROOT_DIR/scripts/install-mai-relay-ubuntu-24.04.sh" --dry-run)"
 update_output="$("$ROOT_DIR/scripts/update-mai-relay-ubuntu-24.04.sh" --dry-run)"
 
-assert_contains "$update_output" "DRY RUN: write /etc/systemd/system/mai-relay.service:"
+for output in "$install_output" "$update_output"; do
+  assert_contains "$output" "DRY RUN: host check would require Ubuntu 22.04 or 24.04 x86_64"
+  assert_contains "$output" "DRY RUN: write /etc/systemd/system/mai-relay.service:"
+done
+
 assert_contains "$update_output" "DRY RUN: systemctl daemon-reload"
 assert_contains "$update_output" "DRY RUN: systemctl restart mai-relay"
 assert_line_before \

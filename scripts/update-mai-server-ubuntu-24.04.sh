@@ -67,15 +67,15 @@ check_host() {
   fi
 
   if [[ "$DRY_RUN" == "true" ]]; then
-    echo "DRY RUN: host check would require Ubuntu 24.04 x86_64; detected ${os_id:-unknown} ${version_id:-unknown} $arch"
+    echo "DRY RUN: host check would require Ubuntu 22.04 or 24.04 x86_64; detected ${os_id:-unknown} ${version_id:-unknown} $arch"
     return 0
   fi
 
-  if [[ "$arch" == "x86_64" && "$os_id" == "ubuntu" && "$version_id" == "24.04" ]]; then
+  if [[ "$arch" == "x86_64" && "$os_id" == "ubuntu" && ( "$version_id" == "22.04" || "$version_id" == "24.04" ) ]]; then
     return 0
   fi
 
-  echo "mai-server updater currently supports only Ubuntu 24.04 x86_64" >&2
+  echo "mai-server updater currently supports only Ubuntu 22.04 or 24.04 x86_64" >&2
   exit 1
 }
 

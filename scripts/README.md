@@ -1,6 +1,6 @@
 # Mai Relay 安装说明
 
-`install-mai-relay-ubuntu-24.04.sh` 用于在 Ubuntu 24.04 x86_64 主机上安装 `mai-relay`，并注册为 systemd 服务。
+`install-mai-relay-ubuntu-24.04.sh` 用于在 Ubuntu 22.04 或 24.04 x86_64 主机上安装 `mai-relay`，并注册为 systemd 服务。
 
 `update-mai-relay-ubuntu-24.04.sh` 用于更新已安装的 `mai-relay`。它和安装脚本使用同一组参数，默认保留已有 token、public URL、bind addr 和 sqlite 路径，替换二进制、刷新 systemd service 文件并重启服务。
 
@@ -108,7 +108,7 @@ curl -fsSL https://raw.githubusercontent.com/ZR233/mai-team/main/scripts/update-
 
 # Mai Server 安装说明
 
-`install-mai-server-ubuntu-24.04.sh` 用于在 Ubuntu 24.04 x86_64 主机上安装 `mai-server`，并注册为 systemd 服务。
+`install-mai-server-ubuntu-24.04.sh` 用于在 Ubuntu 22.04 或 24.04 x86_64 主机上安装 `mai-server`，并注册为 systemd 服务。
 
 `update-mai-server-ubuntu-24.04.sh` 用于更新已安装的 `mai-server`。更新脚本会替换二进制、刷新 systemd service 文件、执行 `systemctl daemon-reload`，并重启服务。
 

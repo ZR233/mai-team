@@ -43,22 +43,32 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$(uname -m)" != "x86_64" && "$DRY_RUN" != "true" ]]; then
-  echo "mai-relay installer currently supports only x86_64 Ubuntu 24.04" >&2
-  exit 1
-fi
+check_host() {
+  local arch
+  arch="$(uname -m)"
+  local os_id=""
+  local version_id=""
 
-if [[ -r /etc/os-release ]]; then
-  . /etc/os-release
-  if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != "24.04" ]]; then
-    if [[ "$DRY_RUN" == "true" ]]; then
-      echo "DRY RUN: host check would require Ubuntu 24.04 x86_64"
-    else
-    echo "mai-relay installer currently supports only Ubuntu 24.04" >&2
-    exit 1
-    fi
+  if [[ -r /etc/os-release ]]; then
+    . /etc/os-release
+    os_id="${ID:-}"
+    version_id="${VERSION_ID:-}"
   fi
-fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "DRY RUN: host check would require Ubuntu 22.04 or 24.04 x86_64; detected ${os_id:-unknown} ${version_id:-unknown} $arch"
+    return 0
+  fi
+
+  if [[ "$arch" == "x86_64" && "$os_id" == "ubuntu" && ( "$version_id" == "22.04" || "$version_id" == "24.04" ) ]]; then
+    return 0
+  fi
+
+  echo "mai-relay installer currently supports only Ubuntu 22.04 or 24.04 x86_64" >&2
+  exit 1
+}
+
+check_host
 
 if [[ $EUID -ne 0 && "$DRY_RUN" != "true" ]]; then
   echo "run as root or use sudo" >&2

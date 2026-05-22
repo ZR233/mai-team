@@ -441,7 +441,7 @@ watch(
 )
 
 onMounted(async () => {
-  connectEvents(handleSSEEvent, refreshAll)
+  connectEvents(handleSSEEvent, refreshAll, showSSERefreshError)
   await applyStartupHash()
   await refreshAll()
 })
@@ -561,6 +561,10 @@ async function handleSSEEvent(event) {
   await refreshProjects()
   if (selectedEnvironmentId.value) await refreshEnvironmentDetail()
   if (selectedProjectId.value) await refreshProjectDetail()
+}
+
+function showSSERefreshError(error) {
+  showToast(error?.message || String(error || 'Failed to refresh live updates.'))
 }
 
 function scheduleSSEDetailRefresh(event) {

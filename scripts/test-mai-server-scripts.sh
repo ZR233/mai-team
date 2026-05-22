@@ -44,6 +44,7 @@ install_output="$("$INSTALL_SCRIPT" --dry-run)"
 update_output="$("$UPDATE_SCRIPT" --dry-run)"
 
 for output in "$install_output" "$update_output"; do
+  assert_contains "$output" "DRY RUN: host check would require Ubuntu 22.04 or 24.04 x86_64"
   assert_contains "$output" "DRY RUN: write /etc/systemd/system/mai-server.service:"
   assert_contains "$output" "EnvironmentFile=/etc/mai-server/mai-server.env"
   assert_contains "$output" "ExecStart=/opt/mai-server/mai-server --data-path /var/lib/mai-server"
