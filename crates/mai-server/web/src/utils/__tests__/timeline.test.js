@@ -112,6 +112,38 @@ const streamedMessage = streamedTimeline.find((item) => item.type === 'message')
 assert.equal(streamedMessage?.content, 'hello world')
 assert.equal(streamedMessage?.streaming, false)
 
+const completedStreamWithPersistedMessageTimeline = buildAgentTimeline({
+  id: 'agent-1',
+  selected_session_id: 'session-1',
+  messages: [
+    {
+      role: 'assistant',
+      content: 'Now let me fetch and inspect the code locally.',
+      created_at: '2026-05-10T00:00:02.000Z'
+    }
+  ],
+  recent_events: [
+    {
+      type: 'agent_message_completed',
+      sequence: 1,
+      timestamp: '2026-05-10T00:00:01.000Z',
+      agent_id: 'agent-1',
+      session_id: 'session-1',
+      turn_id: 'turn-1',
+      message_id: 'message-1',
+      role: 'assistant',
+      channel: 'final',
+      content: 'Now let me fetch and inspect the code locally.'
+    }
+  ]
+})
+const duplicateAssistantMessages = completedStreamWithPersistedMessageTimeline.filter(
+  (item) => item.type === 'message' && item.content === 'Now let me fetch and inspect the code locally.'
+)
+
+assert.equal(duplicateAssistantMessages.length, 1)
+assert.equal(duplicateAssistantMessages[0]?.streaming, false)
+
 const liveStreamingTimeline = buildAgentTimeline(
   {
     id: 'agent-1',

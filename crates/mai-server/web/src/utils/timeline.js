@@ -11,6 +11,14 @@ export function buildAgentTimeline(detail, liveEvents = []) {
 
   const agentMessageEvents = events.filter((event) => event.type === 'agent_message')
   const streamMessages = buildStreamingMessages(events)
+  const completedStreamMessageEvents = streamMessages.items
+    .filter((item) => item.type === 'message' && item.channel === 'final' && !item.streaming)
+    .map((item) => ({
+      role: item.role,
+      content: item.content,
+      timestamp: item.timestamp
+    }))
+  const persistedMessageEvents = [...agentMessageEvents, ...completedStreamMessageEvents]
   const matchedMessageCounts = new Map()
   const items = []
 
@@ -31,6 +39,10 @@ export function buildAgentTimeline(detail, liveEvents = []) {
       fromEvent: true
     })
   }
+  for (const event of completedStreamMessageEvents) {
+    const key = messageMatchKey(event.role, event.content)
+    matchedMessageCounts.set(key, (matchedMessageCounts.get(key) || 0) + 1)
+  }
 
   for (const stream of streamMessages.items) {
     items.push(stream)
@@ -39,7 +51,7 @@ export function buildAgentTimeline(detail, liveEvents = []) {
   for (const [index, message] of (detail.messages || []).entries()) {
     const key = messageMatchKey(message.role, message.content)
     const matchedCount = matchedMessageCounts.get(key) || 0
-    if (matchedCount > 0 && hasNearbyEventMessage(message, agentMessageEvents)) {
+    if (matchedCount > 0 && hasNearbyEventMessage(message, persistedMessageEvents)) {
       matchedMessageCounts.set(key, matchedCount - 1)
       continue
     }

@@ -31,9 +31,11 @@ function reviewRunsFixture() {
           <span><strong>${120_000 + index}</strong><small>Tokens</small></span>
           <span><strong>${80_000 + index}</strong><small>Cache hit</small></span>
         </div>
-        <a class="review-run-pr-link" href="https://github.com/owner/repo/pull/${128 + index}">Open PR</a>
-        <button type="button" class="review-run-pr-link review-run-rereview">Re-review</button>
-        <button type="button" class="review-run-expand">Details</button>
+        <div class="review-run-actions">
+          <a class="review-run-pr-link" href="https://github.com/owner/repo/pull/${128 + index}">Open PR</a>
+          <button type="button" class="review-run-pr-link review-run-rereview">Re-review</button>
+          <button type="button" class="review-run-expand">Details</button>
+        </div>
       </div>
     </article>
   `).join('')
@@ -101,7 +103,7 @@ function reviewRunsFixture() {
 const browser = await chromium.launch({ headless: true })
 
 try {
-  for (const width of [720, 420]) {
+  for (const width of [1280, 720, 420]) {
     const page = await browser.newPage({ viewport: { width, height: 560 } })
     await page.setContent(reviewRunsFixture())
 
@@ -116,6 +118,10 @@ try {
       const tokenRow = first.querySelector('.review-run-token-row')
       const main = first.querySelector('.review-run-main')
       const rereviewButton = first.querySelector('.review-run-rereview')
+      const detailsButton = first.querySelector('.review-run-expand')
+      const prLinkRect = prLink.getBoundingClientRect()
+      const rereviewRect = rereviewButton.getBoundingClientRect()
+      const detailsRect = detailsButton.getBoundingClientRect()
 
       return {
         documentClientWidth: document.documentElement.clientWidth,
@@ -132,6 +138,13 @@ try {
         rereviewRight: rereviewButton?.getBoundingClientRect().right,
         summaryLeft: first.getBoundingClientRect().left,
         summaryRight: first.getBoundingClientRect().right,
+        detailsText: detailsButton?.textContent?.trim(),
+        prLinkTop: prLinkRect.top,
+        rereviewTop: rereviewRect.top,
+        detailsTop: detailsRect.top,
+        prLinkLeft: prLinkRect.left,
+        rereviewLeftEdge: rereviewRect.left,
+        detailsLeft: detailsRect.left,
         runsOverflowY: getComputedStyle(runs).overflowY,
         summaryBottom: summary.getBoundingClientRect().bottom,
         tokenRowText: tokenRow?.textContent || '',
@@ -168,10 +181,27 @@ try {
     )
     assert.equal(metrics.prLinkText, 'Open PR')
     assert.equal(metrics.rereviewText, 'Re-review')
+    assert.equal(metrics.detailsText, 'Details')
     assert.ok(
       metrics.rereviewLeft >= metrics.summaryLeft && metrics.rereviewRight <= metrics.summaryRight,
       `re-review button should stay inside the review run card at ${width}px: ${JSON.stringify(metrics)}`
     )
+    if (width > 820) {
+      assert.equal(
+        Math.round(metrics.prLinkTop),
+        Math.round(metrics.rereviewTop),
+        `open PR and re-review buttons should stay aligned at ${width}px: ${JSON.stringify(metrics)}`
+      )
+      assert.equal(
+        Math.round(metrics.rereviewTop),
+        Math.round(metrics.detailsTop),
+        `details button should stay aligned with review actions at ${width}px: ${JSON.stringify(metrics)}`
+      )
+      assert.ok(
+        metrics.prLinkLeft < metrics.rereviewLeftEdge && metrics.rereviewLeftEdge < metrics.detailsLeft,
+        `review actions should stay in one ordered row at ${width}px: ${JSON.stringify(metrics)}`
+      )
+    }
     assert.ok(
       metrics.tokenRowText.includes('Tokens') && metrics.tokenRowText.includes('Cache hit'),
       `review run card should expose token usage at ${width}px: ${JSON.stringify(metrics)}`

@@ -925,7 +925,7 @@ p {
 .review-run-summary {
   width: 100%;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto auto auto;
+  grid-template-columns: minmax(min(520px, 100%), 1fr) auto auto auto;
   align-items: center;
   gap: 10px;
   padding: 12px;
@@ -1039,6 +1039,14 @@ p {
 
 .review-run-token-row {
   flex-wrap: nowrap;
+}
+
+.review-run-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
 }
 
 .review-run-token-row > span {
@@ -5735,13 +5743,19 @@ select:focus {
 
   .review-run-main-action,
   .review-run-chip-row,
-  .review-run-token-row {
+  .review-run-token-row,
+  .review-run-actions {
     width: 100%;
   }
 
   .review-run-chip-row,
-  .review-run-token-row {
+  .review-run-token-row,
+  .review-run-actions {
     flex-wrap: wrap;
+  }
+
+  .review-run-actions {
+    justify-content: stretch;
   }
 
   .review-run-status,

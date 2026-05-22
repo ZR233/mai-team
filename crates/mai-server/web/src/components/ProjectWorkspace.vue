@@ -217,41 +217,43 @@
                     <small>Hit rate</small>
                   </span>
                 </div>
-                <a
-                  v-if="reviewRunPrUrl(run)"
-                  class="review-run-pr-link"
-                  :href="reviewRunPrUrl(run)"
-                  target="_blank"
-                  rel="noreferrer"
-                  @click.stop
-                >
-                  Open PR
-                </a>
-                <button
-                  v-else
-                  type="button"
-                  class="review-run-pr-link"
-                  @click="toggleReviewRun(run)"
-                >
-                  Details
-                </button>
-                <button
-                  v-if="run.pr"
-                  type="button"
-                  class="review-run-pr-link review-run-rereview"
-                  :disabled="isReviewRunRereviewing(run) || !canRereviewRun(run)"
-                  @click.stop="rereviewRun(run)"
-                >
-                  {{ isReviewRunRereviewing(run) ? 'Queuing...' : 'Re-review' }}
-                </button>
-                <button
-                  type="button"
-                  class="review-run-expand"
-                  :aria-expanded="expandedReviewRunId === run.id"
-                  @click="toggleReviewRun(run)"
-                >
-                  {{ expandedReviewRunId === run.id ? 'Hide' : 'Details' }}
-                </button>
+                <div class="review-run-actions">
+                  <a
+                    v-if="reviewRunPrUrl(run)"
+                    class="review-run-pr-link"
+                    :href="reviewRunPrUrl(run)"
+                    target="_blank"
+                    rel="noreferrer"
+                    @click.stop
+                  >
+                    Open PR
+                  </a>
+                  <button
+                    v-else
+                    type="button"
+                    class="review-run-pr-link"
+                    @click="toggleReviewRun(run)"
+                  >
+                    Details
+                  </button>
+                  <button
+                    v-if="run.pr"
+                    type="button"
+                    class="review-run-pr-link review-run-rereview"
+                    :disabled="isReviewRunRereviewing(run) || !canRereviewRun(run)"
+                    @click.stop="rereviewRun(run)"
+                  >
+                    {{ isReviewRunRereviewing(run) ? 'Queuing...' : 'Re-review' }}
+                  </button>
+                  <button
+                    type="button"
+                    class="review-run-expand"
+                    :aria-expanded="expandedReviewRunId === run.id"
+                    @click="toggleReviewRun(run)"
+                  >
+                    {{ expandedReviewRunId === run.id ? 'Hide' : 'Details' }}
+                  </button>
+                </div>
               </div>
               <div v-if="expandedReviewRunId === run.id" class="review-run-detail">
                 <p v-if="run.summary">{{ run.summary }}</p>
