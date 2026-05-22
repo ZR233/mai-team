@@ -1,6 +1,6 @@
 import { nextTick, reactive, ref } from 'vue'
-import { useApi } from './useApi'
-import { highlightCodeBlocks } from '../utils/markdown'
+import { useApi } from './useApi.js'
+import { highlightCodeBlocks } from '../utils/markdown.js'
 
 const projects = ref([])
 const selectedProjectId = ref(null)
@@ -293,6 +293,16 @@ export function useProjects() {
     }
   }
 
+  async function rereviewProjectPr(pr, projectId = selectedProjectId.value) {
+    if (!projectId || !pr) return null
+    const response = await api(`/projects/${encodeURIComponent(projectId)}/pull-requests/${encodeURIComponent(pr)}/review`, {
+      method: 'POST'
+    })
+    await refreshProjects()
+    if (selectedProjectId.value === projectId) await refreshProjectDetail()
+    return response
+  }
+
   async function loadGitAccountRepositories(accountId) {
     if (!accountId) return { repositories: [] }
     return api(`/git/accounts/${encodeURIComponent(accountId)}/repositories`)
@@ -385,6 +395,7 @@ export function useProjects() {
     createProjectSession,
     updateProjectAgent,
     loadProjectReviewRun,
+    rereviewProjectPr,
     loadGitAccountRepositories,
     loadRuntimeDefaults,
     loadGitAccountRepositoryPackages,

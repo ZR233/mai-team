@@ -32,6 +32,8 @@ function reviewRunsFixture() {
           <span><strong>${80_000 + index}</strong><small>Cache hit</small></span>
         </div>
         <a class="review-run-pr-link" href="https://github.com/owner/repo/pull/${128 + index}">Open PR</a>
+        <button type="button" class="review-run-pr-link review-run-rereview">Re-review</button>
+        <button type="button" class="review-run-expand">Details</button>
       </div>
     </article>
   `).join('')
@@ -113,6 +115,7 @@ try {
       const prLink = first.querySelector('.review-run-pr-link')
       const tokenRow = first.querySelector('.review-run-token-row')
       const main = first.querySelector('.review-run-main')
+      const rereviewButton = first.querySelector('.review-run-rereview')
 
       return {
         documentClientWidth: document.documentElement.clientWidth,
@@ -124,6 +127,11 @@ try {
         listScrollHeight: list.scrollHeight,
         panelBottom: panel.getBoundingClientRect().bottom,
         prLinkText: prLink?.textContent?.trim(),
+        rereviewText: rereviewButton?.textContent?.trim(),
+        rereviewLeft: rereviewButton?.getBoundingClientRect().left,
+        rereviewRight: rereviewButton?.getBoundingClientRect().right,
+        summaryLeft: first.getBoundingClientRect().left,
+        summaryRight: first.getBoundingClientRect().right,
         runsOverflowY: getComputedStyle(runs).overflowY,
         summaryBottom: summary.getBoundingClientRect().bottom,
         tokenRowText: tokenRow?.textContent || '',
@@ -159,6 +167,11 @@ try {
       `recent runs should scroll internally at ${width}px: ${JSON.stringify(metrics)}`
     )
     assert.equal(metrics.prLinkText, 'Open PR')
+    assert.equal(metrics.rereviewText, 'Re-review')
+    assert.ok(
+      metrics.rereviewLeft >= metrics.summaryLeft && metrics.rereviewRight <= metrics.summaryRight,
+      `re-review button should stay inside the review run card at ${width}px: ${JSON.stringify(metrics)}`
+    )
     assert.ok(
       metrics.tokenRowText.includes('Tokens') && metrics.tokenRowText.includes('Cache hit'),
       `review run card should expose token usage at ${width}px: ${JSON.stringify(metrics)}`

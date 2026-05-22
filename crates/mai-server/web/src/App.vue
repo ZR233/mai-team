@@ -40,6 +40,7 @@
         :sending="isProjectSending"
         :stopping="isProjectStopping"
         :review-run-loading="isProjectReviewRunLoading"
+        :rereviewing-prs="rereviewingProjectPrs"
         :providers="providersState.providers"
         :skills="projectComposerSkills"
         :selected-skills="selectedProjectSkills"
@@ -63,6 +64,7 @@
         @detect-project-skills="onDetectProjectSkills"
         @update-review-settings="onUpdateProjectReviewSettings"
         @load-review-run="onLoadProjectReviewRun"
+        @rereview-pr="onRereviewProjectPr"
         @create-session="onCreateProjectSession"
         @select-session="selectProjectSession"
       />
@@ -269,6 +271,7 @@ const {
   createProjectSession,
   updateProjectAgent,
   loadProjectReviewRun,
+  rereviewProjectPr,
   loadGitAccountRepositories,
   loadRuntimeDefaults,
   loadGitAccountRepositoryPackages,
@@ -329,6 +332,7 @@ const selectedSkills = ref([])
 const selectedProjectSkills = ref([])
 const isUpdatingAgentModel = ref(false)
 const isUpdatingProjectAgentModel = ref(false)
+const rereviewingProjectPrs = ref([])
 const previousSessionId = ref(null)
 const previousProjectSessionId = ref(null)
 const skillsError = ref('')
@@ -649,6 +653,29 @@ async function onLoadProjectReviewRun(runId) {
   } catch (error) {
     showToast(error.message)
   }
+}
+
+async function onRereviewProjectPr(pr) {
+  if (!pr || responseListIncludes(rereviewingProjectPrs.value, pr)) return
+  rereviewingProjectPrs.value = [...rereviewingProjectPrs.value, pr]
+  try {
+    const response = await rereviewProjectPr(pr)
+    showToast(rereviewToastMessage(pr, response))
+  } catch (error) {
+    showToast(error.message)
+  } finally {
+    rereviewingProjectPrs.value = rereviewingProjectPrs.value.filter((value) => String(value) !== String(pr))
+  }
+}
+
+function rereviewToastMessage(pr, response) {
+  if (responseListIncludes(response?.queued, pr)) return `PR #${pr} queued for review.`
+  if (responseListIncludes(response?.deduped, pr)) return `PR #${pr} is already queued for review.`
+  return `PR #${pr} was not queued. Enable automatic PR review first.`
+}
+
+function responseListIncludes(values, pr) {
+  return (values || []).some((value) => String(value) === String(pr))
 }
 
 async function onCreateProjectSession(agent) {

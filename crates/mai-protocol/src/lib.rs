@@ -494,6 +494,13 @@ pub struct ProjectReviewRunsResponse {
     pub runs: Vec<ProjectReviewRunSummary>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectReviewQueueResponse {
+    pub queued: Vec<u64>,
+    pub deduped: Vec<u64>,
+    pub ignored: Vec<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDetail {
     #[serde(flatten)]
@@ -2180,6 +2187,24 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ProviderKind>("\"zhipu\"").expect("deserialize"),
             ProviderKind::Zhipu
+        );
+    }
+
+    #[test]
+    fn project_review_queue_response_serializes_queue_summary() {
+        let response = ProjectReviewQueueResponse {
+            queued: vec![7],
+            deduped: vec![8],
+            ignored: vec![9],
+        };
+
+        assert_eq!(
+            json!({
+                "queued": [7],
+                "deduped": [8],
+                "ignored": [9],
+            }),
+            serde_json::to_value(response).expect("serialize response")
         );
     }
 

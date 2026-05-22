@@ -236,6 +236,15 @@
                   Details
                 </button>
                 <button
+                  v-if="run.pr"
+                  type="button"
+                  class="review-run-pr-link review-run-rereview"
+                  :disabled="isReviewRunRereviewing(run) || !canRereviewRun(run)"
+                  @click.stop="rereviewRun(run)"
+                >
+                  {{ isReviewRunRereviewing(run) ? 'Queuing...' : 'Re-review' }}
+                </button>
+                <button
                   type="button"
                   class="review-run-expand"
                   :aria-expanded="expandedReviewRunId === run.id"
@@ -503,6 +512,7 @@ const props = defineProps({
   sending: { type: Boolean, default: false },
   stopping: { type: Boolean, default: false },
   reviewRunLoading: { type: Boolean, default: false },
+  rereviewingPrs: { type: Array, default: () => [] },
   updatingModel: { type: Boolean, default: false },
   providers: { type: Array, default: () => [] },
   skills: { type: Array, default: () => [] },
@@ -538,6 +548,7 @@ const emit = defineEmits([
   'detect-project-skills',
   'update-review-settings',
   'load-review-run',
+  'rereview-pr',
   'create-session',
   'select-session'
 ])
@@ -712,6 +723,19 @@ function toggleReviewRun(run) {
   if (expandedReviewRunId.value === run.id && !run.detail_loaded && (!run.messages || !run.events)) {
     emit('load-review-run', run.id)
   }
+}
+
+function canRereviewRun(run) {
+  return Boolean(run?.pr && projectReady.value && props.detail?.auto_review_enabled)
+}
+
+function isReviewRunRereviewing(run) {
+  return Boolean(run?.pr && props.rereviewingPrs.some((pr) => String(pr) === String(run.pr)))
+}
+
+function rereviewRun(run) {
+  if (!canRereviewRun(run) || isReviewRunRereviewing(run)) return
+  emit('rereview-pr', run.pr)
 }
 
 function reviewRunTitle(run) {

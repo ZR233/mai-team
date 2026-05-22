@@ -5438,6 +5438,90 @@ async fn relay_signal_queues_relay_pr_without_touching_review_pool() {
 }
 
 #[tokio::test]
+async fn manual_rereview_uses_project_review_pool_and_auto_review_gate() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut project = test_project_summary(project_id, maintainer_id, "account-1");
+    project.auto_review_enabled = true;
+    store.save_project(&project).await.expect("save project");
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let queued = runtime
+        .enqueue_project_review(ProjectReviewQueueRequest {
+            project_id,
+            pr: 9,
+            head_sha: None,
+            delivery_id: None,
+            reason: "manual_rereview".to_string(),
+        })
+        .await
+        .expect("queue manual rereview");
+    let deduped = runtime
+        .enqueue_project_review(ProjectReviewQueueRequest {
+            project_id,
+            pr: 9,
+            head_sha: None,
+            delivery_id: None,
+            reason: "manual_rereview".to_string(),
+        })
+        .await
+        .expect("dedupe manual rereview");
+    let project_record = runtime.project(project_id).await.expect("project");
+    {
+        let mut summary = project_record.summary.write().await;
+        summary.auto_review_enabled = false;
+    }
+    let ignored = runtime
+        .enqueue_project_review(ProjectReviewQueueRequest {
+            project_id,
+            pr: 10,
+            head_sha: None,
+            delivery_id: None,
+            reason: "manual_rereview".to_string(),
+        })
+        .await
+        .expect("ignore manual rereview when disabled");
+
+    assert_eq!(
+        ProjectReviewQueueSummary {
+            queued: vec![9],
+            deduped: vec![],
+            ignored: vec![],
+        },
+        queued
+    );
+    assert_eq!(
+        ProjectReviewQueueSummary {
+            queued: vec![],
+            deduped: vec![9],
+            ignored: vec![],
+        },
+        deduped
+    );
+    assert_eq!(
+        ProjectReviewQueueSummary {
+            queued: vec![],
+            deduped: vec![],
+            ignored: vec![10],
+        },
+        ignored
+    );
+    let pending = project_record
+        .review_pool
+        .lock()
+        .await
+        .next()
+        .expect("manual rereview queued");
+    assert_eq!(9, pending.pr);
+    assert_eq!("manual_rereview", pending.reason);
+    assert_eq!(None, pending.head_sha);
+    assert_eq!(None, pending.delivery_id);
+    assert_eq!(None, project_record.review_pool.lock().await.next());
+}
+
+#[tokio::test]
 async fn project_review_selector_pages_and_queues_all_eligible_prs_without_model_request() {
     let mut page_one = vec![github_pr(1, false, "head-1")];
     page_one.extend((2..=20).map(|number| github_pr(number, true, &format!("head-{number}"))));
