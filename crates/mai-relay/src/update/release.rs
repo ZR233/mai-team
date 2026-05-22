@@ -9,7 +9,7 @@ use super::{
     MAX_DOWNLOAD_BYTES, RELAY_ASSET_NAME, RELAY_CHECKSUM_NAME, RELEASE_API_URL, USER_AGENT_VALUE,
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(super) struct GithubRelease {
     pub(super) tag_name: String,
     #[serde(default, deserialize_with = "empty_string_from_null")]
@@ -44,16 +44,29 @@ where
     Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
-pub(super) async fn fetch_latest_release(http: &reqwest::Client) -> RelayResult<GithubRelease> {
-    Ok(http
+pub(super) async fn fetch_latest_relay_release(
+    http: &reqwest::Client,
+) -> RelayResult<GithubRelease> {
+    let releases = http
         .get(RELEASE_API_URL)
         .header(USER_AGENT, USER_AGENT_VALUE)
         .header(ACCEPT, "application/vnd.github+json")
         .send()
         .await?
         .error_for_status()?
-        .json::<GithubRelease>()
-        .await?)
+        .json::<Vec<GithubRelease>>()
+        .await?;
+    latest_relay_release(releases).ok_or_else(|| {
+        RelayErrorKind::InvalidInput(
+            "repository releases do not include a mai-relay release".into(),
+        )
+    })
+}
+
+fn latest_relay_release(releases: Vec<GithubRelease>) -> Option<GithubRelease> {
+    releases
+        .into_iter()
+        .find(|release| release.tag_name.starts_with("mai-relay-v"))
 }
 
 pub(super) fn status_from_release(
@@ -257,6 +270,42 @@ mod tests {
                 .unwrap_or_default()
                 .contains(RELAY_ASSET_NAME)
         );
+    }
+
+    #[test]
+    fn latest_relay_release_skips_server_releases() {
+        let server_release = GithubRelease {
+            tag_name: "mai-server-v0.1.5".to_string(),
+            name: "mai-server v0.1.5".to_string(),
+            body: "server release".to_string(),
+            published_at: "2026-05-21T00:00:00Z".to_string(),
+            html_url: "https://github.com/ZR233/mai-team/releases/tag/mai-server-v0.1.5"
+                .to_string(),
+            assets: vec![asset(
+                "mai-server-x86_64-unknown-linux-gnu.tar.gz",
+                "https://github.com/ZR233/mai-team/releases/download/mai-server-v0.1.5/mai-server.tar.gz",
+                100,
+            )],
+        };
+        let relay_release = release_with_assets(vec![
+            asset(
+                RELAY_ASSET_NAME,
+                "https://github.com/ZR233/mai-team/releases/download/mai-relay-v0.1.4/mai-relay.tar.gz",
+                100,
+            ),
+            asset(
+                RELAY_CHECKSUM_NAME,
+                "https://github.com/ZR233/mai-team/releases/download/mai-relay-v0.1.4/mai-relay.tar.gz.sha256",
+                64,
+            ),
+        ]);
+
+        let expected = relay_release.clone();
+
+        let selected = latest_relay_release(vec![server_release, relay_release])
+            .expect("select relay release");
+
+        assert_eq!(selected, expected);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tempfile::Builder as TempDirBuilder;
 
-const RELEASE_API_URL: &str = "https://api.github.com/repos/ZR233/mai-team/releases/latest";
+const RELEASE_API_URL: &str = "https://api.github.com/repos/ZR233/mai-team/releases?per_page=100";
 const RELAY_ASSET_NAME: &str = "mai-relay-x86_64-unknown-linux-gnu.tar.gz";
 const RELAY_CHECKSUM_NAME: &str = "mai-relay-x86_64-unknown-linux-gnu.tar.gz.sha256";
 const MAX_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
@@ -35,7 +35,7 @@ pub(crate) async fn check(
         }
     }
     let current_version = current_version();
-    match release::fetch_latest_release(http).await {
+    match release::fetch_latest_relay_release(http).await {
         Ok(release) => {
             let status = release::status_from_release(current_version, &release);
             store_cached_status(status.clone());
@@ -56,7 +56,7 @@ pub(crate) async fn apply(http: &reqwest::Client) -> RelayResult<RelayUpdateActi
         ));
     }
 
-    let github_release = release::fetch_latest_release(http).await?;
+    let github_release = release::fetch_latest_relay_release(http).await?;
     let status = release::status_from_release(current_version(), &github_release);
     if !status.has_update {
         return Err(RelayErrorKind::InvalidInput(
