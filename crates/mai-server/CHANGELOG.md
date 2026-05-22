@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.5...mai-server-v0.1.6) - 2026-05-22
+
+### Added
+
+- 添加 SSE 事件处理逻辑，优化事件更新和测试用例
+- 重构审查运行组件，优化样式和测试用例
+- 添加手动重新审查功能，更新相关逻辑和测试用例
+- 添加 Zhipu BigModel 支持，更新相关逻辑和测试用例
+
+### Other
+
+- release v0.1.5 ([#25](https://github.com/ZR233/mai-team/pull/25))
+
 ## [0.1.5](https://github.com/ZR233/mai-team/releases/tag/mai-server-v0.1.5) - 2026-05-21
 
 ### Added
