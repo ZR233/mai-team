@@ -89,6 +89,36 @@ run() {
   fi
 }
 
+docker_socket_group() {
+  if [[ -S /var/run/docker.sock ]]; then
+    stat -c '%G' /var/run/docker.sock
+    return 0
+  fi
+  if getent group docker >/dev/null 2>&1; then
+    printf 'docker\n'
+    return 0
+  fi
+  return 1
+}
+
+configure_docker_access() {
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "DRY RUN: configure mai-server access to Docker socket group"
+    return 0
+  fi
+
+  local group
+  if ! group="$(docker_socket_group)"; then
+    cat >&2 <<'ERROR'
+Docker socket group was not found.
+Install Docker and confirm /var/run/docker.sock exists before installing mai-server.
+ERROR
+    exit 1
+  fi
+
+  usermod -aG "$group" mai-server
+}
+
 check_docker_access() {
   if [[ "$DRY_RUN" == "true" ]]; then
     echo "DRY RUN: check Docker daemon and mai-server user access to Docker socket"
@@ -139,6 +169,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 run groupadd --system mai-server 2>/dev/null || true
 run useradd --system --gid mai-server --home "$DATA_DIR" --shell /usr/sbin/nologin mai-server 2>/dev/null || true
+configure_docker_access
 check_docker_access
 run install -d -m 0755 "$ENV_DIR" "$DATA_DIR" "$BIN_DIR"
 

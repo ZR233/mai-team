@@ -45,6 +45,7 @@ update_output="$("$UPDATE_SCRIPT" --dry-run)"
 
 for output in "$install_output" "$update_output"; do
   assert_contains "$output" "DRY RUN: host check would require Ubuntu 22.04 or 24.04 x86_64"
+  assert_contains "$output" "DRY RUN: configure mai-server access to Docker socket group"
   assert_contains "$output" "DRY RUN: write /etc/systemd/system/mai-server.service:"
   assert_contains "$output" "EnvironmentFile=/etc/mai-server/mai-server.env"
   assert_contains "$output" "ExecStart=/opt/mai-server/mai-server --data-path /var/lib/mai-server"
@@ -54,6 +55,10 @@ for output in "$install_output" "$update_output"; do
     "$output" \
     "DRY RUN: write /etc/systemd/system/mai-server.service:" \
     "DRY RUN: systemctl daemon-reload"
+  assert_line_before \
+    "$output" \
+    "DRY RUN: configure mai-server access to Docker socket group" \
+    "DRY RUN: check Docker daemon and mai-server user access to Docker socket"
 done
 
 assert_contains "$update_output" "DRY RUN: systemctl restart mai-server"
