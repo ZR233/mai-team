@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.6...mai-server-v0.1.7) - 2026-05-22
+
+### Added
+
+- 更新安装脚本以支持 Ubuntu 22.04 和 24.04，优化错误处理逻辑
+
+### Other
+
+- Merge branch 'main' of ssh://github.com/ZR233/mai-team
+
 ## [0.1.6](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.5...mai-server-v0.1.6) - 2026-05-22
 
 ### Added
