@@ -578,6 +578,77 @@ async fn provider_presets_include_builtin_metadata() {
         .find(|model| model.id == "mimo-v2-flash")
         .expect("mimo-v2-flash");
     assert!(mimo_flash.reasoning.is_none());
+
+    let zhipu = presets
+        .providers
+        .iter()
+        .find(|provider| provider.kind == ProviderKind::Zhipu)
+        .expect("zhipu preset");
+    assert_eq!(zhipu.id, "zhipu");
+    assert_eq!(zhipu.name, "Zhipu BigModel");
+    assert_eq!(zhipu.base_url, "https://open.bigmodel.cn/api/paas/v4");
+    assert_eq!(zhipu.default_model, "glm-5.1");
+    assert_eq!(
+        zhipu
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "glm-5.1",
+            "glm-5",
+            "glm-5-turbo",
+            "glm-4.7",
+            "glm-4.7-flashx",
+            "glm-4.6",
+            "glm-4.5-air",
+            "glm-4.5-airx",
+        ]
+    );
+    for model in &zhipu.models {
+        assert_eq!(model.wire_api, ModelWireApi::ChatCompletions);
+        assert_eq!(model.request_policy.max_tokens_field, "max_tokens");
+        assert!(model.supports_tools);
+        assert!(model.capabilities.tools);
+        assert!(!model.capabilities.parallel_tools);
+        assert!(!model.capabilities.continuation);
+        assert!(!model.capabilities.strict_schema);
+        let reasoning = model.reasoning.as_ref().expect("zhipu reasoning");
+        assert_eq!(reasoning.default_variant.as_deref(), Some("enabled"));
+        assert_eq!(
+            reasoning
+                .variants
+                .iter()
+                .map(|variant| variant.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["enabled", "disabled"]
+        );
+        assert_eq!(
+            reasoning.variants[0].request,
+            json!({ "thinking": { "type": "enabled" } })
+        );
+        assert_eq!(
+            reasoning.variants[1].request,
+            json!({ "thinking": { "type": "disabled" } })
+        );
+    }
+    for (id, output_tokens) in [
+        ("glm-5.1", 131_072),
+        ("glm-5", 131_072),
+        ("glm-5-turbo", 131_072),
+        ("glm-4.7", 131_072),
+        ("glm-4.7-flashx", 131_072),
+        ("glm-4.6", 131_072),
+        ("glm-4.5-air", 98_304),
+        ("glm-4.5-airx", 98_304),
+    ] {
+        let model = zhipu
+            .models
+            .iter()
+            .find(|model| model.id == id)
+            .expect("zhipu model");
+        assert_eq!(model.output_tokens, output_tokens);
+    }
 }
 
 #[tokio::test]
@@ -693,6 +764,52 @@ async fn legacy_mimo_models_migrate_to_official_chat_policy() {
         model.request_policy.max_tokens_field,
         "max_completion_tokens"
     );
+}
+
+#[tokio::test]
+async fn legacy_zhipu_models_migrate_to_openai_compatible_chat_policy() {
+    let dir = tempdir().expect("tempdir");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+            default_provider_id = "zhipu"
+
+            [providers.zhipu]
+            kind = "zhipu"
+            name = "Zhipu BigModel"
+            base_url = "https://open.bigmodel.cn/api/paas/v4"
+            api_key = "secret"
+            default_model = "glm-5.1"
+            enabled = true
+
+            [providers.zhipu.models."glm-5.1"]
+            name = "glm-5.1"
+            context_tokens = 128000
+            output_tokens = 131072
+            supports_tools = true
+            wire_api = "responses"
+
+            [providers.zhipu.models."glm-5.1".capabilities]
+            continuation = true
+
+            [providers.zhipu.models."glm-5.1".request_policy]
+            store = true
+        "#,
+    )
+    .expect("write config");
+    let store = ConfigStore::open_with_config_path(dir.path().join("config.sqlite3"), &config_path)
+        .await
+        .expect("open");
+
+    let response = store.providers_response().await.expect("providers");
+    let provider = response.providers.first().expect("provider");
+    assert_eq!(provider.kind, ProviderKind::Zhipu);
+    let model = provider.models.first().expect("model");
+    assert_eq!(model.wire_api, ModelWireApi::ChatCompletions);
+    assert!(!model.capabilities.continuation);
+    assert_eq!(model.request_policy.store, None);
+    assert_eq!(model.request_policy.max_tokens_field, "max_tokens");
 }
 
 #[tokio::test]

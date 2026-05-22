@@ -104,6 +104,7 @@ impl ConfigStore {
             providers: vec![
                 provider_preset(ProviderKind::Openai),
                 provider_preset(ProviderKind::Deepseek),
+                provider_preset(ProviderKind::Zhipu),
                 provider_preset_from_config(mimo_builtin_provider(
                     "mimo-api",
                     "MiMo API",
@@ -412,7 +413,9 @@ fn providers_cache_stamp(path: &Path) -> Result<ProvidersCacheStamp> {
 fn migrated_wire_api(provider_kind: ProviderKind, wire_api: ModelWireApi) -> ModelWireApi {
     match provider_kind {
         ProviderKind::Openai => wire_api,
-        ProviderKind::Deepseek | ProviderKind::Mimo => ModelWireApi::ChatCompletions,
+        ProviderKind::Deepseek | ProviderKind::Mimo | ProviderKind::Zhipu => {
+            ModelWireApi::ChatCompletions
+        }
     }
 }
 
@@ -434,6 +437,11 @@ fn migrated_capabilities(
         ProviderKind::Mimo => {
             capabilities.continuation = false;
         }
+        ProviderKind::Zhipu => {
+            capabilities.continuation = false;
+            capabilities.parallel_tools = false;
+            capabilities.strict_schema = false;
+        }
     }
     capabilities
 }
@@ -449,7 +457,7 @@ fn migrated_request_policy(
                 request_policy.max_tokens_field = "max_output_tokens".to_string();
             }
         }
-        ProviderKind::Deepseek | ProviderKind::Mimo => {
+        ProviderKind::Deepseek | ProviderKind::Mimo | ProviderKind::Zhipu => {
             if request_policy.store == Some(true) {
                 request_policy.store = None;
             }
@@ -534,6 +542,30 @@ fn builtin_provider(kind: ProviderKind) -> ProviderConfig {
             "https://api.xiaomimimo.com/v1",
             "MIMO_API_KEY",
         ),
+        ProviderKind::Zhipu => zhipu_builtin_provider(),
+    }
+}
+
+fn zhipu_builtin_provider() -> ProviderConfig {
+    ProviderConfig {
+        id: "zhipu".to_string(),
+        kind: ProviderKind::Zhipu,
+        name: "Zhipu BigModel".to_string(),
+        base_url: "https://open.bigmodel.cn/api/paas/v4".to_string(),
+        api_key: None,
+        api_key_env: Some("ZAI_API_KEY".to_string()),
+        default_model: "glm-5.1".to_string(),
+        enabled: true,
+        models: vec![
+            zhipu_model("glm-5.1"),
+            zhipu_model("glm-5"),
+            zhipu_model("glm-5-turbo"),
+            zhipu_model("glm-4.7"),
+            zhipu_model("glm-4.7-flashx"),
+            zhipu_model("glm-4.6"),
+            zhipu_model("glm-4.5-air"),
+            zhipu_model("glm-4.5-airx"),
+        ],
     }
 }
 
@@ -671,6 +703,30 @@ fn mimo_model(id: &str, with_reasoning: bool) -> ModelConfig {
     }
 }
 
+fn zhipu_model(id: &str) -> ModelConfig {
+    ModelConfig {
+        id: id.to_string(),
+        name: Some(id.to_string()),
+        context_tokens: 128_000,
+        output_tokens: zhipu_output_tokens(id),
+        supports_tools: true,
+        wire_api: ModelWireApi::ChatCompletions,
+        capabilities: zhipu_capabilities(),
+        request_policy: chat_request_policy("max_tokens"),
+        reasoning: Some(zhipu_reasoning_config()),
+        options: serde_json::Value::Null,
+        headers: BTreeMap::new(),
+    }
+}
+
+fn zhipu_output_tokens(id: &str) -> u64 {
+    if matches!(id, "glm-4.5-air" | "glm-4.5-airx") {
+        98_304
+    } else {
+        131_072
+    }
+}
+
 fn mimo_context_tokens(id: &str) -> u64 {
     match id {
         "mimo-v2.5-pro" | "mimo-v2-pro" | "mimo-v2.5" => 1_000_000,
@@ -702,6 +758,24 @@ fn mimo_reasoning_config() -> ModelReasoningConfig {
     }
 }
 
+fn zhipu_reasoning_config() -> ModelReasoningConfig {
+    ModelReasoningConfig {
+        default_variant: Some("enabled".to_string()),
+        variants: ["enabled", "disabled"]
+            .into_iter()
+            .map(|id| ModelReasoningVariant {
+                id: id.to_string(),
+                label: None,
+                request: serde_json::json!({
+                    "thinking": {
+                        "type": id,
+                    },
+                }),
+            })
+            .collect(),
+    }
+}
+
 fn openai_capabilities() -> ModelCapabilities {
     ModelCapabilities {
         tools: true,
@@ -727,6 +801,16 @@ fn mimo_capabilities(with_reasoning: bool) -> ModelCapabilities {
         tools: true,
         parallel_tools: false,
         reasoning_replay: with_reasoning,
+        strict_schema: false,
+        continuation: false,
+    }
+}
+
+fn zhipu_capabilities() -> ModelCapabilities {
+    ModelCapabilities {
+        tools: true,
+        parallel_tools: false,
+        reasoning_replay: false,
         strict_schema: false,
         continuation: false,
     }

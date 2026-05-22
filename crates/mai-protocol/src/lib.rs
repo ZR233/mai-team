@@ -973,6 +973,7 @@ pub enum ProviderKind {
     Openai,
     Deepseek,
     Mimo,
+    Zhipu,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2168,6 +2169,18 @@ mod tests {
         assert_eq!(request.model, None);
         assert_eq!(request.reasoning_effort, None);
         assert!(request.deep);
+    }
+
+    #[test]
+    fn provider_kind_serializes_zhipu() {
+        assert_eq!(
+            serde_json::to_string(&ProviderKind::Zhipu).expect("serialize"),
+            "\"zhipu\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ProviderKind>("\"zhipu\"").expect("deserialize"),
+            ProviderKind::Zhipu
+        );
     }
 
     #[test]

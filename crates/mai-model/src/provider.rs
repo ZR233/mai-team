@@ -111,7 +111,9 @@ pub(crate) fn response_id_unsupported_for_responses_http(err: &ModelError) -> bo
 fn effective_wire_api(provider: &ProviderSecret, model: &ModelConfig) -> ModelWireApi {
     match provider.kind {
         ProviderKind::Openai => model.wire_api,
-        ProviderKind::Deepseek | ProviderKind::Mimo => ModelWireApi::ChatCompletions,
+        ProviderKind::Deepseek | ProviderKind::Mimo | ProviderKind::Zhipu => {
+            ModelWireApi::ChatCompletions
+        }
     }
 }
 
@@ -279,5 +281,45 @@ mod tests {
             }))
         );
         assert_eq!(options.get("temperature"), Some(&json!(0.2)));
+    }
+
+    #[test]
+    fn zhipu_resolves_to_openai_compatible_chat_completions() {
+        let provider = ProviderSecret {
+            id: "zhipu".to_string(),
+            kind: ProviderKind::Zhipu,
+            name: "Zhipu BigModel".to_string(),
+            base_url: "https://open.bigmodel.cn/api/paas/v4/".to_string(),
+            api_key: "secret".to_string(),
+            api_key_env: Some("ZAI_API_KEY".to_string()),
+            models: Vec::new(),
+            default_model: "glm-5.1".to_string(),
+            enabled: true,
+        };
+        let mut model = model_with_reasoning(
+            "glm-5.1",
+            &["enabled", "disabled"],
+            "enabled",
+            |id| json!({ "thinking": { "type": id } }),
+        );
+        model.wire_api = ModelWireApi::Responses;
+        model.capabilities.continuation = true;
+        model.request_policy.max_tokens_field = "max_tokens".to_string();
+        model.output_tokens = 131_072;
+
+        let resolved = DefaultProviderResolver::new().resolve(&provider, &model, Some("disabled"));
+
+        assert_eq!(
+            resolved.endpoint,
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        );
+        assert_eq!(resolved.max_tokens_field, "max_tokens");
+        assert_eq!(resolved.max_output_tokens, 131_072);
+        assert!(resolved.supports_tools);
+        assert!(!resolved.supports_continuation);
+        assert_eq!(
+            resolved.extra_body.get("thinking"),
+            Some(&json!({ "type": "disabled" }))
+        );
     }
 }

@@ -11,6 +11,7 @@
           <select v-model="dialog.form.kind" @change="$emit('kind-changed', dialog.form.kind)">
             <option value="openai">OpenAI</option>
             <option value="deepseek">DeepSeek</option>
+            <option value="zhipu">Zhipu BigModel</option>
             <option value="mimo-api">MiMo (API)</option>
             <option value="mimo-token-plan">MiMo (Token Plan)</option>
           </select>

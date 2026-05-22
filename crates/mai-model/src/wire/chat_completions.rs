@@ -610,6 +610,56 @@ mod tests {
     }
 
     #[test]
+    fn zhipu_request_uses_thinking_variants_and_max_tokens() {
+        let mut model =
+            model_with_reasoning("glm-5.1", &["enabled", "disabled"], "enabled", |id| {
+                serde_json::json!({
+                    "thinking": {
+                        "type": id,
+                    },
+                })
+            });
+        model.request_policy.max_tokens_field = "max_tokens".to_string();
+        let api = ChatCompletionsApi::openai_compatible();
+        let body = api
+            .build_body(&WireRequest {
+                model_id: &model.id,
+                instructions: "instructions",
+                input: &[ModelInputItem::user_text("hello")],
+                tools: &[ToolDefinition {
+                    kind: "function".to_string(),
+                    name: "container_exec".to_string(),
+                    description: "run a command".to_string(),
+                    parameters: serde_json::json!({ "type": "object" }),
+                }],
+                tool_choice: Some("auto"),
+                stream: false,
+                store: None,
+                previous_response_id: None,
+                prompt_cache_key: Some("agent:agent-1:session:session-1"),
+                max_output_tokens: 131_072,
+                max_tokens_field: &model.request_policy.max_tokens_field,
+                extra_body: crate::provider::request_options(&model, Some("disabled")),
+                supports_tools: true,
+            })
+            .expect("build");
+        let value: Value = serde_json::from_slice(&body).expect("parse");
+
+        assert_eq!(value["model"].as_str(), Some("glm-5.1"));
+        assert_eq!(value["max_tokens"].as_u64(), Some(131_072));
+        assert_eq!(
+            value.pointer("/thinking/type").and_then(Value::as_str),
+            Some("disabled")
+        );
+        assert_eq!(value["tool_choice"].as_str(), Some("auto"));
+        assert_eq!(
+            value.get("tools").and_then(Value::as_array).map(Vec::len),
+            Some(1)
+        );
+        assert!(value.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
     fn deepseek_reasoning_tool_call_messages_have_content_and_effort() {
         let model = deepseek_model();
         let api = ChatCompletionsApi::deepseek();
