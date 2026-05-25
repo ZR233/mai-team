@@ -14,10 +14,10 @@ Relay release 由 release-plz 管理，只发布 GitHub release，不发布 crat
 curl -fsSL https://raw.githubusercontent.com/ZR233/mai-team/main/scripts/install-mai-relay-ubuntu-24.04.sh | sudo bash -s -- --public-url "http://YOUR_RELAY_HOST:8090"
 ```
 
-如果直接使用最新 release，脚本会下载：
+如果直接使用最新 release，脚本会先从 GitHub releases 列表中选择最新的 `mai-relay-vX.Y.Z` tag，再下载：
 
 ```text
-https://github.com/ZR233/mai-team/releases/latest/download/mai-relay-x86_64-unknown-linux-gnu.tar.gz
+https://github.com/ZR233/mai-team/releases/download/mai-relay-vX.Y.Z/mai-relay-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 release-plz 发布流程会为该 release 上传同名二进制包和 `.sha256` 校验文件。不要改动这两个 asset 名称，否则安装脚本和 relay 自更新程序都需要同步调整。
@@ -124,10 +124,10 @@ curl -fsSL https://raw.githubusercontent.com/ZR233/mai-team/main/scripts/update-
 curl -fsSL https://raw.githubusercontent.com/ZR233/mai-team/main/scripts/install-mai-server-ubuntu-24.04.sh | sudo bash -s -- --bind-addr 0.0.0.0:8080
 ```
 
-如果直接使用最新 release，脚本会下载：
+如果直接使用最新 release，脚本会先从 GitHub releases 列表中选择最新的 `mai-server-vX.Y.Z` tag，再下载：
 
 ```text
-https://github.com/ZR233/mai-team/releases/latest/download/mai-server-x86_64-unknown-linux-gnu.tar.gz
+https://github.com/ZR233/mai-team/releases/download/mai-server-vX.Y.Z/mai-server-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 release 发布流程需要为该 release 上传同名二进制包和 `.sha256` 校验文件。不要改动 asset 名称，否则安装脚本和更新脚本都需要同步调整。

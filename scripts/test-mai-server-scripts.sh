@@ -3,12 +3,32 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+release_fixture="$(mktemp)"
+wrong_version_output="$(mktemp)"
+trap 'rm -f "$release_fixture" "$wrong_version_output"' EXIT
+
+cat > "$release_fixture" <<'JSON'
+[
+  { "tag_name": "mai-relay-v0.1.8" },
+  { "tag_name": "mai-server-v0.1.8", "draft": true },
+  { "tag_name": "mai-server-v0.1.7" }
+]
+JSON
 
 assert_contains() {
   local haystack="$1"
   local needle="$2"
   if ! grep -Fq -- "$needle" <<<"$haystack"; then
     printf 'expected output to contain: %s\n' "$needle" >&2
+    exit 1
+  fi
+}
+
+assert_not_contains() {
+  local haystack="$1"
+  local needle="$2"
+  if grep -Fq -- "$needle" <<<"$haystack"; then
+    printf 'expected output not to contain: %s\n' "$needle" >&2
     exit 1
   fi
 }
@@ -40,11 +60,15 @@ UPDATE_SCRIPT="$ROOT_DIR/scripts/update-mai-server-ubuntu-24.04.sh"
 bash -n "$INSTALL_SCRIPT"
 bash -n "$UPDATE_SCRIPT"
 
-install_output="$("$INSTALL_SCRIPT" --dry-run)"
-update_output="$("$UPDATE_SCRIPT" --dry-run)"
+install_output="$(MAI_RELEASES_JSON_FILE="$release_fixture" "$INSTALL_SCRIPT" --dry-run)"
+update_output="$(MAI_RELEASES_JSON_FILE="$release_fixture" "$UPDATE_SCRIPT" --dry-run)"
 
 for output in "$install_output" "$update_output"; do
   assert_contains "$output" "DRY RUN: host check would require Ubuntu 22.04 or 24.04 x86_64"
+  assert_contains "$output" "DRY RUN: resolve latest mai-server release from https://api.github.com/repos/ZR233/mai-team/releases?per_page=100"
+  assert_contains "$output" "DRY RUN: selected latest mai-server release mai-server-v0.1.7"
+  assert_contains "$output" "DRY RUN: download https://github.com/ZR233/mai-team/releases/download/mai-server-v0.1.7/mai-server-x86_64-unknown-linux-gnu.tar.gz"
+  assert_not_contains "$output" "releases/latest/download"
   assert_contains "$output" "DRY RUN: configure mai-server access to Docker socket group"
   assert_contains "$output" "DRY RUN: write /etc/systemd/system/mai-server.service:"
   assert_contains "$output" "EnvironmentFile=/etc/mai-server/mai-server.env"
@@ -66,5 +90,11 @@ assert_line_before \
   "$update_output" \
   "DRY RUN: systemctl daemon-reload" \
   "DRY RUN: systemctl restart mai-server"
+
+if MAI_RELEASES_JSON_FILE="$release_fixture" "$UPDATE_SCRIPT" --dry-run --version mai-relay-v0.1.8 >"$wrong_version_output" 2>&1; then
+  printf 'expected server update script to reject mai-relay version tag\n' >&2
+  exit 1
+fi
+assert_contains "$(< "$wrong_version_output")" "--version for mai-server must start with mai-server-v"
 
 printf 'mai server script tests passed\n'

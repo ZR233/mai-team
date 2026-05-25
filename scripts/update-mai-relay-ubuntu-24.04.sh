@@ -3,6 +3,9 @@ set -euo pipefail
 
 REPO="ZR233/mai-team"
 RELAY_VERSION="latest"
+RELEASE_PACKAGE="mai-relay"
+RELEASE_TAG_PREFIX="mai-relay-v"
+RELEASE_API_URL="https://api.github.com/repos/$REPO/releases?per_page=100"
 ROTATE_TOKEN="false"
 DRY_RUN="false"
 PUBLIC_URL=""
@@ -83,12 +86,6 @@ LEGACY_BIN_PATH="/usr/local/bin/mai-relay"
 SERVICE_FILE="/etc/systemd/system/mai-relay.service"
 ASSET="mai-relay-x86_64-unknown-linux-gnu.tar.gz"
 
-if [[ "$RELAY_VERSION" == "latest" ]]; then
-  DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/$ASSET"
-else
-  DOWNLOAD_URL="https://github.com/$REPO/releases/download/$RELAY_VERSION/$ASSET"
-fi
-
 run() {
   if [[ "$DRY_RUN" == "true" ]]; then
     printf 'DRY RUN:'
@@ -98,6 +95,69 @@ run() {
     "$@"
   fi
 }
+
+release_index_json() {
+  if [[ -n "${MAI_RELEASES_JSON_FILE:-}" ]]; then
+    cat "$MAI_RELEASES_JSON_FILE"
+    return 0
+  fi
+
+  curl -fsSL \
+    -H "Accept: application/vnd.github+json" \
+    -H "User-Agent: mai-relay-updater" \
+    "$RELEASE_API_URL"
+}
+
+resolve_release_tag() {
+  if [[ "$RELAY_VERSION" == "latest" ]]; then
+    if [[ "$DRY_RUN" == "true" ]]; then
+      echo "DRY RUN: resolve latest $RELEASE_PACKAGE release from $RELEASE_API_URL"
+    fi
+    local releases
+    releases="$(release_index_json)"
+    if command -v python3 >/dev/null 2>&1; then
+      RELEASE_TAG="$(RELEASE_TAG_PREFIX="$RELEASE_TAG_PREFIX" python3 -c '
+import json
+import os
+import sys
+
+prefix = os.environ["RELEASE_TAG_PREFIX"]
+for release in json.load(sys.stdin):
+    if release.get("draft") or release.get("prerelease"):
+        continue
+    tag = release.get("tag_name", "")
+    if tag.startswith(prefix):
+        print(tag)
+        break
+' <<<"$releases")"
+    else
+      set +o pipefail
+      RELEASE_TAG="$(
+        grep -E -o "\"tag_name\"[[:space:]]*:[[:space:]]*\"${RELEASE_TAG_PREFIX}[^\"]+\"" <<<"$releases" \
+          | head -n1 \
+          | sed -E "s/.*\"(${RELEASE_TAG_PREFIX}[^\"]+)\".*/\1/"
+      )"
+      set -o pipefail
+    fi
+    if [[ -z "$RELEASE_TAG" ]]; then
+      echo "no $RELEASE_PACKAGE release found in $RELEASE_API_URL" >&2
+      exit 1
+    fi
+    if [[ "$DRY_RUN" == "true" ]]; then
+      echo "DRY RUN: selected latest $RELEASE_PACKAGE release $RELEASE_TAG"
+    fi
+    return 0
+  fi
+
+  if [[ "$RELAY_VERSION" != "$RELEASE_TAG_PREFIX"* ]]; then
+    echo "--version for $RELEASE_PACKAGE must start with $RELEASE_TAG_PREFIX" >&2
+    exit 2
+  fi
+  RELEASE_TAG="$RELAY_VERSION"
+}
+
+resolve_release_tag
+DOWNLOAD_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/$ASSET"
 
 env_value() {
   local name="$1"

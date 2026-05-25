@@ -20,6 +20,10 @@ pub(super) struct GithubRelease {
     published_at: String,
     html_url: String,
     #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
     assets: Vec<GithubReleaseAsset>,
 }
 
@@ -64,9 +68,9 @@ pub(super) async fn fetch_latest_relay_release(
 }
 
 fn latest_relay_release(releases: Vec<GithubRelease>) -> Option<GithubRelease> {
-    releases
-        .into_iter()
-        .find(|release| release.tag_name.starts_with("mai-relay-v"))
+    releases.into_iter().find(|release| {
+        release.tag_name.starts_with("mai-relay-v") && !release.draft && !release.prerelease
+    })
 }
 
 pub(super) fn status_from_release(
@@ -281,6 +285,8 @@ mod tests {
             published_at: "2026-05-21T00:00:00Z".to_string(),
             html_url: "https://github.com/ZR233/mai-team/releases/tag/mai-server-v0.1.5"
                 .to_string(),
+            draft: false,
+            prerelease: false,
             assets: vec![asset(
                 "mai-server-x86_64-unknown-linux-gnu.tar.gz",
                 "https://github.com/ZR233/mai-team/releases/download/mai-server-v0.1.5/mai-server.tar.gz",
@@ -306,6 +312,56 @@ mod tests {
             .expect("select relay release");
 
         assert_eq!(selected, expected);
+    }
+
+    #[test]
+    fn latest_relay_release_requires_package_tag_prefix() {
+        let legacy_release = GithubRelease {
+            tag_name: "v0.1.9".to_string(),
+            name: "workspace v0.1.9".to_string(),
+            body: "legacy release".to_string(),
+            published_at: "2026-05-22T00:00:00Z".to_string(),
+            html_url: "https://github.com/ZR233/mai-team/releases/tag/v0.1.9".to_string(),
+            draft: false,
+            prerelease: false,
+            assets: vec![asset(
+                RELAY_ASSET_NAME,
+                "https://github.com/ZR233/mai-team/releases/download/v0.1.9/mai-relay.tar.gz",
+                100,
+            )],
+        };
+
+        let selected = latest_relay_release(vec![legacy_release]);
+
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn latest_relay_release_skips_prerelease_entries() {
+        let prerelease: GithubRelease = serde_json::from_value(serde_json::json!({
+            "tag_name": "mai-relay-v0.2.0",
+            "name": "mai-relay v0.2.0",
+            "body": "preview release",
+            "published_at": "2026-05-22T00:00:00Z",
+            "html_url": "https://github.com/ZR233/mai-team/releases/tag/mai-relay-v0.2.0",
+            "prerelease": true,
+            "assets": []
+        }))
+        .expect("deserialize prerelease");
+        let stable = GithubRelease {
+            tag_name: "mai-relay-v0.1.9".to_string(),
+            name: "mai-relay v0.1.9".to_string(),
+            body: "stable release".to_string(),
+            published_at: "2026-05-21T00:00:00Z".to_string(),
+            html_url: "https://github.com/ZR233/mai-team/releases/tag/mai-relay-v0.1.9".to_string(),
+            draft: false,
+            prerelease: false,
+            assets: Vec::new(),
+        };
+
+        let selected = latest_relay_release(vec![prerelease, stable.clone()]);
+
+        assert_eq!(selected, Some(stable));
     }
 
     #[test]
@@ -348,6 +404,8 @@ mod tests {
             body: "release".to_string(),
             published_at: "2026-05-15T00:00:00Z".to_string(),
             html_url: "https://github.com/ZR233/mai-team/releases/tag/mai-relay-v0.2.0".to_string(),
+            draft: false,
+            prerelease: false,
             assets,
         }
     }

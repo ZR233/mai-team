@@ -3,6 +3,9 @@ set -euo pipefail
 
 REPO="ZR233/mai-team"
 SERVER_VERSION="latest"
+RELEASE_PACKAGE="mai-server"
+RELEASE_TAG_PREFIX="mai-server-v"
+RELEASE_API_URL="https://api.github.com/repos/$REPO/releases?per_page=100"
 DRY_RUN="false"
 BIND_ADDR=""
 DEFAULT_BIND_ADDR="0.0.0.0:8080"
@@ -48,12 +51,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$SERVER_VERSION" == "latest" ]]; then
-  DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/$ASSET"
-else
-  DOWNLOAD_URL="https://github.com/$REPO/releases/download/$SERVER_VERSION/$ASSET"
-fi
-
 check_host() {
   local arch
   arch="$(uname -m)"
@@ -77,6 +74,66 @@ check_host() {
 
   echo "mai-server updater currently supports only Ubuntu 22.04 or 24.04 x86_64" >&2
   exit 1
+}
+
+release_index_json() {
+  if [[ -n "${MAI_RELEASES_JSON_FILE:-}" ]]; then
+    cat "$MAI_RELEASES_JSON_FILE"
+    return 0
+  fi
+
+  curl -fsSL \
+    -H "Accept: application/vnd.github+json" \
+    -H "User-Agent: mai-server-updater" \
+    "$RELEASE_API_URL"
+}
+
+resolve_release_tag() {
+  if [[ "$SERVER_VERSION" == "latest" ]]; then
+    if [[ "$DRY_RUN" == "true" ]]; then
+      echo "DRY RUN: resolve latest $RELEASE_PACKAGE release from $RELEASE_API_URL"
+    fi
+    local releases
+    releases="$(release_index_json)"
+    if command -v python3 >/dev/null 2>&1; then
+      RELEASE_TAG="$(RELEASE_TAG_PREFIX="$RELEASE_TAG_PREFIX" python3 -c '
+import json
+import os
+import sys
+
+prefix = os.environ["RELEASE_TAG_PREFIX"]
+for release in json.load(sys.stdin):
+    if release.get("draft") or release.get("prerelease"):
+        continue
+    tag = release.get("tag_name", "")
+    if tag.startswith(prefix):
+        print(tag)
+        break
+' <<<"$releases")"
+    else
+      set +o pipefail
+      RELEASE_TAG="$(
+        grep -E -o "\"tag_name\"[[:space:]]*:[[:space:]]*\"${RELEASE_TAG_PREFIX}[^\"]+\"" <<<"$releases" \
+          | head -n1 \
+          | sed -E "s/.*\"(${RELEASE_TAG_PREFIX}[^\"]+)\".*/\1/"
+      )"
+      set -o pipefail
+    fi
+    if [[ -z "$RELEASE_TAG" ]]; then
+      echo "no $RELEASE_PACKAGE release found in $RELEASE_API_URL" >&2
+      exit 1
+    fi
+    if [[ "$DRY_RUN" == "true" ]]; then
+      echo "DRY RUN: selected latest $RELEASE_PACKAGE release $RELEASE_TAG"
+    fi
+    return 0
+  fi
+
+  if [[ "$SERVER_VERSION" != "$RELEASE_TAG_PREFIX"* ]]; then
+    echo "--version for $RELEASE_PACKAGE must start with $RELEASE_TAG_PREFIX" >&2
+    exit 2
+  fi
+  RELEASE_TAG="$SERVER_VERSION"
 }
 
 run() {
@@ -184,6 +241,9 @@ if [[ $EUID -ne 0 && "$DRY_RUN" != "true" ]]; then
   echo "run as root or use sudo" >&2
   exit 1
 fi
+
+resolve_release_tag
+DOWNLOAD_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/$ASSET"
 
 existing_bind_addr="$(env_value MAI_BIND_ADDR "$ENV_FILE")"
 existing_rust_log="$(env_value RUST_LOG "$ENV_FILE")"
