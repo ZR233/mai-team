@@ -632,21 +632,22 @@ async fn provider_presets_include_builtin_metadata() {
             json!({ "thinking": { "type": "disabled" } })
         );
     }
-    for (id, output_tokens) in [
-        ("glm-5.1", 131_072),
-        ("glm-5", 131_072),
-        ("glm-5-turbo", 131_072),
-        ("glm-4.7", 131_072),
-        ("glm-4.7-flashx", 131_072),
-        ("glm-4.6", 131_072),
-        ("glm-4.5-air", 98_304),
-        ("glm-4.5-airx", 98_304),
+    for (id, context_tokens, output_tokens) in [
+        ("glm-5.1", 200_000, 131_072),
+        ("glm-5", 200_000, 131_072),
+        ("glm-5-turbo", 200_000, 131_072),
+        ("glm-4.7", 200_000, 131_072),
+        ("glm-4.7-flashx", 200_000, 131_072),
+        ("glm-4.6", 200_000, 131_072),
+        ("glm-4.5-air", 128_000, 98_304),
+        ("glm-4.5-airx", 128_000, 98_304),
     ] {
         let model = zhipu
             .models
             .iter()
             .find(|model| model.id == id)
             .expect("zhipu model");
+        assert_eq!(model.context_tokens, context_tokens);
         assert_eq!(model.output_tokens, output_tokens);
     }
 }

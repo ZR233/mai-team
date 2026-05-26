@@ -707,7 +707,7 @@ fn zhipu_model(id: &str) -> ModelConfig {
     ModelConfig {
         id: id.to_string(),
         name: Some(id.to_string()),
-        context_tokens: 128_000,
+        context_tokens: zhipu_context_tokens(id),
         output_tokens: zhipu_output_tokens(id),
         supports_tools: true,
         wire_api: ModelWireApi::ChatCompletions,
@@ -716,6 +716,14 @@ fn zhipu_model(id: &str) -> ModelConfig {
         reasoning: Some(zhipu_reasoning_config()),
         options: serde_json::Value::Null,
         headers: BTreeMap::new(),
+    }
+}
+
+fn zhipu_context_tokens(id: &str) -> u64 {
+    match id {
+        "glm-5.1" | "glm-5" | "glm-5-turbo" | "glm-4.7" | "glm-4.7-flashx" | "glm-4.6" => 200_000,
+        "glm-4.5-air" | "glm-4.5-airx" => 128_000,
+        _ => 128_000,
     }
 }
 
