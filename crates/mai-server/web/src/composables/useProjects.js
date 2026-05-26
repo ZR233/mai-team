@@ -49,6 +49,12 @@ export function useProjects() {
     const projectId = selectedProjectId.value
     const agentId = selectedProjectAgentId.value
     const sessionId = selectedProjectSessionId.value
+    const activeDetail = selectedProjectDetail.value
+    const requestedAgentRole = agentId
+      ? activeDetail?.selected_agent?.id === agentId
+        ? activeDetail.selected_agent.role || ''
+        : (activeDetail?.agents || []).find((agent) => agent?.id === agentId)?.role || ''
+      : ''
     const isFirstLoad = !selectedProjectDetail.value
     if (isFirstLoad) isProjectDetailLoading.value = true
     try {
@@ -56,7 +62,7 @@ export function useProjects() {
       if (agentId) params.set('agent_id', agentId)
       if (sessionId) params.set('session_id', sessionId)
       const query = params.toString() ? `?${params.toString()}` : ''
-      const detail = await api(`/projects/${projectId}${query}`)
+      let detail = await api(`/projects/${projectId}${query}`)
       if (
         requestSeq !== projectDetailRequestSeq ||
         selectedProjectId.value !== projectId ||
@@ -65,13 +71,39 @@ export function useProjects() {
       ) {
         return
       }
+      let replacementAgent = null
+      if (
+        agentId &&
+        requestedAgentRole === 'reviewer' &&
+        detail?.selected_agent?.id !== agentId &&
+        detail?.selected_agent_id !== agentId
+      ) {
+        const agents = detail?.agents || []
+        if (detail?.current_reviewer_agent_id) {
+          replacementAgent = agents.find((agent) => agent?.id === detail.current_reviewer_agent_id) || null
+        }
+        if (!replacementAgent) {
+          replacementAgent = agents.find((agent) => agent?.role === requestedAgentRole && agent?.id !== agentId) || null
+        }
+      }
+      if (replacementAgent) {
+        detail = await api(`/projects/${projectId}?agent_id=${encodeURIComponent(replacementAgent.id)}`)
+        if (
+          requestSeq !== projectDetailRequestSeq ||
+          selectedProjectId.value !== projectId ||
+          selectedProjectAgentId.value !== agentId ||
+          selectedProjectSessionId.value !== sessionId
+        ) {
+          return
+        }
+      }
       selectedProjectDetail.value = detail
       selectedProjectAgentId.value = selectedProjectDetail.value?.selected_agent_id
         || selectedProjectDetail.value?.maintainer_agent?.id
         || selectedProjectAgentId.value
         || null
       selectedProjectSessionId.value = selectedProjectDetail.value?.selected_agent?.selected_session_id
-        || selectedProjectSessionId.value
+        || (replacementAgent ? null : selectedProjectSessionId.value)
         || null
       if (selectedProjectDetail.value?.status === 'ready' || selectedProjectDetail.value?.clone_status === 'ready') {
         ensureProjectSkillsLoaded(selectedProjectId.value).catch(() => {})
