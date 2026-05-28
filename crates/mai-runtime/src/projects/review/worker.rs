@@ -5,8 +5,9 @@ use std::sync::Arc;
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::{AbortHandle, Abortable};
 use mai_protocol::{
-    AgentId, AgentSummary, GitProvider, ProjectCloneStatus, ProjectId, ProjectReviewOutcome,
-    ProjectReviewRunStatus, ProjectReviewStatus, ProjectStatus, ProjectSummary, TurnId,
+    AgentId, AgentStatus, AgentSummary, GitProvider, ProjectCloneStatus, ProjectId,
+    ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus, ProjectStatus,
+    ProjectSummary, TurnId,
 };
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
@@ -288,11 +289,15 @@ pub(crate) async fn stop_project_review_loop(
     project.relay_review_queue.lock().await.clear();
     project.review_notify.notify_waiters();
     project.relay_review_notify.notify_waiters();
+    let mut reviewer_ids = active_project_reviewer_ids(&ops, project_id, run_list_limit).await;
     let reviewer_id = project.summary.read().await.current_reviewer_agent_id;
-    let _ = ops
-        .cancel_active_project_review_runs(project_id, reviewer_id, run_list_limit)
-        .await;
     if let Some(reviewer_id) = reviewer_id {
+        reviewer_ids.insert(reviewer_id);
+    }
+    let _ = ops
+        .cancel_active_project_review_runs(project_id, None, run_list_limit)
+        .await;
+    for reviewer_id in reviewer_ids {
         if let Ok(Some(turn_id)) = ops.agent_current_turn(reviewer_id).await {
             let _ = ops.cancel_agent_turn(reviewer_id, turn_id).await;
         }
@@ -422,6 +427,19 @@ async fn run_project_review_pool_worker(
                 continue;
             }
         };
+        if let Some(reviewer) = active_project_reviewer_agent(&ops.ops, ops.project_id).await {
+            tracing::warn!(
+                project_id = %ops.project_id,
+                reviewer_id = %reviewer.id,
+                status = %reviewer.status,
+                "project review signal delayed because another reviewer agent is still active"
+            );
+            requeue_project_review_signal(&ops.ops, ops.project_id, signal).await;
+            if !wait_or_cancel(&ops.cancellation_token, Duration::from_secs(1)).await {
+                break;
+            }
+            continue;
+        }
 
         let decision = ops
             .ops
@@ -690,6 +708,63 @@ async fn requeue_project_review_signal(
     }
 }
 
+async fn active_project_reviewer_ids(
+    ops: &impl ProjectReviewWorkerOps,
+    project_id: ProjectId,
+    run_list_limit: usize,
+) -> HashSet<AgentId> {
+    let mut reviewer_ids = HashSet::new();
+    if let Ok(runs) = ops
+        .load_project_review_runs(project_id, 0, run_list_limit)
+        .await
+    {
+        for run in runs {
+            if run.finished_at.is_some()
+                || !matches!(
+                    run.status,
+                    ProjectReviewRunStatus::Syncing | ProjectReviewRunStatus::Running
+                )
+            {
+                continue;
+            }
+            if let Some(reviewer_id) = run.reviewer_agent_id {
+                reviewer_ids.insert(reviewer_id);
+            }
+        }
+    }
+    for agent in ops.project_auto_reviewer_agents(project_id).await {
+        if project_reviewer_agent_is_active(&agent.status) {
+            reviewer_ids.insert(agent.id);
+        }
+    }
+    reviewer_ids
+}
+
+async fn active_project_reviewer_agent(
+    ops: &impl ProjectReviewWorkerOps,
+    project_id: ProjectId,
+) -> Option<AgentSummary> {
+    ops.project_auto_reviewer_agents(project_id)
+        .await
+        .into_iter()
+        .find(|agent| project_reviewer_agent_is_active(&agent.status))
+}
+
+fn project_reviewer_agent_is_active(status: &AgentStatus) -> bool {
+    match status {
+        AgentStatus::Created
+        | AgentStatus::StartingContainer
+        | AgentStatus::Idle
+        | AgentStatus::RunningTurn
+        | AgentStatus::WaitingTool
+        | AgentStatus::DeletingContainer => true,
+        AgentStatus::Completed
+        | AgentStatus::Failed
+        | AgentStatus::Cancelled
+        | AgentStatus::Deleted => false,
+    }
+}
+
 async fn wait_for_project_review_signal(
     ops: &impl ProjectReviewWorkerOps,
     project_id: ProjectId,
@@ -717,8 +792,9 @@ mod tests {
     use std::sync::Arc;
 
     use mai_protocol::{
-        ProjectCloneStatus, ProjectReviewDecision, ProjectReviewOutcome, ProjectReviewRunSummary,
-        ProjectReviewStatus, ProjectStatus, ProjectSummary, now,
+        AgentRole, AgentStatus, ProjectCloneStatus, ProjectReviewDecision, ProjectReviewOutcome,
+        ProjectReviewRunSummary, ProjectReviewStatus, ProjectStatus, ProjectSummary, TokenUsage,
+        now,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::{Mutex, Notify};
@@ -765,6 +841,9 @@ mod tests {
         failed_enqueue_prs: Arc<Mutex<Vec<u64>>>,
         reviewed_prs: Arc<Mutex<Vec<Option<u64>>>>,
         review_errors: Arc<Mutex<Vec<String>>>,
+        auto_reviewers: Arc<Mutex<Vec<mai_protocol::AgentSummary>>>,
+        cancelled_turns: Arc<Mutex<Vec<(Uuid, Uuid)>>>,
+        deleted_agents: Arc<Mutex<Vec<Uuid>>>,
         git_provider: mai_protocol::GitProvider,
     }
 
@@ -783,6 +862,9 @@ mod tests {
                 failed_enqueue_prs: Arc::new(Mutex::new(Vec::new())),
                 reviewed_prs: Arc::new(Mutex::new(Vec::new())),
                 review_errors: Arc::new(Mutex::new(Vec::new())),
+                auto_reviewers: Arc::new(Mutex::new(Vec::new())),
+                cancelled_turns: Arc::new(Mutex::new(Vec::new())),
+                deleted_agents: Arc::new(Mutex::new(Vec::new())),
                 git_provider: mai_protocol::GitProvider::Github,
             }
         }
@@ -799,6 +881,10 @@ mod tests {
         async fn push_review_error(&self, error: impl Into<String>) {
             self.review_errors.lock().await.push(error.into());
         }
+
+        async fn set_auto_reviewers(&self, reviewers: Vec<mai_protocol::AgentSummary>) {
+            *self.auto_reviewers.lock().await = reviewers;
+        }
     }
 
     impl ProjectReviewWorkerOps for FakeWorkerOps {
@@ -814,7 +900,7 @@ mod tests {
             &self,
             _project_id: Uuid,
         ) -> Vec<mai_protocol::AgentSummary> {
-            vec![]
+            self.auto_reviewers.lock().await.clone()
         }
 
         async fn load_project_review_runs(
@@ -982,15 +1068,23 @@ mod tests {
             })
         }
 
-        async fn agent_current_turn(&self, _agent_id: Uuid) -> crate::Result<Option<Uuid>> {
-            Ok(None)
+        async fn agent_current_turn(&self, agent_id: Uuid) -> crate::Result<Option<Uuid>> {
+            Ok(self
+                .auto_reviewers
+                .lock()
+                .await
+                .iter()
+                .find(|agent| agent.id == agent_id)
+                .and_then(|agent| agent.current_turn))
         }
 
-        async fn cancel_agent_turn(&self, _agent_id: Uuid, _turn_id: Uuid) -> crate::Result<()> {
+        async fn cancel_agent_turn(&self, agent_id: Uuid, turn_id: Uuid) -> crate::Result<()> {
+            self.cancelled_turns.lock().await.push((agent_id, turn_id));
             Ok(())
         }
 
-        async fn delete_agent(&self, _agent_id: Uuid) -> crate::Result<()> {
+        async fn delete_agent(&self, agent_id: Uuid) -> crate::Result<()> {
+            self.deleted_agents.lock().await.push(agent_id);
             Ok(())
         }
     }
@@ -1273,6 +1367,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_worker_does_not_start_second_reviewer_when_active_reviewer_exists() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        ops.set_auto_reviewers(vec![test_reviewer_agent(
+            project_id,
+            ops.project.summary.read().await.maintainer_agent_id,
+            AgentStatus::WaitingTool,
+        )])
+        .await;
+        let token = CancellationToken::new();
+        let task_ops = ops.clone();
+        let task_token = token.clone();
+        let worker_task = tokio::spawn(async move {
+            super::run_project_review_loop(task_ops, project_id, task_token).await;
+        });
+
+        {
+            let mut pool = ops.project.review_pool.lock().await;
+            pool.enqueue_many([ProjectReviewSignalInput {
+                pr: 42,
+                head_sha: Some("head-42".to_string()),
+                delivery_id: Some("delivery-42".to_string()),
+                reason: "test".to_string(),
+            }]);
+        }
+        ops.project.review_notify.notify_waiters();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(Vec::<Option<u64>>::new(), *ops.reviewed_prs.lock().await);
+        let requeued = ops
+            .project
+            .review_pool
+            .lock()
+            .await
+            .next()
+            .expect("active reviewer should leave pending PR in the pool");
+        assert_eq!(42, requeued.pr);
+        assert_eq!(Some("head-42".to_string()), requeued.head_sha);
+        assert_eq!(Some("delivery-42".to_string()), requeued.delivery_id);
+        assert_eq!("test", requeued.reason);
+
+        token.cancel();
+        worker_task.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn stop_project_review_loop_deletes_active_reviewer_when_state_lost_reviewer_id() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        let maintainer_agent_id = ops.project.summary.read().await.maintainer_agent_id;
+        let reviewer =
+            test_reviewer_agent(project_id, maintainer_agent_id, AgentStatus::RunningTurn);
+        let reviewer_id = reviewer.id;
+        let turn_id = reviewer.current_turn.expect("reviewer turn");
+        ops.set_auto_reviewers(vec![reviewer]).await;
+
+        super::stop_project_review_loop(ops.clone(), project_id, 10).await;
+
+        assert_eq!(
+            vec![(reviewer_id, turn_id)],
+            *ops.cancelled_turns.lock().await
+        );
+        assert_eq!(vec![reviewer_id], *ops.deleted_agents.lock().await);
+    }
+
+    #[tokio::test]
     async fn relay_selector_moves_eligible_relay_signal_to_pr_pool() {
         let project_id = Uuid::new_v4();
         let ops = FakeWorkerOps::new(project_id);
@@ -1551,6 +1711,33 @@ mod tests {
             next_review_at: None,
             last_review_outcome: None,
             review_last_error: None,
+        }
+    }
+
+    fn test_reviewer_agent(
+        project_id: Uuid,
+        maintainer_agent_id: Uuid,
+        status: AgentStatus,
+    ) -> mai_protocol::AgentSummary {
+        mai_protocol::AgentSummary {
+            id: Uuid::new_v4(),
+            parent_id: Some(maintainer_agent_id),
+            task_id: None,
+            project_id: Some(project_id),
+            role: Some(AgentRole::Reviewer),
+            name: "reviewer".to_string(),
+            status,
+            container_id: Some("container".to_string()),
+            docker_image: "unused".to_string(),
+            provider_id: "mock".to_string(),
+            provider_name: "Mock".to_string(),
+            model: "mock-model".to_string(),
+            reasoning_effort: Some("medium".to_string()),
+            created_at: now(),
+            updated_at: now(),
+            current_turn: Some(Uuid::new_v4()),
+            last_error: None,
+            token_usage: TokenUsage::default(),
         }
     }
 }
