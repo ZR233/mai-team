@@ -196,7 +196,11 @@
                   </span>
                 </button>
                 <div class="review-run-chip-row">
-                  <span class="review-run-status" :class="reviewRunTone(run.status)">
+                  <span
+                    v-if="projectReviewRunStatusVisible(run)"
+                    class="review-run-status"
+                    :class="reviewRunTone(run.status)"
+                  >
                     {{ formatStatus(run.status) }}
                   </span>
                   <span class="review-run-outcome" :class="projectReviewRunOutcomeTone(run)">
@@ -501,6 +505,7 @@ import {
   numericTokenUsage,
   projectReviewRunOutcomeLabel,
   projectReviewRunOutcomeTone,
+  projectReviewRunStatusVisible,
   statusTone
 } from '../utils/format'
 

@@ -20,6 +20,10 @@ export function projectReviewRunOutcomeTone(run = {}) {
   return ''
 }
 
+export function projectReviewRunStatusVisible(run = {}) {
+  return String(run.status || '').toLowerCase() !== 'completed'
+}
+
 export function formatDate(value) {
   if (!value) return '-'
   return new Date(value).toLocaleString()

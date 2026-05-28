@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   projectReviewRunOutcomeLabel,
   projectReviewRunOutcomeTone,
+  projectReviewRunStatusVisible,
   sessionTokenUsage,
   tokenCacheTooltipLabel,
   tokenCacheTooltipRows,
@@ -93,3 +94,8 @@ assert.equal(projectReviewRunOutcomeLabel({ outcome: 'review_submitted' }), 'Rev
 assert.equal(projectReviewRunOutcomeTone({ review_event: 'approve' }), 'approve')
 assert.equal(projectReviewRunOutcomeTone({ review_event: 'request_changes' }), 'request-changes')
 assert.equal(projectReviewRunOutcomeTone({ review_event: 'comment' }), 'comment')
+assert.equal(projectReviewRunStatusVisible({ status: 'completed' }), false)
+assert.equal(projectReviewRunStatusVisible({ status: 'running' }), true)
+assert.equal(projectReviewRunStatusVisible({ status: 'syncing' }), true)
+assert.equal(projectReviewRunStatusVisible({ status: 'failed' }), true)
+assert.equal(projectReviewRunStatusVisible({ status: 'cancelled' }), true)
