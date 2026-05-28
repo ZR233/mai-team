@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.8...mai-server-v0.1.9) - 2026-05-26
+
+### Added
+
+- 添加项目管理功能的单元测试，并优化项目详情加载逻辑
+
 ## [0.1.7](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.6...mai-server-v0.1.7) - 2026-05-22
 
 ### Added
