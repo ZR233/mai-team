@@ -256,13 +256,29 @@ pub(crate) fn project_review_loop_decision_for_error(error: String) -> ProjectRe
 pub(crate) fn project_review_error_is_retryable(error: &str) -> bool {
     let error = error.trim();
     let error = error.strip_prefix("invalid input: ").unwrap_or(error);
-    matches!(
+    if matches!(
         error,
         "relay is not connected"
             | "relay is enabled but not connected"
             | "relay connection closed"
             | "relay request timed out"
-    )
+    ) {
+        return true;
+    }
+
+    if !error.starts_with("model error: request to ") {
+        return false;
+    }
+
+    error.contains(" failed: error decoding response body")
+        || error.contains(" returned 429 ")
+        || error.contains(" returned 500 ")
+        || error.contains(" returned 502 ")
+        || error.contains(" returned 503 ")
+        || error.contains(" returned 504 ")
+        || error.contains("502 Bad Gateway")
+        || error.contains("503 Service Unavailable")
+        || error.contains("504 Gateway Timeout")
 }
 
 pub(crate) fn project_review_cycle_result_for_reviewer_status(
@@ -692,6 +708,45 @@ mod tests {
             decision.error.as_deref(),
             Some("invalid input: relay request timed out")
         );
+    }
+
+    #[test]
+    fn model_gateway_failure_is_retryable() {
+        let error = "model error: request to https://token-plan-cn.xiaomimimo.com/v1/chat/completions returned 500 Internal Server Error: {\"error\":{\"message\":\"<html><body><h1>502 Bad Gateway</h1></body></html>\"}}";
+
+        let decision = project_review_loop_decision_for_error(error.to_string());
+
+        assert_eq!(decision.delay, Duration::from_secs(1));
+        assert_eq!(decision.status, ProjectReviewStatus::Waiting);
+        assert_eq!(decision.outcome, None);
+        assert_eq!(decision.summary, None);
+        assert_eq!(decision.error.as_deref(), Some(error));
+    }
+
+    #[test]
+    fn model_response_decode_failure_is_retryable() {
+        let error = "model error: request to https://token-plan-cn.xiaomimimo.com/v1/chat/completions failed: error decoding response body";
+
+        let decision = project_review_loop_decision_for_error(error.to_string());
+
+        assert_eq!(decision.delay, Duration::from_secs(1));
+        assert_eq!(decision.status, ProjectReviewStatus::Waiting);
+        assert_eq!(decision.outcome, None);
+        assert_eq!(decision.summary, None);
+        assert_eq!(decision.error.as_deref(), Some(error));
+    }
+
+    #[test]
+    fn model_bad_request_is_not_retryable() {
+        let error = "model error: request to https://example.test/v1/chat/completions returned 400 Bad Request: invalid request";
+
+        let decision = project_review_loop_decision_for_error(error.to_string());
+
+        assert_eq!(decision.delay, Duration::from_secs(600));
+        assert_eq!(decision.status, ProjectReviewStatus::Failed);
+        assert_eq!(decision.outcome, Some(ProjectReviewOutcome::Failed));
+        assert_eq!(decision.summary, None);
+        assert_eq!(decision.error.as_deref(), Some(error));
     }
 
     #[test]

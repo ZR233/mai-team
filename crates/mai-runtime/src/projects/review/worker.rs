@@ -433,8 +433,23 @@ async fn run_project_review_pool_worker(
             .await;
         let mut decision = match decision {
             Ok(result) => {
-                review_backoff.reset();
-                super::project_review_loop_decision_for_result(result)
+                if result.outcome == ProjectReviewOutcome::Failed
+                    && result
+                        .error
+                        .as_deref()
+                        .is_some_and(super::project_review_error_is_retryable)
+                {
+                    requeue_project_review_signal(&ops.ops, ops.project_id, signal).await;
+                    let mut decision = super::project_review_loop_decision_for_error(
+                        result.error.clone().unwrap_or_default(),
+                    );
+                    decision.summary = result.summary;
+                    decision.delay = review_backoff.next_delay();
+                    decision
+                } else {
+                    review_backoff.reset();
+                    super::project_review_loop_decision_for_result(result)
+                }
             }
             Err(RuntimeError::TurnCancelled) if ops.cancellation_token.is_cancelled() => break,
             Err(err) => {
@@ -749,6 +764,7 @@ mod tests {
         ineligible_relay_prs: Arc<Mutex<Vec<u64>>>,
         failed_enqueue_prs: Arc<Mutex<Vec<u64>>>,
         reviewed_prs: Arc<Mutex<Vec<Option<u64>>>>,
+        review_errors: Arc<Mutex<Vec<String>>>,
         git_provider: mai_protocol::GitProvider,
     }
 
@@ -766,6 +782,7 @@ mod tests {
                 ineligible_relay_prs: Arc::new(Mutex::new(Vec::new())),
                 failed_enqueue_prs: Arc::new(Mutex::new(Vec::new())),
                 reviewed_prs: Arc::new(Mutex::new(Vec::new())),
+                review_errors: Arc::new(Mutex::new(Vec::new())),
                 git_provider: mai_protocol::GitProvider::Github,
             }
         }
@@ -777,6 +794,10 @@ mod tests {
 
         async fn push_selector_behavior(&self, behavior: FakeSelectorBehavior) {
             self.selector_behaviors.lock().await.push(behavior);
+        }
+
+        async fn push_review_error(&self, error: impl Into<String>) {
+            self.review_errors.lock().await.push(error.into());
         }
     }
 
@@ -939,6 +960,19 @@ mod tests {
             target_pr: Option<u64>,
         ) -> crate::Result<ProjectReviewCycleResult> {
             self.reviewed_prs.lock().await.push(target_pr);
+            let error = {
+                let mut errors = self.review_errors.lock().await;
+                (!errors.is_empty()).then(|| errors.remove(0))
+            };
+            if let Some(error) = error {
+                return Ok(ProjectReviewCycleResult {
+                    outcome: ProjectReviewOutcome::Failed,
+                    review_event: None,
+                    pr: target_pr,
+                    summary: Some("Review could not be completed.".to_string()),
+                    error: Some(error),
+                });
+            }
             Ok(ProjectReviewCycleResult {
                 outcome: ProjectReviewOutcome::ReviewSubmitted,
                 review_event: Some(ProjectReviewDecision::Approve),
@@ -1175,6 +1209,64 @@ mod tests {
         }
         assert_eq!(vec![Some(42)], *ops.reviewed_prs.lock().await);
         assert_eq!(0, *ops.selector_calls.lock().await);
+
+        token.cancel();
+        worker_task.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn pool_worker_requeues_pr_after_retryable_model_failure() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        ops.push_review_error("model error: request to https://token-plan-cn.xiaomimimo.com/v1/chat/completions returned 500 Internal Server Error: {\"error\":{\"message\":\"<html><body><h1>502 Bad Gateway</h1></body></html>\"}}")
+            .await;
+        let token = CancellationToken::new();
+        let task_ops = ops.clone();
+        let task_token = token.clone();
+        let worker_task = tokio::spawn(async move {
+            super::run_project_review_loop(task_ops, project_id, task_token).await;
+        });
+
+        {
+            let mut pool = ops.project.review_pool.lock().await;
+            pool.enqueue_many([ProjectReviewSignalInput {
+                pr: 42,
+                head_sha: Some("head-42".to_string()),
+                delivery_id: Some("delivery-42".to_string()),
+                reason: "test".to_string(),
+            }]);
+        }
+        ops.project.review_notify.notify_waiters();
+
+        for _ in 0..20 {
+            if !ops.reviewed_prs.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(vec![Some(42)], *ops.reviewed_prs.lock().await);
+        let requeued = ops
+            .project
+            .review_pool
+            .lock()
+            .await
+            .next()
+            .expect("retryable model failure should requeue PR");
+        assert_eq!(42, requeued.pr);
+        assert_eq!(Some("head-42".to_string()), requeued.head_sha);
+        assert_eq!(Some("delivery-42".to_string()), requeued.delivery_id);
+        assert_eq!("test", requeued.reason);
+
+        let states = ops.states.lock().await.clone();
+        let last = states.last().expect("review state");
+        assert_eq!(ProjectReviewStatus::Waiting, last.status);
+        assert_eq!(None, last.outcome);
+        assert!(last.next_review_at_set);
+        assert!(
+            last.error
+                .as_deref()
+                .is_some_and(|error| error.contains("502 Bad Gateway"))
+        );
 
         token.cancel();
         worker_task.await.expect("worker task");
