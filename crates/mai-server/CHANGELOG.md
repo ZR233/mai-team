@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.9...mai-server-v0.1.11) - 2026-05-29
+
+### Added
+
+- 添加项目审核运行状态可见性判断，优化审核状态显示逻辑
+
+### Other
+
+- release v0.1.10 ([#30](https://github.com/ZR233/mai-team/pull/30))
+
 ## [0.1.10](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.9...mai-server-v0.1.10) - 2026-05-28
 
 ### Added
