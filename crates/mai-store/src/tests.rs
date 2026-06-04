@@ -23,6 +23,38 @@ async fn store() -> (TempDir, ConfigStore) {
     (dir, store)
 }
 
+fn test_project_summary(project_id: ProjectId, maintainer_agent_id: AgentId) -> ProjectSummary {
+    let timestamp = Utc::now();
+    ProjectSummary {
+        id: project_id,
+        name: "owner/repo".to_string(),
+        status: ProjectStatus::Ready,
+        owner: "owner".to_string(),
+        repo: "repo".to_string(),
+        repository_full_name: "owner/repo".to_string(),
+        git_account_id: Some("account-1".to_string()),
+        repository_id: 42,
+        installation_id: 0,
+        installation_account: "owner".to_string(),
+        branch: "main".to_string(),
+        docker_image: "ubuntu:latest".to_string(),
+        clone_status: ProjectCloneStatus::Ready,
+        maintainer_agent_id,
+        created_at: timestamp,
+        updated_at: timestamp,
+        last_error: None,
+        auto_review_enabled: true,
+        reviewer_extra_prompt: None,
+        review_status: ProjectReviewStatus::Waiting,
+        current_reviewer_agent_id: None,
+        last_review_started_at: None,
+        last_review_finished_at: None,
+        next_review_at: None,
+        last_review_outcome: None,
+        review_last_error: None,
+    }
+}
+
 #[tokio::test]
 async fn open_in_data_dir_uses_standard_layout() {
     let dir = tempdir().expect("tempdir");
@@ -37,6 +69,41 @@ async fn open_in_data_dir_uses_standard_layout() {
     assert_eq!(
         store.artifact_index_dir(),
         data_dir.join("artifacts").join("index")
+    );
+}
+
+#[tokio::test]
+async fn save_project_waits_for_temporary_sqlite_write_lock() {
+    let (_dir, store) = store().await;
+    let project = test_project_summary(Uuid::new_v4(), Uuid::new_v4());
+    let path = store.path().to_path_buf();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+    let holder = std::thread::spawn(move || {
+        let connection = rusqlite::Connection::open(path).expect("open lock holder");
+        connection
+            .execute("BEGIN IMMEDIATE", [])
+            .expect("hold write lock");
+        ready_tx.send(()).expect("signal write lock");
+        std::thread::sleep(Duration::from_secs(6));
+        connection
+            .execute("COMMIT", [])
+            .expect("release write lock");
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("write lock is held");
+
+    timeout(Duration::from_secs(12), store.save_project(&project))
+        .await
+        .expect("save project timeout")
+        .expect("save project");
+    holder.join().expect("lock holder");
+
+    let projects = store.load_projects().await.expect("load projects");
+    assert_eq!(
+        serde_json::to_value(&projects).expect("projects json"),
+        serde_json::to_value(vec![project]).expect("expected json")
     );
 }
 

@@ -3,6 +3,11 @@ use crate::*;
 
 impl ConfigStore {
     pub async fn save_project(&self, project: &ProjectSummary) -> Result<()> {
+        crate::sqlite_busy::retry_sqlite_busy(|| async { self.save_project_once(project).await })
+            .await
+    }
+
+    async fn save_project_once(&self, project: &ProjectSummary) -> Result<()> {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         Query::<List<ProjectRecordRow>>::filter(

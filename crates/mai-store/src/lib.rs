@@ -36,6 +36,7 @@ mod relay;
 mod runtime_state;
 mod schema;
 mod settings;
+mod sqlite_busy;
 mod store;
 mod tasks;
 

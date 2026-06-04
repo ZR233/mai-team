@@ -72,6 +72,7 @@ const PROJECT_CACHE_VOLUME_MISSING_AFTER_STARTUP_RECONCILE: &str =
     "project cache volume is missing after startup reconcile";
 const RELAY_ENABLED_BUT_NOT_CONNECTED: &str = "relay is enabled but not connected";
 const RELAY_NOT_CONNECTED: &str = "relay is not connected";
+const SQLITE_DATABASE_LOCKED: &str = "database is locked";
 const COMPACT_USER_MESSAGE_MAX_CHARS: usize = 80_000;
 const COMPACT_SUMMARY_PREVIEW_CHARS: usize = 240;
 const COMPACT_SUMMARY_PREFIX: &str = "Context checkpoint summary from earlier conversation history. This is background for continuity, not a new user request.";
@@ -2478,61 +2479,55 @@ impl AgentRuntime {
         project_id: ProjectId,
         maintainer_agent_id: AgentId,
     ) -> Result<()> {
-        let setup_result: Result<()> = async {
-            self.set_project_clone_result(
-                project_id,
-                ProjectStatus::Creating,
-                ProjectCloneStatus::Cloning,
-                None,
-            )
-            .await?;
-            self.clone_project_repository(project_id, maintainer_agent_id)
-                .await?;
-            self.set_project_clone_result(
-                project_id,
-                ProjectStatus::Ready,
-                ProjectCloneStatus::Ready,
-                None,
-            )
-            .await?;
-            let maintainer = self.agent(maintainer_agent_id).await?;
-            let source = self
-                .agent_container_source_for_project(
-                    maintainer_agent_id,
-                    Some(project_id),
-                    agents::ContainerSource::FreshImage,
-                )
-                .await?;
-            agents::ensure_agent_container_with_source(
-                self.as_ref(),
-                &maintainer,
-                AgentStatus::Idle,
-                &source,
-                None,
-            )
-            .await?;
-            Ok(())
-        }
-        .await;
+        self.set_project_clone_result(
+            project_id,
+            ProjectStatus::Creating,
+            ProjectCloneStatus::Cloning,
+            None,
+        )
+        .await?;
 
-        let update = match setup_result {
-            Ok(()) => Ok(self.project(project_id).await?.summary.read().await.clone()),
-            Err(err) => {
-                self.shutdown_project_mcp_manager(project_id).await;
-                let _ = self.delete_project_sidecar(project_id).await;
-                self.set_project_clone_result(
-                    project_id,
-                    ProjectStatus::Failed,
-                    ProjectCloneStatus::Failed,
-                    Some(err.to_string()),
-                )
-                .await
-            }
-        };
-        if let Err(err) = update {
-            tracing::warn!(project_id = %project_id, "failed to update project clone status: {err}");
-            return Err(err);
+        if let Err(err) = self
+            .clone_project_repository(project_id, maintainer_agent_id)
+            .await
+        {
+            self.shutdown_project_mcp_manager(project_id).await;
+            let _ = self.delete_project_sidecar(project_id).await;
+            self.set_project_clone_result(
+                project_id,
+                ProjectStatus::Failed,
+                ProjectCloneStatus::Failed,
+                Some(err.to_string()),
+            )
+            .await?;
+            tracing::warn!(project_id = %project_id, "project workspace clone failed: {err}");
+            return Ok(());
         }
+
+        self.set_project_clone_result(
+            project_id,
+            ProjectStatus::Ready,
+            ProjectCloneStatus::Ready,
+            None,
+        )
+        .await?;
+
+        let maintainer = self.agent(maintainer_agent_id).await?;
+        let source = self
+            .agent_container_source_for_project(
+                maintainer_agent_id,
+                Some(project_id),
+                agents::ContainerSource::FreshImage,
+            )
+            .await?;
+        agents::ensure_agent_container_with_source(
+            self.as_ref(),
+            &maintainer,
+            AgentStatus::Idle,
+            &source,
+            None,
+        )
+        .await?;
         self.start_project_review_loop_if_ready(project_id).await?;
         Ok(())
     }
@@ -5469,7 +5464,7 @@ fn project_workspace_start_error_is_recoverable(error: &str) -> bool {
         PROJECT_CACHE_VOLUME_MISSING_AFTER_STARTUP_RECONCILE
             | RELAY_ENABLED_BUT_NOT_CONNECTED
             | RELAY_NOT_CONNECTED
-    )
+    ) || error.contains(SQLITE_DATABASE_LOCKED)
 }
 
 fn shell_quote(value: &str) -> String {
