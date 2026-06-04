@@ -17,6 +17,11 @@ impl ModelTurnState {
     pub fn acknowledge_history_len(&mut self, len: usize) {
         self.acknowledged_input_len = len;
     }
+
+    pub fn reset_continuation(&mut self) {
+        self.previous_response_id = None;
+        self.acknowledged_input_len = 0;
+    }
 }
 
 pub type ModelEventStream = Pin<Box<dyn Stream<Item = Result<ModelStreamEvent>> + Send>>;

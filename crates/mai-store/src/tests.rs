@@ -58,7 +58,7 @@ fn test_model(id: &str) -> ModelConfig {
     ModelConfig {
         id: id.to_string(),
         name: Some(id.to_string()),
-        context_tokens: 400_000,
+        context_tokens: if id == "gpt-5.5" { 256_000 } else { 400_000 },
         output_tokens: 128_000,
         supports_tools: true,
         reasoning: Some(ModelReasoningConfig {
@@ -488,6 +488,13 @@ async fn provider_presets_include_builtin_metadata() {
         .find(|provider| provider.kind == ProviderKind::Deepseek)
         .expect("deepseek preset");
     assert_eq!(openai.default_model, "gpt-5.5");
+    let gpt_5_5 = openai
+        .models
+        .iter()
+        .find(|model| model.id == "gpt-5.5")
+        .expect("gpt-5.5 preset");
+    assert_eq!(gpt_5_5.context_tokens, 256_000);
+    assert_eq!(gpt_5_5.output_tokens, 128_000);
     assert!(openai.models.iter().any(|model| model.id == "gpt-5.4-mini"));
     assert_eq!(deepseek.default_model, "deepseek-v4-flash");
     let v4_pro = deepseek
@@ -685,6 +692,72 @@ async fn provider_toml_preserves_custom_model_metadata() {
     assert!(!model.supports_tools);
     assert_eq!(model.options["temperature"], json!(0.2));
     assert_eq!(model.headers["X-Test-Model"], "custom");
+}
+
+#[tokio::test]
+async fn legacy_openai_gpt_5_5_context_tokens_migrate_to_256k() {
+    let dir = tempdir().expect("tempdir");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+            default_provider_id = "openai"
+
+            [providers.openai]
+            kind = "openai"
+            name = "OpenAI"
+            base_url = "https://api.openai.com/v1"
+            api_key = "secret"
+            default_model = "gpt-5.5"
+            enabled = true
+
+            [providers.openai.models."gpt-5.5"]
+            name = "gpt-5.5"
+            context_tokens = 400000
+            output_tokens = 128000
+            supports_tools = true
+            wire_api = "responses"
+        "#,
+    )
+    .expect("write config");
+    let store = ConfigStore::open_with_config_path(dir.path().join("config.sqlite3"), &config_path)
+        .await
+        .expect("open");
+
+    let response = store.providers_response().await.expect("providers");
+    let model = response.providers[0]
+        .models
+        .iter()
+        .find(|model| model.id == "gpt-5.5")
+        .expect("gpt-5.5");
+    assert_eq!(model.context_tokens, 256_000);
+    let selection = store
+        .resolve_provider(Some("openai"), Some("gpt-5.5"))
+        .await
+        .expect("resolve");
+    assert_eq!(selection.model.context_tokens, 256_000);
+}
+
+#[tokio::test]
+async fn custom_openai_gpt_5_5_context_tokens_are_preserved() {
+    let (_dir, store) = store().await;
+    let mut provider = provider(Some("secret"));
+    provider.models[0].context_tokens = 123_456;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![provider],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save");
+
+    let response = store.providers_response().await.expect("providers");
+    let model = response.providers[0]
+        .models
+        .iter()
+        .find(|model| model.id == "gpt-5.5")
+        .expect("gpt-5.5");
+    assert_eq!(model.context_tokens, 123_456);
 }
 
 #[tokio::test]

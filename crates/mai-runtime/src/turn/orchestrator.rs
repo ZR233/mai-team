@@ -18,6 +18,7 @@ use crate::events::RuntimeEvents;
 use crate::instructions::{self, ContainerSkillPaths};
 use crate::state::{AgentRecord, RuntimeState};
 use crate::turn::completion::TurnResult;
+use crate::turn::context::{ContextCompactionOutcome, ContextCompactionRequest};
 use crate::turn::model_stream::TurnModelContext;
 use crate::turn::persistence::AgentLogRecord;
 use crate::turn::tools::ToolExecution;
@@ -52,8 +53,9 @@ pub(crate) trait TurnOrchestratorOps: Send + Sync {
         agent_id: AgentId,
         session_id: SessionId,
         turn_id: TurnId,
+        request: ContextCompactionRequest,
         cancellation_token: &CancellationToken,
-    ) -> Result<()>;
+    ) -> Result<ContextCompactionOutcome>;
 
     async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<mai_mcp::McpTool>;
 
@@ -253,7 +255,14 @@ pub(crate) async fn run_turn_inner(
         .sync_agent_skills_to_container(&agent, &skills_manager, &skills_config)
         .await?;
     if let Err(err) = ops
-        .maybe_auto_compact(&agent, agent_id, session_id, turn_id, &cancellation_token)
+        .maybe_auto_compact(
+            &agent,
+            agent_id,
+            session_id,
+            turn_id,
+            ContextCompactionRequest::last_context_only(),
+            &cancellation_token,
+        )
         .await
     {
         if matches!(err, RuntimeError::TurnCancelled) {
@@ -420,28 +429,6 @@ pub(crate) async fn run_turn_inner(
             AgentStatus::RunningTurn,
         )
         .await?;
-        if let Err(err) = ops
-            .maybe_auto_compact(&agent, agent_id, session_id, turn_id, &cancellation_token)
-            .await
-        {
-            if matches!(err, RuntimeError::TurnCancelled) {
-                return Err(err);
-            }
-            tracing::warn!("auto context compaction failed before model request: {err}");
-            super::persistence::record_agent_log(
-                deps.store.as_ref(),
-                AgentLogRecord {
-                    agent_id,
-                    session_id: Some(session_id),
-                    turn_id: Some(turn_id),
-                    level: "warn",
-                    category: "context",
-                    message: "auto context compaction failed",
-                    details: json!({ "stage": "before_model_request", "error": err.to_string() }),
-                },
-            )
-            .await;
-        }
         let history_started = Instant::now();
         let mut history =
             super::history::session_history(deps.store.as_ref(), &agent, agent_id, session_id)
@@ -451,6 +438,58 @@ pub(crate) async fn run_turn_inner(
                 instructions::skill_user_fragment(&skill_injections, &container_skill_paths)
         {
             history.push(skill_fragment);
+        }
+        let estimated_request_tokens = super::context::estimate_model_request_tokens(
+            &model_context.instructions,
+            &history,
+            &model_context.tools,
+        );
+        match ops
+            .maybe_auto_compact(
+                &agent,
+                agent_id,
+                session_id,
+                turn_id,
+                ContextCompactionRequest::from_estimate(estimated_request_tokens),
+                &cancellation_token,
+            )
+            .await
+        {
+            Ok(ContextCompactionOutcome::Compacted { .. }) => {
+                turn_model_state.reset_continuation();
+                history = super::history::session_history(
+                    deps.store.as_ref(),
+                    &agent,
+                    agent_id,
+                    session_id,
+                )
+                .await?;
+                if let Some(skill_fragment) =
+                    instructions::skill_user_fragment(&skill_injections, &container_skill_paths)
+                {
+                    history.push(skill_fragment);
+                }
+            }
+            Ok(ContextCompactionOutcome::Skipped) => {}
+            Err(err) => {
+                if matches!(err, RuntimeError::TurnCancelled) {
+                    return Err(err);
+                }
+                tracing::warn!("auto context compaction failed before model request: {err}");
+                super::persistence::record_agent_log(
+                    deps.store.as_ref(),
+                    AgentLogRecord {
+                        agent_id,
+                        session_id: Some(session_id),
+                        turn_id: Some(turn_id),
+                        level: "warn",
+                        category: "context",
+                        message: "auto context compaction failed",
+                        details: json!({ "stage": "before_model_request", "error": err.to_string() }),
+                    },
+                )
+                .await;
+            }
         }
         let history_duration_ms = u128_to_u64(history_started.elapsed().as_millis());
         let model_started = Instant::now();

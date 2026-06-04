@@ -1915,25 +1915,30 @@ impl AgentRuntime {
         agent_id: AgentId,
         session_id: SessionId,
         turn_id: TurnId,
+        request: turn::context::ContextCompactionRequest,
         cancellation_token: &CancellationToken,
-    ) -> Result<()> {
+    ) -> Result<turn::context::ContextCompactionOutcome> {
         if cancellation_token.is_cancelled() {
             return Err(RuntimeError::TurnCancelled);
         }
         let last_context_tokens =
             turn::history::session_context_tokens(agent, agent_id, session_id).await?;
-        let Some(tokens_before) = last_context_tokens else {
-            return Ok(());
-        };
         let summary = agent.summary.read().await.clone();
         let provider_selection = self
             .deps
             .store
             .resolve_provider(Some(&summary.provider_id), Some(&summary.model))
             .await?;
-        if !should_auto_compact(tokens_before, provider_selection.model.context_tokens) {
-            return Ok(());
-        }
+        let context_tokens = provider_selection.model.context_tokens;
+        let Some(decision) = turn::context::context_compaction_decision(
+            last_context_tokens,
+            request.estimated_tokens,
+            context_tokens,
+            AUTO_COMPACT_THRESHOLD_PERCENT,
+        ) else {
+            return Ok(turn::context::ContextCompactionOutcome::Skipped);
+        };
+        let tokens_before = decision.tokens_before;
 
         let history =
             turn::history::session_history(self.deps.store.as_ref(), agent, agent_id, session_id)
@@ -1947,7 +1952,7 @@ impl AgentRuntime {
                 0,
             )
             .await?;
-            return Ok(());
+            return Ok(turn::context::ContextCompactionOutcome::Skipped);
         }
         let mut compact_input = history.clone();
         compact_input.push(ModelInputItem::user_text(COMPACT_PROMPT));
@@ -2035,13 +2040,23 @@ impl AgentRuntime {
                 category: "context",
                 message: "context compacted",
                 details: json!({
+                    "trigger": decision.trigger.as_str(),
                     "tokens_before": tokens_before,
+                    "last_context_tokens": last_context_tokens,
+                    "estimated_request_tokens": request.estimated_tokens,
+                    "context_tokens": context_tokens,
                     "summary_preview": preview(&summary_text, COMPACT_SUMMARY_PREVIEW_CHARS),
                 }),
             },
         )
         .await;
-        Ok(())
+        Ok(turn::context::ContextCompactionOutcome::Compacted {
+            trigger: decision.trigger,
+            tokens_before,
+            last_context_tokens,
+            estimated_request_tokens: request.estimated_tokens,
+            context_tokens,
+        })
     }
 
     async fn persist_agent(&self, agent: &AgentRecord) -> Result<()> {
@@ -5001,14 +5016,16 @@ impl turn::orchestrator::TurnOrchestratorOps for Arc<AgentRuntime> {
         agent_id: AgentId,
         session_id: SessionId,
         turn_id: TurnId,
+        request: turn::context::ContextCompactionRequest,
         cancellation_token: &CancellationToken,
-    ) -> Result<()> {
+    ) -> Result<turn::context::ContextCompactionOutcome> {
         AgentRuntime::maybe_auto_compact(
             self,
             agent,
             agent_id,
             session_id,
             turn_id,
+            request,
             cancellation_token,
         )
         .await
@@ -5530,14 +5547,6 @@ fn recovered_summary(mut summary: AgentSummary) -> (AgentSummary, bool) {
 #[cfg(test)]
 fn extract_skill_mentions(text: &str) -> Vec<String> {
     mai_skills::extract_skill_mentions(text)
-}
-
-fn should_auto_compact(last_context_tokens: u64, context_tokens: u64) -> bool {
-    if last_context_tokens == 0 || context_tokens == 0 {
-        return false;
-    }
-    last_context_tokens.saturating_mul(100)
-        >= context_tokens.saturating_mul(AUTO_COMPACT_THRESHOLD_PERCENT)
 }
 
 #[cfg(test)]

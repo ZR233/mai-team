@@ -15,7 +15,7 @@ fn test_model(id: &str) -> ModelConfig {
     ModelConfig {
         id: id.to_string(),
         name: Some(id.to_string()),
-        context_tokens: 400_000,
+        context_tokens: if id == "gpt-5.5" { 256_000 } else { 400_000 },
         output_tokens: 128_000,
         supports_tools: true,
         reasoning: Some(openai_reasoning_config(&[
@@ -2100,11 +2100,31 @@ async fn delete_child_keeps_parent_and_sibling() {
 
 #[test]
 fn auto_compact_threshold_uses_last_context_tokens() {
-    assert!(!should_auto_compact(0, 100));
-    assert!(!should_auto_compact(89, 100));
-    assert!(should_auto_compact(90, 100));
-    assert!(should_auto_compact(360_000, 400_000));
-    assert!(!should_auto_compact(90, 0));
+    assert_eq!(
+        turn::context::context_compaction_decision(Some(0), None, 100, 90),
+        None
+    );
+    assert_eq!(
+        turn::context::context_compaction_decision(Some(89), None, 100, 90),
+        None
+    );
+    assert!(turn::context::context_compaction_decision(Some(90), None, 100, 90).is_some());
+    assert!(turn::context::context_compaction_decision(Some(360_000), None, 400_000, 90).is_some());
+    assert_eq!(
+        turn::context::context_compaction_decision(None, Some(90), 100, 90),
+        None
+    );
+    assert_eq!(
+        turn::context::context_compaction_decision(Some(10), Some(90), 100, 90),
+        Some(turn::context::ContextCompactionDecision {
+            trigger: turn::context::ContextCompactionTrigger::RequestEstimate,
+            tokens_before: 90,
+        })
+    );
+    assert_eq!(
+        turn::context::context_compaction_decision(Some(90), None, 0, 90),
+        None
+    );
 }
 
 #[test]
@@ -2963,6 +2983,7 @@ async fn auto_compact_failure_keeps_original_history() {
             agent_id,
             session_id,
             Uuid::new_v4(),
+            turn::context::ContextCompactionRequest::last_context_only(),
             &CancellationToken::new(),
         )
         .await;
@@ -3126,13 +3147,201 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
             if role == "assistant"
                 && matches!(&content[0], ModelContentItem::OutputText { text } if text == "final answer")
     ));
-    assert!(runtime.events.snapshot().await.iter().any(|event| matches!(
-        event.kind,
-        ServiceEventKind::ContextCompacted {
-            tokens_before: 90,
-            ..
-        }
+    let tokens_before = runtime
+        .events
+        .snapshot()
+        .await
+        .iter()
+        .find_map(|event| match event.kind {
+            ServiceEventKind::ContextCompacted { tokens_before, .. } => Some(tokens_before),
+            _ => None,
+        })
+        .expect("context compacted event");
+    assert!(tokens_before >= 90);
+}
+
+#[tokio::test]
+async fn auto_compact_uses_request_estimate_before_model_request() {
+    let (base_url, requests) = start_mock_responses(vec![
+        json!({
+            "id": "first",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "list_agents",
+                "arguments": "{}"
+            }],
+            "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+        }),
+        json!({
+            "id": "compact",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "summary from estimate" }]
+            }],
+            "usage": { "input_tokens": 20, "output_tokens": 5, "total_tokens": 25 }
+        }),
+        json!({
+            "id": "second",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "done after estimate compact" }]
+            }],
+            "usage": { "input_tokens": 30, "output_tokens": 4, "total_tokens": 34 }
+        }),
+    ])
+    .await;
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let mut provider = compact_no_continuation_test_provider(base_url);
+    provider.models[0].context_tokens = 60;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![provider],
+            default_provider_id: Some("mock".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let agent_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    store
+        .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
+        .await
+        .expect("save agent");
+    save_test_session(&store, agent_id, session_id).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    runtime
+        .run_turn_inner(
+            agent_id,
+            session_id,
+            Uuid::new_v4(),
+            "please inspect agents".to_string(),
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn");
+
+    let requests = requests.lock().await.clone();
+    assert_eq!(requests.len(), 3);
+    let compact_input = requests[1]["input"].as_array().expect("compact input");
+    assert!(matches!(
+        compact_input.last(),
+        Some(value) if value["content"][0]["text"].as_str().is_some_and(|text| text.contains("CONTEXT CHECKPOINT COMPACTION"))
+    ));
+    let history = store
+        .load_agent_history(agent_id, session_id)
+        .await
+        .expect("history");
+    assert!(history.iter().any(|item| matches!(
+        item,
+        ModelInputItem::Message { role, content }
+            if role == "user"
+                && matches!(&content[0], ModelContentItem::InputText { text } if turn::history::is_compact_summary(text, COMPACT_SUMMARY_PREFIX) && text.contains("summary from estimate"))
     )));
+    assert!(
+        runtime
+            .events
+            .snapshot()
+            .await
+            .iter()
+            .any(|event| matches!(event.kind, ServiceEventKind::ContextCompacted { .. }))
+    );
+}
+
+#[tokio::test]
+async fn auto_compact_resets_openai_continuation_after_replacing_history() {
+    let (base_url, requests) = start_mock_responses(vec![
+        json!({
+            "id": "first",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "unknown_tool",
+                "arguments": "{}"
+            }],
+            "usage": { "input_tokens": 88, "output_tokens": 2, "total_tokens": 90 }
+        }),
+        json!({
+            "id": "compact",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "summary resets continuation" }]
+            }],
+            "usage": { "input_tokens": 20, "output_tokens": 5, "total_tokens": 25 }
+        }),
+        json!({
+            "id": "second",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "done after reset" }]
+            }],
+            "usage": { "input_tokens": 40, "output_tokens": 4, "total_tokens": 44 }
+        }),
+    ])
+    .await;
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![compact_test_provider(base_url)],
+            default_provider_id: Some("mock".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let agent_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    store
+        .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
+        .await
+        .expect("save agent");
+    save_test_session(&store, agent_id, session_id).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let agent = runtime.agent(agent_id).await.expect("agent");
+    *agent.container.write().await = Some(ContainerHandle {
+        id: "container-1".to_string(),
+        name: "container-1".to_string(),
+        image: "unused".to_string(),
+    });
+
+    runtime
+        .run_turn_inner(
+            agent_id,
+            session_id,
+            Uuid::new_v4(),
+            "please use a tool".to_string(),
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn");
+
+    let requests = requests.lock().await.clone();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].get("previous_response_id").is_none());
+    assert_eq!(
+        requests[1]["input"]
+            .as_array()
+            .expect("compact input")
+            .last()
+            .and_then(|value| value["content"][0]["text"].as_str())
+            .map(|text| text.contains("CONTEXT CHECKPOINT COMPACTION")),
+        Some(true)
+    );
+    assert!(
+        requests[2].get("previous_response_id").is_none(),
+        "compact 后下一次请求必须断开旧 Responses continuation"
+    );
+    assert!(
+        requests[2]["input"]
+            .as_array()
+            .expect("second input")
+            .iter()
+            .any(|value| value["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("summary resets continuation")))
+    );
 }
 
 #[tokio::test]
@@ -4422,7 +4631,7 @@ async fn sessions_are_created_and_selected_independently() {
             .context_usage
             .as_ref()
             .map(|usage| usage.context_tokens),
-        Some(400_000)
+        Some(256_000)
     );
     assert_eq!(
         detail

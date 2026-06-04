@@ -1,5 +1,6 @@
 pub(crate) mod accounting;
 pub(crate) mod completion;
+pub(crate) mod context;
 pub(crate) mod history;
 pub(crate) mod model_stream;
 pub(crate) mod orchestrator;
