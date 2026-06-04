@@ -5,9 +5,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use mai_docker::ContainerHandle;
 use mai_mcp::McpAgentManager;
 use mai_protocol::{
-    AgentId, AgentMessage, AgentSessionSummary, AgentSummary, ArtifactInfo, ModelInputItem,
-    PlanHistoryEntry, ProjectId, ProjectSummary, SessionId, TaskId, TaskPlan, TaskReview,
-    TaskSummary, TurnId,
+    AgentId, AgentMessage, AgentSessionSummary, AgentSummary, ArtifactInfo, PlanHistoryEntry,
+    ProjectId, ProjectSummary, SessionId, TaskId, TaskPlan, TaskReview, TaskSummary, TurnId,
 };
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -110,7 +109,6 @@ pub(crate) struct TurnGuard {
 pub(crate) struct AgentSessionRecord {
     pub(crate) summary: AgentSessionSummary,
     pub(crate) messages: Vec<AgentMessage>,
-    pub(crate) history: Vec<ModelInputItem>,
     pub(crate) last_context_tokens: Option<u64>,
     pub(crate) last_turn_response: Option<String>,
 }

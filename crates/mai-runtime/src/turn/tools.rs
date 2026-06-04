@@ -1638,7 +1638,6 @@ mod tests {
                 sessions: Mutex::new(vec![AgentSessionRecord {
                     summary: session_summary.clone(),
                     messages: Vec::new(),
-                    history: Vec::new(),
                     last_context_tokens: None,
                     last_turn_response: None,
                 }]),
@@ -1673,7 +1672,10 @@ mod tests {
         }
 
         async fn history(&self) -> Vec<ModelInputItem> {
-            self.agent.sessions.lock().await[0].history.clone()
+            self.store
+                .load_agent_history(self.agent_id, self.session_id)
+                .await
+                .expect("load history")
         }
     }
 

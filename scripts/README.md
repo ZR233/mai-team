@@ -181,7 +181,11 @@ systemd service 会通过 `/etc/mai-server/mai-server.env` 读取环境变量，
 
 ```text
 ExecStart=/opt/mai-server/mai-server --data-path /var/lib/mai-server
+MemoryHigh=1500M
+MemoryMax=3000M
 ```
+
+其中 `MemoryHigh` 和 `MemoryMax` 是温和的 systemd 保护阈值，用来避免未来内存回归拖垮整机；它们不是 OOM 根因修复的替代。
 
 安装完成后会执行：
 

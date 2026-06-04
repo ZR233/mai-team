@@ -248,7 +248,6 @@ impl AgentRuntime {
                         ..persisted_session.summary
                     },
                     messages,
-                    history: persisted_session.history,
                     last_context_tokens: persisted_session.last_context_tokens,
                     last_turn_response: None,
                 });
@@ -3161,6 +3160,18 @@ impl agents::AgentServiceOps for AgentRuntime {
         AgentRuntime::resolve_session_id(self, agent_id, session_id).await
     }
 
+    async fn load_agent_history(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> Result<Vec<ModelInputItem>> {
+        Ok(self
+            .deps
+            .store
+            .load_agent_history(agent_id, session_id)
+            .await?)
+    }
+
     async fn replace_agent_history(
         &self,
         agent_id: AgentId,
@@ -3360,6 +3371,18 @@ impl agents::AgentObservabilityOps for AgentRuntime {
         filter: ToolTraceFilter,
     ) -> Result<Vec<ToolTraceSummary>> {
         Ok(self.deps.store.list_tool_traces(agent_id, filter).await?)
+    }
+
+    async fn load_agent_history(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> Result<Vec<ModelInputItem>> {
+        Ok(self
+            .deps
+            .store
+            .load_agent_history(agent_id, session_id)
+            .await?)
     }
 
     fn tool_output_artifact_file_path(

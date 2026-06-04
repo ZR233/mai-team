@@ -75,6 +75,11 @@ pub(crate) trait AgentServiceOps: Send + Sync {
         agent_id: AgentId,
         session_id: Option<SessionId>,
     ) -> Result<SessionId>;
+    async fn load_agent_history(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> Result<Vec<ModelInputItem>>;
     async fn replace_agent_history(
         &self,
         agent_id: AgentId,
@@ -331,7 +336,6 @@ pub(crate) fn session_record_with_title(title: &str) -> AgentSessionRecord {
             token_usage: TokenUsage::default(),
         },
         messages: Vec::new(),
-        history: Vec::new(),
         last_context_tokens: None,
         last_turn_response: None,
     }

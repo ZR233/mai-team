@@ -122,14 +122,12 @@ mod tests {
                 AgentSessionRecord {
                     summary: first_session.clone(),
                     messages: Vec::new(),
-                    history: Vec::new(),
                     last_context_tokens: None,
                     last_turn_response: None,
                 },
                 AgentSessionRecord {
                     summary: second_session.clone(),
                     messages: Vec::new(),
-                    history: Vec::new(),
                     last_context_tokens: None,
                     last_turn_response: None,
                 },

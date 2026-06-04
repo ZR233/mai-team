@@ -426,6 +426,8 @@ ExecStart=$BIN_PATH --data-path $DATA_DIR
 Restart=always
 RestartSec=5
 WorkingDirectory=$DATA_DIR
+MemoryHigh=1500M
+MemoryMax=3000M
 
 [Install]
 WantedBy=multi-user.target

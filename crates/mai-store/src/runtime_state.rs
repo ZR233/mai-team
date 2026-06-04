@@ -300,7 +300,6 @@ impl ConfigStore {
         for row in rows {
             let session_id = parse_session_id(&row.id)?;
             let messages = self.load_agent_messages(agent_id, session_id).await?;
-            let history = self.load_agent_history(agent_id, session_id).await?;
             let last_context_tokens = self
                 .load_session_context_tokens(agent_id, session_id)
                 .await?;
@@ -319,7 +318,6 @@ impl ConfigStore {
                         total_tokens: i64_to_u64(row.total_tokens),
                     },
                 },
-                history,
                 last_context_tokens,
             });
         }
@@ -346,7 +344,7 @@ impl ConfigStore {
             .collect()
     }
 
-    pub(crate) async fn load_agent_history(
+    pub async fn load_agent_history(
         &self,
         agent_id: AgentId,
         session_id: SessionId,
@@ -364,6 +362,27 @@ impl ConfigStore {
         rows.into_iter()
             .map(|row| serde_json::from_str::<ModelInputItem>(&row.item_json).map_err(Into::into))
             .collect()
+    }
+
+    pub async fn agent_history_len(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> Result<usize> {
+        let mut db = self.db.clone();
+        let rows = Query::<List<AgentHistoryRecord>>::filter(
+            AgentHistoryRecord::fields()
+                .agent_id()
+                .eq(agent_id.to_string())
+                .and(
+                    AgentHistoryRecord::fields()
+                        .session_id()
+                        .eq(session_id.to_string()),
+                ),
+        )
+        .exec(&mut db)
+        .await?;
+        Ok(rows.len())
     }
 
     async fn load_session_context_tokens(

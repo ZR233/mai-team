@@ -518,8 +518,13 @@ pub(crate) async fn run_turn_inner(
         if model_turn.last_assistant_text.is_some() {
             last_assistant_text = model_turn.last_assistant_text;
         }
-        let acknowledged_history_len =
-            super::history::raw_session_history_len(&agent, agent_id, session_id).await?;
+        let acknowledged_history_len = super::history::raw_session_history_len(
+            deps.store.as_ref(),
+            &agent,
+            agent_id,
+            session_id,
+        )
+        .await?;
         turn_model_state.acknowledge_history_len(acknowledged_history_len);
 
         if !made_progress {
