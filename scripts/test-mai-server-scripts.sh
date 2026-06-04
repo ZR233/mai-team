@@ -64,6 +64,8 @@ install_output="$(MAI_RELEASES_JSON_FILE="$release_fixture" "$INSTALL_SCRIPT" --
 update_output="$(MAI_RELEASES_JSON_FILE="$release_fixture" "$UPDATE_SCRIPT" --dry-run)"
 source_install_output="$("$INSTALL_SCRIPT" --dry-run --source-dir "$ROOT_DIR")"
 source_update_output="$("$UPDATE_SCRIPT" --dry-run --source-dir "$ROOT_DIR")"
+sudo_source_install_output="$(SUDO_USER=mai-build-user "$INSTALL_SCRIPT" --dry-run --source-dir "$ROOT_DIR")"
+sudo_source_update_output="$(SUDO_USER=mai-build-user "$UPDATE_SCRIPT" --dry-run --source-dir "$ROOT_DIR")"
 
 for output in "$install_output" "$update_output"; do
   assert_contains "$output" "DRY RUN: host check would require Ubuntu 22.04 or 24.04 x86_64"
@@ -94,14 +96,28 @@ assert_line_before \
   "DRY RUN: systemctl restart mai-server"
 
 for output in "$source_install_output" "$source_update_output"; do
-  assert_contains "$output" "DRY RUN: build mai-server from source $ROOT_DIR"
+  assert_contains "$output" "DRY RUN: build mai-server from source $ROOT_DIR as $(id -un)"
   assert_contains "$output" "DRY RUN: cargo build --release -p mai-server"
   assert_contains "$output" "DRY RUN: install built mai-server from $ROOT_DIR/target/release/mai-server to /opt/mai-server/mai-server"
+  assert_line_before \
+    "$output" \
+    "DRY RUN: cargo build --release -p mai-server" \
+    "DRY RUN: install built mai-server from $ROOT_DIR/target/release/mai-server to /opt/mai-server/mai-server"
   assert_not_contains "$output" "DRY RUN: resolve latest mai-server release"
   assert_not_contains "$output" "DRY RUN: download https://github.com/ZR233/mai-team/releases/download"
 done
 
 assert_contains "$source_update_output" "DRY RUN: systemctl restart mai-server"
+for output in "$sudo_source_install_output" "$sudo_source_update_output"; do
+  assert_contains "$output" "DRY RUN: build mai-server from source $ROOT_DIR as mai-build-user"
+  assert_contains "$output" "DRY RUN: sudo -u mai-build-user -H bash -lc"
+  assert_contains "$output" "cargo build --release -p mai-server"
+  assert_not_contains "$output" "DRY RUN: cargo build --release -p mai-server"
+  assert_line_before \
+    "$output" \
+    "DRY RUN: sudo -u mai-build-user -H bash -lc" \
+    "DRY RUN: install built mai-server from $ROOT_DIR/target/release/mai-server to /opt/mai-server/mai-server"
+done
 
 if MAI_RELEASES_JSON_FILE="$release_fixture" "$UPDATE_SCRIPT" --dry-run --version mai-relay-v0.1.8 >"$wrong_version_output" 2>&1; then
   printf 'expected server update script to reject mai-relay version tag\n' >&2

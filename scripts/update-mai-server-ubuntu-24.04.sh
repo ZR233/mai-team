@@ -155,6 +155,41 @@ source_binary_path() {
   printf '%s/target/release/mai-server' "$SOURCE_DIR"
 }
 
+source_build_user() {
+  if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER:-}" != "root" ]]; then
+    local sudo_user_uid
+    if ! sudo_user_uid="$(id -u "$SUDO_USER" 2>/dev/null)"; then
+      echo "SUDO_USER=$SUDO_USER does not exist on this host" >&2
+      exit 1
+    fi
+    if [[ -n "${SUDO_UID:-}" && "$sudo_user_uid" != "$SUDO_UID" ]]; then
+      echo "SUDO_USER=$SUDO_USER does not match SUDO_UID=$SUDO_UID" >&2
+      exit 1
+    fi
+    printf '%s' "$SUDO_USER"
+    return 0
+  fi
+  if [[ "$DRY_RUN" == "true" && -n "${SUDO_USER:-}" && "${SUDO_USER:-}" != "root" ]]; then
+    printf '%s' "$SUDO_USER"
+    return 0
+  fi
+  id -un
+}
+
+run_source_build_as_user() {
+  local build_user="$1"
+  sudo -u "$build_user" -H bash -lc '
+if [[ -r "$HOME/.cargo/env" ]]; then
+  . "$HOME/.cargo/env"
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo was not found for user ${USER:-$(id -un)}. Install Rust/Cargo for that user and retry." >&2
+  exit 127
+fi
+cd "$1" && cargo build --release -p mai-server
+' bash "$SOURCE_DIR"
+}
+
 validate_source_dir() {
   if [[ -z "$SOURCE_DIR" ]]; then
     return 0
@@ -166,13 +201,33 @@ validate_source_dir() {
 }
 
 build_source_binary() {
+  local build_user
+  local current_user
+  build_user="$(source_build_user)"
+  current_user="$(id -un)"
+  if [[ "$DRY_RUN" != "true" && "$current_user" == "root" && "$build_user" == "root" ]]; then
+    cat >&2 <<'ERROR'
+--source-dir builds should not compile as root.
+Install Rust/Cargo for your normal user and run this updater through sudo, for example:
+  sudo scripts/update-mai-server-ubuntu-24.04.sh --source-dir "$(pwd)"
+ERROR
+    exit 1
+  fi
   if [[ "$DRY_RUN" == "true" ]]; then
-    echo "DRY RUN: build mai-server from source $SOURCE_DIR"
-    echo "DRY RUN: cargo build --release -p mai-server"
+    echo "DRY RUN: build mai-server from source $SOURCE_DIR as $build_user"
+    if [[ "$build_user" != "$current_user" ]]; then
+      echo "DRY RUN: sudo -u $build_user -H bash -lc 'source ~/.cargo/env if present; cd $SOURCE_DIR && cargo build --release -p mai-server'"
+    else
+      echo "DRY RUN: cargo build --release -p mai-server"
+    fi
     return 0
   fi
 
-  (cd "$SOURCE_DIR" && cargo build --release -p mai-server)
+  if [[ "$build_user" != "$current_user" ]]; then
+    run_source_build_as_user "$build_user"
+  else
+    (cd "$SOURCE_DIR" && cargo build --release -p mai-server)
+  fi
 }
 
 install_source_binary() {
