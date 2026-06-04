@@ -267,6 +267,12 @@ pub(crate) fn project_review_error_is_retryable(error: &str) -> bool {
         return true;
     }
 
+    if let Some(stream_error) = error.strip_prefix("model error: stream error: ") {
+        return stream_error.contains("stream closed with incomplete SSE frame")
+            || stream_error.contains("stream closed before response.completed")
+            || stream_error.contains("idle timeout waiting for SSE");
+    }
+
     if !error.starts_with("model error: request to ") {
         return false;
     }
@@ -727,6 +733,19 @@ mod tests {
     #[test]
     fn model_response_decode_failure_is_retryable() {
         let error = "model error: request to https://token-plan-cn.xiaomimimo.com/v1/chat/completions failed: error decoding response body";
+
+        let decision = project_review_loop_decision_for_error(error.to_string());
+
+        assert_eq!(decision.delay, Duration::from_secs(1));
+        assert_eq!(decision.status, ProjectReviewStatus::Waiting);
+        assert_eq!(decision.outcome, None);
+        assert_eq!(decision.summary, None);
+        assert_eq!(decision.error.as_deref(), Some(error));
+    }
+
+    #[test]
+    fn model_incomplete_sse_frame_is_retryable() {
+        let error = "model error: stream error: stream closed with incomplete SSE frame";
 
         let decision = project_review_loop_decision_for_error(error.to_string());
 
