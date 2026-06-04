@@ -9,12 +9,19 @@ use crate::{Result, now};
 
 #[derive(Default)]
 pub(crate) struct ReviewStateUpdate {
-    pub(crate) current_reviewer_agent_id: Option<AgentId>,
+    pub(crate) current_reviewer_agent_id: ReviewerAgentUpdate,
     pub(crate) next_review_at: Option<DateTime<Utc>>,
     pub(crate) outcome: Option<ProjectReviewOutcome>,
     pub(crate) summary_text: Option<String>,
     pub(crate) error: Option<String>,
     pub(crate) force_disabled: bool,
+}
+
+#[derive(Default)]
+pub(crate) enum ReviewerAgentUpdate {
+    #[default]
+    Clear,
+    Set(AgentId),
 }
 
 /// Provides project persistence and event publishing needed to transition the
@@ -40,9 +47,18 @@ pub(crate) async fn set_project_review_state(
     let updated = {
         let mut summary = project.summary.write().await;
         summary.review_status = status;
-        summary.current_reviewer_agent_id = update.current_reviewer_agent_id;
+        let reviewer_started = match update.current_reviewer_agent_id {
+            ReviewerAgentUpdate::Clear => {
+                summary.current_reviewer_agent_id = None;
+                false
+            }
+            ReviewerAgentUpdate::Set(reviewer_id) => {
+                summary.current_reviewer_agent_id = Some(reviewer_id);
+                true
+            }
+        };
         summary.next_review_at = update.next_review_at;
-        if update.current_reviewer_agent_id.is_some() {
+        if reviewer_started {
             summary.last_review_started_at = Some(now());
             summary.last_review_finished_at = None;
         } else if update.outcome.is_some() || update.error.is_some() {

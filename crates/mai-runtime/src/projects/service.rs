@@ -349,7 +349,6 @@ pub(crate) async fn project_auto_reviewer_agents(
         .filter(|summary| {
             summary.role == Some(AgentRole::Reviewer)
                 && summary.parent_id == Some(maintainer_agent_id)
-                && !summary.status.is_terminal()
         })
         .collect()
 }

@@ -1772,6 +1772,22 @@ async fn invalid_sqlite_file_is_rebuilt() {
 }
 
 #[tokio::test]
+async fn sqlite_store_uses_wal_journal_mode() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("config.sqlite3");
+    let store = ConfigStore::open_with_config_path(&db_path, dir.path().join("config.toml"))
+        .await
+        .expect("open");
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    let journal_mode: String = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .expect("journal_mode");
+    assert_eq!("wal", journal_mode.to_ascii_lowercase());
+}
+
+#[tokio::test]
 async fn skills_config_persists_in_settings() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("config.sqlite3");

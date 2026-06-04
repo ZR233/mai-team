@@ -44,8 +44,8 @@ pub(crate) async fn record_model_usage(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
     use std::collections::BTreeMap;
+    use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicBool;
@@ -222,10 +222,12 @@ mod tests {
                 total_tokens: 42,
             })
         );
-        assert!(snapshot
-            .recent_events
-            .iter()
-            .any(|event| matches!(event.kind, ServiceEventKind::AgentUpdated { .. })));
+        assert!(
+            snapshot
+                .recent_events
+                .iter()
+                .any(|event| matches!(event.kind, ServiceEventKind::AgentUpdated { .. }))
+        );
     }
 
     fn session(

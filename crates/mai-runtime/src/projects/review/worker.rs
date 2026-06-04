@@ -18,9 +18,12 @@ use super::pool::PendingProjectReview;
 use super::project_review_retry_backoff;
 use super::runs::FinishReviewRun;
 use super::selector::ProjectReviewSelectorRunResult;
+use super::singleton::{ProjectReviewRepairReason, repair_project_review_singleton};
 use super::state::ReviewStateUpdate;
 use crate::state::{ProjectRecord, ProjectReviewWorker};
 use crate::{Result, RuntimeError};
+
+const PROJECT_REVIEW_WORKER_REPAIR_RUN_LIST_LIMIT: usize = 50;
 
 /// Provides project review worker lifecycle side effects while keeping the
 /// background loop independent of the full runtime facade.
@@ -145,72 +148,13 @@ pub(crate) async fn reconcile_project_review_singleton(
     project_id: ProjectId,
     run_list_limit: usize,
 ) -> Result<()> {
-    let project = ops.project(project_id).await?;
-    let summary = project.summary.read().await.clone();
-    let mut stale_reviewer_ids = HashSet::new();
-    if let Some(reviewer_id) = summary.current_reviewer_agent_id {
-        stale_reviewer_ids.insert(reviewer_id);
-    }
-
-    let runs = ops
-        .load_project_review_runs(project_id, 0, run_list_limit)
-        .await?;
-    let mut has_stale_activity = summary.current_reviewer_agent_id.is_some();
-    for run in runs {
-        if run.finished_at.is_some()
-            || !matches!(
-                run.status,
-                ProjectReviewRunStatus::Syncing | ProjectReviewRunStatus::Running
-            )
-        {
-            continue;
-        }
-        has_stale_activity = true;
-        if let Some(reviewer_id) = run.reviewer_agent_id {
-            stale_reviewer_ids.insert(reviewer_id);
-        }
-        let _ = ops
-            .finish_project_review_run(FinishReviewRun {
-                run_id: run.id,
-                project_id,
-                reviewer_agent_id: run.reviewer_agent_id,
-                turn_id: run.turn_id,
-                status: ProjectReviewRunStatus::Cancelled,
-                outcome: None,
-                review_event: None,
-                pr: run.pr,
-                summary_text: run.summary,
-                error: Some("review interrupted by server restart".to_string()),
-            })
-            .await;
-    }
-
-    for agent in ops.project_auto_reviewer_agents(project_id).await {
-        has_stale_activity = true;
-        stale_reviewer_ids.insert(agent.id);
-    }
-
-    for reviewer_id in stale_reviewer_ids {
-        if let Err(err) = ops.delete_agent(reviewer_id).await {
-            tracing::warn!(
-                project_id = %project_id,
-                reviewer_id = %reviewer_id,
-                "failed to delete stale project reviewer agent: {err}"
-            );
-        }
-    }
-
-    if has_stale_activity {
-        let status = if summary.auto_review_enabled {
-            ProjectReviewStatus::Idle
-        } else {
-            ProjectReviewStatus::Disabled
-        };
-        let _ = ops
-            .set_project_review_state(project_id, status, ReviewStateUpdate::default())
-            .await?;
-    }
-    Ok(())
+    repair_project_review_singleton(
+        &ops,
+        project_id,
+        run_list_limit,
+        ProjectReviewRepairReason::Startup,
+    )
+    .await
 }
 
 pub(crate) async fn start_project_review_loop_if_ready(
@@ -427,6 +371,19 @@ async fn run_project_review_pool_worker(
                 continue;
             }
         };
+        if let Err(err) = repair_project_review_singleton(
+            &ops.ops,
+            ops.project_id,
+            PROJECT_REVIEW_WORKER_REPAIR_RUN_LIST_LIMIT,
+            ProjectReviewRepairReason::Runtime,
+        )
+        .await
+        {
+            tracing::warn!(
+                project_id = %ops.project_id,
+                "failed to repair project reviewer singleton before review signal: {err}"
+            );
+        }
         if let Some(reviewer) = active_project_reviewer_agent(&ops.ops, ops.project_id).await {
             tracing::warn!(
                 project_id = %ops.project_id,
@@ -756,9 +713,9 @@ fn project_reviewer_agent_is_active(status: &AgentStatus) -> bool {
         | AgentStatus::StartingContainer
         | AgentStatus::Idle
         | AgentStatus::RunningTurn
-        | AgentStatus::WaitingTool
-        | AgentStatus::DeletingContainer => true,
-        AgentStatus::Completed
+        | AgentStatus::WaitingTool => true,
+        AgentStatus::DeletingContainer
+        | AgentStatus::Completed
         | AgentStatus::Failed
         | AgentStatus::Cancelled
         | AgentStatus::Deleted => false,
@@ -793,8 +750,8 @@ mod tests {
 
     use mai_protocol::{
         AgentRole, AgentStatus, ProjectCloneStatus, ProjectReviewDecision, ProjectReviewOutcome,
-        ProjectReviewRunSummary, ProjectReviewStatus, ProjectStatus, ProjectSummary, TokenUsage,
-        now,
+        ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewStatus, ProjectStatus,
+        ProjectSummary, TokenUsage, now,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::{Mutex, Notify};
@@ -807,8 +764,9 @@ mod tests {
     use crate::state::ProjectRecord;
 
     use super::{
-        FinishReviewRun, ProjectReviewCycleResult, ProjectReviewSelectorRunResult,
-        ProjectReviewTaskContext, ProjectReviewWorkerOps, ReviewStateUpdate, run_selector_attempt,
+        FinishReviewRun, ProjectReviewCycleResult, ProjectReviewRepairReason,
+        ProjectReviewSelectorRunResult, ProjectReviewTaskContext, ProjectReviewWorkerOps,
+        ReviewStateUpdate, repair_project_review_singleton, run_selector_attempt,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -842,6 +800,8 @@ mod tests {
         reviewed_prs: Arc<Mutex<Vec<Option<u64>>>>,
         review_errors: Arc<Mutex<Vec<String>>>,
         auto_reviewers: Arc<Mutex<Vec<mai_protocol::AgentSummary>>>,
+        review_runs: Arc<Mutex<Vec<ProjectReviewRunSummary>>>,
+        finished_runs: Arc<Mutex<Vec<FinishReviewRun>>>,
         cancelled_turns: Arc<Mutex<Vec<(Uuid, Uuid)>>>,
         deleted_agents: Arc<Mutex<Vec<Uuid>>>,
         git_provider: mai_protocol::GitProvider,
@@ -863,6 +823,8 @@ mod tests {
                 reviewed_prs: Arc::new(Mutex::new(Vec::new())),
                 review_errors: Arc::new(Mutex::new(Vec::new())),
                 auto_reviewers: Arc::new(Mutex::new(Vec::new())),
+                review_runs: Arc::new(Mutex::new(Vec::new())),
+                finished_runs: Arc::new(Mutex::new(Vec::new())),
                 cancelled_turns: Arc::new(Mutex::new(Vec::new())),
                 deleted_agents: Arc::new(Mutex::new(Vec::new())),
                 git_provider: mai_protocol::GitProvider::Github,
@@ -884,6 +846,10 @@ mod tests {
 
         async fn set_auto_reviewers(&self, reviewers: Vec<mai_protocol::AgentSummary>) {
             *self.auto_reviewers.lock().await = reviewers;
+        }
+
+        async fn set_review_runs(&self, runs: Vec<ProjectReviewRunSummary>) {
+            *self.review_runs.lock().await = runs;
         }
     }
 
@@ -909,10 +875,11 @@ mod tests {
             _offset: usize,
             _limit: usize,
         ) -> crate::Result<Vec<ProjectReviewRunSummary>> {
-            Ok(vec![])
+            Ok(self.review_runs.lock().await.clone())
         }
 
-        async fn finish_project_review_run(&self, _request: FinishReviewRun) -> crate::Result<()> {
+        async fn finish_project_review_run(&self, request: FinishReviewRun) -> crate::Result<()> {
+            self.finished_runs.lock().await.push(request);
             Ok(())
         }
 
@@ -1370,10 +1337,24 @@ mod tests {
     async fn pool_worker_does_not_start_second_reviewer_when_active_reviewer_exists() {
         let project_id = Uuid::new_v4();
         let ops = FakeWorkerOps::new(project_id);
-        ops.set_auto_reviewers(vec![test_reviewer_agent(
+        let reviewer = test_reviewer_agent(
             project_id,
             ops.project.summary.read().await.maintainer_agent_id,
             AgentStatus::WaitingTool,
+        );
+        let reviewer_id = reviewer.id;
+        let turn_id = reviewer.current_turn;
+        {
+            let mut summary = ops.project.summary.write().await;
+            summary.review_status = ProjectReviewStatus::Running;
+            summary.current_reviewer_agent_id = Some(reviewer_id);
+        }
+        ops.set_auto_reviewers(vec![reviewer]).await;
+        ops.set_review_runs(vec![test_review_run(
+            project_id,
+            Some(reviewer_id),
+            turn_id,
+            ProjectReviewRunStatus::Running,
         )])
         .await;
         let token = CancellationToken::new();
@@ -1410,6 +1391,115 @@ mod tests {
 
         token.cancel();
         worker_task.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn pool_worker_repairs_orphan_deleting_reviewer_and_reviews_next_signal() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        let maintainer_agent_id = ops.project.summary.read().await.maintainer_agent_id;
+        let reviewer = test_reviewer_agent(
+            project_id,
+            maintainer_agent_id,
+            AgentStatus::DeletingContainer,
+        );
+        let reviewer_id = reviewer.id;
+        let turn_id = reviewer.current_turn.expect("reviewer turn");
+        ops.set_auto_reviewers(vec![reviewer]).await;
+        ops.set_review_runs(vec![test_review_run(
+            project_id,
+            Some(reviewer_id),
+            Some(turn_id),
+            ProjectReviewRunStatus::Running,
+        )])
+        .await;
+
+        let token = CancellationToken::new();
+        let task_ops = ops.clone();
+        let task_token = token.clone();
+        let worker_task = tokio::spawn(async move {
+            super::run_project_review_loop(task_ops, project_id, task_token).await;
+        });
+
+        {
+            let mut pool = ops.project.review_pool.lock().await;
+            pool.enqueue_many([ProjectReviewSignalInput {
+                pr: 42,
+                head_sha: Some("head-42".to_string()),
+                delivery_id: Some("delivery-42".to_string()),
+                reason: "test".to_string(),
+            }]);
+        }
+        ops.project.review_notify.notify_waiters();
+
+        for _ in 0..20 {
+            if !ops.reviewed_prs.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(vec![Some(42)], *ops.reviewed_prs.lock().await);
+        assert_eq!(
+            vec![(reviewer_id, turn_id)],
+            *ops.cancelled_turns.lock().await
+        );
+        assert_eq!(vec![reviewer_id], *ops.deleted_agents.lock().await);
+        let finished = ops.finished_runs.lock().await.clone();
+        assert_eq!(1, finished.len());
+        assert_eq!(ProjectReviewRunStatus::Cancelled, finished[0].status);
+        assert_eq!(
+            Some("review interrupted by project reviewer self repair".to_string()),
+            finished[0].error
+        );
+
+        token.cancel();
+        worker_task.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn runtime_repair_keeps_consistent_reviewer_and_deletes_extra_stale_reviewer() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        let maintainer_agent_id = ops.project.summary.read().await.maintainer_agent_id;
+        let reviewer =
+            test_reviewer_agent(project_id, maintainer_agent_id, AgentStatus::RunningTurn);
+        let reviewer_id = reviewer.id;
+        let extra_reviewer =
+            test_reviewer_agent(project_id, maintainer_agent_id, AgentStatus::Failed);
+        let extra_reviewer_id = extra_reviewer.id;
+        {
+            let mut summary = ops.project.summary.write().await;
+            summary.review_status = ProjectReviewStatus::Running;
+            summary.current_reviewer_agent_id = Some(reviewer_id);
+        }
+        ops.set_auto_reviewers(vec![reviewer, extra_reviewer]).await;
+        ops.set_review_runs(vec![
+            test_review_run(
+                project_id,
+                Some(extra_reviewer_id),
+                None,
+                ProjectReviewRunStatus::Running,
+            ),
+            test_review_run(
+                project_id,
+                Some(reviewer_id),
+                None,
+                ProjectReviewRunStatus::Running,
+            ),
+        ])
+        .await;
+
+        repair_project_review_singleton(&ops, project_id, 10, ProjectReviewRepairReason::Runtime)
+            .await
+            .expect("repair");
+
+        let finished = ops.finished_runs.lock().await.clone();
+        assert_eq!(1, finished.len());
+        assert_eq!(Some(extra_reviewer_id), finished[0].reviewer_agent_id);
+        assert_eq!(ProjectReviewRunStatus::Cancelled, finished[0].status);
+        assert_eq!(vec![extra_reviewer_id], *ops.deleted_agents.lock().await);
+        assert_eq!(Vec::<ReviewStateSnapshot>::new(), *ops.states.lock().await);
     }
 
     #[tokio::test]
@@ -1737,6 +1827,29 @@ mod tests {
             updated_at: now(),
             current_turn: Some(Uuid::new_v4()),
             last_error: None,
+            token_usage: TokenUsage::default(),
+        }
+    }
+
+    fn test_review_run(
+        project_id: Uuid,
+        reviewer_agent_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
+        status: ProjectReviewRunStatus,
+    ) -> ProjectReviewRunSummary {
+        ProjectReviewRunSummary {
+            id: Uuid::new_v4(),
+            project_id,
+            reviewer_agent_id,
+            turn_id,
+            started_at: now(),
+            finished_at: None,
+            status,
+            outcome: None,
+            review_event: None,
+            pr: Some(42),
+            summary: None,
+            error: None,
             token_usage: TokenUsage::default(),
         }
     }

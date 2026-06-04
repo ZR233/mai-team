@@ -152,6 +152,20 @@ curl -fsSL https://raw.githubusercontent.com/ZR233/mai-team/main/scripts/update-
 curl -fsSL https://raw.githubusercontent.com/ZR233/mai-team/main/scripts/update-mai-server-ubuntu-24.04.sh | sudo bash -s -- --version mai-server-vX.Y.Z
 ```
 
+从本机源码编译并更新已安装服务：
+
+```bash
+sudo scripts/update-mai-server-ubuntu-24.04.sh --source-dir "$(pwd)"
+```
+
+源码模式会跳过 GitHub release 下载，在 `--source-dir` 指向的仓库根目录执行：
+
+```bash
+cargo build --release -p mai-server
+```
+
+然后安装 `target/release/mai-server` 到 `/opt/mai-server/mai-server`，刷新 systemd service 文件并重启服务。使用源码模式前，请确认目标机器已安装 Rust/Cargo，且 `--source-dir` 指向包含 `Cargo.toml` 的 mai-team 仓库根目录。
+
 ## Mai Server 安装内容
 
 脚本会安装或更新：
@@ -179,6 +193,7 @@ systemctl enable --now mai-server
 ```text
 --version mai-server-vX.Y.Z
                      安装或更新指定 release 版本；默认 latest
+--source-dir PATH     从本机源码编译 mai-server 并安装，跳过 release 下载
 --bind-addr HOST:PORT
                      设置服务监听地址；安装默认 0.0.0.0:8080，更新默认保留已有 MAI_BIND_ADDR
 --dry-run             只打印将要执行的安装或更新动作，不写入系统

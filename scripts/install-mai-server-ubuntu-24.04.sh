@@ -7,6 +7,7 @@ RELEASE_PACKAGE="mai-server"
 RELEASE_TAG_PREFIX="mai-server-v"
 RELEASE_API_URL="https://api.github.com/repos/$REPO/releases?per_page=100"
 DRY_RUN="false"
+SOURCE_DIR=""
 BIND_ADDR="0.0.0.0:8080"
 DEFAULT_RUST_LOG="mai_server=info,mai_runtime=info,tower_http=info"
 RUST_LOG_VALUE="$DEFAULT_RUST_LOG"
@@ -22,7 +23,7 @@ ASSET="mai-server-x86_64-unknown-linux-gnu.tar.gz"
 
 usage() {
   cat <<'USAGE'
-Usage: install-mai-server-ubuntu-24.04.sh [--version mai-server-vX.Y.Z] [--bind-addr HOST:PORT] [--dry-run]
+Usage: install-mai-server-ubuntu-24.04.sh [--version mai-server-vX.Y.Z] [--source-dir PATH] [--bind-addr HOST:PORT] [--dry-run]
 USAGE
 }
 
@@ -34,6 +35,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --bind-addr)
       BIND_ADDR="${2:?--bind-addr requires a value}"
+      shift 2
+      ;;
+    --source-dir)
+      SOURCE_DIR="${2:?--source-dir requires a value}"
       shift 2
       ;;
     --dry-run)
@@ -146,6 +151,45 @@ run() {
   fi
 }
 
+source_binary_path() {
+  printf '%s/target/release/mai-server' "$SOURCE_DIR"
+}
+
+validate_source_dir() {
+  if [[ -z "$SOURCE_DIR" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$SOURCE_DIR/Cargo.toml" ]]; then
+    echo "--source-dir must point to the mai-team repository root with Cargo.toml" >&2
+    exit 2
+  fi
+}
+
+build_source_binary() {
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "DRY RUN: build mai-server from source $SOURCE_DIR"
+    echo "DRY RUN: cargo build --release -p mai-server"
+    return 0
+  fi
+
+  (cd "$SOURCE_DIR" && cargo build --release -p mai-server)
+}
+
+install_source_binary() {
+  local built_binary
+  built_binary="$(source_binary_path)"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "DRY RUN: install built mai-server from $built_binary to $BIN_PATH"
+    echo "DRY RUN: chown -R mai-server:mai-server $BIN_DIR"
+    echo "DRY RUN: ln -sfn $BIN_PATH $LEGACY_BIN_PATH"
+    return 0
+  fi
+
+  install -m 0755 "$built_binary" "$BIN_PATH"
+  chown -R mai-server:mai-server "$BIN_DIR"
+  ln -sfn "$BIN_PATH" "$LEGACY_BIN_PATH"
+}
+
 docker_socket_group() {
   if [[ -S /var/run/docker.sock ]]; then
     stat -c '%G' /var/run/docker.sock
@@ -221,8 +265,11 @@ if [[ $EUID -ne 0 && "$DRY_RUN" != "true" ]]; then
   exit 1
 fi
 
-resolve_release_tag
-DOWNLOAD_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/$ASSET"
+validate_source_dir
+if [[ -z "$SOURCE_DIR" ]]; then
+  resolve_release_tag
+  DOWNLOAD_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/$ASSET"
+fi
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
@@ -233,7 +280,10 @@ configure_docker_access
 check_docker_access
 run install -d -m 0755 "$ENV_DIR" "$DATA_DIR" "$BIN_DIR"
 
-if [[ "$DRY_RUN" != "true" ]]; then
+if [[ -n "$SOURCE_DIR" ]]; then
+  build_source_binary
+  install_source_binary
+elif [[ "$DRY_RUN" != "true" ]]; then
   curl -fsSL "$DOWNLOAD_URL" -o "$tmpdir/$ASSET"
   tar -xzf "$tmpdir/$ASSET" -C "$tmpdir"
   install -m 0755 "$tmpdir/mai-server" "$BIN_PATH"
