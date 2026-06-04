@@ -98,6 +98,7 @@ assert_line_before \
 for output in "$source_install_output" "$source_update_output"; do
   assert_contains "$output" "DRY RUN: build mai-server from source $ROOT_DIR as $(id -un)"
   assert_contains "$output" "DRY RUN: cargo build --release -p mai-server"
+  assert_contains "$output" "DRY RUN: source build environment loads Cargo and Node.js/npm from the build user"
   assert_contains "$output" "DRY RUN: install built mai-server from $ROOT_DIR/target/release/mai-server to /opt/mai-server/mai-server"
   assert_line_before \
     "$output" \
@@ -111,6 +112,7 @@ assert_contains "$source_update_output" "DRY RUN: systemctl restart mai-server"
 for output in "$sudo_source_install_output" "$sudo_source_update_output"; do
   assert_contains "$output" "DRY RUN: build mai-server from source $ROOT_DIR as mai-build-user"
   assert_contains "$output" "DRY RUN: sudo -u mai-build-user -H bash -lc"
+  assert_contains "$output" "source build environment loads Cargo and Node.js/npm from the build user"
   assert_contains "$output" "cargo build --release -p mai-server"
   assert_not_contains "$output" "DRY RUN: cargo build --release -p mai-server"
   assert_line_before \

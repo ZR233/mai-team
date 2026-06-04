@@ -164,8 +164,8 @@ sudo scripts/update-mai-server-ubuntu-24.04.sh --source-dir "$(pwd)"
 cargo build --release -p mai-server
 ```
 
-然后安装 `target/release/mai-server` 到 `/opt/mai-server/mai-server`，刷新 systemd service 文件并重启服务。使用源码模式前，请确认目标机器已安装 Rust/Cargo，且 `--source-dir` 指向包含 `Cargo.toml` 的 mai-team 仓库根目录。
-如果通过 `sudo` 执行脚本，源码编译会切回发起 `sudo` 的用户并加载该用户的 Cargo 环境；只有安装二进制、写入 systemd 配置、重启服务等步骤继续使用 root 权限。
+然后安装 `target/release/mai-server` 到 `/opt/mai-server/mai-server`，刷新 systemd service 文件并重启服务。使用源码模式前，请确认目标机器已安装 Rust/Cargo、Node.js/npm，且 `--source-dir` 指向包含 `Cargo.toml` 的 mai-team 仓库根目录。Web 前端构建要求 Node.js `^20.19.0 || >=22.12.0`。
+如果通过 `sudo` 执行脚本，源码编译会切回发起 `sudo` 的用户并加载该用户的 Cargo 和 Node.js/npm 环境，包括常见的 nvm、mise、asdf、fnm；只有安装二进制、写入 systemd 配置、重启服务等步骤继续使用 root 权限。
 
 ## Mai Server 安装内容
 

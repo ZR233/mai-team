@@ -182,9 +182,30 @@ run_source_build_as_user() {
 if [[ -r "$HOME/.cargo/env" ]]; then
   . "$HOME/.cargo/env"
 fi
+if [[ -r "$HOME/.nvm/nvm.sh" ]]; then
+  export NVM_DIR="$HOME/.nvm"
+  . "$NVM_DIR/nvm.sh"
+fi
+if command -v mise >/dev/null 2>&1; then
+  eval "$(mise activate bash)"
+fi
+if command -v asdf >/dev/null 2>&1; then
+  . "$(asdf info asdf-dir)/asdf.sh"
+fi
+if command -v fnm >/dev/null 2>&1; then
+  eval "$(fnm env --use-on-cd --shell bash)"
+fi
 if ! command -v cargo >/dev/null 2>&1; then
   echo "cargo was not found for user ${USER:-$(id -un)}. Install Rust/Cargo for that user and retry." >&2
   exit 127
+fi
+if ! command -v npm >/dev/null 2>&1; then
+  echo "npm was not found for user ${USER:-$(id -un)}. Install Node.js/npm for that user and retry." >&2
+  exit 127
+fi
+if ! node -e '"'"'const [major, minor] = process.versions.node.split(".").map(Number); process.exit((major === 20 && minor >= 19) || (major === 22 && minor >= 12) || major >= 23 ? 0 : 1);'"'"'; then
+  echo "Node.js $(node --version) does not satisfy mai-server web build requirement: ^20.19.0 || >=22.12.0" >&2
+  exit 1
 fi
 cd "$1" && cargo build --release -p mai-server
 ' bash "$SOURCE_DIR"
@@ -215,8 +236,9 @@ ERROR
   fi
   if [[ "$DRY_RUN" == "true" ]]; then
     echo "DRY RUN: build mai-server from source $SOURCE_DIR as $build_user"
+    echo "DRY RUN: source build environment loads Cargo and Node.js/npm from the build user"
     if [[ "$build_user" != "$current_user" ]]; then
-      echo "DRY RUN: sudo -u $build_user -H bash -lc 'source ~/.cargo/env if present; cd $SOURCE_DIR && cargo build --release -p mai-server'"
+      echo "DRY RUN: sudo -u $build_user -H bash -lc 'source ~/.cargo/env and Node manager env if present; cd $SOURCE_DIR && cargo build --release -p mai-server'"
     else
       echo "DRY RUN: cargo build --release -p mai-server"
     fi
