@@ -219,6 +219,15 @@ import { useGithubApp } from './composables/useGithubApp'
 const { toast, showToast } = useApi()
 const { eventFeed, streamingEvents, connectionState, connectEvents, disconnect } = useSSE()
 const timelineEvents = computed(() => [...streamingEvents.value, ...eventFeed.value])
+const liveTimelineVersion = computed(() => [
+  eventFeed.value.length,
+  ...streamingEvents.value.map((event) => [
+    event.type || '',
+    event.sequence || '',
+    event.call_id || event.message_id || event.channel || '',
+    streamingEventTextLength(event)
+  ].join(':'))
+].join('|'))
 const {
   environments,
   selectedEnvironmentId,
@@ -375,7 +384,7 @@ watch(
     selectedEnvironmentDetail.value?.root_agent?.messages?.length,
     selectedEnvironmentDetail.value?.root_agent?.recent_events?.length,
     selectedEnvironmentDetail.value?.root_agent?.selected_session_id,
-    eventFeed.value.length
+    liveTimelineVersion.value
   ],
   async () => {
     const currentSessionId = selectedEnvironmentDetail.value?.root_agent?.selected_session_id
@@ -409,7 +418,7 @@ watch(
     selectedProjectDetail.value?.selected_agent?.messages?.length,
     selectedProjectDetail.value?.selected_agent?.recent_events?.length,
     selectedProjectDetail.value?.selected_agent?.selected_session_id,
-    eventFeed.value.length
+    liveTimelineVersion.value
   ],
   async () => {
     const currentSessionId = selectedProjectDetail.value?.selected_agent?.selected_session_id
@@ -611,6 +620,10 @@ function isLiveOnlyEvent(event) {
     'user_input_requested',
     'artifact_created'
   ].includes(event?.type)
+}
+
+function streamingEventTextLength(event) {
+  return String(event?.delta || event?.content || event?.arguments_delta || '').length
 }
 
 function openCreateEnvironmentDialog() {
