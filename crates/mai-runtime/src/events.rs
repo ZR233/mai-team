@@ -40,8 +40,10 @@ impl RuntimeEvents {
             timestamp: now(),
             kind,
         };
-        if let Err(err) = self.store.append_service_event(&event).await {
-            tracing::warn!("failed to persist service event: {err}");
+        if should_persist_event(&event) {
+            if let Err(err) = self.store.append_service_event(&event).await {
+                tracing::warn!("failed to persist service event: {err}");
+            }
         }
         {
             let mut recent = self.recent.lock().await;
@@ -121,6 +123,15 @@ impl RuntimeEvents {
     }
 }
 
+fn should_persist_event(event: &ServiceEvent) -> bool {
+    !matches!(
+        event.kind,
+        ServiceEventKind::AgentMessageDelta { .. }
+            | ServiceEventKind::ReasoningDelta { .. }
+            | ServiceEventKind::ToolCallDelta { .. }
+    )
+}
+
 pub(crate) fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
     match &event.kind {
         ServiceEventKind::AgentCreated { agent } | ServiceEventKind::AgentUpdated { agent } => {
@@ -154,5 +165,80 @@ pub(crate) fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         | ServiceEventKind::PlanUpdated { .. } => None,
         ServiceEventKind::ArtifactCreated { artifact } => Some(artifact.agent_id),
         ServiceEventKind::Error { agent_id, .. } => *agent_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use mai_protocol::{MessageRole, TurnStatus};
+    use tempfile::tempdir;
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn delta_events_are_recent_and_broadcast_but_not_persisted() {
+        let dir = tempdir().expect("tempdir");
+        let store = Arc::new(
+            ConfigStore::open_with_config_path(
+                dir.path().join("runtime.sqlite3"),
+                dir.path().join("config.toml"),
+            )
+            .await
+            .expect("store"),
+        );
+        let events = RuntimeEvents::new(Arc::clone(&store), 1, Vec::new());
+        let mut stream = events.subscribe();
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+
+        events
+            .publish(ServiceEventKind::AgentMessageDelta {
+                agent_id,
+                session_id: Some(session_id),
+                turn_id,
+                message_id: "m1".to_string(),
+                role: MessageRole::Assistant,
+                channel: "final".to_string(),
+                delta: "hi".to_string(),
+            })
+            .await;
+        events
+            .publish(ServiceEventKind::TurnCompleted {
+                agent_id,
+                session_id: Some(session_id),
+                turn_id,
+                status: TurnStatus::Completed,
+            })
+            .await;
+
+        let broadcast_delta = stream.recv().await.expect("delta event");
+        assert!(matches!(
+            broadcast_delta.kind,
+            ServiceEventKind::AgentMessageDelta { .. }
+        ));
+        let broadcast_completed = stream.recv().await.expect("completed event");
+        assert!(matches!(
+            broadcast_completed.kind,
+            ServiceEventKind::TurnCompleted { .. }
+        ));
+
+        let snapshot = events.snapshot().await;
+        assert_eq!(snapshot.len(), 2);
+        assert!(matches!(
+            snapshot[0].kind,
+            ServiceEventKind::AgentMessageDelta { .. }
+        ));
+
+        let persisted = store.service_events_after(0, 10).await.expect("persisted");
+        assert_eq!(persisted.len(), 1);
+        assert!(matches!(
+            persisted[0].kind,
+            ServiceEventKind::TurnCompleted { .. }
+        ));
+        assert_eq!(persisted[0].sequence, 2);
     }
 }

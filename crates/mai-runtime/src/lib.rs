@@ -3886,6 +3886,10 @@ impl projects::review::cleanup::ProjectReviewCleanupOps for Arc<AgentRuntime> {
         Ok(self.deps.store.prune_service_events_before(cutoff).await?)
     }
 
+    async fn prune_service_events_to_limit(&self, limit: usize) -> Result<usize> {
+        Ok(self.deps.store.prune_service_events_to_limit(limit).await?)
+    }
+
     async fn prune_agent_logs_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
         Ok(self.deps.store.prune_agent_logs_before(cutoff).await?)
     }

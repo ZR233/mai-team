@@ -1,8 +1,10 @@
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -183,14 +185,24 @@ impl DockerClient {
             capture.output_bytes_cap,
         );
 
+        let wait =
+            wait_child_with_optional_timeout(&mut child, opts.timeout_secs, "docker exec command");
         let status = tokio::select! {
-            status = child.wait() => status?,
+            status = wait => status,
             _ = cancellation_token.cancelled() => {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                await_capture_task(stdout_task).await?;
-                await_capture_task(stderr_task).await?;
+                stdout_task.abort();
+                stderr_task.abort();
                 return Err(DockerError::Cancelled);
+            }
+        };
+        let status = match status {
+            Ok(status) => status,
+            Err(err) => {
+                stdout_task.abort();
+                stderr_task.abort();
+                return Err(err);
             }
         };
         let stdout_capture = await_capture_task(stdout_task).await?;
@@ -227,15 +239,18 @@ impl DockerClient {
         }
         cmd.args([container_id, "/bin/sh", "-lc", &shell_command]);
 
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         cmd.kill_on_drop(true);
-        let output = cmd.output();
-        tokio::pin!(output);
-        let output = tokio::select! {
-            output = &mut output => output?,
-            _ = cancellation_token.cancelled() => {
-                return Err(DockerError::Cancelled);
-            }
-        };
+        let mut child = cmd.spawn()?;
+        let output = collect_child_output_with_cancel(
+            &mut child,
+            opts.timeout_secs,
+            "docker exec command",
+            cancellation_token,
+        )
+        .await?;
         Ok(ExecOutput {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8(output.stdout)?,
@@ -269,16 +284,13 @@ impl DockerClient {
         }
         cmd.arg(image).args(["/bin/sh", "-lc", &shell_command]);
 
-        let output = match params.timeout_secs.filter(|seconds| *seconds > 0) {
-            Some(seconds) => timeout(Duration::from_secs(seconds + 5), cmd.output())
-                .await
-                .map_err(|_| {
-                    DockerError::CommandFailed(format!(
-                        "docker sidecar command timed out after {seconds}s"
-                    ))
-                })??,
-            None => cmd.output().await?,
-        };
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+        let mut child = cmd.spawn()?;
+        let output =
+            collect_child_output(&mut child, params.timeout_secs, "docker sidecar command").await?;
         Ok(ExecOutput {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8(output.stdout)?,
@@ -355,6 +367,121 @@ pub(crate) fn shell_command_with_optional_timeout(
     }
 }
 
+async fn wait_child_with_optional_timeout(
+    child: &mut Child,
+    timeout_secs: Option<u64>,
+    description: &str,
+) -> Result<std::process::ExitStatus> {
+    match host_timeout_duration(timeout_secs) {
+        Some(duration) => match timeout(duration, child.wait()).await {
+            Ok(status) => Ok(status?),
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                Err(DockerError::CommandFailed(format!(
+                    "{description} timed out after {}s",
+                    timeout_secs.unwrap_or_default()
+                )))
+            }
+        },
+        None => Ok(child.wait().await?),
+    }
+}
+
+async fn collect_child_output_with_cancel(
+    child: &mut Child,
+    timeout_secs: Option<u64>,
+    description: &str,
+    cancellation_token: &CancellationToken,
+) -> Result<Output> {
+    let stdout = child.stdout.take().ok_or_else(|| {
+        DockerError::CommandFailed(format!("{description} stdout pipe unavailable"))
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        DockerError::CommandFailed(format!("{description} stderr pipe unavailable"))
+    })?;
+    let stdout_task = read_child_output_stream(stdout);
+    let stderr_task = read_child_output_stream(stderr);
+    let wait = wait_child_with_optional_timeout(child, timeout_secs, description);
+    let status = tokio::select! {
+        status = wait => status,
+        _ = cancellation_token.cancelled() => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(DockerError::Cancelled);
+        }
+    };
+    collect_child_output_after_status(status, stdout_task, stderr_task).await
+}
+
+async fn collect_child_output(
+    child: &mut Child,
+    timeout_secs: Option<u64>,
+    description: &str,
+) -> Result<Output> {
+    let stdout = child.stdout.take().ok_or_else(|| {
+        DockerError::CommandFailed(format!("{description} stdout pipe unavailable"))
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        DockerError::CommandFailed(format!("{description} stderr pipe unavailable"))
+    })?;
+    let stdout_task = read_child_output_stream(stdout);
+    let stderr_task = read_child_output_stream(stderr);
+    let status = wait_child_with_optional_timeout(child, timeout_secs, description).await;
+    collect_child_output_after_status(status, stdout_task, stderr_task).await
+}
+
+async fn collect_child_output_after_status(
+    status: Result<std::process::ExitStatus>,
+    stdout_task: JoinHandle<Result<Vec<u8>>>,
+    stderr_task: JoinHandle<Result<Vec<u8>>>,
+) -> Result<Output> {
+    let status = match status {
+        Ok(status) => status,
+        Err(err) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(err);
+        }
+    };
+    let stdout = await_output_task(stdout_task).await?;
+    let stderr = await_output_task(stderr_task).await?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_child_output_stream<R>(reader: R) -> JoinHandle<Result<Vec<u8>>>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut reader = reader;
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await?;
+        Ok(bytes)
+    })
+}
+
+async fn await_output_task(task: JoinHandle<Result<Vec<u8>>>) -> Result<Vec<u8>> {
+    match task.await {
+        Ok(result) => result,
+        Err(err) => Err(DockerError::CommandFailed(format!(
+            "stream output task failed: {err}"
+        ))),
+    }
+}
+
+fn host_timeout_duration(timeout_secs: Option<u64>) -> Option<Duration> {
+    timeout_secs
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| Duration::from_secs(seconds + 5))
+}
+
 pub(crate) fn shell_quote(value: &str) -> String {
     shell_words::quote(value).into_owned()
 }
@@ -363,9 +490,11 @@ pub(crate) fn shell_quote(value: &str) -> String {
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+
+    static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn exec_shell_command_omits_timeout_wrapper_when_unlimited() {
@@ -385,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn sidecar_shell_env_times_out_stuck_docker_process() {
-        let script = fake_docker_script("sleep 30\n");
+        let script = fake_docker_script("exec sleep 30\n");
         let client = DockerClient::new_with_binary("unused-image", script.to_string_lossy());
 
         let result = client
@@ -402,21 +531,71 @@ mod tests {
             })
             .await;
 
-        assert!(
-            matches!(result, Err(DockerError::CommandFailed(message)) if message.contains("timed out"))
-        );
+        assert_timed_out(result);
+    }
+
+    #[tokio::test]
+    async fn exec_shell_env_times_out_stuck_docker_process() {
+        let script = fake_docker_script("exec sleep 30\n");
+        let client = DockerClient::new_with_binary("unused-image", script.to_string_lossy());
+
+        let result = client.exec_shell("container", "true", None, Some(1)).await;
+
+        assert_timed_out(result);
+    }
+
+    #[tokio::test]
+    async fn exec_shell_captured_times_out_stuck_docker_process() {
+        let script = fake_docker_script("exec sleep 30\n");
+        let client = DockerClient::new_with_binary("unused-image", script.to_string_lossy());
+        let dir = tempfile_dir();
+        let stdout_path = dir.join("stdout.txt");
+        let stderr_path = dir.join("stderr.txt");
+
+        let result = client
+            .exec_shell_captured_with_cancel(
+                "container",
+                "true",
+                None,
+                Some(1),
+                ExecCaptureOptions {
+                    stdout_path: &stdout_path,
+                    stderr_path: &stderr_path,
+                    output_bytes_cap: 1024,
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+
+        assert_timed_out(result);
     }
 
     fn fake_docker_script(body: &str) -> std::path::PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
+        let unique = unique_test_path_id();
         let dir = std::env::temp_dir().join(format!("mai-docker-test-{unique}"));
         fs::create_dir_all(&dir).expect("mkdir");
         let path = dir.join("docker");
         fs::write(&path, format!("#!/bin/sh\n{body}")).expect("write script");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
         path
+    }
+
+    fn tempfile_dir() -> std::path::PathBuf {
+        let unique = unique_test_path_id();
+        let dir = std::env::temp_dir().join(format!("mai-docker-capture-test-{unique}"));
+        fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    fn unique_test_path_id() -> String {
+        let counter = TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{}-{counter}", std::process::id())
+    }
+
+    fn assert_timed_out<T: std::fmt::Debug>(result: Result<T>) {
+        assert!(
+            matches!(result, Err(DockerError::CommandFailed(ref message)) if message.contains("timed out")),
+            "expected docker command timeout error, got {result:?}"
+        );
     }
 }

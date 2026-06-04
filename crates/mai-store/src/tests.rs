@@ -40,6 +40,25 @@ async fn open_in_data_dir_uses_standard_layout() {
     );
 }
 
+fn test_service_event(
+    sequence: u64,
+    agent_id: AgentId,
+    session_id: SessionId,
+    turn_id: TurnId,
+    timestamp: DateTime<Utc>,
+) -> ServiceEvent {
+    ServiceEvent {
+        sequence,
+        timestamp,
+        kind: ServiceEventKind::TurnCompleted {
+            agent_id,
+            session_id: Some(session_id),
+            turn_id,
+            status: TurnStatus::Completed,
+        },
+    }
+}
+
 fn provider(api_key: Option<&str>) -> ProviderConfig {
     ProviderConfig {
         id: "openai".to_string(),
@@ -1140,6 +1159,101 @@ async fn runtime_snapshot_survives_reopen() {
             .load_agent_history(agent_id, session_id)
             .await
             .expect("history")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn service_event_replay_and_snapshot_keep_recent_events() {
+    let (_dir, store) = store().await;
+    let agent_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let turn_id = Uuid::new_v4();
+
+    for sequence in 1..=5 {
+        store
+            .append_service_event(&test_service_event(
+                sequence,
+                agent_id,
+                session_id,
+                turn_id,
+                Utc::now(),
+            ))
+            .await
+            .expect("append event");
+    }
+
+    let replay = store.service_events_after(2, 2).await.expect("replay");
+    assert_eq!(
+        replay
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![3, 4]
+    );
+
+    let snapshot = store.load_runtime_snapshot(2).await.expect("snapshot");
+    assert_eq!(snapshot.next_sequence, 6);
+    assert_eq!(
+        snapshot
+            .recent_events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![4, 5]
+    );
+}
+
+#[tokio::test]
+async fn service_event_count_pruning_keeps_newest_events() {
+    let (_dir, store) = store().await;
+    let agent_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let turn_id = Uuid::new_v4();
+
+    for sequence in 1..=5 {
+        store
+            .append_service_event(&test_service_event(
+                sequence,
+                agent_id,
+                session_id,
+                turn_id,
+                Utc::now(),
+            ))
+            .await
+            .expect("append event");
+    }
+
+    let removed = store
+        .prune_service_events_to_limit(3)
+        .await
+        .expect("prune by limit");
+    assert_eq!(removed, 2);
+
+    let replay = store.service_events_after(0, 10).await.expect("replay");
+    assert_eq!(
+        replay
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+    assert_eq!(
+        store.prune_service_events_to_limit(3).await.expect("noop"),
+        0
+    );
+    assert_eq!(
+        store
+            .prune_service_events_to_limit(0)
+            .await
+            .expect("zero limit"),
+        3
+    );
+    assert!(
+        store
+            .service_events_after(0, 10)
+            .await
+            .expect("empty replay")
             .is_empty()
     );
 }

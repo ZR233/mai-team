@@ -1,3 +1,4 @@
+use crate::events::{next_service_event_sequence_on_path, recent_service_events_on_path};
 use crate::records::*;
 use crate::settings::delete_setting_in_tx;
 use crate::*;
@@ -254,20 +255,8 @@ impl ConfigStore {
         }
         let projects = self.load_projects().await?;
 
-        let mut events = Query::<List<ServiceEventRecord>>::all()
-            .exec(&mut db)
-            .await?;
-        events.sort_by_key(|event| event.sequence);
-        let next_sequence = events
-            .last()
-            .map(|event| i64_to_u64(event.sequence).saturating_add(1))
-            .unwrap_or(1);
-        let skip = events.len().saturating_sub(recent_event_limit);
-        let recent_events = events
-            .into_iter()
-            .skip(skip)
-            .map(|row| serde_json::from_str::<ServiceEvent>(&row.event_json).map_err(Into::into))
-            .collect::<Result<Vec<_>>>()?;
+        let next_sequence = next_service_event_sequence_on_path(&self.path).await?;
+        let recent_events = recent_service_events_on_path(&self.path, recent_event_limit).await?;
 
         Ok(RuntimeSnapshot {
             agents,
