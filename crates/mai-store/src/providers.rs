@@ -378,10 +378,11 @@ impl ModelToml {
         let wire_api = migrated_wire_api(provider_kind, self.wire_api);
         let capabilities = migrated_capabilities(provider_kind, &id, self.capabilities);
         let request_policy = migrated_request_policy(provider_kind, self.request_policy);
+        let context_tokens = migrated_context_tokens(provider_kind, &id, self.context_tokens);
         ModelConfig {
             id,
             name: self.name,
-            context_tokens: self.context_tokens,
+            context_tokens,
             output_tokens: self.output_tokens,
             supports_tools: self.supports_tools,
             wire_api,
@@ -416,6 +417,20 @@ fn migrated_wire_api(provider_kind: ProviderKind, wire_api: ModelWireApi) -> Mod
         ProviderKind::Deepseek | ProviderKind::Mimo | ProviderKind::Zhipu => {
             ModelWireApi::ChatCompletions
         }
+    }
+}
+
+fn migrated_context_tokens(
+    provider_kind: ProviderKind,
+    model_id: &str,
+    context_tokens: u64,
+) -> u64 {
+    match provider_kind {
+        ProviderKind::Openai if model_id == "gpt-5.5" && context_tokens == 400_000 => 256_000,
+        ProviderKind::Openai
+        | ProviderKind::Deepseek
+        | ProviderKind::Mimo
+        | ProviderKind::Zhipu => context_tokens,
     }
 }
 
@@ -502,7 +517,7 @@ fn builtin_provider(kind: ProviderKind) -> ProviderConfig {
             default_model: "gpt-5.5".to_string(),
             enabled: true,
             models: vec![
-                openai_reasoning_model("gpt-5.5", 400_000, 128_000),
+                openai_reasoning_model("gpt-5.5", 256_000, 128_000),
                 openai_reasoning_model("gpt-5.4", 400_000, 128_000),
                 openai_reasoning_model("gpt-5.4-mini", 400_000, 128_000),
                 openai_reasoning_model("gpt-5.4-nano", 400_000, 128_000),
