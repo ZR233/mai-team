@@ -93,7 +93,6 @@ pub struct PersistedAgent {
 #[derive(Debug, Clone)]
 pub struct PersistedAgentSession {
     pub summary: AgentSessionSummary,
-    pub history: Vec<ModelInputItem>,
     pub last_context_tokens: Option<u64>,
 }
 

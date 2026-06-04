@@ -43,6 +43,12 @@ pub(crate) trait AgentObservabilityOps: Send + Sync {
         filter: ToolTraceFilter,
     ) -> impl Future<Output = Result<Vec<ToolTraceSummary>>> + Send;
 
+    fn load_agent_history(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> impl Future<Output = Result<Vec<ModelInputItem>>> + Send;
+
     fn tool_output_artifact_file_path(
         &self,
         agent_id: AgentId,
@@ -66,7 +72,7 @@ pub(crate) async fn tool_trace(
     }
 
     let agent = ops.agent(agent_id).await?;
-    let (session_id, history) = {
+    let session_id = {
         let sessions = agent.sessions.lock().await;
         let selected_session = super::selected_session(&sessions, session_id).ok_or_else(|| {
             RuntimeError::SessionNotFound {
@@ -74,11 +80,9 @@ pub(crate) async fn tool_trace(
                 session_id: session_id.unwrap_or_default(),
             }
         })?;
-        (
-            selected_session.summary.id,
-            selected_session.history.clone(),
-        )
+        selected_session.summary.id
     };
+    let history = ops.load_agent_history(agent_id, session_id).await?;
     let mut tool_name = None;
     let mut arguments = None;
     let mut output = None;

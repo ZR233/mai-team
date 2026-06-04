@@ -1019,14 +1019,18 @@ async fn runtime_snapshot_survives_reopen() {
             total_tokens: 14,
         }
     );
-    assert_eq!(snapshot.agents[0].sessions[0].history.len(), 3);
     assert_eq!(snapshot.agents[0].sessions[0].last_context_tokens, None);
+    let loaded_history = reopened
+        .load_agent_history(agent_id, session_id)
+        .await
+        .expect("load history");
+    assert_eq!(loaded_history.len(), 3);
     assert!(matches!(
-        &snapshot.agents[0].sessions[0].history[1],
+        &loaded_history[1],
         ModelInputItem::Reasoning { content } if content == "thinking"
     ));
     assert!(matches!(
-        &snapshot.agents[0].sessions[0].history[2],
+        &loaded_history[2],
         ModelInputItem::FunctionCall {
             call_id,
             name,
@@ -1341,6 +1345,103 @@ async fn session_context_tokens_survive_reopen_and_clear() {
         .expect("clear");
     let snapshot = reopened.load_runtime_snapshot(10).await.expect("snapshot");
     assert_eq!(snapshot.agents[0].sessions[0].last_context_tokens, None);
+}
+
+#[tokio::test]
+async fn agent_history_len_counts_only_target_session() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("config.sqlite3");
+    let store = ConfigStore::open_with_config_path(&db_path, dir.path().join("config.toml"))
+        .await
+        .expect("open");
+    let agent_id = Uuid::new_v4();
+    let first_session_id = Uuid::new_v4();
+    let second_session_id = Uuid::new_v4();
+    let now = Utc::now();
+    store
+        .save_agent(
+            &AgentSummary {
+                id: agent_id,
+                parent_id: None,
+                task_id: None,
+                project_id: None,
+                role: None,
+                name: "agent-test".to_string(),
+                status: AgentStatus::Completed,
+                container_id: None,
+                docker_image: "ubuntu:latest".to_string(),
+                provider_id: "openai".to_string(),
+                provider_name: "OpenAI".to_string(),
+                model: "gpt-5.2".to_string(),
+                reasoning_effort: None,
+                created_at: now,
+                updated_at: now,
+                current_turn: None,
+                last_error: None,
+                token_usage: TokenUsage::default(),
+            },
+            None,
+        )
+        .await
+        .expect("save agent");
+    for session_id in [first_session_id, second_session_id] {
+        store
+            .save_agent_session(
+                agent_id,
+                &AgentSessionSummary {
+                    id: session_id,
+                    title: "Chat".to_string(),
+                    created_at: now,
+                    updated_at: now,
+                    message_count: 0,
+                    token_usage: TokenUsage::default(),
+                },
+            )
+            .await
+            .expect("save session");
+    }
+    store
+        .append_agent_history_item(
+            agent_id,
+            first_session_id,
+            0,
+            &ModelInputItem::user_text("a"),
+        )
+        .await
+        .expect("first history");
+    store
+        .append_agent_history_item(
+            agent_id,
+            first_session_id,
+            1,
+            &ModelInputItem::user_text("b"),
+        )
+        .await
+        .expect("first history");
+    store
+        .append_agent_history_item(
+            agent_id,
+            second_session_id,
+            0,
+            &ModelInputItem::user_text("other"),
+        )
+        .await
+        .expect("second history");
+
+    assert_eq!(
+        store
+            .agent_history_len(agent_id, first_session_id)
+            .await
+            .expect("first len"),
+        2
+    );
+    assert_eq!(
+        store
+            .agent_history_len(agent_id, second_session_id)
+            .await
+            .expect("second len"),
+        1
+    );
 }
 
 #[tokio::test]

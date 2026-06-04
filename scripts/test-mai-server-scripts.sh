@@ -77,6 +77,8 @@ for output in "$install_output" "$update_output"; do
   assert_contains "$output" "DRY RUN: write /etc/systemd/system/mai-server.service:"
   assert_contains "$output" "EnvironmentFile=/etc/mai-server/mai-server.env"
   assert_contains "$output" "ExecStart=/opt/mai-server/mai-server --data-path /var/lib/mai-server"
+  assert_contains "$output" "MemoryHigh=1500M"
+  assert_contains "$output" "MemoryMax=3000M"
   assert_contains "$output" "DRY RUN: systemctl daemon-reload"
   assert_contains "$output" "DRY RUN: systemctl enable --now mai-server"
   assert_line_before \

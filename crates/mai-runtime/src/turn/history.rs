@@ -50,19 +50,17 @@ pub(crate) async fn record_history_item(
     session_id: SessionId,
     item: ModelInputItem,
 ) -> Result<()> {
-    let position = {
-        let mut sessions = agent.sessions.lock().await;
-        let session = sessions
-            .iter_mut()
+    {
+        let sessions = agent.sessions.lock().await;
+        sessions
+            .iter()
             .find(|session| session.summary.id == session_id)
             .ok_or(RuntimeError::SessionNotFound {
                 agent_id,
                 session_id,
             })?;
-        let position = session.history.len();
-        session.history.push(item.clone());
-        position
-    };
+    }
+    let position = store.agent_history_len(agent_id, session_id).await?;
     store
         .append_agent_history_item(agent_id, session_id, position, &item)
         .await?;
@@ -88,7 +86,6 @@ pub(crate) async fn replace_session_history(
                 agent_id,
                 session_id,
             })?;
-        session.history = history;
         session.last_context_tokens = None;
     }
     Ok(())
@@ -140,17 +137,17 @@ pub(crate) async fn session_history(
     agent_id: AgentId,
     session_id: SessionId,
 ) -> Result<Vec<ModelInputItem>> {
-    let mut history = {
+    {
         let sessions = agent.sessions.lock().await;
         sessions
             .iter()
             .find(|session| session.summary.id == session_id)
-            .map(|session| session.history.clone())
             .ok_or(RuntimeError::SessionNotFound {
                 agent_id,
                 session_id,
-            })?
-    };
+            })?;
+    }
+    let mut history = store.load_agent_history(agent_id, session_id).await?;
     if repair_incomplete_tool_history(&mut history) {
         replace_session_history(store, agent, agent_id, session_id, history.clone()).await?;
     }
@@ -158,19 +155,25 @@ pub(crate) async fn session_history(
 }
 
 pub(crate) async fn raw_session_history_len(
+    store: &ConfigStore,
     agent: &AgentRecord,
     agent_id: AgentId,
     session_id: SessionId,
 ) -> Result<usize> {
-    let sessions = agent.sessions.lock().await;
-    sessions
-        .iter()
-        .find(|session| session.summary.id == session_id)
-        .map(|session| session.history.len())
-        .ok_or(RuntimeError::SessionNotFound {
-            agent_id,
-            session_id,
-        })
+    {
+        let sessions = agent.sessions.lock().await;
+        sessions
+            .iter()
+            .find(|session| session.summary.id == session_id)
+            .ok_or(RuntimeError::SessionNotFound {
+                agent_id,
+                session_id,
+            })?;
+    }
+    store
+        .agent_history_len(agent_id, session_id)
+        .await
+        .map_err(Into::into)
 }
 
 pub(crate) fn compact_summary_from_output(output: &[ModelOutputItem]) -> Option<String> {

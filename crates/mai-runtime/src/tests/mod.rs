@@ -2969,13 +2969,9 @@ async fn auto_compact_failure_keeps_original_history() {
 
     assert!(matches!(compacted, Err(RuntimeError::InvalidInput(_))));
     let history = store
-        .load_runtime_snapshot(10)
+        .load_agent_history(agent_id, session_id)
         .await
-        .expect("snapshot")
-        .agents[0]
-        .sessions[0]
-        .history
-        .clone();
+        .expect("history");
     assert_eq!(history.len(), original_history.len());
     assert!(matches!(
         &history[0],
@@ -3104,28 +3100,28 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
 
     let snapshot = store.load_runtime_snapshot(20).await.expect("snapshot");
     let session = &snapshot.agents[0].sessions[0];
+    let history = store
+        .load_agent_history(agent_id, session_id)
+        .await
+        .expect("history");
     assert_eq!(session.last_context_tokens, Some(44));
-    assert!(session.history.iter().any(|item| matches!(
+    assert!(history.iter().any(|item| matches!(
             item,
             ModelInputItem::Message { role, content }
                 if role == "user"
                     && matches!(&content[0], ModelContentItem::InputText { text } if turn::history::is_compact_summary(text, COMPACT_SUMMARY_PREFIX) && text.contains("summary after tool output"))
         )));
     assert!(
-        !session
-            .history
+        !history
             .iter()
             .any(|item| matches!(item, ModelInputItem::FunctionCallOutput { .. }))
     );
     assert_eq!(
-        session
-            .history
-            .last()
-            .and_then(turn::history::user_message_text),
+        history.last().and_then(turn::history::user_message_text),
         None
     );
     assert!(matches!(
-        session.history.last(),
+        history.last(),
         Some(ModelInputItem::Message { role, content })
             if role == "assistant"
                 && matches!(&content[0], ModelContentItem::OutputText { text } if text == "final answer")
@@ -4349,8 +4345,11 @@ async fn model_failure_after_tool_keeps_tool_success_event_separate() {
         } if call_id == "call_1" && tool_name == "list_agents"
     )));
     drop(events);
-    let snapshot = store.load_runtime_snapshot(20).await.expect("snapshot");
-    assert!(snapshot.agents[0].sessions[0].history.iter().any(|item| {
+    let history = store
+        .load_agent_history(agent_id, session_id)
+        .await
+        .expect("history");
+    assert!(history.iter().any(|item| {
         matches!(
             item,
             ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_1"
@@ -5034,6 +5033,115 @@ async fn spawn_agent_inherits_parent_and_accepts_codex_overrides() {
     assert_eq!(child.model, "gpt-5.4");
     assert_eq!(child.reasoning_effort, Some("high".to_string()));
     assert_eq!(child.role, Some(AgentRole::Executor));
+}
+
+#[tokio::test]
+async fn spawn_agent_fork_context_copies_parent_history_from_store() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let parent_id = Uuid::new_v4();
+    let parent_session_id = Uuid::new_v4();
+    let timestamp = now();
+    let mut parent = test_agent_summary(parent_id, Some("parent-container"));
+    parent.provider_id = "openai".to_string();
+    parent.provider_name = "OpenAI".to_string();
+    parent.model = "gpt-5.5".to_string();
+    parent.docker_image = "ubuntu:latest".to_string();
+    store.save_agent(&parent, None).await.expect("save parent");
+    store
+        .save_agent_session(
+            parent_id,
+            &AgentSessionSummary {
+                id: parent_session_id,
+                title: "Chat 1".to_string(),
+                created_at: timestamp,
+                updated_at: timestamp,
+                message_count: 1,
+                token_usage: TokenUsage::default(),
+            },
+        )
+        .await
+        .expect("save session");
+    let parent_message = AgentMessage {
+        role: MessageRole::User,
+        content: "reuse this context".to_string(),
+        created_at: timestamp,
+    };
+    store
+        .append_agent_message(parent_id, parent_session_id, 0, &parent_message)
+        .await
+        .expect("save message");
+    let parent_history = vec![
+        ModelInputItem::user_text("reuse this context"),
+        ModelInputItem::assistant_text("stored answer"),
+    ];
+    for (position, item) in parent_history.iter().enumerate() {
+        store
+            .append_agent_history_item(parent_id, parent_session_id, position, item)
+            .await
+            .expect("save history");
+    }
+
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let parent = runtime.agent(parent_id).await.expect("parent");
+    *parent.container.write().await = Some(ContainerHandle {
+        id: "parent-container".to_string(),
+        name: "parent-container".to_string(),
+        image: "unused".to_string(),
+    });
+
+    let result = runtime
+        .execute_tool_for_test(
+            parent_id,
+            "spawn_agent",
+            json!({
+                "name": "child",
+                "fork_context": true
+            }),
+        )
+        .await
+        .expect("spawn");
+    assert!(result.success);
+    let child = runtime
+        .list_agents()
+        .await
+        .into_iter()
+        .find(|agent| agent.parent_id == Some(parent_id))
+        .expect("child");
+    let child_session_id = runtime
+        .resolve_session_id(child.id, None)
+        .await
+        .expect("child session");
+    let child_history = store
+        .load_agent_history(child.id, child_session_id)
+        .await
+        .expect("child history");
+    assert_eq!(
+        serde_json::to_value(&child_history).expect("child history json"),
+        serde_json::to_value(&parent_history).expect("parent history json")
+    );
+    let child_record = runtime.agent(child.id).await.expect("child record");
+    let child_messages = {
+        let sessions = child_record.sessions.lock().await;
+        sessions
+            .iter()
+            .find(|session| session.summary.id == child_session_id)
+            .expect("child session")
+            .messages
+            .clone()
+    };
+    let expected_messages = vec![parent_message];
+    assert_eq!(
+        serde_json::to_value(&child_messages).expect("child messages json"),
+        serde_json::to_value(&expected_messages).expect("expected messages json")
+    );
 }
 
 #[tokio::test]
