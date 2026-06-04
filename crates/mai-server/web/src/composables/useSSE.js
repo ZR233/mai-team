@@ -65,7 +65,9 @@ export function useSSE() {
           const parsed = JSON.parse(event.data)
           if (parsed.sequence) lastEventId = parsed.sequence
           updateStreamingEvents(parsed)
-          eventFeed.value = [parsed, ...eventFeed.value].slice(0, 150)
+          if (!isTransientStreamingEvent(parsed)) {
+            eventFeed.value = [parsed, ...eventFeed.value].slice(0, 150)
+          }
           if (onEvent) runCallback(() => onEvent(parsed), onError)
         } catch {
           const fallback = { sequence: Date.now(), type: 'event', timestamp: new Date().toISOString(), message: event.data }
@@ -116,6 +118,14 @@ function isStreamingEvent(event) {
     'reasoning_completed',
     'tool_call_delta'
   ].includes(event.type)
+}
+
+function isTransientStreamingEvent(event) {
+  return [
+    'agent_message_delta',
+    'reasoning_delta',
+    'tool_call_delta'
+  ].includes(event?.type)
 }
 
 function streamingKey(event) {

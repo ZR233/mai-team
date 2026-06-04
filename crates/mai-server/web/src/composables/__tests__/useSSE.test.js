@@ -99,5 +99,47 @@ assert.equal(reportedErrors[0].message, 'detail refresh failed')
 assert.equal(eventFeed.value.length, 1)
 
 disconnect()
+
+eventFeed.value = []
+streamingEvents.value = []
+connectEvents()
+
+for (let index = 0; index < 200; index++) {
+  FakeEventSource.instances.at(-1).dispatch('agent_message_delta', {
+    type: 'agent_message_delta',
+    sequence: 10 + index,
+    timestamp: `2026-05-10T00:00:01.${String(index).padStart(3, '0')}Z`,
+    agent_id: 'agent-1',
+    session_id: 'session-1',
+    turn_id: 'turn-long',
+    message_id: 'message-long',
+    role: 'assistant',
+    channel: 'final',
+    delta: 'x'
+  })
+}
+
+assert.equal(eventFeed.value.length, 0)
+assert.equal(streamingEvents.value.length, 1)
+assert.equal(streamingEvents.value[0].delta.length, 200)
+
+FakeEventSource.instances.at(-1).dispatch('agent_message_completed', {
+  type: 'agent_message_completed',
+  sequence: 220,
+  timestamp: '2026-05-10T00:00:02.000Z',
+  agent_id: 'agent-1',
+  session_id: 'session-1',
+  turn_id: 'turn-long',
+  message_id: 'message-long',
+  role: 'assistant',
+  channel: 'final',
+  content: 'x'.repeat(200)
+})
+
+assert.equal(streamingEvents.value.length, 0)
+assert.equal(eventFeed.value.length, 1)
+assert.equal(eventFeed.value[0].type, 'agent_message_completed')
+
+disconnect()
 process.off('unhandledRejection', onUnhandledRejection)
 globalThis.EventSource = originalEventSource
