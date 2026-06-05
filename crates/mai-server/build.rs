@@ -106,12 +106,10 @@ fn prepare_anthropic_skills(repo_dir: &Path, target_dir: &Path) {
     let refresh_requested = env_flag_enabled(REFRESH_ANTHROPIC_SKILLS_ENV);
     let source_dir = repo_dir.join(ANTHROPIC_SKILLS_SOURCE_DIR);
 
-    if refresh_requested {
-        if let Err(err) = update_anthropic_skills_repo(repo_dir) {
-            println!(
-                "cargo:warning=failed to refresh Anthropic system skills from {ANTHROPIC_SKILLS_REPO}; using cached copy if available: {err}"
-            );
-        }
+    if refresh_requested && let Err(err) = update_anthropic_skills_repo(repo_dir) {
+        println!(
+            "cargo:warning=failed to refresh Anthropic system skills from {ANTHROPIC_SKILLS_REPO}; using cached copy if available: {err}"
+        );
     }
 
     if source_dir.is_dir() {

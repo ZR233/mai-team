@@ -110,12 +110,8 @@ fn is_pull_request_head_ref(refspec: &str) -> bool {
 
 fn pull_request_head_number(refspec: &str) -> Option<&str> {
     let refspec = refspec.strip_prefix("refs/").unwrap_or(refspec);
-    let Some(rest) = refspec.strip_prefix("pull/") else {
-        return None;
-    };
-    let Some(number) = rest.strip_suffix("/head") else {
-        return None;
-    };
+    let rest = refspec.strip_prefix("pull/")?;
+    let number = rest.strip_suffix("/head")?;
     (!number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit())).then_some(number)
 }
 

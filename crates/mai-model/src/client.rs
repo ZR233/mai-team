@@ -15,18 +15,51 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct ModelClient {
     http: reqwest::Client,
     resolver: Arc<dyn ProviderResolver>,
     continuation_cache: Arc<Mutex<HashSet<String>>>,
+    config: ModelClientConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelClientConfig {
+    pub connect_timeout: Duration,
+    pub response_timeout: Duration,
+    pub stream_idle_timeout: Duration,
+}
+
+impl Default for ModelClientConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            response_timeout: DEFAULT_RESPONSE_TIMEOUT,
+            stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+        }
+    }
 }
 
 impl ModelClient {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_config(config: ModelClientConfig) -> Self {
+        let http = reqwest::Client::builder()
+            .connect_timeout(config.connect_timeout)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            http,
+            resolver: Arc::new(crate::provider::DefaultProviderResolver::new()),
+            continuation_cache: Arc::new(Mutex::new(HashSet::new())),
+            config,
+        }
     }
 
     pub fn resolve(
@@ -86,6 +119,7 @@ impl ModelClient {
             Ok(response) => Ok(self.response_stream(
                 resolved.clone_for_stream(),
                 response,
+                self.config.stream_idle_timeout,
                 state,
                 cancellation_token.clone(),
             )),
@@ -118,6 +152,7 @@ impl ModelClient {
                 Ok(self.response_stream(
                     resolved.clone_for_stream(),
                     response,
+                    self.config.stream_idle_timeout,
                     state,
                     cancellation_token.clone(),
                 ))
@@ -147,10 +182,14 @@ impl ModelClient {
                 .body(body.clone())
                 .send();
             let response = tokio::select! {
-                response = send => response.map_err(|source| ModelError::Request {
-                    endpoint: resolved.endpoint.clone(),
-                    source,
-                })?,
+                response = timeout(self.config.response_timeout, send) => {
+                    response
+                        .map_err(|_| ModelError::Stream("timeout waiting for response headers".to_string()))?
+                        .map_err(|source| ModelError::Request {
+                            endpoint: resolved.endpoint.clone(),
+                            source,
+                        })?
+                },
                 _ = cancellation_token.cancelled() => return Err(ModelError::Cancelled),
             };
             let status = response.status();
@@ -181,6 +220,7 @@ impl ModelClient {
         &self,
         resolved: StreamResolvedProvider,
         response: reqwest::Response,
+        stream_idle_timeout: Duration,
         _state: &mut ModelTurnState,
         cancellation_token: CancellationToken,
     ) -> ModelEventStream {
@@ -194,7 +234,7 @@ impl ModelClient {
                     Err(ModelError::Cancelled)?;
                 }
                 let next_chunk: Result<Option<_>> = tokio::select! {
-                    chunk = timeout(STREAM_IDLE_TIMEOUT, body.next()) => {
+                    chunk = timeout(stream_idle_timeout, body.next()) => {
                         chunk.map_err(|_| ModelError::Stream("idle timeout waiting for SSE".to_string()))
                     }
                     _ = cancellation_token.cancelled() => Err(ModelError::Cancelled),
@@ -279,15 +319,7 @@ fn tool_choice(tools: &[ToolDefinition], supports_tools: bool) -> Option<&'stati
 
 impl Default for ModelClient {
     fn default() -> Self {
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
-            http,
-            resolver: Arc::new(crate::provider::DefaultProviderResolver::new()),
-            continuation_cache: Arc::new(Mutex::new(HashSet::new())),
-        }
+        Self::with_config(ModelClientConfig::default())
     }
 }
 
@@ -448,8 +480,16 @@ mod tests {
             .and_then(Value::as_u64)
             .unwrap_or(200);
         let mut body_value = response;
+        let delay_ms = body_value
+            .get("__delay_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
         if let Some(object) = body_value.as_object_mut() {
             object.remove("__status");
+            object.remove("__delay_ms");
+        }
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
         let body = if status == 200 {
             mock_sse_body(&body_value)
@@ -559,6 +599,42 @@ mod tests {
         let response = accumulator.finish()?;
         client.apply_completed_state(state, response.id.as_deref());
         Ok(response)
+    }
+
+    #[tokio::test]
+    async fn model_client_config_times_out_waiting_for_response_headers() {
+        let (base_url, _requests) = start_mock_responses(vec![json!({
+            "__delay_ms": 200,
+            "id": "slow",
+            "output": [],
+            "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+        })])
+        .await;
+        let provider = openai_provider_secret(base_url);
+        let model = openai_model();
+        let client = ModelClient::with_config(ModelClientConfig {
+            response_timeout: Duration::from_millis(25),
+            ..Default::default()
+        });
+        let cancellation_token = CancellationToken::new();
+        let mut state = ModelTurnState::default();
+        let resolved = client.resolve(&provider, &model, None);
+
+        let err = collect_response(
+            &client,
+            &resolved,
+            "instructions",
+            &[ModelInputItem::user_text("slow please")],
+            &[],
+            &mut state,
+            &cancellation_token,
+        )
+        .await
+        .expect_err("slow response should time out");
+
+        assert!(
+            matches!(err, ModelError::Stream(message) if message.contains("timeout waiting for response headers"))
+        );
     }
 
     #[tokio::test]

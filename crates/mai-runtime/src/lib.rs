@@ -3919,14 +3919,13 @@ impl projects::mcp::ProjectMcpToolOps for AgentRuntime {
         AgentRuntime::project_git_token_for_agent(self, agent)
     }
 
-    fn call_project_mcp_tool(
+    async fn call_project_mcp_tool(
         &self,
         manager: Arc<McpAgentManager>,
         model_name: String,
         arguments: Value,
-    ) -> impl std::future::Future<Output = std::result::Result<Value, mai_mcp::McpError>> + Send
-    {
-        async move { manager.call_model_tool(&model_name, arguments).await }
+    ) -> std::result::Result<Value, mai_mcp::McpError> {
+        manager.call_model_tool(&model_name, arguments).await
     }
 }
 

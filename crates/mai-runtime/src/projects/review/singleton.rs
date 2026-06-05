@@ -140,11 +140,7 @@ impl ProjectReviewSingletonSnapshot {
 
     fn has_stale_activity(&self, keep_reviewer_id: Option<AgentId>) -> bool {
         self.summary.current_reviewer_agent_id != keep_reviewer_id
-            || self
-                .runs_to_cancel(keep_reviewer_id)
-                .iter()
-                .next()
-                .is_some()
+            || !self.runs_to_cancel(keep_reviewer_id).is_empty()
             || self
                 .reviewers
                 .iter()

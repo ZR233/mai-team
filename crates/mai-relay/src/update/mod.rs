@@ -29,10 +29,10 @@ pub(crate) async fn check(
     http: &reqwest::Client,
     request: RelayUpdateCheckRequest,
 ) -> RelayResult<RelayUpdateStatusResponse> {
-    if !request.force {
-        if let Some(status) = fresh_cached_status() {
-            return Ok(status);
-        }
+    if !request.force
+        && let Some(status) = fresh_cached_status()
+    {
+        return Ok(status);
     }
     let current_version = current_version();
     match release::fetch_latest_relay_release(http).await {

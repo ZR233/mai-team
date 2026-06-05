@@ -1,5 +1,6 @@
 use super::*;
 use chrono::TimeDelta;
+use mai_model::ModelClientConfig;
 use mai_protocol::{
     GitProvider, ModelConfig, ModelReasoningConfig, ModelReasoningVariant, ProjectReviewDecision,
     ProviderConfig, ProviderKind, ProvidersConfigRequest,
@@ -661,6 +662,21 @@ async fn test_runtime(dir: &tempfile::TempDir, store: Arc<ConfigStore>) -> Arc<A
     AgentRuntime::new(
         DockerClient::new_with_binary("unused", fake_docker_path(dir)),
         ModelClient::new(),
+        store,
+        test_runtime_config(dir, DEFAULT_SIDECAR_IMAGE),
+    )
+    .await
+    .expect("runtime")
+}
+
+async fn test_runtime_with_model_config(
+    dir: &tempfile::TempDir,
+    store: Arc<ConfigStore>,
+    model_config: ModelClientConfig,
+) -> Arc<AgentRuntime> {
+    AgentRuntime::new(
+        DockerClient::new_with_binary("unused", fake_docker_path(dir)),
+        ModelClient::with_config(model_config),
         store,
         test_runtime_config(dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -2967,14 +2983,16 @@ async fn auto_compact_failure_keeps_original_history() {
         .save_session_context_tokens(agent_id, session_id, 90)
         .await
         .expect("save tokens");
-    let runtime = AgentRuntime::new(
-        DockerClient::new("unused"),
-        ModelClient::new(),
+    let runtime = test_runtime_with_model_config(
+        &dir,
         Arc::clone(&store),
-        test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
+        ModelClientConfig {
+            response_timeout: std::time::Duration::from_millis(25),
+            stream_idle_timeout: std::time::Duration::from_millis(25),
+            ..Default::default()
+        },
     )
-    .await
-    .expect("runtime");
+    .await;
     let agent = runtime.agent(agent_id).await.expect("agent");
 
     let compacted = runtime
@@ -3069,14 +3087,16 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
         .await
         .expect("save agent");
     save_test_session(&store, agent_id, session_id).await;
-    let runtime = AgentRuntime::new(
-        DockerClient::new("unused"),
-        ModelClient::new(),
+    let runtime = test_runtime_with_model_config(
+        &dir,
         Arc::clone(&store),
-        test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
+        ModelClientConfig {
+            response_timeout: std::time::Duration::from_millis(25),
+            stream_idle_timeout: std::time::Duration::from_millis(25),
+            ..Default::default()
+        },
     )
-    .await
-    .expect("runtime");
+    .await;
     let agent = runtime.agent(agent_id).await.expect("agent");
     *agent.container.write().await = Some(ContainerHandle {
         id: "container-1".to_string(),
@@ -3370,9 +3390,11 @@ async fn turn_loop_has_no_tool_iteration_budget() {
     let (base_url, requests) = start_mock_responses(responses).await;
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
+    let mut provider = compact_test_provider(base_url);
+    provider.models[0].context_tokens = 1_000_000;
     store
         .save_providers(ProvidersConfigRequest {
-            providers: vec![compact_test_provider(base_url)],
+            providers: vec![provider],
             default_provider_id: Some("mock".to_string()),
         })
         .await
@@ -3447,9 +3469,11 @@ async fn user_turn_includes_selected_skill_as_user_fragment() {
         .await
         .expect("open store"),
     );
+    let mut provider = compact_test_provider(base_url);
+    provider.models[0].context_tokens = 1_000_000;
     store
         .save_providers(ProvidersConfigRequest {
-            providers: vec![compact_test_provider(base_url)],
+            providers: vec![provider],
             default_provider_id: Some("mock".to_string()),
         })
         .await
@@ -4502,9 +4526,11 @@ async fn model_failure_after_tool_keeps_tool_success_event_separate() {
             .await
             .expect("open store"),
     );
+    let mut provider = compact_test_provider(base_url);
+    provider.models[0].context_tokens = 1_000_000;
     store
         .save_providers(ProvidersConfigRequest {
-            providers: vec![compact_test_provider(base_url)],
+            providers: vec![provider],
             default_provider_id: Some("mock".to_string()),
         })
         .await
@@ -4518,7 +4544,11 @@ async fn model_failure_after_tool_keeps_tool_success_event_separate() {
     save_test_session(&store, agent_id, session_id).await;
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
+        ModelClient::with_config(ModelClientConfig {
+            response_timeout: Duration::from_millis(25),
+            stream_idle_timeout: Duration::from_millis(25),
+            ..Default::default()
+        }),
         Arc::clone(&store),
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )

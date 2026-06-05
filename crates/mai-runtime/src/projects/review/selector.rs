@@ -71,12 +71,14 @@ pub(crate) async fn run_project_review_selector(
         pull_requests.sort_by_key(|pull_request| pull_request.number);
         select_and_queue_pull_request_page(
             ops,
-            project_id,
-            &owner,
-            &repo,
-            &identity.login,
-            &pull_requests,
-            cancellation_token.clone(),
+            PullRequestPageSelection {
+                project_id,
+                owner: &owner,
+                repo: &repo,
+                reviewer_login: &identity.login,
+                pull_requests: &pull_requests,
+                cancellation_token: cancellation_token.clone(),
+            },
             &mut selected,
             &mut queue,
         )
@@ -108,31 +110,37 @@ fn project_review_selector_signal(selection: &SelectedProjectReviewPr) -> Projec
     }
 }
 
+struct PullRequestPageSelection<'a> {
+    project_id: ProjectId,
+    owner: &'a str,
+    repo: &'a str,
+    reviewer_login: &'a str,
+    pull_requests: &'a [super::eligibility::GithubPullRequest],
+    cancellation_token: CancellationToken,
+}
+
 async fn select_and_queue_pull_request_page(
     ops: &impl ProjectReviewSelectorOps,
-    project_id: ProjectId,
-    owner: &str,
-    repo: &str,
-    reviewer_login: &str,
-    pull_requests: &[super::eligibility::GithubPullRequest],
-    cancellation_token: CancellationToken,
+    page: PullRequestPageSelection<'_>,
     selected: &mut Vec<SelectedProjectReviewPr>,
     queue: &mut ProjectReviewQueueSummary,
 ) -> Result<()> {
     let mut pending = FuturesUnordered::new();
     let mut next_index = 0usize;
     loop {
-        while pending.len() < SELECTOR_CANDIDATE_CONCURRENCY && next_index < pull_requests.len() {
-            if cancellation_token.is_cancelled() {
+        while pending.len() < SELECTOR_CANDIDATE_CONCURRENCY
+            && next_index < page.pull_requests.len()
+        {
+            if page.cancellation_token.is_cancelled() {
                 return Err(RuntimeError::TurnCancelled);
             }
-            let pull_request = &pull_requests[next_index];
+            let pull_request = &page.pull_requests[next_index];
             pending.push(select_project_review_pull_request(
                 ops,
-                project_id,
-                owner,
-                repo,
-                reviewer_login,
+                page.project_id,
+                page.owner,
+                page.repo,
+                page.reviewer_login,
                 pull_request,
             ));
             next_index += 1;
@@ -141,20 +149,20 @@ async fn select_and_queue_pull_request_page(
         let Some(result) = pending.next().await else {
             return Ok(());
         };
-        if cancellation_token.is_cancelled() {
+        if page.cancellation_token.is_cancelled() {
             return Err(RuntimeError::TurnCancelled);
         }
         for selection in result? {
-            if cancellation_token.is_cancelled() {
+            if page.cancellation_token.is_cancelled() {
                 return Err(RuntimeError::TurnCancelled);
             }
             let signal = project_review_selector_signal(&selection);
             let enqueue_summary = ops
-                .enqueue_project_reviews(project_id, vec![signal])
+                .enqueue_project_reviews(page.project_id, vec![signal])
                 .await?;
             extend_queue_summary(queue, enqueue_summary);
             tracing::info!(
-                project_id = %project_id,
+                project_id = %page.project_id,
                 pr = selection.pr,
                 "project review selector queued PR"
             );

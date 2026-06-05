@@ -40,10 +40,10 @@ impl RuntimeEvents {
             timestamp: now(),
             kind,
         };
-        if should_persist_event(&event) {
-            if let Err(err) = self.store.append_service_event(&event).await {
-                tracing::warn!("failed to persist service event: {err}");
-            }
+        if should_persist_event(&event)
+            && let Err(err) = self.store.append_service_event(&event).await
+        {
+            tracing::warn!("failed to persist service event: {err}");
         }
         {
             let mut recent = self.recent.lock().await;

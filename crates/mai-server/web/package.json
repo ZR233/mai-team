@@ -12,6 +12,7 @@
     "test:chat-container": "node src/utils/__tests__/chatContainerState.test.js",
     "test:format": "node src/utils/__tests__/format.test.js",
     "test:layout": "node src/utils/__tests__/contextStatusLineLayout.test.js",
+    "test:markdown": "node src/utils/__tests__/markdown.test.js",
     "test:providers": "node src/composables/__tests__/useProviders.test.js",
     "test:projects": "node src/composables/__tests__/useProjects.test.js",
     "test:review-layout": "node src/utils/__tests__/projectReviewRunLayout.test.js",

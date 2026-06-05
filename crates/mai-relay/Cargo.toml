@@ -1,6 +1,6 @@
 [package]
 name = "mai-relay"
-version.workspace = true
+version = "0.1.11"
 edition.workspace = true
 license.workspace = true
 
@@ -16,7 +16,7 @@ futures.workspace = true
 flate2 = "1"
 hmac = "0.12"
 jsonwebtoken.workspace = true
-mai-protocol = { path = "../mai-protocol", version = "0.1.2" }
+mai-protocol = { path = "../mai-protocol", version = "0.1.11" }
 percent-encoding.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
