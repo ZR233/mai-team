@@ -84,22 +84,25 @@ pub(crate) struct ToolOutputCapture {
     pub(crate) stderr_name: String,
 }
 
-pub(crate) struct ContainerToolContext<'a> {
+pub(crate) struct ContainerToolContext<'a, O: ContainerToolOps + ?Sized> {
     pub(crate) docker: &'a mai_docker::DockerClient,
     pub(crate) artifact_files_root: &'a Path,
-    pub(crate) ops: &'a dyn ContainerToolOps,
+    pub(crate) ops: &'a O,
 }
 
-#[async_trait::async_trait]
+/// 容器类工具依赖的最小运行时能力。
+///
+/// 实现方只负责把 agent 解析为可执行命令的容器 ID。返回的 future 必须可
+/// 线程间移动，且错误应保持为 runtime 层的 `Result` 以便工具生命周期统一记录。
 pub(crate) trait ContainerToolOps: Send + Sync {
-    async fn container_id(&self, agent_id: AgentId) -> Result<String>;
+    fn container_id(&self, agent_id: AgentId) -> impl Future<Output = Result<String>> + Send;
 }
 
-pub(crate) struct ToolDispatchContext<'a> {
+pub(crate) struct ToolDispatchContext<'a, O: ToolDispatchOps + ContainerToolOps + ?Sized> {
     pub(crate) state: &'a RuntimeState,
-    pub(crate) container: ContainerToolContext<'a>,
+    pub(crate) container: ContainerToolContext<'a, O>,
     pub(crate) events: &'a RuntimeEvents,
-    pub(crate) ops: &'a dyn ToolDispatchOps,
+    pub(crate) ops: &'a O,
 }
 
 #[derive(Debug)]
@@ -133,101 +136,108 @@ pub(crate) struct GithubApiRequest {
     pub(crate) body: Option<Value>,
 }
 
-#[async_trait::async_trait]
+/// 非容器工具依赖的运行时能力集合。
+///
+/// 该 trait 是工具分发表与 `AgentRuntime` 之间的内部边界，覆盖协作 agent、
+/// MCP、任务、项目 Git/GitHub 等副作用。实现方必须保持调用可取消，并让返回
+/// future 满足 `Send`，以便回合执行可以在线程池中安全推进。
 pub(crate) trait ToolDispatchOps: Send + Sync {
-    async fn spawn_agent_from_tool(
+    fn spawn_agent_from_tool(
         &self,
         parent_agent_id: AgentId,
         request: SpawnAgentToolRequest,
-    ) -> Result<SpawnAgentToolResult>;
-    async fn send_input_to_agent(
+    ) -> impl Future<Output = Result<SpawnAgentToolResult>> + Send;
+    fn send_input_to_agent(
         &self,
         target: AgentId,
         session_id: Option<SessionId>,
         message: String,
         skill_mentions: Vec<String>,
         interrupt: bool,
-    ) -> Result<Value>;
-    async fn wait_agents_output_with_cancel(
+    ) -> impl Future<Output = Result<Value>> + Send;
+    fn wait_agents_output_with_cancel(
         &self,
         agent_ids: Vec<AgentId>,
         timeout: std::time::Duration,
         cancellation_token: &tokio_util::sync::CancellationToken,
-    ) -> Result<Value>;
-    async fn list_agents(&self) -> Vec<AgentSummary>;
-    async fn close_agent(&self, agent_id: AgentId) -> Result<mai_protocol::AgentStatus>;
-    async fn resume_agent(&self, agent_id: AgentId) -> Result<AgentSummary>;
-    async fn list_mcp_resources(
+    ) -> impl Future<Output = Result<Value>> + Send;
+    fn list_agents(&self) -> impl Future<Output = Vec<AgentSummary>> + Send;
+    fn close_agent(
+        &self,
+        agent_id: AgentId,
+    ) -> impl Future<Output = Result<mai_protocol::AgentStatus>> + Send;
+    fn resume_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<AgentSummary>> + Send;
+    fn list_mcp_resources(
         &self,
         agent: &AgentRecord,
         agent_id: AgentId,
         cancellation_token: &tokio_util::sync::CancellationToken,
         server: Option<String>,
         cursor: Option<String>,
-    ) -> Result<Value>;
-    async fn list_mcp_resource_templates(
+    ) -> impl Future<Output = Result<Value>> + Send;
+    fn list_mcp_resource_templates(
         &self,
         agent: &AgentRecord,
         agent_id: AgentId,
         cancellation_token: &tokio_util::sync::CancellationToken,
         server: Option<String>,
         cursor: Option<String>,
-    ) -> Result<Value>;
-    async fn read_mcp_resource(
+    ) -> impl Future<Output = Result<Value>> + Send;
+    fn read_mcp_resource(
         &self,
         agent: &AgentRecord,
         agent_id: AgentId,
         cancellation_token: &tokio_util::sync::CancellationToken,
         server: String,
         uri: String,
-    ) -> Result<Value>;
-    async fn save_task_plan(
+    ) -> impl Future<Output = Result<Value>> + Send;
+    fn save_task_plan(
         &self,
         agent_id: AgentId,
         title: String,
         markdown: String,
-    ) -> Result<TaskSummary>;
-    async fn submit_review_result(
+    ) -> impl Future<Output = Result<TaskSummary>> + Send;
+    fn submit_review_result(
         &self,
         agent_id: AgentId,
         passed: bool,
         findings: String,
         summary: String,
-    ) -> Result<TaskReview>;
-    async fn save_artifact(
+    ) -> impl Future<Output = Result<TaskReview>> + Send;
+    fn save_artifact(
         &self,
         agent_id: AgentId,
         path: String,
         display_name: Option<String>,
-    ) -> Result<ArtifactInfo>;
-    async fn execute_project_github_api_get(
+    ) -> impl Future<Output = Result<ArtifactInfo>> + Send;
+    fn execute_project_github_api_get(
         &self,
         agent: &AgentRecord,
         path: String,
-    ) -> Result<ToolExecution>;
-    async fn execute_project_github_api_request(
+    ) -> impl Future<Output = Result<ToolExecution>> + Send;
+    fn execute_project_github_api_request(
         &self,
         agent: &AgentRecord,
         request: GithubApiRequest,
-    ) -> Result<ToolExecution>;
-    async fn queue_project_review_prs(
+    ) -> impl Future<Output = Result<ToolExecution>> + Send;
+    fn queue_project_review_prs(
         &self,
         agent: &AgentRecord,
         prs: Vec<QueueProjectReviewPr>,
-    ) -> Result<ToolExecution>;
-    async fn execute_project_git_tool(
+    ) -> impl Future<Output = Result<ToolExecution>> + Send;
+    fn execute_project_git_tool(
         &self,
         agent: &AgentRecord,
         name: String,
         arguments: Value,
-    ) -> Result<ToolExecution>;
-    async fn execute_mcp_tool(
+    ) -> impl Future<Output = Result<ToolExecution>> + Send;
+    fn execute_mcp_tool(
         &self,
         agent: &AgentRecord,
         model_name: String,
         arguments: Value,
         cancellation_token: tokio_util::sync::CancellationToken,
-    ) -> Result<ToolExecution>;
+    ) -> impl Future<Output = Result<ToolExecution>> + Send;
 }
 
 #[derive(Debug, Clone)]
@@ -336,7 +346,7 @@ pub(crate) async fn visible_tool_names(
 }
 
 pub(crate) async fn execute_container_tool(
-    context: &ContainerToolContext<'_>,
+    context: &ContainerToolContext<'_, impl ContainerToolOps + ?Sized>,
     agent_id: AgentId,
     name: &str,
     arguments: &Value,
@@ -453,7 +463,7 @@ pub(crate) async fn execute_container_tool(
 }
 
 pub(crate) async fn execute_tool(
-    context: &ToolDispatchContext<'_>,
+    context: &ToolDispatchContext<'_, impl ToolDispatchOps + ContainerToolOps + ?Sized>,
     agent: &Arc<AgentRecord>,
     agent_id: AgentId,
     turn_id: TurnId,
@@ -803,7 +813,7 @@ async fn agent_can_access_target(
 }
 
 async fn upload_file(
-    context: &ContainerToolContext<'_>,
+    context: &ContainerToolContext<'_, impl ContainerToolOps + ?Sized>,
     agent_id: AgentId,
     path: &str,
     content_base64: &str,
@@ -822,7 +832,7 @@ async fn upload_file(
 }
 
 async fn download_file_tar(
-    context: &ContainerToolContext<'_>,
+    context: &ContainerToolContext<'_, impl ContainerToolOps + ?Sized>,
     agent_id: AgentId,
     path: &str,
 ) -> Result<Vec<u8>> {

@@ -489,8 +489,10 @@ pub(crate) fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -575,7 +577,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mai-docker-test-{unique}"));
         fs::create_dir_all(&dir).expect("mkdir");
         let path = dir.join("docker");
-        fs::write(&path, format!("#!/bin/sh\n{body}")).expect("write script");
+        let mut file = fs::File::create(&path).expect("create script");
+        file.write_all(format!("#!/bin/sh\n{body}").as_bytes())
+            .expect("write script");
+        file.sync_all().expect("sync script");
+        drop(file);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
         path
     }
@@ -589,7 +595,11 @@ mod tests {
 
     fn unique_test_path_id() -> String {
         let counter = TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("{}-{counter}", std::process::id())
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        format!("{}-{counter}-{nanos}", std::process::id())
     }
 
     fn assert_timed_out<T: std::fmt::Debug>(result: Result<T>) {

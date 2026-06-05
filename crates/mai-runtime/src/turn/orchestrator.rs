@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use mai_model::ModelTurnState;
 use mai_protocol::{
     AgentId, AgentStatus, MessageRole, ModelInputItem, ServiceEventKind, SessionId,
@@ -24,30 +24,40 @@ use crate::turn::persistence::AgentLogRecord;
 use crate::turn::tools::ToolExecution;
 use crate::{Result, RuntimeError};
 
-#[async_trait]
+/// 回合编排器依赖的运行时能力集合。
+///
+/// 该 trait 只描述一次用户回合所需的协调操作：加载 agent、准备容器、
+/// 构建提示、压缩上下文、执行工具和推进排队输入。实现方必须保证返回的
+/// future 可在线程间移动，并且不得在方法内部绕过传入的取消信号。
 pub(crate) trait TurnOrchestratorOps: Send + Sync {
-    async fn agent(&self, agent_id: AgentId) -> Result<Arc<AgentRecord>>;
+    fn agent(&self, agent_id: AgentId) -> impl Future<Output = Result<Arc<AgentRecord>>> + Send;
 
-    async fn ensure_agent_container_for_turn(
+    fn ensure_agent_container_for_turn(
         &self,
         agent: &Arc<AgentRecord>,
         status: AgentStatus,
         turn_id: TurnId,
         cancellation_token: &CancellationToken,
-    ) -> Result<()>;
+    ) -> impl Future<Output = Result<()>> + Send;
 
-    async fn refresh_project_skills_for_agent(&self, agent: &AgentRecord) -> Result<()>;
+    fn refresh_project_skills_for_agent(
+        &self,
+        agent: &AgentRecord,
+    ) -> impl Future<Output = Result<()>> + Send;
 
-    async fn skills_manager_for_agent(&self, agent: &AgentRecord) -> Result<SkillsManager>;
+    fn skills_manager_for_agent(
+        &self,
+        agent: &AgentRecord,
+    ) -> impl Future<Output = Result<SkillsManager>> + Send;
 
-    async fn sync_agent_skills_to_container(
+    fn sync_agent_skills_to_container(
         &self,
         agent: &Arc<AgentRecord>,
         skills_manager: &SkillsManager,
         skills_config: &SkillsConfigRequest,
-    ) -> Result<ContainerSkillPaths>;
+    ) -> impl Future<Output = Result<ContainerSkillPaths>> + Send;
 
-    async fn maybe_auto_compact(
+    fn maybe_auto_compact(
         &self,
         agent: &Arc<AgentRecord>,
         agent_id: AgentId,
@@ -55,24 +65,27 @@ pub(crate) trait TurnOrchestratorOps: Send + Sync {
         turn_id: TurnId,
         request: ContextCompactionRequest,
         cancellation_token: &CancellationToken,
-    ) -> Result<ContextCompactionOutcome>;
+    ) -> impl Future<Output = Result<ContextCompactionOutcome>> + Send;
 
-    async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<mai_mcp::McpTool>;
-
-    async fn project_skill_read_guard(
+    fn agent_mcp_tools(
         &self,
         agent: &AgentRecord,
-    ) -> Option<tokio::sync::OwnedRwLockReadGuard<()>>;
+    ) -> impl Future<Output = Vec<mai_mcp::McpTool>> + Send;
 
-    async fn inject_project_mcp_tools(
+    fn project_skill_read_guard(
+        &self,
+        agent: &AgentRecord,
+    ) -> impl Future<Output = Option<tokio::sync::OwnedRwLockReadGuard<()>>> + Send;
+
+    fn inject_project_mcp_tools(
         &self,
         agent: &AgentRecord,
         agent_id: AgentId,
         session_id: SessionId,
         cancellation_token: &CancellationToken,
-    ) -> Result<()>;
+    ) -> impl Future<Output = Result<()>> + Send;
 
-    async fn build_instructions(
+    fn build_instructions(
         &self,
         agent: &AgentRecord,
         skills_manager: &SkillsManager,
@@ -80,18 +93,18 @@ pub(crate) trait TurnOrchestratorOps: Send + Sync {
         skills_config: &SkillsConfigRequest,
         mcp_tools: &[mai_mcp::McpTool],
         container_skill_paths: &ContainerSkillPaths,
-    ) -> Result<String>;
+    ) -> impl Future<Output = Result<String>> + Send;
 
-    async fn set_turn_status(
+    fn set_turn_status(
         &self,
         agent: &Arc<AgentRecord>,
         turn_id: TurnId,
         cancellation_token: &CancellationToken,
         enforce_current_turn: bool,
         status: AgentStatus,
-    ) -> Result<()>;
+    ) -> impl Future<Output = Result<()>> + Send;
 
-    async fn execute_tool(
+    fn execute_tool(
         &self,
         agent: &Arc<AgentRecord>,
         agent_id: AgentId,
@@ -99,9 +112,12 @@ pub(crate) trait TurnOrchestratorOps: Send + Sync {
         name: &str,
         arguments: Value,
         cancellation_token: CancellationToken,
-    ) -> Result<ToolExecution>;
+    ) -> impl Future<Output = Result<ToolExecution>> + Send;
 
-    async fn start_next_queued_input_after_turn(&self, agent_id: AgentId);
+    fn start_next_queued_input_after_turn(
+        &self,
+        agent_id: AgentId,
+    ) -> impl Future<Output = ()> + Send;
 }
 
 pub(crate) struct TurnRequest {
@@ -117,7 +133,7 @@ pub(crate) async fn run_turn(
     deps: &RuntimeDeps,
     state: &RuntimeState,
     events: &RuntimeEvents,
-    ops: &dyn TurnOrchestratorOps,
+    ops: &(impl TurnOrchestratorOps + ?Sized),
     request: TurnRequest,
 ) {
     let agent_id = request.agent_id;
@@ -182,7 +198,7 @@ pub(crate) async fn run_turn_inner(
     deps: &RuntimeDeps,
     state: &RuntimeState,
     events: &RuntimeEvents,
-    ops: &dyn TurnOrchestratorOps,
+    ops: &(impl TurnOrchestratorOps + ?Sized),
     request: TurnRequest,
 ) -> Result<()> {
     let TurnRequest {
