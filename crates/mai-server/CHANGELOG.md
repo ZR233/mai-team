@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.11...mai-server-v0.1.12) - 2026-06-09
+
+### Added
+
+- 更新多个 crate 的版本至 0.1.11，增强依赖一致性和稳定性
+
+### Fixed
+
+- 修复 project review 超窗与 gpt-5.5 256k
+- 避免长时间流式事件拖垮 Web UI
+
 ## [0.1.11](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.9...mai-server-v0.1.11) - 2026-05-29
 
 ### Added
