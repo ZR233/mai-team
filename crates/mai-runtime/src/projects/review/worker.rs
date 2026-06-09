@@ -341,7 +341,14 @@ async fn run_project_review_pool_worker(
                         },
                     )
                     .await;
-                if !wait_or_cancel(&ops.cancellation_token, delay).await {
+                if !wait_for_project_review_startup_retry(
+                    &ops.ops,
+                    ops.project_id,
+                    &ops.cancellation_token,
+                    delay,
+                )
+                .await
+                {
                     break;
                 }
             }
@@ -738,6 +745,26 @@ async fn wait_for_project_review_signal(
     }
 }
 
+async fn wait_for_project_review_startup_retry(
+    ops: &impl ProjectReviewWorkerOps,
+    project_id: ProjectId,
+    cancellation_token: &CancellationToken,
+    delay: Duration,
+) -> bool {
+    if delay.is_zero() {
+        return true;
+    }
+    let notify = match ops.project(project_id).await {
+        Ok(project) => Arc::clone(&project.review_notify),
+        Err(_) => return true,
+    };
+    tokio::select! {
+        _ = sleep(delay) => true,
+        _ = notify.notified() => true,
+        _ = cancellation_token.cancelled() => false,
+    }
+}
+
 fn project_ready_for_review(summary: &ProjectSummary) -> bool {
     summary.auto_review_enabled
         && summary.status == ProjectStatus::Ready
@@ -797,6 +824,7 @@ mod tests {
         failed_relay_prs: Arc<Mutex<Vec<u64>>>,
         ineligible_relay_prs: Arc<Mutex<Vec<u64>>>,
         failed_enqueue_prs: Arc<Mutex<Vec<u64>>>,
+        cache_ready_errors: Arc<Mutex<Vec<String>>>,
         reviewed_prs: Arc<Mutex<Vec<Option<u64>>>>,
         review_errors: Arc<Mutex<Vec<String>>>,
         auto_reviewers: Arc<Mutex<Vec<mai_protocol::AgentSummary>>>,
@@ -820,6 +848,7 @@ mod tests {
                 failed_relay_prs: Arc::new(Mutex::new(Vec::new())),
                 ineligible_relay_prs: Arc::new(Mutex::new(Vec::new())),
                 failed_enqueue_prs: Arc::new(Mutex::new(Vec::new())),
+                cache_ready_errors: Arc::new(Mutex::new(Vec::new())),
                 reviewed_prs: Arc::new(Mutex::new(Vec::new())),
                 review_errors: Arc::new(Mutex::new(Vec::new())),
                 auto_reviewers: Arc::new(Mutex::new(Vec::new())),
@@ -842,6 +871,10 @@ mod tests {
 
         async fn push_review_error(&self, error: impl Into<String>) {
             self.review_errors.lock().await.push(error.into());
+        }
+
+        async fn push_cache_ready_error(&self, error: impl Into<String>) {
+            self.cache_ready_errors.lock().await.push(error.into());
         }
 
         async fn set_auto_reviewers(&self, reviewers: Vec<mai_protocol::AgentSummary>) {
@@ -927,6 +960,13 @@ mod tests {
         }
 
         async fn ensure_project_cache_ready(&self, _project_id: Uuid) -> crate::Result<()> {
+            let error = {
+                let mut errors = self.cache_ready_errors.lock().await;
+                (!errors.is_empty()).then(|| errors.remove(0))
+            };
+            if let Some(error) = error {
+                return Err(crate::RuntimeError::InvalidInput(error));
+            }
             Ok(())
         }
 
@@ -1270,6 +1310,49 @@ mod tests {
         }
         assert_eq!(vec![Some(42)], *ops.reviewed_prs.lock().await);
         assert_eq!(0, *ops.selector_calls.lock().await);
+
+        token.cancel();
+        worker_task.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn pool_worker_wakes_startup_cache_backoff_when_review_is_queued() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        ops.push_cache_ready_error("project cache volume sync failed")
+            .await;
+        let token = CancellationToken::new();
+        let task_ops = ops.clone();
+        let task_token = token.clone();
+        let worker_task = tokio::spawn(async move {
+            super::run_project_review_loop(task_ops, project_id, task_token).await;
+        });
+
+        for _ in 0..20 {
+            if !ops.states.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        {
+            let mut pool = ops.project.review_pool.lock().await;
+            pool.enqueue_many([ProjectReviewSignalInput {
+                pr: 42,
+                head_sha: Some("head-42".to_string()),
+                delivery_id: None,
+                reason: "manual_rereview".to_string(),
+            }]);
+        }
+        ops.project.review_notify.notify_waiters();
+
+        for _ in 0..20 {
+            if !ops.reviewed_prs.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(vec![Some(42)], *ops.reviewed_prs.lock().await);
 
         token.cancel();
         worker_task.await.expect("worker task");
