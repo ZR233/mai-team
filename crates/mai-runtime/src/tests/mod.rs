@@ -872,6 +872,14 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 	    fi
 	    if printf '%s' "$command" | grep -q "clone --mirror"; then
 	      echo "sidecar-git-cache" >> "$LOG"
+	      if [ -f "$VOLUMES/detect-cache-sidecar-overlap" ]; then
+	        if mkdir "$VOLUMES/cache-sync-active" 2>/dev/null; then
+	          sleep 0.2
+	          rmdir "$VOLUMES/cache-sync-active"
+	        else
+	          echo "cache-sync-overlap" >> "$LOG"
+	        fi
+	      fi
 	      if [ -f "$VOLUMES/fail-cache-clone-once" ]; then
 	        rm -f "$VOLUMES/fail-cache-clone-once"
 	        echo "simulated transient cache clone failure" >&2
@@ -1132,6 +1140,23 @@ fn fake_git_log_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
 
 fn fake_docker_log(dir: &tempfile::TempDir) -> String {
     std::fs::read_to_string(fake_docker_log_path(dir)).unwrap_or_default()
+}
+
+fn docker_sidecar_names(log: &str, prefix: &str) -> Vec<String> {
+    log.lines()
+        .filter_map(|line| {
+            let mut args = line.split_whitespace();
+            while let Some(arg) = args.next() {
+                if arg == "--name" {
+                    let name = args.next()?;
+                    if name.starts_with(prefix) {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+            None
+        })
+        .collect()
 }
 
 fn fake_git_log(dir: &tempfile::TempDir) -> String {
@@ -6576,6 +6601,111 @@ async fn project_clone_retries_transient_cache_git_failure() {
     assert!(docker_log.contains("git_with_retry"));
     assert!(docker_log.contains("http.version=HTTP/1.1"));
     assert!(docker_log.contains("sleep $((attempts * 2))"));
+}
+
+#[tokio::test]
+async fn project_cache_sync_uses_unique_sidecar_names() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let mut agent = test_agent_summary(agent_id, None);
+    agent.project_id = Some(project_id);
+    agent.role = Some(AgentRole::Planner);
+    save_agent_with_session(&store, &agent).await;
+    let project = test_project_summary(project_id, agent_id, "account-1");
+    store.save_project(&project).await.expect("save project");
+    let runtime = test_runtime_with_sidecar_image_and_git(
+        &dir,
+        Arc::clone(&store),
+        "ghcr.io/example/mai-team-sidecar:test",
+    )
+    .await;
+
+    runtime
+        .sync_project_cache_repo(project_id)
+        .await
+        .expect("first sync");
+    runtime
+        .sync_project_cache_repo(project_id)
+        .await
+        .expect("second sync");
+
+    let docker_log = fake_docker_log(&dir);
+    let cache_sidecar_names = docker_sidecar_names(&docker_log, "mai-tool-git-cache-");
+    let unique_names = cache_sidecar_names
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(2, cache_sidecar_names.len());
+    assert_eq!(2, unique_names.len());
+}
+
+#[tokio::test]
+async fn project_cache_sync_serializes_same_project() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    store
+        .upsert_git_account(GitAccountRequest {
+            id: Some("account-1".to_string()),
+            label: "GitHub".to_string(),
+            token: Some("secret-token".to_string()),
+            is_default: true,
+            ..Default::default()
+        })
+        .await
+        .expect("save account");
+    let project_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+    let mut agent = test_agent_summary(agent_id, None);
+    agent.project_id = Some(project_id);
+    agent.role = Some(AgentRole::Planner);
+    save_agent_with_session(&store, &agent).await;
+    let project = test_project_summary(project_id, agent_id, "account-1");
+    store.save_project(&project).await.expect("save project");
+    let volume_marker_dir = dir.path().join("fake-docker-volumes");
+    fs::create_dir_all(&volume_marker_dir).expect("mkdir fake docker volumes");
+    fs::write(volume_marker_dir.join("detect-cache-sidecar-overlap"), "")
+        .expect("write overlap marker");
+    let runtime = test_runtime_with_sidecar_image_and_git(
+        &dir,
+        Arc::clone(&store),
+        "ghcr.io/example/mai-team-sidecar:test",
+    )
+    .await;
+
+    let (first, second) = tokio::join!(
+        runtime.sync_project_cache_repo(project_id),
+        runtime.sync_project_cache_repo(project_id),
+    );
+    first.expect("first sync");
+    second.expect("second sync");
+
+    let docker_log = fake_docker_log(&dir);
+    assert!(!docker_log.contains("cache-sync-overlap"));
 }
 
 #[tokio::test]

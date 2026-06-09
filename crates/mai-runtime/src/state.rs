@@ -42,6 +42,7 @@ impl RuntimeState {
 pub(crate) struct ProjectRecord {
     pub(crate) summary: RwLock<ProjectSummary>,
     pub(crate) sidecar: RwLock<Option<ContainerHandle>>,
+    pub(crate) repo_sync_lock: Mutex<()>,
     pub(crate) review_worker: Mutex<Option<ProjectReviewWorker>>,
     pub(crate) review_pool: Mutex<ProjectReviewPool>,
     pub(crate) review_notify: Arc<Notify>,
@@ -54,6 +55,7 @@ impl ProjectRecord {
         Self {
             summary: RwLock::new(summary),
             sidecar: RwLock::new(None),
+            repo_sync_lock: Mutex::new(()),
             review_worker: Mutex::new(None),
             review_pool: Mutex::new(ProjectReviewPool::default()),
             review_notify: Arc::new(Notify::new()),

@@ -2377,6 +2377,7 @@ impl AgentRuntime {
 
     async fn sync_project_cache_repo(&self, project_id: ProjectId) -> Result<()> {
         let project = self.project(project_id).await?;
+        let _repo_sync_guard = project.repo_sync_lock.lock().await;
         let summary = project.summary.read().await.clone();
         let token = self.project_git_token(project_id).await?.ok_or_else(|| {
             RuntimeError::InvalidInput("project git account token is not configured".to_string())
@@ -2442,6 +2443,8 @@ impl AgentRuntime {
         agent_id: AgentId,
         token: &str,
     ) -> Result<()> {
+        let project_record = self.project(project.id).await?;
+        let _repo_sync_guard = project_record.repo_sync_lock.lock().await;
         self.sync_project_cache_volume_repo(project, token).await?;
         self.sync_agent_workspace_volume_from_cache_repo(project, agent_id, token)
             .await
@@ -2529,7 +2532,7 @@ impl AgentRuntime {
             "MAI_GITHUB_INSTALLATION_TOKEN".to_string(),
             token.to_string(),
         )];
-        let sidecar_name = format!("mai-tool-git-cache-{}", project.id);
+        let sidecar_name = format!("mai-tool-git-cache-{}-{}", project.id, Uuid::new_v4());
         let output = self
             .deps
             .docker
