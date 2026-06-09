@@ -55,28 +55,61 @@ pub(crate) struct ContextCompactionDecision {
     pub(crate) tokens_before: u64,
 }
 
-pub(crate) fn context_compaction_decision(
-    last_context_tokens: Option<u64>,
-    estimated_request_tokens: Option<u64>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContextBudgetPolicy {
     context_tokens: u64,
     threshold_percent: u64,
-) -> Option<ContextCompactionDecision> {
-    if context_tokens == 0 {
-        return None;
+    auto_compact_token_limit: Option<u64>,
+}
+
+impl ContextBudgetPolicy {
+    pub(crate) fn new(
+        context_tokens: u64,
+        threshold_percent: u64,
+        auto_compact_token_limit: Option<u64>,
+    ) -> Self {
+        Self {
+            context_tokens,
+            threshold_percent,
+            auto_compact_token_limit,
+        }
     }
-    let last_tokens = last_context_tokens?;
-    let estimated_tokens = estimated_request_tokens.unwrap_or_default();
-    let (trigger, tokens_before) = if estimated_tokens > last_tokens {
-        (ContextCompactionTrigger::RequestEstimate, estimated_tokens)
-    } else {
-        (ContextCompactionTrigger::LastContextTokens, last_tokens)
-    };
-    should_compact(tokens_before, context_tokens, threshold_percent).then_some(
-        ContextCompactionDecision {
+
+    pub(crate) fn decision(
+        self,
+        last_context_tokens: Option<u64>,
+        estimated_request_tokens: Option<u64>,
+    ) -> Option<ContextCompactionDecision> {
+        let compact_limit = self.compact_limit()?;
+        let (trigger, tokens_before) = match (last_context_tokens, estimated_request_tokens) {
+            (Some(last_tokens), Some(estimated_tokens)) if estimated_tokens > last_tokens => {
+                (ContextCompactionTrigger::RequestEstimate, estimated_tokens)
+            }
+            (Some(last_tokens), _) => (ContextCompactionTrigger::LastContextTokens, last_tokens),
+            (None, Some(estimated_tokens)) => {
+                (ContextCompactionTrigger::RequestEstimate, estimated_tokens)
+            }
+            (None, None) => return None,
+        };
+        (tokens_before >= compact_limit).then_some(ContextCompactionDecision {
             trigger,
             tokens_before,
-        },
-    )
+        })
+    }
+
+    fn compact_limit(self) -> Option<u64> {
+        if self.context_tokens == 0 {
+            return None;
+        }
+        let percent_limit = self
+            .context_tokens
+            .saturating_mul(self.threshold_percent)
+            .div_ceil(100);
+        match self.auto_compact_token_limit {
+            Some(limit) if limit > 0 => Some(limit.min(percent_limit)),
+            Some(_) | None => Some(percent_limit),
+        }
+    }
 }
 
 pub(crate) fn estimate_model_request_tokens(
@@ -86,13 +119,6 @@ pub(crate) fn estimate_model_request_tokens(
 ) -> u64 {
     let bytes = instructions.len() as u64 + serialized_len(history) + serialized_len(tools);
     bytes.div_ceil(TOKEN_ESTIMATE_BYTES)
-}
-
-fn should_compact(tokens_before: u64, context_tokens: u64, threshold_percent: u64) -> bool {
-    if tokens_before == 0 || context_tokens == 0 {
-        return false;
-    }
-    tokens_before.saturating_mul(100) >= context_tokens.saturating_mul(threshold_percent)
 }
 
 fn serialized_len<T: serde::Serialize + ?Sized>(value: &T) -> u64 {

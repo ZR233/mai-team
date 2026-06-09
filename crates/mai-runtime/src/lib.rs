@@ -1828,12 +1828,12 @@ impl AgentRuntime {
             .resolve_provider(Some(&summary.provider_id), Some(&summary.model))
             .await?;
         let context_tokens = provider_selection.model.context_tokens;
-        let Some(decision) = turn::context::context_compaction_decision(
-            last_context_tokens,
-            request.estimated_tokens,
+        let planner = turn::compaction::ContextBudgetPlanner::new(
             context_tokens,
             AUTO_COMPACT_THRESHOLD_PERCENT,
-        ) else {
+            provider_selection.model.auto_compact_token_limit,
+        );
+        let Some(decision) = planner.decision(last_context_tokens, request) else {
             return Ok(turn::context::ContextCompactionOutcome::Skipped);
         };
         let tokens_before = decision.tokens_before;
@@ -1852,8 +1852,13 @@ impl AgentRuntime {
             .await?;
             return Ok(turn::context::ContextCompactionOutcome::Skipped);
         }
-        let mut compact_input = history.clone();
-        compact_input.push(ModelInputItem::user_text(COMPACT_PROMPT));
+        let compactor = turn::compaction::HistoryCompactor::new(
+            &history,
+            COMPACT_SUMMARY_PREFIX,
+            COMPACT_PROMPT,
+            COMPACT_USER_MESSAGE_MAX_CHARS,
+        );
+        let mut compact_input = compactor.compact_request_input();
         let skills_config = self.deps.store.load_skills_config().await?;
         let skills_manager = self.skills_manager_for_agent(agent).await?;
         let instructions = {
@@ -1873,7 +1878,7 @@ impl AgentRuntime {
             &provider_selection.model,
             summary.reasoning_effort.as_deref(),
         );
-        let response = turn::model_stream::consume_model_stream_to_response(
+        let response_result = turn::model_stream::consume_model_stream_to_response(
             &self.deps.model,
             &resolved,
             &instructions,
@@ -1883,7 +1888,38 @@ impl AgentRuntime {
             cancellation_token,
         )
         .await
-        .map_err(turn::model_stream::model_error_to_runtime)?;
+        .map_err(turn::model_stream::model_error_to_runtime);
+        let response = match response_result {
+            Ok(response) => response,
+            Err(err) if turn::compaction::compaction_error_allows_fallback(&err) => {
+                turn::persistence::record_agent_log(
+                    self.deps.store.as_ref(),
+                    turn::persistence::AgentLogRecord {
+                        agent_id,
+                        session_id: Some(session_id),
+                        turn_id: Some(turn_id),
+                        level: "warn",
+                        category: "context",
+                        message: "context compaction retrying with reduced history",
+                        details: json!({ "error": err.to_string() }),
+                    },
+                )
+                .await;
+                compact_input = compactor.fallback_compact_request_input();
+                turn::model_stream::consume_model_stream_to_response(
+                    &self.deps.model,
+                    &resolved,
+                    &instructions,
+                    &compact_input,
+                    &[],
+                    &mut ModelTurnState::default(),
+                    cancellation_token,
+                )
+                .await
+                .map_err(turn::model_stream::model_error_to_runtime)?
+            }
+            Err(err) => return Err(err),
+        };
 
         if cancellation_token.is_cancelled() {
             return Err(RuntimeError::TurnCancelled);
@@ -1905,12 +1941,9 @@ impl AgentRuntime {
             .ok_or_else(|| {
                 RuntimeError::InvalidInput("compact response did not include a summary".to_string())
             })?;
-        let replacement = turn::history::build_compacted_history(
-            &history,
-            &summary_text,
-            COMPACT_USER_MESSAGE_MAX_CHARS,
-            COMPACT_SUMMARY_PREFIX,
-        );
+        let replacement = compactor.replacement_history(&summary_text);
+        let replacement_tokens =
+            turn::compaction::estimate_history_tokens(&instructions, &replacement, &[]);
         turn::history::replace_session_history(
             self.deps.store.as_ref(),
             agent,
@@ -1919,31 +1952,43 @@ impl AgentRuntime {
             replacement,
         )
         .await?;
-        self.events
-            .publish(ServiceEventKind::ContextCompacted {
-                agent_id,
-                session_id,
-                turn_id,
-                tokens_before,
-                summary_preview: preview(&summary_text, COMPACT_SUMMARY_PREVIEW_CHARS),
-            })
-            .await;
+        turn::history::record_session_context_tokens(
+            self.deps.store.as_ref(),
+            agent,
+            agent_id,
+            session_id,
+            replacement_tokens,
+        )
+        .await?;
+        turn::compaction::CompactionRecorder::new(
+            self.deps.store.as_ref(),
+            &self.events,
+            agent_id,
+            session_id,
+            turn_id,
+            COMPACT_SUMMARY_PREVIEW_CHARS,
+        )
+        .record_success(turn::compaction::CompactionRecord {
+            decision,
+            last_context_tokens,
+            estimated_request_tokens: request.estimated_tokens,
+            context_tokens,
+            replacement_tokens,
+            summary: &summary_text,
+        })
+        .await;
         turn::persistence::record_agent_log(
             self.deps.store.as_ref(),
             turn::persistence::AgentLogRecord {
                 agent_id,
                 session_id: Some(session_id),
                 turn_id: Some(turn_id),
-                level: "info",
+                level: "debug",
                 category: "context",
-                message: "context compacted",
+                message: "context compaction request prepared",
                 details: json!({
-                    "trigger": decision.trigger.as_str(),
-                    "tokens_before": tokens_before,
-                    "last_context_tokens": last_context_tokens,
-                    "estimated_request_tokens": request.estimated_tokens,
-                    "context_tokens": context_tokens,
-                    "summary_preview": preview(&summary_text, COMPACT_SUMMARY_PREVIEW_CHARS),
+                    "history_items": history.len(),
+                    "compact_input_items": compact_input.len(),
                 }),
             },
         )

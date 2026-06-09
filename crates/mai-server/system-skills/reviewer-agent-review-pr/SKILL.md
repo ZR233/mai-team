@@ -101,6 +101,8 @@ Run the commands in `rust-plan.json` when present. For Rust PRs, always run `car
 
 When the repository is large, fetch only the target PR details needed for validation and review context.
 
+Keep the review bounded. Once you have enough evidence for a blocking finding, stop broad exploration and submit `REQUEST_CHANGES` with that finding plus the validation context already gathered. Do not keep searching for more issues after a blocking conclusion is clear. For large PRs, inspect the changed files, validation output, relevant nearby code, and 2-3 representative existing patterns; summarize any unreviewed surface as residual risk instead of spending the entire turn exhaustively reading unrelated code. Reserve enough output budget to submit the GitHub review and the final scheduler JSON.
+
 Record exact validation failures. Treat these as blocking:
 
 - `cargo fmt --check` fails.

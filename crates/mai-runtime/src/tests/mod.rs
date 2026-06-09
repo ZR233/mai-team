@@ -22,6 +22,7 @@ fn test_model(id: &str) -> ModelConfig {
         name: Some(id.to_string()),
         context_tokens: if id == "gpt-5.5" { 256_000 } else { 400_000 },
         output_tokens: 128_000,
+        auto_compact_token_limit: None,
         supports_tools: true,
         reasoning: Some(openai_reasoning_config(&[
             "minimal", "low", "medium", "high",
@@ -72,6 +73,7 @@ fn deepseek_test_provider() -> ProviderConfig {
             name: Some("deepseek-v4-pro".to_string()),
             context_tokens: 1_000_000,
             output_tokens: 384_000,
+            auto_compact_token_limit: None,
             supports_tools: true,
             reasoning: Some(deepseek_reasoning_config()),
             options: serde_json::Value::Null,
@@ -402,7 +404,7 @@ fn content_length(headers: &str) -> usize {
 
 fn compact_test_provider(base_url: String) -> ProviderConfig {
     let mut model = test_model("mock-model");
-    model.context_tokens = 100;
+    model.context_tokens = 1_000_000;
     model.output_tokens = 32;
     ProviderConfig {
         id: "mock".to_string(),
@@ -2146,29 +2148,55 @@ async fn delete_child_keeps_parent_and_sibling() {
 #[test]
 fn auto_compact_threshold_uses_last_context_tokens() {
     assert_eq!(
-        turn::context::context_compaction_decision(Some(0), None, 100, 90),
+        turn::context::ContextBudgetPolicy::new(100, 90, None).decision(Some(0), None),
         None
     );
     assert_eq!(
-        turn::context::context_compaction_decision(Some(89), None, 100, 90),
+        turn::context::ContextBudgetPolicy::new(100, 90, None).decision(Some(89), None),
         None
     );
-    assert!(turn::context::context_compaction_decision(Some(90), None, 100, 90).is_some());
-    assert!(turn::context::context_compaction_decision(Some(360_000), None, 400_000, 90).is_some());
-    assert_eq!(
-        turn::context::context_compaction_decision(None, Some(90), 100, 90),
-        None
+    assert!(
+        turn::context::ContextBudgetPolicy::new(100, 90, None)
+            .decision(Some(90), None)
+            .is_some()
+    );
+    assert!(
+        turn::context::ContextBudgetPolicy::new(400_000, 90, None)
+            .decision(Some(360_000), None)
+            .is_some()
     );
     assert_eq!(
-        turn::context::context_compaction_decision(Some(10), Some(90), 100, 90),
+        turn::context::ContextBudgetPolicy::new(100, 90, None).decision(None, Some(90)),
         Some(turn::context::ContextCompactionDecision {
             trigger: turn::context::ContextCompactionTrigger::RequestEstimate,
             tokens_before: 90,
         })
     );
     assert_eq!(
-        turn::context::context_compaction_decision(Some(90), None, 0, 90),
+        turn::context::ContextBudgetPolicy::new(100, 90, None).decision(Some(10), Some(90)),
+        Some(turn::context::ContextCompactionDecision {
+            trigger: turn::context::ContextCompactionTrigger::RequestEstimate,
+            tokens_before: 90,
+        })
+    );
+    assert_eq!(
+        turn::context::ContextBudgetPolicy::new(0, 90, None).decision(Some(90), None),
         None
+    );
+}
+
+#[test]
+fn auto_compact_threshold_honors_explicit_token_limit() {
+    assert_eq!(
+        turn::context::ContextBudgetPolicy::new(100, 90, Some(75)).decision(Some(74), None),
+        None
+    );
+    assert_eq!(
+        turn::context::ContextBudgetPolicy::new(100, 90, Some(75)).decision(Some(10), Some(75)),
+        Some(turn::context::ContextCompactionDecision {
+            trigger: turn::context::ContextCompactionTrigger::RequestEstimate,
+            tokens_before: 75,
+        })
     );
 }
 
@@ -2185,7 +2213,7 @@ fn compact_summary_uses_last_non_empty_assistant_output() {
 
     assert_eq!(
         turn::history::compact_summary_from_output(&output).as_deref(),
-        Some("second")
+        Some("first")
     );
     assert_eq!(turn::history::compact_summary_from_output(&[]), None);
 }
@@ -2388,7 +2416,7 @@ fn repair_keeps_consecutive_function_calls_in_one_batch() {
 }
 
 #[test]
-fn compacted_history_keeps_recent_user_messages_and_summary_only() {
+fn compacted_history_keeps_recent_user_messages_assistant_and_tool_summary() {
     let history = vec![
         ModelInputItem::user_text("first user"),
         ModelInputItem::assistant_text("assistant old"),
@@ -2403,8 +2431,9 @@ fn compacted_history_keeps_recent_user_messages_and_summary_only() {
         },
         ModelInputItem::FunctionCallOutput {
             call_id: "call_1".to_string(),
-            output: "{}".to_string(),
+            output: format!("{}{}", "x".repeat(12_000), "tool tail"),
         },
+        ModelInputItem::assistant_text("assistant recent"),
         ModelInputItem::user_text("second user"),
     ];
 
@@ -2414,19 +2443,56 @@ fn compacted_history_keeps_recent_user_messages_and_summary_only() {
         COMPACT_USER_MESSAGE_MAX_CHARS,
         COMPACT_SUMMARY_PREFIX,
     );
-    assert_eq!(compacted.len(), 3);
+    assert!(compacted.len() >= 5);
     assert!(matches!(
         &compacted[0],
         ModelInputItem::Message { content, .. }
             if matches!(&content[0], ModelContentItem::InputText { text } if text == "first user")
     ));
     assert!(matches!(
-        &compacted[1],
+        compacted
+            .iter()
+            .find(|item| matches!(item, ModelInputItem::Message { role, .. } if role == "user"))
+            .expect("recent user message"),
+        ModelInputItem::Message { content, .. }
+            if matches!(&content[0], ModelContentItem::InputText { text } if text == "first user")
+    ));
+    assert!(compacted.iter().any(|item| matches!(
+        item,
+        ModelInputItem::Message { role, content }
+            if role == "assistant"
+                && matches!(&content[0], ModelContentItem::OutputText { text } if text == "assistant recent")
+    )));
+    assert!(
+        !compacted
+            .iter()
+            .any(|item| matches!(item, ModelInputItem::FunctionCallOutput { .. }))
+    );
+    assert!(compacted.iter().any(|item| matches!(
+        item,
+        ModelInputItem::Message { role, content }
+            if role == "user"
+                && matches!(&content[0], ModelContentItem::InputText { text }
+                    if text.contains("Recent tool result")
+                        && text.contains("tool output truncated")
+                        && text.contains("tool tail")
+                        && text.len() < 12_000)
+    )));
+    assert!(matches!(
+        compacted
+            .iter()
+            .find(|item| matches!(
+                item,
+                ModelInputItem::Message { role, content }
+                    if role == "user"
+                        && matches!(&content[0], ModelContentItem::InputText { text } if text == "second user")
+            ))
+            .expect("second user"),
         ModelInputItem::Message { content, .. }
             if matches!(&content[0], ModelContentItem::InputText { text } if text == "second user")
     ));
     assert!(matches!(
-        &compacted[2],
+        compacted.last().expect("summary"),
         ModelInputItem::Message { content, .. }
             if matches!(&content[0], ModelContentItem::InputText { text } if text.contains("new summary") && turn::history::is_compact_summary(text, COMPACT_SUMMARY_PREFIX))
     ));
@@ -2984,9 +3050,11 @@ async fn auto_compact_failure_keeps_original_history() {
             .await
             .expect("open store"),
     );
+    let mut provider = compact_no_continuation_test_provider(base_url);
+    provider.models[0].context_tokens = 10_000;
     store
         .save_providers(ProvidersConfigRequest {
-            providers: vec![compact_no_continuation_test_provider(base_url)],
+            providers: vec![provider],
             default_provider_id: Some("mock".to_string()),
         })
         .await
@@ -3009,7 +3077,7 @@ async fn auto_compact_failure_keeps_original_history() {
             .expect("append history");
     }
     store
-        .save_session_context_tokens(agent_id, session_id, 90)
+        .save_session_context_tokens(agent_id, session_id, 9_000)
         .await
         .expect("save tokens");
     let runtime = test_runtime_with_model_config(
@@ -3059,8 +3127,231 @@ async fn auto_compact_failure_keeps_original_history() {
             .agents[0]
             .sessions[0]
             .last_context_tokens,
-        Some(90)
+        Some(9_000)
     );
+}
+
+#[tokio::test]
+async fn auto_compact_records_replacement_context_tokens() {
+    let (base_url, _requests) = start_mock_responses(vec![json!({
+        "id": "compact",
+        "output": [{
+            "type": "message",
+            "content": [{ "type": "output_text", "text": "replacement token summary" }]
+        }],
+        "usage": { "input_tokens": 50, "output_tokens": 5, "total_tokens": 55 }
+    })])
+    .await;
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let mut provider = compact_no_continuation_test_provider(base_url);
+    provider.models[0].context_tokens = 10_000;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![provider],
+            default_provider_id: Some("mock".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let agent_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    store
+        .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
+        .await
+        .expect("save agent");
+    save_test_session(&store, agent_id, session_id).await;
+    store
+        .append_agent_history_item(
+            agent_id,
+            session_id,
+            0,
+            &ModelInputItem::user_text("request"),
+        )
+        .await
+        .expect("append user");
+    store
+        .save_session_context_tokens(agent_id, session_id, 9_000)
+        .await
+        .expect("save tokens");
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let agent = runtime.agent(agent_id).await.expect("agent");
+
+    runtime
+        .maybe_auto_compact(
+            &agent,
+            agent_id,
+            session_id,
+            Uuid::new_v4(),
+            turn::context::ContextCompactionRequest::last_context_only(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("compact");
+
+    let snapshot = store.load_runtime_snapshot(20).await.expect("snapshot");
+    let tokens = snapshot.agents[0].sessions[0]
+        .last_context_tokens
+        .expect("replacement context tokens");
+    assert!(tokens > 0);
+    assert!(tokens < 9_000);
+}
+
+#[tokio::test]
+async fn auto_compact_retries_with_reduced_history_when_context_window_fails() {
+    let (base_url, requests) = start_mock_responses(vec![
+        json!({
+            "__status": 400,
+            "error": { "message": "context window exceeded while compacting" }
+        }),
+        json!({
+            "id": "compact_retry",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "summary after reduced retry" }]
+            }],
+            "usage": { "input_tokens": 40, "output_tokens": 4, "total_tokens": 44 }
+        }),
+    ])
+    .await;
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let mut provider = compact_no_continuation_test_provider(base_url);
+    provider.models[0].context_tokens = 10_000;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![provider],
+            default_provider_id: Some("mock".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let agent_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    store
+        .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
+        .await
+        .expect("save agent");
+    save_test_session(&store, agent_id, session_id).await;
+    for index in 0..30 {
+        store
+            .append_agent_history_item(
+                agent_id,
+                session_id,
+                index,
+                &ModelInputItem::user_text(format!("request {index} {}", "x".repeat(500))),
+            )
+            .await
+            .expect("append history");
+    }
+    store
+        .save_session_context_tokens(agent_id, session_id, 9_000)
+        .await
+        .expect("save tokens");
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let agent = runtime.agent(agent_id).await.expect("agent");
+
+    runtime
+        .maybe_auto_compact(
+            &agent,
+            agent_id,
+            session_id,
+            Uuid::new_v4(),
+            turn::context::ContextCompactionRequest::last_context_only(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("compact retry");
+
+    let requests = requests.lock().await.clone();
+    assert_eq!(requests.len(), 2);
+    let first_input_len = requests[0]["input"].as_array().expect("first input").len();
+    let retry_input_len = requests[1]["input"].as_array().expect("retry input").len();
+    assert!(retry_input_len < first_input_len);
+    let history = store
+        .load_agent_history(agent_id, session_id)
+        .await
+        .expect("history");
+    assert!(history.iter().any(|item| matches!(
+        item,
+        ModelInputItem::Message { role, content }
+            if role == "user"
+                && matches!(&content[0], ModelContentItem::InputText { text } if text.contains("summary after reduced retry"))
+    )));
+}
+
+#[tokio::test]
+async fn auto_compact_failure_before_model_request_stops_turn() {
+    let (base_url, requests) = start_mock_responses(vec![
+        json!({
+            "id": "first",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "unknown_tool",
+                "arguments": "{}"
+            }],
+            "usage": { "input_tokens": 8998, "output_tokens": 2, "total_tokens": 9000 }
+        }),
+        json!({
+            "id": "compact_empty",
+            "output": [],
+            "usage": { "input_tokens": 20, "output_tokens": 1, "total_tokens": 21 }
+        }),
+        json!({
+            "id": "should_not_be_requested",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "should not happen" }]
+            }],
+            "usage": { "input_tokens": 30, "output_tokens": 4, "total_tokens": 34 }
+        }),
+    ])
+    .await;
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: {
+                let mut provider = compact_no_continuation_test_provider(base_url);
+                provider.models[0].context_tokens = 10_000;
+                vec![provider]
+            },
+            default_provider_id: Some("mock".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let agent_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    store
+        .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
+        .await
+        .expect("save agent");
+    save_test_session(&store, agent_id, session_id).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let agent = runtime.agent(agent_id).await.expect("agent");
+    *agent.container.write().await = Some(ContainerHandle {
+        id: "container-1".to_string(),
+        name: "container-1".to_string(),
+        image: "unused".to_string(),
+    });
+
+    let err = runtime
+        .run_turn_inner(
+            agent_id,
+            session_id,
+            Uuid::new_v4(),
+            "please use a tool".to_string(),
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("compaction failure stops turn");
+
+    assert!(
+        err.to_string()
+            .contains("compact response did not include a summary")
+    );
+    let requests = requests.lock().await.clone();
+    assert_eq!(requests.len(), 2);
 }
 
 #[tokio::test]
@@ -3074,7 +3365,7 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
                 "name": "unknown_tool",
                 "arguments": "{}"
             }],
-            "usage": { "input_tokens": 88, "output_tokens": 2, "total_tokens": 90 }
+            "usage": { "input_tokens": 8998, "output_tokens": 2, "total_tokens": 9000 }
         }),
         json!({
             "id": "compact",
@@ -3102,9 +3393,11 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
             .await
             .expect("open store"),
     );
+    let mut provider = compact_no_continuation_test_provider(base_url);
+    provider.models[0].context_tokens = 10_000;
     store
         .save_providers(ProvidersConfigRequest {
-            providers: vec![compact_no_continuation_test_provider(base_url)],
+            providers: vec![provider],
             default_provider_id: Some("mock".to_string()),
         })
         .await
@@ -3186,6 +3479,13 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
             .iter()
             .any(|item| matches!(item, ModelInputItem::FunctionCallOutput { .. }))
     );
+    assert!(history.iter().any(|item| matches!(
+        item,
+        ModelInputItem::Message { role, content }
+            if role == "user"
+                && matches!(&content[0], ModelContentItem::InputText { text }
+                    if text.contains("Recent tool result"))
+    )));
     assert_eq!(
         history.last().and_then(turn::history::user_message_text),
         None
@@ -3206,7 +3506,7 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
             _ => None,
         })
         .expect("context compacted event");
-    assert!(tokens_before >= 90);
+    assert!(tokens_before >= 9_000);
 }
 
 #[tokio::test]
@@ -3220,7 +3520,7 @@ async fn auto_compact_uses_request_estimate_before_model_request() {
                 "name": "list_agents",
                 "arguments": "{}"
             }],
-            "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+            "usage": { "input_tokens": 8998, "output_tokens": 2, "total_tokens": 9000 }
         }),
         json!({
             "id": "compact",
@@ -3243,7 +3543,8 @@ async fn auto_compact_uses_request_estimate_before_model_request() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     let mut provider = compact_no_continuation_test_provider(base_url);
-    provider.models[0].context_tokens = 60;
+    provider.models[0].context_tokens = 10_000;
+    provider.models[0].auto_compact_token_limit = Some(8_000);
     store
         .save_providers(ProvidersConfigRequest {
             providers: vec![provider],
@@ -3310,7 +3611,7 @@ async fn auto_compact_resets_openai_continuation_after_replacing_history() {
                 "name": "unknown_tool",
                 "arguments": "{}"
             }],
-            "usage": { "input_tokens": 88, "output_tokens": 2, "total_tokens": 90 }
+            "usage": { "input_tokens": 8998, "output_tokens": 2, "total_tokens": 9000 }
         }),
         json!({
             "id": "compact",
@@ -3332,9 +3633,11 @@ async fn auto_compact_resets_openai_continuation_after_replacing_history() {
     .await;
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
+    let mut provider = compact_test_provider(base_url);
+    provider.models[0].context_tokens = 10_000;
     store
         .save_providers(ProvidersConfigRequest {
-            providers: vec![compact_test_provider(base_url)],
+            providers: vec![provider],
             default_provider_id: Some("mock".to_string()),
         })
         .await

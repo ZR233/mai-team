@@ -990,6 +990,8 @@ pub struct ModelConfig {
     pub name: Option<String>,
     pub context_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<u64>,
     #[serde(default = "default_true")]
     pub supports_tools: bool,
     #[serde(default)]

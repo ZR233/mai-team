@@ -247,14 +247,23 @@ fn content_index(value: &Value) -> Option<usize> {
 }
 
 fn response_error_message(value: &Value, fallback: &str) -> String {
-    value
+    let message = value
         .get("response")
         .and_then(|response| response.get("error"))
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
         .filter(|message| !message.trim().is_empty())
-        .unwrap_or(fallback)
-        .to_string()
+        .unwrap_or(fallback);
+    let reason = value
+        .get("response")
+        .and_then(|response| response.get("incomplete_details"))
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.trim().is_empty());
+    match reason {
+        Some(reason) => format!("{message}: {reason}"),
+        None => message.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -361,6 +370,7 @@ mod tests {
             name: Some(id.to_string()),
             context_tokens: 1_000_000,
             output_tokens: 384_000,
+            auto_compact_token_limit: None,
             supports_tools: true,
             reasoning: Some(ModelReasoningConfig {
                 default_variant: Some(default_variant.to_string()),
@@ -491,5 +501,23 @@ mod tests {
         assert_eq!(value["input"][0]["call_id"].as_str(), Some("call_1"));
         state.acknowledge_history_len(input.len());
         assert_eq!(state.acknowledged_input_len, 3);
+    }
+
+    #[test]
+    fn response_incomplete_error_includes_reason() {
+        let err = parse_stream_event_value(json!({
+            "type": "response.incomplete",
+            "response": {
+                "incomplete_details": {
+                    "reason": "max_output_tokens"
+                }
+            }
+        }))
+        .expect_err("incomplete response should fail the stream");
+
+        assert_eq!(
+            err.to_string(),
+            "stream error: response.incomplete event received: max_output_tokens"
+        );
     }
 }

@@ -422,6 +422,7 @@ mod tests {
             name: Some(id.to_string()),
             context_tokens: 1_000_000,
             output_tokens: 384_000,
+            auto_compact_token_limit: None,
             supports_tools: true,
             reasoning: Some(ModelReasoningConfig {
                 default_variant: Some(default_variant.to_string()),

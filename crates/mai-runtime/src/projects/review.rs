@@ -270,7 +270,9 @@ pub(crate) fn project_review_error_is_retryable(error: &str) -> bool {
     if let Some(stream_error) = error.strip_prefix("model error: stream error: ") {
         return stream_error.contains("stream closed with incomplete SSE frame")
             || stream_error.contains("stream closed before response.completed")
-            || stream_error.contains("idle timeout waiting for SSE");
+            || stream_error.contains("idle timeout waiting for SSE")
+            || (stream_error.contains("response.incomplete event received")
+                && stream_error.contains("max_output_tokens"));
     }
 
     if !error.starts_with("model error: request to ") {
@@ -746,6 +748,20 @@ mod tests {
     #[test]
     fn model_incomplete_sse_frame_is_retryable() {
         let error = "model error: stream error: stream closed with incomplete SSE frame";
+
+        let decision = project_review_loop_decision_for_error(error.to_string());
+
+        assert_eq!(decision.delay, Duration::from_secs(1));
+        assert_eq!(decision.status, ProjectReviewStatus::Waiting);
+        assert_eq!(decision.outcome, None);
+        assert_eq!(decision.summary, None);
+        assert_eq!(decision.error.as_deref(), Some(error));
+    }
+
+    #[test]
+    fn model_response_incomplete_output_limit_is_retryable() {
+        let error =
+            "model error: stream error: response.incomplete event received: max_output_tokens";
 
         let decision = project_review_loop_decision_for_error(error.to_string());
 

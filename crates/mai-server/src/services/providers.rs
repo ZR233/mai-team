@@ -379,6 +379,7 @@ pub(crate) fn provider_test_model(id: &str) -> ModelConfig {
         name: Some(id.to_string()),
         context_tokens: if id == "gpt-5.5" { 256_000 } else { 400_000 },
         output_tokens: 128_000,
+        auto_compact_token_limit: None,
         supports_tools: true,
         wire_api: ModelWireApi::Responses,
         capabilities: ModelCapabilities::default(),

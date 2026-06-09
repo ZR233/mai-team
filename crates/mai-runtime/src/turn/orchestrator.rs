@@ -298,6 +298,7 @@ pub(crate) async fn run_turn_inner(
             },
         )
         .await;
+        return Err(err);
     }
     super::history::record_message(
         deps.store.as_ref(),
@@ -505,6 +506,7 @@ pub(crate) async fn run_turn_inner(
                     },
                 )
                 .await;
+                return Err(err);
             }
         }
         let history_duration_ms = u128_to_u64(history_started.elapsed().as_millis());

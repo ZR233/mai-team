@@ -146,6 +146,7 @@ fn test_model(id: &str) -> ModelConfig {
         name: Some(id.to_string()),
         context_tokens: if id == "gpt-5.5" { 256_000 } else { 400_000 },
         output_tokens: 128_000,
+        auto_compact_token_limit: None,
         supports_tools: true,
         reasoning: Some(ModelReasoningConfig {
             default_variant: Some("medium".to_string()),
@@ -752,6 +753,7 @@ async fn provider_toml_preserves_custom_model_metadata() {
     let mut custom = test_model("custom-chat");
     custom.context_tokens = 123_456;
     custom.output_tokens = 4_096;
+    custom.auto_compact_token_limit = Some(98_765);
     custom.supports_tools = false;
     custom.reasoning = None;
     custom.options = json!({ "temperature": 0.2 });
@@ -775,6 +777,7 @@ async fn provider_toml_preserves_custom_model_metadata() {
         .find(|model| model.id == "custom-chat")
         .expect("custom model");
     assert_eq!(model.context_tokens, 123_456);
+    assert_eq!(model.auto_compact_token_limit, Some(98_765));
     assert!(!model.supports_tools);
     assert_eq!(model.options["temperature"], json!(0.2));
     assert_eq!(model.headers["X-Test-Model"], "custom");

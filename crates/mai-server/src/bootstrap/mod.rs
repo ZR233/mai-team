@@ -235,6 +235,7 @@ mod tests {
                 name: Some("gpt-test".to_string()),
                 context_tokens: 128_000,
                 output_tokens: 16_000,
+                auto_compact_token_limit: None,
                 supports_tools: true,
                 reasoning: None,
                 options: serde_json::Value::Null,

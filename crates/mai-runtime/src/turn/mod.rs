@@ -1,4 +1,5 @@
 pub(crate) mod accounting;
+pub(crate) mod compaction;
 pub(crate) mod completion;
 pub(crate) mod context;
 pub(crate) mod history;

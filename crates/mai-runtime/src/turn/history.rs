@@ -8,6 +8,11 @@ use std::collections::HashSet;
 use crate::state::AgentRecord;
 use crate::{Result, RuntimeError};
 
+const COMPACT_RECENT_ASSISTANT_MAX_CHARS: usize = 8_000;
+const COMPACT_RECENT_TOOL_OUTPUT_MAX_CHARS: usize = 4_000;
+const COMPACT_RECENT_ASSISTANT_ITEMS: usize = 2;
+const COMPACT_RECENT_TOOL_OUTPUT_ITEMS: usize = 3;
+
 pub(crate) async fn record_message(
     store: &ConfigStore,
     agent: &AgentRecord,
@@ -180,7 +185,6 @@ pub(crate) fn compact_summary_from_output(output: &[ModelOutputItem]) -> Option<
     output.iter().rev().find_map(|item| {
         let text = match item {
             ModelOutputItem::Message { text } => text,
-            ModelOutputItem::Reasoning { content } => content,
             _ => return None,
         };
         let text = text.trim();
@@ -251,11 +255,33 @@ pub(crate) fn build_compacted_history(
         .into_iter()
         .map(ModelInputItem::user_text)
         .collect::<Vec<_>>();
+    replacement.extend(recent_compaction_tail(history, summary_prefix));
     replacement.push(ModelInputItem::user_text(compact_summary_message(
         summary,
         summary_prefix,
     )));
     replacement
+}
+
+pub(crate) fn build_compaction_request_history(
+    history: &[ModelInputItem],
+    max_user_chars: usize,
+    summary_prefix: &str,
+) -> Vec<ModelInputItem> {
+    let mut input = Vec::new();
+    if let Some(summary) = latest_compact_summary(history, summary_prefix) {
+        input.push(ModelInputItem::user_text(summary.to_string()));
+    }
+    input.extend(
+        recent_user_messages_since_latest_summary(history, max_user_chars, summary_prefix)
+            .into_iter()
+            .map(ModelInputItem::user_text),
+    );
+    input.extend(recent_compaction_tail(history, summary_prefix));
+    if input.is_empty() {
+        return history.to_vec();
+    }
+    input
 }
 
 pub(crate) fn compact_summary_message(summary: &str, summary_prefix: &str) -> String {
@@ -295,6 +321,17 @@ pub(crate) fn recent_user_messages(
     selected
 }
 
+fn recent_user_messages_since_latest_summary(
+    history: &[ModelInputItem],
+    max_chars: usize,
+    summary_prefix: &str,
+) -> Vec<String> {
+    let start = latest_compact_summary_index(history, summary_prefix)
+        .map(|index| index + 1)
+        .unwrap_or_default();
+    recent_user_messages(&history[start..], max_chars, summary_prefix)
+}
+
 pub(crate) fn user_message_text(item: &ModelInputItem) -> Option<&str> {
     let ModelInputItem::Message { role, content } = item else {
         return None;
@@ -302,6 +339,92 @@ pub(crate) fn user_message_text(item: &ModelInputItem) -> Option<&str> {
     if role != "user" {
         return None;
     }
+    content.iter().find_map(|item| match item {
+        ModelContentItem::InputText { text } => Some(text.as_str()),
+        ModelContentItem::OutputText { .. } => None,
+    })
+}
+
+fn recent_compaction_tail(history: &[ModelInputItem], summary_prefix: &str) -> Vec<ModelInputItem> {
+    let mut selected = Vec::new();
+    let mut assistant_items = 0;
+    let mut tool_output_items = 0;
+    for item in history.iter().rev() {
+        match item {
+            ModelInputItem::Message { role, content } if role == "assistant" => {
+                if assistant_items >= COMPACT_RECENT_ASSISTANT_ITEMS {
+                    continue;
+                }
+                let Some(text) = assistant_output_text(content) else {
+                    continue;
+                };
+                if text.trim().is_empty() {
+                    continue;
+                }
+                selected.push(ModelInputItem::assistant_text(take_last_chars(
+                    text,
+                    COMPACT_RECENT_ASSISTANT_MAX_CHARS,
+                )));
+                assistant_items += 1;
+            }
+            ModelInputItem::FunctionCallOutput { call_id, output } => {
+                if tool_output_items >= COMPACT_RECENT_TOOL_OUTPUT_ITEMS {
+                    continue;
+                }
+                selected.push(ModelInputItem::user_text(format!(
+                    "Recent tool result `{call_id}` retained for context checkpoint:\n{}",
+                    compact_tool_output(output, COMPACT_RECENT_TOOL_OUTPUT_MAX_CHARS)
+                )));
+                tool_output_items += 1;
+            }
+            ModelInputItem::Message { role, content } if role == "user" => {
+                let Some(text) = input_text(content) else {
+                    continue;
+                };
+                if is_compact_summary(text.trim(), summary_prefix) {
+                    break;
+                }
+            }
+            ModelInputItem::Message { .. }
+            | ModelInputItem::Reasoning { .. }
+            | ModelInputItem::FunctionCall { .. } => {}
+        }
+    }
+    selected.reverse();
+    selected
+}
+
+fn latest_compact_summary<'a>(
+    history: &'a [ModelInputItem],
+    summary_prefix: &str,
+) -> Option<&'a str> {
+    latest_compact_summary_index(history, summary_prefix)
+        .and_then(|index| user_message_text(&history[index]))
+}
+
+fn latest_compact_summary_index(history: &[ModelInputItem], summary_prefix: &str) -> Option<usize> {
+    history.iter().enumerate().rev().find_map(|(index, item)| {
+        let text = user_message_text(item)?;
+        is_compact_summary(text.trim(), summary_prefix).then_some(index)
+    })
+}
+
+fn compact_tool_output(output: &str, max_chars: usize) -> String {
+    if output.chars().count() <= max_chars {
+        return output.to_string();
+    }
+    let tail = take_last_chars(output, max_chars);
+    format!("tool output truncated for context compaction; kept last {max_chars} chars\n{tail}")
+}
+
+fn assistant_output_text(content: &[ModelContentItem]) -> Option<&str> {
+    content.iter().find_map(|item| match item {
+        ModelContentItem::OutputText { text } => Some(text.as_str()),
+        ModelContentItem::InputText { .. } => None,
+    })
+}
+
+fn input_text(content: &[ModelContentItem]) -> Option<&str> {
     content.iter().find_map(|item| match item {
         ModelContentItem::InputText { text } => Some(text.as_str()),
         ModelContentItem::OutputText { .. } => None,
