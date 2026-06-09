@@ -110,17 +110,16 @@ impl RelayClient {
         let params = serde_json::to_value(params).map_err(|err| {
             RuntimeError::InvalidInput(format!("relay request serialization failed: {err}"))
         })?;
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id.clone(), tx);
         let sender = match self.wait_for_sender().await {
             Some(sender) => sender,
             None => {
-                self.pending.lock().await.remove(&id);
                 return Err(RuntimeError::InvalidInput(
                     "relay is not connected".to_string(),
                 ));
             }
         };
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id.clone(), tx);
         if sender
             .send(RelayEnvelope::Request(RelayRequest {
                 id: id.clone(),
@@ -368,16 +367,51 @@ impl RelayClient {
                 }
             }
         });
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<RelayEvent>();
+        let event_ack_tx = tx.clone();
+        let event_handler = Arc::clone(&self.event_handler);
+        let event_task = tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                let delivery_id = event.delivery_id.clone();
+                let handler = event_handler.lock().await.clone();
+                let ack = match handler {
+                    Some(handler) => match handler(event).await {
+                        Ok(status) => RelayAck {
+                            delivery_id,
+                            status,
+                            message: None,
+                        },
+                        Err(message) => RelayAck {
+                            delivery_id,
+                            status: RelayAckStatus::Failed,
+                            message: Some(message),
+                        },
+                    },
+                    None => RelayAck {
+                        delivery_id,
+                        status: RelayAckStatus::Ignored,
+                        message: Some("relay event receiver is not running".to_string()),
+                    },
+                };
+                let _ = event_ack_tx.send(RelayEnvelope::Ack(ack));
+            }
+        });
 
-        loop {
+        let read_result: Result<(), RuntimeError> = loop {
             let Some(message) = (tokio::select! {
-                _ = self.cancellation.cancelled() => break,
+                _ = self.cancellation.cancelled() => break Ok(()),
                 message = reader.next() => message,
             }) else {
-                break;
+                break Ok(());
             };
-            let message = message
-                .map_err(|err| RuntimeError::InvalidInput(format!("relay read failed: {err}")))?;
+            let message = match message {
+                Ok(message) => message,
+                Err(err) => {
+                    break Err(RuntimeError::InvalidInput(format!(
+                        "relay read failed: {err}"
+                    )));
+                }
+            };
             let text = match message {
                 Message::Text(text) => text.to_string(),
                 Message::Ping(payload) => {
@@ -386,12 +420,17 @@ impl RelayClient {
                     });
                     continue;
                 }
-                Message::Close(_) => break,
+                Message::Close(_) => break Ok(()),
                 Message::Binary(_) | Message::Frame(_) | Message::Pong(_) => continue,
             };
-            let envelope = serde_json::from_str::<RelayEnvelope>(&text).map_err(|err| {
-                RuntimeError::InvalidInput(format!("invalid relay envelope: {err}"))
-            })?;
+            let envelope = match serde_json::from_str::<RelayEnvelope>(&text) {
+                Ok(envelope) => envelope,
+                Err(err) => {
+                    break Err(RuntimeError::InvalidInput(format!(
+                        "invalid relay envelope: {err}"
+                    )));
+                }
+            };
             match envelope {
                 RelayEnvelope::Request(request) => {
                     let response = self.handle_request(request).await;
@@ -403,8 +442,7 @@ impl RelayClient {
                     }
                 }
                 RelayEnvelope::Event(event) => {
-                    let ack = self.handle_event(event).await;
-                    let _ = tx.send(RelayEnvelope::Ack(ack));
+                    let _ = event_tx.send(event);
                 }
                 RelayEnvelope::Ping { id } => {
                     let _ = tx.send(RelayEnvelope::Pong { id });
@@ -415,17 +453,21 @@ impl RelayClient {
                 }
                 RelayEnvelope::Hello(_) | RelayEnvelope::Ack(_) => {}
             }
-        }
+        };
         write_task.abort();
+        event_task.abort();
         self.mark_disconnected(None).await;
-        Ok(())
+        read_result
     }
 
     async fn mark_disconnected(&self, message: Option<String>) {
-        let mut state = self.state.lock().await;
-        state.sender = None;
-        state.connected = false;
-        state.message = message;
+        {
+            let mut state = self.state.lock().await;
+            state.sender = None;
+            state.connected = false;
+            state.message = message;
+        }
+        self.pending.lock().await.clear();
     }
 
     async fn handle_request(&self, request: RelayRequest) -> RelayResponse {
@@ -445,39 +487,28 @@ impl RelayClient {
         };
         protocol::relay_response(request.id, result)
     }
-
-    async fn handle_event(&self, event: RelayEvent) -> RelayAck {
-        let delivery_id = event.delivery_id.clone();
-        let handler = self.event_handler.lock().await.clone();
-        let Some(handler) = handler else {
-            return RelayAck {
-                delivery_id,
-                status: RelayAckStatus::Ignored,
-                message: Some("relay event receiver is not running".to_string()),
-            };
-        };
-        match handler(event).await {
-            Ok(status) => RelayAck {
-                delivery_id,
-                status,
-                message: None,
-            },
-            Err(message) => RelayAck {
-                delivery_id,
-                status: RelayAckStatus::Failed,
-                message: Some(message),
-            },
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mai_protocol::RelayEnvelope;
+    use mai_protocol::{RelayEnvelope, RelayEvent, RelayEventKind};
     use pretty_assertions::assert_eq;
+    use std::sync::Mutex as StdMutex;
     use tokio::net::TcpListener;
+    use tokio::sync::{Mutex as TokioMutex, oneshot as test_oneshot};
+    use tokio::time::{Duration, sleep, timeout};
     use tokio_tungstenite::accept_async;
+
+    struct DropSignal(Option<test_oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
 
     #[tokio::test]
     async fn request_waits_for_connection_started_in_background() {
@@ -544,6 +575,344 @@ mod tests {
                 .parse::<chrono::DateTime<chrono::Utc>>()
                 .expect("expires")
         );
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn request_receives_response_while_event_handler_is_still_running() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+        let addr = listener.local_addr().expect("relay addr");
+        let (handler_started_tx, handler_started_rx) = test_oneshot::channel();
+        let handler_started = Arc::new(TokioMutex::new(Some(handler_started_tx)));
+        let (release_handler_tx, release_handler_rx) = test_oneshot::channel();
+        let release_handler = Arc::new(TokioMutex::new(Some(release_handler_rx)));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept relay");
+            let mut websocket = accept_async(stream).await.expect("websocket");
+            let hello = websocket
+                .next()
+                .await
+                .expect("hello")
+                .expect("hello message");
+            let RelayEnvelope::Hello(_) =
+                serde_json::from_str::<RelayEnvelope>(&hello.into_text().expect("hello text"))
+                    .expect("decode hello")
+            else {
+                panic!("first relay message should be hello");
+            };
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&RelayEnvelope::Event(RelayEvent {
+                        sequence: 1,
+                        delivery_id: "delivery-1".to_string(),
+                        kind: RelayEventKind::Push,
+                        payload: json!({}),
+                    }))
+                    .expect("encode event")
+                    .into(),
+                ))
+                .await
+                .expect("send event");
+
+            let request = websocket
+                .next()
+                .await
+                .expect("request")
+                .expect("request message");
+            let RelayEnvelope::Request(request) =
+                serde_json::from_str::<RelayEnvelope>(&request.into_text().expect("request text"))
+                    .expect("decode request")
+            else {
+                panic!("second client message should be request");
+            };
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&RelayEnvelope::Response(RelayResponse {
+                        id: request.id,
+                        result: Some(json!({
+                            "token": "relay-token",
+                            "expires_at": "2026-05-18T00:00:00Z"
+                        })),
+                        error: None,
+                    }))
+                    .expect("encode response")
+                    .into(),
+                ))
+                .await
+                .expect("send response");
+
+            let ack = websocket.next().await.expect("ack").expect("ack message");
+            let RelayEnvelope::Ack(ack) =
+                serde_json::from_str::<RelayEnvelope>(&ack.into_text().expect("ack text"))
+                    .expect("decode ack")
+            else {
+                panic!("client should ack relay event");
+            };
+            assert_eq!(ack.delivery_id, "delivery-1");
+            assert_eq!(ack.status, RelayAckStatus::Processed);
+        });
+        let client = Arc::new(RelayClient::new(RelayClientConfig {
+            url: format!("http://{addr}"),
+            token: "secret".to_string(),
+            node_id: "node-1".to_string(),
+        }));
+        client
+            .set_event_handler({
+                let handler_started = Arc::clone(&handler_started);
+                let release_handler = Arc::clone(&release_handler);
+                move |_event| {
+                    let handler_started = Arc::clone(&handler_started);
+                    let release_handler = Arc::clone(&release_handler);
+                    async move {
+                        if let Some(tx) = handler_started.lock().await.take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = release_handler.lock().await.take() {
+                            let _ = rx.await;
+                        }
+                        Ok(RelayAckStatus::Processed)
+                    }
+                }
+            })
+            .await;
+
+        Arc::clone(&client).start();
+        timeout(Duration::from_secs(5), handler_started_rx)
+            .await
+            .expect("handler should start")
+            .expect("handler signal should send");
+
+        let response = timeout(
+            Duration::from_secs(5),
+            client.create_installation_token(42, None, false),
+        )
+        .await
+        .expect("request should not wait for event handler")
+        .expect("relay token");
+
+        assert_eq!(response.token, "relay-token");
+        let _ = release_handler_tx.send(());
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn request_finishes_when_connection_closes_before_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+        let addr = listener.local_addr().expect("relay addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept relay");
+            let mut websocket = accept_async(stream).await.expect("websocket");
+            let hello = websocket
+                .next()
+                .await
+                .expect("hello")
+                .expect("hello message");
+            let RelayEnvelope::Hello(_) =
+                serde_json::from_str::<RelayEnvelope>(&hello.into_text().expect("hello text"))
+                    .expect("decode hello")
+            else {
+                panic!("first relay message should be hello");
+            };
+            let request = websocket
+                .next()
+                .await
+                .expect("request")
+                .expect("request message");
+            let RelayEnvelope::Request(_) =
+                serde_json::from_str::<RelayEnvelope>(&request.into_text().expect("request text"))
+                    .expect("decode request")
+            else {
+                panic!("second relay message should be request");
+            };
+            websocket.close(None).await.expect("close websocket");
+        });
+        let client = Arc::new(RelayClient::new(RelayClientConfig {
+            url: format!("http://{addr}"),
+            token: "secret".to_string(),
+            node_id: "node-1".to_string(),
+        }));
+
+        Arc::clone(&client).start();
+        let err = timeout(
+            Duration::from_secs(5),
+            client.create_installation_token(42, None, false),
+        )
+        .await
+        .expect("request should finish when relay closes")
+        .expect_err("relay request should fail");
+
+        assert!(err.to_string().contains("relay connection closed"));
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn event_worker_stops_when_connection_exits_with_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+        let addr = listener.local_addr().expect("relay addr");
+        let (handler_started_tx, handler_started_rx) = test_oneshot::channel();
+        let handler_started = Arc::new(TokioMutex::new(Some(handler_started_tx)));
+        let (handler_dropped_tx, handler_dropped_rx) = test_oneshot::channel();
+        let handler_dropped = Arc::new(StdMutex::new(Some(handler_dropped_tx)));
+        let (release_handler_tx, release_handler_rx) = test_oneshot::channel();
+        let release_handler = Arc::new(TokioMutex::new(Some(release_handler_rx)));
+        let (send_invalid_tx, send_invalid_rx) = test_oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept relay");
+            let mut websocket = accept_async(stream).await.expect("websocket");
+            let hello = websocket
+                .next()
+                .await
+                .expect("hello")
+                .expect("hello message");
+            let RelayEnvelope::Hello(_) =
+                serde_json::from_str::<RelayEnvelope>(&hello.into_text().expect("hello text"))
+                    .expect("decode hello")
+            else {
+                panic!("first relay message should be hello");
+            };
+
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&RelayEnvelope::Event(RelayEvent {
+                        sequence: 1,
+                        delivery_id: "delivery-1".to_string(),
+                        kind: RelayEventKind::Push,
+                        payload: json!({}),
+                    }))
+                    .expect("encode event")
+                    .into(),
+                ))
+                .await
+                .expect("send event");
+
+            send_invalid_rx.await.expect("send invalid signal");
+            websocket
+                .send(Message::Text("not a relay envelope".into()))
+                .await
+                .expect("send invalid envelope");
+        });
+        let client = Arc::new(RelayClient::new(RelayClientConfig {
+            url: format!("http://{addr}"),
+            token: "secret".to_string(),
+            node_id: "node-1".to_string(),
+        }));
+        client
+            .set_event_handler({
+                let handler_started = Arc::clone(&handler_started);
+                let handler_dropped = Arc::clone(&handler_dropped);
+                let release_handler = Arc::clone(&release_handler);
+                move |_event| {
+                    let handler_started = Arc::clone(&handler_started);
+                    let handler_dropped = Arc::clone(&handler_dropped);
+                    let release_handler = Arc::clone(&release_handler);
+                    async move {
+                        let _drop_signal = handler_dropped
+                            .lock()
+                            .expect("handler dropped mutex")
+                            .take()
+                            .map(|tx| DropSignal(Some(tx)));
+                        if let Some(tx) = handler_started.lock().await.take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = release_handler.lock().await.take() {
+                            let _ = rx.await;
+                        }
+                        Ok(RelayAckStatus::Processed)
+                    }
+                }
+            })
+            .await;
+
+        Arc::clone(&client).start();
+        timeout(Duration::from_secs(5), handler_started_rx)
+            .await
+            .expect("handler should start")
+            .expect("handler signal should send");
+        send_invalid_tx.send(()).expect("send invalid signal");
+
+        timeout(Duration::from_secs(5), handler_dropped_rx)
+            .await
+            .expect("handler should be dropped when connection exits")
+            .expect("handler dropped signal should send");
+
+        let _ = release_handler_tx.send(());
+        client.stop();
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn request_started_before_reconnect_is_not_cleared_before_send() {
+        let probe = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe relay");
+        let addr = probe.local_addr().expect("probe relay addr");
+        drop(probe);
+        let client = Arc::new(RelayClient::new(RelayClientConfig {
+            url: format!("http://{addr}"),
+            token: "secret".to_string(),
+            node_id: "node-1".to_string(),
+        }));
+
+        Arc::clone(&client).start();
+        let request = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.create_installation_token(42, None, false).await }
+        });
+        sleep(Duration::from_millis(1200)).await;
+
+        let listener = TcpListener::bind(addr).await.expect("bind relay");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept relay");
+            let mut websocket = accept_async(stream).await.expect("websocket");
+            let hello = websocket
+                .next()
+                .await
+                .expect("hello")
+                .expect("hello message");
+            let RelayEnvelope::Hello(_) =
+                serde_json::from_str::<RelayEnvelope>(&hello.into_text().expect("hello text"))
+                    .expect("decode hello")
+            else {
+                panic!("first relay message should be hello");
+            };
+            let request = websocket
+                .next()
+                .await
+                .expect("request")
+                .expect("request message");
+            let RelayEnvelope::Request(request) =
+                serde_json::from_str::<RelayEnvelope>(&request.into_text().expect("request text"))
+                    .expect("decode request")
+            else {
+                panic!("second relay message should be request");
+            };
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&RelayEnvelope::Response(RelayResponse {
+                        id: request.id,
+                        result: Some(json!({
+                            "token": "relay-token",
+                            "expires_at": "2026-05-18T00:00:00Z"
+                        })),
+                        error: None,
+                    }))
+                    .expect("encode response")
+                    .into(),
+                ))
+                .await
+                .expect("send response");
+        });
+
+        let response = timeout(Duration::from_secs(8), request)
+            .await
+            .expect("request should finish after reconnect")
+            .expect("request task should finish")
+            .expect("relay token");
+
+        assert_eq!(response.token, "relay-token");
+        client.stop();
         server.await.expect("server");
     }
 }
