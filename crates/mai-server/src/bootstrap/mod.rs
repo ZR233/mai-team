@@ -234,6 +234,8 @@ mod tests {
                 id: "gpt-test".to_string(),
                 name: Some("gpt-test".to_string()),
                 context_tokens: 128_000,
+                max_context_tokens: None,
+                effective_context_window_percent: 95,
                 output_tokens: 16_000,
                 auto_compact_token_limit: None,
                 supports_tools: true,

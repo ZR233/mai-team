@@ -49,7 +49,7 @@
           <textarea
             v-model="dialog.form.modelsText"
             rows="10"
-            placeholder='[{"id":"gpt-5.5","context_tokens":256000,"output_tokens":128000}]'
+            placeholder='[{"id":"gpt-5.5","context_tokens":272000,"effective_context_window_percent":95,"output_tokens":128000}]'
           />
         </label>
         <label>

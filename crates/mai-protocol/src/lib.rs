@@ -989,6 +989,10 @@ pub struct ModelConfig {
     #[serde(default)]
     pub name: Option<String>,
     pub context_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u64>,
+    #[serde(default = "default_effective_context_window_percent")]
+    pub effective_context_window_percent: u64,
     pub output_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_compact_token_limit: Option<u64>,
@@ -1006,6 +1010,20 @@ pub struct ModelConfig {
     pub options: Value,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+}
+
+impl ModelConfig {
+    pub fn effective_context_tokens(&self) -> u64 {
+        let percent = self.effective_context_window_percent.min(100);
+        let context_tokens = if self.context_tokens > 0 {
+            Some(self.context_tokens)
+        } else {
+            self.max_context_tokens
+        };
+        context_tokens
+            .map(|value| value.saturating_mul(percent) / 100)
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1078,6 +1096,10 @@ impl Default for ModelRequestPolicy {
 
 fn default_chat_max_tokens_field() -> String {
     "max_tokens".to_string()
+}
+
+fn default_effective_context_window_percent() -> u64 {
+    95
 }
 
 fn is_null(value: &Value) -> bool {
@@ -1224,6 +1246,10 @@ pub struct ResolvedAgentModelPreference {
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     pub context_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u64>,
+    #[serde(default = "default_effective_context_window_percent")]
+    pub effective_context_window_percent: u64,
     pub output_tokens: u64,
 }
 

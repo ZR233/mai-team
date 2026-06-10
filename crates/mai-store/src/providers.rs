@@ -51,6 +51,10 @@ struct ModelToml {
     #[serde(default)]
     name: Option<String>,
     context_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_context_tokens: Option<u64>,
+    #[serde(default = "default_effective_context_window_percent")]
+    effective_context_window_percent: u64,
     output_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auto_compact_token_limit: Option<u64>,
@@ -365,6 +369,8 @@ impl ModelToml {
         Self {
             name: model.name,
             context_tokens: model.context_tokens,
+            max_context_tokens: model.max_context_tokens,
+            effective_context_window_percent: model.effective_context_window_percent,
             output_tokens: model.output_tokens,
             auto_compact_token_limit: model.auto_compact_token_limit,
             supports_tools: model.supports_tools,
@@ -386,6 +392,8 @@ impl ModelToml {
             id,
             name: self.name,
             context_tokens,
+            max_context_tokens: self.max_context_tokens,
+            effective_context_window_percent: self.effective_context_window_percent,
             output_tokens: self.output_tokens,
             auto_compact_token_limit: self.auto_compact_token_limit,
             supports_tools: self.supports_tools,
@@ -430,7 +438,7 @@ fn migrated_context_tokens(
     context_tokens: u64,
 ) -> u64 {
     match provider_kind {
-        ProviderKind::Openai if model_id == "gpt-5.5" && context_tokens == 400_000 => 256_000,
+        ProviderKind::Openai if model_id == "gpt-5.5" && context_tokens == 400_000 => 272_000,
         ProviderKind::Openai
         | ProviderKind::Deepseek
         | ProviderKind::Mimo
@@ -521,15 +529,17 @@ fn builtin_provider(kind: ProviderKind) -> ProviderConfig {
             default_model: "gpt-5.5".to_string(),
             enabled: true,
             models: vec![
-                openai_reasoning_model("gpt-5.5", 256_000, 128_000),
-                openai_reasoning_model("gpt-5.4", 400_000, 128_000),
-                openai_reasoning_model("gpt-5.4-mini", 400_000, 128_000),
-                openai_reasoning_model("gpt-5.4-nano", 400_000, 128_000),
-                openai_reasoning_model("gpt-5", 400_000, 128_000),
+                openai_reasoning_model("gpt-5.5", 272_000, Some(272_000), 128_000),
+                openai_reasoning_model("gpt-5.4", 272_000, Some(1_000_000), 128_000),
+                openai_reasoning_model("gpt-5.4-mini", 272_000, Some(272_000), 128_000),
+                openai_reasoning_model("gpt-5.4-nano", 272_000, Some(272_000), 128_000),
+                openai_reasoning_model("gpt-5", 272_000, Some(272_000), 128_000),
                 ModelConfig {
                     id: "gpt-4.1".to_string(),
                     name: Some("GPT-4.1".to_string()),
                     context_tokens: 1_047_576,
+                    max_context_tokens: Some(1_047_576),
+                    effective_context_window_percent: default_effective_context_window_percent(),
                     output_tokens: 32_768,
                     auto_compact_token_limit: None,
                     supports_tools: true,
@@ -614,7 +624,12 @@ fn mimo_builtin_provider(
     }
 }
 
-fn openai_reasoning_model(id: &str, context_tokens: u64, output_tokens: u64) -> ModelConfig {
+fn openai_reasoning_model(
+    id: &str,
+    context_tokens: u64,
+    max_context_tokens: Option<u64>,
+    output_tokens: u64,
+) -> ModelConfig {
     let mut variants = vec!["minimal", "low", "medium", "high"];
     if id.contains("5.4") || id.contains("5.5") {
         variants.push("xhigh");
@@ -623,6 +638,8 @@ fn openai_reasoning_model(id: &str, context_tokens: u64, output_tokens: u64) -> 
         id: id.to_string(),
         name: Some(id.to_string()),
         context_tokens,
+        max_context_tokens,
+        effective_context_window_percent: default_effective_context_window_percent(),
         output_tokens,
         auto_compact_token_limit: None,
         supports_tools: true,
@@ -640,6 +657,8 @@ fn deepseek_model(id: &str, with_reasoning: bool) -> ModelConfig {
         id: id.to_string(),
         name: Some(id.to_string()),
         context_tokens: deepseek_context_tokens(id),
+        max_context_tokens: None,
+        effective_context_window_percent: default_effective_context_window_percent(),
         output_tokens: deepseek_output_tokens(id),
         auto_compact_token_limit: None,
         supports_tools: true,
@@ -714,6 +733,8 @@ fn mimo_model(id: &str, with_reasoning: bool) -> ModelConfig {
         id: id.to_string(),
         name: Some(id.to_string()),
         context_tokens: mimo_context_tokens(id),
+        max_context_tokens: None,
+        effective_context_window_percent: default_effective_context_window_percent(),
         output_tokens: mimo_output_tokens(id),
         auto_compact_token_limit: None,
         supports_tools: true,
@@ -731,6 +752,8 @@ fn zhipu_model(id: &str) -> ModelConfig {
         id: id.to_string(),
         name: Some(id.to_string()),
         context_tokens: zhipu_context_tokens(id),
+        max_context_tokens: None,
+        effective_context_window_percent: default_effective_context_window_percent(),
         output_tokens: zhipu_output_tokens(id),
         auto_compact_token_limit: None,
         supports_tools: true,
@@ -868,6 +891,8 @@ fn fallback_model(id: &str) -> ModelConfig {
         id: id.to_string(),
         name: Some(id.to_string()),
         context_tokens: 128_000,
+        max_context_tokens: None,
+        effective_context_window_percent: default_effective_context_window_percent(),
         output_tokens: 8_192,
         auto_compact_token_limit: None,
         supports_tools: true,
@@ -898,6 +923,10 @@ fn normalized_id(value: &str) -> String {
 
 fn is_null(value: &serde_json::Value) -> bool {
     value.is_null()
+}
+
+fn default_effective_context_window_percent() -> u64 {
+    95
 }
 
 fn validate_providers_toml(file: &ProvidersToml) -> Result<()> {

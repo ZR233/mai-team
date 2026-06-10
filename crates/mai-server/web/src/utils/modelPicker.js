@@ -12,11 +12,36 @@ export function filterModels(models, query) {
 
 export function modelOptionSummary(model) {
   const parts = []
-  const contextTokens = Number(model?.context_tokens || 0)
+  const contextTokens = effectiveContextTokens(model)
   if (contextTokens) parts.push(`${formatCompactNumber(contextTokens)} context`)
   if (model?.supports_tools) parts.push('tools')
   if (reasoningOptionsFor(null, model).length) parts.push('reasoning')
   return parts.join(' · ')
+}
+
+export function effectiveContextTokens(model) {
+  const contextTokens = positiveNumber(model?.context_tokens)
+  if (contextTokens) {
+    const effectiveContextWindowPercent = positiveNumber(model?.effective_context_window_percent)
+    if (effectiveContextWindowPercent) {
+      return Math.floor(
+        contextTokens * Math.min(effectiveContextWindowPercent, 100) / 100
+      )
+    }
+    return contextTokens
+  }
+
+  const maxContextTokens = positiveNumber(model?.max_context_tokens)
+  if (maxContextTokens) {
+    const effectiveContextWindowPercent = positiveNumber(model?.effective_context_window_percent)
+    return effectiveContextWindowPercent
+      ? Math.floor(
+        maxContextTokens * Math.min(effectiveContextWindowPercent, 100) / 100
+      )
+      : maxContextTokens
+  }
+
+  return 0
 }
 
 export function resolveModelSelection(providers, providerId, model, reasoningEffort) {
@@ -46,6 +71,11 @@ function formatCompactNumber(value) {
   if (value >= 1_000_000) return `${trimNumber(value / 1_000_000)}M`
   if (value >= 1_000) return `${trimNumber(value / 1_000)}K`
   return String(Math.round(value))
+}
+
+function positiveNumber(value) {
+  const number = Number(value || 0)
+  return Number.isFinite(number) && number > 0 ? number : 0
 }
 
 function trimNumber(value) {

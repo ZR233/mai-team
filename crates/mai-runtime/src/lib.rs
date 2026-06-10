@@ -2859,7 +2859,7 @@ impl agents::AgentServiceOps for AgentRuntime {
             .resolve_provider(Some(provider_id), Some(model))
             .await
             .ok()
-            .map(|selection| selection.model.context_tokens)
+            .map(|selection| selection.model.effective_context_tokens())
     }
 
     async fn resolve_session_id(
@@ -4596,6 +4596,8 @@ fn resolved_agent_model_preference(
         model_name: selection.model.name,
         reasoning_effort,
         context_tokens: selection.model.context_tokens,
+        max_context_tokens: selection.model.max_context_tokens,
+        effective_context_window_percent: selection.model.effective_context_window_percent,
         output_tokens: selection.model.output_tokens,
     }
 }

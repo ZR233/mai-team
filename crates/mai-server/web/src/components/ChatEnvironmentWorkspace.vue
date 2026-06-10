@@ -170,6 +170,7 @@ import { useApi } from '../composables/useApi'
 import { formatDate, formatStatus, statusTone } from '../utils/format'
 import { buildAgentTimeline } from '../utils/timeline'
 import { defaultReasoningEffort, reasoningOptionsFor } from '../utils/reasoning'
+import { effectiveContextTokens } from '../utils/modelPicker'
 import { chatContainerState } from '../utils/chatContainerState'
 
 const props = defineProps({
@@ -281,7 +282,7 @@ const latestActivity = computed(() => {
 })
 const contextCapacity = computed(() => {
   const usage = agent.value?.context_usage
-  const total = Number(usage?.context_tokens || currentModel.value?.context_tokens || 0)
+  const total = Number(usage?.context_tokens || effectiveContextTokens(currentModel.value) || 0)
   if (!total) {
     return {
       visible: false,

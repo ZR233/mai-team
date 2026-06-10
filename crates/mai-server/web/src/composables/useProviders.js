@@ -146,6 +146,8 @@ export function useProviders() {
       ...model,
       id: String(model.id || '').trim(),
       context_tokens: Number(model.context_tokens || 0),
+      max_context_tokens: model.max_context_tokens == null ? null : Number(model.max_context_tokens),
+      effective_context_window_percent: Number(model.effective_context_window_percent || 95),
       output_tokens: Number(model.output_tokens || 0),
       supports_tools: model.supports_tools !== false,
       reasoning: normalizeReasoning(model),

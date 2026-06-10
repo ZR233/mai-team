@@ -103,6 +103,7 @@ import { useApi } from '../composables/useApi'
 import {
   buildAgentTimeline
 } from '../utils/timeline'
+import { effectiveContextTokens } from '../utils/modelPicker'
 
 const props = defineProps({
   detail: { type: Object, default: null },
@@ -181,7 +182,7 @@ const latestActivity = computed(() => {
 })
 const contextCapacity = computed(() => {
   const usage = props.detail?.context_usage
-  const total = Number(usage?.context_tokens || currentModel.value?.context_tokens || 0)
+  const total = Number(usage?.context_tokens || effectiveContextTokens(currentModel.value) || 0)
   if (!total) {
     return {
       visible: false,

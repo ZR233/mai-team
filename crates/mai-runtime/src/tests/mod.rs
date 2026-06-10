@@ -20,7 +20,9 @@ fn test_model(id: &str) -> ModelConfig {
     ModelConfig {
         id: id.to_string(),
         name: Some(id.to_string()),
-        context_tokens: if id == "gpt-5.5" { 256_000 } else { 400_000 },
+        context_tokens: 272_000,
+        max_context_tokens: None,
+        effective_context_window_percent: 95,
         output_tokens: 128_000,
         auto_compact_token_limit: None,
         supports_tools: true,
@@ -72,6 +74,8 @@ fn deepseek_test_provider() -> ProviderConfig {
             id: "deepseek-v4-pro".to_string(),
             name: Some("deepseek-v4-pro".to_string()),
             context_tokens: 1_000_000,
+            max_context_tokens: None,
+            effective_context_window_percent: 95,
             output_tokens: 384_000,
             auto_compact_token_limit: None,
             supports_tools: true,
@@ -4827,7 +4831,7 @@ async fn sessions_are_created_and_selected_independently() {
             .context_usage
             .as_ref()
             .map(|usage| usage.context_tokens),
-        Some(256_000)
+        Some(258_400)
     );
     assert_eq!(
         detail
@@ -4920,7 +4924,7 @@ async fn agent_detail_uses_deepseek_v4_context_tokens() {
             .context_usage
             .as_ref()
             .map(|usage| usage.context_tokens),
-        Some(1_000_000)
+        Some(950_000)
     );
     assert_eq!(
         detail.context_usage.as_ref().map(|usage| usage.used_tokens),

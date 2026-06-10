@@ -144,7 +144,9 @@ fn test_model(id: &str) -> ModelConfig {
     ModelConfig {
         id: id.to_string(),
         name: Some(id.to_string()),
-        context_tokens: if id == "gpt-5.5" { 256_000 } else { 400_000 },
+        context_tokens: 272_000,
+        max_context_tokens: None,
+        effective_context_window_percent: 95,
         output_tokens: 128_000,
         auto_compact_token_limit: None,
         supports_tools: true,
@@ -580,7 +582,9 @@ async fn provider_presets_include_builtin_metadata() {
         .iter()
         .find(|model| model.id == "gpt-5.5")
         .expect("gpt-5.5 preset");
-    assert_eq!(gpt_5_5.context_tokens, 256_000);
+    assert_eq!(gpt_5_5.context_tokens, 272_000);
+    assert_eq!(gpt_5_5.max_context_tokens, Some(272_000));
+    assert_eq!(gpt_5_5.effective_context_window_percent, 95);
     assert_eq!(gpt_5_5.output_tokens, 128_000);
     assert!(openai.models.iter().any(|model| model.id == "gpt-5.4-mini"));
     assert_eq!(deepseek.default_model, "deepseek-v4-flash");
@@ -777,6 +781,7 @@ async fn provider_toml_preserves_custom_model_metadata() {
         .find(|model| model.id == "custom-chat")
         .expect("custom model");
     assert_eq!(model.context_tokens, 123_456);
+    assert_eq!(model.max_context_tokens, None);
     assert_eq!(model.auto_compact_token_limit, Some(98_765));
     assert!(!model.supports_tools);
     assert_eq!(model.options["temperature"], json!(0.2));
@@ -784,7 +789,7 @@ async fn provider_toml_preserves_custom_model_metadata() {
 }
 
 #[tokio::test]
-async fn legacy_openai_gpt_5_5_context_tokens_migrate_to_256k() {
+async fn legacy_openai_gpt_5_5_context_tokens_migrate_to_272k() {
     let dir = tempdir().expect("tempdir");
     let config_path = dir.path().join("config.toml");
     std::fs::write(
@@ -819,12 +824,12 @@ async fn legacy_openai_gpt_5_5_context_tokens_migrate_to_256k() {
         .iter()
         .find(|model| model.id == "gpt-5.5")
         .expect("gpt-5.5");
-    assert_eq!(model.context_tokens, 256_000);
+    assert_eq!(model.context_tokens, 272_000);
     let selection = store
         .resolve_provider(Some("openai"), Some("gpt-5.5"))
         .await
         .expect("resolve");
-    assert_eq!(selection.model.context_tokens, 256_000);
+    assert_eq!(selection.model.context_tokens, 272_000);
 }
 
 #[tokio::test]
@@ -847,6 +852,7 @@ async fn custom_openai_gpt_5_5_context_tokens_are_preserved() {
         .find(|model| model.id == "gpt-5.5")
         .expect("gpt-5.5");
     assert_eq!(model.context_tokens, 123_456);
+    assert_eq!(model.effective_context_window_percent, 95);
 }
 
 #[tokio::test]

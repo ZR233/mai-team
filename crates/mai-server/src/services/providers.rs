@@ -377,7 +377,9 @@ pub(crate) fn provider_test_model(id: &str) -> ModelConfig {
     ModelConfig {
         id: id.to_string(),
         name: Some(id.to_string()),
-        context_tokens: if id == "gpt-5.5" { 256_000 } else { 400_000 },
+        context_tokens: 272_000,
+        max_context_tokens: None,
+        effective_context_window_percent: 95,
         output_tokens: 128_000,
         auto_compact_token_limit: None,
         supports_tools: true,

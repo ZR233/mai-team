@@ -15,7 +15,8 @@ const providers = [
       {
         id: 'gpt-5.5',
         name: 'GPT-5.5',
-        context_tokens: 256000,
+        context_tokens: 272000,
+        effective_context_window_percent: 95,
         output_tokens: 128000,
         supports_tools: true,
         reasoning: {
@@ -29,7 +30,8 @@ const providers = [
       {
         id: 'gpt-5.4-mini',
         name: 'GPT-5.4 Mini',
-        context_tokens: 128000,
+        context_tokens: 400000,
+        effective_context_window_percent: 16,
         output_tokens: 32000,
         supports_tools: true
       }
@@ -61,7 +63,8 @@ assert.deepEqual(
 )
 assert.deepEqual(filterModels(providers[0].models, 'missing'), [])
 
-assert.equal(modelOptionSummary(providers[0].models[0]), '256K context · tools · reasoning')
+assert.equal(modelOptionSummary(providers[0].models[0]), '258K context · tools · reasoning')
+assert.equal(modelOptionSummary(providers[0].models[1]), '64K context · tools')
 assert.equal(modelOptionSummary(providers[1].models[0]), '64K context')
 
 assert.deepEqual(resolveModelSelection(providers, 'openai', '', ''), {

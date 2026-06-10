@@ -366,6 +366,8 @@ mod tests {
             id: id.to_string(),
             name: Some(id.to_string()),
             context_tokens: 1_000_000,
+            max_context_tokens: None,
+            effective_context_window_percent: 95,
             output_tokens: 384_000,
             auto_compact_token_limit: None,
             supports_tools: true,
