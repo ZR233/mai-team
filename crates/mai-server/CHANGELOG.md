@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.12...mai-server-v0.1.13) - 2026-06-10
+
+### Added
+
+- 添加 max_context_tokens 和 effective_context_window_percent 字段，优化模型配置
+- enhance context compaction logic and introduce auto-compaction limits
+
 ## [0.1.12](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.11...mai-server-v0.1.12) - 2026-06-09
 
 ### Added
