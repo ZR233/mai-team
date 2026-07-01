@@ -1,10 +1,10 @@
 use super::*;
 use chrono::TimeDelta;
-use mai_model::ModelClientConfig;
 use mai_protocol::{
     GitProvider, ModelConfig, ModelReasoningConfig, ModelReasoningVariant, ProjectReviewDecision,
     ProviderConfig, ProviderKind, ProvidersConfigRequest,
 };
+use pl_protocol::{Message, MessageContent, MessageRole as PlMessageRole, ToolResultMetadata};
 use pretty_assertions::assert_eq;
 use state::TurnControl;
 use std::fs;
@@ -15,6 +15,36 @@ use turn::completion::TurnResult;
 mod project_github_tools;
 mod project_mcp;
 mod turn_runtime;
+
+fn pl_text(message: &Message) -> &str {
+    match &message.content {
+        MessageContent::Text(text) => text,
+        MessageContent::MultiPart(_) => "",
+    }
+}
+
+fn pl_tool_result_call_id(message: &Message) -> Option<String> {
+    ToolResultMetadata::from_metadata(&message.metadata)
+        .ok()
+        .map(|metadata| metadata.tool_call_id)
+}
+
+fn pl_tool_call_ids(message: &Message) -> Vec<String> {
+    message
+        .metadata
+        .get(pl_protocol::TOOL_CALLS_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| {
+            item.get("id")
+                .or_else(|| item.get("call_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
 
 fn test_model(id: &str) -> ModelConfig {
     ModelConfig {
@@ -344,6 +374,7 @@ async fn write_mock_response(
         .write_all(reply.as_bytes())
         .await
         .expect("write response");
+    stream.shutdown().await.expect("shutdown response");
 }
 
 fn mock_sse_body(response: &Value) -> String {
@@ -362,6 +393,17 @@ fn mock_sse_body(response: &Value) -> String {
         .flatten()
         .enumerate()
     {
+        let mut item = item.clone();
+        if let Some(object) = item.as_object_mut()
+            && object.get("type").and_then(Value::as_str) == Some("message")
+        {
+            object
+                .entry("id".to_string())
+                .or_insert_with(|| json!(format!("msg_{index}")));
+            object
+                .entry("role".to_string())
+                .or_insert_with(|| json!("assistant"));
+        }
         events.push(json!({
             "type": "response.output_item.done",
             "output_index": index,
@@ -377,13 +419,8 @@ fn mock_sse_body(response: &Value) -> String {
     }));
     events
         .into_iter()
-        .map(|event| {
-            let kind = event
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("message");
-            format!("event: {kind}\ndata: {event}\n\n")
-        })
+        .map(|event| format!("data: {event}\n\n"))
+        .chain(std::iter::once("data: [DONE]\n\n".to_string()))
         .collect()
 }
 
@@ -2225,84 +2262,81 @@ fn compact_summary_uses_last_non_empty_assistant_output() {
 #[test]
 fn repair_adds_missing_tool_outputs_for_function_call_after_reasoning() {
     let mut history = vec![
-        ModelInputItem::user_text("do something"),
-        ModelInputItem::Reasoning {
-            content: "thinking".to_string(),
-        },
-        ModelInputItem::FunctionCall {
-            call_id: "call_1".to_string(),
-            name: "container_exec".to_string(),
-            arguments: "{}".to_string(),
-        },
+        turn::history::user_text_message("do something"),
+        turn::history::reasoning_message("thinking"),
+        turn::history::tool_call_message(
+            "call_1".to_string(),
+            "container_exec".to_string(),
+            "{}".to_string(),
+        ),
     ];
     turn::history::repair_incomplete_tool_history(&mut history);
     assert_eq!(history.len(), 4);
-    assert!(matches!(
-        &history[3],
-        ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_1"
-    ));
+    assert_eq!(
+        pl_tool_result_call_id(&history[3]).as_deref(),
+        Some("call_1")
+    );
 }
 
 #[test]
 fn repair_adds_missing_tool_outputs_for_partial_results() {
     let mut history = vec![
-        ModelInputItem::FunctionCall {
-            call_id: "call_1".to_string(),
-            name: "container_exec".to_string(),
-            arguments: "{}".to_string(),
-        },
-        ModelInputItem::FunctionCallOutput {
-            call_id: "call_1".to_string(),
-            output: "done".to_string(),
-        },
-        ModelInputItem::FunctionCall {
-            call_id: "call_2".to_string(),
-            name: "wait_agent".to_string(),
-            arguments: "{}".to_string(),
-        },
+        turn::history::tool_call_message(
+            "call_1".to_string(),
+            "container_exec".to_string(),
+            "{}".to_string(),
+        ),
+        turn::history::tool_result_message(
+            "call_1".to_string(),
+            "container_exec".to_string(),
+            "{}".to_string(),
+            "done".to_string(),
+        ),
+        turn::history::tool_call_message(
+            "call_2".to_string(),
+            "wait_agent".to_string(),
+            "{}".to_string(),
+        ),
     ];
     turn::history::repair_incomplete_tool_history(&mut history);
     assert_eq!(history.len(), 4);
-    assert!(matches!(
-        &history[3],
-        ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_2"
-    ));
+    assert_eq!(
+        pl_tool_result_call_id(&history[3]).as_deref(),
+        Some("call_2")
+    );
 }
 
 #[test]
 fn repair_adds_missing_tool_outputs_for_function_call() {
-    let mut history = vec![ModelInputItem::FunctionCall {
-        call_id: "call_a".to_string(),
-        name: "container_exec".to_string(),
-        arguments: "{}".to_string(),
-    }];
+    let mut history = vec![turn::history::tool_call_message(
+        "call_a".to_string(),
+        "container_exec".to_string(),
+        "{}".to_string(),
+    )];
     turn::history::repair_incomplete_tool_history(&mut history);
     assert_eq!(history.len(), 2);
-    assert!(matches!(
-        &history[1],
-        ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_a"
-    ));
+    assert_eq!(
+        pl_tool_result_call_id(&history[1]).as_deref(),
+        Some("call_a")
+    );
 }
 
 #[test]
 fn repair_does_nothing_for_complete_history() {
     let mut history = vec![
-        ModelInputItem::user_text("run"),
-        ModelInputItem::FunctionCall {
-            call_id: "call_1".to_string(),
-            name: "container_exec".to_string(),
-            arguments: "{}".to_string(),
-        },
-        ModelInputItem::FunctionCallOutput {
-            call_id: "call_1".to_string(),
-            output: "ok".to_string(),
-        },
-        ModelInputItem::Message {
-            role: "assistant".to_string(),
-            content: vec![ModelContentItem::OutputText {
-                text: "done".to_string(),
-            }],
-        },
+        turn::history::user_text_message("run"),
+        turn::history::tool_call_message(
+            "call_1".to_string(),
+            "container_exec".to_string(),
+            "{}".to_string(),
+        ),
+        turn::history::tool_result_message(
+            "call_1".to_string(),
+            "container_exec".to_string(),
+            "{}".to_string(),
+            "ok".to_string(),
+        ),
+        turn::history::assistant_text_message("done"),
     ];
     turn::history::repair_incomplete_tool_history(&mut history);
     assert_eq!(history.len(), 4);
@@ -2310,7 +2344,7 @@ fn repair_does_nothing_for_complete_history() {
 
 #[test]
 fn repair_does_nothing_for_empty_history() {
-    let mut history: Vec<ModelInputItem> = vec![];
+    let mut history: Vec<Message> = vec![];
     turn::history::repair_incomplete_tool_history(&mut history);
     assert!(history.is_empty());
 }
@@ -2318,127 +2352,114 @@ fn repair_does_nothing_for_empty_history() {
 #[test]
 fn repair_inserts_before_user_message() {
     let mut history = vec![
-        ModelInputItem::user_text("do something"),
-        ModelInputItem::FunctionCall {
-            call_id: "call_1".to_string(),
-            name: "container_exec".to_string(),
-            arguments: "{}".to_string(),
-        },
-        ModelInputItem::user_text("继续"),
+        turn::history::user_text_message("do something"),
+        turn::history::tool_call_message(
+            "call_1".to_string(),
+            "container_exec".to_string(),
+            "{}".to_string(),
+        ),
+        turn::history::user_text_message("继续"),
     ];
     turn::history::repair_incomplete_tool_history(&mut history);
-    // Should be: user, FunctionCall, FunctionCallOutput, user("继续")
     assert_eq!(history.len(), 4);
-    assert!(matches!(
-        &history[2],
-        ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_1"
-    ));
-    assert!(matches!(
-        &history[3],
-        ModelInputItem::Message { role, .. } if role == "user"
-    ));
+    assert_eq!(
+        pl_tool_result_call_id(&history[2]).as_deref(),
+        Some("call_1")
+    );
+    assert_eq!(history[3].role, PlMessageRole::User);
 }
 
 #[test]
 fn repair_inserts_partial_before_user_message() {
     let mut history = vec![
-        ModelInputItem::FunctionCall {
-            call_id: "call_1".to_string(),
-            name: "exec".to_string(),
-            arguments: "{}".to_string(),
-        },
-        ModelInputItem::FunctionCallOutput {
-            call_id: "call_1".to_string(),
-            output: "ok".to_string(),
-        },
-        ModelInputItem::FunctionCall {
-            call_id: "call_2".to_string(),
-            name: "read".to_string(),
-            arguments: "{}".to_string(),
-        },
-        ModelInputItem::user_text("继续"),
+        turn::history::tool_call_message(
+            "call_1".to_string(),
+            "exec".to_string(),
+            "{}".to_string(),
+        ),
+        turn::history::tool_result_message(
+            "call_1".to_string(),
+            "exec".to_string(),
+            "{}".to_string(),
+            "ok".to_string(),
+        ),
+        turn::history::tool_call_message(
+            "call_2".to_string(),
+            "read".to_string(),
+            "{}".to_string(),
+        ),
+        turn::history::user_text_message("继续"),
     ];
     turn::history::repair_incomplete_tool_history(&mut history);
-    // Should be: FunctionCall(call_1), FCO(call_1), FunctionCall(call_2), FCO(call_2), user("继续")
     assert_eq!(history.len(), 5);
-    assert!(matches!(
-        &history[3],
-        ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_2"
-    ));
-    assert!(matches!(
-        &history[4],
-        ModelInputItem::Message { role, .. } if role == "user"
-    ));
+    assert_eq!(
+        pl_tool_result_call_id(&history[3]).as_deref(),
+        Some("call_2")
+    );
+    assert_eq!(history[4].role, PlMessageRole::User);
 }
 
 #[test]
 fn repair_keeps_consecutive_function_calls_in_one_batch() {
     let mut history = vec![
-        ModelInputItem::Reasoning {
-            content: "thinking".to_string(),
-        },
-        ModelInputItem::FunctionCall {
-            call_id: "call_1".to_string(),
-            name: "exec".to_string(),
-            arguments: "{}".to_string(),
-        },
-        ModelInputItem::FunctionCall {
-            call_id: "call_2".to_string(),
-            name: "read".to_string(),
-            arguments: "{}".to_string(),
-        },
-        ModelInputItem::FunctionCallOutput {
-            call_id: "call_2".to_string(),
-            output: "ok".to_string(),
-        },
-        ModelInputItem::user_text("继续"),
+        turn::history::reasoning_message("thinking"),
+        turn::history::tool_call_message(
+            "call_1".to_string(),
+            "exec".to_string(),
+            "{}".to_string(),
+        ),
+        turn::history::tool_call_message(
+            "call_2".to_string(),
+            "read".to_string(),
+            "{}".to_string(),
+        ),
+        turn::history::tool_result_message(
+            "call_2".to_string(),
+            "read".to_string(),
+            "{}".to_string(),
+            "ok".to_string(),
+        ),
+        turn::history::user_text_message("继续"),
     ];
     turn::history::repair_incomplete_tool_history(&mut history);
 
     assert_eq!(history.len(), 6);
-    assert!(matches!(
-        &history[1],
-        ModelInputItem::FunctionCall { call_id, .. } if call_id == "call_1"
-    ));
-    assert!(matches!(
-        &history[2],
-        ModelInputItem::FunctionCall { call_id, .. } if call_id == "call_2"
-    ));
-    assert!(matches!(
-        &history[3],
-        ModelInputItem::FunctionCallOutput { call_id, output }
-            if call_id == "call_2" && output == "ok"
-    ));
-    assert!(matches!(
-        &history[4],
-        ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_1"
-    ));
-    assert!(matches!(
-        &history[5],
-        ModelInputItem::Message { role, .. } if role == "user"
-    ));
+    assert_eq!(pl_tool_call_ids(&history[1]), vec!["call_1"]);
+    assert_eq!(pl_tool_call_ids(&history[2]), vec!["call_2"]);
+    assert_eq!(
+        pl_tool_result_call_id(&history[3]).as_deref(),
+        Some("call_2")
+    );
+    assert_eq!(pl_text(&history[3]), "ok");
+    assert_eq!(
+        pl_tool_result_call_id(&history[4]).as_deref(),
+        Some("call_1")
+    );
+    assert_eq!(history[5].role, PlMessageRole::User);
 }
 
 #[test]
 fn compacted_history_keeps_recent_user_messages_assistant_and_tool_summary() {
     let history = vec![
-        ModelInputItem::user_text("first user"),
-        ModelInputItem::assistant_text("assistant old"),
-        ModelInputItem::user_text(turn::history::compact_summary_message(
+        turn::history::user_text_message("first user"),
+        turn::history::assistant_text_message("assistant old"),
+        turn::history::user_text_message(turn::history::compact_summary_message(
             "old summary",
             COMPACT_SUMMARY_PREFIX,
         )),
-        ModelInputItem::FunctionCall {
-            call_id: "call_1".to_string(),
-            name: "container_exec".to_string(),
-            arguments: "{}".to_string(),
-        },
-        ModelInputItem::FunctionCallOutput {
-            call_id: "call_1".to_string(),
-            output: format!("{}{}", "x".repeat(12_000), "tool tail"),
-        },
-        ModelInputItem::assistant_text("assistant recent"),
-        ModelInputItem::user_text("second user"),
+        turn::history::tool_call_message(
+            "call_1".to_string(),
+            "container_exec".to_string(),
+            "{}".to_string(),
+        ),
+        turn::history::tool_result_message(
+            "call_1".to_string(),
+            "container_exec".to_string(),
+            "{}".to_string(),
+            format!("{}{}", "x".repeat(12_000), "tool tail"),
+        ),
+        turn::history::assistant_text_message("assistant recent"),
+        turn::history::user_text_message("second user"),
     ];
 
     let compacted = turn::history::build_compacted_history(
@@ -2448,65 +2469,40 @@ fn compacted_history_keeps_recent_user_messages_assistant_and_tool_summary() {
         COMPACT_SUMMARY_PREFIX,
     );
     assert!(compacted.len() >= 5);
-    assert!(matches!(
-        &compacted[0],
-        ModelInputItem::Message { content, .. }
-            if matches!(&content[0], ModelContentItem::InputText { text } if text == "first user")
-    ));
-    assert!(matches!(
-        compacted
-            .iter()
-            .find(|item| matches!(item, ModelInputItem::Message { role, .. } if role == "user"))
-            .expect("recent user message"),
-        ModelInputItem::Message { content, .. }
-            if matches!(&content[0], ModelContentItem::InputText { text } if text == "first user")
-    ));
-    assert!(compacted.iter().any(|item| matches!(
-        item,
-        ModelInputItem::Message { role, content }
-            if role == "assistant"
-                && matches!(&content[0], ModelContentItem::OutputText { text } if text == "assistant recent")
-    )));
+    assert_eq!(pl_text(&compacted[0]), "first user");
+    assert!(compacted.iter().any(|item| {
+        item.role == PlMessageRole::User && pl_text(item) == "first user"
+    }));
+    assert!(compacted.iter().any(|item| {
+        item.role == PlMessageRole::Assistant && pl_text(item) == "assistant recent"
+    }));
     assert!(
         !compacted
             .iter()
-            .any(|item| matches!(item, ModelInputItem::FunctionCallOutput { .. }))
+            .any(|item| item.role == PlMessageRole::Tool)
     );
-    assert!(compacted.iter().any(|item| matches!(
-        item,
-        ModelInputItem::Message { role, content }
-            if role == "user"
-                && matches!(&content[0], ModelContentItem::InputText { text }
-                    if text.contains("Recent tool result")
-                        && text.contains("tool output truncated")
-                        && text.contains("tool tail")
-                        && text.len() < 12_000)
-    )));
-    assert!(matches!(
-        compacted
-            .iter()
-            .find(|item| matches!(
-                item,
-                ModelInputItem::Message { role, content }
-                    if role == "user"
-                        && matches!(&content[0], ModelContentItem::InputText { text } if text == "second user")
-            ))
-            .expect("second user"),
-        ModelInputItem::Message { content, .. }
-            if matches!(&content[0], ModelContentItem::InputText { text } if text == "second user")
-    ));
-    assert!(matches!(
-        compacted.last().expect("summary"),
-        ModelInputItem::Message { content, .. }
-            if matches!(&content[0], ModelContentItem::InputText { text } if text.contains("new summary") && turn::history::is_compact_summary(text, COMPACT_SUMMARY_PREFIX))
-    ));
+    assert!(compacted.iter().any(|item| {
+        item.role == PlMessageRole::User
+            && pl_text(item).contains("Recent tool result")
+            && pl_text(item).contains("tool output truncated")
+            && pl_text(item).contains("tool tail")
+            && pl_text(item).len() < 12_000
+    }));
+    assert!(compacted.iter().any(|item| {
+        item.role == PlMessageRole::User && pl_text(item) == "second user"
+    }));
+    let summary = compacted.last().expect("summary");
+    assert!(
+        pl_text(summary).contains("new summary")
+            && turn::history::is_compact_summary(pl_text(summary), COMPACT_SUMMARY_PREFIX)
+    );
 }
 
 #[test]
 fn recent_user_messages_truncates_from_oldest_side() {
     let history = vec![
-        ModelInputItem::user_text("abcdef"),
-        ModelInputItem::user_text("ghij"),
+        turn::history::user_text_message("abcdef"),
+        turn::history::user_text_message("ghij"),
     ];
 
     assert_eq!(
@@ -2575,7 +2571,12 @@ async fn restores_persisted_agents_and_continues_event_sequence() {
         .await
         .expect("save message");
     store
-        .append_agent_history_item(agent_id, session_id, 0, &ModelInputItem::user_text("hello"))
+        .append_agent_history_item(
+            agent_id,
+            session_id,
+            0,
+            &turn::history::user_text_message("hello"),
+        )
         .await
         .expect("save history");
     store
@@ -2809,11 +2810,11 @@ async fn tool_trace_returns_full_history_with_event_metadata() {
             agent_id,
             session_id,
             0,
-            &ModelInputItem::FunctionCall {
-                call_id: "call_1".to_string(),
-                name: "container_exec".to_string(),
-                arguments: r#"{"command":"printf hello","cwd":"/workspace"}"#.to_string(),
-            },
+            &turn::history::tool_call_message(
+                "call_1".to_string(),
+                "container_exec".to_string(),
+                r#"{"command":"printf hello","cwd":"/workspace"}"#.to_string(),
+            ),
         )
         .await
         .expect("save call");
@@ -2822,10 +2823,12 @@ async fn tool_trace_returns_full_history_with_event_metadata() {
             agent_id,
             session_id,
             1,
-            &ModelInputItem::FunctionCallOutput {
-                call_id: "call_1".to_string(),
-                output: r#"{"status":0,"stdout":"hello","stderr":""}"#.to_string(),
-            },
+            &turn::history::tool_result_message(
+                "call_1".to_string(),
+                "container_exec".to_string(),
+                r#"{"command":"printf hello","cwd":"/workspace"}"#.to_string(),
+                r#"{"status":0,"stdout":"hello","stderr":""}"#.to_string(),
+            ),
         )
         .await
         .expect("save output");
@@ -2990,11 +2993,11 @@ async fn tool_trace_finds_calls_stored_in_function_call_items() {
             agent_id,
             session_id,
             0,
-            &ModelInputItem::FunctionCall {
-                call_id: "call_nested".to_string(),
-                name: "container_exec".to_string(),
-                arguments: r#"{"command":"pwd"}"#.to_string(),
-            },
+            &turn::history::tool_call_message(
+                "call_nested".to_string(),
+                "container_exec".to_string(),
+                r#"{"command":"pwd"}"#.to_string(),
+            ),
         )
         .await
         .expect("save function call");
@@ -3003,10 +3006,12 @@ async fn tool_trace_finds_calls_stored_in_function_call_items() {
             agent_id,
             session_id,
             1,
-            &ModelInputItem::FunctionCallOutput {
-                call_id: "call_nested".to_string(),
-                output: r#"{"status":0,"stdout":"/workspace\n","stderr":""}"#.to_string(),
-            },
+            &turn::history::tool_result_message(
+                "call_nested".to_string(),
+                "container_exec".to_string(),
+                r#"{"command":"pwd"}"#.to_string(),
+                r#"{"status":0,"stdout":"/workspace\n","stderr":""}"#.to_string(),
+            ),
         )
         .await
         .expect("save output");
@@ -3071,8 +3076,8 @@ async fn auto_compact_failure_keeps_original_history() {
         .expect("save agent");
     save_test_session(&store, agent_id, session_id).await;
     let original_history = [
-        ModelInputItem::user_text("original request"),
-        ModelInputItem::assistant_text("original answer"),
+        turn::history::user_text_message("original request"),
+        turn::history::assistant_text_message("original answer"),
     ];
     for (position, item) in original_history.iter().enumerate() {
         store
@@ -3113,16 +3118,8 @@ async fn auto_compact_failure_keeps_original_history() {
         .await
         .expect("history");
     assert_eq!(history.len(), original_history.len());
-    assert!(matches!(
-        &history[0],
-        ModelInputItem::Message { content, .. }
-            if matches!(&content[0], ModelContentItem::InputText { text } if text == "original request")
-    ));
-    assert!(matches!(
-        &history[1],
-        ModelInputItem::Message { content, .. }
-            if matches!(&content[0], ModelContentItem::OutputText { text } if text == "original answer")
-    ));
+    assert_eq!(pl_text(&history[0]), "original request");
+    assert_eq!(pl_text(&history[1]), "original answer");
     assert_eq!(
         store
             .load_runtime_snapshot(10)
@@ -3169,7 +3166,7 @@ async fn auto_compact_records_replacement_context_tokens() {
             agent_id,
             session_id,
             0,
-            &ModelInputItem::user_text("request"),
+            &turn::history::user_text_message("request"),
         )
         .await
         .expect("append user");
@@ -3241,7 +3238,10 @@ async fn auto_compact_retries_with_reduced_history_when_context_window_fails() {
                 agent_id,
                 session_id,
                 index,
-                &ModelInputItem::user_text(format!("request {index} {}", "x".repeat(500))),
+                &turn::history::user_text_message(format!(
+                    "request {index} {}",
+                    "x".repeat(500)
+                )),
             )
             .await
             .expect("append history");
@@ -3274,12 +3274,9 @@ async fn auto_compact_retries_with_reduced_history_when_context_window_fails() {
         .load_agent_history(agent_id, session_id)
         .await
         .expect("history");
-    assert!(history.iter().any(|item| matches!(
-        item,
-        ModelInputItem::Message { role, content }
-            if role == "user"
-                && matches!(&content[0], ModelContentItem::InputText { text } if text.contains("summary after reduced retry"))
-    )));
+    assert!(history.iter().any(|item| {
+        item.role == PlMessageRole::User && pl_text(item).contains("summary after reduced retry")
+    }));
 }
 
 #[tokio::test]
@@ -3472,33 +3469,25 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
         .await
         .expect("history");
     assert_eq!(session.last_context_tokens, Some(44));
-    assert!(history.iter().any(|item| matches!(
-            item,
-            ModelInputItem::Message { role, content }
-                if role == "user"
-                    && matches!(&content[0], ModelContentItem::InputText { text } if turn::history::is_compact_summary(text, COMPACT_SUMMARY_PREFIX) && text.contains("summary after tool output"))
-        )));
+    assert!(history.iter().any(|item| {
+        item.role == PlMessageRole::User
+            && turn::history::is_compact_summary(pl_text(item), COMPACT_SUMMARY_PREFIX)
+            && pl_text(item).contains("summary after tool output")
+    }));
     assert!(
         !history
             .iter()
-            .any(|item| matches!(item, ModelInputItem::FunctionCallOutput { .. }))
+            .any(|item| pl_tool_result_call_id(item).is_some())
     );
-    assert!(history.iter().any(|item| matches!(
-        item,
-        ModelInputItem::Message { role, content }
-            if role == "user"
-                && matches!(&content[0], ModelContentItem::InputText { text }
-                    if text.contains("Recent tool result"))
-    )));
+    assert!(history.iter().any(|item| {
+        item.role == PlMessageRole::User && pl_text(item).contains("Recent tool result")
+    }));
     assert_eq!(
         history.last().and_then(turn::history::user_message_text),
         None
     );
-    assert!(matches!(
-        history.last(),
-        Some(ModelInputItem::Message { role, content })
-            if role == "assistant"
-                && matches!(&content[0], ModelContentItem::OutputText { text } if text == "final answer")
+    assert!(history.last().is_some_and(
+        |item| item.role == PlMessageRole::Assistant && pl_text(item) == "final answer"
     ));
     let tokens_before = runtime
         .events
@@ -3588,12 +3577,11 @@ async fn auto_compact_uses_request_estimate_before_model_request() {
         .load_agent_history(agent_id, session_id)
         .await
         .expect("history");
-    assert!(history.iter().any(|item| matches!(
-        item,
-        ModelInputItem::Message { role, content }
-            if role == "user"
-                && matches!(&content[0], ModelContentItem::InputText { text } if turn::history::is_compact_summary(text, COMPACT_SUMMARY_PREFIX) && text.contains("summary from estimate"))
-    )));
+    assert!(history.iter().any(|item| {
+        item.role == PlMessageRole::User
+            && turn::history::is_compact_summary(pl_text(item), COMPACT_SUMMARY_PREFIX)
+            && pl_text(item).contains("summary from estimate")
+    }));
     assert!(
         runtime
             .events
@@ -5488,8 +5476,8 @@ async fn spawn_agent_fork_context_copies_parent_history_from_store() {
         .await
         .expect("save message");
     let parent_history = vec![
-        ModelInputItem::user_text("reuse this context"),
-        ModelInputItem::assistant_text("stored answer"),
+        turn::history::user_text_message("reuse this context"),
+        turn::history::assistant_text_message("stored answer"),
     ];
     for (position, item) in parent_history.iter().enumerate() {
         store

@@ -8,10 +8,9 @@ use mai_docker::{
 use mai_mcp::McpAgentManager;
 #[cfg(test)]
 use mai_mcp::McpTool;
-use mai_model::{ModelClient, ModelTurnState};
-use mai_protocol::*;
 #[cfg(test)]
-use mai_protocol::{MessageRole, ModelContentItem};
+use mai_protocol::MessageRole;
+use mai_protocol::*;
 use mai_skills::{SkillInjections, SkillsManager};
 use mai_store::{AgentLogFilter, ConfigStore, ProviderSelection, ToolTraceFilter};
 #[cfg(test)]
@@ -33,6 +32,7 @@ mod events;
 mod facade;
 pub mod github;
 mod instructions;
+mod model_client;
 mod projects;
 mod state;
 mod tasks;
@@ -46,6 +46,7 @@ use github::{
     DEFAULT_GITHUB_API_BASE_URL, DirectGithubAppBackend, GITHUB_HTTP_TIMEOUT_SECS, GithubAppBackend,
 };
 use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
+pub use model_client::{ModelClient, ModelClientConfig, ModelTurnState};
 use projects::review::ProjectReviewCycleResult;
 use projects::review::pool::{ProjectReviewPoolEnqueueSummary, ProjectReviewSignalInput};
 use projects::review::relay_queue::{
@@ -159,7 +160,7 @@ pub enum RuntimeError {
     #[error("docker error: {0}")]
     Docker(#[from] mai_docker::DockerError),
     #[error("model error: {0}")]
-    Model(#[from] mai_model::ModelError),
+    Model(#[from] pl_protocol::PureError),
     #[error("mcp error: {0}")]
     Mcp(#[from] mai_mcp::McpError),
     #[error("store error: {0}")]
@@ -615,14 +616,10 @@ impl AgentRuntime {
             )
             .await?;
         let instructions = "Generate a concise task title of 3-8 words that captures the essence of the user's request. Output only the title text, nothing else. Do not use quotes or punctuation at the end.";
-        let input = vec![ModelInputItem::user_text(message)];
-        let resolved = self
-            .deps
-            .model
-            .resolve(&selection.provider, &selection.model, None);
+        let input = vec![turn::history::user_text_message(message)];
         let response = turn::model_stream::consume_model_stream_to_response(
             &self.deps.model,
-            &resolved,
+            &selection,
             instructions,
             &input,
             &[],
@@ -1821,6 +1818,8 @@ impl AgentRuntime {
         }
         let last_context_tokens =
             turn::history::session_context_tokens(agent, agent_id, session_id).await?;
+        let effective_last_context_tokens =
+            request.last_context_tokens_override.or(last_context_tokens);
         let summary = agent.summary.read().await.clone();
         let provider_selection = self
             .deps
@@ -1833,7 +1832,7 @@ impl AgentRuntime {
             AUTO_COMPACT_THRESHOLD_PERCENT,
             provider_selection.model.auto_compact_token_limit,
         );
-        let Some(decision) = planner.decision(last_context_tokens, request) else {
+        let Some(decision) = planner.decision(effective_last_context_tokens, request) else {
             return Ok(turn::context::ContextCompactionOutcome::Skipped);
         };
         let tokens_before = decision.tokens_before;
@@ -1873,22 +1872,16 @@ impl AgentRuntime {
             )
             .await?
         };
-        let resolved = self.deps.model.resolve(
-            &provider_selection.provider,
-            &provider_selection.model,
-            summary.reasoning_effort.as_deref(),
-        );
         let response_result = turn::model_stream::consume_model_stream_to_response(
             &self.deps.model,
-            &resolved,
+            &provider_selection,
             &instructions,
             &compact_input,
             &[],
             &mut ModelTurnState::default(),
             cancellation_token,
         )
-        .await
-        .map_err(turn::model_stream::model_error_to_runtime);
+        .await;
         let response = match response_result {
             Ok(response) => response,
             Err(err) if turn::compaction::compaction_error_allows_fallback(&err) => {
@@ -1908,17 +1901,16 @@ impl AgentRuntime {
                 compact_input = compactor.fallback_compact_request_input();
                 turn::model_stream::consume_model_stream_to_response(
                     &self.deps.model,
-                    &resolved,
+                    &provider_selection,
                     &instructions,
                     &compact_input,
                     &[],
                     &mut ModelTurnState::default(),
                     cancellation_token,
                 )
-                .await
-                .map_err(turn::model_stream::model_error_to_runtime)?
+                .await?
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         };
 
         if cancellation_token.is_cancelled() {
@@ -1996,7 +1988,7 @@ impl AgentRuntime {
         Ok(turn::context::ContextCompactionOutcome::Compacted {
             trigger: decision.trigger,
             tokens_before,
-            last_context_tokens,
+            last_context_tokens: effective_last_context_tokens,
             estimated_request_tokens: request.estimated_tokens,
             context_tokens,
         })
@@ -2874,7 +2866,7 @@ impl agents::AgentServiceOps for AgentRuntime {
         &self,
         agent_id: AgentId,
         session_id: SessionId,
-    ) -> Result<Vec<ModelInputItem>> {
+    ) -> Result<Vec<pl_protocol::Message>> {
         Ok(self
             .deps
             .store
@@ -2886,7 +2878,7 @@ impl agents::AgentServiceOps for AgentRuntime {
         &self,
         agent_id: AgentId,
         session_id: SessionId,
-        history: &[ModelInputItem],
+        history: &[pl_protocol::Message],
     ) -> Result<()> {
         self.deps
             .store
@@ -3087,7 +3079,7 @@ impl agents::AgentObservabilityOps for AgentRuntime {
         &self,
         agent_id: AgentId,
         session_id: SessionId,
-    ) -> Result<Vec<ModelInputItem>> {
+    ) -> Result<Vec<pl_protocol::Message>> {
         Ok(self
             .deps
             .store

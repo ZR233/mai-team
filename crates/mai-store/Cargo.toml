@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 chrono.workspace = true
 mai-protocol = { path = "../mai-protocol", version = "0.1.11" }
+pl-protocol.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

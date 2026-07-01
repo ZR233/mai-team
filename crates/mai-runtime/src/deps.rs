@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use mai_agents::AgentProfilesManager;
 use mai_docker::DockerClient;
-use mai_model::ModelClient;
 use mai_skills::SkillsManager;
 use mai_store::ConfigStore;
 
 use crate::github::{GitAccountService, GithubAppBackend};
+use crate::model_client::ModelClient;
 
 pub(crate) struct RuntimeDeps {
     pub(crate) docker: DockerClient,

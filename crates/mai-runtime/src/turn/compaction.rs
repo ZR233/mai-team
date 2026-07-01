@@ -1,6 +1,8 @@
-use mai_protocol::{AgentId, ModelInputItem, ServiceEventKind, SessionId, ToolDefinition, TurnId};
+use mai_protocol::{AgentId, ServiceEventKind, SessionId, ToolDefinition, TurnId};
 use mai_store::ConfigStore;
+use pl_protocol::Message;
 use serde_json::json;
+use std::fmt::Display;
 
 use crate::events::RuntimeEvents;
 
@@ -38,7 +40,7 @@ impl ContextBudgetPlanner {
 }
 
 pub(crate) struct HistoryCompactor<'a> {
-    history: &'a [ModelInputItem],
+    history: &'a [Message],
     summary_prefix: &'a str,
     prompt: &'a str,
     max_user_chars: usize,
@@ -46,7 +48,7 @@ pub(crate) struct HistoryCompactor<'a> {
 
 impl<'a> HistoryCompactor<'a> {
     pub(crate) fn new(
-        history: &'a [ModelInputItem],
+        history: &'a [Message],
         summary_prefix: &'a str,
         prompt: &'a str,
         max_user_chars: usize,
@@ -59,17 +61,17 @@ impl<'a> HistoryCompactor<'a> {
         }
     }
 
-    pub(crate) fn compact_request_input(&self) -> Vec<ModelInputItem> {
+    pub(crate) fn compact_request_input(&self) -> Vec<Message> {
         let mut input = history::build_compaction_request_history(
             self.history,
             self.max_user_chars,
             self.summary_prefix,
         );
-        input.push(ModelInputItem::user_text(self.prompt));
+        input.push(history::user_text_message(self.prompt));
         input
     }
 
-    pub(crate) fn fallback_compact_request_input(&self) -> Vec<ModelInputItem> {
+    pub(crate) fn fallback_compact_request_input(&self) -> Vec<Message> {
         let reduced_user_chars = (self.max_user_chars / 4).max(4_000);
         let mut input = history::build_compaction_request_history(
             self.history,
@@ -80,11 +82,11 @@ impl<'a> HistoryCompactor<'a> {
             let keep_from = input.len().saturating_sub(12);
             input.drain(0..keep_from);
         }
-        input.push(ModelInputItem::user_text(self.prompt));
+        input.push(history::user_text_message(self.prompt));
         input
     }
 
-    pub(crate) fn replacement_history(&self, summary: &str) -> Vec<ModelInputItem> {
+    pub(crate) fn replacement_history(&self, summary: &str) -> Vec<Message> {
         history::build_compacted_history(
             self.history,
             summary,
@@ -167,13 +169,13 @@ impl<'a> CompactionRecorder<'a> {
 
 pub(crate) fn estimate_history_tokens(
     instructions: &str,
-    history: &[ModelInputItem],
+    history: &[Message],
     tools: &[ToolDefinition],
 ) -> u64 {
     super::context::estimate_model_request_tokens(instructions, history, tools)
 }
 
-pub(crate) fn compaction_error_allows_fallback(err: &crate::RuntimeError) -> bool {
+pub(crate) fn compaction_error_allows_fallback(err: &impl Display) -> bool {
     let message = err.to_string().to_lowercase();
     message.contains("context")
         && (message.contains("window")

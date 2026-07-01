@@ -3,15 +3,16 @@ pub(crate) use mai_protocol::{
     AgentConfigRequest, AgentId, AgentLogEntry, AgentMessage, AgentSessionSummary, AgentSummary,
     ArtifactInfo, GitAccountRequest, GitAccountStatus, GitAccountSummary, GitAccountsResponse,
     GitProvider, GitTokenKind, GithubAppSettingsRequest, GithubAppSettingsResponse,
-    GithubSettingsResponse, McpServerConfig, ModelCapabilities, ModelConfig, ModelInputItem,
-    ModelReasoningConfig, ModelReasoningVariant, ModelRequestPolicy, ModelWireApi,
-    PlanHistoryEntry, ProjectId, ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary,
-    ProviderConfig, ProviderKind, ProviderPreset, ProviderPresetsResponse, ProviderSecret,
-    ProviderSummary, ProvidersConfigRequest, ProvidersResponse, RelaySettingsRequest,
-    RelaySettingsResponse, ServiceEvent, ServiceEventKind, SessionId, SkillsConfigRequest, TaskId,
-    TaskPlan, TaskReview, TaskSummary, TokenUsage, ToolOutputArtifactInfo, ToolTraceDetail,
-    ToolTraceSummary, TurnId, default_true,
+    GithubSettingsResponse, McpServerConfig, ModelCapabilities, ModelConfig, ModelReasoningConfig,
+    ModelReasoningVariant, ModelRequestPolicy, ModelWireApi, PlanHistoryEntry, ProjectId,
+    ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary, ProviderConfig, ProviderKind,
+    ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
+    ProvidersConfigRequest, ProvidersResponse, RelaySettingsRequest, RelaySettingsResponse,
+    ServiceEvent, ServiceEventKind, SessionId, SkillsConfigRequest, TaskId, TaskPlan, TaskReview,
+    TaskSummary, TokenUsage, ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceSummary, TurnId,
+    default_true,
 };
+pub(crate) use pl_protocol::Message as ModelMessage;
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use std::collections::{BTreeMap, BTreeSet};
 pub(crate) use std::path::{Path, PathBuf};

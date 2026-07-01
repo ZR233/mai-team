@@ -55,7 +55,7 @@
 - Server process logs are emitted through `tracing_subscriber` to stdout/stderr. When starting the server locally, use:
 
 ```bash
-RUST_LOG=mai_server=info,mai_runtime=debug,mai_model=debug,tower_http=info cargo run -p mai-server
+RUST_LOG=mai_server=info,mai_runtime=debug,tower_http=info cargo run -p mai-server
 ```
 
 - If the server is already running in a terminal, inspect that terminal first. The default filter is `mai_server=info,mai_runtime=info,tower_http=info` unless `RUST_LOG` is set.

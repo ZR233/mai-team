@@ -3,7 +3,6 @@ members = [
     "crates/mai-agents",
     "crates/mai-docker",
     "crates/mai-mcp",
-    "crates/mai-model",
     "crates/mai-protocol",
     "crates/mai-relay",
     "crates/mai-relay-client",
@@ -27,6 +26,9 @@ ctrlc = { version = "3", features = ["termination"] }
 fnv = "1"
 percent-encoding = "2"
 pretty_assertions = "1"
+pl-model = { path = "/home/zhourui/.codex/worktrees/ab34/pure-lang-reusable-pl-model-native/code/pl-model" }
+pl-protocol = { path = "/home/zhourui/.codex/worktrees/ab34/pure-lang-reusable-pl-model-native/code/pl-protocol" }
+pl-trace = { path = "/home/zhourui/.codex/worktrees/ab34/pure-lang-reusable-pl-model-native/code/pl-trace" }
 schemars = "1"
 shell-words = "1"
 strum = { version = "0.28", features = ["derive"] }

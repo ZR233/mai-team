@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use mai_docker::DockerClient;
-use mai_model::ModelClient;
-use mai_runtime::RuntimeConfig;
+use mai_runtime::{ModelClient, RuntimeConfig};
 use tracing::info;
 
 use crate::config::{Cli, RelayMode, ServerConfig, ServerPaths, StdEnv};
@@ -157,7 +156,6 @@ async fn ensure_startup_chat_environment(
 mod tests {
     use super::*;
     use mai_docker::DockerClient;
-    use mai_model::ModelClient;
     use mai_protocol::{ModelConfig, ProviderConfig, ProviderKind, ProvidersConfigRequest};
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;

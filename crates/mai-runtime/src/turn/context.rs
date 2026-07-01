@@ -1,4 +1,5 @@
-use mai_protocol::{ModelInputItem, ToolDefinition};
+use mai_protocol::ToolDefinition;
+use pl_protocol::Message;
 use serde_json::json;
 
 const TOKEN_ESTIMATE_BYTES: u64 = 4;
@@ -21,18 +22,28 @@ impl ContextCompactionTrigger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ContextCompactionRequest {
     pub(crate) estimated_tokens: Option<u64>,
+    pub(crate) last_context_tokens_override: Option<u64>,
 }
 
 impl ContextCompactionRequest {
     pub(crate) fn from_estimate(estimated_tokens: u64) -> Self {
         Self {
             estimated_tokens: Some(estimated_tokens),
+            last_context_tokens_override: None,
+        }
+    }
+
+    pub(crate) fn after_model_response(estimated_tokens: u64, last_context_tokens: u64) -> Self {
+        Self {
+            estimated_tokens: Some(estimated_tokens),
+            last_context_tokens_override: Some(last_context_tokens),
         }
     }
 
     pub(crate) fn last_context_only() -> Self {
         Self {
             estimated_tokens: None,
+            last_context_tokens_override: None,
         }
     }
 }
@@ -114,7 +125,7 @@ impl ContextBudgetPolicy {
 
 pub(crate) fn estimate_model_request_tokens(
     instructions: &str,
-    history: &[ModelInputItem],
+    history: &[Message],
     tools: &[ToolDefinition],
 ) -> u64 {
     let bytes = instructions.len() as u64 + serialized_len(history) + serialized_len(tools);

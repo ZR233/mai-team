@@ -160,9 +160,8 @@ mod tests {
     use axum::extract::{Path, State};
     use chrono::Utc;
     use mai_docker::DockerClient;
-    use mai_model::ModelClient;
     use mai_protocol::{AgentRole, AgentStatus, ProjectCloneStatus, ProjectStatus};
-    use mai_runtime::{AgentRuntime, RuntimeConfig};
+    use mai_runtime::{AgentRuntime, ModelClient, RuntimeConfig};
     use mai_store::ConfigStore;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;

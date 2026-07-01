@@ -14,8 +14,10 @@ jsonwebtoken.workspace = true
 mai-docker = { path = "../mai-docker", version = "0.1.11" }
 mai-agents = { path = "../mai-agents", version = "0.1.11" }
 mai-mcp = { path = "../mai-mcp", version = "0.1.11" }
-mai-model = { path = "../mai-model", version = "0.1.11" }
 mai-protocol = { path = "../mai-protocol", version = "0.1.11" }
+pl-model.workspace = true
+pl-protocol.workspace = true
+pl-trace.workspace = true
 mai-skills = { path = "../mai-skills", version = "0.1.11" }
 mai-store = { path = "../mai-store", version = "0.1.11" }
 mai-tools = { path = "../mai-tools", version = "0.1.11" }

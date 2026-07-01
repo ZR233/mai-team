@@ -2,10 +2,9 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
 
-use mai_model::ModelTurnState;
 use mai_protocol::{
-    AgentId, AgentStatus, MessageRole, ModelInputItem, ServiceEventKind, SessionId,
-    SkillsConfigRequest, TurnId, TurnStatus,
+    AgentId, AgentStatus, MessageRole, ServiceEventKind, SessionId, SkillsConfigRequest, TurnId,
+    TurnStatus,
 };
 use mai_skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
 use mai_tools::build_tool_definitions_with_filter;
@@ -22,7 +21,7 @@ use crate::turn::context::{ContextCompactionOutcome, ContextCompactionRequest};
 use crate::turn::model_stream::TurnModelContext;
 use crate::turn::persistence::AgentLogRecord;
 use crate::turn::tools::ToolExecution;
-use crate::{Result, RuntimeError};
+use crate::{ModelTurnState, Result, RuntimeError};
 
 /// 回合编排器依赖的运行时能力集合。
 ///
@@ -314,7 +313,7 @@ pub(crate) async fn run_turn_inner(
         &agent,
         agent_id,
         session_id,
-        ModelInputItem::user_text(message.clone()),
+        super::history::user_text_message(message.clone()),
     )
     .await?;
     events
@@ -550,6 +549,11 @@ pub(crate) async fn run_turn_inner(
         )
         .await;
 
+        let last_model_total_tokens = model_turn
+            .response
+            .usage
+            .as_ref()
+            .map(|usage| usage.total_tokens);
         if let Some(usage) = model_turn.response.usage.clone() {
             super::accounting::record_model_usage(
                 deps.store.as_ref(),
@@ -594,7 +598,7 @@ pub(crate) async fn run_turn_inner(
                 &agent,
                 agent_id,
                 session_id,
-                ModelInputItem::user_text(diagnostic),
+                super::history::user_text_message(diagnostic),
             )
             .await?;
             continue;
@@ -692,6 +696,66 @@ pub(crate) async fn run_turn_inner(
             .await?;
             ops.start_next_queued_input_after_turn(agent_id).await;
             return Ok(());
+        }
+
+        if let Some(tokens) = last_model_total_tokens {
+            super::history::record_session_context_tokens(
+                deps.store.as_ref(),
+                &agent,
+                agent_id,
+                session_id,
+                tokens,
+            )
+            .await?;
+        }
+
+        let history =
+            super::history::session_history(deps.store.as_ref(), &agent, agent_id, session_id)
+                .await?;
+        let estimated_request_tokens = super::context::estimate_model_request_tokens(
+            &model_context.instructions,
+            &history,
+            &model_context.tools,
+        );
+        let compaction_request = if let Some(tokens) = last_model_total_tokens {
+            ContextCompactionRequest::after_model_response(estimated_request_tokens, tokens)
+        } else {
+            ContextCompactionRequest::from_estimate(estimated_request_tokens)
+        };
+        match ops
+            .maybe_auto_compact(
+                &agent,
+                agent_id,
+                session_id,
+                turn_id,
+                compaction_request,
+                &cancellation_token,
+            )
+            .await
+        {
+            Ok(ContextCompactionOutcome::Compacted { .. }) => {
+                turn_model_state.reset_continuation();
+            }
+            Ok(ContextCompactionOutcome::Skipped) => {}
+            Err(err) => {
+                if matches!(err, RuntimeError::TurnCancelled) {
+                    return Err(err);
+                }
+                tracing::warn!("auto context compaction failed after tool execution: {err}");
+                super::persistence::record_agent_log(
+                    deps.store.as_ref(),
+                    AgentLogRecord {
+                        agent_id,
+                        session_id: Some(session_id),
+                        turn_id: Some(turn_id),
+                        level: "warn",
+                        category: "context",
+                        message: "auto context compaction failed",
+                        details: json!({ "stage": "after_tool_execution", "error": err.to_string() }),
+                    },
+                )
+                .await;
+            }
         }
     }
 }

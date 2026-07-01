@@ -5,9 +5,9 @@ use std::sync::atomic::Ordering;
 use chrono::{DateTime, Utc};
 use mai_protocol::{
     AgentDetail, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary,
-    ContextUsage, MessageRole, ModelInputItem, ServiceEvent, ServiceEventKind, SessionId,
-    TokenUsage, now,
+    ContextUsage, MessageRole, ServiceEvent, ServiceEventKind, SessionId, TokenUsage, now,
 };
+use pl_protocol::Message as ModelMessage;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -79,12 +79,12 @@ pub(crate) trait AgentServiceOps: Send + Sync {
         &self,
         agent_id: AgentId,
         session_id: SessionId,
-    ) -> Result<Vec<ModelInputItem>>;
+    ) -> Result<Vec<ModelMessage>>;
     async fn replace_agent_history(
         &self,
         agent_id: AgentId,
         session_id: SessionId,
-        history: &[ModelInputItem],
+        history: &[ModelMessage],
     ) -> Result<()>;
     async fn append_agent_message(
         &self,
