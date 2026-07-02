@@ -2223,6 +2223,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "pl-model"
 version = "0.1.0"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=main#f522080db954435458b63e36dde24f0bc80be0fd"
 dependencies = [
  "async-openai",
  "bitflags",
@@ -2240,6 +2241,7 @@ dependencies = [
 [[package]]
 name = "pl-protocol"
 version = "0.1.0"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=main#f522080db954435458b63e36dde24f0bc80be0fd"
 dependencies = [
  "serde",
  "serde_json",
@@ -2249,6 +2251,7 @@ dependencies = [
 [[package]]
 name = "pl-trace"
 version = "0.1.0"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=main#f522080db954435458b63e36dde24f0bc80be0fd"
 dependencies = [
  "pl-protocol",
  "serde",

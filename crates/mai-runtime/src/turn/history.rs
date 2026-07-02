@@ -187,43 +187,11 @@ pub(crate) fn compact_summary_from_output(output: &[ModelOutputItem]) -> Option<
     output.iter().rev().find_map(|item| {
         let text = match item {
             ModelOutputItem::Message { text } => text,
-            ModelOutputItem::Reasoning { content } => content,
             _ => return None,
         };
         let text = text.trim();
         (!text.is_empty()).then(|| text.to_string())
     })
-}
-
-pub(crate) fn compact_request_history(history: &[Message]) -> Vec<Message> {
-    history.iter().map(compact_request_message).collect()
-}
-
-fn compact_request_message(item: &Message) -> Message {
-    if let Some(tool_calls) = ToolCallHistoryMetadata::from_metadata(&item.metadata) {
-        return assistant_text_message(format!("工具调用:\n{}", tool_calls.tool_calls_json));
-    }
-
-    if item.role == ModelMessageRole::Tool {
-        let prefix = match ToolResultMetadata::from_metadata(&item.metadata) {
-            Ok(metadata) if metadata.tool_name.is_empty() => {
-                format!("工具结果 {}:", metadata.tool_call_id)
-            }
-            Ok(metadata) => format!(
-                "工具结果 {} ({}):",
-                metadata.tool_name, metadata.tool_call_id
-            ),
-            Err(_) => "工具结果:".to_string(),
-        };
-        return user_text_message(format!("{}\n{}", prefix, message_text(item)));
-    }
-
-    Message {
-        role: item.role,
-        content: MessageContent::Text(message_text(item)),
-        reasoning_content: item.reasoning_content.clone(),
-        metadata: Default::default(),
-    }
 }
 
 pub(crate) fn repair_incomplete_tool_history(history: &mut Vec<Message>) -> bool {
@@ -505,7 +473,7 @@ fn recent_compaction_tail(history: &[Message], summary_prefix: &str) -> Vec<Mess
                     continue;
                 }
                 selected.push(assistant_text_message(take_last_chars(
-                    text,
+                    &text,
                     COMPACT_RECENT_ASSISTANT_MAX_CHARS,
                 )));
                 assistant_items += 1;
@@ -538,10 +506,7 @@ fn recent_compaction_tail(history: &[Message], summary_prefix: &str) -> Vec<Mess
     selected
 }
 
-fn latest_compact_summary<'a>(
-    history: &'a [Message],
-    summary_prefix: &str,
-) -> Option<&'a str> {
+fn latest_compact_summary<'a>(history: &'a [Message], summary_prefix: &str) -> Option<&'a str> {
     latest_compact_summary_index(history, summary_prefix)
         .and_then(|index| user_message_text(&history[index]))
 }

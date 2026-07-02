@@ -3,52 +3,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::http::StatusCode;
-use futures::StreamExt;
 use mai_protocol::*;
-use mai_runtime::{ModelClient, ModelTurnState};
+use mai_runtime::{ModelClient, completion_response_preview, completion_response_usage};
 use mai_store::ConfigStore;
-use pl_model::{
-    CompletionResponse, CompletionStreamAccumulator, CompletionStreamEvent, ModelProvider,
-};
+use pl_model::{CompletionResponse, ModelContinuationState};
 use pl_protocol::{Message, MessageContent, MessageRole as PlMessageRole, PureError};
 use tokio_util::sync::CancellationToken;
 
 fn elapsed_millis(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
-}
-
-fn model_output_preview(response: &CompletionResponse) -> String {
-    let mut parts = Vec::new();
-    if let Some(reasoning) = response
-        .reasoning_content
-        .as_deref()
-        .filter(|text| !text.is_empty())
-    {
-        parts.push(reasoning.to_string());
-    }
-    if let Some(content) = response.content.as_deref().filter(|text| !text.is_empty()) {
-        parts.push(content.to_string());
-    }
-    parts.extend(response.tool_calls.iter().map(|call| {
-        format!(
-            "function_call {} {}: {}",
-            call.name,
-            call.call_id.as_deref().unwrap_or(&call.id),
-            call.payload_text()
-        )
-    }));
-    let text = parts.join("\n");
-    mai_protocol::preview(&text, 500)
-}
-
-fn model_usage(usage: &pl_model::TokenUsage) -> TokenUsage {
-    TokenUsage {
-        input_tokens: usage.prompt_tokens,
-        cached_input_tokens: usage.cached_prompt_tokens,
-        output_tokens: usage.completion_tokens,
-        reasoning_output_tokens: usage.reasoning_tokens,
-        total_tokens: usage.total_tokens,
-    }
 }
 
 fn sanitize_provider_test_error(err: &PureError, api_key: &str) -> String {
@@ -187,8 +150,8 @@ async fn run_provider_test(
                 model: model.id,
                 base_url,
                 latency_ms,
-                output_preview: model_output_preview(&response),
-                usage: Some(model_usage(&response.usage)),
+                output_preview: completion_response_preview(&response),
+                usage: Some(completion_response_usage(&response.usage)),
                 error: None,
             },
         },
@@ -225,7 +188,7 @@ impl<'a> ProviderTester<'a> {
         reasoning_effort: Option<&str>,
         deep: bool,
     ) -> std::result::Result<CompletionResponse, PureError> {
-        if deep && supports_continuation(selection) {
+        if deep && ModelClient::supports_continuation(selection) {
             self.run_deep_test(selection, reasoning_effort).await
         } else {
             self.run_single_test(selection, reasoning_effort).await
@@ -238,19 +201,19 @@ impl<'a> ProviderTester<'a> {
         reasoning_effort: Option<&str>,
     ) -> std::result::Result<CompletionResponse, PureError> {
         let input = vec![user_text_message("ping")];
-        let mut state = ModelTurnState::default();
+        let mut continuation = ModelContinuationState::default();
         let cancellation_token = CancellationToken::new();
-        consume_model_stream(
-            self.client,
-            selection,
-            reasoning_effort,
-            "You are a provider connectivity test. Reply with exactly: ok",
-            &input,
-            &[],
-            &mut state,
-            &cancellation_token,
-        )
-        .await
+        self.client
+            .stream_completion_response(
+                selection,
+                reasoning_effort,
+                "You are a provider connectivity test. Reply with exactly: ok",
+                &input,
+                &[],
+                &mut continuation,
+                &cancellation_token,
+            )
+            .await
     }
 
     async fn run_deep_test(
@@ -259,106 +222,42 @@ impl<'a> ProviderTester<'a> {
         reasoning_effort: Option<&str>,
     ) -> std::result::Result<CompletionResponse, PureError> {
         let cancellation_token = CancellationToken::new();
-        let mut state = ModelTurnState::default();
         let first_input = vec![user_text_message(
             "Provider deep connectivity test, step 1. Reply exactly: ok",
         )];
+        let mut continuation = ModelContinuationState::default();
         let instructions = "You are a provider connectivity test. Reply with exactly: ok";
-        let first = consume_model_stream(
-            self.client,
-            selection,
-            reasoning_effort,
-            instructions,
-            &first_input,
-            &[],
-            &mut state,
-            &cancellation_token,
-        )
-        .await?;
+        let first = self
+            .client
+            .stream_completion_response(
+                selection,
+                reasoning_effort,
+                instructions,
+                &first_input,
+                &[],
+                &mut continuation,
+                &cancellation_token,
+            )
+            .await?;
         let mut second_input = first_input;
-        second_input.push(assistant_text_message(model_output_preview(&first)));
+        second_input.push(assistant_text_message(completion_response_preview(&first)));
         second_input.push(user_text_message(
             "Provider deep connectivity test, step 2. Reply exactly: ok",
         ));
-        state.acknowledge_history_len(2);
-        consume_model_stream(
-            self.client,
-            selection,
-            reasoning_effort,
-            instructions,
-            &second_input,
-            &[],
-            &mut state,
-            &cancellation_token,
-        )
-        .await
+        continuation
+            .acknowledge_message_count(second_input.len().saturating_sub(1), second_input.len());
+        self.client
+            .stream_completion_response(
+                selection,
+                reasoning_effort,
+                instructions,
+                &second_input,
+                &[],
+                &mut continuation,
+                &cancellation_token,
+            )
+            .await
     }
-}
-
-async fn consume_model_stream(
-    client: &ModelClient,
-    selection: &mai_store::ProviderSelection,
-    reasoning_effort: Option<&str>,
-    instructions: &str,
-    input: &[Message],
-    tools: &[ToolDefinition],
-    state: &mut ModelTurnState,
-    cancellation_token: &CancellationToken,
-) -> std::result::Result<CompletionResponse, PureError> {
-    let mut prepared = client
-        .prepare_turn(
-            selection,
-            reasoning_effort,
-            instructions.to_string(),
-            input.to_vec(),
-            tools,
-            state,
-        )
-        .await?;
-    let had_continuation = prepared.request.previous_response_id.is_some();
-    let mut stream = match prepared.provider.stream_events(prepared.request).await {
-        Ok(stream) => stream,
-        Err(err) if had_continuation && ModelClient::is_continuation_unsupported_error(&err) => {
-            client.mark_continuation_unsupported(selection, state).await;
-            prepared = client
-                .prepare_turn(
-                    selection,
-                    reasoning_effort,
-                    instructions.to_string(),
-                    input.to_vec(),
-                    tools,
-                    state,
-                )
-                .await?;
-            prepared.provider.stream_events(prepared.request).await?
-        }
-        Err(err) => return Err(err),
-    };
-    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
-    let mut accumulator = CompletionStreamAccumulator::new(None);
-    let mut response_id = None;
-    while let Some(event) = stream.next().await {
-        if cancellation_token.is_cancelled() {
-            return Err(PureError::LlmError("request cancelled".to_string()));
-        }
-        let event = event?;
-        if let CompletionStreamEvent::Completed {
-            response_id: completed_response_id,
-        } = &event
-        {
-            response_id = completed_response_id.clone();
-        }
-        accumulator.apply(event, &event_tx)?;
-    }
-    let response = accumulator.finish(&event_tx)?;
-    client.apply_completed_state(state, input.len(), response_id.as_deref());
-    Ok(response)
-}
-
-fn supports_continuation(selection: &mai_store::ProviderSelection) -> bool {
-    selection.provider.kind == ProviderKind::Openai
-        && selection.model.wire_api == ModelWireApi::Responses
-        && selection.model.capabilities.continuation
 }
 
 fn user_text_message(text: impl Into<String>) -> Message {

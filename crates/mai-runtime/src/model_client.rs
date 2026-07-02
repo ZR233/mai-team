@@ -2,42 +2,26 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use mai_protocol::{
     ModelCapabilities as MaiModelCapabilities, ModelConfig, ModelReasoningVariant, ModelWireApi,
     ProviderKind as MaiProviderKind, ProviderSecret, ToolDefinition,
 };
 use pl_model::{
-    CompletionRequest, MaxTokensField, ModelCapabilities, ModelInfo, ModelModality, ModelParameter,
-    ModelRequestProfile, ParameterWire, ProviderInfo, ReasoningConfig, ReasoningSummary,
-    SharedModelProvider, ToolCapabilities, ToolSchema, WireAssignment, create_provider_with_models,
+    CompletionEventStream, CompletionRequest, CompletionResponse, CompletionStreamAccumulator,
+    MaxTokensField, ModelCapabilities, ModelContinuationState, ModelInfo, ModelModality,
+    ModelParameter, ModelProvider, ModelRequestProfile, ParameterWire, ProviderInfo,
+    ReasoningConfig, ReasoningSummary, SharedModelProvider, ToolCapabilities, ToolSchema,
+    WireAssignment, create_provider_with_models, is_continuation_unsupported_error,
 };
 use pl_protocol::{Message, PureError};
 use serde_json::{Map, Value};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-
-#[derive(Debug, Clone, Default)]
-pub struct ModelTurnState {
-    pub previous_response_id: Option<String>,
-    pub prompt_cache_key: Option<String>,
-    pub acknowledged_input_len: usize,
-    continuation_disabled: bool,
-}
-
-impl ModelTurnState {
-    pub fn acknowledge_history_len(&mut self, len: usize) {
-        self.acknowledged_input_len = len;
-    }
-
-    pub fn reset_continuation(&mut self) {
-        self.previous_response_id = None;
-        self.acknowledged_input_len = 0;
-        self.continuation_disabled = false;
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct ModelClient {
@@ -80,39 +64,29 @@ impl ModelClient {
         selection: &mai_store::ProviderSelection,
         reasoning_effort: Option<&str>,
         instructions: String,
-        messages: Vec<Message>,
+        messages: &[Message],
         tools: &[ToolDefinition],
-        state: &mut ModelTurnState,
+        continuation: &mut ModelContinuationState,
     ) -> Result<PreparedModelTurn, PureError> {
         if self
             .continuation_is_unsupported(&continuation_cache_key(selection))
             .await
         {
-            state.continuation_disabled = true;
-            state.previous_response_id = None;
+            continuation.mark_unsupported();
         }
 
         let provider = create_provider_with_models(
             provider_info(&selection.provider),
             vec![model_info(&selection.model)],
         )?;
-        let use_continuation = supports_continuation(&selection.provider, &selection.model)
-            && !state.continuation_disabled;
-        let request_messages = if use_continuation {
-            messages
-                .get(state.acknowledged_input_len..)
-                .unwrap_or(&messages)
-                .to_vec()
-        } else {
-            messages
-        };
+        let use_continuation = Self::supports_continuation(selection) && !continuation.disabled();
         let request = completion_request(
             &selection.model,
             reasoning_effort,
             instructions,
-            request_messages,
+            messages,
             tools,
-            state,
+            continuation,
             use_continuation,
         );
         Ok(PreparedModelTurn { provider, request })
@@ -120,36 +94,112 @@ impl ModelClient {
 
     pub fn apply_completed_state(
         &self,
-        state: &mut ModelTurnState,
+        continuation: &mut ModelContinuationState,
         history_len: usize,
         response_id: Option<&str>,
     ) {
-        if let Some(response_id) = response_id {
-            state.previous_response_id = Some(response_id.to_string());
-            state.acknowledged_input_len = history_len;
-        } else {
-            state.reset_continuation();
+        continuation.acknowledge_response(
+            history_len,
+            response_id.map(ToString::to_string),
+            history_len,
+        );
+    }
+
+    pub async fn stream_completion_response(
+        &self,
+        selection: &mai_store::ProviderSelection,
+        reasoning_effort: Option<&str>,
+        instructions: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        continuation: &mut ModelContinuationState,
+        cancellation_token: &CancellationToken,
+    ) -> Result<CompletionResponse, PureError> {
+        let mut stream = self
+            .open_completion_event_stream(
+                selection,
+                reasoning_effort,
+                instructions,
+                messages,
+                tools,
+                continuation,
+            )
+            .await?;
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
+        let mut accumulator = CompletionStreamAccumulator::new(None);
+        while let Some(event) = stream.next().await {
+            if cancellation_token.is_cancelled() {
+                return Err(PureError::LlmError("request cancelled".to_string()));
+            }
+            let event = event?;
+            accumulator.apply(event, &event_tx)?;
+        }
+        let response = accumulator.finish(&event_tx)?;
+        self.apply_completed_state(
+            continuation,
+            messages.len(),
+            response.response_id.as_deref(),
+        );
+        Ok(response)
+    }
+
+    pub async fn open_completion_event_stream(
+        &self,
+        selection: &mai_store::ProviderSelection,
+        reasoning_effort: Option<&str>,
+        instructions: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        continuation: &mut ModelContinuationState,
+    ) -> Result<CompletionEventStream, PureError> {
+        let mut prepared = self
+            .prepare_turn(
+                selection,
+                reasoning_effort,
+                instructions.to_string(),
+                messages,
+                tools,
+                continuation,
+            )
+            .await?;
+        let had_continuation = prepared.request.previous_response_id.is_some();
+        match prepared.provider.stream_events(prepared.request).await {
+            Ok(stream) => Ok(stream),
+            Err(err) if had_continuation && is_continuation_unsupported_error(&err) => {
+                self.mark_continuation_unsupported(selection, continuation)
+                    .await;
+                prepared = self
+                    .prepare_turn(
+                        selection,
+                        reasoning_effort,
+                        instructions.to_string(),
+                        messages,
+                        tools,
+                        continuation,
+                    )
+                    .await?;
+                prepared.provider.stream_events(prepared.request).await
+            }
+            Err(err) => Err(err),
         }
     }
 
     pub async fn mark_continuation_unsupported(
         &self,
         selection: &mai_store::ProviderSelection,
-        state: &mut ModelTurnState,
+        continuation: &mut ModelContinuationState,
     ) {
         self.continuation_cache
             .lock()
             .await
             .insert(continuation_cache_key(selection));
-        state.continuation_disabled = true;
-        state.previous_response_id = None;
-        state.acknowledged_input_len = 0;
+        continuation.mark_unsupported();
     }
 
-    pub fn is_continuation_unsupported_error(error: &PureError) -> bool {
-        let message = error.to_string();
-        message.contains("previous_response_id")
-            && (message.contains("not supported") || message.contains("only supported"))
+    pub fn supports_continuation(selection: &mai_store::ProviderSelection) -> bool {
+        selection.provider.kind == MaiProviderKind::Openai
+            && selection.model.wire_api == ModelWireApi::Responses
+            && selection.model.capabilities.continuation
     }
 
     async fn continuation_is_unsupported(&self, key: &str) -> bool {
@@ -255,29 +305,19 @@ fn completion_request(
     model: &ModelConfig,
     reasoning_effort: Option<&str>,
     instructions: String,
-    messages: Vec<Message>,
+    messages: &[Message],
     tools: &[ToolDefinition],
-    state: &ModelTurnState,
+    continuation: &ModelContinuationState,
     use_continuation: bool,
 ) -> CompletionRequest {
-    CompletionRequest {
-        model: model.id.clone(),
-        instructions: Some(instructions),
-        messages,
-        tools: tools.iter().map(tool_schema).collect(),
-        tool_choice: "auto".to_string(),
-        parallel_tool_calls: model.capabilities.parallel_tools,
-        temperature: None,
-        max_tokens: Some(model.output_tokens),
-        store: Some(use_continuation),
-        previous_response_id: use_continuation
-            .then(|| state.previous_response_id.clone())
-            .flatten(),
-        prompt_cache_key: state.prompt_cache_key.clone(),
-        reasoning: reasoning_config(model, reasoning_effort),
-        stream: true,
-        trace: None,
-    }
+    CompletionRequest::builder(model.id.clone())
+        .instructions(instructions)
+        .messages_from_continuation(messages, continuation, use_continuation)
+        .tools(tools.iter().map(tool_schema).collect())
+        .parallel_tool_calls(model.capabilities.parallel_tools)
+        .max_tokens(model.output_tokens)
+        .reasoning(reasoning_config(model, reasoning_effort))
+        .build()
 }
 
 fn tool_schema(tool: &ToolDefinition) -> ToolSchema {
@@ -374,12 +414,6 @@ fn collect_wire_assignments(
             }
         }
     }
-}
-
-fn supports_continuation(provider: &ProviderSecret, model: &ModelConfig) -> bool {
-    provider.kind == MaiProviderKind::Openai
-        && model.wire_api == ModelWireApi::Responses
-        && model.capabilities.continuation
 }
 
 fn continuation_cache_key(selection: &mai_store::ProviderSelection) -> String {

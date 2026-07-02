@@ -46,6 +46,22 @@ fn pl_tool_call_ids(message: &Message) -> Vec<String> {
         .collect()
 }
 
+fn pl_tool_call_names(message: &Message) -> Vec<String> {
+    message
+        .metadata
+        .get(pl_protocol::TOOL_CALLS_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| {
+            item.get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
 fn test_model(id: &str) -> ModelConfig {
     ModelConfig {
         id: id.to_string(),
@@ -378,6 +394,13 @@ async fn write_mock_response(
 }
 
 fn mock_sse_body(response: &Value) -> String {
+    if let Some(events) = response.get("__sse_events").and_then(Value::as_array) {
+        return events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+            .collect();
+    }
     let response_id = response
         .get("id")
         .and_then(Value::as_str)
@@ -464,6 +487,389 @@ fn compact_no_continuation_test_provider(base_url: String) -> ProviderConfig {
     let mut provider = compact_test_provider(base_url);
     provider.models[0].capabilities.continuation = false;
     provider
+}
+
+fn compact_mimo_test_provider(base_url: String) -> ProviderConfig {
+    let mut model = test_model("mimo-v2.5-pro");
+    model.context_tokens = 1_000_000;
+    model.output_tokens = 32_000;
+    model.wire_api = mai_protocol::ModelWireApi::ChatCompletions;
+    ProviderConfig {
+        id: "mimo-token-plan".to_string(),
+        kind: ProviderKind::Mimo,
+        name: "MIMO Token Plan".to_string(),
+        base_url,
+        api_key: Some("secret".to_string()),
+        api_key_env: None,
+        models: vec![model],
+        default_model: "mimo-v2.5-pro".to_string(),
+        enabled: true,
+    }
+}
+
+#[tokio::test]
+async fn model_client_stream_completion_response_retries_without_unsupported_continuation() {
+    let (base_url, requests) = start_mock_responses(vec![
+        json!({
+            "id": "resp_first",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "first" }]
+            }],
+            "usage": { "input_tokens": 3, "output_tokens": 2, "total_tokens": 5 }
+        }),
+        json!({
+            "__status": 400,
+            "error": {
+                "message": "previous_response_id is only supported on Responses WebSocket v2",
+                "type": "invalid_request_error"
+            }
+        }),
+        json!({
+            "id": "resp_second",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "second" }]
+            }],
+            "usage": {
+                "input_tokens": 6,
+                "input_tokens_details": { "cached_tokens": 4 },
+                "output_tokens": 2,
+                "output_tokens_details": { "reasoning_tokens": 1 },
+                "total_tokens": 8
+            }
+        }),
+    ])
+    .await;
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![compact_test_provider(base_url)],
+            default_provider_id: Some("mock".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let selection = store
+        .resolve_provider(Some("mock"), None)
+        .await
+        .expect("resolve provider");
+    let client = ModelClient::new();
+    let mut continuation = pl_model::ModelContinuationState::default();
+    let first_input = vec![Message {
+        role: PlMessageRole::User,
+        content: MessageContent::Text("first".to_string()),
+        reasoning_content: None,
+        metadata: Default::default(),
+    }];
+
+    let first = client
+        .stream_completion_response(
+            &selection,
+            None,
+            "reply briefly",
+            &first_input,
+            &[],
+            &mut continuation,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("first response");
+
+    assert_eq!(first.response_id.as_deref(), Some("resp_first"));
+    let mut second_input = first_input;
+    second_input.push(Message {
+        role: PlMessageRole::Assistant,
+        content: MessageContent::Text(first.content.expect("first content")),
+        reasoning_content: None,
+        metadata: Default::default(),
+    });
+    second_input.push(Message {
+        role: PlMessageRole::User,
+        content: MessageContent::Text("second".to_string()),
+        reasoning_content: None,
+        metadata: Default::default(),
+    });
+
+    let second = client
+        .stream_completion_response(
+            &selection,
+            None,
+            "reply briefly",
+            &second_input,
+            &[],
+            &mut continuation,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("second response");
+
+    assert_eq!(second.content.as_deref(), Some("second"));
+    assert_eq!(second.response_id.as_deref(), Some("resp_second"));
+    assert_eq!(
+        second.usage,
+        pl_model::TokenUsage {
+            prompt_tokens: 6,
+            cached_prompt_tokens: 4,
+            completion_tokens: 2,
+            reasoning_tokens: 1,
+            total_tokens: 8,
+        }
+    );
+    let requests = requests.lock().await.clone();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].get("previous_response_id").is_none());
+    assert_eq!(requests[1]["previous_response_id"], "resp_first");
+    assert!(
+        requests[2].get("previous_response_id").is_none(),
+        "不支持 continuation 后必须全量重试"
+    );
+}
+
+#[tokio::test]
+async fn model_client_exposes_shared_continuation_capability_check() {
+    let (base_url, _requests) = start_mock_responses(Vec::new()).await;
+    let mut model = test_model("gpt-5.5");
+    model.wire_api = mai_protocol::ModelWireApi::Responses;
+    model.capabilities.continuation = true;
+    let provider = ProviderSecret {
+        id: "openai".to_string(),
+        kind: ProviderKind::Openai,
+        name: "OpenAI".to_string(),
+        base_url,
+        api_key: "secret".to_string(),
+        api_key_env: None,
+        models: vec![model.clone()],
+        default_model: model.id.clone(),
+        enabled: true,
+    };
+    let selection = mai_store::ProviderSelection { provider, model };
+
+    assert!(ModelClient::supports_continuation(&selection));
+}
+
+#[test]
+fn pl_model_request_helpers_are_available_to_runtime() {
+    let messages = vec![
+        Message {
+            role: PlMessageRole::User,
+            content: MessageContent::Text("first".to_string()),
+            reasoning_content: None,
+            metadata: Default::default(),
+        },
+        Message {
+            role: PlMessageRole::Assistant,
+            content: MessageContent::Text("answer".to_string()),
+            reasoning_content: None,
+            metadata: Default::default(),
+        },
+        Message {
+            role: PlMessageRole::User,
+            content: MessageContent::Text("second".to_string()),
+            reasoning_content: None,
+            metadata: Default::default(),
+        },
+    ];
+    let mut continuation = pl_model::ModelContinuationState::default();
+    continuation.set_prompt_cache_key("cache-1".to_string());
+    continuation.acknowledge_response(2, Some("resp-1".to_string()), messages.len());
+
+    let request = pl_model::CompletionRequest::builder("gpt-5.5")
+        .messages_from_continuation(&messages, &continuation, true)
+        .build();
+
+    assert_eq!(request.messages, messages[2..]);
+    assert_eq!(request.previous_response_id.as_deref(), Some("resp-1"));
+    assert_eq!(request.prompt_cache_key.as_deref(), Some("cache-1"));
+    assert!(pl_model::is_continuation_unsupported_error(
+        &pl_protocol::PureError::LlmError(
+            "previous_response_id is only supported on Responses WebSocket v2".to_string(),
+        )
+    ));
+}
+
+#[test]
+fn completion_response_projection_is_shared_by_runtime_and_server() {
+    let response = pl_model::CompletionResponse {
+        response_id: Some("resp_shared".to_string()),
+        content: Some("hello".to_string()),
+        raw_content: None,
+        reasoning_content: Some("thought".to_string()),
+        tool_calls: vec![pl_model::ToolCall::function(
+            "tool_1",
+            "lookup",
+            json!({ "q": "rust" }),
+            Some("call_lookup".to_string()),
+        )],
+        trace_events: Vec::new(),
+        next_sequence: 0,
+        usage: pl_model::TokenUsage {
+            prompt_tokens: 10,
+            cached_prompt_tokens: 4,
+            completion_tokens: 3,
+            reasoning_tokens: 2,
+            total_tokens: 13,
+        },
+        finish_reason: pl_model::FinishReason::ToolCalls,
+        model: "gpt-5.5".to_string(),
+    };
+
+    assert_eq!(
+        completion_response_preview(&response),
+        "thought\\nhello\\nfunction_call lookup call_lookup: {\"q\":\"rust\"}"
+    );
+    assert_eq!(
+        completion_response_usage(&response.usage),
+        TokenUsage {
+            input_tokens: 10,
+            cached_input_tokens: 4,
+            output_tokens: 3,
+            reasoning_output_tokens: 2,
+            total_tokens: 13,
+        }
+    );
+    assert_eq!(
+        completion_response_to_model_response(response),
+        ModelResponse {
+            id: Some("resp_shared".to_string()),
+            output: vec![
+                ModelOutputItem::Reasoning {
+                    content: "thought".to_string(),
+                },
+                ModelOutputItem::Message {
+                    text: "hello".to_string(),
+                },
+                ModelOutputItem::FunctionCall {
+                    call_id: "call_lookup".to_string(),
+                    name: "lookup".to_string(),
+                    arguments: json!({ "q": "rust" }),
+                    raw_arguments: "{\"q\":\"rust\"}".to_string(),
+                },
+            ],
+            usage: Some(TokenUsage {
+                input_tokens: 10,
+                cached_input_tokens: 4,
+                output_tokens: 3,
+                reasoning_output_tokens: 2,
+                total_tokens: 13,
+            }),
+        }
+    );
+}
+
+#[tokio::test]
+async fn chat_completion_split_tool_call_reuses_pl_model_tool_stream_identity() {
+    let (base_url, requests) = start_mock_responses(vec![
+        json!({
+            "__sse_events": [
+                {
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "list_agents",
+                                    "arguments": ""
+                                }
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                },
+                {
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "function": {
+                                    "arguments": "{}"
+                                }
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                },
+                {
+                    "choices": [{
+                        "delta": {},
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": { "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12 }
+                }
+            ]
+        }),
+        json!({
+            "__sse_events": [
+                {
+                    "choices": [{
+                        "delta": { "content": "done" },
+                        "finish_reason": null
+                    }]
+                },
+                {
+                    "choices": [{
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 20, "completion_tokens": 1, "total_tokens": 21 }
+                }
+            ]
+        }),
+    ])
+    .await;
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![compact_mimo_test_provider(base_url)],
+            default_provider_id: Some("mimo-token-plan".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let agent_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let mut summary = test_agent_summary(agent_id, None);
+    summary.provider_id = "mimo-token-plan".to_string();
+    summary.provider_name = "MIMO Token Plan".to_string();
+    summary.model = "mimo-v2.5-pro".to_string();
+    store.save_agent(&summary, None).await.expect("save agent");
+    save_test_session(&store, agent_id, session_id).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    runtime
+        .run_turn_inner(
+            agent_id,
+            session_id,
+            Uuid::new_v4(),
+            "list agents then finish".to_string(),
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("split tool call should execute once and finish");
+
+    let requests = requests.lock().await.clone();
+    assert_eq!(requests.len(), 2);
+    let history = store
+        .load_agent_history(agent_id, session_id)
+        .await
+        .expect("history");
+    let tool_names = history
+        .iter()
+        .flat_map(pl_tool_call_names)
+        .collect::<Vec<_>>();
+    assert_eq!(tool_names, vec!["list_agents".to_string()]);
+    let (_, messages) = runtime
+        .agent_recent_messages(agent_id, 5)
+        .await
+        .expect("messages");
+    assert!(
+        messages
+            .iter()
+            .any(|message| { message.role == MessageRole::Assistant && message.content == "done" })
+    );
 }
 
 fn test_agent_summary(agent_id: AgentId, container_id: Option<&str>) -> AgentSummary {
@@ -2470,9 +2876,11 @@ fn compacted_history_keeps_recent_user_messages_assistant_and_tool_summary() {
     );
     assert!(compacted.len() >= 5);
     assert_eq!(pl_text(&compacted[0]), "first user");
-    assert!(compacted.iter().any(|item| {
-        item.role == PlMessageRole::User && pl_text(item) == "first user"
-    }));
+    assert!(
+        compacted
+            .iter()
+            .any(|item| { item.role == PlMessageRole::User && pl_text(item) == "first user" })
+    );
     assert!(compacted.iter().any(|item| {
         item.role == PlMessageRole::Assistant && pl_text(item) == "assistant recent"
     }));
@@ -2488,9 +2896,11 @@ fn compacted_history_keeps_recent_user_messages_assistant_and_tool_summary() {
             && pl_text(item).contains("tool tail")
             && pl_text(item).len() < 12_000
     }));
-    assert!(compacted.iter().any(|item| {
-        item.role == PlMessageRole::User && pl_text(item) == "second user"
-    }));
+    assert!(
+        compacted
+            .iter()
+            .any(|item| { item.role == PlMessageRole::User && pl_text(item) == "second user" })
+    );
     let summary = compacted.last().expect("summary");
     assert!(
         pl_text(summary).contains("new summary")
@@ -3198,6 +3608,60 @@ async fn auto_compact_records_replacement_context_tokens() {
 }
 
 #[tokio::test]
+async fn auto_compact_falls_back_when_saved_agent_provider_is_removed() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![compact_test_provider("http://localhost".to_string())],
+            default_provider_id: Some("mock".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let agent_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let mut summary = test_agent_summary(agent_id, Some("container-1"));
+    summary.provider_id = "openai".to_string();
+    summary.provider_name = "OpenAI".to_string();
+    summary.model = "gpt-5.5".to_string();
+    summary.reasoning_effort = Some("high".to_string());
+    store.save_agent(&summary, None).await.expect("save agent");
+    save_test_session(&store, agent_id, session_id).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let agent = runtime.agent(agent_id).await.expect("agent");
+
+    let compacted = runtime
+        .maybe_auto_compact(
+            &agent,
+            agent_id,
+            session_id,
+            Uuid::new_v4(),
+            turn::context::ContextCompactionRequest::last_context_only(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("stale provider falls back before compact decision");
+
+    assert!(matches!(
+        compacted,
+        turn::context::ContextCompactionOutcome::Skipped
+    ));
+    let updated = runtime
+        .agent(agent_id)
+        .await
+        .expect("agent")
+        .summary
+        .read()
+        .await
+        .clone();
+    assert_eq!(updated.provider_id, "mock");
+    assert_eq!(updated.model, "mock-model");
+    assert_eq!(updated.reasoning_effort, Some("medium".to_string()));
+    let snapshot = store.load_runtime_snapshot(10).await.expect("snapshot");
+    assert_eq!(snapshot.agents[0].summary.provider_id, "mock");
+}
+
+#[tokio::test]
 async fn auto_compact_retries_with_reduced_history_when_context_window_fails() {
     let (base_url, requests) = start_mock_responses(vec![
         json!({
@@ -3238,10 +3702,7 @@ async fn auto_compact_retries_with_reduced_history_when_context_window_fails() {
                 agent_id,
                 session_id,
                 index,
-                &turn::history::user_text_message(format!(
-                    "request {index} {}",
-                    "x".repeat(500)
-                )),
+                &turn::history::user_text_message(format!("request {index} {}", "x".repeat(500))),
             )
             .await
             .expect("append history");
@@ -5041,6 +5502,79 @@ async fn role_model_resolution_falls_back_when_saved_provider_is_removed() {
 
     assert_eq!(resolved.preference.provider_id, "openai");
     assert_eq!(resolved.preference.model, "gpt-5.5");
+}
+
+#[tokio::test]
+async fn conversation_falls_back_when_saved_agent_provider_is_removed() {
+    let (base_url, requests) = start_mock_responses(vec![json!({
+        "id": "fallback-response",
+        "output": [{
+            "type": "message",
+            "content": [{ "type": "output_text", "text": "fallback ok" }]
+        }],
+        "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+    })])
+    .await;
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![compact_test_provider(base_url)],
+            default_provider_id: Some("mock".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let agent_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let mut summary = test_agent_summary(agent_id, Some("container-1"));
+    summary.provider_id = "openai".to_string();
+    summary.provider_name = "OpenAI".to_string();
+    summary.model = "gpt-5.5".to_string();
+    summary.reasoning_effort = Some("high".to_string());
+    store.save_agent(&summary, None).await.expect("save agent");
+    save_test_session(&store, agent_id, session_id).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let agent = runtime.agent(agent_id).await.expect("agent");
+    *agent.container.write().await = Some(ContainerHandle {
+        id: "container-1".to_string(),
+        name: "container-1".to_string(),
+        image: "unused".to_string(),
+    });
+
+    runtime
+        .run_turn_inner(
+            agent_id,
+            session_id,
+            Uuid::new_v4(),
+            "hello".to_string(),
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn falls back to default provider");
+
+    let request = requests.lock().await[0].clone();
+    assert_eq!(request["model"], "mock-model");
+    let updated = runtime
+        .agent(agent_id)
+        .await
+        .expect("agent")
+        .summary
+        .read()
+        .await
+        .clone();
+    assert_eq!(updated.provider_id, "mock");
+    assert_eq!(updated.provider_name, "Mock");
+    assert_eq!(updated.model, "mock-model");
+    assert_eq!(updated.reasoning_effort, Some("medium".to_string()));
+    let snapshot = store.load_runtime_snapshot(10).await.expect("snapshot");
+    assert_eq!(snapshot.agents[0].summary.provider_id, "mock");
+    assert!(runtime.events.snapshot().await.iter().any(|event| matches!(
+        &event.kind,
+        ServiceEventKind::AgentUpdated { agent } if agent.id == agent_id
+            && agent.provider_id == "mock"
+            && agent.model == "mock-model"
+    )));
 }
 
 #[tokio::test]

@@ -33,6 +33,8 @@ mod facade;
 pub mod github;
 mod instructions;
 mod model_client;
+mod model_projection;
+mod model_selection;
 mod projects;
 mod state;
 mod tasks;
@@ -46,7 +48,10 @@ use github::{
     DEFAULT_GITHUB_API_BASE_URL, DirectGithubAppBackend, GITHUB_HTTP_TIMEOUT_SECS, GithubAppBackend,
 };
 use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
-pub use model_client::{ModelClient, ModelClientConfig, ModelTurnState};
+pub use model_client::{ModelClient, ModelClientConfig};
+pub use model_projection::{
+    completion_response_preview, completion_response_to_model_response, completion_response_usage,
+};
 use projects::review::ProjectReviewCycleResult;
 use projects::review::pool::{ProjectReviewPoolEnqueueSummary, ProjectReviewSignalInput};
 use projects::review::relay_queue::{
@@ -620,10 +625,11 @@ impl AgentRuntime {
         let response = turn::model_stream::consume_model_stream_to_response(
             &self.deps.model,
             &selection,
+            None,
             instructions,
             &input,
             &[],
-            &mut ModelTurnState::default(),
+            &mut pl_model::ModelContinuationState::default(),
             &CancellationToken::new(),
         )
         .await?;
@@ -1820,17 +1826,23 @@ impl AgentRuntime {
             turn::history::session_context_tokens(agent, agent_id, session_id).await?;
         let effective_last_context_tokens =
             request.last_context_tokens_override.or(last_context_tokens);
-        let summary = agent.summary.read().await.clone();
-        let provider_selection = self
-            .deps
-            .store
-            .resolve_provider(Some(&summary.provider_id), Some(&summary.model))
-            .await?;
-        let context_tokens = provider_selection.model.context_tokens;
+        let model_selection = model_selection::resolve_agent_model_selection(
+            &self.deps,
+            &self.events,
+            agent,
+            agent_id,
+            Some(session_id),
+            Some(turn_id),
+        )
+        .await?;
+        let context_tokens = model_selection.provider_selection.model.context_tokens;
         let planner = turn::compaction::ContextBudgetPlanner::new(
             context_tokens,
             AUTO_COMPACT_THRESHOLD_PERCENT,
-            provider_selection.model.auto_compact_token_limit,
+            model_selection
+                .provider_selection
+                .model
+                .auto_compact_token_limit,
         );
         let Some(decision) = planner.decision(effective_last_context_tokens, request) else {
             return Ok(turn::context::ContextCompactionOutcome::Skipped);
@@ -1874,11 +1886,12 @@ impl AgentRuntime {
         };
         let response_result = turn::model_stream::consume_model_stream_to_response(
             &self.deps.model,
-            &provider_selection,
+            &model_selection.provider_selection,
+            model_selection.reasoning_effort.as_deref(),
             &instructions,
             &compact_input,
             &[],
-            &mut ModelTurnState::default(),
+            &mut pl_model::ModelContinuationState::default(),
             cancellation_token,
         )
         .await;
@@ -1901,11 +1914,12 @@ impl AgentRuntime {
                 compact_input = compactor.fallback_compact_request_input();
                 turn::model_stream::consume_model_stream_to_response(
                     &self.deps.model,
-                    &provider_selection,
+                    &model_selection.provider_selection,
+                    model_selection.reasoning_effort.as_deref(),
                     &instructions,
                     &compact_input,
                     &[],
-                    &mut ModelTurnState::default(),
+                    &mut pl_model::ModelContinuationState::default(),
                     cancellation_token,
                 )
                 .await?
@@ -2685,7 +2699,10 @@ impl AgentRuntime {
         let preference = role_preference(&config, role);
         match self.resolve_agent_model_preference(role, preference).await {
             Ok(resolved) => Ok(resolved),
-            Err(err) if preference.is_some() && is_stale_agent_model_preference_error(&err) => {
+            Err(err)
+                if preference.is_some()
+                    && model_selection::is_stale_agent_model_selection_error(&err) =>
+            {
                 tracing::warn!(
                     role = agent_role_label(role),
                     error = %err,
@@ -4610,15 +4627,6 @@ fn agent_role_label(role: AgentRole) -> &'static str {
         AgentRole::Executor => "executor",
         AgentRole::Reviewer => "reviewer",
     }
-}
-
-fn is_stale_agent_model_preference_error(err: &RuntimeError) -> bool {
-    let RuntimeError::Store(mai_store::StoreError::InvalidConfig(message)) = err else {
-        return false;
-    };
-    (message.starts_with("provider `") && message.ends_with("` not found"))
-        || (message.starts_with("model `")
-            && message.contains("` is not configured for provider `"))
 }
 
 fn project_failed_by_recoverable_workspace_start_error(project: &ProjectSummary) -> bool {
