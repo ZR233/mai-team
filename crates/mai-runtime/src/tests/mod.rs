@@ -508,7 +508,7 @@ fn compact_mimo_test_provider(base_url: String) -> ProviderConfig {
 }
 
 #[tokio::test]
-async fn model_client_stream_completion_response_retries_without_unsupported_continuation() {
+async fn model_client_stream_session_response_retries_without_unsupported_continuation() {
     let (base_url, requests) = start_mock_responses(vec![
         json!({
             "id": "resp_first",
@@ -555,50 +555,32 @@ async fn model_client_stream_completion_response_retries_without_unsupported_con
         .await
         .expect("resolve provider");
     let client = ModelClient::new();
-    let mut continuation = pl_model::ModelContinuationState::default();
-    let first_input = vec![Message {
-        role: PlMessageRole::User,
-        content: MessageContent::Text("first".to_string()),
-        reasoning_content: None,
-        metadata: Default::default(),
-    }];
+    let mut session = pl_core::CoreSession::new();
+    session.push_user_prompt("first".to_string());
 
     let first = client
-        .stream_completion_response(
+        .stream_session_completion_response(
             &selection,
             None,
             "reply briefly",
-            &first_input,
             &[],
-            &mut continuation,
+            &mut session,
             &CancellationToken::new(),
         )
         .await
         .expect("first response");
 
     assert_eq!(first.response_id.as_deref(), Some("resp_first"));
-    let mut second_input = first_input;
-    second_input.push(Message {
-        role: PlMessageRole::Assistant,
-        content: MessageContent::Text(first.content.expect("first content")),
-        reasoning_content: None,
-        metadata: Default::default(),
-    });
-    second_input.push(Message {
-        role: PlMessageRole::User,
-        content: MessageContent::Text("second".to_string()),
-        reasoning_content: None,
-        metadata: Default::default(),
-    });
+    session.push_assistant_response(first.content.expect("first content"), None);
+    session.push_user_prompt("second".to_string());
 
     let second = client
-        .stream_completion_response(
+        .stream_session_completion_response(
             &selection,
             None,
             "reply briefly",
-            &second_input,
             &[],
-            &mut continuation,
+            &mut session,
             &CancellationToken::new(),
         )
         .await
@@ -649,7 +631,7 @@ async fn model_client_exposes_shared_continuation_capability_check() {
 }
 
 #[test]
-fn pl_model_request_helpers_are_available_to_runtime() {
+fn pl_core_session_helpers_are_available_to_runtime() {
     let messages = vec![
         Message {
             role: PlMessageRole::User,
@@ -670,17 +652,14 @@ fn pl_model_request_helpers_are_available_to_runtime() {
             metadata: Default::default(),
         },
     ];
-    let mut continuation = pl_model::ModelContinuationState::default();
-    continuation.set_prompt_cache_key("cache-1".to_string());
-    continuation.acknowledge_response(2, Some("resp-1".to_string()), messages.len());
+    let mut session = pl_core::CoreSession::from_messages(messages.clone());
+    session.set_prompt_cache_key("cache-1".to_string());
+    session.acknowledge_model_response(2, Some("resp-1".to_string()));
 
-    let request = pl_model::CompletionRequest::builder("gpt-5.5")
-        .messages_from_continuation(&messages, &continuation, true)
-        .build();
-
-    assert_eq!(request.messages, messages[2..]);
-    assert_eq!(request.previous_response_id.as_deref(), Some("resp-1"));
-    assert_eq!(request.prompt_cache_key.as_deref(), Some("cache-1"));
+    assert_eq!(session.continuation_start_index(), Some(2));
+    assert_eq!(&session.messages()[2..], &messages[2..]);
+    assert_eq!(session.previous_response_id(), Some("resp-1"));
+    assert_eq!(session.prompt_cache_key(), Some("cache-1"));
     assert!(pl_model::is_continuation_unsupported_error(
         &pl_protocol::PureError::LlmError(
             "previous_response_id is only supported on Responses WebSocket v2".to_string(),

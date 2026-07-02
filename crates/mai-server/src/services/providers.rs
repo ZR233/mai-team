@@ -6,7 +6,8 @@ use axum::http::StatusCode;
 use mai_protocol::*;
 use mai_runtime::{ModelClient, completion_response_preview, completion_response_usage};
 use mai_store::ConfigStore;
-use pl_model::{CompletionResponse, ModelContinuationState};
+use pl_core::CoreSession;
+use pl_model::CompletionResponse;
 use pl_protocol::{Message, MessageContent, MessageRole as PlMessageRole, PureError};
 use tokio_util::sync::CancellationToken;
 
@@ -200,17 +201,15 @@ impl<'a> ProviderTester<'a> {
         selection: &mai_store::ProviderSelection,
         reasoning_effort: Option<&str>,
     ) -> std::result::Result<CompletionResponse, PureError> {
-        let input = vec![user_text_message("ping")];
-        let mut continuation = ModelContinuationState::default();
+        let mut session = CoreSession::from_messages(vec![user_text_message("ping")]);
         let cancellation_token = CancellationToken::new();
         self.client
-            .stream_completion_response(
+            .stream_session_completion_response(
                 selection,
                 reasoning_effort,
                 "You are a provider connectivity test. Reply with exactly: ok",
-                &input,
                 &[],
-                &mut continuation,
+                &mut session,
                 &cancellation_token,
             )
             .await
@@ -222,38 +221,32 @@ impl<'a> ProviderTester<'a> {
         reasoning_effort: Option<&str>,
     ) -> std::result::Result<CompletionResponse, PureError> {
         let cancellation_token = CancellationToken::new();
-        let first_input = vec![user_text_message(
+        let mut session = CoreSession::from_messages(vec![user_text_message(
             "Provider deep connectivity test, step 1. Reply exactly: ok",
-        )];
-        let mut continuation = ModelContinuationState::default();
+        )]);
         let instructions = "You are a provider connectivity test. Reply with exactly: ok";
         let first = self
             .client
-            .stream_completion_response(
+            .stream_session_completion_response(
                 selection,
                 reasoning_effort,
                 instructions,
-                &first_input,
                 &[],
-                &mut continuation,
+                &mut session,
                 &cancellation_token,
             )
             .await?;
-        let mut second_input = first_input;
-        second_input.push(assistant_text_message(completion_response_preview(&first)));
-        second_input.push(user_text_message(
-            "Provider deep connectivity test, step 2. Reply exactly: ok",
-        ));
-        continuation
-            .acknowledge_message_count(second_input.len().saturating_sub(1), second_input.len());
+        session.push_assistant_response(completion_response_preview(&first), None);
+        session.push_user_prompt(
+            "Provider deep connectivity test, step 2. Reply exactly: ok".to_string(),
+        );
         self.client
-            .stream_completion_response(
+            .stream_session_completion_response(
                 selection,
                 reasoning_effort,
                 instructions,
-                &second_input,
                 &[],
-                &mut continuation,
+                &mut session,
                 &cancellation_token,
             )
             .await
@@ -263,15 +256,6 @@ impl<'a> ProviderTester<'a> {
 fn user_text_message(text: impl Into<String>) -> Message {
     Message {
         role: PlMessageRole::User,
-        content: MessageContent::Text(text.into()),
-        reasoning_content: None,
-        metadata: Default::default(),
-    }
-}
-
-fn assistant_text_message(text: impl Into<String>) -> Message {
-    Message {
-        role: PlMessageRole::Assistant,
         content: MessageContent::Text(text.into()),
         reasoning_content: None,
         metadata: Default::default(),

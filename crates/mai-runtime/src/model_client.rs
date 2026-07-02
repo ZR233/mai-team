@@ -7,14 +7,15 @@ use mai_protocol::{
     ModelCapabilities as MaiModelCapabilities, ModelConfig, ModelReasoningVariant, ModelWireApi,
     ProviderKind as MaiProviderKind, ProviderSecret, ToolDefinition,
 };
+use pl_core::CoreSession;
 use pl_model::{
     CompletionEventStream, CompletionRequest, CompletionResponse, CompletionStreamAccumulator,
-    MaxTokensField, ModelCapabilities, ModelContinuationState, ModelInfo, ModelModality,
-    ModelParameter, ModelProvider, ModelRequestProfile, ParameterWire, ProviderInfo,
-    ReasoningConfig, ReasoningSummary, SharedModelProvider, ToolCapabilities, ToolSchema,
-    WireAssignment, create_provider_with_models, is_continuation_unsupported_error,
+    MaxTokensField, ModelCapabilities, ModelInfo, ModelModality, ModelParameter, ModelProvider,
+    ModelRequestProfile, ParameterWire, ProviderInfo, ReasoningConfig, ReasoningSummary,
+    SharedModelProvider, ToolCapabilities, ToolSchema, WireAssignment, create_provider_with_models,
+    is_continuation_unsupported_error,
 };
-use pl_protocol::{Message, PureError};
+use pl_protocol::PureError;
 use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -64,66 +65,48 @@ impl ModelClient {
         selection: &mai_store::ProviderSelection,
         reasoning_effort: Option<&str>,
         instructions: String,
-        messages: &[Message],
         tools: &[ToolDefinition],
-        continuation: &mut ModelContinuationState,
+        session: &mut CoreSession,
     ) -> Result<PreparedModelTurn, PureError> {
         if self
             .continuation_is_unsupported(&continuation_cache_key(selection))
             .await
         {
-            continuation.mark_unsupported();
+            session.mark_continuation_unsupported();
         }
 
         let provider = create_provider_with_models(
             provider_info(&selection.provider),
             vec![model_info(&selection.model)],
         )?;
-        let use_continuation = Self::supports_continuation(selection) && !continuation.disabled();
+        let use_continuation =
+            Self::supports_continuation(selection) && !session.continuation_disabled();
         let request = completion_request(
             &selection.model,
             reasoning_effort,
             instructions,
-            messages,
             tools,
-            continuation,
+            session,
             use_continuation,
         );
         Ok(PreparedModelTurn { provider, request })
     }
 
-    pub fn apply_completed_state(
-        &self,
-        continuation: &mut ModelContinuationState,
-        history_len: usize,
-        response_id: Option<&str>,
-    ) {
-        continuation.acknowledge_response(
-            history_len,
-            response_id.map(ToString::to_string),
-            history_len,
-        );
+    pub fn apply_completed_state(&self, session: &mut CoreSession, response_id: Option<&str>) {
+        session.acknowledge_model_response(session.len(), response_id.map(ToString::to_string));
     }
 
-    pub async fn stream_completion_response(
+    pub async fn stream_session_completion_response(
         &self,
         selection: &mai_store::ProviderSelection,
         reasoning_effort: Option<&str>,
         instructions: &str,
-        messages: &[Message],
         tools: &[ToolDefinition],
-        continuation: &mut ModelContinuationState,
+        session: &mut CoreSession,
         cancellation_token: &CancellationToken,
     ) -> Result<CompletionResponse, PureError> {
         let mut stream = self
-            .open_completion_event_stream(
-                selection,
-                reasoning_effort,
-                instructions,
-                messages,
-                tools,
-                continuation,
-            )
+            .open_completion_event_stream(selection, reasoning_effort, instructions, tools, session)
             .await?;
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
         let mut accumulator = CompletionStreamAccumulator::new(None);
@@ -135,11 +118,7 @@ impl ModelClient {
             accumulator.apply(event, &event_tx)?;
         }
         let response = accumulator.finish(&event_tx)?;
-        self.apply_completed_state(
-            continuation,
-            messages.len(),
-            response.response_id.as_deref(),
-        );
+        self.apply_completed_state(session, response.response_id.as_deref());
         Ok(response)
     }
 
@@ -148,34 +127,30 @@ impl ModelClient {
         selection: &mai_store::ProviderSelection,
         reasoning_effort: Option<&str>,
         instructions: &str,
-        messages: &[Message],
         tools: &[ToolDefinition],
-        continuation: &mut ModelContinuationState,
+        session: &mut CoreSession,
     ) -> Result<CompletionEventStream, PureError> {
         let mut prepared = self
             .prepare_turn(
                 selection,
                 reasoning_effort,
                 instructions.to_string(),
-                messages,
                 tools,
-                continuation,
+                session,
             )
             .await?;
         let had_continuation = prepared.request.previous_response_id.is_some();
         match prepared.provider.stream_events(prepared.request).await {
             Ok(stream) => Ok(stream),
             Err(err) if had_continuation && is_continuation_unsupported_error(&err) => {
-                self.mark_continuation_unsupported(selection, continuation)
-                    .await;
+                self.mark_continuation_unsupported(selection, session).await;
                 prepared = self
                     .prepare_turn(
                         selection,
                         reasoning_effort,
                         instructions.to_string(),
-                        messages,
                         tools,
-                        continuation,
+                        session,
                     )
                     .await?;
                 prepared.provider.stream_events(prepared.request).await
@@ -187,13 +162,13 @@ impl ModelClient {
     pub async fn mark_continuation_unsupported(
         &self,
         selection: &mai_store::ProviderSelection,
-        continuation: &mut ModelContinuationState,
+        session: &mut CoreSession,
     ) {
         self.continuation_cache
             .lock()
             .await
             .insert(continuation_cache_key(selection));
-        continuation.mark_unsupported();
+        session.mark_continuation_unsupported();
     }
 
     pub fn supports_continuation(selection: &mai_store::ProviderSelection) -> bool {
@@ -305,14 +280,28 @@ fn completion_request(
     model: &ModelConfig,
     reasoning_effort: Option<&str>,
     instructions: String,
-    messages: &[Message],
     tools: &[ToolDefinition],
-    continuation: &ModelContinuationState,
+    session: &CoreSession,
     use_continuation: bool,
 ) -> CompletionRequest {
+    let messages = if use_continuation {
+        session
+            .continuation_start_index()
+            .and_then(|start| session.messages().get(start..))
+            .unwrap_or_else(|| session.messages())
+            .to_vec()
+    } else {
+        session.messages().to_vec()
+    };
+    let previous_response_id = use_continuation
+        .then(|| session.previous_response_id().map(ToString::to_string))
+        .flatten();
     CompletionRequest::builder(model.id.clone())
         .instructions(instructions)
-        .messages_from_continuation(messages, continuation, use_continuation)
+        .messages(messages)
+        .store(Some(use_continuation))
+        .previous_response_id(previous_response_id)
+        .prompt_cache_key(session.prompt_cache_key().map(ToString::to_string))
         .tools(tools.iter().map(tool_schema).collect())
         .parallel_tool_calls(model.capabilities.parallel_tools)
         .max_tokens(model.output_tokens)

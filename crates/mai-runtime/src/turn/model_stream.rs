@@ -6,9 +6,8 @@ use mai_protocol::{
     ToolDefinition, TurnId,
 };
 use mai_store::{ConfigStore, ProviderSelection};
-use pl_model::{
-    CompletionEventStream, CompletionResponse, CompletionStreamAccumulator, ModelContinuationState,
-};
+use pl_core::CoreSession;
+use pl_model::{CompletionEventStream, CompletionResponse, CompletionStreamAccumulator, ToolCall};
 use pl_protocol::{Message, PureError};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -50,23 +49,20 @@ pub(crate) async fn run_model_stream_turn(
     model: &ModelClient,
     ctx: &TurnStreamContext<'_>,
     model_context: &TurnModelContext,
-    history: &[Message],
-    turn_model_state: &mut ModelContinuationState,
+    session: &mut CoreSession,
     cancellation_token: &CancellationToken,
 ) -> Result<ModelTurnResult> {
-    turn_model_state
-        .set_prompt_cache_key(format!("agent:{}:session:{}", ctx.agent_id, ctx.session_id));
+    session.set_prompt_cache_key(format!("agent:{}:session:{}", ctx.agent_id, ctx.session_id));
     let stream = model
         .open_completion_event_stream(
             &model_context.provider_selection,
             model_context.reasoning_effort.as_deref(),
             &model_context.instructions,
-            history,
             &model_context.tools,
-            turn_model_state,
+            session,
         )
         .await?;
-    consume_turn_stream(model, ctx, turn_model_state, stream, cancellation_token).await
+    consume_turn_stream(model, ctx, session, stream, cancellation_token).await
 }
 
 pub(crate) async fn consume_model_stream_to_response(
@@ -76,17 +72,16 @@ pub(crate) async fn consume_model_stream_to_response(
     instructions: &str,
     input: &[Message],
     tools: &[ToolDefinition],
-    continuation: &mut ModelContinuationState,
     cancellation_token: &CancellationToken,
 ) -> std::result::Result<ModelResponse, PureError> {
+    let mut session = CoreSession::from_messages(input.to_vec());
     let response = model
-        .stream_completion_response(
+        .stream_session_completion_response(
             provider_selection,
             reasoning_effort,
             instructions,
-            input,
             tools,
-            continuation,
+            &mut session,
             cancellation_token,
         )
         .await?;
@@ -96,7 +91,7 @@ pub(crate) async fn consume_model_stream_to_response(
 async fn consume_turn_stream(
     model: &ModelClient,
     ctx: &TurnStreamContext<'_>,
-    turn_model_state: &mut ModelContinuationState,
+    session: &mut CoreSession,
     mut stream: CompletionEventStream,
     cancellation_token: &CancellationToken,
 ) -> Result<ModelTurnResult> {
@@ -110,16 +105,14 @@ async fn consume_turn_stream(
         accumulator.apply(event, &event_tx)?;
     }
     let response = accumulator.finish(&event_tx)?;
-    let result = record_completion_response(ctx, response).await?;
-    let history_len =
-        super::history::raw_session_history_len(ctx.store, ctx.agent, ctx.agent_id, ctx.session_id)
-            .await?;
-    model.apply_completed_state(turn_model_state, history_len, result.response.id.as_deref());
+    let result = record_completion_response(ctx, session, response).await?;
+    model.apply_completed_state(session, result.response.id.as_deref());
     Ok(result)
 }
 
 async fn record_completion_response(
     ctx: &TurnStreamContext<'_>,
+    session: &mut CoreSession,
     response: CompletionResponse,
 ) -> Result<ModelTurnResult> {
     let response = completion_response_to_model_response(response);
@@ -132,6 +125,7 @@ async fn record_completion_response(
                 if !content.trim().is_empty() {
                     made_progress = true;
                     record_reasoning_item(ctx, content.clone()).await?;
+                    session.push_assistant_response(String::new(), Some(content.clone()));
                 }
             }
             ModelOutputItem::Message { text } => {
@@ -139,6 +133,7 @@ async fn record_completion_response(
                     made_progress = true;
                     last_assistant_text = Some(text.clone());
                     record_assistant_message(ctx, text.clone()).await?;
+                    session.push_assistant_response(text.clone(), None);
                 }
             }
             ModelOutputItem::FunctionCall {
@@ -171,6 +166,16 @@ async fn record_completion_response(
                     ),
                 )
                 .await?;
+                session.push_assistant_tool_calls(
+                    None,
+                    vec![ToolCall::function(
+                        call_id.clone(),
+                        name.clone(),
+                        arguments.clone(),
+                        Some(call_id.clone()),
+                    )],
+                    None,
+                );
                 tool_calls.push((call_id, name.clone(), arguments.clone()));
             }
             ModelOutputItem::Other { .. } => {}

@@ -18,6 +18,7 @@ mai-protocol = { path = "../mai-protocol", version = "0.1.11" }
 mai-relay-client = { path = "../mai-relay-client", version = "0.1.11" }
 mai-runtime = { path = "../mai-runtime", version = "0.1.11" }
 mai-store = { path = "../mai-store", version = "0.1.11" }
+pl-core.workspace = true
 pl-model.workspace = true
 pl-protocol.workspace = true
 reqwest.workspace = true

@@ -161,28 +161,6 @@ pub(crate) async fn session_history(
     Ok(history)
 }
 
-pub(crate) async fn raw_session_history_len(
-    store: &ConfigStore,
-    agent: &AgentRecord,
-    agent_id: AgentId,
-    session_id: SessionId,
-) -> Result<usize> {
-    {
-        let sessions = agent.sessions.lock().await;
-        sessions
-            .iter()
-            .find(|session| session.summary.id == session_id)
-            .ok_or(RuntimeError::SessionNotFound {
-                agent_id,
-                session_id,
-            })?;
-    }
-    store
-        .agent_history_len(agent_id, session_id)
-        .await
-        .map_err(Into::into)
-}
-
 pub(crate) fn compact_summary_from_output(output: &[ModelOutputItem]) -> Option<String> {
     output.iter().rev().find_map(|item| {
         let text = match item {
