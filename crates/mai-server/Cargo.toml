@@ -14,11 +14,12 @@ futures.workspace = true
 http.workspace = true
 mime_guess.workspace = true
 mai-docker = { path = "../mai-docker", version = "0.1.11" }
-mai-model = { path = "../mai-model", version = "0.1.11" }
 mai-protocol = { path = "../mai-protocol", version = "0.1.11" }
 mai-relay-client = { path = "../mai-relay-client", version = "0.1.11" }
 mai-runtime = { path = "../mai-runtime", version = "0.1.11" }
 mai-store = { path = "../mai-store", version = "0.1.11" }
+pl-model.workspace = true
+pl-protocol.workspace = true
 reqwest.workspace = true
 rust-embed.workspace = true
 serde.workspace = true

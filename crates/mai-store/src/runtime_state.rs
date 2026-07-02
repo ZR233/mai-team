@@ -145,7 +145,7 @@ impl ConfigStore {
         agent_id: AgentId,
         session_id: SessionId,
         position: usize,
-        item: &ModelInputItem,
+        item: &ModelMessage,
     ) -> Result<()> {
         let mut db = self.db.clone();
         toasty::create!(AgentHistoryRecord {
@@ -164,7 +164,7 @@ impl ConfigStore {
         &self,
         agent_id: AgentId,
         session_id: SessionId,
-        items: &[ModelInputItem],
+        items: &[ModelMessage],
     ) -> Result<()> {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
@@ -337,7 +337,7 @@ impl ConfigStore {
         &self,
         agent_id: AgentId,
         session_id: SessionId,
-    ) -> Result<Vec<ModelInputItem>> {
+    ) -> Result<Vec<ModelMessage>> {
         let mut db = self.db.clone();
         let mut rows = Query::<List<AgentHistoryRecord>>::filter(
             AgentHistoryRecord::fields()
@@ -349,7 +349,7 @@ impl ConfigStore {
         rows.retain(|row| row.session_id == session_id.to_string());
         rows.sort_by_key(|row| row.position);
         rows.into_iter()
-            .map(|row| serde_json::from_str::<ModelInputItem>(&row.item_json).map_err(Into::into))
+            .map(|row| serde_json::from_str::<ModelMessage>(&row.item_json).map_err(Into::into))
             .collect()
     }
 

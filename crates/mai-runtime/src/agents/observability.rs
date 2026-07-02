@@ -3,10 +3,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use mai_protocol::{
-    AgentId, AgentLogEntry, AgentLogsResponse, ModelInputItem, SessionId, ToolOutputArtifactInfo,
-    ToolTraceDetail, ToolTraceListResponse, ToolTraceSummary,
+    AgentId, AgentLogEntry, AgentLogsResponse, SessionId, ToolOutputArtifactInfo, ToolTraceDetail,
+    ToolTraceListResponse, ToolTraceSummary,
 };
 use mai_store::{AgentLogFilter, ToolTraceFilter};
+use pl_protocol::{
+    Message as ModelMessage, MessageContent, MessageRole as ModelMessageRole,
+    TOOL_CALLS_METADATA_KEY, ToolResultMetadata,
+};
 use serde_json::{Value, json};
 
 use crate::state::AgentRecord;
@@ -47,7 +51,7 @@ pub(crate) trait AgentObservabilityOps: Send + Sync {
         &self,
         agent_id: AgentId,
         session_id: SessionId,
-    ) -> impl Future<Output = Result<Vec<ModelInputItem>>> + Send;
+    ) -> impl Future<Output = Result<Vec<ModelMessage>>> + Send;
 
     fn tool_output_artifact_file_path(
         &self,
@@ -87,26 +91,33 @@ pub(crate) async fn tool_trace(
     let mut arguments = None;
     let mut output = None;
 
-    for item in history {
-        match item {
-            ModelInputItem::FunctionCall {
-                call_id: item_call_id,
-                name,
-                arguments: raw_arguments,
-            } if item_call_id == call_id => {
-                tool_name = Some(name);
-                arguments = Some(parse_tool_arguments(&raw_arguments));
+    for item in &history {
+        if let Some(raw_tool_calls) = item.metadata.get(TOOL_CALLS_METADATA_KEY)
+            && let Ok(tool_calls) = serde_json::from_str::<Value>(raw_tool_calls)
+            && let Some(tool_calls) = tool_calls.as_array()
+        {
+            for tool_call in tool_calls {
+                let item_call_id = tool_call
+                    .get("id")
+                    .or_else(|| tool_call.get("call_id"))
+                    .and_then(Value::as_str);
+                if item_call_id == Some(call_id.as_str()) {
+                    tool_name = tool_call
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    arguments = tool_call
+                        .get("payload")
+                        .and_then(|payload| payload.get("arguments"))
+                        .cloned();
+                }
             }
-            ModelInputItem::FunctionCallOutput {
-                call_id: item_call_id,
-                output: item_output,
-            } if item_call_id == call_id => {
-                output = Some(item_output);
-            }
-            ModelInputItem::Message { .. }
-            | ModelInputItem::Reasoning { .. }
-            | ModelInputItem::FunctionCall { .. } => {}
-            ModelInputItem::FunctionCallOutput { .. } => {}
+        }
+        if item.role == ModelMessageRole::Tool
+            && let Ok(metadata) = ToolResultMetadata::from_metadata(&item.metadata)
+            && metadata.tool_call_id == call_id
+        {
+            output = Some(message_text(&item.content));
         }
     }
 
@@ -179,6 +190,16 @@ pub(crate) async fn tool_traces(
     })
 }
 
-fn parse_tool_arguments(raw_arguments: &str) -> Value {
-    serde_json::from_str(raw_arguments).unwrap_or_else(|_| json!({ "raw": raw_arguments }))
+fn message_text(content: &MessageContent) -> String {
+    match content {
+        MessageContent::Text(text) => text.clone(),
+        MessageContent::MultiPart(parts) => parts
+            .iter()
+            .filter_map(|part| match part {
+                pl_protocol::ContentPart::Text { text } => Some(text.as_str()),
+                pl_protocol::ContentPart::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+    }
 }

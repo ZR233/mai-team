@@ -2,13 +2,13 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
 
-use mai_model::ModelTurnState;
 use mai_protocol::{
-    AgentId, AgentStatus, MessageRole, ModelInputItem, ServiceEventKind, SessionId,
-    SkillsConfigRequest, TurnId, TurnStatus,
+    AgentId, AgentStatus, MessageRole, ServiceEventKind, SessionId, SkillsConfigRequest, TurnId,
+    TurnStatus,
 };
 use mai_skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
 use mai_tools::build_tool_definitions_with_filter;
+use pl_model::ModelContinuationState;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -314,7 +314,7 @@ pub(crate) async fn run_turn_inner(
         &agent,
         agent_id,
         session_id,
-        ModelInputItem::user_text(message.clone()),
+        super::history::user_text_message(message.clone()),
     )
     .await?;
     events
@@ -394,14 +394,19 @@ pub(crate) async fn run_turn_inner(
             )
             .await?
         };
-        let summary = agent.summary.read().await.clone();
-        let provider_id = summary.provider_id.clone();
-        let model_name = summary.model.clone();
-        let reasoning_effort = summary.reasoning_effort;
-        let provider_selection = deps
-            .store
-            .resolve_provider(Some(&provider_id), Some(&model_name))
-            .await?;
+        let model_selection = crate::model_selection::resolve_agent_model_selection(
+            deps,
+            events,
+            &agent,
+            agent_id,
+            Some(session_id),
+            Some(turn_id),
+        )
+        .await?;
+        let provider_id = model_selection.provider_id;
+        let model_name = model_selection.model_name;
+        let reasoning_effort = model_selection.reasoning_effort;
+        let provider_selection = model_selection.provider_selection;
         super::persistence::record_agent_log(
             deps.store.as_ref(),
             AgentLogRecord {
@@ -432,7 +437,7 @@ pub(crate) async fn run_turn_inner(
         }
     };
     let mut last_assistant_text: Option<String> = None;
-    let mut turn_model_state = ModelTurnState::default();
+    let mut turn_model_state = ModelContinuationState::default();
     let mut empty_progress_count: usize = 0;
     loop {
         if cancellation_token.is_cancelled() {
@@ -450,7 +455,7 @@ pub(crate) async fn run_turn_inner(
         let mut history =
             super::history::session_history(deps.store.as_ref(), &agent, agent_id, session_id)
                 .await?;
-        if turn_model_state.previous_response_id.is_none()
+        if turn_model_state.previous_response_id().is_none()
             && let Some(skill_fragment) =
                 instructions::skill_user_fragment(&skill_injections, &container_skill_paths)
         {
@@ -473,7 +478,7 @@ pub(crate) async fn run_turn_inner(
             .await
         {
             Ok(ContextCompactionOutcome::Compacted { .. }) => {
-                turn_model_state.reset_continuation();
+                turn_model_state.reset();
                 history = super::history::session_history(
                     deps.store.as_ref(),
                     &agent,
@@ -550,6 +555,11 @@ pub(crate) async fn run_turn_inner(
         )
         .await;
 
+        let last_model_total_tokens = model_turn
+            .response
+            .usage
+            .as_ref()
+            .map(|usage| usage.total_tokens);
         if let Some(usage) = model_turn.response.usage.clone() {
             super::accounting::record_model_usage(
                 deps.store.as_ref(),
@@ -582,7 +592,8 @@ pub(crate) async fn run_turn_inner(
             session_id,
         )
         .await?;
-        turn_model_state.acknowledge_history_len(acknowledged_history_len);
+        turn_model_state
+            .acknowledge_message_count(acknowledged_history_len, acknowledged_history_len);
 
         if !made_progress {
             empty_progress_count = empty_progress_count.saturating_add(1);
@@ -594,7 +605,7 @@ pub(crate) async fn run_turn_inner(
                 &agent,
                 agent_id,
                 session_id,
-                ModelInputItem::user_text(diagnostic),
+                super::history::user_text_message(diagnostic),
             )
             .await?;
             continue;
@@ -692,6 +703,67 @@ pub(crate) async fn run_turn_inner(
             .await?;
             ops.start_next_queued_input_after_turn(agent_id).await;
             return Ok(());
+        }
+
+        if let Some(tokens) = last_model_total_tokens {
+            super::history::record_session_context_tokens(
+                deps.store.as_ref(),
+                &agent,
+                agent_id,
+                session_id,
+                tokens,
+            )
+            .await?;
+        }
+
+        let history =
+            super::history::session_history(deps.store.as_ref(), &agent, agent_id, session_id)
+                .await?;
+        let estimated_request_tokens = super::context::estimate_model_request_tokens(
+            &model_context.instructions,
+            &history,
+            &model_context.tools,
+        );
+        let compaction_request = if let Some(tokens) = last_model_total_tokens {
+            ContextCompactionRequest::after_model_response(estimated_request_tokens, tokens)
+        } else {
+            ContextCompactionRequest::from_estimate(estimated_request_tokens)
+        };
+        match ops
+            .maybe_auto_compact(
+                &agent,
+                agent_id,
+                session_id,
+                turn_id,
+                compaction_request,
+                &cancellation_token,
+            )
+            .await
+        {
+            Ok(ContextCompactionOutcome::Compacted { .. }) => {
+                turn_model_state.reset();
+            }
+            Ok(ContextCompactionOutcome::Skipped) => {}
+            Err(err) => {
+                if matches!(err, RuntimeError::TurnCancelled) {
+                    return Err(err);
+                }
+                tracing::warn!("auto context compaction failed after tool execution: {err}");
+                super::persistence::record_agent_log(
+                    deps.store.as_ref(),
+                    AgentLogRecord {
+                        agent_id,
+                        session_id: Some(session_id),
+                        turn_id: Some(turn_id),
+                        level: "warn",
+                        category: "context",
+                        message: "auto context compaction failed",
+                        details: json!({ "stage": "after_tool_execution", "error": err.to_string() }),
+                    },
+                )
+                .await;
+                return Err(err);
+            }
         }
     }
 }

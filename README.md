@@ -32,9 +32,8 @@ Web UI (Vue/Vite)
         v
 mai-server (Axum API + SSE + embedded frontend)
         |
-        +-- mai-runtime: agent、项目、任务、审查循环和工具编排
+        +-- mai-runtime: agent、项目、任务、审查循环、工具编排和 pl-model 调用
         +-- mai-store: SQLite 配置、事件、日志、artifact 索引
-        +-- mai-model: 模型 provider 客户端和流式响应处理
         +-- mai-docker: agent 容器、workspace volume 和命令执行
         +-- mai-mcp / mai-tools / mai-skills: MCP、工具定义和技能加载
         |
@@ -46,10 +45,9 @@ mai-server (Axum API + SSE + embedded frontend)
 主要 crate：
 
 - `crates/mai-server`：HTTP API、Web UI 静态资源、SSE、启动配置和服务编排。
-- `crates/mai-runtime`：agent 生命周期、项目工作区、PR 审查循环、工具调用和 artifact 保存。
+- `crates/mai-runtime`：agent 生命周期、项目工作区、PR 审查循环、工具调用、模型请求和 artifact 保存。
 - `crates/mai-protocol`：跨 crate 共享的数据结构和事件协议。
 - `crates/mai-store`：SQLite 持久化层。
-- `crates/mai-model`：模型 provider 访问层。
 - `crates/mai-docker`：Docker 容器和命令执行封装。
 - `crates/mai-relay` / `crates/mai-relay-client`：GitHub App webhook relay 服务及客户端。
 - `crates/mai-skills`、`crates/mai-agents`、`crates/mai-tools`、`crates/mai-mcp`：技能、系统 agent 配置、工具 schema 和 MCP 集成。

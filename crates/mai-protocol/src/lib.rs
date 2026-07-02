@@ -1514,50 +1514,6 @@ pub enum ServiceEventKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ModelInputItem {
-    Message {
-        role: String,
-        content: Vec<ModelContentItem>,
-    },
-    Reasoning {
-        content: String,
-    },
-    FunctionCall {
-        call_id: String,
-        name: String,
-        arguments: String,
-    },
-    FunctionCallOutput {
-        call_id: String,
-        output: String,
-    },
-}
-
-impl ModelInputItem {
-    pub fn user_text(text: impl Into<String>) -> Self {
-        Self::Message {
-            role: "user".to_string(),
-            content: vec![ModelContentItem::InputText { text: text.into() }],
-        }
-    }
-
-    pub fn assistant_text(text: impl Into<String>) -> Self {
-        Self::Message {
-            role: "assistant".to_string(),
-            content: vec![ModelContentItem::OutputText { text: text.into() }],
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ModelContentItem {
-    InputText { text: String },
-    OutputText { text: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     #[serde(rename = "type")]
     pub kind: String,
@@ -1581,7 +1537,7 @@ impl ToolDefinition {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelOutputItem {
     Message {
@@ -1601,7 +1557,7 @@ pub enum ModelOutputItem {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelResponse {
     pub id: Option<String>,
     pub output: Vec<ModelOutputItem>,
@@ -2234,42 +2190,6 @@ mod tests {
             }),
             serde_json::to_value(response).expect("serialize response")
         );
-    }
-
-    #[test]
-    fn model_ledger_items_round_trip_as_independent_entries() {
-        let items = vec![
-            ModelInputItem::Reasoning {
-                content: "thinking".to_string(),
-            },
-            ModelInputItem::FunctionCall {
-                call_id: "call_1".to_string(),
-                name: "container_exec".to_string(),
-                arguments: "{\"command\":\"pwd\"}".to_string(),
-            },
-            ModelInputItem::FunctionCallOutput {
-                call_id: "call_1".to_string(),
-                output: "{\"status\":0}".to_string(),
-            },
-        ];
-
-        let value = serde_json::to_value(&items).expect("serialize");
-        assert_eq!(value[0]["type"], "reasoning");
-        assert_eq!(value[1]["type"], "function_call");
-        assert_eq!(value[2]["type"], "function_call_output");
-        let decoded: Vec<ModelInputItem> = serde_json::from_value(value).expect("deserialize");
-        assert!(matches!(
-            &decoded[0],
-            ModelInputItem::Reasoning { content } if content == "thinking"
-        ));
-        assert!(matches!(
-            &decoded[1],
-            ModelInputItem::FunctionCall { call_id, .. } if call_id == "call_1"
-        ));
-        assert!(matches!(
-            &decoded[2],
-            ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_1"
-        ));
     }
 
     #[test]

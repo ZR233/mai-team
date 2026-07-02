@@ -1,11 +1,11 @@
 use std::env;
 use std::fs;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mai_docker::DockerClient;
-use mai_model::ModelClient;
-use mai_runtime::RuntimeConfig;
+use mai_runtime::{ModelClient, RuntimeConfig};
 use tracing::info;
 
 use crate::config::{Cli, RelayMode, ServerConfig, ServerPaths, StdEnv};
@@ -24,6 +24,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     let config = ServerConfig::from_sources(cli, &StdEnv)?;
     let paths = ServerPaths::from_data_path(&env::current_dir()?, config.data_path.clone());
     let addr = config.bind_addr;
+    let listener = bind_server_listener(addr).await?;
 
     let docker = DockerClient::new(config.images.agent_base_image.clone());
     let docker_version = docker.check_available().await?;
@@ -120,9 +121,14 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
 
     println!("Open http://{addr}/");
     info!("mai-team listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn bind_server_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(addr).await.with_context(|| {
+        format!("failed to bind MAI_BIND_ADDR {addr}; set MAI_BIND_ADDR to a free address or stop the process using it")
+    })
 }
 
 async fn seed_relay_settings_from_env(
@@ -157,10 +163,25 @@ async fn ensure_startup_chat_environment(
 mod tests {
     use super::*;
     use mai_docker::DockerClient;
-    use mai_model::ModelClient;
     use mai_protocol::{ModelConfig, ProviderConfig, ProviderKind, ProvidersConfigRequest};
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn bind_server_listener_reports_occupied_addr() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind occupied listener");
+        let addr = occupied.local_addr().expect("occupied listener addr");
+
+        let error = bind_server_listener(addr)
+            .await
+            .expect_err("occupied addr should fail");
+
+        let message = format!("{error:#}");
+        assert!(message.contains(&format!("failed to bind MAI_BIND_ADDR {addr}")));
+        assert!(message.contains("set MAI_BIND_ADDR"));
+    }
 
     #[tokio::test]
     async fn startup_ensures_default_chat_environment_with_default_image() {

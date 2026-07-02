@@ -8,9 +8,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use mai_docker::ExecCaptureOptions;
 use mai_mcp::McpTool;
 use mai_protocol::{
-    AgentId, AgentRole, AgentSummary, ArtifactInfo, ModelInputItem, ServiceEventKind, SessionId,
-    TaskReview, TaskSummary, TodoItem, ToolOutputArtifactInfo, ToolTraceDetail, TurnId,
-    UserInputOption, UserInputQuestion, now, preview,
+    AgentId, AgentRole, AgentSummary, ArtifactInfo, ServiceEventKind, SessionId, TaskReview,
+    TaskSummary, TodoItem, ToolOutputArtifactInfo, ToolTraceDetail, TurnId, UserInputOption,
+    UserInputQuestion, now, preview,
 };
 use mai_store::ConfigStore;
 use mai_tools::{RoutedTool, route_tool};
@@ -921,6 +921,7 @@ where
         .await;
 
     let started_at = Instant::now();
+    let raw_arguments = call.arguments.to_string();
     let output = execute(call.arguments).await;
     let duration_ms = u128_to_u64(started_at.elapsed().as_millis());
     let execution = match output {
@@ -934,10 +935,12 @@ where
         ctx.agent,
         ctx.agent_id,
         ctx.session_id,
-        ModelInputItem::FunctionCallOutput {
-            call_id: call.call_id.to_string(),
-            output: execution.model_output.clone(),
-        },
+        super::history::tool_result_message(
+            call.call_id.to_string(),
+            call.name.to_string(),
+            raw_arguments,
+            execution.model_output.clone(),
+        ),
     )
     .await?;
 
@@ -1579,8 +1582,9 @@ fn u128_to_u64(value: u128) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mai_protocol::{AgentSessionSummary, AgentStatus, AgentSummary, ModelInputItem, now};
+    use mai_protocol::{AgentSessionSummary, AgentStatus, AgentSummary, now};
     use mai_store::ToolTraceFilter;
+    use pl_protocol::{MessageContent, ToolResultMetadata};
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicBool;
@@ -1681,7 +1685,7 @@ mod tests {
             }
         }
 
-        async fn history(&self) -> Vec<ModelInputItem> {
+        async fn history(&self) -> Vec<pl_protocol::Message> {
             self.store
                 .load_agent_history(self.agent_id, self.session_id)
                 .await
@@ -1720,10 +1724,12 @@ mod tests {
         assert!(execution.success);
         let history = harness.history().await;
         assert_eq!(history.len(), 1);
+        let metadata =
+            ToolResultMetadata::from_metadata(&history[0].metadata).expect("tool result metadata");
+        assert_eq!(metadata.tool_call_id, "call_1");
         assert!(matches!(
-            &history[0],
-            ModelInputItem::FunctionCallOutput { call_id, output }
-                if call_id == "call_1" && output.contains("\"ok\":true")
+            &history[0].content,
+            MessageContent::Text(output) if output.contains("\"ok\":true")
         ));
         let events = harness.events.snapshot().await;
         assert!(events.iter().any(|event| matches!(

@@ -1,21 +1,22 @@
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::StreamExt;
-use mai_model::{
-    ModelClient, ModelEventStream, ModelStreamAccumulator, ModelStreamEvent, ModelTurnState,
-};
 use mai_protocol::{
-    AgentId, MessageRole, ModelInputItem, ModelOutputItem, ModelResponse, ServiceEventKind,
-    SessionId, TokenUsage, ToolDefinition, TurnId,
+    AgentId, MessageRole, ModelOutputItem, ModelResponse, ServiceEventKind, SessionId,
+    ToolDefinition, TurnId,
 };
 use mai_store::{ConfigStore, ProviderSelection};
+use pl_model::{
+    CompletionEventStream, CompletionResponse, CompletionStreamAccumulator, ModelContinuationState,
+};
+use pl_protocol::{Message, PureError};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::events::RuntimeEvents;
 use crate::state::AgentRecord;
+use crate::{ModelClient, completion_response_to_model_response};
 use crate::{Result, RuntimeError};
 
 #[derive(Debug)]
@@ -36,489 +37,6 @@ pub(crate) struct ModelTurnResult {
     pub(crate) made_progress: bool,
 }
 
-#[derive(Debug, Clone, Default)]
-struct ActiveItem {
-    text: String,
-    reasoning: String,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ToolPreview {
-    call_id: Option<String>,
-    name: Option<String>,
-    arguments: String,
-}
-
-struct ModelStreamReducer<'a> {
-    store: &'a ConfigStore,
-    events: &'a RuntimeEvents,
-    agent: &'a Arc<AgentRecord>,
-    agent_id: AgentId,
-    session_id: SessionId,
-    turn_id: TurnId,
-    message_id: String,
-    reasoning_id: String,
-    active_items: HashMap<usize, ActiveItem>,
-    completed_output_indices: HashSet<usize>,
-    final_output_items: Vec<ModelOutputItem>,
-    pending_tool_previews: HashMap<usize, ToolPreview>,
-    response_id: Option<String>,
-    usage: Option<TokenUsage>,
-    completed: bool,
-    last_assistant_text: Option<String>,
-    fallback_text: String,
-    fallback_reasoning: String,
-    tool_calls: Vec<(String, String, Value)>,
-    made_progress: bool,
-}
-
-impl<'a> ModelStreamReducer<'a> {
-    fn new(
-        store: &'a ConfigStore,
-        events: &'a RuntimeEvents,
-        agent: &'a Arc<AgentRecord>,
-        agent_id: AgentId,
-        session_id: SessionId,
-        turn_id: TurnId,
-    ) -> Self {
-        Self {
-            store,
-            events,
-            agent,
-            agent_id,
-            session_id,
-            turn_id,
-            message_id: format!("msg_{}", Uuid::new_v4()),
-            reasoning_id: format!("reasoning_{}", Uuid::new_v4()),
-            active_items: HashMap::new(),
-            completed_output_indices: HashSet::new(),
-            final_output_items: Vec::new(),
-            pending_tool_previews: HashMap::new(),
-            response_id: None,
-            usage: None,
-            completed: false,
-            last_assistant_text: None,
-            fallback_text: String::new(),
-            fallback_reasoning: String::new(),
-            tool_calls: Vec::new(),
-            made_progress: false,
-        }
-    }
-
-    async fn handle_event(&mut self, event: ModelStreamEvent) -> Result<()> {
-        match event {
-            ModelStreamEvent::ResponseStarted { id } => {
-                if self.response_id.is_none() {
-                    self.response_id = id;
-                }
-            }
-            ModelStreamEvent::OutputItemAdded { output_index, item } => {
-                if self.completed_output_indices.contains(&output_index) {
-                    return Ok(());
-                }
-                self.active_items.entry(output_index).or_default();
-                if let ModelOutputItem::FunctionCall { call_id, name, .. } = item {
-                    self.update_tool_preview(output_index, Some(call_id), Some(name));
-                }
-            }
-            ModelStreamEvent::TextDelta {
-                output_index,
-                delta,
-                ..
-            } => {
-                if delta.is_empty() || self.completed_output_indices.contains(&output_index) {
-                    return Ok(());
-                }
-                self.active_items
-                    .entry(output_index)
-                    .or_default()
-                    .text
-                    .push_str(&delta);
-                self.fallback_text.push_str(&delta);
-                self.events
-                    .publish(ServiceEventKind::AgentMessageDelta {
-                        agent_id: self.agent_id,
-                        session_id: Some(self.session_id),
-                        turn_id: self.turn_id,
-                        message_id: self.message_id.clone(),
-                        role: MessageRole::Assistant,
-                        channel: "final".to_string(),
-                        delta,
-                    })
-                    .await;
-            }
-            ModelStreamEvent::ReasoningDelta {
-                output_index,
-                delta,
-                ..
-            } => {
-                if delta.is_empty() || self.completed_output_indices.contains(&output_index) {
-                    return Ok(());
-                }
-                self.active_items
-                    .entry(output_index)
-                    .or_default()
-                    .reasoning
-                    .push_str(&delta);
-                self.fallback_reasoning.push_str(&delta);
-                self.events
-                    .publish(ServiceEventKind::ReasoningDelta {
-                        agent_id: self.agent_id,
-                        session_id: Some(self.session_id),
-                        turn_id: self.turn_id,
-                        message_id: self.reasoning_id.clone(),
-                        delta,
-                    })
-                    .await;
-            }
-            ModelStreamEvent::ToolCallStarted {
-                output_index,
-                call_id,
-                name,
-            } => {
-                if self.completed_output_indices.contains(&output_index) {
-                    return Ok(());
-                }
-                self.active_items.entry(output_index).or_default();
-                self.update_tool_preview(output_index, call_id, name);
-            }
-            ModelStreamEvent::ToolCallArgumentsDelta {
-                output_index,
-                delta,
-            } => {
-                if delta.is_empty() || self.completed_output_indices.contains(&output_index) {
-                    return Ok(());
-                }
-                let preview = {
-                    let preview = self.pending_tool_previews.entry(output_index).or_default();
-                    preview.arguments.push_str(&delta);
-                    preview.call_id.clone().zip(preview.name.clone())
-                };
-                if let Some((call_id, name)) = preview {
-                    self.events
-                        .publish(ServiceEventKind::ToolCallDelta {
-                            agent_id: self.agent_id,
-                            session_id: Some(self.session_id),
-                            turn_id: self.turn_id,
-                            call_id,
-                            tool_name: name,
-                            arguments_delta: delta,
-                        })
-                        .await;
-                }
-            }
-            ModelStreamEvent::OutputItemDone { output_index, item } => {
-                if !self.completed_output_indices.insert(output_index) {
-                    return Ok(());
-                }
-                self.finalize_output_item(output_index, item).await?;
-            }
-            ModelStreamEvent::Completed { id, usage, .. } => {
-                self.completed = true;
-                if let Some(id) = id {
-                    self.response_id = Some(id);
-                }
-                if let Some(usage) = usage {
-                    self.usage = Some(usage);
-                }
-            }
-            ModelStreamEvent::Status { .. } | ModelStreamEvent::CustomToolInputDelta { .. } => {}
-        }
-        Ok(())
-    }
-
-    fn update_tool_preview(
-        &mut self,
-        output_index: usize,
-        call_id: Option<String>,
-        name: Option<String>,
-    ) {
-        let preview = self.pending_tool_previews.entry(output_index).or_default();
-        if let Some(call_id) = call_id.filter(|value| !value.is_empty()) {
-            preview.call_id = Some(call_id);
-        }
-        if let Some(name) = name.filter(|value| !value.is_empty()) {
-            preview.name = Some(name);
-        }
-    }
-
-    async fn finalize_output_item(
-        &mut self,
-        output_index: usize,
-        item: ModelOutputItem,
-    ) -> Result<()> {
-        let active = self.active_items.remove(&output_index).unwrap_or_default();
-        self.pending_tool_previews.remove(&output_index);
-        match item {
-            ModelOutputItem::Message { text } => {
-                let text = if text.trim().is_empty() {
-                    active.text
-                } else {
-                    text
-                };
-                if !active.reasoning.trim().is_empty() {
-                    self.record_reasoning_item(active.reasoning).await?;
-                }
-                if !text.trim().is_empty() {
-                    self.made_progress = true;
-                    self.final_output_items
-                        .push(ModelOutputItem::Message { text: text.clone() });
-                    self.record_assistant_message(text.clone()).await?;
-                    super::history::record_history_item(
-                        self.store,
-                        self.agent,
-                        self.agent_id,
-                        self.session_id,
-                        ModelInputItem::assistant_text(text),
-                    )
-                    .await?;
-                }
-            }
-            ModelOutputItem::Reasoning { content } => {
-                let content = if content.trim().is_empty() {
-                    active.reasoning
-                } else {
-                    content
-                };
-                self.record_reasoning_item(content).await?;
-            }
-            ModelOutputItem::FunctionCall {
-                call_id,
-                name,
-                arguments,
-                raw_arguments,
-            } => {
-                self.made_progress = true;
-                let call_id = normalized_call_id(call_id);
-                if !active.reasoning.trim().is_empty() {
-                    self.record_reasoning_item(active.reasoning).await?;
-                }
-                if !active.text.trim().is_empty() {
-                    let text = active.text;
-                    self.final_output_items
-                        .push(ModelOutputItem::Message { text: text.clone() });
-                    self.record_assistant_message(text.clone()).await?;
-                    super::history::record_history_item(
-                        self.store,
-                        self.agent,
-                        self.agent_id,
-                        self.session_id,
-                        ModelInputItem::assistant_text(text),
-                    )
-                    .await?;
-                }
-                self.final_output_items.push(ModelOutputItem::FunctionCall {
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    arguments: arguments.clone(),
-                    raw_arguments: raw_arguments.clone(),
-                });
-                super::history::record_history_item(
-                    self.store,
-                    self.agent,
-                    self.agent_id,
-                    self.session_id,
-                    ModelInputItem::FunctionCall {
-                        call_id: call_id.clone(),
-                        name: name.clone(),
-                        arguments: raw_arguments,
-                    },
-                )
-                .await?;
-                self.tool_calls.push((call_id, name, arguments));
-            }
-            ModelOutputItem::Other { raw } => {
-                self.final_output_items.push(ModelOutputItem::Other { raw });
-            }
-        }
-        Ok(())
-    }
-
-    async fn finish(mut self) -> Result<ModelTurnResult> {
-        if !self.completed {
-            return Err(model_error_to_runtime(mai_model::ModelError::Stream(
-                "stream closed before response.completed".to_string(),
-            )));
-        }
-        self.persist_legacy_delta_fallback().await?;
-        self.finalize_pending_tool_calls().await?;
-        Ok(ModelTurnResult {
-            response: ModelResponse {
-                id: self.response_id,
-                output: self.final_output_items,
-                usage: self.usage,
-            },
-            tool_calls: self.tool_calls,
-            last_assistant_text: self.last_assistant_text,
-            made_progress: self.made_progress,
-        })
-    }
-
-    async fn persist_legacy_delta_fallback(&mut self) -> Result<()> {
-        if !self.final_output_items.is_empty() {
-            return Ok(());
-        }
-        let has_text = !self.fallback_text.trim().is_empty();
-        let has_reasoning = !self.fallback_reasoning.trim().is_empty();
-        if has_text && has_reasoning {
-            self.made_progress = true;
-            let text = self.fallback_text.clone();
-            let reasoning = self.fallback_reasoning.clone();
-            self.record_reasoning_item(reasoning).await?;
-            self.final_output_items
-                .push(ModelOutputItem::Message { text: text.clone() });
-            self.record_assistant_message(text.clone()).await?;
-            super::history::record_history_item(
-                self.store,
-                self.agent,
-                self.agent_id,
-                self.session_id,
-                ModelInputItem::assistant_text(text),
-            )
-            .await?;
-        } else if has_text {
-            self.made_progress = true;
-            let text = self.fallback_text.clone();
-            self.final_output_items
-                .push(ModelOutputItem::Message { text: text.clone() });
-            self.record_assistant_message(text.clone()).await?;
-            super::history::record_history_item(
-                self.store,
-                self.agent,
-                self.agent_id,
-                self.session_id,
-                ModelInputItem::assistant_text(text),
-            )
-            .await?;
-        } else if has_reasoning {
-            self.made_progress = true;
-            let reasoning = self.fallback_reasoning.clone();
-            self.record_reasoning_item(reasoning).await?;
-        }
-        Ok(())
-    }
-
-    async fn finalize_pending_tool_calls(&mut self) -> Result<()> {
-        if self.pending_tool_previews.is_empty() {
-            return Ok(());
-        }
-        let pending_indices: Vec<usize> = self.pending_tool_previews.keys().copied().collect();
-        for index in pending_indices {
-            let active = self.active_items.remove(&index).unwrap_or_default();
-            let preview = match self.pending_tool_previews.remove(&index) {
-                Some(preview) => preview,
-                None => continue,
-            };
-            let call_id = normalized_call_id(preview.call_id.unwrap_or_default());
-            let name = preview.name.unwrap_or_default();
-            let raw_arguments = preview.arguments;
-            let arguments = mai_model::types::parse_arguments(&raw_arguments);
-            if !active.reasoning.trim().is_empty() {
-                self.record_reasoning_item(active.reasoning).await?;
-            }
-            if !active.text.trim().is_empty() {
-                let text = active.text;
-                self.final_output_items
-                    .push(ModelOutputItem::Message { text: text.clone() });
-                self.record_assistant_message(text.clone()).await?;
-                super::history::record_history_item(
-                    self.store,
-                    self.agent,
-                    self.agent_id,
-                    self.session_id,
-                    ModelInputItem::assistant_text(text),
-                )
-                .await?;
-            }
-            self.made_progress = true;
-            self.final_output_items.push(ModelOutputItem::FunctionCall {
-                call_id: call_id.clone(),
-                name: name.clone(),
-                arguments: arguments.clone(),
-                raw_arguments: raw_arguments.clone(),
-            });
-            super::history::record_history_item(
-                self.store,
-                self.agent,
-                self.agent_id,
-                self.session_id,
-                ModelInputItem::FunctionCall {
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    arguments: raw_arguments,
-                },
-            )
-            .await?;
-            self.tool_calls.push((call_id, name, arguments));
-        }
-        Ok(())
-    }
-
-    async fn record_reasoning_item(&mut self, content: String) -> Result<()> {
-        if content.trim().is_empty() {
-            return Ok(());
-        }
-        self.made_progress = true;
-        self.final_output_items.push(ModelOutputItem::Reasoning {
-            content: content.clone(),
-        });
-        super::history::record_history_item(
-            self.store,
-            self.agent,
-            self.agent_id,
-            self.session_id,
-            ModelInputItem::Reasoning {
-                content: content.clone(),
-            },
-        )
-        .await?;
-        self.events
-            .publish(ServiceEventKind::ReasoningCompleted {
-                agent_id: self.agent_id,
-                session_id: Some(self.session_id),
-                turn_id: self.turn_id,
-                message_id: self.reasoning_id.clone(),
-                content,
-            })
-            .await;
-        Ok(())
-    }
-
-    async fn record_assistant_message(&mut self, text: String) -> Result<()> {
-        self.last_assistant_text = Some(text.clone());
-        super::history::record_message(
-            self.store,
-            self.agent,
-            self.agent_id,
-            self.session_id,
-            MessageRole::Assistant,
-            text.clone(),
-        )
-        .await?;
-        self.events
-            .publish(ServiceEventKind::AgentMessageCompleted {
-                agent_id: self.agent_id,
-                session_id: Some(self.session_id),
-                turn_id: self.turn_id,
-                message_id: self.message_id.clone(),
-                role: MessageRole::Assistant,
-                channel: "final".to_string(),
-                content: text.clone(),
-            })
-            .await;
-        self.events
-            .publish(ServiceEventKind::AgentMessage {
-                agent_id: self.agent_id,
-                session_id: Some(self.session_id),
-                turn_id: Some(self.turn_id),
-                role: MessageRole::Assistant,
-                content: text,
-            })
-            .await;
-        Ok(())
-    }
-}
-
 pub(crate) struct TurnStreamContext<'a> {
     pub(crate) store: &'a ConfigStore,
     pub(crate) events: &'a RuntimeEvents,
@@ -532,96 +50,201 @@ pub(crate) async fn run_model_stream_turn(
     model: &ModelClient,
     ctx: &TurnStreamContext<'_>,
     model_context: &TurnModelContext,
-    history: &[ModelInputItem],
-    turn_model_state: &mut ModelTurnState,
+    history: &[Message],
+    turn_model_state: &mut ModelContinuationState,
     cancellation_token: &CancellationToken,
 ) -> Result<ModelTurnResult> {
-    turn_model_state.prompt_cache_key =
-        Some(format!("agent:{}:session:{}", ctx.agent_id, ctx.session_id));
-    let resolved = model.resolve(
-        &model_context.provider_selection.provider,
-        &model_context.provider_selection.model,
-        model_context.reasoning_effort.as_deref(),
-    );
+    turn_model_state
+        .set_prompt_cache_key(format!("agent:{}:session:{}", ctx.agent_id, ctx.session_id));
     let stream = model
-        .send_turn(
-            &resolved,
+        .open_completion_event_stream(
+            &model_context.provider_selection,
+            model_context.reasoning_effort.as_deref(),
             &model_context.instructions,
             history,
             &model_context.tools,
             turn_model_state,
-            cancellation_token,
         )
-        .await
-        .map_err(model_error_to_runtime)?;
+        .await?;
     consume_turn_stream(model, ctx, turn_model_state, stream, cancellation_token).await
 }
 
 pub(crate) async fn consume_model_stream_to_response(
     model: &ModelClient,
-    resolved: &mai_model::ResolvedProvider,
+    provider_selection: &ProviderSelection,
+    reasoning_effort: Option<&str>,
     instructions: &str,
-    input: &[ModelInputItem],
+    input: &[Message],
     tools: &[ToolDefinition],
-    state: &mut ModelTurnState,
+    continuation: &mut ModelContinuationState,
     cancellation_token: &CancellationToken,
-) -> std::result::Result<ModelResponse, mai_model::ModelError> {
-    let mut stream = model
-        .send_turn(
-            resolved,
+) -> std::result::Result<ModelResponse, PureError> {
+    let response = model
+        .stream_completion_response(
+            provider_selection,
+            reasoning_effort,
             instructions,
             input,
             tools,
-            state,
+            continuation,
             cancellation_token,
         )
         .await?;
-    let mut accumulator = ModelStreamAccumulator::default();
-    while let Some(event) = stream.next().await {
-        if cancellation_token.is_cancelled() {
-            return Err(mai_model::ModelError::Cancelled);
-        }
-        let event = event?;
-        accumulator.push(&event);
-    }
-    let response = accumulator.finish()?;
-    model.apply_completed_state(state, response.id.as_deref());
-    Ok(response)
+    Ok(completion_response_to_model_response(response))
 }
 
 async fn consume_turn_stream(
     model: &ModelClient,
     ctx: &TurnStreamContext<'_>,
-    turn_model_state: &mut ModelTurnState,
-    mut stream: ModelEventStream,
+    turn_model_state: &mut ModelContinuationState,
+    mut stream: CompletionEventStream,
     cancellation_token: &CancellationToken,
 ) -> Result<ModelTurnResult> {
-    let mut reducer = ModelStreamReducer::new(
-        ctx.store,
-        ctx.events,
-        ctx.agent,
-        ctx.agent_id,
-        ctx.session_id,
-        ctx.turn_id,
-    );
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
+    let mut accumulator = CompletionStreamAccumulator::new(None);
     while let Some(event) = stream.next().await {
         if cancellation_token.is_cancelled() {
             return Err(RuntimeError::TurnCancelled);
         }
-        let event = event.map_err(model_error_to_runtime)?;
-        reducer.handle_event(event).await?;
+        let event = event?;
+        accumulator.apply(event, &event_tx)?;
     }
-    let result = reducer.finish().await?;
-    model.apply_completed_state(turn_model_state, result.response.id.as_deref());
+    let response = accumulator.finish(&event_tx)?;
+    let result = record_completion_response(ctx, response).await?;
+    let history_len =
+        super::history::raw_session_history_len(ctx.store, ctx.agent, ctx.agent_id, ctx.session_id)
+            .await?;
+    model.apply_completed_state(turn_model_state, history_len, result.response.id.as_deref());
     Ok(result)
 }
 
-pub(crate) fn model_error_to_runtime(err: mai_model::ModelError) -> RuntimeError {
-    if matches!(err, mai_model::ModelError::Cancelled) {
-        RuntimeError::TurnCancelled
-    } else {
-        RuntimeError::Model(err)
+async fn record_completion_response(
+    ctx: &TurnStreamContext<'_>,
+    response: CompletionResponse,
+) -> Result<ModelTurnResult> {
+    let response = completion_response_to_model_response(response);
+    let mut tool_calls = Vec::new();
+    let mut last_assistant_text = None;
+    let mut made_progress = false;
+    for item in &response.output {
+        match item {
+            ModelOutputItem::Reasoning { content } => {
+                if !content.trim().is_empty() {
+                    made_progress = true;
+                    record_reasoning_item(ctx, content.clone()).await?;
+                }
+            }
+            ModelOutputItem::Message { text } => {
+                if !text.trim().is_empty() {
+                    made_progress = true;
+                    last_assistant_text = Some(text.clone());
+                    record_assistant_message(ctx, text.clone()).await?;
+                }
+            }
+            ModelOutputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                raw_arguments,
+            } => {
+                made_progress = true;
+                let call_id = normalized_call_id(call_id.clone());
+                ctx.events
+                    .publish(ServiceEventKind::ToolCallDelta {
+                        agent_id: ctx.agent_id,
+                        session_id: Some(ctx.session_id),
+                        turn_id: ctx.turn_id,
+                        call_id: call_id.clone(),
+                        tool_name: name.clone(),
+                        arguments_delta: raw_arguments.clone(),
+                    })
+                    .await;
+                super::history::record_history_item(
+                    ctx.store,
+                    ctx.agent,
+                    ctx.agent_id,
+                    ctx.session_id,
+                    super::history::tool_call_message(
+                        call_id.clone(),
+                        name.clone(),
+                        raw_arguments.clone(),
+                    ),
+                )
+                .await?;
+                tool_calls.push((call_id, name.clone(), arguments.clone()));
+            }
+            ModelOutputItem::Other { .. } => {}
+        }
     }
+    Ok(ModelTurnResult {
+        response,
+        tool_calls,
+        last_assistant_text,
+        made_progress,
+    })
+}
+
+async fn record_reasoning_item(ctx: &TurnStreamContext<'_>, content: String) -> Result<()> {
+    super::history::record_history_item(
+        ctx.store,
+        ctx.agent,
+        ctx.agent_id,
+        ctx.session_id,
+        super::history::reasoning_message(content.clone()),
+    )
+    .await?;
+    ctx.events
+        .publish(ServiceEventKind::ReasoningCompleted {
+            agent_id: ctx.agent_id,
+            session_id: Some(ctx.session_id),
+            turn_id: ctx.turn_id,
+            message_id: format!("reasoning_{}", Uuid::new_v4()),
+            content,
+        })
+        .await;
+    Ok(())
+}
+
+async fn record_assistant_message(ctx: &TurnStreamContext<'_>, text: String) -> Result<()> {
+    super::history::record_message(
+        ctx.store,
+        ctx.agent,
+        ctx.agent_id,
+        ctx.session_id,
+        MessageRole::Assistant,
+        text.clone(),
+    )
+    .await?;
+    super::history::record_history_item(
+        ctx.store,
+        ctx.agent,
+        ctx.agent_id,
+        ctx.session_id,
+        super::history::assistant_text_message(text.clone()),
+    )
+    .await?;
+    let message_id = format!("msg_{}", Uuid::new_v4());
+    ctx.events
+        .publish(ServiceEventKind::AgentMessageCompleted {
+            agent_id: ctx.agent_id,
+            session_id: Some(ctx.session_id),
+            turn_id: ctx.turn_id,
+            message_id: message_id.clone(),
+            role: MessageRole::Assistant,
+            channel: "final".to_string(),
+            content: text.clone(),
+        })
+        .await;
+    ctx.events
+        .publish(ServiceEventKind::AgentMessage {
+            agent_id: ctx.agent_id,
+            session_id: Some(ctx.session_id),
+            turn_id: Some(ctx.turn_id),
+            role: MessageRole::Assistant,
+            content: text,
+        })
+        .await;
+    Ok(())
 }
 
 fn normalized_call_id(call_id: String) -> String {
@@ -629,699 +252,5 @@ fn normalized_call_id(call_id: String) -> String {
         format!("call_{}", Uuid::new_v4())
     } else {
         call_id
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::stream;
-    use mai_protocol::{AgentSessionSummary, AgentStatus, AgentSummary, ModelContentItem, now};
-    use std::collections::VecDeque;
-    use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::AtomicBool;
-    use tempfile::TempDir;
-    use tokio::sync::{Mutex, RwLock};
-
-    use crate::state::{AgentSessionRecord, TurnControl};
-
-    struct Harness {
-        _dir: TempDir,
-        store: Arc<ConfigStore>,
-        events: RuntimeEvents,
-        agent: Arc<AgentRecord>,
-        agent_id: AgentId,
-        session_id: SessionId,
-        turn_id: TurnId,
-    }
-
-    impl Harness {
-        async fn new() -> Self {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let store = Arc::new(
-                ConfigStore::open_with_config_path(
-                    dir.path().join("runtime.sqlite3"),
-                    dir.path().join("config.toml"),
-                )
-                .await
-                .expect("store"),
-            );
-            let agent_id = Uuid::new_v4();
-            let session_id = Uuid::new_v4();
-            let turn_id = Uuid::new_v4();
-            let created_at = now();
-            let summary = AgentSummary {
-                id: agent_id,
-                parent_id: None,
-                task_id: None,
-                project_id: None,
-                role: None,
-                name: "stream-test-agent".to_string(),
-                status: AgentStatus::RunningTurn,
-                container_id: None,
-                docker_image: "unused".to_string(),
-                provider_id: "mock".to_string(),
-                provider_name: "Mock".to_string(),
-                model: "mock-model".to_string(),
-                reasoning_effort: None,
-                created_at,
-                updated_at: created_at,
-                current_turn: Some(turn_id),
-                last_error: None,
-                token_usage: TokenUsage::default(),
-            };
-            let session_summary = AgentSessionSummary {
-                id: session_id,
-                title: "Default".to_string(),
-                created_at,
-                updated_at: created_at,
-                message_count: 0,
-                token_usage: TokenUsage::default(),
-            };
-            let agent = Arc::new(AgentRecord {
-                summary: RwLock::new(summary.clone()),
-                sessions: Mutex::new(vec![AgentSessionRecord {
-                    summary: session_summary.clone(),
-                    messages: Vec::new(),
-                    last_context_tokens: None,
-                    last_turn_response: None,
-                }]),
-                container: RwLock::new(None),
-                mcp: RwLock::new(None),
-                system_prompt: None,
-                turn_lock: Mutex::new(()),
-                cancel_requested: AtomicBool::new(false),
-                active_turn: StdMutex::new(Some(TurnControl {
-                    turn_id,
-                    session_id,
-                    cancellation_token: CancellationToken::new(),
-                    abort_handle: None,
-                })),
-                pending_inputs: Mutex::new(VecDeque::new()),
-            });
-            store.save_agent(&summary, None).await.expect("save agent");
-            store
-                .save_agent_session(agent_id, &session_summary)
-                .await
-                .expect("save session");
-            let events = RuntimeEvents::new(Arc::clone(&store), 0, Vec::new());
-            Self {
-                _dir: dir,
-                store,
-                events,
-                agent,
-                agent_id,
-                session_id,
-                turn_id,
-            }
-        }
-
-        async fn consume(&self, events: Vec<ModelStreamEvent>) -> Result<ModelTurnResult> {
-            let mut state = ModelTurnState::default();
-            consume_turn_stream(
-                &ModelClient::new(),
-                &TurnStreamContext {
-                    store: self.store.as_ref(),
-                    events: &self.events,
-                    agent: &self.agent,
-                    agent_id: self.agent_id,
-                    session_id: self.session_id,
-                    turn_id: self.turn_id,
-                },
-                &mut state,
-                event_stream(events),
-                &CancellationToken::new(),
-            )
-            .await
-        }
-
-        async fn history(&self) -> Vec<ModelInputItem> {
-            self.store
-                .load_agent_history(self.agent_id, self.session_id)
-                .await
-                .expect("load history")
-        }
-
-        async fn messages(&self) -> Vec<mai_protocol::AgentMessage> {
-            self.agent.sessions.lock().await[0].messages.clone()
-        }
-    }
-
-    fn event_stream(events: Vec<ModelStreamEvent>) -> ModelEventStream {
-        Box::pin(stream::iter(
-            events.into_iter().map(Ok::<_, mai_model::ModelError>),
-        ))
-    }
-
-    fn completed() -> ModelStreamEvent {
-        ModelStreamEvent::Completed {
-            id: Some("resp_1".to_string()),
-            usage: Some(TokenUsage {
-                input_tokens: 3,
-                cached_input_tokens: 1,
-                output_tokens: 2,
-                reasoning_output_tokens: 1,
-                total_tokens: 5,
-            }),
-            end_turn: Some(true),
-        }
-    }
-
-    #[tokio::test]
-    async fn delta_then_message_done_writes_one_final_assistant_history() {
-        let harness = Harness::new().await;
-        let result = harness
-            .consume(vec![
-                ModelStreamEvent::ResponseStarted {
-                    id: Some("resp_1".to_string()),
-                },
-                ModelStreamEvent::OutputItemAdded {
-                    output_index: 0,
-                    item: ModelOutputItem::Message {
-                        text: String::new(),
-                    },
-                },
-                ModelStreamEvent::TextDelta {
-                    output_index: 0,
-                    content_index: Some(0),
-                    delta: "hel".to_string(),
-                },
-                ModelStreamEvent::TextDelta {
-                    output_index: 0,
-                    content_index: Some(0),
-                    delta: "lo".to_string(),
-                },
-                ModelStreamEvent::OutputItemDone {
-                    output_index: 0,
-                    item: ModelOutputItem::Message {
-                        text: "hello".to_string(),
-                    },
-                },
-                completed(),
-            ])
-            .await
-            .expect("consume");
-
-        assert!(result.made_progress);
-        assert_eq!(result.last_assistant_text.as_deref(), Some("hello"));
-        assert_eq!(result.response.output.len(), 1);
-        assert!(matches!(
-            &result.response.output[0],
-            ModelOutputItem::Message { text } if text == "hello"
-        ));
-        let history = harness.history().await;
-        assert_eq!(history.len(), 1);
-        assert!(matches!(
-            &history[0],
-            ModelInputItem::Message { role, content }
-                if role == "assistant"
-                    && matches!(&content[0], ModelContentItem::OutputText { text } if text == "hello")
-        ));
-        let messages = harness.messages().await;
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "hello");
-        let event_snapshot = harness.events.snapshot().await;
-        assert_eq!(
-            event_snapshot
-                .iter()
-                .filter(|event| matches!(event.kind, ServiceEventKind::AgentMessageDelta { .. }))
-                .count(),
-            2
-        );
-        assert_eq!(
-            event_snapshot
-                .iter()
-                .filter(|event| matches!(
-                    event.kind,
-                    ServiceEventKind::AgentMessageCompleted { .. }
-                ))
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn reasoning_delta_and_message_done_write_ledger_items() {
-        let harness = Harness::new().await;
-        let result = harness
-            .consume(vec![
-                ModelStreamEvent::OutputItemAdded {
-                    output_index: 0,
-                    item: ModelOutputItem::Message {
-                        text: String::new(),
-                    },
-                },
-                ModelStreamEvent::ReasoningDelta {
-                    output_index: 0,
-                    content_index: Some(0),
-                    delta: "thinking".to_string(),
-                },
-                ModelStreamEvent::TextDelta {
-                    output_index: 0,
-                    content_index: Some(1),
-                    delta: "answer".to_string(),
-                },
-                ModelStreamEvent::OutputItemDone {
-                    output_index: 0,
-                    item: ModelOutputItem::Message {
-                        text: "answer".to_string(),
-                    },
-                },
-                completed(),
-            ])
-            .await
-            .expect("consume");
-
-        assert_eq!(result.last_assistant_text.as_deref(), Some("answer"));
-        assert_eq!(result.response.output.len(), 2);
-        assert!(matches!(
-            &result.response.output[0],
-            ModelOutputItem::Reasoning { content } if content == "thinking"
-        ));
-        assert!(matches!(
-            &result.response.output[1],
-            ModelOutputItem::Message { text } if text == "answer"
-        ));
-        let history = harness.history().await;
-        assert_eq!(history.len(), 2);
-        assert!(matches!(
-            &history[0],
-            ModelInputItem::Reasoning { content } if content == "thinking"
-        ));
-        assert!(matches!(
-            &history[1],
-            ModelInputItem::Message { role, content }
-                if role == "assistant"
-                    && matches!(&content[0], ModelContentItem::OutputText { text } if text == "answer")
-        ));
-        let messages = harness.messages().await;
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "answer");
-        let event_snapshot = harness.events.snapshot().await;
-        assert!(event_snapshot.iter().any(|event| matches!(
-            &event.kind,
-            ServiceEventKind::ReasoningCompleted { content, .. } if content == "thinking"
-        )));
-    }
-
-    #[tokio::test]
-    async fn tool_preview_is_not_history_and_done_enqueues_final_arguments_once() {
-        let harness = Harness::new().await;
-        let result = harness
-            .consume(vec![
-                ModelStreamEvent::OutputItemAdded {
-                    output_index: 0,
-                    item: ModelOutputItem::FunctionCall {
-                        call_id: "call_1".to_string(),
-                        name: "read_file".to_string(),
-                        arguments: serde_json::json!({}),
-                        raw_arguments: String::new(),
-                    },
-                },
-                ModelStreamEvent::ToolCallArgumentsDelta {
-                    output_index: 0,
-                    delta: "{\"path\":\"".to_string(),
-                },
-                ModelStreamEvent::ToolCallArgumentsDelta {
-                    output_index: 0,
-                    delta: "Cargo.toml\"}".to_string(),
-                },
-                ModelStreamEvent::OutputItemDone {
-                    output_index: 0,
-                    item: ModelOutputItem::FunctionCall {
-                        call_id: "call_1".to_string(),
-                        name: "read_file".to_string(),
-                        arguments: serde_json::json!({ "path": "src/lib.rs" }),
-                        raw_arguments: "{\"path\":\"src/lib.rs\"}".to_string(),
-                    },
-                },
-                completed(),
-            ])
-            .await
-            .expect("consume");
-
-        assert_eq!(result.tool_calls.len(), 1);
-        assert_eq!(result.tool_calls[0].0, "call_1");
-        assert_eq!(result.tool_calls[0].1, "read_file");
-        assert_eq!(result.tool_calls[0].2["path"], "src/lib.rs");
-        let history = harness.history().await;
-        assert_eq!(history.len(), 1);
-        assert!(matches!(
-            &history[0],
-            ModelInputItem::FunctionCall {
-                call_id,
-                name,
-                arguments,
-            } if call_id == "call_1"
-                && name == "read_file"
-                && arguments == "{\"path\":\"src/lib.rs\"}"
-        ));
-        let event_snapshot = harness.events.snapshot().await;
-        assert_eq!(
-            event_snapshot
-                .iter()
-                .filter(|event| matches!(event.kind, ServiceEventKind::ToolCallDelta { .. }))
-                .count(),
-            2
-        );
-    }
-
-    #[tokio::test]
-    async fn reasoning_delta_before_function_call_done_is_replayed_with_tool_call() {
-        let harness = Harness::new().await;
-        let result = harness
-            .consume(vec![
-                ModelStreamEvent::OutputItemAdded {
-                    output_index: 0,
-                    item: ModelOutputItem::FunctionCall {
-                        call_id: "call_1".to_string(),
-                        name: "read_file".to_string(),
-                        arguments: serde_json::json!({}),
-                        raw_arguments: String::new(),
-                    },
-                },
-                ModelStreamEvent::ReasoningDelta {
-                    output_index: 0,
-                    content_index: Some(0),
-                    delta: "Need to inspect the file.".to_string(),
-                },
-                ModelStreamEvent::ToolCallArgumentsDelta {
-                    output_index: 0,
-                    delta: "{\"path\":\"Cargo.toml\"}".to_string(),
-                },
-                ModelStreamEvent::OutputItemDone {
-                    output_index: 0,
-                    item: ModelOutputItem::FunctionCall {
-                        call_id: "call_1".to_string(),
-                        name: "read_file".to_string(),
-                        arguments: serde_json::json!({ "path": "Cargo.toml" }),
-                        raw_arguments: "{\"path\":\"Cargo.toml\"}".to_string(),
-                    },
-                },
-                completed(),
-            ])
-            .await
-            .expect("consume");
-
-        assert_eq!(result.tool_calls.len(), 1);
-        assert_eq!(result.response.output.len(), 2);
-        assert!(matches!(
-            &result.response.output[0],
-            ModelOutputItem::Reasoning { content } if content == "Need to inspect the file."
-        ));
-        assert!(matches!(
-            &result.response.output[1],
-            ModelOutputItem::FunctionCall {
-                call_id,
-                name,
-                raw_arguments,
-                ..
-            } if call_id == "call_1"
-                && name == "read_file"
-                && raw_arguments == "{\"path\":\"Cargo.toml\"}"
-        ));
-        let history = harness.history().await;
-        assert_eq!(history.len(), 2);
-        assert!(matches!(
-            &history[0],
-            ModelInputItem::Reasoning { content } if content == "Need to inspect the file."
-        ));
-        assert!(matches!(
-            &history[1],
-            ModelInputItem::FunctionCall {
-                call_id,
-                name,
-                arguments,
-            } if call_id == "call_1"
-                && name == "read_file"
-                && arguments == "{\"path\":\"Cargo.toml\"}"
-        ));
-    }
-
-    #[tokio::test]
-    async fn chat_assistant_done_before_parallel_tool_calls_is_persisted_once() {
-        let harness = Harness::new().await;
-        let result = harness
-            .consume(vec![
-                ModelStreamEvent::ReasoningDelta {
-                    output_index: 0,
-                    content_index: None,
-                    delta: "need repository facts".to_string(),
-                },
-                ModelStreamEvent::TextDelta {
-                    output_index: 0,
-                    content_index: None,
-                    delta: "I will inspect the repo.".to_string(),
-                },
-                ModelStreamEvent::ToolCallStarted {
-                    output_index: 1,
-                    call_id: Some("call_1".to_string()),
-                    name: Some("read_file".to_string()),
-                },
-                ModelStreamEvent::ToolCallArgumentsDelta {
-                    output_index: 1,
-                    delta: "{\"path\":\"Cargo.toml\"}".to_string(),
-                },
-                ModelStreamEvent::ToolCallStarted {
-                    output_index: 2,
-                    call_id: Some("call_2".to_string()),
-                    name: Some("list_files".to_string()),
-                },
-                ModelStreamEvent::ToolCallArgumentsDelta {
-                    output_index: 2,
-                    delta: "{}".to_string(),
-                },
-                ModelStreamEvent::OutputItemDone {
-                    output_index: 0,
-                    item: ModelOutputItem::Message {
-                        text: String::new(),
-                    },
-                },
-                ModelStreamEvent::OutputItemDone {
-                    output_index: 0,
-                    item: ModelOutputItem::Message {
-                        text: String::new(),
-                    },
-                },
-                ModelStreamEvent::OutputItemDone {
-                    output_index: 1,
-                    item: ModelOutputItem::FunctionCall {
-                        call_id: "call_1".to_string(),
-                        name: "read_file".to_string(),
-                        arguments: serde_json::json!({ "path": "Cargo.toml" }),
-                        raw_arguments: "{\"path\":\"Cargo.toml\"}".to_string(),
-                    },
-                },
-                ModelStreamEvent::OutputItemDone {
-                    output_index: 2,
-                    item: ModelOutputItem::FunctionCall {
-                        call_id: "call_2".to_string(),
-                        name: "list_files".to_string(),
-                        arguments: serde_json::json!({}),
-                        raw_arguments: "{}".to_string(),
-                    },
-                },
-                completed(),
-            ])
-            .await
-            .expect("consume");
-
-        assert_eq!(result.tool_calls.len(), 2);
-        assert_eq!(result.response.output.len(), 4);
-        assert!(matches!(
-            &result.response.output[0],
-            ModelOutputItem::Reasoning { content } if content == "need repository facts"
-        ));
-        assert!(matches!(
-            &result.response.output[1],
-            ModelOutputItem::Message { text } if text == "I will inspect the repo."
-        ));
-        assert!(matches!(
-            &result.response.output[2],
-            ModelOutputItem::FunctionCall { call_id, .. } if call_id == "call_1"
-        ));
-        assert!(matches!(
-            &result.response.output[3],
-            ModelOutputItem::FunctionCall { call_id, .. } if call_id == "call_2"
-        ));
-        let history = harness.history().await;
-        assert_eq!(history.len(), 4);
-        assert!(matches!(
-            &history[0],
-            ModelInputItem::Reasoning { content } if content == "need repository facts"
-        ));
-        assert!(matches!(
-            &history[1],
-            ModelInputItem::Message { role, content }
-                if role == "assistant"
-                    && matches!(&content[0], ModelContentItem::OutputText { text } if text == "I will inspect the repo.")
-        ));
-        assert!(matches!(
-            &history[2],
-            ModelInputItem::FunctionCall {
-                call_id,
-                name,
-                arguments,
-            } if call_id == "call_1"
-                && name == "read_file"
-                && arguments == "{\"path\":\"Cargo.toml\"}"
-        ));
-        assert!(matches!(
-            &history[3],
-            ModelInputItem::FunctionCall {
-                call_id,
-                name,
-                arguments,
-            } if call_id == "call_2" && name == "list_files" && arguments == "{}"
-        ));
-        let messages = harness.messages().await;
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "I will inspect the repo.");
-    }
-
-    #[tokio::test]
-    async fn message_then_function_call_items_are_persisted_separately() {
-        let harness = Harness::new().await;
-        let result = harness
-            .consume(vec![
-                ModelStreamEvent::OutputItemDone {
-                    output_index: 0,
-                    item: ModelOutputItem::Reasoning {
-                        content: "Need file contents.".to_string(),
-                    },
-                },
-                ModelStreamEvent::OutputItemDone {
-                    output_index: 1,
-                    item: ModelOutputItem::Message {
-                        text: "I'll inspect that.".to_string(),
-                    },
-                },
-                ModelStreamEvent::OutputItemDone {
-                    output_index: 2,
-                    item: ModelOutputItem::FunctionCall {
-                        call_id: "call_1".to_string(),
-                        name: "read_file".to_string(),
-                        arguments: serde_json::json!({ "path": "src/lib.rs" }),
-                        raw_arguments: "{\"path\":\"src/lib.rs\"}".to_string(),
-                    },
-                },
-                completed(),
-            ])
-            .await
-            .expect("consume");
-
-        assert_eq!(result.tool_calls.len(), 1);
-        let history = harness.history().await;
-        assert_eq!(history.len(), 3);
-        assert!(matches!(
-            &history[0],
-            ModelInputItem::Reasoning { content } if content == "Need file contents."
-        ));
-        assert!(matches!(
-            &history[1],
-            ModelInputItem::Message { role, content }
-                if role == "assistant"
-                    && matches!(&content[0], ModelContentItem::OutputText { text } if text == "I'll inspect that.")
-        ));
-        assert!(matches!(
-            &history[2],
-            ModelInputItem::FunctionCall {
-                call_id,
-                name,
-                arguments,
-            } if call_id == "call_1"
-                && name == "read_file"
-                && arguments == "{\"path\":\"src/lib.rs\"}"
-        ));
-    }
-
-    #[tokio::test]
-    async fn stream_eof_before_completed_is_error() {
-        let harness = Harness::new().await;
-        let err = harness
-            .consume(vec![ModelStreamEvent::TextDelta {
-                output_index: 0,
-                content_index: Some(0),
-                delta: "partial".to_string(),
-            }])
-            .await
-            .expect_err("stream should fail before completed");
-
-        assert!(matches!(
-            err,
-            RuntimeError::Model(mai_model::ModelError::Stream(message))
-                if message == "stream closed before response.completed"
-        ));
-        assert!(harness.history().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn completed_delta_only_stream_uses_legacy_fallback_in_reducer() {
-        let harness = Harness::new().await;
-        let result = harness
-            .consume(vec![
-                ModelStreamEvent::TextDelta {
-                    output_index: 0,
-                    content_index: Some(0),
-                    delta: "fallback answer".to_string(),
-                },
-                completed(),
-            ])
-            .await
-            .expect("consume");
-
-        assert_eq!(
-            result.last_assistant_text.as_deref(),
-            Some("fallback answer")
-        );
-        assert!(matches!(
-            &result.response.output[0],
-            ModelOutputItem::Message { text } if text == "fallback answer"
-        ));
-        let history = harness.history().await;
-        assert_eq!(history.len(), 1);
-        assert!(matches!(
-            &history[0],
-            ModelInputItem::Message { role, content }
-                if role == "assistant"
-                    && matches!(&content[0], ModelContentItem::OutputText { text } if text == "fallback answer")
-        ));
-    }
-
-    #[tokio::test]
-    async fn pending_tool_calls_are_finalized_without_output_item_done() {
-        let harness = Harness::new().await;
-        let result = harness
-            .consume(vec![
-                ModelStreamEvent::ToolCallStarted {
-                    output_index: 0,
-                    call_id: Some("call_1".to_string()),
-                    name: Some("list_files".to_string()),
-                },
-                ModelStreamEvent::ToolCallArgumentsDelta {
-                    output_index: 0,
-                    delta: "{\"max_files\":3}".to_string(),
-                },
-                completed(),
-            ])
-            .await
-            .expect("consume");
-
-        assert_eq!(result.tool_calls.len(), 1);
-        assert_eq!(result.tool_calls[0].0, "call_1");
-        assert_eq!(result.tool_calls[0].1, "list_files");
-        assert_eq!(result.tool_calls[0].2["max_files"], 3);
-        let history = harness.history().await;
-        assert_eq!(history.len(), 1);
-        assert!(matches!(
-            &history[0],
-            ModelInputItem::FunctionCall {
-                call_id,
-                name,
-                arguments,
-            } if call_id == "call_1"
-                && name == "list_files"
-                && arguments == "{\"max_files\":3}"
-        ));
     }
 }

@@ -2,10 +2,11 @@ use super::*;
 use crate::events::event_session_id;
 use crate::schema::{SCHEMA_VERSION, SETTING_SCHEMA_VERSION};
 use mai_protocol::{
-    AgentStatus, McpServerScope, McpServerTransport, MessageRole, ModelContentItem,
-    ProjectCloneStatus, ProjectReviewDecision, ProjectReviewOutcome, ProjectReviewRunStatus,
-    ProjectReviewStatus, ProjectStatus, ServiceEventKind, TurnStatus,
+    AgentStatus, McpServerScope, McpServerTransport, MessageRole, ProjectCloneStatus,
+    ProjectReviewDecision, ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus,
+    ProjectStatus, ServiceEventKind, TurnStatus,
 };
+use pl_protocol::{Message, MessageContent, MessageRole as PlMessageRole};
 use serde_json::json;
 use std::collections::BTreeMap;
 use tempfile::{TempDir, tempdir};
@@ -21,6 +22,15 @@ async fn store() -> (TempDir, ConfigStore) {
     .await
     .expect("open store");
     (dir, store)
+}
+
+fn pl_text_message(role: PlMessageRole, text: &str) -> Message {
+    Message {
+        role,
+        content: MessageContent::Text(text.to_string()),
+        reasoning_content: None,
+        metadata: Default::default(),
+    }
 }
 
 fn test_project_summary(project_id: ProjectId, maintainer_agent_id: AgentId) -> ProjectSummary {
@@ -1093,21 +1103,19 @@ async fn runtime_snapshot_survives_reopen() {
         content: "hello".to_string(),
         created_at: now,
     };
+    let mut tool_call = pl_text_message(PlMessageRole::Assistant, "");
+    tool_call
+        .metadata
+        .insert("tool_calls".to_string(), r#"[{"id":"call_1"}]"#.to_string());
     let history = [
-        ModelInputItem::Message {
-            role: "user".to_string(),
-            content: vec![ModelContentItem::InputText {
-                text: "hello".to_string(),
-            }],
+        pl_text_message(PlMessageRole::User, "hello"),
+        Message {
+            role: PlMessageRole::Assistant,
+            content: MessageContent::Text("answer".to_string()),
+            reasoning_content: Some("thinking".to_string()),
+            metadata: Default::default(),
         },
-        ModelInputItem::Reasoning {
-            content: "thinking".to_string(),
-        },
-        ModelInputItem::FunctionCall {
-            call_id: "call_1".to_string(),
-            name: "container_exec".to_string(),
-            arguments: "{\"command\":\"pwd\"}".to_string(),
-        },
+        tool_call,
     ];
     let event = ServiceEvent {
         sequence: 7,
@@ -1192,21 +1200,7 @@ async fn runtime_snapshot_survives_reopen() {
         .load_agent_history(agent_id, session_id)
         .await
         .expect("load history");
-    assert_eq!(loaded_history.len(), 3);
-    assert!(matches!(
-        &loaded_history[1],
-        ModelInputItem::Reasoning { content } if content == "thinking"
-    ));
-    assert!(matches!(
-        &loaded_history[2],
-        ModelInputItem::FunctionCall {
-            call_id,
-            name,
-            arguments,
-        } if call_id == "call_1"
-            && name == "container_exec"
-            && arguments == "{\"command\":\"pwd\"}"
-    ));
+    assert_eq!(loaded_history, history);
     assert_eq!(snapshot.recent_events.len(), 1);
     assert_eq!(
         event_session_id(&snapshot.recent_events[0]),
@@ -1495,7 +1489,7 @@ async fn replace_agent_history_only_replaces_target_session() {
             agent_id,
             first_session_id,
             0,
-            &ModelInputItem::user_text("old first"),
+            &pl_text_message(PlMessageRole::User, "old first"),
         )
         .await
         .expect("first history");
@@ -1504,7 +1498,7 @@ async fn replace_agent_history_only_replaces_target_session() {
             agent_id,
             second_session_id,
             0,
-            &ModelInputItem::user_text("old second"),
+            &pl_text_message(PlMessageRole::User, "old second"),
         )
         .await
         .expect("second history");
@@ -1513,7 +1507,7 @@ async fn replace_agent_history_only_replaces_target_session() {
         .replace_agent_history(
             agent_id,
             first_session_id,
-            &[ModelInputItem::user_text("new")],
+            &[pl_text_message(PlMessageRole::User, "new")],
         )
         .await
         .expect("replace");
@@ -1525,16 +1519,85 @@ async fn replace_agent_history_only_replaces_target_session() {
         .load_agent_history(agent_id, second_session_id)
         .await
         .expect("second");
-    assert!(matches!(
-        &first[0],
-        ModelInputItem::Message { content, .. }
-            if matches!(&content[0], ModelContentItem::InputText { text } if text == "new")
-    ));
-    assert!(matches!(
-        &second[0],
-        ModelInputItem::Message { content, .. }
-            if matches!(&content[0], ModelContentItem::InputText { text } if text == "old second")
-    ));
+    assert_eq!(first, vec![pl_text_message(PlMessageRole::User, "new")]);
+    assert_eq!(
+        second,
+        vec![pl_text_message(PlMessageRole::User, "old second")]
+    );
+}
+
+#[tokio::test]
+async fn agent_history_uses_native_pl_messages() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("config.sqlite3");
+    let store = ConfigStore::open_with_config_path(&db_path, dir.path().join("config.toml"))
+        .await
+        .expect("open");
+    let agent_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let now = Utc::now();
+    let summary = AgentSummary {
+        id: agent_id,
+        parent_id: None,
+        task_id: None,
+        project_id: None,
+        role: None,
+        name: "agent-test".to_string(),
+        status: AgentStatus::Completed,
+        container_id: None,
+        docker_image: "ubuntu:latest".to_string(),
+        provider_id: "openai".to_string(),
+        provider_name: "OpenAI".to_string(),
+        model: "gpt-5.2".to_string(),
+        reasoning_effort: None,
+        created_at: now,
+        updated_at: now,
+        current_turn: None,
+        last_error: None,
+        token_usage: TokenUsage::default(),
+    };
+    store.save_agent(&summary, None).await.expect("save agent");
+    store
+        .save_agent_session(
+            agent_id,
+            &AgentSessionSummary {
+                id: session_id,
+                title: "Chat".to_string(),
+                created_at: now,
+                updated_at: now,
+                message_count: 0,
+                token_usage: TokenUsage::default(),
+            },
+        )
+        .await
+        .expect("save session");
+    let history = vec![
+        Message {
+            role: PlMessageRole::User,
+            content: MessageContent::Text("hello".to_string()),
+            reasoning_content: None,
+            metadata: Default::default(),
+        },
+        Message {
+            role: PlMessageRole::Assistant,
+            content: MessageContent::Text("answer".to_string()),
+            reasoning_content: Some("thinking".to_string()),
+            metadata: Default::default(),
+        },
+    ];
+
+    store
+        .replace_agent_history(agent_id, session_id, &history)
+        .await
+        .expect("replace history");
+
+    assert_eq!(
+        store
+            .load_agent_history(agent_id, session_id)
+            .await
+            .expect("load history"),
+        history
+    );
 }
 
 #[tokio::test]
@@ -1668,7 +1731,7 @@ async fn agent_history_len_counts_only_target_session() {
             agent_id,
             first_session_id,
             0,
-            &ModelInputItem::user_text("a"),
+            &pl_text_message(PlMessageRole::User, "a"),
         )
         .await
         .expect("first history");
@@ -1677,7 +1740,7 @@ async fn agent_history_len_counts_only_target_session() {
             agent_id,
             first_session_id,
             1,
-            &ModelInputItem::user_text("b"),
+            &pl_text_message(PlMessageRole::User, "b"),
         )
         .await
         .expect("first history");
@@ -1686,7 +1749,7 @@ async fn agent_history_len_counts_only_target_session() {
             agent_id,
             second_session_id,
             0,
-            &ModelInputItem::user_text("other"),
+            &pl_text_message(PlMessageRole::User, "other"),
         )
         .await
         .expect("second history");

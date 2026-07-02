@@ -160,9 +160,7 @@ async fn model_failure_after_tool_keeps_tool_success_event_separate() {
         .await
         .expect("history");
     assert!(history.iter().any(|item| {
-        matches!(
-            item,
-            ModelInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_1"
-        )
+        pl_protocol::ToolResultMetadata::from_metadata(&item.metadata)
+            .is_ok_and(|metadata| metadata.tool_call_id == "call_1")
     }));
 }

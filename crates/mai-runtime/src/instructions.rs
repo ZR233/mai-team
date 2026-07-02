@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use mai_mcp::McpTool;
-use mai_protocol::{ModelInputItem, SkillActivationInfo, SkillScope, SkillsListResponse};
+use mai_protocol::{SkillActivationInfo, SkillScope, SkillsListResponse};
 use mai_skills::{SkillInjections, render_available_response};
+use pl_protocol::{Message, MessageContent, MessageRole as ModelMessageRole};
 
 pub(crate) const CONTAINER_SKILLS_ROOT: &str = "/tmp/.mai-team/skills";
 
@@ -100,7 +101,7 @@ pub(crate) fn skill_activation_info(
 pub(crate) fn skill_user_fragment(
     skill_injections: &SkillInjections,
     container_skill_paths: &ContainerSkillPaths,
-) -> Option<ModelInputItem> {
+) -> Option<Message> {
     if skill_injections.items.is_empty() {
         return None;
     }
@@ -114,7 +115,12 @@ pub(crate) fn skill_user_fragment(
             skill.contents
         ));
     }
-    Some(ModelInputItem::user_text(text))
+    Some(Message {
+        role: ModelMessageRole::User,
+        content: MessageContent::Text(text),
+        reasoning_content: None,
+        metadata: Default::default(),
+    })
 }
 
 pub(crate) fn container_skill_dir(skill: &mai_protocol::SkillMetadata) -> PathBuf {
@@ -168,7 +174,7 @@ fn safe_container_skill_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mai_protocol::{ModelContentItem, SkillMetadata};
+    use mai_protocol::SkillMetadata;
 
     #[test]
     fn skill_user_fragment_wraps_loaded_skill_contents() {
@@ -197,13 +203,14 @@ mod tests {
         .expect("fragment");
         assert!(matches!(
             fragment,
-            ModelInputItem::Message { role, content }
-                if role == "user"
-                    && matches!(&content[0], ModelContentItem::InputText { text }
-                        if text.contains("<skill>")
-                            && text.contains("<name>demo</name>")
-                            && text.contains(path.to_string_lossy().as_ref())
-                            && text.contains("skill body"))
+            Message {
+                role: ModelMessageRole::User,
+                content: MessageContent::Text(ref text),
+                ..
+            } if text.contains("<skill>")
+                && text.contains("<name>demo</name>")
+                && text.contains(path.to_string_lossy().as_ref())
+                && text.contains("skill body")
         ));
     }
 
@@ -238,11 +245,12 @@ mod tests {
 
         assert!(matches!(
             fragment,
-            ModelInputItem::Message { role, content }
-                if role == "user"
-                    && matches!(&content[0], ModelContentItem::InputText { text }
-                        if text.contains(container_path.to_string_lossy().as_ref())
-                            && !text.contains(path.to_string_lossy().as_ref()))
+            Message {
+                role: ModelMessageRole::User,
+                content: MessageContent::Text(ref text),
+                ..
+            } if text.contains(container_path.to_string_lossy().as_ref())
+                && !text.contains(path.to_string_lossy().as_ref())
         ));
     }
 
