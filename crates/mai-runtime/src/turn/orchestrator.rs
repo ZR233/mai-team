@@ -8,7 +8,7 @@ use mai_protocol::{
 };
 use mai_skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
 use mai_tools::build_tool_definitions_with_filter;
-use pl_model::ModelContinuationState;
+use pl_core::CoreSession;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -437,7 +437,7 @@ pub(crate) async fn run_turn_inner(
         }
     };
     let mut last_assistant_text: Option<String> = None;
-    let mut turn_model_state = ModelContinuationState::default();
+    let mut core_session = CoreSession::new();
     let mut empty_progress_count: usize = 0;
     loop {
         if cancellation_token.is_cancelled() {
@@ -452,18 +452,20 @@ pub(crate) async fn run_turn_inner(
         )
         .await?;
         let history_started = Instant::now();
-        let mut history =
+        let history =
             super::history::session_history(deps.store.as_ref(), &agent, agent_id, session_id)
                 .await?;
-        if turn_model_state.previous_response_id().is_none()
+        let mut session_messages = history;
+        if core_session.previous_response_id().is_none()
             && let Some(skill_fragment) =
                 instructions::skill_user_fragment(&skill_injections, &container_skill_paths)
         {
-            history.push(skill_fragment);
+            session_messages.push(skill_fragment);
         }
+        core_session.replace_messages_preserving_continuation(session_messages);
         let estimated_request_tokens = super::context::estimate_model_request_tokens(
             &model_context.instructions,
-            &history,
+            core_session.messages(),
             &model_context.tools,
         );
         match ops
@@ -478,8 +480,8 @@ pub(crate) async fn run_turn_inner(
             .await
         {
             Ok(ContextCompactionOutcome::Compacted { .. }) => {
-                turn_model_state.reset();
-                history = super::history::session_history(
+                core_session.reset_continuation();
+                let mut session_messages = super::history::session_history(
                     deps.store.as_ref(),
                     &agent,
                     agent_id,
@@ -489,8 +491,9 @@ pub(crate) async fn run_turn_inner(
                 if let Some(skill_fragment) =
                     instructions::skill_user_fragment(&skill_injections, &container_skill_paths)
                 {
-                    history.push(skill_fragment);
+                    session_messages.push(skill_fragment);
                 }
+                core_session.replace_messages_preserving_continuation(session_messages);
             }
             Ok(ContextCompactionOutcome::Skipped) => {}
             Err(err) => {
@@ -527,8 +530,7 @@ pub(crate) async fn run_turn_inner(
                 turn_id,
             },
             &model_context,
-            &history,
-            &mut turn_model_state,
+            &mut core_session,
             &cancellation_token,
         )
         .await?;
@@ -546,7 +548,7 @@ pub(crate) async fn run_turn_inner(
                     "provider_id": model_context.provider_id,
                     "model": model_context.model_name,
                     "output_items": model_turn.response.output.len(),
-                    "history_items": history.len(),
+                    "history_items": core_session.len(),
                     "history_load_ms": history_duration_ms,
                     "duration_ms": model_duration_ms,
                     "usage": model_turn.response.usage,
@@ -585,15 +587,6 @@ pub(crate) async fn run_turn_inner(
         if model_turn.last_assistant_text.is_some() {
             last_assistant_text = model_turn.last_assistant_text;
         }
-        let acknowledged_history_len = super::history::raw_session_history_len(
-            deps.store.as_ref(),
-            &agent,
-            agent_id,
-            session_id,
-        )
-        .await?;
-        turn_model_state
-            .acknowledge_message_count(acknowledged_history_len, acknowledged_history_len);
 
         if !made_progress {
             empty_progress_count = empty_progress_count.saturating_add(1);
@@ -741,7 +734,7 @@ pub(crate) async fn run_turn_inner(
             .await
         {
             Ok(ContextCompactionOutcome::Compacted { .. }) => {
-                turn_model_state.reset();
+                core_session.reset_continuation();
             }
             Ok(ContextCompactionOutcome::Skipped) => {}
             Err(err) => {

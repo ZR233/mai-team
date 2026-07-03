@@ -26,6 +26,7 @@ ctrlc = { version = "3", features = ["termination"] }
 fnv = "1"
 percent-encoding = "2"
 pretty_assertions = "1"
+pl-core = { git = "ssh://git@github.com/ZR233/pure-lang.git", branch = "main", default-features = false }
 pl-model = { git = "ssh://git@github.com/ZR233/pure-lang.git", branch = "main" }
 pl-protocol = { git = "ssh://git@github.com/ZR233/pure-lang.git", branch = "main" }
 pl-trace = { git = "ssh://git@github.com/ZR233/pure-lang.git", branch = "main" }

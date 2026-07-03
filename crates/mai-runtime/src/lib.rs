@@ -629,7 +629,6 @@ impl AgentRuntime {
             instructions,
             &input,
             &[],
-            &mut pl_model::ModelContinuationState::default(),
             &CancellationToken::new(),
         )
         .await?;
@@ -1891,7 +1890,6 @@ impl AgentRuntime {
             &instructions,
             &compact_input,
             &[],
-            &mut pl_model::ModelContinuationState::default(),
             cancellation_token,
         )
         .await;
@@ -1919,7 +1917,6 @@ impl AgentRuntime {
                     &instructions,
                     &compact_input,
                     &[],
-                    &mut pl_model::ModelContinuationState::default(),
                     cancellation_token,
                 )
                 .await?
