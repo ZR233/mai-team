@@ -33,6 +33,7 @@ mod facade;
 pub mod github;
 mod instructions;
 mod model_client;
+mod model_profile;
 mod model_projection;
 mod model_selection;
 mod projects;

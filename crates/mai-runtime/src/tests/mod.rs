@@ -631,6 +631,92 @@ async fn model_client_exposes_shared_continuation_capability_check() {
 }
 
 #[test]
+fn model_profile_projects_mai_config_to_pl_runtime_profile() {
+    let mut model = test_model("gpt-5.5");
+    model.name = Some("GPT 5.5".to_string());
+    model.context_tokens = 200_000;
+    model.output_tokens = 64_000;
+    model.capabilities.parallel_tools = true;
+    model.capabilities.reasoning_replay = true;
+    model.request_policy.max_tokens_field = "max_completion_tokens".to_string();
+    model.options = json!({ "temperature": 0.2, "model_option": true });
+    model.request_policy.extra_body = json!({ "policy_option": true });
+    model
+        .headers
+        .insert("X-Model".to_string(), "model".to_string());
+    model
+        .request_policy
+        .headers
+        .insert("X-Policy".to_string(), "policy".to_string());
+
+    let provider = ProviderSecret {
+        id: "mimo".to_string(),
+        kind: ProviderKind::Mimo,
+        name: "MIMO".to_string(),
+        base_url: "http://model.example/v1".to_string(),
+        api_key: "secret".to_string(),
+        api_key_env: None,
+        models: vec![model.clone()],
+        default_model: model.id.clone(),
+        enabled: true,
+    };
+
+    let provider_info = crate::model_profile::provider_info(&provider);
+    assert_eq!(
+        provider_info.provider_kind,
+        pl_model::ProviderKind::OpenAiCompatibleChat
+    );
+    assert_eq!(provider_info.name, "MIMO");
+    assert_eq!(provider_info.base_url, "http://model.example/v1");
+    assert_eq!(provider_info.default_model, "gpt-5.5");
+    assert_eq!(provider_info.bearer_token.as_deref(), Some("secret"));
+
+    let model_info = crate::model_profile::model_info(&model);
+    assert_eq!(model_info.slug, "gpt-5.5");
+    assert_eq!(model_info.display_name, "GPT 5.5");
+    assert_eq!(model_info.context_window, Some(200_000));
+    assert_eq!(model_info.max_context_window, Some(200_000));
+    assert_eq!(model_info.max_output_tokens, Some(64_000));
+    assert!(model_info.capabilities.reasoning);
+    assert!(model_info.capabilities.tools.function_calling);
+    assert!(model_info.capabilities.tools.parallel_tool_calls);
+    assert_eq!(
+        model_info.request_profile.max_tokens_field,
+        pl_model::MaxTokensField::MaxCompletionTokens
+    );
+    assert_eq!(
+        model_info.request_profile.headers.get("X-Model"),
+        Some(&"model".to_string())
+    );
+    assert_eq!(
+        model_info.request_profile.headers.get("X-Policy"),
+        Some(&"policy".to_string())
+    );
+    assert_eq!(
+        model_info.request_profile.body.get("model_option"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        model_info.request_profile.body.get("policy_option"),
+        Some(&json!(true))
+    );
+    let effort = model_info
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == "effort")
+        .expect("reasoning effort parameter");
+    assert_eq!(
+        effort.candidates,
+        vec![
+            "minimal".to_string(),
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string()
+        ]
+    );
+}
+
+#[test]
 fn pl_core_session_helpers_are_available_to_runtime() {
     let messages = vec![
         Message {

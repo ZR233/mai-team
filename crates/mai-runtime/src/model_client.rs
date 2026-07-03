@@ -1,24 +1,20 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use mai_protocol::{
-    ModelCapabilities as MaiModelCapabilities, ModelConfig, ModelReasoningVariant, ModelWireApi,
-    ProviderKind as MaiProviderKind, ProviderSecret, ToolDefinition,
-};
+use mai_protocol::{ModelConfig, ModelWireApi, ProviderKind as MaiProviderKind, ToolDefinition};
 use pl_core::CoreSession;
 use pl_model::{
     CompletionEventStream, CompletionRequest, CompletionResponse, CompletionStreamAccumulator,
-    MaxTokensField, ModelCapabilities, ModelInfo, ModelModality, ModelParameter, ModelProvider,
-    ModelRequestProfile, ParameterWire, ProviderInfo, ReasoningConfig, ReasoningSummary,
-    SharedModelProvider, ToolCapabilities, ToolSchema, WireAssignment, create_provider_with_models,
-    is_continuation_unsupported_error,
+    ModelContinuationState, ModelProvider, SharedModelProvider, ToolSchema,
+    create_provider_with_models, is_continuation_unsupported_error,
 };
 use pl_protocol::PureError;
-use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+
+use crate::model_profile::{model_info, provider_info, reasoning_config};
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -193,89 +189,6 @@ pub struct PreparedModelTurn {
     pub request: CompletionRequest,
 }
 
-fn provider_info(provider: &ProviderSecret) -> ProviderInfo {
-    let mut info = match provider.kind {
-        MaiProviderKind::Openai => ProviderInfo::openai(Some(provider.base_url.clone())),
-        MaiProviderKind::Deepseek => ProviderInfo::deepseek(Some(provider.base_url.clone())),
-        MaiProviderKind::Zhipu => ProviderInfo::zhipu(Some(provider.base_url.clone())),
-        MaiProviderKind::Mimo => ProviderInfo::openai_compatible_chat(
-            provider.name.clone(),
-            provider.base_url.clone(),
-            provider.default_model.clone(),
-        ),
-    };
-    info.name = provider.name.clone();
-    info.default_model = provider.default_model.clone();
-    info.bearer_token = Some(provider.api_key.clone());
-    info
-}
-
-fn model_info(model: &ModelConfig) -> ModelInfo {
-    let mut info = ModelInfo::fallback(&model.id);
-    info.display_name = model.name.clone().unwrap_or_else(|| model.id.clone());
-    info.context_window = Some(model.context_tokens);
-    info.max_context_window = Some(model.context_tokens);
-    info.max_output_tokens = Some(model.output_tokens);
-    info.capabilities = model_capabilities(&model.capabilities, model.supports_tools);
-    info.capabilities.reasoning = model.reasoning.is_some();
-    info.parameters = reasoning_parameters(model);
-    info.request_profile = request_profile(model);
-    info
-}
-
-fn model_capabilities(
-    capabilities: &MaiModelCapabilities,
-    supports_tools: bool,
-) -> ModelCapabilities {
-    ModelCapabilities {
-        streaming: true,
-        temperature: true,
-        reasoning: capabilities.reasoning_replay,
-        web_search: false,
-        input: vec![ModelModality::Text],
-        output: vec![ModelModality::Text],
-        tools: ToolCapabilities {
-            function_calling: supports_tools && capabilities.tools,
-            parallel_tool_calls: capabilities.parallel_tools,
-            custom_tools: false,
-            freeform_tools: false,
-        },
-        interleaved: None,
-    }
-}
-
-fn request_profile(model: &ModelConfig) -> ModelRequestProfile {
-    let mut body = Map::new();
-    merge_object(&mut body, &model.options);
-    merge_object(&mut body, &model.request_policy.extra_body);
-    ModelRequestProfile {
-        api_model: Some(model.id.clone()),
-        headers: model
-            .headers
-            .iter()
-            .chain(model.request_policy.headers.iter())
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<HashMap<_, _>>(),
-        body,
-        options: Map::new(),
-        max_tokens_field: match model.request_policy.max_tokens_field.as_str() {
-            "max_completion_tokens" => MaxTokensField::MaxCompletionTokens,
-            "max_tokens" => MaxTokensField::MaxTokens,
-            _ => MaxTokensField::MaxTokens,
-        },
-    }
-}
-
-fn merge_object(target: &mut Map<String, Value>, value: &Value) {
-    if let Some(object) = value.as_object() {
-        target.extend(
-            object
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
-    }
-}
-
 fn completion_request(
     model: &ModelConfig,
     reasoning_effort: Option<&str>,
@@ -284,29 +197,35 @@ fn completion_request(
     session: &CoreSession,
     use_continuation: bool,
 ) -> CompletionRequest {
-    let messages = if use_continuation {
-        session
-            .continuation_start_index()
-            .and_then(|start| session.messages().get(start..))
-            .unwrap_or_else(|| session.messages())
-            .to_vec()
-    } else {
-        session.messages().to_vec()
-    };
-    let previous_response_id = use_continuation
-        .then(|| session.previous_response_id().map(ToString::to_string))
-        .flatten();
     CompletionRequest::builder(model.id.clone())
         .instructions(instructions)
-        .messages(messages)
-        .store(Some(use_continuation))
-        .previous_response_id(previous_response_id)
-        .prompt_cache_key(session.prompt_cache_key().map(ToString::to_string))
+        .messages_from_continuation(
+            session.messages(),
+            &model_continuation_state(session),
+            use_continuation,
+        )
         .tools(tools.iter().map(tool_schema).collect())
         .parallel_tool_calls(model.capabilities.parallel_tools)
         .max_tokens(model.output_tokens)
         .reasoning(reasoning_config(model, reasoning_effort))
         .build()
+}
+
+fn model_continuation_state(session: &CoreSession) -> ModelContinuationState {
+    let mut continuation = ModelContinuationState::default();
+    if let Some(prompt_cache_key) = session.prompt_cache_key() {
+        continuation.set_prompt_cache_key(prompt_cache_key.to_string());
+    }
+    if session.continuation_disabled() {
+        continuation.mark_unsupported();
+        return continuation;
+    }
+    continuation.acknowledge_response(
+        session.acknowledged_message_count(),
+        session.previous_response_id().map(ToString::to_string),
+        session.len(),
+    );
+    continuation
 }
 
 fn tool_schema(tool: &ToolDefinition) -> ToolSchema {
@@ -321,87 +240,6 @@ fn tool_schema(tool: &ToolDefinition) -> ToolSchema {
             tool.description.clone(),
             tool.parameters.clone(),
         ),
-    }
-}
-
-fn reasoning_config(
-    model: &ModelConfig,
-    reasoning_effort: Option<&str>,
-) -> Option<ReasoningConfig> {
-    let config = model.reasoning.as_ref()?;
-    let effort = reasoning_effort
-        .map(ToString::to_string)
-        .or_else(|| default_reasoning_effort(&config.variants));
-    Some(ReasoningConfig {
-        effort,
-        summary: Some(ReasoningSummary::Auto),
-    })
-}
-
-fn default_reasoning_effort(variants: &[ModelReasoningVariant]) -> Option<String> {
-    variants.first().map(|variant| variant.id.clone())
-}
-
-fn reasoning_parameters(model: &ModelConfig) -> Vec<ModelParameter> {
-    let Some(config) = model.reasoning.as_ref() else {
-        return Vec::new();
-    };
-    if config.variants.is_empty() {
-        return Vec::new();
-    }
-
-    let mut wire = BTreeMap::new();
-    for variant in &config.variants {
-        wire.insert(
-            variant.id.clone(),
-            ParameterWire {
-                set: wire_assignments(&variant.request),
-                remove: Vec::new(),
-            },
-        );
-    }
-
-    vec![ModelParameter {
-        name: "effort".to_string(),
-        label: Some("Reasoning effort".to_string()),
-        candidates: config
-            .variants
-            .iter()
-            .map(|variant| variant.id.clone())
-            .collect(),
-        wire,
-    }]
-}
-
-fn wire_assignments(request: &Value) -> Vec<WireAssignment> {
-    let mut assignments = Vec::new();
-    collect_wire_assignments(None, request, &mut assignments);
-    assignments
-}
-
-fn collect_wire_assignments(
-    prefix: Option<&str>,
-    value: &Value,
-    assignments: &mut Vec<WireAssignment>,
-) {
-    match value {
-        Value::Object(object) => {
-            for (key, value) in object {
-                let path = prefix
-                    .map(|prefix| format!("{prefix}.{key}"))
-                    .unwrap_or_else(|| key.clone());
-                collect_wire_assignments(Some(&path), value, assignments);
-            }
-        }
-        Value::Null => {}
-        Value::Array(_) | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-            if let Some(path) = prefix {
-                assignments.push(WireAssignment {
-                    path: path.to_string(),
-                    value: value.clone(),
-                });
-            }
-        }
     }
 }
 
