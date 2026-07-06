@@ -775,7 +775,13 @@ async fn chat_completion_split_tool_call_reuses_pl_model_tool_stream_identity() 
                         "delta": {},
                         "finish_reason": "tool_calls"
                     }],
-                    "usage": { "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12 }
+                    "usage": {
+                        "input_tokens": 10,
+                        "input_tokens_details": { "cached_tokens": 4 },
+                        "output_tokens": 2,
+                        "output_tokens_details": { "reasoning_tokens": 1 },
+                        "total_tokens": 12
+                    }
                 }
             ]
         }),
@@ -792,7 +798,13 @@ async fn chat_completion_split_tool_call_reuses_pl_model_tool_stream_identity() 
                         "delta": {},
                         "finish_reason": "stop"
                     }],
-                    "usage": { "prompt_tokens": 20, "completion_tokens": 1, "total_tokens": 21 }
+                    "usage": {
+                        "input_tokens": 20,
+                        "input_tokens_details": { "cached_tokens": 8 },
+                        "output_tokens": 1,
+                        "output_tokens_details": { "reasoning_tokens": 1 },
+                        "total_tokens": 21
+                    }
                 }
             ]
         }),
@@ -848,6 +860,24 @@ async fn chat_completion_split_tool_call_reuses_pl_model_tool_stream_identity() 
         messages
             .iter()
             .any(|message| { message.role == MessageRole::Assistant && message.content == "done" })
+    );
+    let detail = runtime
+        .get_agent(agent_id, Some(session_id))
+        .await
+        .expect("agent detail");
+    assert_eq!(
+        detail.sessions[0].token_usage,
+        TokenUsage {
+            input_tokens: 30,
+            cached_input_tokens: 12,
+            output_tokens: 3,
+            reasoning_output_tokens: 2,
+            total_tokens: 33,
+        }
+    );
+    assert_eq!(
+        detail.context_usage.as_ref().map(|usage| usage.used_tokens),
+        Some(21)
     );
 }
 
