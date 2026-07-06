@@ -1,9 +1,11 @@
 use mai_protocol::{AgentId, AgentMessage, MessageRole, ModelOutputItem, SessionId, now};
 use mai_store::ConfigStore;
+#[cfg(test)]
+use pl_protocol::ToolCallHistoryMetadata;
 use pl_protocol::{
     Message, MessageContent, MessageRole as ModelMessageRole, TOOL_CALL_ID_METADATA_KEY,
-    TOOL_CALL_KIND_METADATA_KEY, TOOL_CALLS_METADATA_KEY, TOOL_NAME_METADATA_KEY,
-    ToolCallHistoryMetadata, ToolCallKind, ToolResultMetadata,
+    TOOL_CALL_KIND_METADATA_KEY, TOOL_CALLS_METADATA_KEY, TOOL_NAME_METADATA_KEY, ToolCallKind,
+    ToolResultMetadata,
 };
 use std::collections::HashSet;
 
@@ -312,6 +314,7 @@ pub(crate) fn assistant_text_message(text: impl Into<String>) -> Message {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn reasoning_message(content: impl Into<String>) -> Message {
     Message {
         role: ModelMessageRole::Assistant,
@@ -321,6 +324,7 @@ pub(crate) fn reasoning_message(content: impl Into<String>) -> Message {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn tool_call_message(call_id: String, name: String, raw_arguments: String) -> Message {
     let arguments =
         serde_json::from_str(&raw_arguments).unwrap_or(serde_json::Value::String(raw_arguments));

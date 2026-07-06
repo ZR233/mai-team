@@ -7,6 +7,7 @@ import { chatContainerState } from '../chatContainerState.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const componentPath = resolve(here, '../../components/ChatEnvironmentWorkspace.vue')
+const componentSource = readFileSync(componentPath, 'utf8')
 
 assert.deepEqual(
   chatContainerState({
@@ -79,6 +80,23 @@ assert.deepEqual(
 
 assert.deepEqual(
   chatContainerState({
+    detail: environmentDetail({
+      status: 'failed',
+      container_id: 'container-1',
+      last_error: 'LLM provider error: quota exhausted'
+    }),
+    selectedConversationId: 'session-1'
+  }),
+  {
+    containerReady: true,
+    composerDisabled: false,
+    disabledReason: '',
+    statusItem: null
+  }
+)
+
+assert.deepEqual(
+  chatContainerState({
     detail: environmentDetail({ status: 'idle', container_id: 'container-1' }),
     selectedConversationId: 'session-1'
   }),
@@ -110,7 +128,11 @@ assert.deepEqual(
 )
 
 assert.equal(
-  readFileSync(componentPath, 'utf8').includes('No environment selected'),
+  componentSource.includes('No environment selected'),
+  false
+)
+assert.equal(
+  componentSource.includes('!containerState.value.containerReady'),
   false
 )
 

@@ -102,6 +102,10 @@ export function useTasks() {
       await refreshTasks()
       await refreshDetail()
       return response
+    } catch (error) {
+      await refreshTasks().catch(() => {})
+      await refreshDetail().catch(() => {})
+      throw error
     } finally {
       isSending.value = false
     }

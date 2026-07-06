@@ -4,6 +4,7 @@ import { useEnvironments } from '../useEnvironments.js'
 
 const calls = []
 let createdEnvironment = null
+let failNextMessage = false
 
 globalThis.requestAnimationFrame = (callback) => {
   callback()
@@ -59,6 +60,10 @@ globalThis.fetch = async (path, init = {}) => {
   }
 
   if (path === '/environments/env-1/conversations/session-2/messages') {
+    if (failNextMessage) {
+      failNextMessage = false
+      return errorResponse(409, { error: 'agent is busy' })
+    }
     return jsonResponse({ ok: true })
   }
 
@@ -111,6 +116,18 @@ assert.deepEqual(calls.at(-3), {
   body: { message: 'hello', skill_mentions: ['rust'] }
 })
 
+calls.length = 0
+failNextMessage = true
+await assert.rejects(
+  () => state.sendEnvironmentMessage('busy', []),
+  /agent is busy/
+)
+assert.deepEqual(calls.map((call) => call.path), [
+  '/environments/env-1/conversations/session-2/messages',
+  '/environments',
+  '/environments/env-1?session_id=session-2'
+])
+
 await state.updateAgent('agent-1', 'openai', 'gpt-5', 'high')
 assert.deepEqual(calls.findLast((call) => call.path === '/agents/agent-1'), {
   path: '/agents/agent-1',
@@ -150,6 +167,16 @@ function jsonResponse(payload) {
   return {
     ok: true,
     status: 200,
+    async text() {
+      return JSON.stringify(payload)
+    }
+  }
+}
+
+function errorResponse(status, payload) {
+  return {
+    ok: false,
+    status,
     async text() {
       return JSON.stringify(payload)
     }

@@ -138,6 +138,10 @@ export function useEnvironments() {
       await refreshEnvironments()
       await refreshEnvironmentDetail()
       return response
+    } catch (error) {
+      await refreshEnvironments().catch(() => {})
+      await refreshEnvironmentDetail().catch(() => {})
+      throw error
     } finally {
       isEnvironmentSending.value = false
     }

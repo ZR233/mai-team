@@ -12,6 +12,10 @@ use crate::turn::tools::ToolExecution;
 use crate::{AgentRuntime, ProjectReviewQueueRequest, Result, RuntimeError, agents, turn};
 
 impl turn::orchestrator::TurnOrchestratorOps for Arc<AgentRuntime> {
+    fn runtime_handle(&self) -> Arc<AgentRuntime> {
+        self.clone()
+    }
+
     async fn agent(&self, agent_id: AgentId) -> Result<Arc<AgentRecord>> {
         AgentRuntime::agent(self.as_ref(), agent_id).await
     }
@@ -142,27 +146,6 @@ impl turn::orchestrator::TurnOrchestratorOps for Arc<AgentRuntime> {
             cancellation_token,
             enforce_current_turn,
             status,
-        )
-        .await
-    }
-
-    async fn execute_tool(
-        &self,
-        agent: &Arc<AgentRecord>,
-        agent_id: AgentId,
-        turn_id: TurnId,
-        name: &str,
-        arguments: Value,
-        cancellation_token: CancellationToken,
-    ) -> Result<ToolExecution> {
-        AgentRuntime::execute_tool(
-            self,
-            agent,
-            agent_id,
-            turn_id,
-            name,
-            arguments,
-            cancellation_token,
         )
         .await
     }

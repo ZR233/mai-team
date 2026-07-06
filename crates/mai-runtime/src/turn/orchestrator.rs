@@ -8,8 +8,8 @@ use mai_protocol::{
 };
 use mai_skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
 use mai_tools::build_tool_definitions_with_filter;
-use pl_core::CoreSession;
-use serde_json::{Value, json};
+use pl_protocol::MessageContent;
+use serde_json::json;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -21,7 +21,6 @@ use crate::turn::completion::TurnResult;
 use crate::turn::context::{ContextCompactionOutcome, ContextCompactionRequest};
 use crate::turn::model_stream::TurnModelContext;
 use crate::turn::persistence::AgentLogRecord;
-use crate::turn::tools::ToolExecution;
 use crate::{Result, RuntimeError};
 
 /// 回合编排器依赖的运行时能力集合。
@@ -30,6 +29,8 @@ use crate::{Result, RuntimeError};
 /// 构建提示、压缩上下文、执行工具和推进排队输入。实现方必须保证返回的
 /// future 可在线程间移动，并且不得在方法内部绕过传入的取消信号。
 pub(crate) trait TurnOrchestratorOps: Send + Sync {
+    fn runtime_handle(&self) -> Arc<crate::AgentRuntime>;
+
     fn agent(&self, agent_id: AgentId) -> impl Future<Output = Result<Arc<AgentRecord>>> + Send;
 
     fn ensure_agent_container_for_turn(
@@ -103,16 +104,6 @@ pub(crate) trait TurnOrchestratorOps: Send + Sync {
         enforce_current_turn: bool,
         status: AgentStatus,
     ) -> impl Future<Output = Result<()>> + Send;
-
-    fn execute_tool(
-        &self,
-        agent: &Arc<AgentRecord>,
-        agent_id: AgentId,
-        turn_id: TurnId,
-        name: &str,
-        arguments: Value,
-        cancellation_token: CancellationToken,
-    ) -> impl Future<Output = Result<ToolExecution>> + Send;
 
     fn start_next_queued_input_after_turn(
         &self,
@@ -309,14 +300,6 @@ pub(crate) async fn run_turn_inner(
         message.clone(),
     )
     .await?;
-    super::history::record_history_item(
-        deps.store.as_ref(),
-        &agent,
-        agent_id,
-        session_id,
-        super::history::user_text_message(message.clone()),
-    )
-    .await?;
     events
         .publish(ServiceEventKind::AgentMessage {
             agent_id,
@@ -436,328 +419,125 @@ pub(crate) async fn run_turn_inner(
             instructions,
         }
     };
-    let mut last_assistant_text: Option<String> = None;
-    let mut core_session = CoreSession::new();
-    let mut empty_progress_count: usize = 0;
-    loop {
-        if cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
-        ops.set_turn_status(
+    if cancellation_token.is_cancelled() {
+        return Err(RuntimeError::TurnCancelled);
+    }
+    ops.set_turn_status(
+        &agent,
+        turn_id,
+        &cancellation_token,
+        enforce_current_turn,
+        AgentStatus::RunningTurn,
+    )
+    .await?;
+    let history_started = Instant::now();
+    let history =
+        super::history::session_history(deps.store.as_ref(), &agent, agent_id, session_id).await?;
+    let estimated_request_tokens = super::context::estimate_model_request_tokens(
+        &model_context.instructions,
+        &history,
+        &model_context.tools,
+    );
+    match ops
+        .maybe_auto_compact(
             &agent,
+            agent_id,
+            session_id,
             turn_id,
+            ContextCompactionRequest::from_estimate(estimated_request_tokens),
             &cancellation_token,
-            enforce_current_turn,
-            AgentStatus::RunningTurn,
         )
-        .await?;
-        let history_started = Instant::now();
-        let history =
-            super::history::session_history(deps.store.as_ref(), &agent, agent_id, session_id)
-                .await?;
-        let mut session_messages = history;
-        if core_session.previous_response_id().is_none()
-            && let Some(skill_fragment) =
-                instructions::skill_user_fragment(&skill_injections, &container_skill_paths)
-        {
-            session_messages.push(skill_fragment);
-        }
-        core_session.replace_messages_preserving_continuation(session_messages);
-        let estimated_request_tokens = super::context::estimate_model_request_tokens(
-            &model_context.instructions,
-            core_session.messages(),
-            &model_context.tools,
-        );
-        match ops
-            .maybe_auto_compact(
-                &agent,
-                agent_id,
-                session_id,
-                turn_id,
-                ContextCompactionRequest::from_estimate(estimated_request_tokens),
-                &cancellation_token,
-            )
-            .await
-        {
-            Ok(ContextCompactionOutcome::Compacted { .. }) => {
-                core_session.reset_continuation();
-                let mut session_messages = super::history::session_history(
-                    deps.store.as_ref(),
-                    &agent,
-                    agent_id,
-                    session_id,
-                )
-                .await?;
-                if let Some(skill_fragment) =
-                    instructions::skill_user_fragment(&skill_injections, &container_skill_paths)
-                {
-                    session_messages.push(skill_fragment);
-                }
-                core_session.replace_messages_preserving_continuation(session_messages);
-            }
-            Ok(ContextCompactionOutcome::Skipped) => {}
-            Err(err) => {
-                if matches!(err, RuntimeError::TurnCancelled) {
-                    return Err(err);
-                }
-                tracing::warn!("auto context compaction failed before model request: {err}");
-                super::persistence::record_agent_log(
-                    deps.store.as_ref(),
-                    AgentLogRecord {
-                        agent_id,
-                        session_id: Some(session_id),
-                        turn_id: Some(turn_id),
-                        level: "warn",
-                        category: "context",
-                        message: "auto context compaction failed",
-                        details: json!({ "stage": "before_model_request", "error": err.to_string() }),
-                    },
-                )
-                .await;
+        .await
+    {
+        Ok(ContextCompactionOutcome::Compacted { .. }) => {}
+        Ok(ContextCompactionOutcome::Skipped) => {}
+        Err(err) => {
+            if matches!(err, RuntimeError::TurnCancelled) {
                 return Err(err);
             }
-        }
-        let history_duration_ms = u128_to_u64(history_started.elapsed().as_millis());
-        let model_started = Instant::now();
-        let model_turn = super::model_stream::run_model_stream_turn(
-            &deps.model,
-            &super::model_stream::TurnStreamContext {
-                store: deps.store.as_ref(),
-                events,
-                agent: &agent,
-                agent_id,
-                session_id,
-                turn_id,
-            },
-            &model_context,
-            &mut core_session,
-            &cancellation_token,
-        )
-        .await?;
-        let model_duration_ms = u128_to_u64(model_started.elapsed().as_millis());
-        super::persistence::record_agent_log(
-            deps.store.as_ref(),
-            AgentLogRecord {
-                agent_id,
-                session_id: Some(session_id),
-                turn_id: Some(turn_id),
-                level: "info",
-                category: "model",
-                message: "model stream completed",
-                details: json!({
-                    "provider_id": model_context.provider_id,
-                    "model": model_context.model_name,
-                    "output_items": model_turn.response.output.len(),
-                    "history_items": core_session.len(),
-                    "history_load_ms": history_duration_ms,
-                    "duration_ms": model_duration_ms,
-                    "usage": model_turn.response.usage,
-                }),
-            },
-        )
-        .await;
-
-        let last_model_total_tokens = model_turn
-            .response
-            .usage
-            .as_ref()
-            .map(|usage| usage.total_tokens);
-        if let Some(usage) = model_turn.response.usage.clone() {
-            super::accounting::record_model_usage(
+            tracing::warn!("auto context compaction failed before model request: {err}");
+            super::persistence::record_agent_log(
                 deps.store.as_ref(),
-                events,
-                &agent,
-                agent_id,
-                session_id,
-                &usage,
-            )
-            .await?;
-            super::history::record_session_context_tokens(
-                deps.store.as_ref(),
-                &agent,
-                agent_id,
-                session_id,
-                usage.total_tokens,
-            )
-            .await?;
-        }
-
-        let tool_calls = model_turn.tool_calls;
-        let made_progress = model_turn.made_progress;
-        if model_turn.last_assistant_text.is_some() {
-            last_assistant_text = model_turn.last_assistant_text;
-        }
-
-        if !made_progress {
-            empty_progress_count = empty_progress_count.saturating_add(1);
-            let diagnostic = format!(
-                "Runtime diagnostic: the previous model response produced no assistant text and no tool calls (empty_progress_count={empty_progress_count}). Decide whether to continue, ask the user for clarification, retry with a different approach, or explain the issue."
-            );
-            super::history::record_history_item(
-                deps.store.as_ref(),
-                &agent,
-                agent_id,
-                session_id,
-                super::history::user_text_message(diagnostic),
-            )
-            .await?;
-            continue;
-        }
-        empty_progress_count = 0;
-
-        if tool_calls.is_empty() {
-            super::completion::finish_turn(
-                deps.store.as_ref(),
-                events,
-                &agent,
-                agent_id,
-                session_id,
-                TurnResult {
-                    turn_id,
-                    status: TurnStatus::Completed,
-                    agent_status: AgentStatus::Completed,
-                    final_text: last_assistant_text,
-                    error: None,
-                },
-            )
-            .await?;
-            ops.start_next_queued_input_after_turn(agent_id).await;
-            return Ok(());
-        }
-
-        ops.set_turn_status(
-            &agent,
-            turn_id,
-            &cancellation_token,
-            enforce_current_turn,
-            AgentStatus::WaitingTool,
-        )
-        .await?;
-        let mut should_end_turn = false;
-        for (call_id, name, arguments) in tool_calls {
-            if cancellation_token.is_cancelled() {
-                return Err(RuntimeError::TurnCancelled);
-            }
-            let tool_agent = Arc::clone(&agent);
-            let execution = super::tools::run_tool_call(
-                &super::tools::ToolCallContext {
-                    store: deps.store.as_ref(),
-                    events,
-                    agent: &agent,
+                AgentLogRecord {
                     agent_id,
-                    session_id,
-                    turn_id,
-                },
-                super::tools::ToolCallInfo {
-                    call_id: &call_id,
-                    name: &name,
-                    arguments,
-                },
-                |arguments| {
-                    let cancellation_token = cancellation_token.clone();
-                    let name = name.clone();
-                    async move {
-                        ops.execute_tool(
-                            &tool_agent,
-                            agent_id,
-                            turn_id,
-                            &name,
-                            arguments,
-                            cancellation_token,
-                        )
-                        .await
-                    }
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    level: "warn",
+                    category: "context",
+                    message: "auto context compaction failed",
+                    details: json!({ "stage": "before_model_request", "error": err.to_string() }),
                 },
             )
-            .await?;
-            if execution.ends_turn {
-                should_end_turn = true;
-            }
-            if cancellation_token.is_cancelled() {
-                return Err(RuntimeError::TurnCancelled);
-            }
+            .await;
+            return Err(err);
         }
+    }
+    let history =
+        super::history::session_history(deps.store.as_ref(), &agent, agent_id, session_id).await?;
+    let history_duration_ms = u128_to_u64(history_started.elapsed().as_millis());
+    let message = message_with_skill_fragment(
+        message,
+        instructions::skill_user_fragment(&skill_injections, &container_skill_paths),
+    );
+    super::persistence::record_agent_log(
+        deps.store.as_ref(),
+        AgentLogRecord {
+            agent_id,
+            session_id: Some(session_id),
+            turn_id: Some(turn_id),
+            level: "info",
+            category: "runtime",
+            message: "delegating turn to pl-core",
+            details: json!({
+                "provider_id": model_context.provider_id,
+                "model": model_context.model_name,
+                "tool_count": model_context.tools.len(),
+                "history_items": history.len(),
+                "history_load_ms": history_duration_ms,
+            }),
+        },
+    )
+    .await;
+    super::core_adapter::run_pure_core_turn(super::core_adapter::PureCoreTurnContext {
+        runtime: ops.runtime_handle(),
+        agent: Arc::clone(&agent),
+        agent_id,
+        session_id,
+        turn_id,
+        message,
+        provider_selection: model_context.provider_selection,
+        reasoning_effort: model_context.reasoning_effort,
+        instructions: model_context.instructions,
+        tools: model_context.tools,
+        history,
+        cancellation_token,
+    })
+    .await
+}
 
-        if should_end_turn {
-            super::completion::finish_turn(
-                deps.store.as_ref(),
-                events,
-                &agent,
-                agent_id,
-                session_id,
-                TurnResult {
-                    turn_id,
-                    status: TurnStatus::Completed,
-                    agent_status: AgentStatus::Completed,
-                    final_text: last_assistant_text,
-                    error: None,
-                },
-            )
-            .await?;
-            ops.start_next_queued_input_after_turn(agent_id).await;
-            return Ok(());
-        }
-
-        if let Some(tokens) = last_model_total_tokens {
-            super::history::record_session_context_tokens(
-                deps.store.as_ref(),
-                &agent,
-                agent_id,
-                session_id,
-                tokens,
-            )
-            .await?;
-        }
-
-        let history =
-            super::history::session_history(deps.store.as_ref(), &agent, agent_id, session_id)
-                .await?;
-        let estimated_request_tokens = super::context::estimate_model_request_tokens(
-            &model_context.instructions,
-            &history,
-            &model_context.tools,
-        );
-        let compaction_request = if let Some(tokens) = last_model_total_tokens {
-            ContextCompactionRequest::after_model_response(estimated_request_tokens, tokens)
-        } else {
-            ContextCompactionRequest::from_estimate(estimated_request_tokens)
-        };
-        match ops
-            .maybe_auto_compact(
-                &agent,
-                agent_id,
-                session_id,
-                turn_id,
-                compaction_request,
-                &cancellation_token,
-            )
-            .await
-        {
-            Ok(ContextCompactionOutcome::Compacted { .. }) => {
-                core_session.reset_continuation();
-            }
-            Ok(ContextCompactionOutcome::Skipped) => {}
-            Err(err) => {
-                if matches!(err, RuntimeError::TurnCancelled) {
-                    return Err(err);
-                }
-                tracing::warn!("auto context compaction failed after tool execution: {err}");
-                super::persistence::record_agent_log(
-                    deps.store.as_ref(),
-                    AgentLogRecord {
-                        agent_id,
-                        session_id: Some(session_id),
-                        turn_id: Some(turn_id),
-                        level: "warn",
-                        category: "context",
-                        message: "auto context compaction failed",
-                        details: json!({ "stage": "after_tool_execution", "error": err.to_string() }),
-                    },
-                )
-                .await;
-                return Err(err);
-            }
-        }
+fn message_with_skill_fragment(message: String, fragment: Option<pl_protocol::Message>) -> String {
+    let Some(fragment) = fragment else {
+        return message;
+    };
+    let fragment_text = match fragment.content {
+        MessageContent::Text(text) => text,
+        MessageContent::MultiPart(parts) => parts
+            .into_iter()
+            .filter_map(|part| match part {
+                pl_protocol::ContentPart::Text { text } => Some(text),
+                pl_protocol::ContentPart::Image {
+                    source: _,
+                    media_type: _,
+                    filename: _,
+                } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    if fragment_text.trim().is_empty() {
+        message
+    } else {
+        format!("{message}\n\n{fragment_text}")
     }
 }
 
