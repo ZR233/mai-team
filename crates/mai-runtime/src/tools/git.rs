@@ -1,11 +1,22 @@
+use std::collections::BTreeMap;
+use std::fmt;
+use std::future::Future;
+use std::sync::Arc;
+
 use mai_docker::{DockerClient, SidecarParams};
 use mai_protocol::{AgentId, ProjectSummary};
+use pl_core::{
+    ExecutionBackend, ExecutionOutput, ExecutionRequest, GIT_TOKEN_ENV, GitCredential,
+    GitCredentialProvider, GitCredentialRequest, GitPolicy, GitTool, GitToolKind,
+    GitWorkspaceConfig, PureError, Tool, ToolContext, ToolInput,
+};
 use serde_json::{Value, json};
+#[cfg(test)]
+use tokio::process::Command;
 
 use crate::github::github_clone_url;
 #[cfg(test)]
 use crate::projects;
-use crate::projects::workspace::policy::GitPolicy;
 use crate::turn::tools::ToolExecution;
 use crate::{Result, RuntimeError};
 
@@ -48,161 +59,254 @@ pub(crate) async fn execute_git_tool(
             ));
         }
     }
-    let policy = GitPolicy::new(context.project.branch.clone());
     let output = match name {
-        mai_tools::TOOL_GIT_STATUS => {
-            git_plain(&context, ["status", "--short", "--branch"]).await?
-        }
-        mai_tools::TOOL_GIT_DIFF => git_diff(&context, &arguments, &policy).await?,
-        mai_tools::TOOL_GIT_BRANCH => git_branch(&context, &arguments, &policy).await?,
-        mai_tools::TOOL_GIT_FETCH => {
-            let token = required_token(context.token.as_deref())?;
-            git_fetch(&context, token, &arguments, &policy).await?
-        }
-        mai_tools::TOOL_GIT_COMMIT => git_commit(&context, &arguments).await?,
-        mai_tools::TOOL_GIT_PUSH => {
-            let token = required_token(context.token.as_deref())?;
-            git_push(&context, token, &arguments, &policy).await?
-        }
-        mai_tools::TOOL_GIT_WORKTREE_INFO | mai_tools::TOOL_GIT_WORKSPACE_INFO => {
-            git_workspace_info(&context)
-        }
         mai_tools::TOOL_GIT_SYNC_DEFAULT_BRANCH => {
             let token = required_token(context.token.as_deref())?;
-            git_sync_default_branch(&context, token, &arguments, &policy).await?
+            git_sync_default_branch(&context, token, &arguments).await?
         }
-        _ => {
-            return Err(RuntimeError::InvalidInput(format!(
-                "unsupported git tool `{name}`"
-            )));
+        mai_tools::TOOL_GIT_WORKTREE_INFO => {
+            execute_pl_core_git_tool(&context, GitToolKind::WorkspaceInfo, arguments).await?
         }
+        _ => match git_tool_kind(name) {
+            Some(kind) => execute_pl_core_git_tool(&context, kind, arguments).await?,
+            None => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "unsupported git tool `{name}`"
+                )));
+            }
+        },
     };
     Ok(ToolExecution::new(true, output, false))
 }
 
-async fn git_diff(
-    context: &GitToolContext<'_>,
-    arguments: &Value,
-    policy: &GitPolicy,
-) -> Result<String> {
-    let staged = arguments
-        .get("staged")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let path = optional_arg(arguments, "path")?;
-    if let Some(path) = path.as_deref() {
-        policy.validate_path(path)?;
-    }
-    match (staged, path.as_deref()) {
-        (true, Some(path)) => git_plain(context, ["diff", "--staged", "--", path]).await,
-        (true, None) => git_plain(context, ["diff", "--staged"]).await,
-        (false, Some(path)) => git_plain(context, ["diff", "--", path]).await,
-        (false, None) => git_plain(context, ["diff"]).await,
+fn git_tool_kind(name: &str) -> Option<GitToolKind> {
+    match name {
+        mai_tools::TOOL_GIT_STATUS => Some(GitToolKind::Status),
+        mai_tools::TOOL_GIT_DIFF => Some(GitToolKind::Diff),
+        mai_tools::TOOL_GIT_BRANCH => Some(GitToolKind::Branch),
+        mai_tools::TOOL_GIT_FETCH => Some(GitToolKind::Fetch),
+        mai_tools::TOOL_GIT_COMMIT => Some(GitToolKind::Commit),
+        mai_tools::TOOL_GIT_PUSH => Some(GitToolKind::Push),
+        mai_tools::TOOL_GIT_WORKSPACE_INFO => Some(GitToolKind::WorkspaceInfo),
+        _ => None,
     }
 }
 
-async fn git_branch(
+async fn execute_pl_core_git_tool(
     context: &GitToolContext<'_>,
-    arguments: &Value,
-    policy: &GitPolicy,
+    kind: GitToolKind,
+    arguments: Value,
 ) -> Result<String> {
-    let action = optional_arg(arguments, "action")?.unwrap_or_else(|| "list".to_string());
-    match action.as_str() {
-        "list" => git_plain(context, ["branch", "--list", "--all"]).await,
-        "switch" => {
-            let name = required_arg(arguments, "name")?;
-            policy.validate_branch(&name)?;
-            git_plain(context, ["switch", &name]).await
-        }
-        "create" => {
-            let name = required_arg(arguments, "name")?;
-            policy.validate_branch(&name)?;
-            if let Some(start_point) = optional_arg(arguments, "start_point")? {
-                policy.validate_branch(&start_point)?;
-                git_plain(context, ["switch", "-c", &name, &start_point]).await
-            } else {
-                git_plain(context, ["switch", "-c", &name]).await
+    let config = git_workspace_config(context);
+    let tool = GitTool::new(
+        kind,
+        config.clone(),
+        Arc::new(MaiGitExecutionBackend::new(
+            &context.backend,
+            context.agent_id,
+        )),
+        Arc::new(MaiGitCredentialProvider {
+            token: context.token.clone(),
+        }),
+    );
+    let output = tool
+        .execute(
+            ToolInput {
+                arguments,
+                session_id: "mai-project-git".to_string(),
+                tool_id: kind.name().to_string(),
+                revision_base: 0,
+            },
+            pl_tool_context(config.worktree),
+        )
+        .await
+        .map_err(runtime_error_from_pure)?;
+    Ok(output.description)
+}
+
+fn git_workspace_config(context: &GitToolContext<'_>) -> GitWorkspaceConfig {
+    let mut workspace_info = BTreeMap::new();
+    workspace_info.insert("project_id".to_string(), json!(context.project.id));
+    match &context.backend {
+        GitToolBackend::Sidecar {
+            workspace_volume,
+            repo_path,
+            ..
+        } => {
+            workspace_info.insert("workspace_volume".to_string(), json!(workspace_volume));
+            GitWorkspaceConfig {
+                worktree: std::path::PathBuf::from(repo_path),
+                git_binary: std::path::PathBuf::from("git"),
+                policy: GitPolicy::new(context.project.branch.clone()),
+                default_push_branch: Some(format!("mai-agent/{}", context.agent_id)),
+                workspace_info,
             }
         }
-        other => Err(RuntimeError::InvalidInput(format!(
-            "unsupported git branch action `{other}`"
-        ))),
-    }
-}
-
-async fn git_fetch(
-    context: &GitToolContext<'_>,
-    token: &str,
-    arguments: &Value,
-    policy: &GitPolicy,
-) -> Result<String> {
-    let remote = optional_arg(arguments, "remote")?.unwrap_or_else(|| "origin".to_string());
-    policy.validate_remote(&remote)?;
-    let prune = arguments
-        .get("prune")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let refspec = optional_arg(arguments, "refspec")?;
-    policy.validate_fetch_refspec(refspec.as_deref(), &policy.default_branch)?;
-    if let Some(refspec) = refspec {
-        if prune {
-            git_with_token(context, token, ["fetch", "--prune", &remote, &refspec]).await
-        } else {
-            git_with_token(context, token, ["fetch", &remote, &refspec]).await
+        #[cfg(test)]
+        GitToolBackend::Host {
+            git_binary,
+            projects_root,
+        } => {
+            let repo_cache =
+                projects::workspace::project_repo_cache_path(projects_root, context.project.id);
+            let clone = projects::workspace::agent_clone_path(
+                projects_root,
+                context.project.id,
+                context.agent_id,
+            );
+            workspace_info.insert("repo_cache".to_string(), json!(repo_cache));
+            GitWorkspaceConfig {
+                worktree: clone,
+                git_binary: std::path::PathBuf::from(git_binary),
+                policy: GitPolicy::new(context.project.branch.clone()),
+                default_push_branch: Some(format!("mai-agent/{}", context.agent_id)),
+                workspace_info,
+            }
         }
-    } else if prune {
-        git_with_token(context, token, ["fetch", "--prune", &remote]).await
-    } else {
-        git_with_token(context, token, ["fetch", &remote]).await
     }
 }
 
-async fn git_commit(context: &GitToolContext<'_>, arguments: &Value) -> Result<String> {
-    let message = required_arg(arguments, "message")?;
-    if arguments
-        .get("all")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        git_plain(context, ["commit", "--no-verify", "-am", &message]).await
-    } else {
-        git_plain(context, ["commit", "--no-verify", "-m", &message]).await
+fn pl_tool_context(workspace_root: std::path::PathBuf) -> ToolContext {
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
+    ToolContext {
+        event_tx,
+        options: pl_core::TurnOptions::default(),
+        workspace_access: pl_core::WorkspaceAccess::WorkspaceOnly,
+        mode: pl_core::CompileMode::Auto,
+        workspace_root,
+        workspace_instructions: None,
+        instruction_snapshot: None,
+        provider_call_id: None,
+        active_subagent: None,
+        agent_supervisor: pl_core::AgentSupervisor::default(),
+        lsp_runtime: None,
+        parent_session: Arc::new(pl_core::CoreSession::new()),
     }
 }
 
-async fn git_push(
-    context: &GitToolContext<'_>,
-    token: &str,
-    arguments: &Value,
-    policy: &GitPolicy,
-) -> Result<String> {
-    let remote = optional_arg(arguments, "remote")?.unwrap_or_else(|| "origin".to_string());
-    policy.validate_remote(&remote)?;
-    let branch = optional_arg(arguments, "branch")?;
-    if let Some(branch) = branch.as_deref() {
-        policy.validate_branch(branch)?;
+#[derive(Debug)]
+struct MaiGitCredentialProvider {
+    token: Option<String>,
+}
+
+impl GitCredentialProvider for MaiGitCredentialProvider {
+    fn credential(
+        &self,
+        _request: GitCredentialRequest,
+    ) -> impl Future<Output = std::result::Result<Option<GitCredential>, PureError>> + Send {
+        let token = self
+            .token
+            .clone()
+            .filter(|token| !token.trim().is_empty())
+            .map(GitCredential::new);
+        async move { Ok(token) }
     }
-    let set_upstream = arguments
-        .get("set_upstream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let branch =
-        branch.unwrap_or_else(|| format!("{}{}", policy.agent_branch_prefix, context.agent_id));
-    let destination = format!("HEAD:refs/heads/{branch}");
-    if set_upstream {
-        git_with_token(
-            context,
-            token,
-            ["push", "--no-verify", "-u", &remote, &destination],
-        )
-        .await
-    } else {
-        git_with_token(
-            context,
-            token,
-            ["push", "--no-verify", &remote, &destination],
-        )
-        .await
+}
+
+struct MaiGitExecutionBackend<'a> {
+    backend: &'a GitToolBackend<'a>,
+    agent_id: AgentId,
+}
+
+impl<'a> MaiGitExecutionBackend<'a> {
+    fn new(backend: &'a GitToolBackend<'a>, agent_id: AgentId) -> Self {
+        Self { backend, agent_id }
+    }
+}
+
+impl fmt::Debug for MaiGitExecutionBackend<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.backend {
+            GitToolBackend::Sidecar { .. } => f.write_str("MaiGitExecutionBackend::Sidecar"),
+            #[cfg(test)]
+            GitToolBackend::Host { .. } => f.write_str("MaiGitExecutionBackend::Host"),
+        }
+    }
+}
+
+impl ExecutionBackend for MaiGitExecutionBackend<'_> {
+    fn run(
+        &self,
+        request: ExecutionRequest,
+    ) -> impl Future<Output = std::result::Result<ExecutionOutput, PureError>> + Send {
+        async move {
+            match self.backend {
+                GitToolBackend::Sidecar {
+                    docker,
+                    sidecar_image,
+                    workspace_volume,
+                    repo_path,
+                } => run_sidecar_git_output(
+                    docker,
+                    sidecar_image,
+                    workspace_volume,
+                    repo_path,
+                    self.agent_id,
+                    request.env.get(GIT_TOKEN_ENV).map(String::as_str),
+                    &request.args,
+                )
+                .await
+                .map_err(pure_error_from_runtime),
+                #[cfg(test)]
+                GitToolBackend::Host { .. } => run_host_git_request(request).await,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+async fn run_host_git_request(
+    request: ExecutionRequest,
+) -> std::result::Result<ExecutionOutput, PureError> {
+    let mut command = Command::new(&request.program);
+    command.current_dir(&request.cwd).args(&request.args);
+    apply_host_git_safety_environment(&mut command, &request.cwd);
+    command.envs(&request.env);
+    let output = match request.timeout {
+        Some(timeout) => tokio::time::timeout(timeout, command.output())
+            .await
+            .map_err(|_| pure_tool_error("git", "git command timed out"))?,
+        None => command.output().await,
+    }
+    .map_err(|error| pure_tool_error("git", format!("failed to run git: {error}")))?;
+    Ok(ExecutionOutput {
+        status: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+#[cfg(test)]
+fn apply_host_git_safety_environment(command: &mut Command, cwd: &std::path::Path) {
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "3")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .env("GIT_CONFIG_KEY_1", "safe.directory")
+        .env("GIT_CONFIG_VALUE_1", cwd)
+        .env("GIT_CONFIG_KEY_2", "credential.helper")
+        .env("GIT_CONFIG_VALUE_2", "")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
+        .env_remove("MAI_GITHUB_INSTALLATION_TOKEN");
+}
+
+fn runtime_error_from_pure(error: PureError) -> RuntimeError {
+    RuntimeError::InvalidInput(error.to_string())
+}
+
+fn pure_error_from_runtime(error: RuntimeError) -> PureError {
+    pure_tool_error("git", error)
+}
+
+fn pure_tool_error(tool: &str, error: impl fmt::Display) -> PureError {
+    PureError::ToolExecutionFailed {
+        tool: tool.to_string(),
+        error: error.to_string(),
     }
 }
 
@@ -210,7 +314,6 @@ async fn git_sync_default_branch(
     context: &GitToolContext<'_>,
     token: &str,
     arguments: &Value,
-    policy: &GitPolicy,
 ) -> Result<String> {
     let force = arguments
         .get("force")
@@ -258,7 +361,7 @@ async fn git_sync_default_branch(
     let repo_url = github_clone_url(&context.project.owner, &context.project.repo);
     git_plain(context, ["remote", "set-url", "origin", &repo_url]).await?;
     git_with_token(context, token, ["fetch", "--prune", "origin"]).await?;
-    let branch = format!("{}{}", policy.agent_branch_prefix, context.agent_id);
+    let branch = format!("mai-agent/{}", context.agent_id);
     let origin_branch = format!("origin/{}", context.project.branch);
     git_plain(context, ["checkout", "-B", &branch, &origin_branch]).await?;
     git_plain(context, ["reset", "--hard", &origin_branch]).await?;
@@ -276,39 +379,6 @@ async fn git_sync_default_branch(
         "forced": force,
     })
     .to_string())
-}
-
-fn git_workspace_info(context: &GitToolContext<'_>) -> String {
-    match &context.backend {
-        GitToolBackend::Sidecar {
-            workspace_volume,
-            repo_path,
-            ..
-        } => json!({
-            "project_id": context.project.id,
-            "workspace_volume": workspace_volume,
-            "clone": repo_path,
-            "worktree": repo_path,
-        })
-        .to_string(),
-        #[cfg(test)]
-        GitToolBackend::Host { projects_root, .. } => {
-            let repo_cache =
-                projects::workspace::project_repo_cache_path(projects_root, context.project.id);
-            let clone = projects::workspace::agent_clone_path(
-                projects_root,
-                context.project.id,
-                context.agent_id,
-            );
-            json!({
-                "project_id": context.project.id,
-                "repo_cache": repo_cache,
-                "clone": clone,
-                "worktree": clone,
-            })
-            .to_string()
-        }
-    }
 }
 
 fn repo_path(context: &GitToolContext<'_>) -> String {
@@ -394,7 +464,44 @@ async fn run_sidecar_git(
     token: Option<&str>,
     args: &[&str],
 ) -> Result<String> {
-    let command = sidecar_git_command(repo_path, token.is_some(), args);
+    let args = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
+    let output = run_sidecar_git_output(
+        docker,
+        sidecar_image,
+        workspace_volume,
+        repo_path,
+        agent_id,
+        token,
+        &args,
+    )
+    .await?;
+    if output.status == 0 {
+        return Ok(output.stdout);
+    }
+    let combined = format!("{}\n{}", output.stderr, output.stdout);
+    let redacted = token
+        .map(|token| combined.replace(token, "[redacted]"))
+        .unwrap_or(combined);
+    Err(RuntimeError::InvalidInput(format!(
+        "git sidecar failed: {}",
+        redacted.trim()
+    )))
+}
+
+async fn run_sidecar_git_output(
+    docker: &DockerClient,
+    sidecar_image: &str,
+    workspace_volume: &str,
+    repo_path: &str,
+    agent_id: AgentId,
+    token: Option<&str>,
+    args: &[String],
+) -> Result<ExecutionOutput> {
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let command = sidecar_git_command(repo_path, token.is_some(), &args);
     let env = token
         .map(|token| {
             vec![(
@@ -417,17 +524,11 @@ async fn run_sidecar_git(
             timeout_secs: Some(600),
         })
         .await?;
-    if output.status == 0 {
-        return Ok(output.stdout);
-    }
-    let combined = format!("{}\n{}", output.stderr, output.stdout);
-    let redacted = token
-        .map(|token| combined.replace(token, "[redacted]"))
-        .unwrap_or(combined);
-    Err(RuntimeError::InvalidInput(format!(
-        "git sidecar failed: {}",
-        redacted.trim()
-    )))
+    Ok(ExecutionOutput {
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
 }
 
 fn sidecar_git_command(repo_path: &str, with_token: bool, args: &[&str]) -> String {
@@ -471,23 +572,6 @@ fn required_token(token: Option<&str>) -> Result<&str> {
         .ok_or_else(|| {
             RuntimeError::InvalidInput("project git account token is not configured".to_string())
         })
-}
-
-fn required_arg(arguments: &Value, name: &str) -> Result<String> {
-    optional_arg(arguments, name)?
-        .ok_or_else(|| RuntimeError::InvalidInput(format!("missing string field `{name}`")))
-}
-
-fn optional_arg(arguments: &Value, name: &str) -> Result<Option<String>> {
-    Ok(arguments
-        .get(name)
-        .map(|value| {
-            value.as_str().map(str::to_string).ok_or_else(|| {
-                RuntimeError::InvalidInput(format!("field `{name}` must be a string"))
-            })
-        })
-        .transpose()?
-        .filter(|value| !value.trim().is_empty()))
 }
 
 fn shell_quote(value: &str) -> String {

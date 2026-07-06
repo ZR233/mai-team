@@ -33,13 +33,6 @@ impl ContextCompactionRequest {
         }
     }
 
-    pub(crate) fn after_model_response(estimated_tokens: u64, last_context_tokens: u64) -> Self {
-        Self {
-            estimated_tokens: Some(estimated_tokens),
-            last_context_tokens_override: Some(last_context_tokens),
-        }
-    }
-
     pub(crate) fn last_context_only() -> Self {
         Self {
             estimated_tokens: None,

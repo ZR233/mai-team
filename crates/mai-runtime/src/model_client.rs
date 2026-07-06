@@ -60,6 +60,14 @@ impl ModelClient {
         }
     }
 
+    pub(crate) fn provider_for_selection(
+        selection: &mai_store::ProviderSelection,
+    ) -> Result<SharedModelProvider, PureError> {
+        let mut info = provider_info(&selection.provider);
+        info.default_model = selection.model.id.clone();
+        create_provider_with_models(info, vec![model_info(&selection.model)])
+    }
+
     pub async fn prepare_turn(
         &self,
         selection: &mai_store::ProviderSelection,
@@ -214,7 +222,8 @@ fn model_info(model: &ModelConfig) -> ModelInfo {
     let mut info = ModelInfo::fallback(&model.id);
     info.display_name = model.name.clone().unwrap_or_else(|| model.id.clone());
     info.context_window = Some(model.context_tokens);
-    info.max_context_window = Some(model.context_tokens);
+    info.max_context_window = model.max_context_tokens.or(Some(model.context_tokens));
+    info.auto_compact_token_limit = model.auto_compact_token_limit;
     info.max_output_tokens = Some(model.output_tokens);
     info.capabilities = model_capabilities(&model.capabilities, model.supports_tools);
     info.capabilities.reasoning = model.reasoning.is_some();

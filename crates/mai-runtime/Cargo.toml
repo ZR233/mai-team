@@ -18,7 +18,6 @@ mai-protocol = { path = "../mai-protocol", version = "0.1.11" }
 pl-core.workspace = true
 pl-model.workspace = true
 pl-protocol.workspace = true
-pl-trace.workspace = true
 mai-skills = { path = "../mai-skills", version = "0.1.11" }
 mai-store = { path = "../mai-store", version = "0.1.11" }
 mai-tools = { path = "../mai-tools", version = "0.1.11" }

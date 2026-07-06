@@ -14,7 +14,6 @@ pub(crate) mod docker_reconcile;
 pub(crate) mod lease;
 pub(crate) mod manager;
 pub(crate) mod paths;
-pub(crate) mod policy;
 pub(crate) mod reconcile;
 
 #[cfg(test)]
