@@ -214,6 +214,10 @@ export function useProjects() {
       await refreshProjects()
       await refreshProjectDetail()
       return response
+    } catch (error) {
+      await refreshProjects().catch(() => {})
+      await refreshProjectDetail().catch(() => {})
+      throw error
     } finally {
       isProjectSending.value = false
     }

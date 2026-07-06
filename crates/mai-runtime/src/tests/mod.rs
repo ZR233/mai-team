@@ -9094,6 +9094,64 @@ async fn update_agent_changes_model_persists_and_publishes() {
 }
 
 #[tokio::test]
+async fn update_agent_clears_stale_turn_after_failed_chat() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let agent_id = Uuid::new_v4();
+    let mut summary = test_agent_summary(agent_id, None);
+    summary.status = AgentStatus::Failed;
+    summary.provider_id = "openai".to_string();
+    summary.provider_name = "OpenAI".to_string();
+    summary.model = "gpt-5.5".to_string();
+    summary.reasoning_effort = Some("medium".to_string());
+    summary.last_error = Some("agent is busy".to_string());
+    store.save_agent(&summary, None).await.expect("save agent");
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let agent = runtime.agent(agent_id).await.expect("agent");
+    {
+        let mut summary = agent.summary.write().await;
+        summary.status = AgentStatus::Failed;
+        summary.current_turn = Some(Uuid::new_v4());
+        summary.last_error = Some("agent is busy".to_string());
+    }
+    let mut events = runtime.subscribe();
+
+    let updated = runtime
+        .update_agent(
+            agent_id,
+            UpdateAgentRequest {
+                provider_id: None,
+                model: Some("gpt-5.4".to_string()),
+                reasoning_effort: Some("high".to_string()),
+            },
+        )
+        .await
+        .expect("update after failed chat");
+
+    assert_eq!(updated.status, AgentStatus::Failed);
+    assert_eq!(updated.model, "gpt-5.4");
+    assert_eq!(updated.reasoning_effort, Some("high".to_string()));
+    assert_eq!(updated.current_turn, None);
+    let event = events.recv().await.expect("event");
+    assert!(matches!(
+        event.kind,
+        ServiceEventKind::AgentUpdated { agent } if agent.id == agent_id
+            && agent.model == "gpt-5.4"
+            && agent.current_turn.is_none()
+    ));
+    let snapshot = store.load_runtime_snapshot(10).await.expect("snapshot");
+    assert_eq!(snapshot.agents[0].summary.model, "gpt-5.4");
+    assert_eq!(snapshot.agents[0].summary.current_turn, None);
+}
+
+#[tokio::test]
 async fn update_agent_rejects_invalid_reasoning_and_clears_unsupported_model() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("runtime.sqlite3");

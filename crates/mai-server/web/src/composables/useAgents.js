@@ -115,6 +115,9 @@ export function useAgents() {
         body: JSON.stringify({ message, skill_mentions: skillMentions })
       })
       await refreshDetail()
+    } catch (error) {
+      await refreshDetail().catch(() => {})
+      throw error
     } finally {
       isSending.value = false
     }

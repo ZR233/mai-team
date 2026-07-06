@@ -7,6 +7,7 @@ import { chatContainerState } from '../chatContainerState.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const componentPath = resolve(here, '../../components/ChatEnvironmentWorkspace.vue')
+const componentSource = readFileSync(componentPath, 'utf8')
 
 assert.deepEqual(
   chatContainerState({
@@ -110,7 +111,11 @@ assert.deepEqual(
 )
 
 assert.equal(
-  readFileSync(componentPath, 'utf8').includes('No environment selected'),
+  componentSource.includes('No environment selected'),
+  false
+)
+assert.equal(
+  componentSource.includes('!containerState.value.containerReady'),
   false
 )
 

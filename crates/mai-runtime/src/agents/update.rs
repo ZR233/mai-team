@@ -29,13 +29,13 @@ pub(crate) async fn update_agent(
     request: UpdateAgentRequest,
 ) -> Result<AgentSummary> {
     let agent = ops.agent(agent_id).await?;
-    {
+    let current = {
         let summary = agent.summary.read().await;
-        if !summary.status.can_start_turn() || summary.current_turn.is_some() {
+        if !summary.status.can_start_turn() {
             return Err(RuntimeError::AgentBusy(agent_id));
         }
-    }
-    let current = agent.summary.read().await.clone();
+        summary.clone()
+    };
     let provider_id = request
         .provider_id
         .as_deref()
@@ -57,6 +57,10 @@ pub(crate) async fn update_agent(
     )?;
     let updated = {
         let mut summary = agent.summary.write().await;
+        if !summary.status.can_start_turn() {
+            return Err(RuntimeError::AgentBusy(agent_id));
+        }
+        summary.current_turn = None;
         summary.provider_id = provider_selection.provider.id.clone();
         summary.provider_name = provider_selection.provider.name.clone();
         summary.model = provider_selection.model.id.clone();

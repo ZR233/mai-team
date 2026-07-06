@@ -250,7 +250,9 @@ const containerState = computed(() => chatContainerState({
 const currentProvider = computed(() => props.providers.find((provider) => provider.id === agent.value?.provider_id))
 const currentModel = computed(() => currentProvider.value?.models?.find((model) => model.id === agent.value?.model))
 const currentReasoningOptions = computed(() => reasoningOptionsFor(currentProvider.value, currentModel.value))
-const modelBusy = computed(() => props.updatingModel || !containerState.value.containerReady || ['running_turn', 'waiting_tool', 'starting_container'].includes(agent.value?.status))
+const modelBusy = computed(() =>
+  props.updatingModel || ['running_turn', 'waiting_tool', 'starting_container'].includes(agent.value?.status)
+)
 const inputEnabled = computed(() => containerState.value.containerReady)
 const composerDisabled = computed(() => containerState.value.composerDisabled)
 const composerDisabledReason = computed(() => composerDisabled.value ? containerState.value.disabledReason : '')
