@@ -80,6 +80,23 @@ assert.deepEqual(
 
 assert.deepEqual(
   chatContainerState({
+    detail: environmentDetail({
+      status: 'failed',
+      container_id: 'container-1',
+      last_error: 'LLM provider error: quota exhausted'
+    }),
+    selectedConversationId: 'session-1'
+  }),
+  {
+    containerReady: true,
+    composerDisabled: false,
+    disabledReason: '',
+    statusItem: null
+  }
+)
+
+assert.deepEqual(
+  chatContainerState({
     detail: environmentDetail({ status: 'idle', container_id: 'container-1' }),
     selectedConversationId: 'session-1'
   }),

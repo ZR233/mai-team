@@ -1,4 +1,4 @@
-const READY_STATUSES = new Set(['idle', 'completed', 'cancelled'])
+const READY_STATUSES = new Set(['idle', 'completed', 'failed', 'cancelled'])
 
 export function chatContainerState({
   detail = null,
@@ -45,7 +45,7 @@ export function chatContainerState({
     })
   }
 
-  if (status === 'failed') {
+  if (status === 'failed' && !agent.container_id) {
     const detailText = agent.last_error || 'Environment container failed to start'
     return disabledState(detailText, {
       type: 'process',
