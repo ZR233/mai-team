@@ -142,15 +142,25 @@ mod tests {
     #[test]
     fn container_file_schemas_match_pl_core_tool_schemas() {
         let tools = build_tool_definitions(&[]);
-        for kind in [
-            pl_core::ContainerToolKind::Exec,
-            pl_core::ContainerToolKind::ReadFile,
-            pl_core::ContainerToolKind::ListFiles,
-            pl_core::ContainerToolKind::SearchFiles,
-            pl_core::ContainerToolKind::ApplyPatch,
-            pl_core::ContainerToolKind::CopyUpload,
-            pl_core::ContainerToolKind::CopyDownload,
-        ] {
+        for kind in pl_core::ContainerToolKind::all() {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == kind.name())
+                .unwrap_or_else(|| panic!("{} schema", kind.name()));
+            let pl_schema = kind.to_schema();
+
+            assert_eq!(tool.name, pl_schema.name());
+            assert_eq!(tool.description, pl_schema.description());
+            match pl_schema {
+                pl_model::ToolSchema::Function { input_schema, .. } => {
+                    assert_eq!(tool.parameters, input_schema);
+                }
+                pl_model::ToolSchema::Custom { .. } => {
+                    panic!("{} must be function tool", kind.name())
+                }
+            }
+        }
+        for kind in pl_core::WorkspaceFileToolKind::all() {
             let tool = tools
                 .iter()
                 .find(|tool| tool.name == kind.name())
