@@ -5,7 +5,7 @@ use mai_docker::ExecCaptureOptions;
 use mai_protocol::{AgentId, ToolOutputArtifactInfo};
 use pl_core::{
     ContainerBackend, ContainerCopyFromRequest, ContainerCopyToRequest, ContainerExecOutput,
-    ContainerExecRequest,
+    ContainerExecRequest, ContainerWorkspaceFileBackend,
 };
 use pl_protocol::PureError;
 use serde_json::Value;
@@ -198,6 +198,33 @@ pub(crate) async fn execute_container_tool(
         return Ok(None);
     }
     let backend = MaiContainerBackend { context, agent_id };
+    if matches!(
+        mai_tools::route_tool(name),
+        mai_tools::RoutedTool::ReadFile
+            | mai_tools::RoutedTool::ListFiles
+            | mai_tools::RoutedTool::SearchFiles
+            | mai_tools::RoutedTool::ApplyPatch
+    ) {
+        let file_backend = ContainerWorkspaceFileBackend::new(std::sync::Arc::new(backend));
+        let Some(execution) = pl_core::execute_workspace_file_tool(
+            &file_backend,
+            name,
+            arguments.clone(),
+            Some(cancellation_token.clone()),
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(ToolExecution::with_model_output(
+            execution.success,
+            execution.output,
+            execution.model_output,
+            false,
+            Vec::new(),
+        )));
+    }
+
     let Some(execution) = pl_core::execute_container_tool(
         &backend,
         name,
