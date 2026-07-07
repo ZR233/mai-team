@@ -5,14 +5,13 @@ use mai_protocol::{
     TurnStatus,
 };
 use pl_core::{
-    CompileMode, ContextCompactionConfig, ContextCompactionReplacement, CoreRuntimeProfile,
-    CoreSession, InstructionBlock, InstructionSnapshot, InstructionSource, InstructionSourceKind,
-    OutputTruncation, PureCoreBuilder, ReasoningEffort, RecentInteractionTailConfig, Tool,
-    ToolContext, ToolInput, ToolOutput, ToolRuntimeEvent, TraceRecorder, TurnOptions, TurnRequest,
-    TurnResultStatus,
+    AgentKernel, CompileMode, ContextCompactionConfig, ContextCompactionReplacement,
+    CoreAgentProfile, CoreSession, InstructionBlock, InstructionSnapshot, InstructionSource,
+    InstructionSourceKind, OutputTruncation, ProductToolDefinition, ProductToolRequest,
+    ProductToolRouter, PureCoreBuilder, ReasoningEffort, RecentInteractionTailConfig, ToolOutput,
+    ToolRuntimeEvent, TraceRecorder, TurnOptions, TurnRequest, TurnResultStatus,
 };
 use pl_protocol::PureError;
-use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -38,40 +37,40 @@ pub(crate) struct PureCoreTurnContext {
 pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
     let provider = ModelClient::provider_for_selection(&ctx.provider_selection)?;
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let runtime_profile = CoreRuntimeProfile::host_provided(workspace_root)
-        .with_context_compaction(
-            ContextCompactionConfig::new(
-                ctx.instructions.clone(),
-                crate::COMPACT_PROMPT,
-                crate::COMPACT_SUMMARY_PREFIX,
-                "compact response did not include a summary",
-            )
-            .with_replacement(ContextCompactionReplacement::RecentInteractionTail(
-                RecentInteractionTailConfig {
-                    max_user_chars: crate::COMPACT_USER_MESSAGE_MAX_CHARS,
-                    max_assistant_chars: 8_000,
-                    max_tool_output_chars: 4_000,
-                    assistant_items: 2,
-                    tool_output_items: 3,
-                },
-            )),
-        );
-    let mut builder = PureCoreBuilder::new(provider).with_runtime_profile(runtime_profile);
+    let runtime_profile = CoreAgentProfile::host_provided(workspace_root).with_context_compaction(
+        ContextCompactionConfig::new(
+            ctx.instructions.clone(),
+            crate::COMPACT_PROMPT,
+            crate::COMPACT_SUMMARY_PREFIX,
+            "compact response did not include a summary",
+        )
+        .with_replacement(ContextCompactionReplacement::RecentInteractionTail(
+            RecentInteractionTailConfig {
+                max_user_chars: crate::COMPACT_USER_MESSAGE_MAX_CHARS,
+                max_assistant_chars: 8_000,
+                max_tool_output_chars: 4_000,
+                assistant_items: 2,
+                tool_output_items: 3,
+            },
+        )),
+    );
+    let mut builder = PureCoreBuilder::new(provider);
     if let Some(effort) = ctx.reasoning_effort.as_deref() {
         builder = builder.with_reasoning_effort(ReasoningEffort::new(effort));
     }
-    let mut core = builder.build();
-    for definition in ctx.tools.iter().cloned() {
-        core.register_tool(MaiRuntimeTool::new(
+    let kernel = AgentKernel::builder(builder)
+        .with_profile(runtime_profile)
+        .with_product_tool_router(MaiProductToolRouter::new(
             ctx.runtime.clone(),
             ctx.agent.clone(),
             ctx.agent_id,
             ctx.session_id,
             ctx.turn_id,
-            definition,
+            ctx.tools.clone(),
             ctx.cancellation_token.clone(),
-        ));
-    }
+        ))
+        .build()
+        .await;
 
     let mut session = CoreSession::from_messages(ctx.history.clone());
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(64);
@@ -82,7 +81,7 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
     let options = TurnOptions::default()
         .with_cancellation(ctx.cancellation_token.clone())
         .with_prompt_cache_key(format!("agent:{}:session:{}", ctx.agent_id, ctx.session_id));
-    let result = core
+    let result = kernel
         .run_turn_with_trace(&mut session, request, &mut recorder, options)
         .await?;
     let compacted_summary = new_compaction_summary(&ctx.history, session.messages());
@@ -186,35 +185,40 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
 }
 
 #[derive(Clone)]
-struct MaiRuntimeTool {
+struct MaiProductToolRouter {
     runtime: Arc<AgentRuntime>,
     agent: Arc<AgentRecord>,
     agent_id: AgentId,
     session_id: SessionId,
     turn_id: TurnId,
-    definition: ToolDefinition,
+    definitions: Vec<ToolDefinition>,
     cancellation_token: CancellationToken,
 }
 
-impl std::fmt::Debug for MaiRuntimeTool {
+impl std::fmt::Debug for MaiProductToolRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MaiRuntimeTool")
+        let tools = self
+            .definitions
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>();
+        f.debug_struct("MaiProductToolRouter")
             .field("agent_id", &self.agent_id)
             .field("session_id", &self.session_id)
             .field("turn_id", &self.turn_id)
-            .field("tool", &self.definition.name)
+            .field("tools", &tools)
             .finish()
     }
 }
 
-impl MaiRuntimeTool {
+impl MaiProductToolRouter {
     fn new(
         runtime: Arc<AgentRuntime>,
         agent: Arc<AgentRecord>,
         agent_id: AgentId,
         session_id: SessionId,
         turn_id: TurnId,
-        definition: ToolDefinition,
+        definitions: Vec<ToolDefinition>,
         cancellation_token: CancellationToken,
     ) -> Self {
         Self {
@@ -223,37 +227,32 @@ impl MaiRuntimeTool {
             agent_id,
             session_id,
             turn_id,
-            definition,
+            definitions,
             cancellation_token,
         }
     }
 }
 
-impl Tool for MaiRuntimeTool {
-    fn name(&self) -> &str {
-        &self.definition.name
+impl ProductToolRouter for MaiProductToolRouter {
+    fn tool_definitions(&self) -> Vec<ProductToolDefinition> {
+        self.definitions
+            .iter()
+            .map(|definition| {
+                ProductToolDefinition::new(
+                    definition.name.clone(),
+                    definition.description.clone(),
+                    definition.parameters.clone(),
+                )
+            })
+            .collect()
     }
 
-    fn description(&self) -> &str {
-        &self.definition.description
-    }
-
-    fn input_schema(&self) -> Value {
-        self.definition.parameters.clone()
-    }
-
-    fn execute<'a>(
-        &'a self,
-        input: ToolInput,
-        context: ToolContext,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = std::result::Result<ToolOutput, PureError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
+    fn execute(
+        &self,
+        request: ProductToolRequest,
+    ) -> impl std::future::Future<Output = std::result::Result<ToolOutput, PureError>> + Send {
+        async move {
+            let tool_name = request.definition.name.clone();
             let execution = super::tools::run_tool_call(
                 &super::tools::ToolCallContext {
                     store: self.runtime.deps.store.as_ref(),
@@ -264,17 +263,18 @@ impl Tool for MaiRuntimeTool {
                     turn_id: self.turn_id,
                 },
                 super::tools::ToolCallInfo {
-                    call_id: context
+                    call_id: request
+                        .context
                         .provider_call_id
                         .as_deref()
-                        .unwrap_or(input.tool_id.as_str()),
-                    name: &self.definition.name,
-                    arguments: input.arguments,
+                        .unwrap_or(request.input.tool_id.as_str()),
+                    name: &tool_name,
+                    arguments: request.input.arguments,
                 },
                 |arguments| {
                     let runtime = self.runtime.clone();
                     let agent = self.agent.clone();
-                    let name = self.definition.name.clone();
+                    let name = tool_name.clone();
                     let cancellation_token = self.cancellation_token.clone();
                     async move {
                         runtime
@@ -304,7 +304,7 @@ impl Tool for MaiRuntimeTool {
                     Vec::new()
                 },
             })
-        })
+        }
     }
 }
 

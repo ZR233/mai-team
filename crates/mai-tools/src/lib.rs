@@ -112,6 +112,34 @@ mod tests {
     }
 
     #[test]
+    fn git_status_schema_matches_pl_core_tool_schema() {
+        use pl_core::{GitTool, GitToolKind, GitWorkspaceConfig, LocalExecutionBackend};
+        use pl_core::{NoGitCredentialProvider, Tool};
+
+        let tools = build_tool_definitions(&[]);
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == TOOL_GIT_STATUS)
+            .expect("git_status");
+        let pl_tool = GitTool::new(
+            GitToolKind::Status,
+            GitWorkspaceConfig::local(std::env::temp_dir()),
+            std::sync::Arc::new(LocalExecutionBackend),
+            std::sync::Arc::new(NoGitCredentialProvider),
+        );
+        let pl_schema = pl_tool.to_schema();
+
+        assert_eq!(tool.name, pl_schema.name());
+        assert_eq!(tool.description, pl_schema.description());
+        match pl_schema {
+            pl_model::ToolSchema::Function { input_schema, .. } => {
+                assert_eq!(tool.parameters, input_schema);
+            }
+            pl_model::ToolSchema::Custom { .. } => panic!("git_status must be function tool"),
+        }
+    }
+
+    #[test]
     fn github_tool_schemas_cover_gh_read_write_without_credentials() {
         let tools = build_tool_definitions(&[]);
         let names = tools
