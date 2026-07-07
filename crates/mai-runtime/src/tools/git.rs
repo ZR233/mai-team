@@ -179,6 +179,7 @@ fn pl_tool_context(workspace_root: std::path::PathBuf) -> ToolContext {
         provider_call_id: None,
         active_subagent: None,
         agent_supervisor: pl_core::AgentSupervisor::default(),
+        agent_tool_registrar: None,
         lsp_runtime: None,
         parent_session: Arc::new(pl_core::CoreSession::new()),
     }

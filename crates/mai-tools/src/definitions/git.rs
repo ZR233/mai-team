@@ -1,76 +1,21 @@
-use crate::names::{
-    TOOL_GIT_BRANCH, TOOL_GIT_COMMIT, TOOL_GIT_DIFF, TOOL_GIT_FETCH, TOOL_GIT_PUSH,
-    TOOL_GIT_STATUS, TOOL_GIT_SYNC_DEFAULT_BRANCH, TOOL_GIT_WORKSPACE_INFO, TOOL_GIT_WORKTREE_INFO,
-};
+use crate::names::{TOOL_GIT_SYNC_DEFAULT_BRANCH, TOOL_GIT_WORKTREE_INFO};
 use crate::schema::object_schema;
 use mai_protocol::ToolDefinition;
+use pl_core::{
+    GitTool, GitToolKind, GitWorkspaceConfig, LocalExecutionBackend, NoGitCredentialProvider, Tool,
+};
 use serde_json::json;
+use std::sync::Arc;
 
 pub(crate) fn definitions() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition::function(
-            TOOL_GIT_STATUS,
-            "Show git working tree status for this project agent workspace clone.",
-            object_schema(vec![]),
-        ),
-        ToolDefinition::function(
-            TOOL_GIT_DIFF,
-            "Show git diff for this project agent workspace clone.",
-            object_schema(vec![
-                ("staged", json!({ "type": "boolean" }), false),
-                ("path", json!({ "type": "string" }), false),
-            ]),
-        ),
-        ToolDefinition::function(
-            TOOL_GIT_BRANCH,
-            "List branches or create/switch the current branch in this project agent workspace clone.",
-            object_schema(vec![
-                (
-                    "action",
-                    json!({
-                        "type": "string",
-                        "enum": ["list", "switch", "create"]
-                    }),
-                    false,
-                ),
-                ("name", json!({ "type": "string" }), false),
-                ("start_point", json!({ "type": "string" }), false),
-            ]),
-        ),
-        ToolDefinition::function(
-            TOOL_GIT_FETCH,
-            "Fetch from the project repository remote using host-injected project credentials.",
-            object_schema(vec![
-                ("remote", json!({ "type": "string" }), false),
-                ("refspec", json!({ "type": "string" }), false),
-                ("prune", json!({ "type": "boolean" }), false),
-            ]),
-        ),
-        ToolDefinition::function(
-            TOOL_GIT_COMMIT,
-            "Create a git commit in this project agent workspace clone.",
-            object_schema(vec![
-                ("message", json!({ "type": "string" }), true),
-                ("all", json!({ "type": "boolean" }), false),
-            ]),
-        ),
-        ToolDefinition::function(
-            TOOL_GIT_PUSH,
-            "Push the current branch using host-injected project credentials.",
-            object_schema(vec![
-                ("remote", json!({ "type": "string" }), false),
-                ("branch", json!({ "type": "string" }), false),
-                ("set_upstream", json!({ "type": "boolean" }), false),
-            ]),
-        ),
+    let mut definitions = GitToolKind::all()
+        .iter()
+        .map(|kind| pl_core_git_definition(*kind))
+        .collect::<Vec<_>>();
+    definitions.extend([
         ToolDefinition::function(
             TOOL_GIT_WORKTREE_INFO,
             "Show compatibility information about this project agent git workspace clone.",
-            object_schema(vec![]),
-        ),
-        ToolDefinition::function(
-            TOOL_GIT_WORKSPACE_INFO,
-            "Show information about this project agent git workspace clone.",
             object_schema(vec![]),
         ),
         ToolDefinition::function(
@@ -81,5 +26,25 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
                 ("preserve_changes", json!({ "type": "boolean" }), false),
             ]),
         ),
-    ]
+    ]);
+    definitions
+}
+
+fn pl_core_git_definition(kind: GitToolKind) -> ToolDefinition {
+    let tool = GitTool::new(
+        kind,
+        GitWorkspaceConfig::local(std::env::temp_dir()),
+        Arc::new(LocalExecutionBackend),
+        Arc::new(NoGitCredentialProvider),
+    );
+    match tool.to_schema() {
+        pl_model::ToolSchema::Function {
+            name,
+            description,
+            input_schema,
+        } => ToolDefinition::function(name, description, input_schema),
+        pl_model::ToolSchema::Custom { name, .. } => {
+            panic!("pl-core git tool `{name}` must be a function tool")
+        }
+    }
 }
