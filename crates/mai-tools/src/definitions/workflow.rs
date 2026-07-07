@@ -1,9 +1,7 @@
-use crate::names::{
-    TOOL_REQUEST_USER_INPUT, TOOL_SAVE_ARTIFACT, TOOL_SAVE_TASK_PLAN, TOOL_SUBMIT_REVIEW_RESULT,
-    TOOL_UPDATE_TODO_LIST,
-};
+use crate::names::{TOOL_SAVE_ARTIFACT, TOOL_SAVE_TASK_PLAN, TOOL_SUBMIT_REVIEW_RESULT};
 use crate::schema::object_schema;
 use mai_protocol::ToolDefinition;
+use pl_core::Tool;
 use serde_json::json;
 
 pub(crate) fn definitions() -> Vec<ToolDefinition> {
@@ -27,83 +25,8 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
                 ("summary", json!({ "type": "string" }), true),
             ]),
         ),
-        ToolDefinition::function(
-            TOOL_UPDATE_TODO_LIST,
-            "Update your task todo list. Replaces the entire list each call. \
-             Call this with an items array. Each item has a step description and a status \
-             (pending, in_progress, or completed). \
-             At most one item should be in_progress at a time. \
-             Use this to communicate your progress plan to the user.",
-            object_schema(vec![(
-                "items",
-                json!({
-                    "type": "array",
-                    "description": "The complete list of todo items. Replaces any previous list.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "step": {
-                                "type": "string",
-                                "description": "Description of the task step."
-                            },
-                            "status": {
-                                "type": "string",
-                                "enum": ["pending", "in_progress", "completed"],
-                                "description": "Status of this step. At most one item should be in_progress."
-                            }
-                        },
-                        "required": ["step", "status"],
-                        "additionalProperties": false
-                    }
-                }),
-                true,
-            )]),
-        ),
-        ToolDefinition::function(
-            TOOL_REQUEST_USER_INPUT,
-            "Ask the user a structured question with multiple-choice options. \
-             Use this during planning to resolve ambiguity, confirm assumptions, or choose between meaningful tradeoffs. \
-             Each question must materially change the plan, confirm an assumption, or choose between tradeoffs.",
-            object_schema(vec![
-                (
-                    "header",
-                    json!({ "type": "string", "description": "Short section header for the question group." }),
-                    true,
-                ),
-                (
-                    "questions",
-                    json!({
-                        "type": "array",
-                        "description": "List of questions to ask the user.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": { "type": "string", "description": "Unique identifier for this question." },
-                                "question": { "type": "string", "description": "The question text." },
-                                "options": {
-                                    "type": "array",
-                                    "description": "Available choices. 2-4 options, each with label and description.",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "label": { "type": "string", "description": "Short option label." },
-                                            "description": { "type": "string", "description": "Explanation of what this option means." }
-                                        },
-                                        "required": ["label", "description"],
-                                        "additionalProperties": false
-                                    },
-                                    "minItems": 2,
-                                    "maxItems": 4
-                                }
-                            },
-                            "required": ["id", "question", "options"],
-                            "additionalProperties": false
-                        }
-                    }),
-                    true,
-                ),
-            ]),
-        ),
+        pl_core_definition(pl_core::TodoListTool),
+        pl_core_definition(pl_core::AskUserTool),
         ToolDefinition::function(
             TOOL_SAVE_ARTIFACT,
             "Register a file as a downloadable artifact for the user. \
@@ -123,4 +46,17 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
             ]),
         ),
     ]
+}
+
+fn pl_core_definition(tool: impl Tool) -> ToolDefinition {
+    match tool.to_schema() {
+        pl_model::ToolSchema::Function {
+            name,
+            description,
+            input_schema,
+        } => ToolDefinition::function(name, description, input_schema),
+        pl_model::ToolSchema::Custom { name, .. } => {
+            panic!("pl-core workflow tool {name} must be a function tool")
+        }
+    }
 }

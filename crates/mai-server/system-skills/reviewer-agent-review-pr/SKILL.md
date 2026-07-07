@@ -7,7 +7,7 @@ metadata:
 
 # Reviewer Agent - Review PR
 
-Review exactly one target GitHub pull request for the current project. Mai's system selector is responsible for choosing the PR before this skill starts. Use Mai's visible `github_api_get` and `github_api_request` tools for GitHub reads/writes, local shell commands for git/test work, and the bundled helper for deterministic local preparation.
+Review exactly one target GitHub pull request for the current project. Mai's system selector is responsible for choosing the PR before this skill starts. Use Mai's visible `github_api_request` tool for GitHub reads/writes, local shell commands for git/test work, and the bundled helper for deterministic local preparation.
 
 Mai refreshes the reviewer-owned clone at `/workspace/repo` before this skill starts. PR refs are available in the local clone, commonly as `refs/remotes/origin/pr/<number>` or `refs/pull/<number>/head`. Do not fetch credentials, read `GITHUB_TOKEN`, write credential files, or add model footers. Mai appends the model footer to submitted project reviews.
 
@@ -15,7 +15,7 @@ Mai refreshes the reviewer-owned clone at `/workspace/repo` before this skill st
 
 Use `scripts/review_pr_helper.py` for deterministic local steps before doing review judgment. The script has no third-party dependencies and does not access the network.
 
-Important: save changed-file JSON responses from `github_api_get` or `github_api_request` exactly as returned and feed those files directly to the helper. Do not hand-normalize file lists, GraphQL `nodes`/`edges`, or response wrappers before invoking the helper.
+Important: save changed-file JSON responses from `github_api_request` exactly as returned and feed those files directly to the helper. Do not hand-normalize file lists, GraphQL `nodes`/`edges`, or response wrappers before invoking the helper.
 
 Preferred invocation:
 
@@ -53,7 +53,7 @@ python3 scripts/review_pr_helper.py prepare-review --repo /path/to/repo --agent-
 
 Identify `owner` and `repo` from the project context or `/workspace/repo` remote. Do not look up the authenticated user login before review submission; rely on GitHub's review submission result and use the fallback path if GitHub rejects the review.
 
-If `github_api_get` or `github_api_request` is unavailable, return only:
+If `github_api_request` is unavailable, return only:
 
 ```json
 {"outcome":"failed","pr":null,"summary":"Review could not be completed.","error":"Mai GitHub API tools are unavailable."}
@@ -63,7 +63,7 @@ If `github_api_get` or `github_api_request` is unavailable, return only:
 
 Mai's initial message must name a target pull request. Review only that PR. If no target pull request is present, return a failed JSON result instead of scanning for another PR.
 
-Fetch the target PR with visible Mai GitHub API tools. Use `github_api_get` with these REST paths as needed for review context:
+Fetch the target PR with visible Mai GitHub API tools. Use `github_api_request` with `method: "GET"` and these REST paths as needed for review context:
 
 - `/repos/OWNER/REPO/pulls/PR`
 - `/repos/OWNER/REPO/pulls/PR/reviews`

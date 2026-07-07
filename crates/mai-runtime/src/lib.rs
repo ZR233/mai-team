@@ -76,6 +76,8 @@ const UNCONFIGURED_PROVIDER_NAME: &str = "No provider configured";
 const UNCONFIGURED_MODEL_ID: &str = "unconfigured";
 const PROJECT_CACHE_VOLUME_MISSING_AFTER_STARTUP_RECONCILE: &str =
     "project cache volume is missing after startup reconcile";
+const PROJECT_AGENT_WORKSPACE_VOLUME_MISSING_AFTER_STARTUP_RECONCILE: &str =
+    "project agent workspace volume is missing after startup reconcile";
 const RELAY_ENABLED_BUT_NOT_CONNECTED: &str = "relay is enabled but not connected";
 const RELAY_NOT_CONNECTED: &str = "relay is not connected";
 const SQLITE_DATABASE_LOCKED: &str = "database is locked";
@@ -1148,6 +1150,24 @@ impl AgentRuntime {
                 "failed to remove orphan project cache volumes during startup reconcile"
             );
         }
+        if !volume_report
+            .legacy_agent_workspace_volumes_present
+            .is_empty()
+        {
+            tracing::warn!(
+                count = volume_report.legacy_agent_workspace_volumes_present.len(),
+                "accepted legacy project agent workspace volumes without managed labels during startup reconcile"
+            );
+        }
+        if !volume_report
+            .legacy_project_cache_volumes_present
+            .is_empty()
+        {
+            tracing::warn!(
+                count = volume_report.legacy_project_cache_volumes_present.len(),
+                "accepted legacy project cache volumes without managed labels during startup reconcile"
+            );
+        }
         let recoverable_workspace_projects = projects
             .iter()
             .filter(|project| project_failed_by_recoverable_workspace_start_error(project))
@@ -1203,12 +1223,56 @@ impl AgentRuntime {
                     &agent,
                     AgentStatus::Failed,
                     Some(
-                        "project agent workspace volume is missing after startup reconcile"
-                            .to_string(),
+                        PROJECT_AGENT_WORKSPACE_VOLUME_MISSING_AFTER_STARTUP_RECONCILE.to_string(),
                     ),
                 )
                 .await?;
             }
+        }
+        let mut recovered_agent_count = 0_usize;
+        for agent_summary in &agents {
+            let error = agent_summary
+                .last_error
+                .as_deref()
+                .map(str::trim)
+                .map(|error| error.strip_prefix("invalid input: ").unwrap_or(error));
+            if agent_summary.status != AgentStatus::Failed
+                || agent_summary.current_turn.is_some()
+                || error != Some(PROJECT_AGENT_WORKSPACE_VOLUME_MISSING_AFTER_STARTUP_RECONCILE)
+            {
+                continue;
+            }
+            let Some(project_id) = agent_summary.project_id else {
+                continue;
+            };
+            let workspace_volume = project_agent_workspace_volume(
+                &project_id.to_string(),
+                &agent_summary.id.to_string(),
+            );
+            if !self.deps.docker.volume_exists(&workspace_volume).await? {
+                continue;
+            }
+            let agent = self.agent(agent_summary.id).await?;
+            {
+                let mut summary = agent.summary.write().await;
+                summary.status = AgentStatus::Idle;
+                summary.last_error = None;
+                summary.updated_at = now();
+            }
+            self.persist_agent(&agent).await?;
+            self.events
+                .publish(ServiceEventKind::AgentStatusChanged {
+                    agent_id: agent_summary.id,
+                    status: AgentStatus::Idle,
+                })
+                .await;
+            recovered_agent_count += 1;
+        }
+        if recovered_agent_count > 0 {
+            tracing::warn!(
+                count = recovered_agent_count,
+                "recovered project agents failed by missing workspace volume after startup reconcile"
+            );
         }
         Ok(())
     }

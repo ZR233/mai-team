@@ -314,12 +314,21 @@ export function toolStatusLabel(status) {
 function renderToolArguments(toolName, value) {
   if (isPlainObject(value)) {
     if (toolName === 'container_exec' && typeof value.command === 'string') {
+      const timeoutSecs = value.timeoutSecs ?? value.timeout_secs
       const rows = [
         renderCommandBlock(value.command),
         value.cwd ? renderMetaLine('cwd', value.cwd) : '',
-        value.timeout_secs ? renderMetaLine('timeout', `${value.timeout_secs}s`) : ''
+        timeoutSecs ? renderMetaLine('timeout', `${timeoutSecs}s`) : ''
       ]
       return rows.filter(Boolean).join('')
+    }
+
+    if (toolName === 'container_copy') {
+      return [
+        renderMetaLine('direction', value.direction),
+        renderMetaLine('path', value.path),
+        renderMetaLine('content', compactBase64(value.contentBase64))
+      ].filter(Boolean).join('')
     }
 
     if (toolName === 'container_cp_upload') {
@@ -333,6 +342,15 @@ function renderToolArguments(toolName, value) {
       return renderMetaLine('path', value.path)
     }
 
+    if (toolName === 'send_input') {
+      return [
+        renderMetaLine('agent', value.target),
+        value.triggerTurn ? renderMetaLine('trigger', 'turn') : '',
+        value.interrupt ? renderMetaLine('interrupt', 'true') : '',
+        renderTextBlock('message', value.message)
+      ].filter(Boolean).join('')
+    }
+
     if (toolName === 'send_message') {
       return [
         renderMetaLine('agent', value.agent_id),
@@ -343,17 +361,27 @@ function renderToolArguments(toolName, value) {
 
     if (toolName === 'spawn_agent') {
       return [
-        renderMetaLine('name', value.name),
-        value.provider_id ? renderMetaLine('provider', value.provider_id) : '',
+        value.agentType ? renderMetaLine('type', value.agentType) : '',
+        renderMetaLine('task', value.taskName ?? value.name),
+        value.providerId || value.provider_id ? renderMetaLine('provider', value.providerId ?? value.provider_id) : '',
         value.model ? renderMetaLine('model', value.model) : '',
+        value.reasoningEffort ? renderMetaLine('reasoning', value.reasoningEffort) : '',
+        value.forkTurns ? renderMetaLine('fork turns', value.forkTurns) : '',
         renderTextBlock('message', value.message)
       ].filter(Boolean).join('')
     }
 
-    if (toolName === 'wait_agent' || toolName === 'close_agent') {
+    if (toolName === 'wait_agent') {
+      const timeoutMs = value.timeoutMs ?? (value.timeout_secs ? value.timeout_secs * 1000 : null)
       return [
-        renderMetaLine('agent', value.agent_id),
-        value.timeout_secs ? renderMetaLine('timeout', `${value.timeout_secs}s`) : ''
+        value.targets ? renderMetaLine('agents', value.targets.join(', ')) : '',
+        timeoutMs ? renderMetaLine('timeout', `${timeoutMs}ms`) : ''
+      ].filter(Boolean).join('')
+    }
+
+    if (toolName === 'close_agent' || toolName === 'resume_agent') {
+      return [
+        renderMetaLine('agent', value.target ?? value.agent_id)
       ].filter(Boolean).join('')
     }
 

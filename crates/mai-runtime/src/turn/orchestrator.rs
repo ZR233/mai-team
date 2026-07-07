@@ -363,8 +363,9 @@ pub(crate) async fn run_turn_inner(
         let context_started = Instant::now();
         let mcp_tools = ops.agent_mcp_tools(&agent).await;
         let visible_tools = super::tools::visible_tool_names(state, &agent, &mcp_tools).await;
-        let tools =
+        let product_tools =
             build_tool_definitions_with_filter(&mcp_tools, |name| visible_tools.contains(name));
+        let tools = super::kernel_tools::model_tool_definitions(&visible_tools, product_tools);
         let instructions = {
             let _project_skill_guard = ops.project_skill_read_guard(&agent).await;
             ops.build_instructions(
