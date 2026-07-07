@@ -12,6 +12,7 @@ use crate::github::github_path_segment;
 use crate::{Result, RuntimeError};
 
 pub(crate) const SELECTOR_PAGE_SIZE: u64 = 20;
+const REVIEW_PAGE_SIZE: u64 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectReviewIdentity {
@@ -207,19 +208,27 @@ async fn pull_request_reviews(
     repo: &str,
     pr: u64,
 ) -> Result<Vec<PullRequestReview>> {
-    let path = format!("/repos/{owner}/{repo}/pulls/{pr}/reviews?per_page=100");
-    let value = ops.github_api_get_json(project_id, path).await?;
-    let reviews: Vec<GithubPullRequestReview> =
-        decode_github_json(value, "list pull request reviews")?;
-    Ok(reviews
-        .into_iter()
-        .map(|review| PullRequestReview {
+    let mut page = 1_u64;
+    let mut all_reviews = Vec::new();
+    loop {
+        let path = format!(
+            "/repos/{owner}/{repo}/pulls/{pr}/reviews?per_page={REVIEW_PAGE_SIZE}&page={page}"
+        );
+        let value = ops.github_api_get_json(project_id, path).await?;
+        let reviews: Vec<GithubPullRequestReview> =
+            decode_github_json(value, "list pull request reviews")?;
+        let last_page = reviews.len() < REVIEW_PAGE_SIZE as usize;
+        all_reviews.extend(reviews.into_iter().map(|review| PullRequestReview {
             author_login: review.user.map(|user| user.login),
             state: review.state,
             submitted_at: review.submitted_at,
             commit_id: review.commit_id,
-        })
-        .collect())
+        }));
+        if last_page {
+            return Ok(all_reviews);
+        }
+        page += 1;
+    }
 }
 
 async fn commit_time(
@@ -470,7 +479,7 @@ mod tests {
                 pr_detail(42, false, "head-42"),
             ),
             (
-                "/repos/owner/repo/pulls/42/reviews?per_page=100".to_string(),
+                "/repos/owner/repo/pulls/42/reviews?per_page=100&page=1".to_string(),
                 json!([]),
             ),
             (
@@ -509,7 +518,7 @@ mod tests {
                 pr_detail(7, false, "head-7"),
             ),
             (
-                "/repos/owner/repo/pulls/7/reviews?per_page=100".to_string(),
+                "/repos/owner/repo/pulls/7/reviews?per_page=100&page=1".to_string(),
                 json!([]),
             ),
             (
@@ -543,7 +552,7 @@ mod tests {
                 pr_detail(616, false, "head-616"),
             ),
             (
-                "/repos/owner/repo/pulls/616/reviews?per_page=100".to_string(),
+                "/repos/owner/repo/pulls/616/reviews?per_page=100&page=1".to_string(),
                 json!([
                     {
                         "user": { "login": "mai-bot" },
@@ -580,6 +589,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_pr_eligibility_reads_review_pages_before_rereview() {
+        let project_id = Uuid::new_v4();
+        let first_review_page = (0..100)
+            .map(|index| {
+                json!({
+                    "user": { "login": "mai-bot" },
+                    "state": "APPROVED",
+                    "submitted_at": format!("2026-05-15T{:02}:00:00Z", index % 24),
+                    "commit_id": "old-head"
+                })
+            })
+            .collect::<Vec<_>>();
+        let ops = FakeEligibilityOps::new(vec![
+            (
+                "/repos/owner/repo/pulls/777".to_string(),
+                pr_detail(777, false, "head-777"),
+            ),
+            (
+                "/repos/owner/repo/pulls/777/reviews?per_page=100&page=1".to_string(),
+                Value::Array(first_review_page),
+            ),
+            (
+                "/repos/owner/repo/pulls/777/reviews?per_page=100&page=2".to_string(),
+                json!([
+                    {
+                        "user": { "login": "mai-bot" },
+                        "state": "APPROVED",
+                        "submitted_at": "2026-05-16T07:25:36Z",
+                        "commit_id": "head-777"
+                    }
+                ]),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D777".to_string(),
+                commit("2026-05-16T07:00:00Z"),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D777/check-runs?per_page=100".to_string(),
+                json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}),
+            ),
+            (
+                "/repos/owner/repo/commits/head%2D777/status".to_string(),
+                json!({"state": "success"}),
+            ),
+        ]);
+
+        let selected = select_project_review_pr(&ops, project_id, 777, None)
+            .await
+            .expect("select pr");
+
+        assert_eq!(None, selected);
+    }
+
+    #[tokio::test]
     async fn single_pr_eligibility_ignores_later_review_without_new_commit() {
         let project_id = Uuid::new_v4();
         let ops = FakeEligibilityOps::new(vec![
@@ -588,7 +651,7 @@ mod tests {
                 pr_detail(520, false, "head-520"),
             ),
             (
-                "/repos/owner/repo/pulls/520/reviews?per_page=100".to_string(),
+                "/repos/owner/repo/pulls/520/reviews?per_page=100&page=1".to_string(),
                 json!([
                     {
                         "user": { "login": "mai-bot" },

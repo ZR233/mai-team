@@ -1905,6 +1905,7 @@ dependencies = [
  "pl-core",
  "pl-model",
  "pl-protocol",
+ "pl-trace",
  "pretty_assertions",
  "reqwest",
  "serde",

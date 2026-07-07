@@ -16,6 +16,8 @@ pub(crate) struct DockerVolumeReconcileReport {
     pub(crate) orphan_agent_workspace_volume_removal_failed: Vec<String>,
     pub(crate) orphan_project_cache_volumes_removed: Vec<String>,
     pub(crate) orphan_project_cache_volume_removal_failed: Vec<String>,
+    pub(crate) legacy_agent_workspace_volumes_present: Vec<String>,
+    pub(crate) legacy_project_cache_volumes_present: Vec<String>,
     pub(crate) missing_project_cache_volumes: Vec<ProjectId>,
     pub(crate) missing_agent_workspace_volumes: Vec<AgentId>,
 }
@@ -35,9 +37,40 @@ pub(crate) async fn reconcile_project_volumes(
 ) -> Result<DockerVolumeReconcileReport> {
     let volumes = docker.list_managed_volumes().await?;
     let plan = plan_project_volume_reconcile(&volumes, live_projects, live_agents);
+    let live_agent_projects = live_agents
+        .iter()
+        .filter_map(|agent| agent.project_id.map(|project_id| (agent.id, project_id)))
+        .collect::<HashMap<_, _>>();
+    let mut legacy_project_cache_volumes_present = Vec::new();
+    let mut missing_project_cache_volumes = Vec::new();
+    for project_id in plan.missing_project_cache_volumes {
+        let volume = project_cache_volume(&project_id.to_string());
+        if docker.volume_exists(&volume).await? {
+            legacy_project_cache_volumes_present.push(volume);
+        } else {
+            missing_project_cache_volumes.push(project_id);
+        }
+    }
+    let mut legacy_agent_workspace_volumes_present = Vec::new();
+    let mut missing_agent_workspace_volumes = Vec::new();
+    for agent_id in plan.missing_agent_workspace_volumes {
+        let Some(project_id) = live_agent_projects.get(&agent_id) else {
+            missing_agent_workspace_volumes.push(agent_id);
+            continue;
+        };
+        let volume = project_agent_workspace_volume(&project_id.to_string(), &agent_id.to_string());
+        if docker.volume_exists(&volume).await? {
+            legacy_agent_workspace_volumes_present.push(volume);
+        } else {
+            missing_agent_workspace_volumes.push(agent_id);
+        }
+    }
+
     let mut report = DockerVolumeReconcileReport {
-        missing_project_cache_volumes: plan.missing_project_cache_volumes,
-        missing_agent_workspace_volumes: plan.missing_agent_workspace_volumes,
+        legacy_agent_workspace_volumes_present,
+        legacy_project_cache_volumes_present,
+        missing_project_cache_volumes,
+        missing_agent_workspace_volumes,
         ..DockerVolumeReconcileReport::default()
     };
 
@@ -74,6 +107,8 @@ pub(crate) async fn reconcile_project_volumes(
     report.orphan_agent_workspace_volume_removal_failed.sort();
     report.orphan_project_cache_volumes_removed.sort();
     report.orphan_project_cache_volume_removal_failed.sort();
+    report.legacy_agent_workspace_volumes_present.sort();
+    report.legacy_project_cache_volumes_present.sort();
     report.missing_project_cache_volumes.sort();
     report.missing_agent_workspace_volumes.sort();
     Ok(report)

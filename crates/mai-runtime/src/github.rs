@@ -110,7 +110,7 @@ pub(crate) fn normalize_github_api_get_path(path: &str) -> Result<String> {
         || path.contains(char::is_whitespace)
     {
         return Err(RuntimeError::InvalidInput(
-            "github_api_get path must be a GitHub API path beginning with `/`".to_string(),
+            "github_api_request path must be a GitHub API path beginning with `/`".to_string(),
         ));
     }
     Ok(path.to_string())

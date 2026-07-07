@@ -305,14 +305,6 @@ impl turn::tools::ToolDispatchOps for Arc<AgentRuntime> {
         AgentRuntime::save_artifact(self, agent_id, path, display_name).await
     }
 
-    async fn execute_project_github_api_get(
-        &self,
-        agent: &AgentRecord,
-        path: String,
-    ) -> Result<ToolExecution> {
-        AgentRuntime::execute_project_github_api_get(self.as_ref(), agent, &path).await
-    }
-
     async fn execute_project_github_api_request(
         &self,
         agent: &AgentRecord,

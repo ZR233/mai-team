@@ -188,12 +188,11 @@ pub(crate) async fn execute_container_tool(
     if !matches!(
         mai_tools::route_tool(name),
         mai_tools::RoutedTool::ContainerExec
+            | mai_tools::RoutedTool::ContainerCopy
             | mai_tools::RoutedTool::ReadFile
             | mai_tools::RoutedTool::ListFiles
             | mai_tools::RoutedTool::SearchFiles
             | mai_tools::RoutedTool::ApplyPatch
-            | mai_tools::RoutedTool::ContainerCpUpload
-            | mai_tools::RoutedTool::ContainerCpDownload
     ) {
         return Ok(None);
     }

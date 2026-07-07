@@ -287,8 +287,10 @@ Keep the plan concise and actionable. Prefer behavior-level descriptions over fi
 
 pub(crate) fn agent_type_role(value: &str) -> Option<AgentRole> {
     match value.trim().to_lowercase().as_str() {
+        "planner" => Some(AgentRole::Planner),
         "explorer" => Some(AgentRole::Explorer),
-        "worker" | "default" | "" => Some(AgentRole::Executor),
+        "executor" | "worker" | "default" | "" => Some(AgentRole::Executor),
+        "reviewer" => Some(AgentRole::Reviewer),
         _ => None,
     }
 }

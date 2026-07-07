@@ -602,6 +602,10 @@ const reviewerExtraPromptDraft = ref('')
 const expandedReviewRunId = ref(null)
 const reviewPromptDirty = computed(() => reviewerExtraPromptDraft.value !== (props.detail?.reviewer_extra_prompt || ''))
 const reviewRuns = computed(() => props.detail?.review_runs || [])
+const latestFinishedReviewRun = computed(() => reviewRuns.value.find((run) => run?.finished_at))
+const latestReviewFinishedAt = computed(() => (
+  props.detail?.last_review_finished_at || latestFinishedReviewRun.value?.finished_at || null
+))
 const reviewSettingsHint = computed(() => (
   props.detail?.auto_review_enabled
     ? 'The scheduler keeps the reviewer workspace warm and polls for eligible PRs.'
@@ -613,8 +617,8 @@ const nextReviewLabel = computed(() => {
   return props.detail?.next_review_at ? formatDateTime(props.detail.next_review_at) : 'As soon as possible'
 })
 const reviewLastFinishedLabel = computed(() => (
-  props.detail?.last_review_finished_at
-    ? `Finished ${formatDateTime(props.detail.last_review_finished_at)}`
+  latestReviewFinishedAt.value
+    ? `Finished ${formatDateTime(latestReviewFinishedAt.value)}`
     : 'No review cycle completed yet'
 ))
 const currentReviewerLabel = computed(() => (

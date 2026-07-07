@@ -45,22 +45,6 @@ impl AgentRuntime {
         self.project_git_token(project_id).await
     }
 
-    pub(crate) async fn execute_project_github_api_get(
-        &self,
-        agent: &AgentRecord,
-        path: &str,
-    ) -> Result<ToolExecution> {
-        self.execute_project_github_api_request(
-            agent,
-            &turn::tools::GithubApiRequest {
-                method: "GET".to_string(),
-                path: path.to_string(),
-                body: None,
-            },
-        )
-        .await
-    }
-
     pub(crate) async fn execute_project_github_api_request(
         &self,
         agent: &AgentRecord,

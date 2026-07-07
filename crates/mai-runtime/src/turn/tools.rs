@@ -4,14 +4,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mai_mcp::McpTool;
+#[cfg(test)]
+use mai_protocol::ToolTraceDetail;
 use mai_protocol::{
     AgentId, AgentRole, AgentSummary, ArtifactInfo, ServiceEventKind, SessionId, TaskReview,
-    TaskSummary, TodoItem, ToolOutputArtifactInfo, ToolTraceDetail, TurnId, UserInputOption,
-    UserInputQuestion, now, preview,
+    TaskSummary, TodoItem, ToolOutputArtifactInfo, TurnId, UserInputOption, UserInputQuestion, now,
+    preview,
 };
+#[cfg(test)]
 use mai_store::ConfigStore;
 use mai_tools::{RoutedTool, route_tool};
 use serde_json::{Value, json};
+#[cfg(test)]
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -19,6 +23,7 @@ use crate::agents;
 use crate::events::RuntimeEvents;
 use crate::state::{AgentRecord, CollabInput, RuntimeState};
 use crate::turn::container::{ContainerToolContext, ContainerToolOps};
+#[cfg(test)]
 use crate::turn::persistence::AgentLogRecord;
 use crate::{Result, RuntimeError};
 
@@ -31,10 +36,13 @@ const DEFAULT_MODEL_TOOL_OUTPUT_BYTES: usize =
 
 #[derive(Debug)]
 pub(crate) struct ToolExecution {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) success: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) output: String,
     pub(crate) model_output: String,
     pub(crate) ends_turn: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) output_artifacts: Vec<ToolOutputArtifactInfo>,
 }
 
@@ -200,11 +208,6 @@ pub(crate) trait ToolDispatchOps: Send + Sync {
         path: String,
         display_name: Option<String>,
     ) -> impl Future<Output = Result<ArtifactInfo>> + Send;
-    fn execute_project_github_api_get(
-        &self,
-        agent: &AgentRecord,
-        path: String,
-    ) -> impl Future<Output = Result<ToolExecution>> + Send;
     fn execute_project_github_api_request(
         &self,
         agent: &AgentRecord,
@@ -261,17 +264,8 @@ pub(crate) async fn check_tool_permission(
                 "Tool 'close_agent' is not available for worker agents".to_string(),
             ));
         }
-        RoutedTool::SendInput | RoutedTool::SendMessage => {
-            let target = match route_tool(tool_name) {
-                RoutedTool::SendInput => parse_agent_id(&required_any_string_argument(
-                    arguments,
-                    &["target", "agent_id"],
-                )?)?,
-                RoutedTool::SendMessage => {
-                    parse_agent_id(&required_string_argument(arguments, "agent_id")?)?
-                }
-                _ => unreachable!(),
-            };
+        RoutedTool::SendInput => {
+            let target = parse_agent_id(&required_string_argument(arguments, "target")?)?;
             if !agent_can_access_target(state, agent, target).await {
                 return Err(RuntimeError::InvalidInput(
                     "target agent is outside this agent's communication policy".to_string(),
@@ -295,10 +289,8 @@ pub(crate) async fn visible_tool_names(
         mai_tools::TOOL_LIST_FILES.to_string(),
         mai_tools::TOOL_SEARCH_FILES.to_string(),
         mai_tools::TOOL_APPLY_PATCH.to_string(),
-        mai_tools::TOOL_CONTAINER_CP_UPLOAD.to_string(),
-        mai_tools::TOOL_CONTAINER_CP_DOWNLOAD.to_string(),
+        mai_tools::TOOL_CONTAINER_COPY.to_string(),
         mai_tools::TOOL_SEND_INPUT.to_string(),
-        mai_tools::TOOL_SEND_MESSAGE.to_string(),
         mai_tools::TOOL_WAIT_AGENT.to_string(),
         mai_tools::TOOL_LIST_AGENTS.to_string(),
         mai_tools::TOOL_RESUME_AGENT.to_string(),
@@ -310,7 +302,6 @@ pub(crate) async fn visible_tool_names(
         mai_tools::TOOL_UPDATE_TODO_LIST.to_string(),
         mai_tools::TOOL_REQUEST_USER_INPUT.to_string(),
         mai_tools::TOOL_SAVE_ARTIFACT.to_string(),
-        mai_tools::TOOL_GITHUB_API_GET.to_string(),
         mai_tools::TOOL_GITHUB_API_REQUEST.to_string(),
         mai_tools::TOOL_GIT_STATUS.to_string(),
         mai_tools::TOOL_GIT_DIFF.to_string(),
@@ -318,7 +309,6 @@ pub(crate) async fn visible_tool_names(
         mai_tools::TOOL_GIT_FETCH.to_string(),
         mai_tools::TOOL_GIT_COMMIT.to_string(),
         mai_tools::TOOL_GIT_PUSH.to_string(),
-        mai_tools::TOOL_GIT_WORKTREE_INFO.to_string(),
         mai_tools::TOOL_GIT_WORKSPACE_INFO.to_string(),
         mai_tools::TOOL_GIT_SYNC_DEFAULT_BRANCH.to_string(),
     ]);
@@ -361,12 +351,11 @@ pub(crate) async fn execute_tool(
     }
     match route_tool(name) {
         RoutedTool::ContainerExec
+        | RoutedTool::ContainerCopy
         | RoutedTool::ReadFile
         | RoutedTool::ListFiles
         | RoutedTool::SearchFiles
-        | RoutedTool::ApplyPatch
-        | RoutedTool::ContainerCpUpload
-        | RoutedTool::ContainerCpDownload => unreachable!("container tools are handled above"),
+        | RoutedTool::ApplyPatch => unreachable!("container and file tools are handled above"),
         RoutedTool::SpawnAgent => {
             let request = spawn_agent_tool_request(&arguments)?;
             let result = context.ops.spawn_agent_from_tool(agent_id, request).await?;
@@ -377,10 +366,7 @@ pub(crate) async fn execute_tool(
             ))
         }
         RoutedTool::SendInput => {
-            let target = parse_agent_id(&required_any_string_argument(
-                &arguments,
-                &["target", "agent_id"],
-            )?)?;
+            let target = parse_agent_id(&required_string_argument(&arguments, "target")?)?;
             let collab_input = collab_input_from_args(&arguments)?;
             let message = collab_input.message.ok_or_else(|| {
                 RuntimeError::InvalidInput("send_input requires message or text items".to_string())
@@ -401,35 +387,13 @@ pub(crate) async fn execute_tool(
                 .await?;
             Ok(ToolExecution::new(true, output.to_string(), false))
         }
-        RoutedTool::SendMessage => {
-            let target = parse_agent_id(&required_string_argument(&arguments, "agent_id")?)?;
-            let session_id = optional_string_argument(&arguments, "session_id")
-                .as_deref()
-                .map(parse_session_id)
-                .transpose()?;
-            let message = required_string_argument(&arguments, "message")?;
-            let output = context
-                .ops
-                .send_input_to_agent(target, session_id, message, Vec::new(), false)
-                .await?;
-            Ok(ToolExecution::new(true, output.to_string(), false))
-        }
         RoutedTool::WaitAgent => {
-            let legacy_single_target =
-                arguments.get("targets").is_none() && arguments.get("agent_id").is_some();
             let targets = wait_targets(&arguments)?;
             let timeout = wait_timeout(&arguments);
             let output = context
                 .ops
                 .wait_agents_output_with_cancel(targets, timeout, &cancellation_token)
                 .await?;
-            if legacy_single_target {
-                return Ok(ToolExecution::new(
-                    true,
-                    serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string()),
-                    false,
-                ));
-            }
             Ok(ToolExecution::new(
                 true,
                 serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string()),
@@ -443,10 +407,7 @@ pub(crate) async fn execute_tool(
             false,
         )),
         RoutedTool::CloseAgent => {
-            let target = parse_agent_id(&required_any_string_argument(
-                &arguments,
-                &["target", "agent_id"],
-            )?)?;
+            let target = parse_agent_id(&required_string_argument(&arguments, "target")?)?;
             let previous = context.ops.close_agent(target).await?;
             Ok(ToolExecution::new(
                 true,
@@ -455,10 +416,7 @@ pub(crate) async fn execute_tool(
             ))
         }
         RoutedTool::ResumeAgent => {
-            let target = parse_agent_id(&required_any_string_argument(
-                &arguments,
-                &["id", "agent_id", "target"],
-            )?)?;
+            let target = parse_agent_id(&required_string_argument(&arguments, "target")?)?;
             let resumed = context.ops.resume_agent(target).await?;
             Ok(ToolExecution::new(
                 true,
@@ -551,8 +509,7 @@ pub(crate) async fn execute_tool(
             ))
         }
         RoutedTool::RequestUserInput => {
-            let header = required_string_argument(&arguments, "header")?;
-            let questions = user_input_questions_from_arguments(&arguments)?;
+            let (header, questions) = user_input_questions_from_arguments(&arguments)?;
             context
                 .events
                 .publish(ServiceEventKind::UserInputRequested {
@@ -579,13 +536,6 @@ pub(crate) async fn execute_tool(
                 false,
             ))
         }
-        RoutedTool::GithubApiGet => {
-            let path = required_string_argument(&arguments, "path")?;
-            context
-                .ops
-                .execute_project_github_api_get(agent, path)
-                .await
-        }
         RoutedTool::GithubApiRequest => {
             let request = github_api_request_from_arguments(&arguments)?;
             context
@@ -603,7 +553,6 @@ pub(crate) async fn execute_tool(
         | RoutedTool::GitFetch
         | RoutedTool::GitCommit
         | RoutedTool::GitPush
-        | RoutedTool::GitWorktreeInfo
         | RoutedTool::GitWorkspaceInfo
         | RoutedTool::GitSyncDefaultBranch => {
             context
@@ -685,12 +634,14 @@ async fn agent_can_access_target(
     }
 }
 
+#[cfg(test)]
 pub(crate) struct ToolCallInfo<'a> {
     pub(crate) call_id: &'a str,
     pub(crate) name: &'a str,
     pub(crate) arguments: Value,
 }
 
+#[cfg(test)]
 pub(crate) struct ToolCallContext<'a> {
     pub(crate) store: &'a ConfigStore,
     pub(crate) events: &'a RuntimeEvents,
@@ -700,6 +651,7 @@ pub(crate) struct ToolCallContext<'a> {
     pub(crate) turn_id: TurnId,
 }
 
+#[cfg(test)]
 pub(crate) async fn run_tool_call<F, Fut>(
     ctx: &ToolCallContext<'_>,
     call: ToolCallInfo<'_>,
@@ -953,22 +905,6 @@ fn required_string_argument(arguments: &Value, field: &str) -> Result<String> {
         .ok_or_else(|| RuntimeError::InvalidInput(format!("missing string field `{field}`")))
 }
 
-fn required_any_string_argument(arguments: &Value, fields: &[&str]) -> Result<String> {
-    for field in fields {
-        if let Some(value) = arguments
-            .get(field)
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-        {
-            return Ok(value);
-        }
-    }
-    Err(RuntimeError::InvalidInput(format!(
-        "missing string field `{}`",
-        fields.join("` or `")
-    )))
-}
-
 fn optional_string_argument(arguments: &Value, field: &str) -> Option<String> {
     arguments
         .get(field)
@@ -1031,50 +967,34 @@ fn parse_agent_id(value: &str) -> Result<AgentId> {
         .map_err(|err| RuntimeError::InvalidInput(format!("invalid agent_id `{value}`: {err}")))
 }
 
-fn parse_session_id(value: &str) -> Result<SessionId> {
-    Uuid::parse_str(value)
-        .map_err(|err| RuntimeError::InvalidInput(format!("invalid session_id `{value}`: {err}")))
-}
-
-fn parse_agent_role(value: &str) -> Result<AgentRole> {
-    match value.trim().to_lowercase().as_str() {
-        "" | "executor" => Ok(AgentRole::Executor),
-        "planner" => Ok(AgentRole::Planner),
-        "explorer" => Ok(AgentRole::Explorer),
-        "reviewer" => Ok(AgentRole::Reviewer),
-        _ => Err(RuntimeError::InvalidInput(format!(
-            "invalid agent role `{value}`; expected planner, explorer, executor, or reviewer"
-        ))),
-    }
-}
-
 fn spawn_agent_tool_request(arguments: &Value) -> Result<SpawnAgentToolRequest> {
-    let legacy_role = optional_string_argument(arguments, "role")
+    let agent_type = optional_string_argument(arguments, "agentType");
+    let role = agent_type
         .as_deref()
-        .map(parse_agent_role)
-        .transpose()?;
-    let role = legacy_role
-        .or_else(|| {
-            optional_string_argument(arguments, "agent_type")
-                .and_then(|value| agents::agent_type_role(&value))
-        })
+        .and_then(agents::agent_type_role)
         .unwrap_or_default();
+    let role_profile_requested = agent_type.as_deref().is_some_and(|value| {
+        matches!(
+            value.trim().to_lowercase().as_str(),
+            "planner" | "explorer" | "executor" | "reviewer"
+        )
+    });
     Ok(SpawnAgentToolRequest {
-        name: optional_string_argument(arguments, "name"),
+        name: optional_string_argument(arguments, "taskName"),
         role,
-        legacy_role,
+        legacy_role: role_profile_requested.then_some(role),
         model: optional_string_argument(arguments, "model"),
-        reasoning_effort: optional_string_argument(arguments, "reasoning_effort"),
+        reasoning_effort: optional_string_argument(arguments, "reasoningEffort"),
         fork_context: arguments
-            .get("fork_context")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+            .get("forkTurns")
+            .and_then(Value::as_u64)
+            .is_some_and(|turns| turns > 0),
         collab_input: collab_input_from_args(arguments)?,
     })
 }
 
 fn todo_items_from_arguments(arguments: &Value) -> Result<Vec<TodoItem>> {
-    let Some(items_arg) = arguments.get("items").or_else(|| arguments.get("todos")) else {
+    let Some(items_arg) = arguments.get("items") else {
         return Err(RuntimeError::InvalidInput(
             "missing field `items`".to_string(),
         ));
@@ -1085,8 +1005,26 @@ fn todo_items_from_arguments(arguments: &Value) -> Result<Vec<TodoItem>> {
     } else {
         items_arg.clone()
     };
-    serde_json::from_value(items_value)
-        .map_err(|e| RuntimeError::InvalidInput(format!("invalid items: {e}")))
+    let items = items_value
+        .as_array()
+        .ok_or_else(|| RuntimeError::InvalidInput("items must be an array".to_string()))?;
+    items
+        .iter()
+        .map(|item| {
+            let step = required_string_argument(item, "step")?;
+            let status = match required_string_argument(item, "status")?.as_str() {
+                "pending" => mai_protocol::TodoListStatus::Pending,
+                "inProgress" => mai_protocol::TodoListStatus::InProgress,
+                "completed" => mai_protocol::TodoListStatus::Completed,
+                other => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "invalid todo status `{other}`"
+                    )));
+                }
+            };
+            Ok(TodoItem { step, status })
+        })
+        .collect()
 }
 
 fn collab_input_from_args(arguments: &Value) -> Result<CollabInput> {
@@ -1157,30 +1095,34 @@ fn wait_targets(arguments: &Value) -> Result<Vec<AgentId>> {
             .collect();
     }
     Ok(vec![parse_agent_id(&required_string_argument(
-        arguments, "agent_id",
+        arguments, "target",
     )?)?])
 }
 
 fn wait_timeout(arguments: &Value) -> std::time::Duration {
-    if let Some(ms) = arguments.get("timeout_ms").and_then(Value::as_u64) {
+    if let Some(ms) = arguments.get("timeoutMs").and_then(Value::as_u64) {
         return std::time::Duration::from_millis(ms);
     }
-    std::time::Duration::from_secs(
-        arguments
-            .get("timeout_secs")
-            .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_WAIT_AGENT_OBSERVATION_SECS),
-    )
+    std::time::Duration::from_secs(DEFAULT_WAIT_AGENT_OBSERVATION_SECS)
 }
 
-fn user_input_questions_from_arguments(arguments: &Value) -> Result<Vec<UserInputQuestion>> {
+fn user_input_questions_from_arguments(
+    arguments: &Value,
+) -> Result<(String, Vec<UserInputQuestion>)> {
     let questions_arg = arguments
         .get("questions")
         .ok_or_else(|| RuntimeError::InvalidInput("missing field `questions`".to_string()))?;
     let raw_questions: Vec<Value> = serde_json::from_value(questions_arg.clone())
         .map_err(|e| RuntimeError::InvalidInput(format!("invalid questions: {e}")))?;
     let mut questions = Vec::with_capacity(raw_questions.len());
+    let mut header = None;
     for raw in &raw_questions {
+        if header.is_none() {
+            header = raw
+                .get("header")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
         let id = raw
             .get("id")
             .and_then(Value::as_str)
@@ -1215,7 +1157,7 @@ fn user_input_questions_from_arguments(arguments: &Value) -> Result<Vec<UserInpu
             options,
         });
     }
-    Ok(questions)
+    Ok((header.unwrap_or_else(|| "Input".to_string()), questions))
 }
 
 fn bounded_model_tool_output_with_tokens(output: &str, max_output_tokens: usize) -> String {
@@ -1229,9 +1171,9 @@ fn bounded_model_tool_output_with_tokens(output: &str, max_output_tokens: usize)
     let (text, truncated, bytes_omitted, next_offset) = bounded_text(output, max_bytes, 0);
     json!({
         "truncated": truncated,
-        "bytes_returned": text.len(),
-        "bytes_omitted": bytes_omitted,
-        "next_offset": next_offset,
+        "bytesReturned": text.len(),
+        "bytesOmitted": bytes_omitted,
+        "nextOffset": next_offset,
         "text": text,
     })
     .to_string()
@@ -1240,16 +1182,23 @@ fn bounded_model_tool_output_with_tokens(output: &str, max_output_tokens: usize)
 fn bounded_json_tool_output(mut value: Value, max_bytes: usize) -> Value {
     match &mut value {
         Value::Object(map) => {
-            for key in ["stdout", "stderr", "body", "text", "tar_base64"] {
+            for key in [
+                "stdout",
+                "stderr",
+                "body",
+                "text",
+                "tarBase64",
+                "contentBase64",
+            ] {
                 if let Some(Value::String(text)) = map.get_mut(key) {
                     let (bounded, truncated, bytes_omitted, next_offset) =
                         bounded_text(text, max_bytes, 0);
                     if truncated {
                         *text = bounded;
                         map.insert("truncated".to_string(), Value::Bool(true));
-                        map.insert("bytes_returned".to_string(), json!(max_bytes));
-                        map.insert("bytes_omitted".to_string(), json!(bytes_omitted));
-                        map.insert("next_offset".to_string(), json!(next_offset));
+                        map.insert("bytesReturned".to_string(), json!(max_bytes));
+                        map.insert("bytesOmitted".to_string(), json!(bytes_omitted));
+                        map.insert("nextOffset".to_string(), json!(next_offset));
                         break;
                     }
                 }
@@ -1259,10 +1208,10 @@ fn bounded_json_tool_output(mut value: Value, max_bytes: usize) -> Value {
                 let (text, _, bytes_omitted, next_offset) = bounded_text(&serialized, max_bytes, 0);
                 json!({
                     "truncated": true,
-                    "bytes_returned": text.len(),
-                    "bytes_omitted": bytes_omitted,
-                    "next_offset": next_offset,
-                    "json_preview": text,
+                    "bytesReturned": text.len(),
+                    "bytesOmitted": bytes_omitted,
+                    "nextOffset": next_offset,
+                    "jsonPreview": text,
                 })
             } else {
                 value
@@ -1276,10 +1225,10 @@ fn bounded_json_tool_output(mut value: Value, max_bytes: usize) -> Value {
                 let (text, _, bytes_omitted, next_offset) = bounded_text(&serialized, max_bytes, 0);
                 json!({
                     "truncated": true,
-                    "bytes_returned": text.len(),
-                    "bytes_omitted": bytes_omitted,
-                    "next_offset": next_offset,
-                    "json_preview": text,
+                    "bytesReturned": text.len(),
+                    "bytesOmitted": bytes_omitted,
+                    "nextOffset": next_offset,
+                    "jsonPreview": text,
                 })
             }
         }
@@ -1303,6 +1252,7 @@ fn bounded_text(
     (text, true, omitted, Some(offset.saturating_add(end)))
 }
 
+#[cfg(test)]
 fn inline_event_arguments(value: &Value) -> Option<Value> {
     let redacted = redacted_preview_value(value);
     let serialized = serde_json::to_string(&redacted).ok()?;
@@ -1405,6 +1355,7 @@ fn safe_path_component(raw: &str) -> String {
         .to_string()
 }
 
+#[cfg(test)]
 fn u128_to_u64(value: u128) -> u64 {
     value.min(u64::MAX as u128) as u64
 }
@@ -1725,9 +1676,11 @@ mod tests {
         assert_eq!(model_value["truncated"], true);
         let visible = model_value
             .get("stdout")
-            .or_else(|| model_value.get("json_preview"))
+            .or_else(|| model_value.get("jsonPreview"))
             .and_then(Value::as_str)
             .expect("visible output");
+        assert!(model_value.get("bytesReturned").is_some());
+        assert!(model_value.get("bytes_returned").is_none());
         assert!(visible.len() <= DEFAULT_MODEL_TOOL_OUTPUT_BYTES);
     }
 }
