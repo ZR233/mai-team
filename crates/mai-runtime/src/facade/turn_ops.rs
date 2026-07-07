@@ -155,7 +155,7 @@ impl turn::orchestrator::TurnOrchestratorOps for Arc<AgentRuntime> {
     }
 }
 
-impl turn::tools::ContainerToolOps for Arc<AgentRuntime> {
+impl turn::container::ContainerToolOps for Arc<AgentRuntime> {
     async fn container_id(&self, agent_id: AgentId) -> Result<String> {
         AgentRuntime::container_id(self.as_ref(), agent_id).await
     }
