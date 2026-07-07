@@ -2306,6 +2306,67 @@ async fn update_todo_list_accepts_todos_json_string_alias() {
 }
 
 #[tokio::test]
+async fn container_exec_uses_pl_core_backend_and_records_artifacts() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let agent_id = Uuid::new_v4();
+    save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container-1"))).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let output = runtime
+        .execute_tool_for_test(
+            agent_id,
+            "container_exec",
+            json!({
+                "command": "printf /workspace",
+                "output_bytes_cap": 16
+            }),
+        )
+        .await
+        .expect("container exec");
+
+    assert!(output.success);
+    assert_eq!(output.output_artifacts.len(), 1);
+    let value = serde_json::from_str::<Value>(&output.output).expect("json output");
+    assert_eq!(value["status"], 0);
+    assert_eq!(value["stdout"], "/workspace");
+    assert_eq!(value["stdout_bytes"], 10);
+    assert_eq!(
+        value["output_artifacts"]
+            .as_array()
+            .expect("output artifacts")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn container_exec_dot_alias_uses_pl_core_backend() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let agent_id = Uuid::new_v4();
+    save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container-1"))).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let output = runtime
+        .execute_tool_for_test(
+            agent_id,
+            "container.exec",
+            json!({
+                "command": "printf /workspace",
+                "output_bytes_cap": 16
+            }),
+        )
+        .await
+        .expect("container exec alias");
+
+    assert!(output.success);
+    let value = serde_json::from_str::<Value>(&output.output).expect("json output");
+    assert_eq!(value["status"], 0);
+    assert_eq!(value["stdout"], "/workspace");
+}
+
+#[tokio::test]
 async fn read_file_returns_bounded_paged_output() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;

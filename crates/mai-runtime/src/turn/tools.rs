@@ -3,9 +3,6 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use mai_docker::ExecCaptureOptions;
 use mai_mcp::McpTool;
 use mai_protocol::{
     AgentId, AgentRole, AgentSummary, ArtifactInfo, ServiceEventKind, SessionId, TaskReview,
@@ -21,15 +18,12 @@ use uuid::Uuid;
 use crate::agents;
 use crate::events::RuntimeEvents;
 use crate::state::{AgentRecord, CollabInput, RuntimeState};
-use crate::tools::files::ContainerFileTools;
+use crate::turn::container::{ContainerToolContext, ContainerToolOps};
 use crate::turn::persistence::AgentLogRecord;
 use crate::{Result, RuntimeError};
 
 const TOKEN_ESTIMATE_BYTES: usize = 4;
 pub(crate) const DEFAULT_MODEL_TOOL_OUTPUT_TOKENS: usize = 10_000;
-const DEFAULT_EXEC_OUTPUT_BYTES_CAP: usize = 1024 * 1024;
-const MAX_EXEC_OUTPUT_BYTES_CAP: usize = 16 * 1024 * 1024;
-const MAX_MODEL_TOOL_OUTPUT_TOKENS: usize = 100_000;
 const DEFAULT_WAIT_AGENT_OBSERVATION_SECS: u64 = 30;
 #[cfg(test)]
 const DEFAULT_MODEL_TOOL_OUTPUT_BYTES: usize =
@@ -63,6 +57,16 @@ impl ToolExecution {
         output_artifacts: Vec<ToolOutputArtifactInfo>,
     ) -> Self {
         let model_output = bounded_model_tool_output_with_tokens(&output, max_output_tokens);
+        Self::with_model_output(success, output, model_output, ends_turn, output_artifacts)
+    }
+
+    pub(crate) fn with_model_output(
+        success: bool,
+        output: String,
+        model_output: String,
+        ends_turn: bool,
+        output_artifacts: Vec<ToolOutputArtifactInfo>,
+    ) -> Self {
         Self {
             success,
             output,
@@ -82,20 +86,6 @@ pub(crate) struct ToolOutputCapture {
     pub(crate) stderr_path: PathBuf,
     pub(crate) stdout_name: String,
     pub(crate) stderr_name: String,
-}
-
-pub(crate) struct ContainerToolContext<'a, O: ContainerToolOps + ?Sized> {
-    pub(crate) docker: &'a mai_docker::DockerClient,
-    pub(crate) artifact_files_root: &'a Path,
-    pub(crate) ops: &'a O,
-}
-
-/// 容器类工具依赖的最小运行时能力。
-///
-/// 实现方只负责把 agent 解析为可执行命令的容器 ID。返回的 future 必须可
-/// 线程间移动，且错误应保持为 runtime 层的 `Result` 以便工具生命周期统一记录。
-pub(crate) trait ContainerToolOps: Send + Sync {
-    fn container_id(&self, agent_id: AgentId) -> impl Future<Output = Result<String>> + Send;
 }
 
 pub(crate) struct ToolDispatchContext<'a, O: ToolDispatchOps + ContainerToolOps + ?Sized> {
@@ -345,123 +335,6 @@ pub(crate) async fn visible_tool_names(
     names
 }
 
-pub(crate) async fn execute_container_tool(
-    context: &ContainerToolContext<'_, impl ContainerToolOps + ?Sized>,
-    agent_id: AgentId,
-    name: &str,
-    arguments: &Value,
-    cancellation_token: &tokio_util::sync::CancellationToken,
-) -> Result<Option<ToolExecution>> {
-    match route_tool(name) {
-        RoutedTool::ContainerExec => {
-            let command = required_string_argument(arguments, "command")?;
-            let cwd = optional_string_argument(arguments, "cwd");
-            let timeout = arguments.get("timeout_secs").and_then(Value::as_u64);
-            let max_output_tokens = optional_usize_argument(arguments, "max_output_tokens")?
-                .unwrap_or(DEFAULT_MODEL_TOOL_OUTPUT_TOKENS)
-                .clamp(1, MAX_MODEL_TOOL_OUTPUT_TOKENS);
-            let output_bytes_cap = optional_usize_argument(arguments, "output_bytes_cap")?
-                .unwrap_or(DEFAULT_EXEC_OUTPUT_BYTES_CAP)
-                .clamp(1, MAX_EXEC_OUTPUT_BYTES_CAP);
-            let container_id = context.ops.container_id(agent_id).await?;
-            let capture =
-                prepare_tool_output_capture(context.artifact_files_root, agent_id, &command)
-                    .await?;
-            let output = context
-                .docker
-                .exec_shell_captured_with_cancel(
-                    &container_id,
-                    &command,
-                    cwd.as_deref(),
-                    timeout,
-                    ExecCaptureOptions {
-                        stdout_path: &capture.stdout_path,
-                        stderr_path: &capture.stderr_path,
-                        output_bytes_cap,
-                    },
-                    cancellation_token,
-                )
-                .await?;
-            let artifacts = tool_output_artifacts_from_capture(
-                agent_id,
-                &capture,
-                output.stdout_bytes,
-                output.stderr_bytes,
-            )
-            .await?;
-            Ok(Some(ToolExecution::with_model_tokens(
-                output.output.status == 0,
-                serde_json::to_string(&json!({
-                    "status": output.output.status,
-                    "stdout": output.output.stdout,
-                    "stderr": output.output.stderr,
-                    "stdout_truncated": output.stdout_truncated,
-                    "stderr_truncated": output.stderr_truncated,
-                    "stdout_bytes": output.stdout_bytes,
-                    "stderr_bytes": output.stderr_bytes,
-                    "output_artifacts": artifacts,
-                }))
-                .unwrap_or_else(|_| "{}".to_string()),
-                false,
-                max_output_tokens,
-                artifacts,
-            )))
-        }
-        RoutedTool::ReadFile => {
-            let container_id = context.ops.container_id(agent_id).await?;
-            let output = ContainerFileTools::new(context.docker, &container_id)
-                .read_file(arguments)
-                .await?;
-            Ok(Some(ToolExecution::new(true, output.to_string(), false)))
-        }
-        RoutedTool::ListFiles => {
-            let container_id = context.ops.container_id(agent_id).await?;
-            let output = ContainerFileTools::new(context.docker, &container_id)
-                .list_files(arguments)
-                .await?;
-            Ok(Some(ToolExecution::new(true, output.to_string(), false)))
-        }
-        RoutedTool::SearchFiles => {
-            let container_id = context.ops.container_id(agent_id).await?;
-            let output = ContainerFileTools::new(context.docker, &container_id)
-                .search_files(arguments, cancellation_token)
-                .await?;
-            Ok(Some(ToolExecution::new(true, output.to_string(), false)))
-        }
-        RoutedTool::ApplyPatch => {
-            let container_id = context.ops.container_id(agent_id).await?;
-            let output = ContainerFileTools::new(context.docker, &container_id)
-                .apply_patch(arguments)
-                .await?;
-            Ok(Some(ToolExecution::new(true, output.to_string(), false)))
-        }
-        RoutedTool::ContainerCpUpload => {
-            let path = required_string_argument(arguments, "path")?;
-            let content_base64 = required_string_argument(arguments, "content_base64")?;
-            let bytes = upload_file(context, agent_id, &path, &content_base64).await?;
-            Ok(Some(ToolExecution::new(
-                true,
-                json!({ "path": path, "bytes": bytes }).to_string(),
-                false,
-            )))
-        }
-        RoutedTool::ContainerCpDownload => {
-            let path = required_string_argument(arguments, "path")?;
-            let bytes = download_file_tar(context, agent_id, &path).await?;
-            Ok(Some(ToolExecution::new(
-                true,
-                json!({
-                    "path": path,
-                    "tar_base64": BASE64.encode(bytes),
-                })
-                .to_string(),
-                false,
-            )))
-        }
-        _ => Ok(None),
-    }
-}
-
 pub(crate) async fn execute_tool(
     context: &ToolDispatchContext<'_, impl ToolDispatchOps + ContainerToolOps + ?Sized>,
     agent: &Arc<AgentRecord>,
@@ -475,7 +348,7 @@ pub(crate) async fn execute_tool(
         return Err(RuntimeError::TurnCancelled);
     }
     check_tool_permission(context.state, agent, name, &arguments).await?;
-    if let Some(execution) = execute_container_tool(
+    if let Some(execution) = crate::turn::container::execute_container_tool(
         &context.container,
         agent_id,
         name,
@@ -812,37 +685,6 @@ async fn agent_can_access_target(
     }
 }
 
-async fn upload_file(
-    context: &ContainerToolContext<'_, impl ContainerToolOps + ?Sized>,
-    agent_id: AgentId,
-    path: &str,
-    content_base64: &str,
-) -> Result<usize> {
-    let bytes = BASE64
-        .decode(content_base64.trim())
-        .map_err(|err| RuntimeError::InvalidInput(format!("invalid base64: {err}")))?;
-    let temp = tempfile::NamedTempFile::new()?;
-    std::fs::write(temp.path(), &bytes)?;
-    let container_id = context.ops.container_id(agent_id).await?;
-    context
-        .docker
-        .copy_to_container(&container_id, temp.path(), path)
-        .await?;
-    Ok(bytes.len())
-}
-
-async fn download_file_tar(
-    context: &ContainerToolContext<'_, impl ContainerToolOps + ?Sized>,
-    agent_id: AgentId,
-    path: &str,
-) -> Result<Vec<u8>> {
-    let container_id = context.ops.container_id(agent_id).await?;
-    Ok(context
-        .docker
-        .copy_from_container_tar(&container_id, path)
-        .await?)
-}
-
 pub(crate) struct ToolCallInfo<'a> {
     pub(crate) call_id: &'a str,
     pub(crate) name: &'a str,
@@ -1132,18 +974,6 @@ fn optional_string_argument(arguments: &Value, field: &str) -> Option<String> {
         .get(field)
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
-}
-
-fn optional_usize_argument(arguments: &Value, field: &str) -> Result<Option<usize>> {
-    let Some(value) = arguments.get(field) else {
-        return Ok(None);
-    };
-    let raw = value
-        .as_u64()
-        .ok_or_else(|| RuntimeError::InvalidInput(format!("field `{field}` must be an integer")))?;
-    usize::try_from(raw)
-        .map(Some)
-        .map_err(|_| RuntimeError::InvalidInput(format!("field `{field}` is too large")))
 }
 
 fn queue_project_review_prs_from_arguments(arguments: &Value) -> Result<Vec<QueueProjectReviewPr>> {

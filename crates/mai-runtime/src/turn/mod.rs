@@ -1,6 +1,7 @@
 pub(crate) mod accounting;
 pub(crate) mod compaction;
 pub(crate) mod completion;
+pub(crate) mod container;
 pub(crate) mod context;
 pub(crate) mod core_adapter;
 pub(crate) mod history;

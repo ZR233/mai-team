@@ -1470,7 +1470,7 @@ impl AgentRuntime {
     ) -> Result<ToolExecution> {
         let context = turn::tools::ToolDispatchContext {
             state: &self.state,
-            container: turn::tools::ContainerToolContext {
+            container: turn::container::ContainerToolContext {
                 docker: &self.deps.docker,
                 artifact_files_root: &self.artifact_files_root,
                 ops: self,
