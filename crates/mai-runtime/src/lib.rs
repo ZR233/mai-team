@@ -1667,15 +1667,7 @@ impl AgentRuntime {
             .await?;
         self.project_tool_events_for_test(agent_id, &mut event_rx)
             .await;
-        let output_artifacts = output.output_artifacts_as::<ToolOutputArtifactInfo>();
-        let ends_turn = output.ends_turn();
-        Ok(Some(ToolExecution::with_model_output(
-            output.exit_code.unwrap_or(0) == 0,
-            output.description.clone(),
-            output.description,
-            ends_turn,
-            output_artifacts,
-        )))
+        Ok(Some(output.to_execution_result::<ToolOutputArtifactInfo>()))
     }
 
     #[cfg(test)]
