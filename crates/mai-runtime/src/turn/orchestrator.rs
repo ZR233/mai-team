@@ -365,7 +365,8 @@ pub(crate) async fn run_turn_inner(
         let visible_tools = super::tools::visible_tool_names(state, &agent, &mcp_tools).await;
         let product_tools =
             build_tool_definitions_with_filter(&mcp_tools, |name| visible_tools.contains(name));
-        let tools = super::kernel_tools::model_tool_definitions(&visible_tools, product_tools);
+        let tools =
+            super::kernel_tools::model_tool_definitions(&visible_tools, product_tools.clone());
         let instructions = {
             let _project_skill_guard = ops.project_skill_read_guard(&agent).await;
             ops.build_instructions(
@@ -417,6 +418,7 @@ pub(crate) async fn run_turn_inner(
             reasoning_effort,
             provider_selection,
             tools,
+            product_tools,
             instructions,
         }
     };
@@ -510,6 +512,7 @@ pub(crate) async fn run_turn_inner(
         reasoning_effort: model_context.reasoning_effort,
         instructions: model_context.instructions,
         tools: model_context.tools,
+        product_tools: model_context.product_tools,
         history,
         cancellation_token,
     })

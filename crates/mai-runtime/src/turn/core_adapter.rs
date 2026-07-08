@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use mai_protocol::{
@@ -10,6 +11,8 @@ use pl_core::{
     InstructionSourceKind, PureCoreBuilder, ReasoningEffort, RecentInteractionTailConfig,
     TraceRecorder, TurnOptions, TurnRequest, TurnResultStatus,
 };
+use pl_trace::AgentEvent;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -28,6 +31,7 @@ pub(crate) struct PureCoreTurnContext {
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) instructions: String,
     pub(crate) tools: Vec<ToolDefinition>,
+    pub(crate) product_tools: Vec<ToolDefinition>,
     pub(crate) history: Vec<pl_protocol::Message>,
     pub(crate) cancellation_token: CancellationToken,
 }
@@ -56,32 +60,54 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
     if let Some(effort) = ctx.reasoning_effort.as_deref() {
         builder = builder.with_reasoning_effort(ReasoningEffort::new(effort));
     }
-    let registered_tools = super::kernel_tools::registered_runtime_tools(
+    let product_tool_router = super::product_tools::MaiProductToolRouter::new(
         ctx.runtime.clone(),
         ctx.agent.clone(),
         ctx.agent_id,
-        ctx.turn_id,
-        &ctx.tools,
+        ctx.product_tools.clone(),
         ctx.cancellation_token.clone(),
     );
-    let kernel = AgentKernel::builder(builder)
+    let mut kernel = AgentKernel::builder(builder)
         .with_profile(runtime_profile)
-        .with_registered_tools(registered_tools)
+        .with_product_tool_router(product_tool_router)
         .build()
         .await;
+    register_native_shared_tools(&mut kernel, &ctx).await?;
 
     let mut session = CoreSession::from_messages(ctx.history.clone());
-    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(64);
+    let (event_tx, event_rx) = tokio::sync::broadcast::channel(64);
+    let event_projector = tokio::spawn(project_agent_events(
+        ctx.runtime.clone(),
+        ctx.agent_id,
+        ctx.session_id,
+        ctx.turn_id,
+        event_rx,
+    ));
     let mut recorder = TraceRecorder::new(ctx.session_id.to_string(), event_tx, 0);
     let request = TurnRequest::new(ctx.message.clone(), CompileMode::Auto)
         .with_turn_id(ctx.turn_id.to_string())
         .with_instruction_snapshot(raw_instruction_snapshot(ctx.instructions.clone()));
     let options = TurnOptions::default()
         .with_cancellation(ctx.cancellation_token.clone())
-        .with_prompt_cache_key(format!("agent:{}:session:{}", ctx.agent_id, ctx.session_id));
-    let result = kernel
+        .with_prompt_cache_key(format!("agent:{}:session:{}", ctx.agent_id, ctx.session_id))
+        .with_interaction_callback(mai_user_input_interaction_callback(
+            ctx.runtime.clone(),
+            ctx.agent_id,
+            ctx.session_id,
+            ctx.turn_id,
+        ));
+    let turn_result = kernel
         .run_turn_with_trace(&mut session, request, &mut recorder, options)
-        .await?;
+        .await;
+    let result = match turn_result {
+        Ok(result) => result,
+        Err(error) => {
+            event_projector.abort();
+            return Err(error.into());
+        }
+    };
+    drop(recorder);
+    let _ = event_projector.await;
     super::kernel_tools::project_tool_trace_events(
         &ctx.runtime,
         ctx.agent_id,
@@ -91,7 +117,6 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
     )
     .await;
     let compacted_summary = new_compaction_summary(&ctx.history, session.messages());
-
     super::history::replace_session_history(
         ctx.runtime.deps.store.as_ref(),
         &ctx.agent,
@@ -190,6 +215,200 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn mai_user_input_interaction_callback(
+    runtime: Arc<AgentRuntime>,
+    agent_id: AgentId,
+    session_id: SessionId,
+    turn_id: TurnId,
+) -> pl_core::InteractionCallback {
+    Arc::new(move |interaction| {
+        let runtime = runtime.clone();
+        Box::pin(async move {
+            match interaction.payload {
+                pl_protocol::InteractionPayload::UserInput { questions } => {
+                    let (header, questions) = user_input_questions_from_pl(questions);
+                    runtime
+                        .events
+                        .publish(ServiceEventKind::UserInputRequested {
+                            agent_id,
+                            session_id: Some(session_id),
+                            turn_id,
+                            header,
+                            questions,
+                        })
+                        .await;
+                    pl_protocol::InteractionResolution::UserInput {
+                        answers: Default::default(),
+                    }
+                }
+                pl_protocol::InteractionPayload::ToolApproval { .. } => {
+                    pl_protocol::InteractionResolution::ToolApproval {
+                        decision: pl_protocol::ToolApprovalResolution::Denied,
+                        reason: Some(
+                            "mai-team user input callback does not approve tools".to_string(),
+                        ),
+                    }
+                }
+                pl_protocol::InteractionPayload::PlanConfirmation { .. } => {
+                    pl_protocol::InteractionResolution::PlanConfirmation {
+                        decision: pl_protocol::PlanConfirmationResolution::Dismiss,
+                        content: None,
+                        reason: Some(
+                            "mai-team user input callback does not confirm plans".to_string(),
+                        ),
+                    }
+                }
+            }
+        })
+    })
+}
+
+fn user_input_questions_from_pl(
+    questions: Vec<pl_protocol::UserQuestion>,
+) -> (String, Vec<mai_protocol::UserInputQuestion>) {
+    let mut header = None;
+    let mut projected = Vec::with_capacity(questions.len());
+    for question in questions {
+        if header.is_none() {
+            let value = question.header.trim();
+            if !value.is_empty() {
+                header = Some(value.to_string());
+            }
+        }
+        projected.push(mai_protocol::UserInputQuestion {
+            id: question.id,
+            question: question.question,
+            options: question
+                .options
+                .unwrap_or_default()
+                .into_iter()
+                .map(|option| mai_protocol::UserInputOption {
+                    label: option.label,
+                    description: Some(option.description),
+                })
+                .collect(),
+        });
+    }
+    (header.unwrap_or_else(|| "Input".to_string()), projected)
+}
+
+async fn register_native_shared_tools(
+    kernel: &mut AgentKernel,
+    ctx: &PureCoreTurnContext,
+) -> Result<()> {
+    let backend = Arc::new(super::container::MaiContainerBackend::new(
+        ctx.runtime.clone(),
+        ctx.agent_id,
+    ));
+    let git_runtime =
+        crate::tools::git::native_git_tool_runtime(ctx.runtime.clone(), &ctx.agent, |name| {
+            ctx.tools.iter().any(|tool| tool.name == name)
+        })
+        .await?;
+    let capabilities = pl_core::ToolCapabilityConfig {
+        bash: false,
+        workspace_files: true,
+        skills: false,
+        mcp: false,
+        lsp: false,
+        subagents: false,
+        ask_user: true,
+        git: git_runtime.is_some(),
+        docker: false,
+        container: true,
+    };
+    let visible_tools = ctx
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<HashSet<_>>();
+    let tool_set =
+        pl_core::ToolSetBuilder::from_capabilities(capabilities).with_container_tools(backend);
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if let Some(git_runtime) = git_runtime {
+        tool_set
+            .with_git_tools(
+                git_runtime.config,
+                git_runtime.backend,
+                git_runtime.credential_provider,
+            )
+            .register(kernel.core_mut(), workspace_root, None)
+            .await;
+    } else {
+        tool_set
+            .register(kernel.core_mut(), workspace_root, None)
+            .await;
+    }
+    super::mcp_resources::register_mcp_resource_tools(
+        kernel.core_mut(),
+        ctx.runtime.clone(),
+        ctx.agent.clone(),
+        ctx.agent_id,
+        ctx.cancellation_token.clone(),
+        &visible_tools,
+    );
+    super::agent_control::register_native_agent_control_tools(
+        kernel,
+        ctx.runtime.clone(),
+        ctx.agent.clone(),
+        ctx.agent_id,
+        &visible_tools,
+        ctx.cancellation_token.clone(),
+    );
+    Ok(())
+}
+
+pub(crate) async fn project_agent_events(
+    runtime: Arc<AgentRuntime>,
+    agent_id: AgentId,
+    session_id: SessionId,
+    turn_id: TurnId,
+    mut event_rx: broadcast::Receiver<AgentEvent>,
+) {
+    loop {
+        match event_rx.recv().await {
+            Ok(AgentEvent::TodoListUpdated { snapshot }) => {
+                runtime
+                    .events
+                    .publish(ServiceEventKind::TodoListUpdated {
+                        agent_id,
+                        session_id: Some(session_id),
+                        turn_id,
+                        items: snapshot.items.into_iter().map(todo_item_from_pl).collect(),
+                    })
+                    .await;
+            }
+            Ok(AgentEvent::Done | AgentEvent::Error { .. }) => break,
+            Ok(
+                AgentEvent::TracePartStarted { .. }
+                | AgentEvent::TracePartDelta { .. }
+                | AgentEvent::TracePartCompleted { .. }
+                | AgentEvent::TracePartFailed { .. }
+                | AgentEvent::InteractionChanged { .. }
+                | AgentEvent::AgentStateChanged { .. }
+                | AgentEvent::AgentRuntimeUpdated { .. }
+                | AgentEvent::SkillActivated { .. }
+                | AgentEvent::SubAgentActivity { .. }
+                | AgentEvent::TurnInterrupted { .. }
+                | AgentEvent::TurnBudgetLimited { .. },
+            ) => {}
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+fn todo_item_from_pl(item: pl_protocol::TodoItem) -> mai_protocol::TodoItem {
+    mai_protocol::TodoItem {
+        step: item.step,
+        status: match item.status {
+            pl_protocol::TodoStatus::Pending => mai_protocol::TodoListStatus::Pending,
+            pl_protocol::TodoStatus::InProgress => mai_protocol::TodoListStatus::InProgress,
+            pl_protocol::TodoStatus::Completed => mai_protocol::TodoListStatus::Completed,
+        },
+    }
+}
+
 async fn record_assistant_message(ctx: &PureCoreTurnContext, text: String) -> Result<()> {
     super::history::record_message(
         ctx.runtime.deps.store.as_ref(),
@@ -240,23 +459,29 @@ async fn record_context_compacted(ctx: &PureCoreTurnContext, summary: &str, toke
 }
 
 fn new_compaction_summary(
-    before: &[pl_protocol::Message],
-    after: &[pl_protocol::Message],
+    previous: &[pl_protocol::Message],
+    current: &[pl_protocol::Message],
 ) -> Option<String> {
-    let before_summaries = before
-        .iter()
-        .filter_map(compaction_summary_text)
-        .collect::<std::collections::BTreeSet<_>>();
-    after
-        .iter()
-        .filter_map(compaction_summary_text)
-        .find(|summary| !before_summaries.contains(summary))
-        .map(str::to_string)
+    let before = latest_compaction_summary(previous);
+    let after = latest_compaction_summary(current)?;
+    (before.as_deref() != Some(after.as_str())).then_some(after)
 }
 
-fn compaction_summary_text(message: &pl_protocol::Message) -> Option<&str> {
-    super::history::user_message_text(message).filter(|text| {
-        super::history::is_compact_summary(text.trim(), crate::COMPACT_SUMMARY_PREFIX)
+fn latest_compaction_summary(messages: &[pl_protocol::Message]) -> Option<String> {
+    messages.iter().rev().find_map(|message| {
+        let pl_protocol::MessageContent::Text(text) = &message.content else {
+            return None;
+        };
+        let text = text.trim();
+        if !super::history::is_compact_summary(text, crate::COMPACT_SUMMARY_PREFIX) {
+            return None;
+        }
+        Some(
+            text.strip_prefix(crate::COMPACT_SUMMARY_PREFIX)
+                .unwrap_or(text)
+                .trim()
+                .to_string(),
+        )
     })
 }
 

@@ -3,11 +3,9 @@ use mai_protocol::ToolDefinition;
 
 mod definitions;
 mod names;
-mod routing;
 mod schema;
 
 pub use names::*;
-pub use routing::{RoutedTool, route_tool};
 
 pub fn build_tool_definitions(mcp_tools: &[McpTool]) -> Vec<ToolDefinition> {
     build_tool_definitions_with_filter(mcp_tools, |_| true)
@@ -46,27 +44,11 @@ mod tests {
     use serde_json::{Value, json};
 
     #[test]
-    fn routes_shared_names_without_exposing_legacy_aliases() {
-        assert_eq!(
-            route_tool("container.exec"),
-            RoutedTool::Unknown("container.exec".to_string())
-        );
-        assert_eq!(route_tool("container_exec"), RoutedTool::ContainerExec);
-        assert_eq!(route_tool("container_copy"), RoutedTool::ContainerCopy);
-        assert_eq!(route_tool("apply_patch"), RoutedTool::ApplyPatch);
-        assert_eq!(route_tool("search_files"), RoutedTool::SearchFiles);
-        assert_eq!(
-            route_tool("github_api_get"),
-            RoutedTool::Unknown("github_api_get".to_string())
-        );
-        assert_eq!(
-            route_tool("git_worktree_info"),
-            RoutedTool::Unknown("git_worktree_info".to_string())
-        );
-        assert_eq!(
-            route_tool("container_cp_upload"),
-            RoutedTool::Unknown("container_cp_upload".to_string())
-        );
+    fn product_tool_api_is_definition_only() {
+        let api = include_str!("lib.rs");
+
+        assert!(!api.contains(&format!("{}{}", "route", "_tool")));
+        assert!(!api.contains(&format!("{}{}", "Routed", "Tool")));
     }
 
     #[test]
@@ -78,19 +60,24 @@ mod tests {
         assert!(names.contains(&TOOL_SAVE_ARTIFACT));
         assert!(tools.iter().all(|tool| tool.kind == "function"));
         for legacy in [
-            TOOL_CONTAINER_EXEC,
-            TOOL_READ_FILE,
-            TOOL_LIST_FILES,
-            TOOL_SEARCH_FILES,
-            TOOL_APPLY_PATCH,
-            TOOL_SPAWN_AGENT,
-            TOOL_SEND_INPUT,
-            TOOL_WAIT_AGENT,
-            TOOL_LIST_AGENTS,
-            TOOL_CLOSE_AGENT,
-            TOOL_RESUME_AGENT,
-            TOOL_GIT_STATUS,
-            TOOL_GIT_PUSH,
+            pl_core::TOOL_CONTAINER_EXEC,
+            pl_core::WorkspaceFileToolKind::ReadFile.name(),
+            pl_core::WorkspaceFileToolKind::ListFiles.name(),
+            pl_core::WorkspaceFileToolKind::SearchFiles.name(),
+            pl_core::WorkspaceFileToolKind::ApplyPatch.name(),
+            pl_core::TOOL_SPAWN_AGENT,
+            pl_core::TOOL_SEND_INPUT,
+            pl_core::TOOL_WAIT_AGENT,
+            pl_core::TOOL_LIST_AGENTS,
+            pl_core::TOOL_CLOSE_AGENT,
+            pl_core::TOOL_RESUME_AGENT,
+            "update_todo_list",
+            "request_user_input",
+            pl_core::TOOL_GIT_STATUS,
+            pl_core::TOOL_GIT_PUSH,
+            pl_core::TOOL_LIST_MCP_RESOURCES,
+            pl_core::TOOL_LIST_MCP_RESOURCE_TEMPLATES,
+            pl_core::TOOL_READ_MCP_RESOURCE,
             "github_api_get",
             "send_message",
             "git_worktree_info",
@@ -134,53 +121,6 @@ mod tests {
                 "github_api_request exposes forbidden field {forbidden}"
             );
         }
-    }
-
-    #[test]
-    fn update_todo_list_schema_uses_items_field() {
-        let tools = build_tool_definitions(&[]);
-        let update_todo = tools
-            .iter()
-            .find(|tool| tool.name == TOOL_UPDATE_TODO_LIST)
-            .expect("update_todo_list tool");
-        let properties = update_todo
-            .parameters
-            .get("properties")
-            .and_then(Value::as_object)
-            .expect("properties");
-        assert!(properties.contains_key("items"));
-        assert!(!properties.contains_key("todos"));
-        assert_eq!(
-            update_todo
-                .parameters
-                .pointer("/properties/items/items/properties/status/enum"),
-            Some(&json!(["pending", "inProgress", "completed"]))
-        );
-        assert_eq!(
-            update_todo.parameters.get("required"),
-            Some(&json!(["items"]))
-        );
-    }
-
-    #[test]
-    fn request_user_input_schema_uses_pl_core_question_shape() {
-        let tools = build_tool_definitions(&[]);
-        let ask = tools
-            .iter()
-            .find(|tool| tool.name == TOOL_REQUEST_USER_INPUT)
-            .expect("request_user_input");
-        let properties = ask
-            .parameters
-            .get("properties")
-            .and_then(Value::as_object)
-            .expect("properties");
-        assert!(properties.contains_key("questions"));
-        assert!(properties.get("header").is_none());
-        assert!(
-            ask.parameters
-                .pointer("/properties/questions/items/properties/header")
-                .is_some()
-        );
     }
 
     #[test]

@@ -65,12 +65,14 @@ fn pl_tool_call_names(message: &Message) -> Vec<String> {
 #[test]
 fn kernel_shared_tool_definitions_supply_subagent_schema() {
     let visible = [
-        mai_tools::TOOL_SPAWN_AGENT,
-        mai_tools::TOOL_SEND_INPUT,
-        mai_tools::TOOL_WAIT_AGENT,
-        mai_tools::TOOL_LIST_AGENTS,
-        mai_tools::TOOL_CLOSE_AGENT,
-        mai_tools::TOOL_RESUME_AGENT,
+        pl_core::TOOL_SPAWN_AGENT,
+        pl_core::TOOL_SEND_INPUT,
+        pl_core::TOOL_WAIT_AGENT,
+        pl_core::TOOL_LIST_AGENTS,
+        pl_core::TOOL_CLOSE_AGENT,
+        pl_core::TOOL_RESUME_AGENT,
+        "update_todo_list",
+        "request_user_input",
     ]
     .into_iter()
     .map(str::to_string)
@@ -84,6 +86,8 @@ fn kernel_shared_tool_definitions_supply_subagent_schema() {
     assert_eq!(
         names,
         vec![
+            "request_user_input",
+            "update_todo_list",
             "spawn_agent",
             "send_input",
             "wait_agent",
@@ -94,7 +98,7 @@ fn kernel_shared_tool_definitions_supply_subagent_schema() {
     );
     let spawn = tools
         .iter()
-        .find(|tool| tool.name == mai_tools::TOOL_SPAWN_AGENT)
+        .find(|tool| tool.name == pl_core::TOOL_SPAWN_AGENT)
         .expect("spawn_agent");
     assert!(spawn.parameters.pointer("/properties/taskName").is_some());
     assert!(spawn.parameters.pointer("/properties/agentType").is_some());
@@ -115,10 +119,189 @@ fn kernel_shared_tool_definitions_supply_subagent_schema() {
 
     let wait = tools
         .iter()
-        .find(|tool| tool.name == mai_tools::TOOL_WAIT_AGENT)
+        .find(|tool| tool.name == pl_core::TOOL_WAIT_AGENT)
         .expect("wait_agent");
     assert!(wait.parameters.pointer("/properties/timeoutMs").is_some());
     assert!(wait.parameters.pointer("/properties/timeout_ms").is_none());
+
+    let update_todo = tools
+        .iter()
+        .find(|tool| tool.name == "update_todo_list")
+        .expect("update_todo_list");
+    assert!(
+        update_todo
+            .parameters
+            .pointer("/properties/items")
+            .is_some()
+    );
+    assert!(
+        update_todo
+            .parameters
+            .pointer("/properties/todos")
+            .is_none()
+    );
+    assert_eq!(
+        update_todo
+            .parameters
+            .pointer("/properties/items/items/properties/status/enum"),
+        Some(&serde_json::json!(["pending", "inProgress", "completed"]))
+    );
+
+    let ask = tools
+        .iter()
+        .find(|tool| tool.name == "request_user_input")
+        .expect("request_user_input");
+    assert!(ask.parameters.pointer("/properties/questions").is_some());
+    assert!(ask.parameters.pointer("/properties/header").is_none());
+    assert!(
+        ask.parameters
+            .pointer("/properties/questions/items/properties/header")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn pl_core_user_input_interaction_is_projected_to_service_event() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let agent_id = uuid::Uuid::new_v4();
+    let session_id = uuid::Uuid::new_v4();
+    let turn_id = uuid::Uuid::new_v4();
+    let callback = turn::core_adapter::mai_user_input_interaction_callback(
+        Arc::clone(&runtime),
+        agent_id,
+        session_id,
+        turn_id,
+    );
+
+    let resolution = callback(pl_protocol::InteractionRequest {
+        interaction_id: "interaction-1".to_string(),
+        kind: pl_protocol::InteractionKind::UserInput,
+        status: pl_protocol::InteractionStatus::Pending,
+        scope: pl_protocol::InteractionScope {
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            item_id: Some("call-1".to_string()),
+            tool_id: Some("call-1".to_string()),
+            agent_path: None,
+        },
+        payload: pl_protocol::InteractionPayload::UserInput {
+            questions: vec![pl_protocol::UserQuestion {
+                id: "scope".to_string(),
+                header: "Scope".to_string(),
+                question: "Which scope?".to_string(),
+                is_other: false,
+                is_secret: false,
+                options: Some(vec![pl_protocol::UserQuestionOption {
+                    label: "Full".to_string(),
+                    description: "Use the full scope.".to_string(),
+                }]),
+            }],
+        },
+        created_at: 0,
+        updated_at: 0,
+        resolved_at: None,
+        resolution: None,
+    })
+    .await;
+
+    assert_eq!(
+        resolution,
+        pl_protocol::InteractionResolution::UserInput {
+            answers: std::collections::HashMap::new(),
+        }
+    );
+    let events = runtime.events.snapshot().await;
+    let request = events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            ServiceEventKind::UserInputRequested {
+                agent_id: event_agent_id,
+                session_id: event_session_id,
+                turn_id: event_turn_id,
+                header,
+                questions,
+            } if *event_agent_id == agent_id
+                && *event_session_id == Some(session_id)
+                && *event_turn_id == turn_id =>
+            {
+                Some((header, questions))
+            }
+            _ => None,
+        })
+        .expect("projected user input event");
+    assert_eq!(request.0, "Scope");
+    assert_eq!(request.1.len(), 1);
+    assert_eq!(request.1[0].id, "scope");
+    assert_eq!(request.1[0].question, "Which scope?");
+    assert_eq!(request.1[0].options[0].label, "Full");
+    assert_eq!(
+        request.1[0].options[0].description.as_deref(),
+        Some("Use the full scope.")
+    );
+}
+
+#[tokio::test]
+async fn pl_core_todo_events_are_projected_to_service_events() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let agent_id = uuid::Uuid::new_v4();
+    let session_id = uuid::Uuid::new_v4();
+    let turn_id = uuid::Uuid::new_v4();
+    let (event_tx, event_rx) = tokio::sync::broadcast::channel(8);
+    let projector = tokio::spawn(turn::core_adapter::project_agent_events(
+        Arc::clone(&runtime),
+        agent_id,
+        session_id,
+        turn_id,
+        event_rx,
+    ));
+
+    event_tx
+        .send(pl_trace::AgentEvent::TodoListUpdated {
+            snapshot: pl_protocol::TodoListSnapshot {
+                call_id: "call-1".to_string(),
+                agent_id: None,
+                path: None,
+                parent_path: None,
+                explanation: None,
+                items: vec![pl_protocol::TodoItem {
+                    step: "迁移 todo 工具".to_string(),
+                    status: pl_protocol::TodoStatus::InProgress,
+                }],
+            },
+        })
+        .expect("todo event");
+    event_tx
+        .send(pl_trace::AgentEvent::Done)
+        .expect("done event");
+    projector.await.expect("projector");
+
+    let events = runtime.events.snapshot().await;
+    let items = events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            ServiceEventKind::TodoListUpdated {
+                agent_id: event_agent_id,
+                session_id: event_session_id,
+                turn_id: event_turn_id,
+                items,
+            } if *event_agent_id == agent_id
+                && *event_session_id == Some(session_id)
+                && *event_turn_id == turn_id =>
+            {
+                Some(items)
+            }
+            _ => None,
+        })
+        .expect("projected todo event");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].step, "迁移 todo 工具");
+    assert_eq!(items[0].status, mai_protocol::TodoListStatus::InProgress);
 }
 
 fn test_model(id: &str) -> ModelConfig {
@@ -687,6 +870,95 @@ async fn model_client_exposes_shared_continuation_capability_check() {
     let selection = mai_store::ProviderSelection { provider, model };
 
     assert!(ModelClient::supports_continuation(&selection));
+}
+
+#[test]
+fn model_profile_projects_mai_config_to_pl_runtime_profile() {
+    let mut model = test_model("gpt-5.5");
+    model.name = Some("GPT 5.5".to_string());
+    model.context_tokens = 200_000;
+    model.max_context_tokens = Some(256_000);
+    model.auto_compact_token_limit = Some(180_000);
+    model.output_tokens = 64_000;
+    model.capabilities.parallel_tools = true;
+    model.capabilities.reasoning_replay = true;
+    model.request_policy.max_tokens_field = "max_completion_tokens".to_string();
+    model.options = json!({ "temperature": 0.2, "model_option": true });
+    model.request_policy.extra_body = json!({ "policy_option": true });
+    model
+        .headers
+        .insert("X-Model".to_string(), "model".to_string());
+    model
+        .request_policy
+        .headers
+        .insert("X-Policy".to_string(), "policy".to_string());
+
+    let provider = ProviderSecret {
+        id: "mimo".to_string(),
+        kind: ProviderKind::Mimo,
+        name: "MIMO".to_string(),
+        base_url: "http://model.example/v1".to_string(),
+        api_key: "secret".to_string(),
+        api_key_env: None,
+        models: vec![model.clone()],
+        default_model: model.id.clone(),
+        enabled: true,
+    };
+
+    let provider_info = crate::model_profile::provider_info(&provider);
+    assert_eq!(
+        provider_info.provider_kind,
+        pl_model::ProviderKind::OpenAiCompatibleChat
+    );
+    assert_eq!(provider_info.name, "MIMO");
+    assert_eq!(provider_info.base_url, "http://model.example/v1");
+    assert_eq!(provider_info.default_model, "gpt-5.5");
+    assert_eq!(provider_info.bearer_token.as_deref(), Some("secret"));
+
+    let model_info = crate::model_profile::model_info(&model);
+    assert_eq!(model_info.slug, "gpt-5.5");
+    assert_eq!(model_info.display_name, "GPT 5.5");
+    assert_eq!(model_info.context_window, Some(200_000));
+    assert_eq!(model_info.max_context_window, Some(256_000));
+    assert_eq!(model_info.auto_compact_token_limit, Some(180_000));
+    assert_eq!(model_info.max_output_tokens, Some(64_000));
+    assert!(model_info.capabilities.reasoning);
+    assert!(model_info.capabilities.tools.function_calling);
+    assert!(model_info.capabilities.tools.parallel_tool_calls);
+    assert_eq!(
+        model_info.request_profile.max_tokens_field,
+        pl_model::MaxTokensField::MaxCompletionTokens
+    );
+    assert_eq!(
+        model_info.request_profile.headers.get("X-Model"),
+        Some(&"model".to_string())
+    );
+    assert_eq!(
+        model_info.request_profile.headers.get("X-Policy"),
+        Some(&"policy".to_string())
+    );
+    assert_eq!(
+        model_info.request_profile.body.get("model_option"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        model_info.request_profile.body.get("policy_option"),
+        Some(&json!(true))
+    );
+    let effort = model_info
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == "effort")
+        .expect("reasoning effort parameter");
+    assert_eq!(
+        effort.candidates,
+        vec![
+            "minimal".to_string(),
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string()
+        ]
+    );
 }
 
 #[test]
@@ -3275,14 +3547,15 @@ async fn wait_agent_tool_returns_final_assistant_response() {
             parent_id,
             "wait_agent",
             json!({
-                "targets": [child_id.to_string()],
                 "timeoutMs": 1000
             }),
         )
         .await
         .expect("wait agent");
     assert!(output.success);
-    let value: Value = serde_json::from_str(&output.output).expect("wait output json");
+    let outer: Value = serde_json::from_str(&output.output).expect("wait output json");
+    let value: Value = serde_json::from_str(outer["message"].as_str().expect("wait message json"))
+        .expect("wait message payload");
     let completed = value["completed"].as_array().expect("completed");
     assert_eq!(completed.len(), 1);
     let child_output = &completed[0];
@@ -3301,6 +3574,7 @@ async fn wait_agent_tool_returns_final_assistant_response() {
         child_output["agent"]["id"].as_str(),
         Some(child_id.to_string().as_str())
     );
+    assert_eq!(outer["timedOut"].as_bool(), Some(false));
     assert_eq!(value["timed_out"].as_bool(), Some(false));
     assert!(matches!(
         runtime.agent(child_id).await,
@@ -3895,8 +4169,8 @@ async fn auto_compact_failure_before_model_request_stops_turn() {
             "output": [{
                 "type": "function_call",
                 "call_id": "call_1",
-                "name": "unknown_tool",
-                "arguments": "{}"
+                "name": "update_todo_list",
+                "arguments": "{\"items\":[{\"step\":\"inspect\",\"status\":\"completed\"}]}"
             }],
             "usage": { "input_tokens": 8998, "output_tokens": 2, "total_tokens": 9000 }
         }),
@@ -3971,8 +4245,8 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
             "output": [{
                 "type": "function_call",
                 "call_id": "call_1",
-                "name": "unknown_tool",
-                "arguments": "{}"
+                "name": "update_todo_list",
+                "arguments": "{\"items\":[{\"step\":\"inspect\",\"status\":\"completed\"}]}"
             }],
             "usage": { "input_tokens": 8998, "output_tokens": 2, "total_tokens": 9000 }
         }),
@@ -4210,8 +4484,8 @@ async fn auto_compact_resets_openai_continuation_after_replacing_history() {
             "output": [{
                 "type": "function_call",
                 "call_id": "call_1",
-                "name": "unknown_tool",
-                "arguments": "{}"
+                "name": "update_todo_list",
+                "arguments": "{\"items\":[{\"step\":\"inspect\",\"status\":\"completed\"}]}"
             }],
             "usage": { "input_tokens": 8998, "output_tokens": 2, "total_tokens": 9000 }
         }),
@@ -5883,6 +6157,7 @@ async fn spawn_agent_uses_executor_default_when_role_omitted() {
             "spawn_agent",
             json!({
                 "taskName": "child",
+                "message": "",
                 "model": "gpt-5.4"
             }),
         )
@@ -6005,6 +6280,7 @@ async fn spawn_agent_uses_role_config_over_parent_defaults() {
             "spawn_agent",
             json!({
                 "taskName": "child",
+                "message": "",
                 "agentType": "reviewer",
                 "model": "gpt-5.4"
             }),
@@ -6092,10 +6368,11 @@ async fn spawn_agent_inherits_parent_and_accepts_codex_overrides() {
             parent_id,
             "spawn_agent",
             json!({
+                "taskName": "child",
                 "agentType": "worker",
                 "model": "gpt-5.4",
                 "reasoningEffort": "high",
-                "message": "start"
+                "message": ""
             }),
         )
         .await
@@ -6181,7 +6458,8 @@ async fn spawn_agent_fork_context_copies_parent_history_from_store() {
             "spawn_agent",
             json!({
                 "taskName": "child",
-                "forkTurns": 1
+                "message": "",
+                "forkTurns": "1"
             }),
         )
         .await
@@ -6271,10 +6549,8 @@ async fn spawn_agent_skill_item_injects_child_initial_turn() {
             parent_id,
             "spawn_agent",
             json!({
-                "items": [
-                    { "type": "text", "text": "child task" },
-                    { "type": "skill", "name": "demo" }
-                ]
+                "taskName": "child",
+                "message": "child task"
             }),
         )
         .await
@@ -6293,9 +6569,9 @@ async fn spawn_agent_skill_item_injects_child_initial_turn() {
     let input = requests[0]["input"].as_array().expect("input");
     assert!(input.iter().any(|item| {
         item["role"] == "user"
-            && item["content"][0]["text"].as_str().is_some_and(|text| {
-                text.contains("<name>demo</name>") && text.contains("Use child demo.")
-            })
+            && item["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("child task"))
     }));
 }
 
@@ -6496,8 +6772,8 @@ async fn project_worker_cannot_spawn_agents_and_hidden_from_tools() {
     let worker_record = runtime.agent(worker_id).await.expect("worker");
 
     let visible = turn::tools::visible_tool_names(&runtime.state, &worker_record, &[]).await;
-    assert!(!visible.contains(mai_tools::TOOL_SPAWN_AGENT));
-    assert!(!visible.contains(mai_tools::TOOL_CLOSE_AGENT));
+    assert!(!visible.contains(pl_core::TOOL_SPAWN_AGENT));
+    assert!(!visible.contains(pl_core::TOOL_CLOSE_AGENT));
     assert!(!visible.contains(mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS));
 
     let result = runtime
@@ -6505,13 +6781,14 @@ async fn project_worker_cannot_spawn_agents_and_hidden_from_tools() {
             worker_id,
             "spawn_agent",
             json!({
+                "taskName": "denied",
                 "message": "should fail"
             }),
         )
         .await;
 
     assert!(
-        matches!(result, Err(RuntimeError::InvalidInput(message)) if message.contains("spawn_agent"))
+        matches!(result, Err(RuntimeError::Model(pl_protocol::PureError::ToolExecutionFailed { tool, .. })) if tool == "spawn_agent")
     );
 }
 
@@ -6896,13 +7173,15 @@ async fn project_maintainer_can_spawn_agent() {
     });
 
     let visible = turn::tools::visible_tool_names(&runtime.state, &maintainer_record, &[]).await;
-    assert!(visible.contains(mai_tools::TOOL_SPAWN_AGENT));
+    assert!(visible.contains(pl_core::TOOL_SPAWN_AGENT));
 
     let result = runtime
         .execute_tool_for_test(
             maintainer_id,
             "spawn_agent",
             json!({
+                "taskName": "worker",
+                "message": "",
                 "agentType": "worker"
             }),
         )
@@ -7257,27 +7536,27 @@ async fn wait_agent_accepts_targets_and_send_input_queues_busy_target() {
             "send_input",
             json!({
                 "target": child_id.to_string(),
-                "items": [{ "type": "text", "text": "queued hello" }]
+                "message": "queued hello"
             }),
         )
         .await
         .expect("send input");
     assert!(queued.success);
-    let value: Value = serde_json::from_str(&queued.output).expect("json");
-    assert_eq!(value["queued"].as_bool(), Some(true));
+    assert_eq!(child_record.pending_inputs.lock().await.len(), 1);
 
     let waited = runtime
         .execute_tool_for_test(
             parent_id,
             "wait_agent",
             json!({
-                "targets": [child_id.to_string()],
                 "timeoutMs": 1
             }),
         )
         .await
         .expect("wait");
-    let value: Value = serde_json::from_str(&waited.output).expect("json");
+    let outer: Value = serde_json::from_str(&waited.output).expect("json");
+    let value: Value = serde_json::from_str(outer["message"].as_str().expect("wait message json"))
+        .expect("wait message payload");
     assert!(value["completed"].as_array().expect("completed").is_empty());
     let pending = value["pending"].as_array().expect("pending");
     assert_eq!(pending.len(), 1);
@@ -7291,6 +7570,7 @@ async fn wait_agent_accepts_targets_and_send_input_queues_busy_target() {
         pending[0]["current_turn"].as_str()
     );
     assert!(pending[0]["diagnostics"]["idle_ms"].as_u64().is_some());
+    assert_eq!(outer["timedOut"].as_bool(), Some(true));
     assert_eq!(value["timed_out"].as_bool(), Some(true));
 }
 
@@ -7369,10 +7649,7 @@ async fn send_input_queued_skill_item_is_preserved_for_next_turn() {
             "send_input",
             json!({
                 "target": child_id.to_string(),
-                "items": [
-                    { "type": "text", "text": "queued hello" },
-                    { "type": "skill", "name": "demo" }
-                ]
+                "message": "queued hello"
             }),
         )
         .await
@@ -7399,9 +7676,9 @@ async fn send_input_queued_skill_item_is_preserved_for_next_turn() {
     let input = requests[0]["input"].as_array().expect("input");
     assert!(input.iter().any(|item| {
         item["role"] == "user"
-            && item["content"][0]["text"].as_str().is_some_and(|text| {
-                text.contains("<name>demo</name>") && text.contains("Queued demo body.")
-            })
+            && item["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("queued hello"))
     }));
 }
 

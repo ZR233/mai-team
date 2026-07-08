@@ -3,8 +3,8 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
-use mai_docker::{DockerClient, SidecarParams};
-use mai_protocol::{AgentId, ProjectSummary};
+use mai_docker::{DockerClient, SidecarParams, project_agent_workspace_volume};
+use mai_protocol::{AgentId, ProjectId, ProjectSummary};
 use pl_core::{
     ExecutionBackend, ExecutionOutput, ExecutionRequest, GIT_TOKEN_ENV, GitCredential,
     GitCredentialProvider, GitCredentialRequest, GitPolicy, GitTool, GitToolKind,
@@ -15,10 +15,10 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 
 use crate::github::github_clone_url;
-#[cfg(test)]
 use crate::projects;
+use crate::state::AgentRecord;
 use crate::turn::tools::ToolExecution;
-use crate::{Result, RuntimeError};
+use crate::{AgentRuntime, Result, RuntimeError};
 
 pub(crate) struct GitToolContext<'a> {
     pub(crate) backend: GitToolBackend<'a>,
@@ -78,13 +78,13 @@ pub(crate) async fn execute_git_tool(
 
 fn git_tool_kind(name: &str) -> Option<GitToolKind> {
     match name {
-        mai_tools::TOOL_GIT_STATUS => Some(GitToolKind::Status),
-        mai_tools::TOOL_GIT_DIFF => Some(GitToolKind::Diff),
-        mai_tools::TOOL_GIT_BRANCH => Some(GitToolKind::Branch),
-        mai_tools::TOOL_GIT_FETCH => Some(GitToolKind::Fetch),
-        mai_tools::TOOL_GIT_COMMIT => Some(GitToolKind::Commit),
-        mai_tools::TOOL_GIT_PUSH => Some(GitToolKind::Push),
-        mai_tools::TOOL_GIT_WORKSPACE_INFO => Some(GitToolKind::WorkspaceInfo),
+        pl_core::TOOL_GIT_STATUS => Some(GitToolKind::Status),
+        pl_core::TOOL_GIT_DIFF => Some(GitToolKind::Diff),
+        pl_core::TOOL_GIT_BRANCH => Some(GitToolKind::Branch),
+        pl_core::TOOL_GIT_FETCH => Some(GitToolKind::Fetch),
+        pl_core::TOOL_GIT_COMMIT => Some(GitToolKind::Commit),
+        pl_core::TOOL_GIT_PUSH => Some(GitToolKind::Push),
+        pl_core::TOOL_GIT_WORKSPACE_INFO => Some(GitToolKind::WorkspaceInfo),
         _ => None,
     }
 }
@@ -98,11 +98,11 @@ async fn execute_pl_core_git_tool(
     let tool = GitTool::new(
         kind,
         config.clone(),
-        Arc::new(MaiGitExecutionBackend::new(
+        Arc::new(BorrowedGitExecutionBackend::new(
             &context.backend,
             context.agent_id,
         )),
-        Arc::new(MaiGitCredentialProvider {
+        Arc::new(MaiGitCredentialProvider::Static {
             token: context.token.clone(),
         }),
     );
@@ -121,6 +121,61 @@ async fn execute_pl_core_git_tool(
     Ok(output.description)
 }
 
+pub(crate) struct NativeGitToolRuntime {
+    pub(crate) config: GitWorkspaceConfig,
+    pub(crate) backend: Arc<MaiGitExecutionBackend>,
+    pub(crate) credential_provider: Arc<MaiGitCredentialProvider>,
+}
+
+pub(crate) async fn native_git_tool_runtime(
+    runtime: Arc<AgentRuntime>,
+    agent: &AgentRecord,
+    visible_tool: impl Fn(&str) -> bool,
+) -> Result<Option<NativeGitToolRuntime>> {
+    let summary = agent.summary.read().await.clone();
+    let Some(project_id) = summary.project_id else {
+        return Ok(None);
+    };
+    if !GitToolKind::all()
+        .iter()
+        .any(|kind| visible_tool(kind.name()))
+    {
+        return Ok(None);
+    }
+    let project = runtime.project(project_id).await?;
+    let project_summary = project.summary.read().await.clone();
+    let workspace_volume =
+        project_agent_workspace_volume(&project_id.to_string(), &summary.id.to_string());
+    let mut workspace_info = BTreeMap::new();
+    workspace_info.insert("project_id".to_string(), json!(project_id));
+    workspace_info.insert("workspace_volume".to_string(), json!(workspace_volume));
+    let remote_url = github_clone_url(&project_summary.owner, &project_summary.repo);
+    let config = GitWorkspaceConfig {
+        worktree: std::path::PathBuf::from(projects::workspace::AGENT_WORKSPACE_REPO_PATH),
+        git_binary: std::path::PathBuf::from("git"),
+        policy: GitPolicy::new(project_summary.branch),
+        default_push_branch: Some(format!("mai-agent/{}", summary.id)),
+        remote_url: Some(remote_url),
+        workspace_info,
+    };
+    let backend = Arc::new(MaiGitExecutionBackend {
+        docker: runtime.deps.docker.clone(),
+        sidecar_image: runtime.sidecar_image.clone(),
+        workspace_volume,
+        repo_path: projects::workspace::AGENT_WORKSPACE_REPO_PATH.to_string(),
+        agent_id: summary.id,
+    });
+    let credential_provider = Arc::new(MaiGitCredentialProvider::Project {
+        runtime,
+        project_id,
+    });
+    Ok(Some(NativeGitToolRuntime {
+        config,
+        backend,
+        credential_provider,
+    }))
+}
+
 fn git_workspace_config(context: &GitToolContext<'_>) -> GitWorkspaceConfig {
     let mut workspace_info = BTreeMap::new();
     workspace_info.insert("project_id".to_string(), json!(context.project.id));
@@ -131,11 +186,13 @@ fn git_workspace_config(context: &GitToolContext<'_>) -> GitWorkspaceConfig {
             ..
         } => {
             workspace_info.insert("workspace_volume".to_string(), json!(workspace_volume));
+            let remote_url = github_clone_url(&context.project.owner, &context.project.repo);
             GitWorkspaceConfig {
                 worktree: std::path::PathBuf::from(repo_path),
                 git_binary: std::path::PathBuf::from("git"),
                 policy: GitPolicy::new(context.project.branch.clone()),
                 default_push_branch: Some(format!("mai-agent/{}", context.agent_id)),
+                remote_url: Some(remote_url),
                 workspace_info,
             }
         }
@@ -157,6 +214,10 @@ fn git_workspace_config(context: &GitToolContext<'_>) -> GitWorkspaceConfig {
                 git_binary: std::path::PathBuf::from(git_binary),
                 policy: GitPolicy::new(context.project.branch.clone()),
                 default_push_branch: Some(format!("mai-agent/{}", context.agent_id)),
+                remote_url: Some(github_clone_url(
+                    &context.project.owner,
+                    &context.project.repo,
+                )),
                 workspace_info,
             }
         }
@@ -182,9 +243,33 @@ fn pl_tool_context(workspace_root: std::path::PathBuf) -> ToolContext {
     }
 }
 
-#[derive(Debug)]
-struct MaiGitCredentialProvider {
-    token: Option<String>,
+#[derive(Clone)]
+pub(crate) enum MaiGitCredentialProvider {
+    Static {
+        token: Option<String>,
+    },
+    Project {
+        runtime: Arc<AgentRuntime>,
+        project_id: ProjectId,
+    },
+}
+
+impl fmt::Debug for MaiGitCredentialProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Static { token } => f
+                .debug_struct("MaiGitCredentialProvider::Static")
+                .field(
+                    "has_token",
+                    &token.as_ref().is_some_and(|value| !value.trim().is_empty()),
+                )
+                .finish(),
+            Self::Project { project_id, .. } => f
+                .debug_struct("MaiGitCredentialProvider::Project")
+                .field("project_id", project_id)
+                .finish(),
+        }
+    }
 }
 
 impl GitCredentialProvider for MaiGitCredentialProvider {
@@ -192,37 +277,47 @@ impl GitCredentialProvider for MaiGitCredentialProvider {
         &self,
         _request: GitCredentialRequest,
     ) -> impl Future<Output = std::result::Result<Option<GitCredential>, PureError>> + Send {
-        let token = self
-            .token
-            .clone()
-            .filter(|token| !token.trim().is_empty())
-            .map(GitCredential::new);
-        async move { Ok(token) }
+        let provider = self.clone();
+        async move {
+            let token = match provider {
+                MaiGitCredentialProvider::Static { token } => token,
+                MaiGitCredentialProvider::Project {
+                    runtime,
+                    project_id,
+                } => runtime
+                    .project_git_token(project_id)
+                    .await
+                    .map_err(pure_error_from_runtime)?,
+            };
+            Ok(token
+                .filter(|token| !token.trim().is_empty())
+                .map(GitCredential::new))
+        }
     }
 }
 
-struct MaiGitExecutionBackend<'a> {
+struct BorrowedGitExecutionBackend<'a> {
     backend: &'a GitToolBackend<'a>,
     agent_id: AgentId,
 }
 
-impl<'a> MaiGitExecutionBackend<'a> {
+impl<'a> BorrowedGitExecutionBackend<'a> {
     fn new(backend: &'a GitToolBackend<'a>, agent_id: AgentId) -> Self {
         Self { backend, agent_id }
     }
 }
 
-impl fmt::Debug for MaiGitExecutionBackend<'_> {
+impl fmt::Debug for BorrowedGitExecutionBackend<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.backend {
-            GitToolBackend::Sidecar { .. } => f.write_str("MaiGitExecutionBackend::Sidecar"),
+            GitToolBackend::Sidecar { .. } => f.write_str("BorrowedGitExecutionBackend::Sidecar"),
             #[cfg(test)]
-            GitToolBackend::Host { .. } => f.write_str("MaiGitExecutionBackend::Host"),
+            GitToolBackend::Host { .. } => f.write_str("BorrowedGitExecutionBackend::Host"),
         }
     }
 }
 
-impl ExecutionBackend for MaiGitExecutionBackend<'_> {
+impl ExecutionBackend for BorrowedGitExecutionBackend<'_> {
     fn run(
         &self,
         request: ExecutionRequest,
@@ -249,6 +344,42 @@ impl ExecutionBackend for MaiGitExecutionBackend<'_> {
                 GitToolBackend::Host { .. } => run_host_git_request(request).await,
             }
         }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct MaiGitExecutionBackend {
+    docker: DockerClient,
+    sidecar_image: String,
+    workspace_volume: String,
+    repo_path: String,
+    agent_id: AgentId,
+}
+
+impl fmt::Debug for MaiGitExecutionBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MaiGitExecutionBackend")
+            .field("agent_id", &self.agent_id)
+            .finish()
+    }
+}
+
+impl ExecutionBackend for MaiGitExecutionBackend {
+    async fn run(
+        &self,
+        request: ExecutionRequest,
+    ) -> std::result::Result<ExecutionOutput, PureError> {
+        run_sidecar_git_output(
+            &self.docker,
+            &self.sidecar_image,
+            &self.workspace_volume,
+            &self.repo_path,
+            self.agent_id,
+            request.env.get(GIT_TOKEN_ENV).map(String::as_str),
+            &request.args,
+        )
+        .await
+        .map_err(pure_error_from_runtime)
     }
 }
 
@@ -612,7 +743,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: None,
             },
-            mai_tools::TOOL_GIT_STATUS,
+            pl_core::TOOL_GIT_STATUS,
             json!({}),
         )
         .await
@@ -643,7 +774,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: None,
             },
-            mai_tools::TOOL_GIT_WORKSPACE_INFO,
+            pl_core::TOOL_GIT_WORKSPACE_INFO,
             json!({}),
         )
         .await
@@ -680,7 +811,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: None,
             },
-            mai_tools::TOOL_GIT_WORKSPACE_INFO,
+            pl_core::TOOL_GIT_WORKSPACE_INFO,
             json!({}),
         )
         .await
@@ -709,7 +840,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: None,
             },
-            mai_tools::TOOL_GIT_DIFF,
+            pl_core::TOOL_GIT_DIFF,
             json!({ "path": "../secret" }),
         )
         .await
@@ -738,7 +869,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: None,
             },
-            mai_tools::TOOL_GIT_BRANCH,
+            pl_core::TOOL_GIT_BRANCH,
             json!({ "action": "create", "name": "../escape" }),
         )
         .await
@@ -767,7 +898,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: Some("secret-token".to_string()),
             },
-            mai_tools::TOOL_GIT_FETCH,
+            pl_core::TOOL_GIT_FETCH,
             json!({ "remote": "upstream" }),
         )
         .await
@@ -796,7 +927,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: Some("secret-token".to_string()),
             },
-            mai_tools::TOOL_GIT_FETCH,
+            pl_core::TOOL_GIT_FETCH,
             json!({ "refspec": "pull/679/head:refs/pull/679/head" }),
         )
         .await
@@ -848,7 +979,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: None,
             },
-            mai_tools::TOOL_GIT_COMMIT,
+            pl_core::TOOL_GIT_COMMIT,
             json!({ "message": "save work" }),
         )
         .await
@@ -863,7 +994,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: Some("secret-token".to_string()),
             },
-            mai_tools::TOOL_GIT_PUSH,
+            pl_core::TOOL_GIT_PUSH,
             json!({}),
         )
         .await

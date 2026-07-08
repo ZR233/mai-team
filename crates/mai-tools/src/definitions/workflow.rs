@@ -1,7 +1,6 @@
 use crate::names::{TOOL_SAVE_ARTIFACT, TOOL_SAVE_TASK_PLAN, TOOL_SUBMIT_REVIEW_RESULT};
 use crate::schema::object_schema;
 use mai_protocol::ToolDefinition;
-use pl_core::Tool;
 use serde_json::json;
 
 pub(crate) fn definitions() -> Vec<ToolDefinition> {
@@ -25,8 +24,6 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
                 ("summary", json!({ "type": "string" }), true),
             ]),
         ),
-        pl_core_definition(pl_core::TodoListTool),
-        pl_core_definition(pl_core::AskUserTool),
         ToolDefinition::function(
             TOOL_SAVE_ARTIFACT,
             "Register a file as a downloadable artifact for the user. \
@@ -46,17 +43,4 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
             ]),
         ),
     ]
-}
-
-fn pl_core_definition(tool: impl Tool) -> ToolDefinition {
-    match tool.to_schema() {
-        pl_model::ToolSchema::Function {
-            name,
-            description,
-            input_schema,
-        } => ToolDefinition::function(name, description, input_schema),
-        pl_model::ToolSchema::Custom { name, .. } => {
-            panic!("pl-core workflow tool {name} must be a function tool")
-        }
-    }
 }

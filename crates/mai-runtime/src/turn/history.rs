@@ -1,13 +1,7 @@
 use mai_protocol::{AgentId, AgentMessage, MessageRole, ModelOutputItem, SessionId, now};
 use mai_store::ConfigStore;
-#[cfg(test)]
-use pl_protocol::ToolCallHistoryMetadata;
-use pl_protocol::{
-    Message, MessageContent, MessageRole as ModelMessageRole, TOOL_CALL_ID_METADATA_KEY,
-    TOOL_CALL_KIND_METADATA_KEY, TOOL_CALLS_METADATA_KEY, TOOL_NAME_METADATA_KEY, ToolCallKind,
-    ToolResultMetadata,
-};
-use std::collections::HashSet;
+use pl_protocol::{Message, MessageContent, MessageRole as ModelMessageRole, ToolResultMetadata};
+use pl_protocol::{ToolCallHistoryMetadata, ToolCallKind};
 
 use crate::state::AgentRecord;
 use crate::{Result, RuntimeError};
@@ -164,6 +158,125 @@ pub(crate) async fn session_history(
     Ok(history)
 }
 
+pub(crate) fn repair_incomplete_tool_history(history: &mut Vec<Message>) -> bool {
+    let original_len = history.len();
+    let mut repaired = Vec::with_capacity(history.len());
+    let mut pending = Vec::new();
+
+    for message in std::mem::take(history) {
+        let tool_calls = tool_calls_from_message(&message);
+        let tool_result = tool_result_from_message(&message);
+        if !pending.is_empty() && tool_calls.is_empty() && tool_result.is_none() {
+            append_missing_tool_results(&mut repaired, &mut pending);
+        }
+        if !tool_calls.is_empty() {
+            pending.extend(tool_calls);
+        }
+        if let Some(tool_result) = tool_result {
+            pending.retain(|call: &PendingToolCall| call.id != tool_result.tool_call_id);
+        }
+        repaired.push(message);
+    }
+    append_missing_tool_results(&mut repaired, &mut pending);
+    let changed = repaired.len() != original_len;
+    *history = repaired;
+    changed
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingToolCall {
+    id: String,
+    call_id: Option<String>,
+    name: String,
+    kind: ToolCallKind,
+    arguments: String,
+}
+
+fn append_missing_tool_results(output: &mut Vec<Message>, pending: &mut Vec<PendingToolCall>) {
+    output.extend(pending.drain(..).map(missing_tool_result_message));
+}
+
+fn tool_calls_from_message(message: &Message) -> Vec<PendingToolCall> {
+    let Some(metadata) = ToolCallHistoryMetadata::from_metadata(&message.metadata) else {
+        return Vec::new();
+    };
+    let Ok(serde_json::Value::Array(calls)) =
+        serde_json::from_str::<serde_json::Value>(&metadata.tool_calls_json)
+    else {
+        return Vec::new();
+    };
+    calls
+        .into_iter()
+        .filter_map(|call| {
+            let id = call
+                .get("id")
+                .or_else(|| call.get("call_id"))
+                .and_then(serde_json::Value::as_str)?
+                .to_string();
+            let call_id = call
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let name = call
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let payload = call.get("payload");
+            let kind = payload
+                .and_then(|payload| payload.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .map(tool_call_kind_from_str)
+                .unwrap_or(ToolCallKind::Function);
+            let arguments = payload
+                .and_then(|payload| payload.get("arguments"))
+                .or_else(|| call.get("arguments"))
+                .map(tool_call_arguments)
+                .unwrap_or_else(|| "{}".to_string());
+            Some(PendingToolCall {
+                id,
+                call_id,
+                name,
+                kind,
+                arguments,
+            })
+        })
+        .collect()
+}
+
+fn tool_result_from_message(message: &Message) -> Option<ToolResultMetadata> {
+    ToolResultMetadata::from_metadata(&message.metadata).ok()
+}
+
+fn missing_tool_result_message(call: PendingToolCall) -> Message {
+    let mut metadata = Default::default();
+    ToolResultMetadata::new(call.id, call.call_id, call.name, call.kind, call.arguments)
+        .insert_into(&mut metadata);
+    Message {
+        role: ModelMessageRole::Tool,
+        content: MessageContent::Text(
+            "Tool call did not produce a result before the turn ended.".to_string(),
+        ),
+        reasoning_content: None,
+        metadata,
+    }
+}
+
+fn tool_call_kind_from_str(value: &str) -> ToolCallKind {
+    match value {
+        "custom" => ToolCallKind::Custom,
+        "function" => ToolCallKind::Function,
+        _ => ToolCallKind::Function,
+    }
+}
+
+fn tool_call_arguments(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
 pub(crate) fn compact_summary_from_output(output: &[ModelOutputItem]) -> Option<String> {
     output.iter().rev().find_map(|item| {
         let text = match item {
@@ -173,89 +286,6 @@ pub(crate) fn compact_summary_from_output(output: &[ModelOutputItem]) -> Option<
         let text = text.trim();
         (!text.is_empty()).then(|| text.to_string())
     })
-}
-
-pub(crate) fn repair_incomplete_tool_history(history: &mut Vec<Message>) -> bool {
-    let mut insertions: Vec<(usize, Vec<Message>)> = Vec::new();
-    let mut i = 0;
-    while i < history.len() {
-        let mut call_ids = Vec::new();
-        while i < history.len() {
-            if history[i].metadata.contains_key(TOOL_CALLS_METADATA_KEY) {
-                call_ids.extend(tool_call_ids(&history[i]));
-                i += 1;
-            } else {
-                break;
-            }
-        }
-        if call_ids.is_empty() {
-            i += 1;
-            continue;
-        }
-
-        let mut answered = HashSet::new();
-        while i < history.len() {
-            if history[i].role == ModelMessageRole::Tool {
-                if let Ok(metadata) = ToolResultMetadata::from_metadata(&history[i].metadata)
-                    && call_ids.iter().any(|id| id == &metadata.tool_call_id)
-                {
-                    answered.insert(metadata.tool_call_id);
-                    i += 1;
-                    continue;
-                }
-            }
-            break;
-        }
-
-        let missing_outputs = call_ids
-            .into_iter()
-            .filter(|call_id| !answered.contains(call_id))
-            .map(interrupted_tool_result_message)
-            .collect::<Vec<_>>();
-        if !missing_outputs.is_empty() {
-            insertions.push((i, missing_outputs));
-        }
-    }
-    let changed = !insertions.is_empty();
-    for (pos, items) in insertions.into_iter().rev() {
-        for item in items.into_iter().rev() {
-            history.insert(pos, item);
-        }
-    }
-    changed
-}
-
-fn tool_call_ids(message: &Message) -> Vec<String> {
-    message
-        .metadata
-        .get(TOOL_CALLS_METADATA_KEY)
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|item| {
-            item.get("id")
-                .or_else(|| item.get("call_id"))
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .collect()
-}
-
-fn interrupted_tool_result_message(call_id: String) -> Message {
-    let mut metadata = std::collections::HashMap::new();
-    metadata.insert(TOOL_CALL_ID_METADATA_KEY.to_string(), call_id);
-    metadata.insert(TOOL_NAME_METADATA_KEY.to_string(), String::new());
-    metadata.insert(
-        TOOL_CALL_KIND_METADATA_KEY.to_string(),
-        ToolCallKind::Function.as_str().to_string(),
-    );
-    Message {
-        role: ModelMessageRole::Tool,
-        content: MessageContent::Text("error: tool execution interrupted".to_string()),
-        reasoning_content: None,
-        metadata,
-    }
 }
 
 pub(crate) fn build_compacted_history(

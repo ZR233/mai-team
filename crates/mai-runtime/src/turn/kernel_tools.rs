@@ -1,19 +1,14 @@
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use mai_protocol::{
     AgentId, ServiceEventKind, SessionId, ToolDefinition, ToolTraceDetail, TurnId, now,
 };
-use pl_core::{OutputTruncation, RegisteredTool, Tool, ToolOutput, ToolRuntimeEvent};
-use pl_protocol::PureError;
 use pl_trace::{TraceEvent, TraceEventKind, TracePart, TracePartStatus};
 use serde_json::{Value, json};
-use tokio_util::sync::CancellationToken;
 
-use crate::state::AgentRecord;
+use crate::AgentRuntime;
 use crate::turn::persistence::AgentLogRecord;
-use crate::{AgentRuntime, RuntimeError};
 
 /// 根据 pl-core 共享工具 schema 与 mai 产品工具 schema 构造模型可见工具列表。
 pub(crate) fn model_tool_definitions(
@@ -23,62 +18,6 @@ pub(crate) fn model_tool_definitions(
     let mut tools = shared_tool_definitions(visible_names);
     tools.append(&mut product_tools);
     tools
-}
-
-/// 把模型可见工具定义注册为 pl-core 动态工具。
-pub(crate) fn registered_runtime_tools(
-    runtime: Arc<AgentRuntime>,
-    agent: Arc<AgentRecord>,
-    agent_id: AgentId,
-    turn_id: TurnId,
-    definitions: &[ToolDefinition],
-    cancellation_token: CancellationToken,
-) -> Vec<RegisteredTool> {
-    definitions
-        .iter()
-        .map(|definition| {
-            let name = definition.name.clone();
-            let runtime = runtime.clone();
-            let agent = agent.clone();
-            let cancellation_token = cancellation_token.clone();
-            RegisteredTool::new(
-                definition.name.clone(),
-                definition.description.clone(),
-                definition.parameters.clone(),
-                move |input, _context| {
-                    let runtime = runtime.clone();
-                    let agent = agent.clone();
-                    let name = name.clone();
-                    let cancellation_token = cancellation_token.clone();
-                    async move {
-                        let execution = runtime
-                            .execute_tool(
-                                &agent,
-                                agent_id,
-                                turn_id,
-                                &name,
-                                input.arguments,
-                                cancellation_token,
-                            )
-                            .await
-                            .map_err(|error| pure_tool_error(&name, error))?;
-                        Ok(ToolOutput {
-                            description: execution.model_output,
-                            truncated: OutputTruncation::empty(),
-                            output_file: std::path::PathBuf::new(),
-                            exit_code: None,
-                            timed_out: false,
-                            runtime_events: if execution.ends_turn {
-                                vec![ToolRuntimeEvent::EndTurn]
-                            } else {
-                                Vec::new()
-                            },
-                        })
-                    }
-                },
-            )
-        })
-        .collect()
 }
 
 /// 将 pl-core trace 投影为 mai-store 和 Web UI 仍在消费的 tool lifecycle 事件。
@@ -115,40 +54,34 @@ pub(crate) async fn project_tool_trace_events(
 }
 
 fn shared_tool_definitions(visible_names: &HashSet<String>) -> Vec<ToolDefinition> {
-    let mut tools = Vec::new();
-    tools.extend(
-        pl_core::AgentControlToolKind::all()
-            .iter()
-            .filter(|kind| visible_names.contains(kind.name()))
-            .map(|kind| definition_from_schema(kind.to_schema())),
-    );
-    tools.extend(
-        pl_core::ContainerToolKind::all()
-            .iter()
-            .filter(|kind| visible_names.contains(kind.name()))
-            .map(|kind| definition_from_schema(kind.to_schema())),
-    );
-    tools.extend(
-        pl_core::WorkspaceFileToolKind::all()
-            .iter()
-            .filter(|kind| visible_names.contains(kind.name()))
-            .map(|kind| definition_from_schema(kind.to_schema())),
-    );
-    tools.extend(
-        pl_core::GitToolKind::all()
-            .iter()
-            .filter(|kind| visible_names.contains(kind.name()))
-            .map(|kind| {
-                let tool = pl_core::GitTool::new(
-                    *kind,
-                    pl_core::GitWorkspaceConfig::local(std::env::temp_dir()),
-                    Arc::new(pl_core::LocalExecutionBackend),
-                    Arc::new(pl_core::NoGitCredentialProvider),
-                );
-                definition_from_schema(tool.to_schema())
-            }),
-    );
-    tools
+    shared_tool_schemas(|name| visible_names.contains(name))
+        .into_iter()
+        .map(definition_from_schema)
+        .collect()
+}
+
+pub(crate) fn shared_tool_schemas(filter: impl Fn(&str) -> bool) -> Vec<pl_model::ToolSchema> {
+    pl_core::shared_tool_schemas(pl_core::SharedToolSchemaOptions {
+        bash: false,
+        workspace_files: true,
+        ask_user: true,
+        subagents: true,
+        git: true,
+        container: true,
+        mcp_resources: true,
+        todo: true,
+        plan_exit: false,
+    })
+    .into_iter()
+    .filter(|schema| filter(tool_schema_name(schema)))
+    .collect()
+}
+
+fn tool_schema_name(schema: &pl_model::ToolSchema) -> &str {
+    match schema {
+        pl_model::ToolSchema::Function { name, .. } => name,
+        pl_model::ToolSchema::Custom { name, .. } => name,
+    }
 }
 
 fn definition_from_schema(schema: pl_model::ToolSchema) -> ToolDefinition {
@@ -318,11 +251,4 @@ fn tool_call_id(tool: &pl_trace::TraceToolPart) -> String {
 
 fn trace_time(seconds: i64) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(seconds, 0).unwrap_or_else(now)
-}
-
-fn pure_tool_error(tool: &str, error: RuntimeError) -> PureError {
-    PureError::ToolExecutionFailed {
-        tool: tool.to_string(),
-        error: error.to_string(),
-    }
 }

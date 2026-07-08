@@ -48,7 +48,7 @@ impl AgentRuntime {
     pub(crate) async fn execute_project_github_api_request(
         &self,
         agent: &AgentRecord,
-        request: &turn::tools::GithubApiRequest,
+        request: &turn::product_tools::GithubApiRequest,
     ) -> Result<ToolExecution> {
         let method = github::normalize_github_api_method(&request.method)?;
         let path = github::normalize_github_api_get_path(&request.path)?;

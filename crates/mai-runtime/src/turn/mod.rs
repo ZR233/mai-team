@@ -1,4 +1,5 @@
 pub(crate) mod accounting;
+pub(crate) mod agent_control;
 pub(crate) mod compaction;
 pub(crate) mod completion;
 pub(crate) mod container;
@@ -6,7 +7,9 @@ pub(crate) mod context;
 pub(crate) mod core_adapter;
 pub(crate) mod history;
 pub(crate) mod kernel_tools;
+pub(crate) mod mcp_resources;
 pub(crate) mod model_stream;
 pub(crate) mod orchestrator;
 pub(crate) mod persistence;
+pub(crate) mod product_tools;
 pub(crate) mod tools;

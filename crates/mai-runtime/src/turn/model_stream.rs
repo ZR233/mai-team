@@ -13,6 +13,7 @@ pub(crate) struct TurnModelContext {
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) provider_selection: ProviderSelection,
     pub(crate) tools: Vec<ToolDefinition>,
+    pub(crate) product_tools: Vec<ToolDefinition>,
     pub(crate) instructions: String,
 }
 
