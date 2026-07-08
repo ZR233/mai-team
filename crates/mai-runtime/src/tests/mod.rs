@@ -6434,7 +6434,8 @@ async fn spawn_agent_skill_item_injects_child_initial_turn() {
             "spawn_agent",
             json!({
                 "taskName": "child",
-                "message": "child task"
+                "message": "child task",
+                "skillMentions": ["demo"]
             }),
         )
         .await
@@ -6456,6 +6457,12 @@ async fn spawn_agent_skill_item_injects_child_initial_turn() {
             && item["content"][0]["text"]
                 .as_str()
                 .is_some_and(|text| text.contains("child task"))
+    }));
+    assert!(input.iter().any(|item| {
+        item["role"] == "user"
+            && item["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Use child demo."))
     }));
 }
 

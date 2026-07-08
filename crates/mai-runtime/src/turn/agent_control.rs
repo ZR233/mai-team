@@ -81,7 +81,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
                 forked_history: request.forked_messages,
                 collab_input: CollabInput {
                     message: non_empty_message(request.message),
-                    skill_mentions: Vec::new(),
+                    skill_mentions: request.skill_mentions,
                 },
             },
         )
