@@ -31,18 +31,20 @@ pub(crate) async fn visible_tool_names(
         .with_git(has_project_workspace)
         .with_spawn_agent(capability.can_spawn_agents)
         .with_close_agent(capability.can_close_agents);
-    let mut visibility = pl_core::ToolVisibilitySet::hosted_container(shared_visibility)
-        .with_tool_names([
-            mai_tools::TOOL_SAVE_TASK_PLAN.to_string(),
-            mai_tools::TOOL_SUBMIT_REVIEW_RESULT.to_string(),
-            mai_tools::TOOL_SAVE_ARTIFACT.to_string(),
-            mai_tools::TOOL_GITHUB_API_REQUEST.to_string(),
-        ]);
+    let mut product_tools = vec![
+        mai_tools::TOOL_SAVE_TASK_PLAN.to_string(),
+        mai_tools::TOOL_SUBMIT_REVIEW_RESULT.to_string(),
+        mai_tools::TOOL_SAVE_ARTIFACT.to_string(),
+        mai_tools::TOOL_GITHUB_API_REQUEST.to_string(),
+    ];
     if project_review_queue_tool_visible(agent).await {
-        visibility.extend_tool_names([mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS.to_string()]);
+        product_tools.push(mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS.to_string());
     }
-    visibility.extend_tool_names(mcp_tools.iter().map(|tool| tool.model_name.clone()));
-    visibility
+    pl_core::ToolVisibilitySet::hosted_container_with_tool_names(
+        shared_visibility,
+        product_tools,
+        mcp_tools.iter().map(|tool| tool.model_name.clone()),
+    )
 }
 
 async fn agent_capability(state: &RuntimeState, agent: &AgentRecord) -> AgentCapability {

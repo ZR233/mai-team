@@ -552,8 +552,8 @@ fn tool_visibility_consumes_pl_core_shared_tool_names() {
     let source = include_str!("../turn/tool_visibility.rs");
 
     assert!(
-        source.contains("ToolVisibilitySet::hosted_container"),
-        "hosted container 共享工具可见集合应由 pl-core ToolVisibilitySet 直接构造"
+        source.contains("ToolVisibilitySet::hosted_container_with_tool_names"),
+        "hosted container 共享工具、产品工具、动态工具的组合应由 pl-core ToolVisibilitySet 统一构造"
     );
     assert!(
         source.contains("ToolVisibilitySet"),
@@ -580,6 +580,14 @@ fn tool_visibility_consumes_pl_core_shared_tool_names() {
             "tool visibility 不应维护或解析 pl-core 共享工具名目录: {forbidden}"
         );
     }
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("production section");
+    assert!(
+        !production.contains("extend_tool_names"),
+        "tool visibility 不应在 mai-runtime 手写多阶段工具集合拼装"
+    );
 }
 
 #[test]
