@@ -751,6 +751,14 @@ fn container_output_capture_uses_pl_core_request_constructor() {
         !captured_exec.contains("ToolOutputCaptureRequest {"),
         "mai-runtime 不应手写 ToolOutputCaptureRequest 字段"
     );
+    assert!(
+        captured_exec.contains("ToolOutputStreamSizes::new"),
+        "container 输出流大小的共享字段形状应由 pl-core constructor 承载"
+    );
+    assert!(
+        !captured_exec.contains("ToolOutputStreamSizes {"),
+        "mai-runtime 不应手写 ToolOutputStreamSizes 字段"
+    );
 }
 
 #[test]

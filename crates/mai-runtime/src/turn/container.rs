@@ -108,10 +108,10 @@ async fn execute_with_container_backend(
             )
             .await?;
         let artifacts = capture
-            .collect_artifacts(ToolOutputStreamSizes {
-                stdout_bytes: output.stdout_bytes,
-                stderr_bytes: output.stderr_bytes,
-            })
+            .collect_artifacts(ToolOutputStreamSizes::new(
+                output.stdout_bytes,
+                output.stderr_bytes,
+            ))
             .await
             .map_err(runtime_invalid_input)?;
         let artifacts = artifact_records_from_descriptors(agent_id, artifacts);
