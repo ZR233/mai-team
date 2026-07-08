@@ -1,9 +1,6 @@
-use std::collections::HashSet;
-
 use chrono::{DateTime, Utc};
 use mai_protocol::{
-    AgentId, ServiceEventKind, SessionId, ToolDefinition, ToolOutputArtifactInfo, ToolTraceDetail,
-    TurnId, now,
+    AgentId, ServiceEventKind, SessionId, ToolOutputArtifactInfo, ToolTraceDetail, TurnId, now,
 };
 use pl_core::{ToolLifecyclePhase, ToolLifecycleProjection};
 use pl_trace::TraceEvent;
@@ -11,16 +8,6 @@ use serde_json::{Value, json};
 
 use crate::AgentRuntime;
 use crate::turn::persistence::AgentLogRecord;
-
-/// 根据 pl-core 共享工具 schema 与 mai 产品工具 schema 构造模型可见工具列表。
-pub(crate) fn model_tool_definitions(
-    visible_names: &HashSet<String>,
-    mut product_tools: Vec<ToolDefinition>,
-) -> Vec<ToolDefinition> {
-    let mut tools = shared_tool_definitions(visible_names);
-    tools.append(&mut product_tools);
-    tools
-}
 
 /// 将 pl-core trace 投影为 mai-store 和 Web UI 仍在消费的 tool lifecycle 事件。
 pub(crate) async fn project_tool_trace_events(
@@ -50,13 +37,6 @@ pub(crate) async fn project_tool_trace_events(
     }
 }
 
-fn shared_tool_definitions(visible_names: &HashSet<String>) -> Vec<ToolDefinition> {
-    shared_tool_schemas(|name| visible_names.contains(name))
-        .into_iter()
-        .map(definition_from_schema)
-        .collect()
-}
-
 pub(crate) fn shared_tool_schemas(filter: impl Fn(&str) -> bool) -> Vec<pl_model::ToolSchema> {
     pl_core::shared_tool_schemas(pl_core::SharedToolSchemaOptions {
         bash: false,
@@ -78,19 +58,6 @@ fn tool_schema_name(schema: &pl_model::ToolSchema) -> &str {
     match schema {
         pl_model::ToolSchema::Function { name, .. } => name,
         pl_model::ToolSchema::Custom { name, .. } => name,
-    }
-}
-
-fn definition_from_schema(schema: pl_model::ToolSchema) -> ToolDefinition {
-    match schema {
-        pl_model::ToolSchema::Function {
-            name,
-            description,
-            input_schema,
-        } => ToolDefinition::function(name, description, input_schema),
-        pl_model::ToolSchema::Custom { name, .. } => {
-            panic!("shared tool {name} must be a function tool")
-        }
     }
 }
 

@@ -30,7 +30,7 @@ pub(crate) struct PureCoreTurnContext {
     pub(crate) provider_selection: mai_store::ProviderSelection,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) instructions: String,
-    pub(crate) tools: Vec<ToolDefinition>,
+    pub(crate) visible_tool_names: HashSet<String>,
     pub(crate) product_tools: Vec<ToolDefinition>,
     pub(crate) history: Vec<pl_protocol::Message>,
     pub(crate) cancellation_token: CancellationToken,
@@ -284,7 +284,7 @@ async fn build_kernel_with_native_shared_tools(
     ));
     let git_runtime =
         crate::tools::git::native_git_tool_runtime(ctx.runtime.clone(), &ctx.agent, |name| {
-            ctx.tools.iter().any(|tool| tool.name == name)
+            ctx.visible_tool_names.contains(name)
         })
         .await?;
     let capabilities = pl_core::ToolCapabilityConfig {
@@ -299,11 +299,6 @@ async fn build_kernel_with_native_shared_tools(
         docker: false,
         container: true,
     };
-    let visible_tools = ctx
-        .tools
-        .iter()
-        .map(|tool| tool.name.clone())
-        .collect::<HashSet<_>>();
     let mcp_backend = Arc::new(super::mcp_resources::MaiMcpResourceBackend::new(
         ctx.runtime.clone(),
         ctx.agent.clone(),
@@ -317,7 +312,7 @@ async fn build_kernel_with_native_shared_tools(
         ctx.cancellation_token.clone(),
     ));
     let tool_set = pl_core::ToolSetBuilder::from_capabilities(capabilities)
-        .with_allowed_tools(visible_tools.iter().cloned())
+        .with_allowed_tools(ctx.visible_tool_names.iter().cloned())
         .with_container_tools(backend)
         .with_mcp_resource_tools(mcp_backend)
         .with_agent_control_tools(agent_control_backend);

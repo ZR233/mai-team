@@ -163,11 +163,20 @@ fn kernel_shared_tool_definitions_supply_subagent_schema() {
     .map(str::to_string)
     .collect::<std::collections::HashSet<_>>();
 
-    let tools = turn::kernel_tools::model_tool_definitions(&visible, Vec::new());
-    let names = tools
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<Vec<_>>();
+    let tools = turn::kernel_tools::shared_tool_schemas(|name| visible.contains(name));
+    fn schema_name(schema: &pl_model::ToolSchema) -> &str {
+        match schema {
+            pl_model::ToolSchema::Function { name, .. } => name.as_str(),
+            pl_model::ToolSchema::Custom { name, .. } => name.as_str(),
+        }
+    }
+    fn schema_parameters(schema: &pl_model::ToolSchema) -> &serde_json::Value {
+        match schema {
+            pl_model::ToolSchema::Function { input_schema, .. } => input_schema,
+            pl_model::ToolSchema::Custom { .. } => panic!("shared runtime tools must be functions"),
+        }
+    }
+    let names = tools.iter().map(schema_name).collect::<Vec<_>>();
     assert_eq!(
         names,
         vec![
@@ -183,66 +192,80 @@ fn kernel_shared_tool_definitions_supply_subagent_schema() {
     );
     let spawn = tools
         .iter()
-        .find(|tool| tool.name == pl_core::TOOL_SPAWN_AGENT)
+        .find(|tool| schema_name(tool) == pl_core::TOOL_SPAWN_AGENT)
         .expect("spawn_agent");
-    assert!(spawn.parameters.pointer("/properties/taskName").is_some());
-    assert!(spawn.parameters.pointer("/properties/agentType").is_some());
+    let spawn_parameters = schema_parameters(spawn);
+    assert!(spawn_parameters.pointer("/properties/taskName").is_some());
+    assert!(spawn_parameters.pointer("/properties/agentType").is_some());
     assert!(
-        spawn
-            .parameters
+        spawn_parameters
             .pointer("/properties/reasoningEffort")
             .is_some()
     );
-    assert!(spawn.parameters.pointer("/properties/forkTurns").is_some());
-    assert!(spawn.parameters.pointer("/properties/name").is_none());
+    assert!(spawn_parameters.pointer("/properties/forkTurns").is_some());
+    assert!(spawn_parameters.pointer("/properties/name").is_none());
     assert!(
-        spawn
-            .parameters
+        spawn_parameters
             .pointer("/properties/reasoning_effort")
             .is_none()
     );
 
     let wait = tools
         .iter()
-        .find(|tool| tool.name == pl_core::TOOL_WAIT_AGENT)
+        .find(|tool| schema_name(tool) == pl_core::TOOL_WAIT_AGENT)
         .expect("wait_agent");
-    assert!(wait.parameters.pointer("/properties/timeoutMs").is_some());
-    assert!(wait.parameters.pointer("/properties/timeout_ms").is_none());
+    let wait_parameters = schema_parameters(wait);
+    assert!(wait_parameters.pointer("/properties/timeoutMs").is_some());
+    assert!(wait_parameters.pointer("/properties/timeout_ms").is_none());
 
     let update_todo = tools
         .iter()
-        .find(|tool| tool.name == "update_todo_list")
+        .find(|tool| schema_name(tool) == "update_todo_list")
         .expect("update_todo_list");
+    let update_todo_parameters = schema_parameters(update_todo);
     assert!(
-        update_todo
-            .parameters
+        update_todo_parameters
             .pointer("/properties/items")
             .is_some()
     );
     assert!(
-        update_todo
-            .parameters
+        update_todo_parameters
             .pointer("/properties/todos")
             .is_none()
     );
     assert_eq!(
-        update_todo
-            .parameters
-            .pointer("/properties/items/items/properties/status/enum"),
+        update_todo_parameters.pointer("/properties/items/items/properties/status/enum"),
         Some(&serde_json::json!(["pending", "inProgress", "completed"]))
     );
 
     let ask = tools
         .iter()
-        .find(|tool| tool.name == "request_user_input")
+        .find(|tool| schema_name(tool) == "request_user_input")
         .expect("request_user_input");
-    assert!(ask.parameters.pointer("/properties/questions").is_some());
-    assert!(ask.parameters.pointer("/properties/header").is_none());
+    let ask_parameters = schema_parameters(ask);
+    assert!(ask_parameters.pointer("/properties/questions").is_some());
+    assert!(ask_parameters.pointer("/properties/header").is_none());
     assert!(
-        ask.parameters
+        ask_parameters
             .pointer("/properties/questions/items/properties/header")
             .is_some()
     );
+}
+
+#[test]
+fn kernel_tools_do_not_rebuild_shared_tools_as_mai_definitions() {
+    let source = include_str!("../turn/kernel_tools.rs");
+
+    for forbidden in [
+        "model_tool_definitions",
+        "shared_tool_definitions",
+        "definition_from_schema",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "pl-core shared tools 不应在 mai-runtime 里重建为 mai ToolDefinition: {forbidden}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -4097,10 +4120,7 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
     assert_eq!(requests.len(), 3);
     let visible_tools =
         turn::tool_visibility::visible_tool_names(&runtime.state, &agent, &[]).await;
-    let product_tools =
-        build_tool_definitions_with_filter(&[], |name| visible_tools.contains(name));
-    let expected_tool_count =
-        turn::kernel_tools::model_tool_definitions(&visible_tools, product_tools).len();
+    let expected_tool_count = visible_tools.len();
     assert_eq!(
         requests[0]["tools"].as_array().expect("first tools").len(),
         expected_tool_count

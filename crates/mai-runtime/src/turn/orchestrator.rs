@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -114,7 +114,8 @@ struct TurnModelContext {
     model_name: String,
     reasoning_effort: Option<String>,
     provider_selection: mai_store::ProviderSelection,
-    tools: Vec<mai_protocol::ToolDefinition>,
+    visible_tool_names: HashSet<String>,
+    tool_count: usize,
     product_tools: Vec<mai_protocol::ToolDefinition>,
     instructions: String,
 }
@@ -335,8 +336,7 @@ pub(crate) async fn run_turn_inner(
             super::tool_visibility::visible_tool_names(state, &agent, &mcp_tools).await;
         let product_tools =
             build_tool_definitions_with_filter(&mcp_tools, |name| visible_tools.contains(name));
-        let tools =
-            super::kernel_tools::model_tool_definitions(&visible_tools, product_tools.clone());
+        let tool_count = visible_tools.len();
         let instructions = {
             let _project_skill_guard = ops.project_skill_read_guard(&agent).await;
             ops.build_instructions(
@@ -374,7 +374,7 @@ pub(crate) async fn run_turn_inner(
                 details: json!({
                     "provider_id": provider_id,
                     "model": model_name,
-                    "tool_count": tools.len(),
+                    "tool_count": tool_count,
                     "mcp_tool_count": mcp_tools.len(),
                     "instructions_bytes": instructions.len(),
                     "duration_ms": u128_to_u64(context_started.elapsed().as_millis()),
@@ -387,7 +387,8 @@ pub(crate) async fn run_turn_inner(
             model_name,
             reasoning_effort,
             provider_selection,
-            tools,
+            visible_tool_names: visible_tools,
+            tool_count,
             product_tools,
             instructions,
         }
@@ -423,7 +424,7 @@ pub(crate) async fn run_turn_inner(
             details: json!({
                 "provider_id": model_context.provider_id,
                 "model": model_context.model_name,
-                "tool_count": model_context.tools.len(),
+                "tool_count": model_context.tool_count,
                 "history_items": history.len(),
                 "history_load_ms": history_duration_ms,
             }),
@@ -440,7 +441,7 @@ pub(crate) async fn run_turn_inner(
         provider_selection: model_context.provider_selection,
         reasoning_effort: model_context.reasoning_effort,
         instructions: model_context.instructions,
-        tools: model_context.tools,
+        visible_tool_names: model_context.visible_tool_names,
         product_tools: model_context.product_tools,
         history,
         cancellation_token,
