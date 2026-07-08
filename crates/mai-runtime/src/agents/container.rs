@@ -95,14 +95,17 @@ pub(crate) async fn ensure_agent_container_for_turn(
     turn_id: TurnId,
     cancellation_token: &CancellationToken,
 ) -> Result<String> {
-    if cancellation_token.is_cancelled() {
-        return Err(RuntimeError::TurnCancelled);
+    let current_turn = agent.summary.read().await.current_turn;
+    let current_turn_guard = AgentTurnCurrentGuard::new(turn_id);
+    let guarded_turn = current_turn.as_ref().or(Some(&turn_id));
+    match current_turn_guard.evaluate_with_token(cancellation_token, guarded_turn) {
+        AgentTurnCurrentOutcome::Current => {}
+        AgentTurnCurrentOutcome::Interrupted => return Err(RuntimeError::TurnCancelled),
     }
-    let turn_guard =
-        (agent.summary.read().await.current_turn == Some(turn_id)).then(|| TurnGuard {
-            current_turn: AgentTurnCurrentGuard::new(turn_id),
-            cancellation_token: cancellation_token.clone(),
-        });
+    let turn_guard = (current_turn == Some(turn_id)).then(|| TurnGuard {
+        current_turn: current_turn_guard,
+        cancellation_token: cancellation_token.clone(),
+    });
     let container_id = ensure_agent_container_with_source(
         ops,
         agent,
@@ -112,11 +115,16 @@ pub(crate) async fn ensure_agent_container_for_turn(
     )
     .await?;
     let current_turn = agent.summary.read().await.current_turn;
-    if cancellation_token.is_cancelled() || current_turn.is_some_and(|current| current != turn_id) {
-        if let Some(manager) = agent.mcp.write().await.take() {
-            manager.shutdown().await;
+    let current_turn_guard = AgentTurnCurrentGuard::new(turn_id);
+    let guarded_turn = current_turn.as_ref().or(Some(&turn_id));
+    match current_turn_guard.evaluate_with_token(cancellation_token, guarded_turn) {
+        AgentTurnCurrentOutcome::Current => {}
+        AgentTurnCurrentOutcome::Interrupted => {
+            if let Some(manager) = agent.mcp.write().await.take() {
+                manager.shutdown().await;
+            }
+            return Err(RuntimeError::TurnCancelled);
         }
-        return Err(RuntimeError::TurnCancelled);
     }
     let needs_status_restore = agent.summary.read().await.status != ready_status;
     if needs_status_restore {
@@ -289,10 +297,10 @@ async fn set_status(
 
 async fn ensure_turn_current(agent: &AgentRecord, guard: &TurnGuard) -> Result<()> {
     let current_turn = agent.summary.read().await.current_turn;
-    match guard.current_turn.evaluate(
-        guard.cancellation_token.is_cancelled(),
-        current_turn.as_ref(),
-    ) {
+    match guard
+        .current_turn
+        .evaluate_with_token(&guard.cancellation_token, current_turn.as_ref())
+    {
         AgentTurnCurrentOutcome::Current => Ok(()),
         AgentTurnCurrentOutcome::Interrupted => Err(RuntimeError::TurnCancelled),
     }

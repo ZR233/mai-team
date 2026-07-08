@@ -406,6 +406,26 @@ fn turn_orchestrator_uses_pl_core_cancellation_checkpoint() {
     );
 }
 
+#[test]
+fn container_turn_current_checks_use_pl_core_token_guard() {
+    let source = include_str!("../agents/container.rs");
+
+    assert!(
+        source.contains("evaluate_with_token"),
+        "container 准备流程应复用 pl-core 的当前 turn + token 判断"
+    );
+    for forbidden in [
+        "cancellation_token.is_cancelled()",
+        "current_turn.is_some_and",
+        "guard.cancellation_token.is_cancelled()",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "container 准备流程不应继续本地解释 turn 当前性 `{forbidden}`"
+        );
+    }
+}
+
 fn pl_text(message: &Message) -> &str {
     match &message.content {
         MessageContent::Text(text) => text,
