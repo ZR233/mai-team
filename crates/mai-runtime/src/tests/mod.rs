@@ -772,6 +772,43 @@ fn container_output_capture_uses_pl_core_request_constructor() {
 }
 
 #[test]
+fn container_artifact_descriptors_use_pl_core_accessors() {
+    let source = include_str!("../turn/container.rs");
+    let projection = source
+        .split("fn artifact_records_from_descriptors(")
+        .nth(1)
+        .expect("artifact descriptor projection")
+        .split("fn runtime_invalid_input(")
+        .next()
+        .expect("projection body");
+
+    for required in [
+        "descriptor.id()",
+        "descriptor.call_id()",
+        "descriptor.name()",
+        "descriptor.stream()",
+        "descriptor.size_bytes()",
+    ] {
+        assert!(
+            projection.contains(required),
+            "container artifact 投影应通过 pl-core descriptor accessor 获取 `{required}`"
+        );
+    }
+    for forbidden in [
+        "descriptor.id,",
+        "descriptor.call_id,",
+        "descriptor.name,",
+        "descriptor.stream.as_str()",
+        "descriptor.size_bytes,",
+    ] {
+        assert!(
+            !projection.contains(forbidden),
+            "mai-runtime 不应读取 ToolOutputArtifactDescriptor 字段 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
 fn tool_visibility_consumes_pl_core_shared_tool_names() {
     let source = include_str!("../turn/tool_visibility.rs");
 

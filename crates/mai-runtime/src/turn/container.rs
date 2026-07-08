@@ -194,12 +194,12 @@ fn artifact_records_from_descriptors(
     descriptors
         .into_iter()
         .map(|descriptor| ToolOutputArtifactInfo {
-            id: descriptor.id,
-            call_id: descriptor.call_id,
+            id: descriptor.id().to_string(),
+            call_id: descriptor.call_id().to_string(),
             agent_id,
-            name: descriptor.name,
-            stream: descriptor.stream.as_str().to_string(),
-            size_bytes: descriptor.size_bytes,
+            name: descriptor.name().to_string(),
+            stream: descriptor.stream().as_str().to_string(),
+            size_bytes: descriptor.size_bytes(),
             created_at,
         })
         .collect()
