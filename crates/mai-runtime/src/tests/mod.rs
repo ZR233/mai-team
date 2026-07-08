@@ -52,6 +52,7 @@ fn test_tool_helper_uses_pl_core_kernel_registry() {
         "Call MCP tool".to_string(),
         "ToolSchema::function".to_string(),
         "ToolRuntimeEvent::OutputArtifacts".to_string(),
+        "ToolRuntimeEvent::EndTurn".to_string(),
         "output_artifacts_from_json_for_test".to_string(),
         "serde_json::from_value".to_string(),
     ] {
@@ -63,6 +64,10 @@ fn test_tool_helper_uses_pl_core_kernel_registry() {
     assert!(
         helper.contains("output_artifacts_as::<ToolOutputArtifactInfo>"),
         "测试工具执行应复用 pl-core ToolOutput artifact 解码"
+    );
+    assert!(
+        helper.contains("output.ends_turn()"),
+        "测试工具执行应复用 pl-core ToolOutput turn 结束语义"
     );
 }
 
