@@ -5,10 +5,9 @@ use mai_protocol::{
 };
 use pl_core::{
     AgentKernel, CompileMode, ContextCompactionConfig, ContextCompactionReplacement,
-    CoreAgentProfile, CoreSession, InstructionBlock, InstructionSnapshot, InstructionSource,
-    InstructionSourceKind, PureCoreBuilder, ReasoningEffort, RecentInteractionTailConfig,
-    ToolVisibilitySet, TraceRecorder, TurnOptions, TurnOutcome, TurnOutcomeStatus, TurnRequest,
-    TurnReturnError,
+    CoreAgentProfile, CoreSession, InstructionSnapshot, PureCoreBuilder, ReasoningEffort,
+    RecentInteractionTailConfig, ToolVisibilitySet, TraceRecorder, TurnOptions, TurnOutcome,
+    TurnOutcomeStatus, TurnRequest, TurnReturnError,
 };
 use pl_model::ToolSchema;
 use pl_trace::AgentEvent;
@@ -485,18 +484,7 @@ async fn record_context_compacted(ctx: &PureCoreTurnContext, summary: &str, toke
 }
 
 fn raw_instruction_snapshot(instructions: String) -> InstructionSnapshot {
-    InstructionSnapshot {
-        base: InstructionBlock {
-            source: InstructionSource {
-                kind: InstructionSourceKind::ProfileBaseOverride,
-                label: "mai-team instructions".to_string(),
-                path: None,
-            },
-            content: instructions,
-        },
-        developer: Vec::new(),
-        user: Vec::new(),
-    }
+    InstructionSnapshot::profile_base_override("mai-team instructions", instructions)
 }
 
 #[cfg(test)]
@@ -560,6 +548,30 @@ mod tests {
             assert!(
                 !production.contains(forbidden),
                 "mai-runtime 不应手写 request_user_input 投影 `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_instruction_snapshot_uses_pl_core_constructor() {
+        let source = include_str!("core_adapter.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production section");
+
+        assert!(
+            production.contains("InstructionSnapshot::profile_base_override"),
+            "宿主 base prompt 快照应由 pl-core 构造，mai-runtime 不应直接拼 InstructionSnapshot 结构"
+        );
+        for forbidden in [
+            "InstructionBlock",
+            "InstructionSource",
+            "InstructionSourceKind::ProfileBaseOverride",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "mai-runtime 不应直接依赖 pl-core instruction 内部结构 `{forbidden}`"
             );
         }
     }
