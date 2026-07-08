@@ -194,7 +194,6 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
         &self,
         request: AgentControlListRequest,
     ) -> std::result::Result<AgentControlListOutput, Self::Error> {
-        let path_prefix = request.path_prefix.unwrap_or_default();
         let current_parent = self.agent.summary.read().await.parent_id;
         let agents = self
             .runtime
@@ -202,10 +201,8 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
             .await
             .into_iter()
             .filter(|summary| self.summary_visible(summary, current_parent))
-            .map(compact_agent_record)
-            .filter(|record| path_prefix.is_empty() || record.path.starts_with(&path_prefix))
-            .collect();
-        Ok(AgentControlListOutput { agents })
+            .map(compact_agent_record);
+        Ok(request.into_list_output(agents))
     }
 
     async fn close_agent(
@@ -214,10 +211,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
     ) -> std::result::Result<AgentControlMessageOutput, Self::Error> {
         let target = parse_agent_id(&request.target)?;
         self.runtime.close_agent(target).await?;
-        Ok(AgentControlMessageOutput {
-            target: target.to_string(),
-            status: PlAgentStatus::Shutdown,
-        })
+        Ok(request.into_message_output(PlAgentStatus::Shutdown))
     }
 
     async fn resume_agent(
@@ -226,10 +220,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
     ) -> std::result::Result<AgentControlMessageOutput, Self::Error> {
         let target = parse_agent_id(&request.target)?;
         let resumed = self.runtime.resume_agent(target).await?;
-        Ok(AgentControlMessageOutput {
-            target: resumed.id.to_string(),
-            status: pl_agent_status(&resumed.status),
-        })
+        Ok(request.into_message_output(pl_agent_status(&resumed.status)))
     }
 }
 
@@ -314,14 +305,14 @@ fn parse_agent_id(value: &str) -> crate::Result<AgentId> {
 }
 
 fn compact_agent_record(summary: AgentSummary) -> AgentControlAgentRecord {
-    AgentControlAgentRecord {
-        path: summary.id.to_string(),
-        status: pl_agent_status(&summary.status),
-        role: summary.role.unwrap_or(AgentRole::Executor).to_string(),
-        task: summary.name,
-        summary: Some(format!("{} / {}", summary.provider_name, summary.model)),
-        error: summary.last_error,
-    }
+    AgentControlAgentRecord::new(
+        summary.id.to_string(),
+        pl_agent_status(&summary.status),
+        summary.role.unwrap_or(AgentRole::Executor).to_string(),
+        summary.name,
+        Some(format!("{} / {}", summary.provider_name, summary.model)),
+        summary.last_error,
+    )
 }
 
 fn pl_agent_status(status: &MaiAgentStatus) -> PlAgentStatus {
@@ -386,6 +377,18 @@ mod tests {
             source.contains("into_wait_agent_output"),
             "wait_agent 的 timedOut 输出投影应由 pl-core AgentWaitOutcome 提供"
         );
+        assert!(
+            source.contains("request.into_list_output"),
+            "list_agents 的 pathPrefix 过滤和输出形状应由 pl-core 请求类型提供"
+        );
+        assert!(
+            source.contains("AgentControlAgentRecord::new"),
+            "list_agents 的记录压缩和模型可见字段形状应由 pl-core AgentControlAgentRecord 提供"
+        );
+        assert!(
+            source.contains("request.into_message_output"),
+            "close_agent/resume_agent 的消息输出形状应由 pl-core target 请求类型提供"
+        );
         for forbidden in [
             format!("{}{}", "trigger_turn || ", "interrupt"),
             format!("{}{}", "fn wait", "_timeout"),
@@ -397,6 +400,12 @@ mod tests {
             format!("{}{}", ".get(\"queued\"", ")"),
             format!("{}{}", ".get(\"turnId\"", ")"),
             format!("{}{}", ".get(\"timedOut\"", ")"),
+            format!(
+                "{}{}",
+                "path_prefix.is_empty()", " || record.path.starts_with"
+            ),
+            format!("{}{}", "AgentControlListOutput", " { agents }"),
+            format!("{}{}", "AgentControlMessageOutput", " {"),
             format!(
                 "{}{}",
                 "\"planner\" | \"explorer\"", " | \"executor\" | \"reviewer\""
