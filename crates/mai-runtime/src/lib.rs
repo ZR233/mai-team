@@ -638,17 +638,8 @@ impl AgentRuntime {
             request,
             pl_core::CoreModelTurnOptions::default().with_cancellation(CancellationToken::new()),
         )
-        .await
-        .map(completion_response_to_model_response)?;
-        let title = response
-            .output
-            .into_iter()
-            .filter_map(|item| match item {
-                ModelOutputItem::Message { text } => Some(text),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("")
+        .await?;
+        let title = pl_core::completion_response_message_text(&response)
             .trim()
             .to_string();
         if title.is_empty() {

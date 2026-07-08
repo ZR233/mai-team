@@ -1306,6 +1306,20 @@ fn runtime_does_not_expose_local_model_client_facade() {
     }
 }
 
+#[test]
+fn task_title_generation_uses_pl_core_completion_text_projection() {
+    let lib = include_str!("../lib.rs");
+
+    assert!(
+        lib.contains("pl_core::completion_response_message_text"),
+        "任务标题生成应复用 pl-core 的 completion response 文本投影"
+    );
+    assert!(
+        !lib.contains("ModelOutputItem::Message"),
+        "任务标题生成不应通过 mai_protocol::ModelOutputItem 反向筛模型响应文本"
+    );
+}
+
 #[tokio::test]
 async fn model_profile_exposes_shared_continuation_capability_check() {
     let (base_url, _requests) = start_mock_responses(Vec::new()).await;
