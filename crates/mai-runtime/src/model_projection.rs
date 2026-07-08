@@ -1,12 +1,13 @@
 use mai_protocol::{ModelOutputItem, ModelResponse, TokenUsage};
 
 pub fn completion_response_usage(usage: &pl_model::TokenUsage) -> TokenUsage {
+    let snapshot = pl_core::ModelTokenUsageSnapshot::from_model_usage(usage);
     TokenUsage {
-        input_tokens: usage.prompt_tokens,
-        cached_input_tokens: usage.cached_prompt_tokens,
-        output_tokens: usage.completion_tokens,
-        reasoning_output_tokens: usage.reasoning_tokens,
-        total_tokens: usage.total_tokens,
+        input_tokens: snapshot.input_tokens,
+        cached_input_tokens: snapshot.cached_input_tokens,
+        output_tokens: snapshot.output_tokens,
+        reasoning_output_tokens: snapshot.reasoning_output_tokens,
+        total_tokens: snapshot.total_tokens,
     }
 }
 
@@ -51,5 +52,31 @@ mod tests {
             !source.contains(&format!("{}{}", "pub fn completion", "_response_preview")),
             "completion response preview 应由 pl-core 统一实现"
         );
+    }
+
+    #[test]
+    fn completion_usage_projection_reuses_pl_core_snapshot() {
+        let source = include_str!("model_projection.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+
+        assert!(
+            production.contains("pl_core::ModelTokenUsageSnapshot::from_model_usage"),
+            "模型 usage 字段解释应由 pl-core ModelTokenUsageSnapshot 统一提供"
+        );
+        for forbidden in [
+            "usage.prompt_tokens",
+            "usage.cached_prompt_tokens",
+            "usage.completion_tokens",
+            "usage.reasoning_tokens",
+            "usage.total_tokens",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "mai-runtime 不应直接解释 pl_model::TokenUsage 字段 `{forbidden}`"
+            );
+        }
     }
 }
