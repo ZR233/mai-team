@@ -122,6 +122,25 @@ fn send_input_uses_pl_core_turn_mode_policy() {
 }
 
 #[test]
+fn wait_completion_uses_pl_core_policy() {
+    let agents_source = include_str!("../agents.rs");
+    let wait_source = include_str!("../agents/wait.rs");
+
+    assert!(
+        agents_source.contains("AgentWaitSnapshot"),
+        "wait_agent completion 判断应由 pl-core AgentWaitSnapshot 统一维护"
+    );
+    assert!(
+        !wait_source.contains("AgentStatus::Completed"),
+        "agents/wait.rs 不应直接维护完成状态列表"
+    );
+    assert!(
+        !agents_source.contains("summary.current_turn.is_none()\n        || matches!"),
+        "mai-runtime 不应手写 current_turn + status 的 wait completion 判断"
+    );
+}
+
+#[test]
 fn kernel_tool_projection_uses_pl_core_completion_timestamp_fallback() {
     let source = include_str!("../turn/kernel_tools.rs");
 

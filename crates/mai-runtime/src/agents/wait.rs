@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use mai_protocol::{AgentId, AgentStatus, AgentSummary};
+use mai_protocol::{AgentId, AgentSummary};
 use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
@@ -28,16 +28,7 @@ pub(crate) async fn wait_agent_with_cancel(
         }
         let agent = ops.agent(agent_id).await?;
         let summary = agent.summary.read().await.clone();
-        if summary.current_turn.is_none()
-            || matches!(
-                summary.status,
-                AgentStatus::Completed
-                    | AgentStatus::Failed
-                    | AgentStatus::Cancelled
-                    | AgentStatus::Deleted
-                    | AgentStatus::Idle
-            )
-        {
+        if is_agent_wait_complete(&summary) {
             return Ok(summary);
         }
         if Instant::now() >= deadline {

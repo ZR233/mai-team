@@ -7,6 +7,7 @@ use mai_protocol::{
     AgentDetail, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary,
     ContextUsage, MessageRole, ServiceEvent, ServiceEventKind, SessionId, TokenUsage, now,
 };
+use pl_core::{AgentTurnPresence, AgentWaitSnapshot, AgentWaitStatusKind};
 use pl_protocol::Message as ModelMessage;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -382,15 +383,33 @@ pub(crate) fn last_turn_response(sessions: &[AgentSessionRecord]) -> Option<Stri
 }
 
 pub(crate) fn is_agent_wait_complete(summary: &AgentSummary) -> bool {
-    summary.current_turn.is_none()
-        || matches!(
-            summary.status,
-            AgentStatus::Completed
-                | AgentStatus::Failed
-                | AgentStatus::Cancelled
-                | AgentStatus::Deleted
-                | AgentStatus::Idle
-        )
+    agent_wait_snapshot(summary).is_complete()
+}
+
+fn agent_wait_snapshot(summary: &AgentSummary) -> AgentWaitSnapshot {
+    let turn_presence = match summary.current_turn {
+        Some(_) => AgentTurnPresence::ActiveTurn,
+        None => AgentTurnPresence::NoActiveTurn,
+    };
+    AgentWaitSnapshot {
+        turn_presence,
+        status: agent_wait_status_kind(&summary.status),
+    }
+}
+
+fn agent_wait_status_kind(status: &AgentStatus) -> AgentWaitStatusKind {
+    match status {
+        AgentStatus::Created
+        | AgentStatus::StartingContainer
+        | AgentStatus::RunningTurn
+        | AgentStatus::WaitingTool
+        | AgentStatus::DeletingContainer => AgentWaitStatusKind::Active,
+        AgentStatus::Idle => AgentWaitStatusKind::Idle,
+        AgentStatus::Completed => AgentWaitStatusKind::Completed,
+        AgentStatus::Failed => AgentWaitStatusKind::Failed,
+        AgentStatus::Cancelled => AgentWaitStatusKind::Cancelled,
+        AgentStatus::Deleted => AgentWaitStatusKind::Deleted,
+    }
 }
 
 pub(crate) fn final_wait_response(
