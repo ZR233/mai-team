@@ -92,10 +92,12 @@ impl fmt::Debug for MaiAgentControlBackend {
 }
 
 impl pl_core::AgentControlBackend for MaiAgentControlBackend {
+    type Error = RuntimeError;
+
     async fn spawn_agent(
         &self,
         request: AgentControlSpawnRequest,
-    ) -> pl_core::Result<AgentControlSpawnOutput> {
+    ) -> std::result::Result<AgentControlSpawnOutput, Self::Error> {
         let role = request
             .agent_type
             .as_deref()
@@ -118,8 +120,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
                 },
             },
         )
-        .await
-        .map_err(tool_error(pl_core::TOOL_SPAWN_AGENT))?;
+        .await?;
         Ok(AgentControlSpawnOutput {
             agent_id: result.agent.id.to_string(),
             task_name: result.agent.name,
@@ -132,8 +133,8 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
     async fn send_input(
         &self,
         request: AgentControlSendInputRequest,
-    ) -> pl_core::Result<AgentControlSendInputOutput> {
-        let target = parse_agent_id(pl_core::TOOL_SEND_INPUT, &request.target)?;
+    ) -> std::result::Result<AgentControlSendInputOutput, Self::Error> {
+        let target = parse_agent_id(&request.target)?;
         let interrupt = request.interrupt;
         let trigger_turn = request.trigger_turn || interrupt;
         let output = agents::send_input_to_agent(
@@ -149,8 +150,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
                 cancel_grace: crate::TURN_CANCEL_GRACE,
             },
         )
-        .await
-        .map_err(tool_error(pl_core::TOOL_SEND_INPUT))?;
+        .await?;
         let queued = output
             .get("queued")
             .and_then(Value::as_bool)
@@ -163,8 +163,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
         let status = self
             .runtime
             .agent(target)
-            .await
-            .map_err(tool_error(pl_core::TOOL_SEND_INPUT))?
+            .await?
             .summary
             .read()
             .await
@@ -182,7 +181,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
     async fn wait_agent(
         &self,
         request: AgentControlWaitRequest,
-    ) -> pl_core::Result<AgentControlWaitOutput> {
+    ) -> std::result::Result<AgentControlWaitOutput, Self::Error> {
         let targets = self.child_agent_ids().await;
         if targets.is_empty() {
             return Ok(AgentControlWaitOutput {
@@ -197,8 +196,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
                 wait_timeout(request.timeout_ms),
                 &self.cancellation_token,
             )
-            .await
-            .map_err(tool_error(pl_core::TOOL_WAIT_AGENT))?;
+            .await?;
         let timed_out = output
             .get("timed_out")
             .and_then(Value::as_bool)
@@ -212,7 +210,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
     async fn list_agents(
         &self,
         request: AgentControlListRequest,
-    ) -> pl_core::Result<AgentControlListOutput> {
+    ) -> std::result::Result<AgentControlListOutput, Self::Error> {
         let path_prefix = request.path_prefix.unwrap_or_default();
         let current_parent = self.agent.summary.read().await.parent_id;
         let agents = self
@@ -230,12 +228,9 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
     async fn close_agent(
         &self,
         request: AgentControlTargetRequest,
-    ) -> pl_core::Result<AgentControlMessageOutput> {
-        let target = parse_agent_id(pl_core::TOOL_CLOSE_AGENT, &request.target)?;
-        self.runtime
-            .close_agent(target)
-            .await
-            .map_err(tool_error(pl_core::TOOL_CLOSE_AGENT))?;
+    ) -> std::result::Result<AgentControlMessageOutput, Self::Error> {
+        let target = parse_agent_id(&request.target)?;
+        self.runtime.close_agent(target).await?;
         Ok(AgentControlMessageOutput {
             target: target.to_string(),
             status: PlAgentStatus::Shutdown,
@@ -245,13 +240,9 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
     async fn resume_agent(
         &self,
         request: AgentControlTargetRequest,
-    ) -> pl_core::Result<AgentControlMessageOutput> {
-        let target = parse_agent_id(pl_core::TOOL_RESUME_AGENT, &request.target)?;
-        let resumed = self
-            .runtime
-            .resume_agent(target)
-            .await
-            .map_err(tool_error(pl_core::TOOL_RESUME_AGENT))?;
+    ) -> std::result::Result<AgentControlMessageOutput, Self::Error> {
+        let target = parse_agent_id(&request.target)?;
+        let resumed = self.runtime.resume_agent(target).await?;
         Ok(AgentControlMessageOutput {
             target: resumed.id.to_string(),
             status: pl_agent_status(&resumed.status),
@@ -260,25 +251,29 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
 }
 
 impl pl_core::AgentControlPolicy for MaiAgentControlPolicy {
-    async fn check_tool(&self, kind: pl_core::AgentControlToolKind) -> pl_core::Result<()> {
+    type Error = RuntimeError;
+
+    async fn check_tool(
+        &self,
+        kind: pl_core::AgentControlToolKind,
+    ) -> std::result::Result<(), Self::Error> {
         let visible =
             super::tool_visibility::visible_tool_names(&self.runtime.state, &self.agent, &[]).await;
         if visible.contains(kind.name()) {
             return Ok(());
         }
-        Err(pl_core::PureError::ToolExecutionFailed {
-            tool: kind.name().to_string(),
-            error: format!("Tool '{}' is not available for this agent", kind.name()),
-        })
+        Err(RuntimeError::InvalidInput(format!(
+            "Tool '{}' is not available for this agent",
+            kind.name()
+        )))
     }
 
     async fn check_target(
         &self,
         kind: pl_core::AgentControlToolKind,
         target: &str,
-    ) -> pl_core::Result<()> {
-        let tool = kind.name();
-        let target = parse_agent_id(tool, target)?;
+    ) -> std::result::Result<(), Self::Error> {
+        let target = parse_agent_id(target)?;
         match kind {
             pl_core::AgentControlToolKind::SendInput
             | pl_core::AgentControlToolKind::WaitAgent
@@ -292,17 +287,15 @@ impl pl_core::AgentControlPolicy for MaiAgentControlPolicy {
                 {
                     return Ok(());
                 }
-                Err(pl_core::PureError::ToolExecutionFailed {
-                    tool: tool.to_string(),
-                    error: "target agent is outside this agent's communication policy".to_string(),
-                })
+                Err(RuntimeError::InvalidInput(
+                    "target agent is outside this agent's communication policy".to_string(),
+                ))
             }
             pl_core::AgentControlToolKind::CloseAgent => {
                 if target == self.agent_id {
-                    return Err(pl_core::PureError::ToolExecutionFailed {
-                        tool: tool.to_string(),
-                        error: "cannot close the current agent".to_string(),
-                    });
+                    return Err(RuntimeError::InvalidInput(
+                        "cannot close the current agent".to_string(),
+                    ));
                 }
                 Ok(())
             }
@@ -353,11 +346,9 @@ fn wait_timeout(timeout_ms: Option<i64>) -> Duration {
     Duration::from_millis(timeout_ms.max(100))
 }
 
-fn parse_agent_id(tool: &str, value: &str) -> pl_core::Result<AgentId> {
-    Uuid::parse_str(value).map_err(|error| pl_core::PureError::ToolExecutionFailed {
-        tool: tool.to_string(),
-        error: format!("invalid agent id `{value}`: {error}"),
-    })
+fn parse_agent_id(value: &str) -> crate::Result<AgentId> {
+    Uuid::parse_str(value)
+        .map_err(|error| RuntimeError::InvalidInput(format!("invalid agent id `{value}`: {error}")))
 }
 
 fn compact_agent_record(summary: AgentSummary) -> AgentControlAgentRecord {
@@ -385,11 +376,19 @@ fn pl_agent_status(status: &MaiAgentStatus) -> PlAgentStatus {
     }
 }
 
-fn tool_error(
-    tool: &'static str,
-) -> impl FnOnce(RuntimeError) -> pl_core::PureError + Send + 'static {
-    move |error| pl_core::PureError::ToolExecutionFailed {
-        tool: tool.to_string(),
-        error: error.to_string(),
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn agent_control_backend_delegates_tool_error_shape_to_pl_core() {
+        let source = include_str!("agent_control.rs");
+
+        assert!(
+            !source.contains(&format!("{}{}", "ToolExecution", "Failed")),
+            "agent-control adapter 不应在 mai-team 手动构造工具错误协议"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "Pure", "Error")),
+            "agent-control adapter 不应依赖 pl_protocol/pl_core 错误协议类型"
+        );
     }
 }
