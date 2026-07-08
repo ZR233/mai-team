@@ -150,7 +150,7 @@ impl MaiProductToolRouter {
                 let prs = queue_project_review_prs_from_arguments(&arguments)?;
                 self.queue_project_review_prs(prs).await
             }
-            mai_tools::TOOL_GIT_SYNC_DEFAULT_BRANCH => {
+            pl_core::TOOL_GIT_SYNC_DEFAULT_BRANCH => {
                 self.runtime
                     .execute_project_git_tool(&self.agent, name, arguments)
                     .await

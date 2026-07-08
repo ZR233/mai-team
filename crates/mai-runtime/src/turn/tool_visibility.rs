@@ -43,7 +43,6 @@ pub(crate) async fn visible_tool_names(
     ]);
     if agent.summary.read().await.project_id.is_some() {
         names.extend(canonical_git_tool_names().map(str::to_string));
-        names.insert(mai_tools::TOOL_GIT_SYNC_DEFAULT_BRANCH.to_string());
     }
     if project_review_queue_tool_visible(agent).await {
         names.insert(mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS.to_string());

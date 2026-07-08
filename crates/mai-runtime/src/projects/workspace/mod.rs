@@ -16,8 +16,6 @@ pub(crate) mod manager;
 pub(crate) mod paths;
 pub(crate) mod reconcile;
 
-#[cfg(test)]
-pub(crate) use manager::sync_project_repo_cache;
 pub(crate) use manager::{
     AGENT_WORKSPACE_REPO_PATH, LocalProjectWorkspaceManager, ProjectWorkspaceManager,
 };

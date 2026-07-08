@@ -46,9 +46,14 @@ mod tests {
     #[test]
     fn product_tool_api_is_definition_only() {
         let api = include_str!("lib.rs");
+        let names = include_str!("names.rs");
 
         assert!(!api.contains(&format!("{}{}", "route", "_tool")));
         assert!(!api.contains(&format!("{}{}", "Routed", "Tool")));
+        assert!(
+            !names.contains("TOOL_GIT_SYNC_DEFAULT_BRANCH"),
+            "git_sync_default_branch is a pl-core shared git tool"
+        );
     }
 
     #[test]
@@ -75,6 +80,7 @@ mod tests {
             "request_user_input",
             pl_core::TOOL_GIT_STATUS,
             pl_core::TOOL_GIT_PUSH,
+            pl_core::TOOL_GIT_SYNC_DEFAULT_BRANCH,
             pl_core::TOOL_LIST_MCP_RESOURCES,
             pl_core::TOOL_LIST_MCP_RESOURCE_TEMPLATES,
             pl_core::TOOL_READ_MCP_RESOURCE,

@@ -59,34 +59,10 @@ pub(crate) async fn execute_git_tool(
             ));
         }
     }
-    let output = match name {
-        mai_tools::TOOL_GIT_SYNC_DEFAULT_BRANCH => {
-            let token = required_token(context.token.as_deref())?;
-            git_sync_default_branch(&context, token, &arguments).await?
-        }
-        _ => match git_tool_kind(name) {
-            Some(kind) => execute_pl_core_git_tool(&context, kind, arguments).await?,
-            None => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "unsupported git tool `{name}`"
-                )));
-            }
-        },
-    };
+    let kind = GitToolKind::from_name(name)
+        .ok_or_else(|| RuntimeError::InvalidInput(format!("unsupported git tool `{name}`")))?;
+    let output = execute_pl_core_git_tool(&context, kind, arguments).await?;
     Ok(ToolExecution::new(true, output, false))
-}
-
-fn git_tool_kind(name: &str) -> Option<GitToolKind> {
-    match name {
-        pl_core::TOOL_GIT_STATUS => Some(GitToolKind::Status),
-        pl_core::TOOL_GIT_DIFF => Some(GitToolKind::Diff),
-        pl_core::TOOL_GIT_BRANCH => Some(GitToolKind::Branch),
-        pl_core::TOOL_GIT_FETCH => Some(GitToolKind::Fetch),
-        pl_core::TOOL_GIT_COMMIT => Some(GitToolKind::Commit),
-        pl_core::TOOL_GIT_PUSH => Some(GitToolKind::Push),
-        pl_core::TOOL_GIT_WORKSPACE_INFO => Some(GitToolKind::WorkspaceInfo),
-        _ => None,
-    }
 }
 
 async fn execute_pl_core_git_tool(
@@ -439,187 +415,6 @@ fn pure_tool_error(tool: &str, error: impl fmt::Display) -> PureError {
     }
 }
 
-async fn git_sync_default_branch(
-    context: &GitToolContext<'_>,
-    token: &str,
-    arguments: &Value,
-) -> Result<String> {
-    let force = arguments
-        .get("force")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let preserve_changes = arguments
-        .get("preserve_changes")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if force && preserve_changes {
-        return Err(RuntimeError::InvalidInput(
-            "force and preserve_changes cannot both be true".to_string(),
-        ));
-    }
-
-    let status = git_plain(context, ["status", "--porcelain"]).await?;
-    let dirty = !status.trim().is_empty();
-    if dirty && !force && !preserve_changes {
-        return Err(RuntimeError::InvalidInput(
-            "project git workspace has uncommitted changes; pass force=true to discard them or preserve_changes=true to stash them before sync".to_string(),
-        ));
-    }
-    if dirty && preserve_changes {
-        git_plain(
-            context,
-            ["stash", "push", "-u", "-m", "mai sync default branch"],
-        )
-        .await?;
-    }
-
-    #[cfg(test)]
-    if let GitToolBackend::Host {
-        git_binary,
-        projects_root,
-    } = &context.backend
-    {
-        projects::workspace::sync_project_repo_cache(
-            git_binary,
-            projects_root,
-            &context.project,
-            token,
-        )
-        .await?;
-    }
-    let repo_url = github_clone_url(&context.project.owner, &context.project.repo);
-    git_plain(context, ["remote", "set-url", "origin", &repo_url]).await?;
-    git_with_token(context, token, ["fetch", "--prune", "origin"]).await?;
-    let branch = format!("mai-agent/{}", context.agent_id);
-    let origin_branch = format!("origin/{}", context.project.branch);
-    git_plain(context, ["checkout", "-B", &branch, &origin_branch]).await?;
-    git_plain(context, ["reset", "--hard", &origin_branch]).await?;
-    if force {
-        git_plain(context, ["clean", "-fdx"]).await?;
-    }
-    if dirty && preserve_changes {
-        git_plain(context, ["stash", "pop"]).await?;
-    }
-
-    Ok(json!({
-        "clone": repo_path(context),
-        "worktree": repo_path(context),
-        "preserved_changes": dirty && preserve_changes,
-        "forced": force,
-    })
-    .to_string())
-}
-
-fn repo_path(context: &GitToolContext<'_>) -> String {
-    match &context.backend {
-        GitToolBackend::Sidecar { repo_path, .. } => (*repo_path).to_string(),
-        #[cfg(test)]
-        GitToolBackend::Host { projects_root, .. } => projects::workspace::agent_clone_path(
-            projects_root,
-            context.project.id,
-            context.agent_id,
-        )
-        .to_string_lossy()
-        .to_string(),
-    }
-}
-
-async fn git_plain<const N: usize>(
-    context: &GitToolContext<'_>,
-    args: [&str; N],
-) -> Result<String> {
-    run_git(context, None, args).await
-}
-
-async fn git_with_token<const N: usize>(
-    context: &GitToolContext<'_>,
-    token: &str,
-    args: [&str; N],
-) -> Result<String> {
-    run_git(context, Some(token), args)
-        .await
-        .map(|output| output.replace(token, "[redacted]"))
-}
-
-async fn run_git<const N: usize>(
-    context: &GitToolContext<'_>,
-    token: Option<&str>,
-    args: [&str; N],
-) -> Result<String> {
-    match &context.backend {
-        GitToolBackend::Sidecar {
-            docker,
-            sidecar_image,
-            workspace_volume,
-            repo_path,
-        } => {
-            run_sidecar_git(
-                docker,
-                sidecar_image,
-                workspace_volume,
-                repo_path,
-                context.agent_id,
-                token,
-                &args,
-            )
-            .await
-        }
-        #[cfg(test)]
-        GitToolBackend::Host {
-            git_binary,
-            projects_root,
-        } => {
-            let clone = projects::workspace::agent_clone_path(
-                projects_root,
-                context.project.id,
-                context.agent_id,
-            );
-            match token {
-                Some(token) => projects::workspace::git_with_token(git_binary, &clone, token, args)
-                    .await
-                    .map(|output| output.replace(token, "[redacted]")),
-                None => projects::workspace::git_plain(git_binary, &clone, args).await,
-            }
-        }
-    }
-}
-
-async fn run_sidecar_git(
-    docker: &DockerClient,
-    sidecar_image: &str,
-    workspace_volume: &str,
-    repo_path: &str,
-    agent_id: AgentId,
-    token: Option<&str>,
-    args: &[&str],
-) -> Result<String> {
-    let args = args
-        .iter()
-        .map(|arg| (*arg).to_string())
-        .collect::<Vec<_>>();
-    let output = run_sidecar_git_output(
-        docker,
-        sidecar_image,
-        workspace_volume,
-        repo_path,
-        agent_id,
-        token,
-        &args,
-    )
-    .await?;
-    if output.status == 0 {
-        return Ok(output.stdout);
-    }
-    let combined = format!("{}\n{}", output.stderr, output.stdout);
-    let redacted = token
-        .map(|token| combined.replace(token, "[redacted]"))
-        .unwrap_or(combined);
-    Err(RuntimeError::InvalidInput(format!(
-        "git sidecar failed: {}",
-        redacted.trim()
-    )))
-}
-
 async fn run_sidecar_git_output(
     docker: &DockerClient,
     sidecar_image: &str,
@@ -693,14 +488,6 @@ fn sidecar_git_command_with_askpass(git_command: &str) -> String {
         "askpass=$(mktemp) && cat > \"$askpass\" <<'MAI_GIT_ASKPASS'\n#!/bin/sh\n{}\nMAI_GIT_ASKPASS\nchmod 700 \"$askpass\" && GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=\"$askpass\" {git_command}; status=$?; rm -f \"$askpass\"; exit $status",
         git_askpass_script()
     )
-}
-
-fn required_token(token: Option<&str>) -> Result<&str> {
-    token
-        .filter(|token| !token.trim().is_empty())
-        .ok_or_else(|| {
-            RuntimeError::InvalidInput("project git account token is not configured".to_string())
-        })
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1028,13 +815,45 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: Some("secret-token".to_string()),
             },
-            mai_tools::TOOL_GIT_SYNC_DEFAULT_BRANCH,
+            pl_core::TOOL_GIT_SYNC_DEFAULT_BRANCH,
             json!({}),
         )
         .await
         .expect_err("dirty sync rejected");
 
         assert!(err.to_string().contains("uncommitted changes"));
+    }
+
+    #[tokio::test]
+    async fn git_sync_default_branch_uses_pl_core_camel_case_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = fake_git_path_with_status(dir.path(), " M README.md\n");
+        let project_id = uuid::Uuid::new_v4();
+        let agent_id = uuid::Uuid::new_v4();
+        let clone_path = workspace::agent_clone_path(dir.path(), project_id, agent_id);
+        std::fs::create_dir_all(&clone_path).expect("clone");
+
+        let execution = execute_git_tool(
+            GitToolContext {
+                backend: GitToolBackend::Host {
+                    git_binary: &git,
+                    projects_root: dir.path(),
+                },
+                agent_id,
+                project: test_project(project_id, agent_id),
+                token: Some("secret-token".to_string()),
+            },
+            pl_core::TOOL_GIT_SYNC_DEFAULT_BRANCH,
+            json!({ "preserveChanges": true }),
+        )
+        .await
+        .expect("sync default branch");
+
+        let payload: Value = serde_json::from_str(&execution.output).expect("sync payload");
+        assert_eq!(payload["preservedChanges"], json!(true));
+        let git_log = read_git_log(dir.path());
+        assert!(git_log.contains("stash push -u -m pl-core sync default branch"));
+        assert!(git_log.contains("stash pop"));
     }
 
     fn test_project(project_id: uuid::Uuid, agent_id: uuid::Uuid) -> ProjectSummary {
