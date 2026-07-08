@@ -57,6 +57,7 @@ pub use model_profile::{
 pub use model_projection::{
     completion_response_preview, completion_response_to_model_response, completion_response_usage,
 };
+use pl_core::{AgentTurnStatusGuard, AgentTurnStatusOutcome, AgentTurnStatusTransition};
 use projects::review::ProjectReviewCycleResult;
 use projects::review::pool::{ProjectReviewPoolEnqueueSummary, ProjectReviewSignalInput};
 use projects::review::relay_queue::{
@@ -1935,16 +1936,24 @@ impl AgentRuntime {
         enforce_current_turn: bool,
         status: AgentStatus,
     ) -> Result<()> {
-        if cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
         let agent_id = {
             let mut summary = agent.summary.write().await;
-            if enforce_current_turn && summary.current_turn != Some(turn_id) {
-                return Err(RuntimeError::TurnCancelled);
+            let guard = if enforce_current_turn {
+                AgentTurnStatusGuard::EnforceCurrent
+            } else {
+                AgentTurnStatusGuard::AllowStale
+            };
+            let transition = AgentTurnStatusTransition::new(turn_id, status.clone(), now(), guard);
+            match transition.evaluate(
+                cancellation_token.is_cancelled(),
+                summary.current_turn.as_ref(),
+            ) {
+                AgentTurnStatusOutcome::Applied(mutation) => {
+                    summary.status = mutation.status;
+                    summary.updated_at = mutation.updated_at;
+                }
+                AgentTurnStatusOutcome::Cancelled => return Err(RuntimeError::TurnCancelled),
             }
-            summary.status = status.clone();
-            summary.updated_at = now();
             summary.id
         };
         self.persist_agent(agent).await?;
