@@ -2,6 +2,10 @@ use mai_protocol::{ModelOutputItem, ModelResponse, TokenUsage};
 
 pub fn completion_response_usage(usage: &pl_model::TokenUsage) -> TokenUsage {
     let snapshot = pl_core::ModelTokenUsageSnapshot::from_model_usage(usage);
+    token_usage_from_snapshot(snapshot)
+}
+
+fn token_usage_from_snapshot(snapshot: pl_core::ModelTokenUsageSnapshot) -> TokenUsage {
     TokenUsage {
         input_tokens: snapshot.input_tokens,
         cached_input_tokens: snapshot.cached_input_tokens,
@@ -14,31 +18,34 @@ pub fn completion_response_usage(usage: &pl_model::TokenUsage) -> TokenUsage {
 pub fn completion_response_to_model_response(
     response: pl_model::CompletionResponse,
 ) -> ModelResponse {
-    let mut output = Vec::new();
-    if let Some(reasoning) = response
-        .reasoning_content
-        .filter(|text| !text.trim().is_empty())
-    {
-        output.push(ModelOutputItem::Reasoning { content: reasoning });
-    }
-    if let Some(content) = response.content.filter(|text| !text.trim().is_empty()) {
-        output.push(ModelOutputItem::Message { text: content });
-    }
-    output.extend(response.tool_calls.into_iter().map(|call| {
-        let raw_arguments = call.payload_text();
-        let arguments = call.arguments_for_tool();
-        let call_id = call.call_id.clone().unwrap_or_else(|| call.id.clone());
-        ModelOutputItem::FunctionCall {
-            call_id,
-            name: call.name,
-            arguments,
-            raw_arguments,
-        }
-    }));
+    let snapshot = pl_core::completion_response_snapshot(&response);
+    let output = snapshot
+        .output
+        .into_iter()
+        .map(|item| match item {
+            pl_core::CompletionResponseOutputSnapshot::Reasoning { content } => {
+                ModelOutputItem::Reasoning { content }
+            }
+            pl_core::CompletionResponseOutputSnapshot::Message { text } => {
+                ModelOutputItem::Message { text }
+            }
+            pl_core::CompletionResponseOutputSnapshot::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                raw_arguments,
+            } => ModelOutputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                raw_arguments,
+            },
+        })
+        .collect();
     ModelResponse {
-        id: response.response_id,
+        id: snapshot.id,
         output,
-        usage: Some(completion_response_usage(&response.usage)),
+        usage: Some(token_usage_from_snapshot(snapshot.usage)),
     }
 }
 
@@ -76,6 +83,33 @@ mod tests {
             assert!(
                 !production.contains(forbidden),
                 "mai-runtime 不应直接解释 pl_model::TokenUsage 字段 `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_response_projection_reuses_pl_core_snapshot() {
+        let source = include_str!("model_projection.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+
+        assert!(
+            production.contains("pl_core::completion_response_snapshot"),
+            "CompletionResponse output 语义应由 pl-core completion_response_snapshot 统一提供"
+        );
+        for forbidden in [
+            "response.reasoning_content",
+            "response.content",
+            "response.tool_calls",
+            "call.payload_text",
+            "call.arguments_for_tool",
+            "call.call_id",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "mai-runtime 不应直接解释 pl_model::CompletionResponse 字段或 tool call `{forbidden}`"
             );
         }
     }
