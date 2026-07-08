@@ -1237,7 +1237,8 @@ async fn pl_core_model_turn_response_retries_without_unsupported_continuation() 
     .expect("first response");
 
     assert_eq!(first.response_id.as_deref(), Some("resp_first"));
-    session.push_assistant_response(first.content.expect("first content"), None);
+    assert_eq!(first.content.as_deref(), Some("first"));
+    session.push_assistant_completion_response(&first);
     session.push_user_prompt("second".to_string());
 
     let second = pl_core::stream_session_completion_response(

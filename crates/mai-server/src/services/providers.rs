@@ -235,7 +235,7 @@ impl ProviderTester {
             CoreModelTurnOptions::default().with_cancellation(CancellationToken::new()),
         )
         .await?;
-        session.push_assistant_response(completion_response_preview(&first), None);
+        session.push_assistant_completion_response(&first);
         session.push_user_prompt(
             "Provider deep connectivity test, step 2. Reply exactly: ok".to_string(),
         );
