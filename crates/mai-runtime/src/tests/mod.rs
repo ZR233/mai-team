@@ -76,6 +76,27 @@ fn test_tool_helper_uses_pl_core_kernel_registry() {
 }
 
 #[test]
+fn tool_execution_results_use_explicit_pl_core_constructors() {
+    for (name, source) in [
+        ("lib.rs", include_str!("../lib.rs")),
+        (
+            "facade/project_github.rs",
+            include_str!("../facade/project_github.rs"),
+        ),
+        ("tools/git.rs", include_str!("../tools/git.rs")),
+        (
+            "turn/product_tools.rs",
+            include_str!("../turn/product_tools.rs"),
+        ),
+    ] {
+        assert!(
+            !source.contains("ToolExecution::new("),
+            "{name} 应使用 pl-core ToolExecutionResult::success/failure/json 等显式构造，避免裸 bool 位置参数"
+        );
+    }
+}
+
+#[test]
 fn observability_uses_pl_core_history_success_projection() {
     let source = include_str!("../agents/observability.rs");
 

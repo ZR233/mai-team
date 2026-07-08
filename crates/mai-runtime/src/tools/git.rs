@@ -59,7 +59,7 @@ pub(crate) async fn execute_git_tool(
     let kind = GitToolKind::from_name(name)
         .ok_or_else(|| RuntimeError::InvalidInput(format!("unsupported git tool `{name}`")))?;
     let output = execute_git_tool_via_registry(&context, kind, arguments).await?;
-    Ok(ToolExecution::new(true, output, false))
+    Ok(ToolExecution::success(output))
 }
 
 #[cfg(test)]

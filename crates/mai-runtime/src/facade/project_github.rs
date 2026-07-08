@@ -113,7 +113,7 @@ impl AgentRuntime {
                 "gh api sidecar failed: {message}"
             )));
         }
-        Ok(ToolExecution::new(true, output.stdout, false))
+        Ok(ToolExecution::success(output.stdout))
     }
 }
 

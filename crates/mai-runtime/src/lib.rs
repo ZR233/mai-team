@@ -1608,11 +1608,7 @@ impl AgentRuntime {
             )
             .await?
         else {
-            return Ok(ToolExecution::new(
-                false,
-                format!("unknown tool: {name}"),
-                false,
-            ));
+            return Ok(ToolExecution::failure(format!("unknown tool: {name}")));
         };
         Ok(execution)
     }
