@@ -208,6 +208,26 @@ fn send_input_uses_pl_core_turn_mode_policy() {
 }
 
 #[test]
+fn queued_input_start_uses_pl_core_start_attempt() {
+    let source = include_str!("../agents/input.rs");
+
+    assert!(
+        source.contains("take_start_attempt"),
+        "启动排队输入时应通过 pl-core AgentInputStartAttempt 取出队首输入"
+    );
+    assert!(
+        source.contains("restore_start_attempt"),
+        "启动排队输入遇到 busy 时应通过 pl-core 恢复 start attempt"
+    );
+    for forbidden in [".pop()", "restore_front(input)"] {
+        assert!(
+            !source.contains(forbidden),
+            "mai-runtime 不应直接操作 pending input 队列事务 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
 fn wait_completion_uses_pl_core_policy() {
     let agents_source = include_str!("../agents.rs");
     let wait_source = include_str!("../agents/wait.rs");

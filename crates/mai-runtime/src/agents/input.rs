@@ -82,20 +82,25 @@ pub(crate) async fn start_next_queued_input(
     agent_id: AgentId,
 ) -> Result<Option<TurnId>> {
     let agent = service.agent(agent_id).await?;
-    let Some(input) = agent.pending_inputs.lock().await.pop() else {
+    let Some(attempt) = agent.pending_inputs.lock().await.take_start_attempt() else {
         return Ok(None);
     };
     let session_id = service
-        .resolve_session_id(agent_id, input.session_id)
+        .resolve_session_id(agent_id, attempt.input().session_id)
         .await?;
     let (agent, turn_id) = match prepare_turn(service, agent_id).await {
         Ok(turn) => turn,
         Err(RuntimeError::AgentBusy(_)) => {
-            agent.pending_inputs.lock().await.restore_front(input);
+            agent
+                .pending_inputs
+                .lock()
+                .await
+                .restore_start_attempt(attempt);
             return Ok(None);
         }
         Err(err) => return Err(err),
     };
+    let input = attempt.into_input();
     input_ops.spawn_turn(
         &agent,
         agent_id,
