@@ -17,7 +17,7 @@ use tokio::process::Command;
 use crate::github::github_clone_url;
 use crate::projects;
 use crate::state::AgentRecord;
-use crate::turn::tools::ToolExecution;
+use crate::turn::tool_output::ToolExecution;
 use crate::{AgentRuntime, Result, RuntimeError};
 
 pub(crate) struct GitToolContext<'a> {

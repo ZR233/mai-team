@@ -137,7 +137,7 @@ pub(crate) async fn tool_trace(
         tool_name,
         arguments: arguments.unwrap_or_else(|| json!({})),
         success: event_success.unwrap_or(!output.is_empty()),
-        output_preview: turn::tools::trace_preview_output(&output, 500),
+        output_preview: turn::tool_output::trace_preview_output(&output, 500),
         output,
         duration_ms,
         started_at: None,

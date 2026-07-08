@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::github::GitAccountToken;
 use crate::state::AgentRecord;
-use crate::turn::tools::ToolExecution;
+use crate::turn::tool_output::ToolExecution;
 use crate::{
     AgentRuntime, Result, RuntimeError, github, normalized_text, projects, redact_secret,
     shell_quote, tools, turn,

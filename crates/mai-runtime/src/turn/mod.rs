@@ -12,4 +12,5 @@ pub(crate) mod model_stream;
 pub(crate) mod orchestrator;
 pub(crate) mod persistence;
 pub(crate) mod product_tools;
-pub(crate) mod tools;
+pub(crate) mod tool_output;
+pub(crate) mod tool_visibility;

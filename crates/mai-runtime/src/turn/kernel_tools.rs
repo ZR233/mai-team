@@ -142,7 +142,7 @@ async fn project_tool_started(
             details: json!({
                 "call_id": call_id,
                 "tool_name": tool.name,
-                "arguments_preview": super::tools::trace_preview_value(&arguments, 500),
+                "arguments_preview": super::tool_output::trace_preview_value(&arguments, 500),
             }),
         },
     )
@@ -155,7 +155,7 @@ async fn project_tool_started(
             turn_id,
             call_id,
             tool_name: tool.name.clone(),
-            arguments_preview: Some(super::tools::trace_preview_value(&arguments, 500)),
+            arguments_preview: Some(super::tool_output::trace_preview_value(&arguments, 500)),
             arguments: Some(arguments),
         })
         .await;
@@ -175,7 +175,7 @@ async fn project_tool_completed(
     let call_id = tool_call_id(tool);
     let arguments = arguments_value(&tool.arguments);
     let output = tool.result.clone().unwrap_or_default();
-    let output_preview = super::tools::trace_preview_output(&output, 500);
+    let output_preview = super::tool_output::trace_preview_output(&output, 500);
     let started_at = trace_time(item.created_at);
     let completed_at = trace_time(item.updated_at);
     let duration_ms = item

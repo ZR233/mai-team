@@ -4323,7 +4323,8 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
 
     let requests = requests.lock().await.clone();
     assert_eq!(requests.len(), 3);
-    let visible_tools = turn::tools::visible_tool_names(&runtime.state, &agent, &[]).await;
+    let visible_tools =
+        turn::tool_visibility::visible_tool_names(&runtime.state, &agent, &[]).await;
     let product_tools =
         build_tool_definitions_with_filter(&[], |name| visible_tools.contains(name));
     let expected_tool_count =
@@ -6771,7 +6772,8 @@ async fn project_worker_cannot_spawn_agents_and_hidden_from_tools() {
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     let worker_record = runtime.agent(worker_id).await.expect("worker");
 
-    let visible = turn::tools::visible_tool_names(&runtime.state, &worker_record, &[]).await;
+    let visible =
+        turn::tool_visibility::visible_tool_names(&runtime.state, &worker_record, &[]).await;
     assert!(!visible.contains(pl_core::TOOL_SPAWN_AGENT));
     assert!(!visible.contains(pl_core::TOOL_CLOSE_AGENT));
     assert!(!visible.contains(mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS));
@@ -6835,7 +6837,8 @@ async fn project_selector_can_queue_review_prs() {
     }
     let selector_record = runtime.agent(selector_id).await.expect("selector");
 
-    let visible = turn::tools::visible_tool_names(&runtime.state, &selector_record, &[]).await;
+    let visible =
+        turn::tool_visibility::visible_tool_names(&runtime.state, &selector_record, &[]).await;
     assert!(visible.contains(mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS));
 
     let result = runtime
@@ -7172,7 +7175,8 @@ async fn project_maintainer_can_spawn_agent() {
         image: "unused".to_string(),
     });
 
-    let visible = turn::tools::visible_tool_names(&runtime.state, &maintainer_record, &[]).await;
+    let visible =
+        turn::tool_visibility::visible_tool_names(&runtime.state, &maintainer_record, &[]).await;
     assert!(visible.contains(pl_core::TOOL_SPAWN_AGENT));
 
     let result = runtime
@@ -9791,7 +9795,7 @@ fn tool_event_preview_redacts_sensitive_and_large_values() {
         "content_base64": "a".repeat(320),
     });
 
-    let preview = turn::tools::trace_preview_value(&value, 1_000);
+    let preview = turn::tool_output::trace_preview_value(&value, 1_000);
 
     assert!(preview.contains("echo ok"));
     assert!(preview.contains("<redacted>"));

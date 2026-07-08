@@ -219,7 +219,8 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
 
 impl MaiAgentControlBackend {
     async fn ensure_tool_visible(&self, tool: &'static str) -> pl_core::Result<()> {
-        let visible = super::tools::visible_tool_names(&self.runtime.state, &self.agent, &[]).await;
+        let visible =
+            super::tool_visibility::visible_tool_names(&self.runtime.state, &self.agent, &[]).await;
         if visible.contains(tool) {
             return Ok(());
         }
@@ -235,7 +236,9 @@ impl MaiAgentControlBackend {
         target: &str,
     ) -> pl_core::Result<AgentId> {
         let target = parse_agent_id(tool, target)?;
-        if super::tools::agent_can_access_target(&self.runtime.state, &self.agent, target).await {
+        if super::tool_visibility::agent_can_access_target(&self.runtime.state, &self.agent, target)
+            .await
+        {
             return Ok(target);
         }
         Err(pl_core::PureError::ToolExecutionFailed {

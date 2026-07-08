@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::projects::service;
 use crate::state::{AgentRecord, RuntimeState};
-use crate::turn::tools::ToolExecution;
+use crate::turn::tool_output::ToolExecution;
 use crate::{Result, RuntimeError};
 
 pub(crate) const PROJECT_WORKSPACE_PATH: &str = "/workspace/repo";

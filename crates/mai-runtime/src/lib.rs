@@ -66,7 +66,7 @@ use projects::skills::ProjectSkillSourceDir;
 use projects::workspace::ProjectWorkspaceManager;
 use state::{AgentRecord, AgentSessionRecord, ProjectRecord, RuntimeState, TaskRecord};
 #[cfg(test)]
-use turn::tools::ToolExecution;
+use turn::tool_output::ToolExecution;
 
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 90;
 const PROJECT_REVIEW_RUN_LIST_LIMIT: usize = 50;
@@ -1463,7 +1463,7 @@ impl AgentRuntime {
         artifact_id: &str,
         name: &str,
     ) -> PathBuf {
-        turn::tools::tool_output_artifact_file_path(
+        turn::tool_output::tool_output_artifact_file_path(
             &self.artifact_files_root,
             agent_id,
             call_id,

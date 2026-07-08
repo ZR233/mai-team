@@ -312,7 +312,7 @@ pub(crate) async fn run_turn_inner(
 
     let reserved_tool_names = {
         let mcp_tools = ops.agent_mcp_tools(&agent).await;
-        super::tools::visible_tool_names(state, &agent, &mcp_tools)
+        super::tool_visibility::visible_tool_names(state, &agent, &mcp_tools)
             .await
             .into_iter()
             .collect::<BTreeSet<_>>()
@@ -362,7 +362,8 @@ pub(crate) async fn run_turn_inner(
     let model_context = {
         let context_started = Instant::now();
         let mcp_tools = ops.agent_mcp_tools(&agent).await;
-        let visible_tools = super::tools::visible_tool_names(state, &agent, &mcp_tools).await;
+        let visible_tools =
+            super::tool_visibility::visible_tool_names(state, &agent, &mcp_tools).await;
         let product_tools =
             build_tool_definitions_with_filter(&mcp_tools, |name| visible_tools.contains(name));
         let tools =
