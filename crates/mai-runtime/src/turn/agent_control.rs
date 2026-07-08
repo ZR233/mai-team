@@ -96,6 +96,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
         request: AgentControlSpawnRequest,
     ) -> std::result::Result<AgentControlSpawnOutput, Self::Error> {
         let agent_type = request.agent_type_policy();
+        let initial_message = request.initial_message();
         let role = agents::agent_type_role(agent_type.kind);
         let result = agents::spawn_child_agent(
             &self.runtime,
@@ -108,7 +109,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
                 use_role_model: agent_type.role_profile_requested,
                 forked_history: request.forked_messages,
                 collab_input: CollabInput {
-                    message: non_empty_message(request.message),
+                    message: initial_message,
                     skill_mentions: request.skill_mentions,
                 },
             },
@@ -316,11 +317,6 @@ impl MaiAgentControlBackend {
     }
 }
 
-fn non_empty_message(message: String) -> Option<String> {
-    let trimmed = message.trim();
-    (!trimmed.is_empty()).then(|| message)
-}
-
 fn parse_agent_id(value: &str) -> crate::Result<AgentId> {
     Uuid::parse_str(value)
         .map_err(|error| RuntimeError::InvalidInput(format!("invalid agent id `{value}`: {error}")))
@@ -383,6 +379,10 @@ mod tests {
             source.contains("request.agent_type_policy()"),
             "spawn_agent 的 agentType 解析和 profile 策略应由 pl-core 请求类型提供"
         );
+        assert!(
+            source.contains("request.initial_message()"),
+            "spawn_agent 的初始消息空白归一化应由 pl-core 请求类型提供"
+        );
         for forbidden in [
             format!("{}{}", "trigger_turn || ", "interrupt"),
             format!("{}{}", "fn wait", "_timeout"),
@@ -390,6 +390,7 @@ mod tests {
             format!("{}{}", "timeout_ms", ".and_then"),
             format!("{}{}", ".max", "(100)"),
             format!("{}{}", "fn role_profile", "_requested"),
+            format!("{}{}", "fn non_empty", "_message"),
             format!(
                 "{}{}",
                 "\"planner\" | \"explorer\"", " | \"executor\" | \"reviewer\""
