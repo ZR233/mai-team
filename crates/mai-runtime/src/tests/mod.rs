@@ -291,12 +291,19 @@ fn kernel_tools_do_not_rebuild_shared_tools_as_mai_definitions() {
         "shared_tool_schemas",
         "shared_tool_definitions",
         "definition_from_schema",
+        "output_artifacts_from_values",
+        "serde_json::from_value",
     ] {
         assert!(
             !source.contains(forbidden),
             "pl-core shared tools 不应在 mai-runtime 里重建为 mai 旧工具定义类型: {forbidden}"
         );
     }
+
+    assert!(
+        source.contains("output_artifacts_as::<ToolOutputArtifactInfo>"),
+        "tool lifecycle artifact 解码应复用 pl-core 投影 API"
+    );
 }
 
 #[test]

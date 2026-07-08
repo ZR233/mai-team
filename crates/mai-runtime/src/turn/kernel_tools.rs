@@ -4,7 +4,7 @@ use mai_protocol::{
 };
 use pl_core::{ToolLifecyclePhase, ToolLifecycleProjection};
 use pl_trace::TraceEvent;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::AgentRuntime;
 use crate::turn::persistence::AgentLogRecord;
@@ -110,7 +110,7 @@ async fn project_tool_completed(
             .completed_at_unix
             .unwrap_or(projection.started_at_unix),
     );
-    let output_artifacts = output_artifacts_from_values(&projection.output_artifacts);
+    let output_artifacts = projection.output_artifacts_as::<ToolOutputArtifactInfo>();
     super::persistence::record_tool_trace_completed(
         runtime.deps.store.as_ref(),
         ToolTraceDetail {
@@ -164,13 +164,6 @@ async fn project_tool_completed(
             duration_ms: projection.duration_ms,
         })
         .await;
-}
-
-fn output_artifacts_from_values(values: &[Value]) -> Vec<ToolOutputArtifactInfo> {
-    values
-        .iter()
-        .filter_map(|value| serde_json::from_value(value.clone()).ok())
-        .collect()
 }
 
 fn trace_time(seconds: i64) -> DateTime<Utc> {
