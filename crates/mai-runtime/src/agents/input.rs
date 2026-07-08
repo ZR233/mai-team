@@ -53,7 +53,7 @@ pub(crate) async fn send_input_to_agent(
                 request.message,
                 request.skill_mentions,
             );
-            Ok(json!({ "turn_id": turn_id, "queued": false }))
+            Ok(json!({ "turnId": turn_id, "queued": false }))
         }
         Err(RuntimeError::AgentBusy(_)) if !request.interrupt => {
             Ok(queue_agent_input(&agent, request).await)

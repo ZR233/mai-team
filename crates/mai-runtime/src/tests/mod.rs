@@ -4907,6 +4907,8 @@ async fn send_input_interrupt_starts_replacement_without_losing_message() {
         .await
         .expect("interrupt");
     assert_eq!(output["queued"].as_bool(), Some(false));
+    assert!(output.get("turn_id").is_none());
+    assert!(output["turnId"].as_str().is_some());
     wait_until(
         || {
             let runtime = Arc::clone(&runtime);

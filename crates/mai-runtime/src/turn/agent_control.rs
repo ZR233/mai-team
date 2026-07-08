@@ -156,8 +156,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let turn_id = output
-            .get("turn_id")
-            .or_else(|| output.get("turnId"))
+            .get("turnId")
             .and_then(Value::as_str)
             .map(str::to_string);
         let status = self
