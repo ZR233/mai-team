@@ -44,6 +44,15 @@ pub(crate) struct SharedToolKernelBuildContext {
     pub(crate) cancellation_token: CancellationToken,
 }
 
+pub(crate) struct MaiAgentKernelBuildContext {
+    pub(crate) runtime: Arc<AgentRuntime>,
+    pub(crate) agent: Arc<AgentRecord>,
+    pub(crate) agent_id: AgentId,
+    pub(crate) visible_tool_names: HashSet<String>,
+    pub(crate) product_tool_schemas: Vec<ToolSchema>,
+    pub(crate) cancellation_token: CancellationToken,
+}
+
 pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
     let provider = ModelClient::provider_for_selection(&ctx.provider_selection)?;
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -68,23 +77,15 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
     if let Some(effort) = ctx.reasoning_effort.as_deref() {
         builder = builder.with_reasoning_effort(ReasoningEffort::new(effort));
     }
-    let product_tool_registry = super::product_tools::MaiProductToolRegistry::new(
-        ctx.runtime.clone(),
-        ctx.agent.clone(),
-        ctx.agent_id,
-        ctx.product_tools.clone(),
-        ctx.cancellation_token.clone(),
-    );
-    let product_tools = product_tool_registry.registered_tools()?;
-    let kernel = build_kernel_with_native_shared_tools(
+    let kernel = build_mai_agent_kernel(
         builder,
         runtime_profile,
-        product_tools,
-        SharedToolKernelBuildContext {
+        MaiAgentKernelBuildContext {
             runtime: ctx.runtime.clone(),
             agent: ctx.agent.clone(),
             agent_id: ctx.agent_id,
             visible_tool_names: ctx.visible_tool_names.clone(),
+            product_tool_schemas: ctx.product_tools.clone(),
             cancellation_token: ctx.cancellation_token.clone(),
         },
     )
@@ -347,6 +348,34 @@ pub(crate) async fn build_kernel_with_native_shared_tools(
         kernel_builder.with_tool_set(tool_set).build().await
     };
     Ok(kernel)
+}
+
+pub(crate) async fn build_mai_agent_kernel(
+    builder: PureCoreBuilder,
+    runtime_profile: CoreAgentProfile,
+    ctx: MaiAgentKernelBuildContext,
+) -> Result<AgentKernel> {
+    let product_tool_registry = super::product_tools::MaiProductToolRegistry::new(
+        ctx.runtime.clone(),
+        ctx.agent.clone(),
+        ctx.agent_id,
+        ctx.product_tool_schemas,
+        ctx.cancellation_token.clone(),
+    );
+    let product_tools = product_tool_registry.registered_tools()?;
+    build_kernel_with_native_shared_tools(
+        builder,
+        runtime_profile,
+        product_tools,
+        SharedToolKernelBuildContext {
+            runtime: ctx.runtime,
+            agent: ctx.agent,
+            agent_id: ctx.agent_id,
+            visible_tool_names: ctx.visible_tool_names,
+            cancellation_token: ctx.cancellation_token,
+        },
+    )
+    .await
 }
 
 pub(crate) async fn project_agent_events(

@@ -28,8 +28,8 @@ fn test_tool_helper_uses_pl_core_kernel_registry() {
     let helper = &source[helper_start..helper_start + helper_end];
 
     assert!(
-        helper.contains("turn::core_adapter::build_kernel_with_native_shared_tools"),
-        "测试工具执行路径必须复用主 turn 的共享工具 kernel 构造 helper"
+        helper.contains("turn::core_adapter::build_mai_agent_kernel"),
+        "测试工具执行路径必须复用主 turn 的 mai agent kernel 组装入口"
     );
     assert!(
         helper.contains(".execute_tool("),
@@ -43,6 +43,8 @@ fn test_tool_helper_uses_pl_core_kernel_registry() {
         format!("{}{}", "Tool", "Context {"),
         format!("{}{}", "Tool", "Input {"),
         format!("{}{}", ".register", "(kernel.core_mut"),
+        "MaiProductToolRegistry::new".to_string(),
+        ".registered_tools()".to_string(),
         "AgentKernel::builder".to_string(),
         "ToolSetBuilder::from_capabilities".to_string(),
         ".with_tool_set(".to_string(),
@@ -57,9 +59,16 @@ fn test_tool_helper_uses_pl_core_kernel_registry() {
 #[test]
 fn core_turn_registers_shared_tools_through_kernel_builder() {
     let source = include_str!("../turn/core_adapter.rs");
+    let run_start = source
+        .find("pub(crate) async fn run_pure_core_turn")
+        .unwrap();
+    let run_end = source[run_start..]
+        .find("fn mai_status_from_pl_outcome")
+        .unwrap();
+    let run_path = &source[run_start..run_start + run_end];
     assert!(
-        source.contains("build_kernel_with_native_shared_tools"),
-        "主 turn 路径应通过单一 helper 构造带共享工具集的 AgentKernel"
+        run_path.contains("build_mai_agent_kernel"),
+        "主 turn 路径应通过 mai 自定义 agent kernel 组装入口创建 AgentKernel"
     );
     assert!(
         source.contains(".with_tool_set("),
@@ -67,10 +76,12 @@ fn core_turn_registers_shared_tools_through_kernel_builder() {
     );
     for forbidden in [
         "register_native_shared_tools".to_string(),
+        "MaiProductToolRegistry::new".to_string(),
+        ".registered_tools()".to_string(),
         format!("{}{}", ".register", "(kernel.core_mut"),
     ] {
         assert!(
-            !source.contains(&forbidden),
+            !run_path.contains(&forbidden),
             "主 turn 路径不应保留二阶段共享工具注册 `{forbidden}`"
         );
     }

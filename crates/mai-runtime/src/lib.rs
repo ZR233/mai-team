@@ -1630,23 +1630,15 @@ impl AgentRuntime {
         let (event_tx, mut event_rx) = broadcast::channel(8);
         let cancellation_token = CancellationToken::new();
         let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let product_registry = turn::product_tools::MaiProductToolRegistry::new(
-            self.clone(),
-            agent.clone(),
-            agent_id,
-            product_tools,
-            cancellation_token.clone(),
-        );
-        let product_tools = product_registry.registered_tools()?;
-        let kernel = turn::core_adapter::build_kernel_with_native_shared_tools(
+        let kernel = turn::core_adapter::build_mai_agent_kernel(
             pl_core::PureCoreBuilder::from_provider_info(pl_model::ProviderInfo::deepseek(None))?,
             pl_core::CoreAgentProfile::host_provided(workspace_root.clone()),
-            product_tools,
-            turn::core_adapter::SharedToolKernelBuildContext {
+            turn::core_adapter::MaiAgentKernelBuildContext {
                 runtime: self.clone(),
                 agent: agent.clone(),
                 agent_id,
                 visible_tool_names: HashSet::from([name.to_string()]),
+                product_tool_schemas: product_tools,
                 cancellation_token: cancellation_token.clone(),
             },
         )
