@@ -1768,7 +1768,7 @@ impl AgentRuntime {
         agent_ids: Vec<AgentId>,
         timeout: Duration,
         cancellation_token: &CancellationToken,
-    ) -> Result<Value> {
+    ) -> Result<pl_core::AgentControlWaitOutput> {
         let deadline = Instant::now() + timeout;
         loop {
             if cancellation_token.is_cancelled() {
@@ -1794,11 +1794,14 @@ impl AgentRuntime {
                 for agent_id in pending {
                     pending_outputs.push(self.agent_wait_snapshot(agent_id).await?);
                 }
-                return Ok(json!({
+                let timed_out = !pending_outputs.is_empty();
+                let message = json!({
                     "completed": completed_outputs,
                     "pending": pending_outputs,
-                    "timedOut": !pending_outputs.is_empty(),
-                }));
+                    "timedOut": timed_out,
+                });
+                return Ok(pl_core::AgentWaitOutcome { timed_out }
+                    .into_wait_agent_output(message.to_string()));
             }
             tokio::select! {
                 _ = sleep(Duration::from_millis(250)) => {},

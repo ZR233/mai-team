@@ -9,7 +9,6 @@ use pl_core::{
     AgentControlWaitOutput, AgentControlWaitRequest,
 };
 use pl_protocol::AgentStatus as PlAgentStatus;
-use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -179,14 +178,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
                 &self.cancellation_token,
             )
             .await?;
-        let timed_out = output
-            .get("timedOut")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        Ok(AgentControlWaitOutput {
-            message: output.to_string(),
-            timed_out,
-        })
+        Ok(output)
     }
 
     async fn list_agents(
@@ -377,6 +369,10 @@ mod tests {
             source.contains("into_send_input_output"),
             "send_input 的 queued/turnId 输出投影应由 pl-core typed submission 提供"
         );
+        assert!(
+            source.contains("into_wait_agent_output"),
+            "wait_agent 的 timedOut 输出投影应由 pl-core AgentWaitOutcome 提供"
+        );
         for forbidden in [
             format!("{}{}", "trigger_turn || ", "interrupt"),
             format!("{}{}", "fn wait", "_timeout"),
@@ -387,6 +383,7 @@ mod tests {
             format!("{}{}", "fn non_empty", "_message"),
             format!("{}{}", ".get(\"queued\"", ")"),
             format!("{}{}", ".get(\"turnId\"", ")"),
+            format!("{}{}", ".get(\"timedOut\"", ")"),
             format!(
                 "{}{}",
                 "\"planner\" | \"explorer\"", " | \"executor\" | \"reviewer\""
