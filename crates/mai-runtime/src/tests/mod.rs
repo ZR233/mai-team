@@ -452,10 +452,12 @@ fn project_mcp_cancellation_uses_pl_core_checkpoint() {
     let end = runtime_source[start..].find("#[async_trait]").unwrap();
     let inject_body = &runtime_source[start..start + end];
     let facade_source = include_str!("../facade/project_mcp.rs");
+    let manager_source = include_str!("../projects/mcp.rs");
 
     for (name, source) in [
         ("inject_project_mcp_tools", inject_body),
         ("ensure_project_mcp_manager", facade_source),
+        ("ensure_project_mcp_inner_manager", manager_source),
     ] {
         assert!(
             source.contains("ensure_turn_not_cancelled"),

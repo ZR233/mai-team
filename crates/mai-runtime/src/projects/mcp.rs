@@ -6,6 +6,7 @@ use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient, project_
 use mai_mcp::{McpAgentManager, McpTool};
 use mai_protocol::McpServerConfig;
 use mai_protocol::ProjectId;
+use pl_core::ensure_turn_not_cancelled;
 use tokio_util::sync::CancellationToken;
 
 use crate::projects::service;
@@ -160,18 +161,17 @@ pub(crate) async fn ensure_manager(
     credential: ProjectMcpCredential,
     cancellation_token: &CancellationToken,
 ) -> Result<Arc<McpAgentManager>> {
-    if cancellation_token.is_cancelled() {
-        return Err(RuntimeError::TurnCancelled);
-    }
+    ensure_turn_not_cancelled(cancellation_token)
+        .map_err(crate::turn::core_adapter::runtime_error_from_pl_turn)?;
     if let Some(manager) = cached_manager(state, project_id).await {
         return Ok(manager);
     }
     let sidecar = ensure_sidecar(state, docker, sidecar_image, project_id).await?;
     let configs = project_mcp_configs(&credential.token);
     let manager = McpAgentManager::start(docker.clone(), sidecar.id, configs).await;
-    if cancellation_token.is_cancelled() {
+    if let Err(error) = ensure_turn_not_cancelled(cancellation_token) {
         manager.shutdown().await;
-        return Err(RuntimeError::TurnCancelled);
+        return Err(crate::turn::core_adapter::runtime_error_from_pl_turn(error));
     }
     let manager = Arc::new(manager);
     let previous = {
