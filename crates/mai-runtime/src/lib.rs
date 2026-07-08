@@ -25,7 +25,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast};
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::Duration;
+#[cfg(test)]
+use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -1752,45 +1754,57 @@ impl AgentRuntime {
         timeout: Duration,
         cancellation_token: &CancellationToken,
     ) -> Result<pl_core::AgentControlWaitOutput> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if cancellation_token.is_cancelled() {
-                return Err(RuntimeError::TurnCancelled);
-            }
-            let mut completed = Vec::new();
-            let mut pending = Vec::new();
-            for agent_id in &agent_ids {
-                let summary = self.agent(*agent_id).await?.summary.read().await.clone();
-                if agents::is_agent_wait_complete(&summary) {
-                    completed.push(*agent_id);
+        let result = pl_core::wait_for_agent_completion(
+            || async {
+                let mut completed = Vec::new();
+                let mut pending = Vec::new();
+                for agent_id in &agent_ids {
+                    let summary = self.agent(*agent_id).await?.summary.read().await.clone();
+                    if agents::is_agent_wait_complete(&summary) {
+                        completed.push(*agent_id);
+                    } else {
+                        pending.push(*agent_id);
+                    }
+                }
+                let wait_snapshot = if !completed.is_empty() || pending.is_empty() {
+                    pl_core::AgentWaitSnapshot {
+                        turn_presence: pl_core::AgentTurnPresence::NoActiveTurn,
+                        status: pl_core::AgentLifecycleStatusKind::Completed,
+                    }
                 } else {
-                    pending.push(*agent_id);
-                }
-            }
-            if !completed.is_empty() || pending.is_empty() || Instant::now() >= deadline {
-                let mut completed_outputs = Vec::new();
-                for agent_id in completed {
-                    completed_outputs.push(self.agent_wait_snapshot(agent_id).await?);
-                    self.cleanup_finished_explorer_agent(agent_id).await?;
-                }
-                let mut pending_outputs = Vec::new();
-                for agent_id in pending {
-                    pending_outputs.push(self.agent_wait_snapshot(agent_id).await?);
-                }
-                let timed_out = !pending_outputs.is_empty();
-                let message = json!({
-                    "completed": completed_outputs,
-                    "pending": pending_outputs,
-                    "timedOut": timed_out,
-                });
-                return Ok(pl_core::AgentWaitOutcome { timed_out }
-                    .into_wait_agent_output(message.to_string()));
-            }
-            tokio::select! {
-                _ = sleep(Duration::from_millis(250)) => {},
-                _ = cancellation_token.cancelled() => return Err(RuntimeError::TurnCancelled),
-            }
+                    pl_core::AgentWaitSnapshot {
+                        turn_presence: pl_core::AgentTurnPresence::ActiveTurn,
+                        status: pl_core::AgentLifecycleStatusKind::Active,
+                    }
+                };
+                Ok::<_, RuntimeError>((wait_snapshot, (completed, pending)))
+            },
+            pl_core::AgentWaitLoopOptions::new(timeout),
+            cancellation_token,
+        )
+        .await
+        .map_err(|error| match error {
+            pl_core::AgentWaitLoopError::Cancelled => RuntimeError::TurnCancelled,
+            pl_core::AgentWaitLoopError::Read(error) => error,
+        })?;
+
+        let (completed, pending) = result.value;
+        let mut completed_outputs = Vec::new();
+        for agent_id in completed {
+            completed_outputs.push(self.agent_wait_snapshot(agent_id).await?);
+            self.cleanup_finished_explorer_agent(agent_id).await?;
         }
+        let mut pending_outputs = Vec::new();
+        for agent_id in pending {
+            pending_outputs.push(self.agent_wait_snapshot(agent_id).await?);
+        }
+        let timed_out = !pending_outputs.is_empty();
+        let message = json!({
+            "completed": completed_outputs,
+            "pending": pending_outputs,
+            "timedOut": timed_out,
+        });
+        Ok(pl_core::AgentWaitOutcome { timed_out }.into_wait_agent_output(message.to_string()))
     }
 
     #[cfg(test)]

@@ -211,6 +211,12 @@ fn send_input_uses_pl_core_turn_mode_policy() {
 fn wait_completion_uses_pl_core_policy() {
     let agents_source = include_str!("../agents.rs");
     let wait_source = include_str!("../agents/wait.rs");
+    let lib_source = include_str!("../lib.rs");
+    let wait_agents_function = lib_source
+        .split("async fn wait_agents_output_with_cancel")
+        .nth(1)
+        .and_then(|text| text.split("#[cfg(test)]").next())
+        .expect("wait_agents_output_with_cancel function");
 
     assert!(
         agents_source.contains("AgentWaitSnapshot"),
@@ -227,6 +233,15 @@ fn wait_completion_uses_pl_core_policy() {
     assert!(
         !wait_source.contains("tokio::time::sleep"),
         "agents/wait.rs 不应保留本地 sleep 轮询"
+    );
+    assert!(
+        wait_agents_function.contains("pl_core::wait_for_agent_completion"),
+        "多 agent wait 工具也应复用 pl-core wait loop"
+    );
+    assert!(
+        !wait_agents_function.contains("Duration::from_millis(250)")
+            && !wait_agents_function.contains("tokio::select!"),
+        "多 agent wait 工具不应保留本地 sleep/select 轮询"
     );
     assert!(
         !agents_source.contains("summary.current_turn.is_none()\n        || matches!"),
