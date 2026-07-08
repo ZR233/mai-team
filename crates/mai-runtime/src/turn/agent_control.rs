@@ -104,12 +104,31 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
             .accessible_target(pl_core::TOOL_SEND_INPUT, &request.target)
             .await?;
         let interrupt = request.interrupt;
-        let _trigger_turn = request.trigger_turn;
-        let _output = self
-            .runtime
-            .send_input_to_agent(target, None, request.message, Vec::new(), interrupt)
-            .await
-            .map_err(tool_error(pl_core::TOOL_SEND_INPUT))?;
+        let trigger_turn = request.trigger_turn || interrupt;
+        let output = agents::send_input_to_agent(
+            self.runtime.as_ref(),
+            &self.runtime,
+            agents::SendInputRequest {
+                target,
+                session_id: None,
+                message: request.message,
+                skill_mentions: request.skill_mentions,
+                trigger_turn,
+                interrupt,
+                cancel_grace: crate::TURN_CANCEL_GRACE,
+            },
+        )
+        .await
+        .map_err(tool_error(pl_core::TOOL_SEND_INPUT))?;
+        let queued = output
+            .get("queued")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let turn_id = output
+            .get("turn_id")
+            .or_else(|| output.get("turnId"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let status = self
             .runtime
             .agent(target)
@@ -124,6 +143,8 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
             target: target.to_string(),
             status: pl_agent_status(&status),
             interrupt,
+            queued,
+            turn_id,
         })
     }
 

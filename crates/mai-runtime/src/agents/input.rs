@@ -4,7 +4,7 @@ use mai_protocol::{AgentId, AgentStatus, SessionId, TurnId};
 use serde_json::{Value, json};
 
 use super::{AgentInputOps, AgentServiceOps, prepare_turn, wait_agent};
-use crate::state::QueuedAgentInput;
+use crate::state::{AgentRecord, QueuedAgentInput};
 use crate::{Result, RuntimeError};
 
 pub(crate) struct SendInputRequest {
@@ -12,6 +12,7 @@ pub(crate) struct SendInputRequest {
     pub(crate) session_id: Option<SessionId>,
     pub(crate) message: String,
     pub(crate) skill_mentions: Vec<String>,
+    pub(crate) trigger_turn: bool,
     pub(crate) interrupt: bool,
     pub(crate) cancel_grace: Duration,
 }
@@ -22,6 +23,9 @@ pub(crate) async fn send_input_to_agent(
     request: SendInputRequest,
 ) -> Result<Value> {
     let agent = service.agent(request.target).await?;
+    if !request.trigger_turn && !request.interrupt {
+        return Ok(queue_agent_input(&agent, request).await);
+    }
     if request.interrupt {
         let current_turn = agent.summary.read().await.current_turn;
         if let Some(turn_id) = current_turn {
@@ -52,19 +56,23 @@ pub(crate) async fn send_input_to_agent(
             Ok(json!({ "turn_id": turn_id, "queued": false }))
         }
         Err(RuntimeError::AgentBusy(_)) if !request.interrupt => {
-            agent
-                .pending_inputs
-                .lock()
-                .await
-                .push_back(QueuedAgentInput {
-                    session_id: request.session_id,
-                    message: request.message,
-                    skill_mentions: request.skill_mentions,
-                });
-            Ok(json!({ "queued": true }))
+            Ok(queue_agent_input(&agent, request).await)
         }
         Err(err) => Err(err),
     }
+}
+
+async fn queue_agent_input(agent: &AgentRecord, request: SendInputRequest) -> Value {
+    agent
+        .pending_inputs
+        .lock()
+        .await
+        .push_back(QueuedAgentInput {
+            session_id: request.session_id,
+            message: request.message,
+            skill_mentions: request.skill_mentions,
+        });
+    json!({ "queued": true })
 }
 
 pub(crate) async fn start_next_queued_input(

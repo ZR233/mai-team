@@ -1900,6 +1900,7 @@ impl AgentRuntime {
         }
     }
 
+    #[cfg(test)]
     async fn send_input_to_agent(
         self: &Arc<Self>,
         target: AgentId,
@@ -1916,6 +1917,7 @@ impl AgentRuntime {
                 session_id,
                 message,
                 skill_mentions,
+                trigger_turn: true,
                 interrupt,
                 cancel_grace: TURN_CANCEL_GRACE,
             },

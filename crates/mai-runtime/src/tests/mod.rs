@@ -7296,6 +7296,15 @@ async fn wait_agent_accepts_targets_and_send_input_queues_busy_target() {
         .await
         .expect("send input");
     assert!(queued.success);
+    let queued_output: Value = serde_json::from_str(&queued.output).expect("send input output");
+    assert_eq!(
+        queued_output["target"].as_str(),
+        Some(child_id.to_string().as_str())
+    );
+    assert_eq!(queued_output["status"].as_str(), Some("running"));
+    assert_eq!(queued_output["interrupt"].as_bool(), Some(false));
+    assert_eq!(queued_output["queued"].as_bool(), Some(true));
+    assert!(queued_output["turnId"].is_null());
     assert_eq!(child_record.pending_inputs.lock().await.len(), 1);
 
     let waited = runtime
@@ -7326,6 +7335,75 @@ async fn wait_agent_accepts_targets_and_send_input_queues_busy_target() {
     assert!(pending[0]["diagnostics"]["idle_ms"].as_u64().is_some());
     assert_eq!(outer["timedOut"].as_bool(), Some(true));
     assert_eq!(value["timed_out"].as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn send_input_without_trigger_turn_queues_idle_target() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let child_session_id = Uuid::new_v4();
+    let timestamp = now();
+    store
+        .save_agent(&test_agent_summary_at(parent_id, None, timestamp), None)
+        .await
+        .expect("save parent");
+    save_test_session(&store, parent_id, Uuid::new_v4()).await;
+    let mut child = test_agent_summary_at(child_id, Some(parent_id), timestamp);
+    child.status = AgentStatus::Idle;
+    child.current_turn = None;
+    store.save_agent(&child, None).await.expect("save child");
+    store
+        .save_agent_session(
+            child_id,
+            &AgentSessionSummary {
+                id: child_session_id,
+                title: "Task".to_string(),
+                created_at: timestamp,
+                updated_at: timestamp,
+                message_count: 0,
+                token_usage: TokenUsage::default(),
+            },
+        )
+        .await
+        .expect("save child session");
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let child_record = runtime.agent(child_id).await.expect("child");
+
+    let queued = runtime
+        .execute_tool_for_test(
+            parent_id,
+            "send_input",
+            json!({
+                "target": child_id.to_string(),
+                "message": "queued while idle"
+            }),
+        )
+        .await
+        .expect("send input");
+
+    assert!(queued.success);
+    let queued_output: Value = serde_json::from_str(&queued.output).expect("send input output");
+    assert_eq!(
+        queued_output["target"].as_str(),
+        Some(child_id.to_string().as_str())
+    );
+    assert_eq!(queued_output["status"].as_str(), Some("queued"));
+    assert_eq!(queued_output["interrupt"].as_bool(), Some(false));
+    assert_eq!(queued_output["queued"].as_bool(), Some(true));
+    assert!(queued_output["turnId"].is_null());
+    assert_eq!(child_record.pending_inputs.lock().await.len(), 1);
+    let summary = child_record.summary.read().await;
+    assert_eq!(summary.current_turn, None);
+    assert_eq!(summary.status, AgentStatus::Idle);
 }
 
 #[tokio::test]
