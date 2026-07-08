@@ -279,6 +279,14 @@ fn wait_completion_uses_pl_core_policy() {
         "多 agent wait 的 completed/pending/timedOut 输出形状应由 pl-core helper 统一生成"
     );
     assert!(
+        wait_agents_function.contains("pl_core::AgentWaitOutcome::new"),
+        "多 agent wait outcome 的共享字段形状应由 pl-core constructor 承载"
+    );
+    assert!(
+        !wait_agents_function.contains("pl_core::AgentWaitOutcome {"),
+        "mai-runtime 不应手写 AgentWaitOutcome 字段"
+    );
+    assert!(
         !wait_agents_function.contains("Duration::from_millis(250)")
             && !wait_agents_function.contains("tokio::select!"),
         "多 agent wait 工具不应保留本地 sleep/select 轮询"
