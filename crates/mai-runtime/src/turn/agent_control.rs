@@ -113,13 +113,13 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
             },
         )
         .await?;
-        Ok(AgentControlSpawnOutput {
-            agent_id: result.agent.id.to_string(),
-            task_name: result.agent.name,
-            path: result.agent.id.to_string(),
-            status: agent_control_status_kind(&result.agent.status).to_agent_status(),
-            turn_id: result.turn_id.map(|turn_id| turn_id.to_string()),
-        })
+        Ok(AgentControlSpawnOutput::new(
+            result.agent.id.to_string(),
+            result.agent.name,
+            result.agent.id.to_string(),
+            agent_control_status_kind(&result.agent.status).to_agent_status(),
+            result.turn_id.map(|turn_id| turn_id.to_string()),
+        ))
     }
 
     async fn send_input(
@@ -173,10 +173,10 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
             .map(|target| parse_agent_id(&target))
             .collect::<crate::Result<Vec<_>>>()?;
         if targets.is_empty() {
-            return Ok(AgentControlWaitOutput {
-                message: "no managed sub-agents to wait for".to_string(),
-                timed_out: false,
-            });
+            return Ok(AgentControlWaitOutput::message(
+                "no managed sub-agents to wait for",
+                false,
+            ));
         }
         let output = self
             .runtime
@@ -350,6 +350,10 @@ mod tests {
     #[test]
     fn agent_control_backend_reuses_pl_core_request_policies() {
         let source = include_str!("agent_control.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
 
         assert!(
             source.contains("request.turn_mode()"),
@@ -376,8 +380,13 @@ mod tests {
             "send_input 的 queued/turnId 输出投影应由 pl-core typed submission 提供"
         );
         assert!(
-            source.contains("into_wait_agent_output"),
+            production.contains("AgentControlWaitOutput::message")
+                || production.contains("into_wait_agent_output"),
             "wait_agent 的 timedOut 输出投影应由 pl-core AgentWaitOutcome 提供"
+        );
+        assert!(
+            production.contains("AgentControlSpawnOutput::new"),
+            "spawn_agent 的模型可见输出形状应由 pl-core output constructor 统一生成"
         );
         assert!(
             source.contains("request.into_list_output"),
@@ -412,9 +421,11 @@ mod tests {
                 "{}{}",
                 "\"planner\" | \"explorer\"", " | \"executor\" | \"reviewer\""
             ),
+            format!("{}{}", "AgentControlSpawnOutput", " {"),
+            format!("{}{}", "AgentControlWaitOutput", " {"),
         ] {
             assert!(
-                !source.contains(&forbidden),
+                !production.contains(&forbidden),
                 "agent-control adapter 不应手写共享请求策略 `{forbidden}`"
             );
         }
