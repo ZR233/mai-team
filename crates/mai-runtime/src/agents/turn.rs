@@ -162,11 +162,7 @@ pub(crate) fn spawn_turn(
             task_token,
         )
     });
-    let control = TurnControl {
-        turn_id,
-        session_id,
-        task_handle,
-    };
+    let control = TurnControl::new(turn_id, session_id, task_handle);
     *agent.active_turn.lock().expect("active turn lock") = Some(control);
 }
 
@@ -196,9 +192,7 @@ pub(crate) async fn cancel_agent_turn(
     }
     agent.cancel_requested.store(true, Ordering::SeqCst);
     if let Some(control) = control.filter(|turn| turn.turn_id == turn_id) {
-        control
-            .task_handle
-            .cancel_and_abort_after(ops.turn_cancel_grace());
+        control.cancel_task_and_abort_after(ops.turn_cancel_grace());
     }
     let completed = ops
         .complete_turn_if_current(

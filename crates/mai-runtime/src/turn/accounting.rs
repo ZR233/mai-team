@@ -138,11 +138,11 @@ mod tests {
             system_prompt: None,
             turn_lock: Mutex::new(()),
             cancel_requested: AtomicBool::new(false),
-            active_turn: StdMutex::new(Some(TurnControl {
+            active_turn: StdMutex::new(Some(TurnControl::new(
                 turn_id,
-                session_id: second_session_id,
-                task_handle: TurnTaskHandle::from_external_token(CancellationToken::new()),
-            })),
+                second_session_id,
+                TurnTaskHandle::from_external_token(CancellationToken::new()),
+            ))),
             pending_inputs: Mutex::new(VecDeque::new()),
         });
         store.save_agent(&summary, None).await.expect("save agent");

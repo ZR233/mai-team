@@ -8,7 +8,7 @@ use mai_protocol::{
     AgentId, AgentMessage, AgentSessionSummary, AgentSummary, ArtifactInfo, PlanHistoryEntry,
     ProjectId, ProjectSummary, SessionId, TaskId, TaskPlan, TaskReview, TaskSummary, TurnId,
 };
-use pl_core::TurnTaskHandle;
+use pl_core::ActiveTurnControl;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -94,12 +94,7 @@ pub(crate) struct AgentRecord {
     pub(crate) pending_inputs: Mutex<VecDeque<QueuedAgentInput>>,
 }
 
-#[derive(Clone)]
-pub(crate) struct TurnControl {
-    pub(crate) turn_id: TurnId,
-    pub(crate) session_id: SessionId,
-    pub(crate) task_handle: TurnTaskHandle,
-}
+pub(crate) type TurnControl = ActiveTurnControl<TurnId, SessionId>;
 
 #[derive(Clone)]
 pub(crate) struct TurnGuard {
