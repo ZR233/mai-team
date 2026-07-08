@@ -12,7 +12,7 @@ use pl_core::{
 use pl_model::{
     MaxTokensField, ModelCapabilities, ModelInfo, ModelModality, ModelParameter,
     ModelRequestProfile, ParameterWire, ProviderInfo, ReasoningConfig, ReasoningSummary,
-    SharedModelProvider, ToolCapabilities, ToolSchema, WireAssignment, create_provider_with_models,
+    SharedModelProvider, ToolCapabilities, ToolSchema, create_provider_with_models,
 };
 use pl_protocol::PureError;
 use serde_json::{Map, Value};
@@ -188,7 +188,7 @@ fn reasoning_parameters(model: &ModelConfig) -> Vec<ModelParameter> {
         wire.insert(
             variant.id.clone(),
             ParameterWire {
-                set: wire_assignments(&variant.request),
+                set: pl_model::wire_assignments_from_value(&variant.request),
                 remove: Vec::new(),
             },
         );
@@ -204,38 +204,6 @@ fn reasoning_parameters(model: &ModelConfig) -> Vec<ModelParameter> {
             .collect(),
         wire,
     }]
-}
-
-fn wire_assignments(request: &Value) -> Vec<WireAssignment> {
-    let mut assignments = Vec::new();
-    collect_wire_assignments(None, request, &mut assignments);
-    assignments
-}
-
-fn collect_wire_assignments(
-    prefix: Option<&str>,
-    value: &Value,
-    assignments: &mut Vec<WireAssignment>,
-) {
-    match value {
-        Value::Object(object) => {
-            for (key, value) in object {
-                let path = prefix
-                    .map(|prefix| format!("{prefix}.{key}"))
-                    .unwrap_or_else(|| key.clone());
-                collect_wire_assignments(Some(&path), value, assignments);
-            }
-        }
-        Value::Null => {}
-        Value::Array(_) | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-            if let Some(path) = prefix {
-                assignments.push(WireAssignment {
-                    path: path.to_string(),
-                    value: value.clone(),
-                });
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -265,6 +233,31 @@ mod tests {
             assert!(
                 !production.contains(forbidden),
                 "mai-runtime 不应本地维护 continuation 策略 `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_variant_wire_assignments_use_pl_model_flattener() {
+        let source = include_str!("model_profile.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+
+        assert!(
+            production.contains("pl_model::wire_assignments_from_value"),
+            "reasoning variant request JSON 到 WireAssignment 的拍平语义应由 pl-model 统一提供"
+        );
+        for forbidden in [
+            "fn wire_assignments(",
+            "fn collect_wire_assignments(",
+            "Value::Object(object)",
+            "Value::Null => {}",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "mai-runtime 不应复制 pl-model wire assignment 拍平逻辑 `{forbidden}`"
             );
         }
     }
