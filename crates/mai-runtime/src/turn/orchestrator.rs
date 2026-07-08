@@ -8,6 +8,7 @@ use mai_protocol::{
 };
 use mai_skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
 use mai_tools::build_tool_schemas_with_filter;
+use pl_core::HostMcpToolSpec;
 use pl_protocol::MessageContent;
 use serde_json::json;
 use tokio::time::Instant;
@@ -117,6 +118,7 @@ struct TurnModelContext {
     visible_tool_names: HashSet<String>,
     tool_count: usize,
     product_tools: Vec<pl_model::ToolSchema>,
+    mcp_tool_schemas: Vec<pl_model::ToolSchema>,
     instructions: String,
 }
 
@@ -334,8 +336,13 @@ pub(crate) async fn run_turn_inner(
         let mcp_tools = ops.agent_mcp_tools(&agent).await;
         let visible_tools =
             super::tool_visibility::visible_tool_names(state, &agent, &mcp_tools).await;
-        let product_tools =
-            build_tool_schemas_with_filter(&mcp_tools, |name| visible_tools.contains(name));
+        let product_tools = build_tool_schemas_with_filter(|name| visible_tools.contains(name));
+        let mcp_tool_schemas = pl_core::host_mcp_tool_schemas(
+            mcp_tools
+                .iter()
+                .filter(|tool| visible_tools.contains(&tool.model_name))
+                .map(host_mcp_tool_spec),
+        );
         let tool_count = visible_tools.len();
         let instructions = {
             let _project_skill_guard = ops.project_skill_read_guard(&agent).await;
@@ -390,6 +397,7 @@ pub(crate) async fn run_turn_inner(
             visible_tool_names: visible_tools,
             tool_count,
             product_tools,
+            mcp_tool_schemas,
             instructions,
         }
     };
@@ -443,10 +451,21 @@ pub(crate) async fn run_turn_inner(
         instructions: model_context.instructions,
         visible_tool_names: model_context.visible_tool_names,
         product_tools: model_context.product_tools,
+        mcp_tool_schemas: model_context.mcp_tool_schemas,
         history,
         cancellation_token,
     })
     .await
+}
+
+fn host_mcp_tool_spec(tool: &mai_mcp::McpTool) -> HostMcpToolSpec {
+    HostMcpToolSpec {
+        model_name: tool.model_name.clone(),
+        server: tool.server.clone(),
+        name: tool.name.clone(),
+        description: tool.description.clone(),
+        input_schema: tool.input_schema.clone(),
+    }
 }
 
 fn message_with_skill_fragment(message: String, fragment: Option<pl_protocol::Message>) -> String {

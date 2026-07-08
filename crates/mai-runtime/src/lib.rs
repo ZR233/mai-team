@@ -1593,14 +1593,7 @@ impl AgentRuntime {
         arguments: Value,
     ) -> Result<ToolExecution> {
         let agent = self.agent(agent_id).await?;
-        let mut product_tools = build_tool_schemas_with_filter(&[], |tool| tool == name);
-        if product_tools.is_empty() && name.starts_with("mcp__") {
-            product_tools.push(ToolSchema::function(
-                name.to_string(),
-                format!("Call MCP tool `{name}`."),
-                json!({"type": "object"}),
-            ));
-        }
+        let product_tools = build_tool_schemas_with_filter(|tool| tool == name);
         let Some(execution) = self
             .execute_native_shared_tool_for_test(&agent, agent_id, name, arguments, product_tools)
             .await?
@@ -1635,6 +1628,7 @@ impl AgentRuntime {
                 agent_id,
                 visible_tool_names: HashSet::from([name.to_string()]),
                 product_tool_schemas: product_tools,
+                mcp_tool_schemas: Vec::new(),
                 cancellation_token: cancellation_token.clone(),
             },
         )

@@ -1,4 +1,3 @@
-use mai_mcp::McpTool;
 use pl_model::ToolSchema;
 
 mod definitions;
@@ -7,35 +6,15 @@ mod schema;
 
 pub use names::*;
 
-pub fn build_tool_schemas(mcp_tools: &[McpTool]) -> Vec<ToolSchema> {
-    build_tool_schemas_with_filter(mcp_tools, |_| true)
+pub fn build_tool_schemas() -> Vec<ToolSchema> {
+    build_tool_schemas_with_filter(|_| true)
 }
 
-pub fn build_tool_schemas_with_filter(
-    mcp_tools: &[McpTool],
-    allow_tool: impl Fn(&str) -> bool,
-) -> Vec<ToolSchema> {
-    let mut tools = definitions::builtin_tool_schemas()
+pub fn build_tool_schemas_with_filter(allow_tool: impl Fn(&str) -> bool) -> Vec<ToolSchema> {
+    definitions::builtin_tool_schemas()
         .into_iter()
         .filter(|tool| allow_tool(tool.name()))
-        .collect::<Vec<_>>();
-    tools.extend(
-        mcp_tools
-            .iter()
-            .filter(|tool| allow_tool(&tool.model_name))
-            .map(|tool| {
-                ToolSchema::function(
-                    tool.model_name.clone(),
-                    if tool.description.is_empty() {
-                        format!("Call MCP tool `{}` on server `{}`.", tool.name, tool.server)
-                    } else {
-                        tool.description.clone()
-                    },
-                    tool.input_schema.clone(),
-                )
-            }),
-    );
-    tools
+        .collect::<Vec<_>>()
 }
 
 #[cfg(test)]
@@ -48,6 +27,16 @@ mod tests {
         let api = include_str!("lib.rs");
         let names = include_str!("names.rs");
 
+        let mcp_tool_type = format!("{}{}", "Mcp", "Tool");
+        assert!(
+            !api.contains(&mcp_tool_type),
+            "mai-tools 只能暴露 mai-team 产品工具 schema，MCP schema 由 pl-core host MCP 工具包构造"
+        );
+        let mcp_visible_name = format!("{}{}", "model", "_name");
+        assert!(
+            !api.contains(&mcp_visible_name),
+            "mai-tools 不应再拼装 MCP model tool 名称"
+        );
         assert!(!api.contains(&format!("{}{}", "route", "_tool")));
         assert!(!api.contains(&format!("{}{}", "Routed", "Tool")));
         assert!(
@@ -85,7 +74,7 @@ mod tests {
 
     #[test]
     fn builtin_definitions_are_product_tools_only() {
-        let tools = build_tool_schemas(&[]);
+        let tools = build_tool_schemas();
         let names = tool_names(&tools);
 
         assert!(names.contains(&TOOL_GITHUB_API_REQUEST));
@@ -125,7 +114,7 @@ mod tests {
 
     #[test]
     fn github_request_schema_covers_read_write_without_credentials() {
-        let tools = build_tool_schemas(&[]);
+        let tools = build_tool_schemas();
         let request = tools
             .iter()
             .find(|tool| tool.name() == TOOL_GITHUB_API_REQUEST)
@@ -162,19 +151,9 @@ mod tests {
     }
 
     #[test]
-    fn filters_product_and_mcp_tools() {
-        let mcp = McpTool {
-            server: "s".to_string(),
-            name: "n".to_string(),
-            model_name: "mcp__s__n".to_string(),
-            description: String::new(),
-            input_schema: json!({"type":"object"}),
-            output_schema: None,
-        };
-        let tools = build_tool_schemas_with_filter(&[mcp], |name| {
-            name == TOOL_SAVE_ARTIFACT || name == "mcp__s__n"
-        });
-        assert_eq!(tool_names(&tools), vec![TOOL_SAVE_ARTIFACT, "mcp__s__n"]);
+    fn filters_product_tools() {
+        let tools = build_tool_schemas_with_filter(|name| name == TOOL_SAVE_ARTIFACT);
+        assert_eq!(tool_names(&tools), vec![TOOL_SAVE_ARTIFACT]);
     }
 
     fn tool_names(tools: &[ToolSchema]) -> Vec<&str> {

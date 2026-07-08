@@ -34,6 +34,7 @@ pub(crate) struct PureCoreTurnContext {
     pub(crate) instructions: String,
     pub(crate) visible_tool_names: HashSet<String>,
     pub(crate) product_tools: Vec<ToolSchema>,
+    pub(crate) mcp_tool_schemas: Vec<ToolSchema>,
     pub(crate) history: Vec<pl_protocol::Message>,
     pub(crate) cancellation_token: CancellationToken,
 }
@@ -53,6 +54,7 @@ pub(crate) struct MaiAgentKernelBuildContext {
     pub(crate) agent_id: AgentId,
     pub(crate) visible_tool_names: HashSet<String>,
     pub(crate) product_tool_schemas: Vec<ToolSchema>,
+    pub(crate) mcp_tool_schemas: Vec<ToolSchema>,
     pub(crate) cancellation_token: CancellationToken,
 }
 
@@ -89,6 +91,7 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
             agent_id: ctx.agent_id,
             visible_tool_names: ctx.visible_tool_names.clone(),
             product_tool_schemas: ctx.product_tools.clone(),
+            mcp_tool_schemas: ctx.mcp_tool_schemas.clone(),
             cancellation_token: ctx.cancellation_token.clone(),
         },
     )
@@ -365,15 +368,11 @@ pub(crate) async fn build_mai_agent_kernel(
     runtime_profile: CoreAgentProfile,
     ctx: MaiAgentKernelBuildContext,
 ) -> Result<AgentKernel> {
-    let (mcp_tool_schemas, product_tool_schemas): (Vec<_>, Vec<_>) = ctx
-        .product_tool_schemas
-        .into_iter()
-        .partition(|schema| schema.name().starts_with("mcp__"));
     let product_tool_registry = super::product_tools::MaiProductToolRegistry::new(
         ctx.runtime.clone(),
         ctx.agent.clone(),
         ctx.agent_id,
-        product_tool_schemas,
+        ctx.product_tool_schemas,
         ctx.cancellation_token.clone(),
     );
     let product_tools = product_tool_registry.registered_tools()?;
@@ -386,7 +385,7 @@ pub(crate) async fn build_mai_agent_kernel(
             agent: ctx.agent,
             agent_id: ctx.agent_id,
             visible_tool_names: ctx.visible_tool_names,
-            mcp_tool_schemas,
+            mcp_tool_schemas: ctx.mcp_tool_schemas,
             cancellation_token: ctx.cancellation_token,
         },
     )

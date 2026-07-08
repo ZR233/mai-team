@@ -20,7 +20,7 @@ mod turn_runtime;
 fn test_tool_helper_uses_pl_core_kernel_registry() {
     let source = include_str!("../lib.rs");
     let helper_start = source
-        .find("execute_native_shared_tool_for_test")
+        .find("execute_tool_for_test")
         .expect("test helper exists");
     let helper_end = source[helper_start..]
         .find("fn output_artifacts_from_json_for_test")
@@ -48,6 +48,9 @@ fn test_tool_helper_uses_pl_core_kernel_registry() {
         "AgentKernel::builder".to_string(),
         "ToolSetBuilder::from_capabilities".to_string(),
         ".with_tool_set(".to_string(),
+        "starts_with(\"mcp__\")".to_string(),
+        "Call MCP tool".to_string(),
+        "ToolSchema::function".to_string(),
     ] {
         assert!(
             !helper.contains(&forbidden),
@@ -73,6 +76,10 @@ fn core_turn_registers_shared_tools_through_kernel_builder() {
     assert!(
         source.contains(".with_tool_set("),
         "主 turn 路径必须通过 AgentKernelBuilder 注册共享工具集"
+    );
+    assert!(
+        !source.contains("starts_with(\"mcp__\")"),
+        "MCP 工具 schema 应在 turn context 中与产品工具分离，而不是在 kernel 组装层按名称分流"
     );
     for forbidden in [
         "register_native_shared_tools".to_string(),
