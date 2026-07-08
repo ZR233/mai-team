@@ -3,7 +3,6 @@ use std::sync::Arc;
 use mai_protocol::{AgentId, AgentRole};
 use pl_core::RegisteredTool;
 use pl_model::ToolSchema;
-use pl_protocol::PureError;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -78,7 +77,7 @@ impl MaiProductToolRegistry {
             mai_tools::TOOL_SAVE_TASK_PLAN => {
                 let executor = self.clone();
                 let tool_name = name.clone();
-                Ok(RegisteredTool::new(
+                Ok(RegisteredTool::from_execution_result(
                     name.clone(),
                     description.clone(),
                     input_schema.clone(),
@@ -91,7 +90,7 @@ impl MaiProductToolRegistry {
                                 .save_task_plan(input.arguments)
                                 .await
                                 .map_err(|error| product_tool_error(&tool_name, error))?;
-                            Ok(execution.into_tool_output())
+                            Ok(execution)
                         }
                     },
                 ))
@@ -99,7 +98,7 @@ impl MaiProductToolRegistry {
             mai_tools::TOOL_SUBMIT_REVIEW_RESULT => {
                 let executor = self.clone();
                 let tool_name = name.clone();
-                Ok(RegisteredTool::new(
+                Ok(RegisteredTool::from_execution_result(
                     name.clone(),
                     description.clone(),
                     input_schema.clone(),
@@ -112,7 +111,7 @@ impl MaiProductToolRegistry {
                                 .submit_review_result(input.arguments)
                                 .await
                                 .map_err(|error| product_tool_error(&tool_name, error))?;
-                            Ok(execution.into_tool_output())
+                            Ok(execution)
                         }
                     },
                 ))
@@ -120,7 +119,7 @@ impl MaiProductToolRegistry {
             mai_tools::TOOL_SAVE_ARTIFACT => {
                 let executor = self.clone();
                 let tool_name = name.clone();
-                Ok(RegisteredTool::new(
+                Ok(RegisteredTool::from_execution_result(
                     name.clone(),
                     description.clone(),
                     input_schema.clone(),
@@ -133,7 +132,7 @@ impl MaiProductToolRegistry {
                                 .save_artifact(input.arguments)
                                 .await
                                 .map_err(|error| product_tool_error(&tool_name, error))?;
-                            Ok(execution.into_tool_output())
+                            Ok(execution)
                         }
                     },
                 ))
@@ -141,7 +140,7 @@ impl MaiProductToolRegistry {
             mai_tools::TOOL_GITHUB_API_REQUEST => {
                 let executor = self.clone();
                 let tool_name = name.clone();
-                Ok(RegisteredTool::new(
+                Ok(RegisteredTool::from_execution_result(
                     name.clone(),
                     description.clone(),
                     input_schema.clone(),
@@ -154,7 +153,7 @@ impl MaiProductToolRegistry {
                                 .github_api_request(input.arguments)
                                 .await
                                 .map_err(|error| product_tool_error(&tool_name, error))?;
-                            Ok(execution.into_tool_output())
+                            Ok(execution)
                         }
                     },
                 ))
@@ -162,7 +161,7 @@ impl MaiProductToolRegistry {
             mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS => {
                 let executor = self.clone();
                 let tool_name = name.clone();
-                Ok(RegisteredTool::new(
+                Ok(RegisteredTool::from_execution_result(
                     name.clone(),
                     description.clone(),
                     input_schema.clone(),
@@ -177,7 +176,7 @@ impl MaiProductToolRegistry {
                                 .queue_project_review_prs(prs)
                                 .await
                                 .map_err(|error| product_tool_error(&tool_name, error))?;
-                            Ok(execution.into_tool_output())
+                            Ok(execution)
                         }
                     },
                 ))
@@ -190,7 +189,7 @@ impl MaiProductToolRegistry {
 
     fn ensure_not_cancelled(&self, tool_name: &str) -> pl_protocol::Result<()> {
         if self.cancellation_token.is_cancelled() {
-            return Err(PureError::ToolExecutionFailed {
+            return Err(pl_protocol::PureError::ToolExecutionFailed {
                 tool: tool_name.to_string(),
                 error: RuntimeError::TurnCancelled.to_string(),
             });
@@ -314,8 +313,8 @@ fn optional_string_argument(arguments: &Value, field: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn product_tool_error(tool_name: &str, error: impl std::fmt::Display) -> PureError {
-    PureError::ToolExecutionFailed {
+fn product_tool_error(tool_name: &str, error: impl std::fmt::Display) -> pl_protocol::PureError {
+    pl_protocol::PureError::ToolExecutionFailed {
         tool: tool_name.to_string(),
         error: error.to_string(),
     }
@@ -413,6 +412,14 @@ mod tests {
         assert!(
             !source.contains(&format!("{}{}", "from_tool", "_name")),
             "产品工具 schema 应直接绑定具体 RegisteredTool handler"
+        );
+        assert!(
+            source.contains("RegisteredTool::from_execution_result"),
+            "产品工具应让 pl-core 负责 ToolExecutionResult 到 ToolOutput 的映射"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "into_tool", "_output")),
+            "产品工具注册器不应在 mai-team 手动映射 ToolOutput"
         );
         assert!(
             !source.contains(&format!("{}{}", "TOOL_GIT_SYNC", "_DEFAULT_BRANCH")),
