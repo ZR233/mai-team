@@ -1,11 +1,10 @@
 use std::fmt;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use mai_protocol::{AgentId, AgentRole, ToolDefinition};
 use pl_core::{
-    OutputTruncation, ProductToolDefinition, ProductToolRequest, ProductToolRouter, ToolOutput,
-    ToolRuntimeEvent,
+    ProductToolDefinition, ProductToolRequest, ProductToolRouter, ToolOutput,
+    ToolOutputModelOutputRequest,
 };
 use pl_protocol::PureError;
 use serde_json::{Value, json};
@@ -265,18 +264,11 @@ fn product_definition_from_mai_definition(definition: &ToolDefinition) -> Produc
 }
 
 fn tool_output_from_execution(execution: ToolExecution) -> ToolOutput {
-    ToolOutput {
-        description: execution.model_output,
-        truncated: OutputTruncation::empty(),
-        output_file: PathBuf::new(),
-        exit_code: if execution.success { Some(0) } else { Some(1) },
-        timed_out: false,
-        runtime_events: if execution.ends_turn {
-            vec![ToolRuntimeEvent::EndTurn]
-        } else {
-            Vec::new()
-        },
-    }
+    ToolOutput::from_model_output(ToolOutputModelOutputRequest {
+        model_output: execution.model_output,
+        success: execution.success,
+        ends_turn: execution.ends_turn,
+    })
 }
 
 fn required_string_argument(arguments: &Value, field: &str) -> crate::Result<String> {
