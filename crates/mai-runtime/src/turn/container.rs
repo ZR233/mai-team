@@ -81,14 +81,16 @@ async fn execute_with_container_backend(
         let stdout_id = Uuid::new_v4().to_string();
         let stderr_id = Uuid::new_v4().to_string();
         let namespace = agent_id.to_string();
-        let capture = ToolOutputCapture::prepare(ToolOutputCaptureRequest {
-            artifact_files_root,
-            namespace: Some(&namespace),
-            call_id: &call_id,
-            stdout_id: &stdout_id,
-            stderr_id: &stderr_id,
-            command: &request.command,
-        })
+        let capture = ToolOutputCapture::prepare(
+            ToolOutputCaptureRequest::new(
+                artifact_files_root,
+                &call_id,
+                &stdout_id,
+                &stderr_id,
+                &request.command,
+            )
+            .with_namespace(&namespace),
+        )
         .await
         .map_err(runtime_invalid_input)?;
         let output = docker

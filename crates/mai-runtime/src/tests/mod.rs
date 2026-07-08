@@ -733,6 +733,27 @@ fn tool_output_artifact_paths_use_pl_core_request_constructor() {
 }
 
 #[test]
+fn container_output_capture_uses_pl_core_request_constructor() {
+    let source = include_str!("../turn/container.rs");
+    let captured_exec = source
+        .split("async fn execute_with_container_backend(")
+        .nth(1)
+        .expect("captured container exec")
+        .split("pub(crate) async fn execute_container_tool(")
+        .next()
+        .expect("captured body");
+
+    assert!(
+        captured_exec.contains("ToolOutputCaptureRequest::new"),
+        "container 输出捕获请求的共享字段形状应由 pl-core constructor 承载"
+    );
+    assert!(
+        !captured_exec.contains("ToolOutputCaptureRequest {"),
+        "mai-runtime 不应手写 ToolOutputCaptureRequest 字段"
+    );
+}
+
+#[test]
 fn tool_visibility_consumes_pl_core_shared_tool_names() {
     let source = include_str!("../turn/tool_visibility.rs");
 
