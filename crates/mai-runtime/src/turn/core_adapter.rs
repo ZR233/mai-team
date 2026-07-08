@@ -210,7 +210,7 @@ pub(crate) fn mai_status_from_pl_outcome(status: TurnOutcomeStatus) -> (TurnStat
     }
 }
 
-fn runtime_error_from_pl_turn(error: TurnReturnError) -> RuntimeError {
+pub(crate) fn runtime_error_from_pl_turn(error: TurnReturnError) -> RuntimeError {
     match error {
         TurnReturnError::Cancelled => RuntimeError::TurnCancelled,
         TurnReturnError::Failed(message) => RuntimeError::InvalidInput(message),

@@ -5,7 +5,7 @@ use mai_protocol::{
     AgentId, AgentStatus, MessageRole, ServiceEventKind, SessionId, SkillsConfigRequest, TurnId,
 };
 use mai_skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
-use pl_core::{HostMcpToolSpec, TurnErrorProjection, TurnReturnError};
+use pl_core::{HostMcpToolSpec, TurnErrorProjection, TurnReturnError, ensure_turn_not_cancelled};
 use serde_json::json;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -144,6 +144,11 @@ fn pl_turn_return_error(error: RuntimeError) -> TurnReturnError {
     }
 }
 
+fn check_turn_not_cancelled(cancellation_token: &CancellationToken) -> Result<()> {
+    ensure_turn_not_cancelled(cancellation_token)
+        .map_err(super::core_adapter::runtime_error_from_pl_turn)
+}
+
 pub(crate) async fn run_turn(
     deps: &RuntimeDeps,
     state: &RuntimeState,
@@ -212,9 +217,7 @@ pub(crate) async fn run_turn_inner(
     let agent = ops.agent(agent_id).await?;
     let _turn_guard = agent.turn_lock.lock().await;
     let enforce_current_turn = agent.summary.read().await.current_turn == Some(turn_id);
-    if cancellation_token.is_cancelled() {
-        return Err(RuntimeError::TurnCancelled);
-    }
+    check_turn_not_cancelled(&cancellation_token)?;
     ops.ensure_agent_container_for_turn(
         &agent,
         AgentStatus::RunningTurn,
@@ -222,9 +225,7 @@ pub(crate) async fn run_turn_inner(
         &cancellation_token,
     )
     .await?;
-    if cancellation_token.is_cancelled() {
-        return Err(RuntimeError::TurnCancelled);
-    }
+    check_turn_not_cancelled(&cancellation_token)?;
     events
         .publish(ServiceEventKind::TurnStarted {
             agent_id,
@@ -407,9 +408,7 @@ pub(crate) async fn run_turn_inner(
             instructions,
         }
     };
-    if cancellation_token.is_cancelled() {
-        return Err(RuntimeError::TurnCancelled);
-    }
+    check_turn_not_cancelled(&cancellation_token)?;
     ops.set_turn_status(
         &agent,
         turn_id,

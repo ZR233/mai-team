@@ -372,6 +372,20 @@ fn run_turn_error_completion_uses_pl_core_projection() {
     }
 }
 
+#[test]
+fn turn_orchestrator_uses_pl_core_cancellation_checkpoint() {
+    let source = include_str!("../turn/orchestrator.rs");
+
+    assert!(
+        source.contains("ensure_turn_not_cancelled"),
+        "turn 编排中的取消 checkpoint 应由 pl-core 统一投影为 TurnReturnError"
+    );
+    assert!(
+        !source.contains("cancellation_token.is_cancelled()"),
+        "mai-runtime 不应直接解释 CancellationToken 的 turn cancelled 语义"
+    );
+}
+
 fn pl_text(message: &Message) -> &str {
     match &message.content {
         MessageContent::Text(text) => text,
