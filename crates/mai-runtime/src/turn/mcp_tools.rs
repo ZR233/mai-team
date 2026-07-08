@@ -45,9 +45,6 @@ impl McpToolBackend for MaiMcpToolBackend {
     type Error = String;
 
     async fn call_tool(&self, request: McpToolRequest) -> std::result::Result<Value, Self::Error> {
-        if self.cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled.to_string());
-        }
         self.call_tool_inner(request).await
     }
 }
@@ -61,18 +58,20 @@ impl MaiMcpToolBackend {
         let manager = self.agent.mcp.read().await.clone().ok_or_else(|| {
             RuntimeError::InvalidInput("MCP manager not initialized".to_string()).to_string()
         })?;
-        tokio::select! {
-            output = manager.call_model_tool(&request.name, request.arguments) => {
-                output.map_err(|error| error.to_string())
-            }
-            _ = self.cancellation_token.cancelled() => {
-                Err(RuntimeError::TurnCancelled.to_string())
-            }
-        }
+        let name = request.name;
+        let arguments = request.arguments;
+        pl_core::run_tool_backend_with_cancellation(
+            async move { Ok::<_, String>(manager.call_model_tool(&name, arguments).await) },
+            Some(self.cancellation_token.clone()),
+            || RuntimeError::TurnCancelled.to_string(),
+        )
+        .await?
+        .map_err(|error| error.to_string())
     }
 
     async fn call_project_tool(&self, request: McpToolRequest) -> Result<Value, String> {
-        let tool = request.name.clone();
+        let tool = request.name;
+        let arguments = request.arguments;
         let manager = self
             .runtime
             .project_mcp_manager_for_agent(&self.agent, self.agent_id, &self.cancellation_token)
@@ -89,12 +88,12 @@ impl MaiMcpToolBackend {
             .map_err(|error| error.to_string())?
             .unwrap_or_default();
         let redaction = SecretRedaction::new([token.as_str()]);
-        let output = tokio::select! {
-            output = manager.call_model_tool(&request.name, request.arguments) => output,
-            _ = self.cancellation_token.cancelled() => {
-                return Err(RuntimeError::TurnCancelled.to_string());
-            }
-        };
+        let output = pl_core::run_tool_backend_with_cancellation(
+            async { Ok::<_, String>(manager.call_model_tool(&tool, arguments).await) },
+            Some(self.cancellation_token.clone()),
+            || RuntimeError::TurnCancelled.to_string(),
+        )
+        .await?;
         match output {
             Ok(value) => Ok(redaction.redact_json_value(value)),
             Err(mai_mcp::McpError::ToolNotFound(_)) => Err(RuntimeError::InvalidInput(format!(
@@ -137,6 +136,24 @@ mod tests {
         assert!(
             !source.contains(&format!("{}{}", "fn redact", "_secret")),
             "MCP tool backend 不应保留本地 string 遮蔽实现"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_backend_delegates_cancellation_to_pl_core() {
+        let source = include_str!("mcp_tools.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production section");
+
+        assert!(
+            production.contains("pl_core::run_tool_backend_with_cancellation"),
+            "MCP tool backend 的 backend future 取消语义应由 pl-core 统一维护"
+        );
+        assert!(
+            !production.contains("tokio::select!"),
+            "MCP tool backend 不应手写 backend future 与 cancellation token 的 select"
         );
     }
 }
