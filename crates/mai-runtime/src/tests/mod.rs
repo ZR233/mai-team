@@ -947,10 +947,12 @@ fn model_client_delegates_continuation_cache_to_pl_core() {
         "HashSet",
         "unsupported_continuations",
         "continuation_is_unsupported",
+        "ToolDefinition",
+        "fn tool_schema",
     ] {
         assert!(
             !source.contains(forbidden),
-            "ModelClient 不应继续本地维护 `{forbidden}`"
+            "ModelClient 不应继续本地维护或转换 `{forbidden}`"
         );
     }
 }

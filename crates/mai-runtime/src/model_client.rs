@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use mai_protocol::{ModelWireApi, ProviderKind as MaiProviderKind, ToolDefinition};
+use mai_protocol::{ModelWireApi, ProviderKind as MaiProviderKind};
 use pl_core::{CoreModelTurnClient, CoreModelTurnOptions, CoreModelTurnRequest, CoreSession};
 use pl_model::{CompletionResponse, SharedModelProvider, ToolSchema, create_provider_with_models};
 use pl_protocol::PureError;
@@ -61,14 +61,14 @@ impl ModelClient {
         selection: &mai_store::ProviderSelection,
         reasoning_effort: Option<&str>,
         instructions: String,
-        tools: &[ToolDefinition],
+        tools: &[ToolSchema],
         session: &mut CoreSession,
     ) -> Result<CoreModelTurnRequest, PureError> {
         let use_continuation =
             Self::supports_continuation(selection) && !session.continuation_disabled();
         let mut request = CoreModelTurnRequest::new(selection.model.id.clone())
             .with_instructions(instructions)
-            .with_tools(tools.iter().map(tool_schema).collect())
+            .with_tools(tools.to_vec())
             .with_parallel_tool_calls(selection.model.capabilities.parallel_tools)
             .with_max_tokens(Some(selection.model.output_tokens))
             .with_reasoning(model_profile::reasoning_config(
@@ -87,7 +87,7 @@ impl ModelClient {
         selection: &mai_store::ProviderSelection,
         reasoning_effort: Option<&str>,
         instructions: &str,
-        tools: &[ToolDefinition],
+        tools: &[ToolSchema],
         session: &mut CoreSession,
         cancellation_token: &CancellationToken,
     ) -> Result<CompletionResponse, PureError> {
@@ -119,21 +119,6 @@ impl ModelClient {
 impl Default for ModelClient {
     fn default() -> Self {
         Self::with_config(ModelClientConfig::default())
-    }
-}
-
-fn tool_schema(tool: &ToolDefinition) -> ToolSchema {
-    match tool.kind.as_str() {
-        "function" => ToolSchema::function(
-            tool.name.clone(),
-            tool.description.clone(),
-            tool.parameters.clone(),
-        ),
-        _ => ToolSchema::function(
-            tool.name.clone(),
-            tool.description.clone(),
-            tool.parameters.clone(),
-        ),
     }
 }
 
