@@ -86,6 +86,20 @@ fn observability_uses_pl_core_history_success_projection() {
 }
 
 #[test]
+fn kernel_tool_projection_uses_pl_core_completion_timestamp_fallback() {
+    let source = include_str!("../turn/kernel_tools.rs");
+
+    assert!(
+        source.contains("projection.completed_at_unix_or_started()"),
+        "工具生命周期完成时间 fallback 应由 pl-core ToolLifecycleProjection 提供"
+    );
+    assert!(
+        !source.contains("completed_at_unix\n            .unwrap_or"),
+        "mai-runtime 不应直接拼装 ToolLifecycleProjection 的完成时间 fallback"
+    );
+}
+
+#[test]
 fn core_turn_registers_shared_tools_through_kernel_builder() {
     let source = include_str!("../turn/core_adapter.rs");
     let run_start = source

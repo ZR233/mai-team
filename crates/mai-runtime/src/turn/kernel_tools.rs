@@ -105,11 +105,7 @@ async fn project_tool_completed(
     success: bool,
 ) {
     let started_at = trace_time(projection.started_at_unix);
-    let completed_at = trace_time(
-        projection
-            .completed_at_unix
-            .unwrap_or(projection.started_at_unix),
-    );
+    let completed_at = trace_time(projection.completed_at_unix_or_started());
     let output_artifacts = projection.output_artifacts_as::<ToolOutputArtifactInfo>();
     super::persistence::record_tool_trace_completed(
         runtime.deps.store.as_ref(),
