@@ -8,7 +8,7 @@ use mai_protocol::{AgentId, ProjectId, ProjectSummary};
 use pl_core::{
     ExecutionBackend, ExecutionOutput, ExecutionRequest, GIT_TOKEN_ENV, GitCredential,
     GitCredentialProvider, GitCredentialRequest, GitPolicy, GitToolKind, GitWorkspaceConfig,
-    PureError, ToolCapabilityConfig, ToolContext, ToolInput,
+    PureError, ToolCapabilityConfig,
 };
 use serde_json::{Value, json};
 #[cfg(test)]
@@ -110,16 +110,15 @@ async fn execute_git_tool_via_registry(
     let tool = kernel.tool(kind.name()).ok_or_else(|| {
         RuntimeError::InvalidInput(format!("git tool `{}` was not registered", kind.name()))
     })?;
-    let output = tool
-        .execute(
-            ToolInput {
-                arguments,
-                session_id: "mai-project-git".to_string(),
-                tool_id: kind.name().to_string(),
-                revision_base: 0,
-            },
-            pl_tool_context(workspace_root),
-        )
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
+    let output = kernel
+        .execute_tool(pl_core::AgentKernelToolRequest::new(
+            tool.name(),
+            arguments,
+            "mai-project-git",
+            kind.name(),
+            event_tx,
+        ))
         .await
         .map_err(runtime_error_from_pure)?;
     Ok(output.description)
@@ -225,25 +224,6 @@ fn git_workspace_config(context: &GitToolContext<'_>) -> GitWorkspaceConfig {
                 workspace_info,
             }
         }
-    }
-}
-
-fn pl_tool_context(workspace_root: std::path::PathBuf) -> ToolContext {
-    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
-    ToolContext {
-        event_tx,
-        options: pl_core::TurnOptions::default(),
-        workspace_access: pl_core::WorkspaceAccess::WorkspaceOnly,
-        mode: pl_core::CompileMode::Auto,
-        workspace_root,
-        workspace_instructions: None,
-        instruction_snapshot: None,
-        provider_call_id: None,
-        active_subagent: None,
-        agent_supervisor: pl_core::AgentSupervisor::default(),
-        agent_tool_registrar: None,
-        lsp_runtime: None,
-        parent_session: Arc::new(pl_core::CoreSession::new()),
     }
 }
 
@@ -579,9 +559,22 @@ mod tests {
             "project git tools must be registered through pl-core ToolSetBuilder"
         );
         assert!(
+            execute_path.contains(".execute_tool("),
+            "project git tools must execute through AgentKernel::execute_tool"
+        );
+        assert!(
             !execute_path.contains("GitTool::new"),
             "project git tools must not bypass the pl-core tool registry"
         );
+        for forbidden in [
+            format!("{}{}", "Tool", "Context {"),
+            format!("{}{}", "Tool", "Input {"),
+        ] {
+            assert!(
+                !execute_path.contains(&forbidden),
+                "project git tools must not assemble `{forbidden}` locally"
+            );
+        }
         assert!(
             !source.contains(&format!("{}{}", "execute_pl_core", "_git_tool")),
             "project git tools should not keep a direct GitTool execution helper"

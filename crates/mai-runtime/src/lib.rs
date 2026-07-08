@@ -1656,28 +1656,20 @@ impl AgentRuntime {
         let Some(tool) = kernel.tool(name) else {
             return Ok(None);
         };
-        let context = pl_core::ToolContext {
-            event_tx,
-            options: pl_core::TurnOptions::default().with_cancellation(cancellation_token),
-            workspace_access: pl_core::WorkspaceAccess::WorkspaceOnly,
-            mode: pl_core::CompileMode::Auto,
-            workspace_root,
-            workspace_instructions: None,
-            instruction_snapshot: None,
-            provider_call_id: None,
-            active_subagent: None,
-            agent_supervisor: pl_core::AgentSupervisor::default(),
-            agent_tool_registrar: kernel.agent_tool_registrar(),
-            lsp_runtime: None,
-            parent_session: Arc::new(pl_core::CoreSession::new()),
-        };
-        let input = pl_core::ToolInput {
-            arguments,
-            session_id: agent_id.to_string(),
-            tool_id: Uuid::new_v4().to_string(),
-            revision_base: 0,
-        };
-        let output = pl_core::Tool::execute(tool, input, context).await?;
+        let output = kernel
+            .execute_tool(
+                pl_core::AgentKernelToolRequest::new(
+                    tool.name(),
+                    arguments,
+                    agent_id.to_string(),
+                    Uuid::new_v4().to_string(),
+                    event_tx,
+                )
+                .with_options(
+                    pl_core::TurnOptions::default().with_cancellation(cancellation_token),
+                ),
+            )
+            .await?;
         self.project_tool_events_for_test(agent_id, &mut event_rx)
             .await;
         let output_artifacts = output

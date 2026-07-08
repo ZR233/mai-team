@@ -35,11 +35,17 @@ fn test_tool_helper_uses_pl_core_kernel_registry() {
         helper.contains("ToolSetBuilder::from_capabilities"),
         "测试工具执行路径必须复用 pl-core ToolSetBuilder"
     );
+    assert!(
+        helper.contains(".execute_tool("),
+        "测试工具执行路径必须通过 AgentKernel::execute_tool 注入工具上下文"
+    );
     for forbidden in [
         format!("{}{}", "execute_workspace", "_file_tool"),
         format!("{}{}", "execute_container", "_tool"),
         format!("{}{}", "AgentControl", "Tool::new"),
         format!("{}{}", "TodoList", "Tool"),
+        format!("{}{}", "Tool", "Context {"),
+        format!("{}{}", "Tool", "Input {"),
     ] {
         assert!(
             !helper.contains(&forbidden),
