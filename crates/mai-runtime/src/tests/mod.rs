@@ -712,6 +712,27 @@ fn tool_output_module_does_not_keep_local_tool_lifecycle_runner() {
 }
 
 #[test]
+fn tool_output_artifact_paths_use_pl_core_request_constructor() {
+    let source = include_str!("../lib.rs");
+    let helper = source
+        .split("pub fn tool_output_artifact_file_path(")
+        .nth(1)
+        .expect("tool output artifact path helper")
+        .split("async fn run_turn(")
+        .next()
+        .expect("helper body");
+
+    assert!(
+        helper.contains("pl_core::ToolOutputArtifactPathRequest::new"),
+        "tool output artifact 路径请求的共享字段形状应由 pl-core constructor 承载"
+    );
+    assert!(
+        !helper.contains("pl_core::ToolOutputArtifactPathRequest {"),
+        "mai-runtime 不应手写 ToolOutputArtifactPathRequest 字段"
+    );
+}
+
+#[test]
 fn tool_visibility_consumes_pl_core_shared_tool_names() {
     let source = include_str!("../turn/tool_visibility.rs");
 
