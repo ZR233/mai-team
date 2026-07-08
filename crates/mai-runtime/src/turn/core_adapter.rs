@@ -67,12 +67,13 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
         ctx.product_tools.clone(),
         ctx.cancellation_token.clone(),
     );
-    let mut kernel = AgentKernel::builder(builder)
-        .with_profile(runtime_profile)
-        .with_registered_tools(product_tool_registry.registered_tools())
-        .build()
-        .await;
-    register_native_shared_tools(&mut kernel, &ctx).await?;
+    let kernel = build_kernel_with_native_shared_tools(
+        builder,
+        runtime_profile,
+        product_tool_registry.registered_tools(),
+        &ctx,
+    )
+    .await?;
 
     let mut session = CoreSession::from_messages(ctx.history.clone());
     let (event_tx, event_rx) = tokio::sync::broadcast::channel(64);
@@ -292,10 +293,12 @@ fn user_input_questions_from_pl(
     (header.unwrap_or_else(|| "Input".to_string()), projected)
 }
 
-async fn register_native_shared_tools(
-    kernel: &mut AgentKernel,
+async fn build_kernel_with_native_shared_tools(
+    builder: PureCoreBuilder,
+    runtime_profile: CoreAgentProfile,
+    registered_tools: Vec<pl_core::RegisteredTool>,
     ctx: &PureCoreTurnContext,
-) -> Result<()> {
+) -> Result<AgentKernel> {
     let backend = Arc::new(super::container::MaiContainerBackend::new(
         ctx.runtime.clone(),
         ctx.agent_id,
@@ -339,22 +342,22 @@ async fn register_native_shared_tools(
         .with_container_tools(backend)
         .with_mcp_resource_tools(mcp_backend)
         .with_agent_control_tools(agent_control_backend);
-    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    if let Some(git_runtime) = git_runtime {
-        tool_set
-            .with_git_tools(
+    let kernel_builder = AgentKernel::builder(builder)
+        .with_profile(runtime_profile)
+        .with_registered_tools(registered_tools);
+    let kernel = if let Some(git_runtime) = git_runtime {
+        kernel_builder
+            .with_tool_set(tool_set.with_git_tools(
                 git_runtime.config,
                 git_runtime.backend,
                 git_runtime.credential_provider,
-            )
-            .register(kernel.core_mut(), workspace_root, None)
-            .await;
+            ))
+            .build()
+            .await
     } else {
-        tool_set
-            .register(kernel.core_mut(), workspace_root, None)
-            .await;
-    }
-    Ok(())
+        kernel_builder.with_tool_set(tool_set).build().await
+    };
+    Ok(kernel)
 }
 
 pub(crate) async fn project_agent_events(

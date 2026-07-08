@@ -72,15 +72,6 @@ async fn execute_git_tool_via_registry(
 ) -> Result<String> {
     let config = git_workspace_config(context);
     let workspace_root = config.worktree.clone();
-    let mut kernel = pl_core::AgentKernel::builder(
-        pl_core::PureCoreBuilder::from_provider_info(pl_model::ProviderInfo::deepseek(None))
-            .map_err(runtime_error_from_pure)?,
-    )
-    .with_profile(pl_core::CoreAgentProfile::host_provided(
-        workspace_root.clone(),
-    ))
-    .build()
-    .await;
     let capabilities = ToolCapabilityConfig {
         bash: false,
         workspace_files: false,
@@ -93,7 +84,7 @@ async fn execute_git_tool_via_registry(
         docker: false,
         container: false,
     };
-    pl_core::ToolSetBuilder::from_capabilities(capabilities)
+    let tool_set = pl_core::ToolSetBuilder::from_capabilities(capabilities)
         .with_allowed_tools([kind.name()])
         .with_git_tools(
             config,
@@ -104,9 +95,17 @@ async fn execute_git_tool_via_registry(
             Arc::new(MaiGitCredentialProvider::Static {
                 token: context.token.clone(),
             }),
-        )
-        .register(kernel.core_mut(), workspace_root.clone(), None)
-        .await;
+        );
+    let kernel = pl_core::AgentKernel::builder(
+        pl_core::PureCoreBuilder::from_provider_info(pl_model::ProviderInfo::deepseek(None))
+            .map_err(runtime_error_from_pure)?,
+    )
+    .with_profile(pl_core::CoreAgentProfile::host_provided(
+        workspace_root.clone(),
+    ))
+    .with_tool_set(tool_set)
+    .build()
+    .await;
     let tool = kernel.tool(kind.name()).ok_or_else(|| {
         RuntimeError::InvalidInput(format!("git tool `{}` was not registered", kind.name()))
     })?;
@@ -559,6 +558,10 @@ mod tests {
             "project git tools must be registered through pl-core ToolSetBuilder"
         );
         assert!(
+            execute_path.contains(".with_tool_set("),
+            "project git tools must register their shared tool set through AgentKernelBuilder"
+        );
+        assert!(
             execute_path.contains(".execute_tool("),
             "project git tools must execute through AgentKernel::execute_tool"
         );
@@ -569,6 +572,7 @@ mod tests {
         for forbidden in [
             format!("{}{}", "Tool", "Context {"),
             format!("{}{}", "Tool", "Input {"),
+            format!("{}{}", ".register", "(kernel.core_mut"),
         ] {
             assert!(
                 !execute_path.contains(&forbidden),

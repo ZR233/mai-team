@@ -36,6 +36,10 @@ fn test_tool_helper_uses_pl_core_kernel_registry() {
         "测试工具执行路径必须复用 pl-core ToolSetBuilder"
     );
     assert!(
+        helper.contains(".with_tool_set("),
+        "测试工具执行路径必须通过 AgentKernelBuilder 注册共享工具集"
+    );
+    assert!(
         helper.contains(".execute_tool("),
         "测试工具执行路径必须通过 AgentKernel::execute_tool 注入工具上下文"
     );
@@ -46,10 +50,33 @@ fn test_tool_helper_uses_pl_core_kernel_registry() {
         format!("{}{}", "TodoList", "Tool"),
         format!("{}{}", "Tool", "Context {"),
         format!("{}{}", "Tool", "Input {"),
+        format!("{}{}", ".register", "(kernel.core_mut"),
     ] {
         assert!(
             !helper.contains(&forbidden),
             "测试工具执行不应绕过 pl-core registry 直接调用 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn core_turn_registers_shared_tools_through_kernel_builder() {
+    let source = include_str!("../turn/core_adapter.rs");
+    assert!(
+        source.contains("build_kernel_with_native_shared_tools"),
+        "主 turn 路径应通过单一 helper 构造带共享工具集的 AgentKernel"
+    );
+    assert!(
+        source.contains(".with_tool_set("),
+        "主 turn 路径必须通过 AgentKernelBuilder 注册共享工具集"
+    );
+    for forbidden in [
+        "register_native_shared_tools".to_string(),
+        format!("{}{}", ".register", "(kernel.core_mut"),
+    ] {
+        assert!(
+            !source.contains(&forbidden),
+            "主 turn 路径不应保留二阶段共享工具注册 `{forbidden}`"
         );
     }
 }
