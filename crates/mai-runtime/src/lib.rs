@@ -1667,27 +1667,17 @@ impl AgentRuntime {
             .await?;
         self.project_tool_events_for_test(agent_id, &mut event_rx)
             .await;
-        let output_artifacts = output
+        let output_artifacts = output.output_artifacts_as::<ToolOutputArtifactInfo>();
+        let ends_turn = output
             .runtime_events
             .iter()
-            .filter_map(|event| match event {
-                pl_core::ToolRuntimeEvent::OutputArtifacts { artifacts } => Some(artifacts),
-                pl_core::ToolRuntimeEvent::SkillActivated { .. }
-                | pl_core::ToolRuntimeEvent::ToolResultRevision { .. }
-                | pl_core::ToolRuntimeEvent::EndTurn => None,
-            })
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>();
+            .any(|event| matches!(event, pl_core::ToolRuntimeEvent::EndTurn));
         Ok(Some(ToolExecution::with_model_output(
             output.exit_code.unwrap_or(0) == 0,
             output.description.clone(),
             output.description,
-            output
-                .runtime_events
-                .iter()
-                .any(|event| matches!(event, pl_core::ToolRuntimeEvent::EndTurn)),
-            Self::output_artifacts_from_json_for_test(output_artifacts)?,
+            ends_turn,
+            output_artifacts,
         )))
     }
 
@@ -1722,17 +1712,6 @@ impl AgentRuntime {
                     .await;
             }
         }
-    }
-
-    #[cfg(test)]
-    fn output_artifacts_from_json_for_test(
-        values: Vec<Value>,
-    ) -> Result<Vec<ToolOutputArtifactInfo>> {
-        values
-            .into_iter()
-            .map(serde_json::from_value)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|err| RuntimeError::InvalidInput(format!("invalid tool artifact: {err}")))
     }
 
     async fn wait_agent(&self, agent_id: AgentId, timeout: Duration) -> Result<AgentSummary> {

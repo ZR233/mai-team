@@ -23,7 +23,7 @@ fn test_tool_helper_uses_pl_core_kernel_registry() {
         .find("execute_tool_for_test")
         .expect("test helper exists");
     let helper_end = source[helper_start..]
-        .find("fn output_artifacts_from_json_for_test")
+        .find("async fn wait_agent")
         .expect("next helper exists");
     let helper = &source[helper_start..helper_start + helper_end];
 
@@ -51,12 +51,19 @@ fn test_tool_helper_uses_pl_core_kernel_registry() {
         "starts_with(\"mcp__\")".to_string(),
         "Call MCP tool".to_string(),
         "ToolSchema::function".to_string(),
+        "ToolRuntimeEvent::OutputArtifacts".to_string(),
+        "output_artifacts_from_json_for_test".to_string(),
+        "serde_json::from_value".to_string(),
     ] {
         assert!(
             !helper.contains(&forbidden),
             "测试工具执行不应绕过 pl-core registry 直接调用 `{forbidden}`"
         );
     }
+    assert!(
+        helper.contains("output_artifacts_as::<ToolOutputArtifactInfo>"),
+        "测试工具执行应复用 pl-core ToolOutput artifact 解码"
+    );
 }
 
 #[test]
