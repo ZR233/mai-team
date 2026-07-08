@@ -10,7 +10,7 @@ use crate::state::AgentRecord;
 use crate::turn::tool_output::ToolExecution;
 use crate::{
     AgentRuntime, Result, RuntimeError, github, normalized_text, projects, redact_secret,
-    shell_quote, tools, turn,
+    shell_quote, turn,
 };
 
 impl AgentRuntime {
@@ -114,38 +114,6 @@ impl AgentRuntime {
             )));
         }
         Ok(ToolExecution::new(true, output.stdout, false))
-    }
-
-    pub(crate) async fn execute_project_git_tool(
-        &self,
-        agent: &AgentRecord,
-        name: &str,
-        arguments: Value,
-    ) -> Result<ToolExecution> {
-        let summary = agent.summary.read().await.clone();
-        let project_id = summary.project_id.ok_or_else(|| {
-            RuntimeError::InvalidInput("agent is not attached to a project".to_string())
-        })?;
-        let project = self.project(project_id).await?;
-        let project_summary = project.summary.read().await.clone();
-        let workspace_volume =
-            project_agent_workspace_volume(&project_id.to_string(), &summary.id.to_string());
-        tools::git::execute_git_tool(
-            tools::git::GitToolContext {
-                backend: tools::git::GitToolBackend::Sidecar {
-                    docker: &self.deps.docker,
-                    sidecar_image: &self.sidecar_image,
-                    workspace_volume,
-                    repo_path: projects::workspace::AGENT_WORKSPACE_REPO_PATH,
-                },
-                agent_id: summary.id,
-                project: project_summary,
-                token: self.project_git_token(project_id).await?,
-            },
-            name,
-            arguments,
-        )
-        .await
     }
 }
 

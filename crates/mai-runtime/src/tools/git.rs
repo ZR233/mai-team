@@ -4,22 +4,30 @@ use std::future::Future;
 use std::sync::Arc;
 
 use mai_docker::{DockerClient, SidecarParams, project_agent_workspace_volume};
-use mai_protocol::{AgentId, ProjectId, ProjectSummary};
+#[cfg(test)]
+use mai_protocol::ProjectSummary;
+use mai_protocol::{AgentId, ProjectId};
+#[cfg(test)]
+use pl_core::ToolCapabilityConfig;
 use pl_core::{
     ExecutionBackend, ExecutionOutput, ExecutionRequest, GIT_TOKEN_ENV, GitCredential,
     GitCredentialProvider, GitCredentialRequest, GitPolicy, GitToolKind, GitWorkspaceConfig,
-    PureError, ToolCapabilityConfig,
+    PureError,
 };
-use serde_json::{Value, json};
+#[cfg(test)]
+use serde_json::Value;
+use serde_json::json;
 #[cfg(test)]
 use tokio::process::Command;
 
 use crate::github::github_clone_url;
 use crate::projects;
 use crate::state::AgentRecord;
+#[cfg(test)]
 use crate::turn::tool_output::ToolExecution;
 use crate::{AgentRuntime, Result, RuntimeError};
 
+#[cfg(test)]
 pub(crate) struct GitToolContext<'a> {
     pub(crate) backend: GitToolBackend<'a>,
     pub(crate) agent_id: AgentId,
@@ -27,37 +35,27 @@ pub(crate) struct GitToolContext<'a> {
     pub(crate) token: Option<String>,
 }
 
+#[cfg(test)]
 pub(crate) enum GitToolBackend<'a> {
-    Sidecar {
-        docker: &'a DockerClient,
-        sidecar_image: &'a str,
-        workspace_volume: String,
-        repo_path: &'a str,
-    },
-    #[cfg(test)]
     Host {
         git_binary: &'a str,
         projects_root: &'a std::path::Path,
     },
 }
 
+#[cfg(test)]
 pub(crate) async fn execute_git_tool(
     context: GitToolContext<'_>,
     name: &str,
     arguments: Value,
 ) -> Result<ToolExecution> {
-    #[cfg(test)]
-    if let GitToolBackend::Host { projects_root, .. } = &context.backend {
-        let clone = projects::workspace::agent_clone_path(
-            projects_root,
-            context.project.id,
-            context.agent_id,
-        );
-        if !clone.exists() {
-            return Err(RuntimeError::InvalidInput(
-                "project git workspace is not available".to_string(),
-            ));
-        }
+    let GitToolBackend::Host { projects_root, .. } = &context.backend;
+    let clone =
+        projects::workspace::agent_clone_path(projects_root, context.project.id, context.agent_id);
+    if !clone.exists() {
+        return Err(RuntimeError::InvalidInput(
+            "project git workspace is not available".to_string(),
+        ));
     }
     let kind = GitToolKind::from_name(name)
         .ok_or_else(|| RuntimeError::InvalidInput(format!("unsupported git tool `{name}`")))?;
@@ -65,6 +63,7 @@ pub(crate) async fn execute_git_tool(
     Ok(ToolExecution::new(true, output, false))
 }
 
+#[cfg(test)]
 async fn execute_git_tool_via_registry(
     context: &GitToolContext<'_>,
     kind: GitToolKind,
@@ -88,10 +87,7 @@ async fn execute_git_tool_via_registry(
         .with_allowed_tools([kind.name()])
         .with_git_tools(
             config,
-            Arc::new(ProjectGitExecutionBackend::new(
-                &context.backend,
-                context.agent_id,
-            )),
+            Arc::new(ProjectGitExecutionBackend),
             Arc::new(MaiGitCredentialProvider::Static {
                 token: context.token.clone(),
             }),
@@ -178,59 +174,36 @@ pub(crate) async fn native_git_tool_runtime(
     }))
 }
 
+#[cfg(test)]
 fn git_workspace_config(context: &GitToolContext<'_>) -> GitWorkspaceConfig {
     let mut workspace_info = BTreeMap::new();
     workspace_info.insert("project_id".to_string(), json!(context.project.id));
-    match &context.backend {
-        GitToolBackend::Sidecar {
-            workspace_volume,
-            repo_path,
-            ..
-        } => {
-            workspace_info.insert("workspace_volume".to_string(), json!(workspace_volume));
-            let remote_url = github_clone_url(&context.project.owner, &context.project.repo);
-            GitWorkspaceConfig {
-                worktree: std::path::PathBuf::from(repo_path),
-                git_binary: std::path::PathBuf::from("git"),
-                policy: GitPolicy::new(context.project.branch.clone()),
-                default_push_branch: Some(format!("mai-agent/{}", context.agent_id)),
-                remote_url: Some(remote_url),
-                workspace_info,
-            }
-        }
-        #[cfg(test)]
-        GitToolBackend::Host {
-            git_binary,
-            projects_root,
-        } => {
-            let repo_cache =
-                projects::workspace::project_repo_cache_path(projects_root, context.project.id);
-            let clone = projects::workspace::agent_clone_path(
-                projects_root,
-                context.project.id,
-                context.agent_id,
-            );
-            workspace_info.insert("repo_cache".to_string(), json!(repo_cache));
-            GitWorkspaceConfig {
-                worktree: clone,
-                git_binary: std::path::PathBuf::from(git_binary),
-                policy: GitPolicy::new(context.project.branch.clone()),
-                default_push_branch: Some(format!("mai-agent/{}", context.agent_id)),
-                remote_url: Some(github_clone_url(
-                    &context.project.owner,
-                    &context.project.repo,
-                )),
-                workspace_info,
-            }
-        }
+    let GitToolBackend::Host {
+        git_binary,
+        projects_root,
+    } = &context.backend;
+    let repo_cache =
+        projects::workspace::project_repo_cache_path(projects_root, context.project.id);
+    let clone =
+        projects::workspace::agent_clone_path(projects_root, context.project.id, context.agent_id);
+    workspace_info.insert("repo_cache".to_string(), json!(repo_cache));
+    GitWorkspaceConfig {
+        worktree: clone,
+        git_binary: std::path::PathBuf::from(git_binary),
+        policy: GitPolicy::new(context.project.branch.clone()),
+        default_push_branch: Some(format!("mai-agent/{}", context.agent_id)),
+        remote_url: Some(github_clone_url(
+            &context.project.owner,
+            &context.project.repo,
+        )),
+        workspace_info,
     }
 }
 
 #[derive(Clone)]
 pub(crate) enum MaiGitCredentialProvider {
-    Static {
-        token: Option<String>,
-    },
+    #[cfg(test)]
+    Static { token: Option<String> },
     Project {
         runtime: Arc<AgentRuntime>,
         project_id: ProjectId,
@@ -240,6 +213,7 @@ pub(crate) enum MaiGitCredentialProvider {
 impl fmt::Debug for MaiGitCredentialProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(test)]
             Self::Static { token } => f
                 .debug_struct("MaiGitCredentialProvider::Static")
                 .field(
@@ -263,6 +237,7 @@ impl GitCredentialProvider for MaiGitCredentialProvider {
         let provider = self.clone();
         async move {
             let token = match provider {
+                #[cfg(test)]
                 MaiGitCredentialProvider::Static { token } => token,
                 MaiGitCredentialProvider::Project {
                     runtime,
@@ -279,78 +254,23 @@ impl GitCredentialProvider for MaiGitCredentialProvider {
     }
 }
 
-enum ProjectGitExecutionBackend {
-    Sidecar {
-        docker: DockerClient,
-        sidecar_image: String,
-        workspace_volume: String,
-        repo_path: String,
-        agent_id: AgentId,
-    },
-    #[cfg(test)]
-    Host,
-}
+#[cfg(test)]
+struct ProjectGitExecutionBackend;
 
-impl ProjectGitExecutionBackend {
-    fn new(backend: &GitToolBackend<'_>, agent_id: AgentId) -> Self {
-        match backend {
-            GitToolBackend::Sidecar {
-                docker,
-                sidecar_image,
-                workspace_volume,
-                repo_path,
-            } => Self::Sidecar {
-                docker: (*docker).clone(),
-                sidecar_image: (*sidecar_image).to_string(),
-                workspace_volume: workspace_volume.clone(),
-                repo_path: (*repo_path).to_string(),
-                agent_id,
-            },
-            #[cfg(test)]
-            GitToolBackend::Host { .. } => Self::Host,
-        }
-    }
-}
-
+#[cfg(test)]
 impl fmt::Debug for ProjectGitExecutionBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Sidecar { agent_id, .. } => f
-                .debug_struct("ProjectGitExecutionBackend::Sidecar")
-                .field("agent_id", agent_id)
-                .finish(),
-            #[cfg(test)]
-            Self::Host => f.write_str("ProjectGitExecutionBackend::Host"),
-        }
+        f.write_str("ProjectGitExecutionBackend::Host")
     }
 }
 
+#[cfg(test)]
 impl ExecutionBackend for ProjectGitExecutionBackend {
     async fn run(
         &self,
         request: ExecutionRequest,
     ) -> std::result::Result<ExecutionOutput, PureError> {
-        match self {
-            Self::Sidecar {
-                docker,
-                sidecar_image,
-                workspace_volume,
-                repo_path,
-                agent_id,
-            } => run_sidecar_git_output(
-                docker,
-                sidecar_image,
-                workspace_volume,
-                repo_path,
-                *agent_id,
-                request.env.get(GIT_TOKEN_ENV).map(String::as_str),
-                &request.args,
-            )
-            .await
-            .map_err(pure_error_from_runtime),
-            #[cfg(test)]
-            Self::Host => run_host_git_request(request).await,
-        }
+        run_host_git_request(request).await
     }
 }
 
@@ -431,6 +351,7 @@ fn apply_host_git_safety_environment(command: &mut Command, cwd: &std::path::Pat
         .env_remove("MAI_GITHUB_INSTALLATION_TOKEN");
 }
 
+#[cfg(test)]
 fn runtime_error_from_pure(error: PureError) -> RuntimeError {
     RuntimeError::InvalidInput(error.to_string())
 }
@@ -582,6 +503,10 @@ mod tests {
         assert!(
             !source.contains(&format!("{}{}", "execute_pl_core", "_git_tool")),
             "project git tools should not keep a direct GitTool execution helper"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "GitToolBackend::", "Sidecar")),
+            "sidecar git execution must use MaiGitExecutionBackend through pl-core ToolSetBuilder"
         );
     }
 

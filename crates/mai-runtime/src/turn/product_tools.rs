@@ -25,6 +25,59 @@ pub(crate) struct GithubApiRequest {
     pub(crate) body: Option<Value>,
 }
 
+#[derive(Debug, Clone)]
+enum MaiProductToolHandler {
+    SaveTaskPlan,
+    SubmitReviewResult,
+    SaveArtifact,
+    GithubApiRequest,
+    QueueProjectReviewPrs,
+    Mcp { model_name: String },
+}
+
+impl MaiProductToolHandler {
+    fn from_tool_name(name: &str) -> crate::Result<Self> {
+        match name {
+            mai_tools::TOOL_SAVE_TASK_PLAN => Ok(Self::SaveTaskPlan),
+            mai_tools::TOOL_SUBMIT_REVIEW_RESULT => Ok(Self::SubmitReviewResult),
+            mai_tools::TOOL_SAVE_ARTIFACT => Ok(Self::SaveArtifact),
+            mai_tools::TOOL_GITHUB_API_REQUEST => Ok(Self::GithubApiRequest),
+            mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS => Ok(Self::QueueProjectReviewPrs),
+            model_name if model_name.starts_with("mcp__") => Ok(Self::Mcp {
+                model_name: model_name.to_string(),
+            }),
+            _ => Err(RuntimeError::InvalidInput(format!(
+                "tool `{name}` is not a mai-team product tool"
+            ))),
+        }
+    }
+
+    async fn execute(
+        &self,
+        registry: &MaiProductToolRegistry,
+        arguments: Value,
+    ) -> crate::Result<ToolExecution> {
+        if registry.cancellation_token.is_cancelled() {
+            return Err(RuntimeError::TurnCancelled);
+        }
+        match self {
+            Self::SaveTaskPlan => registry.save_task_plan(arguments).await,
+            Self::SubmitReviewResult => registry.submit_review_result(arguments).await,
+            Self::SaveArtifact => registry.save_artifact(arguments).await,
+            Self::GithubApiRequest => registry.github_api_request(arguments).await,
+            Self::QueueProjectReviewPrs => {
+                let prs = queue_project_review_prs_from_arguments(&arguments)?;
+                registry.queue_project_review_prs(prs).await
+            }
+            Self::Mcp { model_name } => {
+                registry
+                    .execute_mcp_tool(model_name.clone(), arguments)
+                    .await
+            }
+        }
+    }
+}
+
 /// 将 mai-team 产品工具挂入 pl-core agent kernel 的动态工具注册表。
 ///
 /// 该注册器只承载 GitHub、review queue、artifact、task plan 和 MCP 资源等产品语义；
@@ -70,18 +123,20 @@ impl MaiProductToolRegistry {
                         schema.name()
                     )));
                 };
-                let tool_name = name.clone();
+                let handler = MaiProductToolHandler::from_tool_name(name)?;
                 let executor = self.clone();
+                let tool_name = name.clone();
                 Ok(RegisteredTool::new(
                     name.clone(),
                     description.clone(),
                     input_schema.clone(),
                     move |input, _context| {
                         let executor = executor.clone();
+                        let handler = handler.clone();
                         let tool_name = tool_name.clone();
                         async move {
-                            let execution = executor
-                                .execute_product_tool(&tool_name, input.arguments)
+                            let execution = handler
+                                .execute(&executor, input.arguments)
                                 .await
                                 .map_err(|error| PureError::ToolExecutionFailed {
                                     tool: tool_name.clone(),
@@ -95,83 +150,47 @@ impl MaiProductToolRegistry {
             .collect()
     }
 
-    pub(crate) async fn execute_product_tool(
-        &self,
-        name: &str,
-        arguments: Value,
-    ) -> crate::Result<ToolExecution> {
-        if self.cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
-        match name {
-            mai_tools::TOOL_SAVE_TASK_PLAN => {
-                let title = required_string_argument(&arguments, "title")?;
-                let markdown = required_string_argument(&arguments, "markdown")?;
-                let task = self
-                    .runtime
-                    .save_task_plan(self.agent_id, title, markdown)
-                    .await?;
-                Ok(ToolExecution::new(
-                    true,
-                    serde_json::to_string(&task).unwrap_or_else(|_| "{}".to_string()),
-                    false,
-                ))
-            }
-            mai_tools::TOOL_SUBMIT_REVIEW_RESULT => {
-                let passed = arguments
-                    .get("passed")
-                    .and_then(Value::as_bool)
-                    .ok_or_else(|| {
-                        RuntimeError::InvalidInput("missing boolean field `passed`".to_string())
-                    })?;
-                let findings = required_string_argument(&arguments, "findings")?;
-                let summary = required_string_argument(&arguments, "summary")?;
-                let review = self
-                    .runtime
-                    .submit_review_result(self.agent_id, passed, findings, summary)
-                    .await?;
-                Ok(ToolExecution::new(
-                    true,
-                    serde_json::to_string(&review).unwrap_or_else(|_| "{}".to_string()),
-                    false,
-                ))
-            }
-            mai_tools::TOOL_SAVE_ARTIFACT => {
-                let path = required_string_argument(&arguments, "path")?;
-                let name = optional_string_argument(&arguments, "name");
-                let artifact = self
-                    .runtime
-                    .save_artifact(self.agent_id, path, name)
-                    .await?;
-                Ok(ToolExecution::new(
-                    true,
-                    serde_json::to_string(&artifact).unwrap_or_else(|_| "{}".to_string()),
-                    false,
-                ))
-            }
-            mai_tools::TOOL_GITHUB_API_REQUEST => {
-                let request = github_api_request_from_arguments(&arguments)?;
-                self.runtime
-                    .execute_project_github_api_request(&self.agent, &request)
-                    .await
-            }
-            mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS => {
-                let prs = queue_project_review_prs_from_arguments(&arguments)?;
-                self.queue_project_review_prs(prs).await
-            }
-            pl_core::TOOL_GIT_SYNC_DEFAULT_BRANCH => {
-                self.runtime
-                    .execute_project_git_tool(&self.agent, name, arguments)
-                    .await
-            }
-            model_name if model_name.starts_with("mcp__") => {
-                self.execute_mcp_tool(model_name.to_string(), arguments)
-                    .await
-            }
-            _ => Err(RuntimeError::InvalidInput(format!(
-                "tool `{name}` is not a mai-team product tool"
-            ))),
-        }
+    async fn save_task_plan(&self, arguments: Value) -> crate::Result<ToolExecution> {
+        let title = required_string_argument(&arguments, "title")?;
+        let markdown = required_string_argument(&arguments, "markdown")?;
+        let task = self
+            .runtime
+            .save_task_plan(self.agent_id, title, markdown)
+            .await?;
+        Ok(json_tool_execution(&task))
+    }
+
+    async fn submit_review_result(&self, arguments: Value) -> crate::Result<ToolExecution> {
+        let passed = arguments
+            .get("passed")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput("missing boolean field `passed`".to_string())
+            })?;
+        let findings = required_string_argument(&arguments, "findings")?;
+        let summary = required_string_argument(&arguments, "summary")?;
+        let review = self
+            .runtime
+            .submit_review_result(self.agent_id, passed, findings, summary)
+            .await?;
+        Ok(json_tool_execution(&review))
+    }
+
+    async fn save_artifact(&self, arguments: Value) -> crate::Result<ToolExecution> {
+        let path = required_string_argument(&arguments, "path")?;
+        let name = optional_string_argument(&arguments, "name");
+        let artifact = self
+            .runtime
+            .save_artifact(self.agent_id, path, name)
+            .await?;
+        Ok(json_tool_execution(&artifact))
+    }
+
+    async fn github_api_request(&self, arguments: Value) -> crate::Result<ToolExecution> {
+        let request = github_api_request_from_arguments(&arguments)?;
+        self.runtime
+            .execute_project_github_api_request(&self.agent, &request)
+            .await
     }
 
     async fn queue_project_review_prs(
@@ -276,6 +295,14 @@ fn optional_string_argument(arguments: &Value, field: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn json_tool_execution(value: &impl serde::Serialize) -> ToolExecution {
+    ToolExecution::new(
+        true,
+        serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string()),
+        false,
+    )
+}
+
 fn queue_project_review_prs_from_arguments(
     arguments: &Value,
 ) -> crate::Result<Vec<QueueProjectReviewPr>> {
@@ -348,6 +375,14 @@ mod tests {
         assert!(
             !source.contains(&format!("{}{}", "Tool", "Definition")),
             "mai-team 产品工具注册不应再经过 mai_protocol 旧工具定义类型"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "execute_product", "_tool")),
+            "mai-team 产品工具应在注册 RegisteredTool 时绑定具体 handler，而不是保留本地大分发入口"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "TOOL_GIT_SYNC", "_DEFAULT_BRANCH")),
+            "git_sync_default_branch 是 pl-core shared git tool，不应在产品工具注册器里兜底"
         );
     }
 
