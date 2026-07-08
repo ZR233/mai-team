@@ -1,15 +1,15 @@
 use crate::names::TOOL_QUEUE_PROJECT_REVIEW_PRS;
-use crate::schema::object_schema;
+use pl_core::{ToolInputSchemaField, function_tool_schema};
 use pl_model::ToolSchema;
 use serde_json::json;
 
 pub(crate) fn definitions() -> Vec<ToolSchema> {
-    vec![ToolSchema::function(
+    vec![function_tool_schema(
         TOOL_QUEUE_PROJECT_REVIEW_PRS,
         "Queue one or more pull requests for the current Mai project's automatic review pool. \
          The server infers the project from the calling agent; do not provide a project id. \
          Use this only from project PR selector or reviewer workflows.",
-        object_schema(vec![(
+        [ToolInputSchemaField::required(
             "prs",
             json!({
                 "type": "array",
@@ -35,7 +35,6 @@ pub(crate) fn definitions() -> Vec<ToolSchema> {
                     "additionalProperties": false
                 }
             }),
-            true,
-        )]),
+        )],
     )]
 }

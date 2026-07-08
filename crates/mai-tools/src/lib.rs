@@ -2,7 +2,6 @@ use pl_model::ToolSchema;
 
 mod definitions;
 mod names;
-mod schema;
 
 pub use names::*;
 
@@ -160,6 +159,32 @@ mod tests {
 
         assert!(item_properties.contains_key("headSha"));
         assert!(!item_properties.contains_key("head_sha"));
+    }
+
+    #[test]
+    fn product_tool_schemas_use_pl_core_schema_helpers() {
+        let definitions = [
+            include_str!("definitions/workflow.rs"),
+            include_str!("definitions/github.rs"),
+            include_str!("definitions/review.rs"),
+        ]
+        .join("\n");
+
+        assert!(
+            definitions.contains("function_tool_schema(")
+                && definitions.contains("ToolInputSchemaField::required"),
+            "mai-tools 产品工具 schema 应通过 pl-core 统一 helper 构造"
+        );
+        for forbidden in [
+            "ToolSchema::function",
+            "crate::schema::object_schema",
+            "object_schema(vec!",
+        ] {
+            assert!(
+                !definitions.contains(forbidden),
+                "mai-tools 不应保留本地工具 schema 构造 `{forbidden}`"
+            );
+        }
     }
 
     #[test]
