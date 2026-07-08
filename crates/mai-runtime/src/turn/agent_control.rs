@@ -1,6 +1,5 @@
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
 
 use mai_protocol::{AgentId, AgentRole, AgentStatus as MaiAgentStatus, AgentSummary};
 use pl_core::{
@@ -16,8 +15,6 @@ use uuid::Uuid;
 
 use crate::state::{AgentRecord, CollabInput};
 use crate::{AgentRuntime, RuntimeError, agents};
-
-const DEFAULT_WAIT_AGENT_OBSERVATION_SECS: u64 = 30;
 
 /// 将 mai-team 的协作 agent 生命周期接入 pl-core agent-control 工具。
 ///
@@ -136,7 +133,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
     ) -> std::result::Result<AgentControlSendInputOutput, Self::Error> {
         let target = parse_agent_id(&request.target)?;
         let interrupt = request.interrupt;
-        let trigger_turn = request.trigger_turn || interrupt;
+        let mode = request.turn_mode();
         let output = agents::send_input_to_agent(
             self.runtime.as_ref(),
             &self.runtime,
@@ -145,8 +142,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
                 session_id: None,
                 message: request.message,
                 skill_mentions: request.skill_mentions,
-                trigger_turn,
-                interrupt,
+                mode,
                 cancel_grace: crate::TURN_CANCEL_GRACE,
             },
         )
@@ -192,7 +188,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
             .runtime
             .wait_agents_output_with_cancel(
                 targets,
-                wait_timeout(request.timeout_ms),
+                request.timeout_duration(),
                 &self.cancellation_token,
             )
             .await?;
@@ -338,13 +334,6 @@ fn non_empty_message(message: String) -> Option<String> {
     (!trimmed.is_empty()).then(|| message)
 }
 
-fn wait_timeout(timeout_ms: Option<i64>) -> Duration {
-    let Some(timeout_ms) = timeout_ms.and_then(|value| u64::try_from(value).ok()) else {
-        return Duration::from_secs(DEFAULT_WAIT_AGENT_OBSERVATION_SECS);
-    };
-    Duration::from_millis(timeout_ms.max(100))
-}
-
 fn parse_agent_id(value: &str) -> crate::Result<AgentId> {
     Uuid::parse_str(value)
         .map_err(|error| RuntimeError::InvalidInput(format!("invalid agent id `{value}`: {error}")))
@@ -389,5 +378,31 @@ mod tests {
             !source.contains(&format!("{}{}", "Pure", "Error")),
             "agent-control adapter 不应依赖 pl_protocol/pl_core 错误协议类型"
         );
+    }
+
+    #[test]
+    fn agent_control_backend_reuses_pl_core_request_policies() {
+        let source = include_str!("agent_control.rs");
+
+        assert!(
+            source.contains("request.turn_mode()"),
+            "send_input 的 triggerTurn/interrupt 归一化应由 pl-core 请求类型提供"
+        );
+        assert!(
+            source.contains("request.timeout_duration()"),
+            "wait_agent 的 timeout 默认值和下限应由 pl-core 请求类型提供"
+        );
+        for forbidden in [
+            format!("{}{}", "trigger_turn || ", "interrupt"),
+            format!("{}{}", "fn wait", "_timeout"),
+            format!("{}{}", "DEFAULT_WAIT_AGENT", "_OBSERVATION_SECS"),
+            format!("{}{}", "timeout_ms", ".and_then"),
+            format!("{}{}", ".max", "(100)"),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "agent-control adapter 不应手写共享请求策略 `{forbidden}`"
+            );
+        }
     }
 }

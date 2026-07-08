@@ -13,8 +13,7 @@ pub(crate) struct SendInputRequest {
     pub(crate) session_id: Option<SessionId>,
     pub(crate) message: String,
     pub(crate) skill_mentions: Vec<String>,
-    pub(crate) trigger_turn: bool,
-    pub(crate) interrupt: bool,
+    pub(crate) mode: AgentInputTurnMode,
     pub(crate) cancel_grace: Duration,
 }
 
@@ -24,7 +23,7 @@ pub(crate) async fn send_input_to_agent(
     request: SendInputRequest,
 ) -> Result<Value> {
     let agent = service.agent(request.target).await?;
-    let mode = AgentInputTurnMode::from_codex_flags(request.trigger_turn, request.interrupt);
+    let mode = request.mode;
     match mode.initial_action() {
         AgentInputInitialAction::Queue => return Ok(queue_agent_input(&agent, request).await),
         AgentInputInitialAction::StartTurn => {}

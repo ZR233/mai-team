@@ -1824,8 +1824,7 @@ impl AgentRuntime {
                 session_id,
                 message,
                 skill_mentions,
-                trigger_turn: true,
-                interrupt,
+                mode: pl_core::AgentInputTurnMode::from_codex_flags(true, interrupt),
                 cancel_grace: TURN_CANCEL_GRACE,
             },
         )
