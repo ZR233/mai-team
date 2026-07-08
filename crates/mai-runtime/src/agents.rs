@@ -283,13 +283,12 @@ The plan should include:
 
 Keep the plan concise and actionable. Prefer behavior-level descriptions over file-by-file inventories. Mention specific files only when needed to disambiguate a non-obvious change."#;
 
-pub(crate) fn agent_type_role(value: &str) -> Option<AgentRole> {
-    match value.trim().to_lowercase().as_str() {
-        "planner" => Some(AgentRole::Planner),
-        "explorer" => Some(AgentRole::Explorer),
-        "executor" | "worker" | "default" | "" => Some(AgentRole::Executor),
-        "reviewer" => Some(AgentRole::Reviewer),
-        _ => None,
+pub(crate) fn agent_type_role(kind: pl_core::AgentControlAgentType) -> AgentRole {
+    match kind {
+        pl_core::AgentControlAgentType::Planner => AgentRole::Planner,
+        pl_core::AgentControlAgentType::Explorer => AgentRole::Explorer,
+        pl_core::AgentControlAgentType::Executor => AgentRole::Executor,
+        pl_core::AgentControlAgentType::Reviewer => AgentRole::Reviewer,
     }
 }
 

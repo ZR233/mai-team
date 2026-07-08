@@ -95,12 +95,8 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
         &self,
         request: AgentControlSpawnRequest,
     ) -> std::result::Result<AgentControlSpawnOutput, Self::Error> {
-        let role = request
-            .agent_type
-            .as_deref()
-            .and_then(agents::agent_type_role)
-            .unwrap_or_default();
-        let role_profile_requested = role_profile_requested(request.agent_type.as_deref());
+        let agent_type = request.agent_type_policy();
+        let role = agents::agent_type_role(agent_type.kind);
         let result = agents::spawn_child_agent(
             &self.runtime,
             self.agent_id,
@@ -109,7 +105,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
                 role,
                 model: request.model,
                 reasoning_effort: request.reasoning_effort,
-                use_role_model: role_profile_requested,
+                use_role_model: agent_type.role_profile_requested,
                 forked_history: request.forked_messages,
                 collab_input: CollabInput {
                     message: non_empty_message(request.message),
@@ -320,15 +316,6 @@ impl MaiAgentControlBackend {
     }
 }
 
-fn role_profile_requested(agent_type: Option<&str>) -> bool {
-    agent_type.is_some_and(|value| {
-        matches!(
-            value.trim().to_lowercase().as_str(),
-            "planner" | "explorer" | "executor" | "reviewer"
-        )
-    })
-}
-
 fn non_empty_message(message: String) -> Option<String> {
     let trimmed = message.trim();
     (!trimmed.is_empty()).then(|| message)
@@ -392,12 +379,21 @@ mod tests {
             source.contains("request.timeout_duration()"),
             "wait_agent 的 timeout 默认值和下限应由 pl-core 请求类型提供"
         );
+        assert!(
+            source.contains("request.agent_type_policy()"),
+            "spawn_agent 的 agentType 解析和 profile 策略应由 pl-core 请求类型提供"
+        );
         for forbidden in [
             format!("{}{}", "trigger_turn || ", "interrupt"),
             format!("{}{}", "fn wait", "_timeout"),
             format!("{}{}", "DEFAULT_WAIT_AGENT", "_OBSERVATION_SECS"),
             format!("{}{}", "timeout_ms", ".and_then"),
             format!("{}{}", ".max", "(100)"),
+            format!("{}{}", "fn role_profile", "_requested"),
+            format!(
+                "{}{}",
+                "\"planner\" | \"explorer\"", " | \"executor\" | \"reviewer\""
+            ),
         ] {
             assert!(
                 !source.contains(&forbidden),
