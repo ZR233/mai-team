@@ -3022,7 +3022,7 @@ fn repair_adds_missing_tool_outputs_for_function_call_after_reasoning() {
             "{}".to_string(),
         ),
     ];
-    turn::history::repair_incomplete_tool_history(&mut history);
+    pl_core::repair_incomplete_tool_history(&mut history);
     assert_eq!(history.len(), 4);
     assert_eq!(
         pl_tool_result_call_id(&history[3]).as_deref(),
@@ -3050,7 +3050,7 @@ fn repair_adds_missing_tool_outputs_for_partial_results() {
             "{}".to_string(),
         ),
     ];
-    turn::history::repair_incomplete_tool_history(&mut history);
+    pl_core::repair_incomplete_tool_history(&mut history);
     assert_eq!(history.len(), 4);
     assert_eq!(
         pl_tool_result_call_id(&history[3]).as_deref(),
@@ -3065,7 +3065,7 @@ fn repair_adds_missing_tool_outputs_for_function_call() {
         "container_exec".to_string(),
         "{}".to_string(),
     )];
-    turn::history::repair_incomplete_tool_history(&mut history);
+    pl_core::repair_incomplete_tool_history(&mut history);
     assert_eq!(history.len(), 2);
     assert_eq!(
         pl_tool_result_call_id(&history[1]).as_deref(),
@@ -3090,14 +3090,14 @@ fn repair_does_nothing_for_complete_history() {
         ),
         turn::history::assistant_text_message("done"),
     ];
-    turn::history::repair_incomplete_tool_history(&mut history);
+    pl_core::repair_incomplete_tool_history(&mut history);
     assert_eq!(history.len(), 4);
 }
 
 #[test]
 fn repair_does_nothing_for_empty_history() {
     let mut history: Vec<Message> = vec![];
-    turn::history::repair_incomplete_tool_history(&mut history);
+    pl_core::repair_incomplete_tool_history(&mut history);
     assert!(history.is_empty());
 }
 
@@ -3112,7 +3112,7 @@ fn repair_inserts_before_user_message() {
         ),
         turn::history::user_text_message("继续"),
     ];
-    turn::history::repair_incomplete_tool_history(&mut history);
+    pl_core::repair_incomplete_tool_history(&mut history);
     assert_eq!(history.len(), 4);
     assert_eq!(
         pl_tool_result_call_id(&history[2]).as_deref(),
@@ -3142,7 +3142,7 @@ fn repair_inserts_partial_before_user_message() {
         ),
         turn::history::user_text_message("继续"),
     ];
-    turn::history::repair_incomplete_tool_history(&mut history);
+    pl_core::repair_incomplete_tool_history(&mut history);
     assert_eq!(history.len(), 5);
     assert_eq!(
         pl_tool_result_call_id(&history[3]).as_deref(),
@@ -3173,7 +3173,7 @@ fn repair_keeps_consecutive_function_calls_in_one_batch() {
         ),
         turn::history::user_text_message("继续"),
     ];
-    turn::history::repair_incomplete_tool_history(&mut history);
+    pl_core::repair_incomplete_tool_history(&mut history);
 
     assert_eq!(history.len(), 6);
     assert_eq!(pl_tool_call_ids(&history[1]), vec!["call_1"]);
