@@ -4,7 +4,6 @@ use mai_protocol::{AgentId, AgentRole};
 use pl_core::RegisteredTool;
 use pl_model::ToolSchema;
 use serde_json::{Value, json};
-use tokio_util::sync::CancellationToken;
 
 use crate::state::AgentRecord;
 use crate::turn::tool_output::ToolExecution;
@@ -34,7 +33,6 @@ pub(crate) struct MaiProductToolRegistry {
     agent: Arc<AgentRecord>,
     agent_id: AgentId,
     schemas: Vec<ToolSchema>,
-    cancellation_token: CancellationToken,
 }
 
 impl MaiProductToolRegistry {
@@ -43,14 +41,12 @@ impl MaiProductToolRegistry {
         agent: Arc<AgentRecord>,
         agent_id: AgentId,
         schemas: Vec<ToolSchema>,
-        cancellation_token: CancellationToken,
     ) -> Self {
         Self {
             runtime,
             agent,
             agent_id,
             schemas,
-            cancellation_token,
         }
     }
 
@@ -85,7 +81,6 @@ impl MaiProductToolRegistry {
                         let executor = executor.clone();
                         let tool_name = tool_name.clone();
                         async move {
-                            executor.ensure_not_cancelled(&tool_name)?;
                             let execution = executor
                                 .save_task_plan(input.arguments)
                                 .await
@@ -106,7 +101,6 @@ impl MaiProductToolRegistry {
                         let executor = executor.clone();
                         let tool_name = tool_name.clone();
                         async move {
-                            executor.ensure_not_cancelled(&tool_name)?;
                             let execution = executor
                                 .submit_review_result(input.arguments)
                                 .await
@@ -127,7 +121,6 @@ impl MaiProductToolRegistry {
                         let executor = executor.clone();
                         let tool_name = tool_name.clone();
                         async move {
-                            executor.ensure_not_cancelled(&tool_name)?;
                             let execution = executor
                                 .save_artifact(input.arguments)
                                 .await
@@ -148,7 +141,6 @@ impl MaiProductToolRegistry {
                         let executor = executor.clone();
                         let tool_name = tool_name.clone();
                         async move {
-                            executor.ensure_not_cancelled(&tool_name)?;
                             let execution = executor
                                 .github_api_request(input.arguments)
                                 .await
@@ -169,7 +161,6 @@ impl MaiProductToolRegistry {
                         let executor = executor.clone();
                         let tool_name = tool_name.clone();
                         async move {
-                            executor.ensure_not_cancelled(&tool_name)?;
                             let prs = queue_project_review_prs_from_arguments(&input.arguments)
                                 .map_err(|error| product_tool_error(&tool_name, error))?;
                             let execution = executor
@@ -185,16 +176,6 @@ impl MaiProductToolRegistry {
                 "tool `{name}` is not a mai-team product tool"
             ))),
         }
-    }
-
-    fn ensure_not_cancelled(&self, tool_name: &str) -> pl_protocol::Result<()> {
-        if self.cancellation_token.is_cancelled() {
-            return Err(pl_protocol::PureError::ToolExecutionFailed {
-                tool: tool_name.to_string(),
-                error: RuntimeError::TurnCancelled.to_string(),
-            });
-        }
-        Ok(())
     }
 
     async fn save_task_plan(&self, arguments: Value) -> crate::Result<ToolExecution> {
@@ -432,6 +413,23 @@ mod tests {
         assert!(
             !source.contains(&format!("{}{}", "execute_mcp", "_tool")),
             "MCP model tools 应通过 pl-core ToolSetBuilder 后端执行"
+        );
+    }
+
+    #[test]
+    fn product_tools_delegate_cancellation_to_pl_core_registered_tool() {
+        let source = include_str!("product_tools.rs");
+
+        assert!(
+            !source.contains(&format!("{}{}", "ensure_not", "_cancelled")),
+            "产品工具取消检查应由 pl-core RegisteredTool 统一处理"
+        );
+        assert!(
+            !source.contains(&format!(
+                "{}{}{}",
+                "RuntimeError::Turn", "Cancelled", ".to_string()"
+            )),
+            "产品工具不应自行把 turn cancelled 映射为工具错误"
         );
     }
 

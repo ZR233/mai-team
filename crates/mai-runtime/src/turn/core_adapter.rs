@@ -369,7 +369,6 @@ pub(crate) async fn build_mai_agent_kernel(
         ctx.agent.clone(),
         ctx.agent_id,
         ctx.product_tool_schemas,
-        ctx.cancellation_token.clone(),
     );
     let product_tools = product_tool_registry.registered_tools()?;
     build_kernel_with_native_shared_tools(
