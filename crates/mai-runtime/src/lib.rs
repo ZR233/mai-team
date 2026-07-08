@@ -1769,17 +1769,8 @@ impl AgentRuntime {
                         pending.push(*agent_id);
                     }
                 }
-                let wait_snapshot = if !completed.is_empty() || pending.is_empty() {
-                    pl_core::AgentWaitSnapshot {
-                        turn_presence: pl_core::AgentTurnPresence::NoActiveTurn,
-                        status: pl_core::AgentLifecycleStatusKind::Completed,
-                    }
-                } else {
-                    pl_core::AgentWaitSnapshot {
-                        turn_presence: pl_core::AgentTurnPresence::ActiveTurn,
-                        status: pl_core::AgentLifecycleStatusKind::Active,
-                    }
-                };
+                let wait_snapshot =
+                    pl_core::AgentWaitSnapshot::from_group_counts(completed.len(), pending.len());
                 Ok::<_, RuntimeError>((wait_snapshot, (completed, pending)))
             },
             pl_core::AgentWaitLoopOptions::new(timeout),

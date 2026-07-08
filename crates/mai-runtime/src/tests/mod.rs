@@ -259,6 +259,14 @@ fn wait_completion_uses_pl_core_policy() {
         "多 agent wait 工具也应复用 pl-core wait loop"
     );
     assert!(
+        wait_agents_function.contains("pl_core::AgentWaitSnapshot::from_group_counts"),
+        "多 agent wait 的 completed/pending 分组进度应由 pl-core helper 投影"
+    );
+    assert!(
+        !wait_agents_function.contains("pl_core::AgentWaitSnapshot {"),
+        "mai-runtime 不应手写多 agent wait 的 AgentWaitSnapshot 分组状态"
+    );
+    assert!(
         wait_agents_function.contains("into_group_wait_agent_output"),
         "多 agent wait 的 completed/pending/timedOut 输出形状应由 pl-core helper 统一生成"
     );
