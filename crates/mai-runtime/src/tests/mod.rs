@@ -217,8 +217,16 @@ fn wait_completion_uses_pl_core_policy() {
         "wait_agent completion 判断应由 pl-core AgentWaitSnapshot 统一维护"
     );
     assert!(
+        wait_source.contains("pl_core::wait_for_agent_completion"),
+        "wait_agent 轮询、超时和取消语义应由 pl-core wait loop 统一维护"
+    );
+    assert!(
         !wait_source.contains("AgentStatus::Completed"),
         "agents/wait.rs 不应直接维护完成状态列表"
+    );
+    assert!(
+        !wait_source.contains("tokio::time::sleep"),
+        "agents/wait.rs 不应保留本地 sleep 轮询"
     );
     assert!(
         !agents_source.contains("summary.current_turn.is_none()\n        || matches!"),
