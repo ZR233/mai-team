@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use mai_protocol::{AgentId, AgentStatus, SessionId, TurnId};
+use pl_core::AgentInputTurnMode;
 use serde_json::{Value, json};
 
 use super::{AgentInputOps, AgentServiceOps, prepare_turn, wait_agent};
@@ -23,10 +24,11 @@ pub(crate) async fn send_input_to_agent(
     request: SendInputRequest,
 ) -> Result<Value> {
     let agent = service.agent(request.target).await?;
-    if !request.trigger_turn && !request.interrupt {
+    let mode = AgentInputTurnMode::from_codex_flags(request.trigger_turn, request.interrupt);
+    if mode.queues_without_start() {
         return Ok(queue_agent_input(&agent, request).await);
     }
-    if request.interrupt {
+    if mode.interrupts() {
         let current_turn = agent.summary.read().await.current_turn;
         if let Some(turn_id) = current_turn {
             input_ops.cancel_agent_turn(request.target, turn_id).await?;
@@ -55,7 +57,7 @@ pub(crate) async fn send_input_to_agent(
             );
             Ok(json!({ "turnId": turn_id, "queued": false }))
         }
-        Err(RuntimeError::AgentBusy(_)) if !request.interrupt => {
+        Err(RuntimeError::AgentBusy(_)) if mode.queues_when_busy() => {
             Ok(queue_agent_input(&agent, request).await)
         }
         Err(err) => Err(err),

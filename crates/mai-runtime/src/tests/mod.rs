@@ -102,6 +102,26 @@ fn cancel_turn_uses_pl_core_cancellation_guard() {
 }
 
 #[test]
+fn send_input_uses_pl_core_turn_mode_policy() {
+    let source = include_str!("../agents/input.rs");
+
+    assert!(
+        source.contains("AgentInputTurnMode"),
+        "send_input 的 triggerTurn/interrupt 模式应由 pl-core 统一解释"
+    );
+    for forbidden in [
+        "!request.trigger_turn && !request.interrupt",
+        "if request.interrupt",
+        "if !request.interrupt",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "mai-runtime 不应手写 send_input 模式判断 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
 fn kernel_tool_projection_uses_pl_core_completion_timestamp_fallback() {
     let source = include_str!("../turn/kernel_tools.rs");
 
