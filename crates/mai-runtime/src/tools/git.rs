@@ -105,7 +105,7 @@ async fn execute_git_tool_via_registry(
         ))
         .await
         .map_err(runtime_error_from_pure)?;
-    Ok(output.description)
+    Ok(output.into_model_output())
 }
 
 pub(crate) struct NativeGitToolRuntime {
@@ -491,6 +491,7 @@ mod tests {
             format!("{}{}", "Tool", "Context {"),
             format!("{}{}", "Tool", "Input {"),
             format!("{}{}", ".register", "(kernel.core_mut"),
+            "output.description".to_string(),
         ] {
             assert!(
                 !execute_path.contains(&forbidden),
