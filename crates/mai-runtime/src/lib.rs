@@ -4632,10 +4632,7 @@ fn sidecar_git_askpass_script() -> &'static str {
 }
 
 fn redact_secret(value: &str, secret: &str) -> String {
-    if secret.is_empty() {
-        return value.to_string();
-    }
-    value.replace(secret, "<redacted>")
+    pl_core::SecretRedaction::new([secret]).redact_str(value)
 }
 
 fn normalized_text(value: Option<String>) -> Option<String> {

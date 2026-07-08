@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use mai_protocol::AgentId;
-use pl_core::{McpToolBackend, McpToolRequest};
+use pl_core::{McpToolBackend, McpToolRequest, SecretRedaction};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -88,6 +88,7 @@ impl MaiMcpToolBackend {
             .await
             .map_err(|error| error.to_string())?
             .unwrap_or_default();
+        let redaction = SecretRedaction::new([token.as_str()]);
         let output = tokio::select! {
             output = manager.call_model_tool(&request.name, request.arguments) => output,
             _ = self.cancellation_token.cancelled() => {
@@ -95,29 +96,14 @@ impl MaiMcpToolBackend {
             }
         };
         match output {
-            Ok(value) => Ok(redact_value(value, &token)),
+            Ok(value) => Ok(redaction.redact_json_value(value)),
             Err(mai_mcp::McpError::ToolNotFound(_)) => Err(RuntimeError::InvalidInput(format!(
                 "project MCP tool `{tool}` was not discovered"
             ))
             .to_string()),
-            Err(error) => Err(redact_secret(&error.to_string(), &token)),
+            Err(error) => Err(redaction.redact_str(&error.to_string())),
         }
     }
-}
-
-fn redact_value(value: Value, secret: &str) -> Value {
-    if secret.is_empty() {
-        return value;
-    }
-    let redacted = redact_secret(&value.to_string(), secret);
-    serde_json::from_str(&redacted).unwrap_or(Value::String(redacted))
-}
-
-fn redact_secret(value: &str, secret: &str) -> String {
-    if secret.is_empty() {
-        return value.to_string();
-    }
-    value.replace(secret, "<redacted>")
 }
 
 #[cfg(test)]
@@ -133,6 +119,24 @@ mod tests {
         assert!(
             !source.contains(&format!("{}{}", "Pure", "Error")),
             "MCP tool backend 不应依赖 pl_protocol 错误类型"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_backend_uses_pl_core_secret_redaction() {
+        let source = include_str!("mcp_tools.rs");
+
+        assert!(
+            source.contains("SecretRedaction"),
+            "MCP tool backend 应复用 pl-core 的 explicit secret redaction"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "fn redact", "_value")),
+            "MCP tool backend 不应保留本地 JSON 遮蔽实现"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "fn redact", "_secret")),
+            "MCP tool backend 不应保留本地 string 遮蔽实现"
         );
     }
 }
