@@ -1,15 +1,10 @@
-use mai_protocol::{AgentId, AgentMessage, MessageRole, ModelOutputItem, SessionId, now};
+use mai_protocol::{AgentId, AgentMessage, MessageRole, SessionId, now};
 use mai_store::ConfigStore;
 use pl_protocol::{Message, MessageContent, MessageRole as ModelMessageRole, ToolResultMetadata};
 use pl_protocol::{ToolCallHistoryMetadata, ToolCallKind};
 
 use crate::state::AgentRecord;
 use crate::{Result, RuntimeError};
-
-const COMPACT_RECENT_ASSISTANT_MAX_CHARS: usize = 8_000;
-const COMPACT_RECENT_TOOL_OUTPUT_MAX_CHARS: usize = 4_000;
-const COMPACT_RECENT_ASSISTANT_ITEMS: usize = 2;
-const COMPACT_RECENT_TOOL_OUTPUT_ITEMS: usize = 3;
 
 pub(crate) async fn record_message(
     store: &ConfigStore,
@@ -117,22 +112,6 @@ pub(crate) async fn record_session_context_tokens(
         .save_session_context_tokens(agent_id, session_id, tokens)
         .await?;
     Ok(())
-}
-
-pub(crate) async fn session_context_tokens(
-    agent: &AgentRecord,
-    agent_id: AgentId,
-    session_id: SessionId,
-) -> Result<Option<u64>> {
-    let sessions = agent.sessions.lock().await;
-    sessions
-        .iter()
-        .find(|session| session.summary.id == session_id)
-        .map(|session| session.last_context_tokens)
-        .ok_or(RuntimeError::SessionNotFound {
-            agent_id,
-            session_id,
-        })
 }
 
 pub(crate) async fn session_history(
@@ -277,56 +256,6 @@ fn tool_call_arguments(value: &serde_json::Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
-pub(crate) fn compact_summary_from_output(output: &[ModelOutputItem]) -> Option<String> {
-    output.iter().rev().find_map(|item| {
-        let text = match item {
-            ModelOutputItem::Message { text } => text,
-            _ => return None,
-        };
-        let text = text.trim();
-        (!text.is_empty()).then(|| text.to_string())
-    })
-}
-
-pub(crate) fn build_compacted_history(
-    history: &[Message],
-    summary: &str,
-    max_user_chars: usize,
-    summary_prefix: &str,
-) -> Vec<Message> {
-    let mut replacement = recent_user_messages(history, max_user_chars, summary_prefix)
-        .into_iter()
-        .map(user_text_message)
-        .collect::<Vec<_>>();
-    replacement.extend(recent_compaction_tail(history, summary_prefix));
-    replacement.push(user_text_message(compact_summary_message(
-        summary,
-        summary_prefix,
-    )));
-    replacement
-}
-
-pub(crate) fn build_compaction_request_history(
-    history: &[Message],
-    max_user_chars: usize,
-    summary_prefix: &str,
-) -> Vec<Message> {
-    let mut input = Vec::new();
-    if let Some(summary) = latest_compact_summary(history, summary_prefix) {
-        input.push(user_text_message(summary.to_string()));
-    }
-    input.extend(
-        recent_user_messages_since_latest_summary(history, max_user_chars, summary_prefix)
-            .into_iter()
-            .map(user_text_message),
-    );
-    input.extend(recent_compaction_tail(history, summary_prefix));
-    if input.is_empty() {
-        return history.to_vec();
-    }
-    input
-}
-
 pub(crate) fn user_text_message(text: impl Into<String>) -> Message {
     Message {
         role: ModelMessageRole::User,
@@ -336,6 +265,7 @@ pub(crate) fn user_text_message(text: impl Into<String>) -> Message {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn assistant_text_message(text: impl Into<String>) -> Message {
     Message {
         role: ModelMessageRole::Assistant,
@@ -397,54 +327,11 @@ pub(crate) fn tool_result_message(
     }
 }
 
-pub(crate) fn compact_summary_message(summary: &str, summary_prefix: &str) -> String {
-    format!("{}\n{}", summary_prefix, summary.trim())
-}
-
 pub(crate) fn is_compact_summary(text: &str, summary_prefix: &str) -> bool {
     text.starts_with(summary_prefix)
 }
 
-pub(crate) fn recent_user_messages(
-    history: &[Message],
-    max_chars: usize,
-    summary_prefix: &str,
-) -> Vec<String> {
-    let mut selected = Vec::new();
-    let mut remaining = max_chars;
-    for item in history.iter().rev() {
-        if remaining == 0 {
-            break;
-        }
-        let Some(text) = user_message_text(item) else {
-            continue;
-        };
-        if is_compact_summary(text.trim(), summary_prefix) {
-            continue;
-        }
-        if text.chars().count() <= remaining {
-            selected.push(text.to_string());
-            remaining = remaining.saturating_sub(text.chars().count());
-        } else {
-            selected.push(take_last_chars(text, remaining));
-            break;
-        }
-    }
-    selected.reverse();
-    selected
-}
-
-fn recent_user_messages_since_latest_summary(
-    history: &[Message],
-    max_chars: usize,
-    summary_prefix: &str,
-) -> Vec<String> {
-    let start = latest_compact_summary_index(history, summary_prefix)
-        .map(|index| index + 1)
-        .unwrap_or_default();
-    recent_user_messages(&history[start..], max_chars, summary_prefix)
-}
-
+#[cfg(test)]
 pub(crate) fn user_message_text(item: &Message) -> Option<&str> {
     if item.role != ModelMessageRole::User {
         return None;
@@ -456,95 +343,4 @@ pub(crate) fn user_message_text(item: &Message) -> Option<&str> {
             pl_protocol::ContentPart::Image { .. } => None,
         }),
     }
-}
-
-fn message_text(item: &Message) -> String {
-    match &item.content {
-        MessageContent::Text(text) => text.clone(),
-        MessageContent::MultiPart(parts) => parts
-            .iter()
-            .filter_map(|part| match part {
-                pl_protocol::ContentPart::Text { text } => Some(text.as_str()),
-                pl_protocol::ContentPart::Image { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
-}
-
-fn recent_compaction_tail(history: &[Message], summary_prefix: &str) -> Vec<Message> {
-    let mut selected = Vec::new();
-    let mut assistant_items = 0;
-    let mut tool_output_items = 0;
-    for item in history.iter().rev() {
-        match item.role {
-            ModelMessageRole::Assistant => {
-                if assistant_items >= COMPACT_RECENT_ASSISTANT_ITEMS {
-                    continue;
-                }
-                let text = message_text(item);
-                if text.trim().is_empty() {
-                    continue;
-                }
-                selected.push(assistant_text_message(take_last_chars(
-                    &text,
-                    COMPACT_RECENT_ASSISTANT_MAX_CHARS,
-                )));
-                assistant_items += 1;
-            }
-            ModelMessageRole::Tool => {
-                if tool_output_items >= COMPACT_RECENT_TOOL_OUTPUT_ITEMS {
-                    continue;
-                }
-                let call_id = ToolResultMetadata::from_metadata(&item.metadata)
-                    .map(|metadata| metadata.tool_call_id)
-                    .unwrap_or_else(|_| "unknown".to_string());
-                selected.push(user_text_message(format!(
-                    "Recent tool result `{call_id}` retained for context checkpoint:\n{}",
-                    compact_tool_output(&message_text(item), COMPACT_RECENT_TOOL_OUTPUT_MAX_CHARS)
-                )));
-                tool_output_items += 1;
-            }
-            ModelMessageRole::User => {
-                let Some(text) = user_message_text(item) else {
-                    continue;
-                };
-                if is_compact_summary(text.trim(), summary_prefix) {
-                    break;
-                }
-            }
-            ModelMessageRole::System => {}
-        }
-    }
-    selected.reverse();
-    selected
-}
-
-fn latest_compact_summary<'a>(history: &'a [Message], summary_prefix: &str) -> Option<&'a str> {
-    latest_compact_summary_index(history, summary_prefix)
-        .and_then(|index| user_message_text(&history[index]))
-}
-
-fn latest_compact_summary_index(history: &[Message], summary_prefix: &str) -> Option<usize> {
-    history.iter().enumerate().rev().find_map(|(index, item)| {
-        let text = user_message_text(item)?;
-        is_compact_summary(text.trim(), summary_prefix).then_some(index)
-    })
-}
-
-fn compact_tool_output(output: &str, max_chars: usize) -> String {
-    if output.chars().count() <= max_chars {
-        return output.to_string();
-    }
-    let tail = take_last_chars(output, max_chars);
-    format!("tool output truncated for context compaction; kept last {max_chars} chars\n{tail}")
-}
-
-fn take_last_chars(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    let mut chars = text.chars().rev().take(max_chars).collect::<Vec<_>>();
-    chars.reverse();
-    chars.into_iter().collect()
 }

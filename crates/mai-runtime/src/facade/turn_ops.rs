@@ -58,27 +58,6 @@ impl turn::orchestrator::TurnOrchestratorOps for Arc<AgentRuntime> {
         .await
     }
 
-    async fn maybe_auto_compact(
-        &self,
-        agent: &Arc<AgentRecord>,
-        agent_id: AgentId,
-        session_id: SessionId,
-        turn_id: TurnId,
-        request: turn::context::ContextCompactionRequest,
-        cancellation_token: &CancellationToken,
-    ) -> Result<turn::context::ContextCompactionOutcome> {
-        AgentRuntime::maybe_auto_compact(
-            self,
-            agent,
-            agent_id,
-            session_id,
-            turn_id,
-            request,
-            cancellation_token,
-        )
-        .await
-    }
-
     async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<mai_mcp::McpTool> {
         AgentRuntime::agent_mcp_tools(self.as_ref(), agent).await
     }

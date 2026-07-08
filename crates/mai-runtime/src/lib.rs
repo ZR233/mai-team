@@ -625,17 +625,21 @@ impl AgentRuntime {
             )
             .await?;
         let instructions = "Generate a concise task title of 3-8 words that captures the essence of the user's request. Output only the title text, nothing else. Do not use quotes or punctuation at the end.";
-        let input = vec![turn::history::user_text_message(message)];
-        let response = turn::model_stream::consume_model_stream_to_response(
-            &self.deps.model,
-            &selection,
-            None,
-            instructions,
-            &input,
-            &[],
-            &CancellationToken::new(),
-        )
-        .await?;
+        let mut session =
+            pl_core::CoreSession::from_messages(vec![turn::history::user_text_message(message)]);
+        let response = self
+            .deps
+            .model
+            .stream_session_completion_response(
+                &selection,
+                None,
+                instructions,
+                &[],
+                &mut session,
+                &CancellationToken::new(),
+            )
+            .await
+            .map(completion_response_to_model_response)?;
         let title = response
             .output
             .into_iter()
@@ -2012,202 +2016,6 @@ impl AgentRuntime {
             .publish(ServiceEventKind::AgentStatusChanged { agent_id, status })
             .await;
         Ok(())
-    }
-
-    async fn maybe_auto_compact(
-        self: &Arc<Self>,
-        agent: &Arc<AgentRecord>,
-        agent_id: AgentId,
-        session_id: SessionId,
-        turn_id: TurnId,
-        request: turn::context::ContextCompactionRequest,
-        cancellation_token: &CancellationToken,
-    ) -> Result<turn::context::ContextCompactionOutcome> {
-        if cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
-        let last_context_tokens =
-            turn::history::session_context_tokens(agent, agent_id, session_id).await?;
-        let effective_last_context_tokens =
-            request.last_context_tokens_override.or(last_context_tokens);
-        let model_selection = model_selection::resolve_agent_model_selection(
-            &self.deps,
-            &self.events,
-            agent,
-            agent_id,
-            Some(session_id),
-            Some(turn_id),
-        )
-        .await?;
-        let context_tokens = model_selection.provider_selection.model.context_tokens;
-        let planner = turn::compaction::ContextBudgetPlanner::new(
-            context_tokens,
-            AUTO_COMPACT_THRESHOLD_PERCENT,
-            model_selection
-                .provider_selection
-                .model
-                .auto_compact_token_limit,
-        );
-        let Some(decision) = planner.decision(effective_last_context_tokens, request) else {
-            return Ok(turn::context::ContextCompactionOutcome::Skipped);
-        };
-        let tokens_before = decision.tokens_before;
-
-        let history =
-            turn::history::session_history(self.deps.store.as_ref(), agent, agent_id, session_id)
-                .await?;
-        if history.is_empty() {
-            turn::history::record_session_context_tokens(
-                self.deps.store.as_ref(),
-                agent,
-                agent_id,
-                session_id,
-                0,
-            )
-            .await?;
-            return Ok(turn::context::ContextCompactionOutcome::Skipped);
-        }
-        let compactor = turn::compaction::HistoryCompactor::new(
-            &history,
-            COMPACT_SUMMARY_PREFIX,
-            COMPACT_PROMPT,
-            COMPACT_USER_MESSAGE_MAX_CHARS,
-        );
-        let mut compact_input = compactor.compact_request_input();
-        let skills_config = self.deps.store.load_skills_config().await?;
-        let skills_manager = self.skills_manager_for_agent(agent).await?;
-        let instructions = {
-            let _project_skill_guard = self.project_skill_read_guard(agent).await;
-            self.build_instructions(
-                agent,
-                &skills_manager,
-                &SkillInjections::default(),
-                &skills_config,
-                &[],
-                &ContainerSkillPaths::default(),
-            )
-            .await?
-        };
-        let response_result = turn::model_stream::consume_model_stream_to_response(
-            &self.deps.model,
-            &model_selection.provider_selection,
-            model_selection.reasoning_effort.as_deref(),
-            &instructions,
-            &compact_input,
-            &[],
-            cancellation_token,
-        )
-        .await;
-        let response = match response_result {
-            Ok(response) => response,
-            Err(err) if turn::compaction::compaction_error_allows_fallback(&err) => {
-                turn::persistence::record_agent_log(
-                    self.deps.store.as_ref(),
-                    turn::persistence::AgentLogRecord {
-                        agent_id,
-                        session_id: Some(session_id),
-                        turn_id: Some(turn_id),
-                        level: "warn",
-                        category: "context",
-                        message: "context compaction retrying with reduced history",
-                        details: json!({ "error": err.to_string() }),
-                    },
-                )
-                .await;
-                compact_input = compactor.fallback_compact_request_input();
-                turn::model_stream::consume_model_stream_to_response(
-                    &self.deps.model,
-                    &model_selection.provider_selection,
-                    model_selection.reasoning_effort.as_deref(),
-                    &instructions,
-                    &compact_input,
-                    &[],
-                    cancellation_token,
-                )
-                .await?
-            }
-            Err(err) => return Err(err.into()),
-        };
-
-        if cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
-
-        if let Some(usage) = response.usage {
-            turn::accounting::record_model_usage(
-                self.deps.store.as_ref(),
-                &self.events,
-                agent,
-                agent_id,
-                session_id,
-                &usage,
-            )
-            .await?;
-        }
-
-        let summary_text = turn::history::compact_summary_from_output(&response.output)
-            .ok_or_else(|| {
-                RuntimeError::InvalidInput("compact response did not include a summary".to_string())
-            })?;
-        let replacement = compactor.replacement_history(&summary_text);
-        let replacement_tokens =
-            turn::compaction::estimate_history_tokens(&instructions, &replacement, &[]);
-        turn::history::replace_session_history(
-            self.deps.store.as_ref(),
-            agent,
-            agent_id,
-            session_id,
-            replacement,
-        )
-        .await?;
-        turn::history::record_session_context_tokens(
-            self.deps.store.as_ref(),
-            agent,
-            agent_id,
-            session_id,
-            replacement_tokens,
-        )
-        .await?;
-        turn::compaction::CompactionRecorder::new(
-            self.deps.store.as_ref(),
-            &self.events,
-            agent_id,
-            session_id,
-            turn_id,
-            COMPACT_SUMMARY_PREVIEW_CHARS,
-        )
-        .record_success(turn::compaction::CompactionRecord {
-            decision,
-            last_context_tokens,
-            estimated_request_tokens: request.estimated_tokens,
-            context_tokens,
-            replacement_tokens,
-            summary: &summary_text,
-        })
-        .await;
-        turn::persistence::record_agent_log(
-            self.deps.store.as_ref(),
-            turn::persistence::AgentLogRecord {
-                agent_id,
-                session_id: Some(session_id),
-                turn_id: Some(turn_id),
-                level: "debug",
-                category: "context",
-                message: "context compaction request prepared",
-                details: json!({
-                    "history_items": history.len(),
-                    "compact_input_items": compact_input.len(),
-                }),
-            },
-        )
-        .await;
-        Ok(turn::context::ContextCompactionOutcome::Compacted {
-            trigger: decision.trigger,
-            tokens_before,
-            last_context_tokens: effective_last_context_tokens,
-            estimated_request_tokens: request.estimated_tokens,
-            context_tokens,
-        })
     }
 
     async fn persist_agent(&self, agent: &AgentRecord) -> Result<()> {
