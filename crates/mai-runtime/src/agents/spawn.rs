@@ -2,6 +2,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use mai_protocol::{AgentId, AgentRole, AgentStatus, AgentSummary, SessionId, TaskId, TurnId};
+use pl_protocol::Message;
 
 use super::ContainerSource;
 use crate::state::{AgentRecord, CollabInput};
@@ -13,7 +14,7 @@ pub(crate) struct SpawnChildAgentRequest {
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) use_role_model: bool,
-    pub(crate) fork_context: bool,
+    pub(crate) forked_history: Option<Vec<Message>>,
     pub(crate) collab_input: CollabInput,
 }
 
@@ -49,8 +50,8 @@ pub(crate) trait AgentSpawnOps: Send + Sync {
 
     fn fork_agent_context(
         &self,
-        parent_id: AgentId,
         child_id: AgentId,
+        history: Vec<Message>,
     ) -> impl Future<Output = Result<()>> + Send;
 
     fn resolve_session_id(
@@ -161,8 +162,8 @@ pub(crate) async fn spawn_child_agent(
             Some(request.role),
         )
         .await?;
-    if request.fork_context {
-        ops.fork_agent_context(parent_agent_id, created.id).await?;
+    if let Some(history) = request.forked_history {
+        ops.fork_agent_context(created.id, history).await?;
     }
     let turn_id = if let Some(message) = request.collab_input.message {
         let session_id = AgentSpawnOps::resolve_session_id(ops, created.id, None).await?;

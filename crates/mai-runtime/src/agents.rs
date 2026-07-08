@@ -75,11 +75,6 @@ pub(crate) trait AgentServiceOps: Send + Sync {
         agent_id: AgentId,
         session_id: Option<SessionId>,
     ) -> Result<SessionId>;
-    async fn load_agent_history(
-        &self,
-        agent_id: AgentId,
-        session_id: SessionId,
-    ) -> Result<Vec<ModelMessage>>;
     async fn replace_agent_history(
         &self,
         agent_id: AgentId,

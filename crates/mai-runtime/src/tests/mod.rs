@@ -6225,7 +6225,7 @@ async fn spawn_agent_inherits_parent_and_accepts_codex_overrides() {
 }
 
 #[tokio::test]
-async fn spawn_agent_fork_context_copies_parent_history_from_store() {
+async fn spawn_agent_fork_turns_uses_pl_core_filtered_history() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     store
@@ -6258,18 +6258,60 @@ async fn spawn_agent_fork_context_copies_parent_history_from_store() {
         )
         .await
         .expect("save session");
-    let parent_message = AgentMessage {
-        role: MessageRole::User,
-        content: "reuse this context".to_string(),
-        created_at: timestamp,
-    };
-    store
-        .append_agent_message(parent_id, parent_session_id, 0, &parent_message)
-        .await
-        .expect("save message");
+    let parent_messages = vec![
+        AgentMessage {
+            role: MessageRole::User,
+            content: "first turn".to_string(),
+            created_at: timestamp,
+        },
+        AgentMessage {
+            role: MessageRole::Assistant,
+            content: "first answer".to_string(),
+            created_at: timestamp,
+        },
+        AgentMessage {
+            role: MessageRole::User,
+            content: "second turn".to_string(),
+            created_at: timestamp,
+        },
+        AgentMessage {
+            role: MessageRole::Assistant,
+            content: "second answer".to_string(),
+            created_at: timestamp,
+        },
+    ];
+    for (position, message) in parent_messages.iter().enumerate() {
+        store
+            .append_agent_message(parent_id, parent_session_id, position, message)
+            .await
+            .expect("save message");
+    }
     let parent_history = vec![
-        turn::history::user_text_message("reuse this context"),
-        turn::history::assistant_text_message("stored answer"),
+        turn::history::user_text_message("first turn"),
+        Message {
+            role: PlMessageRole::Assistant,
+            content: MessageContent::Text("first answer".to_string()),
+            reasoning_content: Some("hidden reasoning".to_string()),
+            metadata: Default::default(),
+        },
+        turn::history::tool_call_message(
+            "call-1".to_string(),
+            "read_file".to_string(),
+            r#"{"path":"README.md"}"#.to_string(),
+        ),
+        turn::history::tool_result_message(
+            "call-1".to_string(),
+            "read_file".to_string(),
+            r#"{"path":"README.md"}"#.to_string(),
+            "tool output".to_string(),
+        ),
+        turn::history::user_text_message("second turn"),
+        Message {
+            role: PlMessageRole::Assistant,
+            content: MessageContent::Text("second answer".to_string()),
+            reasoning_content: Some("more hidden reasoning".to_string()),
+            metadata: Default::default(),
+        },
     ];
     for (position, item) in parent_history.iter().enumerate() {
         store
@@ -6313,9 +6355,13 @@ async fn spawn_agent_fork_context_copies_parent_history_from_store() {
         .load_agent_history(child.id, child_session_id)
         .await
         .expect("child history");
+    let expected_history = vec![
+        turn::history::user_text_message("second turn"),
+        turn::history::assistant_text_message("second answer"),
+    ];
     assert_eq!(
         serde_json::to_value(&child_history).expect("child history json"),
-        serde_json::to_value(&parent_history).expect("parent history json")
+        serde_json::to_value(&expected_history).expect("expected history json")
     );
     let child_record = runtime.agent(child.id).await.expect("child record");
     let child_messages = {
@@ -6327,11 +6373,15 @@ async fn spawn_agent_fork_context_copies_parent_history_from_store() {
             .messages
             .clone()
     };
-    let expected_messages = vec![parent_message];
-    assert_eq!(
-        serde_json::to_value(&child_messages).expect("child messages json"),
-        serde_json::to_value(&expected_messages).expect("expected messages json")
-    );
+    let child_message_projection = child_messages
+        .iter()
+        .map(|message| (message.role.clone(), message.content.as_str()))
+        .collect::<Vec<_>>();
+    let expected_messages = vec![
+        (MessageRole::User, "second turn"),
+        (MessageRole::Assistant, "second answer"),
+    ];
+    assert_eq!(child_message_projection, expected_messages);
 }
 
 #[tokio::test]

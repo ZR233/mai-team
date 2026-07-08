@@ -78,7 +78,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
                 model: request.model,
                 reasoning_effort: request.reasoning_effort,
                 use_role_model: role_profile_requested,
-                fork_context: should_fork_context(request.fork_turns.as_deref()),
+                forked_history: request.forked_messages,
                 collab_input: CollabInput {
                     message: non_empty_message(request.message),
                     skill_mentions: Vec::new(),
@@ -293,17 +293,6 @@ fn role_profile_requested(agent_type: Option<&str>) -> bool {
             "planner" | "explorer" | "executor" | "reviewer"
         )
     })
-}
-
-fn should_fork_context(fork_turns: Option<&str>) -> bool {
-    let Some(raw) = fork_turns.map(str::trim).filter(|value| !value.is_empty()) else {
-        return false;
-    };
-    match raw.to_lowercase().as_str() {
-        "none" | "0" => false,
-        "all" => true,
-        value => value.parse::<u64>().is_ok_and(|turns| turns > 0),
-    }
 }
 
 fn non_empty_message(message: String) -> Option<String> {

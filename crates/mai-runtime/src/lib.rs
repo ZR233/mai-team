@@ -17,6 +17,7 @@ use mai_store::{AgentLogFilter, ConfigStore, ProviderSelection, ToolTraceFilter}
 use mai_tools::build_tool_schemas_with_filter;
 #[cfg(test)]
 use pl_model::ToolSchema;
+use pl_protocol::Message as ModelMessage;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -1619,6 +1620,11 @@ impl AgentRuntime {
         let (event_tx, mut event_rx) = broadcast::channel(8);
         let cancellation_token = CancellationToken::new();
         let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let session_id = self.resolve_session_id(agent_id, None).await?;
+        let parent_history =
+            turn::history::session_history(self.deps.store.as_ref(), agent, agent_id, session_id)
+                .await?;
+        let parent_session = Arc::new(pl_core::CoreSession::from_messages(parent_history));
         let kernel = turn::core_adapter::build_mai_agent_kernel(
             pl_core::PureCoreBuilder::from_provider_info(pl_model::ProviderInfo::deepseek(None))?,
             pl_core::CoreAgentProfile::host_provided(workspace_root.clone()),
@@ -1646,9 +1652,8 @@ impl AgentRuntime {
                     Uuid::new_v4().to_string(),
                     event_tx,
                 )
-                .with_options(
-                    pl_core::TurnOptions::default().with_cancellation(cancellation_token),
-                ),
+                .with_options(pl_core::TurnOptions::default().with_cancellation(cancellation_token))
+                .with_parent_session(parent_session),
             )
             .await?;
         self.project_tool_events_for_test(agent_id, &mut event_rx)
@@ -1851,8 +1856,12 @@ impl AgentRuntime {
         agents::start_next_queued_input_after_turn(self.as_ref(), self, agent_id).await;
     }
 
-    async fn fork_agent_context(&self, parent_id: AgentId, child_id: AgentId) -> Result<()> {
-        agents::fork_agent_context(self, parent_id, child_id).await
+    async fn fork_agent_context(
+        &self,
+        child_id: AgentId,
+        history: Vec<ModelMessage>,
+    ) -> Result<()> {
+        agents::fork_agent_context(self, child_id, history).await
     }
 
     async fn cleanup_finished_explorer_agent(&self, agent_id: AgentId) -> Result<()> {
@@ -2837,18 +2846,6 @@ impl agents::AgentServiceOps for AgentRuntime {
         AgentRuntime::resolve_session_id(self, agent_id, session_id).await
     }
 
-    async fn load_agent_history(
-        &self,
-        agent_id: AgentId,
-        session_id: SessionId,
-    ) -> Result<Vec<pl_protocol::Message>> {
-        Ok(self
-            .deps
-            .store
-            .load_agent_history(agent_id, session_id)
-            .await?)
-    }
-
     async fn replace_agent_history(
         &self,
         agent_id: AgentId,
@@ -3314,10 +3311,10 @@ impl agents::AgentSpawnOps for Arc<AgentRuntime> {
 
     fn fork_agent_context(
         &self,
-        parent_id: AgentId,
         child_id: AgentId,
+        history: Vec<ModelMessage>,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        AgentRuntime::fork_agent_context(self.as_ref(), parent_id, child_id)
+        AgentRuntime::fork_agent_context(self.as_ref(), child_id, history)
     }
 
     fn resolve_session_id(
