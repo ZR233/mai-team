@@ -347,6 +347,31 @@ fn core_turn_uses_pl_core_turn_outcome() {
     }
 }
 
+#[test]
+fn run_turn_error_completion_uses_pl_core_projection() {
+    let source = include_str!("../turn/orchestrator.rs");
+    let run_start = source.find("pub(crate) async fn run_turn").unwrap();
+    let run_end = source[run_start..]
+        .find("pub(crate) async fn run_turn_inner")
+        .unwrap();
+    let run_path = &source[run_start..run_start + run_end];
+
+    assert!(
+        run_path.contains("TurnErrorProjection::from_return_error"),
+        "run_turn 外壳应复用 pl-core 的错误终止投影"
+    );
+    for forbidden in [
+        "RuntimeError::TurnCancelled",
+        "TurnStatus::Cancelled",
+        "TurnStatus::Failed",
+    ] {
+        assert!(
+            !run_path.contains(forbidden),
+            "run_turn 外壳不应继续本地解释通用错误终态 `{forbidden}`"
+        );
+    }
+}
+
 fn pl_text(message: &Message) -> &str {
     match &message.content {
         MessageContent::Text(text) => text,

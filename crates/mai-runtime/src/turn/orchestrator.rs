@@ -3,10 +3,9 @@ use std::sync::Arc;
 
 use mai_protocol::{
     AgentId, AgentStatus, MessageRole, ServiceEventKind, SessionId, SkillsConfigRequest, TurnId,
-    TurnStatus,
 };
 use mai_skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
-use pl_core::HostMcpToolSpec;
+use pl_core::{HostMcpToolSpec, TurnErrorProjection, TurnReturnError};
 use serde_json::json;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -119,6 +118,32 @@ struct TurnModelContext {
     instructions: String,
 }
 
+fn pl_turn_return_error(error: RuntimeError) -> TurnReturnError {
+    let message = error.to_string();
+    match error {
+        RuntimeError::TurnCancelled => TurnReturnError::Cancelled,
+        RuntimeError::AgentNotFound(_)
+        | RuntimeError::TaskNotFound(_)
+        | RuntimeError::ProjectNotFound(_)
+        | RuntimeError::ProjectReviewRunNotFound(_)
+        | RuntimeError::AgentBusy(_)
+        | RuntimeError::TaskBusy(_)
+        | RuntimeError::MissingContainer(_)
+        | RuntimeError::SessionNotFound { .. }
+        | RuntimeError::ToolTraceNotFound { .. }
+        | RuntimeError::TurnNotFound { .. }
+        | RuntimeError::Docker(_)
+        | RuntimeError::Model(_)
+        | RuntimeError::Mcp(_)
+        | RuntimeError::Store(_)
+        | RuntimeError::Skill(_)
+        | RuntimeError::InvalidInput(_)
+        | RuntimeError::Io(_)
+        | RuntimeError::Http(_)
+        | RuntimeError::Jwt(_) => TurnReturnError::Failed(message),
+    }
+}
+
 pub(crate) async fn run_turn(
     deps: &RuntimeDeps,
     state: &RuntimeState,
@@ -133,28 +158,9 @@ pub(crate) async fn run_turn(
     if let Err(err) = result
         && let Ok(agent) = ops.agent(agent_id).await
     {
-        if matches!(err, RuntimeError::TurnCancelled) {
-            if let Ok(completed) = super::completion::complete_turn_if_current(
-                deps.store.as_ref(),
-                events,
-                &agent,
-                agent_id,
-                TurnResult {
-                    turn_id,
-                    status: TurnStatus::Cancelled,
-                    agent_status: AgentStatus::Cancelled,
-                    final_text: None,
-                    error: None,
-                },
-            )
-            .await
-                && completed
-            {
-                ops.start_next_queued_input_after_turn(agent_id).await;
-            }
-            return;
-        }
-        let message = err.to_string();
+        let projection = TurnErrorProjection::from_return_error(pl_turn_return_error(err));
+        let (turn_status, agent_status) =
+            super::core_adapter::mai_status_from_pl_outcome(projection.status);
         let completed = super::completion::complete_turn_if_current(
             deps.store.as_ref(),
             events,
@@ -162,24 +168,28 @@ pub(crate) async fn run_turn(
             agent_id,
             TurnResult {
                 turn_id,
-                status: TurnStatus::Failed,
-                agent_status: AgentStatus::Failed,
+                status: turn_status,
+                agent_status,
                 final_text: None,
-                error: Some(message.clone()),
+                error: projection.error_message.clone(),
             },
         )
         .await
         .unwrap_or(false);
         if completed {
             ops.start_next_queued_input_after_turn(agent_id).await;
-            events
-                .publish(ServiceEventKind::Error {
-                    agent_id: Some(agent_id),
-                    session_id: Some(session_id),
-                    turn_id: Some(turn_id),
-                    message,
-                })
-                .await;
+            if projection.should_publish_error
+                && let Some(message) = projection.error_message
+            {
+                events
+                    .publish(ServiceEventKind::Error {
+                        agent_id: Some(agent_id),
+                        session_id: Some(session_id),
+                        turn_id: Some(turn_id),
+                        message,
+                    })
+                    .await;
+            }
         }
     }
 }

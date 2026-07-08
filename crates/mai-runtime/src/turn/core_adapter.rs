@@ -202,7 +202,7 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
     Ok(())
 }
 
-fn mai_status_from_pl_outcome(status: TurnOutcomeStatus) -> (TurnStatus, AgentStatus) {
+pub(crate) fn mai_status_from_pl_outcome(status: TurnOutcomeStatus) -> (TurnStatus, AgentStatus) {
     match status {
         TurnOutcomeStatus::Completed => (TurnStatus::Completed, AgentStatus::Completed),
         TurnOutcomeStatus::Cancelled => (TurnStatus::Cancelled, AgentStatus::Cancelled),
