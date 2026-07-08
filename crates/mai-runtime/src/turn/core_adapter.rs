@@ -268,30 +268,24 @@ pub(crate) fn mai_user_input_interaction_callback(
 fn user_input_questions_from_pl(
     questions: Vec<pl_protocol::UserQuestion>,
 ) -> (String, Vec<mai_protocol::UserInputQuestion>) {
-    let mut header = None;
-    let mut projected = Vec::with_capacity(questions.len());
-    for question in questions {
-        if header.is_none() {
-            let value = question.header.trim();
-            if !value.is_empty() {
-                header = Some(value.to_string());
-            }
-        }
-        projected.push(mai_protocol::UserInputQuestion {
-            id: question.id,
-            question: question.question,
+    let projection = pl_core::project_user_input_questions(questions);
+    let questions = projection
+        .questions()
+        .iter()
+        .map(|question| mai_protocol::UserInputQuestion {
+            id: question.id().to_string(),
+            question: question.question().to_string(),
             options: question
-                .options
-                .unwrap_or_default()
-                .into_iter()
+                .options()
+                .iter()
                 .map(|option| mai_protocol::UserInputOption {
-                    label: option.label,
-                    description: Some(option.description),
+                    label: option.label().to_string(),
+                    description: Some(option.description().to_string()),
                 })
                 .collect(),
-        });
-    }
-    (header.unwrap_or_else(|| "Input".to_string()), projected)
+        })
+        .collect();
+    (projection.header().to_string(), questions)
 }
 
 pub(crate) async fn build_kernel_with_native_shared_tools(
@@ -542,6 +536,30 @@ mod tests {
             assert!(
                 !production.contains(forbidden),
                 "mai-runtime 不应直接解释 TurnResult 底层统计字段 `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn user_input_projection_uses_pl_core_projection() {
+        let source = include_str!("core_adapter.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production section");
+
+        assert!(
+            production.contains("pl_core::project_user_input_questions"),
+            "request_user_input 的 header/options 归一化应由 pl-core projection 提供"
+        );
+        for forbidden in [
+            "question.header.trim()",
+            ".options.unwrap_or_default()",
+            "unwrap_or_else(|| \"Input\".to_string())",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "mai-runtime 不应手写 request_user_input 投影 `{forbidden}`"
             );
         }
     }
