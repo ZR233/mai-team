@@ -28,9 +28,9 @@ pub(crate) async fn visible_tool_names(
     mcp_tools: &[McpTool],
 ) -> HashSet<String> {
     let capability = agent_capability(state, agent).await;
-    let mut names = super::kernel_tools::shared_tool_schemas(default_shared_tool_visible)
+    let mut names = pl_core::shared_tool_names(shared_tool_name_options())
         .into_iter()
-        .map(shared_tool_schema_name)
+        .filter(|name| default_shared_tool_visible(name))
         .collect::<HashSet<_>>();
     names.extend([
         pl_core::TOOL_LIST_MCP_RESOURCES.to_string(),
@@ -76,10 +76,17 @@ fn canonical_git_tool_names() -> impl Iterator<Item = &'static str> {
     .into_iter()
 }
 
-fn shared_tool_schema_name(schema: pl_model::ToolSchema) -> String {
-    match schema {
-        pl_model::ToolSchema::Function { name, .. } => name,
-        pl_model::ToolSchema::Custom { name, .. } => name,
+fn shared_tool_name_options() -> pl_core::SharedToolSchemaOptions {
+    pl_core::SharedToolSchemaOptions {
+        bash: false,
+        workspace_files: true,
+        ask_user: true,
+        subagents: true,
+        git: true,
+        container: true,
+        mcp_resources: true,
+        todo: true,
+        plan_exit: false,
     }
 }
 

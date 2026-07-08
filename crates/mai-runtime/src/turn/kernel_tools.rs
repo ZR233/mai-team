@@ -37,30 +37,6 @@ pub(crate) async fn project_tool_trace_events(
     }
 }
 
-pub(crate) fn shared_tool_schemas(filter: impl Fn(&str) -> bool) -> Vec<pl_model::ToolSchema> {
-    pl_core::shared_tool_schemas(pl_core::SharedToolSchemaOptions {
-        bash: false,
-        workspace_files: true,
-        ask_user: true,
-        subagents: true,
-        git: true,
-        container: true,
-        mcp_resources: true,
-        todo: true,
-        plan_exit: false,
-    })
-    .into_iter()
-    .filter(|schema| filter(tool_schema_name(schema)))
-    .collect()
-}
-
-fn tool_schema_name(schema: &pl_model::ToolSchema) -> &str {
-    match schema {
-        pl_model::ToolSchema::Function { name, .. } => name,
-        pl_model::ToolSchema::Custom { name, .. } => name,
-    }
-}
-
 async fn project_tool_started(
     runtime: &AgentRuntime,
     agent_id: AgentId,

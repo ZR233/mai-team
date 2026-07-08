@@ -163,7 +163,20 @@ fn kernel_shared_tool_definitions_supply_subagent_schema() {
     .map(str::to_string)
     .collect::<std::collections::HashSet<_>>();
 
-    let tools = turn::kernel_tools::shared_tool_schemas(|name| visible.contains(name));
+    let tools = pl_core::shared_tool_schemas(pl_core::SharedToolSchemaOptions {
+        bash: false,
+        workspace_files: true,
+        ask_user: true,
+        subagents: true,
+        git: true,
+        container: true,
+        mcp_resources: true,
+        todo: true,
+        plan_exit: false,
+    })
+    .into_iter()
+    .filter(|schema| visible.contains(schema.name()))
+    .collect::<Vec<_>>();
     fn schema_name(schema: &pl_model::ToolSchema) -> &str {
         match schema {
             pl_model::ToolSchema::Function { name, .. } => name.as_str(),
@@ -258,12 +271,29 @@ fn kernel_tools_do_not_rebuild_shared_tools_as_mai_definitions() {
 
     for forbidden in [
         "model_tool_definitions",
+        "shared_tool_schemas",
         "shared_tool_definitions",
         "definition_from_schema",
     ] {
         assert!(
             !source.contains(forbidden),
             "pl-core shared tools 不应在 mai-runtime 里重建为 mai ToolDefinition: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn tool_visibility_consumes_pl_core_shared_tool_names() {
+    let source = include_str!("../turn/tool_visibility.rs");
+
+    assert!(
+        source.contains("shared_tool_names"),
+        "共享工具名目录应由 pl-core 直接提供"
+    );
+    for forbidden in ["pl_model::ToolSchema", "shared_tool_schema_name"] {
+        assert!(
+            !source.contains(forbidden),
+            "tool visibility 不应解析 pl-core schema 来取得工具名: {forbidden}"
         );
     }
 }
