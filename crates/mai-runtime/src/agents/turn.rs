@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use mai_protocol::{AgentId, AgentStatus, ServiceEventKind, SessionId, TurnId, TurnStatus, now};
-use pl_core::{AgentTurnStartOutcome, AgentTurnStartTransition, TurnTaskHandle};
+use pl_core::{
+    AgentTurnCancellationGuard, AgentTurnCancellationOutcome, AgentTurnStartOutcome,
+    AgentTurnStartTransition, TurnTaskHandle,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -191,8 +194,11 @@ pub(crate) async fn cancel_agent_turn(
     let agent = ops.agent(agent_id).await?;
     let control = agent.active_turn.current();
     let current_turn = agent.summary.read().await.current_turn;
-    if current_turn != Some(turn_id) && control.as_ref().map(|turn| turn.turn_id) != Some(turn_id) {
-        return Ok(());
+    let active_turn = control.as_ref().map(|turn| &turn.turn_id);
+    let guard = AgentTurnCancellationGuard::new(turn_id);
+    match guard.evaluate(current_turn.as_ref(), active_turn) {
+        AgentTurnCancellationOutcome::TargetActive => {}
+        AgentTurnCancellationOutcome::Stale => return Ok(()),
     }
     agent.cancel_requested.store(true, Ordering::SeqCst);
     if let Some(control) = control.filter(|turn| turn.turn_id == turn_id) {

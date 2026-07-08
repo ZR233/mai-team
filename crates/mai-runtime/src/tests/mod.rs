@@ -87,6 +87,21 @@ fn observability_uses_pl_core_history_success_projection() {
 }
 
 #[test]
+fn cancel_turn_uses_pl_core_cancellation_guard() {
+    let source = include_str!("../agents/turn.rs");
+
+    assert!(
+        source.contains("AgentTurnCancellationGuard"),
+        "取消 turn 的 current/active 命中规则应由 pl-core 统一提供"
+    );
+    assert!(
+        !source
+            .contains("current_turn != Some(turn_id) && control.as_ref().map(|turn| turn.turn_id) != Some(turn_id)"),
+        "mai-runtime 不应手写 current_turn 与 active_turn 的重复取消判断"
+    );
+}
+
+#[test]
 fn kernel_tool_projection_uses_pl_core_completion_timestamp_fallback() {
     let source = include_str!("../turn/kernel_tools.rs");
 

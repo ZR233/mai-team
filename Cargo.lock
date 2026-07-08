@@ -2329,7 +2329,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "pl-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=codex%2Fmai-team-pl-unified-dependency#a01178fd2a8dd1e6ecef75293428a8913fe9838c"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=codex%2Fmai-team-pl-unified-dependency#a7f96042c22349a3b6df381ad9bc9e7cb1a16c54"
 dependencies = [
  "anyhow",
  "base64",
@@ -2358,7 +2358,7 @@ dependencies = [
 [[package]]
 name = "pl-lsp"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=codex%2Fmai-team-pl-unified-dependency#a01178fd2a8dd1e6ecef75293428a8913fe9838c"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=codex%2Fmai-team-pl-unified-dependency#a7f96042c22349a3b6df381ad9bc9e7cb1a16c54"
 dependencies = [
  "futures",
  "lsp-types",
@@ -2372,7 +2372,7 @@ dependencies = [
 [[package]]
 name = "pl-model"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=codex%2Fmai-team-pl-unified-dependency#a01178fd2a8dd1e6ecef75293428a8913fe9838c"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=codex%2Fmai-team-pl-unified-dependency#a7f96042c22349a3b6df381ad9bc9e7cb1a16c54"
 dependencies = [
  "async-openai",
  "bitflags 2.11.1",
@@ -2390,7 +2390,7 @@ dependencies = [
 [[package]]
 name = "pl-output"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=codex%2Fmai-team-pl-unified-dependency#a01178fd2a8dd1e6ecef75293428a8913fe9838c"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=codex%2Fmai-team-pl-unified-dependency#a7f96042c22349a3b6df381ad9bc9e7cb1a16c54"
 dependencies = [
  "serde",
 ]
@@ -2398,12 +2398,12 @@ dependencies = [
 [[package]]
 name = "pl-patch"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=codex%2Fmai-team-pl-unified-dependency#a01178fd2a8dd1e6ecef75293428a8913fe9838c"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=codex%2Fmai-team-pl-unified-dependency#a7f96042c22349a3b6df381ad9bc9e7cb1a16c54"
 
 [[package]]
 name = "pl-protocol"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=codex%2Fmai-team-pl-unified-dependency#a01178fd2a8dd1e6ecef75293428a8913fe9838c"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=codex%2Fmai-team-pl-unified-dependency#a7f96042c22349a3b6df381ad9bc9e7cb1a16c54"
 dependencies = [
  "serde",
  "serde_json",
@@ -2413,7 +2413,7 @@ dependencies = [
 [[package]]
 name = "pl-skill-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=codex%2Fmai-team-pl-unified-dependency#a01178fd2a8dd1e6ecef75293428a8913fe9838c"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=codex%2Fmai-team-pl-unified-dependency#a7f96042c22349a3b6df381ad9bc9e7cb1a16c54"
 dependencies = [
  "serde",
  "serde_norway",
@@ -2422,7 +2422,7 @@ dependencies = [
 [[package]]
 name = "pl-trace"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=codex%2Fmai-team-pl-unified-dependency#a01178fd2a8dd1e6ecef75293428a8913fe9838c"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=codex%2Fmai-team-pl-unified-dependency#a7f96042c22349a3b6df381ad9bc9e7cb1a16c54"
 dependencies = [
  "pl-protocol",
  "serde",
