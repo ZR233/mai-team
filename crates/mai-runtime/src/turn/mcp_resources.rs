@@ -42,52 +42,60 @@ impl MaiMcpResourceBackend {
         }
     }
 
-    async fn broker(&self) -> pl_protocol::Result<crate::agents::AgentResourceBroker> {
+    async fn broker(&self) -> crate::Result<crate::agents::AgentResourceBroker> {
         self.runtime
             .agent_resource_broker(&self.agent, self.agent_id, &self.cancellation_token)
             .await
-            .map_err(|error| resource_error("mcp_resource", error))
     }
 }
 
 impl pl_core::McpResourceBackend for MaiMcpResourceBackend {
+    type Error = RuntimeError;
+
     async fn list_resources(
         &self,
         request: pl_core::McpListResourcesRequest,
-    ) -> pl_protocol::Result<Value> {
+    ) -> std::result::Result<Value, Self::Error> {
         self.broker()
             .await?
             .list_resources(request.server.as_deref(), request.cursor)
             .await
-            .map_err(|error| resource_error(pl_core::TOOL_LIST_MCP_RESOURCES, error))
     }
 
     async fn list_resource_templates(
         &self,
         request: pl_core::McpListResourceTemplatesRequest,
-    ) -> pl_protocol::Result<Value> {
+    ) -> std::result::Result<Value, Self::Error> {
         self.broker()
             .await?
             .list_resource_templates(request.server.as_deref(), request.cursor)
             .await
-            .map_err(|error| resource_error(pl_core::TOOL_LIST_MCP_RESOURCE_TEMPLATES, error))
     }
 
     async fn read_resource(
         &self,
         request: pl_core::McpReadResourceRequest,
-    ) -> pl_protocol::Result<Value> {
+    ) -> std::result::Result<Value, Self::Error> {
         self.broker()
             .await?
             .read_resource(&request.server, &request.uri)
             .await
-            .map_err(|error| resource_error(pl_core::TOOL_READ_MCP_RESOURCE, error))
     }
 }
 
-fn resource_error(tool: &str, error: RuntimeError) -> pl_protocol::PureError {
-    pl_protocol::PureError::ToolExecutionFailed {
-        tool: tool.to_string(),
-        error: error.to_string(),
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn mcp_resource_backend_delegates_tool_error_shape_to_pl_core() {
+        let source = include_str!("mcp_resources.rs");
+
+        assert!(
+            !source.contains(&format!("{}{}", "ToolExecution", "Failed")),
+            "MCP resource backend 不应在 mai-team 手动构造工具错误协议"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "Pure", "Error")),
+            "MCP resource backend 不应依赖 pl_protocol 错误类型"
+        );
     }
 }

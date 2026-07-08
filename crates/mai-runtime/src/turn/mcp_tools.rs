@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use mai_protocol::AgentId;
 use pl_core::{McpToolBackend, McpToolRequest};
-use pl_protocol::PureError;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -43,79 +42,65 @@ impl fmt::Debug for MaiMcpToolBackend {
 }
 
 impl McpToolBackend for MaiMcpToolBackend {
-    async fn call_tool(&self, request: McpToolRequest) -> pl_protocol::Result<Value> {
+    type Error = String;
+
+    async fn call_tool(&self, request: McpToolRequest) -> std::result::Result<Value, Self::Error> {
         if self.cancellation_token.is_cancelled() {
-            return Err(PureError::ToolExecutionFailed {
-                tool: request.name,
-                error: RuntimeError::TurnCancelled.to_string(),
-            });
+            return Err(RuntimeError::TurnCancelled.to_string());
         }
-        self.call_tool_inner(request)
-            .await
-            .map_err(|error| PureError::ToolExecutionFailed {
-                tool: error.0,
-                error: error.1,
-            })
+        self.call_tool_inner(request).await
     }
 }
 
 impl MaiMcpToolBackend {
-    async fn call_tool_inner(&self, request: McpToolRequest) -> Result<Value, (String, String)> {
+    async fn call_tool_inner(&self, request: McpToolRequest) -> Result<Value, String> {
         if self.agent.summary.read().await.project_id.is_some() {
             return self.call_project_tool(request).await;
         }
 
         let manager = self.agent.mcp.read().await.clone().ok_or_else(|| {
-            (
-                request.name.clone(),
-                RuntimeError::InvalidInput("MCP manager not initialized".to_string()).to_string(),
-            )
+            RuntimeError::InvalidInput("MCP manager not initialized".to_string()).to_string()
         })?;
-        let tool = request.name.clone();
         tokio::select! {
             output = manager.call_model_tool(&request.name, request.arguments) => {
-                output.map_err(|error| (tool, error.to_string()))
+                output.map_err(|error| error.to_string())
             }
             _ = self.cancellation_token.cancelled() => {
-                Err((tool, RuntimeError::TurnCancelled.to_string()))
+                Err(RuntimeError::TurnCancelled.to_string())
             }
         }
     }
 
-    async fn call_project_tool(&self, request: McpToolRequest) -> Result<Value, (String, String)> {
+    async fn call_project_tool(&self, request: McpToolRequest) -> Result<Value, String> {
         let tool = request.name.clone();
         let manager = self
             .runtime
             .project_mcp_manager_for_agent(&self.agent, self.agent_id, &self.cancellation_token)
             .await
-            .map_err(|error| (tool.clone(), error.to_string()))?
+            .map_err(|error| error.to_string())?
             .ok_or_else(|| {
-                (
-                    tool.clone(),
-                    RuntimeError::InvalidInput("project MCP manager is not available".to_string())
-                        .to_string(),
-                )
+                RuntimeError::InvalidInput("project MCP manager is not available".to_string())
+                    .to_string()
             })?;
         let token = self
             .runtime
             .project_git_token_for_agent(&self.agent)
             .await
-            .map_err(|error| (tool.clone(), error.to_string()))?
+            .map_err(|error| error.to_string())?
             .unwrap_or_default();
         let output = tokio::select! {
             output = manager.call_model_tool(&request.name, request.arguments) => output,
             _ = self.cancellation_token.cancelled() => {
-                return Err((tool, RuntimeError::TurnCancelled.to_string()));
+                return Err(RuntimeError::TurnCancelled.to_string());
             }
         };
         match output {
             Ok(value) => Ok(redact_value(value, &token)),
-            Err(mai_mcp::McpError::ToolNotFound(_)) => Err((
-                tool.clone(),
-                RuntimeError::InvalidInput(format!("project MCP tool `{tool}` was not discovered"))
-                    .to_string(),
-            )),
-            Err(error) => Err((tool, redact_secret(&error.to_string(), &token))),
+            Err(mai_mcp::McpError::ToolNotFound(_)) => Err(RuntimeError::InvalidInput(format!(
+                "project MCP tool `{tool}` was not discovered"
+            ))
+            .to_string()),
+            Err(error) => Err(redact_secret(&error.to_string(), &token)),
         }
     }
 }
@@ -133,4 +118,21 @@ fn redact_secret(value: &str, secret: &str) -> String {
         return value.to_string();
     }
     value.replace(secret, "<redacted>")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn mcp_tool_backend_delegates_tool_error_shape_to_pl_core() {
+        let source = include_str!("mcp_tools.rs");
+
+        assert!(
+            !source.contains(&format!("{}{}", "ToolExecution", "Failed")),
+            "MCP tool backend 不应在 mai-team 手动构造工具错误协议"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "Pure", "Error")),
+            "MCP tool backend 不应依赖 pl_protocol 错误类型"
+        );
+    }
 }
