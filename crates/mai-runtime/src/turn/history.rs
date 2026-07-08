@@ -1,6 +1,6 @@
 use mai_protocol::{AgentId, AgentMessage, MessageRole, SessionId, now};
 use mai_store::ConfigStore;
-use pl_protocol::{Message, MessageContent, MessageRole as ModelMessageRole};
+use pl_protocol::Message;
 
 use crate::state::AgentRecord;
 use crate::{Result, RuntimeError};
@@ -112,32 +112,17 @@ pub(crate) async fn session_history(
 }
 
 pub(crate) fn user_text_message(text: impl Into<String>) -> Message {
-    Message {
-        role: ModelMessageRole::User,
-        content: MessageContent::Text(text.into()),
-        reasoning_content: None,
-        metadata: Default::default(),
-    }
+    pl_core::user_text_message(text)
 }
 
 #[cfg(test)]
 pub(crate) fn assistant_text_message(text: impl Into<String>) -> Message {
-    Message {
-        role: ModelMessageRole::Assistant,
-        content: MessageContent::Text(text.into()),
-        reasoning_content: None,
-        metadata: Default::default(),
-    }
+    pl_core::assistant_text_message(text)
 }
 
 #[cfg(test)]
 pub(crate) fn reasoning_message(content: impl Into<String>) -> Message {
-    Message {
-        role: ModelMessageRole::Assistant,
-        content: MessageContent::Text(String::new()),
-        reasoning_content: Some(content.into()),
-        metadata: Default::default(),
-    }
+    pl_core::assistant_reasoning_message(content)
 }
 
 #[cfg(test)]
@@ -157,19 +142,28 @@ pub(crate) fn tool_result_message(
 
 #[cfg(test)]
 pub(crate) fn is_compact_summary(text: &str, summary_prefix: &str) -> bool {
-    text.starts_with(summary_prefix)
+    pl_core::is_compaction_summary_text(text, summary_prefix)
 }
 
 #[cfg(test)]
 pub(crate) fn user_message_text(item: &Message) -> Option<&str> {
-    if item.role != ModelMessageRole::User {
-        return None;
-    }
-    match &item.content {
-        MessageContent::Text(text) => Some(text.as_str()),
-        MessageContent::MultiPart(parts) => parts.iter().find_map(|part| match part {
-            pl_protocol::ContentPart::Text { text } => Some(text.as_str()),
-            pl_protocol::ContentPart::Image { .. } => None,
-        }),
+    pl_core::user_message_text(item)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn message_helpers_delegate_to_pl_core() {
+        let source = include_str!("history.rs");
+
+        assert!(source.contains("pl_core::user_text_message"));
+        assert!(source.contains("pl_core::assistant_text_message"));
+        assert!(source.contains("pl_core::assistant_reasoning_message"));
+        assert!(source.contains("pl_core::user_message_text"));
+        assert!(source.contains("pl_core::is_compaction_summary_text"));
+        assert!(
+            !source.contains(&format!("{}{}", "MessageContent::Text", "(text.into())")),
+            "history adapter 不应再手写模型消息构造"
+        );
     }
 }
