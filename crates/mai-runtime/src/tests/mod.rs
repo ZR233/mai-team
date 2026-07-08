@@ -283,6 +283,18 @@ fn kernel_tools_do_not_rebuild_shared_tools_as_mai_definitions() {
 }
 
 #[test]
+fn tool_output_module_does_not_keep_local_tool_lifecycle_runner() {
+    let source = include_str!("../turn/tool_output.rs");
+
+    for forbidden in ["run_tool_call", "ToolCallContext", "ToolCallInfo"] {
+        assert!(
+            !source.contains(forbidden),
+            "tool lifecycle dispatch/history must stay in pl-core, not mai-runtime: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn tool_visibility_consumes_pl_core_shared_tool_names() {
     let source = include_str!("../turn/tool_visibility.rs");
 
@@ -9695,7 +9707,7 @@ fn tool_event_preview_redacts_sensitive_and_large_values() {
         "content_base64": "a".repeat(320),
     });
 
-    let preview = turn::tool_output::trace_preview_value(&value, 1_000);
+    let preview = pl_core::trace_preview_value(&value, 1_000);
 
     assert!(preview.contains("echo ok"));
     assert!(preview.contains("<redacted>"));

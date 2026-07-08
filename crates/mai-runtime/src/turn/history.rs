@@ -42,31 +42,6 @@ pub(crate) async fn record_message(
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) async fn record_history_item(
-    store: &ConfigStore,
-    agent: &AgentRecord,
-    agent_id: AgentId,
-    session_id: SessionId,
-    item: Message,
-) -> Result<()> {
-    {
-        let sessions = agent.sessions.lock().await;
-        sessions
-            .iter()
-            .find(|session| session.summary.id == session_id)
-            .ok_or(RuntimeError::SessionNotFound {
-                agent_id,
-                session_id,
-            })?;
-    }
-    let position = store.agent_history_len(agent_id, session_id).await?;
-    store
-        .append_agent_history_item(agent_id, session_id, position, &item)
-        .await?;
-    Ok(())
-}
-
 pub(crate) async fn replace_session_history(
     store: &ConfigStore,
     agent: &AgentRecord,
