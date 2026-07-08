@@ -243,6 +243,14 @@ fn wait_completion_uses_pl_core_policy() {
         "wait_agent completion 判断应由 pl-core AgentWaitSnapshot 统一维护"
     );
     assert!(
+        agents_source.contains("AgentWaitSnapshot::new"),
+        "AgentSummary 到 wait snapshot 的共享字段形状应由 pl-core constructor 承载"
+    );
+    assert!(
+        !agents_source.contains("AgentWaitSnapshot {\n        turn_presence"),
+        "mai-runtime 不应手写 AgentWaitSnapshot 字段"
+    );
+    assert!(
         wait_source.contains("pl_core::wait_for_agent_completion"),
         "wait_agent 轮询、超时和取消语义应由 pl-core wait loop 统一维护"
     );

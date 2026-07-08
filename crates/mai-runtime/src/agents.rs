@@ -403,10 +403,7 @@ fn agent_wait_snapshot(summary: &AgentSummary) -> AgentWaitSnapshot {
         Some(_) => AgentTurnPresence::ActiveTurn,
         None => AgentTurnPresence::NoActiveTurn,
     };
-    AgentWaitSnapshot {
-        turn_presence,
-        status: agent_lifecycle_status_kind(&summary.status),
-    }
+    AgentWaitSnapshot::new(turn_presence, agent_lifecycle_status_kind(&summary.status))
 }
 
 fn agent_lifecycle_status_kind(status: &AgentStatus) -> AgentLifecycleStatusKind {
