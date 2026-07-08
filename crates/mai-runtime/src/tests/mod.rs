@@ -10,6 +10,7 @@ use pl_core::{
 use pl_protocol::{Message, MessageContent, MessageRole as PlMessageRole, ToolResultMetadata};
 use pretty_assertions::assert_eq;
 use state::TurnControl;
+use std::collections::VecDeque;
 use std::fs;
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -106,19 +107,34 @@ fn cancel_turn_uses_pl_core_cancellation_guard() {
 #[test]
 fn send_input_uses_pl_core_turn_mode_policy() {
     let source = include_str!("../agents/input.rs");
+    let state_source = include_str!("../state.rs");
 
     assert!(
         source.contains("AgentInputTurnMode"),
         "send_input 的 triggerTurn/interrupt 模式应由 pl-core 统一解释"
     );
+    assert!(
+        source.contains("AgentInputInitialAction") && source.contains("AgentInputBusyAction"),
+        "send_input 的首步动作和 busy 处理应由 pl-core action 类型统一表达"
+    );
+    assert!(
+        state_source.contains("AgentInputQueue<QueuedAgentInput>"),
+        "pending input 队列应复用 pl-core AgentInputQueue"
+    );
     for forbidden in [
         "!request.trigger_turn && !request.interrupt",
         "if request.interrupt",
         "if !request.interrupt",
+        "queues_without_start",
+        "queues_when_busy",
+        "pending_inputs: Mutex<VecDeque",
+        ".push_back(",
+        ".pop_front(",
+        ".push_front(",
     ] {
         assert!(
-            !source.contains(forbidden),
-            "mai-runtime 不应手写 send_input 模式判断 `{forbidden}`"
+            !source.contains(forbidden) && !state_source.contains(forbidden),
+            "mai-runtime 不应手写 send_input/queue 策略 `{forbidden}`"
         );
     }
 }

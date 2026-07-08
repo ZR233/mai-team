@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -8,7 +8,7 @@ use mai_protocol::{
     AgentId, AgentMessage, AgentSessionSummary, AgentSummary, ArtifactInfo, PlanHistoryEntry,
     ProjectId, ProjectSummary, SessionId, TaskId, TaskPlan, TaskReview, TaskSummary, TurnId,
 };
-use pl_core::{ActiveTurnControl, ActiveTurnSlot, AgentTurnCurrentGuard};
+use pl_core::{ActiveTurnControl, ActiveTurnSlot, AgentInputQueue, AgentTurnCurrentGuard};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -91,7 +91,7 @@ pub(crate) struct AgentRecord {
     pub(crate) turn_lock: Mutex<()>,
     pub(crate) cancel_requested: AtomicBool,
     pub(crate) active_turn: TurnControlSlot,
-    pub(crate) pending_inputs: Mutex<VecDeque<QueuedAgentInput>>,
+    pub(crate) pending_inputs: Mutex<AgentInputQueue<QueuedAgentInput>>,
 }
 
 pub(crate) type TurnControl = ActiveTurnControl<TurnId, SessionId>;

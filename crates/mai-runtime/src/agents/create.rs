@@ -105,7 +105,7 @@ pub(crate) async fn create_agent_record(
         turn_lock: Mutex::new(()),
         cancel_requested: AtomicBool::new(false),
         active_turn: TurnControlSlot::new(),
-        pending_inputs: Mutex::new(std::collections::VecDeque::new()),
+        pending_inputs: Mutex::new(pl_core::AgentInputQueue::new()),
     });
 
     ops.insert_agent(Arc::clone(&agent)).await;

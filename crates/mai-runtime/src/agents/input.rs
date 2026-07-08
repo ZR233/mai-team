@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use mai_protocol::{AgentId, AgentStatus, SessionId, TurnId};
-use pl_core::AgentInputTurnMode;
+use pl_core::{AgentInputBusyAction, AgentInputInitialAction, AgentInputTurnMode};
 use serde_json::{Value, json};
 
 use super::{AgentInputOps, AgentServiceOps, prepare_turn, wait_agent};
@@ -25,22 +25,23 @@ pub(crate) async fn send_input_to_agent(
 ) -> Result<Value> {
     let agent = service.agent(request.target).await?;
     let mode = AgentInputTurnMode::from_codex_flags(request.trigger_turn, request.interrupt);
-    if mode.queues_without_start() {
-        return Ok(queue_agent_input(&agent, request).await);
-    }
-    if mode.interrupts() {
-        let current_turn = agent.summary.read().await.current_turn;
-        if let Some(turn_id) = current_turn {
-            input_ops.cancel_agent_turn(request.target, turn_id).await?;
-        } else {
-            agent
-                .cancel_requested
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            input_ops
-                .set_agent_status(&agent, AgentStatus::Cancelled, None)
-                .await?;
+    match mode.initial_action() {
+        AgentInputInitialAction::Queue => return Ok(queue_agent_input(&agent, request).await),
+        AgentInputInitialAction::StartTurn => {}
+        AgentInputInitialAction::InterruptThenStart => {
+            let current_turn = agent.summary.read().await.current_turn;
+            if let Some(turn_id) = current_turn {
+                input_ops.cancel_agent_turn(request.target, turn_id).await?;
+            } else {
+                agent
+                    .cancel_requested
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                input_ops
+                    .set_agent_status(&agent, AgentStatus::Cancelled, None)
+                    .await?;
+            }
+            wait_agent(service, request.target, request.cancel_grace).await?;
         }
-        wait_agent(service, request.target, request.cancel_grace).await?;
     }
     match prepare_turn(service, request.target).await {
         Ok((agent, turn_id)) => {
@@ -57,7 +58,9 @@ pub(crate) async fn send_input_to_agent(
             );
             Ok(json!({ "turnId": turn_id, "queued": false }))
         }
-        Err(RuntimeError::AgentBusy(_)) if mode.queues_when_busy() => {
+        Err(RuntimeError::AgentBusy(_))
+            if matches!(mode.busy_action(), AgentInputBusyAction::Queue) =>
+        {
             Ok(queue_agent_input(&agent, request).await)
         }
         Err(err) => Err(err),
@@ -65,15 +68,11 @@ pub(crate) async fn send_input_to_agent(
 }
 
 async fn queue_agent_input(agent: &AgentRecord, request: SendInputRequest) -> Value {
-    agent
-        .pending_inputs
-        .lock()
-        .await
-        .push_back(QueuedAgentInput {
-            session_id: request.session_id,
-            message: request.message,
-            skill_mentions: request.skill_mentions,
-        });
+    agent.pending_inputs.lock().await.push(QueuedAgentInput {
+        session_id: request.session_id,
+        message: request.message,
+        skill_mentions: request.skill_mentions,
+    });
     json!({ "queued": true })
 }
 
@@ -83,7 +82,7 @@ pub(crate) async fn start_next_queued_input(
     agent_id: AgentId,
 ) -> Result<Option<TurnId>> {
     let agent = service.agent(agent_id).await?;
-    let Some(input) = agent.pending_inputs.lock().await.pop_front() else {
+    let Some(input) = agent.pending_inputs.lock().await.pop() else {
         return Ok(None);
     };
     let session_id = service
@@ -92,7 +91,7 @@ pub(crate) async fn start_next_queued_input(
     let (agent, turn_id) = match prepare_turn(service, agent_id).await {
         Ok(turn) => turn,
         Err(RuntimeError::AgentBusy(_)) => {
-            agent.pending_inputs.lock().await.push_front(input);
+            agent.pending_inputs.lock().await.restore_front(input);
             return Ok(None);
         }
         Err(err) => return Err(err),

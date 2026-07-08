@@ -19,7 +19,7 @@ use mai_tools::build_tool_schemas;
 use pl_model::ToolSchema;
 use pl_protocol::Message as ModelMessage;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -280,7 +280,7 @@ impl AgentRuntime {
                 turn_lock: Mutex::new(()),
                 cancel_requested: AtomicBool::new(false),
                 active_turn: TurnControlSlot::new(),
-                pending_inputs: Mutex::new(VecDeque::new()),
+                pending_inputs: Mutex::new(pl_core::AgentInputQueue::new()),
             });
             if changed {
                 store
@@ -4311,7 +4311,7 @@ impl AgentRuntime {
             turn_lock: Mutex::new(()),
             cancel_requested: AtomicBool::new(false),
             active_turn: TurnControlSlot::new(),
-            pending_inputs: Mutex::new(VecDeque::new()),
+            pending_inputs: Mutex::new(pl_core::AgentInputQueue::new()),
         });
         self.state
             .agents
