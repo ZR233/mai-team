@@ -10,7 +10,7 @@ use pl_core::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::AgentServiceOps;
+use super::{AgentServiceOps, is_agent_turn_start_ready};
 use crate::state::{AgentRecord, TurnControl};
 use crate::turn::completion::TurnResult;
 use crate::{Result, RuntimeError};
@@ -124,7 +124,7 @@ pub(crate) async fn prepare_turn(
     let should_start = {
         let mut summary = agent.summary.write().await;
         let transition = AgentTurnStartTransition::new(turn_id, AgentStatus::RunningTurn, now());
-        match transition.evaluate(summary.status.can_start_turn()) {
+        match transition.evaluate(is_agent_turn_start_ready(&summary)) {
             AgentTurnStartOutcome::Started(mutation) => {
                 summary.status = mutation.status;
                 summary.current_turn = mutation.current_turn;

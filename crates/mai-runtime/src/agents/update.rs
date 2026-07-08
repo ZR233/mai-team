@@ -4,7 +4,7 @@ use std::sync::Arc;
 use mai_protocol::{AgentId, AgentSummary, UpdateAgentRequest, now};
 use mai_store::ProviderSelection;
 
-use super::normalize_reasoning_effort;
+use super::{is_agent_turn_start_ready, normalize_reasoning_effort};
 use crate::state::AgentRecord;
 use crate::{Result, RuntimeError};
 
@@ -31,7 +31,7 @@ pub(crate) async fn update_agent(
     let agent = ops.agent(agent_id).await?;
     let current = {
         let summary = agent.summary.read().await;
-        if !summary.status.can_start_turn() {
+        if !is_agent_turn_start_ready(&summary) {
             return Err(RuntimeError::AgentBusy(agent_id));
         }
         summary.clone()
@@ -57,7 +57,7 @@ pub(crate) async fn update_agent(
     )?;
     let updated = {
         let mut summary = agent.summary.write().await;
-        if !summary.status.can_start_turn() {
+        if !is_agent_turn_start_ready(&summary) {
             return Err(RuntimeError::AgentBusy(agent_id));
         }
         summary.current_turn = None;

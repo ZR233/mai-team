@@ -4,7 +4,9 @@ use mai_protocol::{
     GitProvider, ModelConfig, ModelReasoningConfig, ModelReasoningVariant, ProjectReviewDecision,
     ProviderConfig, ProviderKind, ProvidersConfigRequest,
 };
-use pl_core::TurnTaskHandle;
+use pl_core::{
+    AgentLifecycleStatusKind, AgentTurnStartReadiness, AgentTurnStartSnapshot, TurnTaskHandle,
+};
 use pl_protocol::{Message, MessageContent, MessageRole as PlMessageRole, ToolResultMetadata};
 use pretty_assertions::assert_eq;
 use state::TurnControl;
@@ -137,6 +139,31 @@ fn wait_completion_uses_pl_core_policy() {
     assert!(
         !agents_source.contains("summary.current_turn.is_none()\n        || matches!"),
         "mai-runtime 不应手写 current_turn + status 的 wait completion 判断"
+    );
+}
+
+#[test]
+fn turn_start_readiness_uses_pl_core_policy() {
+    let agents_source = include_str!("../agents.rs");
+    let turn_source = include_str!("../agents/turn.rs");
+    let update_source = include_str!("../agents/update.rs");
+    let protocol_source = include_str!("../../../mai-protocol/src/lib.rs");
+
+    assert!(
+        agents_source.contains("AgentTurnStartSnapshot"),
+        "agent turn 启动可用性判断应由 pl-core AgentTurnStartSnapshot 统一维护"
+    );
+    assert!(
+        !turn_source.contains(".can_start_turn()"),
+        "agents/turn.rs 不应直接调用 mai-protocol 的 can_start_turn"
+    );
+    assert!(
+        !update_source.contains(".can_start_turn()"),
+        "agents/update.rs 不应直接调用 mai-protocol 的 can_start_turn"
+    );
+    assert!(
+        !protocol_source.contains("can_start_turn"),
+        "mai-protocol 不应维护通用 agent turn 启动策略"
     );
 }
 
@@ -864,7 +891,7 @@ async fn wait_for_agent_idle(runtime: Arc<AgentRuntime>, agent_id: AgentId, time
                     .await
                     .map(|agent| {
                         agent.summary.current_turn.is_none()
-                            && agent.summary.status.can_start_turn()
+                            && agents::is_agent_status_turn_start_ready(&agent.summary.status)
                     })
                     .unwrap_or(false)
             }
@@ -2429,8 +2456,19 @@ fn extracts_skill_mentions() {
 
 #[test]
 fn agent_status_allows_new_turn_after_completion() {
-    assert!(AgentStatus::Completed.can_start_turn());
-    assert!(!AgentStatus::RunningTurn.can_start_turn());
+    assert!(agents::is_agent_status_turn_start_ready(
+        &AgentStatus::Completed
+    ));
+    assert!(!agents::is_agent_status_turn_start_ready(
+        &AgentStatus::RunningTurn
+    ));
+    assert_eq!(
+        AgentTurnStartSnapshot {
+            status: AgentLifecycleStatusKind::Completed
+        }
+        .readiness(),
+        AgentTurnStartReadiness::Ready
+    );
 }
 
 #[tokio::test]

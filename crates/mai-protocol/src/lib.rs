@@ -140,13 +140,6 @@ impl AgentStatus {
             Self::Completed | Self::Failed | Self::Cancelled | Self::Deleted
         )
     }
-
-    pub fn can_start_turn(&self) -> bool {
-        matches!(
-            self,
-            Self::Idle | Self::Completed | Self::Failed | Self::Cancelled
-        )
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

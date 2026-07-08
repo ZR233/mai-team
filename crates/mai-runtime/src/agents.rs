@@ -7,7 +7,9 @@ use mai_protocol::{
     AgentDetail, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary,
     ContextUsage, MessageRole, ServiceEvent, ServiceEventKind, SessionId, TokenUsage, now,
 };
-use pl_core::{AgentTurnPresence, AgentWaitSnapshot, AgentWaitStatusKind};
+use pl_core::{
+    AgentLifecycleStatusKind, AgentTurnPresence, AgentTurnStartSnapshot, AgentWaitSnapshot,
+};
 use pl_protocol::Message as ModelMessage;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -386,6 +388,17 @@ pub(crate) fn is_agent_wait_complete(summary: &AgentSummary) -> bool {
     agent_wait_snapshot(summary).is_complete()
 }
 
+pub(crate) fn is_agent_turn_start_ready(summary: &AgentSummary) -> bool {
+    is_agent_status_turn_start_ready(&summary.status)
+}
+
+pub(crate) fn is_agent_status_turn_start_ready(status: &AgentStatus) -> bool {
+    AgentTurnStartSnapshot {
+        status: agent_lifecycle_status_kind(status),
+    }
+    .can_start()
+}
+
 fn agent_wait_snapshot(summary: &AgentSummary) -> AgentWaitSnapshot {
     let turn_presence = match summary.current_turn {
         Some(_) => AgentTurnPresence::ActiveTurn,
@@ -393,22 +406,22 @@ fn agent_wait_snapshot(summary: &AgentSummary) -> AgentWaitSnapshot {
     };
     AgentWaitSnapshot {
         turn_presence,
-        status: agent_wait_status_kind(&summary.status),
+        status: agent_lifecycle_status_kind(&summary.status),
     }
 }
 
-fn agent_wait_status_kind(status: &AgentStatus) -> AgentWaitStatusKind {
+fn agent_lifecycle_status_kind(status: &AgentStatus) -> AgentLifecycleStatusKind {
     match status {
         AgentStatus::Created
         | AgentStatus::StartingContainer
         | AgentStatus::RunningTurn
         | AgentStatus::WaitingTool
-        | AgentStatus::DeletingContainer => AgentWaitStatusKind::Active,
-        AgentStatus::Idle => AgentWaitStatusKind::Idle,
-        AgentStatus::Completed => AgentWaitStatusKind::Completed,
-        AgentStatus::Failed => AgentWaitStatusKind::Failed,
-        AgentStatus::Cancelled => AgentWaitStatusKind::Cancelled,
-        AgentStatus::Deleted => AgentWaitStatusKind::Deleted,
+        | AgentStatus::DeletingContainer => AgentLifecycleStatusKind::Active,
+        AgentStatus::Idle => AgentLifecycleStatusKind::Idle,
+        AgentStatus::Completed => AgentLifecycleStatusKind::Completed,
+        AgentStatus::Failed => AgentLifecycleStatusKind::Failed,
+        AgentStatus::Cancelled => AgentLifecycleStatusKind::Cancelled,
+        AgentStatus::Deleted => AgentLifecycleStatusKind::Deleted,
     }
 }
 
