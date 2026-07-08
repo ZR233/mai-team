@@ -111,6 +111,34 @@ fn observability_uses_pl_core_history_success_projection() {
 }
 
 #[test]
+fn observability_uses_pl_core_history_accessors() {
+    let source = include_str!("../agents/observability.rs");
+
+    for required in [
+        "projection.tool_name()",
+        "projection.arguments()",
+        "projection.output_preview()",
+        "projection.output()",
+    ] {
+        assert!(
+            source.contains(required),
+            "工具历史 fallback 应通过 pl-core ToolHistoryProjection accessor 获取 `{required}`"
+        );
+    }
+    for forbidden in [
+        "projection.tool_name,",
+        "projection.arguments,",
+        "projection.output_preview,",
+        "projection.output,",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "mai-runtime 不应读取 ToolHistoryProjection 字段 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
 fn test_history_messages_reuse_pl_core_metadata_helpers() {
     let source = include_str!("../turn/history.rs");
 
@@ -347,6 +375,44 @@ fn kernel_tool_projection_uses_pl_core_completion_timestamp_fallback() {
         !source.contains("completed_at_unix\n            .unwrap_or"),
         "mai-runtime 不应直接拼装 ToolLifecycleProjection 的完成时间 fallback"
     );
+}
+
+#[test]
+fn kernel_tool_projection_uses_pl_core_lifecycle_accessors() {
+    let source = include_str!("../turn/kernel_tools.rs");
+
+    for required in [
+        "projection.phase()",
+        "projection.call_id()",
+        "projection.tool_name()",
+        "projection.arguments()",
+        "projection.arguments_preview()",
+        "projection.output()",
+        "projection.output_preview()",
+        "projection.duration_ms()",
+        "projection.started_at_unix()",
+    ] {
+        assert!(
+            source.contains(required),
+            "mai-runtime 工具生命周期投影应通过 pl-core accessor 获取 `{required}`"
+        );
+    }
+    for forbidden in [
+        "projection.phase {",
+        "projection.call_id.clone()",
+        "projection.tool_name.clone()",
+        "projection.arguments.clone()",
+        "projection.arguments_preview.clone()",
+        "projection.output.clone()",
+        "projection.output_preview.clone()",
+        "projection.duration_ms,",
+        "projection.started_at_unix)",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "mai-runtime 不应读取 ToolLifecycleProjection 字段 `{forbidden}`"
+        );
+    }
 }
 
 #[test]
