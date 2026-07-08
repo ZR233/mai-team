@@ -4,6 +4,7 @@ use mai_protocol::{
     GitProvider, ModelConfig, ModelReasoningConfig, ModelReasoningVariant, ProjectReviewDecision,
     ProviderConfig, ProviderKind, ProvidersConfigRequest,
 };
+use pl_core::TurnTaskHandle;
 use pl_protocol::{Message, MessageContent, MessageRole as PlMessageRole, ToolResultMetadata};
 use pretty_assertions::assert_eq;
 use state::TurnControl;
@@ -4893,8 +4894,7 @@ async fn send_input_interrupt_starts_replacement_without_losing_message() {
     *agent.active_turn.lock().expect("active turn lock") = Some(TurnControl {
         turn_id: old_turn_id,
         session_id,
-        cancellation_token: CancellationToken::new(),
-        abort_handle: None,
+        task_handle: TurnTaskHandle::from_external_token(CancellationToken::new()),
     });
 
     let output = runtime
@@ -4987,8 +4987,7 @@ async fn stale_turn_completion_does_not_overwrite_current_turn() {
     *agent.active_turn.lock().expect("active turn lock") = Some(TurnControl {
         turn_id: current_turn_id,
         session_id,
-        cancellation_token: CancellationToken::new(),
-        abort_handle: None,
+        task_handle: TurnTaskHandle::from_external_token(CancellationToken::new()),
     });
 
     let completed = turn::completion::complete_turn_if_current(

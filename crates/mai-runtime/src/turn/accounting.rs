@@ -55,6 +55,7 @@ mod tests {
         now,
     };
     use mai_store::ConfigStore;
+    use pl_core::TurnTaskHandle;
     use tokio::sync::{Mutex, RwLock};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
@@ -140,8 +141,7 @@ mod tests {
             active_turn: StdMutex::new(Some(TurnControl {
                 turn_id,
                 session_id: second_session_id,
-                cancellation_token: CancellationToken::new(),
-                abort_handle: None,
+                task_handle: TurnTaskHandle::from_external_token(CancellationToken::new()),
             })),
             pending_inputs: Mutex::new(VecDeque::new()),
         });

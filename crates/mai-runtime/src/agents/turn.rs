@@ -2,8 +2,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use futures::future::{AbortHandle, Abortable};
 use mai_protocol::{AgentId, AgentStatus, ServiceEventKind, SessionId, TurnId, TurnStatus, now};
+use pl_core::TurnTaskHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -152,17 +152,7 @@ pub(crate) fn spawn_turn(
     message: String,
     skill_mentions: Vec<String>,
 ) {
-    let cancellation_token = CancellationToken::new();
-    let task_token = cancellation_token.clone();
-    let (abort_handle, abort_registration) = AbortHandle::new_pair();
-    let control = TurnControl {
-        turn_id,
-        session_id,
-        cancellation_token,
-        abort_handle: Some(abort_handle),
-    };
-    *agent.active_turn.lock().expect("active turn lock") = Some(control);
-    tokio::spawn(Abortable::new(
+    let task_handle = TurnTaskHandle::spawn_with_token(|task_token| {
         ops.run_turn_task(
             agent_id,
             session_id,
@@ -170,9 +160,14 @@ pub(crate) fn spawn_turn(
             message,
             skill_mentions,
             task_token,
-        ),
-        abort_registration,
-    ));
+        )
+    });
+    let control = TurnControl {
+        turn_id,
+        session_id,
+        task_handle,
+    };
+    *agent.active_turn.lock().expect("active turn lock") = Some(control);
 }
 
 pub(crate) async fn cancel_agent(ops: &impl AgentCancelOps, agent_id: AgentId) -> Result<()> {
@@ -201,17 +196,9 @@ pub(crate) async fn cancel_agent_turn(
     }
     agent.cancel_requested.store(true, Ordering::SeqCst);
     if let Some(control) = control.filter(|turn| turn.turn_id == turn_id) {
-        control.cancellation_token.cancel();
-        if let Some(abort_handle) = control.abort_handle {
-            let token = control.cancellation_token.clone();
-            let cancel_grace = ops.turn_cancel_grace();
-            tokio::spawn(async move {
-                tokio::time::sleep(cancel_grace).await;
-                if token.is_cancelled() {
-                    abort_handle.abort();
-                }
-            });
-        }
+        control
+            .task_handle
+            .cancel_and_abort_after(ops.turn_cancel_grace());
     }
     let completed = ops
         .complete_turn_if_current(

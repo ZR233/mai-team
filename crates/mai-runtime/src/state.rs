@@ -8,6 +8,7 @@ use mai_protocol::{
     AgentId, AgentMessage, AgentSessionSummary, AgentSummary, ArtifactInfo, PlanHistoryEntry,
     ProjectId, ProjectSummary, SessionId, TaskId, TaskPlan, TaskReview, TaskSummary, TurnId,
 };
+use pl_core::TurnTaskHandle;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -97,8 +98,7 @@ pub(crate) struct AgentRecord {
 pub(crate) struct TurnControl {
     pub(crate) turn_id: TurnId,
     pub(crate) session_id: SessionId,
-    pub(crate) cancellation_token: CancellationToken,
-    pub(crate) abort_handle: Option<futures::future::AbortHandle>,
+    pub(crate) task_handle: TurnTaskHandle,
 }
 
 #[derive(Clone)]
