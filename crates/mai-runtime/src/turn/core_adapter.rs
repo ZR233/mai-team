@@ -60,7 +60,7 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
     if let Some(effort) = ctx.reasoning_effort.as_deref() {
         builder = builder.with_reasoning_effort(ReasoningEffort::new(effort));
     }
-    let product_tool_router = super::product_tools::MaiProductToolRouter::new(
+    let product_tool_registry = super::product_tools::MaiProductToolRegistry::new(
         ctx.runtime.clone(),
         ctx.agent.clone(),
         ctx.agent_id,
@@ -69,7 +69,7 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
     );
     let mut kernel = AgentKernel::builder(builder)
         .with_profile(runtime_profile)
-        .with_product_tool_router(product_tool_router)
+        .with_registered_tools(product_tool_registry.registered_tools())
         .build()
         .await;
     register_native_shared_tools(&mut kernel, &ctx).await?;

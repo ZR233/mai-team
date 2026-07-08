@@ -57,6 +57,29 @@ mod tests {
     }
 
     #[test]
+    fn pure_lang_dependencies_use_shared_branch() {
+        let manifest = include_str!("../../../Cargo.toml");
+        for package in ["pl-core", "pl-model", "pl-protocol", "pl-trace"] {
+            let line = manifest
+                .lines()
+                .find(|line| line.starts_with(&format!("{package} = ")))
+                .expect("workspace dependency must exist");
+            assert!(
+                line.contains("ssh://git@github.com/ZR233/pure-lang.git"),
+                "{package} must use the shared pure-lang git dependency"
+            );
+            assert!(
+                line.contains("branch = \"codex/mai-team-pl-unified-dependency\""),
+                "{package} must point at the unified mai-team pure-lang branch"
+            );
+            assert!(
+                !line.contains("path = "),
+                "{package} must not use a local path dependency in PR branches"
+            );
+        }
+    }
+
+    #[test]
     fn builtin_definitions_are_product_tools_only() {
         let tools = build_tool_definitions(&[]);
         let names = tool_names(&tools);

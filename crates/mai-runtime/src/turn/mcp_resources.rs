@@ -107,24 +107,6 @@ pub(crate) fn register_mcp_resource_tools(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn mcp_resource_tool_for_test(
-    runtime: Arc<AgentRuntime>,
-    agent: Arc<AgentRecord>,
-    agent_id: AgentId,
-    cancellation_token: CancellationToken,
-    name: &str,
-) -> Option<pl_core::McpResourceTool<MaiMcpResourceBackend>> {
-    let kind = pl_core::McpResourceToolKind::from_name(name)?;
-    let backend = Arc::new(MaiMcpResourceBackend::new(
-        runtime,
-        agent,
-        agent_id,
-        cancellation_token,
-    ));
-    Some(pl_core::McpResourceTool::new(kind, backend))
-}
-
 fn resource_error(tool: &str, error: RuntimeError) -> pl_protocol::PureError {
     pl_protocol::PureError::ToolExecutionFailed {
         tool: tool.to_string(),

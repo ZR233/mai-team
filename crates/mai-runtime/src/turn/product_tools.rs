@@ -1,8 +1,7 @@
-use std::fmt;
 use std::sync::Arc;
 
 use mai_protocol::{AgentId, AgentRole, ToolDefinition};
-use pl_core::{ProductToolDefinition, ProductToolRequest, ProductToolRouter, ToolOutput};
+use pl_core::RegisteredTool;
 use pl_protocol::PureError;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -25,12 +24,12 @@ pub(crate) struct GithubApiRequest {
     pub(crate) body: Option<Value>,
 }
 
-/// 将 mai-team 产品工具挂入 pl-core agent kernel 的产品工具路由器。
+/// 将 mai-team 产品工具挂入 pl-core agent kernel 的动态工具注册表。
 ///
-/// 该路由器只承载 GitHub、review queue、artifact、task plan 和 MCP 资源等产品语义；
+/// 该注册器只承载 GitHub、review queue、artifact、task plan 和 MCP 资源等产品语义；
 /// 工具生命周期、trace、tool result history 和模型回合调度仍由 pl-core 统一处理。
 #[derive(Clone)]
-pub(crate) struct MaiProductToolRouter {
+pub(crate) struct MaiProductToolRegistry {
     runtime: Arc<AgentRuntime>,
     agent: Arc<AgentRecord>,
     agent_id: AgentId,
@@ -38,16 +37,7 @@ pub(crate) struct MaiProductToolRouter {
     cancellation_token: CancellationToken,
 }
 
-impl fmt::Debug for MaiProductToolRouter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MaiProductToolRouter")
-            .field("agent_id", &self.agent_id)
-            .field("tool_count", &self.definitions.len())
-            .finish()
-    }
-}
-
-impl MaiProductToolRouter {
+impl MaiProductToolRegistry {
     pub(crate) fn new(
         runtime: Arc<AgentRuntime>,
         agent: Arc<AgentRecord>,
@@ -63,29 +53,36 @@ impl MaiProductToolRouter {
             cancellation_token,
         }
     }
-}
 
-impl ProductToolRouter for MaiProductToolRouter {
-    fn tool_definitions(&self) -> Vec<ProductToolDefinition> {
+    pub(crate) fn registered_tools(&self) -> Vec<RegisteredTool> {
         self.definitions
             .iter()
-            .map(product_definition_from_mai_definition)
+            .map(|definition| {
+                let tool_name = definition.name.clone();
+                let executor = self.clone();
+                RegisteredTool::new(
+                    definition.name.clone(),
+                    definition.description.clone(),
+                    definition.parameters.clone(),
+                    move |input, _context| {
+                        let executor = executor.clone();
+                        let tool_name = tool_name.clone();
+                        async move {
+                            let execution = executor
+                                .execute_product_tool(&tool_name, input.arguments)
+                                .await
+                                .map_err(|error| PureError::ToolExecutionFailed {
+                                    tool: tool_name.clone(),
+                                    error: error.to_string(),
+                                })?;
+                            Ok(execution.into_tool_output())
+                        }
+                    },
+                )
+            })
             .collect()
     }
 
-    async fn execute(&self, request: ProductToolRequest) -> pl_core::Result<ToolOutput> {
-        let execution = self
-            .execute_product_tool(&request.definition.name, request.input.arguments)
-            .await
-            .map_err(|error| PureError::ToolExecutionFailed {
-                tool: request.definition.name.clone(),
-                error: error.to_string(),
-            })?;
-        Ok(execution.into_tool_output())
-    }
-}
-
-impl MaiProductToolRouter {
     pub(crate) async fn execute_product_tool(
         &self,
         name: &str,
@@ -252,14 +249,6 @@ impl MaiProductToolRouter {
     }
 }
 
-fn product_definition_from_mai_definition(definition: &ToolDefinition) -> ProductToolDefinition {
-    ProductToolDefinition::new(
-        definition.name.clone(),
-        definition.description.clone(),
-        definition.parameters.clone(),
-    )
-}
-
 fn required_string_argument(arguments: &Value, field: &str) -> crate::Result<String> {
     arguments
         .get(field)
@@ -331,6 +320,20 @@ fn optional_json_body_argument(arguments: &Value, field: &str) -> crate::Result<
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn product_tools_register_as_pl_core_tools() {
+        let source = include_str!("product_tools.rs");
+
+        assert!(
+            source.contains(&format!("{}{}", "Registered", "Tool")),
+            "mai-team 产品工具必须作为 pl-core RegisteredTool 注册"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "ProductTool", "Router")),
+            "mai-team 不应保留产品工具 router 大分发层"
+        );
+    }
 
     #[test]
     fn github_api_request_from_arguments_parses_json_string_body() {

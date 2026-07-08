@@ -1595,28 +1595,25 @@ impl AgentRuntime {
         arguments: Value,
     ) -> Result<ToolExecution> {
         let agent = self.agent(agent_id).await?;
-        if let Some(execution) = self
-            .execute_native_shared_tool_for_test(&agent, agent_id, name, arguments.clone())
-            .await?
-        {
-            return Ok(execution);
+        let mut product_tools = build_tool_definitions_with_filter(&[], |tool| tool == name);
+        if product_tools.is_empty() && name.starts_with("mcp__") {
+            product_tools.push(ToolDefinition::function(
+                name.to_string(),
+                format!("Call MCP tool `{name}`."),
+                json!({"type": "object"}),
+            ));
         }
-        let product_tools = build_tool_definitions_with_filter(&[], |tool| tool == name);
-        if product_tools.is_empty() && !name.starts_with("mcp__") {
+        let Some(execution) = self
+            .execute_native_shared_tool_for_test(&agent, agent_id, name, arguments, product_tools)
+            .await?
+        else {
             return Ok(ToolExecution::new(
                 false,
                 format!("unknown tool: {name}"),
                 false,
             ));
-        }
-        let router = turn::product_tools::MaiProductToolRouter::new(
-            self.clone(),
-            agent,
-            agent_id,
-            product_tools,
-            CancellationToken::new(),
-        );
-        router.execute_product_tool(name, arguments).await
+        };
+        Ok(execution)
     }
 
     #[cfg(test)]
@@ -1626,20 +1623,51 @@ impl AgentRuntime {
         agent_id: AgentId,
         name: &str,
         arguments: Value,
+        product_tools: Vec<ToolDefinition>,
     ) -> Result<Option<ToolExecution>> {
         let (event_tx, mut event_rx) = broadcast::channel(8);
+        let cancellation_token = CancellationToken::new();
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let product_registry = turn::product_tools::MaiProductToolRegistry::new(
+            self.clone(),
+            agent.clone(),
+            agent_id,
+            product_tools,
+            cancellation_token.clone(),
+        );
+        let mut kernel = pl_core::AgentKernel::builder(
+            pl_core::PureCoreBuilder::from_provider_info(pl_model::ProviderInfo::deepseek(None))?,
+        )
+        .with_profile(pl_core::CoreAgentProfile::host_provided(
+            workspace_root.clone(),
+        ))
+        .with_registered_tools(product_registry.registered_tools())
+        .build()
+        .await;
+        self.register_shared_tools_for_test(
+            &mut kernel,
+            agent,
+            agent_id,
+            name,
+            workspace_root.clone(),
+            cancellation_token.clone(),
+        )
+        .await?;
+        let Some(tool) = kernel.tool(name) else {
+            return Ok(None);
+        };
         let context = pl_core::ToolContext {
             event_tx,
-            options: pl_core::TurnOptions::default(),
+            options: pl_core::TurnOptions::default().with_cancellation(cancellation_token),
             workspace_access: pl_core::WorkspaceAccess::WorkspaceOnly,
             mode: pl_core::CompileMode::Auto,
-            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            workspace_root,
             workspace_instructions: None,
             instruction_snapshot: None,
             provider_call_id: None,
             active_subagent: None,
             agent_supervisor: pl_core::AgentSupervisor::default(),
-            agent_tool_registrar: None,
+            agent_tool_registrar: kernel.agent_tool_registrar(),
             lsp_runtime: None,
             parent_session: Arc::new(pl_core::CoreSession::new()),
         };
@@ -1649,110 +1677,21 @@ impl AgentRuntime {
             tool_id: Uuid::new_v4().to_string(),
             revision_base: 0,
         };
-        let cancellation_token = CancellationToken::new();
-        let container_backend = turn::container::MaiContainerBackend::new(self.clone(), agent_id);
-        if pl_core::WorkspaceFileToolKind::from_name(name).is_some() {
-            let file_backend =
-                pl_core::ContainerWorkspaceFileBackend::new(Arc::new(container_backend.clone()));
-            let Some(execution) = pl_core::execute_workspace_file_tool(
-                &file_backend,
-                name,
-                input.arguments.clone(),
-                Some(cancellation_token.clone()),
-            )
-            .await?
-            else {
-                return Ok(None);
-            };
-            return Ok(Some(ToolExecution::with_model_output(
-                execution.success,
-                execution.output,
-                execution.model_output,
-                false,
-                Vec::new(),
-            )));
-        }
-        if pl_core::ContainerToolKind::from_name(name).is_some() {
-            let Some(execution) = pl_core::execute_container_tool(
-                &container_backend,
-                name,
-                input.arguments.clone(),
-                Some(cancellation_token),
-            )
-            .await?
-            else {
-                return Ok(None);
-            };
-            return Ok(Some(ToolExecution::with_model_output(
-                execution.success,
-                execution.output,
-                execution.model_output,
-                false,
-                Self::output_artifacts_from_json_for_test(execution.output_artifacts)?,
-            )));
-        }
-        let output = match pl_core::AgentControlToolKind::all()
+        let output = pl_core::Tool::execute(tool, input, context).await?;
+        self.project_tool_events_for_test(agent_id, &mut event_rx)
+            .await;
+        let output_artifacts = output
+            .runtime_events
             .iter()
-            .copied()
-            .find(|kind| kind.name() == name)
-        {
-            Some(kind) => {
-                let backend = Arc::new(turn::agent_control::MaiAgentControlBackend::new(
-                    self.clone(),
-                    agent.clone(),
-                    agent_id,
-                    CancellationToken::new(),
-                ));
-                let tool = pl_core::AgentControlTool::new(kind, backend);
-                pl_core::Tool::execute(&tool, input, context).await?
-            }
-            None if pl_core::McpResourceToolKind::from_name(name).is_some() => {
-                let tool = turn::mcp_resources::mcp_resource_tool_for_test(
-                    self.clone(),
-                    agent.clone(),
-                    agent_id,
-                    CancellationToken::new(),
-                    name,
-                )
-                .expect("mcp resource tool");
-                pl_core::Tool::execute(&tool, input, context).await?
-            }
-            None if name == "update_todo_list" => {
-                let tool = pl_core::TodoListTool;
-                let output = pl_core::Tool::execute(&tool, input, context).await?;
-                while let Ok(event) = event_rx.try_recv() {
-                    if let pl_trace::AgentEvent::TodoListUpdated { snapshot } = event {
-                        self.events
-                            .publish(ServiceEventKind::TodoListUpdated {
-                                agent_id,
-                                session_id: None,
-                                turn_id: Uuid::new_v4(),
-                                items: snapshot
-                                    .items
-                                    .into_iter()
-                                    .map(|item| TodoItem {
-                                        step: item.step,
-                                        status: match item.status {
-                                            pl_protocol::TodoStatus::Pending => {
-                                                TodoListStatus::Pending
-                                            }
-                                            pl_protocol::TodoStatus::InProgress => {
-                                                TodoListStatus::InProgress
-                                            }
-                                            pl_protocol::TodoStatus::Completed => {
-                                                TodoListStatus::Completed
-                                            }
-                                        },
-                                    })
-                                    .collect(),
-                            })
-                            .await;
-                    }
-                }
-                output
-            }
-            None => return Ok(None),
-        };
+            .filter_map(|event| match event {
+                pl_core::ToolRuntimeEvent::OutputArtifacts { artifacts } => Some(artifacts),
+                pl_core::ToolRuntimeEvent::SkillActivated { .. }
+                | pl_core::ToolRuntimeEvent::ToolResultRevision { .. }
+                | pl_core::ToolRuntimeEvent::EndTurn => None,
+            })
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
         Ok(Some(ToolExecution::with_model_output(
             output.exit_code.unwrap_or(0) == 0,
             output.description.clone(),
@@ -1761,8 +1700,106 @@ impl AgentRuntime {
                 .runtime_events
                 .iter()
                 .any(|event| matches!(event, pl_core::ToolRuntimeEvent::EndTurn)),
-            Vec::new(),
+            Self::output_artifacts_from_json_for_test(output_artifacts)?,
         )))
+    }
+
+    #[cfg(test)]
+    async fn register_shared_tools_for_test(
+        self: &Arc<Self>,
+        kernel: &mut pl_core::AgentKernel,
+        agent: &Arc<AgentRecord>,
+        agent_id: AgentId,
+        name: &str,
+        workspace_root: PathBuf,
+        cancellation_token: CancellationToken,
+    ) -> Result<()> {
+        let visible_tools = HashSet::from([name.to_string()]);
+        let container_backend = Arc::new(turn::container::MaiContainerBackend::new(
+            self.clone(),
+            agent_id,
+        ));
+        let git_runtime =
+            tools::git::native_git_tool_runtime(self.clone(), agent, |tool| tool == name).await?;
+        let capabilities = pl_core::ToolCapabilityConfig {
+            bash: false,
+            workspace_files: true,
+            skills: false,
+            mcp: false,
+            lsp: false,
+            subagents: false,
+            ask_user: true,
+            git: git_runtime.is_some(),
+            docker: false,
+            container: true,
+        };
+        let tool_set = pl_core::ToolSetBuilder::from_capabilities(capabilities)
+            .with_allowed_tools(visible_tools.iter().cloned())
+            .with_container_tools(container_backend);
+        if let Some(git_runtime) = git_runtime {
+            tool_set
+                .with_git_tools(
+                    git_runtime.config,
+                    git_runtime.backend,
+                    git_runtime.credential_provider,
+                )
+                .register(kernel.core_mut(), workspace_root, None)
+                .await;
+        } else {
+            tool_set
+                .register(kernel.core_mut(), workspace_root, None)
+                .await;
+        }
+        turn::mcp_resources::register_mcp_resource_tools(
+            kernel.core_mut(),
+            self.clone(),
+            agent.clone(),
+            agent_id,
+            cancellation_token.clone(),
+            &visible_tools,
+        );
+        turn::agent_control::register_native_agent_control_tools(
+            kernel,
+            self.clone(),
+            agent.clone(),
+            agent_id,
+            &visible_tools,
+            cancellation_token,
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn project_tool_events_for_test(
+        &self,
+        agent_id: AgentId,
+        event_rx: &mut broadcast::Receiver<pl_trace::AgentEvent>,
+    ) {
+        while let Ok(event) = event_rx.try_recv() {
+            if let pl_trace::AgentEvent::TodoListUpdated { snapshot } = event {
+                self.events
+                    .publish(ServiceEventKind::TodoListUpdated {
+                        agent_id,
+                        session_id: None,
+                        turn_id: Uuid::new_v4(),
+                        items: snapshot
+                            .items
+                            .into_iter()
+                            .map(|item| TodoItem {
+                                step: item.step,
+                                status: match item.status {
+                                    pl_protocol::TodoStatus::Pending => TodoListStatus::Pending,
+                                    pl_protocol::TodoStatus::InProgress => {
+                                        TodoListStatus::InProgress
+                                    }
+                                    pl_protocol::TodoStatus::Completed => TodoListStatus::Completed,
+                                },
+                            })
+                            .collect(),
+                    })
+                    .await;
+            }
+        }
     }
 
     #[cfg(test)]

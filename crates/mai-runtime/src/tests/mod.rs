@@ -16,6 +16,38 @@ mod project_github_tools;
 mod project_mcp;
 mod turn_runtime;
 
+#[test]
+fn test_tool_helper_uses_pl_core_kernel_registry() {
+    let source = include_str!("../lib.rs");
+    let helper_start = source
+        .find("execute_native_shared_tool_for_test")
+        .expect("test helper exists");
+    let helper_end = source[helper_start..]
+        .find("fn output_artifacts_from_json_for_test")
+        .expect("next helper exists");
+    let helper = &source[helper_start..helper_start + helper_end];
+
+    assert!(
+        helper.contains("AgentKernel::builder"),
+        "测试工具执行路径必须构造 pl-core AgentKernel"
+    );
+    assert!(
+        helper.contains("ToolSetBuilder::from_capabilities"),
+        "测试工具执行路径必须复用 pl-core ToolSetBuilder"
+    );
+    for forbidden in [
+        format!("{}{}", "execute_workspace", "_file_tool"),
+        format!("{}{}", "execute_container", "_tool"),
+        format!("{}{}", "AgentControl", "Tool::new"),
+        format!("{}{}", "TodoList", "Tool"),
+    ] {
+        assert!(
+            !helper.contains(&forbidden),
+            "测试工具执行不应绕过 pl-core registry 直接调用 `{forbidden}`"
+        );
+    }
+}
+
 fn pl_text(message: &Message) -> &str {
     match &message.content {
         MessageContent::Text(text) => text,
