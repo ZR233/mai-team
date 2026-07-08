@@ -475,6 +475,40 @@ fn core_turn_uses_pl_core_turn_outcome() {
 }
 
 #[test]
+fn core_turn_uses_pl_core_turn_projection_accessors() {
+    let source = include_str!("../turn/core_adapter.rs");
+    for required in [
+        "runtime_snapshot.latest_context_compaction()",
+        "runtime_snapshot.last_context_tokens()",
+        "runtime_snapshot.usage()",
+        "outcome.final_text()",
+        "outcome.status()",
+        "outcome.error()",
+        "outcome.return_error()",
+    ] {
+        assert!(
+            source.contains(required),
+            "主 turn 路径应通过 pl-core turn projection accessor 获取 `{required}`"
+        );
+    }
+    for forbidden in [
+        "runtime_snapshot.latest_context_compaction {",
+        "runtime_snapshot.last_context_tokens {",
+        "&runtime_snapshot.usage",
+        "&outcome.final_text",
+        "outcome.status)",
+        "final_text: outcome.final_text,",
+        "error: outcome.error,",
+        "outcome.return_error {",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "mai-runtime 不应读取 pl-core turn 投影字段 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
 fn run_turn_error_completion_uses_pl_core_projection() {
     let source = include_str!("../turn/orchestrator.rs");
     let run_start = source.find("pub(crate) async fn run_turn").unwrap();
@@ -495,6 +529,38 @@ fn run_turn_error_completion_uses_pl_core_projection() {
         assert!(
             !run_path.contains(forbidden),
             "run_turn 外壳不应继续本地解释通用错误终态 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn run_turn_error_completion_uses_pl_core_projection_accessors() {
+    let source = include_str!("../turn/orchestrator.rs");
+    let run_start = source.find("pub(crate) async fn run_turn").unwrap();
+    let run_end = source[run_start..]
+        .find("pub(crate) async fn run_turn_inner")
+        .unwrap();
+    let run_path = &source[run_start..run_start + run_end];
+
+    for required in [
+        "projection.status()",
+        "projection.error_message()",
+        "projection.should_publish_error()",
+    ] {
+        assert!(
+            run_path.contains(required),
+            "run_turn 外壳应通过 pl-core 错误投影 accessor 获取 `{required}`"
+        );
+    }
+    for forbidden in [
+        "projection.status)",
+        "projection.error_message.clone()",
+        "projection.should_publish_error\n",
+        "let Some(message) = projection.error_message\n",
+    ] {
+        assert!(
+            !run_path.contains(forbidden),
+            "run_turn 外壳不应读取 TurnErrorProjection 字段 `{forbidden}`"
         );
     }
 }

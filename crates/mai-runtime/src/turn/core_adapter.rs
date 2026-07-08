@@ -148,10 +148,10 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
         session.messages().to_vec(),
     )
     .await?;
-    if let Some(snapshot) = runtime_snapshot.latest_context_compaction {
+    if let Some(snapshot) = runtime_snapshot.latest_context_compaction() {
         record_context_compacted(&ctx, &snapshot.summary, snapshot.tokens_before).await;
     }
-    if let Some(last_context_tokens) = runtime_snapshot.last_context_tokens {
+    if let Some(last_context_tokens) = runtime_snapshot.last_context_tokens() {
         super::history::record_session_context_tokens(
             ctx.runtime.deps.store.as_ref(),
             &ctx.agent,
@@ -161,7 +161,7 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
         )
         .await?;
     }
-    if let Some(usage) = &runtime_snapshot.usage {
+    if let Some(usage) = runtime_snapshot.usage() {
         super::accounting::record_model_usage(
             ctx.runtime.deps.store.as_ref(),
             &ctx.runtime.events,
@@ -173,11 +173,11 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
         .await?;
     }
     let outcome = TurnOutcome::from_result(&result);
-    if let Some(final_text) = &outcome.final_text {
-        record_assistant_message(&ctx, final_text.clone()).await?;
+    if let Some(final_text) = outcome.final_text() {
+        record_assistant_message(&ctx, final_text.to_string()).await?;
     }
 
-    let (turn_status, agent_status) = mai_status_from_pl_outcome(outcome.status);
+    let (turn_status, agent_status) = mai_status_from_pl_outcome(outcome.status());
     super::completion::finish_turn(
         ctx.runtime.deps.store.as_ref(),
         &ctx.runtime.events,
@@ -188,15 +188,15 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
             turn_id: ctx.turn_id,
             status: turn_status,
             agent_status,
-            final_text: outcome.final_text,
-            error: outcome.error,
+            final_text: outcome.final_text().map(ToString::to_string),
+            error: outcome.error().map(ToString::to_string),
         },
     )
     .await?;
     ctx.runtime
         .start_next_queued_input_after_turn(ctx.agent_id)
         .await;
-    if let Some(error) = outcome.return_error {
+    if let Some(error) = outcome.return_error().cloned() {
         return Err(runtime_error_from_pl_turn(error));
     }
     Ok(())

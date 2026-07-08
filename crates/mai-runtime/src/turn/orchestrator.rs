@@ -165,7 +165,7 @@ pub(crate) async fn run_turn(
     {
         let projection = TurnErrorProjection::from_return_error(pl_turn_return_error(err));
         let (turn_status, agent_status) =
-            super::core_adapter::mai_status_from_pl_outcome(projection.status);
+            super::core_adapter::mai_status_from_pl_outcome(projection.status());
         let completed = super::completion::complete_turn_if_current(
             deps.store.as_ref(),
             events,
@@ -176,22 +176,22 @@ pub(crate) async fn run_turn(
                 status: turn_status,
                 agent_status,
                 final_text: None,
-                error: projection.error_message.clone(),
+                error: projection.error_message().map(ToString::to_string),
             },
         )
         .await
         .unwrap_or(false);
         if completed {
             ops.start_next_queued_input_after_turn(agent_id).await;
-            if projection.should_publish_error
-                && let Some(message) = projection.error_message
+            if projection.should_publish_error()
+                && let Some(message) = projection.error_message()
             {
                 events
                     .publish(ServiceEventKind::Error {
                         agent_id: Some(agent_id),
                         session_id: Some(session_id),
                         turn_id: Some(turn_id),
-                        message,
+                        message: message.to_string(),
                     })
                     .await;
             }
