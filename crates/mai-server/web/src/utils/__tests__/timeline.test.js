@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { buildAgentTimeline, renderToolTrace, timelineItemClasses } from '../timeline.js'
+
+const timelineSource = readFileSync(
+  resolve(dirname(fileURLToPath(import.meta.url)), '../timeline.js'),
+  'utf8'
+)
 
 const detail = {
   id: 'agent-1',
@@ -293,3 +301,47 @@ assert.match(unknownTrace, /alpha/)
 assert.match(unknownTrace, /&lt;b&gt;two&lt;\/b&gt;/)
 assert.doesNotMatch(unknownTrace, /"nested"/)
 assert.doesNotMatch(unknownTrace, /trace-code-json/)
+
+const containerCopyTrace = renderToolTrace({
+  toolName: 'container_copy',
+  kind: 'arguments',
+  value: {
+    direction: 'upload',
+    path: '/workspace/result.txt',
+    contentBase64: 'Zm9vYmFyYmF6'
+  }
+})
+
+assert.match(containerCopyTrace, /direction/)
+assert.match(containerCopyTrace, /upload/)
+assert.match(containerCopyTrace, /\/workspace\/result\.txt/)
+assert.doesNotMatch(containerCopyTrace, /content_base64/)
+
+const sendInputTrace = renderToolTrace({
+  toolName: 'send_input',
+  kind: 'arguments',
+  value: {
+    target: 'agent-2',
+    triggerTurn: true,
+    message: 'continue'
+  }
+})
+
+assert.match(sendInputTrace, /agent-2/)
+assert.match(sendInputTrace, /trigger/)
+assert.doesNotMatch(sendInputTrace, /agent_id/)
+
+for (const legacy of [
+  'container_cp_upload',
+  'container_cp_download',
+  'send_message',
+  'content_base64',
+  'timeout_secs',
+  'provider_id'
+]) {
+  assert.equal(
+    timelineSource.includes(legacy),
+    false,
+    `timeline rendering must not keep legacy shared tool protocol ${legacy}`
+  )
+}

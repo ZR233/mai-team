@@ -314,11 +314,10 @@ export function toolStatusLabel(status) {
 function renderToolArguments(toolName, value) {
   if (isPlainObject(value)) {
     if (toolName === 'container_exec' && typeof value.command === 'string') {
-      const timeoutSecs = value.timeoutSecs ?? value.timeout_secs
       const rows = [
         renderCommandBlock(value.command),
         value.cwd ? renderMetaLine('cwd', value.cwd) : '',
-        timeoutSecs ? renderMetaLine('timeout', `${timeoutSecs}s`) : ''
+        value.timeoutSecs ? renderMetaLine('timeout', `${value.timeoutSecs}s`) : ''
       ]
       return rows.filter(Boolean).join('')
     }
@@ -331,17 +330,6 @@ function renderToolArguments(toolName, value) {
       ].filter(Boolean).join('')
     }
 
-    if (toolName === 'container_cp_upload') {
-      return [
-        renderMetaLine('path', value.path),
-        renderMetaLine('content', compactBase64(value.content_base64))
-      ].filter(Boolean).join('')
-    }
-
-    if (toolName === 'container_cp_download') {
-      return renderMetaLine('path', value.path)
-    }
-
     if (toolName === 'send_input') {
       return [
         renderMetaLine('agent', value.target),
@@ -351,19 +339,10 @@ function renderToolArguments(toolName, value) {
       ].filter(Boolean).join('')
     }
 
-    if (toolName === 'send_message') {
-      return [
-        renderMetaLine('agent', value.agent_id),
-        value.session_id ? renderMetaLine('session', value.session_id) : '',
-        renderTextBlock('message', value.message)
-      ].filter(Boolean).join('')
-    }
-
     if (toolName === 'spawn_agent') {
       return [
         value.agentType ? renderMetaLine('type', value.agentType) : '',
-        renderMetaLine('task', value.taskName ?? value.name),
-        value.providerId || value.provider_id ? renderMetaLine('provider', value.providerId ?? value.provider_id) : '',
+        renderMetaLine('task', value.taskName),
         value.model ? renderMetaLine('model', value.model) : '',
         value.reasoningEffort ? renderMetaLine('reasoning', value.reasoningEffort) : '',
         value.forkTurns ? renderMetaLine('fork turns', value.forkTurns) : '',
@@ -372,16 +351,15 @@ function renderToolArguments(toolName, value) {
     }
 
     if (toolName === 'wait_agent') {
-      const timeoutMs = value.timeoutMs ?? (value.timeout_secs ? value.timeout_secs * 1000 : null)
       return [
         value.targets ? renderMetaLine('agents', value.targets.join(', ')) : '',
-        timeoutMs ? renderMetaLine('timeout', `${timeoutMs}ms`) : ''
+        value.timeoutMs ? renderMetaLine('timeout', `${value.timeoutMs}ms`) : ''
       ].filter(Boolean).join('')
     }
 
     if (toolName === 'close_agent' || toolName === 'resume_agent') {
       return [
-        renderMetaLine('agent', value.target ?? value.agent_id)
+        renderMetaLine('agent', value.target)
       ].filter(Boolean).join('')
     }
 
@@ -773,10 +751,10 @@ function summarizeTool(tool) {
 
 function summarizeToolArgs(value) {
   if (!isPlainObject(value)) return cleanOneLine(formatTraceValue(value)).slice(0, 120)
-  const preferredKeys = ['path', 'agent_id', 'session_id', 'name', 'provider_id', 'model', 'timeout_secs']
+  const preferredKeys = ['path', 'target', 'sessionId', 'taskName', 'name', 'model', 'timeoutSecs']
   const entries = preferredKeys
     .filter((key) => value[key] !== null && value[key] !== undefined && value[key] !== '')
-    .map((key) => `${key.replace(/_id$/, '')} ${cleanOneLine(String(value[key]))}`)
+    .map((key) => `${key.replace(/Id$/, '')} ${cleanOneLine(String(value[key]))}`)
   if (entries.length) return entries.slice(0, 2).join(' · ')
   const keys = Object.keys(value)
   if (!keys.length) return ''
