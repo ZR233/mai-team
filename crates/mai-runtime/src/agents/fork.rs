@@ -1,7 +1,5 @@
 use mai_protocol::{AgentId, AgentMessage, MessageRole, now};
-use pl_protocol::{
-    ContentPart, Message as ModelMessage, MessageContent, MessageRole as ModelMessageRole,
-};
+use pl_protocol::{Message as ModelMessage, MessageRole as ModelMessageRole};
 
 use super::AgentServiceOps;
 use crate::{Result, RuntimeError};
@@ -48,7 +46,7 @@ fn agent_messages_from_history(history: &[ModelMessage]) -> Vec<AgentMessage> {
                 ModelMessageRole::Assistant => MessageRole::Assistant,
                 ModelMessageRole::System | ModelMessageRole::Tool => return None,
             };
-            let content = visible_text(&message.content);
+            let content = pl_core::message_content_text_lines(&message.content);
             (!content.trim().is_empty()).then_some(AgentMessage {
                 role,
                 content,
@@ -58,16 +56,16 @@ fn agent_messages_from_history(history: &[ModelMessage]) -> Vec<AgentMessage> {
         .collect()
 }
 
-fn visible_text(content: &MessageContent) -> String {
-    match content {
-        MessageContent::Text(text) => text.clone(),
-        MessageContent::MultiPart(parts) => parts
-            .iter()
-            .filter_map(|part| match part {
-                ContentPart::Text { text } => Some(text.as_str()),
-                ContentPart::Image { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fork_history_text_projection_delegates_to_pl_core() {
+        let source = include_str!("fork.rs");
+
+        assert!(source.contains("pl_core::message_content_text_lines"));
+        assert!(
+            !source.contains(&format!("{}{}", "ContentPart", "::Text")),
+            "fork UI 历史投影不应复制 pl-core multipart 文本提取逻辑"
+        );
     }
 }
