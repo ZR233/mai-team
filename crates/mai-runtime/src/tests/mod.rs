@@ -90,6 +90,30 @@ fn observability_uses_pl_core_history_success_projection() {
 }
 
 #[test]
+fn test_history_messages_reuse_pl_core_metadata_helpers() {
+    let source = include_str!("../turn/history.rs");
+
+    assert!(
+        source.contains("pl_core::tool_call_history_message"),
+        "测试用 tool call 历史消息应由 pl-core helper 构造"
+    );
+    assert!(
+        source.contains("pl_core::tool_result_history_message"),
+        "测试用 tool result 历史消息应由 pl-core helper 构造"
+    );
+    for forbidden in [
+        format!("{}{}", "ToolCallHistory", "Metadata"),
+        format!("{}{}", "ToolResult", "Metadata::new"),
+        format!("{}{}", "serde_json::", "json!"),
+    ] {
+        assert!(
+            !source.contains(&forbidden),
+            "mai-runtime 不应复制 pl-core 历史 metadata 构造细节: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn cancel_turn_uses_pl_core_cancellation_guard() {
     let source = include_str!("../agents/turn.rs");
 

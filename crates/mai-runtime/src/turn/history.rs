@@ -1,8 +1,6 @@
 use mai_protocol::{AgentId, AgentMessage, MessageRole, SessionId, now};
 use mai_store::ConfigStore;
 use pl_protocol::{Message, MessageContent, MessageRole as ModelMessageRole};
-#[cfg(test)]
-use pl_protocol::{ToolCallHistoryMetadata, ToolCallKind, ToolResultMetadata};
 
 use crate::state::AgentRecord;
 use crate::{Result, RuntimeError};
@@ -144,26 +142,7 @@ pub(crate) fn reasoning_message(content: impl Into<String>) -> Message {
 
 #[cfg(test)]
 pub(crate) fn tool_call_message(call_id: String, name: String, raw_arguments: String) -> Message {
-    let arguments =
-        serde_json::from_str(&raw_arguments).unwrap_or(serde_json::Value::String(raw_arguments));
-    let tool_calls = serde_json::json!([{
-        "id": call_id,
-        "name": name,
-        "payload": {
-            "kind": "function",
-            "arguments": arguments
-        },
-        "call_id": call_id
-    }])
-    .to_string();
-    let mut metadata = Default::default();
-    ToolCallHistoryMetadata::new(tool_calls).insert_into(&mut metadata);
-    Message {
-        role: ModelMessageRole::Assistant,
-        content: MessageContent::Text(String::new()),
-        reasoning_content: None,
-        metadata,
-    }
+    pl_core::tool_call_history_message(call_id, name, raw_arguments)
 }
 
 #[cfg(test)]
@@ -173,15 +152,7 @@ pub(crate) fn tool_result_message(
     raw_arguments: String,
     output: String,
 ) -> Message {
-    let mut metadata = Default::default();
-    ToolResultMetadata::new(call_id, None, name, ToolCallKind::Function, raw_arguments)
-        .insert_into(&mut metadata);
-    Message {
-        role: ModelMessageRole::Tool,
-        content: MessageContent::Text(output),
-        reasoning_content: None,
-        metadata,
-    }
+    pl_core::tool_result_history_message(call_id, name, raw_arguments, output)
 }
 
 #[cfg(test)]
