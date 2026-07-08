@@ -8,7 +8,7 @@ use mai_protocol::{
     AgentId, AgentMessage, AgentSessionSummary, AgentSummary, ArtifactInfo, PlanHistoryEntry,
     ProjectId, ProjectSummary, SessionId, TaskId, TaskPlan, TaskReview, TaskSummary, TurnId,
 };
-use pl_core::{ActiveTurnControl, ActiveTurnSlot};
+use pl_core::{ActiveTurnControl, ActiveTurnSlot, AgentTurnCurrentGuard};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -99,7 +99,7 @@ pub(crate) type TurnControlSlot = ActiveTurnSlot<TurnId, SessionId>;
 
 #[derive(Clone)]
 pub(crate) struct TurnGuard {
-    pub(crate) turn_id: TurnId,
+    pub(crate) current_turn: AgentTurnCurrentGuard<TurnId>,
     pub(crate) cancellation_token: CancellationToken,
 }
 

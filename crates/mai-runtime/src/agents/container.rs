@@ -5,6 +5,7 @@ use std::sync::Arc;
 use mai_docker::ContainerHandle;
 use mai_mcp::McpAgentManager;
 use mai_protocol::{AgentId, AgentStatus, McpServerConfig, McpStartupStatus, TurnId, now};
+use pl_core::{AgentTurnCurrentGuard, AgentTurnCurrentOutcome};
 use tokio_util::sync::CancellationToken;
 
 use crate::state::{AgentRecord, TurnGuard};
@@ -99,7 +100,7 @@ pub(crate) async fn ensure_agent_container_for_turn(
     }
     let turn_guard =
         (agent.summary.read().await.current_turn == Some(turn_id)).then(|| TurnGuard {
-            turn_id,
+            current_turn: AgentTurnCurrentGuard::new(turn_id),
             cancellation_token: cancellation_token.clone(),
         });
     let container_id = ensure_agent_container_with_source(
@@ -287,11 +288,12 @@ async fn set_status(
 }
 
 async fn ensure_turn_current(agent: &AgentRecord, guard: &TurnGuard) -> Result<()> {
-    if guard.cancellation_token.is_cancelled() {
-        return Err(RuntimeError::TurnCancelled);
+    let current_turn = agent.summary.read().await.current_turn;
+    match guard.current_turn.evaluate(
+        guard.cancellation_token.is_cancelled(),
+        current_turn.as_ref(),
+    ) {
+        AgentTurnCurrentOutcome::Current => Ok(()),
+        AgentTurnCurrentOutcome::Interrupted => Err(RuntimeError::TurnCancelled),
     }
-    if agent.summary.read().await.current_turn != Some(guard.turn_id) {
-        return Err(RuntimeError::TurnCancelled);
-    }
-    Ok(())
 }
