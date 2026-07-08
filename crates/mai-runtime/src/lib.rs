@@ -1816,7 +1816,7 @@ impl AgentRuntime {
         skill_mentions: Vec<String>,
         interrupt: bool,
     ) -> Result<Value> {
-        agents::send_input_to_agent(
+        let submission = agents::send_input_to_agent(
             self.as_ref(),
             self,
             agents::SendInputRequest {
@@ -1828,7 +1828,11 @@ impl AgentRuntime {
                 cancel_grace: TURN_CANCEL_GRACE,
             },
         )
-        .await
+        .await?;
+        Ok(json!({
+            "turnId": submission.turn_id(),
+            "queued": submission.queued_flag(),
+        }))
     }
 
     async fn start_next_queued_input_after_turn(self: &Arc<Self>, agent_id: AgentId) {

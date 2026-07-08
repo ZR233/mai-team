@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use mai_protocol::{AgentId, AgentStatus, SessionId, TurnId};
-use pl_core::{AgentInputBusyAction, AgentInputInitialAction, AgentInputTurnMode};
-use serde_json::{Value, json};
+use pl_core::{
+    AgentInputBusyAction, AgentInputInitialAction, AgentInputSubmission, AgentInputTurnMode,
+};
 
 use super::{AgentInputOps, AgentServiceOps, prepare_turn, wait_agent};
 use crate::state::{AgentRecord, QueuedAgentInput};
@@ -21,7 +22,7 @@ pub(crate) async fn send_input_to_agent(
     service: &dyn AgentServiceOps,
     input_ops: &impl AgentInputOps,
     request: SendInputRequest,
-) -> Result<Value> {
+) -> Result<AgentInputSubmission> {
     let agent = service.agent(request.target).await?;
     let mode = request.mode;
     match mode.initial_action() {
@@ -55,7 +56,7 @@ pub(crate) async fn send_input_to_agent(
                 request.message,
                 request.skill_mentions,
             );
-            Ok(json!({ "turnId": turn_id, "queued": false }))
+            Ok(AgentInputSubmission::started(turn_id.to_string()))
         }
         Err(RuntimeError::AgentBusy(_))
             if matches!(mode.busy_action(), AgentInputBusyAction::Queue) =>
@@ -66,13 +67,13 @@ pub(crate) async fn send_input_to_agent(
     }
 }
 
-async fn queue_agent_input(agent: &AgentRecord, request: SendInputRequest) -> Value {
+async fn queue_agent_input(agent: &AgentRecord, request: SendInputRequest) -> AgentInputSubmission {
     agent.pending_inputs.lock().await.push(QueuedAgentInput {
         session_id: request.session_id,
         message: request.message,
         skill_mentions: request.skill_mentions,
     });
-    json!({ "queued": true })
+    AgentInputSubmission::queued()
 }
 
 pub(crate) async fn start_next_queued_input(

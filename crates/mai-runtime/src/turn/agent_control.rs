@@ -131,7 +131,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
         let target = parse_agent_id(&request.target)?;
         let interrupt = request.interrupt;
         let mode = request.turn_mode();
-        let output = agents::send_input_to_agent(
+        let submission = agents::send_input_to_agent(
             self.runtime.as_ref(),
             &self.runtime,
             agents::SendInputRequest {
@@ -144,14 +144,6 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
             },
         )
         .await?;
-        let queued = output
-            .get("queued")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let turn_id = output
-            .get("turnId")
-            .and_then(Value::as_str)
-            .map(str::to_string);
         let status = self
             .runtime
             .agent(target)
@@ -161,13 +153,11 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
             .await
             .status
             .clone();
-        Ok(AgentControlSendInputOutput {
-            target: target.to_string(),
-            status: pl_agent_status(&status),
+        Ok(submission.into_send_input_output(
+            target.to_string(),
+            pl_agent_status(&status),
             interrupt,
-            queued,
-            turn_id,
-        })
+        ))
     }
 
     async fn wait_agent(
@@ -383,6 +373,10 @@ mod tests {
             source.contains("request.initial_message()"),
             "spawn_agent 的初始消息空白归一化应由 pl-core 请求类型提供"
         );
+        assert!(
+            source.contains("into_send_input_output"),
+            "send_input 的 queued/turnId 输出投影应由 pl-core typed submission 提供"
+        );
         for forbidden in [
             format!("{}{}", "trigger_turn || ", "interrupt"),
             format!("{}{}", "fn wait", "_timeout"),
@@ -391,6 +385,8 @@ mod tests {
             format!("{}{}", ".max", "(100)"),
             format!("{}{}", "fn role_profile", "_requested"),
             format!("{}{}", "fn non_empty", "_message"),
+            format!("{}{}", ".get(\"queued\"", ")"),
+            format!("{}{}", ".get(\"turnId\"", ")"),
             format!(
                 "{}{}",
                 "\"planner\" | \"explorer\"", " | \"executor\" | \"reviewer\""

@@ -118,6 +118,10 @@ fn send_input_uses_pl_core_turn_mode_policy() {
         "send_input 的首步动作和 busy 处理应由 pl-core action 类型统一表达"
     );
     assert!(
+        source.contains("AgentInputSubmission"),
+        "send_input 的提交结果应复用 pl-core typed submission，避免在 mai-runtime 用 JSON 当内部协议"
+    );
+    assert!(
         state_source.contains("AgentInputQueue<QueuedAgentInput>"),
         "pending input 队列应复用 pl-core AgentInputQueue"
     );
@@ -131,6 +135,9 @@ fn send_input_uses_pl_core_turn_mode_policy() {
         ".push_back(",
         ".pop_front(",
         ".push_front(",
+        "serde_json::{Value, json}",
+        "json!({ \"turnId\"",
+        "json!({ \"queued\"",
     ] {
         assert!(
             !source.contains(forbidden) && !state_source.contains(forbidden),
