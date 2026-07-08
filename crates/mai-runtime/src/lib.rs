@@ -1802,12 +1802,8 @@ impl AgentRuntime {
             pending_outputs.push(self.agent_wait_snapshot(agent_id).await?);
         }
         let timed_out = !pending_outputs.is_empty();
-        let message = json!({
-            "completed": completed_outputs,
-            "pending": pending_outputs,
-            "timedOut": timed_out,
-        });
-        Ok(pl_core::AgentWaitOutcome { timed_out }.into_wait_agent_output(message.to_string()))
+        Ok(pl_core::AgentWaitOutcome { timed_out }
+            .into_group_wait_agent_output(completed_outputs, pending_outputs))
     }
 
     #[cfg(test)]

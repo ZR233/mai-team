@@ -259,9 +259,18 @@ fn wait_completion_uses_pl_core_policy() {
         "多 agent wait 工具也应复用 pl-core wait loop"
     );
     assert!(
+        wait_agents_function.contains("into_group_wait_agent_output"),
+        "多 agent wait 的 completed/pending/timedOut 输出形状应由 pl-core helper 统一生成"
+    );
+    assert!(
         !wait_agents_function.contains("Duration::from_millis(250)")
             && !wait_agents_function.contains("tokio::select!"),
         "多 agent wait 工具不应保留本地 sleep/select 轮询"
+    );
+    assert!(
+        !wait_agents_function.contains("\"completed\": completed_outputs")
+            && !wait_agents_function.contains("\"pending\": pending_outputs"),
+        "mai-runtime 不应手写多 agent wait 的模型可见 completed/pending JSON"
     );
     assert!(
         !agents_source.contains("summary.current_turn.is_none()\n        || matches!"),
