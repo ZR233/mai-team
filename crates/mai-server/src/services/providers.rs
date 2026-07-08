@@ -4,9 +4,12 @@ use std::time::Instant;
 
 use axum::http::StatusCode;
 use mai_protocol::*;
-use mai_runtime::{ModelClient, completion_response_preview, completion_response_usage};
+use mai_runtime::{
+    completion_response_preview, completion_response_usage, core_model_turn_request,
+    core_provider_for_selection, model_supports_continuation,
+};
 use mai_store::ConfigStore;
-use pl_core::CoreSession;
+use pl_core::{CoreModelTurnOptions, CoreSession};
 use pl_model::CompletionResponse;
 use pl_protocol::{Message, MessageContent, MessageRole as PlMessageRole, PureError};
 use tokio_util::sync::CancellationToken;
@@ -134,8 +137,7 @@ async fn run_provider_test(
     let model = selection.model.clone();
     let base_url = provider.base_url.clone();
     let reasoning_effort = request.reasoning_effort;
-    let client = ModelClient::new();
-    let tester = ProviderTester::new(&client);
+    let tester = ProviderTester::new();
     let response = tester
         .run_test(&selection, reasoning_effort.as_deref(), request.deep)
         .await;
@@ -174,13 +176,11 @@ async fn run_provider_test(
     }
 }
 
-pub(crate) struct ProviderTester<'a> {
-    client: &'a ModelClient,
-}
+pub(crate) struct ProviderTester;
 
-impl<'a> ProviderTester<'a> {
-    pub(crate) fn new(client: &'a ModelClient) -> Self {
-        Self { client }
+impl ProviderTester {
+    pub(crate) fn new() -> Self {
+        Self
     }
 
     pub(crate) async fn run_test(
@@ -189,7 +189,7 @@ impl<'a> ProviderTester<'a> {
         reasoning_effort: Option<&str>,
         deep: bool,
     ) -> std::result::Result<CompletionResponse, PureError> {
-        if deep && ModelClient::supports_continuation(selection) {
+        if deep && model_supports_continuation(selection) {
             self.run_deep_test(selection, reasoning_effort).await
         } else {
             self.run_single_test(selection, reasoning_effort).await
@@ -202,17 +202,20 @@ impl<'a> ProviderTester<'a> {
         reasoning_effort: Option<&str>,
     ) -> std::result::Result<CompletionResponse, PureError> {
         let mut session = CoreSession::from_messages(vec![user_text_message("ping")]);
-        let cancellation_token = CancellationToken::new();
-        self.client
-            .stream_session_completion_response(
-                selection,
-                reasoning_effort,
-                "You are a provider connectivity test. Reply with exactly: ok",
-                &[],
-                &mut session,
-                &cancellation_token,
-            )
-            .await
+        let provider = core_provider_for_selection(selection)?;
+        let request = core_model_turn_request(
+            selection,
+            reasoning_effort,
+            "You are a provider connectivity test. Reply with exactly: ok",
+            Vec::new(),
+        );
+        pl_core::stream_session_completion_response(
+            provider,
+            &mut session,
+            request,
+            CoreModelTurnOptions::default().with_cancellation(CancellationToken::new()),
+        )
+        .await
     }
 
     async fn run_deep_test(
@@ -220,36 +223,29 @@ impl<'a> ProviderTester<'a> {
         selection: &mai_store::ProviderSelection,
         reasoning_effort: Option<&str>,
     ) -> std::result::Result<CompletionResponse, PureError> {
-        let cancellation_token = CancellationToken::new();
+        let provider = core_provider_for_selection(selection)?;
         let mut session = CoreSession::from_messages(vec![user_text_message(
             "Provider deep connectivity test, step 1. Reply exactly: ok",
         )]);
         let instructions = "You are a provider connectivity test. Reply with exactly: ok";
-        let first = self
-            .client
-            .stream_session_completion_response(
-                selection,
-                reasoning_effort,
-                instructions,
-                &[],
-                &mut session,
-                &cancellation_token,
-            )
-            .await?;
+        let first = pl_core::stream_session_completion_response(
+            provider.clone(),
+            &mut session,
+            core_model_turn_request(selection, reasoning_effort, instructions, Vec::new()),
+            CoreModelTurnOptions::default().with_cancellation(CancellationToken::new()),
+        )
+        .await?;
         session.push_assistant_response(completion_response_preview(&first), None);
         session.push_user_prompt(
             "Provider deep connectivity test, step 2. Reply exactly: ok".to_string(),
         );
-        self.client
-            .stream_session_completion_response(
-                selection,
-                reasoning_effort,
-                instructions,
-                &[],
-                &mut session,
-                &cancellation_token,
-            )
-            .await
+        pl_core::stream_session_completion_response(
+            provider,
+            &mut session,
+            core_model_turn_request(selection, reasoning_effort, instructions, Vec::new()),
+            CoreModelTurnOptions::default().with_cancellation(CancellationToken::new()),
+        )
+        .await
     }
 }
 

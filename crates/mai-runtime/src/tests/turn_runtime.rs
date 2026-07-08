@@ -115,11 +115,6 @@ async fn model_failure_after_tool_keeps_tool_success_event_separate() {
     save_test_session(&store, agent_id, session_id).await;
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::with_config(ModelClientConfig {
-            response_timeout: Duration::from_millis(25),
-            stream_idle_timeout: Duration::from_millis(25),
-            ..Default::default()
-        }),
         Arc::clone(&store),
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )

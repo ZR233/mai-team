@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use mai_docker::DockerClient;
-use mai_runtime::{ModelClient, RuntimeConfig};
+use mai_runtime::RuntimeConfig;
 use tracing::info;
 
 use crate::config::{Cli, RelayMode, ServerConfig, ServerPaths, StdEnv};
@@ -57,7 +57,6 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         "released embedded system agents"
     );
 
-    let model_client = ModelClient::new();
     let runtime_config = RuntimeConfig {
         repo_root: env::current_dir()?,
         projects_root: paths.projects_root.clone(),
@@ -96,7 +95,6 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     relay.configure_from_store().await?;
     let runtime = mai_runtime::AgentRuntime::new_with_github_backend(
         docker,
-        model_client,
         Arc::clone(&store),
         runtime_config,
         github_backend,
@@ -204,7 +202,6 @@ mod tests {
             .expect("save providers");
         let runtime = mai_runtime::AgentRuntime::new(
             DockerClient::new_with_binary("ubuntu:latest", fake_docker_path(&dir)),
-            ModelClient::new(),
             Arc::clone(&store),
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),

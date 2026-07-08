@@ -18,7 +18,9 @@ use uuid::Uuid;
 
 use crate::state::AgentRecord;
 use crate::turn::completion::TurnResult;
-use crate::{AgentRuntime, ModelClient, Result, RuntimeError, completion_response_usage};
+use crate::{
+    AgentRuntime, Result, RuntimeError, completion_response_usage, core_provider_for_selection,
+};
 
 pub(crate) struct PureCoreTurnContext {
     pub(crate) runtime: Arc<AgentRuntime>,
@@ -54,7 +56,7 @@ pub(crate) struct MaiAgentKernelBuildContext {
 }
 
 pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
-    let provider = ModelClient::provider_for_selection(&ctx.provider_selection)?;
+    let provider = core_provider_for_selection(&ctx.provider_selection)?;
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let runtime_profile = CoreAgentProfile::host_provided(workspace_root).with_context_compaction(
         ContextCompactionConfig::new(

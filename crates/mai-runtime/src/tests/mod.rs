@@ -906,7 +906,7 @@ fn compact_mimo_test_provider(base_url: String) -> ProviderConfig {
 }
 
 #[tokio::test]
-async fn model_client_stream_session_response_retries_without_unsupported_continuation() {
+async fn pl_core_model_turn_response_retries_without_unsupported_continuation() {
     let (base_url, requests) = start_mock_responses(vec![
         json!({
             "id": "resp_first",
@@ -952,37 +952,31 @@ async fn model_client_stream_session_response_retries_without_unsupported_contin
         .resolve_provider(Some("mock"), None)
         .await
         .expect("resolve provider");
-    let client = ModelClient::new();
+    let provider = core_provider_for_selection(&selection).expect("core provider");
     let mut session = pl_core::CoreSession::new();
     session.push_user_prompt("first".to_string());
 
-    let first = client
-        .stream_session_completion_response(
-            &selection,
-            None,
-            "reply briefly",
-            &[],
-            &mut session,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("first response");
+    let first = pl_core::stream_session_completion_response(
+        provider.clone(),
+        &mut session,
+        core_model_turn_request(&selection, None, "reply briefly", Vec::new()),
+        pl_core::CoreModelTurnOptions::default().with_cancellation(CancellationToken::new()),
+    )
+    .await
+    .expect("first response");
 
     assert_eq!(first.response_id.as_deref(), Some("resp_first"));
     session.push_assistant_response(first.content.expect("first content"), None);
     session.push_user_prompt("second".to_string());
 
-    let second = client
-        .stream_session_completion_response(
-            &selection,
-            None,
-            "reply briefly",
-            &[],
-            &mut session,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("second response");
+    let second = pl_core::stream_session_completion_response(
+        provider,
+        &mut session,
+        core_model_turn_request(&selection, None, "reply briefly", Vec::new()),
+        pl_core::CoreModelTurnOptions::default().with_cancellation(CancellationToken::new()),
+    )
+    .await
+    .expect("second response");
 
     assert_eq!(second.content.as_deref(), Some("second"));
     assert_eq!(second.response_id.as_deref(), Some("resp_second"));
@@ -1007,29 +1001,42 @@ async fn model_client_stream_session_response_retries_without_unsupported_contin
 }
 
 #[test]
-fn model_client_delegates_continuation_cache_to_pl_core() {
-    let source = include_str!("../model_client.rs");
+fn runtime_does_not_expose_local_model_client_facade() {
+    let lib = include_str!("../lib.rs");
+    let core_adapter = include_str!("../turn/core_adapter.rs");
 
     assert!(
-        source.contains("CoreModelTurnClient"),
-        "ModelClient 应只作为 mai provider/config adapter，continuation fallback 缓存由 pl-core 负责"
+        !lib.contains("mod model_client"),
+        "mai-runtime 不应再保留本地 model client 模块"
+    );
+    assert!(
+        !lib.contains("pub use model_client"),
+        "mai-runtime 不应再导出本地 model client facade"
+    );
+    assert!(
+        core_adapter.contains("core_provider_for_selection"),
+        "主 turn 应只消费 mai -> pl-core provider 投影"
     );
     for forbidden in [
-        "HashSet",
-        "unsupported_continuations",
-        "continuation_is_unsupported",
+        "ModelClient",
+        "CoreModelTurnClient",
+        "CoreModelTurnRequest",
+        "CoreModelTurnOptions",
+        "CompletionResponse",
+        "prepare_turn",
+        "stream_session_completion_response",
         &format!("{}{}", "Tool", "Definition"),
         "fn tool_schema",
     ] {
         assert!(
-            !source.contains(forbidden),
-            "ModelClient 不应继续本地维护或转换 `{forbidden}`"
+            !core_adapter.contains(forbidden),
+            "主 turn adapter 不应继续本地维护或转换 `{forbidden}`"
         );
     }
 }
 
 #[tokio::test]
-async fn model_client_exposes_shared_continuation_capability_check() {
+async fn model_profile_exposes_shared_continuation_capability_check() {
     let (base_url, _requests) = start_mock_responses(Vec::new()).await;
     let mut model = test_model("gpt-5.5");
     model.wire_api = mai_protocol::ModelWireApi::Responses;
@@ -1047,7 +1054,7 @@ async fn model_client_exposes_shared_continuation_capability_check() {
     };
     let selection = mai_store::ProviderSelection { provider, model };
 
-    assert!(ModelClient::supports_continuation(&selection));
+    assert!(model_supports_continuation(&selection));
 }
 
 #[test]
@@ -1649,22 +1656,6 @@ fn ensure_project_clone(
 async fn test_runtime(dir: &tempfile::TempDir, store: Arc<ConfigStore>) -> Arc<AgentRuntime> {
     AgentRuntime::new(
         DockerClient::new_with_binary("unused", fake_docker_path(dir)),
-        ModelClient::new(),
-        store,
-        test_runtime_config(dir, DEFAULT_SIDECAR_IMAGE),
-    )
-    .await
-    .expect("runtime")
-}
-
-async fn test_runtime_with_model_config(
-    dir: &tempfile::TempDir,
-    store: Arc<ConfigStore>,
-    model_config: ModelClientConfig,
-) -> Arc<AgentRuntime> {
-    AgentRuntime::new(
-        DockerClient::new_with_binary("unused", fake_docker_path(dir)),
-        ModelClient::with_config(model_config),
         store,
         test_runtime_config(dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -1679,7 +1670,6 @@ async fn test_runtime_with_sidecar_image_and_git(
 ) -> Arc<AgentRuntime> {
     AgentRuntime::new(
         DockerClient::new_with_binary("unused-agent", fake_docker_path(dir)),
-        ModelClient::new(),
         store,
         RuntimeConfig {
             git_binary: Some(fake_git_path(dir)),
@@ -1697,7 +1687,6 @@ async fn test_runtime_with_github_api(
 ) -> Arc<AgentRuntime> {
     AgentRuntime::new(
         DockerClient::new_with_binary("unused", fake_docker_path(dir)),
-        ModelClient::new(),
         store,
         RuntimeConfig {
             github_api_base_url: Some(github_api_base_url),
@@ -2512,7 +2501,6 @@ exit 0
         .expect("save providers");
     let runtime = AgentRuntime::new(
         DockerClient::new_with_binary("slow-agent", docker.to_string_lossy().to_string()),
-        ModelClient::new(),
         Arc::clone(&store),
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -3459,7 +3447,6 @@ async fn restores_persisted_agents_and_continues_event_sequence() {
     );
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         store,
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -3712,7 +3699,6 @@ async fn tool_trace_returns_full_history_with_event_metadata() {
 
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         Arc::new(
             ConfigStore::open_with_config_path(&db_path, &config_path)
                 .await
@@ -3841,7 +3827,6 @@ async fn tool_trace_prefers_persisted_trace_records() {
 
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         Arc::new(
             ConfigStore::open_with_config_path(&db_path, &config_path)
                 .await
@@ -3941,7 +3926,6 @@ async fn tool_trace_finds_calls_stored_in_function_call_items() {
 
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         Arc::new(
             ConfigStore::open_with_config_path(&db_path, &config_path)
                 .await
@@ -4135,16 +4119,7 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
         .await
         .expect("save agent");
     save_test_session(&store, agent_id, session_id).await;
-    let runtime = test_runtime_with_model_config(
-        &dir,
-        Arc::clone(&store),
-        ModelClientConfig {
-            response_timeout: std::time::Duration::from_millis(25),
-            stream_idle_timeout: std::time::Duration::from_millis(25),
-            ..Default::default()
-        },
-    )
-    .await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     let agent = runtime.agent(agent_id).await.expect("agent");
     *agent.container.write().await = Some(ContainerHandle {
         id: "container-1".to_string(),
@@ -5498,7 +5473,6 @@ async fn sessions_are_created_and_selected_independently() {
         .expect("save providers");
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         Arc::clone(&store),
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -5623,7 +5597,6 @@ async fn agent_detail_uses_deepseek_v4_context_tokens() {
         .expect("save session");
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         store,
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -5664,7 +5637,6 @@ async fn agent_config_resolves_effective_default_and_validates_updates() {
         .expect("save providers");
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         Arc::clone(&store),
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -5752,7 +5724,6 @@ async fn role_model_resolution_falls_back_when_saved_provider_is_removed() {
         .expect("save stale config");
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         Arc::clone(&store),
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -7129,7 +7100,6 @@ async fn skill_resource_can_read_bundled_relative_file() {
     save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container-1"))).await;
     let runtime = AgentRuntime::new(
         DockerClient::new_with_binary("unused", fake_docker_path(&dir)),
-        ModelClient::new(),
         Arc::clone(&store),
         RuntimeConfig {
             system_skills_root: Some(dir.path().join("system-skills")),
@@ -7623,7 +7593,6 @@ async fn create_agent_persists_and_uses_explicit_docker_image() {
         .expect("save providers");
     let runtime = AgentRuntime::new(
         DockerClient::new_with_binary("ubuntu:latest", fake_docker_path(&dir)),
-        ModelClient::new(),
         Arc::clone(&store),
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -8842,7 +8811,6 @@ async fn auto_review_refreshes_project_skills_from_synced_default_branch() {
         .expect("save project");
     let runtime = AgentRuntime::new(
         DockerClient::new_with_binary("unused-agent", fake_docker_path(&dir)),
-        ModelClient::new(),
         store,
         RuntimeConfig {
             git_binary: Some(fake_git_path(&dir)),
@@ -8940,7 +8908,6 @@ async fn project_reviewer_instructions_include_extra_prompt_project_skill() {
         .expect("write system skill");
     let runtime = AgentRuntime::new(
         DockerClient::new_with_binary("unused", fake_docker_path(&dir)),
-        ModelClient::new(),
         Arc::clone(&store),
         RuntimeConfig {
             system_skills_root: Some(dir.path().join("system-skills")),
@@ -9301,7 +9268,6 @@ async fn project_workspace_setup_failure_marks_project_failed() {
     store.save_project(&project).await.expect("save project");
     let runtime = AgentRuntime::new(
         DockerClient::new_with_binary("unused-agent", fake_docker_path(&dir)),
-        ModelClient::new(),
         Arc::clone(&store),
         RuntimeConfig {
             sidecar_image: "bad image".to_string(),
@@ -9454,7 +9420,6 @@ async fn update_agent_changes_model_persists_and_publishes() {
     store.save_agent(&summary, None).await.expect("save agent");
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         Arc::clone(&store),
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -9591,7 +9556,6 @@ async fn update_agent_rejects_invalid_reasoning_and_clears_unsupported_model() {
     store.save_agent(&summary, None).await.expect("save agent");
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         Arc::clone(&store),
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -9667,7 +9631,6 @@ async fn update_agent_rejects_busy_and_unknown_model() {
     store.save_agent(&summary, None).await.expect("save agent");
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         store,
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )

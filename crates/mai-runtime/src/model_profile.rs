@@ -1,15 +1,55 @@
 use std::collections::{BTreeMap, HashMap};
 
 use mai_protocol::{
-    ModelCapabilities as MaiModelCapabilities, ModelConfig, ModelReasoningVariant,
+    ModelCapabilities as MaiModelCapabilities, ModelConfig, ModelReasoningVariant, ModelWireApi,
     ProviderKind as MaiProviderKind, ProviderSecret,
 };
+use mai_store::ProviderSelection;
+use pl_core::CoreModelTurnRequest;
 use pl_model::{
     MaxTokensField, ModelCapabilities, ModelInfo, ModelModality, ModelParameter,
     ModelRequestProfile, ParameterWire, ProviderInfo, ReasoningConfig, ReasoningSummary,
-    ToolCapabilities, WireAssignment,
+    SharedModelProvider, ToolCapabilities, ToolSchema, WireAssignment, create_provider_with_models,
 };
+use pl_protocol::PureError;
 use serde_json::{Map, Value};
+
+/// 将 mai 的 provider/model 选择投影成 pl-core 可直接执行的 provider。
+pub fn core_provider_for_selection(
+    selection: &ProviderSelection,
+) -> Result<SharedModelProvider, PureError> {
+    let mut info = provider_info(&selection.provider);
+    info.default_model = selection.model.id.clone();
+    create_provider_with_models(info, vec![model_info(&selection.model)])
+}
+
+/// 将 mai 的模型配置投影成 pl-core 的单次模型请求。
+pub fn core_model_turn_request(
+    selection: &ProviderSelection,
+    reasoning_effort: Option<&str>,
+    instructions: impl Into<String>,
+    tools: Vec<ToolSchema>,
+) -> CoreModelTurnRequest {
+    let supports_continuation = model_supports_continuation(selection);
+    let mut request = CoreModelTurnRequest::new(selection.model.id.clone())
+        .with_instructions(instructions)
+        .with_tools(tools)
+        .with_parallel_tool_calls(selection.model.capabilities.parallel_tools)
+        .with_max_tokens(Some(selection.model.output_tokens))
+        .with_reasoning(reasoning_config(&selection.model, reasoning_effort))
+        .with_continuation(supports_continuation);
+    if supports_continuation {
+        request = request.with_continuation_cache_key(continuation_cache_key(selection));
+    }
+    request
+}
+
+/// 判断当前 mai provider/model 选择是否能走 pl-core continuation 路径。
+pub fn model_supports_continuation(selection: &ProviderSelection) -> bool {
+    selection.provider.kind == MaiProviderKind::Openai
+        && selection.model.wire_api == ModelWireApi::Responses
+        && selection.model.capabilities.continuation
+}
 
 pub(crate) fn provider_info(provider: &ProviderSecret) -> ProviderInfo {
     let mut info = match provider.kind {
@@ -26,6 +66,15 @@ pub(crate) fn provider_info(provider: &ProviderSecret) -> ProviderInfo {
     info.default_model = provider.default_model.clone();
     info.bearer_token = Some(provider.api_key.clone());
     info
+}
+
+fn continuation_cache_key(selection: &ProviderSelection) -> String {
+    format!(
+        "{:?}|{}|{}",
+        selection.provider.kind,
+        selection.provider.base_url.trim_end_matches('/'),
+        selection.model.id
+    )
 }
 
 pub(crate) fn model_info(model: &ModelConfig) -> ModelInfo {

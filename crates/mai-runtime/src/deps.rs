@@ -6,11 +6,9 @@ use mai_skills::SkillsManager;
 use mai_store::ConfigStore;
 
 use crate::github::{GitAccountService, GithubAppBackend};
-use crate::model_client::ModelClient;
 
 pub(crate) struct RuntimeDeps {
     pub(crate) docker: DockerClient,
-    pub(crate) model: ModelClient,
     pub(crate) store: Arc<ConfigStore>,
     pub(crate) skills: SkillsManager,
     pub(crate) agent_profiles: AgentProfilesManager,

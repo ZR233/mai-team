@@ -34,7 +34,6 @@ mod events;
 mod facade;
 pub mod github;
 mod instructions;
-mod model_client;
 mod model_profile;
 mod model_projection;
 mod model_selection;
@@ -51,7 +50,9 @@ use github::{
     DEFAULT_GITHUB_API_BASE_URL, DirectGithubAppBackend, GITHUB_HTTP_TIMEOUT_SECS, GithubAppBackend,
 };
 use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
-pub use model_client::{ModelClient, ModelClientConfig};
+pub use model_profile::{
+    core_model_turn_request, core_provider_for_selection, model_supports_continuation,
+};
 pub use model_projection::{
     completion_response_preview, completion_response_to_model_response, completion_response_usage,
 };
@@ -224,16 +225,14 @@ struct ResolvedAgentModel {
 impl AgentRuntime {
     pub async fn new(
         docker: DockerClient,
-        model: ModelClient,
         store: Arc<ConfigStore>,
         config: RuntimeConfig,
     ) -> Result<Arc<Self>> {
-        Self::new_with_github_backend(docker, model, store, config, None).await
+        Self::new_with_github_backend(docker, store, config, None).await
     }
 
     pub async fn new_with_github_backend(
         docker: DockerClient,
-        model: ModelClient,
         store: Arc<ConfigStore>,
         config: RuntimeConfig,
         github_backend: Option<Arc<dyn GithubAppBackend>>,
@@ -364,7 +363,6 @@ impl AgentRuntime {
         let runtime = Arc::new(Self {
             deps: RuntimeDeps {
                 docker,
-                model,
                 store: Arc::clone(&store),
                 skills,
                 agent_profiles,
@@ -629,19 +627,17 @@ impl AgentRuntime {
         let instructions = "Generate a concise task title of 3-8 words that captures the essence of the user's request. Output only the title text, nothing else. Do not use quotes or punctuation at the end.";
         let mut session =
             pl_core::CoreSession::from_messages(vec![turn::history::user_text_message(message)]);
-        let response = self
-            .deps
-            .model
-            .stream_session_completion_response(
-                &selection,
-                None,
-                instructions,
-                &[],
-                &mut session,
-                &CancellationToken::new(),
-            )
-            .await
-            .map(completion_response_to_model_response)?;
+        let provider = model_profile::core_provider_for_selection(&selection)?;
+        let request =
+            model_profile::core_model_turn_request(&selection, None, instructions, Vec::new());
+        let response = pl_core::stream_session_completion_response(
+            provider,
+            &mut session,
+            request,
+            pl_core::CoreModelTurnOptions::default().with_cancellation(CancellationToken::new()),
+        )
+        .await
+        .map(completion_response_to_model_response)?;
         let title = response
             .output
             .into_iter()
