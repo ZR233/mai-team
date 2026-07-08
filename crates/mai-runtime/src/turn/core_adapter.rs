@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use mai_protocol::{
@@ -8,7 +7,8 @@ use pl_core::{
     AgentKernel, CompileMode, ContextCompactionConfig, ContextCompactionReplacement,
     CoreAgentProfile, CoreSession, InstructionBlock, InstructionSnapshot, InstructionSource,
     InstructionSourceKind, PureCoreBuilder, ReasoningEffort, RecentInteractionTailConfig,
-    TraceRecorder, TurnOptions, TurnOutcome, TurnOutcomeStatus, TurnRequest, TurnReturnError,
+    ToolVisibilitySet, TraceRecorder, TurnOptions, TurnOutcome, TurnOutcomeStatus, TurnRequest,
+    TurnReturnError,
 };
 use pl_model::ToolSchema;
 use pl_trace::AgentEvent;
@@ -32,7 +32,7 @@ pub(crate) struct PureCoreTurnContext {
     pub(crate) provider_selection: mai_store::ProviderSelection,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) instructions: String,
-    pub(crate) visible_tool_names: HashSet<String>,
+    pub(crate) visible_tool_names: ToolVisibilitySet,
     pub(crate) product_tools: Vec<ToolSchema>,
     pub(crate) mcp_tool_schemas: Vec<ToolSchema>,
     pub(crate) history: Vec<pl_protocol::Message>,
@@ -43,7 +43,7 @@ pub(crate) struct SharedToolKernelBuildContext {
     pub(crate) runtime: Arc<AgentRuntime>,
     pub(crate) agent: Arc<AgentRecord>,
     pub(crate) agent_id: AgentId,
-    pub(crate) visible_tool_names: HashSet<String>,
+    pub(crate) visible_tool_names: ToolVisibilitySet,
     pub(crate) mcp_tool_schemas: Vec<ToolSchema>,
     pub(crate) cancellation_token: CancellationToken,
 }
@@ -52,7 +52,7 @@ pub(crate) struct MaiAgentKernelBuildContext {
     pub(crate) runtime: Arc<AgentRuntime>,
     pub(crate) agent: Arc<AgentRecord>,
     pub(crate) agent_id: AgentId,
-    pub(crate) visible_tool_names: HashSet<String>,
+    pub(crate) visible_tool_names: ToolVisibilitySet,
     pub(crate) product_tool_schemas: Vec<ToolSchema>,
     pub(crate) mcp_tool_schemas: Vec<ToolSchema>,
     pub(crate) cancellation_token: CancellationToken,

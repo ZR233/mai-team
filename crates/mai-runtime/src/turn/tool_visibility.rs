@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use mai_mcp::McpTool;
 use mai_protocol::{AgentId, AgentRole};
 
@@ -26,27 +24,25 @@ pub(crate) async fn visible_tool_names(
     state: &RuntimeState,
     agent: &AgentRecord,
     mcp_tools: &[McpTool],
-) -> HashSet<String> {
+) -> pl_core::ToolVisibilitySet {
     let capability = agent_capability(state, agent).await;
     let has_project_workspace = agent.summary.read().await.project_id.is_some();
     let shared_visibility = pl_core::HostedSharedToolVisibility::default()
         .with_git(has_project_workspace)
         .with_spawn_agent(capability.can_spawn_agents)
         .with_close_agent(capability.can_close_agents);
-    let mut names = pl_core::hosted_container_shared_tool_names(shared_visibility)
-        .into_iter()
-        .collect::<HashSet<_>>();
-    names.extend([
-        mai_tools::TOOL_SAVE_TASK_PLAN.to_string(),
-        mai_tools::TOOL_SUBMIT_REVIEW_RESULT.to_string(),
-        mai_tools::TOOL_SAVE_ARTIFACT.to_string(),
-        mai_tools::TOOL_GITHUB_API_REQUEST.to_string(),
-    ]);
+    let mut visibility = pl_core::ToolVisibilitySet::hosted_container(shared_visibility)
+        .with_tool_names([
+            mai_tools::TOOL_SAVE_TASK_PLAN.to_string(),
+            mai_tools::TOOL_SUBMIT_REVIEW_RESULT.to_string(),
+            mai_tools::TOOL_SAVE_ARTIFACT.to_string(),
+            mai_tools::TOOL_GITHUB_API_REQUEST.to_string(),
+        ]);
     if project_review_queue_tool_visible(agent).await {
-        names.insert(mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS.to_string());
+        visibility.extend_tool_names([mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS.to_string()]);
     }
-    names.extend(mcp_tools.iter().map(|tool| tool.model_name.clone()));
-    names
+    visibility.extend_tool_names(mcp_tools.iter().map(|tool| tool.model_name.clone()));
+    visibility
 }
 
 async fn agent_capability(state: &RuntimeState, agent: &AgentRecord) -> AgentCapability {

@@ -316,8 +316,16 @@ fn tool_visibility_consumes_pl_core_shared_tool_names() {
     let source = include_str!("../turn/tool_visibility.rs");
 
     assert!(
-        source.contains("hosted_container_shared_tool_names"),
-        "hosted container 共享工具可见名目录应由 pl-core 直接提供"
+        source.contains("ToolVisibilitySet::hosted_container"),
+        "hosted container 共享工具可见集合应由 pl-core ToolVisibilitySet 直接构造"
+    );
+    assert!(
+        source.contains("ToolVisibilitySet"),
+        "tool visibility 应返回 pl-core ToolVisibilitySet，避免 mai-runtime 自己维护裸工具名集合"
+    );
+    assert!(
+        !source.contains("HashSet"),
+        "tool visibility 不应再用裸 HashSet 表达模型可见工具集合"
     );
     assert!(
         !source.contains("bash: false") && !source.contains("workspace_files: true"),

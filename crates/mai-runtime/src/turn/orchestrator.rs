@@ -1,4 +1,3 @@
-use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -7,7 +6,6 @@ use mai_protocol::{
     TurnStatus,
 };
 use mai_skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
-use mai_tools::build_tool_schemas_with_filter;
 use pl_core::HostMcpToolSpec;
 use pl_protocol::MessageContent;
 use serde_json::json;
@@ -115,7 +113,7 @@ struct TurnModelContext {
     model_name: String,
     reasoning_effort: Option<String>,
     provider_selection: mai_store::ProviderSelection,
-    visible_tool_names: HashSet<String>,
+    visible_tool_names: pl_core::ToolVisibilitySet,
     tool_count: usize,
     product_tools: Vec<pl_model::ToolSchema>,
     mcp_tool_schemas: Vec<pl_model::ToolSchema>,
@@ -286,8 +284,7 @@ pub(crate) async fn run_turn_inner(
         let mcp_tools = ops.agent_mcp_tools(&agent).await;
         super::tool_visibility::visible_tool_names(state, &agent, &mcp_tools)
             .await
-            .into_iter()
-            .collect::<BTreeSet<_>>()
+            .to_btree_set()
     };
     let skill_injections = {
         let _project_skill_guard = ops.project_skill_read_guard(&agent).await;
@@ -336,7 +333,7 @@ pub(crate) async fn run_turn_inner(
         let mcp_tools = ops.agent_mcp_tools(&agent).await;
         let visible_tools =
             super::tool_visibility::visible_tool_names(state, &agent, &mcp_tools).await;
-        let product_tools = build_tool_schemas_with_filter(|name| visible_tools.contains(name));
+        let product_tools = visible_tools.filter_schemas(mai_tools::build_tool_schemas());
         let mcp_tool_schemas = pl_core::host_mcp_tool_schemas(
             mcp_tools
                 .iter()

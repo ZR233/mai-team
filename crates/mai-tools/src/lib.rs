@@ -7,14 +7,7 @@ mod schema;
 pub use names::*;
 
 pub fn build_tool_schemas() -> Vec<ToolSchema> {
-    build_tool_schemas_with_filter(|_| true)
-}
-
-pub fn build_tool_schemas_with_filter(allow_tool: impl Fn(&str) -> bool) -> Vec<ToolSchema> {
     definitions::builtin_tool_schemas()
-        .into_iter()
-        .filter(|tool| allow_tool(tool.name()))
-        .collect::<Vec<_>>()
 }
 
 #[cfg(test)]
@@ -151,8 +144,9 @@ mod tests {
     }
 
     #[test]
-    fn filters_product_tools() {
-        let tools = build_tool_schemas_with_filter(|name| name == TOOL_SAVE_ARTIFACT);
+    fn product_tool_filtering_uses_pl_core_visibility_set() {
+        let tools = pl_core::ToolVisibilitySet::from_tool_names([TOOL_SAVE_ARTIFACT])
+            .filter_schemas(build_tool_schemas());
         assert_eq!(tool_names(&tools), vec![TOOL_SAVE_ARTIFACT]);
     }
 

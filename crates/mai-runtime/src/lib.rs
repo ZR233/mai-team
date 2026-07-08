@@ -14,7 +14,7 @@ use mai_protocol::*;
 use mai_skills::{SkillInjections, SkillsManager};
 use mai_store::{AgentLogFilter, ConfigStore, ProviderSelection, ToolTraceFilter};
 #[cfg(test)]
-use mai_tools::build_tool_schemas_with_filter;
+use mai_tools::build_tool_schemas;
 #[cfg(test)]
 use pl_model::ToolSchema;
 use pl_protocol::Message as ModelMessage;
@@ -1594,9 +1594,17 @@ impl AgentRuntime {
         arguments: Value,
     ) -> Result<ToolExecution> {
         let agent = self.agent(agent_id).await?;
-        let product_tools = build_tool_schemas_with_filter(|tool| tool == name);
+        let visible_tool_names = pl_core::ToolVisibilitySet::from_tool_names([name.to_string()]);
+        let product_tools = visible_tool_names.filter_schemas(build_tool_schemas());
         let Some(execution) = self
-            .execute_native_shared_tool_for_test(&agent, agent_id, name, arguments, product_tools)
+            .execute_native_shared_tool_for_test(
+                &agent,
+                agent_id,
+                name,
+                arguments,
+                visible_tool_names,
+                product_tools,
+            )
             .await?
         else {
             return Ok(ToolExecution::new(
@@ -1615,6 +1623,7 @@ impl AgentRuntime {
         agent_id: AgentId,
         name: &str,
         arguments: Value,
+        visible_tool_names: pl_core::ToolVisibilitySet,
         product_tools: Vec<ToolSchema>,
     ) -> Result<Option<ToolExecution>> {
         let (event_tx, mut event_rx) = broadcast::channel(8);
@@ -1632,7 +1641,7 @@ impl AgentRuntime {
                 runtime: self.clone(),
                 agent: agent.clone(),
                 agent_id,
-                visible_tool_names: HashSet::from([name.to_string()]),
+                visible_tool_names,
                 product_tool_schemas: product_tools,
                 mcp_tool_schemas: Vec::new(),
                 cancellation_token: cancellation_token.clone(),
