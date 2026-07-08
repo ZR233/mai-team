@@ -5,10 +5,9 @@ use mai_protocol::{AgentId, AgentRole, AgentStatus as MaiAgentStatus, AgentSumma
 use pl_core::{
     AgentControlAgentRecord, AgentControlListOutput, AgentControlListRequest,
     AgentControlMessageOutput, AgentControlSendInputOutput, AgentControlSendInputRequest,
-    AgentControlSpawnOutput, AgentControlSpawnRequest, AgentControlTargetRequest,
-    AgentControlWaitOutput, AgentControlWaitRequest,
+    AgentControlSpawnOutput, AgentControlSpawnRequest, AgentControlStatusKind,
+    AgentControlTargetRequest, AgentControlWaitOutput, AgentControlWaitRequest,
 };
-use pl_protocol::AgentStatus as PlAgentStatus;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -118,7 +117,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
             agent_id: result.agent.id.to_string(),
             task_name: result.agent.name,
             path: result.agent.id.to_string(),
-            status: pl_agent_status(&result.agent.status),
+            status: agent_control_status_kind(&result.agent.status).to_agent_status(),
             turn_id: result.turn_id.map(|turn_id| turn_id.to_string()),
         })
     }
@@ -154,7 +153,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
             .clone();
         Ok(submission.into_send_input_output(
             target.to_string(),
-            pl_agent_status(&status),
+            agent_control_status_kind(&status).to_agent_status(),
             interrupt,
         ))
     }
@@ -211,7 +210,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
     ) -> std::result::Result<AgentControlMessageOutput, Self::Error> {
         let target = parse_agent_id(&request.target)?;
         self.runtime.close_agent(target).await?;
-        Ok(request.into_message_output(PlAgentStatus::Shutdown))
+        Ok(request.into_message_output(AgentControlStatusKind::Shutdown.to_agent_status()))
     }
 
     async fn resume_agent(
@@ -220,7 +219,8 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
     ) -> std::result::Result<AgentControlMessageOutput, Self::Error> {
         let target = parse_agent_id(&request.target)?;
         let resumed = self.runtime.resume_agent(target).await?;
-        Ok(request.into_message_output(pl_agent_status(&resumed.status)))
+        Ok(request
+            .into_message_output(agent_control_status_kind(&resumed.status).to_agent_status()))
     }
 }
 
@@ -307,7 +307,7 @@ fn parse_agent_id(value: &str) -> crate::Result<AgentId> {
 fn compact_agent_record(summary: AgentSummary) -> AgentControlAgentRecord {
     AgentControlAgentRecord::new(
         summary.id.to_string(),
-        pl_agent_status(&summary.status),
+        agent_control_status_kind(&summary.status).to_agent_status(),
         summary.role.unwrap_or(AgentRole::Executor).to_string(),
         summary.name,
         Some(format!("{} / {}", summary.provider_name, summary.model)),
@@ -315,17 +315,19 @@ fn compact_agent_record(summary: AgentSummary) -> AgentControlAgentRecord {
     )
 }
 
-fn pl_agent_status(status: &MaiAgentStatus) -> PlAgentStatus {
+fn agent_control_status_kind(status: &MaiAgentStatus) -> AgentControlStatusKind {
     match status {
         MaiAgentStatus::Created | MaiAgentStatus::StartingContainer | MaiAgentStatus::Idle => {
-            PlAgentStatus::Queued
+            AgentControlStatusKind::Queued
         }
-        MaiAgentStatus::RunningTurn => PlAgentStatus::Running,
-        MaiAgentStatus::WaitingTool => PlAgentStatus::Waiting,
-        MaiAgentStatus::Completed => PlAgentStatus::Completed,
-        MaiAgentStatus::Failed => PlAgentStatus::Errored,
-        MaiAgentStatus::Cancelled => PlAgentStatus::Interrupted,
-        MaiAgentStatus::DeletingContainer | MaiAgentStatus::Deleted => PlAgentStatus::Shutdown,
+        MaiAgentStatus::RunningTurn => AgentControlStatusKind::Running,
+        MaiAgentStatus::WaitingTool => AgentControlStatusKind::Waiting,
+        MaiAgentStatus::Completed => AgentControlStatusKind::Completed,
+        MaiAgentStatus::Failed => AgentControlStatusKind::Errored,
+        MaiAgentStatus::Cancelled => AgentControlStatusKind::Interrupted,
+        MaiAgentStatus::DeletingContainer | MaiAgentStatus::Deleted => {
+            AgentControlStatusKind::Shutdown
+        }
     }
 }
 
@@ -416,5 +418,23 @@ mod tests {
                 "agent-control adapter 不应手写共享请求策略 `{forbidden}`"
             );
         }
+    }
+
+    #[test]
+    fn agent_control_backend_uses_pl_core_status_kind() {
+        let source = include_str!("agent_control.rs");
+
+        assert!(
+            source.contains("AgentControlStatusKind"),
+            "agent-control adapter 应把产品状态映射到 pl-core status kind"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "pl_protocol::", "AgentStatus")),
+            "agent-control adapter 不应直接维护模型 wire status enum"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "PlAgent", "Status")),
+            "agent-control adapter 不应保留本地 wire status alias"
+        );
     }
 }
