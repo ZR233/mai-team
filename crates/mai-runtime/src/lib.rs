@@ -1467,13 +1467,14 @@ impl AgentRuntime {
         artifact_id: &str,
         name: &str,
     ) -> PathBuf {
-        turn::tool_output::tool_output_artifact_file_path(
-            &self.artifact_files_root,
-            agent_id,
+        let namespace = agent_id.to_string();
+        pl_core::tool_output_artifact_file_path(pl_core::ToolOutputArtifactPathRequest {
+            artifact_files_root: &self.artifact_files_root,
+            namespace: Some(&namespace),
             call_id,
             artifact_id,
             name,
-        )
+        })
     }
 
     async fn run_turn(

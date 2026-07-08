@@ -2,14 +2,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use mai_docker::ExecCaptureOptions;
-use mai_protocol::AgentId;
+use mai_protocol::{AgentId, ToolOutputArtifactInfo, now};
 use pl_core::{
     ContainerBackend, ContainerCopyFromRequest, ContainerCopyToRequest, ContainerExecOutput,
-    ContainerExecRequest,
+    ContainerExecRequest, ToolOutputArtifactDescriptor, ToolOutputCapture,
+    ToolOutputCaptureRequest, ToolOutputStreamSizes,
 };
 use pl_protocol::PureError;
+use uuid::Uuid;
 
-use crate::turn::tool_output::{prepare_tool_output_capture, tool_output_artifacts_from_capture};
 use crate::{AgentRuntime, Result};
 
 #[derive(Clone)]
@@ -75,9 +76,20 @@ async fn execute_with_container_backend(
         .cancellation_token
         .unwrap_or_else(tokio_util::sync::CancellationToken::new);
     if let Some(output_bytes_cap) = request.output_bytes_cap {
-        let capture = prepare_tool_output_capture(artifact_files_root, agent_id, &request.command)
-            .await
-            .map_err(container_backend_error)?;
+        let call_id = Uuid::new_v4().to_string();
+        let stdout_id = Uuid::new_v4().to_string();
+        let stderr_id = Uuid::new_v4().to_string();
+        let namespace = agent_id.to_string();
+        let capture = ToolOutputCapture::prepare(ToolOutputCaptureRequest {
+            artifact_files_root,
+            namespace: Some(&namespace),
+            call_id: &call_id,
+            stdout_id: &stdout_id,
+            stderr_id: &stderr_id,
+            command: &request.command,
+        })
+        .await
+        .map_err(container_backend_error)?;
         let output = docker
             .exec_shell_captured_with_cancel(
                 &container_id,
@@ -85,22 +97,22 @@ async fn execute_with_container_backend(
                 request.cwd.as_deref(),
                 request.timeout_secs,
                 ExecCaptureOptions {
-                    stdout_path: &capture.stdout_path,
-                    stderr_path: &capture.stderr_path,
+                    stdout_path: &capture.stdout.path,
+                    stderr_path: &capture.stderr.path,
                     output_bytes_cap,
                 },
                 &cancellation_token,
             )
             .await
             .map_err(container_backend_error)?;
-        let artifacts = tool_output_artifacts_from_capture(
-            agent_id,
-            &capture,
-            output.stdout_bytes,
-            output.stderr_bytes,
-        )
-        .await
-        .map_err(container_backend_error)?;
+        let artifacts = capture
+            .collect_artifacts(ToolOutputStreamSizes {
+                stdout_bytes: output.stdout_bytes,
+                stderr_bytes: output.stderr_bytes,
+            })
+            .await
+            .map_err(container_backend_error)?;
+        let artifacts = artifact_records_from_descriptors(agent_id, artifacts);
         let output_artifacts = artifacts
             .iter()
             .map(serde_json::to_value)
@@ -175,6 +187,25 @@ async fn copy_to_container_backend(
         .copy_to_container(&container_id, temp.path(), &request.path)
         .await
         .map_err(container_backend_error)
+}
+
+fn artifact_records_from_descriptors(
+    agent_id: AgentId,
+    descriptors: Vec<ToolOutputArtifactDescriptor>,
+) -> Vec<ToolOutputArtifactInfo> {
+    let created_at = now();
+    descriptors
+        .into_iter()
+        .map(|descriptor| ToolOutputArtifactInfo {
+            id: descriptor.id,
+            call_id: descriptor.call_id,
+            agent_id,
+            name: descriptor.name,
+            stream: descriptor.stream.as_str().to_string(),
+            size_bytes: descriptor.size_bytes,
+            created_at,
+        })
+        .collect()
 }
 
 fn container_backend_error(error: impl std::fmt::Display) -> PureError {

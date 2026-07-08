@@ -116,7 +116,7 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
         &result.trace_events,
     )
     .await;
-    let compacted_summary = new_compaction_summary(&ctx.history, session.messages());
+    let compaction_snapshot = result.context_compactions.last().cloned();
     super::history::replace_session_history(
         ctx.runtime.deps.store.as_ref(),
         &ctx.agent,
@@ -125,8 +125,8 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
         session.messages().to_vec(),
     )
     .await?;
-    if let Some(summary) = compacted_summary {
-        record_context_compacted(&ctx, &summary, result.usage.total_tokens).await;
+    if let Some(snapshot) = compaction_snapshot {
+        record_context_compacted(&ctx, &snapshot.summary, snapshot.tokens_before).await;
     }
     if let Some(last_context_tokens) = result.last_context_tokens {
         super::history::record_session_context_tokens(
@@ -456,33 +456,6 @@ async fn record_context_compacted(ctx: &PureCoreTurnContext, summary: &str, toke
             summary_preview: preview(summary, crate::COMPACT_SUMMARY_PREVIEW_CHARS),
         })
         .await;
-}
-
-fn new_compaction_summary(
-    previous: &[pl_protocol::Message],
-    current: &[pl_protocol::Message],
-) -> Option<String> {
-    let before = latest_compaction_summary(previous);
-    let after = latest_compaction_summary(current)?;
-    (before.as_deref() != Some(after.as_str())).then_some(after)
-}
-
-fn latest_compaction_summary(messages: &[pl_protocol::Message]) -> Option<String> {
-    messages.iter().rev().find_map(|message| {
-        let pl_protocol::MessageContent::Text(text) = &message.content else {
-            return None;
-        };
-        let text = text.trim();
-        if !super::history::is_compact_summary(text, crate::COMPACT_SUMMARY_PREFIX) {
-            return None;
-        }
-        Some(
-            text.strip_prefix(crate::COMPACT_SUMMARY_PREFIX)
-                .unwrap_or(text)
-                .trim()
-                .to_string(),
-        )
-    })
 }
 
 fn preview(text: &str, max_chars: usize) -> String {

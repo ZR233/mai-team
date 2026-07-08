@@ -1,14 +1,15 @@
-use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
 
+use mai_protocol::ToolOutputArtifactInfo;
 #[cfg(test)]
 use mai_protocol::ToolTraceDetail;
 #[cfg(test)]
 use mai_protocol::TurnId;
-use mai_protocol::{AgentId, ToolOutputArtifactInfo, now};
 #[cfg(test)]
-use mai_protocol::{ServiceEventKind, SessionId};
+use mai_protocol::now;
+#[cfg(test)]
+use mai_protocol::{AgentId, ServiceEventKind, SessionId};
 #[cfg(test)]
 use mai_store::ConfigStore;
 use serde_json::Value;
@@ -16,8 +17,10 @@ use serde_json::Value;
 use serde_json::json;
 #[cfg(test)]
 use tokio::time::Instant;
+#[cfg(test)]
 use uuid::Uuid;
 
+#[cfg(test)]
 use crate::Result;
 #[cfg(test)]
 use crate::RuntimeError;
@@ -83,17 +86,6 @@ impl ToolExecution {
             output_artifacts,
         }
     }
-}
-
-#[derive(Debug)]
-pub(crate) struct ToolOutputCapture {
-    pub(crate) call_id: String,
-    pub(crate) stdout_id: String,
-    pub(crate) stderr_id: String,
-    pub(crate) stdout_path: PathBuf,
-    pub(crate) stderr_path: PathBuf,
-    pub(crate) stdout_name: String,
-    pub(crate) stderr_name: String,
 }
 
 #[cfg(test)]
@@ -258,94 +250,6 @@ where
     Ok(execution)
 }
 
-pub(crate) async fn prepare_tool_output_capture(
-    artifact_files_root: &Path,
-    agent_id: AgentId,
-    command: &str,
-) -> Result<ToolOutputCapture> {
-    let call_id = Uuid::new_v4().to_string();
-    let stdout_id = Uuid::new_v4().to_string();
-    let stderr_id = Uuid::new_v4().to_string();
-    let stdout_name = tool_output_file_name(command, "stdout");
-    let stderr_name = tool_output_file_name(command, "stderr");
-    let stdout_path = tool_output_artifact_file_path(
-        artifact_files_root,
-        agent_id,
-        &call_id,
-        &stdout_id,
-        &stdout_name,
-    );
-    let stderr_path = tool_output_artifact_file_path(
-        artifact_files_root,
-        agent_id,
-        &call_id,
-        &stderr_id,
-        &stderr_name,
-    );
-    if let Some(parent) = stdout_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    if let Some(parent) = stderr_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    Ok(ToolOutputCapture {
-        call_id,
-        stdout_id,
-        stderr_id,
-        stdout_path,
-        stderr_path,
-        stdout_name,
-        stderr_name,
-    })
-}
-
-pub(crate) async fn tool_output_artifacts_from_capture(
-    agent_id: AgentId,
-    capture: &ToolOutputCapture,
-    stdout_bytes: u64,
-    stderr_bytes: u64,
-) -> Result<Vec<ToolOutputArtifactInfo>> {
-    let created_at = now();
-    let mut artifacts = Vec::new();
-    if stdout_bytes > 0 {
-        artifacts.push(ToolOutputArtifactInfo {
-            id: capture.stdout_id.clone(),
-            call_id: capture.call_id.clone(),
-            agent_id,
-            name: capture.stdout_name.clone(),
-            stream: "stdout".to_string(),
-            size_bytes: stdout_bytes,
-            created_at,
-        });
-    } else {
-        let _ = tokio::fs::remove_file(&capture.stdout_path).await;
-    }
-    if stderr_bytes > 0 {
-        artifacts.push(ToolOutputArtifactInfo {
-            id: capture.stderr_id.clone(),
-            call_id: capture.call_id.clone(),
-            agent_id,
-            name: capture.stderr_name.clone(),
-            stream: "stderr".to_string(),
-            size_bytes: stderr_bytes,
-            created_at,
-        });
-    } else {
-        let _ = tokio::fs::remove_file(&capture.stderr_path).await;
-    }
-    Ok(artifacts)
-}
-
-pub(crate) fn tool_output_artifact_file_path(
-    artifact_files_root: &Path,
-    agent_id: AgentId,
-    call_id: &str,
-    artifact_id: &str,
-    name: &str,
-) -> PathBuf {
-    tool_output_artifact_dir(artifact_files_root, agent_id, call_id, artifact_id).join(name)
-}
-
 pub(crate) fn trace_preview_value(value: &Value, max: usize) -> String {
     pl_core::trace_preview_value(value, max)
 }
@@ -359,44 +263,6 @@ fn inline_event_arguments(value: &Value) -> Option<Value> {
     let redacted = pl_core::redacted_trace_preview_value(value);
     let serialized = serde_json::to_string(&redacted).ok()?;
     (serialized.len() <= 2_000).then_some(redacted)
-}
-
-fn tool_output_artifact_dir(
-    artifact_files_root: &Path,
-    agent_id: AgentId,
-    call_id: &str,
-    artifact_id: &str,
-) -> PathBuf {
-    artifact_files_root
-        .join("tool-output")
-        .join(agent_id.to_string())
-        .join(safe_path_component(call_id))
-        .join(artifact_id)
-}
-
-fn tool_output_file_name(command: &str, stream: &str) -> String {
-    let command = command
-        .split_whitespace()
-        .next()
-        .map(safe_path_component)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "command".to_string());
-    format!("{command}-{stream}.txt")
-}
-
-fn safe_path_component(raw: &str) -> String {
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('.')
-        .trim_matches('_')
-        .to_string()
 }
 
 #[cfg(test)]
@@ -628,31 +494,6 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.kind, ServiceEventKind::ToolCompleted { .. }))
         );
-    }
-
-    #[tokio::test]
-    async fn capture_artifacts_keep_non_empty_streams_and_delete_empty_files() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let agent_id = Uuid::new_v4();
-        let capture = prepare_tool_output_capture(dir.path(), agent_id, "cargo test")
-            .await
-            .expect("capture");
-        tokio::fs::write(&capture.stdout_path, b"ok")
-            .await
-            .expect("stdout");
-        tokio::fs::write(&capture.stderr_path, b"")
-            .await
-            .expect("stderr");
-
-        let artifacts = tool_output_artifacts_from_capture(agent_id, &capture, 2, 0)
-            .await
-            .expect("artifacts");
-
-        assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].stream, "stdout");
-        assert_eq!(artifacts[0].name, "cargo-stdout.txt");
-        assert!(capture.stdout_path.exists());
-        assert!(!capture.stderr_path.exists());
     }
 
     #[test]

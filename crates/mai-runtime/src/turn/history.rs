@@ -209,6 +209,7 @@ pub(crate) fn tool_result_message(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn is_compact_summary(text: &str, summary_prefix: &str) -> bool {
     text.starts_with(summary_prefix)
 }
