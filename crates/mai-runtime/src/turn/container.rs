@@ -100,8 +100,8 @@ async fn execute_with_container_backend(
                 request.cwd.as_deref(),
                 request.timeout_secs,
                 ExecCaptureOptions {
-                    stdout_path: &capture.stdout.path,
-                    stderr_path: &capture.stderr.path,
+                    stdout_path: capture.stdout_path(),
+                    stderr_path: capture.stderr_path(),
                     output_bytes_cap,
                 },
                 &cancellation_token,

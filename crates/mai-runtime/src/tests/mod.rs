@@ -752,6 +752,16 @@ fn container_output_capture_uses_pl_core_request_constructor() {
         "mai-runtime 不应手写 ToolOutputCaptureRequest 字段"
     );
     assert!(
+        captured_exec.contains("capture.stdout_path()")
+            && captured_exec.contains("capture.stderr_path()"),
+        "container 输出捕获路径应通过 pl-core accessor 获取"
+    );
+    assert!(
+        !captured_exec.contains("capture.stdout.path")
+            && !captured_exec.contains("capture.stderr.path"),
+        "mai-runtime 不应读取 ToolOutputCapture 内部 stream 字段"
+    );
+    assert!(
         captured_exec.contains("ToolOutputStreamSizes::new"),
         "container 输出流大小的共享字段形状应由 pl-core constructor 承载"
     );
