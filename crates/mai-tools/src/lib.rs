@@ -144,6 +144,25 @@ mod tests {
     }
 
     #[test]
+    fn product_tool_schemas_use_codex_camel_case_fields() {
+        let tools = build_tool_schemas();
+        let queue = tools
+            .iter()
+            .find(|tool| tool.name() == TOOL_QUEUE_PROJECT_REVIEW_PRS)
+            .expect("queue_project_review_prs");
+        let ToolSchema::Function { input_schema, .. } = queue else {
+            panic!("queue_project_review_prs must be a function tool");
+        };
+        let item_properties = input_schema
+            .pointer("/properties/prs/items/properties")
+            .and_then(Value::as_object)
+            .expect("queue item properties");
+
+        assert!(item_properties.contains_key("headSha"));
+        assert!(!item_properties.contains_key("head_sha"));
+    }
+
+    #[test]
     fn product_tool_filtering_uses_pl_core_visibility_set() {
         let tools = pl_core::ToolVisibilitySet::from_tool_names([TOOL_SAVE_ARTIFACT])
             .filter_schemas(build_tool_schemas());

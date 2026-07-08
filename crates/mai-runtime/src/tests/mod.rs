@@ -6820,8 +6820,8 @@ async fn project_selector_can_queue_review_prs() {
             "queue_project_review_prs",
             json!({
                 "prs": [
-                    { "number": 9, "head_sha": "abc", "reason": "test" },
-                    { "number": 9, "head_sha": "def", "reason": "test-duplicate" },
+                    { "number": 9, "headSha": "abc", "reason": "test" },
+                    { "number": 9, "headSha": "def", "reason": "test-duplicate" },
                     { "number": 4, "reason": "test" }
                 ]
             }),

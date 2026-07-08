@@ -22,7 +22,7 @@ pub(crate) fn definitions() -> Vec<ToolSchema> {
                             "minimum": 1,
                             "description": "GitHub pull request number."
                         },
-                        "head_sha": {
+                        "headSha": {
                             "type": "string",
                             "description": "Optional current PR head commit SHA."
                         },

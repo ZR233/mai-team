@@ -3,13 +3,14 @@ use std::sync::Arc;
 use mai_protocol::{AgentId, AgentRole};
 use pl_core::RegisteredTool;
 use pl_model::ToolSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::state::AgentRecord;
 use crate::turn::tool_output::ToolExecution;
 use crate::{AgentRuntime, ProjectReviewQueueRequest, RuntimeError};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QueueProjectReviewPr {
     pub(crate) number: u64,
     pub(crate) head_sha: Option<String>,
@@ -21,6 +22,20 @@ pub(crate) struct GithubApiRequest {
     pub(crate) method: String,
     pub(crate) path: String,
     pub(crate) body: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct QueueProjectReviewPrsInput {
+    prs: Vec<QueueProjectReviewPrInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct QueueProjectReviewPrInput {
+    number: u64,
+    head_sha: Option<String>,
+    reason: Option<String>,
 }
 
 /// 将 mai-team 产品工具挂入 pl-core agent kernel 的动态工具注册表。
@@ -266,23 +281,23 @@ fn json_tool_execution(value: &impl serde::Serialize) -> ToolExecution {
 fn queue_project_review_prs_from_arguments(
     arguments: &Value,
 ) -> crate::Result<Vec<QueueProjectReviewPr>> {
-    let Some(items) = arguments.get("prs").and_then(Value::as_array) else {
-        return Err(RuntimeError::InvalidInput(
-            "missing array field `prs`".to_string(),
-        ));
-    };
-    items
-        .iter()
+    let input: QueueProjectReviewPrsInput =
+        serde_json::from_value(arguments.clone()).map_err(|error| {
+            RuntimeError::InvalidInput(format!("invalid queue_project_review_prs input: {error}"))
+        })?;
+    input
+        .prs
+        .into_iter()
         .map(|item| {
-            let number = item.get("number").and_then(Value::as_u64).ok_or_else(|| {
-                RuntimeError::InvalidInput(
-                    "each `prs` item must include integer field `number`".to_string(),
-                )
-            })?;
+            if item.number == 0 {
+                return Err(RuntimeError::InvalidInput(
+                    "each `prs` item must include positive integer field `number`".to_string(),
+                ));
+            }
             Ok(QueueProjectReviewPr {
-                number,
-                head_sha: optional_string_argument(item, "head_sha"),
-                reason: optional_string_argument(item, "reason"),
+                number: item.number,
+                head_sha: item.head_sha,
+                reason: item.reason,
             })
         })
         .collect()
@@ -300,13 +315,7 @@ fn optional_json_body_argument(arguments: &Value, field: &str) -> crate::Result<
     let Some(value) = arguments.get(field) else {
         return Ok(None);
     };
-    let parsed = if let Some(raw) = value.as_str() {
-        serde_json::from_str(raw).map_err(|err| {
-            RuntimeError::InvalidInput(format!("field `{field}` must be JSON: {err}"))
-        })?
-    } else {
-        value.clone()
-    };
+    let parsed = value.clone();
     if parsed.is_object() || parsed.is_null() {
         return Ok(Some(parsed));
     }
@@ -395,22 +404,17 @@ mod tests {
     }
 
     #[test]
-    fn github_api_request_from_arguments_parses_json_string_body() {
-        let request = github_api_request_from_arguments(&json!({
+    fn github_api_request_from_arguments_rejects_json_string_body() {
+        let err = github_api_request_from_arguments(&json!({
             "method": "POST",
             "path": "/repos/owner/repo/pulls/42/reviews",
             "body": r#"{"event":"COMMENT","body":"Looks good."}"#
         }))
-        .expect("request");
+        .expect_err("JSON string body should be rejected");
 
-        assert_eq!(request.method, "POST");
-        assert_eq!(request.path, "/repos/owner/repo/pulls/42/reviews");
-        assert_eq!(
-            request.body,
-            Some(json!({
-                "event": "COMMENT",
-                "body": "Looks good."
-            }))
+        assert!(
+            err.to_string()
+                .contains("field `body` must be a JSON object or null")
         );
     }
 
@@ -427,5 +431,36 @@ mod tests {
             err.to_string()
                 .contains("field `body` must be a JSON object or null")
         );
+    }
+
+    #[test]
+    fn queue_project_review_prs_uses_camel_case_head_sha() {
+        let prs = queue_project_review_prs_from_arguments(&json!({
+            "prs": [
+                { "number": 42, "headSha": "abc123", "reason": "ready" }
+            ]
+        }))
+        .expect("queue input");
+
+        assert_eq!(
+            prs,
+            vec![QueueProjectReviewPr {
+                number: 42,
+                head_sha: Some("abc123".to_string()),
+                reason: Some("ready".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn queue_project_review_prs_rejects_snake_case_head_sha() {
+        let err = queue_project_review_prs_from_arguments(&json!({
+            "prs": [
+                { "number": 42, "head_sha": "abc123" }
+            ]
+        }))
+        .expect_err("snake_case field should be rejected");
+
+        assert!(err.to_string().contains("unknown field `head_sha`"));
     }
 }
