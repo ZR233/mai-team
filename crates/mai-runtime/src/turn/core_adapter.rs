@@ -329,12 +329,18 @@ pub(crate) async fn build_kernel_with_native_shared_tools(
         ctx.agent_id,
         ctx.cancellation_token.clone(),
     ));
+    let agent_control_policy = Arc::new(super::agent_control::MaiAgentControlPolicy::new(
+        ctx.runtime.clone(),
+        ctx.agent.clone(),
+        ctx.agent_id,
+    ));
     let tool_set = pl_core::ToolSetBuilder::from_capabilities(capabilities)
         .with_allowed_tools(ctx.visible_tool_names.iter().cloned())
         .with_container_tools(backend)
         .with_mcp_resource_tools(mcp_backend)
         .with_mcp_tools(ctx.mcp_tool_schemas, mcp_tool_backend)
-        .with_agent_control_tools(agent_control_backend);
+        .with_agent_control_tools(agent_control_backend)
+        .with_agent_control_policy(agent_control_policy);
     let kernel_builder = AgentKernel::builder(builder)
         .with_profile(runtime_profile)
         .with_registered_tools(registered_tools);

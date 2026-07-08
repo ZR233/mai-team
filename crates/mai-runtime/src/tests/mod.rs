@@ -346,6 +346,34 @@ fn tool_visibility_consumes_pl_core_shared_tool_names() {
     }
 }
 
+#[test]
+fn agent_control_permissions_use_pl_core_policy_hook() {
+    let source = include_str!("../turn/agent_control.rs");
+
+    assert!(
+        source.contains("impl pl_core::AgentControlPolicy for MaiAgentControlPolicy"),
+        "agent-control 权限和通信边界应通过 pl-core AgentControlPolicy hook 注入"
+    );
+    let backend_start = source
+        .find("impl pl_core::AgentControlBackend for MaiAgentControlBackend")
+        .expect("backend impl");
+    let policy_start = source
+        .find("impl pl_core::AgentControlPolicy for MaiAgentControlPolicy")
+        .unwrap_or(source.len());
+    let backend_impl = &source[backend_start..policy_start];
+    for forbidden in [
+        "tool_visibility::visible_tool_names",
+        "agent_can_access_target",
+        "ensure_tool_visible",
+        "accessible_target",
+    ] {
+        assert!(
+            !backend_impl.contains(forbidden),
+            "MaiAgentControlBackend 不应在业务执行分支里做 pl-core policy 检查: {forbidden}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn pl_core_user_input_interaction_is_projected_to_service_event() {
     let dir = tempdir().expect("tempdir");

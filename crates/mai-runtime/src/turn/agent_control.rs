@@ -23,7 +23,7 @@ const DEFAULT_WAIT_AGENT_OBSERVATION_SECS: u64 = 30;
 ///
 /// pl-core 负责模型可见 schema、输入解析、输出序列化、trace 与工具生命周期；
 /// 本 adapter 只保留 mai-team 的产品语义，包括容器 clone、上下文 fork、store/UI
-/// 双写、通信边界与 project maintainer 策略。
+/// 双写与 project agent 生命周期动作。
 #[derive(Clone)]
 pub(crate) struct MaiAgentControlBackend {
     runtime: Arc<AgentRuntime>,
@@ -48,6 +48,40 @@ impl MaiAgentControlBackend {
     }
 }
 
+/// mai-team 注入 pl-core agent-control 工具的产品权限策略。
+///
+/// 工具可见性和目标通信边界在 pl-core 调用 backend 之前统一检查；backend
+/// 只执行已经授权的生命周期动作。
+#[derive(Clone)]
+pub(crate) struct MaiAgentControlPolicy {
+    runtime: Arc<AgentRuntime>,
+    agent: Arc<AgentRecord>,
+    agent_id: AgentId,
+}
+
+impl MaiAgentControlPolicy {
+    pub(crate) fn new(
+        runtime: Arc<AgentRuntime>,
+        agent: Arc<AgentRecord>,
+        agent_id: AgentId,
+    ) -> Self {
+        Self {
+            runtime,
+            agent,
+            agent_id,
+        }
+    }
+}
+
+impl fmt::Debug for MaiAgentControlPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MaiAgentControlPolicy")
+            .field("agent_id", &self.agent_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl fmt::Debug for MaiAgentControlBackend {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -62,7 +96,6 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
         &self,
         request: AgentControlSpawnRequest,
     ) -> pl_core::Result<AgentControlSpawnOutput> {
-        self.ensure_tool_visible(pl_core::TOOL_SPAWN_AGENT).await?;
         let role = request
             .agent_type
             .as_deref()
@@ -100,9 +133,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
         &self,
         request: AgentControlSendInputRequest,
     ) -> pl_core::Result<AgentControlSendInputOutput> {
-        let target = self
-            .accessible_target(pl_core::TOOL_SEND_INPUT, &request.target)
-            .await?;
+        let target = parse_agent_id(pl_core::TOOL_SEND_INPUT, &request.target)?;
         let interrupt = request.interrupt;
         let trigger_turn = request.trigger_turn || interrupt;
         let output = agents::send_input_to_agent(
@@ -200,14 +231,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
         &self,
         request: AgentControlTargetRequest,
     ) -> pl_core::Result<AgentControlMessageOutput> {
-        self.ensure_tool_visible(pl_core::TOOL_CLOSE_AGENT).await?;
         let target = parse_agent_id(pl_core::TOOL_CLOSE_AGENT, &request.target)?;
-        if target == self.agent_id {
-            return Err(pl_core::PureError::ToolExecutionFailed {
-                tool: pl_core::TOOL_CLOSE_AGENT.to_string(),
-                error: "cannot close the current agent".to_string(),
-            });
-        }
         self.runtime
             .close_agent(target)
             .await
@@ -222,9 +246,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
         &self,
         request: AgentControlTargetRequest,
     ) -> pl_core::Result<AgentControlMessageOutput> {
-        let target = self
-            .accessible_target(pl_core::TOOL_RESUME_AGENT, &request.target)
-            .await?;
+        let target = parse_agent_id(pl_core::TOOL_RESUME_AGENT, &request.target)?;
         let resumed = self
             .runtime
             .resume_agent(target)
@@ -237,36 +259,60 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
     }
 }
 
-impl MaiAgentControlBackend {
-    async fn ensure_tool_visible(&self, tool: &'static str) -> pl_core::Result<()> {
+impl pl_core::AgentControlPolicy for MaiAgentControlPolicy {
+    async fn check_tool(&self, kind: pl_core::AgentControlToolKind) -> pl_core::Result<()> {
         let visible =
             super::tool_visibility::visible_tool_names(&self.runtime.state, &self.agent, &[]).await;
-        if visible.contains(tool) {
+        if visible.contains(kind.name()) {
             return Ok(());
         }
         Err(pl_core::PureError::ToolExecutionFailed {
-            tool: tool.to_string(),
-            error: format!("Tool '{tool}' is not available for this agent"),
+            tool: kind.name().to_string(),
+            error: format!("Tool '{}' is not available for this agent", kind.name()),
         })
     }
 
-    async fn accessible_target(
+    async fn check_target(
         &self,
-        tool: &'static str,
+        kind: pl_core::AgentControlToolKind,
         target: &str,
-    ) -> pl_core::Result<AgentId> {
+    ) -> pl_core::Result<()> {
+        let tool = kind.name();
         let target = parse_agent_id(tool, target)?;
-        if super::tool_visibility::agent_can_access_target(&self.runtime.state, &self.agent, target)
-            .await
-        {
-            return Ok(target);
+        match kind {
+            pl_core::AgentControlToolKind::SendInput
+            | pl_core::AgentControlToolKind::WaitAgent
+            | pl_core::AgentControlToolKind::ResumeAgent => {
+                if super::tool_visibility::agent_can_access_target(
+                    &self.runtime.state,
+                    &self.agent,
+                    target,
+                )
+                .await
+                {
+                    return Ok(());
+                }
+                Err(pl_core::PureError::ToolExecutionFailed {
+                    tool: tool.to_string(),
+                    error: "target agent is outside this agent's communication policy".to_string(),
+                })
+            }
+            pl_core::AgentControlToolKind::CloseAgent => {
+                if target == self.agent_id {
+                    return Err(pl_core::PureError::ToolExecutionFailed {
+                        tool: tool.to_string(),
+                        error: "cannot close the current agent".to_string(),
+                    });
+                }
+                Ok(())
+            }
+            pl_core::AgentControlToolKind::SpawnAgent
+            | pl_core::AgentControlToolKind::ListAgents => Ok(()),
         }
-        Err(pl_core::PureError::ToolExecutionFailed {
-            tool: tool.to_string(),
-            error: "target agent is outside this agent's communication policy".to_string(),
-        })
     }
+}
 
+impl MaiAgentControlBackend {
     async fn child_agent_ids(&self) -> Vec<AgentId> {
         self.runtime
             .list_agents()
@@ -307,7 +353,7 @@ fn wait_timeout(timeout_ms: Option<i64>) -> Duration {
     Duration::from_millis(timeout_ms.max(100))
 }
 
-fn parse_agent_id(tool: &'static str, value: &str) -> pl_core::Result<AgentId> {
+fn parse_agent_id(tool: &str, value: &str) -> pl_core::Result<AgentId> {
     Uuid::parse_str(value).map_err(|error| pl_core::PureError::ToolExecutionFailed {
         tool: tool.to_string(),
         error: format!("invalid agent id `{value}`: {error}"),
