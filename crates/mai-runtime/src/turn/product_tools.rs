@@ -3,39 +3,56 @@ use std::sync::Arc;
 use mai_protocol::{AgentId, AgentRole};
 use pl_core::RegisteredTool;
 use pl_model::ToolSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 use serde_json::{Value, json};
 
 use crate::state::AgentRecord;
 use crate::turn::tool_output::ToolExecution;
 use crate::{AgentRuntime, ProjectReviewQueueRequest, RuntimeError};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct QueueProjectReviewPr {
     pub(crate) number: u64,
     pub(crate) head_sha: Option<String>,
     pub(crate) reason: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct GithubApiRequest {
     pub(crate) method: String,
     pub(crate) path: String,
+    #[serde(default, deserialize_with = "deserialize_optional_json_object")]
     pub(crate) body: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct QueueProjectReviewPrsInput {
-    prs: Vec<QueueProjectReviewPrInput>,
+struct SaveTaskPlanInput {
+    title: String,
+    markdown: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct QueueProjectReviewPrInput {
-    number: u64,
-    head_sha: Option<String>,
-    reason: Option<String>,
+struct SubmitReviewResultInput {
+    passed: bool,
+    findings: String,
+    summary: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SaveArtifactInput {
+    path: String,
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct QueueProjectReviewPrsInput {
+    prs: Vec<QueueProjectReviewPr>,
 }
 
 /// 将 mai-team 产品工具挂入 pl-core agent kernel 的动态工具注册表。
@@ -87,64 +104,61 @@ impl MaiProductToolRegistry {
         match name.as_str() {
             mai_tools::TOOL_SAVE_TASK_PLAN => {
                 let executor = self.clone();
-                Ok(RegisteredTool::from_fallible_execution_result(
+                Ok(RegisteredTool::from_typed_fallible_execution_result(
                     name.clone(),
                     description.clone(),
                     input_schema.clone(),
-                    move |input, _context| {
+                    move |input: SaveTaskPlanInput, _context| {
                         let executor = executor.clone();
-                        async move { executor.save_task_plan(input.arguments).await }
+                        async move { executor.save_task_plan(input).await }
                     },
                 ))
             }
             mai_tools::TOOL_SUBMIT_REVIEW_RESULT => {
                 let executor = self.clone();
-                Ok(RegisteredTool::from_fallible_execution_result(
+                Ok(RegisteredTool::from_typed_fallible_execution_result(
                     name.clone(),
                     description.clone(),
                     input_schema.clone(),
-                    move |input, _context| {
+                    move |input: SubmitReviewResultInput, _context| {
                         let executor = executor.clone();
-                        async move { executor.submit_review_result(input.arguments).await }
+                        async move { executor.submit_review_result(input).await }
                     },
                 ))
             }
             mai_tools::TOOL_SAVE_ARTIFACT => {
                 let executor = self.clone();
-                Ok(RegisteredTool::from_fallible_execution_result(
+                Ok(RegisteredTool::from_typed_fallible_execution_result(
                     name.clone(),
                     description.clone(),
                     input_schema.clone(),
-                    move |input, _context| {
+                    move |input: SaveArtifactInput, _context| {
                         let executor = executor.clone();
-                        async move { executor.save_artifact(input.arguments).await }
+                        async move { executor.save_artifact(input).await }
                     },
                 ))
             }
             mai_tools::TOOL_GITHUB_API_REQUEST => {
                 let executor = self.clone();
-                Ok(RegisteredTool::from_fallible_execution_result(
+                Ok(RegisteredTool::from_typed_fallible_execution_result(
                     name.clone(),
                     description.clone(),
                     input_schema.clone(),
-                    move |input, _context| {
+                    move |input: GithubApiRequest, _context| {
                         let executor = executor.clone();
-                        async move { executor.github_api_request(input.arguments).await }
+                        async move { executor.github_api_request(input).await }
                     },
                 ))
             }
             mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS => {
                 let executor = self.clone();
-                Ok(RegisteredTool::from_fallible_execution_result(
+                Ok(RegisteredTool::from_typed_fallible_execution_result(
                     name.clone(),
                     description.clone(),
                     input_schema.clone(),
-                    move |input, _context| {
+                    move |input: QueueProjectReviewPrsInput, _context| {
                         let executor = executor.clone();
-                        async move {
-                            let prs = queue_project_review_prs_from_arguments(&input.arguments)?;
-                            executor.queue_project_review_prs(prs).await
-                        }
+                        async move { executor.queue_project_review_prs(input).await }
                     },
                 ))
             }
@@ -154,44 +168,34 @@ impl MaiProductToolRegistry {
         }
     }
 
-    async fn save_task_plan(&self, arguments: Value) -> crate::Result<ToolExecution> {
-        let title = required_string_argument(&arguments, "title")?;
-        let markdown = required_string_argument(&arguments, "markdown")?;
+    async fn save_task_plan(&self, input: SaveTaskPlanInput) -> crate::Result<ToolExecution> {
         let task = self
             .runtime
-            .save_task_plan(self.agent_id, title, markdown)
+            .save_task_plan(self.agent_id, input.title, input.markdown)
             .await?;
         Ok(ToolExecution::json(&task)?)
     }
 
-    async fn submit_review_result(&self, arguments: Value) -> crate::Result<ToolExecution> {
-        let passed = arguments
-            .get("passed")
-            .and_then(Value::as_bool)
-            .ok_or_else(|| {
-                RuntimeError::InvalidInput("missing boolean field `passed`".to_string())
-            })?;
-        let findings = required_string_argument(&arguments, "findings")?;
-        let summary = required_string_argument(&arguments, "summary")?;
+    async fn submit_review_result(
+        &self,
+        input: SubmitReviewResultInput,
+    ) -> crate::Result<ToolExecution> {
         let review = self
             .runtime
-            .submit_review_result(self.agent_id, passed, findings, summary)
+            .submit_review_result(self.agent_id, input.passed, input.findings, input.summary)
             .await?;
         Ok(ToolExecution::json(&review)?)
     }
 
-    async fn save_artifact(&self, arguments: Value) -> crate::Result<ToolExecution> {
-        let path = required_string_argument(&arguments, "path")?;
-        let name = optional_string_argument(&arguments, "name");
+    async fn save_artifact(&self, input: SaveArtifactInput) -> crate::Result<ToolExecution> {
         let artifact = self
             .runtime
-            .save_artifact(self.agent_id, path, name)
+            .save_artifact(self.agent_id, input.path, input.name)
             .await?;
         Ok(ToolExecution::json(&artifact)?)
     }
 
-    async fn github_api_request(&self, arguments: Value) -> crate::Result<ToolExecution> {
-        let request = github_api_request_from_arguments(&arguments)?;
+    async fn github_api_request(&self, request: GithubApiRequest) -> crate::Result<ToolExecution> {
         self.runtime
             .execute_project_github_api_request(&self.agent, &request)
             .await
@@ -199,7 +203,7 @@ impl MaiProductToolRegistry {
 
     async fn queue_project_review_prs(
         &self,
-        prs: Vec<QueueProjectReviewPr>,
+        input: QueueProjectReviewPrsInput,
     ) -> crate::Result<ToolExecution> {
         let agent_summary = self.agent.summary.read().await.clone();
         let project_id = agent_summary.project_id.ok_or_else(|| {
@@ -220,7 +224,12 @@ impl MaiProductToolRegistry {
         let mut queued = Vec::new();
         let mut deduped = Vec::new();
         let mut ignored = Vec::new();
-        for pr in prs {
+        for pr in input.prs {
+            if pr.number == 0 {
+                return Err(RuntimeError::InvalidInput(
+                    "each `prs` item must include positive integer field `number`".to_string(),
+                ));
+            }
             let reason = pr
                 .reason
                 .as_deref()
@@ -250,65 +259,20 @@ impl MaiProductToolRegistry {
     }
 }
 
-fn required_string_argument(arguments: &Value, field: &str) -> crate::Result<String> {
-    arguments
-        .get(field)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| RuntimeError::InvalidInput(format!("missing string field `{field}`")))
-}
-
-fn optional_string_argument(arguments: &Value, field: &str) -> Option<String> {
-    arguments
-        .get(field)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn queue_project_review_prs_from_arguments(
-    arguments: &Value,
-) -> crate::Result<Vec<QueueProjectReviewPr>> {
-    let input: QueueProjectReviewPrsInput =
-        serde_json::from_value(arguments.clone()).map_err(|error| {
-            RuntimeError::InvalidInput(format!("invalid queue_project_review_prs input: {error}"))
-        })?;
-    input
-        .prs
-        .into_iter()
-        .map(|item| {
-            if item.number == 0 {
-                return Err(RuntimeError::InvalidInput(
-                    "each `prs` item must include positive integer field `number`".to_string(),
-                ));
-            }
-            Ok(QueueProjectReviewPr {
-                number: item.number,
-                head_sha: item.head_sha,
-                reason: item.reason,
-            })
-        })
-        .collect()
-}
-
-fn github_api_request_from_arguments(arguments: &Value) -> crate::Result<GithubApiRequest> {
-    Ok(GithubApiRequest {
-        method: required_string_argument(arguments, "method")?,
-        path: required_string_argument(arguments, "path")?,
-        body: optional_json_body_argument(arguments, "body")?,
-    })
-}
-
-fn optional_json_body_argument(arguments: &Value, field: &str) -> crate::Result<Option<Value>> {
-    let Some(value) = arguments.get(field) else {
-        return Ok(None);
-    };
-    let parsed = value.clone();
-    if parsed.is_object() || parsed.is_null() {
-        return Ok(Some(parsed));
+fn deserialize_optional_json_object<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    if value
+        .as_ref()
+        .is_none_or(|value| value.is_object() || value.is_null())
+    {
+        return Ok(value);
     }
-    Err(RuntimeError::InvalidInput(format!(
-        "field `{field}` must be a JSON object or null"
-    )))
+    Err(de::Error::custom(
+        "field `body` must be a JSON object or null",
+    ))
 }
 
 #[cfg(test)]
@@ -347,7 +311,7 @@ mod tests {
         assert!(
             source.contains(&format!(
                 "{}{}",
-                "RegisteredTool::from_fallible_", "execution_result"
+                "RegisteredTool::from_typed_fallible_", "execution_result"
             )),
             "产品工具应让 pl-core 负责 ToolExecutionResult 到 ToolOutput 以及业务错误到 ToolExecutionFailed 的映射"
         );
@@ -413,8 +377,36 @@ mod tests {
     }
 
     #[test]
-    fn github_api_request_from_arguments_rejects_json_string_body() {
-        let err = github_api_request_from_arguments(&json!({
+    fn product_tools_use_pl_core_typed_input_registration() {
+        let source = include_str!("product_tools.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+
+        assert!(
+            production.contains("RegisteredTool::from_typed_fallible_execution_result"),
+            "产品工具输入反序列化应由 pl-core typed RegisteredTool 统一处理"
+        );
+        for forbidden in [
+            "input.arguments",
+            "arguments.get(",
+            "fn required_string_argument",
+            "fn optional_string_argument",
+            "fn github_api_request_from_arguments",
+            "fn queue_project_review_prs_from_arguments",
+            "serde_json::from_value",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "产品工具注册器不应手写输入解析 `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn github_api_request_input_rejects_json_string_body() {
+        let err = serde_json::from_value::<GithubApiRequest>(json!({
             "method": "POST",
             "path": "/repos/owner/repo/pulls/42/reviews",
             "body": r#"{"event":"COMMENT","body":"Looks good."}"#
@@ -428,8 +420,8 @@ mod tests {
     }
 
     #[test]
-    fn github_api_request_from_arguments_rejects_non_object_body() {
-        let err = github_api_request_from_arguments(&json!({
+    fn github_api_request_input_rejects_non_object_body() {
+        let err = serde_json::from_value::<GithubApiRequest>(json!({
             "method": "POST",
             "path": "/repos/owner/repo/issues/42/comments",
             "body": "[\"not\", \"an\", \"object\"]"
@@ -444,7 +436,7 @@ mod tests {
 
     #[test]
     fn queue_project_review_prs_uses_camel_case_head_sha() {
-        let prs = queue_project_review_prs_from_arguments(&json!({
+        let input = serde_json::from_value::<QueueProjectReviewPrsInput>(json!({
             "prs": [
                 { "number": 42, "headSha": "abc123", "reason": "ready" }
             ]
@@ -452,7 +444,7 @@ mod tests {
         .expect("queue input");
 
         assert_eq!(
-            prs,
+            input.prs,
             vec![QueueProjectReviewPr {
                 number: 42,
                 head_sha: Some("abc123".to_string()),
@@ -463,7 +455,7 @@ mod tests {
 
     #[test]
     fn queue_project_review_prs_rejects_snake_case_head_sha() {
-        let err = queue_project_review_prs_from_arguments(&json!({
+        let err = serde_json::from_value::<QueueProjectReviewPrsInput>(json!({
             "prs": [
                 { "number": 42, "head_sha": "abc123" }
             ]
