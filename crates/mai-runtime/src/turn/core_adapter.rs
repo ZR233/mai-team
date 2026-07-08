@@ -43,6 +43,7 @@ pub(crate) struct SharedToolKernelBuildContext {
     pub(crate) agent: Arc<AgentRecord>,
     pub(crate) agent_id: AgentId,
     pub(crate) visible_tool_names: HashSet<String>,
+    pub(crate) mcp_tool_schemas: Vec<ToolSchema>,
     pub(crate) cancellation_token: CancellationToken,
 }
 
@@ -323,6 +324,12 @@ pub(crate) async fn build_kernel_with_native_shared_tools(
         ctx.agent_id,
         ctx.cancellation_token.clone(),
     ));
+    let mcp_tool_backend = Arc::new(super::mcp_tools::MaiMcpToolBackend::new(
+        ctx.runtime.clone(),
+        ctx.agent.clone(),
+        ctx.agent_id,
+        ctx.cancellation_token.clone(),
+    ));
     let agent_control_backend = Arc::new(super::agent_control::MaiAgentControlBackend::new(
         ctx.runtime.clone(),
         ctx.agent.clone(),
@@ -333,6 +340,7 @@ pub(crate) async fn build_kernel_with_native_shared_tools(
         .with_allowed_tools(ctx.visible_tool_names.iter().cloned())
         .with_container_tools(backend)
         .with_mcp_resource_tools(mcp_backend)
+        .with_mcp_tools(ctx.mcp_tool_schemas, mcp_tool_backend)
         .with_agent_control_tools(agent_control_backend);
     let kernel_builder = AgentKernel::builder(builder)
         .with_profile(runtime_profile)
@@ -357,11 +365,15 @@ pub(crate) async fn build_mai_agent_kernel(
     runtime_profile: CoreAgentProfile,
     ctx: MaiAgentKernelBuildContext,
 ) -> Result<AgentKernel> {
+    let (mcp_tool_schemas, product_tool_schemas): (Vec<_>, Vec<_>) = ctx
+        .product_tool_schemas
+        .into_iter()
+        .partition(|schema| schema.name().starts_with("mcp__"));
     let product_tool_registry = super::product_tools::MaiProductToolRegistry::new(
         ctx.runtime.clone(),
         ctx.agent.clone(),
         ctx.agent_id,
-        ctx.product_tool_schemas,
+        product_tool_schemas,
         ctx.cancellation_token.clone(),
     );
     let product_tools = product_tool_registry.registered_tools()?;
@@ -374,6 +386,7 @@ pub(crate) async fn build_mai_agent_kernel(
             agent: ctx.agent,
             agent_id: ctx.agent_id,
             visible_tool_names: ctx.visible_tool_names,
+            mcp_tool_schemas,
             cancellation_token: ctx.cancellation_token,
         },
     )

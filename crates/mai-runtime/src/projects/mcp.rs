@@ -1,18 +1,15 @@
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::sync::Arc;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient, project_cache_volume};
 use mai_mcp::{McpAgentManager, McpTool};
 use mai_protocol::McpServerConfig;
-use mai_protocol::{AgentId, ProjectId};
-use serde_json::Value;
+use mai_protocol::ProjectId;
 use tokio_util::sync::CancellationToken;
 
 use crate::projects::service;
-use crate::state::{AgentRecord, RuntimeState};
-use crate::turn::tool_output::ToolExecution;
+use crate::state::RuntimeState;
 use crate::{Result, RuntimeError};
 
 pub(crate) const PROJECT_WORKSPACE_PATH: &str = "/workspace/repo";
@@ -201,78 +198,6 @@ pub(crate) async fn ensure_manager(
         previous.manager.shutdown().await;
     }
     Ok(manager)
-}
-
-/// Provides the project-scoped MCP manager and git token needed to execute a
-/// project MCP model tool without exposing the full runtime.
-pub(crate) trait ProjectMcpToolOps: Send + Sync {
-    fn project_mcp_manager_for_agent(
-        &self,
-        agent: &AgentRecord,
-        agent_id: AgentId,
-        cancellation_token: &CancellationToken,
-    ) -> impl Future<Output = Result<Option<Arc<McpAgentManager>>>> + Send;
-
-    fn project_git_token_for_agent(
-        &self,
-        agent: &AgentRecord,
-    ) -> impl Future<Output = Result<Option<String>>> + Send;
-
-    fn call_project_mcp_tool(
-        &self,
-        manager: Arc<McpAgentManager>,
-        model_name: String,
-        arguments: Value,
-    ) -> impl Future<Output = std::result::Result<Value, mai_mcp::McpError>> + Send;
-}
-
-pub(crate) async fn execute_project_mcp_tool(
-    ops: &impl ProjectMcpToolOps,
-    agent: &AgentRecord,
-    model_name: &str,
-    arguments: Value,
-    cancellation_token: CancellationToken,
-) -> Result<ToolExecution> {
-    let agent_id = agent.summary.read().await.id;
-    let Some(manager) = ops
-        .project_mcp_manager_for_agent(agent, agent_id, &cancellation_token)
-        .await?
-    else {
-        return Err(RuntimeError::InvalidInput(
-            "project MCP manager is not available".to_string(),
-        ));
-    };
-    let token = ops
-        .project_git_token_for_agent(agent)
-        .await?
-        .unwrap_or_default();
-    let output = tokio::select! {
-        output = ops.call_project_mcp_tool(manager, model_name.to_string(), arguments) => output,
-        _ = cancellation_token.cancelled() => {
-            return Err(RuntimeError::TurnCancelled);
-        }
-    };
-    match output {
-        Ok(output) => Ok(ToolExecution::new(
-            true,
-            redact_secret(&output.to_string(), &token),
-            false,
-        )),
-        Err(mai_mcp::McpError::ToolNotFound(_)) => Err(RuntimeError::InvalidInput(format!(
-            "project MCP tool `{model_name}` was not discovered"
-        ))),
-        Err(err) => Err(RuntimeError::InvalidInput(redact_secret(
-            &err.to_string(),
-            &token,
-        ))),
-    }
-}
-
-fn redact_secret(value: &str, secret: &str) -> String {
-    if secret.is_empty() {
-        return value.to_string();
-    }
-    value.replace(secret, "<redacted>")
 }
 
 #[cfg(test)]

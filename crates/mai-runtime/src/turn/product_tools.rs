@@ -32,7 +32,6 @@ enum MaiProductToolHandler {
     SaveArtifact,
     GithubApiRequest,
     QueueProjectReviewPrs,
-    Mcp { model_name: String },
 }
 
 impl MaiProductToolHandler {
@@ -43,9 +42,6 @@ impl MaiProductToolHandler {
             mai_tools::TOOL_SAVE_ARTIFACT => Ok(Self::SaveArtifact),
             mai_tools::TOOL_GITHUB_API_REQUEST => Ok(Self::GithubApiRequest),
             mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS => Ok(Self::QueueProjectReviewPrs),
-            model_name if model_name.starts_with("mcp__") => Ok(Self::Mcp {
-                model_name: model_name.to_string(),
-            }),
             _ => Err(RuntimeError::InvalidInput(format!(
                 "tool `{name}` is not a mai-team product tool"
             ))),
@@ -68,11 +64,6 @@ impl MaiProductToolHandler {
             Self::QueueProjectReviewPrs => {
                 let prs = queue_project_review_prs_from_arguments(&arguments)?;
                 registry.queue_project_review_prs(prs).await
-            }
-            Self::Mcp { model_name } => {
-                registry
-                    .execute_mcp_tool(model_name.clone(), arguments)
-                    .await
             }
         }
     }
@@ -249,35 +240,6 @@ impl MaiProductToolRegistry {
             false,
         ))
     }
-
-    async fn execute_mcp_tool(
-        &self,
-        model_name: String,
-        arguments: Value,
-    ) -> crate::Result<ToolExecution> {
-        if self.agent.summary.read().await.project_id.is_some() {
-            return self
-                .runtime
-                .execute_project_mcp_tool(
-                    &self.agent,
-                    &model_name,
-                    arguments,
-                    self.cancellation_token.clone(),
-                )
-                .await;
-        }
-        let manager =
-            self.agent.mcp.read().await.clone().ok_or_else(|| {
-                RuntimeError::InvalidInput("MCP manager not initialized".to_string())
-            })?;
-        let output = tokio::select! {
-            output = manager.call_model_tool(&model_name, arguments) => output?,
-            _ = self.cancellation_token.cancelled() => {
-                return Err(RuntimeError::TurnCancelled);
-            }
-        };
-        Ok(ToolExecution::new(true, output.to_string(), false))
-    }
 }
 
 fn required_string_argument(arguments: &Value, field: &str) -> crate::Result<String> {
@@ -383,6 +345,14 @@ mod tests {
         assert!(
             !source.contains(&format!("{}{}", "TOOL_GIT_SYNC", "_DEFAULT_BRANCH")),
             "git_sync_default_branch 是 pl-core shared git tool，不应在产品工具注册器里兜底"
+        );
+        assert!(
+            !source.contains("starts_with(\"mcp__\")"),
+            "MCP model tools 应由 pl-core shared MCP tool pack 注册，不应作为 mai 产品工具"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "execute_mcp", "_tool")),
+            "MCP model tools 应通过 pl-core ToolSetBuilder 后端执行"
         );
     }
 
