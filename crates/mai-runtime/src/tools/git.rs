@@ -71,27 +71,16 @@ async fn execute_git_tool_via_registry(
 ) -> Result<String> {
     let config = git_workspace_config(context);
     let workspace_root = config.worktree.clone();
-    let capabilities = ToolCapabilityConfig {
-        bash: false,
-        workspace_files: false,
-        skills: false,
-        mcp: false,
-        lsp: false,
-        subagents: false,
-        ask_user: false,
-        git: true,
-        docker: false,
-        container: false,
-    };
-    let tool_set = pl_core::ToolSetBuilder::from_capabilities(capabilities)
-        .with_allowed_tools([kind.name()])
-        .with_git_tools(
-            config,
-            Arc::new(ProjectGitExecutionBackend),
-            Arc::new(MaiGitCredentialProvider::Static {
-                token: context.token.clone(),
-            }),
-        );
+    let tool_set =
+        pl_core::ToolSetBuilder::from_capabilities(ToolCapabilityConfig::git_workspace())
+            .with_allowed_tools([kind.name()])
+            .with_git_tools(
+                config,
+                Arc::new(ProjectGitExecutionBackend),
+                Arc::new(MaiGitCredentialProvider::Static {
+                    token: context.token.clone(),
+                }),
+            );
     let kernel = pl_core::AgentKernel::builder(
         pl_core::PureCoreBuilder::from_provider_info(pl_model::ProviderInfo::deepseek(None))
             .map_err(runtime_error_from_pure)?,
@@ -477,6 +466,14 @@ mod tests {
         assert!(
             execute_path.contains("ToolSetBuilder::from_capabilities"),
             "project git tools must be registered through pl-core ToolSetBuilder"
+        );
+        assert!(
+            execute_path.contains("ToolCapabilityConfig::git_workspace()"),
+            "project git tools must reuse the pl-core git workspace capability preset"
+        );
+        assert!(
+            !execute_path.contains("ToolCapabilityConfig {"),
+            "project git tools must not hand-write a shared tool capability matrix"
         );
         assert!(
             execute_path.contains(".with_tool_set("),
