@@ -161,7 +161,7 @@ impl MaiProductToolRegistry {
             .runtime
             .save_task_plan(self.agent_id, title, markdown)
             .await?;
-        Ok(json_tool_execution(&task))
+        Ok(ToolExecution::json(&task)?)
     }
 
     async fn submit_review_result(&self, arguments: Value) -> crate::Result<ToolExecution> {
@@ -177,7 +177,7 @@ impl MaiProductToolRegistry {
             .runtime
             .submit_review_result(self.agent_id, passed, findings, summary)
             .await?;
-        Ok(json_tool_execution(&review))
+        Ok(ToolExecution::json(&review)?)
     }
 
     async fn save_artifact(&self, arguments: Value) -> crate::Result<ToolExecution> {
@@ -187,7 +187,7 @@ impl MaiProductToolRegistry {
             .runtime
             .save_artifact(self.agent_id, path, name)
             .await?;
-        Ok(json_tool_execution(&artifact))
+        Ok(ToolExecution::json(&artifact)?)
     }
 
     async fn github_api_request(&self, arguments: Value) -> crate::Result<ToolExecution> {
@@ -242,16 +242,11 @@ impl MaiProductToolRegistry {
             deduped.extend(summary.deduped);
             ignored.extend(summary.ignored);
         }
-        Ok(ToolExecution::new(
-            true,
-            json!({
-                "queued": queued,
-                "deduped": deduped,
-                "ignored": ignored,
-            })
-            .to_string(),
-            false,
-        ))
+        Ok(ToolExecution::json(json!({
+            "queued": queued,
+            "deduped": deduped,
+            "ignored": ignored,
+        }))?)
     }
 }
 
@@ -268,14 +263,6 @@ fn optional_string_argument(arguments: &Value, field: &str) -> Option<String> {
         .get(field)
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
-}
-
-fn json_tool_execution(value: &impl serde::Serialize) -> ToolExecution {
-    ToolExecution::new(
-        true,
-        serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string()),
-        false,
-    )
 }
 
 fn queue_project_review_prs_from_arguments(
@@ -400,6 +387,28 @@ mod tests {
                 "RuntimeError::Turn", "Cancelled", ".to_string()"
             )),
             "产品工具不应自行把 turn cancelled 映射为工具错误"
+        );
+    }
+
+    #[test]
+    fn product_tools_reuse_pl_core_json_execution_result() {
+        let source = include_str!("product_tools.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+
+        assert!(
+            production.contains("ToolExecution::json("),
+            "产品工具 JSON 输出应复用 pl-core ToolExecutionResult::json"
+        );
+        assert!(
+            !production.contains(&format!("{}{}", "fn json_tool", "_execution")),
+            "mai-team 不应保留本地 JSON 工具输出 helper"
+        );
+        assert!(
+            !production.contains("serde_json::to_string(value).unwrap_or_else"),
+            "产品工具不应自行吞掉 JSON 序列化错误"
         );
     }
 
