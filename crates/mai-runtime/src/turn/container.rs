@@ -8,10 +8,9 @@ use pl_core::{
     ContainerExecRequest, ToolOutputArtifactDescriptor, ToolOutputCapture,
     ToolOutputCaptureRequest, ToolOutputStreamSizes,
 };
-use pl_protocol::PureError;
 use uuid::Uuid;
 
-use crate::{AgentRuntime, Result};
+use crate::{AgentRuntime, Result, RuntimeError};
 
 #[derive(Clone)]
 pub(crate) struct MaiContainerBackend {
@@ -34,7 +33,9 @@ impl std::fmt::Debug for MaiContainerBackend {
 }
 
 impl ContainerBackend for MaiContainerBackend {
-    async fn exec(&self, request: ContainerExecRequest) -> pl_core::Result<ContainerExecOutput> {
+    type Error = RuntimeError;
+
+    async fn exec(&self, request: ContainerExecRequest) -> Result<ContainerExecOutput> {
         execute_with_container_backend(
             &self.runtime.deps.docker,
             &self.runtime.artifact_files_root,
@@ -45,7 +46,7 @@ impl ContainerBackend for MaiContainerBackend {
         .await
     }
 
-    async fn copy_from(&self, request: ContainerCopyFromRequest) -> pl_core::Result<Vec<u8>> {
+    async fn copy_from(&self, request: ContainerCopyFromRequest) -> Result<Vec<u8>> {
         copy_from_container_backend(
             &self.runtime.deps.docker,
             self.runtime.container_id(self.agent_id).await,
@@ -54,7 +55,7 @@ impl ContainerBackend for MaiContainerBackend {
         .await
     }
 
-    async fn copy_to(&self, request: ContainerCopyToRequest) -> pl_core::Result<()> {
+    async fn copy_to(&self, request: ContainerCopyToRequest) -> Result<()> {
         copy_to_container_backend(
             &self.runtime.deps.docker,
             self.runtime.container_id(self.agent_id).await,
@@ -70,8 +71,8 @@ async fn execute_with_container_backend(
     container_id: Result<String>,
     agent_id: AgentId,
     request: ContainerExecRequest,
-) -> pl_core::Result<ContainerExecOutput> {
-    let container_id = container_id.map_err(container_backend_error)?;
+) -> Result<ContainerExecOutput> {
+    let container_id = container_id?;
     let cancellation_token = request
         .cancellation_token
         .unwrap_or_else(tokio_util::sync::CancellationToken::new);
@@ -89,7 +90,7 @@ async fn execute_with_container_backend(
             command: &request.command,
         })
         .await
-        .map_err(container_backend_error)?;
+        .map_err(runtime_invalid_input)?;
         let output = docker
             .exec_shell_captured_with_cancel(
                 &container_id,
@@ -103,21 +104,20 @@ async fn execute_with_container_backend(
                 },
                 &cancellation_token,
             )
-            .await
-            .map_err(container_backend_error)?;
+            .await?;
         let artifacts = capture
             .collect_artifacts(ToolOutputStreamSizes {
                 stdout_bytes: output.stdout_bytes,
                 stderr_bytes: output.stderr_bytes,
             })
             .await
-            .map_err(container_backend_error)?;
+            .map_err(runtime_invalid_input)?;
         let artifacts = artifact_records_from_descriptors(agent_id, artifacts);
         let output_artifacts = artifacts
             .iter()
             .map(serde_json::to_value)
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(container_backend_error)?;
+            .map_err(runtime_invalid_input)?;
         return Ok(ContainerExecOutput {
             status: output.output.status,
             stdout: output.output.stdout,
@@ -138,8 +138,7 @@ async fn execute_with_container_backend(
             request.timeout_secs,
             &cancellation_token,
         )
-        .await
-        .map_err(container_backend_error)?;
+        .await?;
     Ok(ContainerExecOutput {
         status: output.status,
         stdout_bytes: output.stdout.len() as u64,
@@ -156,37 +155,33 @@ async fn copy_from_container_backend(
     docker: &mai_docker::DockerClient,
     container_id: Result<String>,
     request: ContainerCopyFromRequest,
-) -> pl_core::Result<Vec<u8>> {
-    let container_id = container_id.map_err(container_backend_error)?;
+) -> Result<Vec<u8>> {
+    let container_id = container_id?;
     if request.archive {
-        return docker
+        return Ok(docker
             .copy_from_container_tar(&container_id, &request.path)
-            .await
-            .map_err(container_backend_error);
+            .await?);
     }
-    let dir = tempfile::tempdir().map_err(container_backend_error)?;
+    let dir = tempfile::tempdir()?;
     let host_path = dir.path().join("file");
     docker
         .copy_from_container_to_file(&container_id, &request.path, &host_path)
-        .await
-        .map_err(container_backend_error)?;
-    tokio::fs::read(&host_path)
-        .await
-        .map_err(container_backend_error)
+        .await?;
+    Ok(tokio::fs::read(&host_path).await?)
 }
 
 async fn copy_to_container_backend(
     docker: &mai_docker::DockerClient,
     container_id: Result<String>,
     request: ContainerCopyToRequest,
-) -> pl_core::Result<()> {
-    let container_id = container_id.map_err(container_backend_error)?;
-    let temp = tempfile::NamedTempFile::new().map_err(container_backend_error)?;
-    std::fs::write(temp.path(), &request.content).map_err(container_backend_error)?;
+) -> Result<()> {
+    let container_id = container_id?;
+    let temp = tempfile::NamedTempFile::new()?;
+    std::fs::write(temp.path(), &request.content)?;
     docker
         .copy_to_container(&container_id, temp.path(), &request.path)
-        .await
-        .map_err(container_backend_error)
+        .await?;
+    Ok(())
 }
 
 fn artifact_records_from_descriptors(
@@ -208,9 +203,23 @@ fn artifact_records_from_descriptors(
         .collect()
 }
 
-fn container_backend_error(error: impl std::fmt::Display) -> PureError {
-    PureError::ToolExecutionFailed {
-        tool: "container".to_string(),
-        error: error.to_string(),
+fn runtime_invalid_input(error: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::InvalidInput(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn container_backend_delegates_tool_error_shape_to_pl_core() {
+        let source = include_str!("container.rs");
+
+        assert!(
+            !source.contains(&format!("{}{}", "ToolExecution", "Failed")),
+            "container backend adapter 不应手动构造 pl-core 工具错误"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "Pure", "Error")),
+            "container backend adapter 不应依赖 pl 协议错误类型"
+        );
     }
 }
