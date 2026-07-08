@@ -5,7 +5,10 @@ use mai_protocol::{
     ProviderKind as MaiProviderKind, ProviderSecret,
 };
 use mai_store::ProviderSelection;
-use pl_core::CoreModelTurnRequest;
+use pl_core::{
+    CoreModelContinuationConfig, CoreModelContinuationProfile, CoreModelProviderFamily,
+    CoreModelTurnRequest, CoreModelWireApi,
+};
 use pl_model::{
     MaxTokensField, ModelCapabilities, ModelInfo, ModelModality, ModelParameter,
     ModelRequestProfile, ParameterWire, ProviderInfo, ReasoningConfig, ReasoningSummary,
@@ -30,25 +33,18 @@ pub fn core_model_turn_request(
     instructions: impl Into<String>,
     tools: Vec<ToolSchema>,
 ) -> CoreModelTurnRequest {
-    let supports_continuation = model_supports_continuation(selection);
-    let mut request = CoreModelTurnRequest::new(selection.model.id.clone())
+    CoreModelTurnRequest::new(selection.model.id.clone())
         .with_instructions(instructions)
         .with_tools(tools)
         .with_parallel_tool_calls(selection.model.capabilities.parallel_tools)
         .with_max_tokens(Some(selection.model.output_tokens))
         .with_reasoning(reasoning_config(&selection.model, reasoning_effort))
-        .with_continuation(supports_continuation);
-    if supports_continuation {
-        request = request.with_continuation_cache_key(continuation_cache_key(selection));
-    }
-    request
+        .with_continuation_config(model_continuation_config(selection))
 }
 
 /// 判断当前 mai provider/model 选择是否能走 pl-core continuation 路径。
 pub fn model_supports_continuation(selection: &ProviderSelection) -> bool {
-    selection.provider.kind == MaiProviderKind::Openai
-        && selection.model.wire_api == ModelWireApi::Responses
-        && selection.model.capabilities.continuation
+    model_continuation_config(selection).enabled()
 }
 
 pub(crate) fn provider_info(provider: &ProviderSecret) -> ProviderInfo {
@@ -68,13 +64,30 @@ pub(crate) fn provider_info(provider: &ProviderSecret) -> ProviderInfo {
     info
 }
 
-fn continuation_cache_key(selection: &ProviderSelection) -> String {
-    format!(
-        "{:?}|{}|{}",
-        selection.provider.kind,
-        selection.provider.base_url.trim_end_matches('/'),
-        selection.model.id
-    )
+fn model_continuation_config(selection: &ProviderSelection) -> CoreModelContinuationConfig {
+    CoreModelContinuationConfig::from_profile(CoreModelContinuationProfile {
+        provider_family: provider_family(selection.provider.kind),
+        wire_api: wire_api(selection.model.wire_api),
+        model_supports_continuation: selection.model.capabilities.continuation,
+        base_url: selection.provider.base_url.clone(),
+        model: selection.model.id.clone(),
+    })
+}
+
+fn provider_family(kind: MaiProviderKind) -> CoreModelProviderFamily {
+    match kind {
+        MaiProviderKind::Openai => CoreModelProviderFamily::OpenAi,
+        MaiProviderKind::Deepseek | MaiProviderKind::Zhipu | MaiProviderKind::Mimo => {
+            CoreModelProviderFamily::Other
+        }
+    }
+}
+
+fn wire_api(wire_api: ModelWireApi) -> CoreModelWireApi {
+    match wire_api {
+        ModelWireApi::Responses => CoreModelWireApi::Responses,
+        ModelWireApi::ChatCompletions => CoreModelWireApi::Chat,
+    }
 }
 
 pub(crate) fn model_info(model: &ModelConfig) -> ModelInfo {
@@ -221,6 +234,38 @@ fn collect_wire_assignments(
                     value: value.clone(),
                 });
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn continuation_policy_delegates_to_pl_core_profile() {
+        let source = include_str!("model_profile.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+
+        assert!(
+            production.contains("CoreModelContinuationConfig::from_profile"),
+            "模型 continuation 规则应由 pl-core CoreModelContinuationConfig 统一提供"
+        );
+        assert!(
+            production.contains("with_continuation_config"),
+            "CoreModelTurnRequest 应直接消费 pl-core continuation config"
+        );
+        for forbidden in [
+            "with_continuation(supports_continuation)",
+            "with_continuation_cache_key",
+            "fn continuation_cache_key",
+            "selection.provider.kind == MaiProviderKind::Openai",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "mai-runtime 不应本地维护 continuation 策略 `{forbidden}`"
+            );
         }
     }
 }
