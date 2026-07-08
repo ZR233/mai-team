@@ -81,6 +81,26 @@ fn core_turn_registers_shared_tools_through_kernel_builder() {
     }
 }
 
+#[test]
+fn core_turn_uses_pl_core_turn_outcome() {
+    let source = include_str!("../turn/core_adapter.rs");
+    assert!(
+        source.contains("TurnOutcome::from_result"),
+        "主 turn 路径应复用 pl-core 的 turn outcome 归一化"
+    );
+    for forbidden in [
+        "TurnResultStatus::Completed",
+        "TurnResultStatus::Aborted",
+        "TurnResultStatus::Errored",
+        "TurnAbortReason::Interrupted",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "主 turn 路径不应继续本地解释 pl-core 终态 `{forbidden}`"
+        );
+    }
+}
+
 fn pl_text(message: &Message) -> &str {
     match &message.content {
         MessageContent::Text(text) => text,

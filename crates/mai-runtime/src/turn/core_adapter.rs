@@ -9,7 +9,7 @@ use pl_core::{
     AgentKernel, CompileMode, ContextCompactionConfig, ContextCompactionReplacement,
     CoreAgentProfile, CoreSession, InstructionBlock, InstructionSnapshot, InstructionSource,
     InstructionSourceKind, PureCoreBuilder, ReasoningEffort, RecentInteractionTailConfig,
-    TraceRecorder, TurnOptions, TurnRequest, TurnResultStatus,
+    TraceRecorder, TurnOptions, TurnOutcome, TurnOutcomeStatus, TurnRequest, TurnReturnError,
 };
 use pl_trace::AgentEvent;
 use tokio::sync::broadcast;
@@ -150,48 +150,12 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
         )
         .await?;
     }
-    if !result.content.trim().is_empty() {
-        record_assistant_message(&ctx, result.content.clone()).await?;
+    let outcome = TurnOutcome::from_result(&result);
+    if let Some(final_text) = &outcome.final_text {
+        record_assistant_message(&ctx, final_text.clone()).await?;
     }
 
-    let return_error = match result.status {
-        TurnResultStatus::Completed => None,
-        TurnResultStatus::Aborted
-            if result.abort_reason == Some(pl_core::TurnAbortReason::Interrupted) =>
-        {
-            Some(RuntimeError::TurnCancelled)
-        }
-        TurnResultStatus::Aborted | TurnResultStatus::Errored => Some(RuntimeError::InvalidInput(
-            result
-                .error
-                .clone()
-                .unwrap_or_else(|| "pl-core turn failed".to_string()),
-        )),
-    };
-    let (turn_status, agent_status, error) = match result.status {
-        TurnResultStatus::Completed => (TurnStatus::Completed, AgentStatus::Completed, None),
-        TurnResultStatus::Aborted => match result.abort_reason {
-            Some(pl_core::TurnAbortReason::Interrupted) => (
-                TurnStatus::Cancelled,
-                AgentStatus::Cancelled,
-                result.error.clone(),
-            ),
-            Some(pl_core::TurnAbortReason::BudgetLimited)
-            | Some(pl_core::TurnAbortReason::Shutdown)
-            | Some(pl_core::TurnAbortReason::ProviderError)
-            | Some(pl_core::TurnAbortReason::ToolError)
-            | None => (
-                TurnStatus::Failed,
-                AgentStatus::Failed,
-                result.error.clone(),
-            ),
-        },
-        TurnResultStatus::Errored => (
-            TurnStatus::Failed,
-            AgentStatus::Failed,
-            result.error.clone(),
-        ),
-    };
+    let (turn_status, agent_status) = mai_status_from_pl_outcome(outcome.status);
     super::completion::finish_turn(
         ctx.runtime.deps.store.as_ref(),
         &ctx.runtime.events,
@@ -202,18 +166,33 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
             turn_id: ctx.turn_id,
             status: turn_status,
             agent_status,
-            final_text: (!result.content.trim().is_empty()).then_some(result.content),
-            error,
+            final_text: outcome.final_text,
+            error: outcome.error,
         },
     )
     .await?;
     ctx.runtime
         .start_next_queued_input_after_turn(ctx.agent_id)
         .await;
-    if let Some(error) = return_error {
-        return Err(error);
+    if let Some(error) = outcome.return_error {
+        return Err(runtime_error_from_pl_turn(error));
     }
     Ok(())
+}
+
+fn mai_status_from_pl_outcome(status: TurnOutcomeStatus) -> (TurnStatus, AgentStatus) {
+    match status {
+        TurnOutcomeStatus::Completed => (TurnStatus::Completed, AgentStatus::Completed),
+        TurnOutcomeStatus::Cancelled => (TurnStatus::Cancelled, AgentStatus::Cancelled),
+        TurnOutcomeStatus::Failed => (TurnStatus::Failed, AgentStatus::Failed),
+    }
+}
+
+fn runtime_error_from_pl_turn(error: TurnReturnError) -> RuntimeError {
+    match error {
+        TurnReturnError::Cancelled => RuntimeError::TurnCancelled,
+        TurnReturnError::Failed(message) => RuntimeError::InvalidInput(message),
+    }
 }
 
 pub(crate) fn mai_user_input_interaction_callback(
