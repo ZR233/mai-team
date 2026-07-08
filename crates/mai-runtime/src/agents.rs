@@ -392,10 +392,7 @@ pub(crate) fn is_agent_turn_start_ready(summary: &AgentSummary) -> bool {
 }
 
 pub(crate) fn is_agent_status_turn_start_ready(status: &AgentStatus) -> bool {
-    AgentTurnStartSnapshot {
-        status: agent_lifecycle_status_kind(status),
-    }
-    .can_start()
+    AgentTurnStartSnapshot::new(agent_lifecycle_status_kind(status)).can_start()
 }
 
 fn agent_wait_snapshot(summary: &AgentSummary) -> AgentWaitSnapshot {

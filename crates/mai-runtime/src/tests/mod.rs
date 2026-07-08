@@ -306,6 +306,14 @@ fn turn_start_readiness_uses_pl_core_policy() {
         "agent turn 启动可用性判断应由 pl-core AgentTurnStartSnapshot 统一维护"
     );
     assert!(
+        agents_source.contains("AgentTurnStartSnapshot::new"),
+        "AgentStatus 到 turn start snapshot 的共享字段形状应由 pl-core constructor 承载"
+    );
+    assert!(
+        !agents_source.contains("AgentTurnStartSnapshot {\n        status"),
+        "mai-runtime 不应手写 AgentTurnStartSnapshot 字段"
+    );
+    assert!(
         !turn_source.contains(".can_start_turn()"),
         "agents/turn.rs 不应直接调用 mai-protocol 的 can_start_turn"
     );
@@ -2748,10 +2756,7 @@ fn agent_status_allows_new_turn_after_completion() {
         &AgentStatus::RunningTurn
     ));
     assert_eq!(
-        AgentTurnStartSnapshot {
-            status: AgentLifecycleStatusKind::Completed
-        }
-        .readiness(),
+        AgentTurnStartSnapshot::new(AgentLifecycleStatusKind::Completed).readiness(),
         AgentTurnStartReadiness::Ready
     );
 }
