@@ -256,6 +256,7 @@ pub(crate) fn trace_preview_value(value: &Value, max: usize) -> String {
     pl_core::trace_preview_value(value, max)
 }
 
+#[cfg(test)]
 pub(crate) fn trace_preview_output(output: &str, max: usize) -> String {
     pl_core::trace_preview_output(output, max)
 }
