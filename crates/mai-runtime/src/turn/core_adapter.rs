@@ -309,9 +309,9 @@ async fn register_native_shared_tools(
         bash: false,
         workspace_files: true,
         skills: false,
-        mcp: false,
+        mcp: true,
         lsp: false,
-        subagents: false,
+        subagents: true,
         ask_user: true,
         git: git_runtime.is_some(),
         docker: false,
@@ -322,8 +322,23 @@ async fn register_native_shared_tools(
         .iter()
         .map(|tool| tool.name.clone())
         .collect::<HashSet<_>>();
-    let tool_set =
-        pl_core::ToolSetBuilder::from_capabilities(capabilities).with_container_tools(backend);
+    let mcp_backend = Arc::new(super::mcp_resources::MaiMcpResourceBackend::new(
+        ctx.runtime.clone(),
+        ctx.agent.clone(),
+        ctx.agent_id,
+        ctx.cancellation_token.clone(),
+    ));
+    let agent_control_backend = Arc::new(super::agent_control::MaiAgentControlBackend::new(
+        ctx.runtime.clone(),
+        ctx.agent.clone(),
+        ctx.agent_id,
+        ctx.cancellation_token.clone(),
+    ));
+    let tool_set = pl_core::ToolSetBuilder::from_capabilities(capabilities)
+        .with_allowed_tools(visible_tools.iter().cloned())
+        .with_container_tools(backend)
+        .with_mcp_resource_tools(mcp_backend)
+        .with_agent_control_tools(agent_control_backend);
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     if let Some(git_runtime) = git_runtime {
         tool_set
@@ -339,22 +354,6 @@ async fn register_native_shared_tools(
             .register(kernel.core_mut(), workspace_root, None)
             .await;
     }
-    super::mcp_resources::register_mcp_resource_tools(
-        kernel.core_mut(),
-        ctx.runtime.clone(),
-        ctx.agent.clone(),
-        ctx.agent_id,
-        ctx.cancellation_token.clone(),
-        &visible_tools,
-    );
-    super::agent_control::register_native_agent_control_tools(
-        kernel,
-        ctx.runtime.clone(),
-        ctx.agent.clone(),
-        ctx.agent_id,
-        &visible_tools,
-        ctx.cancellation_token.clone(),
-    );
     Ok(())
 }
 

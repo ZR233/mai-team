@@ -1725,17 +1725,31 @@ impl AgentRuntime {
             bash: false,
             workspace_files: true,
             skills: false,
-            mcp: false,
+            mcp: true,
             lsp: false,
-            subagents: false,
+            subagents: true,
             ask_user: true,
             git: git_runtime.is_some(),
             docker: false,
             container: true,
         };
+        let mcp_backend = Arc::new(turn::mcp_resources::MaiMcpResourceBackend::new(
+            self.clone(),
+            agent.clone(),
+            agent_id,
+            cancellation_token.clone(),
+        ));
+        let agent_control_backend = Arc::new(turn::agent_control::MaiAgentControlBackend::new(
+            self.clone(),
+            agent.clone(),
+            agent_id,
+            cancellation_token.clone(),
+        ));
         let tool_set = pl_core::ToolSetBuilder::from_capabilities(capabilities)
             .with_allowed_tools(visible_tools.iter().cloned())
-            .with_container_tools(container_backend);
+            .with_container_tools(container_backend)
+            .with_mcp_resource_tools(mcp_backend)
+            .with_agent_control_tools(agent_control_backend);
         if let Some(git_runtime) = git_runtime {
             tool_set
                 .with_git_tools(
@@ -1750,22 +1764,6 @@ impl AgentRuntime {
                 .register(kernel.core_mut(), workspace_root, None)
                 .await;
         }
-        turn::mcp_resources::register_mcp_resource_tools(
-            kernel.core_mut(),
-            self.clone(),
-            agent.clone(),
-            agent_id,
-            cancellation_token.clone(),
-            &visible_tools,
-        );
-        turn::agent_control::register_native_agent_control_tools(
-            kernel,
-            self.clone(),
-            agent.clone(),
-            agent_id,
-            &visible_tools,
-            cancellation_token,
-        );
         Ok(())
     }
 

@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use mai_protocol::AgentId;
@@ -83,27 +82,6 @@ impl pl_core::McpResourceBackend for MaiMcpResourceBackend {
             .read_resource(&request.server, &request.uri)
             .await
             .map_err(|error| resource_error(pl_core::TOOL_READ_MCP_RESOURCE, error))
-    }
-}
-
-pub(crate) fn register_mcp_resource_tools(
-    core: &mut pl_core::PureCore,
-    runtime: Arc<AgentRuntime>,
-    agent: Arc<AgentRecord>,
-    agent_id: AgentId,
-    cancellation_token: CancellationToken,
-    visible_names: &HashSet<String>,
-) {
-    let backend = Arc::new(MaiMcpResourceBackend::new(
-        runtime,
-        agent,
-        agent_id,
-        cancellation_token,
-    ));
-    for kind in pl_core::McpResourceToolKind::all() {
-        if visible_names.contains(kind.name()) {
-            core.register_tool(pl_core::McpResourceTool::new(*kind, backend.clone()));
-        }
     }
 }
 

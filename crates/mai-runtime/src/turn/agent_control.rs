@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +7,7 @@ use pl_core::{
     AgentControlAgentRecord, AgentControlListOutput, AgentControlListRequest,
     AgentControlMessageOutput, AgentControlSendInputOutput, AgentControlSendInputRequest,
     AgentControlSpawnOutput, AgentControlSpawnRequest, AgentControlTargetRequest,
-    AgentControlWaitOutput, AgentControlWaitRequest, AgentKernel,
+    AgentControlWaitOutput, AgentControlWaitRequest,
 };
 use pl_protocol::AgentStatus as PlAgentStatus;
 use serde_json::Value;
@@ -263,30 +262,6 @@ impl MaiAgentControlBackend {
             return true;
         }
         current_parent == Some(summary.id)
-    }
-}
-
-pub(crate) fn register_native_agent_control_tools(
-    kernel: &mut AgentKernel,
-    runtime: Arc<AgentRuntime>,
-    agent: Arc<AgentRecord>,
-    agent_id: AgentId,
-    visible_tools: &HashSet<String>,
-    cancellation_token: CancellationToken,
-) {
-    let backend = Arc::new(MaiAgentControlBackend::new(
-        runtime,
-        agent,
-        agent_id,
-        cancellation_token,
-    ));
-    for kind in pl_core::AgentControlToolKind::all() {
-        let kind = *kind;
-        if visible_tools.contains(kind.name()) {
-            kernel
-                .core_mut()
-                .register_tool(pl_core::AgentControlTool::new(kind, backend.clone()));
-        }
     }
 }
 
