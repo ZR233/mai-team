@@ -163,7 +163,16 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
         &self,
         request: AgentControlWaitRequest,
     ) -> std::result::Result<AgentControlWaitOutput, Self::Error> {
-        let targets = self.child_agent_ids().await;
+        let targets = request
+            .targets_or_all(
+                self.child_agent_ids()
+                    .await
+                    .into_iter()
+                    .map(|agent_id| agent_id.to_string()),
+            )
+            .into_iter()
+            .map(|target| parse_agent_id(&target))
+            .collect::<crate::Result<Vec<_>>>()?;
         if targets.is_empty() {
             return Ok(AgentControlWaitOutput {
                 message: "no managed sub-agents to wait for".to_string(),
@@ -356,6 +365,10 @@ mod tests {
         assert!(
             source.contains("request.timeout_duration()"),
             "wait_agent 的 timeout 默认值和下限应由 pl-core 请求类型提供"
+        );
+        assert!(
+            source.contains("request.targets_or_all"),
+            "wait_agent 的 target/targets 选择与默认全选策略应由 pl-core 请求类型提供"
         );
         assert!(
             source.contains("request.agent_type_policy()"),
