@@ -25,50 +25,6 @@ pub(crate) struct GithubApiRequest {
     pub(crate) body: Option<Value>,
 }
 
-#[derive(Debug, Clone)]
-enum MaiProductToolHandler {
-    SaveTaskPlan,
-    SubmitReviewResult,
-    SaveArtifact,
-    GithubApiRequest,
-    QueueProjectReviewPrs,
-}
-
-impl MaiProductToolHandler {
-    fn from_tool_name(name: &str) -> crate::Result<Self> {
-        match name {
-            mai_tools::TOOL_SAVE_TASK_PLAN => Ok(Self::SaveTaskPlan),
-            mai_tools::TOOL_SUBMIT_REVIEW_RESULT => Ok(Self::SubmitReviewResult),
-            mai_tools::TOOL_SAVE_ARTIFACT => Ok(Self::SaveArtifact),
-            mai_tools::TOOL_GITHUB_API_REQUEST => Ok(Self::GithubApiRequest),
-            mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS => Ok(Self::QueueProjectReviewPrs),
-            _ => Err(RuntimeError::InvalidInput(format!(
-                "tool `{name}` is not a mai-team product tool"
-            ))),
-        }
-    }
-
-    async fn execute(
-        &self,
-        registry: &MaiProductToolRegistry,
-        arguments: Value,
-    ) -> crate::Result<ToolExecution> {
-        if registry.cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
-        match self {
-            Self::SaveTaskPlan => registry.save_task_plan(arguments).await,
-            Self::SubmitReviewResult => registry.submit_review_result(arguments).await,
-            Self::SaveArtifact => registry.save_artifact(arguments).await,
-            Self::GithubApiRequest => registry.github_api_request(arguments).await,
-            Self::QueueProjectReviewPrs => {
-                let prs = queue_project_review_prs_from_arguments(&arguments)?;
-                registry.queue_project_review_prs(prs).await
-            }
-        }
-    }
-}
-
 /// 将 mai-team 产品工具挂入 pl-core agent kernel 的动态工具注册表。
 ///
 /// 该注册器只承载 GitHub、review queue、artifact、task plan 和 MCP 资源等产品语义；
@@ -102,19 +58,24 @@ impl MaiProductToolRegistry {
     pub(crate) fn registered_tools(&self) -> crate::Result<Vec<RegisteredTool>> {
         self.schemas
             .iter()
-            .map(|schema| {
-                let ToolSchema::Function {
-                    name,
-                    description,
-                    input_schema,
-                } = schema
-                else {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "mai-team product tool `{}` must be a function schema",
-                        schema.name()
-                    )));
-                };
-                let handler = MaiProductToolHandler::from_tool_name(name)?;
+            .map(|schema| self.registered_tool(schema))
+            .collect()
+    }
+
+    fn registered_tool(&self, schema: &ToolSchema) -> crate::Result<RegisteredTool> {
+        let ToolSchema::Function {
+            name,
+            description,
+            input_schema,
+        } = schema
+        else {
+            return Err(RuntimeError::InvalidInput(format!(
+                "mai-team product tool `{}` must be a function schema",
+                schema.name()
+            )));
+        };
+        match name.as_str() {
+            mai_tools::TOOL_SAVE_TASK_PLAN => {
                 let executor = self.clone();
                 let tool_name = name.clone();
                 Ok(RegisteredTool::new(
@@ -123,22 +84,118 @@ impl MaiProductToolRegistry {
                     input_schema.clone(),
                     move |input, _context| {
                         let executor = executor.clone();
-                        let handler = handler.clone();
                         let tool_name = tool_name.clone();
                         async move {
-                            let execution = handler
-                                .execute(&executor, input.arguments)
+                            executor.ensure_not_cancelled(&tool_name)?;
+                            let execution = executor
+                                .save_task_plan(input.arguments)
                                 .await
-                                .map_err(|error| PureError::ToolExecutionFailed {
-                                    tool: tool_name.clone(),
-                                    error: error.to_string(),
-                                })?;
+                                .map_err(|error| product_tool_error(&tool_name, error))?;
                             Ok(execution.into_tool_output())
                         }
                     },
                 ))
-            })
-            .collect()
+            }
+            mai_tools::TOOL_SUBMIT_REVIEW_RESULT => {
+                let executor = self.clone();
+                let tool_name = name.clone();
+                Ok(RegisteredTool::new(
+                    name.clone(),
+                    description.clone(),
+                    input_schema.clone(),
+                    move |input, _context| {
+                        let executor = executor.clone();
+                        let tool_name = tool_name.clone();
+                        async move {
+                            executor.ensure_not_cancelled(&tool_name)?;
+                            let execution = executor
+                                .submit_review_result(input.arguments)
+                                .await
+                                .map_err(|error| product_tool_error(&tool_name, error))?;
+                            Ok(execution.into_tool_output())
+                        }
+                    },
+                ))
+            }
+            mai_tools::TOOL_SAVE_ARTIFACT => {
+                let executor = self.clone();
+                let tool_name = name.clone();
+                Ok(RegisteredTool::new(
+                    name.clone(),
+                    description.clone(),
+                    input_schema.clone(),
+                    move |input, _context| {
+                        let executor = executor.clone();
+                        let tool_name = tool_name.clone();
+                        async move {
+                            executor.ensure_not_cancelled(&tool_name)?;
+                            let execution = executor
+                                .save_artifact(input.arguments)
+                                .await
+                                .map_err(|error| product_tool_error(&tool_name, error))?;
+                            Ok(execution.into_tool_output())
+                        }
+                    },
+                ))
+            }
+            mai_tools::TOOL_GITHUB_API_REQUEST => {
+                let executor = self.clone();
+                let tool_name = name.clone();
+                Ok(RegisteredTool::new(
+                    name.clone(),
+                    description.clone(),
+                    input_schema.clone(),
+                    move |input, _context| {
+                        let executor = executor.clone();
+                        let tool_name = tool_name.clone();
+                        async move {
+                            executor.ensure_not_cancelled(&tool_name)?;
+                            let execution = executor
+                                .github_api_request(input.arguments)
+                                .await
+                                .map_err(|error| product_tool_error(&tool_name, error))?;
+                            Ok(execution.into_tool_output())
+                        }
+                    },
+                ))
+            }
+            mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS => {
+                let executor = self.clone();
+                let tool_name = name.clone();
+                Ok(RegisteredTool::new(
+                    name.clone(),
+                    description.clone(),
+                    input_schema.clone(),
+                    move |input, _context| {
+                        let executor = executor.clone();
+                        let tool_name = tool_name.clone();
+                        async move {
+                            executor.ensure_not_cancelled(&tool_name)?;
+                            let prs = queue_project_review_prs_from_arguments(&input.arguments)
+                                .map_err(|error| product_tool_error(&tool_name, error))?;
+                            let execution = executor
+                                .queue_project_review_prs(prs)
+                                .await
+                                .map_err(|error| product_tool_error(&tool_name, error))?;
+                            Ok(execution.into_tool_output())
+                        }
+                    },
+                ))
+            }
+            _ => Err(RuntimeError::InvalidInput(format!(
+                "tool `{name}` is not a mai-team product tool"
+            ))),
+        }
+    }
+
+    fn ensure_not_cancelled(&self, tool_name: &str) -> pl_protocol::Result<()> {
+        if self.cancellation_token.is_cancelled() {
+            return Err(PureError::ToolExecutionFailed {
+                tool: tool_name.to_string(),
+                error: RuntimeError::TurnCancelled.to_string(),
+            });
+        }
+        Ok(())
     }
 
     async fn save_task_plan(&self, arguments: Value) -> crate::Result<ToolExecution> {
@@ -257,6 +314,13 @@ fn optional_string_argument(arguments: &Value, field: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn product_tool_error(tool_name: &str, error: impl std::fmt::Display) -> PureError {
+    PureError::ToolExecutionFailed {
+        tool: tool_name.to_string(),
+        error: error.to_string(),
+    }
+}
+
 fn json_tool_execution(value: &impl serde::Serialize) -> ToolExecution {
     ToolExecution::new(
         true,
@@ -341,6 +405,14 @@ mod tests {
         assert!(
             !source.contains(&format!("{}{}", "execute_product", "_tool")),
             "mai-team 产品工具应在注册 RegisteredTool 时绑定具体 handler，而不是保留本地大分发入口"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "enum MaiProduct", "ToolHandler")),
+            "mai-team 产品工具不应再通过本地 handler enum 做二次 route"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "from_tool", "_name")),
+            "产品工具 schema 应直接绑定具体 RegisteredTool handler"
         );
         assert!(
             !source.contains(&format!("{}{}", "TOOL_GIT_SYNC", "_DEFAULT_BRANCH")),
