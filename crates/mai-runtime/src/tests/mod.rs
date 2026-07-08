@@ -3695,7 +3695,8 @@ async fn wait_agent_tool_returns_final_assistant_response() {
         Some(child_id.to_string().as_str())
     );
     assert_eq!(outer["timedOut"].as_bool(), Some(false));
-    assert_eq!(value["timed_out"].as_bool(), Some(false));
+    assert!(value.get("timed_out").is_none());
+    assert_eq!(value["timedOut"].as_bool(), Some(false));
     assert!(matches!(
         runtime.agent(child_id).await,
         Err(RuntimeError::AgentNotFound(id)) if id == child_id
@@ -7558,7 +7559,8 @@ async fn wait_agent_accepts_targets_and_send_input_queues_busy_target() {
     );
     assert!(pending[0]["diagnostics"]["idle_ms"].as_u64().is_some());
     assert_eq!(outer["timedOut"].as_bool(), Some(true));
-    assert_eq!(value["timed_out"].as_bool(), Some(true));
+    assert!(value.get("timed_out").is_none());
+    assert_eq!(value["timedOut"].as_bool(), Some(true));
 }
 
 #[tokio::test]

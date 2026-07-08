@@ -197,7 +197,7 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
             )
             .await?;
         let timed_out = output
-            .get("timed_out")
+            .get("timedOut")
             .and_then(Value::as_bool)
             .unwrap_or(false);
         Ok(AgentControlWaitOutput {

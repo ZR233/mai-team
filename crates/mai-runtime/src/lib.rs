@@ -1794,7 +1794,7 @@ impl AgentRuntime {
                 return Ok(json!({
                     "completed": completed_outputs,
                     "pending": pending_outputs,
-                    "timed_out": !pending_outputs.is_empty(),
+                    "timedOut": !pending_outputs.is_empty(),
                 }));
             }
             tokio::select! {
