@@ -14,7 +14,9 @@ use mai_protocol::*;
 use mai_skills::{SkillInjections, SkillsManager};
 use mai_store::{AgentLogFilter, ConfigStore, ProviderSelection, ToolTraceFilter};
 #[cfg(test)]
-use mai_tools::build_tool_definitions_with_filter;
+use mai_tools::build_tool_schemas_with_filter;
+#[cfg(test)]
+use pl_model::ToolSchema;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -1595,9 +1597,9 @@ impl AgentRuntime {
         arguments: Value,
     ) -> Result<ToolExecution> {
         let agent = self.agent(agent_id).await?;
-        let mut product_tools = build_tool_definitions_with_filter(&[], |tool| tool == name);
+        let mut product_tools = build_tool_schemas_with_filter(&[], |tool| tool == name);
         if product_tools.is_empty() && name.starts_with("mcp__") {
-            product_tools.push(ToolDefinition::function(
+            product_tools.push(ToolSchema::function(
                 name.to_string(),
                 format!("Call MCP tool `{name}`."),
                 json!({"type": "object"}),
@@ -1623,7 +1625,7 @@ impl AgentRuntime {
         agent_id: AgentId,
         name: &str,
         arguments: Value,
-        product_tools: Vec<ToolDefinition>,
+        product_tools: Vec<ToolSchema>,
     ) -> Result<Option<ToolExecution>> {
         let (event_tx, mut event_rx) = broadcast::channel(8);
         let cancellation_token = CancellationToken::new();
@@ -1635,9 +1637,10 @@ impl AgentRuntime {
             product_tools,
             cancellation_token.clone(),
         );
+        let product_tools = product_registry.registered_tools()?;
         let kernel = self
             .build_shared_tool_kernel_for_test(
-                product_registry.registered_tools(),
+                product_tools,
                 workspace_root.clone(),
                 agent,
                 agent_id,

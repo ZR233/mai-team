@@ -1,10 +1,10 @@
 use crate::names::TOOL_GITHUB_API_REQUEST;
 use crate::schema::object_schema;
-use mai_protocol::ToolDefinition;
+use pl_model::ToolSchema;
 use serde_json::json;
 
-pub(crate) fn definitions() -> Vec<ToolDefinition> {
-    vec![ToolDefinition::function(
+pub(crate) fn definitions() -> Vec<ToolSchema> {
+    vec![ToolSchema::function(
         TOOL_GITHUB_API_REQUEST,
         "Call the current Mai project's GitHub REST API through the managed gh sidecar. \
              Use this for PR review submission, issue comments, labels, and other GitHub reads or writes. \

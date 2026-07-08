@@ -277,7 +277,7 @@ fn kernel_tools_do_not_rebuild_shared_tools_as_mai_definitions() {
     ] {
         assert!(
             !source.contains(forbidden),
-            "pl-core shared tools 不应在 mai-runtime 里重建为 mai ToolDefinition: {forbidden}"
+            "pl-core shared tools 不应在 mai-runtime 里重建为 mai 旧工具定义类型: {forbidden}"
         );
     }
 }
@@ -1000,7 +1000,7 @@ fn model_client_delegates_continuation_cache_to_pl_core() {
         "HashSet",
         "unsupported_continuations",
         "continuation_is_unsupported",
-        "ToolDefinition",
+        &format!("{}{}", "Tool", "Definition"),
         "fn tool_schema",
     ] {
         assert!(

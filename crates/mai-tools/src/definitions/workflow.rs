@@ -1,11 +1,11 @@
 use crate::names::{TOOL_SAVE_ARTIFACT, TOOL_SAVE_TASK_PLAN, TOOL_SUBMIT_REVIEW_RESULT};
 use crate::schema::object_schema;
-use mai_protocol::ToolDefinition;
+use pl_model::ToolSchema;
 use serde_json::json;
 
-pub(crate) fn definitions() -> Vec<ToolDefinition> {
+pub(crate) fn definitions() -> Vec<ToolSchema> {
     vec![
-        ToolDefinition::function(
+        ToolSchema::function(
             TOOL_SAVE_TASK_PLAN,
             "Save or update the task plan. Each call replaces the previous plan and increments the version. \
              Plans must be decision-complete: the Executor should not need to make design decisions. \
@@ -15,7 +15,7 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
                 ("markdown", json!({ "type": "string" }), true),
             ]),
         ),
-        ToolDefinition::function(
+        ToolSchema::function(
             TOOL_SUBMIT_REVIEW_RESULT,
             "Submit the structured review result for a task workflow. Only reviewer agents attached to a task may call this.",
             object_schema(vec![
@@ -24,7 +24,7 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
                 ("summary", json!({ "type": "string" }), true),
             ]),
         ),
-        ToolDefinition::function(
+        ToolSchema::function(
             TOOL_SAVE_ARTIFACT,
             "Register a file as a downloadable artifact for the user. \
              Use this when you have produced a deliverable file (report, code output, data export, generated document, etc.) \

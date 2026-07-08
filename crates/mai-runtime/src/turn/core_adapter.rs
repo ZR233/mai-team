@@ -2,8 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use mai_protocol::{
-    AgentId, AgentStatus, MessageRole, ServiceEventKind, SessionId, ToolDefinition, TurnId,
-    TurnStatus,
+    AgentId, AgentStatus, MessageRole, ServiceEventKind, SessionId, TurnId, TurnStatus,
 };
 use pl_core::{
     AgentKernel, CompileMode, ContextCompactionConfig, ContextCompactionReplacement,
@@ -11,6 +10,7 @@ use pl_core::{
     InstructionSourceKind, PureCoreBuilder, ReasoningEffort, RecentInteractionTailConfig,
     TraceRecorder, TurnOptions, TurnOutcome, TurnOutcomeStatus, TurnRequest, TurnReturnError,
 };
+use pl_model::ToolSchema;
 use pl_trace::AgentEvent;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -31,7 +31,7 @@ pub(crate) struct PureCoreTurnContext {
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) instructions: String,
     pub(crate) visible_tool_names: HashSet<String>,
-    pub(crate) product_tools: Vec<ToolDefinition>,
+    pub(crate) product_tools: Vec<ToolSchema>,
     pub(crate) history: Vec<pl_protocol::Message>,
     pub(crate) cancellation_token: CancellationToken,
 }
@@ -67,13 +67,10 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
         ctx.product_tools.clone(),
         ctx.cancellation_token.clone(),
     );
-    let kernel = build_kernel_with_native_shared_tools(
-        builder,
-        runtime_profile,
-        product_tool_registry.registered_tools(),
-        &ctx,
-    )
-    .await?;
+    let product_tools = product_tool_registry.registered_tools()?;
+    let kernel =
+        build_kernel_with_native_shared_tools(builder, runtime_profile, product_tools, &ctx)
+            .await?;
 
     let mut session = CoreSession::from_messages(ctx.history.clone());
     let (event_tx, event_rx) = tokio::sync::broadcast::channel(64);

@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use mai_protocol::{AgentId, AgentRole, ToolDefinition};
+use mai_protocol::{AgentId, AgentRole};
 use pl_core::RegisteredTool;
+use pl_model::ToolSchema;
 use pl_protocol::PureError;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -33,7 +34,7 @@ pub(crate) struct MaiProductToolRegistry {
     runtime: Arc<AgentRuntime>,
     agent: Arc<AgentRecord>,
     agent_id: AgentId,
-    definitions: Vec<ToolDefinition>,
+    schemas: Vec<ToolSchema>,
     cancellation_token: CancellationToken,
 }
 
@@ -42,28 +43,39 @@ impl MaiProductToolRegistry {
         runtime: Arc<AgentRuntime>,
         agent: Arc<AgentRecord>,
         agent_id: AgentId,
-        definitions: Vec<ToolDefinition>,
+        schemas: Vec<ToolSchema>,
         cancellation_token: CancellationToken,
     ) -> Self {
         Self {
             runtime,
             agent,
             agent_id,
-            definitions,
+            schemas,
             cancellation_token,
         }
     }
 
-    pub(crate) fn registered_tools(&self) -> Vec<RegisteredTool> {
-        self.definitions
+    pub(crate) fn registered_tools(&self) -> crate::Result<Vec<RegisteredTool>> {
+        self.schemas
             .iter()
-            .map(|definition| {
-                let tool_name = definition.name.clone();
+            .map(|schema| {
+                let ToolSchema::Function {
+                    name,
+                    description,
+                    input_schema,
+                } = schema
+                else {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "mai-team product tool `{}` must be a function schema",
+                        schema.name()
+                    )));
+                };
+                let tool_name = name.clone();
                 let executor = self.clone();
-                RegisteredTool::new(
-                    definition.name.clone(),
-                    definition.description.clone(),
-                    definition.parameters.clone(),
+                Ok(RegisteredTool::new(
+                    name.clone(),
+                    description.clone(),
+                    input_schema.clone(),
                     move |input, _context| {
                         let executor = executor.clone();
                         let tool_name = tool_name.clone();
@@ -78,7 +90,7 @@ impl MaiProductToolRegistry {
                             Ok(execution.into_tool_output())
                         }
                     },
-                )
+                ))
             })
             .collect()
     }
@@ -332,6 +344,10 @@ mod tests {
         assert!(
             !source.contains(&format!("{}{}", "ProductTool", "Router")),
             "mai-team 不应保留产品工具 router 大分发层"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "Tool", "Definition")),
+            "mai-team 产品工具注册不应再经过 mai_protocol 旧工具定义类型"
         );
     }
 

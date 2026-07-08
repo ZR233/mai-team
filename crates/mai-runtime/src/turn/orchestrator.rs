@@ -7,7 +7,7 @@ use mai_protocol::{
     TurnStatus,
 };
 use mai_skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
-use mai_tools::build_tool_definitions_with_filter;
+use mai_tools::build_tool_schemas_with_filter;
 use pl_protocol::MessageContent;
 use serde_json::json;
 use tokio::time::Instant;
@@ -116,7 +116,7 @@ struct TurnModelContext {
     provider_selection: mai_store::ProviderSelection,
     visible_tool_names: HashSet<String>,
     tool_count: usize,
-    product_tools: Vec<mai_protocol::ToolDefinition>,
+    product_tools: Vec<pl_model::ToolSchema>,
     instructions: String,
 }
 
@@ -335,7 +335,7 @@ pub(crate) async fn run_turn_inner(
         let visible_tools =
             super::tool_visibility::visible_tool_names(state, &agent, &mcp_tools).await;
         let product_tools =
-            build_tool_definitions_with_filter(&mcp_tools, |name| visible_tools.contains(name));
+            build_tool_schemas_with_filter(&mcp_tools, |name| visible_tools.contains(name));
         let tool_count = visible_tools.len();
         let instructions = {
             let _project_skill_guard = ops.project_skill_read_guard(&agent).await;

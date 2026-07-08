@@ -1993,7 +1993,6 @@ name = "mai-tools"
 version = "0.1.11"
 dependencies = [
  "mai-mcp",
- "mai-protocol",
  "pl-core",
  "pl-model",
  "schemars",

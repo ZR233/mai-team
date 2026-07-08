@@ -1513,30 +1513,6 @@ pub enum ServiceEventKind {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolDefinition {
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub name: String,
-    pub description: String,
-    pub parameters: Value,
-}
-
-impl ToolDefinition {
-    pub fn function(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        parameters: Value,
-    ) -> Self {
-        Self {
-            kind: "function".to_string(),
-            name: name.into(),
-            description: description.into(),
-            parameters,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelOutputItem {

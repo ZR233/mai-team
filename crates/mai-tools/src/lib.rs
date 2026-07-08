@@ -1,5 +1,5 @@
 use mai_mcp::McpTool;
-use mai_protocol::ToolDefinition;
+use pl_model::ToolSchema;
 
 mod definitions;
 mod names;
@@ -7,24 +7,24 @@ mod schema;
 
 pub use names::*;
 
-pub fn build_tool_definitions(mcp_tools: &[McpTool]) -> Vec<ToolDefinition> {
-    build_tool_definitions_with_filter(mcp_tools, |_| true)
+pub fn build_tool_schemas(mcp_tools: &[McpTool]) -> Vec<ToolSchema> {
+    build_tool_schemas_with_filter(mcp_tools, |_| true)
 }
 
-pub fn build_tool_definitions_with_filter(
+pub fn build_tool_schemas_with_filter(
     mcp_tools: &[McpTool],
     allow_tool: impl Fn(&str) -> bool,
-) -> Vec<ToolDefinition> {
-    let mut tools = definitions::builtin_tool_definitions()
+) -> Vec<ToolSchema> {
+    let mut tools = definitions::builtin_tool_schemas()
         .into_iter()
-        .filter(|tool| allow_tool(&tool.name))
+        .filter(|tool| allow_tool(tool.name()))
         .collect::<Vec<_>>();
     tools.extend(
         mcp_tools
             .iter()
             .filter(|tool| allow_tool(&tool.model_name))
             .map(|tool| {
-                ToolDefinition::function(
+                ToolSchema::function(
                     tool.model_name.clone(),
                     if tool.description.is_empty() {
                         format!("Call MCP tool `{}` on server `{}`.", tool.name, tool.server)
@@ -44,12 +44,16 @@ mod tests {
     use serde_json::{Value, json};
 
     #[test]
-    fn product_tool_api_is_definition_only() {
+    fn product_tool_api_is_pl_schema_only() {
         let api = include_str!("lib.rs");
         let names = include_str!("names.rs");
 
         assert!(!api.contains(&format!("{}{}", "route", "_tool")));
         assert!(!api.contains(&format!("{}{}", "Routed", "Tool")));
+        assert!(
+            !api.contains(&format!("{}{}", "Tool", "Definition")),
+            "mai-tools 产品工具 schema 应直接使用 pl_model::ToolSchema"
+        );
         assert!(
             !names.contains("TOOL_GIT_SYNC_DEFAULT_BRANCH"),
             "git_sync_default_branch is a pl-core shared git tool"
@@ -81,12 +85,11 @@ mod tests {
 
     #[test]
     fn builtin_definitions_are_product_tools_only() {
-        let tools = build_tool_definitions(&[]);
+        let tools = build_tool_schemas(&[]);
         let names = tool_names(&tools);
 
         assert!(names.contains(&TOOL_GITHUB_API_REQUEST));
         assert!(names.contains(&TOOL_SAVE_ARTIFACT));
-        assert!(tools.iter().all(|tool| tool.kind == "function"));
         for legacy in [
             pl_core::TOOL_CONTAINER_EXEC,
             pl_core::WorkspaceFileToolKind::ReadFile.name(),
@@ -122,17 +125,24 @@ mod tests {
 
     #[test]
     fn github_request_schema_covers_read_write_without_credentials() {
-        let tools = build_tool_definitions(&[]);
+        let tools = build_tool_schemas(&[]);
         let request = tools
             .iter()
-            .find(|tool| tool.name == TOOL_GITHUB_API_REQUEST)
+            .find(|tool| tool.name() == TOOL_GITHUB_API_REQUEST)
             .expect("github_api_request");
+        let ToolSchema::Function {
+            description,
+            input_schema,
+            ..
+        } = request
+        else {
+            panic!("github_api_request must be a function tool");
+        };
         assert_eq!(
-            request.parameters.get("required"),
+            input_schema.get("required"),
             Some(&json!(["method", "path"]))
         );
-        let properties = request
-            .parameters
+        let properties = input_schema
             .get("properties")
             .and_then(Value::as_object)
             .expect("properties");
@@ -140,7 +150,6 @@ mod tests {
             properties.get("body").and_then(|schema| schema.get("type")),
             Some(&json!("object"))
         );
-        let description = request.description.as_str();
         assert!(description.contains("single POST"));
         assert!(description.contains("event"));
         assert!(description.contains("pending review"));
@@ -162,13 +171,13 @@ mod tests {
             input_schema: json!({"type":"object"}),
             output_schema: None,
         };
-        let tools = build_tool_definitions_with_filter(&[mcp], |name| {
+        let tools = build_tool_schemas_with_filter(&[mcp], |name| {
             name == TOOL_SAVE_ARTIFACT || name == "mcp__s__n"
         });
         assert_eq!(tool_names(&tools), vec![TOOL_SAVE_ARTIFACT, "mcp__s__n"]);
     }
 
-    fn tool_names(tools: &[ToolDefinition]) -> Vec<&str> {
-        tools.iter().map(|tool| tool.name.as_str()).collect()
+    fn tool_names(tools: &[ToolSchema]) -> Vec<&str> {
+        tools.iter().map(ToolSchema::name).collect()
     }
 }

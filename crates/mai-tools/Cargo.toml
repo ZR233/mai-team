@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 mai-mcp = { path = "../mai-mcp", version = "0.1.11" }
-mai-protocol = { path = "../mai-protocol", version = "0.1.11" }
 pl-core.workspace = true
 pl-model.workspace = true
 schemars.workspace = true
