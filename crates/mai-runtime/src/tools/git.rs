@@ -7,8 +7,8 @@ use mai_docker::{DockerClient, SidecarParams, project_agent_workspace_volume};
 use mai_protocol::{AgentId, ProjectId, ProjectSummary};
 use pl_core::{
     ExecutionBackend, ExecutionOutput, ExecutionRequest, GIT_TOKEN_ENV, GitCredential,
-    GitCredentialProvider, GitCredentialRequest, GitPolicy, GitTool, GitToolKind,
-    GitWorkspaceConfig, PureError, Tool, ToolContext, ToolInput,
+    GitCredentialProvider, GitCredentialRequest, GitPolicy, GitToolKind, GitWorkspaceConfig,
+    PureError, ToolCapabilityConfig, ToolContext, ToolInput,
 };
 use serde_json::{Value, json};
 #[cfg(test)]
@@ -61,27 +61,55 @@ pub(crate) async fn execute_git_tool(
     }
     let kind = GitToolKind::from_name(name)
         .ok_or_else(|| RuntimeError::InvalidInput(format!("unsupported git tool `{name}`")))?;
-    let output = execute_pl_core_git_tool(&context, kind, arguments).await?;
+    let output = execute_git_tool_via_registry(&context, kind, arguments).await?;
     Ok(ToolExecution::new(true, output, false))
 }
 
-async fn execute_pl_core_git_tool(
+async fn execute_git_tool_via_registry(
     context: &GitToolContext<'_>,
     kind: GitToolKind,
     arguments: Value,
 ) -> Result<String> {
     let config = git_workspace_config(context);
-    let tool = GitTool::new(
-        kind,
-        config.clone(),
-        Arc::new(BorrowedGitExecutionBackend::new(
-            &context.backend,
-            context.agent_id,
-        )),
-        Arc::new(MaiGitCredentialProvider::Static {
-            token: context.token.clone(),
-        }),
-    );
+    let workspace_root = config.worktree.clone();
+    let mut kernel = pl_core::AgentKernel::builder(
+        pl_core::PureCoreBuilder::from_provider_info(pl_model::ProviderInfo::deepseek(None))
+            .map_err(runtime_error_from_pure)?,
+    )
+    .with_profile(pl_core::CoreAgentProfile::host_provided(
+        workspace_root.clone(),
+    ))
+    .build()
+    .await;
+    let capabilities = ToolCapabilityConfig {
+        bash: false,
+        workspace_files: false,
+        skills: false,
+        mcp: false,
+        lsp: false,
+        subagents: false,
+        ask_user: false,
+        git: true,
+        docker: false,
+        container: false,
+    };
+    pl_core::ToolSetBuilder::from_capabilities(capabilities)
+        .with_allowed_tools([kind.name()])
+        .with_git_tools(
+            config,
+            Arc::new(ProjectGitExecutionBackend::new(
+                &context.backend,
+                context.agent_id,
+            )),
+            Arc::new(MaiGitCredentialProvider::Static {
+                token: context.token.clone(),
+            }),
+        )
+        .register(kernel.core_mut(), workspace_root.clone(), None)
+        .await;
+    let tool = kernel.tool(kind.name()).ok_or_else(|| {
+        RuntimeError::InvalidInput(format!("git tool `{}` was not registered", kind.name()))
+    })?;
     let output = tool
         .execute(
             ToolInput {
@@ -90,7 +118,7 @@ async fn execute_pl_core_git_tool(
                 tool_id: kind.name().to_string(),
                 revision_base: 0,
             },
-            pl_tool_context(config.worktree),
+            pl_tool_context(workspace_root),
         )
         .await
         .map_err(runtime_error_from_pure)?;
@@ -272,53 +300,77 @@ impl GitCredentialProvider for MaiGitCredentialProvider {
     }
 }
 
-struct BorrowedGitExecutionBackend<'a> {
-    backend: &'a GitToolBackend<'a>,
-    agent_id: AgentId,
+enum ProjectGitExecutionBackend {
+    Sidecar {
+        docker: DockerClient,
+        sidecar_image: String,
+        workspace_volume: String,
+        repo_path: String,
+        agent_id: AgentId,
+    },
+    #[cfg(test)]
+    Host,
 }
 
-impl<'a> BorrowedGitExecutionBackend<'a> {
-    fn new(backend: &'a GitToolBackend<'a>, agent_id: AgentId) -> Self {
-        Self { backend, agent_id }
-    }
-}
-
-impl fmt::Debug for BorrowedGitExecutionBackend<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.backend {
-            GitToolBackend::Sidecar { .. } => f.write_str("BorrowedGitExecutionBackend::Sidecar"),
+impl ProjectGitExecutionBackend {
+    fn new(backend: &GitToolBackend<'_>, agent_id: AgentId) -> Self {
+        match backend {
+            GitToolBackend::Sidecar {
+                docker,
+                sidecar_image,
+                workspace_volume,
+                repo_path,
+            } => Self::Sidecar {
+                docker: (*docker).clone(),
+                sidecar_image: (*sidecar_image).to_string(),
+                workspace_volume: workspace_volume.clone(),
+                repo_path: (*repo_path).to_string(),
+                agent_id,
+            },
             #[cfg(test)]
-            GitToolBackend::Host { .. } => f.write_str("BorrowedGitExecutionBackend::Host"),
+            GitToolBackend::Host { .. } => Self::Host,
         }
     }
 }
 
-impl ExecutionBackend for BorrowedGitExecutionBackend<'_> {
-    fn run(
+impl fmt::Debug for ProjectGitExecutionBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sidecar { agent_id, .. } => f
+                .debug_struct("ProjectGitExecutionBackend::Sidecar")
+                .field("agent_id", agent_id)
+                .finish(),
+            #[cfg(test)]
+            Self::Host => f.write_str("ProjectGitExecutionBackend::Host"),
+        }
+    }
+}
+
+impl ExecutionBackend for ProjectGitExecutionBackend {
+    async fn run(
         &self,
         request: ExecutionRequest,
-    ) -> impl Future<Output = std::result::Result<ExecutionOutput, PureError>> + Send {
-        async move {
-            match self.backend {
-                GitToolBackend::Sidecar {
-                    docker,
-                    sidecar_image,
-                    workspace_volume,
-                    repo_path,
-                } => run_sidecar_git_output(
-                    docker,
-                    sidecar_image,
-                    workspace_volume,
-                    repo_path,
-                    self.agent_id,
-                    request.env.get(GIT_TOKEN_ENV).map(String::as_str),
-                    &request.args,
-                )
-                .await
-                .map_err(pure_error_from_runtime),
-                #[cfg(test)]
-                GitToolBackend::Host { .. } => run_host_git_request(request).await,
-            }
+    ) -> std::result::Result<ExecutionOutput, PureError> {
+        match self {
+            Self::Sidecar {
+                docker,
+                sidecar_image,
+                workspace_volume,
+                repo_path,
+                agent_id,
+            } => run_sidecar_git_output(
+                docker,
+                sidecar_image,
+                workspace_volume,
+                repo_path,
+                *agent_id,
+                request.env.get(GIT_TOKEN_ENV).map(String::as_str),
+                &request.args,
+            )
+            .await
+            .map_err(pure_error_from_runtime),
+            #[cfg(test)]
+            Self::Host => run_host_git_request(request).await,
         }
     }
 }
@@ -510,6 +562,31 @@ mod tests {
 
     use super::*;
     use crate::projects::workspace;
+
+    #[test]
+    fn project_git_tool_uses_pl_core_tool_set_registry() {
+        let source = include_str!("git.rs");
+        let start = source
+            .find("pub(crate) async fn execute_git_tool")
+            .expect("execute_git_tool");
+        let end = source
+            .find("pub(crate) struct NativeGitToolRuntime")
+            .expect("native git runtime");
+        let execute_path = &source[start..end];
+
+        assert!(
+            execute_path.contains("ToolSetBuilder::from_capabilities"),
+            "project git tools must be registered through pl-core ToolSetBuilder"
+        );
+        assert!(
+            !execute_path.contains("GitTool::new"),
+            "project git tools must not bypass the pl-core tool registry"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "execute_pl_core", "_git_tool")),
+            "project git tools should not keep a direct GitTool execution helper"
+        );
+    }
 
     #[tokio::test]
     async fn git_status_runs_inside_agent_clone() {
