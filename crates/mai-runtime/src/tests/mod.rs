@@ -443,6 +443,31 @@ fn set_turn_status_uses_pl_core_token_transition() {
     );
 }
 
+#[test]
+fn project_mcp_cancellation_uses_pl_core_checkpoint() {
+    let runtime_source = include_str!("../lib.rs");
+    let start = runtime_source
+        .find("async fn inject_project_mcp_tools(")
+        .unwrap();
+    let end = runtime_source[start..].find("#[async_trait]").unwrap();
+    let inject_body = &runtime_source[start..start + end];
+    let facade_source = include_str!("../facade/project_mcp.rs");
+
+    for (name, source) in [
+        ("inject_project_mcp_tools", inject_body),
+        ("ensure_project_mcp_manager", facade_source),
+    ] {
+        assert!(
+            source.contains("ensure_turn_not_cancelled"),
+            "{name} 应复用 pl-core 的取消 checkpoint"
+        );
+        assert!(
+            !source.contains("cancellation_token.is_cancelled()"),
+            "{name} 不应直接解释 CancellationToken"
+        );
+    }
+}
+
 fn pl_text(message: &Message) -> &str {
     match &message.content {
         MessageContent::Text(text) => text,

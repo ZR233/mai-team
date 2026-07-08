@@ -57,7 +57,10 @@ pub use model_profile::{
     core_model_turn_request, core_provider_for_selection, model_supports_continuation,
 };
 pub use model_projection::{completion_response_to_model_response, completion_response_usage};
-use pl_core::{AgentTurnStatusGuard, AgentTurnStatusOutcome, AgentTurnStatusTransition};
+use pl_core::{
+    AgentTurnStatusGuard, AgentTurnStatusOutcome, AgentTurnStatusTransition,
+    ensure_turn_not_cancelled,
+};
 use projects::review::ProjectReviewCycleResult;
 use projects::review::pool::{ProjectReviewPoolEnqueueSummary, ProjectReviewSignalInput};
 use projects::review::relay_queue::{
@@ -2775,9 +2778,8 @@ impl AgentRuntime {
         _session_id: SessionId,
         cancellation_token: &CancellationToken,
     ) -> Result<()> {
-        if cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
+        ensure_turn_not_cancelled(cancellation_token)
+            .map_err(turn::core_adapter::runtime_error_from_pl_turn)?;
         if agent.summary.read().await.project_id.is_none() {
             return Ok(());
         }
