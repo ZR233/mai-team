@@ -316,17 +316,24 @@ fn tool_visibility_consumes_pl_core_shared_tool_names() {
     let source = include_str!("../turn/tool_visibility.rs");
 
     assert!(
-        source.contains("shared_tool_names"),
-        "共享工具名目录应由 pl-core 直接提供"
+        source.contains("hosted_container_shared_tool_names"),
+        "hosted container 共享工具可见名目录应由 pl-core 直接提供"
     );
     assert!(
         !source.contains("bash: false") && !source.contains("workspace_files: true"),
         "tool visibility 不应手写共享工具 schema options，应从 pl-core hosted capability preset 派生"
     );
-    for forbidden in ["pl_model::ToolSchema", "shared_tool_schema_name"] {
+    for forbidden in [
+        "pl_model::ToolSchema",
+        "shared_tool_schema_name",
+        "pl_core::shared_tool_names",
+        "shared_tool_name_options",
+        "canonical_git_tool_names",
+        "TOOL_GIT_STATUS",
+    ] {
         assert!(
             !source.contains(forbidden),
-            "tool visibility 不应解析 pl-core schema 来取得工具名: {forbidden}"
+            "tool visibility 不应维护或解析 pl-core 共享工具名目录: {forbidden}"
         );
     }
 }

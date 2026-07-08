@@ -28,59 +28,25 @@ pub(crate) async fn visible_tool_names(
     mcp_tools: &[McpTool],
 ) -> HashSet<String> {
     let capability = agent_capability(state, agent).await;
-    let mut names = pl_core::shared_tool_names(shared_tool_name_options())
+    let has_project_workspace = agent.summary.read().await.project_id.is_some();
+    let shared_visibility = pl_core::HostedSharedToolVisibility::default()
+        .with_git(has_project_workspace)
+        .with_spawn_agent(capability.can_spawn_agents)
+        .with_close_agent(capability.can_close_agents);
+    let mut names = pl_core::hosted_container_shared_tool_names(shared_visibility)
         .into_iter()
-        .filter(|name| default_shared_tool_visible(name))
         .collect::<HashSet<_>>();
     names.extend([
-        pl_core::TOOL_LIST_MCP_RESOURCES.to_string(),
-        pl_core::TOOL_LIST_MCP_RESOURCE_TEMPLATES.to_string(),
-        pl_core::TOOL_READ_MCP_RESOURCE.to_string(),
         mai_tools::TOOL_SAVE_TASK_PLAN.to_string(),
         mai_tools::TOOL_SUBMIT_REVIEW_RESULT.to_string(),
         mai_tools::TOOL_SAVE_ARTIFACT.to_string(),
         mai_tools::TOOL_GITHUB_API_REQUEST.to_string(),
     ]);
-    if agent.summary.read().await.project_id.is_some() {
-        names.extend(canonical_git_tool_names().map(str::to_string));
-    }
     if project_review_queue_tool_visible(agent).await {
         names.insert(mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS.to_string());
     }
-    if capability.can_spawn_agents {
-        names.insert(pl_core::TOOL_SPAWN_AGENT.to_string());
-    }
-    if capability.can_close_agents {
-        names.insert(pl_core::TOOL_CLOSE_AGENT.to_string());
-    }
     names.extend(mcp_tools.iter().map(|tool| tool.model_name.clone()));
     names
-}
-
-fn default_shared_tool_visible(name: &str) -> bool {
-    !matches!(name, pl_core::TOOL_SPAWN_AGENT | pl_core::TOOL_CLOSE_AGENT)
-        && !canonical_git_tool_names().any(|tool| tool == name)
-}
-
-fn canonical_git_tool_names() -> impl Iterator<Item = &'static str> {
-    [
-        pl_core::TOOL_GIT_STATUS,
-        pl_core::TOOL_GIT_DIFF,
-        pl_core::TOOL_GIT_BRANCH,
-        pl_core::TOOL_GIT_FETCH,
-        pl_core::TOOL_GIT_COMMIT,
-        pl_core::TOOL_GIT_PUSH,
-        pl_core::TOOL_GIT_WORKSPACE_INFO,
-        pl_core::TOOL_GIT_SYNC_DEFAULT_BRANCH,
-    ]
-    .into_iter()
-}
-
-fn shared_tool_name_options() -> pl_core::SharedToolSchemaOptions {
-    pl_core::SharedToolSchemaOptions::from_capabilities(
-        &pl_core::ToolCapabilityConfig::hosted_container_workspace(),
-    )
-    .with_plan_exit(false)
 }
 
 async fn agent_capability(state: &RuntimeState, agent: &AgentRecord) -> AgentCapability {
