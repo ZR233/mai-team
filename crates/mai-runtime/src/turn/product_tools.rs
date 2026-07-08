@@ -72,102 +72,63 @@ impl MaiProductToolRegistry {
         match name.as_str() {
             mai_tools::TOOL_SAVE_TASK_PLAN => {
                 let executor = self.clone();
-                let tool_name = name.clone();
-                Ok(RegisteredTool::from_execution_result(
+                Ok(RegisteredTool::from_fallible_execution_result(
                     name.clone(),
                     description.clone(),
                     input_schema.clone(),
                     move |input, _context| {
                         let executor = executor.clone();
-                        let tool_name = tool_name.clone();
-                        async move {
-                            let execution = executor
-                                .save_task_plan(input.arguments)
-                                .await
-                                .map_err(|error| product_tool_error(&tool_name, error))?;
-                            Ok(execution)
-                        }
+                        async move { executor.save_task_plan(input.arguments).await }
                     },
                 ))
             }
             mai_tools::TOOL_SUBMIT_REVIEW_RESULT => {
                 let executor = self.clone();
-                let tool_name = name.clone();
-                Ok(RegisteredTool::from_execution_result(
+                Ok(RegisteredTool::from_fallible_execution_result(
                     name.clone(),
                     description.clone(),
                     input_schema.clone(),
                     move |input, _context| {
                         let executor = executor.clone();
-                        let tool_name = tool_name.clone();
-                        async move {
-                            let execution = executor
-                                .submit_review_result(input.arguments)
-                                .await
-                                .map_err(|error| product_tool_error(&tool_name, error))?;
-                            Ok(execution)
-                        }
+                        async move { executor.submit_review_result(input.arguments).await }
                     },
                 ))
             }
             mai_tools::TOOL_SAVE_ARTIFACT => {
                 let executor = self.clone();
-                let tool_name = name.clone();
-                Ok(RegisteredTool::from_execution_result(
+                Ok(RegisteredTool::from_fallible_execution_result(
                     name.clone(),
                     description.clone(),
                     input_schema.clone(),
                     move |input, _context| {
                         let executor = executor.clone();
-                        let tool_name = tool_name.clone();
-                        async move {
-                            let execution = executor
-                                .save_artifact(input.arguments)
-                                .await
-                                .map_err(|error| product_tool_error(&tool_name, error))?;
-                            Ok(execution)
-                        }
+                        async move { executor.save_artifact(input.arguments).await }
                     },
                 ))
             }
             mai_tools::TOOL_GITHUB_API_REQUEST => {
                 let executor = self.clone();
-                let tool_name = name.clone();
-                Ok(RegisteredTool::from_execution_result(
+                Ok(RegisteredTool::from_fallible_execution_result(
                     name.clone(),
                     description.clone(),
                     input_schema.clone(),
                     move |input, _context| {
                         let executor = executor.clone();
-                        let tool_name = tool_name.clone();
-                        async move {
-                            let execution = executor
-                                .github_api_request(input.arguments)
-                                .await
-                                .map_err(|error| product_tool_error(&tool_name, error))?;
-                            Ok(execution)
-                        }
+                        async move { executor.github_api_request(input.arguments).await }
                     },
                 ))
             }
             mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS => {
                 let executor = self.clone();
-                let tool_name = name.clone();
-                Ok(RegisteredTool::from_execution_result(
+                Ok(RegisteredTool::from_fallible_execution_result(
                     name.clone(),
                     description.clone(),
                     input_schema.clone(),
                     move |input, _context| {
                         let executor = executor.clone();
-                        let tool_name = tool_name.clone();
                         async move {
-                            let prs = queue_project_review_prs_from_arguments(&input.arguments)
-                                .map_err(|error| product_tool_error(&tool_name, error))?;
-                            let execution = executor
-                                .queue_project_review_prs(prs)
-                                .await
-                                .map_err(|error| product_tool_error(&tool_name, error))?;
-                            Ok(execution)
+                            let prs = queue_project_review_prs_from_arguments(&input.arguments)?;
+                            executor.queue_project_review_prs(prs).await
                         }
                     },
                 ))
@@ -294,13 +255,6 @@ fn optional_string_argument(arguments: &Value, field: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn product_tool_error(tool_name: &str, error: impl std::fmt::Display) -> pl_protocol::PureError {
-    pl_protocol::PureError::ToolExecutionFailed {
-        tool: tool_name.to_string(),
-        error: error.to_string(),
-    }
-}
-
 fn json_tool_execution(value: &impl serde::Serialize) -> ToolExecution {
     ToolExecution::new(
         true,
@@ -395,8 +349,15 @@ mod tests {
             "产品工具 schema 应直接绑定具体 RegisteredTool handler"
         );
         assert!(
-            source.contains("RegisteredTool::from_execution_result"),
-            "产品工具应让 pl-core 负责 ToolExecutionResult 到 ToolOutput 的映射"
+            source.contains(&format!(
+                "{}{}",
+                "RegisteredTool::from_fallible_", "execution_result"
+            )),
+            "产品工具应让 pl-core 负责 ToolExecutionResult 到 ToolOutput 以及业务错误到 ToolExecutionFailed 的映射"
+        );
+        assert!(
+            !source.contains(&format!("{}{}", "product_tool", "_error")),
+            "产品工具注册器不应在 mai-team 手动包装 pl-core 工具错误"
         );
         assert!(
             !source.contains(&format!("{}{}", "into_tool", "_output")),
