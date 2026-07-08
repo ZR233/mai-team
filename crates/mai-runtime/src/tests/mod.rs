@@ -3560,6 +3560,69 @@ async fn tool_trace_returns_full_history_with_event_metadata() {
 }
 
 #[tokio::test]
+async fn pl_core_tool_trace_projection_persists_output_artifacts() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let agent_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let turn_id = Uuid::new_v4();
+    save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container-1"))).await;
+    save_test_session(&store, agent_id, session_id).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let artifact = mai_protocol::ToolOutputArtifactInfo {
+        id: "artifact-1".to_string(),
+        call_id: "call_1".to_string(),
+        agent_id,
+        name: "printf-stdout.txt".to_string(),
+        stream: "stdout".to_string(),
+        size_bytes: 5,
+        created_at: now(),
+    };
+    let events = vec![
+        pl_trace::TraceEvent {
+            session_id: session_id.to_string(),
+            sequence: 1,
+            timestamp: 10,
+            kind: pl_trace::TraceEventKind::TracePartStarted {
+                item: trace_tool_part(
+                    turn_id,
+                    pl_trace::TracePartStatus::Started,
+                    None,
+                    Vec::new(),
+                ),
+            },
+        },
+        pl_trace::TraceEvent {
+            session_id: session_id.to_string(),
+            sequence: 2,
+            timestamp: 12,
+            kind: pl_trace::TraceEventKind::TracePartCompleted {
+                item: trace_tool_part(
+                    turn_id,
+                    pl_trace::TracePartStatus::Completed,
+                    Some(r#"{"status":0,"stdout":"hello","stderr":""}"#),
+                    vec![serde_json::to_value(&artifact).expect("artifact json")],
+                ),
+            },
+        },
+    ];
+
+    turn::kernel_tools::project_tool_trace_events(&runtime, agent_id, session_id, turn_id, &events)
+        .await;
+
+    let trace = runtime
+        .tool_trace(agent_id, Some(session_id), "call_1".to_string())
+        .await
+        .expect("trace");
+    assert_eq!(
+        serde_json::to_value(&trace.output_artifacts).expect("trace artifacts json"),
+        serde_json::to_value(vec![artifact]).expect("expected artifacts json")
+    );
+    assert_eq!(trace.duration_ms, Some(2_000));
+    assert!(trace.output_preview.contains("\"stdout\": \"hello\""));
+}
+
+#[tokio::test]
 async fn tool_trace_prefers_persisted_trace_records() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("runtime.sqlite3");
@@ -3722,6 +3785,45 @@ async fn tool_trace_finds_calls_stored_in_function_call_items() {
         r#"{"status":0,"stdout":"/workspace\n","stderr":""}"#
     );
     assert!(trace.success);
+}
+
+fn trace_tool_part(
+    turn_id: TurnId,
+    status: pl_trace::TracePartStatus,
+    result: Option<&str>,
+    output_artifacts: Vec<serde_json::Value>,
+) -> pl_trace::TracePart {
+    pl_trace::TracePart {
+        turn_id: turn_id.to_string(),
+        item_id: "tool_1".to_string(),
+        started_sequence: 1,
+        revision: 0,
+        kind: pl_trace::TracePartKind::Tool,
+        status,
+        created_at: 10,
+        updated_at: 12,
+        source: pl_trace::TracePartSource::Runtime,
+        text_channel: None,
+        content: String::new(),
+        attachments: Vec::new(),
+        thinking_chunks: Vec::new(),
+        tool: Some(pl_trace::TraceToolPart {
+            tool_call_id: "trace_call_1".to_string(),
+            call_id: Some("call_1".to_string()),
+            provider_item_id: None,
+            name: "container_exec".to_string(),
+            arguments: r#"{"command":"printf hello","cwd":"/workspace"}"#.to_string(),
+            result: result.map(ToString::to_string),
+            exit_code: Some(0),
+            timed_out: false,
+            output_artifacts,
+            working_directory: None,
+            denial_reason: None,
+        }),
+        agent: None,
+        inference: None,
+        usage: None,
+    }
 }
 
 #[tokio::test]

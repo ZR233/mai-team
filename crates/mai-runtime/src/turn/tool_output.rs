@@ -12,6 +12,7 @@ use mai_protocol::now;
 use mai_protocol::{AgentId, ServiceEventKind, SessionId};
 #[cfg(test)]
 use mai_store::ConfigStore;
+#[cfg(test)]
 use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
@@ -250,6 +251,7 @@ where
     Ok(execution)
 }
 
+#[cfg(test)]
 pub(crate) fn trace_preview_value(value: &Value, max: usize) -> String {
     pl_core::trace_preview_value(value, max)
 }

@@ -2,9 +2,11 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use mai_protocol::{
-    AgentId, ServiceEventKind, SessionId, ToolDefinition, ToolTraceDetail, TurnId, now,
+    AgentId, ServiceEventKind, SessionId, ToolDefinition, ToolOutputArtifactInfo, ToolTraceDetail,
+    TurnId, now,
 };
-use pl_trace::{TraceEvent, TraceEventKind, TracePart, TracePartStatus};
+use pl_core::{ToolLifecyclePhase, ToolLifecycleProjection};
+use pl_trace::TraceEvent;
 use serde_json::{Value, json};
 
 use crate::AgentRuntime;
@@ -28,27 +30,22 @@ pub(crate) async fn project_tool_trace_events(
     turn_id: TurnId,
     events: &[TraceEvent],
 ) {
-    for event in events {
-        match &event.kind {
-            TraceEventKind::TracePartStarted { item }
-                if item.status == TracePartStatus::Started && item.tool.is_some() =>
-            {
-                project_tool_started(runtime, agent_id, session_id, turn_id, item).await;
+    for projection in pl_core::tool_lifecycle_projections(events, 500) {
+        match &projection.phase {
+            ToolLifecyclePhase::Started => {
+                project_tool_started(runtime, agent_id, session_id, turn_id, &projection).await;
             }
-            TraceEventKind::TracePartCompleted { item } if item.tool.is_some() => {
-                project_tool_completed(runtime, agent_id, session_id, turn_id, item, true).await;
+            ToolLifecyclePhase::Finished { success } => {
+                project_tool_completed(
+                    runtime,
+                    agent_id,
+                    session_id,
+                    turn_id,
+                    &projection,
+                    *success,
+                )
+                .await;
             }
-            TraceEventKind::TracePartFailed { item, .. } if item.tool.is_some() => {
-                project_tool_completed(runtime, agent_id, session_id, turn_id, item, false).await;
-            }
-            TraceEventKind::TracePartDelta { .. }
-            | TraceEventKind::PlanLifecycleChanged { .. }
-            | TraceEventKind::InteractionChanged { .. }
-            | TraceEventKind::SkillActivated { .. }
-            | TraceEventKind::EnabledToolsRecorded { .. }
-            | TraceEventKind::TracePartStarted { .. }
-            | TraceEventKind::TracePartCompleted { .. }
-            | TraceEventKind::TracePartFailed { .. } => {}
         }
     }
 }
@@ -102,23 +99,18 @@ async fn project_tool_started(
     agent_id: AgentId,
     session_id: SessionId,
     turn_id: TurnId,
-    item: &TracePart,
+    projection: &ToolLifecycleProjection,
 ) {
-    let Some(tool) = &item.tool else {
-        return;
-    };
-    let call_id = tool_call_id(tool);
-    let arguments = arguments_value(&tool.arguments);
-    let started_at = trace_time(item.created_at);
+    let started_at = trace_time(projection.started_at_unix);
     super::persistence::record_tool_trace_started(
         runtime.deps.store.as_ref(),
         ToolTraceDetail {
             agent_id,
             session_id: Some(session_id),
             turn_id: Some(turn_id),
-            call_id: call_id.clone(),
-            tool_name: tool.name.clone(),
-            arguments: arguments.clone(),
+            call_id: projection.call_id.clone(),
+            tool_name: projection.tool_name.clone(),
+            arguments: projection.arguments.clone(),
             output: String::new(),
             success: false,
             duration_ms: None,
@@ -140,9 +132,9 @@ async fn project_tool_started(
             category: "tool",
             message: "tool started",
             details: json!({
-                "call_id": call_id,
-                "tool_name": tool.name,
-                "arguments_preview": super::tool_output::trace_preview_value(&arguments, 500),
+                "call_id": projection.call_id,
+                "tool_name": projection.tool_name,
+                "arguments_preview": projection.arguments_preview,
             }),
         },
     )
@@ -153,10 +145,10 @@ async fn project_tool_started(
             agent_id,
             session_id: Some(session_id),
             turn_id,
-            call_id,
-            tool_name: tool.name.clone(),
-            arguments_preview: Some(super::tool_output::trace_preview_value(&arguments, 500)),
-            arguments: Some(arguments),
+            call_id: projection.call_id.clone(),
+            tool_name: projection.tool_name.clone(),
+            arguments_preview: Some(projection.arguments_preview.clone()),
+            arguments: Some(projection.arguments.clone()),
         })
         .await;
 }
@@ -166,40 +158,32 @@ async fn project_tool_completed(
     agent_id: AgentId,
     session_id: SessionId,
     turn_id: TurnId,
-    item: &TracePart,
+    projection: &ToolLifecycleProjection,
     success: bool,
 ) {
-    let Some(tool) = &item.tool else {
-        return;
-    };
-    let call_id = tool_call_id(tool);
-    let arguments = arguments_value(&tool.arguments);
-    let output = tool.result.clone().unwrap_or_default();
-    let output_preview = super::tool_output::trace_preview_output(&output, 500);
-    let started_at = trace_time(item.created_at);
-    let completed_at = trace_time(item.updated_at);
-    let duration_ms = item
-        .updated_at
-        .saturating_sub(item.created_at)
-        .try_into()
-        .ok()
-        .map(|seconds: u64| seconds.saturating_mul(1000));
+    let started_at = trace_time(projection.started_at_unix);
+    let completed_at = trace_time(
+        projection
+            .completed_at_unix
+            .unwrap_or(projection.started_at_unix),
+    );
+    let output_artifacts = output_artifacts_from_values(&projection.output_artifacts);
     super::persistence::record_tool_trace_completed(
         runtime.deps.store.as_ref(),
         ToolTraceDetail {
             agent_id,
             session_id: Some(session_id),
             turn_id: Some(turn_id),
-            call_id: call_id.clone(),
-            tool_name: tool.name.clone(),
-            arguments,
-            output: output.clone(),
+            call_id: projection.call_id.clone(),
+            tool_name: projection.tool_name.clone(),
+            arguments: projection.arguments.clone(),
+            output: projection.output.clone(),
             success,
-            duration_ms,
+            duration_ms: projection.duration_ms,
             started_at: Some(started_at),
             completed_at: Some(completed_at),
-            output_preview: output_preview.clone(),
-            output_artifacts: Vec::new(),
+            output_preview: projection.output_preview.clone(),
+            output_artifacts,
         },
         started_at,
         completed_at,
@@ -215,11 +199,11 @@ async fn project_tool_completed(
             category: "tool",
             message: "tool completed",
             details: json!({
-                "call_id": call_id,
-                "tool_name": tool.name,
+                "call_id": projection.call_id,
+                "tool_name": projection.tool_name,
                 "success": success,
-                "duration_ms": duration_ms,
-                "output_preview": output_preview.as_str(),
+                "duration_ms": projection.duration_ms,
+                "output_preview": projection.output_preview.as_str(),
             }),
         },
     )
@@ -230,23 +214,20 @@ async fn project_tool_completed(
             agent_id,
             session_id: Some(session_id),
             turn_id,
-            call_id,
-            tool_name: tool.name.clone(),
+            call_id: projection.call_id.clone(),
+            tool_name: projection.tool_name.clone(),
             success,
-            output_preview,
-            duration_ms,
+            output_preview: projection.output_preview.clone(),
+            duration_ms: projection.duration_ms,
         })
         .await;
 }
 
-fn arguments_value(arguments: &str) -> Value {
-    serde_json::from_str(arguments).unwrap_or_else(|_| json!(arguments))
-}
-
-fn tool_call_id(tool: &pl_trace::TraceToolPart) -> String {
-    tool.call_id
-        .clone()
-        .unwrap_or_else(|| tool.tool_call_id.clone())
+fn output_artifacts_from_values(values: &[Value]) -> Vec<ToolOutputArtifactInfo> {
+    values
+        .iter()
+        .filter_map(|value| serde_json::from_value(value.clone()).ok())
+        .collect()
 }
 
 fn trace_time(seconds: i64) -> DateTime<Utc> {
