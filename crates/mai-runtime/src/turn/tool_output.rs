@@ -32,62 +32,13 @@ use crate::state::AgentRecord;
 #[cfg(test)]
 use crate::turn::persistence::AgentLogRecord;
 
+#[cfg(test)]
 pub(crate) const DEFAULT_MODEL_TOOL_OUTPUT_TOKENS: usize =
     pl_core::DEFAULT_MODEL_TOOL_OUTPUT_TOKENS;
 #[cfg(test)]
 const DEFAULT_MODEL_TOOL_OUTPUT_BYTES: usize = DEFAULT_MODEL_TOOL_OUTPUT_TOKENS * 4;
 
-#[derive(Debug)]
-pub(crate) struct ToolExecution {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) success: bool,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) output: String,
-    pub(crate) model_output: String,
-    pub(crate) ends_turn: bool,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) output_artifacts: Vec<ToolOutputArtifactInfo>,
-}
-
-impl ToolExecution {
-    pub(crate) fn new(success: bool, output: String, ends_turn: bool) -> Self {
-        Self::with_model_tokens(
-            success,
-            output,
-            ends_turn,
-            DEFAULT_MODEL_TOOL_OUTPUT_TOKENS,
-            Vec::new(),
-        )
-    }
-
-    pub(crate) fn with_model_tokens(
-        success: bool,
-        output: String,
-        ends_turn: bool,
-        max_output_tokens: usize,
-        output_artifacts: Vec<ToolOutputArtifactInfo>,
-    ) -> Self {
-        let model_output =
-            pl_core::model_visible_tool_output_with_tokens(&output, max_output_tokens);
-        Self::with_model_output(success, output, model_output, ends_turn, output_artifacts)
-    }
-
-    pub(crate) fn with_model_output(
-        success: bool,
-        output: String,
-        model_output: String,
-        ends_turn: bool,
-        output_artifacts: Vec<ToolOutputArtifactInfo>,
-    ) -> Self {
-        Self {
-            success,
-            output,
-            model_output,
-            ends_turn,
-            output_artifacts,
-        }
-    }
-}
+pub(crate) type ToolExecution = pl_core::ToolExecutionResult<ToolOutputArtifactInfo>;
 
 #[cfg(test)]
 pub(crate) struct ToolCallInfo<'a> {

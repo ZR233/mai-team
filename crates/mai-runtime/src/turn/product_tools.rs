@@ -2,10 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use mai_protocol::{AgentId, AgentRole, ToolDefinition};
-use pl_core::{
-    ProductToolDefinition, ProductToolRequest, ProductToolRouter, ToolOutput,
-    ToolOutputModelOutputRequest,
-};
+use pl_core::{ProductToolDefinition, ProductToolRequest, ProductToolRouter, ToolOutput};
 use pl_protocol::PureError;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -84,7 +81,7 @@ impl ProductToolRouter for MaiProductToolRouter {
                 tool: request.definition.name.clone(),
                 error: error.to_string(),
             })?;
-        Ok(tool_output_from_execution(execution))
+        Ok(execution.into_tool_output())
     }
 }
 
@@ -261,14 +258,6 @@ fn product_definition_from_mai_definition(definition: &ToolDefinition) -> Produc
         definition.description.clone(),
         definition.parameters.clone(),
     )
-}
-
-fn tool_output_from_execution(execution: ToolExecution) -> ToolOutput {
-    ToolOutput::from_model_output(ToolOutputModelOutputRequest {
-        model_output: execution.model_output,
-        success: execution.success,
-        ends_turn: execution.ends_turn,
-    })
 }
 
 fn required_string_argument(arguments: &Value, field: &str) -> crate::Result<String> {
