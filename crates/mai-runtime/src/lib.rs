@@ -1638,16 +1638,19 @@ impl AgentRuntime {
             cancellation_token.clone(),
         );
         let product_tools = product_registry.registered_tools()?;
-        let kernel = self
-            .build_shared_tool_kernel_for_test(
-                product_tools,
-                workspace_root.clone(),
-                agent,
+        let kernel = turn::core_adapter::build_kernel_with_native_shared_tools(
+            pl_core::PureCoreBuilder::from_provider_info(pl_model::ProviderInfo::deepseek(None))?,
+            pl_core::CoreAgentProfile::host_provided(workspace_root.clone()),
+            product_tools,
+            turn::core_adapter::SharedToolKernelBuildContext {
+                runtime: self.clone(),
+                agent: agent.clone(),
                 agent_id,
-                name,
-                cancellation_token.clone(),
-            )
-            .await?;
+                visible_tool_names: HashSet::from([name.to_string()]),
+                cancellation_token: cancellation_token.clone(),
+            },
+        )
+        .await?;
 
         let Some(tool) = kernel.tool(name) else {
             return Ok(None);
@@ -1690,72 +1693,6 @@ impl AgentRuntime {
                 .any(|event| matches!(event, pl_core::ToolRuntimeEvent::EndTurn)),
             Self::output_artifacts_from_json_for_test(output_artifacts)?,
         )))
-    }
-
-    #[cfg(test)]
-    async fn build_shared_tool_kernel_for_test(
-        self: &Arc<Self>,
-        registered_tools: Vec<pl_core::RegisteredTool>,
-        workspace_root: PathBuf,
-        agent: &Arc<AgentRecord>,
-        agent_id: AgentId,
-        name: &str,
-        cancellation_token: CancellationToken,
-    ) -> Result<pl_core::AgentKernel> {
-        let visible_tools = HashSet::from([name.to_string()]);
-        let container_backend = Arc::new(turn::container::MaiContainerBackend::new(
-            self.clone(),
-            agent_id,
-        ));
-        let git_runtime =
-            tools::git::native_git_tool_runtime(self.clone(), agent, |tool| tool == name).await?;
-        let capabilities = pl_core::ToolCapabilityConfig {
-            bash: false,
-            workspace_files: true,
-            skills: false,
-            mcp: true,
-            lsp: false,
-            subagents: true,
-            ask_user: true,
-            git: git_runtime.is_some(),
-            docker: false,
-            container: true,
-        };
-        let mcp_backend = Arc::new(turn::mcp_resources::MaiMcpResourceBackend::new(
-            self.clone(),
-            agent.clone(),
-            agent_id,
-            cancellation_token.clone(),
-        ));
-        let agent_control_backend = Arc::new(turn::agent_control::MaiAgentControlBackend::new(
-            self.clone(),
-            agent.clone(),
-            agent_id,
-            cancellation_token.clone(),
-        ));
-        let tool_set = pl_core::ToolSetBuilder::from_capabilities(capabilities)
-            .with_allowed_tools(visible_tools.iter().cloned())
-            .with_container_tools(container_backend)
-            .with_mcp_resource_tools(mcp_backend)
-            .with_agent_control_tools(agent_control_backend);
-        let kernel_builder = pl_core::AgentKernel::builder(
-            pl_core::PureCoreBuilder::from_provider_info(pl_model::ProviderInfo::deepseek(None))?,
-        )
-        .with_profile(pl_core::CoreAgentProfile::host_provided(workspace_root))
-        .with_registered_tools(registered_tools);
-        let kernel = if let Some(git_runtime) = git_runtime {
-            kernel_builder
-                .with_tool_set(tool_set.with_git_tools(
-                    git_runtime.config,
-                    git_runtime.backend,
-                    git_runtime.credential_provider,
-                ))
-                .build()
-                .await
-        } else {
-            kernel_builder.with_tool_set(tool_set).build().await
-        };
-        Ok(kernel)
     }
 
     #[cfg(test)]

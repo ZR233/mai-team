@@ -36,6 +36,14 @@ pub(crate) struct PureCoreTurnContext {
     pub(crate) cancellation_token: CancellationToken,
 }
 
+pub(crate) struct SharedToolKernelBuildContext {
+    pub(crate) runtime: Arc<AgentRuntime>,
+    pub(crate) agent: Arc<AgentRecord>,
+    pub(crate) agent_id: AgentId,
+    pub(crate) visible_tool_names: HashSet<String>,
+    pub(crate) cancellation_token: CancellationToken,
+}
+
 pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
     let provider = ModelClient::provider_for_selection(&ctx.provider_selection)?;
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -68,9 +76,19 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
         ctx.cancellation_token.clone(),
     );
     let product_tools = product_tool_registry.registered_tools()?;
-    let kernel =
-        build_kernel_with_native_shared_tools(builder, runtime_profile, product_tools, &ctx)
-            .await?;
+    let kernel = build_kernel_with_native_shared_tools(
+        builder,
+        runtime_profile,
+        product_tools,
+        SharedToolKernelBuildContext {
+            runtime: ctx.runtime.clone(),
+            agent: ctx.agent.clone(),
+            agent_id: ctx.agent_id,
+            visible_tool_names: ctx.visible_tool_names.clone(),
+            cancellation_token: ctx.cancellation_token.clone(),
+        },
+    )
+    .await?;
 
     let mut session = CoreSession::from_messages(ctx.history.clone());
     let (event_tx, event_rx) = tokio::sync::broadcast::channel(64);
@@ -269,11 +287,11 @@ fn user_input_questions_from_pl(
     (header.unwrap_or_else(|| "Input".to_string()), projected)
 }
 
-async fn build_kernel_with_native_shared_tools(
+pub(crate) async fn build_kernel_with_native_shared_tools(
     builder: PureCoreBuilder,
     runtime_profile: CoreAgentProfile,
     registered_tools: Vec<pl_core::RegisteredTool>,
-    ctx: &PureCoreTurnContext,
+    ctx: SharedToolKernelBuildContext,
 ) -> Result<AgentKernel> {
     let backend = Arc::new(super::container::MaiContainerBackend::new(
         ctx.runtime.clone(),

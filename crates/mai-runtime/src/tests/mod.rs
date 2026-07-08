@@ -28,16 +28,8 @@ fn test_tool_helper_uses_pl_core_kernel_registry() {
     let helper = &source[helper_start..helper_start + helper_end];
 
     assert!(
-        helper.contains("AgentKernel::builder"),
-        "测试工具执行路径必须构造 pl-core AgentKernel"
-    );
-    assert!(
-        helper.contains("ToolSetBuilder::from_capabilities"),
-        "测试工具执行路径必须复用 pl-core ToolSetBuilder"
-    );
-    assert!(
-        helper.contains(".with_tool_set("),
-        "测试工具执行路径必须通过 AgentKernelBuilder 注册共享工具集"
+        helper.contains("turn::core_adapter::build_kernel_with_native_shared_tools"),
+        "测试工具执行路径必须复用主 turn 的共享工具 kernel 构造 helper"
     );
     assert!(
         helper.contains(".execute_tool("),
@@ -51,6 +43,9 @@ fn test_tool_helper_uses_pl_core_kernel_registry() {
         format!("{}{}", "Tool", "Context {"),
         format!("{}{}", "Tool", "Input {"),
         format!("{}{}", ".register", "(kernel.core_mut"),
+        "AgentKernel::builder".to_string(),
+        "ToolSetBuilder::from_capabilities".to_string(),
+        ".with_tool_set(".to_string(),
     ] {
         assert!(
             !helper.contains(&forbidden),
