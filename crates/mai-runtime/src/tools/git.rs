@@ -12,7 +12,6 @@ use pl_core::ToolCapabilityConfig;
 use pl_core::{
     ExecutionBackend, ExecutionOutput, ExecutionRequest, GIT_TOKEN_ENV, GitCredential,
     GitCredentialProvider, GitCredentialRequest, GitPolicy, GitToolKind, GitWorkspaceConfig,
-    PureError,
 };
 #[cfg(test)]
 use serde_json::Value;
@@ -219,10 +218,12 @@ impl fmt::Debug for MaiGitCredentialProvider {
 }
 
 impl GitCredentialProvider for MaiGitCredentialProvider {
+    type Error = RuntimeError;
+
     fn credential(
         &self,
         _request: GitCredentialRequest,
-    ) -> impl Future<Output = std::result::Result<Option<GitCredential>, PureError>> + Send {
+    ) -> impl Future<Output = Result<Option<GitCredential>>> + Send {
         let provider = self.clone();
         async move {
             let token = match provider {
@@ -231,10 +232,7 @@ impl GitCredentialProvider for MaiGitCredentialProvider {
                 MaiGitCredentialProvider::Project {
                     runtime,
                     project_id,
-                } => runtime
-                    .project_git_token(project_id)
-                    .await
-                    .map_err(pure_error_from_runtime)?,
+                } => runtime.project_git_token(project_id).await?,
             };
             Ok(token
                 .filter(|token| !token.trim().is_empty())
@@ -255,10 +253,9 @@ impl fmt::Debug for ProjectGitExecutionBackend {
 
 #[cfg(test)]
 impl ExecutionBackend for ProjectGitExecutionBackend {
-    async fn run(
-        &self,
-        request: ExecutionRequest,
-    ) -> std::result::Result<ExecutionOutput, PureError> {
+    type Error = RuntimeError;
+
+    async fn run(&self, request: ExecutionRequest) -> Result<ExecutionOutput> {
         run_host_git_request(request).await
     }
 }
@@ -281,10 +278,9 @@ impl fmt::Debug for MaiGitExecutionBackend {
 }
 
 impl ExecutionBackend for MaiGitExecutionBackend {
-    async fn run(
-        &self,
-        request: ExecutionRequest,
-    ) -> std::result::Result<ExecutionOutput, PureError> {
+    type Error = RuntimeError;
+
+    async fn run(&self, request: ExecutionRequest) -> Result<ExecutionOutput> {
         run_sidecar_git_output(
             &self.docker,
             &self.sidecar_image,
@@ -295,14 +291,11 @@ impl ExecutionBackend for MaiGitExecutionBackend {
             &request.args,
         )
         .await
-        .map_err(pure_error_from_runtime)
     }
 }
 
 #[cfg(test)]
-async fn run_host_git_request(
-    request: ExecutionRequest,
-) -> std::result::Result<ExecutionOutput, PureError> {
+async fn run_host_git_request(request: ExecutionRequest) -> Result<ExecutionOutput> {
     let mut command = Command::new(&request.program);
     command.current_dir(&request.cwd).args(&request.args);
     apply_host_git_safety_environment(&mut command, &request.cwd);
@@ -310,10 +303,9 @@ async fn run_host_git_request(
     let output = match request.timeout {
         Some(timeout) => tokio::time::timeout(timeout, command.output())
             .await
-            .map_err(|_| pure_tool_error("git", "git command timed out"))?,
+            .map_err(|_| RuntimeError::InvalidInput("git command timed out".to_string()))?,
         None => command.output().await,
-    }
-    .map_err(|error| pure_tool_error("git", format!("failed to run git: {error}")))?;
+    }?;
     Ok(ExecutionOutput {
         status: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -341,19 +333,8 @@ fn apply_host_git_safety_environment(command: &mut Command, cwd: &std::path::Pat
 }
 
 #[cfg(test)]
-fn runtime_error_from_pure(error: PureError) -> RuntimeError {
+fn runtime_error_from_pure(error: pl_core::PureError) -> RuntimeError {
     RuntimeError::InvalidInput(error.to_string())
-}
-
-fn pure_error_from_runtime(error: RuntimeError) -> PureError {
-    pure_tool_error("git", error)
-}
-
-fn pure_tool_error(tool: &str, error: impl fmt::Display) -> PureError {
-    PureError::ToolExecutionFailed {
-        tool: tool.to_string(),
-        error: error.to_string(),
-    }
 }
 
 async fn run_sidecar_git_output(
@@ -506,6 +487,41 @@ mod tests {
             !source.contains(&format!("{}{}", "GitToolBackend::", "Sidecar")),
             "sidecar git execution must use MaiGitExecutionBackend through pl-core ToolSetBuilder"
         );
+    }
+
+    #[test]
+    fn git_backends_delegate_tool_error_shape_to_pl_core() {
+        let source = include_str!("git.rs");
+        let credential_impl = source_snippet(
+            source,
+            "impl GitCredentialProvider for MaiGitCredentialProvider",
+            "#[cfg(test)]\nstruct ProjectGitExecutionBackend",
+        );
+        let host_backend_impl = source_snippet(
+            source,
+            "impl ExecutionBackend for ProjectGitExecutionBackend",
+            "#[derive(Clone)]\npub(crate) struct MaiGitExecutionBackend",
+        );
+        let sidecar_backend_impl = source_snippet(
+            source,
+            "impl ExecutionBackend for MaiGitExecutionBackend",
+            "#[cfg(test)]\nasync fn run_host_git_request",
+        );
+
+        for snippet in [credential_impl, host_backend_impl, sidecar_backend_impl] {
+            assert!(
+                !snippet.contains(&format!("{}{}", "ToolExecution", "Failed")),
+                "git adapter 不应手动构造 pl-core 工具错误"
+            );
+            assert!(
+                !snippet.contains(&format!("{}{}", "Pure", "Error")),
+                "git adapter 不应依赖 pl 协议错误类型"
+            );
+            assert!(
+                !snippet.contains("pure_error_from_runtime"),
+                "git adapter 不应把 RuntimeError 包装回 pl 协议错误"
+            );
+        }
     }
 
     #[tokio::test]
@@ -887,6 +903,15 @@ mod tests {
 
     fn fake_git_path(root: &Path) -> String {
         fake_git_path_with_status(root, "")
+    }
+
+    fn source_snippet<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start = source.find(start).expect("snippet start");
+        let end = source[start..]
+            .find(end)
+            .map(|offset| start + offset)
+            .expect("snippet end");
+        &source[start..end]
     }
 
     fn fake_git_path_with_status(root: &Path, status_output: &str) -> String {
