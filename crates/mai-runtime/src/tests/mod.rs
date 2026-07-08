@@ -72,6 +72,20 @@ fn test_tool_helper_uses_pl_core_kernel_registry() {
 }
 
 #[test]
+fn observability_uses_pl_core_history_success_projection() {
+    let source = include_str!("../agents/observability.rs");
+
+    assert!(
+        source.contains("projection.inferred_success()"),
+        "工具历史 fallback 的成功推断应由 pl-core ToolHistoryProjection 提供"
+    );
+    assert!(
+        !source.contains("!projection.output.is_empty()"),
+        "mai-runtime 不应直接根据模型可见输出字符串推断工具成功状态"
+    );
+}
+
+#[test]
 fn core_turn_registers_shared_tools_through_kernel_builder() {
     let source = include_str!("../turn/core_adapter.rs");
     let run_start = source

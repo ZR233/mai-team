@@ -93,6 +93,7 @@ pub(crate) async fn tool_trace(
     let (event_success, duration_ms) = ops
         .tool_metadata(agent_id, session_id, call_id.clone())
         .await;
+    let success = event_success.unwrap_or_else(|| projection.inferred_success());
     Ok(ToolTraceDetail {
         agent_id,
         session_id: Some(session_id),
@@ -100,7 +101,7 @@ pub(crate) async fn tool_trace(
         call_id,
         tool_name: projection.tool_name,
         arguments: projection.arguments,
-        success: event_success.unwrap_or(!projection.output.is_empty()),
+        success,
         output_preview: projection.output_preview,
         output: projection.output,
         duration_ms,
