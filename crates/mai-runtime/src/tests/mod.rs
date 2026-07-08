@@ -426,6 +426,23 @@ fn container_turn_current_checks_use_pl_core_token_guard() {
     }
 }
 
+#[test]
+fn set_turn_status_uses_pl_core_token_transition() {
+    let source = include_str!("../lib.rs");
+    let start = source.find("async fn set_turn_status(").unwrap();
+    let end = source[start..].find("async fn persist_agent").unwrap();
+    let body = &source[start..start + end];
+
+    assert!(
+        body.contains("evaluate_with_token"),
+        "set_turn_status 应复用 pl-core 的 token-aware turn status transition"
+    );
+    assert!(
+        !body.contains("cancellation_token.is_cancelled()"),
+        "set_turn_status 不应直接解释 CancellationToken"
+    );
+}
+
 fn pl_text(message: &Message) -> &str {
     match &message.content {
         MessageContent::Text(text) => text,

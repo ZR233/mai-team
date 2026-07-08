@@ -1947,10 +1947,8 @@ impl AgentRuntime {
                 AgentTurnStatusGuard::AllowStale
             };
             let transition = AgentTurnStatusTransition::new(turn_id, status.clone(), now(), guard);
-            match transition.evaluate(
-                cancellation_token.is_cancelled(),
-                summary.current_turn.as_ref(),
-            ) {
+            match transition.evaluate_with_token(cancellation_token, summary.current_turn.as_ref())
+            {
                 AgentTurnStatusOutcome::Applied(mutation) => {
                     summary.status = mutation.status;
                     summary.updated_at = mutation.updated_at;
