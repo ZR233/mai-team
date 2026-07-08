@@ -139,7 +139,7 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
         &result.trace_events,
     )
     .await;
-    let compaction_snapshot = result.context_compactions.last().cloned();
+    let runtime_snapshot = result.runtime_snapshot();
     super::history::replace_session_history(
         ctx.runtime.deps.store.as_ref(),
         &ctx.agent,
@@ -148,10 +148,10 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
         session.messages().to_vec(),
     )
     .await?;
-    if let Some(snapshot) = compaction_snapshot {
+    if let Some(snapshot) = runtime_snapshot.latest_context_compaction {
         record_context_compacted(&ctx, &snapshot.summary, snapshot.tokens_before).await;
     }
-    if let Some(last_context_tokens) = result.last_context_tokens {
+    if let Some(last_context_tokens) = runtime_snapshot.last_context_tokens {
         super::history::record_session_context_tokens(
             ctx.runtime.deps.store.as_ref(),
             &ctx.agent,
@@ -161,14 +161,14 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
         )
         .await?;
     }
-    if result.usage.total_tokens > 0 {
+    if let Some(usage) = &runtime_snapshot.usage {
         super::accounting::record_model_usage(
             ctx.runtime.deps.store.as_ref(),
             &ctx.runtime.events,
             &ctx.agent,
             ctx.agent_id,
             ctx.session_id,
-            &completion_response_usage(&result.usage),
+            &completion_response_usage(usage),
         )
         .await?;
     }
@@ -520,5 +520,29 @@ mod tests {
             !production.contains("fn preview("),
             "context compaction summary preview 不应在 mai-runtime 复制文本截断 helper"
         );
+    }
+
+    #[test]
+    fn turn_runtime_statistics_use_pl_core_snapshot() {
+        let source = include_str!("core_adapter.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production section");
+
+        assert!(
+            production.contains("result.runtime_snapshot()"),
+            "usage/context/compaction 统计暴露规则应由 pl-core TurnRuntimeSnapshot 统一提供"
+        );
+        for forbidden in [
+            "result.context_compactions.last()",
+            "result.last_context_tokens",
+            "result.usage.total_tokens > 0",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "mai-runtime 不应直接解释 TurnResult 底层统计字段 `{forbidden}`"
+            );
+        }
     }
 }
