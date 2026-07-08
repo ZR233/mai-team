@@ -4891,7 +4891,7 @@ async fn send_input_interrupt_starts_replacement_without_losing_message() {
         name: "container-1".to_string(),
         image: "unused".to_string(),
     });
-    *agent.active_turn.lock().expect("active turn lock") = Some(TurnControl::new(
+    agent.active_turn.set(TurnControl::new(
         old_turn_id,
         session_id,
         TurnTaskHandle::from_external_token(CancellationToken::new()),
@@ -4984,7 +4984,7 @@ async fn stale_turn_completion_does_not_overwrite_current_turn() {
         summary.status = AgentStatus::RunningTurn;
         summary.current_turn = Some(current_turn_id);
     }
-    *agent.active_turn.lock().expect("active turn lock") = Some(TurnControl::new(
+    agent.active_turn.set(TurnControl::new(
         current_turn_id,
         session_id,
         TurnTaskHandle::from_external_token(CancellationToken::new()),

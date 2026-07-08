@@ -38,17 +38,10 @@ pub(crate) async fn complete_turn_if_current(
     result: TurnResult,
 ) -> Result<bool> {
     let turn_id = result.turn_id;
-    let session_id = {
-        let mut active_turn = agent.active_turn.lock().expect("active turn lock");
-        let active_session_id = active_turn
-            .as_ref()
-            .filter(|turn| turn.turn_id == turn_id)
-            .map(|turn| turn.session_id);
-        if active_session_id.is_some() {
-            *active_turn = None;
-        }
-        active_session_id
-    };
+    let session_id = agent
+        .active_turn
+        .take_if_turn(&turn_id)
+        .map(|turn| turn.session_id);
     let session_id = match session_id {
         Some(session_id) => session_id,
         None => {

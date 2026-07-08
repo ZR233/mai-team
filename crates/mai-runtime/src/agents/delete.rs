@@ -74,7 +74,7 @@ async fn delete_agent_record(ops: &impl AgentDeleteOps, agent_id: AgentId) -> Re
         },
     )
     .await?;
-    if let Some(control) = agent.active_turn.lock().expect("active turn lock").clone() {
+    if let Some(control) = agent.active_turn.current() {
         control.cancel_task();
         control.abort_task();
     }

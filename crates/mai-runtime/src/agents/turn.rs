@@ -163,7 +163,7 @@ pub(crate) fn spawn_turn(
         )
     });
     let control = TurnControl::new(turn_id, session_id, task_handle);
-    *agent.active_turn.lock().expect("active turn lock") = Some(control);
+    agent.active_turn.set(control);
 }
 
 pub(crate) async fn cancel_agent(ops: &impl AgentCancelOps, agent_id: AgentId) -> Result<()> {
@@ -185,7 +185,7 @@ pub(crate) async fn cancel_agent_turn(
     turn_id: TurnId,
 ) -> Result<()> {
     let agent = ops.agent(agent_id).await?;
-    let control = agent.active_turn.lock().expect("active turn lock").clone();
+    let control = agent.active_turn.current();
     let current_turn = agent.summary.read().await.current_turn;
     if current_turn != Some(turn_id) && control.as_ref().map(|turn| turn.turn_id) != Some(turn_id) {
         return Ok(());

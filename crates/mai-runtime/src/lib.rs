@@ -21,8 +21,8 @@ use pl_protocol::Message as ModelMessage;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::time::{Duration, Instant, sleep};
@@ -68,7 +68,9 @@ use projects::review::state::ReviewStateUpdate;
 use projects::skills::PROJECT_SKILLS_CACHE_DIR;
 use projects::skills::ProjectSkillSourceDir;
 use projects::workspace::ProjectWorkspaceManager;
-use state::{AgentRecord, AgentSessionRecord, ProjectRecord, RuntimeState, TaskRecord};
+use state::{
+    AgentRecord, AgentSessionRecord, ProjectRecord, RuntimeState, TaskRecord, TurnControlSlot,
+};
 #[cfg(test)]
 use turn::tool_output::ToolExecution;
 
@@ -276,7 +278,7 @@ impl AgentRuntime {
                 system_prompt: persisted.system_prompt,
                 turn_lock: Mutex::new(()),
                 cancel_requested: AtomicBool::new(false),
-                active_turn: StdMutex::new(None),
+                active_turn: TurnControlSlot::new(),
                 pending_inputs: Mutex::new(VecDeque::new()),
             });
             if changed {
@@ -4299,7 +4301,7 @@ impl AgentRuntime {
             system_prompt: None,
             turn_lock: Mutex::new(()),
             cancel_requested: AtomicBool::new(false),
-            active_turn: StdMutex::new(None),
+            active_turn: TurnControlSlot::new(),
             pending_inputs: Mutex::new(VecDeque::new()),
         });
         self.state
