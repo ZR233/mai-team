@@ -632,16 +632,14 @@ impl AgentRuntime {
         let provider = model_profile::core_provider_for_selection(&selection)?;
         let request =
             model_profile::core_model_turn_request(&selection, None, instructions, Vec::new());
-        let response = pl_core::stream_session_completion_response(
+        let title = pl_core::stream_session_completion_message_text(
             provider,
             &mut session,
             request,
             pl_core::CoreModelTurnOptions::default().with_cancellation(CancellationToken::new()),
         )
         .await?;
-        let title = pl_core::completion_response_message_text(&response)
-            .trim()
-            .to_string();
+        let title = title.trim().to_string();
         if title.is_empty() {
             return Ok("New Task".to_string());
         }

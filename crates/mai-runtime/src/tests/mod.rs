@@ -1308,16 +1308,23 @@ fn runtime_does_not_expose_local_model_client_facade() {
 }
 
 #[test]
-fn task_title_generation_uses_pl_core_completion_text_projection() {
+fn task_title_generation_uses_pl_core_completion_text_turn() {
     let lib = include_str!("../lib.rs");
+    let function = lib
+        .split("async fn generate_task_title")
+        .nth(1)
+        .and_then(|text| text.split("async fn update_task_title").next())
+        .expect("generate_task_title function");
 
     assert!(
-        lib.contains("pl_core::completion_response_message_text"),
-        "任务标题生成应复用 pl-core 的 completion response 文本投影"
+        function.contains("pl_core::stream_session_completion_message_text"),
+        "任务标题生成应复用 pl-core 的单轮 completion 文本 helper"
     );
     assert!(
-        !lib.contains("ModelOutputItem::Message"),
-        "任务标题生成不应通过 mai_protocol::ModelOutputItem 反向筛模型响应文本"
+        !function.contains("stream_session_completion_response")
+            && !function.contains("completion_response_message_text")
+            && !function.contains("ModelOutputItem::Message"),
+        "任务标题生成不应在 mai-runtime 手写 stream response 到文本的转换链路"
     );
 }
 
