@@ -482,19 +482,12 @@ async fn record_context_compacted(ctx: &PureCoreTurnContext, summary: &str, toke
             session_id: ctx.session_id,
             turn_id: ctx.turn_id,
             tokens_before,
-            summary_preview: preview(summary, crate::COMPACT_SUMMARY_PREVIEW_CHARS),
+            summary_preview: pl_core::text_preview_chars(
+                summary,
+                crate::COMPACT_SUMMARY_PREVIEW_CHARS,
+            ),
         })
         .await;
-}
-
-fn preview(text: &str, max_chars: usize) -> String {
-    let trimmed = text.trim();
-    if trimmed.chars().count() <= max_chars {
-        return trimmed.to_string();
-    }
-    let mut chars = trimmed.chars().take(max_chars).collect::<String>();
-    chars.push_str("...");
-    chars
 }
 
 fn raw_instruction_snapshot(instructions: String) -> InstructionSnapshot {
@@ -509,5 +502,23 @@ fn raw_instruction_snapshot(instructions: String) -> InstructionSnapshot {
         },
         developer: Vec::new(),
         user: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn context_summary_preview_delegates_to_pl_core() {
+        let source = include_str!("core_adapter.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production section");
+
+        assert!(production.contains("pl_core::text_preview_chars"));
+        assert!(
+            !production.contains("fn preview("),
+            "context compaction summary preview 不应在 mai-runtime 复制文本截断 helper"
+        );
     }
 }
