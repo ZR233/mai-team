@@ -7,7 +7,6 @@ use mai_protocol::{
 };
 use mai_skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
 use pl_core::HostMcpToolSpec;
-use pl_protocol::MessageContent;
 use serde_json::json;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -466,29 +465,7 @@ fn host_mcp_tool_spec(tool: &mai_mcp::McpTool) -> HostMcpToolSpec {
 }
 
 fn message_with_skill_fragment(message: String, fragment: Option<pl_protocol::Message>) -> String {
-    let Some(fragment) = fragment else {
-        return message;
-    };
-    let fragment_text = match fragment.content {
-        MessageContent::Text(text) => text,
-        MessageContent::MultiPart(parts) => parts
-            .into_iter()
-            .filter_map(|part| match part {
-                pl_protocol::ContentPart::Text { text } => Some(text),
-                pl_protocol::ContentPart::Image {
-                    source: _,
-                    media_type: _,
-                    filename: _,
-                } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    };
-    if fragment_text.trim().is_empty() {
-        message
-    } else {
-        format!("{message}\n\n{fragment_text}")
-    }
+    pl_core::append_message_fragment_text(message, fragment.as_ref())
 }
 
 fn u128_to_u64(value: u128) -> u64 {

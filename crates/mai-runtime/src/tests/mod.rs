@@ -114,6 +114,22 @@ fn test_history_messages_reuse_pl_core_metadata_helpers() {
 }
 
 #[test]
+fn skill_fragment_text_projection_uses_pl_core_message_helper() {
+    let source = include_str!("../turn/orchestrator.rs");
+
+    assert!(
+        source.contains("pl_core::append_message_fragment_text"),
+        "skill fragment 文本拼接应复用 pl-core MessageContent 文本投影"
+    );
+    for forbidden in ["MessageContent::MultiPart", "ContentPart::Text"] {
+        assert!(
+            !source.contains(forbidden),
+            "mai-runtime 不应复制 pl-core MessageContent 文本提取逻辑: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn cancel_turn_uses_pl_core_cancellation_guard() {
     let source = include_str!("../agents/turn.rs");
 
