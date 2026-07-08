@@ -3,7 +3,10 @@ use std::sync::Arc;
 use mai_protocol::{AgentId, AgentRole};
 use pl_core::RegisteredTool;
 use pl_model::ToolSchema;
-use serde::{Deserialize, Deserializer, de};
+use serde::{
+    Deserialize, Deserializer,
+    de::{self, DeserializeOwned},
+};
 use serde_json::{Value, json};
 
 use crate::state::AgentRecord;
@@ -85,87 +88,72 @@ impl MaiProductToolRegistry {
     pub(crate) fn registered_tools(&self) -> crate::Result<Vec<RegisteredTool>> {
         self.schemas
             .iter()
+            .cloned()
             .map(|schema| self.registered_tool(schema))
             .collect()
     }
 
-    fn registered_tool(&self, schema: &ToolSchema) -> crate::Result<RegisteredTool> {
-        let ToolSchema::Function {
-            name,
-            description,
-            input_schema,
-        } = schema
-        else {
-            return Err(RuntimeError::InvalidInput(format!(
-                "mai-team product tool `{}` must be a function schema",
-                schema.name()
-            )));
-        };
+    fn registered_tool(&self, schema: ToolSchema) -> crate::Result<RegisteredTool> {
+        let name = schema.name().to_string();
         match name.as_str() {
             mai_tools::TOOL_SAVE_TASK_PLAN => {
                 let executor = self.clone();
-                Ok(RegisteredTool::from_typed_fallible_execution_result(
-                    name.clone(),
-                    description.clone(),
-                    input_schema.clone(),
-                    move |input: SaveTaskPlanInput, _context| {
-                        let executor = executor.clone();
-                        async move { executor.save_task_plan(input).await }
-                    },
-                ))
+                Self::registered_schema_tool(schema, move |input: SaveTaskPlanInput, _context| {
+                    let executor = executor.clone();
+                    async move { executor.save_task_plan(input).await }
+                })
             }
             mai_tools::TOOL_SUBMIT_REVIEW_RESULT => {
                 let executor = self.clone();
-                Ok(RegisteredTool::from_typed_fallible_execution_result(
-                    name.clone(),
-                    description.clone(),
-                    input_schema.clone(),
+                Self::registered_schema_tool(
+                    schema,
                     move |input: SubmitReviewResultInput, _context| {
                         let executor = executor.clone();
                         async move { executor.submit_review_result(input).await }
                     },
-                ))
+                )
             }
             mai_tools::TOOL_SAVE_ARTIFACT => {
                 let executor = self.clone();
-                Ok(RegisteredTool::from_typed_fallible_execution_result(
-                    name.clone(),
-                    description.clone(),
-                    input_schema.clone(),
-                    move |input: SaveArtifactInput, _context| {
-                        let executor = executor.clone();
-                        async move { executor.save_artifact(input).await }
-                    },
-                ))
+                Self::registered_schema_tool(schema, move |input: SaveArtifactInput, _context| {
+                    let executor = executor.clone();
+                    async move { executor.save_artifact(input).await }
+                })
             }
             mai_tools::TOOL_GITHUB_API_REQUEST => {
                 let executor = self.clone();
-                Ok(RegisteredTool::from_typed_fallible_execution_result(
-                    name.clone(),
-                    description.clone(),
-                    input_schema.clone(),
-                    move |input: GithubApiRequest, _context| {
-                        let executor = executor.clone();
-                        async move { executor.github_api_request(input).await }
-                    },
-                ))
+                Self::registered_schema_tool(schema, move |input: GithubApiRequest, _context| {
+                    let executor = executor.clone();
+                    async move { executor.github_api_request(input).await }
+                })
             }
             mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS => {
                 let executor = self.clone();
-                Ok(RegisteredTool::from_typed_fallible_execution_result(
-                    name.clone(),
-                    description.clone(),
-                    input_schema.clone(),
+                Self::registered_schema_tool(
+                    schema,
                     move |input: QueueProjectReviewPrsInput, _context| {
                         let executor = executor.clone();
                         async move { executor.queue_project_review_prs(input).await }
                     },
-                ))
+                )
             }
             _ => Err(RuntimeError::InvalidInput(format!(
                 "tool `{name}` is not a mai-team product tool"
             ))),
         }
+    }
+
+    fn registered_schema_tool<Input, F, Fut>(
+        schema: ToolSchema,
+        handler: F,
+    ) -> crate::Result<RegisteredTool>
+    where
+        Input: DeserializeOwned + Send + 'static,
+        F: Fn(Input, pl_core::ToolContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = crate::Result<ToolExecution>> + Send + 'static,
+    {
+        RegisteredTool::from_schema_typed_fallible_execution_result(schema, handler)
+            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))
     }
 
     async fn save_task_plan(&self, input: SaveTaskPlanInput) -> crate::Result<ToolExecution> {
@@ -311,9 +299,9 @@ mod tests {
         assert!(
             source.contains(&format!(
                 "{}{}",
-                "RegisteredTool::from_typed_fallible_", "execution_result"
+                "RegisteredTool::from_schema_typed_fallible_", "execution_result"
             )),
-            "产品工具应让 pl-core 负责 ToolExecutionResult 到 ToolOutput 以及业务错误到 ToolExecutionFailed 的映射"
+            "产品工具应把 schema 解包、输入解析和 ToolExecutionResult 投影全部交给 pl-core"
         );
         assert!(
             !source.contains(&format!("{}{}", "product_tool", "_error")),
@@ -385,10 +373,13 @@ mod tests {
             .expect("production source");
 
         assert!(
-            production.contains("RegisteredTool::from_typed_fallible_execution_result"),
-            "产品工具输入反序列化应由 pl-core typed RegisteredTool 统一处理"
+            production.contains("RegisteredTool::from_schema_typed_fallible_execution_result"),
+            "产品工具 schema 解包和输入反序列化应由 pl-core typed RegisteredTool 统一处理"
         );
         for forbidden in [
+            "ToolSchema::Function",
+            "description.clone()",
+            "input_schema.clone()",
             "input.arguments",
             "arguments.get(",
             "fn required_string_argument",
