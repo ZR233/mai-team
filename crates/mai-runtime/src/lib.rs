@@ -54,9 +54,7 @@ use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
 pub use model_profile::{
     core_model_turn_request, core_provider_for_selection, model_supports_continuation,
 };
-pub use model_projection::{
-    completion_response_preview, completion_response_to_model_response, completion_response_usage,
-};
+pub use model_projection::{completion_response_to_model_response, completion_response_usage};
 use pl_core::{AgentTurnStatusGuard, AgentTurnStatusOutcome, AgentTurnStatusTransition};
 use projects::review::ProjectReviewCycleResult;
 use projects::review::pool::{ProjectReviewPoolEnqueueSummary, ProjectReviewSignalInput};

@@ -5,13 +5,13 @@ use std::time::Instant;
 use axum::http::StatusCode;
 use mai_protocol::*;
 use mai_runtime::{
-    completion_response_preview, completion_response_usage, core_model_turn_request,
-    core_provider_for_selection, model_supports_continuation,
+    completion_response_usage, core_model_turn_request, core_provider_for_selection,
+    model_supports_continuation,
 };
 use mai_store::ConfigStore;
-use pl_core::{CoreModelTurnOptions, CoreSession};
+use pl_core::{CoreModelTurnOptions, CoreSession, completion_response_preview, user_text_message};
 use pl_model::CompletionResponse;
-use pl_protocol::{Message, MessageContent, MessageRole as PlMessageRole, PureError};
+use pl_protocol::PureError;
 use tokio_util::sync::CancellationToken;
 
 fn elapsed_millis(started: Instant) -> u64 {
@@ -246,15 +246,6 @@ impl ProviderTester {
             CoreModelTurnOptions::default().with_cancellation(CancellationToken::new()),
         )
         .await
-    }
-}
-
-fn user_text_message(text: impl Into<String>) -> Message {
-    Message {
-        role: PlMessageRole::User,
-        content: MessageContent::Text(text.into()),
-        reasoning_content: None,
-        metadata: Default::default(),
     }
 }
 

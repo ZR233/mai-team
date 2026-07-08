@@ -1,28 +1,5 @@
 use mai_protocol::{ModelOutputItem, ModelResponse, TokenUsage};
 
-pub fn completion_response_preview(response: &pl_model::CompletionResponse) -> String {
-    let mut parts = Vec::new();
-    if let Some(reasoning) = response
-        .reasoning_content
-        .as_deref()
-        .filter(|text| !text.is_empty())
-    {
-        parts.push(reasoning.to_string());
-    }
-    if let Some(content) = response.content.as_deref().filter(|text| !text.is_empty()) {
-        parts.push(content.to_string());
-    }
-    parts.extend(response.tool_calls.iter().map(|call| {
-        format!(
-            "function_call {} {}: {}",
-            call.name,
-            call.call_id.as_deref().unwrap_or(&call.id),
-            call.payload_text()
-        )
-    }));
-    mai_protocol::preview(&parts.join("\n"), 500)
-}
-
 pub fn completion_response_usage(usage: &pl_model::TokenUsage) -> TokenUsage {
     TokenUsage {
         input_tokens: usage.prompt_tokens,
@@ -61,5 +38,18 @@ pub fn completion_response_to_model_response(
         id: response.response_id,
         output,
         usage: Some(completion_response_usage(&response.usage)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn completion_preview_is_owned_by_pl_core() {
+        let source = include_str!("model_projection.rs");
+
+        assert!(
+            !source.contains(&format!("{}{}", "pub fn completion", "_response_preview")),
+            "completion response preview 应由 pl-core 统一实现"
+        );
     }
 }

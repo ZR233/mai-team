@@ -1460,7 +1460,7 @@ fn completion_response_projection_is_shared_by_runtime_and_server() {
     };
 
     assert_eq!(
-        completion_response_preview(&response),
+        pl_core::completion_response_preview(&response),
         "thought\\nhello\\nfunction_call lookup call_lookup: {\"q\":\"rust\"}"
     );
     assert_eq!(
