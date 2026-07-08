@@ -935,6 +935,26 @@ async fn model_client_stream_session_response_retries_without_unsupported_contin
     );
 }
 
+#[test]
+fn model_client_delegates_continuation_cache_to_pl_core() {
+    let source = include_str!("../model_client.rs");
+
+    assert!(
+        source.contains("CoreModelTurnClient"),
+        "ModelClient 应只作为 mai provider/config adapter，continuation fallback 缓存由 pl-core 负责"
+    );
+    for forbidden in [
+        "HashSet",
+        "unsupported_continuations",
+        "continuation_is_unsupported",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "ModelClient 不应继续本地维护 `{forbidden}`"
+        );
+    }
+}
+
 #[tokio::test]
 async fn model_client_exposes_shared_continuation_capability_check() {
     let (base_url, _requests) = start_mock_responses(Vec::new()).await;

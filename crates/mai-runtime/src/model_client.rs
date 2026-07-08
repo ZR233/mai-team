@@ -1,12 +1,9 @@
-use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use mai_protocol::{ModelWireApi, ProviderKind as MaiProviderKind, ToolDefinition};
-use pl_core::{CoreModelTurnOptions, CoreModelTurnRequest, CoreSession};
+use pl_core::{CoreModelTurnClient, CoreModelTurnOptions, CoreModelTurnRequest, CoreSession};
 use pl_model::{CompletionResponse, SharedModelProvider, ToolSchema, create_provider_with_models};
 use pl_protocol::PureError;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::model_profile;
@@ -17,7 +14,7 @@ const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct ModelClient {
-    continuation_cache: Arc<Mutex<HashSet<String>>>,
+    core_model: CoreModelTurnClient,
     #[allow(dead_code)]
     config: ModelClientConfig,
 }
@@ -46,7 +43,7 @@ impl ModelClient {
 
     pub fn with_config(config: ModelClientConfig) -> Self {
         Self {
-            continuation_cache: Arc::new(Mutex::new(HashSet::new())),
+            core_model: CoreModelTurnClient::new(),
             config,
         }
     }
@@ -59,7 +56,7 @@ impl ModelClient {
         create_provider_with_models(info, vec![model_profile::model_info(&selection.model)])
     }
 
-    pub async fn prepare_turn(
+    pub fn prepare_turn(
         &self,
         selection: &mai_store::ProviderSelection,
         reasoning_effort: Option<&str>,
@@ -67,16 +64,9 @@ impl ModelClient {
         tools: &[ToolDefinition],
         session: &mut CoreSession,
     ) -> Result<CoreModelTurnRequest, PureError> {
-        if self
-            .continuation_is_unsupported(&continuation_cache_key(selection))
-            .await
-        {
-            session.mark_continuation_unsupported();
-        }
-
         let use_continuation =
             Self::supports_continuation(selection) && !session.continuation_disabled();
-        Ok(CoreModelTurnRequest::new(selection.model.id.clone())
+        let mut request = CoreModelTurnRequest::new(selection.model.id.clone())
             .with_instructions(instructions)
             .with_tools(tools.iter().map(tool_schema).collect())
             .with_parallel_tool_calls(selection.model.capabilities.parallel_tools)
@@ -85,7 +75,11 @@ impl ModelClient {
                 &selection.model,
                 reasoning_effort,
             ))
-            .with_continuation(use_continuation))
+            .with_continuation(use_continuation);
+        if Self::supports_continuation(selection) {
+            request = request.with_continuation_cache_key(continuation_cache_key(selection));
+        }
+        Ok(request)
     }
 
     pub async fn stream_session_completion_response(
@@ -97,42 +91,28 @@ impl ModelClient {
         session: &mut CoreSession,
         cancellation_token: &CancellationToken,
     ) -> Result<CompletionResponse, PureError> {
-        let used_continuation =
-            Self::supports_continuation(selection) && !session.continuation_disabled();
-        let request = self
-            .prepare_turn(
-                selection,
-                reasoning_effort,
-                instructions.to_string(),
-                tools,
-                session,
-            )
-            .await?;
-        let provider = Self::provider_for_selection(selection)?;
-        let response = pl_core::stream_session_completion_response(
-            provider,
+        let request = self.prepare_turn(
+            selection,
+            reasoning_effort,
+            instructions.to_string(),
+            tools,
             session,
-            request,
-            CoreModelTurnOptions::default().with_cancellation(cancellation_token.clone()),
-        )
-        .await?;
-        if used_continuation && session.continuation_disabled() {
-            self.continuation_cache
-                .lock()
-                .await
-                .insert(continuation_cache_key(selection));
-        }
-        Ok(response)
+        )?;
+        let provider = Self::provider_for_selection(selection)?;
+        self.core_model
+            .stream_session_completion_response(
+                provider,
+                session,
+                request,
+                CoreModelTurnOptions::default().with_cancellation(cancellation_token.clone()),
+            )
+            .await
     }
 
     pub fn supports_continuation(selection: &mai_store::ProviderSelection) -> bool {
         selection.provider.kind == MaiProviderKind::Openai
             && selection.model.wire_api == ModelWireApi::Responses
             && selection.model.capabilities.continuation
-    }
-
-    async fn continuation_is_unsupported(&self, key: &str) -> bool {
-        self.continuation_cache.lock().await.contains(key)
     }
 }
 
