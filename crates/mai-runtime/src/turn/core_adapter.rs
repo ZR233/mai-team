@@ -309,18 +309,8 @@ pub(crate) async fn build_kernel_with_native_shared_tools(
             ctx.visible_tool_names.contains(name)
         })
         .await?;
-    let capabilities = pl_core::ToolCapabilityConfig {
-        bash: false,
-        workspace_files: true,
-        skills: false,
-        mcp: true,
-        lsp: false,
-        subagents: true,
-        ask_user: true,
-        git: git_runtime.is_some(),
-        docker: false,
-        container: true,
-    };
+    let capabilities =
+        pl_core::ToolCapabilityConfig::hosted_container_workspace().with_git(git_runtime.is_some());
     let mcp_backend = Arc::new(super::mcp_resources::MaiMcpResourceBackend::new(
         ctx.runtime.clone(),
         ctx.agent.clone(),

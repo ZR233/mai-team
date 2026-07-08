@@ -81,6 +81,10 @@ fn core_turn_registers_shared_tools_through_kernel_builder() {
         !source.contains("starts_with(\"mcp__\")"),
         "MCP 工具 schema 应在 turn context 中与产品工具分离，而不是在 kernel 组装层按名称分流"
     );
+    assert!(
+        !source.contains("ToolCapabilityConfig {"),
+        "主 turn kernel 组装不应手写共享工具能力矩阵，应复用 pl-core hosted capability preset"
+    );
     for forbidden in [
         "register_native_shared_tools".to_string(),
         "MaiProductToolRegistry::new".to_string(),
@@ -314,6 +318,10 @@ fn tool_visibility_consumes_pl_core_shared_tool_names() {
     assert!(
         source.contains("shared_tool_names"),
         "共享工具名目录应由 pl-core 直接提供"
+    );
+    assert!(
+        !source.contains("bash: false") && !source.contains("workspace_files: true"),
+        "tool visibility 不应手写共享工具 schema options，应从 pl-core hosted capability preset 派生"
     );
     for forbidden in ["pl_model::ToolSchema", "shared_tool_schema_name"] {
         assert!(

@@ -77,17 +77,10 @@ fn canonical_git_tool_names() -> impl Iterator<Item = &'static str> {
 }
 
 fn shared_tool_name_options() -> pl_core::SharedToolSchemaOptions {
-    pl_core::SharedToolSchemaOptions {
-        bash: false,
-        workspace_files: true,
-        ask_user: true,
-        subagents: true,
-        git: true,
-        container: true,
-        mcp_resources: true,
-        todo: true,
-        plan_exit: false,
-    }
+    pl_core::SharedToolSchemaOptions::from_capabilities(
+        &pl_core::ToolCapabilityConfig::hosted_container_workspace(),
+    )
+    .with_plan_exit(false)
 }
 
 async fn agent_capability(state: &RuntimeState, agent: &AgentRecord) -> AgentCapability {
