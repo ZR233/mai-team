@@ -267,27 +267,7 @@ pub(crate) fn project_review_error_is_retryable(error: &str) -> bool {
         return true;
     }
 
-    if let Some(stream_error) = error.strip_prefix("model error: stream error: ") {
-        return stream_error.contains("stream closed with incomplete SSE frame")
-            || stream_error.contains("stream closed before response.completed")
-            || stream_error.contains("idle timeout waiting for SSE")
-            || (stream_error.contains("response.incomplete event received")
-                && stream_error.contains("max_output_tokens"));
-    }
-
-    if !error.starts_with("model error: request to ") {
-        return false;
-    }
-
-    error.contains(" failed: error decoding response body")
-        || error.contains(" returned 429 ")
-        || error.contains(" returned 500 ")
-        || error.contains(" returned 502 ")
-        || error.contains(" returned 503 ")
-        || error.contains(" returned 504 ")
-        || error.contains("502 Bad Gateway")
-        || error.contains("503 Service Unavailable")
-        || error.contains("504 Gateway Timeout")
+    pl_core::is_retryable_model_error(error)
 }
 
 pub(crate) fn project_review_cycle_result_for_reviewer_status(
@@ -770,6 +750,35 @@ mod tests {
         assert_eq!(decision.outcome, None);
         assert_eq!(decision.summary, None);
         assert_eq!(decision.error.as_deref(), Some(error));
+    }
+
+    #[test]
+    fn model_retryable_error_classification_delegates_to_pl_core() {
+        let source = include_str!("review.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+
+        assert!(
+            production.contains("pl_core::is_retryable_model_error"),
+            "模型 provider/stream 瞬态错误分类应由 pl-core 统一提供"
+        );
+        for forbidden in [
+            "stream closed with incomplete SSE frame",
+            "stream closed before response.completed",
+            "idle timeout waiting for SSE",
+            "response.incomplete event received",
+            "error decoding response body",
+            " returned 429 ",
+            " returned 500 ",
+            " returned 502 ",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "mai-runtime 不应复制模型错误重试分类 `{forbidden}`"
+            );
+        }
     }
 
     #[test]
