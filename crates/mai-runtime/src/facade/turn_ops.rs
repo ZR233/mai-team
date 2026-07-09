@@ -155,7 +155,7 @@ impl turn::orchestrator::TurnOrchestratorOps for Arc<AgentRuntime> {
     }
 }
 
-impl turn::tools::ContainerToolOps for Arc<AgentRuntime> {
+impl turn::container::ContainerToolOps for Arc<AgentRuntime> {
     async fn container_id(&self, agent_id: AgentId) -> Result<String> {
         AgentRuntime::container_id(self.as_ref(), agent_id).await
     }
@@ -303,14 +303,6 @@ impl turn::tools::ToolDispatchOps for Arc<AgentRuntime> {
         display_name: Option<String>,
     ) -> Result<ArtifactInfo> {
         AgentRuntime::save_artifact(self, agent_id, path, display_name).await
-    }
-
-    async fn execute_project_github_api_get(
-        &self,
-        agent: &AgentRecord,
-        path: String,
-    ) -> Result<ToolExecution> {
-        AgentRuntime::execute_project_github_api_get(self.as_ref(), agent, &path).await
     }
 
     async fn execute_project_github_api_request(

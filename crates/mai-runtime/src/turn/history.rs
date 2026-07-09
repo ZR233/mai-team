@@ -52,6 +52,7 @@ pub(crate) async fn record_message(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn record_history_item(
     store: &ConfigStore,
     agent: &AgentRecord,
@@ -348,6 +349,7 @@ pub(crate) fn tool_call_message(call_id: String, name: String, raw_arguments: St
     }
 }
 
+#[cfg(test)]
 pub(crate) fn tool_result_message(
     call_id: String,
     name: String,

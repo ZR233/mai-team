@@ -5,14 +5,11 @@ use mai_protocol::{
     TurnStatus,
 };
 use pl_core::{
-    CompileMode, ContextCompactionConfig, ContextCompactionReplacement, CoreRuntimeProfile,
-    CoreSession, InstructionBlock, InstructionSnapshot, InstructionSource, InstructionSourceKind,
-    OutputTruncation, PureCoreBuilder, ReasoningEffort, RecentInteractionTailConfig, Tool,
-    ToolContext, ToolInput, ToolOutput, ToolRuntimeEvent, TraceRecorder, TurnOptions, TurnRequest,
-    TurnResultStatus,
+    AgentKernel, CompileMode, ContextCompactionConfig, ContextCompactionReplacement,
+    CoreAgentProfile, CoreSession, InstructionBlock, InstructionSnapshot, InstructionSource,
+    InstructionSourceKind, PureCoreBuilder, ReasoningEffort, RecentInteractionTailConfig,
+    TraceRecorder, TurnOptions, TurnRequest, TurnResultStatus,
 };
-use pl_protocol::PureError;
-use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -38,40 +35,40 @@ pub(crate) struct PureCoreTurnContext {
 pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
     let provider = ModelClient::provider_for_selection(&ctx.provider_selection)?;
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let runtime_profile = CoreRuntimeProfile::host_provided(workspace_root)
-        .with_context_compaction(
-            ContextCompactionConfig::new(
-                ctx.instructions.clone(),
-                crate::COMPACT_PROMPT,
-                crate::COMPACT_SUMMARY_PREFIX,
-                "compact response did not include a summary",
-            )
-            .with_replacement(ContextCompactionReplacement::RecentInteractionTail(
-                RecentInteractionTailConfig {
-                    max_user_chars: crate::COMPACT_USER_MESSAGE_MAX_CHARS,
-                    max_assistant_chars: 8_000,
-                    max_tool_output_chars: 4_000,
-                    assistant_items: 2,
-                    tool_output_items: 3,
-                },
-            )),
-        );
-    let mut builder = PureCoreBuilder::new(provider).with_runtime_profile(runtime_profile);
+    let runtime_profile = CoreAgentProfile::host_provided(workspace_root).with_context_compaction(
+        ContextCompactionConfig::new(
+            ctx.instructions.clone(),
+            crate::COMPACT_PROMPT,
+            crate::COMPACT_SUMMARY_PREFIX,
+            "compact response did not include a summary",
+        )
+        .with_replacement(ContextCompactionReplacement::RecentInteractionTail(
+            RecentInteractionTailConfig {
+                max_user_chars: crate::COMPACT_USER_MESSAGE_MAX_CHARS,
+                max_assistant_chars: 8_000,
+                max_tool_output_chars: 4_000,
+                assistant_items: 2,
+                tool_output_items: 3,
+            },
+        )),
+    );
+    let mut builder = PureCoreBuilder::new(provider);
     if let Some(effort) = ctx.reasoning_effort.as_deref() {
         builder = builder.with_reasoning_effort(ReasoningEffort::new(effort));
     }
-    let mut core = builder.build();
-    for definition in ctx.tools.iter().cloned() {
-        core.register_tool(MaiRuntimeTool::new(
-            ctx.runtime.clone(),
-            ctx.agent.clone(),
-            ctx.agent_id,
-            ctx.session_id,
-            ctx.turn_id,
-            definition,
-            ctx.cancellation_token.clone(),
-        ));
-    }
+    let registered_tools = super::kernel_tools::registered_runtime_tools(
+        ctx.runtime.clone(),
+        ctx.agent.clone(),
+        ctx.agent_id,
+        ctx.turn_id,
+        &ctx.tools,
+        ctx.cancellation_token.clone(),
+    );
+    let kernel = AgentKernel::builder(builder)
+        .with_profile(runtime_profile)
+        .with_registered_tools(registered_tools)
+        .build()
+        .await;
 
     let mut session = CoreSession::from_messages(ctx.history.clone());
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(64);
@@ -82,9 +79,17 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
     let options = TurnOptions::default()
         .with_cancellation(ctx.cancellation_token.clone())
         .with_prompt_cache_key(format!("agent:{}:session:{}", ctx.agent_id, ctx.session_id));
-    let result = core
+    let result = kernel
         .run_turn_with_trace(&mut session, request, &mut recorder, options)
         .await?;
+    super::kernel_tools::project_tool_trace_events(
+        &ctx.runtime,
+        ctx.agent_id,
+        ctx.session_id,
+        ctx.turn_id,
+        &result.trace_events,
+    )
+    .await;
     let compacted_summary = new_compaction_summary(&ctx.history, session.messages());
 
     super::history::replace_session_history(
@@ -185,129 +190,6 @@ pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone)]
-struct MaiRuntimeTool {
-    runtime: Arc<AgentRuntime>,
-    agent: Arc<AgentRecord>,
-    agent_id: AgentId,
-    session_id: SessionId,
-    turn_id: TurnId,
-    definition: ToolDefinition,
-    cancellation_token: CancellationToken,
-}
-
-impl std::fmt::Debug for MaiRuntimeTool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MaiRuntimeTool")
-            .field("agent_id", &self.agent_id)
-            .field("session_id", &self.session_id)
-            .field("turn_id", &self.turn_id)
-            .field("tool", &self.definition.name)
-            .finish()
-    }
-}
-
-impl MaiRuntimeTool {
-    fn new(
-        runtime: Arc<AgentRuntime>,
-        agent: Arc<AgentRecord>,
-        agent_id: AgentId,
-        session_id: SessionId,
-        turn_id: TurnId,
-        definition: ToolDefinition,
-        cancellation_token: CancellationToken,
-    ) -> Self {
-        Self {
-            runtime,
-            agent,
-            agent_id,
-            session_id,
-            turn_id,
-            definition,
-            cancellation_token,
-        }
-    }
-}
-
-impl Tool for MaiRuntimeTool {
-    fn name(&self) -> &str {
-        &self.definition.name
-    }
-
-    fn description(&self) -> &str {
-        &self.definition.description
-    }
-
-    fn input_schema(&self) -> Value {
-        self.definition.parameters.clone()
-    }
-
-    fn execute<'a>(
-        &'a self,
-        input: ToolInput,
-        context: ToolContext,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = std::result::Result<ToolOutput, PureError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            let execution = super::tools::run_tool_call(
-                &super::tools::ToolCallContext {
-                    store: self.runtime.deps.store.as_ref(),
-                    events: &self.runtime.events,
-                    agent: &self.agent,
-                    agent_id: self.agent_id,
-                    session_id: self.session_id,
-                    turn_id: self.turn_id,
-                },
-                super::tools::ToolCallInfo {
-                    call_id: context
-                        .provider_call_id
-                        .as_deref()
-                        .unwrap_or(input.tool_id.as_str()),
-                    name: &self.definition.name,
-                    arguments: input.arguments,
-                },
-                |arguments| {
-                    let runtime = self.runtime.clone();
-                    let agent = self.agent.clone();
-                    let name = self.definition.name.clone();
-                    let cancellation_token = self.cancellation_token.clone();
-                    async move {
-                        runtime
-                            .execute_tool(
-                                &agent,
-                                self.agent_id,
-                                self.turn_id,
-                                &name,
-                                arguments,
-                                cancellation_token,
-                            )
-                            .await
-                    }
-                },
-            )
-            .await
-            .map_err(pure_error_from_runtime)?;
-            Ok(ToolOutput {
-                description: execution.model_output,
-                truncated: OutputTruncation::empty(),
-                output_file: std::path::PathBuf::new(),
-                exit_code: None,
-                timed_out: false,
-                runtime_events: if execution.ends_turn {
-                    vec![ToolRuntimeEvent::EndTurn]
-                } else {
-                    Vec::new()
-                },
-            })
-        })
-    }
-}
-
 async fn record_assistant_message(ctx: &PureCoreTurnContext, text: String) -> Result<()> {
     super::history::record_message(
         ctx.runtime.deps.store.as_ref(),
@@ -400,12 +282,5 @@ fn raw_instruction_snapshot(instructions: String) -> InstructionSnapshot {
         },
         developer: Vec::new(),
         user: Vec::new(),
-    }
-}
-
-fn pure_error_from_runtime(error: RuntimeError) -> PureError {
-    PureError::ToolExecutionFailed {
-        tool: "mai_runtime_tool".to_string(),
-        error: error.to_string(),
     }
 }

@@ -62,6 +62,65 @@ fn pl_tool_call_names(message: &Message) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn kernel_shared_tool_definitions_supply_subagent_schema() {
+    let visible = [
+        mai_tools::TOOL_SPAWN_AGENT,
+        mai_tools::TOOL_SEND_INPUT,
+        mai_tools::TOOL_WAIT_AGENT,
+        mai_tools::TOOL_LIST_AGENTS,
+        mai_tools::TOOL_CLOSE_AGENT,
+        mai_tools::TOOL_RESUME_AGENT,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<std::collections::HashSet<_>>();
+
+    let tools = turn::kernel_tools::model_tool_definitions(&visible, Vec::new());
+    let names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "spawn_agent",
+            "send_input",
+            "wait_agent",
+            "list_agents",
+            "close_agent",
+            "resume_agent"
+        ]
+    );
+    let spawn = tools
+        .iter()
+        .find(|tool| tool.name == mai_tools::TOOL_SPAWN_AGENT)
+        .expect("spawn_agent");
+    assert!(spawn.parameters.pointer("/properties/taskName").is_some());
+    assert!(spawn.parameters.pointer("/properties/agentType").is_some());
+    assert!(
+        spawn
+            .parameters
+            .pointer("/properties/reasoningEffort")
+            .is_some()
+    );
+    assert!(spawn.parameters.pointer("/properties/forkTurns").is_some());
+    assert!(spawn.parameters.pointer("/properties/name").is_none());
+    assert!(
+        spawn
+            .parameters
+            .pointer("/properties/reasoning_effort")
+            .is_none()
+    );
+
+    let wait = tools
+        .iter()
+        .find(|tool| tool.name == mai_tools::TOOL_WAIT_AGENT)
+        .expect("wait_agent");
+    assert!(wait.parameters.pointer("/properties/timeoutMs").is_some());
+    assert!(wait.parameters.pointer("/properties/timeout_ms").is_none());
+}
+
 fn test_model(id: &str) -> ModelConfig {
     ModelConfig {
         id: id.to_string(),
@@ -1027,6 +1086,23 @@ fn seed_project_agent_workspace_volume(
             ("mai.team.role", role),
         ],
     );
+}
+
+fn seed_unmanaged_project_agent_workspace_volume(
+    dir: &tempfile::TempDir,
+    project_id: ProjectId,
+    agent_id: AgentId,
+) {
+    let volume_root = dir.path().join("fake-docker-volumes");
+    fs::create_dir_all(&volume_root).expect("mkdir fake docker volumes");
+    fs::write(
+        volume_root.join(mai_docker::project_agent_workspace_volume(
+            &project_id.to_string(),
+            &agent_id.to_string(),
+        )),
+        "",
+    )
+    .expect("seed fake unmanaged docker volume");
 }
 
 fn seed_fake_docker_volume(dir: &tempfile::TempDir, name: &str, labels: &[(&str, &str)]) {
@@ -2268,7 +2344,7 @@ async fn task_plan_tool_requires_planner_and_updates_task_status() {
 }
 
 #[tokio::test]
-async fn update_todo_list_accepts_todos_json_string_alias() {
+async fn update_todo_list_accepts_codex_items_shape() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     let agent_id = Uuid::new_v4();
@@ -2276,15 +2352,18 @@ async fn update_todo_list_accepts_todos_json_string_alias() {
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
 
     let output = runtime
-            .execute_tool_for_test(
-                agent_id,
-                "update_todo_list",
-                json!({
-                    "todos": r#"[{"step":"获取认证用户信息和读取 helper 脚本","status":"in_progress"},{"step":"选择一个符合条件的 PR","status":"pending"}]"#
-                }),
-            )
-            .await
-            .expect("update todo list");
+        .execute_tool_for_test(
+            agent_id,
+            "update_todo_list",
+            json!({
+                "items": [
+                    {"step":"获取认证用户信息和读取 helper 脚本","status":"inProgress"},
+                    {"step":"选择一个符合条件的 PR","status":"pending"}
+                ]
+            }),
+        )
+        .await
+        .expect("update todo list");
 
     assert!(output.success);
     let events = runtime.events.snapshot().await;
@@ -2306,6 +2385,65 @@ async fn update_todo_list_accepts_todos_json_string_alias() {
 }
 
 #[tokio::test]
+async fn container_exec_uses_pl_core_backend_and_records_artifacts() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let agent_id = Uuid::new_v4();
+    save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container-1"))).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let output = runtime
+        .execute_tool_for_test(
+            agent_id,
+            "container_exec",
+            json!({
+                "command": "printf /workspace",
+                "outputBytesCap": 16
+            }),
+        )
+        .await
+        .expect("container exec");
+
+    assert!(output.success);
+    assert_eq!(output.output_artifacts.len(), 1);
+    let value = serde_json::from_str::<Value>(&output.output).expect("json output");
+    assert_eq!(value["status"], 0);
+    assert_eq!(value["stdout"], "/workspace");
+    assert_eq!(value["stdoutBytes"], 10);
+    assert_eq!(
+        value["outputArtifacts"]
+            .as_array()
+            .expect("output artifacts")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn container_exec_dot_alias_is_not_registered() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let agent_id = Uuid::new_v4();
+    save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container-1"))).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let output = runtime
+        .execute_tool_for_test(
+            agent_id,
+            "container.exec",
+            json!({
+                "command": "printf /workspace",
+                "outputBytesCap": 16
+            }),
+        )
+        .await
+        .expect("container exec alias rejection");
+
+    assert!(!output.success);
+    assert_eq!(output.output, "unknown tool: container.exec");
+}
+
+#[tokio::test]
 async fn read_file_returns_bounded_paged_output() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
@@ -2322,9 +2460,9 @@ async fn read_file_returns_bounded_paged_output() {
             "read_file",
             json!({
                 "path": "/workspace/repo/sample.txt",
-                "line_start": 2,
-                "line_count": 2,
-                "max_bytes": 20
+                "lineStart": 2,
+                "lineCount": 2,
+                "maxBytes": 20
             }),
         )
         .await
@@ -2356,7 +2494,7 @@ async fn file_tools_list_files_respects_glob_and_limit() {
             json!({
                 "path": "/workspace/repo",
                 "glob": "*.rs",
-                "max_files": 1
+                "maxFiles": 1
             }),
         )
         .await
@@ -2396,7 +2534,7 @@ async fn file_tools_search_files_returns_structured_matches() {
                 "path": "/workspace/repo",
                 "glob": "*.txt",
                 "literal": true,
-                "max_matches": 5
+                "maxMatches": 5
             }),
         )
         .await
@@ -2451,7 +2589,7 @@ async fn file_tools_apply_patch_add_update_delete_and_move() {
     assert!(!workspace.join("edit.txt").exists());
     assert!(!workspace.join("delete.txt").exists());
     let value = serde_json::from_str::<Value>(&output.output).expect("json output");
-    assert!(value["changed_files"].as_array().unwrap().len() >= 3);
+    assert!(value["changedFiles"].as_array().unwrap().len() >= 3);
 }
 
 #[tokio::test]
@@ -3137,8 +3275,8 @@ async fn wait_agent_tool_returns_final_assistant_response() {
             parent_id,
             "wait_agent",
             json!({
-                "agent_id": child_id.to_string(),
-                "timeout_secs": 1
+                "targets": [child_id.to_string()],
+                "timeoutMs": 1000
             }),
         )
         .await
@@ -3912,8 +4050,10 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
     let requests = requests.lock().await.clone();
     assert_eq!(requests.len(), 3);
     let visible_tools = turn::tools::visible_tool_names(&runtime.state, &agent, &[]).await;
+    let product_tools =
+        build_tool_definitions_with_filter(&[], |name| visible_tools.contains(name));
     let expected_tool_count =
-        build_tool_definitions_with_filter(&[], |name| visible_tools.contains(name)).len();
+        turn::kernel_tools::model_tool_definitions(&visible_tools, product_tools).len();
     assert_eq!(
         requests[0]["tools"].as_array().expect("first tools").len(),
         expected_tool_count
@@ -5742,8 +5882,7 @@ async fn spawn_agent_uses_executor_default_when_role_omitted() {
             parent_id,
             "spawn_agent",
             json!({
-                "name": "child",
-                "provider_id": "openai",
+                "taskName": "child",
                 "model": "gpt-5.4"
             }),
         )
@@ -5865,9 +6004,8 @@ async fn spawn_agent_uses_role_config_over_parent_defaults() {
             parent_id,
             "spawn_agent",
             json!({
-                "name": "child",
-                "role": "reviewer",
-                "provider_id": "openai",
+                "taskName": "child",
+                "agentType": "reviewer",
                 "model": "gpt-5.4"
             }),
         )
@@ -5954,9 +6092,9 @@ async fn spawn_agent_inherits_parent_and_accepts_codex_overrides() {
             parent_id,
             "spawn_agent",
             json!({
-                "agent_type": "worker",
+                "agentType": "worker",
                 "model": "gpt-5.4",
-                "reasoning_effort": "high",
+                "reasoningEffort": "high",
                 "message": "start"
             }),
         )
@@ -6042,8 +6180,8 @@ async fn spawn_agent_fork_context_copies_parent_history_from_store() {
             parent_id,
             "spawn_agent",
             json!({
-                "name": "child",
-                "fork_context": true
+                "taskName": "child",
+                "forkTurns": 1
             }),
         )
         .await
@@ -6584,7 +6722,7 @@ async fn project_review_selector_pages_and_queues_all_eligible_prs_without_model
             github_pr(1, false, "head-1"),
         ),
         (
-            "/repos/owner/repo/pulls/1/reviews?per_page=100".to_string(),
+            "/repos/owner/repo/pulls/1/reviews?per_page=100&page=1".to_string(),
             json!([]),
         ),
         (
@@ -6620,7 +6758,7 @@ async fn project_review_selector_pages_and_queues_all_eligible_prs_without_model
             github_pr(21, false, "head-21"),
         ),
         (
-            "/repos/owner/repo/pulls/21/reviews?per_page=100".to_string(),
+            "/repos/owner/repo/pulls/21/reviews?per_page=100&page=1".to_string(),
             json!([]),
         ),
         (
@@ -6640,7 +6778,7 @@ async fn project_review_selector_pages_and_queues_all_eligible_prs_without_model
             github_pr(22, false, "head-22"),
         ),
         (
-            "/repos/owner/repo/pulls/22/reviews?per_page=100".to_string(),
+            "/repos/owner/repo/pulls/22/reviews?per_page=100&page=1".to_string(),
             json!([]),
         ),
         (
@@ -6765,7 +6903,7 @@ async fn project_maintainer_can_spawn_agent() {
             maintainer_id,
             "spawn_agent",
             json!({
-                "agent_type": "worker"
+                "agentType": "worker"
             }),
         )
         .await
@@ -7134,7 +7272,7 @@ async fn wait_agent_accepts_targets_and_send_input_queues_busy_target() {
             "wait_agent",
             json!({
                 "targets": [child_id.to_string()],
-                "timeout_ms": 1
+                "timeoutMs": 1
             }),
         )
         .await
@@ -7930,6 +8068,67 @@ async fn runtime_start_accepts_missing_legacy_project_agent_clone_when_volume_ex
         )
         .exists()
     );
+}
+
+#[tokio::test]
+async fn runtime_start_accepts_unmanaged_project_agent_volume_with_expected_name() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    maintainer.role = Some(AgentRole::Planner);
+    save_agent_with_session(&store, &maintainer).await;
+    let project = ready_test_project_summary(project_id, maintainer_id, "account-1");
+    store.save_project(&project).await.expect("save project");
+    ensure_project_repo(&dir, project_id);
+    seed_unmanaged_project_agent_workspace_volume(&dir, project_id, maintainer_id);
+
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let agent = runtime.get_agent(maintainer_id, None).await.expect("agent");
+    assert_eq!(agent.summary.status, AgentStatus::Idle);
+    assert_eq!(agent.summary.last_error, None);
+}
+
+#[tokio::test]
+async fn runtime_start_recovers_agent_failed_by_missing_workspace_volume_when_volume_exists() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    maintainer.role = Some(AgentRole::Planner);
+    maintainer.status = AgentStatus::Failed;
+    maintainer.last_error =
+        Some("project agent workspace volume is missing after startup reconcile".to_string());
+    save_agent_with_session(&store, &maintainer).await;
+    let project = ready_test_project_summary(project_id, maintainer_id, "account-1");
+    store.save_project(&project).await.expect("save project");
+    ensure_project_repo(&dir, project_id);
+    seed_unmanaged_project_agent_workspace_volume(&dir, project_id, maintainer_id);
+
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+
+    let agent = runtime.get_agent(maintainer_id, None).await.expect("agent");
+    assert_eq!(agent.summary.status, AgentStatus::Idle);
+    assert_eq!(agent.summary.last_error, None);
 }
 
 #[tokio::test]

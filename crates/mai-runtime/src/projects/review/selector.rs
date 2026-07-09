@@ -520,7 +520,7 @@ mod tests {
                 pr_detail(1, false, "head-1"),
             ),
             (
-                "/repos/owner/repo/pulls/1/reviews?per_page=100".to_string(),
+                "/repos/owner/repo/pulls/1/reviews?per_page=100&page=1".to_string(),
                 json!([]),
             ),
             (
@@ -553,7 +553,7 @@ mod tests {
                 pr_detail(21, false, "head-21"),
             ),
             (
-                "/repos/owner/repo/pulls/21/reviews?per_page=100".to_string(),
+                "/repos/owner/repo/pulls/21/reviews?per_page=100&page=1".to_string(),
                 json!([]),
             ),
             (
@@ -600,7 +600,7 @@ mod tests {
                 pr_detail(4, false, "head-4"),
             ),
             (
-                "/repos/owner/repo/pulls/4/reviews?per_page=100".to_string(),
+                "/repos/owner/repo/pulls/4/reviews?per_page=100&page=1".to_string(),
                 json!([]),
             ),
             (
@@ -620,7 +620,7 @@ mod tests {
                 pr_detail(5, false, "head-5"),
             ),
             (
-                "/repos/owner/repo/pulls/5/reviews?per_page=100".to_string(),
+                "/repos/owner/repo/pulls/5/reviews?per_page=100&page=1".to_string(),
                 json!([]),
             ),
             (
@@ -649,7 +649,7 @@ mod tests {
     async fn selector_enqueues_ready_candidate_without_waiting_for_slow_candidate() {
         let project_id = Uuid::new_v4();
         let ops = Arc::new(ConcurrentSelectorOps::new(
-            "/repos/owner/repo/pulls/4/reviews?per_page=100",
+            "/repos/owner/repo/pulls/4/reviews?per_page=100&page=1",
             vec![
             (
                 "/repos/owner/repo/pulls?state=open&sort=created&direction=asc&per_page=20&page=1"
@@ -664,7 +664,7 @@ mod tests {
                 pr_detail(4, false, "head-4"),
             ),
             (
-                "/repos/owner/repo/pulls/4/reviews?per_page=100".to_string(),
+                "/repos/owner/repo/pulls/4/reviews?per_page=100&page=1".to_string(),
                 json!([]),
             ),
             (
@@ -684,7 +684,7 @@ mod tests {
                 pr_detail(5, false, "head-5"),
             ),
             (
-                "/repos/owner/repo/pulls/5/reviews?per_page=100".to_string(),
+                "/repos/owner/repo/pulls/5/reviews?per_page=100&page=1".to_string(),
                 json!([]),
             ),
             (

@@ -64,9 +64,6 @@ pub(crate) async fn execute_git_tool(
             let token = required_token(context.token.as_deref())?;
             git_sync_default_branch(&context, token, &arguments).await?
         }
-        mai_tools::TOOL_GIT_WORKTREE_INFO => {
-            execute_pl_core_git_tool(&context, GitToolKind::WorkspaceInfo, arguments).await?
-        }
         _ => match git_tool_kind(name) {
             Some(kind) => execute_pl_core_git_tool(&context, kind, arguments).await?,
             None => {
@@ -179,6 +176,7 @@ fn pl_tool_context(workspace_root: std::path::PathBuf) -> ToolContext {
         provider_call_id: None,
         active_subagent: None,
         agent_supervisor: pl_core::AgentSupervisor::default(),
+        agent_tool_registrar: None,
         lsp_runtime: None,
         parent_session: Arc::new(pl_core::CoreSession::new()),
     }
@@ -627,7 +625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_worktree_info_returns_clone_oriented_payload() {
+    async fn git_workspace_info_returns_clone_oriented_payload() {
         let dir = tempfile::tempdir().expect("tempdir");
         let git = fake_git_path(dir.path());
         let project_id = uuid::Uuid::new_v4();
@@ -645,7 +643,7 @@ mod tests {
                 project: test_project(project_id, agent_id),
                 token: None,
             },
-            mai_tools::TOOL_GIT_WORKTREE_INFO,
+            mai_tools::TOOL_GIT_WORKSPACE_INFO,
             json!({}),
         )
         .await

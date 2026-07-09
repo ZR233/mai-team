@@ -206,7 +206,7 @@ Expected: pass.
 
 - [ ] **Step 1: Write failing tool tests**
 
-Add or update tests so project Git tools look for `clones/{agent_id}/repo`, not `worktrees/{agent_id}`, and `git_worktree_info` returns clone-oriented fields for compatibility.
+Add or update tests so project Git tools look for `clones/{agent_id}/repo`, not `worktrees/{agent_id}`, and `git_workspace_info` returns clone-oriented fields.
 
 - [ ] **Step 2: Verify tests fail**
 
