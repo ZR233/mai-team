@@ -15,7 +15,6 @@ use pl_model::{
     SharedModelProvider, ToolCapabilities, ToolSchema, create_provider_with_models,
 };
 use pl_protocol::PureError;
-use serde_json::{Map, Value};
 
 /// 将 mai 的 provider/model 选择投影成 pl-core 可直接执行的 provider。
 pub fn core_provider_for_selection(
@@ -140,10 +139,7 @@ fn model_capabilities(
 }
 
 fn request_profile(model: &ModelConfig) -> ModelRequestProfile {
-    let mut body = Map::new();
-    merge_object(&mut body, &model.options);
-    merge_object(&mut body, &model.request_policy.extra_body);
-    ModelRequestProfile {
+    let mut profile = ModelRequestProfile {
         api_model: Some(model.id.clone()),
         headers: model
             .headers
@@ -151,24 +147,16 @@ fn request_profile(model: &ModelConfig) -> ModelRequestProfile {
             .chain(model.request_policy.headers.iter())
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<HashMap<_, _>>(),
-        body,
-        options: Map::new(),
         max_tokens_field: match model.request_policy.max_tokens_field.as_str() {
             "max_completion_tokens" => MaxTokensField::MaxCompletionTokens,
             "max_tokens" => MaxTokensField::MaxTokens,
             _ => MaxTokensField::MaxTokens,
         },
-    }
-}
-
-fn merge_object(target: &mut Map<String, Value>, value: &Value) {
-    if let Some(object) = value.as_object() {
-        target.extend(
-            object
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
-    }
+        ..ModelRequestProfile::default()
+    };
+    profile.extend_body_from_value(&model.options);
+    profile.extend_body_from_value(&model.request_policy.extra_body);
+    profile
 }
 
 fn default_reasoning_effort(variants: &[ModelReasoningVariant]) -> Option<String> {
@@ -258,6 +246,26 @@ mod tests {
             assert!(
                 !production.contains(forbidden),
                 "mai-runtime 不应复制 pl-model wire assignment 拍平逻辑 `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn request_profile_body_merge_uses_pl_model_helper() {
+        let source = include_str!("model_profile.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+
+        assert!(
+            production.contains("extend_body_from_value"),
+            "模型 request profile 的 body object 合并语义应由 pl-model ModelRequestProfile 提供"
+        );
+        for forbidden in ["fn merge_object(", "value.as_object()", "target.extend("] {
+            assert!(
+                !production.contains(forbidden),
+                "mai-runtime 不应复制 request profile body 合并逻辑 `{forbidden}`"
             );
         }
     }
