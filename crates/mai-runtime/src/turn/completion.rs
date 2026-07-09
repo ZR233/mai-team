@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use mai_protocol::{AgentId, AgentStatus, ServiceEventKind, SessionId, TurnId, TurnStatus, now};
 use mai_store::ConfigStore;
+use pl_core::{AgentTurnCompletionOutcome, AgentTurnCompletionTransition};
 use serde_json::json;
 
 use crate::events::RuntimeEvents;
@@ -38,17 +39,10 @@ pub(crate) async fn complete_turn_if_current(
     result: TurnResult,
 ) -> Result<bool> {
     let turn_id = result.turn_id;
-    let session_id = {
-        let mut active_turn = agent.active_turn.lock().expect("active turn lock");
-        let active_session_id = active_turn
-            .as_ref()
-            .filter(|turn| turn.turn_id == turn_id)
-            .map(|turn| turn.session_id);
-        if active_session_id.is_some() {
-            *active_turn = None;
-        }
-        active_session_id
-    };
+    let session_id = agent
+        .active_turn
+        .take_if_turn(&turn_id)
+        .map(|turn| turn.session_id);
     let session_id = match session_id {
         Some(session_id) => session_id,
         None => {
@@ -68,14 +62,22 @@ pub(crate) async fn complete_turn_if_current(
     };
     {
         let mut summary = agent.summary.write().await;
-        if summary.current_turn != Some(turn_id) {
-            return Ok(false);
-        }
-        summary.status = result.agent_status.clone();
-        summary.current_turn = None;
-        summary.updated_at = now();
-        if let Some(error) = result.error {
-            summary.last_error = Some(error);
+        let transition = AgentTurnCompletionTransition::new(
+            turn_id,
+            result.agent_status.clone(),
+            now(),
+            result.error,
+        );
+        match transition.evaluate(summary.current_turn.as_ref()) {
+            AgentTurnCompletionOutcome::Completed(mutation) => {
+                summary.status = mutation.status;
+                summary.current_turn = mutation.current_turn;
+                summary.updated_at = mutation.updated_at;
+                if let Some(error) = mutation.last_error {
+                    summary.last_error = Some(error);
+                }
+            }
+            AgentTurnCompletionOutcome::Stale => return Ok(false),
         }
     }
     {

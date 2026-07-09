@@ -1,14 +1,14 @@
-use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
 
+use crate::skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
 use mai_protocol::{
     AgentId, AgentStatus, MessageRole, ServiceEventKind, SessionId, SkillsConfigRequest, TurnId,
-    TurnStatus,
 };
-use mai_skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
-use mai_tools::build_tool_definitions_with_filter;
-use pl_protocol::MessageContent;
+use pl_core::{
+    HostMcpToolSpec, TurnErrorProjection, TurnReturnError, TurnReturnErrorKind,
+    ensure_turn_not_cancelled,
+};
 use serde_json::json;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -18,8 +18,6 @@ use crate::events::RuntimeEvents;
 use crate::instructions::{self, ContainerSkillPaths};
 use crate::state::{AgentRecord, RuntimeState};
 use crate::turn::completion::TurnResult;
-use crate::turn::context::{ContextCompactionOutcome, ContextCompactionRequest};
-use crate::turn::model_stream::TurnModelContext;
 use crate::turn::persistence::AgentLogRecord;
 use crate::{Result, RuntimeError};
 
@@ -58,20 +56,10 @@ pub(crate) trait TurnOrchestratorOps: Send + Sync {
         skills_config: &SkillsConfigRequest,
     ) -> impl Future<Output = Result<ContainerSkillPaths>> + Send;
 
-    fn maybe_auto_compact(
-        &self,
-        agent: &Arc<AgentRecord>,
-        agent_id: AgentId,
-        session_id: SessionId,
-        turn_id: TurnId,
-        request: ContextCompactionRequest,
-        cancellation_token: &CancellationToken,
-    ) -> impl Future<Output = Result<ContextCompactionOutcome>> + Send;
-
     fn agent_mcp_tools(
         &self,
         agent: &AgentRecord,
-    ) -> impl Future<Output = Vec<mai_mcp::McpTool>> + Send;
+    ) -> impl Future<Output = Vec<crate::mcp::McpTool>> + Send;
 
     fn project_skill_read_guard(
         &self,
@@ -92,7 +80,7 @@ pub(crate) trait TurnOrchestratorOps: Send + Sync {
         skills_manager: &SkillsManager,
         skill_injections: &SkillInjections,
         skills_config: &SkillsConfigRequest,
-        mcp_tools: &[mai_mcp::McpTool],
+        mcp_tools: &[crate::mcp::McpTool],
         container_skill_paths: &ContainerSkillPaths,
     ) -> impl Future<Output = Result<String>> + Send;
 
@@ -120,6 +108,33 @@ pub(crate) struct TurnRequest {
     pub(crate) cancellation_token: CancellationToken,
 }
 
+#[derive(Debug)]
+struct TurnModelContext {
+    provider_id: String,
+    model_name: String,
+    reasoning_effort: Option<String>,
+    provider_selection: mai_store::ProviderSelection,
+    visible_tool_names: pl_core::ToolVisibilitySet,
+    tool_count: usize,
+    product_tools: Vec<pl_model::ToolSchema>,
+    mcp_tool_schemas: Vec<pl_model::ToolSchema>,
+    instructions: String,
+}
+
+fn pl_turn_return_error(error: RuntimeError) -> TurnReturnError {
+    let kind = if matches!(error, RuntimeError::TurnCancelled) {
+        TurnReturnErrorKind::Cancelled
+    } else {
+        TurnReturnErrorKind::Failed
+    };
+    TurnReturnError::from_host_error(error, kind)
+}
+
+fn check_turn_not_cancelled(cancellation_token: &CancellationToken) -> Result<()> {
+    ensure_turn_not_cancelled(cancellation_token)
+        .map_err(super::core_adapter::runtime_error_from_pl_turn)
+}
+
 pub(crate) async fn run_turn(
     deps: &RuntimeDeps,
     state: &RuntimeState,
@@ -134,28 +149,9 @@ pub(crate) async fn run_turn(
     if let Err(err) = result
         && let Ok(agent) = ops.agent(agent_id).await
     {
-        if matches!(err, RuntimeError::TurnCancelled) {
-            if let Ok(completed) = super::completion::complete_turn_if_current(
-                deps.store.as_ref(),
-                events,
-                &agent,
-                agent_id,
-                TurnResult {
-                    turn_id,
-                    status: TurnStatus::Cancelled,
-                    agent_status: AgentStatus::Cancelled,
-                    final_text: None,
-                    error: None,
-                },
-            )
-            .await
-                && completed
-            {
-                ops.start_next_queued_input_after_turn(agent_id).await;
-            }
-            return;
-        }
-        let message = err.to_string();
+        let projection = TurnErrorProjection::from_return_error(pl_turn_return_error(err));
+        let (turn_status, agent_status) =
+            super::core_adapter::mai_status_from_pl_outcome(projection.status());
         let completed = super::completion::complete_turn_if_current(
             deps.store.as_ref(),
             events,
@@ -163,24 +159,28 @@ pub(crate) async fn run_turn(
             agent_id,
             TurnResult {
                 turn_id,
-                status: TurnStatus::Failed,
-                agent_status: AgentStatus::Failed,
+                status: turn_status,
+                agent_status,
                 final_text: None,
-                error: Some(message.clone()),
+                error: projection.error_message().map(ToString::to_string),
             },
         )
         .await
         .unwrap_or(false);
         if completed {
             ops.start_next_queued_input_after_turn(agent_id).await;
-            events
-                .publish(ServiceEventKind::Error {
-                    agent_id: Some(agent_id),
-                    session_id: Some(session_id),
-                    turn_id: Some(turn_id),
-                    message,
-                })
-                .await;
+            if projection.should_publish_error()
+                && let Some(message) = projection.error_message()
+            {
+                events
+                    .publish(ServiceEventKind::Error {
+                        agent_id: Some(agent_id),
+                        session_id: Some(session_id),
+                        turn_id: Some(turn_id),
+                        message: message.to_string(),
+                    })
+                    .await;
+            }
         }
     }
 }
@@ -203,9 +203,7 @@ pub(crate) async fn run_turn_inner(
     let agent = ops.agent(agent_id).await?;
     let _turn_guard = agent.turn_lock.lock().await;
     let enforce_current_turn = agent.summary.read().await.current_turn == Some(turn_id);
-    if cancellation_token.is_cancelled() {
-        return Err(RuntimeError::TurnCancelled);
-    }
+    check_turn_not_cancelled(&cancellation_token)?;
     ops.ensure_agent_container_for_turn(
         &agent,
         AgentStatus::RunningTurn,
@@ -213,9 +211,7 @@ pub(crate) async fn run_turn_inner(
         &cancellation_token,
     )
     .await?;
-    if cancellation_token.is_cancelled() {
-        return Err(RuntimeError::TurnCancelled);
-    }
+    check_turn_not_cancelled(&cancellation_token)?;
     events
         .publish(ServiceEventKind::TurnStarted {
             agent_id,
@@ -261,36 +257,6 @@ pub(crate) async fn run_turn_inner(
     let container_skill_paths = ops
         .sync_agent_skills_to_container(&agent, &skills_manager, &skills_config)
         .await?;
-    if let Err(err) = ops
-        .maybe_auto_compact(
-            &agent,
-            agent_id,
-            session_id,
-            turn_id,
-            ContextCompactionRequest::last_context_only(),
-            &cancellation_token,
-        )
-        .await
-    {
-        if matches!(err, RuntimeError::TurnCancelled) {
-            return Err(err);
-        }
-        tracing::warn!("auto context compaction failed before user message: {err}");
-        super::persistence::record_agent_log(
-            deps.store.as_ref(),
-            AgentLogRecord {
-                agent_id,
-                session_id: Some(session_id),
-                turn_id: Some(turn_id),
-                level: "warn",
-                category: "context",
-                message: "auto context compaction failed",
-                details: json!({ "stage": "before_user_message", "error": err.to_string() }),
-            },
-        )
-        .await;
-        return Err(err);
-    }
     super::history::record_message(
         deps.store.as_ref(),
         &agent,
@@ -312,10 +278,9 @@ pub(crate) async fn run_turn_inner(
 
     let reserved_tool_names = {
         let mcp_tools = ops.agent_mcp_tools(&agent).await;
-        super::tools::visible_tool_names(state, &agent, &mcp_tools)
+        super::tool_visibility::visible_tool_names(state, &agent, &mcp_tools)
             .await
-            .into_iter()
-            .collect::<BTreeSet<_>>()
+            .to_btree_set()
     };
     let skill_injections = {
         let _project_skill_guard = ops.project_skill_read_guard(&agent).await;
@@ -362,10 +327,17 @@ pub(crate) async fn run_turn_inner(
     let model_context = {
         let context_started = Instant::now();
         let mcp_tools = ops.agent_mcp_tools(&agent).await;
-        let visible_tools = super::tools::visible_tool_names(state, &agent, &mcp_tools).await;
+        let visible_tools =
+            super::tool_visibility::visible_tool_names(state, &agent, &mcp_tools).await;
         let product_tools =
-            build_tool_definitions_with_filter(&mcp_tools, |name| visible_tools.contains(name));
-        let tools = super::kernel_tools::model_tool_definitions(&visible_tools, product_tools);
+            visible_tools.filter_schemas(crate::turn::product_tool_schemas::build_tool_schemas());
+        let mcp_tool_schemas = pl_core::host_mcp_tool_schemas(
+            mcp_tools
+                .iter()
+                .filter(|tool| visible_tools.contains(&tool.model_name))
+                .map(host_mcp_tool_spec),
+        );
+        let tool_count = visible_tools.len();
         let instructions = {
             let _project_skill_guard = ops.project_skill_read_guard(&agent).await;
             ops.build_instructions(
@@ -403,7 +375,7 @@ pub(crate) async fn run_turn_inner(
                 details: json!({
                     "provider_id": provider_id,
                     "model": model_name,
-                    "tool_count": tools.len(),
+                    "tool_count": tool_count,
                     "mcp_tool_count": mcp_tools.len(),
                     "instructions_bytes": instructions.len(),
                     "duration_ms": u128_to_u64(context_started.elapsed().as_millis()),
@@ -416,13 +388,14 @@ pub(crate) async fn run_turn_inner(
             model_name,
             reasoning_effort,
             provider_selection,
-            tools,
+            visible_tool_names: visible_tools,
+            tool_count,
+            product_tools,
+            mcp_tool_schemas,
             instructions,
         }
     };
-    if cancellation_token.is_cancelled() {
-        return Err(RuntimeError::TurnCancelled);
-    }
+    check_turn_not_cancelled(&cancellation_token)?;
     ops.set_turn_status(
         &agent,
         turn_id,
@@ -432,47 +405,6 @@ pub(crate) async fn run_turn_inner(
     )
     .await?;
     let history_started = Instant::now();
-    let history =
-        super::history::session_history(deps.store.as_ref(), &agent, agent_id, session_id).await?;
-    let estimated_request_tokens = super::context::estimate_model_request_tokens(
-        &model_context.instructions,
-        &history,
-        &model_context.tools,
-    );
-    match ops
-        .maybe_auto_compact(
-            &agent,
-            agent_id,
-            session_id,
-            turn_id,
-            ContextCompactionRequest::from_estimate(estimated_request_tokens),
-            &cancellation_token,
-        )
-        .await
-    {
-        Ok(ContextCompactionOutcome::Compacted { .. }) => {}
-        Ok(ContextCompactionOutcome::Skipped) => {}
-        Err(err) => {
-            if matches!(err, RuntimeError::TurnCancelled) {
-                return Err(err);
-            }
-            tracing::warn!("auto context compaction failed before model request: {err}");
-            super::persistence::record_agent_log(
-                deps.store.as_ref(),
-                AgentLogRecord {
-                    agent_id,
-                    session_id: Some(session_id),
-                    turn_id: Some(turn_id),
-                    level: "warn",
-                    category: "context",
-                    message: "auto context compaction failed",
-                    details: json!({ "stage": "before_model_request", "error": err.to_string() }),
-                },
-            )
-            .await;
-            return Err(err);
-        }
-    }
     let history =
         super::history::session_history(deps.store.as_ref(), &agent, agent_id, session_id).await?;
     let history_duration_ms = u128_to_u64(history_started.elapsed().as_millis());
@@ -492,7 +424,7 @@ pub(crate) async fn run_turn_inner(
             details: json!({
                 "provider_id": model_context.provider_id,
                 "model": model_context.model_name,
-                "tool_count": model_context.tools.len(),
+                "tool_count": model_context.tool_count,
                 "history_items": history.len(),
                 "history_load_ms": history_duration_ms,
             }),
@@ -509,37 +441,27 @@ pub(crate) async fn run_turn_inner(
         provider_selection: model_context.provider_selection,
         reasoning_effort: model_context.reasoning_effort,
         instructions: model_context.instructions,
-        tools: model_context.tools,
+        visible_tool_names: model_context.visible_tool_names,
+        product_tools: model_context.product_tools,
+        mcp_tool_schemas: model_context.mcp_tool_schemas,
         history,
         cancellation_token,
     })
     .await
 }
 
-fn message_with_skill_fragment(message: String, fragment: Option<pl_protocol::Message>) -> String {
-    let Some(fragment) = fragment else {
-        return message;
-    };
-    let fragment_text = match fragment.content {
-        MessageContent::Text(text) => text,
-        MessageContent::MultiPart(parts) => parts
-            .into_iter()
-            .filter_map(|part| match part {
-                pl_protocol::ContentPart::Text { text } => Some(text),
-                pl_protocol::ContentPart::Image {
-                    source: _,
-                    media_type: _,
-                    filename: _,
-                } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    };
-    if fragment_text.trim().is_empty() {
-        message
-    } else {
-        format!("{message}\n\n{fragment_text}")
+fn host_mcp_tool_spec(tool: &crate::mcp::McpTool) -> HostMcpToolSpec {
+    HostMcpToolSpec {
+        model_name: tool.model_name.clone(),
+        server: tool.server.clone(),
+        name: tool.name.clone(),
+        description: tool.description.clone(),
+        input_schema: tool.input_schema.clone(),
     }
+}
+
+fn message_with_skill_fragment(message: String, fragment: Option<pl_protocol::Message>) -> String {
+    pl_core::append_message_fragment_text(message, fragment.as_ref())
 }
 
 fn u128_to_u64(value: u128) -> u64 {

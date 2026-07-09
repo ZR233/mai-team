@@ -2,15 +2,15 @@ use std::sync::Arc;
 
 use mai_docker::{SidecarParams, project_agent_workspace_volume};
 use mai_protocol::{GitProvider, ProjectId, ProjectSummary};
+use pl_core::shell_quote_word;
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::github::GitAccountToken;
 use crate::state::AgentRecord;
-use crate::turn::tools::ToolExecution;
+use crate::turn::tool_output::ToolExecution;
 use crate::{
-    AgentRuntime, Result, RuntimeError, github, normalized_text, projects, redact_secret,
-    shell_quote, tools, turn,
+    AgentRuntime, Result, RuntimeError, github, normalized_text, projects, redact_secret, turn,
 };
 
 impl AgentRuntime {
@@ -48,7 +48,7 @@ impl AgentRuntime {
     pub(crate) async fn execute_project_github_api_request(
         &self,
         agent: &AgentRecord,
-        request: &turn::tools::GithubApiRequest,
+        request: &turn::product_tools::GithubApiRequest,
     ) -> Result<ToolExecution> {
         let method = github::normalize_github_api_method(&request.method)?;
         let path = github::normalize_github_api_get_path(&request.path)?;
@@ -82,14 +82,14 @@ impl AgentRuntime {
             env.push(("MAI_GH_API_BODY".to_string(), body));
             format!(
                 "printf '%s' \"$MAI_GH_API_BODY\" | gh api --method {} --input - {}",
-                shell_quote(&method),
-                shell_quote(&path)
+                shell_quote_word(&method),
+                shell_quote_word(&path)
             )
         } else {
             format!(
                 "gh api --method {} {}",
-                shell_quote(&method),
-                shell_quote(&path)
+                shell_quote_word(&method),
+                shell_quote_word(&path)
             )
         };
         let output = self
@@ -113,39 +113,7 @@ impl AgentRuntime {
                 "gh api sidecar failed: {message}"
             )));
         }
-        Ok(ToolExecution::new(true, output.stdout, false))
-    }
-
-    pub(crate) async fn execute_project_git_tool(
-        &self,
-        agent: &AgentRecord,
-        name: &str,
-        arguments: Value,
-    ) -> Result<ToolExecution> {
-        let summary = agent.summary.read().await.clone();
-        let project_id = summary.project_id.ok_or_else(|| {
-            RuntimeError::InvalidInput("agent is not attached to a project".to_string())
-        })?;
-        let project = self.project(project_id).await?;
-        let project_summary = project.summary.read().await.clone();
-        let workspace_volume =
-            project_agent_workspace_volume(&project_id.to_string(), &summary.id.to_string());
-        tools::git::execute_git_tool(
-            tools::git::GitToolContext {
-                backend: tools::git::GitToolBackend::Sidecar {
-                    docker: &self.deps.docker,
-                    sidecar_image: &self.sidecar_image,
-                    workspace_volume,
-                    repo_path: projects::workspace::AGENT_WORKSPACE_REPO_PATH,
-                },
-                agent_id: summary.id,
-                project: project_summary,
-                token: self.project_git_token(project_id).await?,
-            },
-            name,
-            arguments,
-        )
-        .await
+        Ok(ToolExecution::success(output.stdout))
     }
 }
 

@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use mai_mcp::McpTool;
+use crate::mcp::McpTool;
+use crate::skills::{SkillInjections, render_available_response};
 use mai_protocol::{SkillActivationInfo, SkillScope, SkillsListResponse};
-use mai_skills::{SkillInjections, render_available_response};
-use pl_protocol::{Message, MessageContent, MessageRole as ModelMessageRole};
+use pl_protocol::Message;
 
 pub(crate) const CONTAINER_SKILLS_ROOT: &str = "/tmp/.mai-team/skills";
 
@@ -115,12 +115,7 @@ pub(crate) fn skill_user_fragment(
             skill.contents
         ));
     }
-    Some(Message {
-        role: ModelMessageRole::User,
-        content: MessageContent::Text(text),
-        reasoning_content: None,
-        metadata: Default::default(),
-    })
+    Some(pl_core::user_text_message(text))
 }
 
 pub(crate) fn container_skill_dir(skill: &mai_protocol::SkillMetadata) -> PathBuf {
@@ -175,13 +170,14 @@ fn safe_container_skill_segment(value: &str) -> String {
 mod tests {
     use super::*;
     use mai_protocol::SkillMetadata;
+    use pl_protocol::{MessageContent, MessageRole as ModelMessageRole};
 
     #[test]
     fn skill_user_fragment_wraps_loaded_skill_contents() {
         let path = PathBuf::from("/tmp/demo/SKILL.md");
         let fragment = skill_user_fragment(
             &SkillInjections {
-                items: vec![mai_skills::LoadedSkill {
+                items: vec![crate::skills::LoadedSkill {
                     metadata: SkillMetadata {
                         name: "demo".to_string(),
                         description: "Demo skill".to_string(),
@@ -222,7 +218,7 @@ mod tests {
         paths.insert(path.clone(), container_path.clone());
         let fragment = skill_user_fragment(
             &SkillInjections {
-                items: vec![mai_skills::LoadedSkill {
+                items: vec![crate::skills::LoadedSkill {
                     metadata: SkillMetadata {
                         name: "demo".to_string(),
                         description: "Demo skill".to_string(),
@@ -272,6 +268,24 @@ mod tests {
         assert_eq!(
             container_skill_dir(&skill),
             PathBuf::from("/tmp/.mai-team/skills/system/demo")
+        );
+    }
+
+    #[test]
+    fn skill_user_fragment_uses_pl_core_user_message_helper() {
+        let source = include_str!("instructions.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production section");
+
+        assert!(
+            production.contains("pl_core::user_text_message"),
+            "skill 用户片段应复用 pl-core 的用户消息构造 helper"
+        );
+        assert!(
+            !production.contains(&format!("{}{}", "role: ModelMessageRole", "::User")),
+            "生产代码不应手写 pl_protocol 用户消息 role"
         );
     }
 }

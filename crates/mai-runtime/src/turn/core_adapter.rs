@@ -1,21 +1,15 @@
 use std::sync::Arc;
 
-use mai_protocol::{
-    AgentId, AgentStatus, MessageRole, ServiceEventKind, SessionId, ToolDefinition, TurnId,
-    TurnStatus,
-};
+use mai_protocol::{AgentId, AgentStatus, ServiceEventKind, SessionId, TurnId, TurnStatus};
 use pl_core::{
-    AgentKernel, CompileMode, ContextCompactionConfig, ContextCompactionReplacement,
-    CoreAgentProfile, CoreSession, InstructionBlock, InstructionSnapshot, InstructionSource,
-    InstructionSourceKind, PureCoreBuilder, ReasoningEffort, RecentInteractionTailConfig,
-    TraceRecorder, TurnOptions, TurnRequest, TurnResultStatus,
+    AgentKernel, CoreAgentProfile, PureCoreBuilder, ToolVisibilitySet, TurnOutcomeStatus,
+    TurnReturnError,
 };
+use pl_model::ToolSchema;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use crate::state::AgentRecord;
-use crate::turn::completion::TurnResult;
-use crate::{AgentRuntime, ModelClient, Result, RuntimeError, completion_response_usage};
+use crate::{AgentRuntime, Result, RuntimeError};
 
 pub(crate) struct PureCoreTurnContext {
     pub(crate) runtime: Arc<AgentRuntime>,
@@ -27,260 +21,301 @@ pub(crate) struct PureCoreTurnContext {
     pub(crate) provider_selection: mai_store::ProviderSelection,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) instructions: String,
-    pub(crate) tools: Vec<ToolDefinition>,
+    pub(crate) visible_tool_names: ToolVisibilitySet,
+    pub(crate) product_tools: Vec<ToolSchema>,
+    pub(crate) mcp_tool_schemas: Vec<ToolSchema>,
     pub(crate) history: Vec<pl_protocol::Message>,
     pub(crate) cancellation_token: CancellationToken,
 }
 
+pub(crate) struct SharedToolKernelBuildContext {
+    pub(crate) runtime: Arc<AgentRuntime>,
+    pub(crate) agent: Arc<AgentRecord>,
+    pub(crate) agent_id: AgentId,
+    pub(crate) visible_tool_names: ToolVisibilitySet,
+    pub(crate) mcp_tool_schemas: Vec<ToolSchema>,
+    pub(crate) cancellation_token: CancellationToken,
+}
+
+pub(crate) struct MaiAgentKernelBuildContext {
+    pub(crate) runtime: Arc<AgentRuntime>,
+    pub(crate) agent: Arc<AgentRecord>,
+    pub(crate) agent_id: AgentId,
+    pub(crate) visible_tool_names: ToolVisibilitySet,
+    pub(crate) product_tool_schemas: Vec<ToolSchema>,
+    pub(crate) mcp_tool_schemas: Vec<ToolSchema>,
+    pub(crate) cancellation_token: CancellationToken,
+}
+
 pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
-    let provider = ModelClient::provider_for_selection(&ctx.provider_selection)?;
-    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let runtime_profile = CoreAgentProfile::host_provided(workspace_root).with_context_compaction(
-        ContextCompactionConfig::new(
-            ctx.instructions.clone(),
-            crate::COMPACT_PROMPT,
-            crate::COMPACT_SUMMARY_PREFIX,
-            "compact response did not include a summary",
-        )
-        .with_replacement(ContextCompactionReplacement::RecentInteractionTail(
-            RecentInteractionTailConfig {
-                max_user_chars: crate::COMPACT_USER_MESSAGE_MAX_CHARS,
-                max_assistant_chars: 8_000,
-                max_tool_output_chars: 4_000,
-                assistant_items: 2,
-                tool_output_items: 3,
-            },
-        )),
-    );
-    let mut builder = PureCoreBuilder::new(provider);
-    if let Some(effort) = ctx.reasoning_effort.as_deref() {
-        builder = builder.with_reasoning_effort(ReasoningEffort::new(effort));
-    }
-    let registered_tools = super::kernel_tools::registered_runtime_tools(
-        ctx.runtime.clone(),
-        ctx.agent.clone(),
-        ctx.agent_id,
-        ctx.turn_id,
-        &ctx.tools,
-        ctx.cancellation_token.clone(),
-    );
-    let kernel = AgentKernel::builder(builder)
-        .with_profile(runtime_profile)
-        .with_registered_tools(registered_tools)
-        .build()
-        .await;
-
-    let mut session = CoreSession::from_messages(ctx.history.clone());
-    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(64);
-    let mut recorder = TraceRecorder::new(ctx.session_id.to_string(), event_tx, 0);
-    let request = TurnRequest::new(ctx.message.clone(), CompileMode::Auto)
-        .with_turn_id(ctx.turn_id.to_string())
-        .with_instruction_snapshot(raw_instruction_snapshot(ctx.instructions.clone()));
-    let options = TurnOptions::default()
-        .with_cancellation(ctx.cancellation_token.clone())
-        .with_prompt_cache_key(format!("agent:{}:session:{}", ctx.agent_id, ctx.session_id));
-    let result = kernel
-        .run_turn_with_trace(&mut session, request, &mut recorder, options)
-        .await?;
-    super::kernel_tools::project_tool_trace_events(
-        &ctx.runtime,
-        ctx.agent_id,
-        ctx.session_id,
-        ctx.turn_id,
-        &result.trace_events,
-    )
-    .await;
-    let compacted_summary = new_compaction_summary(&ctx.history, session.messages());
-
-    super::history::replace_session_history(
-        ctx.runtime.deps.store.as_ref(),
-        &ctx.agent,
-        ctx.agent_id,
-        ctx.session_id,
-        session.messages().to_vec(),
-    )
-    .await?;
-    if let Some(summary) = compacted_summary {
-        record_context_compacted(&ctx, &summary, result.usage.total_tokens).await;
-    }
-    if let Some(last_context_tokens) = result.last_context_tokens {
-        super::history::record_session_context_tokens(
-            ctx.runtime.deps.store.as_ref(),
-            &ctx.agent,
-            ctx.agent_id,
-            ctx.session_id,
-            last_context_tokens,
-        )
-        .await?;
-    }
-    if result.usage.total_tokens > 0 {
-        super::accounting::record_model_usage(
-            ctx.runtime.deps.store.as_ref(),
-            &ctx.runtime.events,
-            &ctx.agent,
-            ctx.agent_id,
-            ctx.session_id,
-            &completion_response_usage(&result.usage),
-        )
-        .await?;
-    }
-    if !result.content.trim().is_empty() {
-        record_assistant_message(&ctx, result.content.clone()).await?;
-    }
-
-    let return_error = match result.status {
-        TurnResultStatus::Completed => None,
-        TurnResultStatus::Aborted
-            if result.abort_reason == Some(pl_core::TurnAbortReason::Interrupted) =>
-        {
-            Some(RuntimeError::TurnCancelled)
-        }
-        TurnResultStatus::Aborted | TurnResultStatus::Errored => Some(RuntimeError::InvalidInput(
-            result
-                .error
-                .clone()
-                .unwrap_or_else(|| "pl-core turn failed".to_string()),
-        )),
-    };
-    let (turn_status, agent_status, error) = match result.status {
-        TurnResultStatus::Completed => (TurnStatus::Completed, AgentStatus::Completed, None),
-        TurnResultStatus::Aborted => match result.abort_reason {
-            Some(pl_core::TurnAbortReason::Interrupted) => (
-                TurnStatus::Cancelled,
-                AgentStatus::Cancelled,
-                result.error.clone(),
-            ),
-            Some(pl_core::TurnAbortReason::BudgetLimited)
-            | Some(pl_core::TurnAbortReason::Shutdown)
-            | Some(pl_core::TurnAbortReason::ProviderError)
-            | Some(pl_core::TurnAbortReason::ToolError)
-            | None => (
-                TurnStatus::Failed,
-                AgentStatus::Failed,
-                result.error.clone(),
-            ),
-        },
-        TurnResultStatus::Errored => (
-            TurnStatus::Failed,
-            AgentStatus::Failed,
-            result.error.clone(),
-        ),
-    };
-    super::completion::finish_turn(
-        ctx.runtime.deps.store.as_ref(),
-        &ctx.runtime.events,
-        &ctx.agent,
-        ctx.agent_id,
-        ctx.session_id,
-        TurnResult {
-            turn_id: ctx.turn_id,
-            status: turn_status,
-            agent_status,
-            final_text: (!result.content.trim().is_empty()).then_some(result.content),
-            error,
-        },
-    )
-    .await?;
-    ctx.runtime
-        .start_next_queued_input_after_turn(ctx.agent_id)
-        .await;
-    if let Some(error) = return_error {
-        return Err(error);
-    }
-    Ok(())
+    super::hosted_runtime::run_hosted_agent_turn(ctx).await
 }
 
-async fn record_assistant_message(ctx: &PureCoreTurnContext, text: String) -> Result<()> {
-    super::history::record_message(
-        ctx.runtime.deps.store.as_ref(),
-        &ctx.agent,
-        ctx.agent_id,
-        ctx.session_id,
-        MessageRole::Assistant,
-        text.clone(),
-    )
-    .await?;
-    let message_id = format!("msg_{}", Uuid::new_v4());
-    ctx.runtime
-        .events
-        .publish(ServiceEventKind::AgentMessageCompleted {
-            agent_id: ctx.agent_id,
-            session_id: Some(ctx.session_id),
-            turn_id: ctx.turn_id,
-            message_id: message_id.clone(),
-            role: MessageRole::Assistant,
-            channel: "final".to_string(),
-            content: text.clone(),
+pub(crate) fn mai_status_from_pl_outcome(status: TurnOutcomeStatus) -> (TurnStatus, AgentStatus) {
+    match status {
+        TurnOutcomeStatus::Completed => (TurnStatus::Completed, AgentStatus::Completed),
+        TurnOutcomeStatus::Cancelled => (TurnStatus::Cancelled, AgentStatus::Cancelled),
+        TurnOutcomeStatus::Failed => (TurnStatus::Failed, AgentStatus::Failed),
+    }
+}
+
+pub(crate) fn runtime_error_from_pl_turn(error: TurnReturnError) -> RuntimeError {
+    match error {
+        TurnReturnError::Cancelled => RuntimeError::TurnCancelled,
+        TurnReturnError::Failed(message) => RuntimeError::InvalidInput(message),
+    }
+}
+
+pub(crate) fn mai_user_input_interaction_callback(
+    runtime: Arc<AgentRuntime>,
+    agent_id: AgentId,
+    session_id: SessionId,
+    turn_id: TurnId,
+) -> pl_core::InteractionCallback {
+    Arc::new(move |interaction| {
+        let runtime = runtime.clone();
+        Box::pin(async move {
+            match interaction.payload {
+                pl_protocol::InteractionPayload::UserInput { questions } => {
+                    let (header, questions) = user_input_questions_from_pl(questions);
+                    runtime
+                        .events
+                        .publish(ServiceEventKind::UserInputRequested {
+                            agent_id,
+                            session_id: Some(session_id),
+                            turn_id,
+                            header,
+                            questions,
+                        })
+                        .await;
+                    pl_protocol::InteractionResolution::UserInput {
+                        answers: Default::default(),
+                    }
+                }
+                pl_protocol::InteractionPayload::ToolApproval { .. } => {
+                    pl_protocol::InteractionResolution::ToolApproval {
+                        decision: pl_protocol::ToolApprovalResolution::Denied,
+                        reason: Some(
+                            "mai-team user input callback does not approve tools".to_string(),
+                        ),
+                    }
+                }
+                pl_protocol::InteractionPayload::PlanConfirmation { .. } => {
+                    pl_protocol::InteractionResolution::PlanConfirmation {
+                        decision: pl_protocol::PlanConfirmationResolution::Dismiss,
+                        content: None,
+                        reason: Some(
+                            "mai-team user input callback does not confirm plans".to_string(),
+                        ),
+                    }
+                }
+            }
         })
-        .await;
-    ctx.runtime
-        .events
-        .publish(ServiceEventKind::AgentMessage {
-            agent_id: ctx.agent_id,
-            session_id: Some(ctx.session_id),
-            turn_id: Some(ctx.turn_id),
-            role: MessageRole::Assistant,
-            content: text,
-        })
-        .await;
-    Ok(())
-}
-
-async fn record_context_compacted(ctx: &PureCoreTurnContext, summary: &str, tokens_before: u64) {
-    ctx.runtime
-        .events
-        .publish(ServiceEventKind::ContextCompacted {
-            agent_id: ctx.agent_id,
-            session_id: ctx.session_id,
-            turn_id: ctx.turn_id,
-            tokens_before,
-            summary_preview: preview(summary, crate::COMPACT_SUMMARY_PREVIEW_CHARS),
-        })
-        .await;
-}
-
-fn new_compaction_summary(
-    before: &[pl_protocol::Message],
-    after: &[pl_protocol::Message],
-) -> Option<String> {
-    let before_summaries = before
-        .iter()
-        .filter_map(compaction_summary_text)
-        .collect::<std::collections::BTreeSet<_>>();
-    after
-        .iter()
-        .filter_map(compaction_summary_text)
-        .find(|summary| !before_summaries.contains(summary))
-        .map(str::to_string)
-}
-
-fn compaction_summary_text(message: &pl_protocol::Message) -> Option<&str> {
-    super::history::user_message_text(message).filter(|text| {
-        super::history::is_compact_summary(text.trim(), crate::COMPACT_SUMMARY_PREFIX)
     })
 }
 
-fn preview(text: &str, max_chars: usize) -> String {
-    let trimmed = text.trim();
-    if trimmed.chars().count() <= max_chars {
-        return trimmed.to_string();
-    }
-    let mut chars = trimmed.chars().take(max_chars).collect::<String>();
-    chars.push_str("...");
-    chars
+fn user_input_questions_from_pl(
+    questions: Vec<pl_protocol::UserQuestion>,
+) -> (String, Vec<mai_protocol::UserInputQuestion>) {
+    let projection = pl_core::project_user_input_questions(questions);
+    let questions = projection
+        .questions()
+        .iter()
+        .map(|question| mai_protocol::UserInputQuestion {
+            id: question.id().to_string(),
+            question: question.question().to_string(),
+            options: question
+                .options()
+                .iter()
+                .map(|option| mai_protocol::UserInputOption {
+                    label: option.label().to_string(),
+                    description: Some(option.description().to_string()),
+                })
+                .collect(),
+        })
+        .collect();
+    (projection.header().to_string(), questions)
 }
 
-fn raw_instruction_snapshot(instructions: String) -> InstructionSnapshot {
-    InstructionSnapshot {
-        base: InstructionBlock {
-            source: InstructionSource {
-                kind: InstructionSourceKind::ProfileBaseOverride,
-                label: "mai-team instructions".to_string(),
-                path: None,
-            },
-            content: instructions,
+pub(crate) async fn build_kernel_with_native_shared_tools(
+    builder: PureCoreBuilder,
+    runtime_profile: CoreAgentProfile,
+    registered_tools: Vec<pl_core::RegisteredTool>,
+    ctx: SharedToolKernelBuildContext,
+) -> Result<AgentKernel> {
+    let backend = Arc::new(super::container::MaiContainerBackend::new(
+        ctx.runtime.clone(),
+        ctx.agent_id,
+    ));
+    let git_runtime =
+        crate::tools::git::native_git_tool_runtime(ctx.runtime.clone(), &ctx.agent, |name| {
+            ctx.visible_tool_names.contains(name)
+        })
+        .await?;
+    let capabilities =
+        pl_core::ToolCapabilityConfig::hosted_container_workspace().with_git(git_runtime.is_some());
+    let mcp_backend = Arc::new(super::mcp_resources::MaiMcpResourceBackend::new(
+        ctx.runtime.clone(),
+        ctx.agent.clone(),
+        ctx.agent_id,
+        ctx.cancellation_token.clone(),
+    ));
+    let mcp_tool_backend = Arc::new(super::mcp_tools::MaiMcpToolBackend::new(
+        ctx.runtime.clone(),
+        ctx.agent.clone(),
+        ctx.agent_id,
+        ctx.cancellation_token.clone(),
+    ));
+    let agent_control_backend = Arc::new(super::agent_control::MaiAgentControlBackend::new(
+        ctx.runtime.clone(),
+        ctx.agent.clone(),
+        ctx.agent_id,
+        ctx.cancellation_token.clone(),
+    ));
+    let agent_control_policy = Arc::new(super::agent_control::MaiAgentControlPolicy::new(
+        ctx.runtime.clone(),
+        ctx.agent.clone(),
+        ctx.agent_id,
+    ));
+    let tool_set = pl_core::ToolSetBuilder::from_capabilities(capabilities)
+        .with_allowed_tools(ctx.visible_tool_names.iter().cloned())
+        .with_container_tools(backend)
+        .with_mcp_resource_tools(mcp_backend)
+        .with_mcp_tools(ctx.mcp_tool_schemas, mcp_tool_backend)
+        .with_agent_control_tools(agent_control_backend)
+        .with_agent_control_policy(agent_control_policy);
+    let kernel_builder = AgentKernel::builder(builder)
+        .with_profile(runtime_profile)
+        .with_registered_tools(registered_tools);
+    let kernel = if let Some(git_runtime) = git_runtime {
+        kernel_builder
+            .with_tool_set(tool_set.with_git_tools(
+                git_runtime.config,
+                git_runtime.backend,
+                git_runtime.credential_provider,
+            ))
+            .build()
+            .await
+    } else {
+        kernel_builder.with_tool_set(tool_set).build().await
+    };
+    Ok(kernel)
+}
+
+pub(crate) async fn build_mai_agent_kernel(
+    builder: PureCoreBuilder,
+    runtime_profile: CoreAgentProfile,
+    ctx: MaiAgentKernelBuildContext,
+) -> Result<AgentKernel> {
+    let product_tool_registry = super::product_tools::MaiProductToolRegistry::new(
+        ctx.runtime.clone(),
+        ctx.agent.clone(),
+        ctx.agent_id,
+        ctx.product_tool_schemas,
+    );
+    let product_tools = product_tool_registry.registered_tools()?;
+    build_kernel_with_native_shared_tools(
+        builder,
+        runtime_profile,
+        product_tools,
+        SharedToolKernelBuildContext {
+            runtime: ctx.runtime,
+            agent: ctx.agent,
+            agent_id: ctx.agent_id,
+            visible_tool_names: ctx.visible_tool_names,
+            mcp_tool_schemas: ctx.mcp_tool_schemas,
+            cancellation_token: ctx.cancellation_token,
         },
-        developer: Vec::new(),
-        user: Vec::new(),
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn context_summary_preview_delegates_to_pl_core() {
+        let source = include_str!("hosted_runtime.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production section");
+
+        assert!(production.contains("pl_core::text_preview_chars"));
+        assert!(
+            !production.contains("fn preview("),
+            "context compaction summary preview 不应在 mai-runtime 复制文本截断 helper"
+        );
+    }
+
+    #[test]
+    fn turn_runtime_statistics_use_pl_core_snapshot() {
+        let source = include_str!("hosted_runtime.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production section");
+
+        assert!(
+            production.contains("result.runtime_snapshot()"),
+            "usage/context/compaction 统计暴露规则应由 pl-core TurnRuntimeSnapshot 统一提供"
+        );
+        for forbidden in [
+            "result.context_compactions.last()",
+            "result.last_context_tokens",
+            "result.usage.total_tokens > 0",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "mai-runtime 不应直接解释 TurnResult 底层统计字段 `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn user_input_projection_uses_pl_core_projection() {
+        let source = include_str!("core_adapter.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production section");
+
+        assert!(
+            production.contains("pl_core::project_user_input_questions"),
+            "request_user_input 的 header/options 归一化应由 pl-core projection 提供"
+        );
+        for forbidden in [
+            "question.header.trim()",
+            ".options.unwrap_or_default()",
+            "unwrap_or_else(|| \"Input\".to_string())",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "mai-runtime 不应手写 request_user_input 投影 `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_instruction_snapshot_uses_pl_core_constructor() {
+        let source = include_str!("hosted_runtime.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production section");
+
+        assert!(
+            production.contains("InstructionSnapshot::profile_base_override"),
+            "宿主 base prompt 快照应由 pl-core 构造，mai-runtime 不应直接拼 InstructionSnapshot 结构"
+        );
+        for forbidden in [
+            "InstructionBlock",
+            "InstructionSource",
+            "InstructionSourceKind::ProfileBaseOverride",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "mai-runtime 不应直接依赖 pl-core instruction 内部结构 `{forbidden}`"
+            );
+        }
     }
 }

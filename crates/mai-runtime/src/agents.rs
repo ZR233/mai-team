@@ -7,6 +7,9 @@ use mai_protocol::{
     AgentDetail, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary,
     ContextUsage, MessageRole, ServiceEvent, ServiceEventKind, SessionId, TokenUsage, now,
 };
+use pl_core::{
+    AgentLifecycleStatusKind, AgentTurnPresence, AgentTurnStartSnapshot, AgentWaitSnapshot,
+};
 use pl_protocol::Message as ModelMessage;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -22,6 +25,7 @@ mod fork;
 mod input;
 mod model;
 mod observability;
+pub(crate) mod profiles;
 mod resources;
 mod spawn;
 mod turn;
@@ -75,11 +79,6 @@ pub(crate) trait AgentServiceOps: Send + Sync {
         agent_id: AgentId,
         session_id: Option<SessionId>,
     ) -> Result<SessionId>;
-    async fn load_agent_history(
-        &self,
-        agent_id: AgentId,
-        session_id: SessionId,
-    ) -> Result<Vec<ModelMessage>>;
     async fn replace_agent_history(
         &self,
         agent_id: AgentId,
@@ -285,13 +284,12 @@ The plan should include:
 
 Keep the plan concise and actionable. Prefer behavior-level descriptions over file-by-file inventories. Mention specific files only when needed to disambiguate a non-obvious change."#;
 
-pub(crate) fn agent_type_role(value: &str) -> Option<AgentRole> {
-    match value.trim().to_lowercase().as_str() {
-        "planner" => Some(AgentRole::Planner),
-        "explorer" => Some(AgentRole::Explorer),
-        "executor" | "worker" | "default" | "" => Some(AgentRole::Executor),
-        "reviewer" => Some(AgentRole::Reviewer),
-        _ => None,
+pub(crate) fn agent_type_role(kind: pl_core::AgentControlAgentType) -> AgentRole {
+    match kind {
+        pl_core::AgentControlAgentType::Planner => AgentRole::Planner,
+        pl_core::AgentControlAgentType::Explorer => AgentRole::Explorer,
+        pl_core::AgentControlAgentType::Executor => AgentRole::Executor,
+        pl_core::AgentControlAgentType::Reviewer => AgentRole::Reviewer,
     }
 }
 
@@ -387,15 +385,38 @@ pub(crate) fn last_turn_response(sessions: &[AgentSessionRecord]) -> Option<Stri
 }
 
 pub(crate) fn is_agent_wait_complete(summary: &AgentSummary) -> bool {
-    summary.current_turn.is_none()
-        || matches!(
-            summary.status,
-            AgentStatus::Completed
-                | AgentStatus::Failed
-                | AgentStatus::Cancelled
-                | AgentStatus::Deleted
-                | AgentStatus::Idle
-        )
+    agent_wait_snapshot(summary).is_complete()
+}
+
+pub(crate) fn is_agent_turn_start_ready(summary: &AgentSummary) -> bool {
+    is_agent_status_turn_start_ready(&summary.status)
+}
+
+pub(crate) fn is_agent_status_turn_start_ready(status: &AgentStatus) -> bool {
+    AgentTurnStartSnapshot::new(agent_lifecycle_status_kind(status)).can_start()
+}
+
+fn agent_wait_snapshot(summary: &AgentSummary) -> AgentWaitSnapshot {
+    let turn_presence = match summary.current_turn {
+        Some(_) => AgentTurnPresence::ActiveTurn,
+        None => AgentTurnPresence::NoActiveTurn,
+    };
+    AgentWaitSnapshot::new(turn_presence, agent_lifecycle_status_kind(&summary.status))
+}
+
+fn agent_lifecycle_status_kind(status: &AgentStatus) -> AgentLifecycleStatusKind {
+    match status {
+        AgentStatus::Created
+        | AgentStatus::StartingContainer
+        | AgentStatus::RunningTurn
+        | AgentStatus::WaitingTool
+        | AgentStatus::DeletingContainer => AgentLifecycleStatusKind::Active,
+        AgentStatus::Idle => AgentLifecycleStatusKind::Idle,
+        AgentStatus::Completed => AgentLifecycleStatusKind::Completed,
+        AgentStatus::Failed => AgentLifecycleStatusKind::Failed,
+        AgentStatus::Cancelled => AgentLifecycleStatusKind::Cancelled,
+        AgentStatus::Deleted => AgentLifecycleStatusKind::Deleted,
+    }
 }
 
 pub(crate) fn final_wait_response(

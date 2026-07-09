@@ -4,6 +4,8 @@ use mai_protocol::ProjectId;
 #[cfg(test)]
 use mai_protocol::preview;
 #[cfg(test)]
+use pl_core::{GIT_TOKEN_ENV, git_askpass_script};
+#[cfg(test)]
 use tokio::process::Command;
 
 use crate::Result;
@@ -16,8 +18,6 @@ pub(crate) mod manager;
 pub(crate) mod paths;
 pub(crate) mod reconcile;
 
-#[cfg(test)]
-pub(crate) use manager::sync_project_repo_cache;
 pub(crate) use manager::{
     AGENT_WORKSPACE_REPO_PATH, LocalProjectWorkspaceManager, ProjectWorkspaceManager,
 };
@@ -60,10 +60,7 @@ async fn run_git(
     if token.is_some() {
         tmp = tempfile::TempDir::new()?;
         askpass_path = tmp.path().join("askpass.sh");
-        std::fs::write(
-            &askpass_path,
-            "#!/bin/sh\ncase \"$1\" in\n  *Username*) printf '%s\\n' x-access-token ;;\n  *Password*) printf '%s\\n' \"$MAI_GITHUB_INSTALLATION_TOKEN\" ;;\n  *) printf '\\n' ;;\nesac\n",
-        )?;
+        std::fs::write(&askpass_path, git_askpass_script())?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -95,9 +92,9 @@ async fn run_git(
     if let Some(token) = token {
         command
             .env("GIT_ASKPASS", &askpass_path)
-            .env("MAI_GITHUB_INSTALLATION_TOKEN", token);
+            .env(GIT_TOKEN_ENV, token);
     } else {
-        command.env_remove("MAI_GITHUB_INSTALLATION_TOKEN");
+        command.env_remove(GIT_TOKEN_ENV);
     }
     let output = command.output().await?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();

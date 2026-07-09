@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
-use mai_mcp::McpAgentManager;
+use crate::mcp::McpAgentManager;
 use mai_protocol::{AgentId, ProjectId, ServiceEventKind};
-use serde_json::Value;
+use pl_core::ensure_turn_not_cancelled;
 use tokio_util::sync::CancellationToken;
 
 use crate::state::AgentRecord;
-use crate::turn::tools::ToolExecution;
 use crate::{AgentRuntime, Result, RuntimeError, projects, redact_secret};
 
 impl AgentRuntime {
@@ -16,9 +15,8 @@ impl AgentRuntime {
         agent_id: AgentId,
         cancellation_token: &CancellationToken,
     ) -> Result<Option<Arc<McpAgentManager>>> {
-        if cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
+        ensure_turn_not_cancelled(cancellation_token)
+            .map_err(crate::turn::core_adapter::runtime_error_from_pl_turn)?;
         if projects::mcp::project_mcp_configs("").is_empty() {
             return Ok(None);
         }
@@ -92,49 +90,5 @@ impl AgentRuntime {
         project_id: ProjectId,
     ) -> Result<Vec<String>> {
         projects::mcp::delete_sidecar(&self.state, &self.deps.docker, project_id).await
-    }
-
-    pub(crate) async fn execute_project_mcp_tool(
-        &self,
-        agent: &AgentRecord,
-        model_name: &str,
-        arguments: Value,
-        cancellation_token: CancellationToken,
-    ) -> Result<ToolExecution> {
-        projects::mcp::execute_project_mcp_tool(
-            self,
-            agent,
-            model_name,
-            arguments,
-            cancellation_token,
-        )
-        .await
-    }
-}
-
-impl projects::mcp::ProjectMcpToolOps for AgentRuntime {
-    fn project_mcp_manager_for_agent(
-        &self,
-        agent: &AgentRecord,
-        agent_id: AgentId,
-        cancellation_token: &CancellationToken,
-    ) -> impl std::future::Future<Output = Result<Option<Arc<McpAgentManager>>>> + Send {
-        AgentRuntime::project_mcp_manager_for_agent(self, agent, agent_id, cancellation_token)
-    }
-
-    fn project_git_token_for_agent(
-        &self,
-        agent: &AgentRecord,
-    ) -> impl std::future::Future<Output = Result<Option<String>>> + Send {
-        AgentRuntime::project_git_token_for_agent(self, agent)
-    }
-
-    async fn call_project_mcp_tool(
-        &self,
-        manager: Arc<McpAgentManager>,
-        model_name: String,
-        arguments: Value,
-    ) -> std::result::Result<Value, mai_mcp::McpError> {
-        manager.call_model_tool(&model_name, arguments).await
     }
 }

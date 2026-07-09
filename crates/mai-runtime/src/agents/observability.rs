@@ -7,14 +7,10 @@ use mai_protocol::{
     ToolTraceListResponse, ToolTraceSummary,
 };
 use mai_store::{AgentLogFilter, ToolTraceFilter};
-use pl_protocol::{
-    Message as ModelMessage, MessageContent, MessageRole as ModelMessageRole,
-    TOOL_CALLS_METADATA_KEY, ToolResultMetadata,
-};
-use serde_json::{Value, json};
+use pl_protocol::Message as ModelMessage;
 
 use crate::state::AgentRecord;
-use crate::{Result, RuntimeError, turn};
+use crate::{Result, RuntimeError};
 
 /// Provides persisted logs, tool trace records, recent event metadata, and
 /// agent history access needed by read-only observability APIs.
@@ -87,58 +83,27 @@ pub(crate) async fn tool_trace(
         selected_session.summary.id
     };
     let history = ops.load_agent_history(agent_id, session_id).await?;
-    let mut tool_name = None;
-    let mut arguments = None;
-    let mut output = None;
-
-    for item in &history {
-        if let Some(raw_tool_calls) = item.metadata.get(TOOL_CALLS_METADATA_KEY)
-            && let Ok(tool_calls) = serde_json::from_str::<Value>(raw_tool_calls)
-            && let Some(tool_calls) = tool_calls.as_array()
-        {
-            for tool_call in tool_calls {
-                let item_call_id = tool_call
-                    .get("id")
-                    .or_else(|| tool_call.get("call_id"))
-                    .and_then(Value::as_str);
-                if item_call_id == Some(call_id.as_str()) {
-                    tool_name = tool_call
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                    arguments = tool_call
-                        .get("payload")
-                        .and_then(|payload| payload.get("arguments"))
-                        .cloned();
-                }
+    let projection =
+        pl_core::tool_history_projection(&history, &call_id, 500).ok_or_else(|| {
+            RuntimeError::ToolTraceNotFound {
+                agent_id,
+                call_id: call_id.clone(),
             }
-        }
-        if item.role == ModelMessageRole::Tool
-            && let Ok(metadata) = ToolResultMetadata::from_metadata(&item.metadata)
-            && metadata.tool_call_id == call_id
-        {
-            output = Some(message_text(&item.content));
-        }
-    }
-
-    let tool_name = tool_name.ok_or_else(|| RuntimeError::ToolTraceNotFound {
-        agent_id,
-        call_id: call_id.clone(),
-    })?;
-    let output = output.unwrap_or_default();
+        })?;
     let (event_success, duration_ms) = ops
         .tool_metadata(agent_id, session_id, call_id.clone())
         .await;
+    let success = event_success.unwrap_or_else(|| projection.inferred_success());
     Ok(ToolTraceDetail {
         agent_id,
         session_id: Some(session_id),
         turn_id: None,
         call_id,
-        tool_name,
-        arguments: arguments.unwrap_or_else(|| json!({})),
-        success: event_success.unwrap_or(!output.is_empty()),
-        output_preview: turn::tools::trace_preview_output(&output, 500),
-        output,
+        tool_name: projection.tool_name().to_string(),
+        arguments: projection.arguments().clone(),
+        success,
+        output_preview: projection.output_preview().to_string(),
+        output: projection.output().to_string(),
         duration_ms,
         started_at: None,
         completed_at: None,
@@ -188,18 +153,4 @@ pub(crate) async fn tool_traces(
     Ok(ToolTraceListResponse {
         tool_calls: ops.list_tool_traces(agent_id, filter).await?,
     })
-}
-
-fn message_text(content: &MessageContent) -> String {
-    match content {
-        MessageContent::Text(text) => text.clone(),
-        MessageContent::MultiPart(parts) => parts
-            .iter()
-            .filter_map(|part| match part {
-                pl_protocol::ContentPart::Text { text } => Some(text.as_str()),
-                pl_protocol::ContentPart::Image { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-    }
 }

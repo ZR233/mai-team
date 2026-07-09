@@ -2,9 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::skills::SkillsManager;
 use mai_protocol::{ProjectId, SkillScope, SkillsListResponse};
-use mai_skills::SkillsManager;
 use mai_store::ConfigStore;
+use pl_core::shell_quote_word;
 use tokio::sync::RwLock;
 
 use crate::projects::mcp::PROJECT_WORKSPACE_PATH;
@@ -66,9 +67,9 @@ pub(crate) fn detect_existing_dirs_command() -> String {
             let container_path = format!("{PROJECT_WORKSPACE_PATH}/{relative}");
             format!(
                 "if [ -d {path} ]; then printf '%s\\t%s\\t%s\\n' {relative} {cache_name} {path}; fi",
-                relative = shell_word(relative),
-                cache_name = shell_word(cache_name),
-                path = shell_word(&container_path),
+                relative = shell_quote_word(relative),
+                cache_name = shell_quote_word(cache_name),
+                path = shell_quote_word(&container_path),
             )
         })
         .collect::<Vec<_>>()
@@ -218,10 +219,6 @@ fn source_path(cache_dir: &Path, path: &Path) -> Option<PathBuf> {
         }
     }
     Some(source_path)
-}
-
-fn shell_word(value: &str) -> String {
-    shell_words::quote(value).into_owned()
 }
 
 #[cfg(test)]

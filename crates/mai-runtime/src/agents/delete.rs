@@ -74,11 +74,9 @@ async fn delete_agent_record(ops: &impl AgentDeleteOps, agent_id: AgentId) -> Re
         },
     )
     .await?;
-    if let Some(control) = agent.active_turn.lock().expect("active turn lock").clone() {
-        control.cancellation_token.cancel();
-        if let Some(abort_handle) = control.abort_handle {
-            abort_handle.abort();
-        }
+    if let Some(control) = agent.active_turn.current() {
+        control.cancel_task();
+        control.abort_task();
     }
     if let Some(manager) = agent.mcp.write().await.take() {
         manager.shutdown().await;

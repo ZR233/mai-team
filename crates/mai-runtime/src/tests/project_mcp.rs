@@ -24,7 +24,8 @@ async fn project_agent_without_discovered_mcp_tools_has_no_static_fallback() {
     let tools = runtime.agent_mcp_tools(&maintainer_record).await;
 
     assert!(tools.is_empty());
-    let visible = turn::tools::visible_tool_names(&runtime.state, &maintainer_record, &tools).await;
+    let visible =
+        turn::tool_visibility::visible_tool_names(&runtime.state, &maintainer_record, &tools).await;
     assert!(!visible.contains("mcp__github__create_pull_request_review"));
     assert!(!visible.contains("mcp__github__pull_request_review_write"));
     assert!(!visible.contains("mcp__git__git_status"));
@@ -67,7 +68,8 @@ async fn project_mcp_tools_are_not_visible_even_if_cached() {
         .map(|tool| tool.model_name.as_str())
         .collect::<HashSet<_>>();
     assert_eq!(names, HashSet::new());
-    let visible = turn::tools::visible_tool_names(&runtime.state, &maintainer_record, &tools).await;
+    let visible =
+        turn::tool_visibility::visible_tool_names(&runtime.state, &maintainer_record, &tools).await;
     assert!(!visible.contains("mcp__git__git_diff_unstaged"));
     assert!(!visible.contains("mcp__github__pull_request_review_write"));
     assert!(!visible.contains("mcp__github__create_pull_request_review"));

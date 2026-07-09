@@ -45,9 +45,7 @@ pub(crate) async fn record_model_usage(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::collections::VecDeque;
     use std::sync::Arc;
-    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicBool;
 
     use mai_protocol::{
@@ -55,12 +53,13 @@ mod tests {
         now,
     };
     use mai_store::ConfigStore;
+    use pl_core::{AgentInputQueue, TurnTaskHandle};
     use tokio::sync::{Mutex, RwLock};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     use crate::events::RuntimeEvents;
-    use crate::state::{AgentRecord, AgentSessionRecord, TurnControl};
+    use crate::state::{AgentRecord, AgentSessionRecord, TurnControl, TurnControlSlot};
 
     #[tokio::test]
     async fn record_model_usage_updates_agent_and_selected_session() {
@@ -137,13 +136,12 @@ mod tests {
             system_prompt: None,
             turn_lock: Mutex::new(()),
             cancel_requested: AtomicBool::new(false),
-            active_turn: StdMutex::new(Some(TurnControl {
+            active_turn: TurnControlSlot::with_active(TurnControl::new(
                 turn_id,
-                session_id: second_session_id,
-                cancellation_token: CancellationToken::new(),
-                abort_handle: None,
-            })),
-            pending_inputs: Mutex::new(VecDeque::new()),
+                second_session_id,
+                TurnTaskHandle::from_external_token(CancellationToken::new()),
+            )),
+            pending_inputs: Mutex::new(AgentInputQueue::new()),
         });
         store.save_agent(&summary, None).await.expect("save agent");
         store

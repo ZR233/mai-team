@@ -831,7 +831,7 @@ mod tests {
             r#"#!/bin/sh
 LOG={}
 echo "$*" >> "$LOG"
-if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
+if [ -n "$PL_GIT_TOKEN" ]; then
   echo "token-present" >> "$LOG"
 fi
 case "$1" in

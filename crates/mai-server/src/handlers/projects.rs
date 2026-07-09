@@ -161,7 +161,7 @@ mod tests {
     use chrono::Utc;
     use mai_docker::DockerClient;
     use mai_protocol::{AgentRole, AgentStatus, ProjectCloneStatus, ProjectStatus};
-    use mai_runtime::{AgentRuntime, ModelClient, RuntimeConfig};
+    use mai_runtime::{AgentRuntime, RuntimeConfig};
     use mai_store::ConfigStore;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
@@ -202,7 +202,6 @@ mod tests {
         save_test_project(&store, project_id, maintainer_id, true).await;
         let runtime = AgentRuntime::new(
             DockerClient::new_with_binary("unused", fake_docker_path(&dir)),
-            ModelClient::new(),
             Arc::clone(&store),
             RuntimeConfig {
                 repo_root: dir.path().to_path_buf(),

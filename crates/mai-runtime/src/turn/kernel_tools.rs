@@ -1,85 +1,13 @@
-use std::collections::HashSet;
-use std::sync::Arc;
-
 use chrono::{DateTime, Utc};
 use mai_protocol::{
-    AgentId, ServiceEventKind, SessionId, ToolDefinition, ToolTraceDetail, TurnId, now,
+    AgentId, ServiceEventKind, SessionId, ToolOutputArtifactInfo, ToolTraceDetail, TurnId, now,
 };
-use pl_core::{OutputTruncation, RegisteredTool, Tool, ToolOutput, ToolRuntimeEvent};
-use pl_protocol::PureError;
-use pl_trace::{TraceEvent, TraceEventKind, TracePart, TracePartStatus};
-use serde_json::{Value, json};
-use tokio_util::sync::CancellationToken;
+use pl_core::{ToolLifecyclePhase, ToolLifecycleProjection};
+use pl_trace::TraceEvent;
+use serde_json::json;
 
-use crate::state::AgentRecord;
+use crate::AgentRuntime;
 use crate::turn::persistence::AgentLogRecord;
-use crate::{AgentRuntime, RuntimeError};
-
-/// 根据 pl-core 共享工具 schema 与 mai 产品工具 schema 构造模型可见工具列表。
-pub(crate) fn model_tool_definitions(
-    visible_names: &HashSet<String>,
-    mut product_tools: Vec<ToolDefinition>,
-) -> Vec<ToolDefinition> {
-    let mut tools = shared_tool_definitions(visible_names);
-    tools.append(&mut product_tools);
-    tools
-}
-
-/// 把模型可见工具定义注册为 pl-core 动态工具。
-pub(crate) fn registered_runtime_tools(
-    runtime: Arc<AgentRuntime>,
-    agent: Arc<AgentRecord>,
-    agent_id: AgentId,
-    turn_id: TurnId,
-    definitions: &[ToolDefinition],
-    cancellation_token: CancellationToken,
-) -> Vec<RegisteredTool> {
-    definitions
-        .iter()
-        .map(|definition| {
-            let name = definition.name.clone();
-            let runtime = runtime.clone();
-            let agent = agent.clone();
-            let cancellation_token = cancellation_token.clone();
-            RegisteredTool::new(
-                definition.name.clone(),
-                definition.description.clone(),
-                definition.parameters.clone(),
-                move |input, _context| {
-                    let runtime = runtime.clone();
-                    let agent = agent.clone();
-                    let name = name.clone();
-                    let cancellation_token = cancellation_token.clone();
-                    async move {
-                        let execution = runtime
-                            .execute_tool(
-                                &agent,
-                                agent_id,
-                                turn_id,
-                                &name,
-                                input.arguments,
-                                cancellation_token,
-                            )
-                            .await
-                            .map_err(|error| pure_tool_error(&name, error))?;
-                        Ok(ToolOutput {
-                            description: execution.model_output,
-                            truncated: OutputTruncation::empty(),
-                            output_file: std::path::PathBuf::new(),
-                            exit_code: None,
-                            timed_out: false,
-                            runtime_events: if execution.ends_turn {
-                                vec![ToolRuntimeEvent::EndTurn]
-                            } else {
-                                Vec::new()
-                            },
-                        })
-                    }
-                },
-            )
-        })
-        .collect()
-}
 
 /// 将 pl-core trace 投影为 mai-store 和 Web UI 仍在消费的 tool lifecycle 事件。
 pub(crate) async fn project_tool_trace_events(
@@ -89,77 +17,22 @@ pub(crate) async fn project_tool_trace_events(
     turn_id: TurnId,
     events: &[TraceEvent],
 ) {
-    for event in events {
-        match &event.kind {
-            TraceEventKind::TracePartStarted { item }
-                if item.status == TracePartStatus::Started && item.tool.is_some() =>
-            {
-                project_tool_started(runtime, agent_id, session_id, turn_id, item).await;
+    for projection in pl_core::tool_lifecycle_projections(events, 500) {
+        match projection.phase() {
+            ToolLifecyclePhase::Started => {
+                project_tool_started(runtime, agent_id, session_id, turn_id, &projection).await;
             }
-            TraceEventKind::TracePartCompleted { item } if item.tool.is_some() => {
-                project_tool_completed(runtime, agent_id, session_id, turn_id, item, true).await;
+            ToolLifecyclePhase::Finished { success } => {
+                project_tool_completed(
+                    runtime,
+                    agent_id,
+                    session_id,
+                    turn_id,
+                    &projection,
+                    *success,
+                )
+                .await;
             }
-            TraceEventKind::TracePartFailed { item, .. } if item.tool.is_some() => {
-                project_tool_completed(runtime, agent_id, session_id, turn_id, item, false).await;
-            }
-            TraceEventKind::TracePartDelta { .. }
-            | TraceEventKind::PlanLifecycleChanged { .. }
-            | TraceEventKind::InteractionChanged { .. }
-            | TraceEventKind::SkillActivated { .. }
-            | TraceEventKind::EnabledToolsRecorded { .. }
-            | TraceEventKind::TracePartStarted { .. }
-            | TraceEventKind::TracePartCompleted { .. }
-            | TraceEventKind::TracePartFailed { .. } => {}
-        }
-    }
-}
-
-fn shared_tool_definitions(visible_names: &HashSet<String>) -> Vec<ToolDefinition> {
-    let mut tools = Vec::new();
-    tools.extend(
-        pl_core::AgentControlToolKind::all()
-            .iter()
-            .filter(|kind| visible_names.contains(kind.name()))
-            .map(|kind| definition_from_schema(kind.to_schema())),
-    );
-    tools.extend(
-        pl_core::ContainerToolKind::all()
-            .iter()
-            .filter(|kind| visible_names.contains(kind.name()))
-            .map(|kind| definition_from_schema(kind.to_schema())),
-    );
-    tools.extend(
-        pl_core::WorkspaceFileToolKind::all()
-            .iter()
-            .filter(|kind| visible_names.contains(kind.name()))
-            .map(|kind| definition_from_schema(kind.to_schema())),
-    );
-    tools.extend(
-        pl_core::GitToolKind::all()
-            .iter()
-            .filter(|kind| visible_names.contains(kind.name()))
-            .map(|kind| {
-                let tool = pl_core::GitTool::new(
-                    *kind,
-                    pl_core::GitWorkspaceConfig::local(std::env::temp_dir()),
-                    Arc::new(pl_core::LocalExecutionBackend),
-                    Arc::new(pl_core::NoGitCredentialProvider),
-                );
-                definition_from_schema(tool.to_schema())
-            }),
-    );
-    tools
-}
-
-fn definition_from_schema(schema: pl_model::ToolSchema) -> ToolDefinition {
-    match schema {
-        pl_model::ToolSchema::Function {
-            name,
-            description,
-            input_schema,
-        } => ToolDefinition::function(name, description, input_schema),
-        pl_model::ToolSchema::Custom { name, .. } => {
-            panic!("shared tool {name} must be a function tool")
         }
     }
 }
@@ -169,23 +42,18 @@ async fn project_tool_started(
     agent_id: AgentId,
     session_id: SessionId,
     turn_id: TurnId,
-    item: &TracePart,
+    projection: &ToolLifecycleProjection,
 ) {
-    let Some(tool) = &item.tool else {
-        return;
-    };
-    let call_id = tool_call_id(tool);
-    let arguments = arguments_value(&tool.arguments);
-    let started_at = trace_time(item.created_at);
+    let started_at = trace_time(projection.started_at_unix());
     super::persistence::record_tool_trace_started(
         runtime.deps.store.as_ref(),
         ToolTraceDetail {
             agent_id,
             session_id: Some(session_id),
             turn_id: Some(turn_id),
-            call_id: call_id.clone(),
-            tool_name: tool.name.clone(),
-            arguments: arguments.clone(),
+            call_id: projection.call_id().to_string(),
+            tool_name: projection.tool_name().to_string(),
+            arguments: projection.arguments().clone(),
             output: String::new(),
             success: false,
             duration_ms: None,
@@ -207,9 +75,9 @@ async fn project_tool_started(
             category: "tool",
             message: "tool started",
             details: json!({
-                "call_id": call_id,
-                "tool_name": tool.name,
-                "arguments_preview": super::tools::trace_preview_value(&arguments, 500),
+                "call_id": projection.call_id(),
+                "tool_name": projection.tool_name(),
+                "arguments_preview": projection.arguments_preview(),
             }),
         },
     )
@@ -220,10 +88,10 @@ async fn project_tool_started(
             agent_id,
             session_id: Some(session_id),
             turn_id,
-            call_id,
-            tool_name: tool.name.clone(),
-            arguments_preview: Some(super::tools::trace_preview_value(&arguments, 500)),
-            arguments: Some(arguments),
+            call_id: projection.call_id().to_string(),
+            tool_name: projection.tool_name().to_string(),
+            arguments_preview: Some(projection.arguments_preview().to_string()),
+            arguments: Some(projection.arguments().clone()),
         })
         .await;
 }
@@ -233,40 +101,28 @@ async fn project_tool_completed(
     agent_id: AgentId,
     session_id: SessionId,
     turn_id: TurnId,
-    item: &TracePart,
+    projection: &ToolLifecycleProjection,
     success: bool,
 ) {
-    let Some(tool) = &item.tool else {
-        return;
-    };
-    let call_id = tool_call_id(tool);
-    let arguments = arguments_value(&tool.arguments);
-    let output = tool.result.clone().unwrap_or_default();
-    let output_preview = super::tools::trace_preview_output(&output, 500);
-    let started_at = trace_time(item.created_at);
-    let completed_at = trace_time(item.updated_at);
-    let duration_ms = item
-        .updated_at
-        .saturating_sub(item.created_at)
-        .try_into()
-        .ok()
-        .map(|seconds: u64| seconds.saturating_mul(1000));
+    let started_at = trace_time(projection.started_at_unix());
+    let completed_at = trace_time(projection.completed_at_unix_or_started());
+    let output_artifacts = projection.output_artifacts_as::<ToolOutputArtifactInfo>();
     super::persistence::record_tool_trace_completed(
         runtime.deps.store.as_ref(),
         ToolTraceDetail {
             agent_id,
             session_id: Some(session_id),
             turn_id: Some(turn_id),
-            call_id: call_id.clone(),
-            tool_name: tool.name.clone(),
-            arguments,
-            output: output.clone(),
+            call_id: projection.call_id().to_string(),
+            tool_name: projection.tool_name().to_string(),
+            arguments: projection.arguments().clone(),
+            output: projection.output().to_string(),
             success,
-            duration_ms,
+            duration_ms: projection.duration_ms(),
             started_at: Some(started_at),
             completed_at: Some(completed_at),
-            output_preview: output_preview.clone(),
-            output_artifacts: Vec::new(),
+            output_preview: projection.output_preview().to_string(),
+            output_artifacts,
         },
         started_at,
         completed_at,
@@ -282,11 +138,11 @@ async fn project_tool_completed(
             category: "tool",
             message: "tool completed",
             details: json!({
-                "call_id": call_id,
-                "tool_name": tool.name,
+                "call_id": projection.call_id(),
+                "tool_name": projection.tool_name(),
                 "success": success,
-                "duration_ms": duration_ms,
-                "output_preview": output_preview.as_str(),
+                "duration_ms": projection.duration_ms(),
+                "output_preview": projection.output_preview(),
             }),
         },
     )
@@ -297,32 +153,15 @@ async fn project_tool_completed(
             agent_id,
             session_id: Some(session_id),
             turn_id,
-            call_id,
-            tool_name: tool.name.clone(),
+            call_id: projection.call_id().to_string(),
+            tool_name: projection.tool_name().to_string(),
             success,
-            output_preview,
-            duration_ms,
+            output_preview: projection.output_preview().to_string(),
+            duration_ms: projection.duration_ms(),
         })
         .await;
 }
 
-fn arguments_value(arguments: &str) -> Value {
-    serde_json::from_str(arguments).unwrap_or_else(|_| json!(arguments))
-}
-
-fn tool_call_id(tool: &pl_trace::TraceToolPart) -> String {
-    tool.call_id
-        .clone()
-        .unwrap_or_else(|| tool.tool_call_id.clone())
-}
-
 fn trace_time(seconds: i64) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(seconds, 0).unwrap_or_else(now)
-}
-
-fn pure_tool_error(tool: &str, error: RuntimeError) -> PureError {
-    PureError::ToolExecutionFailed {
-        tool: tool.to_string(),
-        error: error.to_string(),
-    }
 }

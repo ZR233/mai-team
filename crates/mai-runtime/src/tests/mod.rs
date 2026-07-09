@@ -4,9 +4,13 @@ use mai_protocol::{
     GitProvider, ModelConfig, ModelReasoningConfig, ModelReasoningVariant, ProjectReviewDecision,
     ProviderConfig, ProviderKind, ProvidersConfigRequest,
 };
+use pl_core::{
+    AgentLifecycleStatusKind, AgentTurnStartReadiness, AgentTurnStartSnapshot, TurnTaskHandle,
+};
 use pl_protocol::{Message, MessageContent, MessageRole as PlMessageRole, ToolResultMetadata};
 use pretty_assertions::assert_eq;
 use state::TurnControl;
+use std::collections::VecDeque;
 use std::fs;
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,6 +19,732 @@ use turn::completion::TurnResult;
 mod project_github_tools;
 mod project_mcp;
 mod turn_runtime;
+
+#[test]
+fn wrapper_crates_are_inlined_into_runtime() {
+    let workspace_manifest = include_str!("../../../../Cargo.toml");
+    let runtime_manifest = include_str!("../../Cargo.toml");
+    for package in ["mai-tools", "mai-agents", "mai-skills", "mai-mcp"] {
+        assert!(
+            !workspace_manifest.contains(&format!("\"crates/{package}\"")),
+            "workspace 不应继续包含包装 crate `{package}`"
+        );
+        assert!(
+            !runtime_manifest.contains(package),
+            "mai-runtime 不应继续依赖包装 crate `{package}`"
+        );
+    }
+
+    for (name, source) in [
+        ("lib.rs", include_str!("../lib.rs")),
+        ("deps.rs", include_str!("../deps.rs")),
+        ("state.rs", include_str!("../state.rs")),
+        (
+            "turn/orchestrator.rs",
+            include_str!("../turn/orchestrator.rs"),
+        ),
+        (
+            "turn/product_tools.rs",
+            include_str!("../turn/product_tools.rs"),
+        ),
+        (
+            "turn/tool_visibility.rs",
+            include_str!("../turn/tool_visibility.rs"),
+        ),
+        ("projects/mcp.rs", include_str!("../projects/mcp.rs")),
+        (
+            "agents/resources.rs",
+            include_str!("../agents/resources.rs"),
+        ),
+    ] {
+        for prefix in [
+            format!("{}{}", "mai_tools", "::"),
+            format!("{}{}", "mai_agents", "::"),
+            format!("{}{}", "mai_skills", "::"),
+            format!("{}{}", "mai_mcp", "::"),
+        ] {
+            assert!(
+                !source.contains(&prefix),
+                "{name} 不应继续通过包装 crate `{prefix}` 调用"
+            );
+        }
+    }
+}
+
+#[test]
+fn main_turn_uses_pl_core_hosted_agent_runner() {
+    let adapter = include_str!("../turn/core_adapter.rs");
+    let hosted_runtime = include_str!("../turn/hosted_runtime.rs");
+
+    assert!(
+        adapter.contains("super::hosted_runtime::run_hosted_agent_turn(ctx).await"),
+        "core_adapter 主 turn 入口应只委托给 mai hosted adapter"
+    );
+    assert!(
+        hosted_runtime.contains("HostedAgentRunner::new"),
+        "主 turn 应交给 pl-core HostedAgentRunner 执行"
+    );
+    for forbidden in [
+        "TraceRecorder::new(",
+        "CoreSession::from_messages(",
+        ".run_turn_with_trace(",
+        "tokio::sync::broadcast::channel(64)",
+    ] {
+        assert!(
+            !adapter.contains(forbidden),
+            "mai-runtime core_adapter 不应继续保留通用框架外壳 `{forbidden}`"
+        );
+        assert!(
+            !hosted_runtime.contains(forbidden),
+            "mai-runtime hosted adapter 不应继续保留通用框架外壳 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn test_tool_helper_uses_pl_core_kernel_registry() {
+    let source = include_str!("../lib.rs");
+    let helper_start = source
+        .find("execute_tool_for_test")
+        .expect("test helper exists");
+    let helper_end = source[helper_start..]
+        .find("async fn wait_agent")
+        .expect("next helper exists");
+    let helper = &source[helper_start..helper_start + helper_end];
+
+    assert!(
+        helper.contains("turn::core_adapter::build_mai_agent_kernel"),
+        "测试工具执行路径必须复用主 turn 的 mai agent kernel 组装入口"
+    );
+    assert!(
+        helper.contains(".execute_tool("),
+        "测试工具执行路径必须通过 AgentKernel::execute_tool 注入工具上下文"
+    );
+    for forbidden in [
+        format!("{}{}", "execute_workspace", "_file_tool"),
+        format!("{}{}", "execute_container", "_tool"),
+        format!("{}{}", "AgentControl", "Tool::new"),
+        format!("{}{}", "TodoList", "Tool"),
+        format!("{}{}", "Tool", "Context {"),
+        format!("{}{}", "Tool", "Input {"),
+        format!("{}{}", ".register", "(kernel.core_mut"),
+        "MaiProductToolRegistry::new".to_string(),
+        ".registered_tools()".to_string(),
+        "AgentKernel::builder".to_string(),
+        "ToolSetBuilder::from_capabilities".to_string(),
+        ".with_tool_set(".to_string(),
+        "starts_with(\"mcp__\")".to_string(),
+        "Call MCP tool".to_string(),
+        "ToolSchema::function".to_string(),
+        "ToolRuntimeEvent::OutputArtifacts".to_string(),
+        "ToolRuntimeEvent::EndTurn".to_string(),
+        "output.exit_code".to_string(),
+        "output.description".to_string(),
+        "output_artifacts_as::<ToolOutputArtifactInfo>".to_string(),
+        "output.ends_turn()".to_string(),
+        "output_artifacts_from_json_for_test".to_string(),
+        "serde_json::from_value".to_string(),
+    ] {
+        assert!(
+            !helper.contains(&forbidden),
+            "测试工具执行不应绕过 pl-core registry 直接调用 `{forbidden}`"
+        );
+    }
+    assert!(
+        helper.contains("to_execution_result::<ToolOutputArtifactInfo>"),
+        "测试工具执行应复用 pl-core ToolOutput 到 ToolExecutionResult 的统一投影"
+    );
+}
+
+#[test]
+fn tool_execution_results_use_explicit_pl_core_constructors() {
+    for (name, source) in [
+        ("lib.rs", include_str!("../lib.rs")),
+        (
+            "facade/project_github.rs",
+            include_str!("../facade/project_github.rs"),
+        ),
+        ("tools/git.rs", include_str!("../tools/git.rs")),
+        (
+            "turn/product_tools.rs",
+            include_str!("../turn/product_tools.rs"),
+        ),
+    ] {
+        assert!(
+            !source.contains("ToolExecution::new("),
+            "{name} 应使用 pl-core ToolExecutionResult::success/failure/json 等显式构造，避免裸 bool 位置参数"
+        );
+    }
+}
+
+#[test]
+fn observability_uses_pl_core_history_success_projection() {
+    let source = include_str!("../agents/observability.rs");
+
+    assert!(
+        source.contains("projection.inferred_success()"),
+        "工具历史 fallback 的成功推断应由 pl-core ToolHistoryProjection 提供"
+    );
+    assert!(
+        !source.contains("!projection.output.is_empty()"),
+        "mai-runtime 不应直接根据模型可见输出字符串推断工具成功状态"
+    );
+}
+
+#[test]
+fn observability_uses_pl_core_history_accessors() {
+    let source = include_str!("../agents/observability.rs");
+
+    for required in [
+        "projection.tool_name()",
+        "projection.arguments()",
+        "projection.output_preview()",
+        "projection.output()",
+    ] {
+        assert!(
+            source.contains(required),
+            "工具历史 fallback 应通过 pl-core ToolHistoryProjection accessor 获取 `{required}`"
+        );
+    }
+    for forbidden in [
+        "projection.tool_name,",
+        "projection.arguments,",
+        "projection.output_preview,",
+        "projection.output,",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "mai-runtime 不应读取 ToolHistoryProjection 字段 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn test_history_messages_reuse_pl_core_metadata_helpers() {
+    let source = include_str!("../turn/history.rs");
+
+    assert!(
+        source.contains("pl_core::tool_call_history_message"),
+        "测试用 tool call 历史消息应由 pl-core helper 构造"
+    );
+    assert!(
+        source.contains("pl_core::tool_result_history_message"),
+        "测试用 tool result 历史消息应由 pl-core helper 构造"
+    );
+    for forbidden in [
+        format!("{}{}", "ToolCallHistory", "Metadata"),
+        format!("{}{}", "ToolResult", "Metadata::new"),
+        format!("{}{}", "serde_json::", "json!"),
+    ] {
+        assert!(
+            !source.contains(&forbidden),
+            "mai-runtime 不应复制 pl-core 历史 metadata 构造细节: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn skill_fragment_text_projection_uses_pl_core_message_helper() {
+    let source = include_str!("../turn/orchestrator.rs");
+
+    assert!(
+        source.contains("pl_core::append_message_fragment_text"),
+        "skill fragment 文本拼接应复用 pl-core MessageContent 文本投影"
+    );
+    for forbidden in ["MessageContent::MultiPart", "ContentPart::Text"] {
+        assert!(
+            !source.contains(forbidden),
+            "mai-runtime 不应复制 pl-core MessageContent 文本提取逻辑: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn cancel_turn_uses_pl_core_cancellation_guard() {
+    let source = include_str!("../agents/turn.rs");
+
+    assert!(
+        source.contains("AgentTurnCancellationGuard"),
+        "取消 turn 的 current/active 命中规则应由 pl-core 统一提供"
+    );
+    assert!(
+        !source
+            .contains("current_turn != Some(turn_id) && control.as_ref().map(|turn| turn.turn_id) != Some(turn_id)"),
+        "mai-runtime 不应手写 current_turn 与 active_turn 的重复取消判断"
+    );
+}
+
+#[test]
+fn send_input_uses_pl_core_turn_mode_policy() {
+    let source = include_str!("../agents/input.rs");
+    let state_source = include_str!("../state.rs");
+
+    assert!(
+        source.contains("AgentInputTurnMode"),
+        "send_input 的 triggerTurn/interrupt 模式应由 pl-core 统一解释"
+    );
+    assert!(
+        source.contains("AgentInputInitialAction") && source.contains("AgentInputBusyAction"),
+        "send_input 的首步动作和 busy 处理应由 pl-core action 类型统一表达"
+    );
+    assert!(
+        source.contains("AgentInputSubmission"),
+        "send_input 的提交结果应复用 pl-core typed submission，避免在 mai-runtime 用 JSON 当内部协议"
+    );
+    assert!(
+        state_source.contains("AgentInputQueue<QueuedAgentInput>"),
+        "pending input 队列应复用 pl-core AgentInputQueue"
+    );
+    for forbidden in [
+        "!request.trigger_turn && !request.interrupt",
+        "if request.interrupt",
+        "if !request.interrupt",
+        "queues_without_start",
+        "queues_when_busy",
+        "pending_inputs: Mutex<VecDeque",
+        ".push_back(",
+        ".pop_front(",
+        ".push_front(",
+        "serde_json::{Value, json}",
+        "json!({ \"turnId\"",
+        "json!({ \"queued\"",
+    ] {
+        assert!(
+            !source.contains(forbidden) && !state_source.contains(forbidden),
+            "mai-runtime 不应手写 send_input/queue 策略 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn queued_input_start_uses_pl_core_start_attempt() {
+    let source = include_str!("../agents/input.rs");
+
+    assert!(
+        source.contains("take_start_attempt"),
+        "启动排队输入时应通过 pl-core AgentInputStartAttempt 取出队首输入"
+    );
+    assert!(
+        source.contains("restore_start_attempt"),
+        "启动排队输入遇到 busy 时应通过 pl-core 恢复 start attempt"
+    );
+    for forbidden in [".pop()", "restore_front(input)"] {
+        assert!(
+            !source.contains(forbidden),
+            "mai-runtime 不应直接操作 pending input 队列事务 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn wait_completion_uses_pl_core_policy() {
+    let agents_source = include_str!("../agents.rs");
+    let wait_source = include_str!("../agents/wait.rs");
+    let lib_source = include_str!("../lib.rs");
+    let wait_agents_function = lib_source
+        .split("async fn wait_agents_output_with_cancel")
+        .nth(1)
+        .and_then(|text| text.split("#[cfg(test)]").next())
+        .expect("wait_agents_output_with_cancel function");
+
+    assert!(
+        agents_source.contains("AgentWaitSnapshot"),
+        "wait_agent completion 判断应由 pl-core AgentWaitSnapshot 统一维护"
+    );
+    assert!(
+        agents_source.contains("AgentWaitSnapshot::new"),
+        "AgentSummary 到 wait snapshot 的共享字段形状应由 pl-core constructor 承载"
+    );
+    assert!(
+        !agents_source.contains("AgentWaitSnapshot {\n        turn_presence"),
+        "mai-runtime 不应手写 AgentWaitSnapshot 字段"
+    );
+    assert!(
+        wait_source.contains("pl_core::wait_for_agent_completion"),
+        "wait_agent 轮询、超时和取消语义应由 pl-core wait loop 统一维护"
+    );
+    assert!(
+        !wait_source.contains("AgentStatus::Completed"),
+        "agents/wait.rs 不应直接维护完成状态列表"
+    );
+    assert!(
+        !wait_source.contains("tokio::time::sleep"),
+        "agents/wait.rs 不应保留本地 sleep 轮询"
+    );
+    assert!(
+        wait_agents_function.contains("pl_core::wait_for_agent_completion"),
+        "多 agent wait 工具也应复用 pl-core wait loop"
+    );
+    assert!(
+        wait_agents_function.contains("pl_core::AgentWaitSnapshot::from_group_counts"),
+        "多 agent wait 的 completed/pending 分组进度应由 pl-core helper 投影"
+    );
+    assert!(
+        !wait_agents_function.contains("pl_core::AgentWaitSnapshot {"),
+        "mai-runtime 不应手写多 agent wait 的 AgentWaitSnapshot 分组状态"
+    );
+    assert!(
+        wait_agents_function.contains("into_group_wait_agent_output"),
+        "多 agent wait 的 completed/pending/timedOut 输出形状应由 pl-core helper 统一生成"
+    );
+    assert!(
+        wait_agents_function.contains("pl_core::AgentWaitOutcome::new"),
+        "多 agent wait outcome 的共享字段形状应由 pl-core constructor 承载"
+    );
+    assert!(
+        !wait_agents_function.contains("pl_core::AgentWaitOutcome {"),
+        "mai-runtime 不应手写 AgentWaitOutcome 字段"
+    );
+    assert!(
+        !wait_agents_function.contains("Duration::from_millis(250)")
+            && !wait_agents_function.contains("tokio::select!"),
+        "多 agent wait 工具不应保留本地 sleep/select 轮询"
+    );
+    assert!(
+        !wait_agents_function.contains("\"completed\": completed_outputs")
+            && !wait_agents_function.contains("\"pending\": pending_outputs"),
+        "mai-runtime 不应手写多 agent wait 的模型可见 completed/pending JSON"
+    );
+    assert!(
+        !agents_source.contains("summary.current_turn.is_none()\n        || matches!"),
+        "mai-runtime 不应手写 current_turn + status 的 wait completion 判断"
+    );
+}
+
+#[test]
+fn turn_start_readiness_uses_pl_core_policy() {
+    let agents_source = include_str!("../agents.rs");
+    let turn_source = include_str!("../agents/turn.rs");
+    let update_source = include_str!("../agents/update.rs");
+    let protocol_source = include_str!("../../../mai-protocol/src/lib.rs");
+
+    assert!(
+        agents_source.contains("AgentTurnStartSnapshot"),
+        "agent turn 启动可用性判断应由 pl-core AgentTurnStartSnapshot 统一维护"
+    );
+    assert!(
+        agents_source.contains("AgentTurnStartSnapshot::new"),
+        "AgentStatus 到 turn start snapshot 的共享字段形状应由 pl-core constructor 承载"
+    );
+    assert!(
+        !agents_source.contains("AgentTurnStartSnapshot {\n        status"),
+        "mai-runtime 不应手写 AgentTurnStartSnapshot 字段"
+    );
+    assert!(
+        !turn_source.contains(".can_start_turn()"),
+        "agents/turn.rs 不应直接调用 mai-protocol 的 can_start_turn"
+    );
+    assert!(
+        !update_source.contains(".can_start_turn()"),
+        "agents/update.rs 不应直接调用 mai-protocol 的 can_start_turn"
+    );
+    assert!(
+        !protocol_source.contains("can_start_turn"),
+        "mai-protocol 不应维护通用 agent turn 启动策略"
+    );
+}
+
+#[test]
+fn kernel_tool_projection_uses_pl_core_completion_timestamp_fallback() {
+    let source = include_str!("../turn/kernel_tools.rs");
+
+    assert!(
+        source.contains("projection.completed_at_unix_or_started()"),
+        "工具生命周期完成时间 fallback 应由 pl-core ToolLifecycleProjection 提供"
+    );
+    assert!(
+        !source.contains("completed_at_unix\n            .unwrap_or"),
+        "mai-runtime 不应直接拼装 ToolLifecycleProjection 的完成时间 fallback"
+    );
+}
+
+#[test]
+fn kernel_tool_projection_uses_pl_core_lifecycle_accessors() {
+    let source = include_str!("../turn/kernel_tools.rs");
+
+    for required in [
+        "projection.phase()",
+        "projection.call_id()",
+        "projection.tool_name()",
+        "projection.arguments()",
+        "projection.arguments_preview()",
+        "projection.output()",
+        "projection.output_preview()",
+        "projection.duration_ms()",
+        "projection.started_at_unix()",
+    ] {
+        assert!(
+            source.contains(required),
+            "mai-runtime 工具生命周期投影应通过 pl-core accessor 获取 `{required}`"
+        );
+    }
+    for forbidden in [
+        "projection.phase {",
+        "projection.call_id.clone()",
+        "projection.tool_name.clone()",
+        "projection.arguments.clone()",
+        "projection.arguments_preview.clone()",
+        "projection.output.clone()",
+        "projection.output_preview.clone()",
+        "projection.duration_ms,",
+        "projection.started_at_unix)",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "mai-runtime 不应读取 ToolLifecycleProjection 字段 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn core_turn_registers_shared_tools_through_kernel_builder() {
+    let core_adapter = include_str!("../turn/core_adapter.rs");
+    let hosted_runtime = include_str!("../turn/hosted_runtime.rs");
+    assert!(
+        hosted_runtime.contains("build_mai_agent_kernel"),
+        "主 turn 路径应通过 mai 自定义 agent kernel 组装入口创建 AgentKernel"
+    );
+    assert!(
+        core_adapter.contains(".with_tool_set("),
+        "主 turn 路径必须通过 AgentKernelBuilder 注册共享工具集"
+    );
+    assert!(
+        !core_adapter.contains("starts_with(\"mcp__\")"),
+        "MCP 工具 schema 应在 turn context 中与产品工具分离，而不是在 kernel 组装层按名称分流"
+    );
+    assert!(
+        !core_adapter.contains("ToolCapabilityConfig {"),
+        "主 turn kernel 组装不应手写共享工具能力矩阵，应复用 pl-core hosted capability preset"
+    );
+    for forbidden in [
+        "register_native_shared_tools".to_string(),
+        "MaiProductToolRegistry::new".to_string(),
+        ".registered_tools()".to_string(),
+        format!("{}{}", ".register", "(kernel.core_mut"),
+    ] {
+        assert!(
+            !hosted_runtime.contains(&forbidden),
+            "主 turn 路径不应保留二阶段共享工具注册 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn core_turn_uses_pl_core_turn_outcome() {
+    let source = include_str!("../turn/hosted_runtime.rs");
+    assert!(
+        source.contains("TurnOutcome::from_result"),
+        "主 turn 路径应复用 pl-core 的 turn outcome 归一化"
+    );
+    for forbidden in [
+        "TurnResultStatus::Completed",
+        "TurnResultStatus::Aborted",
+        "TurnResultStatus::Errored",
+        "TurnAbortReason::Interrupted",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "主 turn 路径不应继续本地解释 pl-core 终态 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn core_turn_uses_pl_core_turn_projection_accessors() {
+    let source = include_str!("../turn/hosted_runtime.rs");
+    for required in [
+        "runtime_snapshot.latest_context_compaction()",
+        "runtime_snapshot.last_context_tokens()",
+        "runtime_snapshot.usage()",
+        "outcome.final_text()",
+        "outcome.status()",
+        "outcome.error()",
+        "outcome.return_error()",
+    ] {
+        assert!(
+            source.contains(required),
+            "主 turn 路径应通过 pl-core turn projection accessor 获取 `{required}`"
+        );
+    }
+    for forbidden in [
+        "runtime_snapshot.latest_context_compaction {",
+        "runtime_snapshot.last_context_tokens {",
+        "&runtime_snapshot.usage",
+        "&outcome.final_text",
+        "outcome.status)",
+        "final_text: outcome.final_text,",
+        "error: outcome.error,",
+        "outcome.return_error {",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "mai-runtime 不应读取 pl-core turn 投影字段 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn run_turn_error_completion_uses_pl_core_projection() {
+    let source = include_str!("../turn/orchestrator.rs");
+    let run_start = source.find("pub(crate) async fn run_turn").unwrap();
+    let run_end = source[run_start..]
+        .find("pub(crate) async fn run_turn_inner")
+        .unwrap();
+    let run_path = &source[run_start..run_start + run_end];
+
+    assert!(
+        run_path.contains("TurnErrorProjection::from_return_error"),
+        "run_turn 外壳应复用 pl-core 的错误终止投影"
+    );
+    for forbidden in [
+        "RuntimeError::TurnCancelled",
+        "TurnStatus::Cancelled",
+        "TurnStatus::Failed",
+    ] {
+        assert!(
+            !run_path.contains(forbidden),
+            "run_turn 外壳不应继续本地解释通用错误终态 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn run_turn_error_completion_uses_pl_core_projection_accessors() {
+    let source = include_str!("../turn/orchestrator.rs");
+    let run_start = source.find("pub(crate) async fn run_turn").unwrap();
+    let run_end = source[run_start..]
+        .find("pub(crate) async fn run_turn_inner")
+        .unwrap();
+    let run_path = &source[run_start..run_start + run_end];
+
+    for required in [
+        "projection.status()",
+        "projection.error_message()",
+        "projection.should_publish_error()",
+    ] {
+        assert!(
+            run_path.contains(required),
+            "run_turn 外壳应通过 pl-core 错误投影 accessor 获取 `{required}`"
+        );
+    }
+    for forbidden in [
+        "projection.status)",
+        "projection.error_message.clone()",
+        "projection.should_publish_error\n",
+        "let Some(message) = projection.error_message\n",
+    ] {
+        assert!(
+            !run_path.contains(forbidden),
+            "run_turn 外壳不应读取 TurnErrorProjection 字段 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn run_turn_error_classification_uses_pl_core_return_error_helper() {
+    let source = include_str!("../turn/orchestrator.rs");
+    let helper_start = source.find("fn pl_turn_return_error").unwrap();
+    let helper_end = source[helper_start..]
+        .find("fn check_turn_not_cancelled")
+        .map(|offset| helper_start + offset)
+        .unwrap();
+    let helper = &source[helper_start..helper_end];
+
+    assert!(helper.contains("TurnReturnError::from_host_error"));
+    assert!(helper.contains("TurnReturnErrorKind::Cancelled"));
+    assert!(helper.contains("TurnReturnErrorKind::Failed"));
+    for forbidden in [
+        "RuntimeError::AgentNotFound",
+        "RuntimeError::TaskNotFound",
+        "RuntimeError::ProjectNotFound",
+        "RuntimeError::Docker",
+        "RuntimeError::Model",
+        "RuntimeError::InvalidInput",
+    ] {
+        assert!(
+            !helper.contains(forbidden),
+            "turn 错误返回分类不应在 mai-runtime 枚举 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn turn_orchestrator_uses_pl_core_cancellation_checkpoint() {
+    let source = include_str!("../turn/orchestrator.rs");
+
+    assert!(
+        source.contains("ensure_turn_not_cancelled"),
+        "turn 编排中的取消 checkpoint 应由 pl-core 统一投影为 TurnReturnError"
+    );
+    assert!(
+        !source.contains("cancellation_token.is_cancelled()"),
+        "mai-runtime 不应直接解释 CancellationToken 的 turn cancelled 语义"
+    );
+}
+
+#[test]
+fn container_turn_current_checks_use_pl_core_token_guard() {
+    let source = include_str!("../agents/container.rs");
+
+    assert!(
+        source.contains("evaluate_with_token"),
+        "container 准备流程应复用 pl-core 的当前 turn + token 判断"
+    );
+    for forbidden in [
+        "cancellation_token.is_cancelled()",
+        "current_turn.is_some_and",
+        "guard.cancellation_token.is_cancelled()",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "container 准备流程不应继续本地解释 turn 当前性 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn set_turn_status_uses_pl_core_token_transition() {
+    let source = include_str!("../lib.rs");
+    let start = source.find("async fn set_turn_status(").unwrap();
+    let end = source[start..].find("async fn persist_agent").unwrap();
+    let body = &source[start..start + end];
+
+    assert!(
+        body.contains("evaluate_with_token"),
+        "set_turn_status 应复用 pl-core 的 token-aware turn status transition"
+    );
+    assert!(
+        !body.contains("cancellation_token.is_cancelled()"),
+        "set_turn_status 不应直接解释 CancellationToken"
+    );
+}
+
+#[test]
+fn project_mcp_cancellation_uses_pl_core_checkpoint() {
+    let runtime_source = include_str!("../lib.rs");
+    let start = runtime_source
+        .find("async fn inject_project_mcp_tools(")
+        .unwrap();
+    let end = runtime_source[start..].find("#[async_trait]").unwrap();
+    let inject_body = &runtime_source[start..start + end];
+    let facade_source = include_str!("../facade/project_mcp.rs");
+    let manager_source = include_str!("../projects/mcp.rs");
+
+    for (name, source) in [
+        ("inject_project_mcp_tools", inject_body),
+        ("ensure_project_mcp_manager", facade_source),
+        ("ensure_project_mcp_inner_manager", manager_source),
+    ] {
+        assert!(
+            source.contains("ensure_turn_not_cancelled"),
+            "{name} 应复用 pl-core 的取消 checkpoint"
+        );
+        assert!(
+            !source.contains("cancellation_token.is_cancelled()"),
+            "{name} 不应直接解释 CancellationToken"
+        );
+    }
+}
 
 fn pl_text(message: &Message) -> &str {
     match &message.content {
@@ -65,25 +795,51 @@ fn pl_tool_call_names(message: &Message) -> Vec<String> {
 #[test]
 fn kernel_shared_tool_definitions_supply_subagent_schema() {
     let visible = [
-        mai_tools::TOOL_SPAWN_AGENT,
-        mai_tools::TOOL_SEND_INPUT,
-        mai_tools::TOOL_WAIT_AGENT,
-        mai_tools::TOOL_LIST_AGENTS,
-        mai_tools::TOOL_CLOSE_AGENT,
-        mai_tools::TOOL_RESUME_AGENT,
+        pl_core::TOOL_SPAWN_AGENT,
+        pl_core::TOOL_SEND_INPUT,
+        pl_core::TOOL_WAIT_AGENT,
+        pl_core::TOOL_LIST_AGENTS,
+        pl_core::TOOL_CLOSE_AGENT,
+        pl_core::TOOL_RESUME_AGENT,
+        "update_todo_list",
+        "request_user_input",
     ]
     .into_iter()
     .map(str::to_string)
     .collect::<std::collections::HashSet<_>>();
 
-    let tools = turn::kernel_tools::model_tool_definitions(&visible, Vec::new());
-    let names = tools
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<Vec<_>>();
+    let tools = pl_core::shared_tool_schemas(pl_core::SharedToolSchemaOptions {
+        bash: false,
+        workspace_files: true,
+        ask_user: true,
+        subagents: true,
+        git: true,
+        container: true,
+        mcp_resources: true,
+        todo: true,
+        plan_exit: false,
+    })
+    .into_iter()
+    .filter(|schema| visible.contains(schema.name()))
+    .collect::<Vec<_>>();
+    fn schema_name(schema: &pl_model::ToolSchema) -> &str {
+        match schema {
+            pl_model::ToolSchema::Function { name, .. } => name.as_str(),
+            pl_model::ToolSchema::Custom { name, .. } => name.as_str(),
+        }
+    }
+    fn schema_parameters(schema: &pl_model::ToolSchema) -> &serde_json::Value {
+        match schema {
+            pl_model::ToolSchema::Function { input_schema, .. } => input_schema,
+            pl_model::ToolSchema::Custom { .. } => panic!("shared runtime tools must be functions"),
+        }
+    }
+    let names = tools.iter().map(schema_name).collect::<Vec<_>>();
     assert_eq!(
         names,
         vec![
+            "request_user_input",
+            "update_todo_list",
             "spawn_agent",
             "send_input",
             "wait_agent",
@@ -94,31 +850,404 @@ fn kernel_shared_tool_definitions_supply_subagent_schema() {
     );
     let spawn = tools
         .iter()
-        .find(|tool| tool.name == mai_tools::TOOL_SPAWN_AGENT)
+        .find(|tool| schema_name(tool) == pl_core::TOOL_SPAWN_AGENT)
         .expect("spawn_agent");
-    assert!(spawn.parameters.pointer("/properties/taskName").is_some());
-    assert!(spawn.parameters.pointer("/properties/agentType").is_some());
+    let spawn_parameters = schema_parameters(spawn);
+    assert!(spawn_parameters.pointer("/properties/taskName").is_some());
+    assert!(spawn_parameters.pointer("/properties/agentType").is_some());
     assert!(
-        spawn
-            .parameters
+        spawn_parameters
             .pointer("/properties/reasoningEffort")
             .is_some()
     );
-    assert!(spawn.parameters.pointer("/properties/forkTurns").is_some());
-    assert!(spawn.parameters.pointer("/properties/name").is_none());
+    assert!(spawn_parameters.pointer("/properties/forkTurns").is_some());
+    assert!(spawn_parameters.pointer("/properties/name").is_none());
     assert!(
-        spawn
-            .parameters
+        spawn_parameters
             .pointer("/properties/reasoning_effort")
             .is_none()
     );
 
     let wait = tools
         .iter()
-        .find(|tool| tool.name == mai_tools::TOOL_WAIT_AGENT)
+        .find(|tool| schema_name(tool) == pl_core::TOOL_WAIT_AGENT)
         .expect("wait_agent");
-    assert!(wait.parameters.pointer("/properties/timeoutMs").is_some());
-    assert!(wait.parameters.pointer("/properties/timeout_ms").is_none());
+    let wait_parameters = schema_parameters(wait);
+    assert!(wait_parameters.pointer("/properties/timeoutMs").is_some());
+    assert!(wait_parameters.pointer("/properties/timeout_ms").is_none());
+
+    let update_todo = tools
+        .iter()
+        .find(|tool| schema_name(tool) == "update_todo_list")
+        .expect("update_todo_list");
+    let update_todo_parameters = schema_parameters(update_todo);
+    assert!(
+        update_todo_parameters
+            .pointer("/properties/items")
+            .is_some()
+    );
+    assert!(
+        update_todo_parameters
+            .pointer("/properties/todos")
+            .is_none()
+    );
+    assert_eq!(
+        update_todo_parameters.pointer("/properties/items/items/properties/status/enum"),
+        Some(&serde_json::json!(["pending", "inProgress", "completed"]))
+    );
+
+    let ask = tools
+        .iter()
+        .find(|tool| schema_name(tool) == "request_user_input")
+        .expect("request_user_input");
+    let ask_parameters = schema_parameters(ask);
+    assert!(ask_parameters.pointer("/properties/questions").is_some());
+    assert!(ask_parameters.pointer("/properties/header").is_none());
+    assert!(
+        ask_parameters
+            .pointer("/properties/questions/items/properties/header")
+            .is_some()
+    );
+}
+
+#[test]
+fn kernel_tools_do_not_rebuild_shared_tools_as_mai_definitions() {
+    let source = include_str!("../turn/kernel_tools.rs");
+
+    for forbidden in [
+        "model_tool_definitions",
+        "shared_tool_schemas",
+        "shared_tool_definitions",
+        "definition_from_schema",
+        "output_artifacts_from_values",
+        "serde_json::from_value",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "pl-core shared tools 不应在 mai-runtime 里重建为 mai 旧工具定义类型: {forbidden}"
+        );
+    }
+
+    assert!(
+        source.contains("output_artifacts_as::<ToolOutputArtifactInfo>"),
+        "tool lifecycle artifact 解码应复用 pl-core 投影 API"
+    );
+}
+
+#[test]
+fn tool_output_module_does_not_keep_local_tool_lifecycle_runner() {
+    let source = include_str!("../turn/tool_output.rs");
+
+    for forbidden in ["run_tool_call", "ToolCallContext", "ToolCallInfo"] {
+        assert!(
+            !source.contains(forbidden),
+            "tool lifecycle dispatch/history must stay in pl-core, not mai-runtime: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn tool_output_artifact_paths_use_pl_core_request_constructor() {
+    let source = include_str!("../lib.rs");
+    let helper = source
+        .split("pub fn tool_output_artifact_file_path(")
+        .nth(1)
+        .expect("tool output artifact path helper")
+        .split("async fn run_turn(")
+        .next()
+        .expect("helper body");
+
+    assert!(
+        helper.contains("pl_core::ToolOutputArtifactPathRequest::new"),
+        "tool output artifact 路径请求的共享字段形状应由 pl-core constructor 承载"
+    );
+    assert!(
+        !helper.contains("pl_core::ToolOutputArtifactPathRequest {"),
+        "mai-runtime 不应手写 ToolOutputArtifactPathRequest 字段"
+    );
+}
+
+#[test]
+fn container_output_capture_uses_pl_core_request_constructor() {
+    let source = include_str!("../turn/container.rs");
+    let captured_exec = source
+        .split("async fn execute_with_container_backend(")
+        .nth(1)
+        .expect("captured container exec")
+        .split("pub(crate) async fn execute_container_tool(")
+        .next()
+        .expect("captured body");
+
+    assert!(
+        captured_exec.contains("ToolOutputCaptureRequest::new"),
+        "container 输出捕获请求的共享字段形状应由 pl-core constructor 承载"
+    );
+    assert!(
+        !captured_exec.contains("ToolOutputCaptureRequest {"),
+        "mai-runtime 不应手写 ToolOutputCaptureRequest 字段"
+    );
+    assert!(
+        captured_exec.contains("capture.stdout_path()")
+            && captured_exec.contains("capture.stderr_path()"),
+        "container 输出捕获路径应通过 pl-core accessor 获取"
+    );
+    assert!(
+        !captured_exec.contains("capture.stdout.path")
+            && !captured_exec.contains("capture.stderr.path"),
+        "mai-runtime 不应读取 ToolOutputCapture 内部 stream 字段"
+    );
+    assert!(
+        captured_exec.contains("ToolOutputStreamSizes::new"),
+        "container 输出流大小的共享字段形状应由 pl-core constructor 承载"
+    );
+    assert!(
+        !captured_exec.contains("ToolOutputStreamSizes {"),
+        "mai-runtime 不应手写 ToolOutputStreamSizes 字段"
+    );
+}
+
+#[test]
+fn container_artifact_descriptors_use_pl_core_accessors() {
+    let source = include_str!("../turn/container.rs");
+    let projection = source
+        .split("fn artifact_records_from_descriptors(")
+        .nth(1)
+        .expect("artifact descriptor projection")
+        .split("fn runtime_invalid_input(")
+        .next()
+        .expect("projection body");
+
+    for required in [
+        "descriptor.id()",
+        "descriptor.call_id()",
+        "descriptor.name()",
+        "descriptor.stream()",
+        "descriptor.size_bytes()",
+    ] {
+        assert!(
+            projection.contains(required),
+            "container artifact 投影应通过 pl-core descriptor accessor 获取 `{required}`"
+        );
+    }
+    for forbidden in [
+        "descriptor.id,",
+        "descriptor.call_id,",
+        "descriptor.name,",
+        "descriptor.stream.as_str()",
+        "descriptor.size_bytes,",
+    ] {
+        assert!(
+            !projection.contains(forbidden),
+            "mai-runtime 不应读取 ToolOutputArtifactDescriptor 字段 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn tool_visibility_consumes_pl_core_shared_tool_names() {
+    let source = include_str!("../turn/tool_visibility.rs");
+
+    assert!(
+        source.contains("ToolVisibilitySet::hosted_container_with_tool_names"),
+        "hosted container 共享工具、产品工具、动态工具的组合应由 pl-core ToolVisibilitySet 统一构造"
+    );
+    assert!(
+        source.contains("ToolVisibilitySet"),
+        "tool visibility 应返回 pl-core ToolVisibilitySet，避免 mai-runtime 自己维护裸工具名集合"
+    );
+    assert!(
+        !source.contains("HashSet"),
+        "tool visibility 不应再用裸 HashSet 表达模型可见工具集合"
+    );
+    assert!(
+        !source.contains("bash: false") && !source.contains("workspace_files: true"),
+        "tool visibility 不应手写共享工具 schema options，应从 pl-core hosted capability preset 派生"
+    );
+    for forbidden in [
+        "pl_model::ToolSchema",
+        "shared_tool_schema_name",
+        "pl_core::shared_tool_names",
+        "shared_tool_name_options",
+        "canonical_git_tool_names",
+        "TOOL_GIT_STATUS",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "tool visibility 不应维护或解析 pl-core 共享工具名目录: {forbidden}"
+        );
+    }
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("production section");
+    assert!(
+        !production.contains("extend_tool_names"),
+        "tool visibility 不应在 mai-runtime 手写多阶段工具集合拼装"
+    );
+}
+
+#[test]
+fn agent_control_permissions_use_pl_core_policy_hook() {
+    let source = include_str!("../turn/agent_control.rs");
+
+    assert!(
+        source.contains("impl pl_core::AgentControlPolicy for MaiAgentControlPolicy"),
+        "agent-control 权限和通信边界应通过 pl-core AgentControlPolicy hook 注入"
+    );
+    let backend_start = source
+        .find("impl pl_core::AgentControlBackend for MaiAgentControlBackend")
+        .expect("backend impl");
+    let policy_start = source
+        .find("impl pl_core::AgentControlPolicy for MaiAgentControlPolicy")
+        .unwrap_or(source.len());
+    let backend_impl = &source[backend_start..policy_start];
+    for forbidden in [
+        "tool_visibility::visible_tool_names",
+        "agent_can_access_target",
+        "ensure_tool_visible",
+        "accessible_target",
+    ] {
+        assert!(
+            !backend_impl.contains(forbidden),
+            "MaiAgentControlBackend 不应在业务执行分支里做 pl-core policy 检查: {forbidden}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pl_core_user_input_interaction_is_projected_to_service_event() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let agent_id = uuid::Uuid::new_v4();
+    let session_id = uuid::Uuid::new_v4();
+    let turn_id = uuid::Uuid::new_v4();
+    let callback = turn::core_adapter::mai_user_input_interaction_callback(
+        Arc::clone(&runtime),
+        agent_id,
+        session_id,
+        turn_id,
+    );
+
+    let resolution = callback(pl_protocol::InteractionRequest {
+        interaction_id: "interaction-1".to_string(),
+        kind: pl_protocol::InteractionKind::UserInput,
+        status: pl_protocol::InteractionStatus::Pending,
+        scope: pl_protocol::InteractionScope {
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            item_id: Some("call-1".to_string()),
+            tool_id: Some("call-1".to_string()),
+            agent_path: None,
+        },
+        payload: pl_protocol::InteractionPayload::UserInput {
+            questions: vec![pl_protocol::UserQuestion {
+                id: "scope".to_string(),
+                header: "Scope".to_string(),
+                question: "Which scope?".to_string(),
+                is_other: false,
+                is_secret: false,
+                options: Some(vec![pl_protocol::UserQuestionOption {
+                    label: "Full".to_string(),
+                    description: "Use the full scope.".to_string(),
+                }]),
+            }],
+        },
+        created_at: 0,
+        updated_at: 0,
+        resolved_at: None,
+        resolution: None,
+    })
+    .await;
+
+    assert_eq!(
+        resolution,
+        pl_protocol::InteractionResolution::UserInput {
+            answers: std::collections::HashMap::new(),
+        }
+    );
+    let events = runtime.events.snapshot().await;
+    let request = events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            ServiceEventKind::UserInputRequested {
+                agent_id: event_agent_id,
+                session_id: event_session_id,
+                turn_id: event_turn_id,
+                header,
+                questions,
+            } if *event_agent_id == agent_id
+                && *event_session_id == Some(session_id)
+                && *event_turn_id == turn_id =>
+            {
+                Some((header, questions))
+            }
+            _ => None,
+        })
+        .expect("projected user input event");
+    assert_eq!(request.0, "Scope");
+    assert_eq!(request.1.len(), 1);
+    assert_eq!(request.1[0].id, "scope");
+    assert_eq!(request.1[0].question, "Which scope?");
+    assert_eq!(request.1[0].options[0].label, "Full");
+    assert_eq!(
+        request.1[0].options[0].description.as_deref(),
+        Some("Use the full scope.")
+    );
+}
+
+#[tokio::test]
+async fn pl_core_todo_events_are_projected_to_service_events() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let agent_id = uuid::Uuid::new_v4();
+    let session_id = uuid::Uuid::new_v4();
+    let turn_id = uuid::Uuid::new_v4();
+    turn::hosted_runtime::project_hosted_agent_event(
+        runtime.as_ref(),
+        agent_id,
+        session_id,
+        turn_id,
+        pl_trace::AgentEvent::TodoListUpdated {
+            snapshot: pl_protocol::TodoListSnapshot {
+                call_id: "call-1".to_string(),
+                agent_id: None,
+                path: None,
+                parent_path: None,
+                explanation: None,
+                items: vec![pl_protocol::TodoItem {
+                    step: "迁移 todo 工具".to_string(),
+                    status: pl_protocol::TodoStatus::InProgress,
+                }],
+            },
+        },
+    )
+    .await;
+
+    let events = runtime.events.snapshot().await;
+    let items = events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            ServiceEventKind::TodoListUpdated {
+                agent_id: event_agent_id,
+                session_id: event_session_id,
+                turn_id: event_turn_id,
+                items,
+            } if *event_agent_id == agent_id
+                && *event_session_id == Some(session_id)
+                && *event_turn_id == turn_id =>
+            {
+                Some(items)
+            }
+            _ => None,
+        })
+        .expect("projected todo event");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].step, "迁移 todo 工具");
+    assert_eq!(items[0].status, mai_protocol::TodoListStatus::InProgress);
 }
 
 fn test_model(id: &str) -> ModelConfig {
@@ -365,7 +1494,7 @@ async fn wait_for_agent_idle(runtime: Arc<AgentRuntime>, agent_id: AgentId, time
                     .await
                     .map(|agent| {
                         agent.summary.current_turn.is_none()
-                            && agent.summary.status.can_start_turn()
+                            && agents::is_agent_status_turn_start_ready(&agent.summary.status)
                     })
                     .unwrap_or(false)
             }
@@ -567,7 +1696,7 @@ fn compact_mimo_test_provider(base_url: String) -> ProviderConfig {
 }
 
 #[tokio::test]
-async fn model_client_stream_session_response_retries_without_unsupported_continuation() {
+async fn pl_core_model_turn_response_retries_without_unsupported_continuation() {
     let (base_url, requests) = start_mock_responses(vec![
         json!({
             "id": "resp_first",
@@ -613,37 +1742,32 @@ async fn model_client_stream_session_response_retries_without_unsupported_contin
         .resolve_provider(Some("mock"), None)
         .await
         .expect("resolve provider");
-    let client = ModelClient::new();
+    let provider = core_provider_for_selection(&selection).expect("core provider");
     let mut session = pl_core::CoreSession::new();
     session.push_user_prompt("first".to_string());
 
-    let first = client
-        .stream_session_completion_response(
-            &selection,
-            None,
-            "reply briefly",
-            &[],
-            &mut session,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("first response");
+    let first = pl_core::stream_session_completion_response(
+        provider.clone(),
+        &mut session,
+        core_model_turn_request(&selection, None, "reply briefly", Vec::new()),
+        pl_core::CoreModelTurnOptions::default().with_cancellation(CancellationToken::new()),
+    )
+    .await
+    .expect("first response");
 
     assert_eq!(first.response_id.as_deref(), Some("resp_first"));
-    session.push_assistant_response(first.content.expect("first content"), None);
+    assert_eq!(first.content.as_deref(), Some("first"));
+    session.push_assistant_completion_response(&first);
     session.push_user_prompt("second".to_string());
 
-    let second = client
-        .stream_session_completion_response(
-            &selection,
-            None,
-            "reply briefly",
-            &[],
-            &mut session,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("second response");
+    let second = pl_core::stream_session_completion_response(
+        provider,
+        &mut session,
+        core_model_turn_request(&selection, None, "reply briefly", Vec::new()),
+        pl_core::CoreModelTurnOptions::default().with_cancellation(CancellationToken::new()),
+    )
+    .await
+    .expect("second response");
 
     assert_eq!(second.content.as_deref(), Some("second"));
     assert_eq!(second.response_id.as_deref(), Some("resp_second"));
@@ -667,8 +1791,63 @@ async fn model_client_stream_session_response_retries_without_unsupported_contin
     );
 }
 
+#[test]
+fn runtime_does_not_expose_local_model_client_facade() {
+    let lib = include_str!("../lib.rs");
+    let hosted_runtime = include_str!("../turn/hosted_runtime.rs");
+
+    assert!(
+        !lib.contains("mod model_client"),
+        "mai-runtime 不应再保留本地 model client 模块"
+    );
+    assert!(
+        !lib.contains("pub use model_client"),
+        "mai-runtime 不应再导出本地 model client facade"
+    );
+    assert!(
+        hosted_runtime.contains("core_provider_for_selection"),
+        "主 turn 应只消费 mai -> pl-core provider 投影"
+    );
+    for forbidden in [
+        "ModelClient",
+        "CoreModelTurnClient",
+        "CoreModelTurnRequest",
+        "CoreModelTurnOptions",
+        "CompletionResponse",
+        "stream_session_completion_response",
+        &format!("{}{}", "Tool", "Definition"),
+        "fn tool_schema",
+    ] {
+        assert!(
+            !hosted_runtime.contains(forbidden),
+            "主 turn adapter 不应继续本地维护或转换 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn task_title_generation_uses_pl_core_completion_text_turn() {
+    let lib = include_str!("../lib.rs");
+    let function = lib
+        .split("async fn generate_task_title")
+        .nth(1)
+        .and_then(|text| text.split("async fn update_task_title").next())
+        .expect("generate_task_title function");
+
+    assert!(
+        function.contains("pl_core::stream_history_completion_message_text"),
+        "任务标题生成应复用 pl-core 的单轮 completion 文本 helper"
+    );
+    assert!(
+        !function.contains("stream_session_completion_response")
+            && !function.contains("completion_response_message_text")
+            && !function.contains("ModelOutputItem::Message"),
+        "任务标题生成不应在 mai-runtime 手写 stream response 到文本的转换链路"
+    );
+}
+
 #[tokio::test]
-async fn model_client_exposes_shared_continuation_capability_check() {
+async fn model_profile_exposes_shared_continuation_capability_check() {
     let (base_url, _requests) = start_mock_responses(Vec::new()).await;
     let mut model = test_model("gpt-5.5");
     model.wire_api = mai_protocol::ModelWireApi::Responses;
@@ -686,7 +1865,96 @@ async fn model_client_exposes_shared_continuation_capability_check() {
     };
     let selection = mai_store::ProviderSelection { provider, model };
 
-    assert!(ModelClient::supports_continuation(&selection));
+    assert!(model_supports_continuation(&selection));
+}
+
+#[test]
+fn model_profile_projects_mai_config_to_pl_runtime_profile() {
+    let mut model = test_model("gpt-5.5");
+    model.name = Some("GPT 5.5".to_string());
+    model.context_tokens = 200_000;
+    model.max_context_tokens = Some(256_000);
+    model.auto_compact_token_limit = Some(180_000);
+    model.output_tokens = 64_000;
+    model.capabilities.parallel_tools = true;
+    model.capabilities.reasoning_replay = true;
+    model.request_policy.max_tokens_field = "max_completion_tokens".to_string();
+    model.options = json!({ "temperature": 0.2, "model_option": true });
+    model.request_policy.extra_body = json!({ "policy_option": true });
+    model
+        .headers
+        .insert("X-Model".to_string(), "model".to_string());
+    model
+        .request_policy
+        .headers
+        .insert("X-Policy".to_string(), "policy".to_string());
+
+    let provider = ProviderSecret {
+        id: "mimo".to_string(),
+        kind: ProviderKind::Mimo,
+        name: "MIMO".to_string(),
+        base_url: "http://model.example/v1".to_string(),
+        api_key: "secret".to_string(),
+        api_key_env: None,
+        models: vec![model.clone()],
+        default_model: model.id.clone(),
+        enabled: true,
+    };
+
+    let provider_info = crate::model_profile::provider_info(&provider);
+    assert_eq!(
+        provider_info.provider_kind,
+        pl_model::ProviderKind::OpenAiCompatibleChat
+    );
+    assert_eq!(provider_info.name, "MIMO");
+    assert_eq!(provider_info.base_url, "http://model.example/v1");
+    assert_eq!(provider_info.default_model, "gpt-5.5");
+    assert_eq!(provider_info.bearer_token.as_deref(), Some("secret"));
+
+    let model_info = crate::model_profile::model_info(&model);
+    assert_eq!(model_info.slug, "gpt-5.5");
+    assert_eq!(model_info.display_name, "GPT 5.5");
+    assert_eq!(model_info.context_window, Some(200_000));
+    assert_eq!(model_info.max_context_window, Some(256_000));
+    assert_eq!(model_info.auto_compact_token_limit, Some(180_000));
+    assert_eq!(model_info.max_output_tokens, Some(64_000));
+    assert!(model_info.capabilities.reasoning);
+    assert!(model_info.capabilities.tools.function_calling);
+    assert!(model_info.capabilities.tools.parallel_tool_calls);
+    assert_eq!(
+        model_info.request_profile.max_tokens_field,
+        pl_model::MaxTokensField::MaxCompletionTokens
+    );
+    assert_eq!(
+        model_info.request_profile.headers.get("X-Model"),
+        Some(&"model".to_string())
+    );
+    assert_eq!(
+        model_info.request_profile.headers.get("X-Policy"),
+        Some(&"policy".to_string())
+    );
+    assert_eq!(
+        model_info.request_profile.body.get("model_option"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        model_info.request_profile.body.get("policy_option"),
+        Some(&json!(true))
+    );
+    let effort = model_info
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == "effort")
+        .expect("reasoning effort parameter");
+    assert_eq!(
+        effort.candidates,
+        vec![
+            "minimal".to_string(),
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string()
+        ]
+    );
 }
 
 #[test]
@@ -753,7 +2021,7 @@ fn completion_response_projection_is_shared_by_runtime_and_server() {
     };
 
     assert_eq!(
-        completion_response_preview(&response),
+        pl_core::completion_response_preview(&response),
         "thought\\nhello\\nfunction_call lookup call_lookup: {\"q\":\"rust\"}"
     );
     assert_eq!(
@@ -1199,22 +2467,6 @@ fn ensure_project_clone(
 async fn test_runtime(dir: &tempfile::TempDir, store: Arc<ConfigStore>) -> Arc<AgentRuntime> {
     AgentRuntime::new(
         DockerClient::new_with_binary("unused", fake_docker_path(dir)),
-        ModelClient::new(),
-        store,
-        test_runtime_config(dir, DEFAULT_SIDECAR_IMAGE),
-    )
-    .await
-    .expect("runtime")
-}
-
-async fn test_runtime_with_model_config(
-    dir: &tempfile::TempDir,
-    store: Arc<ConfigStore>,
-    model_config: ModelClientConfig,
-) -> Arc<AgentRuntime> {
-    AgentRuntime::new(
-        DockerClient::new_with_binary("unused", fake_docker_path(dir)),
-        ModelClient::with_config(model_config),
         store,
         test_runtime_config(dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -1229,7 +2481,6 @@ async fn test_runtime_with_sidecar_image_and_git(
 ) -> Arc<AgentRuntime> {
     AgentRuntime::new(
         DockerClient::new_with_binary("unused-agent", fake_docker_path(dir)),
-        ModelClient::new(),
         store,
         RuntimeConfig {
             git_binary: Some(fake_git_path(dir)),
@@ -1247,7 +2498,6 @@ async fn test_runtime_with_github_api(
 ) -> Arc<AgentRuntime> {
     AgentRuntime::new(
         DockerClient::new_with_binary("unused", fake_docker_path(dir)),
-        ModelClient::new(),
         store,
         RuntimeConfig {
             github_api_base_url: Some(github_api_base_url),
@@ -1343,7 +2593,7 @@ fn test_mcp_tool(server: &str, name: &str) -> McpTool {
     McpTool {
         server: server.to_string(),
         name: name.to_string(),
-        model_name: mai_mcp::model_tool_name(server, name),
+        model_name: crate::mcp::model_tool_name(server, name),
         description: format!("{server} {name}"),
         input_schema: json!({
             "type": "object",
@@ -1422,14 +2672,14 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 	        fi
 	        echo "sidecar-git-cache" >> "$LOG"
 	      fi
-	      if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
+	      if [ -n "$PL_GIT_TOKEN" ]; then
 	        echo "token-present" >> "$LOG"
 	      fi
 	      mkdir -p "$WORKSPACE/repo.git"
 	    fi
 	    if printf '%s' "$command" | grep -q "clone --no-checkout"; then
 	      echo "sidecar-git-clone" >> "$LOG"
-	      if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
+	      if [ -n "$PL_GIT_TOKEN" ]; then
 	        echo "token-present" >> "$LOG"
 	      fi
 	      mkdir -p "$WORKSPACE/repo/.git" "$WORKSPACE/.mai/install-log" "$WORKSPACE/.mai/tool-state" "$WORKSPACE/tmp"
@@ -1539,7 +2789,7 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 	    fi
 	    if printf '%s' "$command" | grep -q "git -c credential.helper= clone"; then
 	      echo "sidecar-git-clone" >> "$LOG"
-	      if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
+	      if [ -n "$PL_GIT_TOKEN" ]; then
 	        echo "token-present" >> "$LOG"
 	      fi
 	      mkdir -p "$WORKSPACE"
@@ -1634,7 +2884,7 @@ echo "$*" >> "$LOG"
 if [ -n "$GIT_ASKPASS" ]; then
   echo "askpass=$GIT_ASKPASS" >> "$LOG"
 fi
-if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
+if [ -n "$PL_GIT_TOKEN" ]; then
   echo "token-present" >> "$LOG"
 fi
 case "$1" in
@@ -1830,8 +3080,16 @@ fn extracts_skill_mentions() {
 
 #[test]
 fn agent_status_allows_new_turn_after_completion() {
-    assert!(AgentStatus::Completed.can_start_turn());
-    assert!(!AgentStatus::RunningTurn.can_start_turn());
+    assert!(agents::is_agent_status_turn_start_ready(
+        &AgentStatus::Completed
+    ));
+    assert!(!agents::is_agent_status_turn_start_ready(
+        &AgentStatus::RunningTurn
+    ));
+    assert_eq!(
+        AgentTurnStartSnapshot::new(AgentLifecycleStatusKind::Completed).readiness(),
+        AgentTurnStartReadiness::Ready
+    );
 }
 
 #[tokio::test]
@@ -2062,7 +3320,6 @@ exit 0
         .expect("save providers");
     let runtime = AgentRuntime::new(
         DockerClient::new_with_binary("slow-agent", docker.to_string_lossy().to_string()),
-        ModelClient::new(),
         Arc::clone(&store),
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -2740,79 +3997,6 @@ async fn delete_child_keeps_parent_and_sibling() {
 }
 
 #[test]
-fn auto_compact_threshold_uses_last_context_tokens() {
-    assert_eq!(
-        turn::context::ContextBudgetPolicy::new(100, 90, None).decision(Some(0), None),
-        None
-    );
-    assert_eq!(
-        turn::context::ContextBudgetPolicy::new(100, 90, None).decision(Some(89), None),
-        None
-    );
-    assert!(
-        turn::context::ContextBudgetPolicy::new(100, 90, None)
-            .decision(Some(90), None)
-            .is_some()
-    );
-    assert!(
-        turn::context::ContextBudgetPolicy::new(400_000, 90, None)
-            .decision(Some(360_000), None)
-            .is_some()
-    );
-    assert_eq!(
-        turn::context::ContextBudgetPolicy::new(100, 90, None).decision(None, Some(90)),
-        Some(turn::context::ContextCompactionDecision {
-            trigger: turn::context::ContextCompactionTrigger::RequestEstimate,
-            tokens_before: 90,
-        })
-    );
-    assert_eq!(
-        turn::context::ContextBudgetPolicy::new(100, 90, None).decision(Some(10), Some(90)),
-        Some(turn::context::ContextCompactionDecision {
-            trigger: turn::context::ContextCompactionTrigger::RequestEstimate,
-            tokens_before: 90,
-        })
-    );
-    assert_eq!(
-        turn::context::ContextBudgetPolicy::new(0, 90, None).decision(Some(90), None),
-        None
-    );
-}
-
-#[test]
-fn auto_compact_threshold_honors_explicit_token_limit() {
-    assert_eq!(
-        turn::context::ContextBudgetPolicy::new(100, 90, Some(75)).decision(Some(74), None),
-        None
-    );
-    assert_eq!(
-        turn::context::ContextBudgetPolicy::new(100, 90, Some(75)).decision(Some(10), Some(75)),
-        Some(turn::context::ContextCompactionDecision {
-            trigger: turn::context::ContextCompactionTrigger::RequestEstimate,
-            tokens_before: 75,
-        })
-    );
-}
-
-#[test]
-fn compact_summary_uses_last_non_empty_assistant_output() {
-    let output = vec![
-        ModelOutputItem::Message {
-            text: "first".to_string(),
-        },
-        ModelOutputItem::Reasoning {
-            content: "  second  ".to_string(),
-        },
-    ];
-
-    assert_eq!(
-        turn::history::compact_summary_from_output(&output).as_deref(),
-        Some("first")
-    );
-    assert_eq!(turn::history::compact_summary_from_output(&[]), None);
-}
-
-#[test]
 fn repair_adds_missing_tool_outputs_for_function_call_after_reasoning() {
     let mut history = vec![
         turn::history::user_text_message("do something"),
@@ -2823,7 +4007,7 @@ fn repair_adds_missing_tool_outputs_for_function_call_after_reasoning() {
             "{}".to_string(),
         ),
     ];
-    turn::history::repair_incomplete_tool_history(&mut history);
+    pl_core::repair_incomplete_tool_history(&mut history);
     assert_eq!(history.len(), 4);
     assert_eq!(
         pl_tool_result_call_id(&history[3]).as_deref(),
@@ -2851,7 +4035,7 @@ fn repair_adds_missing_tool_outputs_for_partial_results() {
             "{}".to_string(),
         ),
     ];
-    turn::history::repair_incomplete_tool_history(&mut history);
+    pl_core::repair_incomplete_tool_history(&mut history);
     assert_eq!(history.len(), 4);
     assert_eq!(
         pl_tool_result_call_id(&history[3]).as_deref(),
@@ -2866,7 +4050,7 @@ fn repair_adds_missing_tool_outputs_for_function_call() {
         "container_exec".to_string(),
         "{}".to_string(),
     )];
-    turn::history::repair_incomplete_tool_history(&mut history);
+    pl_core::repair_incomplete_tool_history(&mut history);
     assert_eq!(history.len(), 2);
     assert_eq!(
         pl_tool_result_call_id(&history[1]).as_deref(),
@@ -2891,14 +4075,14 @@ fn repair_does_nothing_for_complete_history() {
         ),
         turn::history::assistant_text_message("done"),
     ];
-    turn::history::repair_incomplete_tool_history(&mut history);
+    pl_core::repair_incomplete_tool_history(&mut history);
     assert_eq!(history.len(), 4);
 }
 
 #[test]
 fn repair_does_nothing_for_empty_history() {
     let mut history: Vec<Message> = vec![];
-    turn::history::repair_incomplete_tool_history(&mut history);
+    pl_core::repair_incomplete_tool_history(&mut history);
     assert!(history.is_empty());
 }
 
@@ -2913,7 +4097,7 @@ fn repair_inserts_before_user_message() {
         ),
         turn::history::user_text_message("继续"),
     ];
-    turn::history::repair_incomplete_tool_history(&mut history);
+    pl_core::repair_incomplete_tool_history(&mut history);
     assert_eq!(history.len(), 4);
     assert_eq!(
         pl_tool_result_call_id(&history[2]).as_deref(),
@@ -2943,7 +4127,7 @@ fn repair_inserts_partial_before_user_message() {
         ),
         turn::history::user_text_message("继续"),
     ];
-    turn::history::repair_incomplete_tool_history(&mut history);
+    pl_core::repair_incomplete_tool_history(&mut history);
     assert_eq!(history.len(), 5);
     assert_eq!(
         pl_tool_result_call_id(&history[3]).as_deref(),
@@ -2974,7 +4158,7 @@ fn repair_keeps_consecutive_function_calls_in_one_batch() {
         ),
         turn::history::user_text_message("继续"),
     ];
-    turn::history::repair_incomplete_tool_history(&mut history);
+    pl_core::repair_incomplete_tool_history(&mut history);
 
     assert_eq!(history.len(), 6);
     assert_eq!(pl_tool_call_ids(&history[1]), vec!["call_1"]);
@@ -2989,83 +4173,6 @@ fn repair_keeps_consecutive_function_calls_in_one_batch() {
         Some("call_1")
     );
     assert_eq!(history[5].role, PlMessageRole::User);
-}
-
-#[test]
-fn compacted_history_keeps_recent_user_messages_assistant_and_tool_summary() {
-    let history = vec![
-        turn::history::user_text_message("first user"),
-        turn::history::assistant_text_message("assistant old"),
-        turn::history::user_text_message(turn::history::compact_summary_message(
-            "old summary",
-            COMPACT_SUMMARY_PREFIX,
-        )),
-        turn::history::tool_call_message(
-            "call_1".to_string(),
-            "container_exec".to_string(),
-            "{}".to_string(),
-        ),
-        turn::history::tool_result_message(
-            "call_1".to_string(),
-            "container_exec".to_string(),
-            "{}".to_string(),
-            format!("{}{}", "x".repeat(12_000), "tool tail"),
-        ),
-        turn::history::assistant_text_message("assistant recent"),
-        turn::history::user_text_message("second user"),
-    ];
-
-    let compacted = turn::history::build_compacted_history(
-        &history,
-        "new summary",
-        COMPACT_USER_MESSAGE_MAX_CHARS,
-        COMPACT_SUMMARY_PREFIX,
-    );
-    assert!(compacted.len() >= 5);
-    assert_eq!(pl_text(&compacted[0]), "first user");
-    assert!(
-        compacted
-            .iter()
-            .any(|item| { item.role == PlMessageRole::User && pl_text(item) == "first user" })
-    );
-    assert!(compacted.iter().any(|item| {
-        item.role == PlMessageRole::Assistant && pl_text(item) == "assistant recent"
-    }));
-    assert!(
-        !compacted
-            .iter()
-            .any(|item| item.role == PlMessageRole::Tool)
-    );
-    assert!(compacted.iter().any(|item| {
-        item.role == PlMessageRole::User
-            && pl_text(item).contains("Recent tool result")
-            && pl_text(item).contains("tool output truncated")
-            && pl_text(item).contains("tool tail")
-            && pl_text(item).len() < 12_000
-    }));
-    assert!(
-        compacted
-            .iter()
-            .any(|item| { item.role == PlMessageRole::User && pl_text(item) == "second user" })
-    );
-    let summary = compacted.last().expect("summary");
-    assert!(
-        pl_text(summary).contains("new summary")
-            && turn::history::is_compact_summary(pl_text(summary), COMPACT_SUMMARY_PREFIX)
-    );
-}
-
-#[test]
-fn recent_user_messages_truncates_from_oldest_side() {
-    let history = vec![
-        turn::history::user_text_message("abcdef"),
-        turn::history::user_text_message("ghij"),
-    ];
-
-    assert_eq!(
-        turn::history::recent_user_messages(&history, 7, COMPACT_SUMMARY_PREFIX),
-        vec!["def", "ghij"]
-    );
 }
 
 #[tokio::test]
@@ -3159,7 +4266,6 @@ async fn restores_persisted_agents_and_continues_event_sequence() {
     );
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         store,
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -3275,14 +4381,15 @@ async fn wait_agent_tool_returns_final_assistant_response() {
             parent_id,
             "wait_agent",
             json!({
-                "targets": [child_id.to_string()],
                 "timeoutMs": 1000
             }),
         )
         .await
         .expect("wait agent");
     assert!(output.success);
-    let value: Value = serde_json::from_str(&output.output).expect("wait output json");
+    let outer: Value = serde_json::from_str(&output.output).expect("wait output json");
+    let value: Value = serde_json::from_str(outer["message"].as_str().expect("wait message json"))
+        .expect("wait message payload");
     let completed = value["completed"].as_array().expect("completed");
     assert_eq!(completed.len(), 1);
     let child_output = &completed[0];
@@ -3301,7 +4408,9 @@ async fn wait_agent_tool_returns_final_assistant_response() {
         child_output["agent"]["id"].as_str(),
         Some(child_id.to_string().as_str())
     );
-    assert_eq!(value["timed_out"].as_bool(), Some(false));
+    assert_eq!(outer["timedOut"].as_bool(), Some(false));
+    assert!(value.get("timed_out").is_none());
+    assert_eq!(value["timedOut"].as_bool(), Some(false));
     assert!(matches!(
         runtime.agent(child_id).await,
         Err(RuntimeError::AgentNotFound(id)) if id == child_id
@@ -3410,7 +4519,6 @@ async fn tool_trace_returns_full_history_with_event_metadata() {
 
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         Arc::new(
             ConfigStore::open_with_config_path(&db_path, &config_path)
                 .await
@@ -3432,6 +4540,69 @@ async fn tool_trace_returns_full_history_with_event_metadata() {
     assert_eq!(trace.duration_ms, Some(27));
     assert_eq!(trace.agent_id, agent_id);
     assert_eq!(trace.session_id, Some(session_id));
+    assert!(trace.output_preview.contains("\"stdout\": \"hello\""));
+}
+
+#[tokio::test]
+async fn pl_core_tool_trace_projection_persists_output_artifacts() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let agent_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let turn_id = Uuid::new_v4();
+    save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container-1"))).await;
+    save_test_session(&store, agent_id, session_id).await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let artifact = mai_protocol::ToolOutputArtifactInfo {
+        id: "artifact-1".to_string(),
+        call_id: "call_1".to_string(),
+        agent_id,
+        name: "printf-stdout.txt".to_string(),
+        stream: "stdout".to_string(),
+        size_bytes: 5,
+        created_at: now(),
+    };
+    let events = vec![
+        pl_trace::TraceEvent {
+            session_id: session_id.to_string(),
+            sequence: 1,
+            timestamp: 10,
+            kind: pl_trace::TraceEventKind::TracePartStarted {
+                item: trace_tool_part(
+                    turn_id,
+                    pl_trace::TracePartStatus::Started,
+                    None,
+                    Vec::new(),
+                ),
+            },
+        },
+        pl_trace::TraceEvent {
+            session_id: session_id.to_string(),
+            sequence: 2,
+            timestamp: 12,
+            kind: pl_trace::TraceEventKind::TracePartCompleted {
+                item: trace_tool_part(
+                    turn_id,
+                    pl_trace::TracePartStatus::Completed,
+                    Some(r#"{"status":0,"stdout":"hello","stderr":""}"#),
+                    vec![serde_json::to_value(&artifact).expect("artifact json")],
+                ),
+            },
+        },
+    ];
+
+    turn::kernel_tools::project_tool_trace_events(&runtime, agent_id, session_id, turn_id, &events)
+        .await;
+
+    let trace = runtime
+        .tool_trace(agent_id, Some(session_id), "call_1".to_string())
+        .await
+        .expect("trace");
+    assert_eq!(
+        serde_json::to_value(&trace.output_artifacts).expect("trace artifacts json"),
+        serde_json::to_value(vec![artifact]).expect("expected artifacts json")
+    );
+    assert_eq!(trace.duration_ms, Some(2_000));
     assert!(trace.output_preview.contains("\"stdout\": \"hello\""));
 }
 
@@ -3476,7 +4647,6 @@ async fn tool_trace_prefers_persisted_trace_records() {
 
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         Arc::new(
             ConfigStore::open_with_config_path(&db_path, &config_path)
                 .await
@@ -3576,7 +4746,6 @@ async fn tool_trace_finds_calls_stored_in_function_call_items() {
 
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         Arc::new(
             ConfigStore::open_with_config_path(&db_path, &config_path)
                 .await
@@ -3600,291 +4769,43 @@ async fn tool_trace_finds_calls_stored_in_function_call_items() {
     assert!(trace.success);
 }
 
-#[tokio::test]
-async fn auto_compact_failure_keeps_original_history() {
-    let (base_url, _requests) = start_mock_responses(vec![json!({
-        "id": "compact_empty",
-        "output": [],
-        "usage": { "input_tokens": 50, "output_tokens": 1, "total_tokens": 51 }
-    })])
-    .await;
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("runtime.sqlite3");
-    let config_path = dir.path().join("config.toml");
-    let store = Arc::new(
-        ConfigStore::open_with_config_path(&db_path, &config_path)
-            .await
-            .expect("open store"),
-    );
-    let mut provider = compact_no_continuation_test_provider(base_url);
-    provider.models[0].context_tokens = 10_000;
-    store
-        .save_providers(ProvidersConfigRequest {
-            providers: vec![provider],
-            default_provider_id: Some("mock".to_string()),
-        })
-        .await
-        .expect("save providers");
-    let agent_id = Uuid::new_v4();
-    let session_id = Uuid::new_v4();
-    store
-        .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
-        .await
-        .expect("save agent");
-    save_test_session(&store, agent_id, session_id).await;
-    let original_history = [
-        turn::history::user_text_message("original request"),
-        turn::history::assistant_text_message("original answer"),
-    ];
-    for (position, item) in original_history.iter().enumerate() {
-        store
-            .append_agent_history_item(agent_id, session_id, position, item)
-            .await
-            .expect("append history");
-    }
-    store
-        .save_session_context_tokens(agent_id, session_id, 9_000)
-        .await
-        .expect("save tokens");
-    let runtime = test_runtime_with_model_config(
-        &dir,
-        Arc::clone(&store),
-        ModelClientConfig {
-            response_timeout: std::time::Duration::from_millis(25),
-            stream_idle_timeout: std::time::Duration::from_millis(25),
-            ..Default::default()
-        },
-    )
-    .await;
-    let agent = runtime.agent(agent_id).await.expect("agent");
-
-    let compacted = runtime
-        .maybe_auto_compact(
-            &agent,
-            agent_id,
-            session_id,
-            Uuid::new_v4(),
-            turn::context::ContextCompactionRequest::last_context_only(),
-            &CancellationToken::new(),
-        )
-        .await;
-
-    assert!(matches!(compacted, Err(RuntimeError::InvalidInput(_))));
-    let history = store
-        .load_agent_history(agent_id, session_id)
-        .await
-        .expect("history");
-    assert_eq!(history.len(), original_history.len());
-    assert_eq!(pl_text(&history[0]), "original request");
-    assert_eq!(pl_text(&history[1]), "original answer");
-    assert_eq!(
-        store
-            .load_runtime_snapshot(10)
-            .await
-            .expect("snapshot")
-            .agents[0]
-            .sessions[0]
-            .last_context_tokens,
-        Some(9_000)
-    );
-}
-
-#[tokio::test]
-async fn auto_compact_records_replacement_context_tokens() {
-    let (base_url, _requests) = start_mock_responses(vec![json!({
-        "id": "compact",
-        "output": [{
-            "type": "message",
-            "content": [{ "type": "output_text", "text": "replacement token summary" }]
-        }],
-        "usage": { "input_tokens": 50, "output_tokens": 5, "total_tokens": 55 }
-    })])
-    .await;
-    let dir = tempdir().expect("tempdir");
-    let store = test_store(&dir).await;
-    let mut provider = compact_no_continuation_test_provider(base_url);
-    provider.models[0].context_tokens = 10_000;
-    store
-        .save_providers(ProvidersConfigRequest {
-            providers: vec![provider],
-            default_provider_id: Some("mock".to_string()),
-        })
-        .await
-        .expect("save providers");
-    let agent_id = Uuid::new_v4();
-    let session_id = Uuid::new_v4();
-    store
-        .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
-        .await
-        .expect("save agent");
-    save_test_session(&store, agent_id, session_id).await;
-    store
-        .append_agent_history_item(
-            agent_id,
-            session_id,
-            0,
-            &turn::history::user_text_message("request"),
-        )
-        .await
-        .expect("append user");
-    store
-        .save_session_context_tokens(agent_id, session_id, 9_000)
-        .await
-        .expect("save tokens");
-    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
-    let agent = runtime.agent(agent_id).await.expect("agent");
-
-    runtime
-        .maybe_auto_compact(
-            &agent,
-            agent_id,
-            session_id,
-            Uuid::new_v4(),
-            turn::context::ContextCompactionRequest::last_context_only(),
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("compact");
-
-    let snapshot = store.load_runtime_snapshot(20).await.expect("snapshot");
-    let tokens = snapshot.agents[0].sessions[0]
-        .last_context_tokens
-        .expect("replacement context tokens");
-    assert!(tokens > 0);
-    assert!(tokens < 9_000);
-}
-
-#[tokio::test]
-async fn auto_compact_falls_back_when_saved_agent_provider_is_removed() {
-    let dir = tempdir().expect("tempdir");
-    let store = test_store(&dir).await;
-    store
-        .save_providers(ProvidersConfigRequest {
-            providers: vec![compact_test_provider("http://localhost".to_string())],
-            default_provider_id: Some("mock".to_string()),
-        })
-        .await
-        .expect("save providers");
-    let agent_id = Uuid::new_v4();
-    let session_id = Uuid::new_v4();
-    let mut summary = test_agent_summary(agent_id, Some("container-1"));
-    summary.provider_id = "openai".to_string();
-    summary.provider_name = "OpenAI".to_string();
-    summary.model = "gpt-5.5".to_string();
-    summary.reasoning_effort = Some("high".to_string());
-    store.save_agent(&summary, None).await.expect("save agent");
-    save_test_session(&store, agent_id, session_id).await;
-    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
-    let agent = runtime.agent(agent_id).await.expect("agent");
-
-    let compacted = runtime
-        .maybe_auto_compact(
-            &agent,
-            agent_id,
-            session_id,
-            Uuid::new_v4(),
-            turn::context::ContextCompactionRequest::last_context_only(),
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("stale provider falls back before compact decision");
-
-    assert!(matches!(
-        compacted,
-        turn::context::ContextCompactionOutcome::Skipped
-    ));
-    let updated = runtime
-        .agent(agent_id)
-        .await
-        .expect("agent")
-        .summary
-        .read()
-        .await
-        .clone();
-    assert_eq!(updated.provider_id, "mock");
-    assert_eq!(updated.model, "mock-model");
-    assert_eq!(updated.reasoning_effort, Some("medium".to_string()));
-    let snapshot = store.load_runtime_snapshot(10).await.expect("snapshot");
-    assert_eq!(snapshot.agents[0].summary.provider_id, "mock");
-}
-
-#[tokio::test]
-async fn auto_compact_retries_with_reduced_history_when_context_window_fails() {
-    let (base_url, requests) = start_mock_responses(vec![
-        json!({
-            "__status": 400,
-            "error": { "message": "context window exceeded while compacting" }
+fn trace_tool_part(
+    turn_id: TurnId,
+    status: pl_trace::TracePartStatus,
+    result: Option<&str>,
+    output_artifacts: Vec<serde_json::Value>,
+) -> pl_trace::TracePart {
+    pl_trace::TracePart {
+        turn_id: turn_id.to_string(),
+        item_id: "tool_1".to_string(),
+        started_sequence: 1,
+        revision: 0,
+        kind: pl_trace::TracePartKind::Tool,
+        status,
+        created_at: 10,
+        updated_at: 12,
+        source: pl_trace::TracePartSource::Runtime,
+        text_channel: None,
+        content: String::new(),
+        attachments: Vec::new(),
+        thinking_chunks: Vec::new(),
+        tool: Some(pl_trace::TraceToolPart {
+            tool_call_id: "trace_call_1".to_string(),
+            call_id: Some("call_1".to_string()),
+            provider_item_id: None,
+            name: "container_exec".to_string(),
+            arguments: r#"{"command":"printf hello","cwd":"/workspace"}"#.to_string(),
+            result: result.map(ToString::to_string),
+            exit_code: Some(0),
+            timed_out: false,
+            output_artifacts,
+            working_directory: None,
+            denial_reason: None,
         }),
-        json!({
-            "id": "compact_retry",
-            "output": [{
-                "type": "message",
-                "content": [{ "type": "output_text", "text": "summary after reduced retry" }]
-            }],
-            "usage": { "input_tokens": 40, "output_tokens": 4, "total_tokens": 44 }
-        }),
-    ])
-    .await;
-    let dir = tempdir().expect("tempdir");
-    let store = test_store(&dir).await;
-    let mut provider = compact_no_continuation_test_provider(base_url);
-    provider.models[0].context_tokens = 10_000;
-    store
-        .save_providers(ProvidersConfigRequest {
-            providers: vec![provider],
-            default_provider_id: Some("mock".to_string()),
-        })
-        .await
-        .expect("save providers");
-    let agent_id = Uuid::new_v4();
-    let session_id = Uuid::new_v4();
-    store
-        .save_agent(&test_agent_summary(agent_id, Some("container-1")), None)
-        .await
-        .expect("save agent");
-    save_test_session(&store, agent_id, session_id).await;
-    for index in 0..30 {
-        store
-            .append_agent_history_item(
-                agent_id,
-                session_id,
-                index,
-                &turn::history::user_text_message(format!("request {index} {}", "x".repeat(500))),
-            )
-            .await
-            .expect("append history");
+        agent: None,
+        inference: None,
+        usage: None,
     }
-    store
-        .save_session_context_tokens(agent_id, session_id, 9_000)
-        .await
-        .expect("save tokens");
-    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
-    let agent = runtime.agent(agent_id).await.expect("agent");
-
-    runtime
-        .maybe_auto_compact(
-            &agent,
-            agent_id,
-            session_id,
-            Uuid::new_v4(),
-            turn::context::ContextCompactionRequest::last_context_only(),
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("compact retry");
-
-    let requests = requests.lock().await.clone();
-    assert_eq!(requests.len(), 2);
-    let first_input_len = requests[0]["input"].as_array().expect("first input").len();
-    let retry_input_len = requests[1]["input"].as_array().expect("retry input").len();
-    assert!(retry_input_len < first_input_len);
-    let history = store
-        .load_agent_history(agent_id, session_id)
-        .await
-        .expect("history");
-    assert!(history.iter().any(|item| {
-        item.role == PlMessageRole::User && pl_text(item).contains("summary after reduced retry")
-    }));
 }
 
 #[tokio::test]
@@ -3895,8 +4816,8 @@ async fn auto_compact_failure_before_model_request_stops_turn() {
             "output": [{
                 "type": "function_call",
                 "call_id": "call_1",
-                "name": "unknown_tool",
-                "arguments": "{}"
+                "name": "update_todo_list",
+                "arguments": "{\"items\":[{\"step\":\"inspect\",\"status\":\"completed\"}]}"
             }],
             "usage": { "input_tokens": 8998, "output_tokens": 2, "total_tokens": 9000 }
         }),
@@ -3971,8 +4892,8 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
             "output": [{
                 "type": "function_call",
                 "call_id": "call_1",
-                "name": "unknown_tool",
-                "arguments": "{}"
+                "name": "update_todo_list",
+                "arguments": "{\"items\":[{\"step\":\"inspect\",\"status\":\"completed\"}]}"
             }],
             "usage": { "input_tokens": 8998, "output_tokens": 2, "total_tokens": 9000 }
         }),
@@ -4018,16 +4939,7 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
         .await
         .expect("save agent");
     save_test_session(&store, agent_id, session_id).await;
-    let runtime = test_runtime_with_model_config(
-        &dir,
-        Arc::clone(&store),
-        ModelClientConfig {
-            response_timeout: std::time::Duration::from_millis(25),
-            stream_idle_timeout: std::time::Duration::from_millis(25),
-            ..Default::default()
-        },
-    )
-    .await;
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     let agent = runtime.agent(agent_id).await.expect("agent");
     *agent.container.write().await = Some(ContainerHandle {
         id: "container-1".to_string(),
@@ -4049,11 +4961,9 @@ async fn auto_compact_runs_after_tool_output_before_next_model_request() {
 
     let requests = requests.lock().await.clone();
     assert_eq!(requests.len(), 3);
-    let visible_tools = turn::tools::visible_tool_names(&runtime.state, &agent, &[]).await;
-    let product_tools =
-        build_tool_definitions_with_filter(&[], |name| visible_tools.contains(name));
-    let expected_tool_count =
-        turn::kernel_tools::model_tool_definitions(&visible_tools, product_tools).len();
+    let visible_tools =
+        turn::tool_visibility::visible_tool_names(&runtime.state, &agent, &[]).await;
+    let expected_tool_count = visible_tools.len();
     assert_eq!(
         requests[0]["tools"].as_array().expect("first tools").len(),
         expected_tool_count
@@ -4210,8 +5120,8 @@ async fn auto_compact_resets_openai_continuation_after_replacing_history() {
             "output": [{
                 "type": "function_call",
                 "call_id": "call_1",
-                "name": "unknown_tool",
-                "arguments": "{}"
+                "name": "update_todo_list",
+                "arguments": "{\"items\":[{\"step\":\"inspect\",\"status\":\"completed\"}]}"
             }],
             "usage": { "input_tokens": 8998, "output_tokens": 2, "total_tokens": 9000 }
         }),
@@ -4694,12 +5604,11 @@ async fn send_input_interrupt_starts_replacement_without_losing_message() {
         name: "container-1".to_string(),
         image: "unused".to_string(),
     });
-    *agent.active_turn.lock().expect("active turn lock") = Some(TurnControl {
-        turn_id: old_turn_id,
+    agent.active_turn.set(TurnControl::new(
+        old_turn_id,
         session_id,
-        cancellation_token: CancellationToken::new(),
-        abort_handle: None,
-    });
+        TurnTaskHandle::from_external_token(CancellationToken::new()),
+    ));
 
     let output = runtime
         .send_input_to_agent(
@@ -4712,6 +5621,8 @@ async fn send_input_interrupt_starts_replacement_without_losing_message() {
         .await
         .expect("interrupt");
     assert_eq!(output["queued"].as_bool(), Some(false));
+    assert!(output.get("turn_id").is_none());
+    assert!(output["turnId"].as_str().is_some());
     wait_until(
         || {
             let runtime = Arc::clone(&runtime);
@@ -4786,12 +5697,11 @@ async fn stale_turn_completion_does_not_overwrite_current_turn() {
         summary.status = AgentStatus::RunningTurn;
         summary.current_turn = Some(current_turn_id);
     }
-    *agent.active_turn.lock().expect("active turn lock") = Some(TurnControl {
-        turn_id: current_turn_id,
+    agent.active_turn.set(TurnControl::new(
+        current_turn_id,
         session_id,
-        cancellation_token: CancellationToken::new(),
-        abort_handle: None,
-    });
+        TurnTaskHandle::from_external_token(CancellationToken::new()),
+    ));
 
     let completed = turn::completion::complete_turn_if_current(
         runtime.deps.store.as_ref(),
@@ -5383,7 +6293,6 @@ async fn sessions_are_created_and_selected_independently() {
         .expect("save providers");
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         Arc::clone(&store),
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -5508,7 +6417,6 @@ async fn agent_detail_uses_deepseek_v4_context_tokens() {
         .expect("save session");
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         store,
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -5549,7 +6457,6 @@ async fn agent_config_resolves_effective_default_and_validates_updates() {
         .expect("save providers");
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         Arc::clone(&store),
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -5637,7 +6544,6 @@ async fn role_model_resolution_falls_back_when_saved_provider_is_removed() {
         .expect("save stale config");
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         Arc::clone(&store),
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -5883,6 +6789,7 @@ async fn spawn_agent_uses_executor_default_when_role_omitted() {
             "spawn_agent",
             json!({
                 "taskName": "child",
+                "message": "",
                 "model": "gpt-5.4"
             }),
         )
@@ -6005,6 +6912,7 @@ async fn spawn_agent_uses_role_config_over_parent_defaults() {
             "spawn_agent",
             json!({
                 "taskName": "child",
+                "message": "",
                 "agentType": "reviewer",
                 "model": "gpt-5.4"
             }),
@@ -6092,10 +7000,11 @@ async fn spawn_agent_inherits_parent_and_accepts_codex_overrides() {
             parent_id,
             "spawn_agent",
             json!({
+                "taskName": "child",
                 "agentType": "worker",
                 "model": "gpt-5.4",
                 "reasoningEffort": "high",
-                "message": "start"
+                "message": ""
             }),
         )
         .await
@@ -6114,7 +7023,7 @@ async fn spawn_agent_inherits_parent_and_accepts_codex_overrides() {
 }
 
 #[tokio::test]
-async fn spawn_agent_fork_context_copies_parent_history_from_store() {
+async fn spawn_agent_fork_turns_uses_pl_core_filtered_history() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     store
@@ -6147,18 +7056,60 @@ async fn spawn_agent_fork_context_copies_parent_history_from_store() {
         )
         .await
         .expect("save session");
-    let parent_message = AgentMessage {
-        role: MessageRole::User,
-        content: "reuse this context".to_string(),
-        created_at: timestamp,
-    };
-    store
-        .append_agent_message(parent_id, parent_session_id, 0, &parent_message)
-        .await
-        .expect("save message");
+    let parent_messages = vec![
+        AgentMessage {
+            role: MessageRole::User,
+            content: "first turn".to_string(),
+            created_at: timestamp,
+        },
+        AgentMessage {
+            role: MessageRole::Assistant,
+            content: "first answer".to_string(),
+            created_at: timestamp,
+        },
+        AgentMessage {
+            role: MessageRole::User,
+            content: "second turn".to_string(),
+            created_at: timestamp,
+        },
+        AgentMessage {
+            role: MessageRole::Assistant,
+            content: "second answer".to_string(),
+            created_at: timestamp,
+        },
+    ];
+    for (position, message) in parent_messages.iter().enumerate() {
+        store
+            .append_agent_message(parent_id, parent_session_id, position, message)
+            .await
+            .expect("save message");
+    }
     let parent_history = vec![
-        turn::history::user_text_message("reuse this context"),
-        turn::history::assistant_text_message("stored answer"),
+        turn::history::user_text_message("first turn"),
+        Message {
+            role: PlMessageRole::Assistant,
+            content: MessageContent::Text("first answer".to_string()),
+            reasoning_content: Some("hidden reasoning".to_string()),
+            metadata: Default::default(),
+        },
+        turn::history::tool_call_message(
+            "call-1".to_string(),
+            "read_file".to_string(),
+            r#"{"path":"README.md"}"#.to_string(),
+        ),
+        turn::history::tool_result_message(
+            "call-1".to_string(),
+            "read_file".to_string(),
+            r#"{"path":"README.md"}"#.to_string(),
+            "tool output".to_string(),
+        ),
+        turn::history::user_text_message("second turn"),
+        Message {
+            role: PlMessageRole::Assistant,
+            content: MessageContent::Text("second answer".to_string()),
+            reasoning_content: Some("more hidden reasoning".to_string()),
+            metadata: Default::default(),
+        },
     ];
     for (position, item) in parent_history.iter().enumerate() {
         store
@@ -6181,7 +7132,8 @@ async fn spawn_agent_fork_context_copies_parent_history_from_store() {
             "spawn_agent",
             json!({
                 "taskName": "child",
-                "forkTurns": 1
+                "message": "",
+                "forkTurns": "1"
             }),
         )
         .await
@@ -6201,9 +7153,13 @@ async fn spawn_agent_fork_context_copies_parent_history_from_store() {
         .load_agent_history(child.id, child_session_id)
         .await
         .expect("child history");
+    let expected_history = vec![
+        turn::history::user_text_message("second turn"),
+        turn::history::assistant_text_message("second answer"),
+    ];
     assert_eq!(
         serde_json::to_value(&child_history).expect("child history json"),
-        serde_json::to_value(&parent_history).expect("parent history json")
+        serde_json::to_value(&expected_history).expect("expected history json")
     );
     let child_record = runtime.agent(child.id).await.expect("child record");
     let child_messages = {
@@ -6215,11 +7171,15 @@ async fn spawn_agent_fork_context_copies_parent_history_from_store() {
             .messages
             .clone()
     };
-    let expected_messages = vec![parent_message];
-    assert_eq!(
-        serde_json::to_value(&child_messages).expect("child messages json"),
-        serde_json::to_value(&expected_messages).expect("expected messages json")
-    );
+    let child_message_projection = child_messages
+        .iter()
+        .map(|message| (message.role.clone(), message.content.as_str()))
+        .collect::<Vec<_>>();
+    let expected_messages = vec![
+        (MessageRole::User, "second turn"),
+        (MessageRole::Assistant, "second answer"),
+    ];
+    assert_eq!(child_message_projection, expected_messages);
 }
 
 #[tokio::test]
@@ -6271,10 +7231,9 @@ async fn spawn_agent_skill_item_injects_child_initial_turn() {
             parent_id,
             "spawn_agent",
             json!({
-                "items": [
-                    { "type": "text", "text": "child task" },
-                    { "type": "skill", "name": "demo" }
-                ]
+                "taskName": "child",
+                "message": "child task",
+                "skillMentions": ["demo"]
             }),
         )
         .await
@@ -6293,9 +7252,15 @@ async fn spawn_agent_skill_item_injects_child_initial_turn() {
     let input = requests[0]["input"].as_array().expect("input");
     assert!(input.iter().any(|item| {
         item["role"] == "user"
-            && item["content"][0]["text"].as_str().is_some_and(|text| {
-                text.contains("<name>demo</name>") && text.contains("Use child demo.")
-            })
+            && item["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("child task"))
+    }));
+    assert!(input.iter().any(|item| {
+        item["role"] == "user"
+            && item["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Use child demo."))
     }));
 }
 
@@ -6495,23 +7460,25 @@ async fn project_worker_cannot_spawn_agents_and_hidden_from_tools() {
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
     let worker_record = runtime.agent(worker_id).await.expect("worker");
 
-    let visible = turn::tools::visible_tool_names(&runtime.state, &worker_record, &[]).await;
-    assert!(!visible.contains(mai_tools::TOOL_SPAWN_AGENT));
-    assert!(!visible.contains(mai_tools::TOOL_CLOSE_AGENT));
-    assert!(!visible.contains(mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS));
+    let visible =
+        turn::tool_visibility::visible_tool_names(&runtime.state, &worker_record, &[]).await;
+    assert!(!visible.contains(pl_core::TOOL_SPAWN_AGENT));
+    assert!(!visible.contains(pl_core::TOOL_CLOSE_AGENT));
+    assert!(!visible.contains(crate::turn::product_tool_schemas::TOOL_QUEUE_PROJECT_REVIEW_PRS));
 
     let result = runtime
         .execute_tool_for_test(
             worker_id,
             "spawn_agent",
             json!({
+                "taskName": "denied",
                 "message": "should fail"
             }),
         )
         .await;
 
     assert!(
-        matches!(result, Err(RuntimeError::InvalidInput(message)) if message.contains("spawn_agent"))
+        matches!(result, Err(RuntimeError::Model(pl_protocol::PureError::ToolExecutionFailed { tool, .. })) if tool == "spawn_agent")
     );
 }
 
@@ -6558,8 +7525,9 @@ async fn project_selector_can_queue_review_prs() {
     }
     let selector_record = runtime.agent(selector_id).await.expect("selector");
 
-    let visible = turn::tools::visible_tool_names(&runtime.state, &selector_record, &[]).await;
-    assert!(visible.contains(mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS));
+    let visible =
+        turn::tool_visibility::visible_tool_names(&runtime.state, &selector_record, &[]).await;
+    assert!(visible.contains(crate::turn::product_tool_schemas::TOOL_QUEUE_PROJECT_REVIEW_PRS));
 
     let result = runtime
         .execute_tool_for_test(
@@ -6567,8 +7535,8 @@ async fn project_selector_can_queue_review_prs() {
             "queue_project_review_prs",
             json!({
                 "prs": [
-                    { "number": 9, "head_sha": "abc", "reason": "test" },
-                    { "number": 9, "head_sha": "def", "reason": "test-duplicate" },
+                    { "number": 9, "headSha": "abc", "reason": "test" },
+                    { "number": 9, "headSha": "def", "reason": "test-duplicate" },
                     { "number": 4, "reason": "test" }
                 ]
             }),
@@ -6582,6 +7550,59 @@ async fn project_selector_can_queue_review_prs() {
     assert_eq!(output["deduped"], json!([9]));
     assert_eq!(output["ignored"], json!([]));
     runtime.stop_project_review_loop(project_id).await;
+}
+
+#[tokio::test]
+async fn project_reviewer_cannot_see_task_review_result_tool() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let reviewer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    maintainer.role = Some(AgentRole::Planner);
+    let mut reviewer = test_agent_summary_with_parent(
+        reviewer_id,
+        Some(maintainer_id),
+        Some("reviewer-container"),
+    );
+    reviewer.project_id = Some(project_id);
+    reviewer.role = Some(AgentRole::Reviewer);
+    save_agent_with_session(&store, &maintainer).await;
+    store
+        .save_project(&ready_test_project_summary(
+            project_id,
+            maintainer_id,
+            "account-1",
+        ))
+        .await
+        .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(maintainer_id, "planner")]);
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let reviewer_record = Arc::new(state::AgentRecord {
+        summary: RwLock::new(reviewer),
+        sessions: Mutex::new(Vec::new()),
+        container: RwLock::new(None),
+        mcp: RwLock::new(None),
+        system_prompt: None,
+        turn_lock: Mutex::new(()),
+        cancel_requested: std::sync::atomic::AtomicBool::new(false),
+        active_turn: state::TurnControlSlot::new(),
+        pending_inputs: Mutex::new(pl_core::AgentInputQueue::new()),
+    });
+    runtime
+        .state
+        .agents
+        .write()
+        .await
+        .insert(reviewer_id, Arc::clone(&reviewer_record));
+
+    let visible =
+        turn::tool_visibility::visible_tool_names(&runtime.state, &reviewer_record, &[]).await;
+
+    assert!(visible.contains(crate::turn::product_tool_schemas::TOOL_QUEUE_PROJECT_REVIEW_PRS));
+    assert!(!visible.contains(crate::turn::product_tool_schemas::TOOL_SUBMIT_REVIEW_RESULT));
 }
 
 #[tokio::test]
@@ -6895,14 +7916,17 @@ async fn project_maintainer_can_spawn_agent() {
         image: "unused".to_string(),
     });
 
-    let visible = turn::tools::visible_tool_names(&runtime.state, &maintainer_record, &[]).await;
-    assert!(visible.contains(mai_tools::TOOL_SPAWN_AGENT));
+    let visible =
+        turn::tool_visibility::visible_tool_names(&runtime.state, &maintainer_record, &[]).await;
+    assert!(visible.contains(pl_core::TOOL_SPAWN_AGENT));
 
     let result = runtime
         .execute_tool_for_test(
             maintainer_id,
             "spawn_agent",
             json!({
+                "taskName": "worker",
+                "message": "",
                 "agentType": "worker"
             }),
         )
@@ -7006,7 +8030,6 @@ async fn skill_resource_can_read_bundled_relative_file() {
     save_agent_with_session(&store, &test_agent_summary(agent_id, Some("container-1"))).await;
     let runtime = AgentRuntime::new(
         DockerClient::new_with_binary("unused", fake_docker_path(&dir)),
-        ModelClient::new(),
         Arc::clone(&store),
         RuntimeConfig {
             system_skills_root: Some(dir.path().join("system-skills")),
@@ -7257,27 +8280,36 @@ async fn wait_agent_accepts_targets_and_send_input_queues_busy_target() {
             "send_input",
             json!({
                 "target": child_id.to_string(),
-                "items": [{ "type": "text", "text": "queued hello" }]
+                "message": "queued hello"
             }),
         )
         .await
         .expect("send input");
     assert!(queued.success);
-    let value: Value = serde_json::from_str(&queued.output).expect("json");
-    assert_eq!(value["queued"].as_bool(), Some(true));
+    let queued_output: Value = serde_json::from_str(&queued.output).expect("send input output");
+    assert_eq!(
+        queued_output["target"].as_str(),
+        Some(child_id.to_string().as_str())
+    );
+    assert_eq!(queued_output["status"].as_str(), Some("running"));
+    assert_eq!(queued_output["interrupt"].as_bool(), Some(false));
+    assert_eq!(queued_output["queued"].as_bool(), Some(true));
+    assert!(queued_output["turnId"].is_null());
+    assert_eq!(child_record.pending_inputs.lock().await.len(), 1);
 
     let waited = runtime
         .execute_tool_for_test(
             parent_id,
             "wait_agent",
             json!({
-                "targets": [child_id.to_string()],
                 "timeoutMs": 1
             }),
         )
         .await
         .expect("wait");
-    let value: Value = serde_json::from_str(&waited.output).expect("json");
+    let outer: Value = serde_json::from_str(&waited.output).expect("json");
+    let value: Value = serde_json::from_str(outer["message"].as_str().expect("wait message json"))
+        .expect("wait message payload");
     assert!(value["completed"].as_array().expect("completed").is_empty());
     let pending = value["pending"].as_array().expect("pending");
     assert_eq!(pending.len(), 1);
@@ -7291,7 +8323,149 @@ async fn wait_agent_accepts_targets_and_send_input_queues_busy_target() {
         pending[0]["current_turn"].as_str()
     );
     assert!(pending[0]["diagnostics"]["idle_ms"].as_u64().is_some());
-    assert_eq!(value["timed_out"].as_bool(), Some(true));
+    assert_eq!(outer["timedOut"].as_bool(), Some(true));
+    assert!(value.get("timed_out").is_none());
+    assert_eq!(value["timedOut"].as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn wait_agent_respects_explicit_targets() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let parent_id = Uuid::new_v4();
+    let target_child_id = Uuid::new_v4();
+    let other_child_id = Uuid::new_v4();
+    let timestamp = now();
+    store
+        .save_agent(&test_agent_summary_at(parent_id, None, timestamp), None)
+        .await
+        .expect("save parent");
+    save_test_session(&store, parent_id, Uuid::new_v4()).await;
+    for child_id in [target_child_id, other_child_id] {
+        let mut child = test_agent_summary_at(child_id, Some(parent_id), timestamp);
+        child.status = AgentStatus::RunningTurn;
+        child.current_turn = Some(Uuid::new_v4());
+        store.save_agent(&child, None).await.expect("save child");
+        store
+            .save_agent_session(
+                child_id,
+                &AgentSessionSummary {
+                    id: Uuid::new_v4(),
+                    title: "Task".to_string(),
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    message_count: 0,
+                    token_usage: TokenUsage::default(),
+                },
+            )
+            .await
+            .expect("save child session");
+    }
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    for child_id in [target_child_id, other_child_id] {
+        let child_record = runtime.agent(child_id).await.expect("child");
+        let mut summary = child_record.summary.write().await;
+        summary.status = AgentStatus::RunningTurn;
+        summary.current_turn = Some(Uuid::new_v4());
+    }
+
+    let waited = runtime
+        .execute_tool_for_test(
+            parent_id,
+            "wait_agent",
+            json!({
+                "targets": [target_child_id.to_string()],
+                "timeoutMs": 1
+            }),
+        )
+        .await
+        .expect("wait");
+    let outer: Value = serde_json::from_str(&waited.output).expect("json");
+    let value: Value = serde_json::from_str(outer["message"].as_str().expect("wait message json"))
+        .expect("wait message payload");
+    let pending = value["pending"].as_array().expect("pending");
+
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0]["agent_id"].as_str(),
+        Some(target_child_id.to_string().as_str())
+    );
+}
+
+#[tokio::test]
+async fn send_input_without_trigger_turn_queues_idle_target() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![test_provider()],
+            default_provider_id: Some("openai".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let child_session_id = Uuid::new_v4();
+    let timestamp = now();
+    store
+        .save_agent(&test_agent_summary_at(parent_id, None, timestamp), None)
+        .await
+        .expect("save parent");
+    save_test_session(&store, parent_id, Uuid::new_v4()).await;
+    let mut child = test_agent_summary_at(child_id, Some(parent_id), timestamp);
+    child.status = AgentStatus::Idle;
+    child.current_turn = None;
+    store.save_agent(&child, None).await.expect("save child");
+    store
+        .save_agent_session(
+            child_id,
+            &AgentSessionSummary {
+                id: child_session_id,
+                title: "Task".to_string(),
+                created_at: timestamp,
+                updated_at: timestamp,
+                message_count: 0,
+                token_usage: TokenUsage::default(),
+            },
+        )
+        .await
+        .expect("save child session");
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let child_record = runtime.agent(child_id).await.expect("child");
+
+    let queued = runtime
+        .execute_tool_for_test(
+            parent_id,
+            "send_input",
+            json!({
+                "target": child_id.to_string(),
+                "message": "queued while idle"
+            }),
+        )
+        .await
+        .expect("send input");
+
+    assert!(queued.success);
+    let queued_output: Value = serde_json::from_str(&queued.output).expect("send input output");
+    assert_eq!(
+        queued_output["target"].as_str(),
+        Some(child_id.to_string().as_str())
+    );
+    assert_eq!(queued_output["status"].as_str(), Some("queued"));
+    assert_eq!(queued_output["interrupt"].as_bool(), Some(false));
+    assert_eq!(queued_output["queued"].as_bool(), Some(true));
+    assert!(queued_output["turnId"].is_null());
+    assert_eq!(child_record.pending_inputs.lock().await.len(), 1);
+    let summary = child_record.summary.read().await;
+    assert_eq!(summary.current_turn, None);
+    assert_eq!(summary.status, AgentStatus::Idle);
 }
 
 #[tokio::test]
@@ -7369,10 +8543,7 @@ async fn send_input_queued_skill_item_is_preserved_for_next_turn() {
             "send_input",
             json!({
                 "target": child_id.to_string(),
-                "items": [
-                    { "type": "text", "text": "queued hello" },
-                    { "type": "skill", "name": "demo" }
-                ]
+                "message": "queued hello"
             }),
         )
         .await
@@ -7399,9 +8570,9 @@ async fn send_input_queued_skill_item_is_preserved_for_next_turn() {
     let input = requests[0]["input"].as_array().expect("input");
     assert!(input.iter().any(|item| {
         item["role"] == "user"
-            && item["content"][0]["text"].as_str().is_some_and(|text| {
-                text.contains("<name>demo</name>") && text.contains("Queued demo body.")
-            })
+            && item["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("queued hello"))
     }));
 }
 
@@ -7424,7 +8595,6 @@ async fn create_agent_persists_and_uses_explicit_docker_image() {
         .expect("save providers");
     let runtime = AgentRuntime::new(
         DockerClient::new_with_binary("ubuntu:latest", fake_docker_path(&dir)),
-        ModelClient::new(),
         Arc::clone(&store),
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -8643,7 +9813,6 @@ async fn auto_review_refreshes_project_skills_from_synced_default_branch() {
         .expect("save project");
     let runtime = AgentRuntime::new(
         DockerClient::new_with_binary("unused-agent", fake_docker_path(&dir)),
-        ModelClient::new(),
         store,
         RuntimeConfig {
             git_binary: Some(fake_git_path(&dir)),
@@ -8741,7 +9910,6 @@ async fn project_reviewer_instructions_include_extra_prompt_project_skill() {
         .expect("write system skill");
     let runtime = AgentRuntime::new(
         DockerClient::new_with_binary("unused", fake_docker_path(&dir)),
-        ModelClient::new(),
         Arc::clone(&store),
         RuntimeConfig {
             system_skills_root: Some(dir.path().join("system-skills")),
@@ -9102,7 +10270,6 @@ async fn project_workspace_setup_failure_marks_project_failed() {
     store.save_project(&project).await.expect("save project");
     let runtime = AgentRuntime::new(
         DockerClient::new_with_binary("unused-agent", fake_docker_path(&dir)),
-        ModelClient::new(),
         Arc::clone(&store),
         RuntimeConfig {
             sidecar_image: "bad image".to_string(),
@@ -9255,7 +10422,6 @@ async fn update_agent_changes_model_persists_and_publishes() {
     store.save_agent(&summary, None).await.expect("save agent");
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         Arc::clone(&store),
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -9392,7 +10558,6 @@ async fn update_agent_rejects_invalid_reasoning_and_clears_unsupported_model() {
     store.save_agent(&summary, None).await.expect("save agent");
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         Arc::clone(&store),
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -9468,7 +10633,6 @@ async fn update_agent_rejects_busy_and_unknown_model() {
     store.save_agent(&summary, None).await.expect("save agent");
     let runtime = AgentRuntime::new(
         DockerClient::new("unused"),
-        ModelClient::new(),
         store,
         test_runtime_config(&dir, DEFAULT_SIDECAR_IMAGE),
     )
@@ -9514,7 +10678,7 @@ fn tool_event_preview_redacts_sensitive_and_large_values() {
         "content_base64": "a".repeat(320),
     });
 
-    let preview = turn::tools::trace_preview_value(&value, 1_000);
+    let preview = pl_core::trace_preview_value(&value, 1_000);
 
     assert!(preview.contains("echo ok"));
     assert!(preview.contains("<redacted>"));

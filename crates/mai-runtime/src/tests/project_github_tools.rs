@@ -218,7 +218,7 @@ async fn reviewer_github_api_request_rejects_direct_inline_comment_creation() {
 }
 
 #[tokio::test]
-async fn github_api_request_accepts_json_string_body() {
+async fn github_api_request_rejects_json_string_body() {
     let dir = tempdir().expect("tempdir");
     let store = test_store(&dir).await;
     store
@@ -247,7 +247,7 @@ async fn github_api_request_accepts_json_string_body() {
     seed_project_workspace_volumes(&dir, project_id, &[(maintainer_id, "planner")]);
     let runtime = test_runtime(&dir, Arc::clone(&store)).await;
 
-    let result = runtime
+    let err = runtime
         .execute_tool_for_test(
             maintainer_id,
             "github_api_request",
@@ -258,14 +258,15 @@ async fn github_api_request_accepts_json_string_body() {
             }),
         )
         .await
-        .expect("github api request");
+        .expect_err("JSON string body should be rejected before gh sidecar");
 
-    assert!(result.success);
+    assert!(
+        err.to_string()
+            .contains("field `body` must be a JSON object or null")
+    );
     let docker_log = fake_docker_log(&dir);
-    assert!(docker_log.contains("sidecar-gh-api"));
-    assert!(docker_log.contains("MAI_GH_API_BODY"));
-    assert!(docker_log.contains(r#"gh-body={"body":"Looks good.","event":"COMMENT"}"#));
-    assert!(!docker_log.contains(r#"gh-body="{\"event\":\"COMMENT\""#));
+    assert!(!docker_log.contains("sidecar-gh-api"));
+    assert!(!docker_log.contains("MAI_GH_API_BODY"));
 }
 
 #[tokio::test]

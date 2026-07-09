@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::{initial_session_record, normalize_reasoning_effort};
 use crate::Result;
-use crate::state::AgentRecord;
+use crate::state::{AgentRecord, TurnControlSlot};
 
 /// Context supplied when creating an agent record.
 pub(crate) struct CreateAgentRecordContext {
@@ -104,8 +104,8 @@ pub(crate) async fn create_agent_record(
         system_prompt,
         turn_lock: Mutex::new(()),
         cancel_requested: AtomicBool::new(false),
-        active_turn: std::sync::Mutex::new(None),
-        pending_inputs: Mutex::new(std::collections::VecDeque::new()),
+        active_turn: TurnControlSlot::new(),
+        pending_inputs: Mutex::new(pl_core::AgentInputQueue::new()),
     });
 
     ops.insert_agent(Arc::clone(&agent)).await;

@@ -1,28 +1,33 @@
+use crate::agents::profiles::AgentProfilesManager;
+use crate::mcp::McpAgentManager;
+#[cfg(test)]
+use crate::mcp::McpTool;
+use crate::skills::{SkillInjections, SkillsManager};
+#[cfg(test)]
+use crate::turn::product_tool_schemas::build_tool_schemas;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use mai_agents::AgentProfilesManager;
 use mai_docker::{
     ContainerHandle, DockerClient, SidecarParams, project_agent_workspace_volume,
     project_cache_volume,
 };
-use mai_mcp::McpAgentManager;
-#[cfg(test)]
-use mai_mcp::McpTool;
 #[cfg(test)]
 use mai_protocol::MessageRole;
 use mai_protocol::*;
-use mai_skills::{SkillInjections, SkillsManager};
 use mai_store::{AgentLogFilter, ConfigStore, ProviderSelection, ToolTraceFilter};
 #[cfg(test)]
-use mai_tools::build_tool_definitions_with_filter;
+use pl_model::ToolSchema;
+use pl_protocol::Message as ModelMessage;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast};
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::Duration;
+#[cfg(test)]
+use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -32,10 +37,12 @@ mod events;
 mod facade;
 pub mod github;
 mod instructions;
-mod model_client;
+mod mcp;
+mod model_profile;
 mod model_projection;
 mod model_selection;
 mod projects;
+mod skills;
 mod state;
 mod tasks;
 mod tools;
@@ -48,9 +55,14 @@ use github::{
     DEFAULT_GITHUB_API_BASE_URL, DirectGithubAppBackend, GITHUB_HTTP_TIMEOUT_SECS, GithubAppBackend,
 };
 use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
-pub use model_client::{ModelClient, ModelClientConfig};
-pub use model_projection::{
-    completion_response_preview, completion_response_to_model_response, completion_response_usage,
+pub use model_profile::{
+    core_model_turn_request, core_provider_for_selection, model_supports_continuation,
+};
+pub use model_projection::{completion_response_to_model_response, completion_response_usage};
+use pl_core::{
+    AgentTurnStatusGuard, AgentTurnStatusOutcome, AgentTurnStatusTransition, GIT_TOKEN_ENV,
+    ensure_turn_not_cancelled, git_shell_credential_prelude, git_shell_retry_function,
+    shell_quote_word,
 };
 use projects::review::ProjectReviewCycleResult;
 use projects::review::pool::{ProjectReviewPoolEnqueueSummary, ProjectReviewSignalInput};
@@ -63,8 +75,11 @@ use projects::review::state::ReviewStateUpdate;
 use projects::skills::PROJECT_SKILLS_CACHE_DIR;
 use projects::skills::ProjectSkillSourceDir;
 use projects::workspace::ProjectWorkspaceManager;
-use state::{AgentRecord, AgentSessionRecord, ProjectRecord, RuntimeState, TaskRecord};
-use turn::tools::ToolExecution;
+use state::{
+    AgentRecord, AgentSessionRecord, ProjectRecord, RuntimeState, TaskRecord, TurnControlSlot,
+};
+#[cfg(test)]
+use turn::tool_output::ToolExecution;
 
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 90;
 const PROJECT_REVIEW_RUN_LIST_LIMIT: usize = 50;
@@ -169,11 +184,11 @@ pub enum RuntimeError {
     #[error("model error: {0}")]
     Model(#[from] pl_protocol::PureError),
     #[error("mcp error: {0}")]
-    Mcp(#[from] mai_mcp::McpError),
+    Mcp(#[from] crate::mcp::McpError),
     #[error("store error: {0}")]
     Store(#[from] mai_store::StoreError),
     #[error("skill error: {0}")]
-    Skill(#[from] mai_skills::SkillError),
+    Skill(#[from] crate::skills::SkillError),
     #[error("invalid input: {0}")]
     InvalidInput(String),
     #[error("io error: {0}")]
@@ -220,16 +235,14 @@ struct ResolvedAgentModel {
 impl AgentRuntime {
     pub async fn new(
         docker: DockerClient,
-        model: ModelClient,
         store: Arc<ConfigStore>,
         config: RuntimeConfig,
     ) -> Result<Arc<Self>> {
-        Self::new_with_github_backend(docker, model, store, config, None).await
+        Self::new_with_github_backend(docker, store, config, None).await
     }
 
     pub async fn new_with_github_backend(
         docker: DockerClient,
-        model: ModelClient,
         store: Arc<ConfigStore>,
         config: RuntimeConfig,
         github_backend: Option<Arc<dyn GithubAppBackend>>,
@@ -272,8 +285,8 @@ impl AgentRuntime {
                 system_prompt: persisted.system_prompt,
                 turn_lock: Mutex::new(()),
                 cancel_requested: AtomicBool::new(false),
-                active_turn: StdMutex::new(None),
-                pending_inputs: Mutex::new(VecDeque::new()),
+                active_turn: TurnControlSlot::new(),
+                pending_inputs: Mutex::new(pl_core::AgentInputQueue::new()),
             });
             if changed {
                 store
@@ -360,7 +373,6 @@ impl AgentRuntime {
         let runtime = Arc::new(Self {
             deps: RuntimeDeps {
                 docker,
-                model,
                 store: Arc::clone(&store),
                 skills,
                 agent_profiles,
@@ -459,7 +471,7 @@ impl AgentRuntime {
         &self,
         request: SkillsConfigRequest,
     ) -> Result<SkillsListResponse> {
-        let normalized = mai_skills::normalize_config(&request)?;
+        let normalized = crate::skills::normalize_config(&request)?;
         self.deps.store.save_skills_config(&normalized).await?;
         Ok(self.deps.skills.list(&normalized)?)
     }
@@ -623,28 +635,17 @@ impl AgentRuntime {
             )
             .await?;
         let instructions = "Generate a concise task title of 3-8 words that captures the essence of the user's request. Output only the title text, nothing else. Do not use quotes or punctuation at the end.";
-        let input = vec![turn::history::user_text_message(message)];
-        let response = turn::model_stream::consume_model_stream_to_response(
-            &self.deps.model,
-            &selection,
-            None,
-            instructions,
-            &input,
-            &[],
-            &CancellationToken::new(),
+        let provider = model_profile::core_provider_for_selection(&selection)?;
+        let request =
+            model_profile::core_model_turn_request(&selection, None, instructions, Vec::new());
+        let title = pl_core::stream_history_completion_message_text(
+            provider,
+            vec![turn::history::user_text_message(message)],
+            request,
+            pl_core::CoreModelTurnOptions::default().with_cancellation(CancellationToken::new()),
         )
         .await?;
-        let title = response
-            .output
-            .into_iter()
-            .filter_map(|item| match item {
-                ModelOutputItem::Message { text } => Some(text),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("")
-            .trim()
-            .to_string();
+        let title = title.trim().to_string();
         if title.is_empty() {
             return Ok("New Task".to_string());
         }
@@ -1461,12 +1462,15 @@ impl AgentRuntime {
         artifact_id: &str,
         name: &str,
     ) -> PathBuf {
-        turn::tools::tool_output_artifact_file_path(
-            &self.artifact_files_root,
-            agent_id,
-            call_id,
-            artifact_id,
-            name,
+        let namespace = agent_id.to_string();
+        pl_core::tool_output_artifact_file_path(
+            pl_core::ToolOutputArtifactPathRequest::new(
+                &self.artifact_files_root,
+                call_id,
+                artifact_id,
+                name,
+            )
+            .with_namespace(&namespace),
         )
     }
 
@@ -1519,37 +1523,6 @@ impl AgentRuntime {
                 skill_mentions,
                 cancellation_token,
             },
-        )
-        .await
-    }
-
-    async fn execute_tool(
-        self: &Arc<Self>,
-        agent: &Arc<AgentRecord>,
-        agent_id: AgentId,
-        turn_id: TurnId,
-        name: &str,
-        arguments: Value,
-        cancellation_token: CancellationToken,
-    ) -> Result<ToolExecution> {
-        let context = turn::tools::ToolDispatchContext {
-            state: &self.state,
-            container: turn::container::ContainerToolContext {
-                docker: &self.deps.docker,
-                artifact_files_root: &self.artifact_files_root,
-                ops: self,
-            },
-            events: &self.events,
-            ops: self,
-        };
-        turn::tools::execute_tool(
-            &context,
-            agent,
-            agent_id,
-            turn_id,
-            name,
-            arguments,
-            cancellation_token,
         )
         .await
     }
@@ -1619,15 +1592,108 @@ impl AgentRuntime {
         arguments: Value,
     ) -> Result<ToolExecution> {
         let agent = self.agent(agent_id).await?;
-        self.execute_tool(
-            &agent,
-            agent_id,
-            Uuid::new_v4(),
-            name,
-            arguments,
-            CancellationToken::new(),
+        let visible_tool_names = pl_core::ToolVisibilitySet::from_tool_names([name.to_string()]);
+        let product_tools = visible_tool_names.filter_schemas(build_tool_schemas());
+        let Some(execution) = self
+            .execute_native_shared_tool_for_test(
+                &agent,
+                agent_id,
+                name,
+                arguments,
+                visible_tool_names,
+                product_tools,
+            )
+            .await?
+        else {
+            return Ok(ToolExecution::failure(format!("unknown tool: {name}")));
+        };
+        Ok(execution)
+    }
+
+    #[cfg(test)]
+    async fn execute_native_shared_tool_for_test(
+        self: &Arc<Self>,
+        agent: &Arc<AgentRecord>,
+        agent_id: AgentId,
+        name: &str,
+        arguments: Value,
+        visible_tool_names: pl_core::ToolVisibilitySet,
+        product_tools: Vec<ToolSchema>,
+    ) -> Result<Option<ToolExecution>> {
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        let cancellation_token = CancellationToken::new();
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let session_id = self.resolve_session_id(agent_id, None).await?;
+        let parent_history =
+            turn::history::session_history(self.deps.store.as_ref(), agent, agent_id, session_id)
+                .await?;
+        let kernel = turn::core_adapter::build_mai_agent_kernel(
+            pl_core::PureCoreBuilder::from_provider_info(pl_model::ProviderInfo::deepseek(None))?,
+            pl_core::CoreAgentProfile::host_provided(workspace_root.clone()),
+            turn::core_adapter::MaiAgentKernelBuildContext {
+                runtime: self.clone(),
+                agent: agent.clone(),
+                agent_id,
+                visible_tool_names,
+                product_tool_schemas: product_tools,
+                mcp_tool_schemas: Vec::new(),
+                cancellation_token: cancellation_token.clone(),
+            },
         )
-        .await
+        .await?;
+
+        let Some(tool) = kernel.tool(name) else {
+            return Ok(None);
+        };
+        let output = kernel
+            .execute_tool(
+                pl_core::AgentKernelToolRequest::new(
+                    tool.name(),
+                    arguments,
+                    agent_id.to_string(),
+                    Uuid::new_v4().to_string(),
+                    event_tx,
+                )
+                .with_options(pl_core::TurnOptions::default().with_cancellation(cancellation_token))
+                .with_parent_history(parent_history),
+            )
+            .await?;
+        self.project_tool_events_for_test(agent_id, &mut event_rx)
+            .await;
+        Ok(Some(output.to_execution_result::<ToolOutputArtifactInfo>()))
+    }
+
+    #[cfg(test)]
+    async fn project_tool_events_for_test(
+        &self,
+        agent_id: AgentId,
+        event_rx: &mut broadcast::Receiver<pl_trace::AgentEvent>,
+    ) {
+        while let Ok(event) = event_rx.try_recv() {
+            if let pl_trace::AgentEvent::TodoListUpdated { snapshot } = event {
+                self.events
+                    .publish(ServiceEventKind::TodoListUpdated {
+                        agent_id,
+                        session_id: None,
+                        turn_id: Uuid::new_v4(),
+                        items: snapshot
+                            .items
+                            .into_iter()
+                            .map(|item| TodoItem {
+                                step: item.step,
+                                status: match item.status {
+                                    pl_protocol::TodoStatus::Pending => TodoListStatus::Pending,
+                                    pl_protocol::TodoStatus::InProgress => {
+                                        TodoListStatus::InProgress
+                                    }
+                                    pl_protocol::TodoStatus::Completed => TodoListStatus::Completed,
+                                },
+                            })
+                            .collect(),
+                    })
+                    .await;
+            }
+        }
     }
 
     async fn wait_agent(&self, agent_id: AgentId, timeout: Duration) -> Result<AgentSummary> {
@@ -1692,45 +1758,48 @@ impl AgentRuntime {
         agent_ids: Vec<AgentId>,
         timeout: Duration,
         cancellation_token: &CancellationToken,
-    ) -> Result<Value> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if cancellation_token.is_cancelled() {
-                return Err(RuntimeError::TurnCancelled);
-            }
-            let mut completed = Vec::new();
-            let mut pending = Vec::new();
-            for agent_id in &agent_ids {
-                let summary = self.agent(*agent_id).await?.summary.read().await.clone();
-                if agents::is_agent_wait_complete(&summary) {
-                    completed.push(*agent_id);
-                } else {
-                    pending.push(*agent_id);
+    ) -> Result<pl_core::AgentControlWaitOutput> {
+        let result = pl_core::wait_for_agent_completion(
+            || async {
+                let mut completed = Vec::new();
+                let mut pending = Vec::new();
+                for agent_id in &agent_ids {
+                    let summary = self.agent(*agent_id).await?.summary.read().await.clone();
+                    if agents::is_agent_wait_complete(&summary) {
+                        completed.push(*agent_id);
+                    } else {
+                        pending.push(*agent_id);
+                    }
                 }
-            }
-            if !completed.is_empty() || pending.is_empty() || Instant::now() >= deadline {
-                let mut completed_outputs = Vec::new();
-                for agent_id in completed {
-                    completed_outputs.push(self.agent_wait_snapshot(agent_id).await?);
-                    self.cleanup_finished_explorer_agent(agent_id).await?;
-                }
-                let mut pending_outputs = Vec::new();
-                for agent_id in pending {
-                    pending_outputs.push(self.agent_wait_snapshot(agent_id).await?);
-                }
-                return Ok(json!({
-                    "completed": completed_outputs,
-                    "pending": pending_outputs,
-                    "timed_out": !pending_outputs.is_empty(),
-                }));
-            }
-            tokio::select! {
-                _ = sleep(Duration::from_millis(250)) => {},
-                _ = cancellation_token.cancelled() => return Err(RuntimeError::TurnCancelled),
-            }
+                let wait_snapshot =
+                    pl_core::AgentWaitSnapshot::from_group_counts(completed.len(), pending.len());
+                Ok::<_, RuntimeError>((wait_snapshot, (completed, pending)))
+            },
+            pl_core::AgentWaitLoopOptions::new(timeout),
+            cancellation_token,
+        )
+        .await
+        .map_err(|error| match error {
+            pl_core::AgentWaitLoopError::Cancelled => RuntimeError::TurnCancelled,
+            pl_core::AgentWaitLoopError::Read(error) => error,
+        })?;
+
+        let (completed, pending) = result.value;
+        let mut completed_outputs = Vec::new();
+        for agent_id in completed {
+            completed_outputs.push(self.agent_wait_snapshot(agent_id).await?);
+            self.cleanup_finished_explorer_agent(agent_id).await?;
         }
+        let mut pending_outputs = Vec::new();
+        for agent_id in pending {
+            pending_outputs.push(self.agent_wait_snapshot(agent_id).await?);
+        }
+        let timed_out = !pending_outputs.is_empty();
+        Ok(pl_core::AgentWaitOutcome::new(timed_out)
+            .into_group_wait_agent_output(completed_outputs, pending_outputs))
     }
 
+    #[cfg(test)]
     async fn send_input_to_agent(
         self: &Arc<Self>,
         target: AgentId,
@@ -1739,7 +1808,7 @@ impl AgentRuntime {
         skill_mentions: Vec<String>,
         interrupt: bool,
     ) -> Result<Value> {
-        agents::send_input_to_agent(
+        let submission = agents::send_input_to_agent(
             self.as_ref(),
             self,
             agents::SendInputRequest {
@@ -1747,19 +1816,27 @@ impl AgentRuntime {
                 session_id,
                 message,
                 skill_mentions,
-                interrupt,
+                mode: pl_core::AgentInputTurnMode::from_codex_flags(true, interrupt),
                 cancel_grace: TURN_CANCEL_GRACE,
             },
         )
-        .await
+        .await?;
+        Ok(json!({
+            "turnId": submission.turn_id(),
+            "queued": submission.queued_flag(),
+        }))
     }
 
     async fn start_next_queued_input_after_turn(self: &Arc<Self>, agent_id: AgentId) {
         agents::start_next_queued_input_after_turn(self.as_ref(), self, agent_id).await;
     }
 
-    async fn fork_agent_context(&self, parent_id: AgentId, child_id: AgentId) -> Result<()> {
-        agents::fork_agent_context(self, parent_id, child_id).await
+    async fn fork_agent_context(
+        &self,
+        child_id: AgentId,
+        history: Vec<ModelMessage>,
+    ) -> Result<()> {
+        agents::fork_agent_context(self, child_id, history).await
     }
 
     async fn cleanup_finished_explorer_agent(&self, agent_id: AgentId) -> Result<()> {
@@ -1800,7 +1877,7 @@ impl AgentRuntime {
         skills_manager: &SkillsManager,
         skill_injections: &SkillInjections,
         skills_config: &SkillsConfigRequest,
-        mcp_tools: &[mai_mcp::McpTool],
+        mcp_tools: &[crate::mcp::McpTool],
         container_skill_paths: &ContainerSkillPaths,
     ) -> Result<String> {
         let summary = agent.summary.read().await;
@@ -1854,16 +1931,22 @@ impl AgentRuntime {
         enforce_current_turn: bool,
         status: AgentStatus,
     ) -> Result<()> {
-        if cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
         let agent_id = {
             let mut summary = agent.summary.write().await;
-            if enforce_current_turn && summary.current_turn != Some(turn_id) {
-                return Err(RuntimeError::TurnCancelled);
+            let guard = if enforce_current_turn {
+                AgentTurnStatusGuard::EnforceCurrent
+            } else {
+                AgentTurnStatusGuard::AllowStale
+            };
+            let transition = AgentTurnStatusTransition::new(turn_id, status.clone(), now(), guard);
+            match transition.evaluate_with_token(cancellation_token, summary.current_turn.as_ref())
+            {
+                AgentTurnStatusOutcome::Applied(mutation) => {
+                    summary.status = mutation.status;
+                    summary.updated_at = mutation.updated_at;
+                }
+                AgentTurnStatusOutcome::Cancelled => return Err(RuntimeError::TurnCancelled),
             }
-            summary.status = status.clone();
-            summary.updated_at = now();
             summary.id
         };
         self.persist_agent(agent).await?;
@@ -1871,202 +1954,6 @@ impl AgentRuntime {
             .publish(ServiceEventKind::AgentStatusChanged { agent_id, status })
             .await;
         Ok(())
-    }
-
-    async fn maybe_auto_compact(
-        self: &Arc<Self>,
-        agent: &Arc<AgentRecord>,
-        agent_id: AgentId,
-        session_id: SessionId,
-        turn_id: TurnId,
-        request: turn::context::ContextCompactionRequest,
-        cancellation_token: &CancellationToken,
-    ) -> Result<turn::context::ContextCompactionOutcome> {
-        if cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
-        let last_context_tokens =
-            turn::history::session_context_tokens(agent, agent_id, session_id).await?;
-        let effective_last_context_tokens =
-            request.last_context_tokens_override.or(last_context_tokens);
-        let model_selection = model_selection::resolve_agent_model_selection(
-            &self.deps,
-            &self.events,
-            agent,
-            agent_id,
-            Some(session_id),
-            Some(turn_id),
-        )
-        .await?;
-        let context_tokens = model_selection.provider_selection.model.context_tokens;
-        let planner = turn::compaction::ContextBudgetPlanner::new(
-            context_tokens,
-            AUTO_COMPACT_THRESHOLD_PERCENT,
-            model_selection
-                .provider_selection
-                .model
-                .auto_compact_token_limit,
-        );
-        let Some(decision) = planner.decision(effective_last_context_tokens, request) else {
-            return Ok(turn::context::ContextCompactionOutcome::Skipped);
-        };
-        let tokens_before = decision.tokens_before;
-
-        let history =
-            turn::history::session_history(self.deps.store.as_ref(), agent, agent_id, session_id)
-                .await?;
-        if history.is_empty() {
-            turn::history::record_session_context_tokens(
-                self.deps.store.as_ref(),
-                agent,
-                agent_id,
-                session_id,
-                0,
-            )
-            .await?;
-            return Ok(turn::context::ContextCompactionOutcome::Skipped);
-        }
-        let compactor = turn::compaction::HistoryCompactor::new(
-            &history,
-            COMPACT_SUMMARY_PREFIX,
-            COMPACT_PROMPT,
-            COMPACT_USER_MESSAGE_MAX_CHARS,
-        );
-        let mut compact_input = compactor.compact_request_input();
-        let skills_config = self.deps.store.load_skills_config().await?;
-        let skills_manager = self.skills_manager_for_agent(agent).await?;
-        let instructions = {
-            let _project_skill_guard = self.project_skill_read_guard(agent).await;
-            self.build_instructions(
-                agent,
-                &skills_manager,
-                &SkillInjections::default(),
-                &skills_config,
-                &[],
-                &ContainerSkillPaths::default(),
-            )
-            .await?
-        };
-        let response_result = turn::model_stream::consume_model_stream_to_response(
-            &self.deps.model,
-            &model_selection.provider_selection,
-            model_selection.reasoning_effort.as_deref(),
-            &instructions,
-            &compact_input,
-            &[],
-            cancellation_token,
-        )
-        .await;
-        let response = match response_result {
-            Ok(response) => response,
-            Err(err) if turn::compaction::compaction_error_allows_fallback(&err) => {
-                turn::persistence::record_agent_log(
-                    self.deps.store.as_ref(),
-                    turn::persistence::AgentLogRecord {
-                        agent_id,
-                        session_id: Some(session_id),
-                        turn_id: Some(turn_id),
-                        level: "warn",
-                        category: "context",
-                        message: "context compaction retrying with reduced history",
-                        details: json!({ "error": err.to_string() }),
-                    },
-                )
-                .await;
-                compact_input = compactor.fallback_compact_request_input();
-                turn::model_stream::consume_model_stream_to_response(
-                    &self.deps.model,
-                    &model_selection.provider_selection,
-                    model_selection.reasoning_effort.as_deref(),
-                    &instructions,
-                    &compact_input,
-                    &[],
-                    cancellation_token,
-                )
-                .await?
-            }
-            Err(err) => return Err(err.into()),
-        };
-
-        if cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
-
-        if let Some(usage) = response.usage {
-            turn::accounting::record_model_usage(
-                self.deps.store.as_ref(),
-                &self.events,
-                agent,
-                agent_id,
-                session_id,
-                &usage,
-            )
-            .await?;
-        }
-
-        let summary_text = turn::history::compact_summary_from_output(&response.output)
-            .ok_or_else(|| {
-                RuntimeError::InvalidInput("compact response did not include a summary".to_string())
-            })?;
-        let replacement = compactor.replacement_history(&summary_text);
-        let replacement_tokens =
-            turn::compaction::estimate_history_tokens(&instructions, &replacement, &[]);
-        turn::history::replace_session_history(
-            self.deps.store.as_ref(),
-            agent,
-            agent_id,
-            session_id,
-            replacement,
-        )
-        .await?;
-        turn::history::record_session_context_tokens(
-            self.deps.store.as_ref(),
-            agent,
-            agent_id,
-            session_id,
-            replacement_tokens,
-        )
-        .await?;
-        turn::compaction::CompactionRecorder::new(
-            self.deps.store.as_ref(),
-            &self.events,
-            agent_id,
-            session_id,
-            turn_id,
-            COMPACT_SUMMARY_PREVIEW_CHARS,
-        )
-        .record_success(turn::compaction::CompactionRecord {
-            decision,
-            last_context_tokens,
-            estimated_request_tokens: request.estimated_tokens,
-            context_tokens,
-            replacement_tokens,
-            summary: &summary_text,
-        })
-        .await;
-        turn::persistence::record_agent_log(
-            self.deps.store.as_ref(),
-            turn::persistence::AgentLogRecord {
-                agent_id,
-                session_id: Some(session_id),
-                turn_id: Some(turn_id),
-                level: "debug",
-                category: "context",
-                message: "context compaction request prepared",
-                details: json!({
-                    "history_items": history.len(),
-                    "compact_input_items": compact_input.len(),
-                }),
-            },
-        )
-        .await;
-        Ok(turn::context::ContextCompactionOutcome::Compacted {
-            trigger: decision.trigger,
-            tokens_before,
-            last_context_tokens: effective_last_context_tokens,
-            estimated_request_tokens: request.estimated_tokens,
-            context_tokens,
-        })
     }
 
     async fn persist_agent(&self, agent: &AgentRecord) -> Result<()> {
@@ -2169,7 +2056,7 @@ impl AgentRuntime {
                 &container_id,
                 &format!(
                     "rm -rf {root} && mkdir -p {root}",
-                    root = shell_quote(CONTAINER_SKILLS_ROOT)
+                    root = shell_quote_word(CONTAINER_SKILLS_ROOT)
                 ),
                 Some("/"),
                 Some(10),
@@ -2576,7 +2463,7 @@ impl AgentRuntime {
         let branch = format!("mai-agent/{agent_id}");
         let origin_branch = format!("origin/{}", project.branch);
         let command = format!(
-            "{}\
+            "set -eu\n{}{}\
              rm -rf /workspace/repo\n\
              mkdir -p /workspace /workspace/.mai/install-log /workspace/.mai/tool-state /workspace/tmp\n\
              git_with_retry clone --no-checkout -- /cache/repo.git /workspace/repo\n\
@@ -2584,15 +2471,13 @@ impl AgentRuntime {
              git_with_retry fetch /cache/repo.git '+refs/pull/*/head:refs/remotes/origin/pr/*'\n\
              git remote set-url origin {}\n\
              git checkout -B {} {}",
-            sidecar_git_askpass_script(),
-            shell_quote(&repo_url),
-            shell_quote(&branch),
-            shell_quote(&origin_branch),
+            git_shell_credential_prelude(),
+            git_shell_retry_function(),
+            shell_quote_word(&repo_url),
+            shell_quote_word(&branch),
+            shell_quote_word(&origin_branch),
         );
-        let env = [(
-            "MAI_GITHUB_INSTALLATION_TOKEN".to_string(),
-            token.to_string(),
-        )];
+        let env = [(GIT_TOKEN_ENV.to_string(), token.to_string())];
         let sidecar_name = format!("mai-tool-git-clone-{agent_id}");
         let cache_mounts = [(cache_volume.as_str(), "/cache")];
         let output = self
@@ -2628,7 +2513,7 @@ impl AgentRuntime {
         self.ensure_project_cache_volume(project.id).await?;
         let repo_url = github::github_clone_url(&project.owner, &project.repo);
         let command = format!(
-            "{}\
+            "set -eu\n{}{}\
              mkdir -p /workspace\n\
              if [ -d /workspace/repo.git ] && git -C /workspace/repo.git rev-parse --is-bare-repository >/dev/null 2>&1; then\n\
                git -C /workspace/repo.git remote set-url origin {repo_url}\n\
@@ -2637,13 +2522,11 @@ impl AgentRuntime {
                rm -rf /workspace/repo.git\n\
                git_with_retry clone --mirror -- {repo_url} /workspace/repo.git\n\
              fi",
-            sidecar_git_askpass_script(),
-            repo_url = shell_quote(&repo_url),
+            git_shell_credential_prelude(),
+            git_shell_retry_function(),
+            repo_url = shell_quote_word(&repo_url),
         );
-        let env = [(
-            "MAI_GITHUB_INSTALLATION_TOKEN".to_string(),
-            token.to_string(),
-        )];
+        let env = [(GIT_TOKEN_ENV.to_string(), token.to_string())];
         let sidecar_name = format!("mai-tool-git-cache-{}-{}", project.id, Uuid::new_v4());
         let output = self
             .deps
@@ -2844,7 +2727,7 @@ impl AgentRuntime {
         agents::ensure_agent_container(self, &agent, ready_status).await
     }
 
-    async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<mai_mcp::McpTool> {
+    async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<crate::mcp::McpTool> {
         let project_id = agent.summary.read().await.project_id;
         if let Some(project_id) = project_id {
             if projects::mcp::project_mcp_configs("").is_empty() {
@@ -2880,9 +2763,8 @@ impl AgentRuntime {
         _session_id: SessionId,
         cancellation_token: &CancellationToken,
     ) -> Result<()> {
-        if cancellation_token.is_cancelled() {
-            return Err(RuntimeError::TurnCancelled);
-        }
+        ensure_turn_not_cancelled(cancellation_token)
+            .map_err(turn::core_adapter::runtime_error_from_pl_turn)?;
         if agent.summary.read().await.project_id.is_none() {
             return Ok(());
         }
@@ -2938,18 +2820,6 @@ impl agents::AgentServiceOps for AgentRuntime {
         session_id: Option<SessionId>,
     ) -> Result<SessionId> {
         AgentRuntime::resolve_session_id(self, agent_id, session_id).await
-    }
-
-    async fn load_agent_history(
-        &self,
-        agent_id: AgentId,
-        session_id: SessionId,
-    ) -> Result<Vec<pl_protocol::Message>> {
-        Ok(self
-            .deps
-            .store
-            .load_agent_history(agent_id, session_id)
-            .await?)
     }
 
     async fn replace_agent_history(
@@ -3417,10 +3287,10 @@ impl agents::AgentSpawnOps for Arc<AgentRuntime> {
 
     fn fork_agent_context(
         &self,
-        parent_id: AgentId,
         child_id: AgentId,
+        history: Vec<ModelMessage>,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        AgentRuntime::fork_agent_context(self.as_ref(), parent_id, child_id)
+        AgentRuntime::fork_agent_context(self.as_ref(), child_id, history)
     }
 
     fn resolve_session_id(
@@ -4428,8 +4298,8 @@ impl AgentRuntime {
             system_prompt: None,
             turn_lock: Mutex::new(()),
             cancel_requested: AtomicBool::new(false),
-            active_turn: StdMutex::new(None),
-            pending_inputs: Mutex::new(VecDeque::new()),
+            active_turn: TurnControlSlot::new(),
+            pending_inputs: Mutex::new(pl_core::AgentInputQueue::new()),
         });
         self.state
             .agents
@@ -4710,44 +4580,8 @@ fn project_workspace_start_error_is_recoverable(error: &str) -> bool {
     ) || error.contains(SQLITE_DATABASE_LOCKED)
 }
 
-fn shell_quote(value: &str) -> String {
-    shell_words::quote(value).into_owned()
-}
-
-fn sidecar_git_askpass_script() -> &'static str {
-    "set -eu\n\
-     askpass=/tmp/mai-git-askpass-$$.sh\n\
-     trap 'rm -f \"$askpass\"' EXIT\n\
-     cat > \"$askpass\" <<'EOF'\n\
-     #!/bin/sh\n\
-     case \"$1\" in\n\
-       *Username*) printf '%s\\n' x-access-token ;;\n\
-       *Password*) printf '%s\\n' \"$MAI_GITHUB_INSTALLATION_TOKEN\" ;;\n\
-       *) printf '\\n' ;;\n\
-     esac\n\
-     EOF\n\
-     chmod 700 \"$askpass\"\n\
-     export GIT_ASKPASS=\"$askpass\"\n\
-     export GIT_TERMINAL_PROMPT=0\n\
-     git_with_retry() {\n\
-       attempts=0\n\
-       while :; do\n\
-         attempts=$((attempts + 1))\n\
-         git -c credential.helper= -c http.version=HTTP/1.1 \"$@\" && return 0\n\
-         status=$?\n\
-         if [ \"$attempts\" -ge 3 ]; then\n\
-           return \"$status\"\n\
-         fi\n\
-         sleep $((attempts * 2))\n\
-       done\n\
-     }\n"
-}
-
 fn redact_secret(value: &str, secret: &str) -> String {
-    if secret.is_empty() {
-        return value.to_string();
-    }
-    value.replace(secret, "<redacted>")
+    pl_core::SecretRedaction::new([secret]).redact_str(value)
 }
 
 fn normalized_text(value: Option<String>) -> Option<String> {
@@ -4788,7 +4622,7 @@ fn recovered_summary(mut summary: AgentSummary) -> (AgentSummary, bool) {
 
 #[cfg(test)]
 fn extract_skill_mentions(text: &str) -> Vec<String> {
-    mai_skills::extract_skill_mentions(text)
+    crate::skills::extract_skill_mentions(text)
 }
 
 #[cfg(test)]
