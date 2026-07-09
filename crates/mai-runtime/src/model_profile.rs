@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use mai_protocol::{
-    ModelCapabilities as MaiModelCapabilities, ModelConfig, ModelReasoningVariant, ModelWireApi,
+    ModelCapabilities as MaiModelCapabilities, ModelConfig, ModelWireApi,
     ProviderKind as MaiProviderKind, ProviderSecret,
 };
 use mai_store::ProviderSelection;
@@ -10,9 +10,10 @@ use pl_core::{
     CoreModelTurnRequest, CoreModelWireApi,
 };
 use pl_model::{
-    MaxTokensField, ModelCapabilities, ModelInfo, ModelModality, ModelParameter,
-    ModelRequestProfile, ParameterWire, ProviderInfo, ReasoningConfig, ReasoningSummary,
-    SharedModelProvider, ToolCapabilities, ToolSchema, create_provider_with_models,
+    MaxTokensField, MissingCandidatePolicy, ModelCapabilities, ModelInfo, ModelModality,
+    ModelParameter, ModelParameterCandidateRequest, ModelRequestProfile, ParameterWire,
+    ProviderInfo, ReasoningConfig, ReasoningSummary, SharedModelProvider, ToolCapabilities,
+    ToolSchema, create_provider_with_models,
 };
 use pl_protocol::PureError;
 
@@ -108,9 +109,15 @@ pub(crate) fn reasoning_config(
     reasoning_effort: Option<&str>,
 ) -> Option<ReasoningConfig> {
     let config = model.reasoning.as_ref()?;
-    let effort = reasoning_effort
-        .map(ToString::to_string)
-        .or_else(|| default_reasoning_effort(&config.variants));
+    let effort = reasoning_parameter(model)?
+        .resolve_candidate(ModelParameterCandidateRequest {
+            requested: reasoning_effort,
+            default_candidate: config.default_variant.as_deref(),
+            missing: MissingCandidatePolicy::UseDefault,
+            disabled_values: &[],
+        })
+        .ok()
+        .flatten();
     Some(ReasoningConfig {
         effort,
         summary: Some(ReasoningSummary::Auto),
@@ -159,16 +166,16 @@ fn request_profile(model: &ModelConfig) -> ModelRequestProfile {
     profile
 }
 
-fn default_reasoning_effort(variants: &[ModelReasoningVariant]) -> Option<String> {
-    variants.first().map(|variant| variant.id.clone())
+fn reasoning_parameters(model: &ModelConfig) -> Vec<ModelParameter> {
+    reasoning_parameter(model).into_iter().collect()
 }
 
-fn reasoning_parameters(model: &ModelConfig) -> Vec<ModelParameter> {
+pub(crate) fn reasoning_parameter(model: &ModelConfig) -> Option<ModelParameter> {
     let Some(config) = model.reasoning.as_ref() else {
-        return Vec::new();
+        return None;
     };
     if config.variants.is_empty() {
-        return Vec::new();
+        return None;
     }
 
     let mut wire = BTreeMap::new();
@@ -182,7 +189,7 @@ fn reasoning_parameters(model: &ModelConfig) -> Vec<ModelParameter> {
         );
     }
 
-    vec![ModelParameter {
+    Some(ModelParameter {
         name: "effort".to_string(),
         label: Some("Reasoning effort".to_string()),
         candidates: config
@@ -191,11 +198,55 @@ fn reasoning_parameters(model: &ModelConfig) -> Vec<ModelParameter> {
             .map(|variant| variant.id.clone())
             .collect(),
         wire,
-    }]
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use mai_protocol::{
+        ModelCapabilities as MaiModelCapabilities, ModelConfig, ModelReasoningConfig,
+        ModelReasoningVariant, ModelWireApi,
+    };
+    use pretty_assertions::assert_eq;
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    fn reasoning_model() -> ModelConfig {
+        ModelConfig {
+            id: "reasoning-model".to_string(),
+            name: None,
+            context_tokens: 128_000,
+            max_context_tokens: None,
+            effective_context_window_percent: 95,
+            output_tokens: 4096,
+            auto_compact_token_limit: None,
+            supports_tools: true,
+            wire_api: ModelWireApi::Responses,
+            capabilities: MaiModelCapabilities::default(),
+            request_policy: Default::default(),
+            reasoning: Some(ModelReasoningConfig {
+                default_variant: Some("medium".to_string()),
+                variants: ["high", "medium"]
+                    .into_iter()
+                    .map(|id| ModelReasoningVariant {
+                        id: id.to_string(),
+                        label: None,
+                        request: json!({
+                            "reasoning": {
+                                "effort": id,
+                            },
+                        }),
+                    })
+                    .collect(),
+            }),
+            options: Value::Null,
+            headers: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn continuation_policy_delegates_to_pl_core_profile() {
         let source = include_str!("model_profile.rs");
@@ -268,5 +319,37 @@ mod tests {
                 "mai-runtime 不应复制 request profile body 合并逻辑 `{forbidden}`"
             );
         }
+    }
+
+    #[test]
+    fn reasoning_config_default_effort_uses_pl_model_candidate_resolution() {
+        let source = include_str!("model_profile.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+
+        assert!(
+            production.contains("resolve_candidate"),
+            "模型请求默认 reasoning effort 应由 pl-model ModelParameter 候选值解析统一提供"
+        );
+        for forbidden in [
+            "fn default_reasoning_effort(",
+            "variants.first().map(|variant| variant.id.clone())",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "mai-runtime 不应复制 reasoning effort 默认候选值规则 `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_config_uses_configured_default_variant() {
+        let model = reasoning_model();
+
+        let config = reasoning_config(&model, None).expect("reasoning config");
+
+        assert_eq!(config.effort, Some("medium".to_string()));
     }
 }
