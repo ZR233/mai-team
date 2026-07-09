@@ -26,10 +26,15 @@ ctrlc = { version = "3", features = ["termination"] }
 fnv = "1"
 percent-encoding = "2"
 pretty_assertions = "1"
-pl-core = { git = "ssh://git@github.com/ZR233/pure-lang.git", branch = "codex/mai-team-pl-unified-dependency", default-features = false }
-pl-model = { git = "ssh://git@github.com/ZR233/pure-lang.git", branch = "codex/mai-team-pl-unified-dependency" }
-pl-protocol = { git = "ssh://git@github.com/ZR233/pure-lang.git", branch = "codex/mai-team-pl-unified-dependency" }
-pl-trace = { git = "ssh://git@github.com/ZR233/pure-lang.git", branch = "codex/mai-team-pl-unified-dependency" }
+# pl-core = { git = "ssh://git@github.com/ZR233/pure-lang.git", branch = "codex/mai-team-pl-unified-dependency", default-features = false }
+# pl-model = { git = "ssh://git@github.com/ZR233/pure-lang.git", branch = "codex/mai-team-pl-unified-dependency" }
+# pl-protocol = { git = "ssh://git@github.com/ZR233/pure-lang.git", branch = "codex/mai-team-pl-unified-dependency" }
+# pl-trace = { git = "ssh://git@github.com/ZR233/pure-lang.git", branch = "codex/mai-team-pl-unified-dependency" }
+pl-core = { path = "../pure-lang-pr/code/pl-core", default-features = false }
+pl-model = { path = "../pure-lang-pr/code/pl-model" }
+pl-protocol = { path = "../pure-lang-pr/code/pl-protocol" }
+pl-trace = { path = "../pure-lang-pr/code/pl-trace" }
+
 schemars = "1"
 shell-words = "1"
 strum = { version = "0.28", features = ["derive"] }
