@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::constants::{SKILL_FILE, SKILL_PATH_PREFIX};
+use super::constants::{SKILL_FILE, SKILL_PATH_PREFIX};
 
 pub(crate) fn canonicalize_or_clone(path: impl AsRef<Path>) -> PathBuf {
     fs::canonicalize(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf())

@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use mai_protocol::{SkillErrorInfo, SkillMetadata, SkillScope};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::constants::{MAX_SCAN_DEPTH, SKILL_FILE};
-use crate::ordering::skill_sort;
-use crate::parser::parse_skill_file;
-use crate::paths::canonicalize_or_clone;
+use super::constants::{MAX_SCAN_DEPTH, SKILL_FILE};
+use super::ordering::skill_sort;
+use super::parser::parse_skill_file;
+use super::paths::canonicalize_or_clone;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SkillRoot {
@@ -20,10 +20,6 @@ pub(crate) struct SkillLoadOutcome {
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) skills: Vec<SkillMetadata>,
     pub(crate) errors: Vec<SkillErrorInfo>,
-}
-
-pub(crate) fn default_roots(repo_root: &Path) -> Vec<SkillRoot> {
-    default_roots_with_system(repo_root, None)
 }
 
 pub(crate) fn default_roots_with_system(

@@ -1,10 +1,10 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use crate::skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
 use mai_protocol::{
     AgentId, AgentStatus, MessageRole, ServiceEventKind, SessionId, SkillsConfigRequest, TurnId,
 };
-use mai_skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
 use pl_core::{
     HostMcpToolSpec, TurnErrorProjection, TurnReturnError, TurnReturnErrorKind,
     ensure_turn_not_cancelled,
@@ -59,7 +59,7 @@ pub(crate) trait TurnOrchestratorOps: Send + Sync {
     fn agent_mcp_tools(
         &self,
         agent: &AgentRecord,
-    ) -> impl Future<Output = Vec<mai_mcp::McpTool>> + Send;
+    ) -> impl Future<Output = Vec<crate::mcp::McpTool>> + Send;
 
     fn project_skill_read_guard(
         &self,
@@ -80,7 +80,7 @@ pub(crate) trait TurnOrchestratorOps: Send + Sync {
         skills_manager: &SkillsManager,
         skill_injections: &SkillInjections,
         skills_config: &SkillsConfigRequest,
-        mcp_tools: &[mai_mcp::McpTool],
+        mcp_tools: &[crate::mcp::McpTool],
         container_skill_paths: &ContainerSkillPaths,
     ) -> impl Future<Output = Result<String>> + Send;
 
@@ -329,7 +329,8 @@ pub(crate) async fn run_turn_inner(
         let mcp_tools = ops.agent_mcp_tools(&agent).await;
         let visible_tools =
             super::tool_visibility::visible_tool_names(state, &agent, &mcp_tools).await;
-        let product_tools = visible_tools.filter_schemas(mai_tools::build_tool_schemas());
+        let product_tools =
+            visible_tools.filter_schemas(crate::turn::product_tool_schemas::build_tool_schemas());
         let mcp_tool_schemas = pl_core::host_mcp_tool_schemas(
             mcp_tools
                 .iter()
@@ -449,7 +450,7 @@ pub(crate) async fn run_turn_inner(
     .await
 }
 
-fn host_mcp_tool_spec(tool: &mai_mcp::McpTool) -> HostMcpToolSpec {
+fn host_mcp_tool_spec(tool: &crate::mcp::McpTool) -> HostMcpToolSpec {
     HostMcpToolSpec {
         model_name: tool.model_name.clone(),
         server: tool.server.clone(),

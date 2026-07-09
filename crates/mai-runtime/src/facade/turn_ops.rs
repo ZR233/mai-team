@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
+use crate::skills::{SkillInjections, SkillsManager};
 use mai_protocol::*;
-use mai_skills::{SkillInjections, SkillsManager};
 use tokio_util::sync::CancellationToken;
 
 use crate::instructions::ContainerSkillPaths;
@@ -58,7 +58,7 @@ impl turn::orchestrator::TurnOrchestratorOps for Arc<AgentRuntime> {
         .await
     }
 
-    async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<mai_mcp::McpTool> {
+    async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<crate::mcp::McpTool> {
         AgentRuntime::agent_mcp_tools(self.as_ref(), agent).await
     }
 
@@ -92,7 +92,7 @@ impl turn::orchestrator::TurnOrchestratorOps for Arc<AgentRuntime> {
         skills_manager: &SkillsManager,
         skill_injections: &SkillInjections,
         skills_config: &SkillsConfigRequest,
-        mcp_tools: &[mai_mcp::McpTool],
+        mcp_tools: &[crate::mcp::McpTool],
         container_skill_paths: &ContainerSkillPaths,
     ) -> Result<String> {
         AgentRuntime::build_instructions(

@@ -1,20 +1,20 @@
+use crate::agents::profiles::AgentProfilesManager;
+use crate::mcp::McpAgentManager;
+#[cfg(test)]
+use crate::mcp::McpTool;
+use crate::skills::{SkillInjections, SkillsManager};
+#[cfg(test)]
+use crate::turn::product_tool_schemas::build_tool_schemas;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use mai_agents::AgentProfilesManager;
 use mai_docker::{
     ContainerHandle, DockerClient, SidecarParams, project_agent_workspace_volume,
     project_cache_volume,
 };
-use mai_mcp::McpAgentManager;
-#[cfg(test)]
-use mai_mcp::McpTool;
 #[cfg(test)]
 use mai_protocol::MessageRole;
 use mai_protocol::*;
-use mai_skills::{SkillInjections, SkillsManager};
 use mai_store::{AgentLogFilter, ConfigStore, ProviderSelection, ToolTraceFilter};
-#[cfg(test)]
-use mai_tools::build_tool_schemas;
 #[cfg(test)]
 use pl_model::ToolSchema;
 use pl_protocol::Message as ModelMessage;
@@ -37,10 +37,12 @@ mod events;
 mod facade;
 pub mod github;
 mod instructions;
+mod mcp;
 mod model_profile;
 mod model_projection;
 mod model_selection;
 mod projects;
+mod skills;
 mod state;
 mod tasks;
 mod tools;
@@ -182,11 +184,11 @@ pub enum RuntimeError {
     #[error("model error: {0}")]
     Model(#[from] pl_protocol::PureError),
     #[error("mcp error: {0}")]
-    Mcp(#[from] mai_mcp::McpError),
+    Mcp(#[from] crate::mcp::McpError),
     #[error("store error: {0}")]
     Store(#[from] mai_store::StoreError),
     #[error("skill error: {0}")]
-    Skill(#[from] mai_skills::SkillError),
+    Skill(#[from] crate::skills::SkillError),
     #[error("invalid input: {0}")]
     InvalidInput(String),
     #[error("io error: {0}")]
@@ -469,7 +471,7 @@ impl AgentRuntime {
         &self,
         request: SkillsConfigRequest,
     ) -> Result<SkillsListResponse> {
-        let normalized = mai_skills::normalize_config(&request)?;
+        let normalized = crate::skills::normalize_config(&request)?;
         self.deps.store.save_skills_config(&normalized).await?;
         Ok(self.deps.skills.list(&normalized)?)
     }
@@ -1875,7 +1877,7 @@ impl AgentRuntime {
         skills_manager: &SkillsManager,
         skill_injections: &SkillInjections,
         skills_config: &SkillsConfigRequest,
-        mcp_tools: &[mai_mcp::McpTool],
+        mcp_tools: &[crate::mcp::McpTool],
         container_skill_paths: &ContainerSkillPaths,
     ) -> Result<String> {
         let summary = agent.summary.read().await;
@@ -2725,7 +2727,7 @@ impl AgentRuntime {
         agents::ensure_agent_container(self, &agent, ready_status).await
     }
 
-    async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<mai_mcp::McpTool> {
+    async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<crate::mcp::McpTool> {
         let project_id = agent.summary.read().await.project_id;
         if let Some(project_id) = project_id {
             if projects::mcp::project_mcp_configs("").is_empty() {
@@ -4620,7 +4622,7 @@ fn recovered_summary(mut summary: AgentSummary) -> (AgentSummary, bool) {
 
 #[cfg(test)]
 fn extract_skill_mentions(text: &str) -> Vec<String> {
-    mai_skills::extract_skill_mentions(text)
+    crate::skills::extract_skill_mentions(text)
 }
 
 #[cfg(test)]

@@ -5,33 +5,36 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 base64.workspace = true
-percent-encoding.workspace = true
-shell-words.workspace = true
 chrono.workspace = true
+dirs.workspace = true
+fnv.workspace = true
 futures.workspace = true
+gray_matter.workspace = true
 jsonwebtoken.workspace = true
 mai-docker = { path = "../mai-docker", version = "0.1.11" }
-mai-agents = { path = "../mai-agents", version = "0.1.11" }
-mai-mcp = { path = "../mai-mcp", version = "0.1.11" }
 mai-protocol = { path = "../mai-protocol", version = "0.1.11" }
+mai-store = { path = "../mai-store", version = "0.1.11" }
+percent-encoding.workspace = true
 pl-core.workspace = true
 pl-model.workspace = true
 pl-protocol.workspace = true
 pl-trace.workspace = true
-mai-skills = { path = "../mai-skills", version = "0.1.11" }
-mai-store = { path = "../mai-store", version = "0.1.11" }
-mai-tools = { path = "../mai-tools", version = "0.1.11" }
 reqwest.workspace = true
+rmcp = { workspace = true, features = ["client", "reqwest", "transport-async-rw", "transport-streamable-http-client-reqwest"] }
 serde.workspace = true
+serde-saphyr.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
+shell-words.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-async-trait.workspace = true
+walkdir.workspace = true
 
 [dev-dependencies]
 libc = "0.2"

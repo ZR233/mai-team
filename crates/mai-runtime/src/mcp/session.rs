@@ -3,10 +3,10 @@ use mai_protocol::{McpServerConfig, McpServerTransport};
 use rmcp::model::{ListResourceTemplatesResult, ListResourcesResult, ReadResourceResult};
 use serde_json::Value;
 
-use crate::error::Result;
-use crate::http::RmcpSession;
-use crate::stdio::StdioMcpSession;
-use crate::types::McpTool;
+use super::error::Result;
+use super::http::RmcpSession;
+use super::stdio::StdioMcpSession;
+use super::types::McpTool;
 
 pub(crate) enum McpSession {
     Stdio(Box<StdioMcpSession>),
@@ -24,32 +24,6 @@ impl McpSession {
             McpServerTransport::Stdio => {
                 let session =
                     StdioMcpSession::start(docker, container_id, server_name, config).await?;
-                Ok(Self::Stdio(Box::new(session)))
-            }
-            McpServerTransport::StreamableHttp => {
-                let session = RmcpSession::start_http(server_name, config).await?;
-                Ok(Self::Http(Box::new(session)))
-            }
-        }
-    }
-
-    pub(crate) async fn start_sidecar(
-        docker: &DockerClient,
-        workspace_volume: &str,
-        image: &str,
-        server_name: String,
-        config: McpServerConfig,
-    ) -> Result<Self> {
-        match config.transport {
-            McpServerTransport::Stdio => {
-                let session = StdioMcpSession::start_sidecar(
-                    docker,
-                    workspace_volume,
-                    image,
-                    server_name,
-                    config,
-                )
-                .await?;
                 Ok(Self::Stdio(Box::new(session)))
             }
             McpServerTransport::StreamableHttp => {

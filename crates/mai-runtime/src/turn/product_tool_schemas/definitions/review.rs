@@ -1,4 +1,4 @@
-use crate::names::TOOL_QUEUE_PROJECT_REVIEW_PRS;
+use super::super::names::TOOL_QUEUE_PROJECT_REVIEW_PRS;
 use pl_core::{ToolInputSchemaField, function_tool_schema};
 use pl_model::ToolSchema;
 use serde_json::json;

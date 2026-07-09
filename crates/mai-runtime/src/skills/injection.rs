@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use mai_protocol::SkillMetadata;
 
-use crate::mentions::{extract_plain_skill_names, extract_tool_mentions, normalize_mention};
-use crate::paths::{canonicalize_or_clone, looks_like_path, normalized_skill_path};
-use crate::scan::SkillLoadOutcome;
+use super::mentions::{extract_plain_skill_names, extract_tool_mentions, normalize_mention};
+use super::paths::{canonicalize_or_clone, looks_like_path, normalized_skill_path};
+use super::scan::SkillLoadOutcome;
 
 #[derive(Debug, Clone)]
 pub struct LoadedSkill {

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use crate::mcp::McpAgentManager;
 use mai_docker::ContainerHandle;
-use mai_mcp::McpAgentManager;
 use mai_protocol::{
     AgentId, AgentMessage, AgentSessionSummary, AgentSummary, ArtifactInfo, PlanHistoryEntry,
     ProjectId, ProjectSummary, SessionId, TaskId, TaskPlan, TaskReview, TaskSummary, TurnId,

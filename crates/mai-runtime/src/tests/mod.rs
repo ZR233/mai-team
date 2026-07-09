@@ -21,6 +21,57 @@ mod project_mcp;
 mod turn_runtime;
 
 #[test]
+fn wrapper_crates_are_inlined_into_runtime() {
+    let workspace_manifest = include_str!("../../../../Cargo.toml");
+    let runtime_manifest = include_str!("../../Cargo.toml");
+    for package in ["mai-tools", "mai-agents", "mai-skills", "mai-mcp"] {
+        assert!(
+            !workspace_manifest.contains(&format!("\"crates/{package}\"")),
+            "workspace 不应继续包含包装 crate `{package}`"
+        );
+        assert!(
+            !runtime_manifest.contains(package),
+            "mai-runtime 不应继续依赖包装 crate `{package}`"
+        );
+    }
+
+    for (name, source) in [
+        ("lib.rs", include_str!("../lib.rs")),
+        ("deps.rs", include_str!("../deps.rs")),
+        ("state.rs", include_str!("../state.rs")),
+        (
+            "turn/orchestrator.rs",
+            include_str!("../turn/orchestrator.rs"),
+        ),
+        (
+            "turn/product_tools.rs",
+            include_str!("../turn/product_tools.rs"),
+        ),
+        (
+            "turn/tool_visibility.rs",
+            include_str!("../turn/tool_visibility.rs"),
+        ),
+        ("projects/mcp.rs", include_str!("../projects/mcp.rs")),
+        (
+            "agents/resources.rs",
+            include_str!("../agents/resources.rs"),
+        ),
+    ] {
+        for prefix in [
+            format!("{}{}", "mai_tools", "::"),
+            format!("{}{}", "mai_agents", "::"),
+            format!("{}{}", "mai_skills", "::"),
+            format!("{}{}", "mai_mcp", "::"),
+        ] {
+            assert!(
+                !source.contains(&prefix),
+                "{name} 不应继续通过包装 crate `{prefix}` 调用"
+            );
+        }
+    }
+}
+
+#[test]
 fn main_turn_uses_pl_core_hosted_agent_runner() {
     let adapter = include_str!("../turn/core_adapter.rs");
     let hosted_runtime = include_str!("../turn/hosted_runtime.rs");
@@ -2542,7 +2593,7 @@ fn test_mcp_tool(server: &str, name: &str) -> McpTool {
     McpTool {
         server: server.to_string(),
         name: name.to_string(),
-        model_name: mai_mcp::model_tool_name(server, name),
+        model_name: crate::mcp::model_tool_name(server, name),
         description: format!("{server} {name}"),
         input_schema: json!({
             "type": "object",
@@ -7413,7 +7464,7 @@ async fn project_worker_cannot_spawn_agents_and_hidden_from_tools() {
         turn::tool_visibility::visible_tool_names(&runtime.state, &worker_record, &[]).await;
     assert!(!visible.contains(pl_core::TOOL_SPAWN_AGENT));
     assert!(!visible.contains(pl_core::TOOL_CLOSE_AGENT));
-    assert!(!visible.contains(mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS));
+    assert!(!visible.contains(crate::turn::product_tool_schemas::TOOL_QUEUE_PROJECT_REVIEW_PRS));
 
     let result = runtime
         .execute_tool_for_test(
@@ -7476,7 +7527,7 @@ async fn project_selector_can_queue_review_prs() {
 
     let visible =
         turn::tool_visibility::visible_tool_names(&runtime.state, &selector_record, &[]).await;
-    assert!(visible.contains(mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS));
+    assert!(visible.contains(crate::turn::product_tool_schemas::TOOL_QUEUE_PROJECT_REVIEW_PRS));
 
     let result = runtime
         .execute_tool_for_test(
@@ -7499,6 +7550,59 @@ async fn project_selector_can_queue_review_prs() {
     assert_eq!(output["deduped"], json!([9]));
     assert_eq!(output["ignored"], json!([]));
     runtime.stop_project_review_loop(project_id).await;
+}
+
+#[tokio::test]
+async fn project_reviewer_cannot_see_task_review_result_tool() {
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let reviewer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    maintainer.role = Some(AgentRole::Planner);
+    let mut reviewer = test_agent_summary_with_parent(
+        reviewer_id,
+        Some(maintainer_id),
+        Some("reviewer-container"),
+    );
+    reviewer.project_id = Some(project_id);
+    reviewer.role = Some(AgentRole::Reviewer);
+    save_agent_with_session(&store, &maintainer).await;
+    store
+        .save_project(&ready_test_project_summary(
+            project_id,
+            maintainer_id,
+            "account-1",
+        ))
+        .await
+        .expect("save project");
+    seed_project_workspace_volumes(&dir, project_id, &[(maintainer_id, "planner")]);
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    let reviewer_record = Arc::new(state::AgentRecord {
+        summary: RwLock::new(reviewer),
+        sessions: Mutex::new(Vec::new()),
+        container: RwLock::new(None),
+        mcp: RwLock::new(None),
+        system_prompt: None,
+        turn_lock: Mutex::new(()),
+        cancel_requested: std::sync::atomic::AtomicBool::new(false),
+        active_turn: state::TurnControlSlot::new(),
+        pending_inputs: Mutex::new(pl_core::AgentInputQueue::new()),
+    });
+    runtime
+        .state
+        .agents
+        .write()
+        .await
+        .insert(reviewer_id, Arc::clone(&reviewer_record));
+
+    let visible =
+        turn::tool_visibility::visible_tool_names(&runtime.state, &reviewer_record, &[]).await;
+
+    assert!(visible.contains(crate::turn::product_tool_schemas::TOOL_QUEUE_PROJECT_REVIEW_PRS));
+    assert!(!visible.contains(crate::turn::product_tool_schemas::TOOL_SUBMIT_REVIEW_RESULT));
 }
 
 #[tokio::test]

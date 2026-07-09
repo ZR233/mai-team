@@ -96,7 +96,7 @@ impl MaiMcpToolBackend {
         .await?;
         match output {
             Ok(value) => Ok(redaction.redact_json_value(value)),
-            Err(mai_mcp::McpError::ToolNotFound(_)) => Err(RuntimeError::InvalidInput(format!(
+            Err(crate::mcp::McpError::ToolNotFound(_)) => Err(RuntimeError::InvalidInput(format!(
                 "project MCP tool `{tool}` was not discovered"
             ))
             .to_string()),

@@ -1,7 +1,7 @@
 use mai_protocol::{SkillConfigEntry, SkillMetadata, SkillScope, SkillsConfigRequest};
 
-use crate::error::{Result, SkillError};
-use crate::paths::canonicalize_or_clone;
+use super::error::{Result, SkillError};
+use super::paths::canonicalize_or_clone;
 
 pub fn normalize_config(config: &SkillsConfigRequest) -> Result<SkillsConfigRequest> {
     let mut out = SkillsConfigRequest::default();

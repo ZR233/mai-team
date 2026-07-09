@@ -2,15 +2,15 @@ use std::path::{Path, PathBuf};
 
 use mai_protocol::{SkillScope, SkillsConfigRequest, SkillsListResponse};
 
-use crate::config::apply_config;
-use crate::error::Result;
-use crate::injection::{
-    SkillInjections, SkillInput, SkillSelection, build_injections_from_outcome,
-};
-use crate::render::render_available_response;
-use crate::scan::{
-    SkillLoadOutcome, SkillRoot, default_roots, default_roots_with_system, roots_from_pairs,
-    scan_roots,
+use super::config::apply_config;
+use super::error::Result;
+#[cfg(test)]
+use super::injection::SkillSelection;
+use super::injection::{SkillInjections, SkillInput, build_injections_from_outcome};
+#[cfg(test)]
+use super::render::render_available_response;
+use super::scan::{
+    SkillLoadOutcome, SkillRoot, default_roots_with_system, roots_from_pairs, scan_roots,
 };
 
 #[derive(Debug, Clone)]
@@ -19,12 +19,6 @@ pub struct SkillsManager {
 }
 
 impl SkillsManager {
-    pub fn new(repo_root: impl AsRef<Path>) -> Self {
-        Self {
-            roots: default_roots(repo_root.as_ref()),
-        }
-    }
-
     pub fn new_with_system_root(
         repo_root: impl AsRef<Path>,
         system_root: Option<impl AsRef<Path>>,
@@ -37,6 +31,7 @@ impl SkillsManager {
         }
     }
 
+    #[cfg(test)]
     pub fn new_with_system_root_and_extra_roots(
         repo_root: impl AsRef<Path>,
         system_root: Option<impl AsRef<Path>>,
@@ -56,10 +51,6 @@ impl SkillsManager {
         }
     }
 
-    pub fn root_paths(&self) -> Vec<PathBuf> {
-        self.roots.iter().map(|root| root.path.clone()).collect()
-    }
-
     pub fn clone_with_extra_roots(&self, extra_roots: Vec<(PathBuf, SkillScope)>) -> Self {
         let mut roots = self.roots.clone();
         roots.extend(roots_from_pairs(extra_roots));
@@ -76,10 +67,12 @@ impl SkillsManager {
         })
     }
 
+    #[cfg(test)]
     pub fn render_available(&self, config: &SkillsConfigRequest) -> Result<String> {
         Ok(render_available_response(self.list(config)?))
     }
 
+    #[cfg(test)]
     pub fn build_injections(
         &self,
         explicit_mentions: &[String],
@@ -99,6 +92,7 @@ impl SkillsManager {
         ))
     }
 
+    #[cfg(test)]
     pub fn build_injections_for_message(
         &self,
         message: &str,

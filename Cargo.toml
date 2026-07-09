@@ -1,16 +1,12 @@
 [workspace]
 members = [
-    "crates/mai-agents",
     "crates/mai-docker",
-    "crates/mai-mcp",
     "crates/mai-protocol",
     "crates/mai-relay",
     "crates/mai-relay-client",
     "crates/mai-runtime",
     "crates/mai-server",
-    "crates/mai-skills",
     "crates/mai-store",
-    "crates/mai-tools",
     "xtask",
 ]
 resolver = "3"

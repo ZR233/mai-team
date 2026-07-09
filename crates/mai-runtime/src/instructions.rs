@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use mai_mcp::McpTool;
+use crate::mcp::McpTool;
+use crate::skills::{SkillInjections, render_available_response};
 use mai_protocol::{SkillActivationInfo, SkillScope, SkillsListResponse};
-use mai_skills::{SkillInjections, render_available_response};
 use pl_protocol::Message;
 
 pub(crate) const CONTAINER_SKILLS_ROOT: &str = "/tmp/.mai-team/skills";
@@ -177,7 +177,7 @@ mod tests {
         let path = PathBuf::from("/tmp/demo/SKILL.md");
         let fragment = skill_user_fragment(
             &SkillInjections {
-                items: vec![mai_skills::LoadedSkill {
+                items: vec![crate::skills::LoadedSkill {
                     metadata: SkillMetadata {
                         name: "demo".to_string(),
                         description: "Demo skill".to_string(),
@@ -218,7 +218,7 @@ mod tests {
         paths.insert(path.clone(), container_path.clone());
         let fragment = skill_user_fragment(
             &SkillInjections {
-                items: vec![mai_skills::LoadedSkill {
+                items: vec![crate::skills::LoadedSkill {
                     metadata: SkillMetadata {
                         name: "demo".to_string(),
                         description: "Demo skill".to_string(),

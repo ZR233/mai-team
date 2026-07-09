@@ -4,9 +4,9 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mai_mcp::McpAgentManager;
+use crate::mcp::McpAgentManager;
+use crate::skills::SkillsManager;
 use mai_protocol::{AgentId, SkillScope, SkillsConfigRequest, SkillsListResponse};
-use mai_skills::SkillsManager;
 use serde_json::{Value, json};
 use tokio::sync::OwnedRwLockReadGuard;
 use tokio_util::sync::CancellationToken;

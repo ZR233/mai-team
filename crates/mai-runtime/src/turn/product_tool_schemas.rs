@@ -16,24 +16,24 @@ mod tests {
 
     #[test]
     fn product_tool_api_is_pl_schema_only() {
-        let api = include_str!("lib.rs");
-        let names = include_str!("names.rs");
+        let api = include_str!("product_tool_schemas.rs");
+        let names = include_str!("product_tool_schemas/names.rs");
 
         let mcp_tool_type = format!("{}{}", "Mcp", "Tool");
         assert!(
             !api.contains(&mcp_tool_type),
-            "mai-tools 只能暴露 mai-team 产品工具 schema，MCP schema 由 pl-core host MCP 工具包构造"
+            "product_tool_schemas 只能暴露 mai-team 产品工具 schema，MCP schema 由 pl-core host MCP 工具包构造"
         );
         let mcp_visible_name = format!("{}{}", "model", "_name");
         assert!(
             !api.contains(&mcp_visible_name),
-            "mai-tools 不应再拼装 MCP model tool 名称"
+            "product_tool_schemas 不应再拼装 MCP model tool 名称"
         );
         assert!(!api.contains(&format!("{}{}", "route", "_tool")));
         assert!(!api.contains(&format!("{}{}", "Routed", "Tool")));
         assert!(
             !api.contains(&format!("{}{}", "Tool", "Definition")),
-            "mai-tools 产品工具 schema 应直接使用 pl_model::ToolSchema"
+            "product_tool_schemas 产品工具 schema 应直接使用 pl_model::ToolSchema"
         );
         assert!(
             !names.contains("TOOL_GIT_SYNC_DEFAULT_BRANCH"),
@@ -43,7 +43,7 @@ mod tests {
 
     #[test]
     fn pure_lang_dependencies_use_local_pr_checkout() {
-        let manifest = include_str!("../../../Cargo.toml");
+        let manifest = include_str!("../../../../Cargo.toml");
         for package in ["pl-core", "pl-model", "pl-protocol", "pl-trace"] {
             let line = manifest
                 .lines()
@@ -157,16 +157,16 @@ mod tests {
     #[test]
     fn product_tool_schemas_use_pl_core_schema_helpers() {
         let definitions = [
-            include_str!("definitions/workflow.rs"),
-            include_str!("definitions/github.rs"),
-            include_str!("definitions/review.rs"),
+            include_str!("product_tool_schemas/definitions/workflow.rs"),
+            include_str!("product_tool_schemas/definitions/github.rs"),
+            include_str!("product_tool_schemas/definitions/review.rs"),
         ]
         .join("\n");
 
         assert!(
             definitions.contains("function_tool_schema(")
                 && definitions.contains("ToolInputSchemaField::required"),
-            "mai-tools 产品工具 schema 应通过 pl-core 统一 helper 构造"
+            "product_tool_schemas 产品工具 schema 应通过 pl-core 统一 helper 构造"
         );
         for forbidden in [
             "ToolSchema::function",
@@ -175,7 +175,7 @@ mod tests {
         ] {
             assert!(
                 !definitions.contains(forbidden),
-                "mai-tools 不应保留本地工具 schema 构造 `{forbidden}`"
+                "product_tool_schemas 不应保留本地工具 schema 构造 `{forbidden}`"
             );
         }
     }

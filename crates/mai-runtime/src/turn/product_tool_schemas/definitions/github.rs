@@ -1,4 +1,4 @@
-use crate::names::TOOL_GITHUB_API_REQUEST;
+use super::super::names::TOOL_GITHUB_API_REQUEST;
 use pl_core::{ToolInputSchemaField, function_tool_schema};
 use pl_model::ToolSchema;
 use serde_json::json;

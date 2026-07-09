@@ -2,7 +2,7 @@ use std::path::Path;
 
 use mai_protocol::{SkillMetadata, SkillsListResponse};
 
-use crate::ordering::skill_sort;
+use super::ordering::skill_sort;
 
 pub fn render_available_response(response: SkillsListResponse) -> String {
     let mut skills = response

@@ -25,6 +25,7 @@ mod fork;
 mod input;
 mod model;
 mod observability;
+pub(crate) mod profiles;
 mod resources;
 mod spawn;
 mod turn;

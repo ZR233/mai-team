@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use mai_mcp::McpAgentManager;
+use crate::mcp::McpAgentManager;
 use mai_protocol::{AgentId, ProjectId, ServiceEventKind};
 use pl_core::ensure_turn_not_cancelled;
 use tokio_util::sync::CancellationToken;

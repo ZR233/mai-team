@@ -96,14 +96,14 @@ impl MaiProductToolRegistry {
     fn registered_tool(&self, schema: ToolSchema) -> crate::Result<RegisteredTool> {
         let name = schema.name().to_string();
         match name.as_str() {
-            mai_tools::TOOL_SAVE_TASK_PLAN => {
+            crate::turn::product_tool_schemas::TOOL_SAVE_TASK_PLAN => {
                 let executor = self.clone();
                 Self::registered_schema_tool(schema, move |input: SaveTaskPlanInput, _context| {
                     let executor = executor.clone();
                     async move { executor.save_task_plan(input).await }
                 })
             }
-            mai_tools::TOOL_SUBMIT_REVIEW_RESULT => {
+            crate::turn::product_tool_schemas::TOOL_SUBMIT_REVIEW_RESULT => {
                 let executor = self.clone();
                 Self::registered_schema_tool(
                     schema,
@@ -113,21 +113,21 @@ impl MaiProductToolRegistry {
                     },
                 )
             }
-            mai_tools::TOOL_SAVE_ARTIFACT => {
+            crate::turn::product_tool_schemas::TOOL_SAVE_ARTIFACT => {
                 let executor = self.clone();
                 Self::registered_schema_tool(schema, move |input: SaveArtifactInput, _context| {
                     let executor = executor.clone();
                     async move { executor.save_artifact(input).await }
                 })
             }
-            mai_tools::TOOL_GITHUB_API_REQUEST => {
+            crate::turn::product_tool_schemas::TOOL_GITHUB_API_REQUEST => {
                 let executor = self.clone();
                 Self::registered_schema_tool(schema, move |input: GithubApiRequest, _context| {
                     let executor = executor.clone();
                     async move { executor.github_api_request(input).await }
                 })
             }
-            mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS => {
+            crate::turn::product_tool_schemas::TOOL_QUEUE_PROJECT_REVIEW_PRS => {
                 let executor = self.clone();
                 Self::registered_schema_tool(
                     schema,

@@ -10,7 +10,9 @@ mod stdio;
 mod tools;
 mod types;
 
-pub use error::{McpError, Result};
+pub use error::McpError;
 pub use manager::McpAgentManager;
-pub use naming::model_tool_name;
-pub use types::{McpServerStatus, McpTool};
+pub use types::McpTool;
+
+#[cfg(test)]
+pub(crate) use naming::model_tool_name;

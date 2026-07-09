@@ -9,8 +9,8 @@ use mai_protocol::{
 };
 use serde::Deserialize;
 
-use crate::constants::{MAX_DESCRIPTION_LEN, MAX_NAME_LEN, METADATA_DIR, METADATA_FILE};
-use crate::paths::canonicalize_or_clone;
+use super::constants::{MAX_DESCRIPTION_LEN, MAX_NAME_LEN, METADATA_DIR, METADATA_FILE};
+use super::paths::canonicalize_or_clone;
 
 #[derive(Debug, Deserialize)]
 struct SkillFrontmatter {

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use mai_agents::AgentProfilesManager;
+use crate::agents::profiles::AgentProfilesManager;
+use crate::skills::SkillsManager;
 use mai_docker::DockerClient;
-use mai_skills::SkillsManager;
 use mai_store::ConfigStore;
 
 use crate::github::{GitAccountService, GithubAppBackend};

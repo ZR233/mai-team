@@ -9,12 +9,12 @@ use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 
-use crate::constants::DEFAULT_STARTUP_TIMEOUT;
-use crate::error::{McpError, Result};
-use crate::resources::{list_resource_templates_value, list_resources_value, with_server};
-use crate::session::McpSession;
-use crate::tools::collision_safe_tool_name;
-use crate::types::{McpServerStatus, McpTool};
+use super::constants::DEFAULT_STARTUP_TIMEOUT;
+use super::error::{McpError, Result};
+use super::resources::{list_resource_templates_value, list_resources_value, with_server};
+use super::session::McpSession;
+use super::tools::collision_safe_tool_name;
+use super::types::{McpServerStatus, McpTool};
 
 pub struct McpAgentManager {
     sessions: RwLock<BTreeMap<String, Arc<McpSession>>>,
@@ -26,6 +26,7 @@ pub struct McpAgentManager {
 
 impl McpAgentManager {
     #[doc(hidden)]
+    #[cfg(test)]
     pub fn from_tools_for_test(tools: Vec<McpTool>) -> Self {
         Self {
             sessions: RwLock::new(BTreeMap::new()),
@@ -43,6 +44,7 @@ impl McpAgentManager {
 
     #[cfg(debug_assertions)]
     #[doc(hidden)]
+    #[cfg(test)]
     pub fn from_resources_for_test(resources: Vec<(&str, Vec<Value>)>) -> Self {
         Self {
             sessions: RwLock::new(BTreeMap::new()),
@@ -119,82 +121,6 @@ impl McpAgentManager {
                         )
                         .await;
                     tracing::warn!("failed to initialize MCP server `{server_name}`: {err}");
-                }
-            }
-        }
-
-        manager
-    }
-
-    pub async fn start_sidecars(
-        docker: DockerClient,
-        workspace_volume: String,
-        image: String,
-        configs: BTreeMap<String, McpServerConfig>,
-    ) -> Self {
-        let manager = Self::empty();
-        let enabled_configs = configs
-            .into_iter()
-            .filter(|(_, config)| config.enabled)
-            .collect::<Vec<_>>();
-        for (server_name, config) in &enabled_configs {
-            manager
-                .set_status(
-                    server_name,
-                    McpStartupStatus::Starting,
-                    None,
-                    config.required,
-                )
-                .await;
-        }
-
-        let mut startup_tasks =
-            stream::iter(enabled_configs.into_iter().map(|(server_name, config)| {
-                let docker = docker.clone();
-                let workspace_volume = workspace_volume.clone();
-                let image = image.clone();
-                async move {
-                    let required = config.required;
-                    let result = start_sidecar_server_session(
-                        docker,
-                        workspace_volume,
-                        image,
-                        server_name.clone(),
-                        config,
-                    )
-                    .await;
-                    (server_name, required, result)
-                }
-            }))
-            .buffer_unordered(16);
-
-        while let Some((server_name, required, result)) = startup_tasks.next().await {
-            match result {
-                Ok((session, tools)) => {
-                    manager
-                        .sessions
-                        .write()
-                        .await
-                        .insert(server_name.clone(), Arc::clone(&session));
-                    let mut tool_map = manager.tools.write().await;
-                    for mut tool in tools {
-                        tool.model_name = collision_safe_tool_name(&tool_map, &tool);
-                        tool_map.insert(tool.model_name.clone(), tool);
-                    }
-                    manager
-                        .set_status(&server_name, McpStartupStatus::Ready, None, required)
-                        .await;
-                }
-                Err(err) => {
-                    manager
-                        .set_status(
-                            &server_name,
-                            McpStartupStatus::Failed,
-                            Some(err.to_string()),
-                            required,
-                        )
-                        .await;
-                    tracing::warn!("failed to initialize MCP sidecar `{server_name}`: {err}");
                 }
             }
         }
@@ -415,30 +341,6 @@ async fn start_server_session(
     timeout(startup_timeout, async move {
         let session =
             Arc::new(McpSession::start(&docker, &container_id, server_name, config).await?);
-        let tools = session.list_tools().await?;
-        Ok((session, tools))
-    })
-    .await
-    .map_err(|_| McpError::Timeout(timeout_server, "initialize".to_string()))?
-}
-
-async fn start_sidecar_server_session(
-    docker: DockerClient,
-    workspace_volume: String,
-    image: String,
-    server_name: String,
-    config: McpServerConfig,
-) -> Result<(Arc<McpSession>, Vec<McpTool>)> {
-    let startup_timeout = config
-        .startup_timeout_secs
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
-    let timeout_server = server_name.clone();
-    timeout(startup_timeout, async move {
-        let session = Arc::new(
-            McpSession::start_sidecar(&docker, &workspace_volume, &image, server_name, config)
-                .await?,
-        );
         let tools = session.list_tools().await?;
         Ok((session, tools))
     })

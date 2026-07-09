@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
+use crate::mcp::McpAgentManager;
 use mai_docker::ContainerHandle;
-use mai_mcp::McpAgentManager;
 use mai_protocol::{AgentId, AgentStatus, McpServerConfig, McpStartupStatus, TurnId, now};
 use pl_core::{AgentTurnCurrentGuard, AgentTurnCurrentOutcome};
 use tokio_util::sync::CancellationToken;

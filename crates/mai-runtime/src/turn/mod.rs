@@ -10,6 +10,7 @@ pub(crate) mod mcp_resources;
 pub(crate) mod mcp_tools;
 pub(crate) mod orchestrator;
 pub(crate) mod persistence;
+pub(crate) mod product_tool_schemas;
 pub(crate) mod product_tools;
 pub(crate) mod tool_output;
 pub(crate) mod tool_visibility;

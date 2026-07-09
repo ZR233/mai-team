@@ -4,9 +4,9 @@ use std::fs;
 use mai_protocol::{SkillConfigEntry, SkillScope, SkillsConfigRequest};
 use tempfile::tempdir;
 
-use crate::constants::SKILL_FILE;
-use crate::paths::canonicalize_or_clone;
-use crate::{SkillInput, SkillsManager, extract_skill_mentions};
+use super::constants::SKILL_FILE;
+use super::paths::canonicalize_or_clone;
+use super::{SkillInput, SkillsManager, extract_skill_mentions};
 
 #[test]
 fn discovers_skill_frontmatter_and_metadata() {

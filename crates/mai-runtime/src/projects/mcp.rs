@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::mcp::{McpAgentManager, McpTool};
 use chrono::{DateTime, TimeDelta, Utc};
 use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient, project_cache_volume};
-use mai_mcp::{McpAgentManager, McpTool};
 use mai_protocol::McpServerConfig;
 use mai_protocol::ProjectId;
 use pl_core::ensure_turn_not_cancelled;

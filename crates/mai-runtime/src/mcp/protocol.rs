@@ -7,7 +7,7 @@ use rmcp::transport::async_rw::AsyncRwTransport;
 use serde_json::Value;
 use tokio::process::{ChildStdin, ChildStdout};
 
-use crate::error::{McpError, Result};
+use super::error::{McpError, Result};
 
 pub(crate) fn rmcp_transport(
     stdout: ChildStdout,

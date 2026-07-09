@@ -8,7 +8,6 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use thiserror::Error;
 use walkdir::{DirEntry, WalkDir};
 
 const AGENT_FILE: &str = "AGENT.md";
@@ -19,16 +18,6 @@ const MAX_SLOT_LEN: usize = 128;
 const MAX_DESCRIPTION_LEN: usize = 8192;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
-
-#[derive(Debug, Error)]
-pub enum AgentProfileError {
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("yaml error: {0}")]
-    Yaml(#[from] serde_yaml::Error),
-}
-
-pub type Result<T> = std::result::Result<T, AgentProfileError>;
 
 #[derive(Debug, Clone)]
 pub struct AgentProfilesManager {
@@ -101,12 +90,6 @@ impl fmt::Display for AgentProfileParseError {
 impl Error for AgentProfileParseError {}
 
 impl AgentProfilesManager {
-    pub fn new(repo_root: impl AsRef<Path>) -> Self {
-        Self {
-            roots: default_roots(repo_root.as_ref()),
-        }
-    }
-
     pub fn new_with_system_root(
         repo_root: impl AsRef<Path>,
         system_root: Option<impl AsRef<Path>>,
@@ -119,23 +102,7 @@ impl AgentProfilesManager {
         }
     }
 
-    pub fn new_with_system_root_and_extra_roots(
-        repo_root: impl AsRef<Path>,
-        system_root: Option<impl AsRef<Path>>,
-        extra_roots: Vec<(PathBuf, AgentProfileScope)>,
-    ) -> Self {
-        let mut roots = default_roots_with_system(
-            repo_root.as_ref(),
-            system_root.as_ref().map(|path| path.as_ref()),
-        );
-        roots.extend(
-            extra_roots
-                .into_iter()
-                .map(|(path, scope)| AgentProfileRoot { path, scope }),
-        );
-        Self { roots }
-    }
-
+    #[cfg(test)]
     pub fn with_roots(roots: Vec<(PathBuf, AgentProfileScope)>) -> Self {
         Self {
             roots: roots
@@ -143,20 +110,6 @@ impl AgentProfilesManager {
                 .map(|(path, scope)| AgentProfileRoot { path, scope })
                 .collect(),
         }
-    }
-
-    pub fn root_paths(&self) -> Vec<PathBuf> {
-        self.roots.iter().map(|root| root.path.clone()).collect()
-    }
-
-    pub fn clone_with_extra_roots(&self, extra_roots: Vec<(PathBuf, AgentProfileScope)>) -> Self {
-        let mut roots = self.roots.clone();
-        roots.extend(
-            extra_roots
-                .into_iter()
-                .map(|(path, scope)| AgentProfileRoot { path, scope }),
-        );
-        Self { roots }
     }
 
     pub fn list(&self) -> AgentProfilesResponse {
@@ -172,10 +125,7 @@ impl AgentProfilesManager {
         }
     }
 
-    pub fn load_profiles(&self) -> Vec<AgentProfile> {
-        self.load_outcome().profiles
-    }
-
+    #[cfg(test)]
     pub fn load_profile(&self, id: &str) -> Option<AgentProfile> {
         self.load_outcome()
             .profiles
@@ -183,6 +133,7 @@ impl AgentProfilesManager {
             .find(|profile| profile.id == id)
     }
 
+    #[cfg(test)]
     pub fn resolve_for_slot(
         &self,
         slot: &str,
@@ -247,10 +198,6 @@ impl AgentProfilesManager {
         outcome.profiles.sort_by(agent_profile_sort);
         outcome
     }
-}
-
-fn default_roots(repo_root: &Path) -> Vec<AgentProfileRoot> {
-    default_roots_with_system(repo_root, None)
 }
 
 fn default_roots_with_system(

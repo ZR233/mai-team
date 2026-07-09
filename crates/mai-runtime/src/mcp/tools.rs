@@ -4,8 +4,8 @@ use mai_protocol::McpServerConfig;
 use rmcp::model::{ListToolsResult, Tool};
 use serde_json::{Map, Value, json};
 
-use crate::naming::{fnv1a_hex, model_tool_name};
-use crate::types::McpTool;
+use super::naming::{fnv1a_hex, model_tool_name};
+use super::types::McpTool;
 
 pub(crate) fn parse_tools_result(
     server: &str,
@@ -102,8 +102,8 @@ pub(crate) fn collision_safe_tool_name(
 mod tests {
     use std::borrow::Cow;
 
+    use super::super::naming::model_tool_name;
     use super::*;
-    use crate::naming::model_tool_name;
 
     #[test]
     fn tool_schema_gets_properties() {

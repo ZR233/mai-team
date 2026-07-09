@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use mai_protocol::SkillMetadata;
 
-use crate::paths::normalized_skill_path;
+use super::paths::normalized_skill_path;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ToolMentions {
@@ -12,7 +12,8 @@ pub(crate) struct ToolMentions {
     blocked_plain_names: BTreeSet<String>,
 }
 
-pub fn extract_skill_mentions(text: &str) -> Vec<String> {
+#[cfg(test)]
+pub(crate) fn extract_skill_mentions(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut seen = BTreeSet::<String>::new();

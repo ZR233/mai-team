@@ -1,4 +1,4 @@
-use mai_mcp::McpTool;
+use crate::mcp::McpTool;
 use mai_protocol::{AgentId, AgentRole};
 
 use crate::state::{AgentRecord, RuntimeState};
@@ -26,19 +26,26 @@ pub(crate) async fn visible_tool_names(
     mcp_tools: &[McpTool],
 ) -> pl_core::ToolVisibilitySet {
     let capability = agent_capability(state, agent).await;
-    let has_project_workspace = agent.summary.read().await.project_id.is_some();
+    let summary = agent.summary.read().await.clone();
+    let has_project_workspace = summary.project_id.is_some();
     let shared_visibility = pl_core::HostedSharedToolVisibility::default()
         .with_git(has_project_workspace)
         .with_spawn_agent(capability.can_spawn_agents)
         .with_close_agent(capability.can_close_agents);
     let mut product_tools = vec![
-        mai_tools::TOOL_SAVE_TASK_PLAN.to_string(),
-        mai_tools::TOOL_SUBMIT_REVIEW_RESULT.to_string(),
-        mai_tools::TOOL_SAVE_ARTIFACT.to_string(),
-        mai_tools::TOOL_GITHUB_API_REQUEST.to_string(),
+        crate::turn::product_tool_schemas::TOOL_SAVE_ARTIFACT.to_string(),
+        crate::turn::product_tool_schemas::TOOL_GITHUB_API_REQUEST.to_string(),
     ];
-    if project_review_queue_tool_visible(agent).await {
-        product_tools.push(mai_tools::TOOL_QUEUE_PROJECT_REVIEW_PRS.to_string());
+    if task_plan_tool_visible(&summary) {
+        product_tools.push(crate::turn::product_tool_schemas::TOOL_SAVE_TASK_PLAN.to_string());
+    }
+    if task_review_result_tool_visible(&summary) {
+        product_tools
+            .push(crate::turn::product_tool_schemas::TOOL_SUBMIT_REVIEW_RESULT.to_string());
+    }
+    if project_review_queue_tool_visible(&summary) {
+        product_tools
+            .push(crate::turn::product_tool_schemas::TOOL_QUEUE_PROJECT_REVIEW_PRS.to_string());
     }
     pl_core::ToolVisibilitySet::hosted_container_with_tool_names(
         shared_visibility,
@@ -74,8 +81,15 @@ async fn agent_capability(state: &RuntimeState, agent: &AgentRecord) -> AgentCap
     }
 }
 
-async fn project_review_queue_tool_visible(agent: &AgentRecord) -> bool {
-    let summary = agent.summary.read().await;
+fn task_plan_tool_visible(summary: &mai_protocol::AgentSummary) -> bool {
+    summary.task_id.is_some() && matches!(summary.role, Some(AgentRole::Planner))
+}
+
+fn task_review_result_tool_visible(summary: &mai_protocol::AgentSummary) -> bool {
+    summary.task_id.is_some() && matches!(summary.role, Some(AgentRole::Reviewer))
+}
+
+fn project_review_queue_tool_visible(summary: &mai_protocol::AgentSummary) -> bool {
     summary.project_id.is_some()
         && matches!(
             summary.role,

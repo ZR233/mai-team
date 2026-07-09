@@ -2,8 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::skills::SkillsManager;
 use mai_protocol::{ProjectId, SkillScope, SkillsListResponse};
-use mai_skills::SkillsManager;
 use mai_store::ConfigStore;
 use pl_core::shell_quote_word;
 use tokio::sync::RwLock;
