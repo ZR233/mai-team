@@ -58,8 +58,9 @@ pub use model_profile::{
 };
 pub use model_projection::{completion_response_to_model_response, completion_response_usage};
 use pl_core::{
-    AgentTurnStatusGuard, AgentTurnStatusOutcome, AgentTurnStatusTransition,
-    ensure_turn_not_cancelled,
+    AgentTurnStatusGuard, AgentTurnStatusOutcome, AgentTurnStatusTransition, GIT_TOKEN_ENV,
+    ensure_turn_not_cancelled, git_shell_credential_prelude, git_shell_retry_function,
+    shell_quote_word,
 };
 use projects::review::ProjectReviewCycleResult;
 use projects::review::pool::{ProjectReviewPoolEnqueueSummary, ProjectReviewSignalInput};
@@ -2056,7 +2057,7 @@ impl AgentRuntime {
                 &container_id,
                 &format!(
                     "rm -rf {root} && mkdir -p {root}",
-                    root = shell_quote(CONTAINER_SKILLS_ROOT)
+                    root = shell_quote_word(CONTAINER_SKILLS_ROOT)
                 ),
                 Some("/"),
                 Some(10),
@@ -2463,7 +2464,7 @@ impl AgentRuntime {
         let branch = format!("mai-agent/{agent_id}");
         let origin_branch = format!("origin/{}", project.branch);
         let command = format!(
-            "{}\
+            "set -eu\n{}{}\
              rm -rf /workspace/repo\n\
              mkdir -p /workspace /workspace/.mai/install-log /workspace/.mai/tool-state /workspace/tmp\n\
              git_with_retry clone --no-checkout -- /cache/repo.git /workspace/repo\n\
@@ -2471,15 +2472,13 @@ impl AgentRuntime {
              git_with_retry fetch /cache/repo.git '+refs/pull/*/head:refs/remotes/origin/pr/*'\n\
              git remote set-url origin {}\n\
              git checkout -B {} {}",
-            sidecar_git_askpass_script(),
-            shell_quote(&repo_url),
-            shell_quote(&branch),
-            shell_quote(&origin_branch),
+            git_shell_credential_prelude(),
+            git_shell_retry_function(),
+            shell_quote_word(&repo_url),
+            shell_quote_word(&branch),
+            shell_quote_word(&origin_branch),
         );
-        let env = [(
-            "MAI_GITHUB_INSTALLATION_TOKEN".to_string(),
-            token.to_string(),
-        )];
+        let env = [(GIT_TOKEN_ENV.to_string(), token.to_string())];
         let sidecar_name = format!("mai-tool-git-clone-{agent_id}");
         let cache_mounts = [(cache_volume.as_str(), "/cache")];
         let output = self
@@ -2515,7 +2514,7 @@ impl AgentRuntime {
         self.ensure_project_cache_volume(project.id).await?;
         let repo_url = github::github_clone_url(&project.owner, &project.repo);
         let command = format!(
-            "{}\
+            "set -eu\n{}{}\
              mkdir -p /workspace\n\
              if [ -d /workspace/repo.git ] && git -C /workspace/repo.git rev-parse --is-bare-repository >/dev/null 2>&1; then\n\
                git -C /workspace/repo.git remote set-url origin {repo_url}\n\
@@ -2524,13 +2523,11 @@ impl AgentRuntime {
                rm -rf /workspace/repo.git\n\
                git_with_retry clone --mirror -- {repo_url} /workspace/repo.git\n\
              fi",
-            sidecar_git_askpass_script(),
-            repo_url = shell_quote(&repo_url),
+            git_shell_credential_prelude(),
+            git_shell_retry_function(),
+            repo_url = shell_quote_word(&repo_url),
         );
-        let env = [(
-            "MAI_GITHUB_INSTALLATION_TOKEN".to_string(),
-            token.to_string(),
-        )];
+        let env = [(GIT_TOKEN_ENV.to_string(), token.to_string())];
         let sidecar_name = format!("mai-tool-git-cache-{}-{}", project.id, Uuid::new_v4());
         let output = self
             .deps
@@ -4582,39 +4579,6 @@ fn project_workspace_start_error_is_recoverable(error: &str) -> bool {
             | RELAY_ENABLED_BUT_NOT_CONNECTED
             | RELAY_NOT_CONNECTED
     ) || error.contains(SQLITE_DATABASE_LOCKED)
-}
-
-fn shell_quote(value: &str) -> String {
-    shell_words::quote(value).into_owned()
-}
-
-fn sidecar_git_askpass_script() -> &'static str {
-    "set -eu\n\
-     askpass=/tmp/mai-git-askpass-$$.sh\n\
-     trap 'rm -f \"$askpass\"' EXIT\n\
-     cat > \"$askpass\" <<'EOF'\n\
-     #!/bin/sh\n\
-     case \"$1\" in\n\
-       *Username*) printf '%s\\n' x-access-token ;;\n\
-       *Password*) printf '%s\\n' \"$MAI_GITHUB_INSTALLATION_TOKEN\" ;;\n\
-       *) printf '\\n' ;;\n\
-     esac\n\
-     EOF\n\
-     chmod 700 \"$askpass\"\n\
-     export GIT_ASKPASS=\"$askpass\"\n\
-     export GIT_TERMINAL_PROMPT=0\n\
-     git_with_retry() {\n\
-       attempts=0\n\
-       while :; do\n\
-         attempts=$((attempts + 1))\n\
-         git -c credential.helper= -c http.version=HTTP/1.1 \"$@\" && return 0\n\
-         status=$?\n\
-         if [ \"$attempts\" -ge 3 ]; then\n\
-           return \"$status\"\n\
-         fi\n\
-         sleep $((attempts * 2))\n\
-       done\n\
-     }\n"
 }
 
 fn redact_secret(value: &str, secret: &str) -> String {

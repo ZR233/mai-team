@@ -2578,14 +2578,14 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 	        fi
 	        echo "sidecar-git-cache" >> "$LOG"
 	      fi
-	      if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
+	      if [ -n "$PL_GIT_TOKEN" ]; then
 	        echo "token-present" >> "$LOG"
 	      fi
 	      mkdir -p "$WORKSPACE/repo.git"
 	    fi
 	    if printf '%s' "$command" | grep -q "clone --no-checkout"; then
 	      echo "sidecar-git-clone" >> "$LOG"
-	      if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
+	      if [ -n "$PL_GIT_TOKEN" ]; then
 	        echo "token-present" >> "$LOG"
 	      fi
 	      mkdir -p "$WORKSPACE/repo/.git" "$WORKSPACE/.mai/install-log" "$WORKSPACE/.mai/tool-state" "$WORKSPACE/tmp"
@@ -2695,7 +2695,7 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 	    fi
 	    if printf '%s' "$command" | grep -q "git -c credential.helper= clone"; then
 	      echo "sidecar-git-clone" >> "$LOG"
-	      if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
+	      if [ -n "$PL_GIT_TOKEN" ]; then
 	        echo "token-present" >> "$LOG"
 	      fi
 	      mkdir -p "$WORKSPACE"
@@ -2790,7 +2790,7 @@ echo "$*" >> "$LOG"
 if [ -n "$GIT_ASKPASS" ]; then
   echo "askpass=$GIT_ASKPASS" >> "$LOG"
 fi
-if [ -n "$MAI_GITHUB_INSTALLATION_TOKEN" ]; then
+if [ -n "$PL_GIT_TOKEN" ]; then
   echo "token-present" >> "$LOG"
 fi
 case "$1" in

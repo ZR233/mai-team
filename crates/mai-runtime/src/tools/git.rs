@@ -11,7 +11,8 @@ use mai_protocol::{AgentId, ProjectId};
 use pl_core::ToolCapabilityConfig;
 use pl_core::{
     ExecutionBackend, ExecutionOutput, ExecutionRequest, GIT_TOKEN_ENV, GitCredential,
-    GitCredentialProvider, GitCredentialRequest, GitPolicy, GitToolKind, GitWorkspaceConfig,
+    GitCredentialProvider, GitCredentialRequest, GitPolicy, GitShellCommandRequest,
+    GitShellCredential, GitToolKind, GitWorkspaceConfig, git_shell_command,
 };
 #[cfg(test)]
 use serde_json::Value;
@@ -329,7 +330,7 @@ fn apply_host_git_safety_environment(command: &mut Command, cwd: &std::path::Pat
         .env_remove("GH_TOKEN")
         .env_remove("GIT_ASKPASS")
         .env_remove("SSH_ASKPASS")
-        .env_remove("MAI_GITHUB_INSTALLATION_TOKEN");
+        .env_remove(GIT_TOKEN_ENV);
 }
 
 #[cfg(test)]
@@ -347,14 +348,17 @@ async fn run_sidecar_git_output(
     args: &[String],
 ) -> Result<ExecutionOutput> {
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let command = sidecar_git_command(repo_path, token.is_some(), &args);
+    let credential = match token {
+        Some(_) => GitShellCredential::EnvToken,
+        None => GitShellCredential::Disabled,
+    };
+    let command = git_shell_command(GitShellCommandRequest {
+        safe_directory: repo_path,
+        args: &args,
+        credential,
+    });
     let env = token
-        .map(|token| {
-            vec![(
-                "MAI_GITHUB_INSTALLATION_TOKEN".to_string(),
-                token.to_string(),
-            )]
-        })
+        .map(|token| vec![(GIT_TOKEN_ENV.to_string(), token.to_string())])
         .unwrap_or_default();
     let sidecar_name = format!("mai-tool-git-{agent_id}-{}", uuid::Uuid::new_v4());
     let output = docker
@@ -375,50 +379,6 @@ async fn run_sidecar_git_output(
         stdout: output.stdout,
         stderr: output.stderr,
     })
-}
-
-fn sidecar_git_command(repo_path: &str, with_token: bool, args: &[&str]) -> String {
-    let mut command_parts = vec![
-        "git".to_string(),
-        "-c".to_string(),
-        shell_quote("core.hooksPath=/dev/null"),
-        "-c".to_string(),
-        shell_quote(&format!("safe.directory={repo_path}")),
-        "-c".to_string(),
-        shell_quote("credential.helper="),
-    ];
-    if with_token {
-        let git_command = command_parts
-            .iter()
-            .chain(
-                args.iter()
-                    .map(|arg| shell_quote(arg))
-                    .collect::<Vec<_>>()
-                    .iter(),
-            )
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ");
-        return sidecar_git_command_with_askpass(&git_command);
-    }
-    command_parts.extend(args.iter().map(|arg| shell_quote(arg)));
-    command_parts.join(" ")
-}
-
-fn sidecar_git_command_with_askpass(git_command: &str) -> String {
-    format!(
-        "askpass=$(mktemp) && cat > \"$askpass\" <<'MAI_GIT_ASKPASS'\n#!/bin/sh\n{}\nMAI_GIT_ASKPASS\nchmod 700 \"$askpass\" && GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=\"$askpass\" {git_command}; status=$?; rm -f \"$askpass\"; exit $status",
-        git_askpass_script()
-    )
-}
-
-fn shell_quote(value: &str) -> String {
-    shell_words::quote(value).into_owned()
-}
-
-fn git_askpass_script() -> String {
-    "case \"$1\" in\n  *Username*) printf '%s\\n' x-access-token ;;\n  *Password*) printf '%s\\n' \"$MAI_GITHUB_INSTALLATION_TOKEN\" ;;\n  *) printf '\\n' ;;\nesac"
-        .to_string()
 }
 
 #[cfg(test)]
@@ -743,21 +703,17 @@ mod tests {
     }
 
     #[test]
-    fn git_askpass_script_uses_installation_token_for_password_prompt() {
-        let script = git_askpass_script();
+    fn sidecar_git_command_delegates_to_pl_core_shell_helper() {
+        let source = include_str!("git.rs");
+        let production =
+            source_snippet(source, "async fn run_sidecar_git_output", "\n#[cfg(test)]");
 
-        assert!(script.contains("x-access-token"));
-        assert!(script.contains("$MAI_GITHUB_INSTALLATION_TOKEN"));
-    }
-
-    #[test]
-    fn sidecar_git_command_uses_askpass_instead_of_literal_extraheader() {
-        let command = sidecar_git_command("/workspace/repo", true, &["fetch", "origin"]);
-
-        assert!(command.contains("GIT_ASKPASS="));
-        assert!(command.contains("x-access-token"));
-        assert!(command.contains("$MAI_GITHUB_INSTALLATION_TOKEN"));
-        assert!(!command.contains("extraheader"));
+        assert!(production.contains("git_shell_command"));
+        assert!(production.contains("GitShellCommandRequest"));
+        assert!(!production.contains("fn git_askpass_script"));
+        assert!(!production.contains("sidecar_git_command_with_askpass"));
+        assert!(!production.contains("MAI_GITHUB_INSTALLATION_TOKEN"));
+        assert!(!production.contains("shell_words::quote"));
     }
 
     #[tokio::test]

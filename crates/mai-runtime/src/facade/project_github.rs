@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use mai_docker::{SidecarParams, project_agent_workspace_volume};
 use mai_protocol::{GitProvider, ProjectId, ProjectSummary};
+use pl_core::shell_quote_word;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -9,8 +10,7 @@ use crate::github::GitAccountToken;
 use crate::state::AgentRecord;
 use crate::turn::tool_output::ToolExecution;
 use crate::{
-    AgentRuntime, Result, RuntimeError, github, normalized_text, projects, redact_secret,
-    shell_quote, turn,
+    AgentRuntime, Result, RuntimeError, github, normalized_text, projects, redact_secret, turn,
 };
 
 impl AgentRuntime {
@@ -82,14 +82,14 @@ impl AgentRuntime {
             env.push(("MAI_GH_API_BODY".to_string(), body));
             format!(
                 "printf '%s' \"$MAI_GH_API_BODY\" | gh api --method {} --input - {}",
-                shell_quote(&method),
-                shell_quote(&path)
+                shell_quote_word(&method),
+                shell_quote_word(&path)
             )
         } else {
             format!(
                 "gh api --method {} {}",
-                shell_quote(&method),
-                shell_quote(&path)
+                shell_quote_word(&method),
+                shell_quote_word(&path)
             )
         };
         let output = self
