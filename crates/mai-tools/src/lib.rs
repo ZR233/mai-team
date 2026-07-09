@@ -42,24 +42,17 @@ mod tests {
     }
 
     #[test]
-    fn pure_lang_dependencies_use_shared_branch() {
+    fn pure_lang_dependencies_use_local_pr_checkout() {
         let manifest = include_str!("../../../Cargo.toml");
         for package in ["pl-core", "pl-model", "pl-protocol", "pl-trace"] {
             let line = manifest
                 .lines()
                 .find(|line| line.starts_with(&format!("{package} = ")))
                 .expect("workspace dependency must exist");
+            let expected_path = format!("path = \"../pure-lang-pr/code/{package}\"");
             assert!(
-                line.contains("ssh://git@github.com/ZR233/pure-lang.git"),
-                "{package} must use the shared pure-lang git dependency"
-            );
-            assert!(
-                line.contains("branch = \"codex/mai-team-pl-unified-dependency\""),
-                "{package} must point at the unified mai-team pure-lang branch"
-            );
-            assert!(
-                !line.contains("path = "),
-                "{package} must not use a local path dependency in PR branches"
+                line.contains(&expected_path),
+                "{package} must use the local pure-lang-pr checkout"
             );
         }
     }
