@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::process::{Output, Stdio};
 
+use pl_core::{ShellCommandTimeout, shell_command_with_timeout};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
@@ -151,7 +152,10 @@ impl DockerClient {
         capture: ExecCaptureOptions<'_>,
         cancellation_token: &CancellationToken,
     ) -> Result<CapturedExecOutput> {
-        let shell_command = shell_command_with_optional_timeout(command, opts.timeout_secs);
+        let shell_command = shell_command_with_timeout(
+            command,
+            ShellCommandTimeout::from_optional_seconds(opts.timeout_secs),
+        );
         let mut cmd = Command::new(&self.binary);
         cmd.arg("exec");
         if let Some(cwd) = opts.cwd {
@@ -227,7 +231,10 @@ impl DockerClient {
         opts: &ShellExecOptions<'_>,
         cancellation_token: &CancellationToken,
     ) -> Result<ExecOutput> {
-        let shell_command = shell_command_with_optional_timeout(command, opts.timeout_secs);
+        let shell_command = shell_command_with_timeout(
+            command,
+            ShellCommandTimeout::from_optional_seconds(opts.timeout_secs),
+        );
         let mut cmd = Command::new(&self.binary);
         cmd.arg("exec");
         if let Some(cwd) = opts.cwd {
@@ -260,8 +267,10 @@ impl DockerClient {
 
     pub async fn run_sidecar_shell_env(&self, params: &SidecarParams<'_>) -> Result<ExecOutput> {
         let image = validate_image(params.image)?;
-        let shell_command =
-            shell_command_with_optional_timeout(params.command, params.timeout_secs);
+        let shell_command = shell_command_with_timeout(
+            params.command,
+            ShellCommandTimeout::from_optional_seconds(params.timeout_secs),
+        );
         let mut cmd = Command::new(&self.binary);
         cmd.arg("run")
             .arg("--rm")
@@ -349,21 +358,6 @@ impl DockerClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         Ok(cmd.spawn()?)
-    }
-}
-
-pub(crate) fn shell_command_with_optional_timeout(
-    command: &str,
-    timeout_secs: Option<u64>,
-) -> String {
-    match timeout_secs {
-        Some(seconds) if seconds > 0 => {
-            format!(
-                "timeout --preserve-status {seconds}s /bin/sh -lc {}",
-                shell_quote(command)
-            )
-        }
-        _ => command.to_string(),
     }
 }
 
@@ -482,10 +476,6 @@ fn host_timeout_duration(timeout_secs: Option<u64>) -> Option<Duration> {
         .map(|seconds| Duration::from_secs(seconds + 5))
 }
 
-pub(crate) fn shell_quote(value: &str) -> String {
-    shell_words::quote(value).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -501,17 +491,41 @@ mod tests {
     #[test]
     fn exec_shell_command_omits_timeout_wrapper_when_unlimited() {
         assert_eq!(
-            shell_command_with_optional_timeout("sleep 1000", None),
+            shell_command_with_timeout(
+                "sleep 1000",
+                ShellCommandTimeout::from_optional_seconds(None)
+            ),
             "sleep 1000"
         );
         assert_eq!(
-            shell_command_with_optional_timeout("sleep 1000", Some(0)),
+            shell_command_with_timeout(
+                "sleep 1000",
+                ShellCommandTimeout::from_optional_seconds(Some(0))
+            ),
             "sleep 1000"
         );
         assert!(
-            shell_command_with_optional_timeout("sleep 1000", Some(5))
-                .starts_with("timeout --preserve-status 5s /bin/sh -lc ")
+            shell_command_with_timeout(
+                "sleep 1000",
+                ShellCommandTimeout::from_optional_seconds(Some(5))
+            )
+            .starts_with("timeout --preserve-status 5s /bin/sh -lc ")
         );
+    }
+
+    #[test]
+    fn shell_command_helpers_delegate_to_pl_core() {
+        let source = include_str!("exec.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production section");
+
+        assert!(production.contains("shell_command_with_timeout"));
+        assert!(production.contains("ShellCommandTimeout"));
+        assert!(!production.contains("shell_words::quote"));
+        assert!(!production.contains("fn shell_command_with_optional_timeout"));
+        assert!(!production.contains("fn shell_quote"));
     }
 
     #[tokio::test]

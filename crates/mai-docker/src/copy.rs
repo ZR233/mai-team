@@ -1,11 +1,11 @@
 use std::path::Path;
 
+use pl_core::shell_quote_word;
 use tokio::process::Command;
 
 use crate::args::{create_workspace_copy_container_args, validate_image};
 use crate::client::{DockerClient, stderr_or_stdout};
 use crate::error::{DockerError, Result};
-use crate::exec::shell_quote;
 
 impl DockerClient {
     pub async fn copy_to_container(
@@ -19,7 +19,7 @@ impl DockerClient {
             let mkdir = self
                 .exec_shell(
                     container_id,
-                    &format!("mkdir -p {}", shell_quote(&parent)),
+                    &format!("mkdir -p {}", shell_quote_word(&parent)),
                     Some("/"),
                     Some(10),
                 )
