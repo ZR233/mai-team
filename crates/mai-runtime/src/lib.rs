@@ -633,14 +633,12 @@ impl AgentRuntime {
             )
             .await?;
         let instructions = "Generate a concise task title of 3-8 words that captures the essence of the user's request. Output only the title text, nothing else. Do not use quotes or punctuation at the end.";
-        let mut session =
-            pl_core::CoreSession::from_messages(vec![turn::history::user_text_message(message)]);
         let provider = model_profile::core_provider_for_selection(&selection)?;
         let request =
             model_profile::core_model_turn_request(&selection, None, instructions, Vec::new());
-        let title = pl_core::stream_session_completion_message_text(
+        let title = pl_core::stream_history_completion_message_text(
             provider,
-            &mut session,
+            vec![turn::history::user_text_message(message)],
             request,
             pl_core::CoreModelTurnOptions::default().with_cancellation(CancellationToken::new()),
         )
@@ -1627,7 +1625,6 @@ impl AgentRuntime {
         let parent_history =
             turn::history::session_history(self.deps.store.as_ref(), agent, agent_id, session_id)
                 .await?;
-        let parent_session = Arc::new(pl_core::CoreSession::from_messages(parent_history));
         let kernel = turn::core_adapter::build_mai_agent_kernel(
             pl_core::PureCoreBuilder::from_provider_info(pl_model::ProviderInfo::deepseek(None))?,
             pl_core::CoreAgentProfile::host_provided(workspace_root.clone()),
@@ -1656,7 +1653,7 @@ impl AgentRuntime {
                     event_tx,
                 )
                 .with_options(pl_core::TurnOptions::default().with_cancellation(cancellation_token))
-                .with_parent_session(parent_session),
+                .with_parent_history(parent_history),
             )
             .await?;
         self.project_tool_events_for_test(agent_id, &mut event_rx)

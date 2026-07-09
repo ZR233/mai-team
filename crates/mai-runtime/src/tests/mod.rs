@@ -21,6 +21,36 @@ mod project_mcp;
 mod turn_runtime;
 
 #[test]
+fn main_turn_uses_pl_core_hosted_agent_runner() {
+    let adapter = include_str!("../turn/core_adapter.rs");
+    let hosted_runtime = include_str!("../turn/hosted_runtime.rs");
+
+    assert!(
+        adapter.contains("super::hosted_runtime::run_hosted_agent_turn(ctx).await"),
+        "core_adapter 主 turn 入口应只委托给 mai hosted adapter"
+    );
+    assert!(
+        hosted_runtime.contains("HostedAgentRunner::new"),
+        "主 turn 应交给 pl-core HostedAgentRunner 执行"
+    );
+    for forbidden in [
+        "TraceRecorder::new(",
+        "CoreSession::from_messages(",
+        ".run_turn_with_trace(",
+        "tokio::sync::broadcast::channel(64)",
+    ] {
+        assert!(
+            !adapter.contains(forbidden),
+            "mai-runtime core_adapter 不应继续保留通用框架外壳 `{forbidden}`"
+        );
+        assert!(
+            !hosted_runtime.contains(forbidden),
+            "mai-runtime hosted adapter 不应继续保留通用框架外壳 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
 fn test_tool_helper_uses_pl_core_kernel_registry() {
     let source = include_str!("../lib.rs");
     let helper_start = source
@@ -417,28 +447,22 @@ fn kernel_tool_projection_uses_pl_core_lifecycle_accessors() {
 
 #[test]
 fn core_turn_registers_shared_tools_through_kernel_builder() {
-    let source = include_str!("../turn/core_adapter.rs");
-    let run_start = source
-        .find("pub(crate) async fn run_pure_core_turn")
-        .unwrap();
-    let run_end = source[run_start..]
-        .find("fn mai_status_from_pl_outcome")
-        .unwrap();
-    let run_path = &source[run_start..run_start + run_end];
+    let core_adapter = include_str!("../turn/core_adapter.rs");
+    let hosted_runtime = include_str!("../turn/hosted_runtime.rs");
     assert!(
-        run_path.contains("build_mai_agent_kernel"),
+        hosted_runtime.contains("build_mai_agent_kernel"),
         "主 turn 路径应通过 mai 自定义 agent kernel 组装入口创建 AgentKernel"
     );
     assert!(
-        source.contains(".with_tool_set("),
+        core_adapter.contains(".with_tool_set("),
         "主 turn 路径必须通过 AgentKernelBuilder 注册共享工具集"
     );
     assert!(
-        !source.contains("starts_with(\"mcp__\")"),
+        !core_adapter.contains("starts_with(\"mcp__\")"),
         "MCP 工具 schema 应在 turn context 中与产品工具分离，而不是在 kernel 组装层按名称分流"
     );
     assert!(
-        !source.contains("ToolCapabilityConfig {"),
+        !core_adapter.contains("ToolCapabilityConfig {"),
         "主 turn kernel 组装不应手写共享工具能力矩阵，应复用 pl-core hosted capability preset"
     );
     for forbidden in [
@@ -448,7 +472,7 @@ fn core_turn_registers_shared_tools_through_kernel_builder() {
         format!("{}{}", ".register", "(kernel.core_mut"),
     ] {
         assert!(
-            !run_path.contains(&forbidden),
+            !hosted_runtime.contains(&forbidden),
             "主 turn 路径不应保留二阶段共享工具注册 `{forbidden}`"
         );
     }
@@ -456,7 +480,7 @@ fn core_turn_registers_shared_tools_through_kernel_builder() {
 
 #[test]
 fn core_turn_uses_pl_core_turn_outcome() {
-    let source = include_str!("../turn/core_adapter.rs");
+    let source = include_str!("../turn/hosted_runtime.rs");
     assert!(
         source.contains("TurnOutcome::from_result"),
         "主 turn 路径应复用 pl-core 的 turn outcome 归一化"
@@ -476,7 +500,7 @@ fn core_turn_uses_pl_core_turn_outcome() {
 
 #[test]
 fn core_turn_uses_pl_core_turn_projection_accessors() {
-    let source = include_str!("../turn/core_adapter.rs");
+    let source = include_str!("../turn/hosted_runtime.rs");
     for required in [
         "runtime_snapshot.latest_context_compaction()",
         "runtime_snapshot.last_context_tokens()",
@@ -1130,17 +1154,12 @@ async fn pl_core_todo_events_are_projected_to_service_events() {
     let agent_id = uuid::Uuid::new_v4();
     let session_id = uuid::Uuid::new_v4();
     let turn_id = uuid::Uuid::new_v4();
-    let (event_tx, event_rx) = tokio::sync::broadcast::channel(8);
-    let projector = tokio::spawn(turn::core_adapter::project_agent_events(
-        Arc::clone(&runtime),
+    turn::hosted_runtime::project_hosted_agent_event(
+        runtime.as_ref(),
         agent_id,
         session_id,
         turn_id,
-        event_rx,
-    ));
-
-    event_tx
-        .send(pl_trace::AgentEvent::TodoListUpdated {
+        pl_trace::AgentEvent::TodoListUpdated {
             snapshot: pl_protocol::TodoListSnapshot {
                 call_id: "call-1".to_string(),
                 agent_id: None,
@@ -1152,12 +1171,9 @@ async fn pl_core_todo_events_are_projected_to_service_events() {
                     status: pl_protocol::TodoStatus::InProgress,
                 }],
             },
-        })
-        .expect("todo event");
-    event_tx
-        .send(pl_trace::AgentEvent::Done)
-        .expect("done event");
-    projector.await.expect("projector");
+        },
+    )
+    .await;
 
     let events = runtime.events.snapshot().await;
     let items = events
@@ -1727,7 +1743,7 @@ async fn pl_core_model_turn_response_retries_without_unsupported_continuation() 
 #[test]
 fn runtime_does_not_expose_local_model_client_facade() {
     let lib = include_str!("../lib.rs");
-    let core_adapter = include_str!("../turn/core_adapter.rs");
+    let hosted_runtime = include_str!("../turn/hosted_runtime.rs");
 
     assert!(
         !lib.contains("mod model_client"),
@@ -1738,7 +1754,7 @@ fn runtime_does_not_expose_local_model_client_facade() {
         "mai-runtime 不应再导出本地 model client facade"
     );
     assert!(
-        core_adapter.contains("core_provider_for_selection"),
+        hosted_runtime.contains("core_provider_for_selection"),
         "主 turn 应只消费 mai -> pl-core provider 投影"
     );
     for forbidden in [
@@ -1747,13 +1763,12 @@ fn runtime_does_not_expose_local_model_client_facade() {
         "CoreModelTurnRequest",
         "CoreModelTurnOptions",
         "CompletionResponse",
-        "prepare_turn",
         "stream_session_completion_response",
         &format!("{}{}", "Tool", "Definition"),
         "fn tool_schema",
     ] {
         assert!(
-            !core_adapter.contains(forbidden),
+            !hosted_runtime.contains(forbidden),
             "主 turn adapter 不应继续本地维护或转换 `{forbidden}`"
         );
     }
@@ -1769,7 +1784,7 @@ fn task_title_generation_uses_pl_core_completion_text_turn() {
         .expect("generate_task_title function");
 
     assert!(
-        function.contains("pl_core::stream_session_completion_message_text"),
+        function.contains("pl_core::stream_history_completion_message_text"),
         "任务标题生成应复用 pl-core 的单轮 completion 文本 helper"
     );
     assert!(

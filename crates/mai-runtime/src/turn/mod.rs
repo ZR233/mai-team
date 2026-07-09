@@ -4,6 +4,7 @@ pub(crate) mod completion;
 pub(crate) mod container;
 pub(crate) mod core_adapter;
 pub(crate) mod history;
+pub(crate) mod hosted_runtime;
 pub(crate) mod kernel_tools;
 pub(crate) mod mcp_resources;
 pub(crate) mod mcp_tools;

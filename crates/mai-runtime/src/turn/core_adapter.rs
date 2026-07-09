@@ -1,25 +1,15 @@
 use std::sync::Arc;
 
-use mai_protocol::{
-    AgentId, AgentStatus, MessageRole, ServiceEventKind, SessionId, TurnId, TurnStatus,
-};
+use mai_protocol::{AgentId, AgentStatus, ServiceEventKind, SessionId, TurnId, TurnStatus};
 use pl_core::{
-    AgentKernel, CompileMode, ContextCompactionConfig, ContextCompactionReplacement,
-    CoreAgentProfile, CoreSession, InstructionSnapshot, PureCoreBuilder, ReasoningEffort,
-    RecentInteractionTailConfig, ToolVisibilitySet, TraceRecorder, TurnOptions, TurnOutcome,
-    TurnOutcomeStatus, TurnRequest, TurnReturnError,
+    AgentKernel, CoreAgentProfile, PureCoreBuilder, ToolVisibilitySet, TurnOutcomeStatus,
+    TurnReturnError,
 };
 use pl_model::ToolSchema;
-use pl_trace::AgentEvent;
-use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use crate::state::AgentRecord;
-use crate::turn::completion::TurnResult;
-use crate::{
-    AgentRuntime, Result, RuntimeError, completion_response_usage, core_provider_for_selection,
-};
+use crate::{AgentRuntime, Result, RuntimeError};
 
 pub(crate) struct PureCoreTurnContext {
     pub(crate) runtime: Arc<AgentRuntime>,
@@ -58,147 +48,7 @@ pub(crate) struct MaiAgentKernelBuildContext {
 }
 
 pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
-    let provider = core_provider_for_selection(&ctx.provider_selection)?;
-    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let runtime_profile = CoreAgentProfile::host_provided(workspace_root).with_context_compaction(
-        ContextCompactionConfig::new(
-            ctx.instructions.clone(),
-            crate::COMPACT_PROMPT,
-            crate::COMPACT_SUMMARY_PREFIX,
-            "compact response did not include a summary",
-        )
-        .with_replacement(ContextCompactionReplacement::RecentInteractionTail(
-            RecentInteractionTailConfig {
-                max_user_chars: crate::COMPACT_USER_MESSAGE_MAX_CHARS,
-                max_assistant_chars: 8_000,
-                max_tool_output_chars: 4_000,
-                assistant_items: 2,
-                tool_output_items: 3,
-            },
-        )),
-    );
-    let mut builder = PureCoreBuilder::new(provider);
-    if let Some(effort) = ctx.reasoning_effort.as_deref() {
-        builder = builder.with_reasoning_effort(ReasoningEffort::new(effort));
-    }
-    let kernel = build_mai_agent_kernel(
-        builder,
-        runtime_profile,
-        MaiAgentKernelBuildContext {
-            runtime: ctx.runtime.clone(),
-            agent: ctx.agent.clone(),
-            agent_id: ctx.agent_id,
-            visible_tool_names: ctx.visible_tool_names.clone(),
-            product_tool_schemas: ctx.product_tools.clone(),
-            mcp_tool_schemas: ctx.mcp_tool_schemas.clone(),
-            cancellation_token: ctx.cancellation_token.clone(),
-        },
-    )
-    .await?;
-
-    let mut session = CoreSession::from_messages(ctx.history.clone());
-    let (event_tx, event_rx) = tokio::sync::broadcast::channel(64);
-    let event_projector = tokio::spawn(project_agent_events(
-        ctx.runtime.clone(),
-        ctx.agent_id,
-        ctx.session_id,
-        ctx.turn_id,
-        event_rx,
-    ));
-    let mut recorder = TraceRecorder::new(ctx.session_id.to_string(), event_tx, 0);
-    let request = TurnRequest::new(ctx.message.clone(), CompileMode::Auto)
-        .with_turn_id(ctx.turn_id.to_string())
-        .with_instruction_snapshot(raw_instruction_snapshot(ctx.instructions.clone()));
-    let options = TurnOptions::default()
-        .with_cancellation(ctx.cancellation_token.clone())
-        .with_prompt_cache_key(format!("agent:{}:session:{}", ctx.agent_id, ctx.session_id))
-        .with_interaction_callback(mai_user_input_interaction_callback(
-            ctx.runtime.clone(),
-            ctx.agent_id,
-            ctx.session_id,
-            ctx.turn_id,
-        ));
-    let turn_result = kernel
-        .run_turn_with_trace(&mut session, request, &mut recorder, options)
-        .await;
-    let result = match turn_result {
-        Ok(result) => result,
-        Err(error) => {
-            event_projector.abort();
-            return Err(error.into());
-        }
-    };
-    drop(recorder);
-    let _ = event_projector.await;
-    super::kernel_tools::project_tool_trace_events(
-        &ctx.runtime,
-        ctx.agent_id,
-        ctx.session_id,
-        ctx.turn_id,
-        &result.trace_events,
-    )
-    .await;
-    let runtime_snapshot = result.runtime_snapshot();
-    super::history::replace_session_history(
-        ctx.runtime.deps.store.as_ref(),
-        &ctx.agent,
-        ctx.agent_id,
-        ctx.session_id,
-        session.messages().to_vec(),
-    )
-    .await?;
-    if let Some(snapshot) = runtime_snapshot.latest_context_compaction() {
-        record_context_compacted(&ctx, &snapshot.summary, snapshot.tokens_before).await;
-    }
-    if let Some(last_context_tokens) = runtime_snapshot.last_context_tokens() {
-        super::history::record_session_context_tokens(
-            ctx.runtime.deps.store.as_ref(),
-            &ctx.agent,
-            ctx.agent_id,
-            ctx.session_id,
-            last_context_tokens,
-        )
-        .await?;
-    }
-    if let Some(usage) = runtime_snapshot.usage() {
-        super::accounting::record_model_usage(
-            ctx.runtime.deps.store.as_ref(),
-            &ctx.runtime.events,
-            &ctx.agent,
-            ctx.agent_id,
-            ctx.session_id,
-            &completion_response_usage(usage),
-        )
-        .await?;
-    }
-    let outcome = TurnOutcome::from_result(&result);
-    if let Some(final_text) = outcome.final_text() {
-        record_assistant_message(&ctx, final_text.to_string()).await?;
-    }
-
-    let (turn_status, agent_status) = mai_status_from_pl_outcome(outcome.status());
-    super::completion::finish_turn(
-        ctx.runtime.deps.store.as_ref(),
-        &ctx.runtime.events,
-        &ctx.agent,
-        ctx.agent_id,
-        ctx.session_id,
-        TurnResult {
-            turn_id: ctx.turn_id,
-            status: turn_status,
-            agent_status,
-            final_text: outcome.final_text().map(ToString::to_string),
-            error: outcome.error().map(ToString::to_string),
-        },
-    )
-    .await?;
-    ctx.runtime
-        .start_next_queued_input_after_turn(ctx.agent_id)
-        .await;
-    if let Some(error) = outcome.return_error().cloned() {
-        return Err(runtime_error_from_pl_turn(error));
-    }
-    Ok(())
+    super::hosted_runtime::run_hosted_agent_turn(ctx).await
 }
 
 pub(crate) fn mai_status_from_pl_outcome(status: TurnOutcomeStatus) -> (TurnStatus, AgentStatus) {
@@ -380,118 +230,11 @@ pub(crate) async fn build_mai_agent_kernel(
     .await
 }
 
-pub(crate) async fn project_agent_events(
-    runtime: Arc<AgentRuntime>,
-    agent_id: AgentId,
-    session_id: SessionId,
-    turn_id: TurnId,
-    mut event_rx: broadcast::Receiver<AgentEvent>,
-) {
-    loop {
-        match event_rx.recv().await {
-            Ok(AgentEvent::TodoListUpdated { snapshot }) => {
-                runtime
-                    .events
-                    .publish(ServiceEventKind::TodoListUpdated {
-                        agent_id,
-                        session_id: Some(session_id),
-                        turn_id,
-                        items: snapshot.items.into_iter().map(todo_item_from_pl).collect(),
-                    })
-                    .await;
-            }
-            Ok(AgentEvent::Done | AgentEvent::Error { .. }) => break,
-            Ok(
-                AgentEvent::TracePartStarted { .. }
-                | AgentEvent::TracePartDelta { .. }
-                | AgentEvent::TracePartCompleted { .. }
-                | AgentEvent::TracePartFailed { .. }
-                | AgentEvent::InteractionChanged { .. }
-                | AgentEvent::AgentStateChanged { .. }
-                | AgentEvent::AgentRuntimeUpdated { .. }
-                | AgentEvent::SkillActivated { .. }
-                | AgentEvent::SubAgentActivity { .. }
-                | AgentEvent::TurnInterrupted { .. }
-                | AgentEvent::TurnBudgetLimited { .. },
-            ) => {}
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => break,
-        }
-    }
-}
-
-fn todo_item_from_pl(item: pl_protocol::TodoItem) -> mai_protocol::TodoItem {
-    mai_protocol::TodoItem {
-        step: item.step,
-        status: match item.status {
-            pl_protocol::TodoStatus::Pending => mai_protocol::TodoListStatus::Pending,
-            pl_protocol::TodoStatus::InProgress => mai_protocol::TodoListStatus::InProgress,
-            pl_protocol::TodoStatus::Completed => mai_protocol::TodoListStatus::Completed,
-        },
-    }
-}
-
-async fn record_assistant_message(ctx: &PureCoreTurnContext, text: String) -> Result<()> {
-    super::history::record_message(
-        ctx.runtime.deps.store.as_ref(),
-        &ctx.agent,
-        ctx.agent_id,
-        ctx.session_id,
-        MessageRole::Assistant,
-        text.clone(),
-    )
-    .await?;
-    let message_id = format!("msg_{}", Uuid::new_v4());
-    ctx.runtime
-        .events
-        .publish(ServiceEventKind::AgentMessageCompleted {
-            agent_id: ctx.agent_id,
-            session_id: Some(ctx.session_id),
-            turn_id: ctx.turn_id,
-            message_id: message_id.clone(),
-            role: MessageRole::Assistant,
-            channel: "final".to_string(),
-            content: text.clone(),
-        })
-        .await;
-    ctx.runtime
-        .events
-        .publish(ServiceEventKind::AgentMessage {
-            agent_id: ctx.agent_id,
-            session_id: Some(ctx.session_id),
-            turn_id: Some(ctx.turn_id),
-            role: MessageRole::Assistant,
-            content: text,
-        })
-        .await;
-    Ok(())
-}
-
-async fn record_context_compacted(ctx: &PureCoreTurnContext, summary: &str, tokens_before: u64) {
-    ctx.runtime
-        .events
-        .publish(ServiceEventKind::ContextCompacted {
-            agent_id: ctx.agent_id,
-            session_id: ctx.session_id,
-            turn_id: ctx.turn_id,
-            tokens_before,
-            summary_preview: pl_core::text_preview_chars(
-                summary,
-                crate::COMPACT_SUMMARY_PREVIEW_CHARS,
-            ),
-        })
-        .await;
-}
-
-fn raw_instruction_snapshot(instructions: String) -> InstructionSnapshot {
-    InstructionSnapshot::profile_base_override("mai-team instructions", instructions)
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
     fn context_summary_preview_delegates_to_pl_core() {
-        let source = include_str!("core_adapter.rs");
+        let source = include_str!("hosted_runtime.rs");
         let production = source
             .split("#[cfg(test)]")
             .next()
@@ -506,7 +249,7 @@ mod tests {
 
     #[test]
     fn turn_runtime_statistics_use_pl_core_snapshot() {
-        let source = include_str!("core_adapter.rs");
+        let source = include_str!("hosted_runtime.rs");
         let production = source
             .split("#[cfg(test)]")
             .next()
@@ -554,7 +297,7 @@ mod tests {
 
     #[test]
     fn raw_instruction_snapshot_uses_pl_core_constructor() {
-        let source = include_str!("core_adapter.rs");
+        let source = include_str!("hosted_runtime.rs");
         let production = source
             .split("#[cfg(test)]")
             .next()
