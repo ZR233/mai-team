@@ -566,6 +566,34 @@ fn run_turn_error_completion_uses_pl_core_projection_accessors() {
 }
 
 #[test]
+fn run_turn_error_classification_uses_pl_core_return_error_helper() {
+    let source = include_str!("../turn/orchestrator.rs");
+    let helper_start = source.find("fn pl_turn_return_error").unwrap();
+    let helper_end = source[helper_start..]
+        .find("fn check_turn_not_cancelled")
+        .map(|offset| helper_start + offset)
+        .unwrap();
+    let helper = &source[helper_start..helper_end];
+
+    assert!(helper.contains("TurnReturnError::from_host_error"));
+    assert!(helper.contains("TurnReturnErrorKind::Cancelled"));
+    assert!(helper.contains("TurnReturnErrorKind::Failed"));
+    for forbidden in [
+        "RuntimeError::AgentNotFound",
+        "RuntimeError::TaskNotFound",
+        "RuntimeError::ProjectNotFound",
+        "RuntimeError::Docker",
+        "RuntimeError::Model",
+        "RuntimeError::InvalidInput",
+    ] {
+        assert!(
+            !helper.contains(forbidden),
+            "turn 错误返回分类不应在 mai-runtime 枚举 `{forbidden}`"
+        );
+    }
+}
+
+#[test]
 fn turn_orchestrator_uses_pl_core_cancellation_checkpoint() {
     let source = include_str!("../turn/orchestrator.rs");
 

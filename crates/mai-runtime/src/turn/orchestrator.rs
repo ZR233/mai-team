@@ -5,7 +5,10 @@ use mai_protocol::{
     AgentId, AgentStatus, MessageRole, ServiceEventKind, SessionId, SkillsConfigRequest, TurnId,
 };
 use mai_skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
-use pl_core::{HostMcpToolSpec, TurnErrorProjection, TurnReturnError, ensure_turn_not_cancelled};
+use pl_core::{
+    HostMcpToolSpec, TurnErrorProjection, TurnReturnError, TurnReturnErrorKind,
+    ensure_turn_not_cancelled,
+};
 use serde_json::json;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -119,29 +122,12 @@ struct TurnModelContext {
 }
 
 fn pl_turn_return_error(error: RuntimeError) -> TurnReturnError {
-    let message = error.to_string();
-    match error {
-        RuntimeError::TurnCancelled => TurnReturnError::Cancelled,
-        RuntimeError::AgentNotFound(_)
-        | RuntimeError::TaskNotFound(_)
-        | RuntimeError::ProjectNotFound(_)
-        | RuntimeError::ProjectReviewRunNotFound(_)
-        | RuntimeError::AgentBusy(_)
-        | RuntimeError::TaskBusy(_)
-        | RuntimeError::MissingContainer(_)
-        | RuntimeError::SessionNotFound { .. }
-        | RuntimeError::ToolTraceNotFound { .. }
-        | RuntimeError::TurnNotFound { .. }
-        | RuntimeError::Docker(_)
-        | RuntimeError::Model(_)
-        | RuntimeError::Mcp(_)
-        | RuntimeError::Store(_)
-        | RuntimeError::Skill(_)
-        | RuntimeError::InvalidInput(_)
-        | RuntimeError::Io(_)
-        | RuntimeError::Http(_)
-        | RuntimeError::Jwt(_) => TurnReturnError::Failed(message),
-    }
+    let kind = if matches!(error, RuntimeError::TurnCancelled) {
+        TurnReturnErrorKind::Cancelled
+    } else {
+        TurnReturnErrorKind::Failed
+    };
+    TurnReturnError::from_host_error(error, kind)
 }
 
 fn check_turn_not_cancelled(cancellation_token: &CancellationToken) -> Result<()> {
