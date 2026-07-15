@@ -53,13 +53,14 @@ mod tests {
         now,
     };
     use mai_store::ConfigStore;
-    use pl_core::{AgentInputQueue, TurnTaskHandle};
+    use pl_core::AgentInputQueue;
     use tokio::sync::{Mutex, RwLock};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     use crate::events::RuntimeEvents;
     use crate::state::{AgentRecord, AgentSessionRecord, TurnControl, TurnControlSlot};
+    use crate::turn::control::TurnTaskHandle;
 
     #[tokio::test]
     async fn record_model_usage_updates_agent_and_selected_session() {

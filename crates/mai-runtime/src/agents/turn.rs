@@ -3,16 +3,13 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use mai_protocol::{AgentId, AgentStatus, ServiceEventKind, SessionId, TurnId, TurnStatus, now};
-use pl_core::{
-    AgentTurnCancellationGuard, AgentTurnCancellationOutcome, AgentTurnStartOutcome,
-    AgentTurnStartTransition, TurnTaskHandle,
-};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{AgentServiceOps, is_agent_turn_start_ready};
 use crate::state::{AgentRecord, TurnControl};
 use crate::turn::completion::TurnResult;
+use crate::turn::control::TurnTaskHandle;
 use crate::{Result, RuntimeError};
 
 /// Runs the asynchronous body of an agent turn after the shared turn state and
@@ -123,19 +120,15 @@ pub(crate) async fn prepare_turn(
     let turn_id = Uuid::new_v4();
     let should_start = {
         let mut summary = agent.summary.write().await;
-        let transition = AgentTurnStartTransition::new(turn_id, AgentStatus::RunningTurn, now());
-        match transition.evaluate(is_agent_turn_start_ready(&summary)) {
-            AgentTurnStartOutcome::Started(mutation) => {
-                summary.status = mutation.status;
-                summary.current_turn = mutation.current_turn;
-                summary.updated_at = mutation.updated_at;
-                summary.last_error = mutation.last_error;
-                agent
-                    .cancel_requested
-                    .store(mutation.cancel_requested, Ordering::SeqCst);
-                true
-            }
-            AgentTurnStartOutcome::Busy => false,
+        if is_agent_turn_start_ready(&summary) {
+            summary.status = AgentStatus::RunningTurn;
+            summary.current_turn = Some(turn_id);
+            summary.updated_at = now();
+            summary.last_error = None;
+            agent.cancel_requested.store(false, Ordering::SeqCst);
+            true
+        } else {
+            false
         }
     };
     if !should_start {
@@ -194,11 +187,9 @@ pub(crate) async fn cancel_agent_turn(
     let agent = ops.agent(agent_id).await?;
     let control = agent.active_turn.current();
     let current_turn = agent.summary.read().await.current_turn;
-    let active_turn = control.as_ref().map(|turn| &turn.turn_id);
-    let guard = AgentTurnCancellationGuard::new(turn_id);
-    match guard.evaluate(current_turn.as_ref(), active_turn) {
-        AgentTurnCancellationOutcome::TargetActive => {}
-        AgentTurnCancellationOutcome::Stale => return Ok(()),
+    let active_turn = control.as_ref().map(|turn| turn.turn_id);
+    if current_turn != Some(turn_id) && active_turn != Some(turn_id) {
+        return Ok(());
     }
     agent.cancel_requested.store(true, Ordering::SeqCst);
     if let Some(control) = control.filter(|turn| turn.turn_id == turn_id) {

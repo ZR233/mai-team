@@ -5,10 +5,7 @@ use crate::skills::{SkillInjections, SkillInput, SkillSelection, SkillsManager};
 use mai_protocol::{
     AgentId, AgentStatus, MessageRole, ServiceEventKind, SessionId, SkillsConfigRequest, TurnId,
 };
-use pl_core::{
-    HostMcpToolSpec, TurnErrorProjection, TurnReturnError, TurnReturnErrorKind,
-    ensure_turn_not_cancelled,
-};
+use pl_core::HostMcpToolSpec;
 use serde_json::json;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -18,6 +15,8 @@ use crate::events::RuntimeEvents;
 use crate::instructions::{self, ContainerSkillPaths};
 use crate::state::{AgentRecord, RuntimeState};
 use crate::turn::completion::TurnResult;
+use crate::turn::control::ensure_not_cancelled;
+use crate::turn::outcome::TurnFailure;
 use crate::turn::persistence::AgentLogRecord;
 use crate::{Result, RuntimeError};
 
@@ -84,6 +83,11 @@ pub(crate) trait TurnOrchestratorOps: Send + Sync {
         container_skill_paths: &ContainerSkillPaths,
     ) -> impl Future<Output = Result<String>> + Send;
 
+    fn workspace_instructions_for_agent(
+        &self,
+        agent: &AgentRecord,
+    ) -> impl Future<Output = Result<Option<String>>> + Send;
+
     fn set_turn_status(
         &self,
         agent: &Arc<AgentRecord>,
@@ -119,20 +123,11 @@ struct TurnModelContext {
     product_tools: Vec<pl_model::ToolSchema>,
     mcp_tool_schemas: Vec<pl_model::ToolSchema>,
     instructions: String,
-}
-
-fn pl_turn_return_error(error: RuntimeError) -> TurnReturnError {
-    let kind = if matches!(error, RuntimeError::TurnCancelled) {
-        TurnReturnErrorKind::Cancelled
-    } else {
-        TurnReturnErrorKind::Failed
-    };
-    TurnReturnError::from_host_error(error, kind)
+    workspace_instructions: Option<String>,
 }
 
 fn check_turn_not_cancelled(cancellation_token: &CancellationToken) -> Result<()> {
-    ensure_turn_not_cancelled(cancellation_token)
-        .map_err(super::core_adapter::runtime_error_from_pl_turn)
+    ensure_not_cancelled(cancellation_token)
 }
 
 pub(crate) async fn run_turn(
@@ -149,9 +144,7 @@ pub(crate) async fn run_turn(
     if let Err(err) = result
         && let Ok(agent) = ops.agent(agent_id).await
     {
-        let projection = TurnErrorProjection::from_return_error(pl_turn_return_error(err));
-        let (turn_status, agent_status) =
-            super::core_adapter::mai_status_from_pl_outcome(projection.status());
+        let failure = TurnFailure::from_error(err);
         let completed = super::completion::complete_turn_if_current(
             deps.store.as_ref(),
             events,
@@ -159,25 +152,25 @@ pub(crate) async fn run_turn(
             agent_id,
             TurnResult {
                 turn_id,
-                status: turn_status,
-                agent_status,
+                status: failure.turn_status,
+                agent_status: failure.agent_status,
                 final_text: None,
-                error: projection.error_message().map(ToString::to_string),
+                error: failure.error_message.clone(),
             },
         )
         .await
         .unwrap_or(false);
         if completed {
             ops.start_next_queued_input_after_turn(agent_id).await;
-            if projection.should_publish_error()
-                && let Some(message) = projection.error_message()
+            if failure.should_publish_error
+                && let Some(message) = failure.error_message
             {
                 events
                     .publish(ServiceEventKind::Error {
                         agent_id: Some(agent_id),
                         session_id: Some(session_id),
                         turn_id: Some(turn_id),
-                        message: message.to_string(),
+                        message,
                     })
                     .await;
             }
@@ -350,6 +343,7 @@ pub(crate) async fn run_turn_inner(
             )
             .await?
         };
+        let workspace_instructions = ops.workspace_instructions_for_agent(&agent).await?;
         let model_selection = crate::model_selection::resolve_agent_model_selection(
             deps,
             events,
@@ -393,6 +387,7 @@ pub(crate) async fn run_turn_inner(
             product_tools,
             mcp_tool_schemas,
             instructions,
+            workspace_instructions,
         }
     };
     check_turn_not_cancelled(&cancellation_token)?;
@@ -441,6 +436,7 @@ pub(crate) async fn run_turn_inner(
         provider_selection: model_context.provider_selection,
         reasoning_effort: model_context.reasoning_effort,
         instructions: model_context.instructions,
+        workspace_instructions: model_context.workspace_instructions,
         visible_tool_names: model_context.visible_tool_names,
         product_tools: model_context.product_tools,
         mcp_tool_schemas: model_context.mcp_tool_schemas,

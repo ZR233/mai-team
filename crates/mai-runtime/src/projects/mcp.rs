@@ -6,11 +6,11 @@ use chrono::{DateTime, TimeDelta, Utc};
 use mai_docker::{ContainerCreateOptions, ContainerHandle, DockerClient, project_cache_volume};
 use mai_protocol::McpServerConfig;
 use mai_protocol::ProjectId;
-use pl_core::ensure_turn_not_cancelled;
 use tokio_util::sync::CancellationToken;
 
 use crate::projects::service;
 use crate::state::RuntimeState;
+use crate::turn::control::ensure_not_cancelled;
 use crate::{Result, RuntimeError};
 
 pub(crate) const PROJECT_WORKSPACE_PATH: &str = "/workspace/repo";
@@ -161,17 +161,16 @@ pub(crate) async fn ensure_manager(
     credential: ProjectMcpCredential,
     cancellation_token: &CancellationToken,
 ) -> Result<Arc<McpAgentManager>> {
-    ensure_turn_not_cancelled(cancellation_token)
-        .map_err(crate::turn::core_adapter::runtime_error_from_pl_turn)?;
+    ensure_not_cancelled(cancellation_token)?;
     if let Some(manager) = cached_manager(state, project_id).await {
         return Ok(manager);
     }
     let sidecar = ensure_sidecar(state, docker, sidecar_image, project_id).await?;
     let configs = project_mcp_configs(&credential.token);
     let manager = McpAgentManager::start(docker.clone(), sidecar.id, configs).await;
-    if let Err(error) = ensure_turn_not_cancelled(cancellation_token) {
+    if let Err(error) = ensure_not_cancelled(cancellation_token) {
         manager.shutdown().await;
-        return Err(crate::turn::core_adapter::runtime_error_from_pl_turn(error));
+        return Err(error);
     }
     let manager = Arc::new(manager);
     let previous = {

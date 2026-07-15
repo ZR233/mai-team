@@ -53,7 +53,7 @@ pub(crate) trait ProjectReviewCycleOps: Send + Sync {
         project_id: ProjectId,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    fn refresh_project_skills_from_agent_workspace(
+    fn refresh_project_review_context_from_default_branch(
         &self,
         project_id: ProjectId,
     ) -> impl Future<Output = Result<()>> + Send;
@@ -137,7 +137,7 @@ pub(crate) async fn run_project_review_once(
         return Err(err);
     }
     if let Err(err) = ops
-        .refresh_project_skills_from_agent_workspace(project_id)
+        .refresh_project_review_context_from_default_branch(project_id)
         .await
     {
         let error = err.to_string();
@@ -411,6 +411,7 @@ mod tests {
         finished_runs: Arc<Mutex<Vec<FinishReviewRun>>>,
         run_summary: Arc<Mutex<Option<ProjectReviewRunSummary>>>,
         deleted_agents: Arc<Mutex<Vec<AgentId>>>,
+        operations: Arc<Mutex<Vec<&'static str>>>,
         fail_running_state: bool,
     }
 
@@ -423,6 +424,7 @@ mod tests {
                 finished_runs: Arc::new(Mutex::new(Vec::new())),
                 run_summary: Arc::new(Mutex::new(None)),
                 deleted_agents: Arc::new(Mutex::new(Vec::new())),
+                operations: Arc::new(Mutex::new(Vec::new())),
                 fail_running_state: false,
             }
         }
@@ -492,13 +494,18 @@ mod tests {
         }
 
         async fn sync_project_cache_repo(&self, _project_id: ProjectId) -> Result<()> {
+            self.operations.lock().await.push("sync_project_cache_repo");
             Ok(())
         }
 
-        async fn refresh_project_skills_from_agent_workspace(
+        async fn refresh_project_review_context_from_default_branch(
             &self,
             _project_id: ProjectId,
         ) -> Result<()> {
+            self.operations
+                .lock()
+                .await
+                .push("refresh_project_review_context_from_default_branch");
             Ok(())
         }
 
@@ -506,6 +513,10 @@ mod tests {
             &self,
             _project_id: ProjectId,
         ) -> Result<AgentSummary> {
+            self.operations
+                .lock()
+                .await
+                .push("spawn_project_reviewer_agent");
             Ok(self.reviewer.clone())
         }
 
@@ -523,6 +534,7 @@ mod tests {
             _reviewer_id: AgentId,
             message: String,
         ) -> Result<TurnId> {
+            self.operations.lock().await.push("start_reviewer_turn");
             self.started_messages.lock().await.push(message);
             Ok(Uuid::new_v4())
         }
@@ -549,6 +561,33 @@ mod tests {
             self.deleted_agents.lock().await.push(agent_id);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn review_cycle_refreshes_default_branch_context_before_reviewer_turn() {
+        let project_id = Uuid::new_v4();
+        let reviewer_id = Uuid::new_v4();
+        let ops = FakeCycleOps::new(
+            project_id,
+            reviewer_id,
+            vec![r#"{"outcome":"failed","review_event":null,"pr":726,"summary":"done","error":"stop"}"#
+                .to_string()],
+        );
+
+        let result = run_project_review_once(&ops, project_id, CancellationToken::new(), Some(726))
+            .await
+            .expect("review result");
+
+        assert_eq!(ProjectReviewOutcome::Failed, result.outcome);
+        assert_eq!(
+            vec![
+                "sync_project_cache_repo",
+                "refresh_project_review_context_from_default_branch",
+                "spawn_project_reviewer_agent",
+                "start_reviewer_turn",
+            ],
+            *ops.operations.lock().await
+        );
     }
 
     #[tokio::test]

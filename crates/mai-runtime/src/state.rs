@@ -6,15 +6,16 @@ use crate::mcp::McpAgentManager;
 use mai_docker::ContainerHandle;
 use mai_protocol::{
     AgentId, AgentMessage, AgentSessionSummary, AgentSummary, ArtifactInfo, PlanHistoryEntry,
-    ProjectId, ProjectSummary, SessionId, TaskId, TaskPlan, TaskReview, TaskSummary, TurnId,
+    ProjectId, ProjectSummary, SessionId, TaskId, TaskPlan, TaskReview, TaskSummary,
 };
-use pl_core::{ActiveTurnControl, ActiveTurnSlot, AgentInputQueue, AgentTurnCurrentGuard};
+use pl_core::AgentInputQueue;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::projects::mcp::ProjectMcpManagerHandle;
 use crate::projects::review::pool::ProjectReviewPool;
 use crate::projects::review::relay_queue::ProjectReviewRelayQueue;
+pub(crate) use crate::turn::control::{TurnControl, TurnControlSlot, TurnGuard};
 
 pub(crate) struct RuntimeState {
     pub(crate) agents: RwLock<HashMap<AgentId, Arc<AgentRecord>>>,
@@ -44,6 +45,7 @@ pub(crate) struct ProjectRecord {
     pub(crate) summary: RwLock<ProjectSummary>,
     pub(crate) sidecar: RwLock<Option<ContainerHandle>>,
     pub(crate) repo_sync_lock: Mutex<()>,
+    pub(crate) review_workspace_instructions: RwLock<Option<String>>,
     pub(crate) review_worker: Mutex<Option<ProjectReviewWorker>>,
     pub(crate) review_pool: Mutex<ProjectReviewPool>,
     pub(crate) review_notify: Arc<Notify>,
@@ -57,6 +59,7 @@ impl ProjectRecord {
             summary: RwLock::new(summary),
             sidecar: RwLock::new(None),
             repo_sync_lock: Mutex::new(()),
+            review_workspace_instructions: RwLock::new(None),
             review_worker: Mutex::new(None),
             review_pool: Mutex::new(ProjectReviewPool::default()),
             review_notify: Arc::new(Notify::new()),
@@ -92,15 +95,6 @@ pub(crate) struct AgentRecord {
     pub(crate) cancel_requested: AtomicBool,
     pub(crate) active_turn: TurnControlSlot,
     pub(crate) pending_inputs: Mutex<AgentInputQueue<QueuedAgentInput>>,
-}
-
-pub(crate) type TurnControl = ActiveTurnControl<TurnId, SessionId>;
-pub(crate) type TurnControlSlot = ActiveTurnSlot<TurnId, SessionId>;
-
-#[derive(Clone)]
-pub(crate) struct TurnGuard {
-    pub(crate) current_turn: AgentTurnCurrentGuard<TurnId>,
-    pub(crate) cancellation_token: CancellationToken,
 }
 
 #[derive(Clone)]

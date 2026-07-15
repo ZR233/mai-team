@@ -60,10 +60,9 @@ pub use model_profile::{
 };
 pub use model_projection::{completion_response_to_model_response, completion_response_usage};
 use pl_core::{
-    AgentTurnStatusGuard, AgentTurnStatusOutcome, AgentTurnStatusTransition, GIT_TOKEN_ENV,
-    ensure_turn_not_cancelled, git_shell_credential_prelude, git_shell_retry_function,
-    shell_quote_word,
+    GIT_TOKEN_ENV, git_shell_credential_prelude, git_shell_retry_function, shell_quote_word,
 };
+use projects::instructions::ProjectInstructionSourceFile;
 use projects::review::ProjectReviewCycleResult;
 use projects::review::pool::{ProjectReviewPoolEnqueueSummary, ProjectReviewSignalInput};
 use projects::review::relay_queue::{
@@ -774,7 +773,7 @@ impl AgentRuntime {
             self.shutdown_project_mcp_manager(project_id).await;
             self.sync_project_cache_repo(project_id).await?;
             let _ = self
-                .refresh_project_skills_from_agent_workspace(project_id)
+                .refresh_project_review_context_from_default_branch(project_id)
                 .await;
             self.events
                 .publish(ServiceEventKind::ProjectUpdated { project: summary })
@@ -1933,20 +1932,12 @@ impl AgentRuntime {
     ) -> Result<()> {
         let agent_id = {
             let mut summary = agent.summary.write().await;
-            let guard = if enforce_current_turn {
-                AgentTurnStatusGuard::EnforceCurrent
-            } else {
-                AgentTurnStatusGuard::AllowStale
-            };
-            let transition = AgentTurnStatusTransition::new(turn_id, status.clone(), now(), guard);
-            match transition.evaluate_with_token(cancellation_token, summary.current_turn.as_ref())
-            {
-                AgentTurnStatusOutcome::Applied(mutation) => {
-                    summary.status = mutation.status;
-                    summary.updated_at = mutation.updated_at;
-                }
-                AgentTurnStatusOutcome::Cancelled => return Err(RuntimeError::TurnCancelled),
+            turn::control::ensure_not_cancelled(cancellation_token)?;
+            if enforce_current_turn && summary.current_turn != Some(turn_id) {
+                return Err(RuntimeError::TurnCancelled);
             }
+            summary.status = status.clone();
+            summary.updated_at = now();
             summary.id
         };
         self.persist_agent(agent).await?;
@@ -2016,9 +2007,14 @@ impl AgentRuntime {
     }
 
     async fn refresh_project_skills_for_agent(&self, agent: &AgentRecord) -> Result<()> {
-        let Some(project_id) = agent.summary.read().await.project_id else {
+        let summary = agent.summary.read().await;
+        if summary.role == Some(AgentRole::Reviewer) {
+            return Ok(());
+        }
+        let Some(project_id) = summary.project_id else {
             return Ok(());
         };
+        drop(summary);
         self.refresh_project_skills_from_project_sidecar_if_ready(project_id)
             .await
     }
@@ -2118,7 +2114,7 @@ impl AgentRuntime {
         .await
     }
 
-    async fn refresh_project_skills_from_agent_workspace(
+    async fn refresh_project_review_context_from_default_branch(
         &self,
         project_id: ProjectId,
     ) -> Result<()> {
@@ -2128,7 +2124,31 @@ impl AgentRuntime {
             project_id,
             summary.maintainer_agent_id,
         )
-        .await
+        .await?;
+        let instructions = self
+            .project_workspace_instructions_from_agent_workspace(
+                project_id,
+                summary.maintainer_agent_id,
+            )
+            .await?;
+        *project.review_workspace_instructions.write().await = Some(instructions);
+        Ok(())
+    }
+
+    async fn project_review_workspace_instructions_for_agent(
+        &self,
+        agent: &AgentRecord,
+    ) -> Result<Option<String>> {
+        let summary = agent.summary.read().await;
+        if summary.role != Some(AgentRole::Reviewer) {
+            return Ok(None);
+        }
+        let Some(project_id) = summary.project_id else {
+            return Ok(None);
+        };
+        drop(summary);
+        let project = self.project(project_id).await?;
+        Ok(project.review_workspace_instructions.read().await.clone())
     }
 
     fn project_skill_cache_dir(&self, project_id: ProjectId) -> PathBuf {
@@ -2236,6 +2256,94 @@ impl AgentRuntime {
                 .map_err(|err| {
                     RuntimeError::InvalidInput(format!(
                         "failed to copy project skill source from workspace volume: {err}"
+                    ))
+                })?;
+            source.host_path = Some(target);
+        }
+        Ok(sources)
+    }
+
+    async fn project_workspace_instructions_from_agent_workspace(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+    ) -> Result<String> {
+        let stage_root = self
+            .cache_root
+            .join("project-instruction-stage")
+            .join(project_id.to_string())
+            .join(Uuid::new_v4().to_string());
+        let result = async {
+            let sources = self
+                .project_instruction_sources_from_agent_workspace(project_id, agent_id, &stage_root)
+                .await?;
+            if sources.is_empty() {
+                return Ok(String::new());
+            }
+            projects::instructions::load_workspace_instructions(&stage_root)
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&stage_root);
+        result
+    }
+
+    async fn project_instruction_sources_from_agent_workspace(
+        &self,
+        project_id: ProjectId,
+        agent_id: AgentId,
+        stage_root: &Path,
+    ) -> Result<Vec<ProjectInstructionSourceFile>> {
+        let workspace_volume =
+            project_agent_workspace_volume(&project_id.to_string(), &agent_id.to_string());
+        let command = projects::instructions::detect_existing_files_command();
+        let sidecar_name = format!(
+            "mai-tool-instruction-detect-{project_id}-{}",
+            Uuid::new_v4()
+        );
+        let output = self
+            .deps
+            .docker
+            .run_sidecar_shell_env(&SidecarParams {
+                name: &sidecar_name,
+                image: &self.sidecar_image,
+                command: &command,
+                args: &[],
+                cwd: None,
+                env: &[],
+                workspace_volume: Some(&workspace_volume),
+                mounts: &[],
+                timeout_secs: Some(120),
+            })
+            .await?;
+        if output.status != 0 {
+            let message = preview(format!("{}{}", output.stdout, output.stderr).trim(), 500);
+            return Err(RuntimeError::InvalidInput(format!(
+                "project instruction discovery sidecar failed: {message}"
+            )));
+        }
+
+        let mut sources = projects::instructions::detected_files_from_stdout(&output.stdout)?;
+        if sources.is_empty() {
+            return Ok(sources);
+        }
+
+        std::fs::create_dir_all(stage_root)?;
+        for source in &mut sources {
+            let target = stage_root.join(&source.file_name);
+            let copy_name = format!("mai-tool-instruction-copy-{project_id}-{}", Uuid::new_v4());
+            self.deps
+                .docker
+                .copy_from_workspace_volume_to_file(
+                    &copy_name,
+                    &self.sidecar_image,
+                    &workspace_volume,
+                    &source.container_path,
+                    &target,
+                )
+                .await
+                .map_err(|err| {
+                    RuntimeError::InvalidInput(format!(
+                        "failed to copy project instruction source from workspace volume: {err}"
                     ))
                 })?;
             source.host_path = Some(target);
@@ -2763,8 +2871,7 @@ impl AgentRuntime {
         _session_id: SessionId,
         cancellation_token: &CancellationToken,
     ) -> Result<()> {
-        ensure_turn_not_cancelled(cancellation_token)
-            .map_err(turn::core_adapter::runtime_error_from_pl_turn)?;
+        turn::control::ensure_not_cancelled(cancellation_token)?;
         if agent.summary.read().await.project_id.is_none() {
             return Ok(());
         }
@@ -3660,11 +3767,11 @@ impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
         AgentRuntime::sync_project_cache_repo(self.as_ref(), project_id)
     }
 
-    fn refresh_project_skills_from_agent_workspace(
+    fn refresh_project_review_context_from_default_branch(
         &self,
         project_id: ProjectId,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        AgentRuntime::refresh_project_skills_from_agent_workspace(self.as_ref(), project_id)
+        AgentRuntime::refresh_project_review_context_from_default_branch(self.as_ref(), project_id)
     }
 
     fn spawn_project_reviewer_agent(

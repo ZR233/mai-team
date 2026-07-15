@@ -5,7 +5,6 @@ use std::sync::Arc;
 use crate::mcp::McpAgentManager;
 use mai_docker::ContainerHandle;
 use mai_protocol::{AgentId, AgentStatus, McpServerConfig, McpStartupStatus, TurnId, now};
-use pl_core::{AgentTurnCurrentGuard, AgentTurnCurrentOutcome};
 use tokio_util::sync::CancellationToken;
 
 use crate::state::{AgentRecord, TurnGuard};
@@ -96,16 +95,10 @@ pub(crate) async fn ensure_agent_container_for_turn(
     cancellation_token: &CancellationToken,
 ) -> Result<String> {
     let current_turn = agent.summary.read().await.current_turn;
-    let current_turn_guard = AgentTurnCurrentGuard::new(turn_id);
+    let turn_guard = TurnGuard::new(turn_id, cancellation_token.clone());
     let guarded_turn = current_turn.as_ref().or(Some(&turn_id));
-    match current_turn_guard.evaluate_with_token(cancellation_token, guarded_turn) {
-        AgentTurnCurrentOutcome::Current => {}
-        AgentTurnCurrentOutcome::Interrupted => return Err(RuntimeError::TurnCancelled),
-    }
-    let turn_guard = (current_turn == Some(turn_id)).then(|| TurnGuard {
-        current_turn: current_turn_guard,
-        cancellation_token: cancellation_token.clone(),
-    });
+    turn_guard.ensure_current(guarded_turn)?;
+    let turn_guard = (current_turn == Some(turn_id)).then_some(turn_guard);
     let container_id = ensure_agent_container_with_source(
         ops,
         agent,
@@ -115,16 +108,15 @@ pub(crate) async fn ensure_agent_container_for_turn(
     )
     .await?;
     let current_turn = agent.summary.read().await.current_turn;
-    let current_turn_guard = AgentTurnCurrentGuard::new(turn_id);
     let guarded_turn = current_turn.as_ref().or(Some(&turn_id));
-    match current_turn_guard.evaluate_with_token(cancellation_token, guarded_turn) {
-        AgentTurnCurrentOutcome::Current => {}
-        AgentTurnCurrentOutcome::Interrupted => {
-            if let Some(manager) = agent.mcp.write().await.take() {
-                manager.shutdown().await;
-            }
-            return Err(RuntimeError::TurnCancelled);
+    if TurnGuard::new(turn_id, cancellation_token.clone())
+        .ensure_current(guarded_turn)
+        .is_err()
+    {
+        if let Some(manager) = agent.mcp.write().await.take() {
+            manager.shutdown().await;
         }
+        return Err(RuntimeError::TurnCancelled);
     }
     let needs_status_restore = agent.summary.read().await.status != ready_status;
     if needs_status_restore {
@@ -297,11 +289,5 @@ async fn set_status(
 
 async fn ensure_turn_current(agent: &AgentRecord, guard: &TurnGuard) -> Result<()> {
     let current_turn = agent.summary.read().await.current_turn;
-    match guard
-        .current_turn
-        .evaluate_with_token(&guard.cancellation_token, current_turn.as_ref())
-    {
-        AgentTurnCurrentOutcome::Current => Ok(()),
-        AgentTurnCurrentOutcome::Interrupted => Err(RuntimeError::TurnCancelled),
-    }
+    guard.ensure_current(current_turn.as_ref())
 }

@@ -1,15 +1,12 @@
 use std::sync::Arc;
 
-use mai_protocol::{AgentId, AgentStatus, ServiceEventKind, SessionId, TurnId, TurnStatus};
-use pl_core::{
-    AgentKernel, CoreAgentProfile, PureCoreBuilder, ToolVisibilitySet, TurnOutcomeStatus,
-    TurnReturnError,
-};
+use mai_protocol::{AgentId, ServiceEventKind, SessionId, TurnId};
+use pl_core::{AgentKernel, CoreAgentProfile, PureCoreBuilder, ToolVisibilitySet};
 use pl_model::ToolSchema;
 use tokio_util::sync::CancellationToken;
 
 use crate::state::AgentRecord;
-use crate::{AgentRuntime, Result, RuntimeError};
+use crate::{AgentRuntime, Result};
 
 pub(crate) struct PureCoreTurnContext {
     pub(crate) runtime: Arc<AgentRuntime>,
@@ -21,6 +18,7 @@ pub(crate) struct PureCoreTurnContext {
     pub(crate) provider_selection: mai_store::ProviderSelection,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) instructions: String,
+    pub(crate) workspace_instructions: Option<String>,
     pub(crate) visible_tool_names: ToolVisibilitySet,
     pub(crate) product_tools: Vec<ToolSchema>,
     pub(crate) mcp_tool_schemas: Vec<ToolSchema>,
@@ -49,21 +47,6 @@ pub(crate) struct MaiAgentKernelBuildContext {
 
 pub(crate) async fn run_pure_core_turn(ctx: PureCoreTurnContext) -> Result<()> {
     super::hosted_runtime::run_hosted_agent_turn(ctx).await
-}
-
-pub(crate) fn mai_status_from_pl_outcome(status: TurnOutcomeStatus) -> (TurnStatus, AgentStatus) {
-    match status {
-        TurnOutcomeStatus::Completed => (TurnStatus::Completed, AgentStatus::Completed),
-        TurnOutcomeStatus::Cancelled => (TurnStatus::Cancelled, AgentStatus::Cancelled),
-        TurnOutcomeStatus::Failed => (TurnStatus::Failed, AgentStatus::Failed),
-    }
-}
-
-pub(crate) fn runtime_error_from_pl_turn(error: TurnReturnError) -> RuntimeError {
-    match error {
-        TurnReturnError::Cancelled => RuntimeError::TurnCancelled,
-        TurnReturnError::Failed(message) => RuntimeError::InvalidInput(message),
-    }
 }
 
 pub(crate) fn mai_user_input_interaction_callback(
@@ -248,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_runtime_statistics_use_pl_core_snapshot() {
+    fn turn_runtime_statistics_use_latest_pl_core_result_shape() {
         let source = include_str!("hosted_runtime.rs");
         let production = source
             .split("#[cfg(test)]")
@@ -256,19 +239,12 @@ mod tests {
             .expect("production section");
 
         assert!(
-            production.contains("result.runtime_snapshot()"),
-            "usage/context/compaction 统计暴露规则应由 pl-core TurnRuntimeSnapshot 统一提供"
+            production.contains("result.context_compactions.last()")
+                && production.contains("result.last_context_tokens")
+                && production.contains("result.usage.total_tokens > 0"),
+            "usage/context/compaction 统计应适配最新 pl-core TurnResult 公开字段"
         );
-        for forbidden in [
-            "result.context_compactions.last()",
-            "result.last_context_tokens",
-            "result.usage.total_tokens > 0",
-        ] {
-            assert!(
-                !production.contains(forbidden),
-                "mai-runtime 不应直接解释 TurnResult 底层统计字段 `{forbidden}`"
-            );
-        }
+        assert!(!production.contains("result.runtime_snapshot()"));
     }
 
     #[test]

@@ -4,9 +4,7 @@ use mai_protocol::{
     GitProvider, ModelConfig, ModelReasoningConfig, ModelReasoningVariant, ProjectReviewDecision,
     ProviderConfig, ProviderKind, ProvidersConfigRequest,
 };
-use pl_core::{
-    AgentLifecycleStatusKind, AgentTurnStartReadiness, AgentTurnStartSnapshot, TurnTaskHandle,
-};
+use pl_core::{AgentLifecycleStatusKind, AgentTurnStartReadiness, AgentTurnStartSnapshot};
 use pl_protocol::{Message, MessageContent, MessageRole as PlMessageRole, ToolResultMetadata};
 use pretty_assertions::assert_eq;
 use state::TurnControl;
@@ -15,6 +13,7 @@ use std::fs;
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use turn::completion::TurnResult;
+use turn::control::TurnTaskHandle;
 
 mod project_github_tools;
 mod project_mcp;
@@ -260,17 +259,16 @@ fn skill_fragment_text_projection_uses_pl_core_message_helper() {
 }
 
 #[test]
-fn cancel_turn_uses_pl_core_cancellation_guard() {
+fn cancel_turn_keeps_product_current_and_active_guard() {
     let source = include_str!("../agents/turn.rs");
 
     assert!(
-        source.contains("AgentTurnCancellationGuard"),
-        "取消 turn 的 current/active 命中规则应由 pl-core 统一提供"
+        source.contains("current_turn != Some(turn_id) && active_turn != Some(turn_id)"),
+        "取消 turn 应同时核对持久化 current turn 与内存 active turn"
     );
     assert!(
-        !source
-            .contains("current_turn != Some(turn_id) && control.as_ref().map(|turn| turn.turn_id) != Some(turn_id)"),
-        "mai-runtime 不应手写 current_turn 与 active_turn 的重复取消判断"
+        !source.contains("AgentTurnCancellationGuard"),
+        "pl-core 收紧公开 API 后，产品 turn 状态不应再依赖已删除的通用 guard"
     );
 }
 
@@ -530,61 +528,56 @@ fn core_turn_registers_shared_tools_through_kernel_builder() {
 }
 
 #[test]
-fn core_turn_uses_pl_core_turn_outcome() {
-    let source = include_str!("../turn/hosted_runtime.rs");
+fn core_turn_projects_pl_result_at_product_boundary() {
+    let hosted_source = include_str!("../turn/hosted_runtime.rs");
+    let outcome_source = include_str!("../turn/outcome.rs");
     assert!(
-        source.contains("TurnOutcome::from_result"),
-        "主 turn 路径应复用 pl-core 的 turn outcome 归一化"
+        hosted_source.contains("CoreTurnOutcome::from_result"),
+        "主 turn 路径应通过 mai 产品边界投影 pl-core 结果"
     );
-    for forbidden in [
+    for required in [
         "TurnResultStatus::Completed",
         "TurnResultStatus::Aborted",
         "TurnResultStatus::Errored",
         "TurnAbortReason::Interrupted",
     ] {
         assert!(
-            !source.contains(forbidden),
-            "主 turn 路径不应继续本地解释 pl-core 终态 `{forbidden}`"
+            outcome_source.contains(required),
+            "产品结果投影必须穷尽处理 pl-core 终态 `{required}`"
         );
     }
 }
 
 #[test]
-fn core_turn_uses_pl_core_turn_projection_accessors() {
+fn core_turn_uses_public_pl_result_fields_after_projection_api_removal() {
     let source = include_str!("../turn/hosted_runtime.rs");
     for required in [
-        "runtime_snapshot.latest_context_compaction()",
-        "runtime_snapshot.last_context_tokens()",
-        "runtime_snapshot.usage()",
+        "result.context_compactions.last()",
+        "result.last_context_tokens",
+        "result.usage.total_tokens > 0",
         "outcome.final_text()",
-        "outcome.status()",
-        "outcome.error()",
-        "outcome.return_error()",
+        "outcome.take_return_error()",
+        "outcome.into_completion(ctx.turn_id)",
     ] {
         assert!(
             source.contains(required),
-            "主 turn 路径应通过 pl-core turn projection accessor 获取 `{required}`"
+            "主 turn 路径应使用最新 pl-core 公开结果形状 `{required}`"
         );
     }
     for forbidden in [
-        "runtime_snapshot.latest_context_compaction {",
-        "runtime_snapshot.last_context_tokens {",
-        "&runtime_snapshot.usage",
-        "&outcome.final_text",
-        "outcome.status)",
-        "final_text: outcome.final_text,",
-        "error: outcome.error,",
-        "outcome.return_error {",
+        "result.runtime_snapshot()",
+        "pl_core::TurnOutcome",
+        "TurnReturnError",
     ] {
         assert!(
             !source.contains(forbidden),
-            "mai-runtime 不应读取 pl-core turn 投影字段 `{forbidden}`"
+            "主 turn 不应继续依赖 pl-core 已删除的投影 API `{forbidden}`"
         );
     }
 }
 
 #[test]
-fn run_turn_error_completion_uses_pl_core_projection() {
+fn run_turn_error_completion_uses_product_projection() {
     let source = include_str!("../turn/orchestrator.rs");
     let run_start = source.find("pub(crate) async fn run_turn").unwrap();
     let run_end = source[run_start..]
@@ -593,23 +586,14 @@ fn run_turn_error_completion_uses_pl_core_projection() {
     let run_path = &source[run_start..run_start + run_end];
 
     assert!(
-        run_path.contains("TurnErrorProjection::from_return_error"),
-        "run_turn 外壳应复用 pl-core 的错误终止投影"
+        run_path.contains("TurnFailure::from_error"),
+        "run_turn 外壳应通过产品边界统一投影错误终态"
     );
-    for forbidden in [
-        "RuntimeError::TurnCancelled",
-        "TurnStatus::Cancelled",
-        "TurnStatus::Failed",
-    ] {
-        assert!(
-            !run_path.contains(forbidden),
-            "run_turn 外壳不应继续本地解释通用错误终态 `{forbidden}`"
-        );
-    }
+    assert!(!run_path.contains("TurnErrorProjection"));
 }
 
 #[test]
-fn run_turn_error_completion_uses_pl_core_projection_accessors() {
+fn run_turn_error_completion_uses_projection_fields() {
     let source = include_str!("../turn/orchestrator.rs");
     let run_start = source.find("pub(crate) async fn run_turn").unwrap();
     let run_end = source[run_start..]
@@ -618,41 +602,29 @@ fn run_turn_error_completion_uses_pl_core_projection_accessors() {
     let run_path = &source[run_start..run_start + run_end];
 
     for required in [
-        "projection.status()",
-        "projection.error_message()",
-        "projection.should_publish_error()",
+        "failure.turn_status",
+        "failure.agent_status",
+        "failure.error_message.clone()",
+        "failure.should_publish_error",
     ] {
         assert!(
             run_path.contains(required),
-            "run_turn 外壳应通过 pl-core 错误投影 accessor 获取 `{required}`"
-        );
-    }
-    for forbidden in [
-        "projection.status)",
-        "projection.error_message.clone()",
-        "projection.should_publish_error\n",
-        "let Some(message) = projection.error_message\n",
-    ] {
-        assert!(
-            !run_path.contains(forbidden),
-            "run_turn 外壳不应读取 TurnErrorProjection 字段 `{forbidden}`"
+            "run_turn 外壳应消费产品错误投影字段 `{required}`"
         );
     }
 }
 
 #[test]
-fn run_turn_error_classification_uses_pl_core_return_error_helper() {
-    let source = include_str!("../turn/orchestrator.rs");
-    let helper_start = source.find("fn pl_turn_return_error").unwrap();
-    let helper_end = source[helper_start..]
-        .find("fn check_turn_not_cancelled")
-        .map(|offset| helper_start + offset)
-        .unwrap();
-    let helper = &source[helper_start..helper_end];
+fn run_turn_error_classification_is_owned_by_product_projection() {
+    let source = include_str!("../turn/outcome.rs");
+    let helper = source
+        .split("impl TurnFailure")
+        .nth(1)
+        .expect("TurnFailure implementation");
 
-    assert!(helper.contains("TurnReturnError::from_host_error"));
-    assert!(helper.contains("TurnReturnErrorKind::Cancelled"));
-    assert!(helper.contains("TurnReturnErrorKind::Failed"));
+    assert!(helper.contains("RuntimeError::TurnCancelled"));
+    assert!(helper.contains("should_publish_error: false"));
+    assert!(helper.contains("should_publish_error: true"));
     for forbidden in [
         "RuntimeError::AgentNotFound",
         "RuntimeError::TaskNotFound",
@@ -663,32 +635,32 @@ fn run_turn_error_classification_uses_pl_core_return_error_helper() {
     ] {
         assert!(
             !helper.contains(forbidden),
-            "turn 错误返回分类不应在 mai-runtime 枚举 `{forbidden}`"
+            "turn 错误返回分类不应枚举无关产品错误 `{forbidden}`"
         );
     }
 }
 
 #[test]
-fn turn_orchestrator_uses_pl_core_cancellation_checkpoint() {
+fn turn_orchestrator_uses_local_cancellation_checkpoint() {
     let source = include_str!("../turn/orchestrator.rs");
 
     assert!(
-        source.contains("ensure_turn_not_cancelled"),
-        "turn 编排中的取消 checkpoint 应由 pl-core 统一投影为 TurnReturnError"
+        source.contains("ensure_not_cancelled"),
+        "turn 编排中的取消 checkpoint 应复用 mai-runtime turn control"
     );
     assert!(
         !source.contains("cancellation_token.is_cancelled()"),
-        "mai-runtime 不应直接解释 CancellationToken 的 turn cancelled 语义"
+        "取消 token 的产品错误映射应集中在 turn control"
     );
 }
 
 #[test]
-fn container_turn_current_checks_use_pl_core_token_guard() {
+fn container_turn_current_checks_use_local_token_guard() {
     let source = include_str!("../agents/container.rs");
 
     assert!(
-        source.contains("evaluate_with_token"),
-        "container 准备流程应复用 pl-core 的当前 turn + token 判断"
+        source.contains("TurnGuard::new") && source.contains(".ensure_current("),
+        "container 准备流程应复用 mai-runtime 的当前 turn + token 判断"
     );
     for forbidden in [
         "cancellation_token.is_cancelled()",
@@ -697,21 +669,21 @@ fn container_turn_current_checks_use_pl_core_token_guard() {
     ] {
         assert!(
             !source.contains(forbidden),
-            "container 准备流程不应继续本地解释 turn 当前性 `{forbidden}`"
+            "container 准备流程不应分散解释 turn 当前性 `{forbidden}`"
         );
     }
 }
 
 #[test]
-fn set_turn_status_uses_pl_core_token_transition() {
+fn set_turn_status_uses_local_cancellation_checkpoint() {
     let source = include_str!("../lib.rs");
     let start = source.find("async fn set_turn_status(").unwrap();
     let end = source[start..].find("async fn persist_agent").unwrap();
     let body = &source[start..start + end];
 
     assert!(
-        body.contains("evaluate_with_token"),
-        "set_turn_status 应复用 pl-core 的 token-aware turn status transition"
+        body.contains("turn::control::ensure_not_cancelled"),
+        "set_turn_status 应复用 mai-runtime 的 token-aware turn control"
     );
     assert!(
         !body.contains("cancellation_token.is_cancelled()"),
@@ -720,7 +692,7 @@ fn set_turn_status_uses_pl_core_token_transition() {
 }
 
 #[test]
-fn project_mcp_cancellation_uses_pl_core_checkpoint() {
+fn project_mcp_cancellation_uses_local_checkpoint() {
     let runtime_source = include_str!("../lib.rs");
     let start = runtime_source
         .find("async fn inject_project_mcp_tools(")
@@ -736,8 +708,8 @@ fn project_mcp_cancellation_uses_pl_core_checkpoint() {
         ("ensure_project_mcp_inner_manager", manager_source),
     ] {
         assert!(
-            source.contains("ensure_turn_not_cancelled"),
-            "{name} 应复用 pl-core 的取消 checkpoint"
+            source.contains("ensure_not_cancelled"),
+            "{name} 应复用 mai-runtime 的取消 checkpoint"
         );
         assert!(
             !source.contains("cancellation_token.is_cancelled()"),
@@ -2316,6 +2288,23 @@ fn write_workspace_project_skill(
     skill
 }
 
+fn write_workspace_project_instructions(
+    dir: &tempfile::TempDir,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    file_name: &str,
+    contents: &str,
+) -> PathBuf {
+    let repo_path = ensure_project_clone(dir, project_id, agent_id);
+    let path = repo_path.join(file_name);
+    fs::write(&path, contents).expect("write workspace instructions");
+    let sidecar_workspace = fake_sidecar_workspace_path(dir);
+    fs::create_dir_all(&sidecar_workspace).expect("mkdir sidecar workspace");
+    fs::write(sidecar_workspace.join(file_name), contents)
+        .expect("write sidecar workspace instructions");
+    path
+}
+
 fn seed_project_workspace_volumes(
     dir: &tempfile::TempDir,
     project_id: ProjectId,
@@ -2650,6 +2639,15 @@ fn fake_docker_path(dir: &tempfile::TempDir) -> String {
 	      [ -d "$WORKSPACE/.claude/skills" ] && printf '%s\t%s\t%s\n' ".claude/skills" "claude" "/workspace/repo/.claude/skills"
 	      [ -d "$WORKSPACE/.agents/skills" ] && printf '%s\t%s\t%s\n' ".agents/skills" "agents" "/workspace/repo/.agents/skills"
 	      [ -d "$WORKSPACE/skills" ] && printf '%s\t%s\t%s\n' "skills" "skills" "/workspace/repo/skills"
+	    fi
+	    if printf '%s' "$command" | grep -q "/workspace/repo/AGENTS"; then
+	      if [ -f "$WORKSPACE/AGENTS.override.md" ]; then
+	        printf '%s\t%s\n' "AGENTS.override.md" "/workspace/repo/AGENTS.override.md"
+	      elif [ -f "$WORKSPACE/AGENTS.md" ]; then
+	        printf '%s\t%s\n' "AGENTS.md" "/workspace/repo/AGENTS.md"
+	      elif [ -f "$WORKSPACE/Agents.md" ]; then
+	        printf '%s\t%s\n' "Agents.md" "/workspace/repo/Agents.md"
+	      fi
 	    fi
 	    if printf '%s' "$command" | grep -q "fetch --prune origin"; then
 	      echo "review-sync" >> "$LOG"
@@ -9845,7 +9843,7 @@ async fn auto_review_refreshes_project_skills_from_synced_default_branch() {
         "New review body.",
     );
     runtime
-        .refresh_project_skills_from_agent_workspace(project_id)
+        .refresh_project_review_context_from_default_branch(project_id)
         .await
         .expect("refresh review skills");
 
@@ -9987,6 +9985,161 @@ async fn project_reviewer_instructions_include_extra_prompt_project_skill() {
         docker_log.contains("cp")
             && docker_log.contains("/tmp/.mai-team/skills/project/review-single-pr")
     );
+}
+
+#[tokio::test]
+async fn project_reviewer_uses_default_branch_agents_and_skills_after_pr_checkout_changes() {
+    let (base_url, requests) = start_mock_responses(vec![json!({
+        "id": "review-default-context",
+        "output": [{
+            "type": "message",
+            "content": [{ "type": "output_text", "text": "{\"outcome\":\"failed\",\"review_event\":null,\"pr\":42,\"summary\":\"done\",\"error\":\"stop\"}" }]
+        }],
+        "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+    })])
+    .await;
+    let dir = tempdir().expect("tempdir");
+    let store = test_store(&dir).await;
+    store
+        .save_providers(ProvidersConfigRequest {
+            providers: vec![compact_test_provider(base_url)],
+            default_provider_id: Some("mock".to_string()),
+        })
+        .await
+        .expect("save providers");
+    let project_id = Uuid::new_v4();
+    let maintainer_id = Uuid::new_v4();
+    let reviewer_id = Uuid::new_v4();
+    let mut maintainer = test_agent_summary(maintainer_id, Some("maintainer-container"));
+    maintainer.project_id = Some(project_id);
+    maintainer.role = Some(AgentRole::Planner);
+    let mut reviewer = test_agent_summary_with_parent(
+        reviewer_id,
+        Some(maintainer_id),
+        Some("reviewer-container"),
+    );
+    reviewer.project_id = Some(project_id);
+    reviewer.role = Some(AgentRole::Reviewer);
+    let session_id = Uuid::new_v4();
+    save_agent_with_session(&store, &maintainer).await;
+    store
+        .save_agent(&reviewer, None)
+        .await
+        .expect("save reviewer");
+    save_test_session(&store, reviewer_id, session_id).await;
+    store
+        .save_project(&ready_test_project_summary(
+            project_id,
+            maintainer_id,
+            "account-1",
+        ))
+        .await
+        .expect("save project");
+    seed_project_workspace_volumes(
+        &dir,
+        project_id,
+        &[(maintainer_id, "planner"), (reviewer_id, "reviewer")],
+    );
+    let runtime = test_runtime(&dir, Arc::clone(&store)).await;
+    runtime.state.project_mcp_managers.write().await.insert(
+        project_id,
+        projects::mcp::ProjectMcpManagerHandle::without_token_expiry(Arc::new(
+            McpAgentManager::from_tools_for_test(Vec::new()),
+        )),
+    );
+    if runtime.agent(reviewer_id).await.is_err() {
+        runtime.state.agents.write().await.insert(
+            reviewer_id,
+            Arc::new(state::AgentRecord {
+                summary: RwLock::new(reviewer),
+                sessions: Mutex::new(vec![state::AgentSessionRecord {
+                    summary: AgentSessionSummary {
+                        id: session_id,
+                        title: "Chat 1".to_string(),
+                        created_at: now(),
+                        updated_at: now(),
+                        message_count: 0,
+                        token_usage: TokenUsage::default(),
+                    },
+                    messages: Vec::new(),
+                    last_context_tokens: None,
+                    last_turn_response: None,
+                }]),
+                container: RwLock::new(None),
+                mcp: RwLock::new(None),
+                system_prompt: None,
+                turn_lock: Mutex::new(()),
+                cancel_requested: std::sync::atomic::AtomicBool::new(false),
+                active_turn: state::TurnControlSlot::new(),
+                pending_inputs: Mutex::new(pl_core::AgentInputQueue::new()),
+            }),
+        );
+    }
+    let reviewer_record = runtime.agent(reviewer_id).await.expect("reviewer");
+    *reviewer_record.container.write().await = Some(ContainerHandle {
+        id: "reviewer-container".to_string(),
+        name: "reviewer".to_string(),
+        image: "unused".to_string(),
+    });
+    write_workspace_project_instructions(
+        &dir,
+        project_id,
+        maintainer_id,
+        "AGENTS.md",
+        "Default branch AGENTS instructions.",
+    );
+    write_workspace_project_skill(
+        &dir,
+        project_id,
+        maintainer_id,
+        ".claude/skills",
+        "review-context-skill",
+        "Default branch review skill.",
+        "Default branch review skill body.",
+    );
+
+    runtime
+        .refresh_project_review_context_from_default_branch(project_id)
+        .await
+        .expect("refresh default branch review context");
+    write_workspace_project_instructions(
+        &dir,
+        project_id,
+        reviewer_id,
+        "AGENTS.md",
+        "PR checkout AGENTS instructions.",
+    );
+    write_workspace_project_skill(
+        &dir,
+        project_id,
+        reviewer_id,
+        ".claude/skills",
+        "review-context-skill",
+        "PR checkout review skill.",
+        "PR checkout review skill body.",
+    );
+
+    runtime
+        .run_turn_inner(
+            reviewer_id,
+            session_id,
+            Uuid::new_v4(),
+            "review PR #42 with review-context-skill".to_string(),
+            vec!["review-context-skill".to_string()],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn");
+
+    let requests = requests.lock().await.clone();
+    let request_text = serde_json::to_string(&requests[0]).expect("request json");
+    assert!(request_text.contains("Default branch AGENTS instructions."));
+    assert!(request_text.contains("Default branch review skill."));
+    assert!(request_text.contains("Default branch review skill body."));
+    assert!(!request_text.contains("PR checkout AGENTS instructions."));
+    assert!(!request_text.contains("PR checkout review skill."));
+    assert!(!request_text.contains("PR checkout review skill body."));
+    assert!(!request_text.contains(r#""role":"system""#));
 }
 
 #[tokio::test]

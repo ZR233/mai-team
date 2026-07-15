@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use crate::mcp::McpAgentManager;
 use mai_protocol::{AgentId, ProjectId, ServiceEventKind};
-use pl_core::ensure_turn_not_cancelled;
 use tokio_util::sync::CancellationToken;
 
 use crate::state::AgentRecord;
+use crate::turn::control::ensure_not_cancelled;
 use crate::{AgentRuntime, Result, RuntimeError, projects, redact_secret};
 
 impl AgentRuntime {
@@ -15,8 +15,7 @@ impl AgentRuntime {
         agent_id: AgentId,
         cancellation_token: &CancellationToken,
     ) -> Result<Option<Arc<McpAgentManager>>> {
-        ensure_turn_not_cancelled(cancellation_token)
-            .map_err(crate::turn::core_adapter::runtime_error_from_pl_turn)?;
+        ensure_not_cancelled(cancellation_token)?;
         if projects::mcp::project_mcp_configs("").is_empty() {
             return Ok(None);
         }

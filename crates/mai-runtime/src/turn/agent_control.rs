@@ -227,6 +227,10 @@ impl pl_core::AgentControlBackend for MaiAgentControlBackend {
 impl pl_core::AgentControlPolicy for MaiAgentControlPolicy {
     type Error = RuntimeError;
 
+    fn spawn_role_policy(&self) -> pl_core::AgentControlSpawnRolePolicy {
+        pl_core::AgentControlSpawnRolePolicy::HostManaged
+    }
+
     async fn check_tool(
         &self,
         kind: pl_core::AgentControlToolKind,

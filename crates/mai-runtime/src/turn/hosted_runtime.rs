@@ -5,21 +5,21 @@ use pl_core::{
     AgentKernel, CompileMode, ContextCompactionConfig, ContextCompactionReplacement,
     CoreAgentProfile, HostedAgentRunError, HostedAgentRunner, HostedAgentRuntime,
     HostedTurnCompletion, HostedTurnPreparation, HostedTurnRequest, InstructionSnapshot,
-    PureCoreBuilder, ReasoningEffort, RecentInteractionTailConfig, TurnOptions, TurnOutcome,
-    TurnRequest,
+    PureCoreBuilder, ReasoningEffort, RecentInteractionTailConfig, TurnOptions, TurnRequest,
 };
+use pl_model::OpenAiCompactionMode;
 use pl_trace::AgentEvent;
 use uuid::Uuid;
 
-use crate::turn::completion::TurnResult;
 use crate::{
     AgentRuntime, Result, RuntimeError, completion_response_usage, core_provider_for_selection,
 };
 
 use super::core_adapter::{
     MaiAgentKernelBuildContext, PureCoreTurnContext, build_mai_agent_kernel,
-    mai_status_from_pl_outcome, mai_user_input_interaction_callback, runtime_error_from_pl_turn,
+    mai_user_input_interaction_callback,
 };
+use super::outcome::CoreTurnOutcome;
 
 pub(crate) async fn run_hosted_agent_turn(ctx: PureCoreTurnContext) -> Result<()> {
     let request = HostedTurnRequest::new(ctx.session_id.to_string(), ctx.turn_id.to_string());
@@ -46,34 +46,43 @@ impl HostedAgentRuntime for MaiHostedAgentRuntime {
             let provider = core_provider_for_selection(&ctx.provider_selection)?;
             let workspace_root =
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let workspace_instructions = ctx
+                .workspace_instructions
+                .as_ref()
+                .map(|instructions| instructions.trim())
+                .filter(|instructions| !instructions.is_empty())
+                .map(ToOwned::to_owned);
+            let instructions = instructions_with_workspace_overlay(
+                &ctx.instructions,
+                workspace_instructions.as_deref(),
+            );
             let runtime_profile = CoreAgentProfile::host_provided(workspace_root)
                 .with_context_compaction(
                     ContextCompactionConfig::new(
-                        ctx.instructions.clone(),
+                        crate::COMPACT_PROMPT,
                         crate::COMPACT_PROMPT,
                         crate::COMPACT_SUMMARY_PREFIX,
                         "compact response did not include a summary",
                     )
-                    .with_replacement(
-                        ContextCompactionReplacement::RecentInteractionTail(
-                            RecentInteractionTailConfig {
-                                max_user_chars: crate::COMPACT_USER_MESSAGE_MAX_CHARS,
-                                max_assistant_chars: 8_000,
-                                max_tool_output_chars: 4_000,
-                                assistant_items: 2,
-                                tool_output_items: 3,
-                            },
-                        ),
-                    ),
+                    .with_replacement(ContextCompactionReplacement::RecentInteractionTail(
+                        RecentInteractionTailConfig {
+                            max_user_chars: crate::COMPACT_USER_MESSAGE_MAX_CHARS,
+                            max_assistant_chars: 8_000,
+                            max_tool_output_chars: 4_000,
+                            assistant_items: 2,
+                            tool_output_items: 3,
+                        },
+                    ))
+                    .with_openai_mode(OpenAiCompactionMode::Local),
                 );
             let mut builder = PureCoreBuilder::new(provider);
             if let Some(effort) = ctx.reasoning_effort.as_deref() {
                 builder = builder.with_reasoning_effort(ReasoningEffort::new(effort));
             }
             let kernel = build_mai_hosted_agent_kernel(&ctx, builder, runtime_profile).await?;
-            let turn_request = TurnRequest::new(ctx.message.clone(), CompileMode::Auto)
+            let turn_request = TurnRequest::new(ctx.message.clone(), CompileMode::Simple)
                 .with_turn_id(ctx.turn_id.to_string())
-                .with_instruction_snapshot(raw_instruction_snapshot(ctx.instructions.clone()));
+                .with_instruction_snapshot(raw_instruction_snapshot(instructions));
             let options = TurnOptions::default()
                 .with_cancellation(ctx.cancellation_token.clone())
                 .with_prompt_cache_key(format!("agent:{}:session:{}", ctx.agent_id, ctx.session_id))
@@ -174,7 +183,6 @@ async fn complete_hosted_turn(
         &result.trace_events,
     )
     .await;
-    let runtime_snapshot = result.runtime_snapshot();
     super::history::replace_session_history(
         ctx.runtime.deps.store.as_ref(),
         &ctx.agent,
@@ -183,10 +191,15 @@ async fn complete_hosted_turn(
         session.messages().to_vec(),
     )
     .await?;
-    if let Some(snapshot) = runtime_snapshot.latest_context_compaction() {
-        record_context_compacted(ctx, &snapshot.summary, snapshot.tokens_before).await;
+    if let Some(snapshot) = result.context_compactions.last() {
+        record_context_compacted(
+            ctx,
+            snapshot.summary.as_deref().unwrap_or_default(),
+            snapshot.tokens_before,
+        )
+        .await;
     }
-    if let Some(last_context_tokens) = runtime_snapshot.last_context_tokens() {
+    if let Some(last_context_tokens) = result.last_context_tokens {
         super::history::record_session_context_tokens(
             ctx.runtime.deps.store.as_ref(),
             &ctx.agent,
@@ -196,43 +209,37 @@ async fn complete_hosted_turn(
         )
         .await?;
     }
-    if let Some(usage) = runtime_snapshot.usage() {
+    if result.usage.total_tokens > 0 {
         super::accounting::record_model_usage(
             ctx.runtime.deps.store.as_ref(),
             &ctx.runtime.events,
             &ctx.agent,
             ctx.agent_id,
             ctx.session_id,
-            &completion_response_usage(usage),
+            &completion_response_usage(&result.usage),
         )
         .await?;
     }
-    let outcome = TurnOutcome::from_result(&result);
+    let mut outcome = CoreTurnOutcome::from_result(&result);
     if let Some(final_text) = outcome.final_text() {
         record_assistant_message(ctx, final_text.to_string()).await?;
     }
 
-    let (turn_status, agent_status) = mai_status_from_pl_outcome(outcome.status());
+    let return_error = outcome.take_return_error();
     super::completion::finish_turn(
         ctx.runtime.deps.store.as_ref(),
         &ctx.runtime.events,
         &ctx.agent,
         ctx.agent_id,
         ctx.session_id,
-        TurnResult {
-            turn_id: ctx.turn_id,
-            status: turn_status,
-            agent_status,
-            final_text: outcome.final_text().map(ToString::to_string),
-            error: outcome.error().map(ToString::to_string),
-        },
+        outcome.into_completion(ctx.turn_id),
     )
     .await?;
     ctx.runtime
         .start_next_queued_input_after_turn(ctx.agent_id)
         .await;
-    if let Some(error) = outcome.return_error().cloned() {
-        return Err(runtime_error_from_pl_turn(error));
+    if let Some(error) = return_error {
+        return Err(error);
     }
     Ok(())
 }
@@ -301,6 +308,13 @@ async fn record_context_compacted(ctx: &PureCoreTurnContext, summary: &str, toke
 
 fn raw_instruction_snapshot(instructions: String) -> InstructionSnapshot {
     InstructionSnapshot::profile_base_override("mai-team instructions", instructions)
+}
+
+fn instructions_with_workspace_overlay(base: &str, workspace_instructions: Option<&str>) -> String {
+    let Some(workspace_instructions) = workspace_instructions else {
+        return base.to_string();
+    };
+    format!("{base}\n\n# Project Workspace Instructions\n\n{workspace_instructions}")
 }
 
 fn todo_item_from_pl(item: pl_protocol::TodoItem) -> TodoItem {

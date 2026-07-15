@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use mai_protocol::{AgentId, AgentStatus, ServiceEventKind, SessionId, TurnId, TurnStatus, now};
 use mai_store::ConfigStore;
-use pl_core::{AgentTurnCompletionOutcome, AgentTurnCompletionTransition};
 use serde_json::json;
 
 use crate::events::RuntimeEvents;
@@ -62,22 +61,14 @@ pub(crate) async fn complete_turn_if_current(
     };
     {
         let mut summary = agent.summary.write().await;
-        let transition = AgentTurnCompletionTransition::new(
-            turn_id,
-            result.agent_status.clone(),
-            now(),
-            result.error,
-        );
-        match transition.evaluate(summary.current_turn.as_ref()) {
-            AgentTurnCompletionOutcome::Completed(mutation) => {
-                summary.status = mutation.status;
-                summary.current_turn = mutation.current_turn;
-                summary.updated_at = mutation.updated_at;
-                if let Some(error) = mutation.last_error {
-                    summary.last_error = Some(error);
-                }
-            }
-            AgentTurnCompletionOutcome::Stale => return Ok(false),
+        if summary.current_turn != Some(turn_id) {
+            return Ok(false);
+        }
+        summary.status = result.agent_status.clone();
+        summary.current_turn = None;
+        summary.updated_at = now();
+        if let Some(error) = result.error {
+            summary.last_error = Some(error);
         }
     }
     {

@@ -107,6 +107,13 @@ impl turn::orchestrator::TurnOrchestratorOps for Arc<AgentRuntime> {
         .await
     }
 
+    async fn workspace_instructions_for_agent(
+        &self,
+        agent: &AgentRecord,
+    ) -> Result<Option<String>> {
+        AgentRuntime::project_review_workspace_instructions_for_agent(self.as_ref(), agent).await
+    }
+
     async fn set_turn_status(
         &self,
         agent: &Arc<AgentRecord>,
