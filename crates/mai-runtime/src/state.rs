@@ -1,21 +1,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use crate::mcp::McpAgentManager;
 use mai_docker::ContainerHandle;
 use mai_protocol::{
-    AgentId, AgentMessage, AgentSessionSummary, AgentSummary, ArtifactInfo, PlanHistoryEntry,
-    ProjectId, ProjectSummary, SessionId, TaskId, TaskPlan, TaskReview, TaskSummary,
+    AgentId, AgentSummary, ArtifactInfo, PlanHistoryEntry, ProjectId, ProjectSummary, TaskId,
+    TaskPlan, TaskReview, TaskSummary,
 };
-use pl_core::AgentInputQueue;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::projects::mcp::ProjectMcpManagerHandle;
+use crate::projects::review::context::ProjectReviewContext;
 use crate::projects::review::pool::ProjectReviewPool;
 use crate::projects::review::relay_queue::ProjectReviewRelayQueue;
-pub(crate) use crate::turn::control::{TurnControl, TurnControlSlot, TurnGuard};
 
 pub(crate) struct RuntimeState {
     pub(crate) agents: RwLock<HashMap<AgentId, Arc<AgentRecord>>>,
@@ -45,7 +43,7 @@ pub(crate) struct ProjectRecord {
     pub(crate) summary: RwLock<ProjectSummary>,
     pub(crate) sidecar: RwLock<Option<ContainerHandle>>,
     pub(crate) repo_sync_lock: Mutex<()>,
-    pub(crate) review_workspace_instructions: RwLock<Option<String>>,
+    pub(crate) review_cycle_lock: Mutex<()>,
     pub(crate) review_worker: Mutex<Option<ProjectReviewWorker>>,
     pub(crate) review_pool: Mutex<ProjectReviewPool>,
     pub(crate) review_notify: Arc<Notify>,
@@ -59,7 +57,7 @@ impl ProjectRecord {
             summary: RwLock::new(summary),
             sidecar: RwLock::new(None),
             repo_sync_lock: Mutex::new(()),
-            review_workspace_instructions: RwLock::new(None),
+            review_cycle_lock: Mutex::new(()),
             review_worker: Mutex::new(None),
             review_pool: Mutex::new(ProjectReviewPool::default()),
             review_notify: Arc::new(Notify::new()),
@@ -73,7 +71,7 @@ pub(crate) struct ProjectReviewWorker {
     pub(crate) cancellation_token: CancellationToken,
     pub(crate) pool_abort_handle: futures::future::AbortHandle,
     pub(crate) selector_abort_handle: Option<futures::future::AbortHandle>,
-    pub(crate) relay_selector_abort_handle: futures::future::AbortHandle,
+    pub(crate) relay_selector_abort_handle: Option<futures::future::AbortHandle>,
 }
 
 pub(crate) struct TaskRecord {
@@ -86,34 +84,10 @@ pub(crate) struct TaskRecord {
 }
 
 pub(crate) struct AgentRecord {
+    pub(crate) runtime_agent_id: RwLock<pl_core::AgentId>,
     pub(crate) summary: RwLock<AgentSummary>,
-    pub(crate) sessions: Mutex<Vec<AgentSessionRecord>>,
     pub(crate) container: RwLock<Option<ContainerHandle>>,
     pub(crate) mcp: RwLock<Option<Arc<McpAgentManager>>>,
+    pub(crate) review_context: RwLock<Option<Arc<ProjectReviewContext>>>,
     pub(crate) system_prompt: Option<String>,
-    pub(crate) turn_lock: Mutex<()>,
-    pub(crate) cancel_requested: AtomicBool,
-    pub(crate) active_turn: TurnControlSlot,
-    pub(crate) pending_inputs: Mutex<AgentInputQueue<QueuedAgentInput>>,
-}
-
-#[derive(Clone)]
-pub(crate) struct AgentSessionRecord {
-    pub(crate) summary: AgentSessionSummary,
-    pub(crate) messages: Vec<AgentMessage>,
-    pub(crate) last_context_tokens: Option<u64>,
-    pub(crate) last_turn_response: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct QueuedAgentInput {
-    pub(crate) session_id: Option<SessionId>,
-    pub(crate) message: String,
-    pub(crate) skill_mentions: Vec<String>,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct CollabInput {
-    pub(crate) message: Option<String>,
-    pub(crate) skill_mentions: Vec<String>,
 }

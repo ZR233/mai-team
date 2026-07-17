@@ -17,12 +17,16 @@ pub(crate) mod lease;
 pub(crate) mod manager;
 pub(crate) mod paths;
 pub(crate) mod reconcile;
+pub(crate) mod repository;
 
 pub(crate) use manager::{
     AGENT_WORKSPACE_REPO_PATH, LocalProjectWorkspaceManager, ProjectWorkspaceManager,
 };
 #[cfg(test)]
 pub(crate) use paths::{agent_clone_path, project_repo_cache_path};
+pub(crate) use repository::{
+    ProjectRepositoryReviewTarget, ProjectRepositoryRevision, ProjectRepositorySyncTarget,
+};
 
 pub(crate) fn delete_project_workspace(projects_root: &Path, project_id: ProjectId) -> Result<()> {
     let _ = std::fs::remove_dir_all(paths::project_dir(projects_root, project_id));
@@ -96,7 +100,19 @@ async fn run_git(
     } else {
         command.env_remove(GIT_TOKEN_ENV);
     }
-    let output = command.output().await?;
+    let mut executable_busy_retries = 0;
+    let output = loop {
+        match command.output().await {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && executable_busy_retries < 3 =>
+            {
+                executable_busy_retries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            result => break result?,
+        }
+    };
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if output.status.success() {

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mai_protocol::{AgentId, ServiceEvent, ServiceEventKind, SessionId, now};
-use mai_store::ConfigStore;
+use mai_store::MaiStore;
 use tokio::sync::{Mutex, broadcast};
 
 pub(crate) const RECENT_EVENT_LIMIT: usize = 500;
@@ -12,12 +12,12 @@ pub(crate) struct RuntimeEvents {
     tx: broadcast::Sender<ServiceEvent>,
     sequence: AtomicU64,
     recent: Mutex<VecDeque<ServiceEvent>>,
-    store: Arc<ConfigStore>,
+    store: Arc<MaiStore>,
 }
 
 impl RuntimeEvents {
     pub(crate) fn new(
-        store: Arc<ConfigStore>,
+        store: Arc<MaiStore>,
         next_sequence: u64,
         recent_events: Vec<ServiceEvent>,
     ) -> Self {
@@ -53,15 +53,6 @@ impl RuntimeEvents {
             recent.push_back(event.clone());
         }
         let _ = self.tx.send(event);
-    }
-
-    pub(crate) async fn for_agent(&self, agent_id: AgentId) -> Vec<ServiceEvent> {
-        let events = self.recent.lock().await;
-        events
-            .iter()
-            .filter(|event| event_agent_id(event) == Some(agent_id))
-            .cloned()
-            .collect()
     }
 
     pub(crate) async fn recent_for_agent(
@@ -137,7 +128,7 @@ pub(crate) fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         ServiceEventKind::AgentCreated { agent } | ServiceEventKind::AgentUpdated { agent } => {
             Some(agent.id)
         }
-        ServiceEventKind::AgentStatusChanged { agent_id, .. }
+        ServiceEventKind::AgentStateChanged { agent_id, .. }
         | ServiceEventKind::AgentDeleted { agent_id }
         | ServiceEventKind::TurnStarted { agent_id, .. }
         | ServiceEventKind::TurnCompleted { agent_id, .. }
@@ -182,7 +173,7 @@ mod tests {
     async fn delta_events_are_recent_and_broadcast_but_not_persisted() {
         let dir = tempdir().expect("tempdir");
         let store = Arc::new(
-            ConfigStore::open_with_config_path(
+            MaiStore::open_with_config_path(
                 dir.path().join("runtime.sqlite3"),
                 dir.path().join("config.toml"),
             )

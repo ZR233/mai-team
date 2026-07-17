@@ -103,7 +103,7 @@ pub(crate) fn create_project_sidecar_container_args(
         "-v".to_string(),
         format!("{workspace_volume}:/workspace"),
         "-w".to_string(),
-        "/workspace".to_string(),
+        "/workspace/repo".to_string(),
     ];
     apply_container_create_options(&mut args, options);
     args.extend([
@@ -292,7 +292,10 @@ mod tests {
             args.windows(2)
                 .any(|window| window == ["--network", "host"])
         );
-        assert!(args.windows(2).any(|window| window == ["-w", "/workspace"]));
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-w", "/workspace/repo"])
+        );
         assert!(
             args.windows(3)
                 .any(|window| { window == [image, "sleep", "infinity"] })

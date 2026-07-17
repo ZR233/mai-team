@@ -32,7 +32,7 @@ export function useSSE() {
     const names = [
       'agent_created',
       'agent_updated',
-      'agent_status_changed',
+      'agent_state_changed',
       'agent_deleted',
       'task_created',
       'task_updated',

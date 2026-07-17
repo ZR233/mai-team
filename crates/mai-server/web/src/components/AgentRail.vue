@@ -28,7 +28,7 @@
             <span v-if="row.is_orphan"> (detached)</span>
           </span>
         </span>
-        <span class="status-dot" :class="statusTone(row.agent.status)" :title="formatStatus(row.agent.status)" />
+        <span class="status-dot" :class="statusTone(agentDisplayStatus(row.agent))" :title="formatStatus(agentDisplayStatus(row.agent))" />
       </button>
       <div v-if="!agents.length" class="empty-rail">
         <strong>No task agents yet</strong>
@@ -42,6 +42,7 @@
 import { computed } from 'vue'
 import { initial, statusTone, formatStatus } from '../utils/format'
 import { buildAgentTreeRows } from '../utils/agentTree'
+import { agentDisplayStatus } from '../utils/agentState.js'
 
 const props = defineProps({
   agents: { type: Array, required: true },

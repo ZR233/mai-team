@@ -1,6 +1,7 @@
 import { nextTick, reactive, ref } from 'vue'
 import { useApi } from './useApi'
 import { highlightCodeBlocks } from '../utils/markdown'
+import { activeAgentTurn } from '../utils/agentState.js'
 
 const agents = ref([])
 const selectedAgentId = ref(null)
@@ -130,7 +131,7 @@ export function useAgents() {
 
   async function stopAgentTurn(agent = selectedDetail.value) {
     const agentId = agent?.id || selectedAgentId.value
-    const turnId = agent?.current_turn || selectedDetail.value?.current_turn
+    const turnId = activeAgentTurn(agent || selectedDetail.value)
     if (!agentId || !turnId) return null
     isStopping.value = true
     try {

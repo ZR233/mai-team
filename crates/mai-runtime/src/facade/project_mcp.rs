@@ -5,7 +5,7 @@ use mai_protocol::{AgentId, ProjectId, ServiceEventKind};
 use tokio_util::sync::CancellationToken;
 
 use crate::state::AgentRecord;
-use crate::turn::control::ensure_not_cancelled;
+use crate::turn::cancellation::ensure_not_cancelled;
 use crate::{AgentRuntime, Result, RuntimeError, projects, redact_secret};
 
 impl AgentRuntime {

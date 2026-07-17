@@ -1,4 +1,4 @@
-const READY_STATUSES = new Set(['idle', 'completed', 'failed', 'cancelled'])
+import { agentResourceError, agentResourceState } from './agentState.js'
 
 export function chatContainerState({
   detail = null,
@@ -20,10 +20,10 @@ export function chatContainerState({
     })
   }
 
-  const status = String(agent.status || '').toLowerCase()
+  const resource = agentResourceState(agent)
   const agentId = agent.id || 'default'
 
-  if (status === 'starting_container') {
+  if (resource === 'provisioning') {
     const detailText = agent.docker_image ? `Preparing ${agent.docker_image}` : 'Preparing environment container'
     return disabledState(detailText, {
       type: 'process',
@@ -34,19 +34,8 @@ export function chatContainerState({
     })
   }
 
-  if (status === 'created') {
-    const detailText = 'Container startup will begin shortly'
-    return disabledState(detailText, {
-      type: 'process',
-      key: `container-created-${agentId}`,
-      tone: 'muted',
-      label: 'Preparing Environment',
-      detail: detailText
-    })
-  }
-
-  if (status === 'failed' && !agent.container_id) {
-    const detailText = agent.last_error || 'Environment container failed to start'
+  if (resource === 'failed') {
+    const detailText = agentResourceError(agent) || 'Environment container failed to start'
     return disabledState(detailText, {
       type: 'process',
       key: `container-failed-${agentId}`,
@@ -56,7 +45,7 @@ export function chatContainerState({
     })
   }
 
-  if (status === 'deleting_container' || status === 'deleted') {
+  if (resource === 'deleting' || resource === 'deleted') {
     const detailText = 'Environment container is unavailable'
     return disabledState(detailText, {
       type: 'process',
@@ -65,16 +54,6 @@ export function chatContainerState({
       label: 'Container Unavailable',
       detail: detailText
     })
-  }
-
-  if (!READY_STATUSES.has(status)) {
-    const detailText = 'Agent is busy'
-    return {
-      containerReady: false,
-      composerDisabled: true,
-      disabledReason: detailText,
-      statusItem: null
-    }
   }
 
   if (!agent.container_id) {

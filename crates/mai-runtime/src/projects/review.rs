@@ -1,5 +1,5 @@
 use mai_protocol::{
-    AgentRole, AgentStatus, AgentSummary, ProjectReviewDecision, ProjectReviewOutcome,
+    AgentRole, AgentSummary, AgentTurnOutcomeKind, ProjectReviewDecision, ProjectReviewOutcome,
     ProjectReviewStatus,
 };
 use serde::Deserialize;
@@ -10,6 +10,7 @@ use crate::{Result, RuntimeError};
 
 pub(crate) mod backoff;
 pub(crate) mod cleanup;
+pub(crate) mod context;
 pub(crate) mod cycle;
 pub(crate) mod eligibility;
 pub(crate) mod pool;
@@ -21,12 +22,14 @@ pub(crate) mod selection;
 pub(crate) mod selector;
 pub(crate) mod singleton;
 pub(crate) mod state;
+pub(crate) mod target;
 pub(crate) mod worker;
 
 const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;
 const PROJECT_REVIEW_SELECTOR_INTERVAL_SECS: u64 = 1800;
 const PROJECT_REVIEW_RETRY_INITIAL_SECS: u64 = 1;
 const PROJECT_REVIEW_FAILURE_RETRY_SECS: u64 = 600;
+pub(crate) const REVIEW_TARGET_HEAD_CHANGED: &str = "review target head changed";
 
 fn project_review_retry_backoff() -> backoff::ProjectReviewRetryBackoff {
     backoff::ProjectReviewRetryBackoff::new(backoff::ProjectReviewRetryBackoffConfig {
@@ -66,7 +69,7 @@ pub(crate) struct ProjectReviewLoopDecision {
 }
 
 pub(crate) fn project_reviewer_system_prompt() -> &'static str {
-    "You are an autonomous project pull request reviewer. Review exactly one target GitHub pull request for this project, using only the Mai GitHub API tools visible in the current tool list for GitHub reads/writes and local shell commands for git/test work. The repository has already been cloned and synced at /workspace/repo, and this reviewer owns that isolated clone. Do not look for GitHub tokens in the environment or write credentials. Finish with only the required JSON object so the project scheduler can decide the next cycle."
+    "You are an autonomous project pull request reviewer. Review exactly one target GitHub pull request for this project, using only the Mai GitHub API tools visible in the current tool list for GitHub reads/writes and local shell commands for git/test work. The repository has already been cloned at /workspace/repo, verified clean, and checked out at the exact target head; this reviewer owns that isolated clone. Do not checkout another revision, look for GitHub tokens in the environment, or write credentials. Finish with only the required JSON object so the project scheduler can decide the next cycle."
 }
 
 pub(crate) fn parse_project_review_cycle_report(text: &str) -> Result<ProjectReviewCycleResult> {
@@ -266,6 +269,9 @@ pub(crate) fn project_review_error_is_retryable(error: &str) -> bool {
     ) {
         return true;
     }
+    if error.contains(REVIEW_TARGET_HEAD_CHANGED) {
+        return true;
+    }
 
     pl_core::is_retryable_model_error(error)
 }
@@ -273,16 +279,25 @@ pub(crate) fn project_review_error_is_retryable(error: &str) -> bool {
 pub(crate) fn project_review_cycle_result_for_reviewer_status(
     summary: &AgentSummary,
 ) -> Option<ProjectReviewCycleResult> {
-    if summary.status == AgentStatus::Completed {
+    let Some(last_turn) = summary.state.runtime.last_turn.as_ref() else {
+        return Some(ProjectReviewCycleResult {
+            outcome: ProjectReviewOutcome::Failed,
+            review_event: None,
+            pr: None,
+            summary: Some("Review could not be completed.".to_string()),
+            error: Some("reviewer became idle without a turn outcome".to_string()),
+        });
+    };
+    if last_turn.outcome == AgentTurnOutcomeKind::Completed {
         return None;
     }
-    let status_error = format!("reviewer ended with status {:?}", summary.status);
+    let outcome_error = format!("reviewer turn ended with outcome {:?}", last_turn.outcome);
     Some(ProjectReviewCycleResult {
         outcome: ProjectReviewOutcome::Failed,
         review_event: None,
         pr: None,
         summary: Some("Review could not be completed.".to_string()),
-        error: Some(normalize_optional_text(summary.last_error.clone()).unwrap_or(status_error)),
+        error: Some(normalize_optional_text(last_turn.reason.clone()).unwrap_or(outcome_error)),
     })
 }
 
@@ -330,9 +345,109 @@ fn github_api_path_without_query(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+pub(crate) fn validate_project_reviewer_github_api_target(
+    method: &str,
+    path: &str,
+    role: Option<&AgentRole>,
+    owner: &str,
+    repo: &str,
+) -> Result<()> {
+    if !matches!(role, Some(AgentRole::Reviewer)) {
+        return Ok(());
+    }
+    let valid = is_base_repository_api_path(path, owner, repo)
+        || is_base_repository_scoped_search(method, path, owner, repo);
+    if !valid {
+        return Err(RuntimeError::InvalidInput(format!(
+            "reviewer GitHub API request must target the project base repository `{owner}/{repo}`"
+        )));
+    }
+    Ok(())
+}
+
+fn is_base_repository_api_path(path: &str, owner: &str, repo: &str) -> bool {
+    let segments = github_api_path_without_query(path)
+        .split('/')
+        .collect::<Vec<_>>();
+    segments.len() >= 4
+        && segments[0].is_empty()
+        && segments[1] == "repos"
+        && decoded_path_segment(segments[2]).is_some_and(|value| value.eq_ignore_ascii_case(owner))
+        && decoded_path_segment(segments[3]).is_some_and(|value| value.eq_ignore_ascii_case(repo))
+}
+
+fn is_base_repository_scoped_search(method: &str, path: &str, owner: &str, repo: &str) -> bool {
+    if !method.eq_ignore_ascii_case("GET") {
+        return false;
+    }
+    let Some((search_path, query_string)) = path.split_once('?') else {
+        return false;
+    };
+    if !matches!(
+        search_path,
+        "/search/issues" | "/search/code" | "/search/commits"
+    ) {
+        return false;
+    }
+
+    let mut search_queries = query_string.split('&').filter_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        decoded_query_component(name)
+            .filter(|name| name == "q")
+            .and_then(|_| decoded_query_component(value))
+    });
+    let Some(search_query) = search_queries.next() else {
+        return false;
+    };
+    if search_queries.next().is_some() {
+        return false;
+    }
+
+    let repository_qualifiers = search_query
+        .split_whitespace()
+        .filter_map(|term| {
+            let (qualifier, repository) = term.split_once(':')?;
+            qualifier.eq_ignore_ascii_case("repo").then_some(repository)
+        })
+        .collect::<Vec<_>>();
+    let expected_repository = format!("{owner}/{repo}");
+    matches!(repository_qualifiers.as_slice(), [repository]
+        if repository.eq_ignore_ascii_case(&expected_repository))
+}
+
+fn decoded_query_component(value: &str) -> Option<String> {
+    let value = value.replace('+', " ");
+    percent_encoding::percent_decode_str(&value)
+        .decode_utf8()
+        .ok()
+        .map(|value| value.into_owned())
+}
+
+pub(crate) fn project_review_submission_pr(method: &str, path: &str) -> Option<u64> {
+    if !method.eq_ignore_ascii_case("POST") {
+        return None;
+    }
+    github_pull_request_review_path_pr(path)
+}
+
+fn github_pull_request_review_path_pr(path: &str) -> Option<u64> {
+    let segments = github_api_path_without_query(path)
+        .split('/')
+        .collect::<Vec<_>>();
+    match segments.as_slice() {
+        ["", "repos", _owner, _repo, "pulls", pr, "reviews"] => pr.parse().ok(),
+        _ => None,
+    }
+}
+
+fn decoded_path_segment(value: &str) -> Option<std::borrow::Cow<'_, str>> {
+    percent_encoding::percent_decode_str(value)
+        .decode_utf8()
+        .ok()
+}
+
 fn is_github_pull_request_review_path(method: &str, path: &str) -> bool {
-    let path = github_api_path_without_query(path);
-    method.eq_ignore_ascii_case("POST") && path.contains("/pulls/") && path.ends_with("/reviews")
+    method.eq_ignore_ascii_case("POST") && github_pull_request_review_path_pr(path).is_some()
 }
 
 fn is_github_pending_review_event_path(method: &str, path: &str) -> bool {
@@ -365,9 +480,97 @@ fn is_github_pull_request_review_comment_path(method: &str, path: &str) -> bool 
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
-    use mai_protocol::{AgentId, TokenUsage};
+    use mai_protocol::{
+        AgentId, AgentLastTurn, AgentResourceState, AgentRuntimeState, AgentState,
+        AgentTurnOutcomeKind, TokenUsage,
+    };
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn reviewer_github_paths_are_confined_to_base_repository() {
+        validate_project_reviewer_github_api_target(
+            "GET",
+            "/repos/owner/base-repo/pulls/42",
+            Some(&AgentRole::Reviewer),
+            "owner",
+            "base-repo",
+        )
+        .expect("base repository path");
+
+        let error = validate_project_reviewer_github_api_target(
+            "GET",
+            "/repos/fork-owner/base-repo/pulls/42",
+            Some(&AgentRole::Reviewer),
+            "owner",
+            "base-repo",
+        )
+        .expect_err("fork path must be rejected");
+
+        assert!(error.to_string().contains("project base repository"));
+    }
+
+    #[test]
+    fn reviewer_repository_scoped_searches_are_allowed() {
+        for path in [
+            "/search/issues?q=repo%3Aowner%2Fbase-repo+type%3Apr+is%3Aopen",
+            "/search/code?q=repo%3AOWNER%2FBASE-REPO+symbol&per_page=100",
+            "/search/commits?q=fix+repo%3Aowner%2Fbase-repo",
+        ] {
+            validate_project_reviewer_github_api_target(
+                "GET",
+                path,
+                Some(&AgentRole::Reviewer),
+                "owner",
+                "base-repo",
+            )
+            .expect("repository-scoped search");
+        }
+    }
+
+    #[test]
+    fn reviewer_searches_reject_unscoped_cross_repository_and_write_requests() {
+        for (method, path) in [
+            ("GET", "/search/issues?q=type%3Apr+is%3Aopen"),
+            (
+                "GET",
+                "/search/issues?q=repo%3Afork-owner%2Fbase-repo+type%3Apr",
+            ),
+            (
+                "GET",
+                "/search/issues?q=repo%3Aowner%2Fbase-repo+repo%3Aother%2Frepo",
+            ),
+            ("POST", "/search/issues?q=repo%3Aowner%2Fbase-repo"),
+        ] {
+            validate_project_reviewer_github_api_target(
+                method,
+                path,
+                Some(&AgentRole::Reviewer),
+                "owner",
+                "base-repo",
+            )
+            .expect_err("out-of-bound search must be rejected");
+        }
+    }
+
+    #[test]
+    fn exact_review_submission_path_yields_target_pr() {
+        assert_eq!(
+            project_review_submission_pr("POST", "/repos/owner/repo/pulls/42/reviews"),
+            Some(42)
+        );
+        assert_eq!(
+            project_review_submission_pr("GET", "/repos/owner/repo/pulls/42/reviews"),
+            None
+        );
+    }
+
+    #[test]
+    fn changed_review_head_is_retryable() {
+        assert!(project_review_error_is_retryable(
+            "invalid input: review target head changed for PR #42"
+        ));
+    }
 
     #[test]
     fn review_body_gets_model_footer() {
@@ -739,6 +942,19 @@ mod tests {
     }
 
     #[test]
+    fn responses_websocket_disconnect_is_retryable() {
+        let error = "transient model transport error: Responses WebSocket stream failed: server closed the connection";
+
+        let decision = project_review_loop_decision_for_error(error.to_string());
+
+        assert_eq!(decision.delay, Duration::from_secs(1));
+        assert_eq!(decision.status, ProjectReviewStatus::Waiting);
+        assert_eq!(decision.outcome, None);
+        assert_eq!(decision.summary, None);
+        assert_eq!(decision.error.as_deref(), Some(error));
+    }
+
+    #[test]
     fn model_response_incomplete_output_limit_is_retryable() {
         let error =
             "model error: stream error: response.incomplete event received: max_output_tokens";
@@ -836,10 +1052,12 @@ mod tests {
     }
 
     #[test]
-    fn failed_reviewer_status_becomes_failure_result() {
+    fn failed_reviewer_turn_becomes_failure_result() {
         let mut summary = test_agent_summary(Uuid::new_v4());
-        summary.status = AgentStatus::Failed;
-        summary.last_error = Some("container command timed out".to_string());
+        summary.state.runtime.last_turn = Some(test_last_turn(
+            AgentTurnOutcomeKind::Failed,
+            Some("container command timed out"),
+        ));
 
         let result = project_review_cycle_result_for_reviewer_status(&summary)
             .expect("failed reviewer should produce failed review result");
@@ -854,9 +1072,10 @@ mod tests {
     }
 
     #[test]
-    fn completed_reviewer_status_does_not_skip_final_json_parsing() {
+    fn completed_reviewer_turn_does_not_skip_final_json_parsing() {
         let mut summary = test_agent_summary(Uuid::new_v4());
-        summary.status = AgentStatus::Completed;
+        summary.state.runtime.last_turn =
+            Some(test_last_turn(AgentTurnOutcomeKind::Completed, None));
 
         assert!(project_review_cycle_result_for_reviewer_status(&summary).is_none());
     }
@@ -870,7 +1089,11 @@ mod tests {
             project_id: None,
             role: None,
             name: "reviewer".to_string(),
-            status: AgentStatus::Idle,
+            state: AgentState {
+                resource: AgentResourceState::Ready,
+                runtime: AgentRuntimeState::default(),
+                ..AgentState::default()
+            },
             container_id: None,
             docker_image: "ubuntu:latest".to_string(),
             provider_id: "mock".to_string(),
@@ -879,9 +1102,18 @@ mod tests {
             reasoning_effort: Some("medium".to_string()),
             created_at: timestamp,
             updated_at: timestamp,
-            current_turn: None,
-            last_error: None,
             token_usage: TokenUsage::default(),
+        }
+    }
+
+    fn test_last_turn(outcome: AgentTurnOutcomeKind, reason: Option<&str>) -> AgentLastTurn {
+        AgentLastTurn {
+            turn_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            outcome,
+            reason: reason.map(str::to_string),
+            usage: TokenUsage::default(),
+            finished_at: Utc::now(),
         }
     }
 }

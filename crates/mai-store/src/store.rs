@@ -1,19 +1,18 @@
-use crate::providers::ProvidersCache;
 use crate::schema::{SCHEMA_VERSION, SETTING_SCHEMA_VERSION, build_db, has_sqlite_header};
 use crate::settings::{get_setting_on, set_setting_on};
 use crate::*;
+use std::io::ErrorKind;
 use tokio::sync::Mutex;
 
-pub struct ConfigStore {
+pub struct MaiStore {
     pub(crate) path: PathBuf,
     pub(crate) config_path: PathBuf,
     pub(crate) artifact_index_dir: PathBuf,
     pub(crate) db: Db,
     pub(crate) git_accounts_lock: Mutex<()>,
-    pub(crate) providers_cache: Mutex<Option<ProvidersCache>>,
 }
 
-impl ConfigStore {
+impl MaiStore {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_config_path(path, Self::default_config_path()?).await
     }
@@ -54,7 +53,7 @@ impl ConfigStore {
         let mut was_empty =
             !path.exists() || path.metadata().is_ok_and(|metadata| metadata.len() == 0);
         if !was_empty && !has_sqlite_header(&path)? {
-            let _ = std::fs::remove_file(&path);
+            remove_database_files(&path)?;
             was_empty = true;
         }
 
@@ -69,7 +68,7 @@ impl ConfigStore {
                 .flatten();
             if current_schema_version.as_deref() != Some(SCHEMA_VERSION) {
                 drop(db);
-                let _ = std::fs::remove_file(&path);
+                remove_database_files(&path)?;
                 db = build_db(&path).await?;
                 db.push_schema().await?;
                 set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
@@ -82,7 +81,6 @@ impl ConfigStore {
             artifact_index_dir,
             db,
             git_accounts_lock: Mutex::new(()),
-            providers_cache: Mutex::new(None),
         };
         Ok(store)
     }
@@ -111,7 +109,33 @@ impl ConfigStore {
         &self.config_path
     }
 
+    /// 返回只负责 serde 配置文档 IO 的独立存储。
+    pub fn config_documents(&self) -> crate::ConfigDocumentStore {
+        crate::ConfigDocumentStore::new(self.config_path.clone())
+    }
+
     pub fn artifact_index_dir(&self) -> &Path {
         &self.artifact_index_dir
     }
+}
+
+fn remove_database_files(path: &Path) -> Result<()> {
+    for candidate in [
+        path.to_path_buf(),
+        sqlite_sidecar_path(path, "-wal"),
+        sqlite_sidecar_path(path, "-shm"),
+    ] {
+        match std::fs::remove_file(candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }

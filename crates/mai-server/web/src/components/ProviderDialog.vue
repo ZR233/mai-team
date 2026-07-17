@@ -8,28 +8,61 @@
       <div class="form-grid">
         <label>
           <span>Model Provider</span>
-          <select v-model="dialog.form.kind" @change="$emit('kind-changed', dialog.form.kind)">
-            <option value="openai">OpenAI</option>
-            <option value="deepseek">DeepSeek</option>
-            <option value="zhipu">Zhipu BigModel</option>
-            <option value="mimo-api">MiMo (API)</option>
-            <option value="mimo-token-plan">MiMo (Token Plan)</option>
+          <select v-model="dialog.form.preset_id" @change="$emit('kind-changed', dialog.form.preset_id)">
+            <option
+              v-for="preset in presets"
+              :key="preset.id"
+              :value="preset.id"
+            >
+              {{ preset.display_name }}
+            </option>
+            <option value="">Custom provider</option>
           </select>
         </label>
         <label>
           <span>Provider ID</span>
-          <input v-model.trim="dialog.form.id" placeholder="openai" />
+          <input v-model.trim="dialog.form.id" placeholder="provider-id" />
+        </label>
+        <label v-if="!dialog.form.preset_id">
+          <span>Wire Protocol</span>
+          <select v-model="dialog.form.protocol" @change="onProtocolChanged">
+            <option v-for="protocol in protocolOptions" :key="protocol.id" :value="protocol.id">
+              {{ protocol.label }}
+            </option>
+          </select>
         </label>
         <label>
           <span>Display Name</span>
-          <input v-model.trim="dialog.form.name" placeholder="OpenAI" />
+          <input v-model.trim="dialog.form.name" placeholder="Provider name" />
         </label>
         <label class="span-2">
           <span>Base URL</span>
-          <input v-model.trim="dialog.form.base_url" placeholder="https://api.openai.com/v1" />
+          <input v-model.trim="dialog.form.base_url" placeholder="https://api.example.com/v1" />
         </label>
+        <div v-if="dialog.form.connection_modes.length" class="span-2 provider-connection-field">
+          <span>Connection</span>
+          <div
+            class="segmented-control provider-connection-tabs"
+            :style="{ gridTemplateColumns: `repeat(${dialog.form.connection_modes.length}, minmax(0, 1fr))` }"
+            role="tablist"
+            aria-label="Provider connection mode"
+          >
+            <button
+              v-for="mode in dialog.form.connection_modes"
+              :key="mode.id"
+              type="button"
+              role="tab"
+              :aria-selected="dialog.form.connection_mode === mode.id"
+              :class="{ active: dialog.form.connection_mode === mode.id }"
+              :disabled="dialog.form.connection_modes.length === 1"
+              @click="dialog.form.connection_mode = mode.id"
+            >
+              {{ mode.display_name }}
+            </button>
+          </div>
+        </div>
         <label>
-          <span>API Key</span>
+          <span>{{ dialog.form.credential_label || 'API Key' }}</span>
           <input
             v-model="dialog.form.api_key"
             type="password"
@@ -38,18 +71,31 @@
         </label>
         <label>
           <span>API Key Env</span>
-          <input v-model.trim="dialog.form.api_key_env" placeholder="OPENAI_API_KEY" />
+          <input v-model.trim="dialog.form.api_key_env" placeholder="PROVIDER_API_KEY" />
         </label>
         <label>
           <span>Default Model</span>
-          <input v-model.trim="dialog.form.default_model" placeholder="gpt-5.2" />
+          <input
+            v-model.trim="dialog.form.default_model"
+            list="provider-dialog-models"
+            placeholder="Select or enter a model"
+          />
+          <datalist id="provider-dialog-models">
+            <option
+              v-for="model in dialog.form.effectiveModels"
+              :key="model.id"
+              :value="model.id"
+            >
+              {{ model.name || model.id }}
+            </option>
+          </datalist>
         </label>
         <label class="span-2">
-          <span>Models JSON</span>
+          <span>{{ dialog.form.catalog_source === 'bundled' ? 'Additional Models JSON' : 'Models JSON' }}</span>
           <textarea
             v-model="dialog.form.modelsText"
             rows="10"
-            placeholder='[{"id":"gpt-5.5","context_tokens":272000,"effective_context_window_percent":95,"output_tokens":128000}]'
+            placeholder='[{"id":"model-id","context_tokens":128000,"effective_context_window_percent":95,"output_tokens":8192}]'
           />
         </label>
         <label>
@@ -77,6 +123,8 @@
 </template>
 
 <script setup>
+import { computed } from 'vue'
+
 let backdropDown = false
 
 function onBackdropDown() {
@@ -90,9 +138,37 @@ function onBackdropUp(_event, callback) {
   }
 }
 
-defineProps({
-  dialog: { type: Object, required: true }
+const props = defineProps({
+  dialog: { type: Object, required: true },
+  presets: { type: Array, default: () => [] }
 })
 
 defineEmits(['close', 'save', 'kind-changed'])
+
+const protocolOptions = computed(() => {
+  const protocols = new Map()
+  for (const preset of props.presets) {
+    const transport = preset.transport
+    if (!transport?.protocol || protocols.has(transport.protocol)) continue
+    protocols.set(transport.protocol, {
+      id: transport.protocol,
+      label: transport.protocol
+        .replaceAll('_', ' ')
+        .replace(/\b\w/g, (letter) => letter.toUpperCase()),
+      modes: transport.connection_modes || [],
+      defaultMode: transport.connection_modes?.some((mode) => mode.id === 'http')
+        ? 'http'
+        : transport.default_connection_mode
+    })
+  }
+  return [...protocols.values()]
+})
+
+function onProtocolChanged() {
+  const protocol = protocolOptions.value.find(
+    (candidate) => candidate.id === props.dialog.form.protocol
+  )
+  props.dialog.form.connection_modes = protocol?.modes || []
+  props.dialog.form.connection_mode = protocol?.defaultMode || 'http'
+}
 </script>

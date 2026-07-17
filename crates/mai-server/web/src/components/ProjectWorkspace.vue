@@ -455,7 +455,7 @@
               </span>
               <span class="agent-meta">{{ formatStatus(agent.role) }} · {{ agent.model || 'model unset' }}</span>
             </span>
-            <span class="status-dot" :class="statusTone(agent.status)" :title="formatStatus(agent.status)" />
+            <span class="status-dot" :class="statusTone(agentDisplayStatus(agent))" :title="formatStatus(agentDisplayStatus(agent))" />
           </button>
         </div>
         <AgentDetail
@@ -508,6 +508,7 @@ import {
   projectReviewRunStatusVisible,
   statusTone
 } from '../utils/format'
+import { agentDisplayStatus, agentResourceState } from '../utils/agentState.js'
 
 const props = defineProps({
   projects: { type: Array, required: true },
@@ -632,7 +633,7 @@ const projectProgressMessage = computed(() => {
   if (!props.detail) return ''
   if (isProjectFailed.value) return 'Project setup failed.'
   if (props.detail.clone_status === 'cloning') return 'Cloning the repository into the project workspace.'
-  if (props.detail.maintainer_agent?.status === 'starting_container') return 'Starting the maintainer workspace container.'
+  if (agentResourceState(props.detail.maintainer_agent) === 'provisioning') return 'Starting the maintainer workspace container.'
   return 'Project accepted. Preparing the maintainer workspace.'
 })
 const projectSetupSteps = computed(() => {
@@ -653,7 +654,7 @@ const projectSetupSteps = computed(() => {
       id: 'workspace',
       label: 'Workspace',
       value: failed ? 'Failed' : (cloning || cloneReady ? 'Started' : 'Starting'),
-      help: detail.maintainer_agent?.status ? formatStatus(detail.maintainer_agent.status) : 'Waiting for maintainer container',
+      help: detail.maintainer_agent ? formatStatus(agentDisplayStatus(detail.maintainer_agent)) : 'Waiting for maintainer container',
       done: cloning || cloneReady,
       failed
     },

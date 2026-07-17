@@ -1,107 +1,52 @@
-use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
-use chrono::{DateTime, Utc};
-use mai_protocol::{
-    AgentDetail, AgentId, AgentMessage, AgentRole, AgentSessionSummary, AgentStatus, AgentSummary,
-    ContextUsage, MessageRole, ServiceEvent, ServiceEventKind, SessionId, TokenUsage, now,
-};
-use pl_core::{
-    AgentLifecycleStatusKind, AgentTurnPresence, AgentTurnStartSnapshot, AgentWaitSnapshot,
-};
-use pl_protocol::Message as ModelMessage;
-use serde_json::{Value, json};
-use uuid::Uuid;
+use mai_protocol::{AgentId, AgentRole, AgentSummary, now};
 
-use crate::state::{AgentRecord, AgentSessionRecord};
-use crate::{Result, RuntimeError};
+use crate::Result;
+use crate::state::AgentRecord;
 
 mod container;
 mod create;
-mod delete;
 mod files;
-mod fork;
-mod input;
 mod model;
 mod observability;
 pub(crate) mod profiles;
+mod purge;
 mod resources;
-mod spawn;
-mod turn;
 mod update;
-mod wait;
 
 pub(crate) use container::{
     AgentContainerOps, AgentContainerStartRequest, AgentContainerStatusChange,
-    AgentMcpStatusChange, ContainerSource, ensure_agent_container, ensure_agent_container_for_turn,
+    AgentMcpStatusChange, ContainerSource, ensure_agent_container,
     ensure_agent_container_with_source,
 };
 pub(crate) use create::{AgentCreateOps, CreateAgentRecordContext, create_agent_record};
-pub(crate) use delete::{
-    AgentContainerDeleteRequest, AgentDeleteOps, AgentDeleteStatusChange, delete_agent,
-};
 pub(crate) use files::{AgentFileOps, download_file_tar, upload_file};
-pub(crate) use fork::fork_agent_context;
-pub(crate) use input::{
-    SendInputRequest, send_input_to_agent, start_next_queued_input,
-    start_next_queued_input_after_turn,
-};
 pub(crate) use model::normalize_reasoning_effort;
 pub(crate) use observability::{
     AgentObservabilityOps, agent_logs, tool_output_artifact, tool_trace, tool_traces,
 };
+pub(crate) use purge::{AgentPurgeOps, purge_agent_tree};
 pub(crate) use resources::{AgentResourceBroker, AgentResourceBrokerOps, agent_resource_broker};
-pub(crate) use spawn::{
-    AgentSpawnOps, SpawnChildAgentRequest, spawn_child_agent, spawn_task_role_agent,
-};
-pub(crate) use turn::{
-    AgentCancelOps, AgentInputOps, AgentTurnTaskOps, cancel_agent, cancel_agent_turn, prepare_turn,
-    send_message, spawn_turn, start_agent_turn,
-};
 pub(crate) use update::{AgentUpdateOps, update_agent};
-pub(crate) use wait::{wait_agent, wait_agent_until_complete_with_cancel};
 
-#[async_trait::async_trait]
-pub(crate) trait AgentServiceOps: Send + Sync {
-    async fn agent(&self, agent_id: AgentId) -> Result<Arc<AgentRecord>>;
-    async fn save_agent_session(
+/// 关闭产品资源时所需的最小端口；framework 生命周期由 PL 独占。
+pub(crate) trait AgentCloseOps: Send + Sync {
+    fn agent(
         &self,
         agent_id: AgentId,
-        session: &AgentSessionSummary,
-    ) -> Result<()>;
-    async fn persist_agent(&self, agent: &AgentRecord) -> Result<()>;
-    async fn publish(&self, event: ServiceEventKind);
-    async fn recent_events_for_agent(&self, agent_id: AgentId) -> Vec<ServiceEvent>;
-    async fn provider_context_tokens(&self, provider_id: &str, model: &str) -> Option<u64>;
-    async fn resolve_session_id(
+    ) -> impl std::future::Future<Output = Result<Arc<AgentRecord>>> + Send;
+
+    fn persist_agent(
         &self,
-        agent_id: AgentId,
-        session_id: Option<SessionId>,
-    ) -> Result<SessionId>;
-    async fn replace_agent_history(
-        &self,
-        agent_id: AgentId,
-        session_id: SessionId,
-        history: &[ModelMessage],
-    ) -> Result<()>;
-    async fn append_agent_message(
-        &self,
-        agent_id: AgentId,
-        session_id: SessionId,
-        position: usize,
-        message: &AgentMessage,
-    ) -> Result<()>;
-    async fn delete_agent_containers(
+        agent: &AgentRecord,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    fn delete_agent_containers(
         &self,
         agent_id: AgentId,
         preferred_container_id: Option<String>,
-    ) -> Result<Vec<String>>;
-    async fn ensure_agent_container(
-        &self,
-        agent: &Arc<AgentRecord>,
-        status: AgentStatus,
-    ) -> Result<()>;
+    ) -> impl std::future::Future<Output = Result<Vec<String>>> + Send;
 }
 
 pub(crate) async fn list_agents(agents: Vec<Arc<AgentRecord>>) -> Vec<AgentSummary> {
@@ -113,88 +58,8 @@ pub(crate) async fn list_agents(agents: Vec<Arc<AgentRecord>>) -> Vec<AgentSumma
     summaries
 }
 
-pub(crate) async fn get_agent(
-    ops: &dyn AgentServiceOps,
-    agent_id: AgentId,
-    session_id: Option<SessionId>,
-    auto_compact_threshold_percent: u64,
-) -> Result<AgentDetail> {
+pub(crate) async fn close_agent(ops: &impl AgentCloseOps, agent_id: AgentId) -> Result<()> {
     let agent = ops.agent(agent_id).await?;
-    let summary = agent.summary.read().await.clone();
-    let (sessions, selected_session_id, context_tokens_used, messages) = {
-        let sessions = agent.sessions.lock().await;
-        let selected_session = selected_session(&sessions, session_id).ok_or_else(|| {
-            RuntimeError::SessionNotFound {
-                agent_id,
-                session_id: session_id.unwrap_or_default(),
-            }
-        })?;
-        (
-            sessions
-                .iter()
-                .map(|session| session.summary.clone())
-                .collect(),
-            selected_session.summary.id,
-            selected_session.last_context_tokens.unwrap_or_default(),
-            selected_session.messages.clone(),
-        )
-    };
-    let context_usage = ops
-        .provider_context_tokens(&summary.provider_id, &summary.model)
-        .await
-        .map(|context_tokens| ContextUsage {
-            used_tokens: context_tokens_used,
-            context_tokens,
-            threshold_percent: auto_compact_threshold_percent,
-        });
-    let recent_events = ops.recent_events_for_agent(agent_id).await;
-    Ok(AgentDetail {
-        summary,
-        sessions,
-        selected_session_id,
-        context_usage,
-        messages,
-        recent_events,
-    })
-}
-
-pub(crate) async fn create_session(
-    ops: &dyn AgentServiceOps,
-    agent_id: AgentId,
-) -> Result<AgentSessionSummary> {
-    let agent = ops.agent(agent_id).await?;
-    let summary = agent.summary.read().await;
-    if is_internal_workflow_agent(&summary) {
-        return Err(RuntimeError::InvalidInput(
-            "workflow child agents use a single internal task session".to_string(),
-        ));
-    }
-    drop(summary);
-    let session = {
-        let mut sessions = agent.sessions.lock().await;
-        let session = next_chat_session_record(sessions.len());
-        sessions.push(session.clone());
-        session.summary
-    };
-    ops.save_agent_session(agent_id, &session).await?;
-    Ok(session)
-}
-
-fn is_internal_workflow_agent(summary: &AgentSummary) -> bool {
-    summary.task_id.is_some()
-        && matches!(
-            summary.role,
-            Some(AgentRole::Explorer | AgentRole::Executor | AgentRole::Reviewer)
-        )
-}
-
-pub(crate) async fn close_agent(
-    ops: &dyn AgentServiceOps,
-    agent_id: AgentId,
-) -> Result<AgentStatus> {
-    let agent = ops.agent(agent_id).await?;
-    agent.cancel_requested.store(true, Ordering::SeqCst);
-    let previous_status = agent.summary.read().await.status.clone();
     if let Some(manager) = agent.mcp.write().await.take() {
         manager.shutdown().await;
     }
@@ -210,38 +75,11 @@ pub(crate) async fn close_agent(
         .await?;
     {
         let mut summary = agent.summary.write().await;
-        summary.status = AgentStatus::Deleted;
         summary.container_id = None;
-        summary.current_turn = None;
         summary.updated_at = now();
     }
     ops.persist_agent(&agent).await?;
-    ops.publish(ServiceEventKind::AgentStatusChanged {
-        agent_id,
-        status: AgentStatus::Deleted,
-    })
-    .await;
-    Ok(previous_status)
-}
-
-pub(crate) async fn resume_agent(
-    ops: &dyn AgentServiceOps,
-    agent_id: AgentId,
-) -> Result<AgentSummary> {
-    let agent = ops.agent(agent_id).await?;
-    {
-        let mut summary = agent.summary.write().await;
-        if summary.status == AgentStatus::Deleted {
-            summary.status = AgentStatus::Idle;
-            summary.last_error = None;
-            summary.updated_at = now();
-        }
-        summary.container_id = None;
-    }
-    ops.persist_agent(&agent).await?;
-    ops.ensure_agent_container(&agent, AgentStatus::Idle)
-        .await?;
-    Ok(agent.summary.read().await.clone())
+    Ok(())
 }
 
 pub(crate) const PLANNER_SYSTEM_PROMPT: &str = r#"You are the Planner for a Mai task. Your job is to create a decision-complete implementation plan through a structured 3-phase process. A decision-complete plan can be handed to the Executor agent and implemented without any additional design decisions.
@@ -284,15 +122,6 @@ The plan should include:
 
 Keep the plan concise and actionable. Prefer behavior-level descriptions over file-by-file inventories. Mention specific files only when needed to disambiguate a non-obvious change."#;
 
-pub(crate) fn agent_type_role(kind: pl_core::AgentControlAgentType) -> AgentRole {
-    match kind {
-        pl_core::AgentControlAgentType::Planner => AgentRole::Planner,
-        pl_core::AgentControlAgentType::Explorer => AgentRole::Explorer,
-        pl_core::AgentControlAgentType::Executor => AgentRole::Executor,
-        pl_core::AgentControlAgentType::Reviewer => AgentRole::Reviewer,
-    }
-}
-
 pub(crate) fn task_role_system_prompt(role: AgentRole) -> &'static str {
     match role {
         AgentRole::Planner => PLANNER_SYSTEM_PROMPT,
@@ -308,175 +137,6 @@ pub(crate) fn task_role_system_prompt(role: AgentRole) -> &'static str {
     }
 }
 
-pub(crate) fn initial_session_record(task_owned: bool) -> AgentSessionRecord {
-    if task_owned {
-        session_record_with_title("Task")
-    } else {
-        default_session_record()
-    }
-}
-
-pub(crate) fn default_session_record() -> AgentSessionRecord {
-    session_record_with_title("Chat 1")
-}
-
-pub(crate) fn next_chat_session_record(existing_session_count: usize) -> AgentSessionRecord {
-    session_record_with_title(&format!("Chat {}", existing_session_count + 1))
-}
-
-pub(crate) fn session_record_with_title(title: &str) -> AgentSessionRecord {
-    let now = now();
-    AgentSessionRecord {
-        summary: AgentSessionSummary {
-            id: Uuid::new_v4(),
-            title: title.to_string(),
-            created_at: now,
-            updated_at: now,
-            message_count: 0,
-            token_usage: TokenUsage::default(),
-        },
-        messages: Vec::new(),
-        last_context_tokens: None,
-        last_turn_response: None,
-    }
-}
-
 pub(crate) fn short_id(id: AgentId) -> String {
     id.to_string().chars().take(8).collect()
-}
-
-pub(crate) fn selected_session(
-    sessions: &[AgentSessionRecord],
-    session_id: Option<SessionId>,
-) -> Option<&AgentSessionRecord> {
-    if let Some(session_id) = session_id {
-        return sessions
-            .iter()
-            .find(|session| session.summary.id == session_id);
-    }
-    sessions
-        .iter()
-        .max_by(|left, right| {
-            left.summary
-                .updated_at
-                .cmp(&right.summary.updated_at)
-                .then_with(|| left.summary.created_at.cmp(&right.summary.created_at))
-        })
-        .or_else(|| sessions.first())
-}
-
-pub(crate) fn recent_messages(
-    sessions: &[AgentSessionRecord],
-    limit: usize,
-) -> (Option<SessionId>, Vec<AgentMessage>) {
-    let Some(session) = selected_session(sessions, None) else {
-        return (None, Vec::new());
-    };
-    let len = session.messages.len();
-    let start = len.saturating_sub(limit);
-    (Some(session.summary.id), session.messages[start..].to_vec())
-}
-
-pub(crate) fn last_turn_response(sessions: &[AgentSessionRecord]) -> Option<String> {
-    sessions
-        .iter()
-        .filter_map(|session| session.last_turn_response.clone())
-        .next_back()
-}
-
-pub(crate) fn is_agent_wait_complete(summary: &AgentSummary) -> bool {
-    agent_wait_snapshot(summary).is_complete()
-}
-
-pub(crate) fn is_agent_turn_start_ready(summary: &AgentSummary) -> bool {
-    is_agent_status_turn_start_ready(&summary.status)
-}
-
-pub(crate) fn is_agent_status_turn_start_ready(status: &AgentStatus) -> bool {
-    AgentTurnStartSnapshot::new(agent_lifecycle_status_kind(status)).can_start()
-}
-
-fn agent_wait_snapshot(summary: &AgentSummary) -> AgentWaitSnapshot {
-    let turn_presence = match summary.current_turn {
-        Some(_) => AgentTurnPresence::ActiveTurn,
-        None => AgentTurnPresence::NoActiveTurn,
-    };
-    AgentWaitSnapshot::new(turn_presence, agent_lifecycle_status_kind(&summary.status))
-}
-
-fn agent_lifecycle_status_kind(status: &AgentStatus) -> AgentLifecycleStatusKind {
-    match status {
-        AgentStatus::Created
-        | AgentStatus::StartingContainer
-        | AgentStatus::RunningTurn
-        | AgentStatus::WaitingTool
-        | AgentStatus::DeletingContainer => AgentLifecycleStatusKind::Active,
-        AgentStatus::Idle => AgentLifecycleStatusKind::Idle,
-        AgentStatus::Completed => AgentLifecycleStatusKind::Completed,
-        AgentStatus::Failed => AgentLifecycleStatusKind::Failed,
-        AgentStatus::Cancelled => AgentLifecycleStatusKind::Cancelled,
-        AgentStatus::Deleted => AgentLifecycleStatusKind::Deleted,
-    }
-}
-
-pub(crate) fn final_wait_response(
-    summary: &AgentSummary,
-    recent_messages: &[AgentMessage],
-    tracked_response: Option<String>,
-) -> Option<String> {
-    if !is_agent_wait_complete(summary) {
-        return None;
-    }
-    tracked_response.or_else(|| {
-        recent_messages
-            .iter()
-            .rev()
-            .find(|message| message.role == MessageRole::Assistant)
-            .map(|message| message.content.clone())
-    })
-}
-
-pub(crate) fn last_activity_at(
-    summary: &AgentSummary,
-    recent_messages: &[AgentMessage],
-    recent_events: &[ServiceEvent],
-) -> DateTime<Utc> {
-    let mut timestamp = summary.updated_at;
-    if let Some(message) = recent_messages.last() {
-        timestamp = timestamp.max(message.created_at);
-    }
-    if let Some(event) = recent_events.last() {
-        timestamp = timestamp.max(event.timestamp);
-    }
-    timestamp
-}
-
-pub(crate) fn active_tool_snapshot(recent_events: &[ServiceEvent]) -> Option<Value> {
-    let mut completed = HashSet::new();
-    for event in recent_events.iter().rev() {
-        match &event.kind {
-            ServiceEventKind::ToolCompleted { call_id, .. } => {
-                completed.insert(call_id.clone());
-            }
-            ServiceEventKind::ToolStarted {
-                turn_id,
-                call_id,
-                tool_name,
-                arguments_preview,
-                arguments,
-                ..
-            } if !completed.contains(call_id) => {
-                return Some(json!({
-                    "turn_id": turn_id,
-                    "call_id": call_id,
-                    "tool_name": tool_name,
-                    "arguments_preview": arguments_preview,
-                    "arguments": arguments,
-                    "started_at": event.timestamp,
-                }));
-            }
-            _ => {}
-        }
-    }
-    None
 }

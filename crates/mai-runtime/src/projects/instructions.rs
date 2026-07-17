@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 
 use pl_core::shell_quote_word;
 
-use crate::projects::mcp::PROJECT_WORKSPACE_PATH;
 use crate::{Result, RuntimeError};
 
 const PROJECT_INSTRUCTION_CANDIDATE_FILES: [&str; 3] =
@@ -15,11 +14,11 @@ pub(crate) struct ProjectInstructionSourceFile {
     pub(crate) host_path: Option<PathBuf>,
 }
 
-pub(crate) fn detect_existing_files_command() -> String {
+pub(crate) fn detect_existing_files_command(workspace_root: &str) -> String {
     PROJECT_INSTRUCTION_CANDIDATE_FILES
         .iter()
         .map(|file_name| {
-            let container_path = format!("{PROJECT_WORKSPACE_PATH}/{file_name}");
+            let container_path = format!("{workspace_root}/{file_name}");
             format!(
                 "if [ -f {path} ]; then printf '%s\\t%s\\n' {file_name} {path}; exit 0; fi",
                 file_name = shell_quote_word(file_name),
@@ -31,13 +30,14 @@ pub(crate) fn detect_existing_files_command() -> String {
 }
 
 pub(crate) fn detected_files_from_stdout(
+    workspace_root: &str,
     stdout: &str,
 ) -> Result<Vec<ProjectInstructionSourceFile>> {
     stdout
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(detected_file_from_line)
+        .map(|line| detected_file_from_line(workspace_root, line))
         .collect()
 }
 
@@ -49,7 +49,10 @@ pub(crate) fn load_workspace_instructions(stage_root: &Path) -> Result<String> {
     })
 }
 
-fn detected_file_from_line(line: &str) -> Result<ProjectInstructionSourceFile> {
+fn detected_file_from_line(
+    workspace_root: &str,
+    line: &str,
+) -> Result<ProjectInstructionSourceFile> {
     let parts = line.split('\t').collect::<Vec<_>>();
     let [file_name, container_path] = parts.as_slice() else {
         return Err(RuntimeError::InvalidInput(format!(
@@ -64,7 +67,7 @@ fn detected_file_from_line(line: &str) -> Result<ProjectInstructionSourceFile> {
             "unsupported project instruction source listing: {line}"
         )));
     }
-    let expected_path = format!("{PROJECT_WORKSPACE_PATH}/{file_name}");
+    let expected_path = format!("{workspace_root}/{file_name}");
     if *container_path != expected_path {
         return Err(RuntimeError::InvalidInput(format!(
             "unexpected project instruction source path: {container_path}"
@@ -85,7 +88,8 @@ mod tests {
     #[test]
     fn parses_detected_project_instruction_file() {
         let files =
-            detected_files_from_stdout("AGENTS.md\t/workspace/repo/AGENTS.md\n").expect("parse");
+            detected_files_from_stdout("/workspace/repo", "AGENTS.md\t/workspace/repo/AGENTS.md\n")
+                .expect("parse");
 
         assert_eq!(
             files,
@@ -99,8 +103,9 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_project_instruction_file() {
-        let err = detected_files_from_stdout("README.md\t/workspace/repo/README.md\n")
-            .expect_err("reject source");
+        let err =
+            detected_files_from_stdout("/workspace/repo", "README.md\t/workspace/repo/README.md\n")
+                .expect_err("reject source");
 
         assert!(
             err.to_string()

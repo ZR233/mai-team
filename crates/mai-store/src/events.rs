@@ -5,7 +5,7 @@ use rusqlite::params;
 
 const SERVICE_EVENT_SQLITE_BUSY_TIMEOUT_SECS: u64 = 30;
 
-impl ConfigStore {
+impl MaiStore {
     pub async fn append_service_event(&self, event: &ServiceEvent) -> Result<()> {
         let mut db = self.db.clone();
         Query::<List<ServiceEventRecord>>::filter(
@@ -173,7 +173,7 @@ fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
         ServiceEventKind::AgentCreated { agent } | ServiceEventKind::AgentUpdated { agent } => {
             Some(agent.id)
         }
-        ServiceEventKind::AgentStatusChanged { agent_id, .. }
+        ServiceEventKind::AgentStateChanged { agent_id, .. }
         | ServiceEventKind::AgentDeleted { agent_id }
         | ServiceEventKind::TurnStarted { agent_id, .. }
         | ServiceEventKind::TurnCompleted { agent_id, .. }

@@ -149,7 +149,11 @@ export function messageClass(role) {
 export function eventSummary(event, formatStatusFn, roleLabelFn) {
   if (event.message) return event.message
   if (event.type === 'agent_created') return `Agent created: ${event.agent?.name || event.agent?.id || ''}`
-  if (event.type === 'agent_status_changed') return `${event.agent_id} is ${formatStatusFn(event.status)}`
+  if (event.type === 'agent_state_changed') {
+    const resource = event.state?.resource || 'provisioning'
+    const activity = event.state?.runtime?.activity || 'idle'
+    return `${event.agent_id} resource=${formatStatusFn(resource)} runtime=${formatStatusFn(activity)}`
+  }
   if (event.type === 'agent_deleted') return `Agent deleted: ${event.agent_id}`
   if (event.type === 'task_created') return `Task created: ${event.task?.title || event.task?.id || ''}`
   if (event.type === 'task_updated') return `Task updated: ${event.task?.title || event.task?.id || ''}`

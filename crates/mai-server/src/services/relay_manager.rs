@@ -15,13 +15,13 @@ use tokio::sync::RwLock;
 use crate::services::relay_events;
 
 pub(crate) struct RelayManager {
-    store: Arc<mai_store::ConfigStore>,
+    store: Arc<mai_store::MaiStore>,
     runtime: Arc<RwLock<Option<Arc<AgentRuntime>>>>,
     relay: RwLock<Option<Arc<RelayClient>>>,
 }
 
 impl RelayManager {
-    pub(crate) fn new(store: Arc<mai_store::ConfigStore>) -> Arc<Self> {
+    pub(crate) fn new(store: Arc<mai_store::MaiStore>) -> Arc<Self> {
         Arc::new(Self {
             store,
             runtime: Arc::new(RwLock::new(None)),

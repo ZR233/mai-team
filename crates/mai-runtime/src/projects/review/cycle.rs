@@ -1,15 +1,18 @@
 use std::future::Future;
 
 use mai_protocol::{
-    AgentId, AgentStatus, AgentSummary, ProjectId, ProjectReviewOutcome, ProjectReviewRunDetail,
-    ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewStatus, TurnId, now,
+    AgentId, AgentSummary, AgentTurnOutcomeKind, ProjectId, ProjectReviewOutcome,
+    ProjectReviewRunDetail, ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewStatus,
+    TurnId, now,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::ProjectReviewCycleResult;
+use super::reviewer::PreparedProjectReviewer;
 use super::runs::FinishReviewRun;
 use super::state::{ReviewStateUpdate, ReviewerAgentUpdate};
+use super::target::ProjectReviewRequest;
 use crate::{Result, RuntimeError};
 
 const REVIEWER_FINAL_JSON_REPAIR_PROMPT: &str = "The previous response did not include the required final JSON object, so the project review scheduler could not record the result. Continue from the existing review state. If the GitHub review has already been submitted, do not submit a duplicate review. If it has not been submitted yet, submit it now using the available GitHub API tool. Then reply with only one JSON object matching this schema exactly and no surrounding text: {\"outcome\":\"review_submitted|failed\",\"review_event\":\"approve|request_changes|comment\"|null,\"pr\":123|null,\"summary\":\"short result\",\"error\":null|\"failure reason\"}";
@@ -48,26 +51,19 @@ pub(crate) trait ProjectReviewCycleOps: Send + Sync {
         request: FinishReviewRun,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    fn sync_project_cache_repo(
+    fn prepare_project_reviewer(
         &self,
         project_id: ProjectId,
-    ) -> impl Future<Output = Result<()>> + Send;
-
-    fn refresh_project_review_context_from_default_branch(
-        &self,
-        project_id: ProjectId,
-    ) -> impl Future<Output = Result<()>> + Send;
-
-    fn spawn_project_reviewer_agent(
-        &self,
-        project_id: ProjectId,
-    ) -> impl Future<Output = Result<AgentSummary>> + Send;
+        run_id: Uuid,
+        request: ProjectReviewRequest,
+    ) -> impl Future<Output = Result<PreparedProjectReviewer>> + Send;
 
     fn project_reviewer_initial_message(
         &self,
         project_id: ProjectId,
         reviewer_id: AgentId,
-        target_pr: Option<u64>,
+        target: super::target::ResolvedProjectReviewTarget,
+        project_revision: crate::projects::workspace::ProjectRepositoryRevision,
     ) -> impl Future<Output = Result<String>> + Send;
 
     fn start_reviewer_turn(
@@ -87,6 +83,11 @@ pub(crate) trait ProjectReviewCycleOps: Send + Sync {
         reviewer_id: AgentId,
     ) -> impl Future<Output = Result<String>> + Send;
 
+    fn reviewer_target_is_stale(
+        &self,
+        reviewer_id: AgentId,
+    ) -> impl Future<Output = Result<bool>> + Send;
+
     fn delete_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -94,9 +95,10 @@ pub(crate) async fn run_project_review_once(
     ops: &impl ProjectReviewCycleOps,
     project_id: ProjectId,
     cancellation_token: CancellationToken,
-    target_pr: Option<u64>,
+    request: ProjectReviewRequest,
 ) -> Result<ProjectReviewCycleResult> {
     let run_id = Uuid::new_v4();
+    let target_pr = Some(request.pr);
     ops.set_project_review_state(
         project_id,
         ProjectReviewStatus::Syncing,
@@ -119,43 +121,6 @@ pub(crate) async fn run_project_review_once(
         token_usage: Default::default(),
     })
     .await?;
-    if let Err(err) = ops.sync_project_cache_repo(project_id).await {
-        let error = err.to_string();
-        ops.finish_project_review_run(FinishReviewRun {
-            run_id,
-            project_id,
-            reviewer_agent_id: None,
-            turn_id: None,
-            status: ProjectReviewRunStatus::Failed,
-            outcome: Some(ProjectReviewOutcome::Failed),
-            review_event: None,
-            pr: target_pr,
-            summary_text: None,
-            error: Some(error),
-        })
-        .await?;
-        return Err(err);
-    }
-    if let Err(err) = ops
-        .refresh_project_review_context_from_default_branch(project_id)
-        .await
-    {
-        let error = err.to_string();
-        ops.finish_project_review_run(FinishReviewRun {
-            run_id,
-            project_id,
-            reviewer_agent_id: None,
-            turn_id: None,
-            status: ProjectReviewRunStatus::Failed,
-            outcome: Some(ProjectReviewOutcome::Failed),
-            review_event: None,
-            pr: target_pr,
-            summary_text: None,
-            error: Some(error),
-        })
-        .await?;
-        return Err(err);
-    }
     if cancellation_token.is_cancelled() {
         ops.finish_project_review_run(FinishReviewRun {
             run_id,
@@ -172,8 +137,11 @@ pub(crate) async fn run_project_review_once(
         .await?;
         return Err(RuntimeError::TurnCancelled);
     }
-    let reviewer = match ops.spawn_project_reviewer_agent(project_id).await {
-        Ok(reviewer) => reviewer,
+    let prepared = match ops
+        .prepare_project_reviewer(project_id, run_id, request)
+        .await
+    {
+        Ok(prepared) => prepared,
         Err(err) => {
             ops.finish_project_review_run(FinishReviewRun {
                 run_id,
@@ -191,6 +159,7 @@ pub(crate) async fn run_project_review_once(
             return Err(err);
         }
     };
+    let reviewer = &prepared.agent;
     let reviewer_id = reviewer.id;
     if let Err(err) = ops
         .set_project_review_state(
@@ -241,7 +210,12 @@ pub(crate) async fn run_project_review_once(
     }
     let cycle_result = async {
         let message = ops
-            .project_reviewer_initial_message(project_id, reviewer_id, target_pr)
+            .project_reviewer_initial_message(
+                project_id,
+                reviewer_id,
+                prepared.target.clone(),
+                prepared.project_revision.clone(),
+            )
             .await?;
         let turn_id = ops.start_reviewer_turn(reviewer_id, message).await?;
         ops.update_project_review_run_turn(project_id, run_id, reviewer_id, turn_id)
@@ -249,7 +223,7 @@ pub(crate) async fn run_project_review_once(
         let summary = ops
             .wait_agent_until_complete_with_cancel(reviewer_id, &cancellation_token)
             .await?;
-        if summary.status == AgentStatus::Cancelled && cancellation_token.is_cancelled() {
+        if last_turn_cancelled(&summary) && cancellation_token.is_cancelled() {
             return Err(RuntimeError::TurnCancelled);
         }
         if let Some(result) = super::project_review_cycle_result_for_reviewer_status(&summary) {
@@ -258,6 +232,26 @@ pub(crate) async fn run_project_review_once(
         parse_reviewer_final_response(ops, reviewer_id, &cancellation_token).await
     }
     .await;
+    let cycle_result = match ops.reviewer_target_is_stale(reviewer_id).await {
+        Ok(true) => Err(RuntimeError::InvalidInput(format!(
+            "{} for PR #{}",
+            super::REVIEW_TARGET_HEAD_CHANGED,
+            prepared.target.pr
+        ))),
+        Ok(false) => cycle_result.and_then(|result| {
+            match result.pr {
+                Some(reported_pr) if reported_pr != prepared.target.pr => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "reviewer reported PR #{reported_pr} while the prepared target is PR #{}",
+                        prepared.target.pr
+                    )));
+                }
+                Some(_) | None => {}
+            }
+            Ok(result)
+        }),
+        Err(error) => Err(error),
+    };
     let turn_id = match ops.load_project_review_run(project_id, run_id).await {
         Ok(run) => run.and_then(|run| run.summary.turn_id),
         Err(err) => {
@@ -270,7 +264,7 @@ pub(crate) async fn run_project_review_once(
             None
         }
     };
-    let (status, outcome, review_event, pr, summary, error) = match &cycle_result {
+    let (status, outcome, review_event, summary, error) = match &cycle_result {
         Ok(result) => {
             let status = if result.outcome == ProjectReviewOutcome::Failed {
                 ProjectReviewRunStatus::Failed
@@ -281,7 +275,6 @@ pub(crate) async fn run_project_review_once(
                 status,
                 Some(result.outcome.clone()),
                 result.review_event.clone(),
-                result.pr,
                 result.summary.clone(),
                 result.error.clone(),
             )
@@ -291,13 +284,11 @@ pub(crate) async fn run_project_review_once(
             None,
             None,
             None,
-            None,
             Some("review cancelled".to_string()),
         ),
         Err(err) => (
             ProjectReviewRunStatus::Failed,
             Some(ProjectReviewOutcome::Failed),
-            None,
             None,
             None,
             Some(err.to_string()),
@@ -312,7 +303,7 @@ pub(crate) async fn run_project_review_once(
             status,
             outcome,
             review_event,
-            pr,
+            pr: target_pr,
             summary_text: summary,
             error,
         })
@@ -380,7 +371,7 @@ async fn parse_reviewer_final_response(
             let summary = ops
                 .wait_agent_until_complete_with_cancel(reviewer_id, cancellation_token)
                 .await?;
-            if summary.status == AgentStatus::Cancelled && cancellation_token.is_cancelled() {
+            if last_turn_cancelled(&summary) && cancellation_token.is_cancelled() {
                 return Err(RuntimeError::TurnCancelled);
             }
             if let Some(result) = super::project_review_cycle_result_for_reviewer_status(&summary) {
@@ -392,12 +383,24 @@ async fn parse_reviewer_final_response(
     }
 }
 
+fn last_turn_cancelled(summary: &AgentSummary) -> bool {
+    summary
+        .state
+        .runtime
+        .last_turn
+        .as_ref()
+        .is_some_and(|turn| turn.outcome == AgentTurnOutcomeKind::Cancelled)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use chrono::Utc;
-    use mai_protocol::{ProjectCloneStatus, ProjectReviewDecision, ProjectStatus, TokenUsage};
+    use mai_protocol::{
+        AgentLastTurn, AgentResourceState, AgentRuntimeState, AgentState, ProjectCloneStatus,
+        ProjectReviewDecision, ProjectStatus, TokenUsage,
+    };
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
 
@@ -413,6 +416,7 @@ mod tests {
         deleted_agents: Arc<Mutex<Vec<AgentId>>>,
         operations: Arc<Mutex<Vec<&'static str>>>,
         fail_running_state: bool,
+        target_stale: bool,
     }
 
     impl FakeCycleOps {
@@ -426,11 +430,17 @@ mod tests {
                 deleted_agents: Arc::new(Mutex::new(Vec::new())),
                 operations: Arc::new(Mutex::new(Vec::new())),
                 fail_running_state: false,
+                target_stale: false,
             }
         }
 
         fn with_running_state_failure(mut self) -> Self {
             self.fail_running_state = true;
+            self
+        }
+
+        fn with_stale_target(mut self) -> Self {
+            self.target_stale = true;
             self
         }
     }
@@ -493,40 +503,39 @@ mod tests {
             Ok(())
         }
 
-        async fn sync_project_cache_repo(&self, _project_id: ProjectId) -> Result<()> {
-            self.operations.lock().await.push("sync_project_cache_repo");
-            Ok(())
-        }
-
-        async fn refresh_project_review_context_from_default_branch(
+        async fn prepare_project_reviewer(
             &self,
             _project_id: ProjectId,
-        ) -> Result<()> {
-            self.operations
-                .lock()
-                .await
-                .push("refresh_project_review_context_from_default_branch");
-            Ok(())
-        }
-
-        async fn spawn_project_reviewer_agent(
-            &self,
-            _project_id: ProjectId,
-        ) -> Result<AgentSummary> {
-            self.operations
-                .lock()
-                .await
-                .push("spawn_project_reviewer_agent");
-            Ok(self.reviewer.clone())
+            _run_id: Uuid,
+            request: ProjectReviewRequest,
+        ) -> Result<PreparedProjectReviewer> {
+            self.operations.lock().await.extend([
+                "resolve_review_target",
+                "sync_project_repository",
+                "snapshot_default_branch_context",
+                "spawn_project_reviewer",
+            ]);
+            Ok(PreparedProjectReviewer {
+                agent: self.reviewer.clone(),
+                target: super::super::target::ResolvedProjectReviewTarget {
+                    pr: request.pr,
+                    head_sha: "head-sha".to_string(),
+                },
+                project_revision: crate::projects::workspace::ProjectRepositoryRevision {
+                    branch: "main".to_string(),
+                    base_sha: "base-sha".to_string(),
+                },
+            })
         }
 
         async fn project_reviewer_initial_message(
             &self,
             _project_id: ProjectId,
             _reviewer_id: AgentId,
-            target_pr: Option<u64>,
+            target: super::super::target::ResolvedProjectReviewTarget,
+            _project_revision: crate::projects::workspace::ProjectRepositoryRevision,
         ) -> Result<String> {
-            Ok(format!("review target {target_pr:?}"))
+            Ok(format!("review target {}", target.pr))
         }
 
         async fn start_reviewer_turn(
@@ -557,6 +566,10 @@ mod tests {
             Ok(responses.remove(0))
         }
 
+        async fn reviewer_target_is_stale(&self, _reviewer_id: AgentId) -> Result<bool> {
+            Ok(self.target_stale)
+        }
+
         async fn delete_agent(&self, agent_id: AgentId) -> Result<()> {
             self.deleted_agents.lock().await.push(agent_id);
             Ok(())
@@ -574,16 +587,18 @@ mod tests {
                 .to_string()],
         );
 
-        let result = run_project_review_once(&ops, project_id, CancellationToken::new(), Some(726))
-            .await
-            .expect("review result");
+        let result =
+            run_project_review_once(&ops, project_id, CancellationToken::new(), request(726))
+                .await
+                .expect("review result");
 
         assert_eq!(ProjectReviewOutcome::Failed, result.outcome);
         assert_eq!(
             vec![
-                "sync_project_cache_repo",
-                "refresh_project_review_context_from_default_branch",
-                "spawn_project_reviewer_agent",
+                "resolve_review_target",
+                "sync_project_repository",
+                "snapshot_default_branch_context",
+                "spawn_project_reviewer",
                 "start_reviewer_turn",
             ],
             *ops.operations.lock().await
@@ -603,7 +618,7 @@ mod tests {
         .with_running_state_failure();
 
         let result =
-            run_project_review_once(&ops, project_id, CancellationToken::new(), Some(726)).await;
+            run_project_review_once(&ops, project_id, CancellationToken::new(), request(726)).await;
 
         assert!(result.is_err());
         assert_eq!(vec![reviewer_id], *ops.deleted_agents.lock().await);
@@ -632,9 +647,10 @@ mod tests {
             ],
         );
 
-        let result = run_project_review_once(&ops, project_id, CancellationToken::new(), Some(726))
-            .await
-            .expect("review result");
+        let result =
+            run_project_review_once(&ops, project_id, CancellationToken::new(), request(726))
+                .await
+                .expect("review result");
 
         assert_eq!(ProjectReviewOutcome::ReviewSubmitted, result.outcome);
         assert_eq!(
@@ -658,6 +674,62 @@ mod tests {
             Some(ProjectReviewDecision::RequestChanges),
             finished[0].review_event
         );
+        assert_eq!(Some(726), finished[0].pr);
+    }
+
+    #[tokio::test]
+    async fn stale_target_overrides_model_result_and_still_cleans_reviewer() {
+        let project_id = Uuid::new_v4();
+        let reviewer_id = Uuid::new_v4();
+        let ops = FakeCycleOps::new(
+            project_id,
+            reviewer_id,
+            vec![r#"{"outcome":"review_submitted","review_event":"approve","pr":726,"summary":"submitted","error":null}"#.to_string()],
+        )
+        .with_stale_target();
+
+        let error =
+            run_project_review_once(&ops, project_id, CancellationToken::new(), request(726))
+                .await
+                .expect_err("stale target must fail the run");
+
+        assert!(
+            error
+                .to_string()
+                .contains(super::super::REVIEW_TARGET_HEAD_CHANGED)
+        );
+        assert_eq!(vec![reviewer_id], *ops.deleted_agents.lock().await);
+        let finished = ops.finished_runs.lock().await.clone();
+        assert_eq!(ProjectReviewRunStatus::Failed, finished[0].status);
+        assert_eq!(Some(726), finished[0].pr);
+        assert!(
+            finished[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains(super::super::REVIEW_TARGET_HEAD_CHANGED))
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_report_for_another_pr_is_rejected_without_changing_run_target() {
+        let project_id = Uuid::new_v4();
+        let reviewer_id = Uuid::new_v4();
+        let ops = FakeCycleOps::new(
+            project_id,
+            reviewer_id,
+            vec![r#"{"outcome":"review_submitted","review_event":"approve","pr":727,"summary":"submitted","error":null}"#.to_string()],
+        );
+
+        let error =
+            run_project_review_once(&ops, project_id, CancellationToken::new(), request(726))
+                .await
+                .expect_err("a mismatched reviewer report must fail the run");
+
+        assert!(error.to_string().contains("prepared target is PR #726"));
+        assert_eq!(vec![reviewer_id], *ops.deleted_agents.lock().await);
+        let finished = ops.finished_runs.lock().await.clone();
+        assert_eq!(1, finished.len());
+        assert_eq!(ProjectReviewRunStatus::Failed, finished[0].status);
         assert_eq!(Some(726), finished[0].pr);
     }
 
@@ -697,6 +769,13 @@ mod tests {
         }
     }
 
+    fn request(pr: u64) -> ProjectReviewRequest {
+        ProjectReviewRequest {
+            pr,
+            head_sha_hint: Some("head-hint".to_string()),
+        }
+    }
+
     fn test_agent_summary(project_id: ProjectId, reviewer_id: AgentId) -> AgentSummary {
         let timestamp = Utc::now();
         AgentSummary {
@@ -706,7 +785,21 @@ mod tests {
             project_id: Some(project_id),
             role: Some(mai_protocol::AgentRole::Reviewer),
             name: "reviewer".to_string(),
-            status: AgentStatus::Completed,
+            state: AgentState {
+                resource: AgentResourceState::Ready,
+                runtime: AgentRuntimeState {
+                    last_turn: Some(AgentLastTurn {
+                        turn_id: Uuid::new_v4(),
+                        session_id: Uuid::new_v4(),
+                        outcome: AgentTurnOutcomeKind::Completed,
+                        reason: None,
+                        usage: TokenUsage::default(),
+                        finished_at: timestamp,
+                    }),
+                    ..AgentRuntimeState::default()
+                },
+                ..AgentState::default()
+            },
             container_id: Some("container".to_string()),
             docker_image: "ubuntu:latest".to_string(),
             provider_id: "mock".to_string(),
@@ -715,8 +808,6 @@ mod tests {
             reasoning_effort: Some("medium".to_string()),
             created_at: timestamp,
             updated_at: timestamp,
-            current_turn: None,
-            last_error: None,
             token_usage: TokenUsage::default(),
         }
     }

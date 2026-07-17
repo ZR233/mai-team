@@ -10,7 +10,7 @@ use crate::services::relay_manager::RelayManager;
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) runtime: Arc<mai_runtime::AgentRuntime>,
-    pub(crate) store: Arc<mai_store::ConfigStore>,
+    pub(crate) store: Arc<mai_store::MaiStore>,
     pub(crate) relay: Arc<RelayManager>,
 }
 

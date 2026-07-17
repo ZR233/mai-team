@@ -9,7 +9,7 @@ use mai_protocol::{
     GithubAppSettingsRequest, GithubAppSettingsResponse, GithubInstallationsResponse,
     GithubRepositoriesResponse, GithubRepositorySummary, RelayGithubInstallationTokenResponse,
 };
-use mai_store::ConfigStore;
+use mai_store::MaiStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -70,7 +70,7 @@ struct CachedGithubToken {
 }
 
 pub struct DirectGithubAppBackend {
-    store: Arc<ConfigStore>,
+    store: Arc<MaiStore>,
     github_http: reqwest::Client,
     github_api_base_url: String,
     github_tokens: Mutex<HashMap<String, CachedGithubToken>>,
@@ -79,7 +79,7 @@ pub struct DirectGithubAppBackend {
 
 impl DirectGithubAppBackend {
     pub fn new(
-        store: Arc<ConfigStore>,
+        store: Arc<MaiStore>,
         github_http: reqwest::Client,
         github_api_base_url: String,
     ) -> Self {
@@ -582,9 +582,9 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    async fn test_store(dir: &tempfile::TempDir) -> Arc<ConfigStore> {
+    async fn test_store(dir: &tempfile::TempDir) -> Arc<MaiStore> {
         Arc::new(
-            ConfigStore::open_with_config_and_artifact_index_path(
+            MaiStore::open_with_config_and_artifact_index_path(
                 dir.path().join("runtime.sqlite3"),
                 dir.path().join("config.toml"),
                 dir.path().join("data/artifacts/index"),

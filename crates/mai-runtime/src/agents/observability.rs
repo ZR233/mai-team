@@ -49,6 +49,12 @@ pub(crate) trait AgentObservabilityOps: Send + Sync {
         session_id: SessionId,
     ) -> impl Future<Output = Result<Vec<ModelMessage>>> + Send;
 
+    fn resolve_session_id(
+        &self,
+        agent_id: AgentId,
+        session_id: Option<SessionId>,
+    ) -> impl Future<Output = Result<crate::agent_host::ResolvedAgentSessionId>> + Send;
+
     fn tool_output_artifact_file_path(
         &self,
         agent_id: AgentId,
@@ -71,18 +77,10 @@ pub(crate) async fn tool_trace(
         return Ok(trace);
     }
 
-    let agent = ops.agent(agent_id).await?;
-    let session_id = {
-        let sessions = agent.sessions.lock().await;
-        let selected_session = super::selected_session(&sessions, session_id).ok_or_else(|| {
-            RuntimeError::SessionNotFound {
-                agent_id,
-                session_id: session_id.unwrap_or_default(),
-            }
-        })?;
-        selected_session.summary.id
-    };
-    let history = ops.load_agent_history(agent_id, session_id).await?;
+    let session_id = ops.resolve_session_id(agent_id, session_id).await?;
+    let history = ops
+        .load_agent_history(agent_id, session_id.protocol)
+        .await?;
     let projection =
         pl_core::tool_history_projection(&history, &call_id, 500).ok_or_else(|| {
             RuntimeError::ToolTraceNotFound {
@@ -91,12 +89,12 @@ pub(crate) async fn tool_trace(
             }
         })?;
     let (event_success, duration_ms) = ops
-        .tool_metadata(agent_id, session_id, call_id.clone())
+        .tool_metadata(agent_id, session_id.protocol, call_id.clone())
         .await;
     let success = event_success.unwrap_or_else(|| projection.inferred_success());
     Ok(ToolTraceDetail {
         agent_id,
-        session_id: Some(session_id),
+        session_id: Some(session_id.protocol),
         turn_id: None,
         call_id,
         tool_name: projection.tool_name().to_string(),

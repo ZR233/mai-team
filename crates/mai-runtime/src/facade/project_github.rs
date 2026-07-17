@@ -64,17 +64,104 @@ impl AgentRuntime {
         let project_id = summary.project_id.ok_or_else(|| {
             RuntimeError::InvalidInput("agent is not attached to a project".to_string())
         })?;
+        let project = self.project(project_id).await?;
+        let project_summary = project.summary.read().await.clone();
+        projects::review::validate_project_reviewer_github_api_target(
+            &method,
+            &path,
+            summary.role.as_ref(),
+            &project_summary.owner,
+            &project_summary.repo,
+        )?;
+        let review_context = if summary.role == Some(mai_protocol::AgentRole::Reviewer) {
+            Some(agent.review_context.read().await.clone().ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "reviewer GitHub API request is missing its review context snapshot"
+                        .to_string(),
+                )
+            })?)
+        } else {
+            None
+        };
         let workspace_volume =
             project_agent_workspace_volume(&project_id.to_string(), &summary.id.to_string());
         let mut env = vec![("GH_TOKEN".to_string(), token.clone())];
         let sidecar_name = format!("mai-tool-gh-api-{}-{}", summary.id, Uuid::new_v4());
-        let body = projects::review::project_review_github_api_body_with_model_footer(
+        let mut body = projects::review::project_review_github_api_body_with_model_footer(
             &method,
             &path,
             request.body.clone(),
             summary.role.as_ref(),
             &summary.model,
         )?;
+        if let Some(submitted_pr) = projects::review::project_review_submission_pr(&method, &path) {
+            let context = review_context.as_ref().ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "only a prepared reviewer may submit a project review".to_string(),
+                )
+            })?;
+            if submitted_pr != context.target.pr {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "reviewer may submit only its prepared PR #{}",
+                    context.target.pr
+                )));
+            }
+            let detail_path = format!(
+                "/repos/{}/{}/pulls/{}",
+                github::github_path_segment(&project_summary.owner),
+                github::github_path_segment(&project_summary.repo),
+                context.target.pr
+            );
+            let detail = github::project_github_api_get_json(
+                &self.deps.github_http,
+                &self.github_api_base_url,
+                Some(token.clone()),
+                &detail_path,
+            )
+            .await?;
+            let current_head = detail
+                .get("head")
+                .and_then(|head| head.get("sha"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|sha| !sha.is_empty())
+                .ok_or_else(|| {
+                    RuntimeError::InvalidInput(format!(
+                        "GitHub pull request #{} response is missing head SHA",
+                        context.target.pr
+                    ))
+                })?;
+            if current_head != context.target.head_sha {
+                context.mark_target_stale();
+                return Err(RuntimeError::InvalidInput(format!(
+                    "{} for PR #{}: prepared {}, current {}",
+                    projects::review::REVIEW_TARGET_HEAD_CHANGED,
+                    context.target.pr,
+                    context.target.head_sha,
+                    current_head
+                )));
+            }
+            let body_object = body
+                .as_mut()
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    RuntimeError::InvalidInput(
+                        "review submission body must be a JSON object".to_string(),
+                    )
+                })?;
+            body_object.insert(
+                "commit_id".to_string(),
+                Value::String(context.target.head_sha.clone()),
+            );
+            tracing::info!(
+                project_id = %project_id,
+                run_id = %context.run_id,
+                pr = context.target.pr,
+                base_sha = %context.project_revision.base_sha,
+                head_sha = %context.target.head_sha,
+                "verified project review target before GitHub submission"
+            );
+        }
         let command = if let Some(body) = &body {
             let body = serde_json::to_string(body).map_err(|err| {
                 RuntimeError::InvalidInput(format!("invalid GitHub API JSON body: {err}"))
@@ -110,7 +197,7 @@ impl AgentRuntime {
         if output.status != 0 {
             let message = redact_secret(&format!("{}{}", output.stdout, output.stderr), &token);
             return Err(RuntimeError::InvalidInput(format!(
-                "gh api sidecar failed: {message}"
+                "GitHub API {method} {path} failed: {message}"
             )));
         }
         Ok(ToolExecution::success(output.stdout))

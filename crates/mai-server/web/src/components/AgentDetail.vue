@@ -104,6 +104,7 @@ import {
   buildAgentTimeline
 } from '../utils/timeline'
 import { effectiveContextTokens } from '../utils/modelPicker'
+import { canStopAgentTurn, isAgentBusy } from '../utils/agentState.js'
 
 const props = defineProps({
   detail: { type: Object, default: null },
@@ -152,10 +153,7 @@ const emptyTrace = { loading: false, error: '', detail: null }
 const currentReasoningEffort = ref('')
 
 const timelineItems = computed(() => buildAgentTimeline(props.detail, props.events))
-const canStopTurn = computed(() => {
-  if (!props.detail?.current_turn) return false
-  return ['running_turn', 'waiting_tool', 'starting_container'].includes(props.detail.status)
-})
+const canStopTurn = computed(() => canStopAgentTurn(props.detail))
 const pendingUserInput = computed(() => {
   if (!props.inputEnabled) return null
   const items = timelineItems.value
@@ -208,10 +206,7 @@ const contextCapacity = computed(() => {
     tone: percentValue >= threshold ? 'full' : percentValue >= Math.max(1, threshold - 15) ? 'warm' : 'low'
   }
 })
-const isModelChangeBusy = computed(() => {
-  const status = props.detail?.status
-  return status === 'running_turn' || status === 'waiting_tool' || status === 'starting_container'
-})
+const isModelChangeBusy = computed(() => isAgentBusy(props.detail))
 
 watch(
   () => props.detail?.id,

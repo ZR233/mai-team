@@ -2544,6 +2544,18 @@ p {
   box-shadow: 0 2px 6px rgba(31, 111, 235, 0.12);
 }
 
+.provider-connection-field {
+  display: grid;
+  gap: 6px;
+  color: #405066;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.provider-connection-tabs {
+  width: min(320px, 100%);
+}
+
 .github-org-field {
   max-width: 360px;
 }

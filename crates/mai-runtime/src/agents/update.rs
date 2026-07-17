@@ -1,12 +1,11 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use mai_protocol::{AgentId, AgentSummary, UpdateAgentRequest, now};
-use mai_store::ProviderSelection;
+use mai_protocol::{AgentId, AgentRole, AgentSummary, UpdateAgentRequest, now};
 
-use super::{is_agent_turn_start_ready, normalize_reasoning_effort};
+use super::normalize_reasoning_effort;
 use crate::state::AgentRecord;
-use crate::{Result, RuntimeError};
+use crate::{ProviderSelection, Result, RuntimeError};
 
 /// Provides the narrow runtime capabilities needed to update agent model config.
 pub(crate) trait AgentUpdateOps: Send + Sync {
@@ -14,6 +13,7 @@ pub(crate) trait AgentUpdateOps: Send + Sync {
 
     fn resolve_provider(
         &self,
+        role: AgentRole,
         provider_id: Option<&str>,
         model: Option<&str>,
     ) -> impl Future<Output = Result<ProviderSelection>> + Send;
@@ -31,7 +31,7 @@ pub(crate) async fn update_agent(
     let agent = ops.agent(agent_id).await?;
     let current = {
         let summary = agent.summary.read().await;
-        if !is_agent_turn_start_ready(&summary) {
+        if !summary.state.can_reconfigure() {
             return Err(RuntimeError::AgentBusy(agent_id));
         }
         summary.clone()
@@ -41,7 +41,9 @@ pub(crate) async fn update_agent(
         .as_deref()
         .or(Some(&current.provider_id));
     let model = request.model.as_deref().or(Some(&current.model));
-    let provider_selection = ops.resolve_provider(provider_id, model).await?;
+    let provider_selection = ops
+        .resolve_provider(current.role.unwrap_or_default(), provider_id, model)
+        .await?;
     let requested_reasoning_effort = if request.reasoning_effort.is_some()
         || provider_selection.model.id != current.model
         || provider_selection.provider.id != current.provider_id
@@ -57,10 +59,9 @@ pub(crate) async fn update_agent(
     )?;
     let updated = {
         let mut summary = agent.summary.write().await;
-        if !is_agent_turn_start_ready(&summary) {
+        if !summary.state.can_reconfigure() {
             return Err(RuntimeError::AgentBusy(agent_id));
         }
-        summary.current_turn = None;
         summary.provider_id = provider_selection.provider.id.clone();
         summary.provider_name = provider_selection.provider.name.clone();
         summary.model = provider_selection.model.id.clone();

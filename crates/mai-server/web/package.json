@@ -13,7 +13,7 @@
     "test:format": "node src/utils/__tests__/format.test.js",
     "test:layout": "node src/utils/__tests__/contextStatusLineLayout.test.js",
     "test:markdown": "node src/utils/__tests__/markdown.test.js",
-    "test:providers": "node src/composables/__tests__/useProviders.test.js",
+    "test:providers": "node src/composables/__tests__/providerCatalog.test.js",
     "test:projects": "node src/composables/__tests__/useProjects.test.js",
     "test:review-layout": "node src/utils/__tests__/projectReviewRunLayout.test.js",
     "test:sse": "node src/composables/__tests__/useSSE.test.js",

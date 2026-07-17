@@ -23,12 +23,14 @@ pub(crate) struct SettingRecord {
 pub(crate) struct AgentRecordRow {
     #[key]
     pub(crate) id: String,
+    pub(crate) runtime_agent_id: String,
     pub(crate) parent_id: Option<String>,
     pub(crate) task_id: Option<String>,
     pub(crate) project_id: Option<String>,
     pub(crate) role: Option<String>,
     pub(crate) name: String,
-    pub(crate) status: String,
+    pub(crate) resource_state: String,
+    pub(crate) resource_error: Option<String>,
     pub(crate) container_id: Option<String>,
     pub(crate) docker_image: String,
     pub(crate) provider_id: String,
@@ -37,13 +39,6 @@ pub(crate) struct AgentRecordRow {
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
-    pub(crate) current_turn: Option<String>,
-    pub(crate) last_error: Option<String>,
-    pub(crate) input_tokens: i64,
-    pub(crate) cached_input_tokens: i64,
-    pub(crate) output_tokens: i64,
-    pub(crate) reasoning_output_tokens: i64,
-    pub(crate) total_tokens: i64,
     pub(crate) system_prompt: Option<String>,
 }
 
@@ -176,6 +171,84 @@ pub(crate) struct AgentSessionRecord {
     pub(crate) output_tokens: i64,
     pub(crate) reasoning_output_tokens: i64,
     pub(crate) total_tokens: i64,
+    pub(crate) last_context_tokens: Option<i64>,
+    pub(crate) trace_sequence: i64,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "agent_runtime_states"]
+pub(crate) struct AgentRuntimeStateRecord {
+    #[key]
+    pub(crate) agent_id: String,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) role: String,
+    pub(crate) depth: i64,
+    pub(crate) lifecycle: String,
+    pub(crate) activity: String,
+    pub(crate) active_turn_id: Option<String>,
+    pub(crate) active_session_id: Option<String>,
+    pub(crate) pending_inputs: i64,
+    pub(crate) last_turn_json: Option<String>,
+    pub(crate) revision: i64,
+    pub(crate) event_sequence: i64,
+    pub(crate) updated_at: i64,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "agent_pending_inputs"]
+pub(crate) struct AgentPendingInputRecord {
+    #[key]
+    pub(crate) id: String,
+    #[index]
+    pub(crate) agent_id: String,
+    pub(crate) position: i64,
+    pub(crate) turn_id: String,
+    pub(crate) session_id: String,
+    pub(crate) message: String,
+    pub(crate) metadata_json: String,
+    pub(crate) queued_at: i64,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "agent_turns"]
+pub(crate) struct AgentTurnRecord {
+    #[key]
+    pub(crate) turn_id: String,
+    #[index]
+    pub(crate) agent_id: String,
+    pub(crate) session_id: String,
+    pub(crate) status: String,
+    pub(crate) error: Option<String>,
+    pub(crate) prompt_tokens: i64,
+    pub(crate) cached_prompt_tokens: i64,
+    pub(crate) completion_tokens: i64,
+    pub(crate) reasoning_tokens: i64,
+    pub(crate) total_tokens: i64,
+    pub(crate) started_at: Option<i64>,
+    pub(crate) finished_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "agent_runtime_events"]
+pub(crate) struct AgentRuntimeEventRecord {
+    #[key]
+    pub(crate) id: String,
+    #[index]
+    pub(crate) agent_id: String,
+    pub(crate) sequence: i64,
+    pub(crate) created_at: i64,
+    pub(crate) event_json: String,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "agent_runtime_traces"]
+pub(crate) struct AgentRuntimeTraceRecord {
+    #[key]
+    pub(crate) id: String,
+    #[index]
+    pub(crate) agent_id: String,
+    pub(crate) sequence: i64,
+    pub(crate) trace_json: String,
 }
 
 #[derive(Debug, Clone, toasty::Model)]
@@ -275,7 +348,11 @@ impl AgentRecordRow {
                 .transpose()?,
             role: self.role.as_deref().map(parse_store_enum).transpose()?,
             name: self.name,
-            status: parse_store_enum(&self.status)?,
+            state: mai_protocol::AgentState {
+                resource: parse_store_enum(&self.resource_state)?,
+                resource_error: self.resource_error,
+                runtime: mai_protocol::AgentRuntimeState::default(),
+            },
             container_id: self.container_id,
             docker_image: self.docker_image,
             provider_id: self.provider_id,
@@ -284,19 +361,7 @@ impl AgentRecordRow {
             reasoning_effort: self.reasoning_effort,
             created_at: parse_utc(&self.created_at)?,
             updated_at: parse_utc(&self.updated_at)?,
-            current_turn: self
-                .current_turn
-                .as_deref()
-                .map(parse_turn_id)
-                .transpose()?,
-            last_error: self.last_error,
-            token_usage: TokenUsage {
-                input_tokens: i64_to_u64(self.input_tokens),
-                cached_input_tokens: i64_to_u64(self.cached_input_tokens),
-                output_tokens: i64_to_u64(self.output_tokens),
-                reasoning_output_tokens: i64_to_u64(self.reasoning_output_tokens),
-                total_tokens: i64_to_u64(self.total_tokens),
-            },
+            token_usage: TokenUsage::default(),
         })
     }
 }

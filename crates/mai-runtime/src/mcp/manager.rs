@@ -42,23 +42,6 @@ impl McpAgentManager {
         }
     }
 
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    #[cfg(test)]
-    pub fn from_resources_for_test(resources: Vec<(&str, Vec<Value>)>) -> Self {
-        Self {
-            sessions: RwLock::new(BTreeMap::new()),
-            tools: RwLock::new(BTreeMap::new()),
-            statuses: RwLock::new(BTreeMap::new()),
-            test_resources: RwLock::new(
-                resources
-                    .into_iter()
-                    .map(|(server, resources)| (server.to_string(), resources))
-                    .collect(),
-            ),
-        }
-    }
-
     pub async fn start(
         docker: DockerClient,
         container_id: String,

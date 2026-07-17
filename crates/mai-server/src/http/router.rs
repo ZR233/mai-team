@@ -119,8 +119,8 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
             get(handlers::github_app::list_github_repository_packages),
         )
         .route(
-            "/provider-presets",
-            get(handlers::config::get_provider_presets),
+            "/provider-catalog",
+            get(handlers::config::get_provider_catalog),
         )
         .route("/skills", get(handlers::config::list_skills))
         .route(

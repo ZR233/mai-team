@@ -5,30 +5,24 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+mod agent_state;
+
+pub use agent_state::{
+    AgentLastTurn, AgentResourceState, AgentRuntimeActivity, AgentRuntimeLifecycle,
+    AgentRuntimeState, AgentState, AgentTurnOutcomeKind,
+};
+pub use pl_protocol::{
+    CredentialDescriptorDto, ModelCapabilitiesDto, ModelCatalogDescriptor, ModelDescriptor,
+    ModelPricingDto, ModelReasoningDescriptor, PROVIDER_CATALOG_SCHEMA_VERSION,
+    ProviderCatalogSnapshot, ProviderConnectionModeDescriptor, ProviderPresetDescriptor,
+};
+
 pub type AgentId = Uuid;
 pub type EnvironmentId = Uuid;
 pub type ProjectId = Uuid;
 pub type SessionId = Uuid;
 pub type TaskId = Uuid;
 pub type TurnId = Uuid;
-
-#[derive(
-    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum AgentStatus {
-    Created,
-    StartingContainer,
-    Idle,
-    RunningTurn,
-    WaitingTool,
-    Completed,
-    Failed,
-    Cancelled,
-    DeletingContainer,
-    Deleted,
-}
 
 #[derive(
     Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString,
@@ -133,15 +127,6 @@ pub enum PlanStatus {
     Approved,
 }
 
-impl AgentStatus {
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::Completed | Self::Failed | Self::Cancelled | Self::Deleted
-        )
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum McpStartupStatus {
@@ -201,7 +186,7 @@ pub struct UserInputQuestion {
     pub options: Vec<UserInputOption>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentMessage {
     pub role: MessageRole,
     pub content: String,
@@ -260,7 +245,7 @@ pub struct AgentSummary {
     #[serde(default)]
     pub role: Option<AgentRole>,
     pub name: String,
-    pub status: AgentStatus,
+    pub state: AgentState,
     pub container_id: Option<String>,
     #[serde(default)]
     pub docker_image: String,
@@ -271,8 +256,6 @@ pub struct AgentSummary {
     pub reasoning_effort: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub current_turn: Option<TurnId>,
-    pub last_error: Option<String>,
     pub token_usage: TokenUsage,
 }
 
@@ -968,12 +951,31 @@ pub struct ErrorResponse {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ProviderKind {
+pub enum ProviderWireProtocol {
     #[default]
-    Openai,
-    Deepseek,
-    Mimo,
-    Zhipu,
+    Responses,
+    ChatCompletions,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderConnectionMode {
+    WebSocket,
+    #[default]
+    Http,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderTransportConfig {
+    pub protocol: ProviderWireProtocol,
+    pub connection_mode: ProviderConnectionMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderTransportSummary {
+    pub protocol: ProviderWireProtocol,
+    pub connection_mode: ProviderConnectionMode,
+    pub connection_modes: Vec<ProviderConnectionModeDescriptor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -991,8 +993,6 @@ pub struct ModelConfig {
     pub auto_compact_token_limit: Option<u64>,
     #[serde(default = "default_true")]
     pub supports_tools: bool,
-    #[serde(default)]
-    pub wire_api: ModelWireApi,
     #[serde(default)]
     pub capabilities: ModelCapabilities,
     #[serde(default)]
@@ -1019,14 +1019,6 @@ impl ModelConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelWireApi {
-    #[default]
-    Responses,
-    ChatCompletions,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelCapabilities {
     #[serde(default = "default_true")]
@@ -1037,8 +1029,6 @@ pub struct ModelCapabilities {
     pub reasoning_replay: bool,
     #[serde(default)]
     pub strict_schema: bool,
-    #[serde(default)]
-    pub continuation: bool,
 }
 
 impl Default for ModelCapabilities {
@@ -1048,7 +1038,6 @@ impl Default for ModelCapabilities {
             parallel_tools: false,
             reasoning_replay: false,
             strict_schema: false,
-            continuation: false,
         }
     }
 }
@@ -1063,8 +1052,8 @@ pub enum ToolSchemaPolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelRequestPolicy {
-    #[serde(default = "default_chat_max_tokens_field")]
-    pub max_tokens_field: String,
+    #[serde(default)]
+    pub max_tokens_field: ModelMaxTokensField,
     #[serde(default)]
     pub store: Option<bool>,
     #[serde(default)]
@@ -1078,7 +1067,7 @@ pub struct ModelRequestPolicy {
 impl Default for ModelRequestPolicy {
     fn default() -> Self {
         Self {
-            max_tokens_field: default_chat_max_tokens_field(),
+            max_tokens_field: ModelMaxTokensField::default(),
             store: None,
             tool_schema: ToolSchemaPolicy::Standard,
             extra_body: Value::Null,
@@ -1087,8 +1076,17 @@ impl Default for ModelRequestPolicy {
     }
 }
 
-fn default_chat_max_tokens_field() -> String {
-    "max_tokens".to_string()
+/// 模型请求允许使用的输出 token 字段。
+///
+/// `Omit` 是有意义的协议策略，不能退化成 Chat Completions 的默认字段。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelMaxTokensField {
+    Omit,
+    MaxOutputTokens,
+    MaxCompletionTokens,
+    #[default]
+    MaxTokens,
 }
 
 fn default_effective_context_window_percent() -> u64 {
@@ -1120,27 +1118,49 @@ pub struct ModelReasoningVariant {
 pub struct ProviderConfig {
     pub id: String,
     #[serde(default)]
-    pub kind: ProviderKind,
+    pub preset_id: Option<String>,
+    #[serde(default)]
+    pub transport: ProviderTransportConfig,
     pub name: String,
     pub base_url: String,
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
-    #[serde(default)]
-    pub models: Vec<ModelConfig>,
+    /// 只写的 provider 请求头；实例边界未变化时，`None` 表示由服务端保留原值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_headers: Option<BTreeMap<String, String>>,
+    pub catalog: ProviderModelCatalogConfig,
     pub default_model: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
 
+/// mai HTTP 边界中的 provider 模型目录引用。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum ProviderModelCatalogConfig {
+    Bundled {
+        catalog_id: String,
+        #[serde(default)]
+        additional_models: Vec<ModelConfig>,
+    },
+    Explicit {
+        #[serde(default)]
+        models: Vec<ModelConfig>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderSummary {
     pub id: String,
-    pub kind: ProviderKind,
+    pub preset_id: Option<String>,
+    pub transport: ProviderTransportSummary,
     pub name: String,
     pub base_url: String,
     pub api_key_env: Option<String>,
+    pub catalog: ProviderModelCatalogConfig,
+    /// 服务端通过 PL 目录解析后的唯一有效模型列表。
     pub models: Vec<ModelConfig>,
     pub default_model: String,
     pub enabled: bool,
@@ -1183,7 +1203,7 @@ pub struct ProviderTestResponse {
     pub ok: bool,
     pub provider_id: String,
     pub provider_name: String,
-    pub provider_kind: ProviderKind,
+    pub transport: ProviderTransportConfig,
     pub model: String,
     pub base_url: String,
     pub latency_ms: u64,
@@ -1232,7 +1252,7 @@ pub enum AgentRole {
 pub struct ResolvedAgentModelPreference {
     pub provider_id: String,
     pub provider_name: String,
-    pub provider_kind: ProviderKind,
+    pub transport: ProviderTransportConfig,
     pub model: String,
     #[serde(default)]
     pub model_name: Option<String>,
@@ -1282,28 +1302,15 @@ pub struct AgentConfigResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ProviderPreset {
-    pub id: String,
-    pub kind: ProviderKind,
-    pub name: String,
-    pub base_url: String,
-    pub default_model: String,
-    pub models: Vec<ModelConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ProviderPresetsResponse {
-    pub providers: Vec<ProviderPreset>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderSecret {
     pub id: String,
-    pub kind: ProviderKind,
+    pub transport: ProviderTransportConfig,
     pub name: String,
     pub base_url: String,
     pub api_key: String,
     pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub http_headers: BTreeMap<String, String>,
     pub models: Vec<ModelConfig>,
     pub default_model: String,
     pub enabled: bool,
@@ -1323,9 +1330,9 @@ pub enum ServiceEventKind {
     AgentCreated {
         agent: AgentSummary,
     },
-    AgentStatusChanged {
+    AgentStateChanged {
         agent_id: AgentId,
-        status: AgentStatus,
+        state: AgentState,
     },
     AgentUpdated {
         agent: AgentSummary,
@@ -2132,14 +2139,28 @@ mod tests {
     }
 
     #[test]
-    fn provider_kind_serializes_zhipu() {
+    fn provider_wire_protocol_serializes_canonical_names() {
         assert_eq!(
-            serde_json::to_string(&ProviderKind::Zhipu).expect("serialize"),
-            "\"zhipu\""
+            serde_json::to_string(&ProviderWireProtocol::Responses).expect("serialize"),
+            "\"responses\""
         );
         assert_eq!(
-            serde_json::from_str::<ProviderKind>("\"zhipu\"").expect("deserialize"),
-            ProviderKind::Zhipu
+            serde_json::from_str::<ProviderWireProtocol>("\"chat_completions\"")
+                .expect("deserialize"),
+            ProviderWireProtocol::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn provider_transport_keeps_protocol_and_connection_orthogonal() {
+        let transport = ProviderTransportConfig {
+            protocol: ProviderWireProtocol::Responses,
+            connection_mode: ProviderConnectionMode::WebSocket,
+        };
+
+        assert_eq!(
+            serde_json::to_value(transport).expect("serialize provider transport"),
+            json!({ "protocol": "responses", "connection_mode": "web_socket" })
         );
     }
 

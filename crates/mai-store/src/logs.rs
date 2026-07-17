@@ -1,7 +1,7 @@
 use crate::records::*;
 use crate::*;
 
-impl ConfigStore {
+impl MaiStore {
     pub async fn append_agent_log_entry(&self, entry: &AgentLogEntry) -> Result<()> {
         let mut db = self.db.clone();
         toasty::create!(AgentLogRecord {

@@ -6,7 +6,7 @@ use mai_protocol::{
     GitAccountsResponse, GitProvider, GitTokenKind, GithubRepositoriesResponse,
     GithubRepositorySummary, RepositoryPackagesResponse,
 };
-use mai_store::ConfigStore;
+use mai_store::MaiStore;
 
 use super::{
     GithubRepositoryApi, GithubUserApi, decode_github_response, git_token_kind, github_api_url,
@@ -43,7 +43,7 @@ impl GitAccountTokenUse {
 
 #[derive(Clone)]
 pub(crate) struct GitAccountService {
-    store: Arc<ConfigStore>,
+    store: Arc<MaiStore>,
     http: reqwest::Client,
     api_base_url: String,
     github_backend: Arc<dyn GithubAppBackend>,
@@ -51,7 +51,7 @@ pub(crate) struct GitAccountService {
 
 impl GitAccountService {
     pub(crate) fn new(
-        store: Arc<ConfigStore>,
+        store: Arc<MaiStore>,
         http: reqwest::Client,
         api_base_url: String,
         github_backend: Arc<dyn GithubAppBackend>,
@@ -434,9 +434,9 @@ mod tests {
         }
     }
 
-    async fn test_store(dir: &tempfile::TempDir) -> Arc<ConfigStore> {
+    async fn test_store(dir: &tempfile::TempDir) -> Arc<MaiStore> {
         Arc::new(
-            ConfigStore::open_with_config_and_artifact_index_path(
+            MaiStore::open_with_config_and_artifact_index_path(
                 dir.path().join("runtime.sqlite3"),
                 dir.path().join("config.toml"),
                 dir.path().join("data/artifacts/index"),

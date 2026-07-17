@@ -12,7 +12,7 @@ struct RelayConfig {
     node_id: Option<String>,
 }
 
-impl ConfigStore {
+impl MaiStore {
     pub async fn relay_settings(&self) -> Result<RelaySettingsResponse> {
         let config = self.relay_config().await?;
         Ok(relay_settings_response(&config))

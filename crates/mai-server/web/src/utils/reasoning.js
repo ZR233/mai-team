@@ -1,13 +1,3 @@
-const EFFORT_LABELS = {
-  none: 'None',
-  minimal: 'Minimal',
-  low: 'Low',
-  medium: 'Medium',
-  high: 'High',
-  xhigh: 'Xhigh',
-  max: 'Max'
-}
-
 export function reasoningOptionsFor(provider, model) {
   const variants = Array.isArray(model?.reasoning?.variants) ? model.reasoning.variants : []
   if (variants.length) {
@@ -34,7 +24,7 @@ export function defaultReasoningEffort(provider, model) {
 export function reasoningLabel(value) {
   if (!value) return ''
   const normalized = String(value)
-  return EFFORT_LABELS[normalized.toLowerCase()] || normalized
+  return normalized
     .replace(/[_-]+/g, ' ')
     .replace(/\b\w/g, (char) => char.toUpperCase())
 }

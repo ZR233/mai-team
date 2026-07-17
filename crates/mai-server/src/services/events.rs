@@ -13,13 +13,13 @@ const SSE_REPLAY_LIMIT: usize = 1_000;
 pub(crate) type EventStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 
 pub(crate) struct EventStreamService {
-    store: Arc<mai_store::ConfigStore>,
+    store: Arc<mai_store::MaiStore>,
     runtime: Arc<mai_runtime::AgentRuntime>,
 }
 
 impl EventStreamService {
     pub(crate) fn new(
-        store: Arc<mai_store::ConfigStore>,
+        store: Arc<mai_store::MaiStore>,
         runtime: Arc<mai_runtime::AgentRuntime>,
     ) -> Self {
         Self { store, runtime }
@@ -71,7 +71,7 @@ fn sse_event(event: ServiceEvent) -> Event {
 fn event_name(event: &ServiceEvent) -> &'static str {
     match &event.kind {
         mai_protocol::ServiceEventKind::AgentCreated { .. } => "agent_created",
-        mai_protocol::ServiceEventKind::AgentStatusChanged { .. } => "agent_status_changed",
+        mai_protocol::ServiceEventKind::AgentStateChanged { .. } => "agent_state_changed",
         mai_protocol::ServiceEventKind::AgentUpdated { .. } => "agent_updated",
         mai_protocol::ServiceEventKind::AgentDeleted { .. } => "agent_deleted",
         mai_protocol::ServiceEventKind::TaskCreated { .. } => "task_created",

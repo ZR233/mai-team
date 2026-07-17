@@ -1,4 +1,5 @@
 import hljs from 'highlight.js/lib/common'
+import { agentDisplayStatus } from './agentState.js'
 
 const MESSAGE_MATCH_LIMIT_MS = 120_000
 
@@ -135,7 +136,7 @@ export function buildAgentTimeline(detail, liveEvents = []) {
           sequence: (anchor?.sequence || event.sequence || 0) + 0.05
         })
       }
-    } else if (event.type === 'agent_status_changed') {
+    } else if (event.type === 'agent_state_changed') {
       const row = statusProcessRow(event)
       if (row) items.push(row)
     } else if (event.type === 'tool_started') {
@@ -357,7 +358,7 @@ function renderToolArguments(toolName, value) {
       ].filter(Boolean).join('')
     }
 
-    if (toolName === 'close_agent' || toolName === 'resume_agent') {
+    if (toolName === 'close_agent') {
       return [
         renderMetaLine('agent', value.target)
       ].filter(Boolean).join('')
@@ -819,14 +820,14 @@ function contextCompactionSummary(event) {
 }
 
 function statusProcessRow(event) {
-  const status = String(event.status || '')
-  if (!['starting_container', 'failed', 'cancelled', 'deleting_container', 'deleted'].includes(status)) {
+  const status = agentDisplayStatus({ state: event.state })
+  if (!['provisioning', 'failed', 'deleting', 'deleted', 'faulted'].includes(status)) {
     return null
   }
   return {
     type: 'process',
     key: `status-${event.sequence || event.timestamp}`,
-    tone: status.includes('fail') ? 'error' : status.includes('cancel') ? 'warning' : status.includes('start') ? 'active' : 'muted',
+    tone: status.includes('fail') || status === 'faulted' ? 'error' : status === 'provisioning' ? 'active' : 'muted',
     label: status.replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase()),
     detail: 'Status changed',
     timestamp: event.timestamp,

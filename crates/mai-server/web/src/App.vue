@@ -105,9 +105,12 @@
         v-else-if="activeTab === 'providers'"
         :providers="providersState.providers"
         :default-id="providersState.default_provider_id"
+        :loading="providersState.loading"
+        :error="providersState.error"
         @add="openProviderDialog(null)"
         @edit="openProviderDialog"
         @delete="confirmDeleteProvider"
+        @retry="loadProviders"
       />
 
       <ResearchAgentConfigPanel
@@ -147,6 +150,7 @@
 
     <ProviderDialog
       :dialog="providerDialog"
+      :presets="providersState.catalog?.presets || []"
       @close="closeProviderDialog"
       @save="saveProviderDialog"
       @kind-changed="fillFromPreset"

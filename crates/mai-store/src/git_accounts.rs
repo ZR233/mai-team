@@ -37,7 +37,7 @@ struct StoredGitAccount {
     relay_id: Option<String>,
 }
 
-impl ConfigStore {
+impl MaiStore {
     pub async fn list_git_accounts(&self) -> Result<GitAccountsResponse> {
         let _guard = self.git_accounts_lock.lock().await;
         let config = self.git_accounts_config().await?;

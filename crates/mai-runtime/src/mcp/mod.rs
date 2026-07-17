@@ -13,6 +13,3 @@ mod types;
 pub use error::McpError;
 pub use manager::McpAgentManager;
 pub use types::McpTool;
-
-#[cfg(test)]
-pub(crate) use naming::model_tool_name;

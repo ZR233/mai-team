@@ -39,8 +39,8 @@
         </span>
         <span
           class="status-dot"
-          :class="statusTone(row.type === 'task' ? row.task.status : row.agent.status)"
-          :title="formatStatus(row.type === 'task' ? row.task.status : row.agent.status)"
+          :class="statusTone(row.type === 'task' ? row.task.status : agentDisplayStatus(row.agent))"
+          :title="formatStatus(row.type === 'task' ? row.task.status : agentDisplayStatus(row.agent))"
         />
       </button>
       <div v-if="!tasks.length" class="empty-rail">
@@ -55,6 +55,7 @@
 import { computed } from 'vue'
 import { formatStatus, initial, statusTone } from '../utils/format'
 import { buildTaskTreeRows } from '../utils/taskTree'
+import { agentDisplayStatus } from '../utils/agentState.js'
 
 const props = defineProps({
   tasks: { type: Array, required: true },

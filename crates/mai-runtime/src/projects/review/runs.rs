@@ -6,7 +6,7 @@ use mai_protocol::{
     ProjectReviewRunDetail, ProjectReviewRunStatus, ProjectReviewRunSummary,
     ProjectReviewRunsResponse, ServiceEvent, TokenUsage, TurnId, now,
 };
-use mai_store::ConfigStore;
+use mai_store::MaiStore;
 use uuid::Uuid;
 
 use crate::{Result, RuntimeError};
@@ -42,7 +42,7 @@ pub(crate) struct FinishReviewRun {
 }
 
 pub(crate) async fn list_project_review_runs(
-    store: &ConfigStore,
+    store: &MaiStore,
     project_id: ProjectId,
     retention_days: i64,
     offset: usize,
@@ -56,7 +56,7 @@ pub(crate) async fn list_project_review_runs(
 }
 
 pub(crate) async fn get_project_review_run(
-    store: &ConfigStore,
+    store: &MaiStore,
     project_id: ProjectId,
     run_id: Uuid,
 ) -> Result<ProjectReviewRunDetail> {
@@ -67,7 +67,7 @@ pub(crate) async fn get_project_review_run(
 }
 
 pub(crate) async fn record_project_review_startup_failure(
-    store: &ConfigStore,
+    store: &MaiStore,
     project_id: ProjectId,
     error: String,
 ) -> Result<()> {
@@ -96,7 +96,7 @@ pub(crate) async fn record_project_review_startup_failure(
 }
 
 pub(crate) async fn cancel_active_project_review_runs(
-    store: &ConfigStore,
+    store: &MaiStore,
     snapshot_source: &impl ReviewRunSnapshotSource,
     project_id: ProjectId,
     reviewer_agent_id: Option<AgentId>,
@@ -137,7 +137,7 @@ pub(crate) async fn cancel_active_project_review_runs(
 }
 
 pub(crate) async fn save_project_review_run_status(
-    store: &ConfigStore,
+    store: &MaiStore,
     summary: ProjectReviewRunSummary,
     messages: Vec<AgentMessage>,
     events: Vec<ServiceEvent>,
@@ -153,7 +153,7 @@ pub(crate) async fn save_project_review_run_status(
 }
 
 pub(crate) async fn update_project_review_run_turn(
-    store: &ConfigStore,
+    store: &MaiStore,
     project_id: ProjectId,
     run_id: Uuid,
     reviewer_agent_id: AgentId,
@@ -170,7 +170,7 @@ pub(crate) async fn update_project_review_run_turn(
 }
 
 pub(crate) async fn finish_project_review_run(
-    store: &ConfigStore,
+    store: &MaiStore,
     snapshot_source: &impl ReviewRunSnapshotSource,
     request: FinishReviewRun,
 ) -> Result<()> {
@@ -201,7 +201,7 @@ pub(crate) async fn finish_project_review_run(
                 status: request.status,
                 outcome: request.outcome,
                 review_event: request.review_event,
-                pr: request.pr,
+                pr: request.pr.or(existing.summary.pr),
                 summary: request.summary_text,
                 error: request.error,
                 token_usage: snapshot.token_usage,

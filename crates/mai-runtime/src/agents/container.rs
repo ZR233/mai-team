@@ -4,15 +4,19 @@ use std::sync::Arc;
 
 use crate::mcp::McpAgentManager;
 use mai_docker::ContainerHandle;
-use mai_protocol::{AgentId, AgentStatus, McpServerConfig, McpStartupStatus, TurnId, now};
-use tokio_util::sync::CancellationToken;
+use mai_protocol::{AgentId, AgentResourceState, McpServerConfig, McpStartupStatus, now};
 
-use crate::state::{AgentRecord, TurnGuard};
+use crate::projects::workspace::{ProjectRepositoryReviewTarget, ProjectRepositoryRevision};
+use crate::state::AgentRecord;
 use crate::{Result, RuntimeError};
 
 #[derive(Debug, Clone)]
 pub(crate) enum ContainerSource {
     FreshImage,
+    ProjectReviewWorkspace {
+        target: ProjectRepositoryReviewTarget,
+        revision: ProjectRepositoryRevision,
+    },
     ProjectWorkspace {
         workspace_volume: String,
         repo_path: String,
@@ -39,7 +43,7 @@ pub(crate) struct AgentMcpStatusChange {
 }
 
 pub(crate) struct AgentContainerStatusChange {
-    pub(crate) status: AgentStatus,
+    pub(crate) state: AgentResourceState,
     pub(crate) error: Option<String>,
 }
 
@@ -67,7 +71,7 @@ pub(crate) trait AgentContainerOps: Send + Sync {
         configs: BTreeMap<String, McpServerConfig>,
     ) -> impl Future<Output = McpAgentManager> + Send;
 
-    fn set_agent_status(
+    fn set_agent_resource_state(
         &self,
         agent: Arc<AgentRecord>,
         change: AgentContainerStatusChange,
@@ -81,60 +85,15 @@ pub(crate) trait AgentContainerOps: Send + Sync {
 pub(crate) async fn ensure_agent_container(
     ops: &impl AgentContainerOps,
     agent: &Arc<AgentRecord>,
-    ready_status: AgentStatus,
 ) -> Result<String> {
-    ensure_agent_container_with_source(ops, agent, ready_status, &ContainerSource::FreshImage, None)
-        .await
-}
-
-pub(crate) async fn ensure_agent_container_for_turn(
-    ops: &impl AgentContainerOps,
-    agent: &Arc<AgentRecord>,
-    ready_status: AgentStatus,
-    turn_id: TurnId,
-    cancellation_token: &CancellationToken,
-) -> Result<String> {
-    let current_turn = agent.summary.read().await.current_turn;
-    let turn_guard = TurnGuard::new(turn_id, cancellation_token.clone());
-    let guarded_turn = current_turn.as_ref().or(Some(&turn_id));
-    turn_guard.ensure_current(guarded_turn)?;
-    let turn_guard = (current_turn == Some(turn_id)).then_some(turn_guard);
-    let container_id = ensure_agent_container_with_source(
-        ops,
-        agent,
-        ready_status.clone(),
-        &ContainerSource::FreshImage,
-        turn_guard,
-    )
-    .await?;
-    let current_turn = agent.summary.read().await.current_turn;
-    let guarded_turn = current_turn.as_ref().or(Some(&turn_id));
-    if TurnGuard::new(turn_id, cancellation_token.clone())
-        .ensure_current(guarded_turn)
-        .is_err()
-    {
-        if let Some(manager) = agent.mcp.write().await.take() {
-            manager.shutdown().await;
-        }
-        return Err(RuntimeError::TurnCancelled);
-    }
-    let needs_status_restore = agent.summary.read().await.status != ready_status;
-    if needs_status_restore {
-        set_status(ops, agent, ready_status, None).await?;
-    }
-    Ok(container_id)
+    ensure_agent_container_with_source(ops, agent, &ContainerSource::FreshImage).await
 }
 
 pub(crate) async fn ensure_agent_container_with_source(
     ops: &impl AgentContainerOps,
     agent: &Arc<AgentRecord>,
-    ready_status: AgentStatus,
     container_source: &ContainerSource,
-    turn_guard: Option<TurnGuard>,
 ) -> Result<String> {
-    if let Some(guard) = &turn_guard {
-        ensure_turn_current(agent, guard).await?;
-    }
     if let Some(container_id) = agent
         .container
         .read()
@@ -161,10 +120,7 @@ pub(crate) async fn ensure_agent_container_with_source(
         return Ok(container_id);
     }
 
-    set_status(ops, agent, AgentStatus::StartingContainer, None).await?;
-    if let Some(guard) = &turn_guard {
-        ensure_turn_current(agent, guard).await?;
-    }
+    set_resource_state(ops, agent, AgentResourceState::Provisioning, None).await?;
     let container = match ops
         .start_agent_container(AgentContainerStartRequest {
             agent_id,
@@ -178,7 +134,8 @@ pub(crate) async fn ensure_agent_container_with_source(
         Err(err) => {
             let message = err.to_string();
             drop(container_guard);
-            if let Err(store_err) = set_status(ops, agent, AgentStatus::Failed, Some(message)).await
+            if let Err(store_err) =
+                set_resource_state(ops, agent, AgentResourceState::Failed, Some(message)).await
             {
                 tracing::warn!("failed to persist container startup failure: {store_err}");
             }
@@ -187,13 +144,6 @@ pub(crate) async fn ensure_agent_container_with_source(
     };
 
     let container_id = container.id.clone();
-    if let Some(guard) = &turn_guard
-        && let Err(err) = ensure_turn_current(agent, guard).await
-    {
-        drop(container_guard);
-        ops.remove_agent_container(agent_id, container_id).await;
-        return Err(err);
-    }
     {
         let mut summary = agent.summary.write().await;
         summary.container_id = Some(container_id.clone());
@@ -217,18 +167,6 @@ pub(crate) async fn ensure_agent_container_with_source(
         .await;
     }
     let mcp = ops.start_agent_mcp_manager(container.id, mcp_configs).await;
-    if let Some(guard) = &turn_guard
-        && let Err(err) = ensure_turn_current(agent, guard).await
-    {
-        mcp.shutdown().await;
-        *agent.container.write().await = None;
-        {
-            let mut summary = agent.summary.write().await;
-            summary.container_id = None;
-        }
-        ops.remove_agent_container(agent_id, container_id).await;
-        return Err(err);
-    }
     for status in mcp.statuses().await {
         ops.publish_mcp_status(AgentMcpStatusChange {
             agent_id,
@@ -261,33 +199,31 @@ pub(crate) async fn ensure_agent_container_with_source(
             summary.container_id = None;
         }
         ops.remove_agent_container(agent_id, container_id).await;
-        set_status(ops, agent, AgentStatus::Failed, Some(message.clone())).await?;
+        set_resource_state(
+            ops,
+            agent,
+            AgentResourceState::Failed,
+            Some(message.clone()),
+        )
+        .await?;
         return Err(RuntimeError::InvalidInput(format!(
             "required MCP server startup failed: {message}"
         )));
     }
-    if let Some(guard) = &turn_guard {
-        ensure_turn_current(agent, guard).await?;
-    }
     *agent.mcp.write().await = Some(Arc::new(mcp));
-    set_status(ops, agent, ready_status, None).await?;
+    set_resource_state(ops, agent, AgentResourceState::Ready, None).await?;
     Ok(container_id)
 }
 
-async fn set_status(
+async fn set_resource_state(
     ops: &impl AgentContainerOps,
     agent: &Arc<AgentRecord>,
-    status: AgentStatus,
+    state: AgentResourceState,
     error: Option<String>,
 ) -> Result<()> {
-    ops.set_agent_status(
+    ops.set_agent_resource_state(
         Arc::clone(agent),
-        AgentContainerStatusChange { status, error },
+        AgentContainerStatusChange { state, error },
     )
     .await
-}
-
-async fn ensure_turn_current(agent: &AgentRecord, guard: &TurnGuard) -> Result<()> {
-    let current_turn = agent.summary.read().await.current_turn;
-    guard.ensure_current(current_turn.as_ref())
 }

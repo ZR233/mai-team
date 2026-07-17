@@ -3,13 +3,13 @@ use std::sync::Arc;
 use crate::agents::profiles::AgentProfilesManager;
 use crate::skills::SkillsManager;
 use mai_docker::DockerClient;
-use mai_store::ConfigStore;
+use mai_store::MaiStore;
 
 use crate::github::{GitAccountService, GithubAppBackend};
 
 pub(crate) struct RuntimeDeps {
     pub(crate) docker: DockerClient,
-    pub(crate) store: Arc<ConfigStore>,
+    pub(crate) store: Arc<MaiStore>,
     pub(crate) skills: SkillsManager,
     pub(crate) agent_profiles: AgentProfilesManager,
     pub(crate) github_http: reqwest::Client,

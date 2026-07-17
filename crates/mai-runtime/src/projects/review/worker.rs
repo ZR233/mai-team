@@ -5,9 +5,9 @@ use std::sync::Arc;
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::{AbortHandle, Abortable};
 use mai_protocol::{
-    AgentId, AgentStatus, AgentSummary, GitProvider, ProjectCloneStatus, ProjectId,
-    ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus, ProjectStatus,
-    ProjectSummary, TurnId,
+    AgentId, AgentResourceState, AgentRuntimeLifecycle, AgentSummary, GitProvider,
+    ProjectCloneStatus, ProjectId, ProjectReviewOutcome, ProjectReviewRunStatus,
+    ProjectReviewStatus, ProjectStatus, ProjectSummary, TurnId,
 };
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
@@ -72,7 +72,7 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         update: ReviewStateUpdate,
     ) -> impl Future<Output = Result<ProjectSummary>> + Send;
 
-    fn ensure_project_cache_ready(
+    fn ensure_project_repository_ready(
         &self,
         project_id: ProjectId,
     ) -> impl Future<Output = Result<()>> + Send;
@@ -105,7 +105,7 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         &self,
         project_id: ProjectId,
         cancellation_token: CancellationToken,
-        target_pr: Option<u64>,
+        request: super::target::ProjectReviewRequest,
     ) -> impl Future<Output = Result<ProjectReviewCycleResult>> + Send;
 
     fn agent_current_turn(
@@ -162,23 +162,57 @@ pub(crate) async fn start_project_review_loop_if_ready(
     project_id: ProjectId,
 ) -> Result<()> {
     let project = ops.project(project_id).await?;
-    let should_start = {
+    let (resources_ready, auto_review_enabled) = {
         let summary = project.summary.read().await;
-        project_ready_for_review(&summary)
+        (
+            project_resources_ready_for_review(&summary),
+            summary.auto_review_enabled,
+        )
     };
-    if !should_start {
+    let has_pending_manual_review = !project.review_pool.lock().await.is_empty();
+    if !resources_ready || (!auto_review_enabled && !has_pending_manual_review) {
         return Ok(());
     }
 
-    let git_provider = match ops.project_git_provider(project_id).await {
-        Ok(provider) => provider,
-        Err(err) => {
-            tracing::warn!(project_id = %project_id, "failed to read project git provider: {err}");
-            None
+    let git_provider = if auto_review_enabled {
+        match ops.project_git_provider(project_id).await {
+            Ok(provider) => provider,
+            Err(err) => {
+                tracing::warn!(project_id = %project_id, "failed to read project git provider: {err}");
+                None
+            }
         }
+    } else {
+        None
     };
     let mut worker = project.review_worker.lock().await;
-    if worker.is_some() {
+    if let Some(worker) = worker.as_mut() {
+        if auto_review_enabled {
+            let context = ProjectReviewTaskContext {
+                ops: ops.clone(),
+                project_id,
+                cancellation_token: worker.cancellation_token.clone(),
+            };
+            if worker.relay_selector_abort_handle.is_none() {
+                worker.relay_selector_abort_handle = Some(spawn_project_review_child(
+                    super::relay_selector::run_project_review_relay_selector_loop(
+                        context.ops.clone(),
+                        context.project_id,
+                        context.cancellation_token.clone(),
+                    ),
+                ));
+            }
+            if worker.selector_abort_handle.is_none()
+                && matches!(
+                    git_provider,
+                    Some(GitProvider::Github) | Some(GitProvider::GithubAppRelay)
+                )
+            {
+                worker.selector_abort_handle = Some(spawn_project_review_child(
+                    run_project_review_selector_loop(context),
+                ));
+            }
+        }
         return Ok(());
     }
     let cancellation_token = CancellationToken::new();
@@ -189,18 +223,23 @@ pub(crate) async fn start_project_review_loop_if_ready(
     };
     let pool_abort_handle =
         spawn_project_review_child(run_project_review_pool_worker(context.clone()));
-    let relay_selector_abort_handle = spawn_project_review_child(
-        super::relay_selector::run_project_review_relay_selector_loop(
-            context.ops.clone(),
-            context.project_id,
-            context.cancellation_token.clone(),
-        ),
-    );
-    let selector_abort_handle = match git_provider {
-        Some(GitProvider::Github) | Some(GitProvider::GithubAppRelay) => Some(
+    let relay_selector_abort_handle = auto_review_enabled.then(|| {
+        spawn_project_review_child(
+            super::relay_selector::run_project_review_relay_selector_loop(
+                context.ops.clone(),
+                context.project_id,
+                context.cancellation_token.clone(),
+            ),
+        )
+    });
+    let selector_abort_handle = match (auto_review_enabled, git_provider) {
+        (true, Some(GitProvider::Github) | Some(GitProvider::GithubAppRelay)) => Some(
             spawn_project_review_child(run_project_review_selector_loop(context.clone())),
         ),
-        None => None,
+        (true, None)
+        | (false, Some(GitProvider::Github))
+        | (false, Some(GitProvider::GithubAppRelay))
+        | (false, None) => None,
     };
     *worker = Some(ProjectReviewWorker {
         cancellation_token,
@@ -227,7 +266,9 @@ pub(crate) async fn stop_project_review_loop(
         if let Some(selector_abort_handle) = worker.selector_abort_handle {
             selector_abort_handle.abort();
         }
-        worker.relay_selector_abort_handle.abort();
+        if let Some(relay_selector_abort_handle) = worker.relay_selector_abort_handle {
+            relay_selector_abort_handle.abort();
+        }
     }
     project.review_pool.lock().await.clear();
     project.relay_review_queue.lock().await.clear();
@@ -308,7 +349,11 @@ async fn run_project_review_pool_worker(
         if !project_still_ready(&ops).await {
             break;
         }
-        match ops.ops.ensure_project_cache_ready(ops.project_id).await {
+        match ops
+            .ops
+            .ensure_project_repository_ready(ops.project_id)
+            .await
+        {
             Ok(()) => break,
             Err(err) => {
                 let error = err.to_string();
@@ -395,7 +440,9 @@ async fn run_project_review_pool_worker(
             tracing::warn!(
                 project_id = %ops.project_id,
                 reviewer_id = %reviewer.id,
-                status = %reviewer.status,
+                resource = %reviewer.state.resource,
+                lifecycle = ?reviewer.state.runtime.lifecycle,
+                activity = ?reviewer.state.runtime.activity,
                 "project review signal delayed because another reviewer agent is still active"
             );
             requeue_project_review_signal(&ops.ops, ops.project_id, signal).await;
@@ -410,7 +457,10 @@ async fn run_project_review_pool_worker(
             .run_project_review_once(
                 ops.project_id,
                 ops.cancellation_token.clone(),
-                Some(signal.pr),
+                super::target::ProjectReviewRequest {
+                    pr: signal.pr,
+                    head_sha_hint: signal.head_sha.clone(),
+                },
             )
             .await;
         let mut decision = match decision {
@@ -637,7 +687,7 @@ async fn project_still_ready(ops: &ProjectReviewTaskContext<impl ProjectReviewWo
     match ops.ops.project(ops.project_id).await {
         Ok(project) => {
             let summary = project.summary.read().await;
-            project_ready_for_review(&summary)
+            project_resources_ready_for_review(&summary)
         }
         Err(_) => false,
     }
@@ -697,7 +747,7 @@ async fn active_project_reviewer_ids(
         }
     }
     for agent in ops.project_auto_reviewer_agents(project_id).await {
-        if project_reviewer_agent_is_active(&agent.status) {
+        if project_reviewer_agent_is_active(&agent) {
             reviewer_ids.insert(agent.id);
         }
     }
@@ -711,22 +761,14 @@ async fn active_project_reviewer_agent(
     ops.project_auto_reviewer_agents(project_id)
         .await
         .into_iter()
-        .find(|agent| project_reviewer_agent_is_active(&agent.status))
+        .find(project_reviewer_agent_is_active)
 }
 
-fn project_reviewer_agent_is_active(status: &AgentStatus) -> bool {
-    match status {
-        AgentStatus::Created
-        | AgentStatus::StartingContainer
-        | AgentStatus::Idle
-        | AgentStatus::RunningTurn
-        | AgentStatus::WaitingTool => true,
-        AgentStatus::DeletingContainer
-        | AgentStatus::Completed
-        | AgentStatus::Failed
-        | AgentStatus::Cancelled
-        | AgentStatus::Deleted => false,
-    }
+fn project_reviewer_agent_is_active(agent: &AgentSummary) -> bool {
+    matches!(
+        agent.state.resource,
+        AgentResourceState::Provisioning | AgentResourceState::Ready
+    ) && agent.state.runtime.lifecycle == AgentRuntimeLifecycle::Active
 }
 
 async fn wait_for_project_review_signal(
@@ -765,10 +807,8 @@ async fn wait_for_project_review_startup_retry(
     }
 }
 
-fn project_ready_for_review(summary: &ProjectSummary) -> bool {
-    summary.auto_review_enabled
-        && summary.status == ProjectStatus::Ready
-        && summary.clone_status == ProjectCloneStatus::Ready
+fn project_resources_ready_for_review(summary: &ProjectSummary) -> bool {
+    summary.status == ProjectStatus::Ready && summary.clone_status == ProjectCloneStatus::Ready
 }
 
 #[cfg(test)]
@@ -776,9 +816,10 @@ mod tests {
     use std::sync::Arc;
 
     use mai_protocol::{
-        AgentRole, AgentStatus, ProjectCloneStatus, ProjectReviewDecision, ProjectReviewOutcome,
-        ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewStatus, ProjectStatus,
-        ProjectSummary, TokenUsage, now,
+        AgentResourceState, AgentRole, AgentRuntimeActivity, AgentRuntimeState, AgentState,
+        ProjectCloneStatus, ProjectReviewDecision, ProjectReviewOutcome, ProjectReviewRunStatus,
+        ProjectReviewRunSummary, ProjectReviewStatus, ProjectStatus, ProjectSummary, TokenUsage,
+        now,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::{Mutex, Notify};
@@ -959,7 +1000,7 @@ mod tests {
             Ok(summary.clone())
         }
 
-        async fn ensure_project_cache_ready(&self, _project_id: Uuid) -> crate::Result<()> {
+        async fn ensure_project_repository_ready(&self, _project_id: Uuid) -> crate::Result<()> {
             let error = {
                 let mut errors = self.cache_ready_errors.lock().await;
                 (!errors.is_empty()).then(|| errors.remove(0))
@@ -1050,8 +1091,9 @@ mod tests {
             &self,
             _project_id: Uuid,
             _cancellation_token: CancellationToken,
-            target_pr: Option<u64>,
+            request: crate::projects::review::target::ProjectReviewRequest,
         ) -> crate::Result<ProjectReviewCycleResult> {
+            let target_pr = Some(request.pr);
             self.reviewed_prs.lock().await.push(target_pr);
             let error = {
                 let mut errors = self.review_errors.lock().await;
@@ -1082,7 +1124,7 @@ mod tests {
                 .await
                 .iter()
                 .find(|agent| agent.id == agent_id)
-                .and_then(|agent| agent.current_turn))
+                .and_then(|agent| agent.state.active_turn()))
         }
 
         async fn cancel_agent_turn(&self, agent_id: Uuid, turn_id: Uuid) -> crate::Result<()> {
@@ -1423,10 +1465,10 @@ mod tests {
         let reviewer = test_reviewer_agent(
             project_id,
             ops.project.summary.read().await.maintainer_agent_id,
-            AgentStatus::WaitingTool,
+            TestReviewerState::WaitingTool,
         );
         let reviewer_id = reviewer.id;
-        let turn_id = reviewer.current_turn;
+        let turn_id = reviewer.state.active_turn();
         {
             let mut summary = ops.project.summary.write().await;
             summary.review_status = ProjectReviewStatus::Running;
@@ -1481,13 +1523,10 @@ mod tests {
         let project_id = Uuid::new_v4();
         let ops = FakeWorkerOps::new(project_id);
         let maintainer_agent_id = ops.project.summary.read().await.maintainer_agent_id;
-        let reviewer = test_reviewer_agent(
-            project_id,
-            maintainer_agent_id,
-            AgentStatus::DeletingContainer,
-        );
+        let reviewer =
+            test_reviewer_agent(project_id, maintainer_agent_id, TestReviewerState::Deleting);
         let reviewer_id = reviewer.id;
-        let turn_id = reviewer.current_turn.expect("reviewer turn");
+        let turn_id = reviewer.state.active_turn().expect("reviewer turn");
         ops.set_auto_reviewers(vec![reviewer]).await;
         ops.set_review_runs(vec![test_review_run(
             project_id,
@@ -1546,10 +1585,10 @@ mod tests {
         let ops = FakeWorkerOps::new(project_id);
         let maintainer_agent_id = ops.project.summary.read().await.maintainer_agent_id;
         let reviewer =
-            test_reviewer_agent(project_id, maintainer_agent_id, AgentStatus::RunningTurn);
+            test_reviewer_agent(project_id, maintainer_agent_id, TestReviewerState::Running);
         let reviewer_id = reviewer.id;
         let extra_reviewer =
-            test_reviewer_agent(project_id, maintainer_agent_id, AgentStatus::Failed);
+            test_reviewer_agent(project_id, maintainer_agent_id, TestReviewerState::Failed);
         let extra_reviewer_id = extra_reviewer.id;
         {
             let mut summary = ops.project.summary.write().await;
@@ -1586,14 +1625,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_repair_purges_closed_reviewer_tombstone() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        let maintainer_agent_id = ops.project.summary.read().await.maintainer_agent_id;
+        let reviewer =
+            test_reviewer_agent(project_id, maintainer_agent_id, TestReviewerState::Deleted);
+        let reviewer_id = reviewer.id;
+        ops.set_auto_reviewers(vec![reviewer]).await;
+
+        repair_project_review_singleton(&ops, project_id, 10, ProjectReviewRepairReason::Startup)
+            .await
+            .expect("startup repair");
+
+        assert_eq!(vec![reviewer_id], *ops.deleted_agents.lock().await);
+    }
+
+    #[tokio::test]
     async fn stop_project_review_loop_deletes_active_reviewer_when_state_lost_reviewer_id() {
         let project_id = Uuid::new_v4();
         let ops = FakeWorkerOps::new(project_id);
         let maintainer_agent_id = ops.project.summary.read().await.maintainer_agent_id;
         let reviewer =
-            test_reviewer_agent(project_id, maintainer_agent_id, AgentStatus::RunningTurn);
+            test_reviewer_agent(project_id, maintainer_agent_id, TestReviewerState::Running);
         let reviewer_id = reviewer.id;
-        let turn_id = reviewer.current_turn.expect("reviewer turn");
+        let turn_id = reviewer.state.active_turn().expect("reviewer turn");
         ops.set_auto_reviewers(vec![reviewer]).await;
 
         super::stop_project_review_loop(ops.clone(), project_id, 10).await;
@@ -1800,6 +1856,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_queue_starts_only_pool_worker_when_auto_review_is_disabled() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        {
+            let mut summary = ops.project.summary.write().await;
+            summary.auto_review_enabled = false;
+            summary.review_status = ProjectReviewStatus::Disabled;
+        }
+        ops.project
+            .review_pool
+            .lock()
+            .await
+            .enqueue_many([ProjectReviewSignalInput {
+                pr: 17,
+                head_sha: None,
+                delivery_id: None,
+                reason: "manual_rereview".to_string(),
+            }]);
+
+        super::start_project_review_loop_if_ready(ops.clone(), project_id)
+            .await
+            .expect("start manual review worker");
+
+        {
+            let worker = ops.project.review_worker.lock().await;
+            let worker = worker.as_ref().expect("pool worker");
+            assert!(worker.selector_abort_handle.is_none());
+            assert!(worker.relay_selector_abort_handle.is_none());
+        }
+
+        super::stop_project_review_loop(ops, project_id, 10).await;
+    }
+
+    #[tokio::test]
     async fn selector_worker_starts_for_github_token_and_github_app_providers() {
         for git_provider in [
             mai_protocol::GitProvider::Github,
@@ -1887,11 +1977,54 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum TestReviewerState {
+        WaitingTool,
+        Deleting,
+        Running,
+        Failed,
+        Deleted,
+    }
+
     fn test_reviewer_agent(
         project_id: Uuid,
         maintainer_agent_id: Uuid,
-        status: AgentStatus,
+        test_state: TestReviewerState,
     ) -> mai_protocol::AgentSummary {
+        let turn_id = Uuid::new_v4();
+        let mut state = AgentState {
+            resource: AgentResourceState::Ready,
+            runtime: AgentRuntimeState {
+                activity: AgentRuntimeActivity::Running,
+                active_turn: Some(turn_id),
+                active_session: Some(Uuid::new_v4()),
+                ..AgentRuntimeState::default()
+            },
+            ..AgentState::default()
+        };
+        match test_state {
+            TestReviewerState::WaitingTool => {
+                state.runtime.activity = AgentRuntimeActivity::WaitingTool;
+            }
+            TestReviewerState::Deleting => {
+                state.resource = AgentResourceState::Deleting;
+            }
+            TestReviewerState::Running => {}
+            TestReviewerState::Failed => {
+                state.resource = AgentResourceState::Failed;
+                state.resource_error = Some("reviewer failed".to_string());
+                state.runtime.activity = AgentRuntimeActivity::Idle;
+                state.runtime.active_turn = None;
+                state.runtime.active_session = None;
+            }
+            TestReviewerState::Deleted => {
+                state.resource = AgentResourceState::Deleted;
+                state.runtime.lifecycle = mai_protocol::AgentRuntimeLifecycle::Closed;
+                state.runtime.activity = AgentRuntimeActivity::Idle;
+                state.runtime.active_turn = None;
+                state.runtime.active_session = None;
+            }
+        }
         mai_protocol::AgentSummary {
             id: Uuid::new_v4(),
             parent_id: Some(maintainer_agent_id),
@@ -1899,7 +2032,7 @@ mod tests {
             project_id: Some(project_id),
             role: Some(AgentRole::Reviewer),
             name: "reviewer".to_string(),
-            status,
+            state,
             container_id: Some("container".to_string()),
             docker_image: "unused".to_string(),
             provider_id: "mock".to_string(),
@@ -1908,8 +2041,6 @@ mod tests {
             reasoning_effort: Some("medium".to_string()),
             created_at: now(),
             updated_at: now(),
-            current_turn: Some(Uuid::new_v4()),
-            last_error: None,
             token_usage: TokenUsage::default(),
         }
     }

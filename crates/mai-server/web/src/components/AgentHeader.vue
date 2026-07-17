@@ -5,8 +5,8 @@
       <div class="agent-title">
         <div class="title-row">
           <h2>{{ detail.name }}</h2>
-          <span class="status-pill" :class="statusTone(detail.status)">
-            {{ formatStatus(detail.status) }}
+          <span class="status-pill" :class="statusTone(agentDisplayStatus(detail))">
+            {{ formatStatus(agentDisplayStatus(detail)) }}
           </span>
         </div>
         <p v-if="detail.docker_image">
@@ -14,7 +14,7 @@
           <span>/</span>
           <span class="mono">{{ detail.docker_image }}</span>
         </p>
-        <p v-if="detail.last_error" class="error-text">{{ detail.last_error }}</p>
+        <p v-if="agentResourceError(detail)" class="error-text">{{ agentResourceError(detail) }}</p>
       </div>
     </div>
 
@@ -30,6 +30,7 @@
 
 <script setup>
 import { formatStatus, initial, statusTone } from '../utils/format'
+import { agentDisplayStatus, agentResourceError } from '../utils/agentState.js'
 
 defineProps({
   detail: { type: Object, required: true },

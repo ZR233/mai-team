@@ -172,6 +172,7 @@ import { buildAgentTimeline } from '../utils/timeline'
 import { defaultReasoningEffort, reasoningOptionsFor } from '../utils/reasoning'
 import { effectiveContextTokens } from '../utils/modelPicker'
 import { chatContainerState } from '../utils/chatContainerState'
+import { agentDisplayStatus, canStopAgentTurn, isAgentBusy } from '../utils/agentState.js'
 
 const props = defineProps({
   environments: { type: Array, required: true },
@@ -239,7 +240,7 @@ const currentConversationTitle = computed(() => {
   return 'New Conversation'
 })
 const environmentName = computed(() => props.detail?.name || '默认环境')
-const environmentStatus = computed(() => agent.value ? formatStatus(agent.value.status) : 'Preparing Container')
+const environmentStatus = computed(() => agent.value ? formatStatus(agentDisplayStatus(agent.value)) : 'Preparing Container')
 const timelineItems = computed(() => buildAgentTimeline(agent.value, props.events))
 const containerState = computed(() => chatContainerState({
   detail: props.detail,
@@ -251,17 +252,14 @@ const currentProvider = computed(() => props.providers.find((provider) => provid
 const currentModel = computed(() => currentProvider.value?.models?.find((model) => model.id === agent.value?.model))
 const currentReasoningOptions = computed(() => reasoningOptionsFor(currentProvider.value, currentModel.value))
 const modelBusy = computed(() =>
-  props.updatingModel || ['running_turn', 'waiting_tool', 'starting_container'].includes(agent.value?.status)
+  props.updatingModel || isAgentBusy(agent.value)
 )
 const inputEnabled = computed(() => containerState.value.containerReady)
 const composerDisabled = computed(() => containerState.value.composerDisabled)
 const composerDisabledReason = computed(() => composerDisabled.value ? containerState.value.disabledReason : '')
 const containerStatusItem = computed(() => containerState.value.statusItem)
 const timelineLoading = computed(() => props.loading && Boolean(agent.value))
-const canStopTurn = computed(() => {
-  if (!agent.value?.current_turn) return false
-  return ['running_turn', 'waiting_tool', 'starting_container'].includes(agent.value.status)
-})
+const canStopTurn = computed(() => canStopAgentTurn(agent.value))
 const pendingUserInput = computed(() => {
   if (!agent.value) return null
   const input = timelineItems.value.find((item) => item.type === 'user_input' && !answeredInputKeys.has(item.key))

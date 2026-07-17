@@ -14,7 +14,7 @@ export default defineConfig({
       '/git': apiTarget,
       '/github': apiTarget,
       '/mcp-servers': apiTarget,
-      '/provider-presets': apiTarget,
+      '/provider-catalog': apiTarget,
       '/providers': apiTarget,
       '/projects': apiTarget,
       '/relay': apiTarget,

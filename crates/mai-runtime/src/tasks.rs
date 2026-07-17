@@ -285,7 +285,10 @@ pub(crate) async fn list_tasks(state: &RuntimeState) -> Vec<TaskSummary> {
     summaries
 }
 
-pub(crate) async fn list_environments(state: &RuntimeState) -> Vec<EnvironmentSummary> {
+pub(crate) async fn list_environments(
+    state: &RuntimeState,
+    ops: &impl TaskReadOps,
+) -> Vec<EnvironmentSummary> {
     let task_records = {
         let tasks = state.tasks.read().await;
         tasks.values().cloned().collect::<Vec<_>>()
@@ -293,7 +296,7 @@ pub(crate) async fn list_environments(state: &RuntimeState) -> Vec<EnvironmentSu
     let mut summaries = Vec::with_capacity(task_records.len());
     for task in task_records {
         let task_summary = task.summary.read().await.clone();
-        if let Some(summary) = environment_summary(state, &task_summary).await {
+        if let Some(summary) = environment_summary(state, ops, &task_summary).await {
             summaries.push(summary);
         }
     }
@@ -351,9 +354,7 @@ pub(crate) async fn create_environment(
             workflow_lock: Mutex::new(()),
         }),
     );
-    Ok(environment_summary(state, &task)
-        .await
-        .unwrap_or_else(|| environment_summary_from_root(&task, &root_agent, 1)))
+    Ok(environment_summary_from_root(&task, &root_agent, 1))
 }
 
 pub(crate) async fn get_environment(
@@ -459,6 +460,7 @@ pub(crate) async fn get_task(
 
 pub(crate) async fn environment_summary(
     state: &RuntimeState,
+    ops: &impl TaskReadOps,
     task: &TaskSummary,
 ) -> Option<EnvironmentSummary> {
     let root_agent = {
@@ -466,7 +468,12 @@ pub(crate) async fn environment_summary(
         agents.get(&task.planner_agent_id).cloned()
     }?;
     let root_summary = root_agent.summary.read().await.clone();
-    let conversation_count = root_agent.sessions.lock().await.len();
+    let conversation_count = ops
+        .get_agent(task.planner_agent_id, None)
+        .await
+        .ok()?
+        .sessions
+        .len();
     Some(environment_summary_from_root(
         task,
         &root_summary,
@@ -491,7 +498,15 @@ fn environment_summary_from_root(
         last_error: task
             .last_error
             .clone()
-            .or_else(|| root_agent.last_error.clone()),
+            .or_else(|| root_agent.state.resource_error.clone())
+            .or_else(|| {
+                root_agent
+                    .state
+                    .runtime
+                    .last_turn
+                    .as_ref()
+                    .and_then(|turn| turn.reason.clone())
+            }),
     }
 }
 

@@ -5,10 +5,22 @@
         <h2>Providers</h2>
         <p>Configure built-in provider presets and custom model metadata for task agents.</p>
       </div>
-      <button class="primary-button" @click="$emit('add')">Add Provider</button>
+      <button class="primary-button" :disabled="loading || !!error" @click="$emit('add')">Add Provider</button>
     </div>
 
-    <div class="provider-grid">
+    <div v-if="error" class="empty-stage providers-empty">
+      <div class="empty-mark">!</div>
+      <h2>Provider catalog failed to load</h2>
+      <p>{{ error }}</p>
+      <button class="primary-button" @click="$emit('retry')">Retry</button>
+    </div>
+
+    <div v-else-if="loading" class="empty-stage providers-empty">
+      <div class="spinner-sm"></div>
+      <h2>Loading provider catalog</h2>
+    </div>
+
+    <div v-else class="provider-grid">
       <article
         v-for="(provider, index) in providers"
         :key="provider.id"
@@ -20,7 +32,7 @@
             <div class="provider-icon">{{ initial(provider.name) }}</div>
             <div class="provider-title-block">
               <h3>{{ provider.name }}</h3>
-              <p class="mono">{{ provider.id }} / {{ providerKind(provider.kind) }}</p>
+              <p class="mono">{{ provider.id }} / {{ transportLabel(provider.transport) }}</p>
             </div>
           </div>
           <div class="provider-badges">
@@ -76,7 +88,7 @@
       </article>
     </div>
 
-    <div v-if="!providers.length" class="empty-stage providers-empty">
+    <div v-if="!loading && !error && !providers.length" class="empty-stage providers-empty">
       <div class="empty-mark">P</div>
       <h2>No providers configured</h2>
       <p>Add a provider before creating tasks.</p>
@@ -92,10 +104,12 @@ const MAX_VISIBLE_MODELS = 4
 
 defineProps({
   providers: { type: Array, required: true },
-  defaultId: { type: String, default: null }
+  defaultId: { type: String, default: null },
+  loading: { type: Boolean, default: false },
+  error: { type: String, default: '' }
 })
 
-defineEmits(['add', 'edit', 'delete'])
+defineEmits(['add', 'edit', 'delete', 'retry'])
 
 function visibleModels(provider) {
   return (provider.models || []).slice(0, MAX_VISIBLE_MODELS)
@@ -109,8 +123,10 @@ function modelCount(provider) {
   return (provider.models || []).length
 }
 
-function providerKind(kind) {
-  return String(kind || 'custom').toUpperCase()
+function transportLabel(transport) {
+  const protocol = String(transport?.protocol || 'custom').replaceAll('_', ' ')
+  const mode = String(transport?.connection_mode || '').replaceAll('_', ' ')
+  return mode ? `${protocol} / ${mode}`.toUpperCase() : protocol.toUpperCase()
 }
 
 function defaultModelLabel(provider) {

@@ -20,7 +20,7 @@ struct GithubAppConfig {
     owner_type: Option<String>,
 }
 
-impl ConfigStore {
+impl MaiStore {
     pub async fn get_github_app_settings(&self) -> Result<GithubAppSettingsResponse> {
         let config = self.github_app_config().await?;
         Ok(GithubAppSettingsResponse {

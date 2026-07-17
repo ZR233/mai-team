@@ -1,6 +1,7 @@
 import { nextTick, reactive, ref } from 'vue'
 import { useApi } from './useApi.js'
 import { highlightCodeBlocks } from '../utils/markdown.js'
+import { activeAgentTurn } from '../utils/agentState.js'
 
 const environments = ref([])
 const selectedEnvironmentId = ref(null)
@@ -149,7 +150,7 @@ export function useEnvironments() {
 
   async function stopEnvironmentAgentTurn(agent = selectedEnvironmentDetail.value?.root_agent) {
     const agentId = agent?.id || selectedEnvironmentDetail.value?.root_agent?.id
-    const turnId = agent?.current_turn || selectedEnvironmentDetail.value?.root_agent?.current_turn
+    const turnId = activeAgentTurn(agent || selectedEnvironmentDetail.value?.root_agent)
     if (!agentId || !turnId) return null
     isEnvironmentStopping.value = true
     try {

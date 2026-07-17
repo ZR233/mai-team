@@ -86,7 +86,7 @@ function projectDetail(selectedAgentId) {
     id: 'maintainer-1',
     role: 'planner',
     name: 'Maintainer',
-    status: 'idle',
+    state: agentState('idle'),
     selected_session_id: 'maintainer-session',
     messages: [],
     recent_events: []
@@ -95,7 +95,7 @@ function projectDetail(selectedAgentId) {
     id: activeReviewerId,
     role: 'reviewer',
     name: 'Auto Reviewer',
-    status: 'running_turn',
+    state: agentState('running'),
     selected_session_id: `${activeReviewerId}-session`,
     messages: [],
     recent_events: []
@@ -111,6 +111,22 @@ function projectDetail(selectedAgentId) {
     maintainer_agent: maintainerAgent,
     agents,
     selected_agent: selectedAgent
+  }
+}
+
+function agentState(activity) {
+  return {
+    resource: 'ready',
+    resource_error: null,
+    runtime: {
+      lifecycle: 'active',
+      activity,
+      active_turn: activity === 'running' ? 'turn-1' : null,
+      active_session: null,
+      pending_inputs: 0,
+      last_turn: null,
+      revision: 1
+    }
   }
 }
 

@@ -1,7 +1,7 @@
 use crate::records::*;
 use crate::*;
 
-impl ConfigStore {
+impl MaiStore {
     pub async fn save_task(&self, task: &TaskSummary, plan: &TaskPlan) -> Result<()> {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;

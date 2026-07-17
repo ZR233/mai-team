@@ -1,15 +1,15 @@
 ---
 name: reviewer-agent-review-pr
-description: Reviewer agent skill for performing a script-assisted, deep, single GitHub pull request review. The reviewer agent reviews the target PR already selected by Mai, uses bundled helper scripts for reviewer clone checkout, changed-file/crate detection, Rust validation command planning, and final scheduler JSON, then performs human-quality code review and submits a GitHub review with inline comments. Trigger when the reviewer agent is invoked to review PRs, or when tasks are assigned for PR code review.
+description: Reviewer agent skill for performing a script-assisted, deep, single GitHub pull request review. The reviewer agent reviews the target PR already prepared by Mai, uses bundled helper scripts for revision verification, changed-file/crate detection, Rust validation command planning, and final scheduler JSON, then performs human-quality code review and submits a GitHub review with inline comments. Trigger when the reviewer agent is invoked to review PRs, or when tasks are assigned for PR code review.
 metadata:
   short-description: Script-assisted reviewer agent single-PR review
 ---
 
 # Reviewer Agent - Review PR
 
-Review exactly one target GitHub pull request for the current project. Mai's system selector is responsible for choosing the PR before this skill starts. Use Mai's visible `github_api_request` tool for GitHub reads/writes, local shell commands for git/test work, and the bundled helper for deterministic local preparation.
+Review exactly one target GitHub pull request for the current project. Mai's system selector is responsible for choosing the PR before this skill starts. Use Mai's visible `github_api_request` tool for GitHub reads/writes, local shell commands for git/test work, and the bundled helper for deterministic revision verification.
 
-Mai refreshes the reviewer-owned clone at `/workspace/repo` before this skill starts. PR refs are available in the local clone, commonly as `refs/remotes/origin/pr/<number>` or `refs/pull/<number>/head`. Do not fetch credentials, read `GITHUB_TOKEN`, write credential files, or add model footers. Mai appends the model footer to submitted project reviews.
+Mai refreshes the project default branch repository, snapshots project skills and memory from that default branch, then prepares the reviewer-owned clone at `/workspace/repo` at the exact target head before this skill starts. The default branch remains available as `refs/remotes/origin/<default-branch>`. Do not checkout another revision, fetch credentials, read `GITHUB_TOKEN`, write credential files, or add model footers. Mai appends the model footer to submitted project reviews.
 
 ## Use Bundled Scripts First
 
@@ -32,7 +32,7 @@ python3 /tmp/review_pr_helper.py test
 The helper commands are:
 
 ```bash
-python3 scripts/review_pr_helper.py prepare-review --repo /workspace/repo --agent-id "$REVIEWER_AGENT_ID" --pr "$PR"
+python3 scripts/review_pr_helper.py prepare-review --repo /workspace/repo --pr "$PR" --head-sha "$HEAD_SHA" --base-ref "origin/$DEFAULT_BRANCH"
 python3 scripts/review_pr_helper.py changed-files --repo "$REVIEW_REPO" --files files.json
 python3 scripts/review_pr_helper.py rust-plan --repo "$REVIEW_REPO" --changed changed.json
 python3 scripts/review_pr_helper.py final-json --outcome review_submitted --review-event approve --pr "$PR" --summary "Submitted APPROVE for owner/repo#$PR after validation passed."
@@ -40,11 +40,12 @@ python3 scripts/review_pr_helper.py final-json --outcome review_submitted --revi
 
 Treat helper output as structured facts and command suggestions. You still own code understanding, finding severity, inline comment wording, and the final GitHub review decision.
 
-When dogfooding this skill outside Mai, `/workspace/repo` may not exist. Use the local clone as `--repo` and make sure PR refs exist first:
+When dogfooding this skill outside Mai, `/workspace/repo` may not exist. Use an isolated local clone as `--repo`, prepare its exact revision first, and then run the same verification:
 
 ```bash
-git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'
-python3 scripts/review_pr_helper.py prepare-review --repo /path/to/repo --agent-id "$REVIEWER_AGENT_ID" --pr "$PR"
+git fetch origin "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH" "+refs/pull/$PR/head:refs/remotes/origin/pr/$PR"
+git checkout --detach "$HEAD_SHA"
+python3 scripts/review_pr_helper.py prepare-review --repo /path/to/repo --pr "$PR" --head-sha "$HEAD_SHA" --base-ref "origin/$DEFAULT_BRANCH"
 ```
 
 ## Workflow
@@ -80,9 +81,9 @@ Read previous review comments and PR comments before making a decision. Check wh
 
 Check CI status and check runs before submitting. If CI is failing, inspect the failing checks enough to decide whether the failure is caused by this PR's changes. Do not approve when a current CI failure is caused by the PR; request changes or comment with the failure context instead.
 
-### 3. Prepare the Reviewer Clone
+### 3. Verify the Prepared Reviewer Clone
 
-Run `prepare-review` for the target PR. Work only inside `/workspace/repo`, which is this reviewer agent's isolated clone. Treat the returned `repo` value as `REVIEW_REPO`; in Mai it should be `/workspace/repo`.
+Run `prepare-review` for the target PR using the head SHA, base ref, and default branch in Mai's initial message. This command verifies state and never performs a checkout. Work only inside `/workspace/repo`, which is this reviewer agent's isolated clone. Treat the returned `repo` value as `REVIEW_REPO`; in Mai it should be `/workspace/repo`.
 
 Before submitting the review, confirm the PR head SHA still matches the checked-out clone SHA. If it changed, return a failed final JSON result; the scheduler will queue a fresh signal.
 
@@ -197,7 +198,7 @@ Failed:
 ## Constraints
 
 - Review exactly one PR per invocation.
-- Always work in the reviewer-owned clone at `/workspace/repo`.
-- Use helper scripts for local preparation and final scheduler JSON; use reviewer judgment for code review.
+- Always work in the reviewer-owned PR-head clone at `/workspace/repo`; never checkout another revision.
+- Use helper scripts for local verification and final scheduler JSON; use reviewer judgment for code review.
 - Use only visible Mai GitHub API tools for GitHub reads/writes.
 - Leave cleanup to Mai; reviewer agent deletion removes the clone.

@@ -2,8 +2,8 @@
   <div class="context-status-line">
     <div class="status-line-left">
       <span class="status-line-state">
-        <span class="status-dot" :class="statusTone(detail.status)"></span>
-        <strong>{{ formatStatus(detail.status) }}</strong>
+        <span class="status-dot" :class="statusTone(agentDisplayStatus(detail))"></span>
+        <strong>{{ formatStatus(agentDisplayStatus(detail)) }}</strong>
       </span>
       <span v-if="activity" class="status-line-activity">{{ activity }}</span>
     </div>
@@ -49,6 +49,7 @@
 <script setup>
 import { formatStatus, statusTone, tokenCacheTooltipLabel, tokenCacheTooltipRows, totalTokens } from '../utils/format'
 import { reasoningLabel } from '../utils/reasoning'
+import { agentDisplayStatus } from '../utils/agentState.js'
 
 defineProps({
   detail: { type: Object, required: true },

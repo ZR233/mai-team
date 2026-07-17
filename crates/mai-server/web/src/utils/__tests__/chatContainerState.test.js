@@ -31,16 +31,16 @@ assert.deepEqual(
 
 assert.equal(
   chatContainerState({
-    detail: environmentDetail({ status: 'created', container_id: null }),
+    detail: environmentDetail({ state: agentState('provisioning'), container_id: null }),
     selectedConversationId: 'session-1'
   }).disabledReason,
-  'Container startup will begin shortly'
+  'Preparing ghcr.io/example/default:latest'
 )
 
 assert.deepEqual(
   chatContainerState({
     detail: environmentDetail({
-      status: 'starting_container',
+      state: agentState('provisioning'),
       container_id: null,
       docker_image: 'ubuntu:latest'
     }),
@@ -58,9 +58,8 @@ assert.deepEqual(
 assert.deepEqual(
   chatContainerState({
     detail: environmentDetail({
-      status: 'failed',
+      state: agentState('failed', 'idle', 'docker pull failed'),
       container_id: null,
-      last_error: 'docker pull failed'
     }),
     selectedConversationId: 'session-1'
   }),
@@ -81,9 +80,8 @@ assert.deepEqual(
 assert.deepEqual(
   chatContainerState({
     detail: environmentDetail({
-      status: 'failed',
+      state: agentState('ready', 'idle'),
       container_id: 'container-1',
-      last_error: 'LLM provider error: quota exhausted'
     }),
     selectedConversationId: 'session-1'
   }),
@@ -97,7 +95,7 @@ assert.deepEqual(
 
 assert.deepEqual(
   chatContainerState({
-    detail: environmentDetail({ status: 'idle', container_id: 'container-1' }),
+    detail: environmentDetail({ state: agentState('ready'), container_id: 'container-1' }),
     selectedConversationId: 'session-1'
   }),
   {
@@ -110,7 +108,7 @@ assert.deepEqual(
 
 assert.deepEqual(
   chatContainerState({
-    detail: environmentDetail({ status: 'idle', container_id: null }),
+    detail: environmentDetail({ state: agentState('ready'), container_id: null }),
     selectedConversationId: 'session-1'
   }),
   {
@@ -145,7 +143,7 @@ function environmentDetail(agentPatch) {
     root_agent: {
       id: 'agent-1',
       name: '默认环境',
-      status: 'idle',
+      state: agentState('ready'),
       container_id: 'container-1',
       docker_image: 'ghcr.io/example/default:latest',
       selected_session_id: 'session-1',
@@ -154,5 +152,21 @@ function environmentDetail(agentPatch) {
       ...agentPatch
     },
     conversations: [{ id: 'session-1', title: 'Chat 1', message_count: 0 }]
+  }
+}
+
+function agentState(resource, activity = 'idle', resourceError = null) {
+  return {
+    resource,
+    resource_error: resourceError,
+    runtime: {
+      lifecycle: 'active',
+      activity,
+      active_turn: null,
+      active_session: null,
+      pending_inputs: 0,
+      last_turn: null,
+      revision: 1
+    }
   }
 }
