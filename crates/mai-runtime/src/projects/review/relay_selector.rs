@@ -169,6 +169,7 @@ async fn project_still_ready(ops: &impl ProjectReviewWorkerOps, project_id: Proj
         | Err(RuntimeError::InvalidInput(_))
         | Err(RuntimeError::Io(_))
         | Err(RuntimeError::Http(_))
+        | Err(RuntimeError::GithubUnavailable { .. })
         | Err(RuntimeError::Jwt(_)) => false,
     }
 }

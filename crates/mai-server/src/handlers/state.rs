@@ -35,6 +35,7 @@ impl From<mai_runtime::RuntimeError> for ApiError {
             InvalidInput(_) => StatusCode::BAD_REQUEST,
             MissingContainer(_) => StatusCode::CONFLICT,
             TurnCancelled => StatusCode::CONFLICT,
+            GithubUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Docker(_) | Model(_) | Store(_) | Skill(_) | Io(_) | Http(_) | Jwt(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -135,5 +136,17 @@ mod tests {
         let err = RuntimeError::TurnCancelled;
         let api: ApiError = err.into();
         assert_eq!(api.status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn runtime_error_github_unavailable_maps_to_503() {
+        let err = RuntimeError::GithubUnavailable {
+            operation: "read project GitHub API".to_string(),
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            message: "temporarily unavailable".to_string(),
+            retry_after: None,
+        };
+        let api: ApiError = err.into();
+        assert_eq!(api.status, StatusCode::SERVICE_UNAVAILABLE);
     }
 }

@@ -282,6 +282,9 @@ pub(crate) fn project_review_error_is_retryable(error: &str) -> bool {
     if error.contains(REVIEW_TARGET_HEAD_CHANGED) {
         return true;
     }
+    if crate::github::github_error_message_is_retryable(error) {
+        return true;
+    }
 
     pl_core::is_retryable_model_error(error)
 }
@@ -573,6 +576,9 @@ mod tests {
     fn changed_review_head_is_retryable() {
         assert!(project_review_error_is_retryable(
             "invalid input: review target head changed for PR #42"
+        ));
+        assert!(project_review_error_is_retryable(
+            "GitHub read project GitHub API failed (503 Service Unavailable): temporarily unavailable"
         ));
     }
 

@@ -182,6 +182,13 @@ pub enum RuntimeError {
     Io(#[from] std::io::Error),
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("GitHub {operation} failed ({status}): {message}")]
+    GithubUnavailable {
+        operation: String,
+        status: reqwest::StatusCode,
+        message: String,
+        retry_after: Option<Duration>,
+    },
     #[error("jwt error: {0}")]
     Jwt(#[from] jsonwebtoken::errors::Error),
 }

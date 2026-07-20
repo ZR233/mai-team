@@ -1,5 +1,5 @@
 use mai_protocol::{GitTokenKind, GithubInstallationSummary, GithubRepositorySummary, preview};
-use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
@@ -13,6 +13,7 @@ mod accounts;
 mod app;
 mod etag_cache;
 mod packages;
+mod retry;
 mod service;
 
 pub(crate) use accounts::{GitAccountService, GitAccountToken, VerifiedGithubRepository};
@@ -20,6 +21,7 @@ pub use app::DirectGithubAppBackend;
 pub use app::GithubAppBackend;
 pub(crate) use etag_cache::GithubGetCache;
 pub(crate) use packages::repository_packages_with_token;
+pub(crate) use retry::{github_error_message_is_retryable, retry_github_request};
 pub(crate) use service::*;
 
 #[derive(Debug, Deserialize)]
@@ -176,15 +178,59 @@ pub(crate) async fn decode_github_response<T: DeserializeOwned>(
     if status.is_success() {
         return Ok(response.json::<T>().await?);
     }
+    let retry_after = github_retry_after(response.headers());
     let text = response.text().await.unwrap_or_default();
     let message = serde_json::from_str::<GithubErrorResponse>(&text)
         .ok()
         .and_then(|error| error.message)
         .filter(|message| !message.trim().is_empty())
         .unwrap_or_else(|| preview(&text, 300));
+    let transient = matches!(
+        status,
+        reqwest::StatusCode::REQUEST_TIMEOUT
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+            | reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    ) || (status == reqwest::StatusCode::FORBIDDEN && retry_after.is_some());
+    if transient {
+        return Err(RuntimeError::GithubUnavailable {
+            operation: action.to_string(),
+            status,
+            message,
+            retry_after,
+        });
+    }
     Err(RuntimeError::InvalidInput(format!(
         "GitHub {action} failed ({status}): {message}"
     )))
+}
+
+fn github_retry_after(headers: &HeaderMap) -> Option<std::time::Duration> {
+    if let Some(seconds) = headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Some(std::time::Duration::from_secs(seconds));
+    }
+    let remaining = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())?;
+    if remaining != "0" {
+        return None;
+    }
+    let reset = headers
+        .get("x-ratelimit-reset")
+        .and_then(|value| value.to_str().ok())?
+        .parse::<u64>()
+        .ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(std::time::Duration::from_secs(reset.saturating_sub(now)))
 }
 
 trait IfEmpty {

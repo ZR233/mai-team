@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use super::{
     GitAccountService, GithubAppBackend, decode_github_response, github_api_url, github_headers,
-    normalize_github_api_get_path, repository_packages_with_token,
+    normalize_github_api_get_path, repository_packages_with_token, retry_github_request,
 };
 use crate::{Result, RuntimeError};
 
@@ -145,11 +145,14 @@ pub(crate) async fn project_github_api_get_json(
     };
     let path = normalize_github_api_get_path(path)?;
     let url = github_api_url(github_api_base_url, &path);
-    let response = github_http
-        .get(url)
-        .bearer_auth(&token)
-        .headers(github_headers())
-        .send()
-        .await?;
-    decode_github_response(response, "read project GitHub API").await
+    retry_github_request("read project GitHub API", || async {
+        let response = github_http
+            .get(&url)
+            .bearer_auth(&token)
+            .headers(github_headers())
+            .send()
+            .await?;
+        decode_github_response(response, "read project GitHub API").await
+    })
+    .await
 }

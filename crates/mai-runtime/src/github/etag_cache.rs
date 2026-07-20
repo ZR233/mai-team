@@ -5,7 +5,7 @@ use reqwest::header::{ETAG, IF_NONE_MATCH};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use super::{decode_github_response, github_api_url, github_headers};
+use super::{decode_github_response, github_api_url, github_headers, retry_github_request};
 use crate::{Result, RuntimeError};
 
 #[derive(Debug, Clone)]
@@ -34,35 +34,54 @@ impl GithubGetCache {
         let key =
             pl_core::canonical_content_hash(format!("{api_base_url}\0{path}\0{token}").as_bytes());
         let cached = self.entries.read().await.get(&key).cloned();
-        let mut request = client
-            .get(github_api_url(api_base_url, path))
-            .bearer_auth(token)
-            .headers(github_headers());
-        if let Some(cached) = &cached {
-            request = request.header(IF_NONE_MATCH, &cached.etag);
-        }
-        let response = request.send().await?;
-        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            return cached.map(|entry| entry.value).ok_or_else(|| {
-                RuntimeError::InvalidInput(
-                    "GitHub returned 304 without a matching cached response".to_string(),
-                )
-            });
-        }
-        let etag = response
-            .headers()
-            .get(ETAG)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let value: Value = decode_github_response(response, "read project GitHub API").await?;
-        if let Some(etag) = etag {
-            self.entries.write().await.insert(
-                key,
-                CacheEntry {
-                    etag,
-                    value: value.clone(),
-                },
-            );
+        let (not_modified, etag, value) =
+            retry_github_request("read cached project GitHub API", || {
+                let cached = cached.clone();
+                async move {
+                    let mut request = client
+                        .get(github_api_url(api_base_url, path))
+                        .bearer_auth(token)
+                        .headers(github_headers());
+                    if let Some(cached) = &cached {
+                        request = request.header(IF_NONE_MATCH, &cached.etag);
+                    }
+                    let response = request.send().await?;
+                    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+                        return cached
+                            .map(|entry| (true, None, entry.value))
+                            .ok_or_else(|| {
+                                RuntimeError::InvalidInput(
+                                    "GitHub returned 304 without a matching cached response"
+                                        .to_string(),
+                                )
+                            });
+                    }
+                    let etag = response
+                        .headers()
+                        .get(ETAG)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    let value: Value =
+                        decode_github_response(response, "read project GitHub API").await?;
+                    Ok((false, etag, value))
+                }
+            })
+            .await?;
+        if !not_modified {
+            match etag {
+                Some(etag) => {
+                    self.entries.write().await.insert(
+                        key,
+                        CacheEntry {
+                            etag,
+                            value: value.clone(),
+                        },
+                    );
+                }
+                None => {
+                    self.entries.write().await.remove(&key);
+                }
+            }
         }
         Ok(value)
     }
@@ -84,6 +103,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
             for response in [
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: 37\r\nconnection: close\r\n\r\n{\"message\":\"temporarily unavailable\"}",
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\netag: \"v1\"\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"ok\":true}",
                 "HTTP/1.1 304 Not Modified\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
             ] {
@@ -124,8 +144,9 @@ mod tests {
 
         assert_eq!(first, serde_json::json!({"ok": true}));
         assert_eq!(second, first);
+        assert_eq!(requests.len(), 3);
         assert!(
-            requests[1]
+            requests[2]
                 .to_ascii_lowercase()
                 .contains("if-none-match: \"v1\"")
         );
