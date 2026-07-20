@@ -6,7 +6,6 @@ use pl_core::{
     CoreAgentProfile, TurnEngineBuilder,
 };
 use pl_model::ToolSchema;
-use tokio_util::sync::CancellationToken;
 
 use crate::state::AgentRecord;
 use crate::{AgentRuntime, Result};
@@ -19,8 +18,7 @@ pub(crate) struct MaiFrameworkKernelBuildContext {
     pub(crate) framework_runtime: AgentRuntimeHandle,
     pub(crate) policy: AgentExecutionPolicy,
     pub(crate) product_tool_schemas: Vec<ToolSchema>,
-    pub(crate) mcp_tool_schemas: Vec<ToolSchema>,
-    pub(crate) cancellation_token: CancellationToken,
+    pub(crate) mcp_lease: Option<pl_core::McpTurnLease>,
 }
 
 pub(crate) fn mai_user_input_interaction_callback(
@@ -121,20 +119,12 @@ pub(crate) async fn build_mai_framework_kernel(
     let mcp_backend = Arc::new(super::mcp_resources::MaiMcpResourceBackend::new(
         ctx.runtime.clone(),
         ctx.agent.clone(),
-        ctx.agent_id,
-        ctx.cancellation_token.clone(),
-    ));
-    let mcp_tool_backend = Arc::new(super::mcp_tools::MaiMcpToolBackend::new(
-        ctx.runtime.clone(),
-        ctx.agent.clone(),
-        ctx.agent_id,
-        ctx.cancellation_token,
+        ctx.mcp_lease.clone(),
     ));
     let tool_set = pl_core::ToolSetBuilder::from_capabilities(capabilities)
         .with_allowed_tools(ctx.policy.visible_tools.iter().cloned())
         .with_container_tools(backend)
-        .with_mcp_resource_tools(mcp_backend)
-        .with_mcp_tools(ctx.mcp_tool_schemas, mcp_tool_backend);
+        .with_mcp_resource_tools(mcp_backend);
     let collaboration_tools = pl_core::AgentCollaborationTools::new(
         ctx.framework_runtime,
         ctx.framework_agent_id,
@@ -145,7 +135,7 @@ pub(crate) async fn build_mai_framework_kernel(
         .with_profile(runtime_profile)
         .with_tools(collaboration_tools)
         .with_registered_tools(product_tools);
-    let kernel = if let Some(git_runtime) = git_runtime {
+    let mut kernel = if let Some(git_runtime) = git_runtime {
         kernel_builder
             .with_tool_set(tool_set.with_git_tools(
                 git_runtime.config,
@@ -157,6 +147,9 @@ pub(crate) async fn build_mai_framework_kernel(
     } else {
         kernel_builder.with_tool_set(tool_set).build().await
     };
+    if let Some(lease) = ctx.mcp_lease {
+        lease.install_tools(kernel.core_mut())?;
+    }
     Ok(kernel)
 }
 

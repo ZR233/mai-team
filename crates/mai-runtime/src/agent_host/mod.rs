@@ -3,6 +3,7 @@ mod lifecycle;
 mod policy;
 mod protocol;
 mod repository;
+mod review_manifest;
 mod sessions;
 mod trace_projection;
 mod turn_factory;

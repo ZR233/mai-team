@@ -124,6 +124,7 @@
         :skills-error="skillsError"
         :mcp-servers-state="mcpServersState"
         :mcp-saving="mcpServersState.saving"
+        :web-search-state="webSearchState"
         :git-accounts-state="gitAccountsState"
         :github-app-state="githubAppState"
         :initial-section="settingsInitialSection"
@@ -133,6 +134,8 @@
         @save-skills="onSaveSkillsConfig"
         @reload-mcp="onLoadMcpServers"
         @open-mcp="mcpDialogOpen = true"
+        @reload-web-search="onLoadWebSearch"
+        @save-web-search="onSaveWebSearch"
         @open-providers="activeTab = 'providers'"
         @save-git-account="onSaveGitAccount"
         @verify-git-account="onVerifyGitAccount"
@@ -177,8 +180,10 @@
       :open="mcpDialogOpen"
       :servers-state="mcpServersState"
       :saving="mcpServersState.saving"
+      :rechecking="mcpServersState.rechecking"
       @close="mcpDialogOpen = false"
       @save="onSaveMcpServers"
+      @recheck="onRecheckMcpServers"
     />
 
     <ConfirmDialog
@@ -217,6 +222,7 @@ import { useProviders } from './composables/useProviders'
 import { useAgentConfig } from './composables/useAgentConfig'
 import { useSkills } from './composables/useSkills'
 import { useMcpServers } from './composables/useMcpServers'
+import { useWebSearch } from './composables/useWebSearch'
 import { useGitAccounts } from './composables/useGitAccounts'
 import { useGithubApp } from './composables/useGithubApp'
 
@@ -311,8 +317,10 @@ const {
 const {
   mcpServersState,
   loadMcpServers,
-  saveMcpServers
+  saveMcpServers,
+  recheckMcpServers
 } = useMcpServers()
+const { webSearchState, loadWebSearch, saveWebSearch } = useWebSearch()
 const {
   gitAccountsState,
   loadGitAccounts,
@@ -477,6 +485,7 @@ async function refreshAll() {
       loadAgentConfig(),
       loadSkills(),
       loadMcpServers(),
+      loadWebSearch(),
       loadGitAccounts(),
       refreshGithubAppSettingsState(),
       refreshEnvironments(),
@@ -1140,6 +1149,32 @@ async function onSaveMcpServers(servers) {
     await saveMcpServers(servers)
     mcpDialogOpen.value = false
     showToast('MCP config saved.')
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onRecheckMcpServers() {
+  try {
+    await recheckMcpServers()
+    showToast('MCP servers checked.')
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onLoadWebSearch() {
+  try {
+    await loadWebSearch()
+  } catch (error) {
+    showToast(error.message)
+  }
+}
+
+async function onSaveWebSearch(config) {
+  try {
+    await saveWebSearch(config)
+    showToast('Web Search config saved.')
   } catch (error) {
     showToast(error.message)
   }

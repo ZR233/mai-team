@@ -11,12 +11,14 @@ const GITHUB_API_VERSION: &str = "2022-11-28";
 
 mod accounts;
 mod app;
+mod etag_cache;
 mod packages;
 mod service;
 
 pub(crate) use accounts::{GitAccountService, GitAccountToken, VerifiedGithubRepository};
 pub use app::DirectGithubAppBackend;
 pub use app::GithubAppBackend;
+pub(crate) use etag_cache::GithubGetCache;
 pub(crate) use packages::repository_packages_with_token;
 pub(crate) use service::*;
 

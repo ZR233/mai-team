@@ -17,7 +17,7 @@ mod update;
 
 pub(crate) use container::{
     AgentContainerOps, AgentContainerStartRequest, AgentContainerStatusChange,
-    AgentMcpStatusChange, ContainerSource, ensure_agent_container,
+    AgentMcpRuntimeConfig, AgentMcpStatusChange, ContainerSource, ensure_agent_container,
     ensure_agent_container_with_source,
 };
 pub(crate) use create::{AgentCreateOps, CreateAgentRecordContext, create_agent_record};
@@ -27,7 +27,10 @@ pub(crate) use observability::{
     AgentObservabilityOps, agent_logs, tool_output_artifact, tool_trace, tool_traces,
 };
 pub(crate) use purge::{AgentPurgeOps, purge_agent_tree};
-pub(crate) use resources::{AgentResourceBroker, AgentResourceBrokerOps, agent_resource_broker};
+pub(crate) use resources::{
+    AgentResourceBroker, AgentResourceBrokerOps, PROJECT_SKILL_RESOURCE_SERVER,
+    SKILL_RESOURCE_SCHEME, SKILL_RESOURCE_SERVER, agent_resource_broker,
+};
 pub(crate) use update::{AgentUpdateOps, update_agent};
 
 /// 关闭产品资源时所需的最小端口；framework 生命周期由 PL 独占。

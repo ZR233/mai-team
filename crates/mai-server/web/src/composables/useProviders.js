@@ -43,7 +43,7 @@ export function useProviders() {
   async function saveProviders(providers, defaultProviderId) {
     const response = await api('/providers', {
       method: 'PUT',
-      body: JSON.stringify({ providers, default_provider_id: defaultProviderId })
+      body: JSON.stringify({ providers: providers.map(providerRequest), default_provider_id: defaultProviderId })
     })
     providersState.providers = response.providers || []
     providersState.default_provider_id = response.default_provider_id || null
@@ -76,6 +76,9 @@ export function useProviders() {
       api_key: '',
       api_key_env: '',
       credential_label: 'API Key',
+      capability_source: 'explicit',
+      hosted_web_search: false,
+      standalone_web_search: '',
       catalog_source: 'explicit',
       catalog_id: '',
       default_model: '',
@@ -102,6 +105,9 @@ export function useProviders() {
       providerDialog.form.protocol = 'chat_completions'
       providerDialog.form.connection_mode = 'http'
       providerDialog.form.connection_modes = connectionModesForProtocol('chat_completions')
+      providerDialog.form.capability_source = 'explicit'
+      providerDialog.form.hosted_web_search = false
+      providerDialog.form.standalone_web_search = ''
       return
     }
     const credential = credentialForPreset(preset)
@@ -116,6 +122,9 @@ export function useProviders() {
       base_url: preset.base_url,
       api_key_env: credential.envVar,
       credential_label: credential.label,
+      capability_source: 'preset_defaults',
+      hosted_web_search: preset.service_capabilities?.web_search?.hosted_responses === true,
+      standalone_web_search: preset.service_capabilities?.web_search?.standalone || '',
       catalog_source: 'bundled',
       catalog_id: preset.model_catalog_id,
       default_model: preset.suggested_model,
@@ -146,6 +155,12 @@ export function useProviders() {
       ? catalog.additional_models || []
       : catalog.models || []
     const credential = credentialForPreset(preset)
+    const selection = provider.capability_selection || {
+      source: provider.preset_id ? 'preset_defaults' : 'explicit',
+      web_search: provider.service_capabilities?.web_search || {}
+    }
+    const explicitCapabilities = selection.source === 'explicit' ? selection : null
+    const effectiveCapabilities = explicitCapabilities || provider.service_capabilities || preset?.service_capabilities || {}
     providerDialog.form = {
       id: provider.id || '',
       preset_id: preset?.id || provider.preset_id || '',
@@ -157,6 +172,9 @@ export function useProviders() {
       api_key: '',
       api_key_env: provider.api_key_env || credential.envVar,
       credential_label: credential.label,
+      capability_source: selection.source || 'explicit',
+      hosted_web_search: effectiveCapabilities.web_search?.hosted_responses === true,
+      standalone_web_search: effectiveCapabilities.web_search?.standalone || '',
       catalog_source: catalog.source || 'explicit',
       catalog_id: catalog.catalog_id || '',
       default_model: provider.default_model || '',
@@ -203,6 +221,15 @@ export function useProviders() {
         protocol: form.protocol,
         connection_mode: form.connection_mode
       },
+      capabilities: form.capability_source === 'preset_defaults'
+        ? { source: 'preset_defaults' }
+        : {
+            source: 'explicit',
+            web_search: {
+              hosted_responses: form.hosted_web_search === true,
+              standalone: form.standalone_web_search || null
+            }
+          },
       name: form.name,
       base_url: form.base_url,
       api_key: form.api_key,
@@ -266,6 +293,28 @@ export function useProviders() {
     saveProviderDialog,
     fillFromPreset,
     showToast
+  }
+}
+
+function providerRequest(provider) {
+  return {
+    id: provider.id,
+    preset_id: provider.preset_id || null,
+    transport: {
+      protocol: provider.transport?.protocol || 'chat_completions',
+      connection_mode: provider.transport?.connection_mode || 'http'
+    },
+    capabilities: provider.capabilities || provider.capability_selection || {
+      source: provider.preset_id ? 'preset_defaults' : 'explicit',
+      web_search: { hosted_responses: false, standalone: null }
+    },
+    name: provider.name,
+    base_url: provider.base_url,
+    api_key: provider.api_key || '',
+    api_key_env: provider.api_key_env || null,
+    catalog: provider.catalog,
+    default_model: provider.default_model,
+    enabled: provider.enabled !== false
   }
 }
 

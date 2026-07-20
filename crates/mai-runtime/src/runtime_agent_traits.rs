@@ -159,15 +159,6 @@ impl agents::AgentObservabilityOps for AgentRuntime {
 }
 
 impl agents::AgentResourceBrokerOps for AgentRuntime {
-    fn project_mcp_manager_for_agent(
-        &self,
-        agent: &AgentRecord,
-        agent_id: AgentId,
-        cancellation_token: &CancellationToken,
-    ) -> impl std::future::Future<Output = Result<Option<Arc<McpAgentManager>>>> + Send {
-        AgentRuntime::project_mcp_manager_for_agent(self, agent, agent_id, cancellation_token)
-    }
-
     fn project_skill_read_guard(
         &self,
         agent: &AgentRecord,
@@ -273,6 +264,7 @@ impl agents::AgentContainerOps for AgentRuntime {
             agents::ContainerSource::ProjectWorkspace {
                 workspace_volume,
                 repo_path,
+                repository_view,
             } => {
                 if repo_path != projects::workspace::AGENT_WORKSPACE_REPO_PATH {
                     return Err(RuntimeError::InvalidInput(format!(
@@ -285,15 +277,33 @@ impl agents::AgentContainerOps for AgentRuntime {
                     None,
                 )
                 .await?;
+                let mounts = match repository_view {
+                    Some(view) => {
+                        if view.container_path
+                            != projects::review::context::PROJECT_REPOSITORY_CONTAINER_PATH
+                        {
+                            return Err(RuntimeError::InvalidInput(format!(
+                                "unsupported project repository view path `{}`",
+                                view.container_path
+                            )));
+                        }
+                        vec![ContainerVolumeMount::read_only_subpath(
+                            view.volume,
+                            view.container_path,
+                            view.volume_subpath,
+                        )?]
+                    }
+                    None => Vec::new(),
+                };
                 Ok(self
                     .deps
                     .docker
-                    .ensure_agent_container_from_image_with_workspace_and_repo_mount(
+                    .ensure_agent_container_from_image_with_workspace_and_mounts(
                         &request.agent_id.to_string(),
                         request.preferred_container_id.as_deref(),
                         &request.docker_image,
                         Some(&workspace_volume),
-                        None,
+                        &mounts,
                     )
                     .await?)
             }
@@ -324,11 +334,11 @@ impl agents::AgentContainerOps for AgentRuntime {
                     Ok(self
                         .deps
                         .docker
-                        .create_agent_container_from_parent_with_workspace_and_repo_mount(
+                        .create_agent_container_from_parent_with_workspace_and_mounts(
                             &request.agent_id.to_string(),
                             &parent_container_id,
                             workspace_volume.as_deref(),
-                            None,
+                            &[],
                         )
                         .await?)
                 }
@@ -344,25 +354,45 @@ impl agents::AgentContainerOps for AgentRuntime {
             .await;
     }
 
-    async fn agent_mcp_server_configs(
+    async fn agent_mcp_runtime_config(
         &self,
-    ) -> Result<std::collections::BTreeMap<String, McpServerConfig>> {
-        Ok(self
+        agent: &AgentRecord,
+    ) -> Result<agents::AgentMcpRuntimeConfig> {
+        let has_project = agent.summary.read().await.project_id.is_some();
+        let user_servers = self
             .deps
             .store
             .list_mcp_servers()
             .await?
             .into_iter()
-            .filter(|(_, config)| config.scope == McpServerScope::Agent)
-            .collect())
+            .filter(|(_, config)| match config.scope {
+                McpServerScope::Agent | McpServerScope::System => true,
+                McpServerScope::Project => has_project,
+            })
+            .collect();
+        let config = self.mai_config.read().await;
+        Ok(agents::AgentMcpRuntimeConfig {
+            enabled: config.mcp.enabled,
+            user_servers,
+            builtin_servers: config.mcp.builtin_servers.clone(),
+            models: config.models.clone(),
+        })
     }
 
-    async fn start_agent_mcp_manager(
+    async fn start_agent_mcp_runtime(
         &self,
         container_id: String,
-        configs: std::collections::BTreeMap<String, McpServerConfig>,
-    ) -> McpAgentManager {
-        McpAgentManager::start(self.deps.docker.clone(), container_id, configs).await
+        config: agents::AgentMcpRuntimeConfig,
+    ) -> Result<crate::mcp::ContainerMcpRuntime> {
+        crate::mcp::ContainerMcpRuntime::start(
+            self.deps.docker.clone(),
+            container_id,
+            config.enabled,
+            &config.user_servers,
+            &config.builtin_servers,
+            &config.models,
+        )
+        .await
     }
 
     async fn set_agent_resource_state(

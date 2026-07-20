@@ -43,7 +43,6 @@ impl AgentRuntime {
             .clone_project_repository(project_id, maintainer_agent_id)
             .await
         {
-            self.shutdown_project_mcp_manager(project_id).await;
             let _ = self.delete_project_sidecar(project_id).await;
             self.set_project_clone_result(
                 project_id,
@@ -270,7 +269,7 @@ impl AgentRuntime {
         );
         let env = [(GIT_TOKEN_ENV.to_string(), token.to_string())];
         let sidecar_name = format!("mai-tool-git-clone-{agent_id}");
-        let cache_mounts = [(cache_volume.as_str(), "/cache")];
+        let cache_mounts = [ContainerVolumeMount::read_only(&cache_volume, "/cache")?];
         let output = self
             .deps
             .docker
@@ -352,7 +351,10 @@ test -z "$(git status --porcelain)"
         );
         let env = [(GIT_TOKEN_ENV.to_string(), token.to_string())];
         let sidecar_name = format!("mai-tool-review-clone-{agent_id}");
-        let mounts = [(repository_volume.as_str(), "/project")];
+        let mounts = [ContainerVolumeMount::read_only(
+            &repository_volume,
+            "/project",
+        )?];
         let output = self
             .deps
             .docker
@@ -522,9 +524,7 @@ printf '{base_marker}%s\n' "$base_sha"
     pub(super) async fn agent_resource_broker(
         &self,
         agent: &AgentRecord,
-        agent_id: AgentId,
-        cancellation_token: &CancellationToken,
     ) -> Result<AgentResourceBroker> {
-        agents::agent_resource_broker(self, agent, agent_id, cancellation_token).await
+        agents::agent_resource_broker(self, agent).await
     }
 }

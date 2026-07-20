@@ -7,8 +7,9 @@ use pretty_assertions::assert_eq;
 use crate::records::{AgentRuntimeEventRecord, AgentRuntimeTraceRecord};
 use crate::{
     AgentRuntimeCommitDocument, AgentRuntimeCommitOutcome, MaiStore, StoredAgentPendingInput,
-    StoredAgentRuntime, StoredAgentRuntimeEvent, StoredAgentRuntimeSession,
-    StoredAgentRuntimeState, StoredAgentRuntimeTrace, StoredAgentTurn, StoredTokenUsage,
+    StoredAgentRuntime, StoredAgentRuntimeEvent, StoredAgentRuntimeMutation,
+    StoredAgentRuntimeSession, StoredAgentRuntimeState, StoredAgentRuntimeTrace, StoredAgentTurn,
+    StoredTokenUsage,
 };
 use toasty::stmt::{List, Query};
 
@@ -62,6 +63,78 @@ async fn runtime_commit_round_trips_queue_session_and_canonical_history() {
         vec![second.runtime]
     );
     assert_eq!(runtime_projection_counts(&store).await, (2, 2));
+}
+
+#[tokio::test]
+async fn trace_only_commit_updates_metadata_without_rewriting_history_or_queue() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = MaiStore::open_with_config_path(
+        temp.path().join("mai.sqlite3"),
+        temp.path().join("config.toml"),
+    )
+    .await
+    .unwrap();
+    let first = document(None, 1, "running");
+    store.commit_agent_runtime(first.clone()).await.unwrap();
+    let mut trace = document(Some(1), 2, "waiting_tool");
+    trace.mutation = StoredAgentRuntimeMutation::AppendTrace;
+    trace.runtime.state.active_session_id = Some("session-1".to_string());
+    trace.runtime.sessions[0].trace_sequence = 9;
+    trace.runtime.sessions[0].history_items = vec![serde_json::json!({
+        "role": "assistant",
+        "content": "must not replace canonical history"
+    })];
+    trace.runtime.sessions[0].messages.clear();
+    trace.runtime.pending_inputs.clear();
+
+    store.commit_agent_runtime(trace).await.unwrap();
+    let loaded = store.load_agent_runtimes().await.unwrap().remove(0);
+
+    assert_eq!(loaded.state.revision, 2);
+    assert_eq!(loaded.sessions[0].trace_sequence, 9);
+    assert_eq!(
+        loaded.sessions[0].history_items,
+        first.runtime.sessions[0].history_items
+    );
+    assert_eq!(
+        loaded.sessions[0].messages,
+        first.runtime.sessions[0].messages
+    );
+    assert_eq!(loaded.pending_inputs, first.runtime.pending_inputs);
+}
+
+#[tokio::test]
+async fn session_checkpoint_replaces_only_the_selected_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = MaiStore::open_with_config_path(
+        temp.path().join("mai.sqlite3"),
+        temp.path().join("config.toml"),
+    )
+    .await
+    .unwrap();
+    let first = document(None, 1, "running");
+    store.commit_agent_runtime(first.clone()).await.unwrap();
+    let mut checkpoint = document(Some(1), 2, "running");
+    checkpoint.mutation = StoredAgentRuntimeMutation::ReplaceSession {
+        session_id: "session-1".to_string(),
+    };
+    checkpoint.runtime.sessions[0].history_items = vec![serde_json::json!({
+        "type": "pinnedContext",
+        "section": {"id": "mai.review_manifest"}
+    })];
+    checkpoint.runtime.pending_inputs.clear();
+
+    store
+        .commit_agent_runtime(checkpoint.clone())
+        .await
+        .unwrap();
+    let loaded = store.load_agent_runtimes().await.unwrap().remove(0);
+
+    assert_eq!(
+        loaded.sessions[0].history_items,
+        checkpoint.runtime.sessions[0].history_items
+    );
+    assert_eq!(loaded.pending_inputs, first.runtime.pending_inputs);
 }
 
 async fn runtime_projection_counts(store: &MaiStore) -> (usize, usize) {
@@ -141,6 +214,7 @@ fn document(
 ) -> AgentRuntimeCommitDocument {
     AgentRuntimeCommitDocument {
         expected_revision,
+        mutation: StoredAgentRuntimeMutation::SnapshotAndQueue,
         runtime: StoredAgentRuntime {
             state: StoredAgentRuntimeState {
                 agent_id: "agent-1".to_string(),

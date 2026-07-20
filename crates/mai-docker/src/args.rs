@@ -1,4 +1,5 @@
 use crate::error::{DockerError, Result};
+use crate::mount::ContainerVolumeMount;
 use crate::naming::{
     MANAGED_LABEL, PROJECT_LABEL_KEY, PROJECT_SIDECAR_KIND, SIDECAR_KIND_LABEL_KEY,
     SIDECAR_LABEL_KEY,
@@ -32,7 +33,7 @@ pub(crate) fn create_agent_container_args(
     image: &str,
     workspace_volume: &str,
 ) -> Vec<String> {
-    create_agent_container_args_with_workspace(name, agent_label, image, workspace_volume)
+    create_agent_container_args_with_workspace(name, agent_label, image, workspace_volume, &[])
 }
 
 pub(crate) fn create_agent_container_args_with_workspace(
@@ -40,12 +41,14 @@ pub(crate) fn create_agent_container_args_with_workspace(
     agent_label: &str,
     image: &str,
     workspace_volume: &str,
+    mounts: &[ContainerVolumeMount],
 ) -> Vec<String> {
     create_agent_container_args_with_workspace_options(
         name,
         agent_label,
         image,
         workspace_volume,
+        mounts,
         &default_agent_container_options(),
     )
 }
@@ -55,6 +58,7 @@ pub(crate) fn create_agent_container_args_with_workspace_options(
     agent_label: &str,
     image: &str,
     workspace_volume: &str,
+    mounts: &[ContainerVolumeMount],
     options: &ContainerCreateOptions,
 ) -> Vec<String> {
     let mut args = vec![
@@ -70,6 +74,9 @@ pub(crate) fn create_agent_container_args_with_workspace_options(
         "--user".to_string(),
         "root".to_string(),
     ];
+    for mount in mounts {
+        args.extend(["--mount".to_string(), mount.docker_mount_spec()]);
+    }
     apply_container_create_options(&mut args, options);
     args.extend([
         "-w".to_string(),
@@ -366,6 +373,7 @@ mod tests {
             "mai.team.agent=maintainer",
             image,
             "mai-team-project-project-1-agent-maintainer",
+            &[],
         );
 
         assert!(args.windows(2).any(|window| window
@@ -388,9 +396,38 @@ mod tests {
             "mai.team.agent=maintainer",
             image,
             "mai-team-project-project-1-agent-maintainer",
+            &[],
         );
 
         assert!(args.windows(2).any(|window| window == ["--user", "root"]));
+    }
+
+    #[test]
+    fn reviewer_container_args_include_read_only_project_snapshot_subpath() {
+        let mount = ContainerVolumeMount::read_only_subpath(
+            "mai-team-project-project-1-cache",
+            "/project/repo",
+            "review-contexts/run-1/repo",
+        )
+        .expect("valid reviewer mount");
+        let args = create_agent_container_args_with_workspace(
+            "mai-team-reviewer",
+            "mai.team.agent=reviewer",
+            "mai-reviewer:latest",
+            "mai-team-project-project-1-agent-reviewer",
+            &[mount],
+        );
+
+        assert!(args.windows(2).any(|window| {
+            window
+                == [
+                    "--mount",
+                    "type=volume,src=mai-team-project-project-1-cache,dst=/project/repo,volume-subpath=review-contexts/run-1/repo,readonly",
+                ]
+        }));
+        assert!(args.windows(2).any(|window| {
+            window == ["-v", "mai-team-project-project-1-agent-reviewer:/workspace"]
+        }));
     }
 
     #[test]

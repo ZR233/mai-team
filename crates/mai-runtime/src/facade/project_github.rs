@@ -162,6 +162,21 @@ impl AgentRuntime {
                 "verified project review target before GitHub submission"
             );
         }
+        if method == "GET" {
+            let value = self
+                .github_get_cache
+                .get(
+                    &self.deps.github_http,
+                    &self.github_api_base_url,
+                    &token,
+                    &path,
+                )
+                .await?;
+            return Ok(ToolExecution::json(select_github_fields(
+                value,
+                &request.fields,
+            ))?);
+        }
         let command = if let Some(body) = &body {
             let body = serde_json::to_string(body).map_err(|err| {
                 RuntimeError::InvalidInput(format!("invalid GitHub API JSON body: {err}"))
@@ -266,5 +281,82 @@ impl projects::review::eligibility::ProjectReviewEligibilityOps for Arc<AgentRun
             &path,
         )
         .await
+    }
+}
+
+fn select_github_fields(value: Value, requested: &[String]) -> Value {
+    if requested.is_empty() {
+        return value;
+    }
+    const ALWAYS_RETAINED: [&str; 9] = [
+        "message",
+        "documentation_url",
+        "status",
+        "url",
+        "total_count",
+        "incomplete_results",
+        "has_next_page",
+        "next",
+        "last",
+    ];
+    let requested = requested
+        .iter()
+        .map(|field| field.trim())
+        .filter(|field| !field.is_empty())
+        .take(32)
+        .collect::<std::collections::BTreeSet<_>>();
+    let select_object = |map: serde_json::Map<String, Value>| {
+        Value::Object(
+            map.into_iter()
+                .filter(|(key, _)| {
+                    requested.contains(key.as_str()) || ALWAYS_RETAINED.contains(&key.as_str())
+                })
+                .collect(),
+        )
+    };
+    match value {
+        Value::Object(map) => select_object(map),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| match item {
+                    Value::Object(map) => select_object(map),
+                    Value::Array(_)
+                    | Value::String(_)
+                    | Value::Number(_)
+                    | Value::Bool(_)
+                    | Value::Null => item,
+                })
+                .collect(),
+        ),
+        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    use super::select_github_fields;
+
+    #[test]
+    fn github_field_projection_keeps_requested_and_protocol_metadata() {
+        let projected = select_github_fields(
+            json!({
+                "total_count": 2,
+                "check_runs": [{"name": "test", "status": "completed"}],
+                "large_unused": [1, 2, 3],
+            }),
+            &["check_runs".to_string()],
+        );
+
+        assert_eq!(
+            projected,
+            json!({
+                "total_count": 2,
+                "check_runs": [{"name": "test", "status": "completed"}],
+            })
+        );
     }
 }

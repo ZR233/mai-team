@@ -3,8 +3,8 @@ use std::sync::{Arc, Weak};
 use mai_protocol::AgentId;
 use pl_core::{
     AgentTurnFactory, AgentTurnPreparationContext, ContextCompactionConfig,
-    ContextCompactionReplacement, CoreAgentProfile, HostMcpToolSpec, InstructionSnapshot,
-    PreparedAgentTurn, RecentInteractionTailConfig, TurnEngineBuilder, TurnOptions, TurnRequest,
+    ContextCompactionReplacement, CoreAgentProfile, InstructionSnapshot, PreparedAgentTurn,
+    RecentInteractionTailConfig, TurnEngineBuilder, TurnOptions, TurnRequest,
 };
 use pl_model::{OpenAiCompactionMode, create_provider_with_catalog};
 use tokio::sync::RwLock;
@@ -48,6 +48,7 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
             .models
             .resolve(&context.snapshot.identity.role)
             .map_err(RuntimeError::Model)?;
+        let web_search = pl_core::plan_web_search(&config.models, &route, &config.web_search)?;
         let provider = create_provider_with_catalog(route.provider_info, route.models)
             .map_err(RuntimeError::Model)?;
         let mut builder = TurnEngineBuilder::new(provider);
@@ -64,11 +65,11 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
         let container_skill_paths = runtime
             .sync_agent_skills_to_container(&agent, &skills_manager, &skills_config)
             .await?;
-        let initial_mcp_tools = if config.mcp.enabled {
-            runtime.agent_mcp_tools(&agent).await
-        } else {
-            Vec::new()
-        };
+        let mcp_lease = runtime.prepare_agent_mcp_lease(&agent, &config).await?;
+        let mcp_tools: Vec<crate::mcp::McpTool> = mcp_lease
+            .as_ref()
+            .map(|lease| lease.tools().iter().map(mcp_tool).collect::<Vec<_>>())
+            .unwrap_or_default();
         let policy_context = super::MaiPolicyContext {
             can_manage_agents: crate::turn::tool_visibility::can_manage_agents(
                 &runtime.state,
@@ -77,13 +78,15 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
             .await,
         };
         let configured_roles = config.models.routes.keys().cloned().collect::<Vec<_>>();
-        let initial_visibility = super::compile_execution_policy(
+        let mut initial_policy = super::compile_execution_policy(
             &context.snapshot,
             configured_roles.clone(),
-            crate::turn::tool_visibility::visible_tool_names(&agent, &initial_mcp_tools).await,
+            crate::turn::tool_visibility::visible_tool_names(&agent, &mcp_tools).await,
             policy_context,
-        )
-        .visible_tools;
+        );
+        initial_policy.visible_tools =
+            web_search.constrain_visibility(initial_policy.visible_tools);
+        let initial_visibility = initial_policy.visible_tools;
         let skill_injections = {
             let _guard = runtime.project_skill_read_guard(&agent).await;
             skills_manager.build_injections_for_input(
@@ -114,38 +117,16 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
                 })
                 .await;
         }
-        if config.mcp.enabled {
-            runtime
-                .inject_project_mcp_tools(
-                    &agent,
-                    product_agent_id,
-                    product_session_id,
-                    &context.cancellation_token,
-                )
-                .await?;
-        }
-        let mcp_tools = if config.mcp.enabled {
-            runtime.agent_mcp_tools(&agent).await
-        } else {
-            Vec::new()
-        };
-        let base_visibility =
-            crate::turn::tool_visibility::visible_tool_names(&agent, &mcp_tools).await;
-        let policy = super::compile_execution_policy(
+        let mut policy = super::compile_execution_policy(
             &context.snapshot,
             configured_roles,
-            base_visibility,
+            crate::turn::tool_visibility::visible_tool_names(&agent, &mcp_tools).await,
             policy_context,
         );
+        policy.visible_tools = web_search.constrain_visibility(policy.visible_tools);
         let product_tools = policy
             .visible_tools
             .filter_schemas(crate::turn::product_tool_schemas::build_tool_schemas());
-        let mcp_tool_schemas = pl_core::host_mcp_tool_schemas(
-            mcp_tools
-                .iter()
-                .filter(|tool| policy.visible_tools.contains(&tool.model_name))
-                .map(host_mcp_tool_spec),
-        );
         let generated_instructions = {
             let _guard = runtime.project_skill_read_guard(&agent).await;
             runtime
@@ -162,6 +143,13 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
         let workspace_instructions = runtime
             .project_review_workspace_instructions_for_agent(&agent)
             .await?;
+        let review_manifest = agent
+            .review_context
+            .read()
+            .await
+            .as_deref()
+            .map(|context| super::review_manifest::section(context, &skill_injections))
+            .transpose()?;
         let instructions = instructions_for_turn(
             &config,
             Some(&generated_instructions),
@@ -172,7 +160,7 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         )
         .with_context_compaction(context_compaction());
-        let kernel = build_mai_framework_kernel(
+        let mut kernel = build_mai_framework_kernel(
             builder,
             profile,
             MaiFrameworkKernelBuildContext {
@@ -183,11 +171,11 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
                 framework_runtime: context.runtime.clone(),
                 policy: policy.clone(),
                 product_tool_schemas: product_tools,
-                mcp_tool_schemas,
-                cancellation_token: context.cancellation_token.clone(),
+                mcp_lease,
             },
         )
         .await?;
+        web_search.install(kernel.core_mut(), &config.web_search)?;
         let request = TurnRequest::new(context.input.message)
             .with_turn_id(context.turn_id.to_string())
             .with_instruction_snapshot(InstructionSnapshot::profile_base_override(
@@ -208,7 +196,11 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
                 product_session_id,
                 product_turn_id,
             ));
-        Ok(PreparedAgentTurn::new(kernel, request, options, policy))
+        let mut prepared = PreparedAgentTurn::new(kernel, request, options, policy);
+        if let Some(review_manifest) = review_manifest {
+            prepared = prepared.with_pinned_context(review_manifest);
+        }
+        Ok(prepared)
     }
 }
 
@@ -302,12 +294,13 @@ fn context_compaction() -> ContextCompactionConfig {
     .with_openai_mode(OpenAiCompactionMode::Local)
 }
 
-fn host_mcp_tool_spec(tool: &crate::mcp::McpTool) -> HostMcpToolSpec {
-    HostMcpToolSpec {
-        model_name: tool.model_name.clone(),
-        server: tool.server.clone(),
-        name: tool.name.clone(),
+fn mcp_tool(tool: &pl_core::McpRuntimeToolDescriptor) -> crate::mcp::McpTool {
+    crate::mcp::McpTool {
+        server: tool.server_id.clone(),
+        name: tool.raw_name.clone(),
+        model_name: tool.exposed_name.clone(),
         description: tool.description.clone(),
         input_schema: tool.input_schema.clone(),
+        output_schema: None,
     }
 }

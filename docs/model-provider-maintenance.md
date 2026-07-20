@@ -11,6 +11,11 @@ mai 不维护内置 provider preset 或模型元数据。canonical 数据位于 
 mai-runtime 的 `MaiConfig` 只保存 provider 实例：ID、preset/catalog 引用、凭证、endpoint
 override、连接方式、附加模型和角色路由。mai-store 不包含内置模型构造器。
 
+Provider 的厂商身份、wire protocol、连接方式和外部服务能力彼此正交。preset 在 PL registry 中
+声明默认 `ProviderServiceCapabilities`；preset 实例默认保存 `PresetDefaults`，因此重新编译即可
+继承新增能力。自定义 provider 保存显式能力，默认不宣称兼容服务；代理 endpoint（例如 muxai）
+可在通用高级设置中覆盖能力，不需要增加 endpoint 或 provider ID 分支。
+
 ## 传输边界
 
 协议与连接方式正交：
@@ -45,6 +50,22 @@ endpoint、连接模式、附加模型和 routes。
 
 目录加载失败时 UI 显示错误与重试，不能退回陈旧常量。未知 preset、model、mode 或 icon 必须由
 通用组件展示。
+
+## Web Search 能力规划
+
+Web Search 默认配置为 `Cached`。`pl-core::plan_web_search` 按如下顺序确定路径：
+
+1. 校验配置是否启用。
+2. 根据当前已解析 provider、协议和模型能力形成 hosted candidate。
+3. 按当前 provider、角色路由、provider 配置顺序确定 standalone candidate。
+4. 当前模型可调用 function tool 时优先 additive standalone；否则使用 exclusive hosted。
+5. 无路径时明确区分缺凭证、provider 不支持和模型不支持。
+
+`GET/PUT /settings/web-search` 返回配置及 planner、explorer、executor、reviewer 四个角色的公共
+resolution。Web 只展示 configured/effective mode、实际路径和不可用原因，不复刻上述算法。
+
+OpenAI preset 当前声明 Responses hosted 与 OpenAI Search API standalone 能力。任何未来 preset
+只要使用已支持 dialect 并在 PL catalog 声明能力，Studio 和 Mai 都会自动获得相同行为。
 
 ## MiMo 资料
 

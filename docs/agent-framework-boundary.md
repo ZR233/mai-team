@@ -25,6 +25,29 @@ active turn、pending queue、cancel flag 或 turn lock。
 mai-store 的 `ConfigDocumentStore` 只提供泛型 load/save 与原子文件替换；SQLite store 命名为
 `MaiStore`。mai-protocol 继续保持轻量，只定义外部 DTO，并在 mai-runtime 单点转换。
 
+## 可复用工具能力
+
+Web Search 的路径选择和 MCP 的运行状态机均属于 PL，不属于产品：
+
+- `pl-core::plan_web_search` 只读取已解析 provider/model 能力与产品配置，确定 standalone、
+  hosted 或不可用路径。Studio 与 Mai 只能应用计划，不能按 provider ID 另写选择规则。
+- `pl-core::McpRuntime<H>` 负责 fingerprint、并行探测、增量 reconcile、工具发现、命名冲突、
+  generation、lease、health 与失败隔离。
+- 新 generation 在所有 server 完成探测后原子生效；准备期间旧 generation 的活动 turn 可继续
+  调用。最后一个旧 lease 释放后，PL 才关闭不再复用的 session。
+- `mai-runtime::mcp::ContainerMcpRuntimeHost` 只负责 transport：Streamable HTTP 在 server 进程
+  建立，stdio 通过 Docker exec 在 agent 容器建立。它不实现第二套 reconcile 或工具命名逻辑。
+- 每个 agent/container 拥有一个 MCP handle。容器销毁时先关闭 handle；配置或 provider secret
+  变化时，Mai 并发要求所有活动 handle reconcile；Turn Factory 每轮只获取固定 lease。
+
+Mai 的 MCP 配置由 agent、system 与 project scope 组合。project agent 同时获得 agent/system
+配置和当前项目配置。PL 内置 Zhipu Search、Reader、ZRead、Vision；四者有 Coding Plan 凭证时
+默认启用，均声明为 `Read` effect。内置 identity 与 endpoint 锁定，Mai 只保存启停状态。
+
+HTTP API 只返回公共 descriptor、脱敏 endpoint 和 agent 聚合 health。token、header value 与 env
+value 都是 write-only：空值保留，显式 clear 才删除。Host 错误在进入 health、trace 或模型输出前
+由 PL 统一脱敏。
+
 ## 状态协议
 
 产品状态由资源与框架 runtime 状态组成：

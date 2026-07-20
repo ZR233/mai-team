@@ -265,7 +265,6 @@ impl AgentRuntime {
             && summary.status == ProjectStatus::Ready
             && summary.clone_status == ProjectCloneStatus::Ready
         {
-            self.shutdown_project_mcp_manager(project_id).await;
             self.sync_project_repository(
                 project_id,
                 projects::workspace::ProjectRepositorySyncTarget::DefaultBranch,

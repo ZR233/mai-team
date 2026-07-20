@@ -6,8 +6,10 @@ mod migration;
 use std::collections::BTreeMap;
 
 use pl_core::{
-    AgentModelConfig, AgentRoleId, ModelRouteConfig, ProviderConfig, ProviderId, ReasoningEffort,
+    AgentModelConfig, AgentRoleId, BuiltinMcpServerState, ModelRouteConfig, ProviderConfig,
+    ProviderId, ReasoningEffort,
 };
+use pl_model::WebSearchConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::{Result, RuntimeError};
@@ -17,7 +19,7 @@ pub(crate) use conversion::{
     agent_config_from_models, preserve_provider_private_fields, provider_selection_from_models,
     providers_request_from_models, providers_response_from_models,
 };
-pub const MAI_CONFIG_SCHEMA_VERSION: u32 = 4;
+pub const MAI_CONFIG_SCHEMA_VERSION: u32 = 5;
 
 const REQUIRED_ROLES: [&str; 4] = ["planner", "explorer", "executor", "reviewer"];
 
@@ -26,6 +28,8 @@ const REQUIRED_ROLES: [&str; 4] = ["planner", "explorer", "executor", "reviewer"
 pub struct MaiConfig {
     pub schema_version: u32,
     pub models: AgentModelConfig,
+    #[serde(default)]
+    pub web_search: WebSearchConfig,
     #[serde(default)]
     pub containers: MaiContainerConfig,
     #[serde(default)]
@@ -69,6 +73,8 @@ pub struct MaiSkillsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MaiMcpConfig {
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub builtin_servers: BTreeMap<String, BuiltinMcpServerState>,
 }
 
 /// GitHub 产品能力开关。
@@ -94,6 +100,8 @@ impl MaiConfig {
             )));
         }
         self.models.validate().map_err(RuntimeError::Model)?;
+        pl_core::validate_builtin_mcp_server_states(&self.mcp.builtin_servers)
+            .map_err(RuntimeError::Model)?;
         for role in REQUIRED_ROLES {
             let role = AgentRoleId::new(role).map_err(RuntimeError::Model)?;
             self.models.resolve(&role).map_err(RuntimeError::Model)?;
@@ -155,6 +163,7 @@ pub async fn seed_default_provider_from_env(
             protocol: mai_protocol::ProviderWireProtocol::Responses,
             connection_mode: mai_protocol::ProviderConnectionMode::Http,
         },
+        capabilities: mai_protocol::ProviderCapabilitySelection::Explicit(Default::default()),
         name: "OpenAI".to_string(),
         base_url,
         api_key: Some(api_key),
@@ -239,6 +248,7 @@ impl Default for MaiConfig {
                 providers: BTreeMap::from([(provider_id, provider)]),
                 routes,
             },
+            web_search: WebSearchConfig::default(),
             containers: MaiContainerConfig::default(),
             instructions: MaiInstructionsConfig::default(),
             skills: MaiSkillsConfig::default(),
@@ -268,7 +278,10 @@ impl Default for MaiSkillsConfig {
 
 impl Default for MaiMcpConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            builtin_servers: BTreeMap::new(),
+        }
     }
 }
 

@@ -137,49 +137,17 @@ impl AgentRuntime {
         agents::ensure_agent_container(self, &agent).await
     }
 
-    pub(super) async fn agent_mcp_tools(&self, agent: &AgentRecord) -> Vec<crate::mcp::McpTool> {
-        let project_id = agent.summary.read().await.project_id;
-        if let Some(project_id) = project_id {
-            if projects::mcp::project_mcp_configs("").is_empty() {
-                return Vec::new();
-            }
-            let manager = self
-                .state
-                .project_mcp_managers
-                .read()
-                .await
-                .get(&project_id)
-                .map(projects::mcp::ProjectMcpManagerHandle::manager);
-            let Some(manager) = manager else {
-                return Vec::new();
-            };
-            return manager
-                .tools()
-                .await
-                .into_iter()
-                .filter(|tool| !projects::mcp::is_github_mcp_tool(tool))
-                .collect();
-        }
-        let Some(manager) = agent.mcp.read().await.clone() else {
-            return Vec::new();
-        };
-        manager.tools().await
-    }
-
-    pub(super) async fn inject_project_mcp_tools(
+    pub(super) async fn prepare_agent_mcp_lease(
         &self,
         agent: &AgentRecord,
-        agent_id: AgentId,
-        _session_id: SessionId,
-        cancellation_token: &CancellationToken,
-    ) -> Result<()> {
-        turn::cancellation::ensure_not_cancelled(cancellation_token)?;
-        if agent.summary.read().await.project_id.is_none() {
-            return Ok(());
+        config: &MaiConfig,
+    ) -> Result<Option<pl_core::McpTurnLease>> {
+        let Some(runtime) = agent.mcp.read().await.clone() else {
+            return Ok(None);
+        };
+        if !config.mcp.enabled {
+            return Ok(None);
         }
-        let _ = self
-            .project_mcp_manager_for_agent(agent, agent_id, cancellation_token)
-            .await?;
-        Ok(())
+        Ok(Some(runtime.handle().acquire_turn_lease().await?))
     }
 }

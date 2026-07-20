@@ -43,10 +43,6 @@ pub(crate) trait ProjectLifecycleOps: Send + Sync {
     fn stop_project_review_loop(&self, project_id: ProjectId) -> impl Future<Output = ()> + Send;
     fn delete_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<()>> + Send;
     fn cancel_project_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<()>> + Send;
-    fn shutdown_project_mcp_manager(
-        &self,
-        project_id: ProjectId,
-    ) -> impl Future<Output = ()> + Send;
     fn delete_project_sidecar(
         &self,
         project_id: ProjectId,
@@ -430,7 +426,6 @@ pub(crate) async fn delete_project(
     for agent_id in root_agents {
         let _ = ops.delete_agent(agent_id).await;
     }
-    ops.shutdown_project_mcp_manager(project_id).await;
     let _ = ops.delete_project_sidecar(project_id).await;
     let _ = ops.delete_project_workspace(project_id).await;
     ops.delete_project_from_store(project_id).await?;
@@ -464,7 +459,6 @@ pub(crate) async fn cancel_project(
     ops.save_project(&updated).await?;
     ops.publish_project_event(ServiceEventKind::ProjectUpdated { project: updated })
         .await;
-    ops.shutdown_project_mcp_manager(project_id).await;
     let _ = ops.delete_project_sidecar(project_id).await;
     Ok(())
 }

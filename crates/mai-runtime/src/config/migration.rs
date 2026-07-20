@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 
 use mai_store::ConfigDocumentStore;
 use pl_core::{
-    AgentModelConfig, AgentRoleId, ModelRouteConfig, ProviderConfig, ProviderId,
-    ProviderModelCatalogConfig, ProviderPresetId, ProviderTransportSelection, ReasoningEffort,
-    builtin_provider_catalog,
+    AgentModelConfig, AgentRoleId, ModelRouteConfig, ProviderCapabilitySelection, ProviderConfig,
+    ProviderId, ProviderModelCatalogConfig, ProviderPresetId, ProviderTransportSelection,
+    ReasoningEffort, builtin_provider_catalog,
 };
 use pl_model::{
     ApplyPatchToolType, ModelInfo, ProviderConnectionMode, ProviderInfo, ProviderWireProtocol,
@@ -119,12 +119,35 @@ struct LegacyCatalogProviderConfig {
 }
 
 pub(super) async fn migrate(documents: &ConfigDocumentStore) -> Result<MaiConfig> {
+    if let Ok(Some(mut config)) = documents.load::<MaiConfig>().await
+        && config.schema_version == 4
+    {
+        migrate_v4_provider_capabilities(&mut config.models);
+        config.schema_version = MAI_CONFIG_SCHEMA_VERSION;
+        config.validate()?;
+        backup_document(documents.path(), 4).await?;
+        documents.save(&config).await?;
+        return Ok(config);
+    }
     if let Ok(Some(legacy)) = documents.load::<LegacyCatalogMaiConfig>().await
         && matches!(legacy.schema_version, 2 | 3)
     {
         return migrate_catalog_config(documents, legacy).await;
     }
     migrate_v1(documents).await
+}
+
+fn migrate_v4_provider_capabilities(models: &mut AgentModelConfig) {
+    for provider in models.providers.values_mut() {
+        provider.capabilities = match &provider.transport {
+            ProviderTransportSelection::Preset { .. } => {
+                ProviderCapabilitySelection::PresetDefaults
+            }
+            ProviderTransportSelection::Custom { .. } => {
+                ProviderCapabilitySelection::Explicit(Default::default())
+            }
+        };
+    }
 }
 
 async fn migrate_catalog_config(
@@ -144,6 +167,7 @@ async fn migrate_catalog_config(
             providers,
             routes: legacy.models.routes,
         },
+        web_search: Default::default(),
         containers: legacy.containers,
         instructions: legacy.instructions,
         skills: legacy.skills,
@@ -169,15 +193,21 @@ fn migrate_catalog_provider(
             migrated_preset_connection_mode(legacy.preset.as_ref(), &legacy.base_url)
         })
     };
-    let transport = match legacy.preset {
-        Some(preset) => ProviderTransportSelection::Preset {
-            preset,
-            connection_mode,
-        },
-        None => ProviderTransportSelection::Custom {
-            protocol,
-            connection_mode: ProviderConnectionMode::Http,
-        },
+    let (transport, capabilities) = match legacy.preset {
+        Some(preset) => (
+            ProviderTransportSelection::Preset {
+                preset,
+                connection_mode,
+            },
+            ProviderCapabilitySelection::PresetDefaults,
+        ),
+        None => (
+            ProviderTransportSelection::Custom {
+                protocol,
+                connection_mode: ProviderConnectionMode::Http,
+            },
+            ProviderCapabilitySelection::Explicit(Default::default()),
+        ),
     };
     Ok(ProviderConfig {
         transport,
@@ -188,6 +218,7 @@ fn migrate_catalog_provider(
         http_headers: legacy.http_headers,
         tool_wire_policy: legacy.tool_wire_policy,
         apply_patch_tool_type: legacy.apply_patch_tool_type,
+        capabilities,
         catalog: legacy.catalog,
     })
 }
@@ -215,6 +246,7 @@ async fn migrate_v1(documents: &ConfigDocumentStore) -> Result<MaiConfig> {
     let config = MaiConfig {
         schema_version: MAI_CONFIG_SCHEMA_VERSION,
         models: AgentModelConfig { providers, routes },
+        web_search: Default::default(),
         containers: legacy.containers,
         instructions: legacy.instructions,
         skills: legacy.skills,
@@ -239,6 +271,7 @@ fn migrate_provider(id: &ProviderId, legacy: LegacyProviderConfig) -> Result<Pro
         http_headers: legacy.http_headers,
         tool_wire_policy: legacy.tool_wire_policy,
         apply_patch_tool_type: legacy.apply_patch_tool_type,
+        service_capabilities: Default::default(),
     };
     let bearer_token_env = legacy.bearer_token_env;
     let registry = builtin_provider_catalog();
@@ -382,6 +415,31 @@ mod tests {
             routes[&role].reasoning_effort.as_ref().unwrap().as_str(),
             "enabled"
         );
+    }
+
+    #[test]
+    fn schema_four_capabilities_follow_preset_but_not_custom_provider() {
+        let mut models = crate::MaiConfig::default().models;
+        let custom_id = ProviderId::new("custom").unwrap();
+        let custom = ProviderConfig::from_explicit_models(
+            ProviderInfo::responses_compatible("Custom", "https://example.com/v1", "future-model"),
+            vec![ModelInfo::fallback("future-model")],
+        );
+        models.providers.insert(custom_id.clone(), custom);
+        for provider in models.providers.values_mut() {
+            provider.capabilities = ProviderCapabilitySelection::PresetDefaults;
+        }
+
+        migrate_v4_provider_capabilities(&mut models);
+
+        assert!(matches!(
+            models.providers[&ProviderId::new("deepseek").unwrap()].capabilities,
+            ProviderCapabilitySelection::PresetDefaults
+        ));
+        assert!(matches!(
+            models.providers[&custom_id].capabilities,
+            ProviderCapabilitySelection::Explicit(_)
+        ));
     }
 
     #[test]

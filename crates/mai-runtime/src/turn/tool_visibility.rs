@@ -21,6 +21,7 @@ pub(crate) async fn visible_tool_names(
     );
     let mut product_tools = vec![
         crate::turn::product_tool_schemas::TOOL_SAVE_ARTIFACT.to_string(),
+        crate::turn::product_tool_schemas::TOOL_READ_TOOL_ARTIFACT.to_string(),
         crate::turn::product_tool_schemas::TOOL_GITHUB_API_REQUEST.to_string(),
     ];
     if task_plan_tool_visible(&summary) {

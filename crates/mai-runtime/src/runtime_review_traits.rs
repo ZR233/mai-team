@@ -182,6 +182,14 @@ impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
         Ok(())
     }
 
+    async fn delete_project_review_context(
+        &self,
+        project_id: ProjectId,
+        context: Arc<projects::review::context::ProjectReviewContext>,
+    ) -> Result<()> {
+        AgentRuntime::cleanup_project_review_context(self.as_ref(), project_id, &context).await
+    }
+
     fn delete_agent(
         &self,
         agent_id: AgentId,
@@ -309,7 +317,7 @@ impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
         &self,
         agent_id: AgentId,
         cancellation_token: &CancellationToken,
-    ) -> impl std::future::Future<Output = Result<AgentSummary>> + Send {
+    ) -> impl std::future::Future<Output = Result<pl_core::AgentWaitResult>> + Send {
         AgentRuntime::wait_agent_until_complete_with_cancel(
             self.as_ref(),
             agent_id,

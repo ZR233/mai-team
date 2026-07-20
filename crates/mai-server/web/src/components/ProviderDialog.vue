@@ -90,6 +90,31 @@
             </option>
           </datalist>
         </label>
+        <label>
+          <span>Service Capabilities</span>
+          <select v-model="dialog.form.capability_source">
+            <option v-if="dialog.form.preset_id" value="preset_defaults">Follow preset defaults</option>
+            <option value="explicit">Explicit override</option>
+          </select>
+        </label>
+        <template v-if="dialog.form.capability_source === 'explicit'">
+          <label>
+            <span>Hosted Web Search</span>
+            <select v-model="dialog.form.hosted_web_search">
+              <option :value="false">Disabled</option>
+              <option :value="true">Enabled</option>
+            </select>
+          </label>
+          <label>
+            <span>Standalone Web Search</span>
+            <select v-model="dialog.form.standalone_web_search">
+              <option value="">Disabled</option>
+              <option v-for="dialect in standaloneDialects" :key="dialect" :value="dialect">
+                {{ formatCapability(dialect) }}
+              </option>
+            </select>
+          </label>
+        </template>
         <label class="span-2">
           <span>{{ dialog.form.catalog_source === 'bundled' ? 'Additional Models JSON' : 'Models JSON' }}</span>
           <textarea
@@ -163,6 +188,20 @@ const protocolOptions = computed(() => {
   }
   return [...protocols.values()]
 })
+
+const standaloneDialects = computed(() => {
+  const values = new Set()
+  for (const preset of props.presets) {
+    const dialect = preset.service_capabilities?.web_search?.standalone
+    if (dialect) values.add(dialect)
+  }
+  if (props.dialog.form.standalone_web_search) values.add(props.dialog.form.standalone_web_search)
+  return [...values]
+})
+
+function formatCapability(value) {
+  return value.replaceAll('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
 
 function onProtocolChanged() {
   const protocol = protocolOptions.value.find(

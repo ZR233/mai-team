@@ -22,6 +22,12 @@ const futurePreset = {
   },
   base_url: 'https://future.example/v1',
   credential: { label: 'Access Key', env_var: 'FUTURE_KEY' },
+  service_capabilities: {
+    web_search: {
+      hosted_responses: true,
+      standalone: 'future_search_dialect'
+    }
+  },
   model_catalog_id: 'future-catalog',
   suggested_model: 'future-model',
 }
@@ -62,6 +68,9 @@ test('provider draft uses the catalog connection default without provider id bra
   assert.equal(providerDialog.form.connection_mode, 'web_socket')
   assert.deepEqual(providerDialog.form.connection_modes, futurePreset.transport.connection_modes)
   assert.equal(providerDialog.form.protocol, 'responses')
+  assert.equal(providerDialog.form.capability_source, 'preset_defaults')
+  assert.equal(providerDialog.form.hosted_web_search, true)
+  assert.equal(providerDialog.form.standalone_web_search, 'future_search_dialect')
 })
 
 test('multiple instances of one preset receive distinct provider ids', () => {
@@ -112,6 +121,8 @@ test('updating an api key preserves transport and catalog fields', async () => {
     name: 'Future Provider',
     base_url: futurePreset.base_url,
     api_key_env: 'FUTURE_KEY',
+    capability_selection: { source: 'preset_defaults' },
+    service_capabilities: futurePreset.service_capabilities,
     catalog: {
       source: 'bundled',
       catalog_id: 'future-catalog',
@@ -138,4 +149,5 @@ test('updating an api key preserves transport and catalog fields', async () => {
     additional_models: []
   })
   assert.equal(payload.providers[0].api_key, 'updated-secret')
+  assert.deepEqual(payload.providers[0].capabilities, { source: 'preset_defaults' })
 })

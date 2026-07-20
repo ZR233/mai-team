@@ -523,6 +523,13 @@
           </div>
         </section>
 
+        <WebSearchSettingsPanel
+          v-else-if="activeSettingsSection === 'web-search'"
+          :state="webSearchState"
+          @reload="$emit('reload-web-search')"
+          @save="$emit('save-web-search', $event)"
+        />
+
         <section v-else class="settings-section-panel mcp-settings">
           <div class="settings-section-header">
             <div>
@@ -558,6 +565,7 @@
 <script setup>
 import { computed, reactive, ref, watch } from 'vue'
 import ModelSelector from './ModelSelector.vue'
+import WebSearchSettingsPanel from './WebSearchSettingsPanel.vue'
 import { defaultReasoningEffort, reasoningLabel } from '../utils/reasoning'
 
 const ROLE_DEFINITIONS = [
@@ -592,6 +600,7 @@ const SETTINGS_SECTIONS = [
   { key: 'skills', title: 'Skills', icon: 'S' },
   { key: 'git-accounts', title: 'Git Accounts', icon: 'G' },
   { key: 'github-app', title: 'GitHub App', icon: 'A' },
+  { key: 'web-search', title: 'Web Search', icon: 'W' },
   { key: 'mcp', title: 'MCP Servers', icon: 'M' }
 ]
 
@@ -605,6 +614,7 @@ const props = defineProps({
   skillsError: { type: String, default: '' },
   mcpServersState: { type: Object, required: true },
   mcpSaving: { type: Boolean, default: false },
+  webSearchState: { type: Object, required: true },
   gitAccountsState: { type: Object, default: () => ({ accounts: [] }) },
   githubAppState: { type: Object, default: () => ({ relay: null, app: null, installations: [] }) },
   initialSection: { type: String, default: 'roles' }
@@ -618,6 +628,8 @@ const emit = defineEmits([
   'save-skills',
   'reload-mcp',
   'open-mcp',
+  'reload-web-search',
+  'save-web-search',
   'save-git-account',
   'verify-git-account',
   'delete-git-account',
@@ -693,11 +705,11 @@ const reasoningConfigured = computed(() =>
   ROLE_DEFINITIONS.every((role) => forms[role.key].reasoning_effort || forms[role.key].model)
 )
 
-const mcpServers = computed(() => Object.values(props.mcpServersState.servers || {}))
+const mcpServers = computed(() => props.mcpServersState.servers || [])
 const mcpServerCount = computed(() => mcpServers.value.length)
 const mcpEnabledCount = computed(() => mcpServers.value.filter((server) => server.enabled !== false).length)
 const mcpTransportLabel = computed(() => {
-  const transports = new Set(mcpServers.value.map((server) => server.transport || 'stdio'))
+  const transports = new Set(mcpServers.value.map((server) => server.descriptor?.transport || 'stdio'))
   if (!transports.size) return 'None'
   return Array.from(transports).join(' · ')
 })
@@ -994,6 +1006,7 @@ function sectionStatus(section) {
   if (section === 'skills') return `${enabledSkillCount.value} enabled`
   if (section === 'git-accounts') return gitAccountCount.value ? `${gitAccountCount.value} connected` : 'No accounts'
   if (section === 'github-app') return githubAppStatusLabel.value
+  if (section === 'web-search') return props.webSearchState.config?.mode || 'Not loaded'
   if (section === 'mcp') return `${mcpEnabledCount.value} active`
   return ''
 }

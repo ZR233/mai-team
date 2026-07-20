@@ -101,10 +101,20 @@ pub struct StoredAgentRuntime {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentRuntimeCommitDocument {
     pub expected_revision: Option<u64>,
+    pub mutation: StoredAgentRuntimeMutation,
     pub runtime: StoredAgentRuntime,
     pub turns: Vec<StoredAgentTurn>,
     pub events: Vec<StoredAgentRuntimeEvent>,
     pub traces: Vec<StoredAgentRuntimeTrace>,
+}
+
+/// 与 PL repository mutation 对齐，但不让 mai-store 反向依赖 pl-core。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum StoredAgentRuntimeMutation {
+    SnapshotAndQueue,
+    ReplaceSession { session_id: String },
+    AppendTrace,
 }
 
 /// CAS 提交结果；冲突不会写入任何记录。
@@ -186,14 +196,59 @@ impl MaiStore {
         .collect::<BTreeMap<_, _>>();
 
         replace_state(&mut tx, &document.runtime.state).await?;
-        replace_sessions(
-            &mut tx,
-            &agent_id,
-            &existing_sessions,
-            &document.runtime.sessions,
-        )
-        .await?;
-        replace_pending_inputs(&mut tx, &agent_id, &document.runtime.pending_inputs).await?;
+        match &document.mutation {
+            StoredAgentRuntimeMutation::SnapshotAndQueue => {
+                replace_sessions(
+                    &mut tx,
+                    &agent_id,
+                    &existing_sessions,
+                    &document.runtime.sessions,
+                )
+                .await?;
+                replace_pending_inputs(&mut tx, &agent_id, &document.runtime.pending_inputs)
+                    .await?;
+            }
+            StoredAgentRuntimeMutation::ReplaceSession { session_id } => {
+                let session = document
+                    .runtime
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == *session_id)
+                    .ok_or_else(|| {
+                        StoreError::InvalidConfig(format!(
+                            "replacement session `{session_id}` is missing from runtime commit"
+                        ))
+                    })?;
+                replace_one_session(
+                    &mut tx,
+                    &agent_id,
+                    existing_sessions.get(session_id),
+                    session,
+                )
+                .await?;
+            }
+            StoredAgentRuntimeMutation::AppendTrace => {
+                if let Some(session_id) = &document.runtime.state.active_session_id {
+                    let session = document
+                        .runtime
+                        .sessions
+                        .iter()
+                        .find(|session| session.session_id == *session_id)
+                        .ok_or_else(|| {
+                            StoreError::InvalidConfig(format!(
+                                "trace session `{session_id}` is missing from runtime commit"
+                            ))
+                        })?;
+                    replace_session_record(
+                        &mut tx,
+                        &agent_id,
+                        existing_sessions.get(session_id),
+                        session,
+                    )
+                    .await?;
+                }
+            }
+        }
         upsert_turns(&mut tx, &agent_id, &document.turns).await?;
         append_events(&mut tx, &agent_id, &document.events).await?;
         append_traces(&mut tx, &agent_id, &document.traces).await?;
@@ -271,53 +326,122 @@ async fn replace_sessions(
     .await?;
 
     for session in sessions {
-        let prior = existing.get(&session.session_id);
-        toasty::create!(AgentSessionRecord {
-            id: session.session_id.clone(),
+        insert_session_record(tx, agent_id, existing.get(&session.session_id), session).await?;
+        insert_session_content(tx, agent_id, session).await?;
+    }
+    Ok(())
+}
+
+async fn replace_one_session(
+    tx: &mut toasty::Transaction<'_>,
+    agent_id: &str,
+    prior: Option<&AgentSessionRecord>,
+    session: &StoredAgentRuntimeSession,
+) -> Result<()> {
+    Query::<List<AgentSessionRecord>>::filter(
+        AgentSessionRecord::fields()
+            .id()
+            .eq(session.session_id.clone()),
+    )
+    .delete()
+    .exec(&mut *tx)
+    .await?;
+    Query::<List<AgentHistoryRecord>>::filter(
+        AgentHistoryRecord::fields()
+            .session_id()
+            .eq(session.session_id.clone()),
+    )
+    .delete()
+    .exec(&mut *tx)
+    .await?;
+    Query::<List<AgentMessageRecord>>::filter(
+        AgentMessageRecord::fields()
+            .session_id()
+            .eq(session.session_id.clone()),
+    )
+    .delete()
+    .exec(&mut *tx)
+    .await?;
+    insert_session_record(tx, agent_id, prior, session).await?;
+    insert_session_content(tx, agent_id, session).await
+}
+
+async fn replace_session_record(
+    tx: &mut toasty::Transaction<'_>,
+    agent_id: &str,
+    prior: Option<&AgentSessionRecord>,
+    session: &StoredAgentRuntimeSession,
+) -> Result<()> {
+    Query::<List<AgentSessionRecord>>::filter(
+        AgentSessionRecord::fields()
+            .id()
+            .eq(session.session_id.clone()),
+    )
+    .delete()
+    .exec(&mut *tx)
+    .await?;
+    insert_session_record(tx, agent_id, prior, session).await
+}
+
+async fn insert_session_record(
+    tx: &mut toasty::Transaction<'_>,
+    agent_id: &str,
+    prior: Option<&AgentSessionRecord>,
+    session: &StoredAgentRuntimeSession,
+) -> Result<()> {
+    toasty::create!(AgentSessionRecord {
+        id: session.session_id.clone(),
+        agent_id: agent_id.to_string(),
+        title: session
+            .title
+            .clone()
+            .or_else(|| prior.map(|value| value.title.clone()))
+            .unwrap_or_else(|| "New session".to_string()),
+        created_at: prior
+            .map(|value| value.created_at.clone())
+            .unwrap_or_else(|| unix_timestamp_rfc3339(session.created_at)),
+        updated_at: unix_timestamp_rfc3339(session.updated_at),
+        input_tokens: u64_to_i64(session.usage.prompt_tokens),
+        cached_input_tokens: u64_to_i64(session.usage.cached_prompt_tokens),
+        output_tokens: u64_to_i64(session.usage.completion_tokens),
+        reasoning_output_tokens: u64_to_i64(session.usage.reasoning_tokens),
+        total_tokens: u64_to_i64(session.usage.total_tokens),
+        last_context_tokens: session.last_context_tokens.map(u64_to_i64),
+        trace_sequence: u64_to_i64(session.trace_sequence),
+    })
+    .exec(&mut *tx)
+    .await?;
+    Ok(())
+}
+
+async fn insert_session_content(
+    tx: &mut toasty::Transaction<'_>,
+    agent_id: &str,
+    session: &StoredAgentRuntimeSession,
+) -> Result<()> {
+    for (position, item) in session.history_items.iter().enumerate() {
+        toasty::create!(AgentHistoryRecord {
+            id: Uuid::new_v4().to_string(),
             agent_id: agent_id.to_string(),
-            title: session
-                .title
-                .clone()
-                .or_else(|| prior.map(|value| value.title.clone()))
-                .unwrap_or_else(|| "New session".to_string()),
-            created_at: prior
-                .map(|value| value.created_at.clone())
-                .unwrap_or_else(|| unix_timestamp_rfc3339(session.created_at)),
-            updated_at: unix_timestamp_rfc3339(session.updated_at),
-            input_tokens: u64_to_i64(session.usage.prompt_tokens),
-            cached_input_tokens: u64_to_i64(session.usage.cached_prompt_tokens),
-            output_tokens: u64_to_i64(session.usage.completion_tokens),
-            reasoning_output_tokens: u64_to_i64(session.usage.reasoning_tokens),
-            total_tokens: u64_to_i64(session.usage.total_tokens),
-            last_context_tokens: session.last_context_tokens.map(u64_to_i64),
-            trace_sequence: u64_to_i64(session.trace_sequence),
+            session_id: session.session_id.clone(),
+            position: usize_to_i64(position),
+            item_json: serde_json::to_string(item)?,
         })
         .exec(&mut *tx)
         .await?;
-        for (position, item) in session.history_items.iter().enumerate() {
-            toasty::create!(AgentHistoryRecord {
-                id: Uuid::new_v4().to_string(),
-                agent_id: agent_id.to_string(),
-                session_id: session.session_id.clone(),
-                position: usize_to_i64(position),
-                item_json: serde_json::to_string(item)?,
-            })
-            .exec(&mut *tx)
-            .await?;
-        }
-        for (position, message) in session.messages.iter().enumerate() {
-            toasty::create!(AgentMessageRecord {
-                id: Uuid::new_v4().to_string(),
-                agent_id: agent_id.to_string(),
-                session_id: session.session_id.clone(),
-                position: usize_to_i64(position),
-                role: message.role.to_string(),
-                content: message.content.clone(),
-                created_at: message.created_at.to_rfc3339(),
-            })
-            .exec(&mut *tx)
-            .await?;
-        }
+    }
+    for (position, message) in session.messages.iter().enumerate() {
+        toasty::create!(AgentMessageRecord {
+            id: Uuid::new_v4().to_string(),
+            agent_id: agent_id.to_string(),
+            session_id: session.session_id.clone(),
+            position: usize_to_i64(position),
+            role: message.role.to_string(),
+            content: message.content.clone(),
+            created_at: message.created_at.to_rfc3339(),
+        })
+        .exec(&mut *tx)
+        .await?;
     }
     Ok(())
 }

@@ -6,6 +6,7 @@ mod copy;
 mod error;
 mod exec;
 mod inspect;
+mod mount;
 pub mod naming;
 mod selection;
 
@@ -15,4 +16,5 @@ pub use container::ContainerHandle;
 pub use error::{DockerError, Result};
 pub use exec::{CapturedExecOutput, ExecCaptureOptions, ExecOutput, SidecarParams};
 pub use inspect::{ManagedContainer, ManagedVolume};
+pub use mount::{ContainerMountAccess, ContainerVolumeMount};
 pub use naming::{agent_workspace_volume, project_agent_workspace_volume, project_cache_volume};

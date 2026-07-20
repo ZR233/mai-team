@@ -47,7 +47,6 @@ http = "1"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 mime_guess = "2"
 reqwest = { version = "0.13", features = ["json", "rustls", "stream"], default-features = false }
-rmcp = { version = "1.6.0", default-features = false }
 rusqlite = { version = "0.39", features = ["bundled"] }
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 serde = { version = "1", features = ["derive"] }

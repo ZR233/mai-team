@@ -2,10 +2,12 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use crate::mcp::McpAgentManager;
+use crate::mcp::ContainerMcpRuntime;
 use mai_docker::ContainerHandle;
 use mai_protocol::{AgentId, AgentResourceState, McpServerConfig, McpStartupStatus, now};
+use pl_core::{AgentModelConfig, BuiltinMcpServerState};
 
+use crate::projects::review::context::ProjectRepositoryView;
 use crate::projects::workspace::{ProjectRepositoryReviewTarget, ProjectRepositoryRevision};
 use crate::state::AgentRecord;
 use crate::{Result, RuntimeError};
@@ -16,10 +18,12 @@ pub(crate) enum ContainerSource {
     ProjectReviewWorkspace {
         target: ProjectRepositoryReviewTarget,
         revision: ProjectRepositoryRevision,
+        repository_view: ProjectRepositoryView,
     },
     ProjectWorkspace {
         workspace_volume: String,
         repo_path: String,
+        repository_view: Option<ProjectRepositoryView>,
     },
     CloneFrom {
         parent_container_id: String,
@@ -42,6 +46,13 @@ pub(crate) struct AgentMcpStatusChange {
     pub(crate) error: Option<String>,
 }
 
+pub(crate) struct AgentMcpRuntimeConfig {
+    pub(crate) enabled: bool,
+    pub(crate) user_servers: BTreeMap<String, McpServerConfig>,
+    pub(crate) builtin_servers: BTreeMap<String, BuiltinMcpServerState>,
+    pub(crate) models: AgentModelConfig,
+}
+
 pub(crate) struct AgentContainerStatusChange {
     pub(crate) state: AgentResourceState,
     pub(crate) error: Option<String>,
@@ -61,15 +72,16 @@ pub(crate) trait AgentContainerOps: Send + Sync {
         container_id: String,
     ) -> impl Future<Output = ()> + Send;
 
-    fn agent_mcp_server_configs(
+    fn agent_mcp_runtime_config(
         &self,
-    ) -> impl Future<Output = Result<BTreeMap<String, McpServerConfig>>> + Send;
+        agent: &AgentRecord,
+    ) -> impl Future<Output = Result<AgentMcpRuntimeConfig>> + Send;
 
-    fn start_agent_mcp_manager(
+    fn start_agent_mcp_runtime(
         &self,
         container_id: String,
-        configs: BTreeMap<String, McpServerConfig>,
-    ) -> impl Future<Output = McpAgentManager> + Send;
+        config: AgentMcpRuntimeConfig,
+    ) -> impl Future<Output = Result<ContainerMcpRuntime>> + Send;
 
     fn set_agent_resource_state(
         &self,
@@ -120,6 +132,12 @@ pub(crate) async fn ensure_agent_container_with_source(
         return Ok(container_id);
     }
 
+    // 容器缺失即代表 transport identity 已变化；必须先关闭旧 MCP handle，
+    // 避免旧 stdio 进程或 HTTP session 在新容器 generation 建立后继续存活。
+    if let Some(previous) = agent.mcp.write().await.take() {
+        previous.shutdown().await;
+    }
+
     set_resource_state(ops, agent, AgentResourceState::Provisioning, None).await?;
     let container = match ops
         .start_agent_container(AgentContainerStartRequest {
@@ -153,8 +171,9 @@ pub(crate) async fn ensure_agent_container_with_source(
     *container_guard = Some(container.clone());
     drop(container_guard);
 
-    let mcp_configs = ops.agent_mcp_server_configs().await?;
-    for server in mcp_configs
+    let mcp_config = ops.agent_mcp_runtime_config(agent).await?;
+    for server in mcp_config
+        .user_servers
         .iter()
         .filter_map(|(server, config)| config.enabled.then_some(server))
     {
@@ -166,7 +185,9 @@ pub(crate) async fn ensure_agent_container_with_source(
         })
         .await;
     }
-    let mcp = ops.start_agent_mcp_manager(container.id, mcp_configs).await;
+    let mcp = ops
+        .start_agent_mcp_runtime(container.id, mcp_config)
+        .await?;
     for status in mcp.statuses().await {
         ops.publish_mcp_status(AgentMcpStatusChange {
             agent_id,

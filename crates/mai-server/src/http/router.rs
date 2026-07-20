@@ -28,6 +28,18 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
             get(handlers::providers::get_mcp_servers).put(handlers::providers::save_mcp_servers),
         )
         .route(
+            "/mcp-servers/builtins",
+            axum::routing::put(handlers::providers::save_builtin_mcp_servers),
+        )
+        .route(
+            "/mcp-servers/recheck",
+            post(handlers::providers::recheck_mcp_servers),
+        )
+        .route(
+            "/settings/web-search",
+            get(handlers::providers::get_web_search).put(handlers::providers::save_web_search),
+        )
+        .route(
             "/git/accounts",
             get(handlers::git_accounts::list_git_accounts)
                 .post(handlers::git_accounts::save_git_account),

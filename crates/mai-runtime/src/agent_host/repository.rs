@@ -6,13 +6,14 @@ use mai_protocol::{AgentMessage, MessageRole};
 use mai_store::{
     AgentRuntimeCommitDocument, AgentRuntimeCommitOutcome as StoreCommitOutcome, MaiStore,
     StoredAgentPendingInput, StoredAgentRuntime, StoredAgentRuntimeEvent,
-    StoredAgentRuntimeSession, StoredAgentRuntimeState, StoredAgentRuntimeTrace, StoredAgentTurn,
-    StoredTokenUsage,
+    StoredAgentRuntimeMutation, StoredAgentRuntimeSession, StoredAgentRuntimeState,
+    StoredAgentRuntimeTrace, StoredAgentTurn, StoredTokenUsage,
 };
 use pl_core::{
     AgentActivityState, AgentCommit, AgentCommitOutcome, AgentDurableState, AgentId, AgentIdentity,
-    AgentLifecycleState, AgentSession, AgentSessionState, AgentSnapshot, AgentStateRepository,
-    AgentTurnOutcome, PendingAgentInput, RestoredAgentRuntime, SessionId, TurnId, TurnOutcomeKind,
+    AgentLifecycleState, AgentSession, AgentSessionState, AgentSnapshot, AgentStateMutation,
+    AgentStateRepository, AgentTurnOutcome, PendingAgentInput, RestoredAgentRuntime, SessionId,
+    TurnId, TurnOutcomeKind,
 };
 use pl_protocol::{Message as ModelMessage, MessageRole as ModelMessageRole, ModelContextItem};
 
@@ -59,6 +60,7 @@ fn commit_to_store(commit: AgentCommit) -> Result<AgentRuntimeCommitDocument> {
         next_state,
         events,
         trace_events,
+        mutation,
         ..
     } = commit;
     let timestamp = datetime_from_unix(next_state.snapshot.updated_at);
@@ -94,6 +96,15 @@ fn commit_to_store(commit: AgentCommit) -> Result<AgentRuntimeCommitDocument> {
         .collect::<Result<_>>()?;
     Ok(AgentRuntimeCommitDocument {
         expected_revision,
+        mutation: match mutation {
+            AgentStateMutation::SnapshotAndQueue => StoredAgentRuntimeMutation::SnapshotAndQueue,
+            AgentStateMutation::ReplaceSession { session_id } => {
+                StoredAgentRuntimeMutation::ReplaceSession {
+                    session_id: session_id.to_string(),
+                }
+            }
+            AgentStateMutation::AppendTrace => StoredAgentRuntimeMutation::AppendTrace,
+        },
         runtime: StoredAgentRuntime {
             state: snapshot_to_store(&next_state.snapshot)?,
             sessions,

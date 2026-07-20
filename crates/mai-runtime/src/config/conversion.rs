@@ -3,19 +3,22 @@ use std::collections::BTreeMap;
 use mai_protocol::{
     AgentConfigRequest, AgentModelPreference, ModelCapabilities as ApiModelCapabilities,
     ModelConfig as ApiModelConfig, ModelMaxTokensField, ModelReasoningConfig,
-    ModelReasoningVariant, ModelRequestPolicy, ProviderConfig as ApiProviderConfig,
-    ProviderConnectionMode as ApiProviderConnectionMode, ProviderConnectionModeDescriptor,
-    ProviderModelCatalogConfig as ApiProviderModelCatalogConfig, ProviderSecret, ProviderSummary,
-    ProviderTransportConfig as ApiProviderTransportConfig, ProviderTransportSummary,
-    ProviderWireProtocol as ApiProviderWireProtocol, ProvidersConfigRequest, ProvidersResponse,
+    ModelReasoningVariant, ModelRequestPolicy,
+    ProviderCapabilitySelection as ApiProviderCapabilitySelection,
+    ProviderConfig as ApiProviderConfig, ProviderConnectionMode as ApiProviderConnectionMode,
+    ProviderConnectionModeDescriptor, ProviderModelCatalogConfig as ApiProviderModelCatalogConfig,
+    ProviderSecret, ProviderSummary, ProviderTransportConfig as ApiProviderTransportConfig,
+    ProviderTransportSummary, ProviderWireProtocol as ApiProviderWireProtocol,
+    ProvidersConfigRequest, ProvidersResponse,
 };
 use pl_core::{
-    AgentModelConfig, AgentRoleId, ModelCatalogId, ModelRouteConfig, ProviderConfig, ProviderId,
-    ProviderModelCatalogConfig, ProviderPresetId, ReasoningEffort, builtin_provider_catalog,
+    AgentModelConfig, AgentRoleId, ModelCatalogId, ModelRouteConfig, ProviderCapabilitySelection,
+    ProviderConfig, ProviderId, ProviderModelCatalogConfig, ProviderPresetId, ReasoningEffort,
+    builtin_provider_catalog, provider_service_capabilities_descriptor,
 };
 use pl_model::{
-    MaxTokensField, ModelInfo, ProviderConnectionMode, ProviderInfo, ProviderWireProtocol,
-    ResponsesMaxTokensField,
+    MaxTokensField, ModelInfo, ProviderConnectionMode, ProviderInfo, ProviderServiceCapabilities,
+    ProviderWireProtocol, ResponsesMaxTokensField, WebSearchProviderCapabilities,
 };
 
 use crate::model_profile::model_info;
@@ -108,6 +111,7 @@ pub fn providers_request_from_models(models: &AgentModelConfig) -> ProvidersConf
                     protocol: api_protocol(protocol),
                     connection_mode: api_connection_mode(provider.connection_mode()),
                 },
+                capabilities: api_capability_selection(&provider.capabilities),
                 name: provider.name.clone(),
                 base_url: provider.base_url.clone(),
                 api_key: provider.bearer_token.clone(),
@@ -150,6 +154,20 @@ pub fn providers_response_from_models(models: &AgentModelConfig) -> ProvidersRes
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let resolved_capabilities = models
+        .providers
+        .iter()
+        .map(|(id, provider)| {
+            (
+                id.to_string(),
+                provider_service_capabilities_descriptor(
+                    &provider
+                        .service_capabilities()
+                        .expect("validated provider capabilities"),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     ProvidersResponse {
         providers: request
             .providers
@@ -164,6 +182,10 @@ pub fn providers_response_from_models(models: &AgentModelConfig) -> ProvidersRes
                     .get(&provider.id)
                     .cloned()
                     .unwrap_or_default();
+                let service_capabilities = resolved_capabilities
+                    .get(&provider.id)
+                    .cloned()
+                    .unwrap_or_default();
                 ProviderSummary {
                     id: provider.id,
                     preset_id: provider.preset_id,
@@ -172,6 +194,8 @@ pub fn providers_response_from_models(models: &AgentModelConfig) -> ProvidersRes
                         connection_mode: provider.transport.connection_mode,
                         connection_modes,
                     },
+                    capability_selection: provider.capabilities,
+                    service_capabilities,
                     name: provider.name,
                     base_url: provider.base_url,
                     api_key_env: provider.api_key_env,
@@ -403,6 +427,7 @@ pub(super) fn provider_from_api(provider: &ApiProviderConfig) -> Result<Provider
     if let Some(preset_id) = preset_id {
         config = config.with_preset(preset_id);
     }
+    config.capabilities = core_capability_selection(&provider.capabilities)?;
     config.effective_models().map_err(RuntimeError::Model)?;
     Ok(config)
 }
@@ -478,6 +503,47 @@ fn api_connection_mode(mode: ProviderConnectionMode) -> ApiProviderConnectionMod
     }
 }
 
+fn api_capability_selection(
+    selection: &ProviderCapabilitySelection,
+) -> ApiProviderCapabilitySelection {
+    match selection {
+        ProviderCapabilitySelection::PresetDefaults => {
+            ApiProviderCapabilitySelection::PresetDefaults
+        }
+        ProviderCapabilitySelection::Explicit(capabilities) => {
+            ApiProviderCapabilitySelection::Explicit(provider_service_capabilities_descriptor(
+                capabilities,
+            ))
+        }
+    }
+}
+
+fn core_capability_selection(
+    selection: &ApiProviderCapabilitySelection,
+) -> Result<ProviderCapabilitySelection> {
+    match selection {
+        ApiProviderCapabilitySelection::PresetDefaults => {
+            Ok(ProviderCapabilitySelection::PresetDefaults)
+        }
+        ApiProviderCapabilitySelection::Explicit(capabilities) => {
+            let standalone = capabilities
+                .web_search
+                .standalone
+                .as_deref()
+                .map(|dialect| dialect.parse().map_err(RuntimeError::InvalidInput))
+                .transpose()?;
+            Ok(ProviderCapabilitySelection::Explicit(
+                ProviderServiceCapabilities {
+                    web_search: WebSearchProviderCapabilities {
+                        hosted_responses: capabilities.web_search.hosted_responses,
+                        standalone,
+                    },
+                },
+            ))
+        }
+    }
+}
+
 fn core_connection_mode(mode: ApiProviderConnectionMode) -> ProviderConnectionMode {
     match mode {
         ApiProviderConnectionMode::WebSocket => ProviderConnectionMode::WebSocket,
@@ -514,6 +580,7 @@ fn api_model(model: &ModelInfo, protocol: ProviderWireProtocol) -> ApiModelConfi
             parallel_tools: model.capabilities.tools.parallel_tool_calls,
             reasoning_replay: model.capabilities.reasoning,
             strict_schema: false,
+            web_search: model.capabilities.web_search,
         },
         request_policy: ModelRequestPolicy {
             max_tokens_field: match protocol {
@@ -662,6 +729,7 @@ mod tests {
                     protocol: ProviderWireProtocol::Responses,
                     connection_mode: ApiProviderConnectionMode::WebSocket,
                 },
+                capabilities: ApiProviderCapabilitySelection::Explicit(Default::default()),
                 name: "Custom".to_string(),
                 base_url: "https://example.test/v1".to_string(),
                 api_key: Some("secret".to_string()),
@@ -828,6 +896,7 @@ mod tests {
                 protocol: ProviderWireProtocol::Responses,
                 connection_mode,
             },
+            capabilities: ApiProviderCapabilitySelection::PresetDefaults,
             name: format!("OpenAI {id}"),
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: Some(format!("secret-{id}")),

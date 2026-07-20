@@ -35,7 +35,7 @@ impl From<mai_runtime::RuntimeError> for ApiError {
             InvalidInput(_) => StatusCode::BAD_REQUEST,
             MissingContainer(_) => StatusCode::CONFLICT,
             TurnCancelled => StatusCode::CONFLICT,
-            Docker(_) | Model(_) | Mcp(_) | Store(_) | Skill(_) | Io(_) | Http(_) | Jwt(_) => {
+            Docker(_) | Model(_) | Store(_) | Skill(_) | Io(_) | Http(_) | Jwt(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         };

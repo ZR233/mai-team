@@ -115,7 +115,7 @@ fn model_capabilities(
         streaming: true,
         temperature: true,
         reasoning: capabilities.reasoning_replay,
-        web_search: false,
+        web_search: capabilities.web_search,
         input: vec![ModelModality::Text],
         output: vec![ModelModality::Text],
         tools: ToolCapabilities {

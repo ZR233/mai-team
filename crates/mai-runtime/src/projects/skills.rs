@@ -168,16 +168,24 @@ pub(crate) fn apply_project_source_paths(
 }
 
 pub(crate) fn apply_source_paths(cache_dir: &Path, response: &mut SkillsListResponse) {
+    apply_source_paths_with_workspace_root(cache_dir, PROJECT_WORKSPACE_PATH, response);
+}
+
+pub(crate) fn apply_source_paths_with_workspace_root(
+    cache_dir: &Path,
+    workspace_root: &str,
+    response: &mut SkillsListResponse,
+) {
     for skill in &mut response.skills {
         if skill.scope != SkillScope::Project {
             continue;
         }
-        if let Some(source_path) = source_path(cache_dir, &skill.path) {
+        if let Some(source_path) = source_path(cache_dir, workspace_root, &skill.path) {
             skill.source_path = Some(source_path);
         }
     }
     for error in &mut response.errors {
-        if let Some(source_path) = source_path(cache_dir, &error.path) {
+        if let Some(source_path) = source_path(cache_dir, workspace_root, &error.path) {
             error.path = source_path;
         }
     }
@@ -186,7 +194,7 @@ pub(crate) fn apply_source_paths(cache_dir: &Path, response: &mut SkillsListResp
         .filter_map(|(relative, cache_name)| {
             let root = cache_dir.join(cache_name);
             root.exists()
-                .then(|| PathBuf::from(PROJECT_WORKSPACE_PATH).join(relative))
+                .then(|| PathBuf::from(workspace_root).join(relative))
         })
         .collect();
 }
@@ -205,7 +213,7 @@ pub(crate) fn normalize_copied_dir(target: &Path, cache_name: &str) -> Result<()
     Ok(())
 }
 
-fn source_path(cache_dir: &Path, path: &Path) -> Option<PathBuf> {
+fn source_path(cache_dir: &Path, workspace_root: &str, path: &Path) -> Option<PathBuf> {
     let relative = path.strip_prefix(cache_dir).ok()?;
     let mut components = relative.components();
     let cache_name = match components.next()? {
@@ -216,7 +224,7 @@ fn source_path(cache_dir: &Path, path: &Path) -> Option<PathBuf> {
         .iter()
         .find(|(_, name)| *name == cache_name.as_ref())
         .map(|(relative, _)| *relative)?;
-    let mut source_path = PathBuf::from(PROJECT_WORKSPACE_PATH).join(source_relative);
+    let mut source_path = PathBuf::from(workspace_root).join(source_relative);
     for component in components {
         match component {
             std::path::Component::Normal(part) => source_path.push(part),
@@ -264,5 +272,28 @@ mod tests {
             .expect_err("reject source");
 
         assert!(err.to_string().contains("unsupported project skill source"));
+    }
+
+    #[test]
+    fn reviewer_skill_roots_point_to_read_only_project_view() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cache = temp.path().join("cache");
+        std::fs::create_dir_all(cache.join("agents")).expect("skill cache");
+        let mut response = SkillsListResponse {
+            roots: Vec::new(),
+            skills: Vec::new(),
+            errors: Vec::new(),
+        };
+
+        apply_source_paths_with_workspace_root(&cache, "/project/repo", &mut response);
+
+        assert_eq!(
+            response,
+            SkillsListResponse {
+                roots: vec![PathBuf::from("/project/repo/.agents/skills")],
+                skills: Vec::new(),
+                errors: Vec::new(),
+            }
+        );
     }
 }

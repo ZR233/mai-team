@@ -22,7 +22,6 @@ pl-model.workspace = true
 pl-protocol.workspace = true
 pl-trace.workspace = true
 reqwest.workspace = true
-rmcp = { workspace = true, features = ["client", "reqwest", "transport-async-rw", "transport-streamable-http-client-reqwest"] }
 serde.workspace = true
 serde-saphyr.workspace = true
 serde_json.workspace = true

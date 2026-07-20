@@ -43,8 +43,9 @@ mod tests;
 
 pub use agent_runtime::{
     AgentRuntimeCommitDocument, AgentRuntimeCommitOutcome, StoredAgentPendingInput,
-    StoredAgentRuntime, StoredAgentRuntimeEvent, StoredAgentRuntimeSession,
-    StoredAgentRuntimeState, StoredAgentRuntimeTrace, StoredAgentTurn, StoredTokenUsage,
+    StoredAgentRuntime, StoredAgentRuntimeEvent, StoredAgentRuntimeMutation,
+    StoredAgentRuntimeSession, StoredAgentRuntimeState, StoredAgentRuntimeTrace, StoredAgentTurn,
+    StoredTokenUsage,
 };
 pub use config_document::ConfigDocumentStore;
 pub use store::MaiStore;

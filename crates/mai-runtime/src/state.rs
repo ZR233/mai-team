@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::mcp::McpAgentManager;
+use crate::mcp::ContainerMcpRuntime;
 use mai_docker::ContainerHandle;
 use mai_protocol::{
     AgentId, AgentSummary, ArtifactInfo, PlanHistoryEntry, ProjectId, ProjectSummary, TaskId,
@@ -10,7 +10,6 @@ use mai_protocol::{
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use crate::projects::mcp::ProjectMcpManagerHandle;
 use crate::projects::review::context::ProjectReviewContext;
 use crate::projects::review::pool::ProjectReviewPool;
 use crate::projects::review::relay_queue::ProjectReviewRelayQueue;
@@ -20,7 +19,6 @@ pub(crate) struct RuntimeState {
     pub(crate) tasks: RwLock<HashMap<TaskId, Arc<TaskRecord>>>,
     pub(crate) projects: RwLock<HashMap<ProjectId, Arc<ProjectRecord>>>,
     pub(crate) project_skill_locks: RwLock<HashMap<ProjectId, Arc<RwLock<()>>>>,
-    pub(crate) project_mcp_managers: RwLock<HashMap<ProjectId, ProjectMcpManagerHandle>>,
 }
 
 impl RuntimeState {
@@ -34,7 +32,6 @@ impl RuntimeState {
             tasks: RwLock::new(tasks),
             projects: RwLock::new(projects),
             project_skill_locks: RwLock::new(HashMap::new()),
-            project_mcp_managers: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -87,7 +84,7 @@ pub(crate) struct AgentRecord {
     pub(crate) runtime_agent_id: RwLock<pl_core::AgentId>,
     pub(crate) summary: RwLock<AgentSummary>,
     pub(crate) container: RwLock<Option<ContainerHandle>>,
-    pub(crate) mcp: RwLock<Option<Arc<McpAgentManager>>>,
+    pub(crate) mcp: RwLock<Option<Arc<ContainerMcpRuntime>>>,
     pub(crate) review_context: RwLock<Option<Arc<ProjectReviewContext>>>,
     pub(crate) system_prompt: Option<String>,
 }

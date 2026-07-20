@@ -43,13 +43,6 @@ impl projects::service::ProjectLifecycleOps for Arc<AgentRuntime> {
         Ok(())
     }
 
-    fn shutdown_project_mcp_manager(
-        &self,
-        project_id: ProjectId,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        AgentRuntime::shutdown_project_mcp_manager(self, project_id)
-    }
-
     async fn delete_project_sidecar(&self, project_id: ProjectId) -> Result<()> {
         AgentRuntime::delete_project_sidecar(self.as_ref(), project_id)
             .await

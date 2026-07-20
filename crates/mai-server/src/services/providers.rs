@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -7,6 +6,7 @@ use mai_protocol::*;
 use mai_runtime::{
     completion_response_usage, core_model_turn_request, core_provider_for_selection,
 };
+#[cfg(test)]
 use mai_store::MaiStore;
 use pl_core::{AgentSession, CoreModelTurnOptions, completion_response_preview, user_text_message};
 use pl_model::CompletionResponse;
@@ -31,12 +31,11 @@ fn redact_secret(value: &str, secret: &str) -> String {
 
 pub(crate) struct ProviderService {
     runtime: Arc<mai_runtime::AgentRuntime>,
-    store: Arc<MaiStore>,
 }
 
 impl ProviderService {
-    pub(crate) fn new(runtime: Arc<mai_runtime::AgentRuntime>, store: Arc<MaiStore>) -> Self {
-        Self { runtime, store }
+    pub(crate) fn new(runtime: Arc<mai_runtime::AgentRuntime>) -> Self {
+        Self { runtime }
     }
 
     pub(crate) async fn providers_response(
@@ -52,22 +51,43 @@ impl ProviderService {
         self.runtime.update_providers(request).await
     }
 
+    pub(crate) async fn web_search(
+        &self,
+    ) -> Result<WebSearchSettingsResponse, mai_runtime::RuntimeError> {
+        self.runtime.web_search_settings().await
+    }
+
+    pub(crate) async fn save_web_search(
+        &self,
+        request: WebSearchSettings,
+    ) -> Result<WebSearchSettingsResponse, mai_runtime::RuntimeError> {
+        self.runtime.update_web_search_settings(request).await
+    }
+
     pub(crate) async fn mcp_servers(
         &self,
-    ) -> Result<McpServersConfigRequest, mai_store::StoreError> {
-        Ok(McpServersConfigRequest {
-            servers: self.store.list_mcp_servers().await?,
-        })
+    ) -> Result<McpServersResponse, mai_runtime::RuntimeError> {
+        self.runtime.mcp_servers_response().await
     }
 
     pub(crate) async fn save_mcp_servers(
         &self,
-        servers: &BTreeMap<String, McpServerConfig>,
-    ) -> Result<McpServersConfigRequest, mai_store::StoreError> {
-        self.store.save_mcp_servers(servers).await?;
-        Ok(McpServersConfigRequest {
-            servers: self.store.list_mcp_servers().await?,
-        })
+        request: McpServersConfigRequest,
+    ) -> Result<McpServersResponse, mai_runtime::RuntimeError> {
+        self.runtime.update_mcp_servers(request).await
+    }
+
+    pub(crate) async fn save_builtin_mcp_servers(
+        &self,
+        request: BuiltinMcpServersRequest,
+    ) -> Result<McpServersResponse, mai_runtime::RuntimeError> {
+        self.runtime.update_builtin_mcp_servers(request).await
+    }
+
+    pub(crate) async fn recheck_mcp_servers(
+        &self,
+    ) -> Result<McpServersResponse, mai_runtime::RuntimeError> {
+        self.runtime.recheck_mcp_servers().await
     }
 
     pub(crate) async fn test_provider(
@@ -320,6 +340,7 @@ pub(crate) fn provider_config(base_url: &str, api_key: Option<&str>) -> Provider
             protocol: ProviderWireProtocol::Responses,
             connection_mode: ProviderConnectionMode::Http,
         },
+        capabilities: ProviderCapabilitySelection::Explicit(Default::default()),
         name: "OpenAI".to_string(),
         base_url: base_url.to_string(),
         api_key: api_key.map(str::to_string),
@@ -380,7 +401,7 @@ mod tests {
         ServiceEventKind, TokenUsage,
     };
     use serde_json::{Value, json};
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};

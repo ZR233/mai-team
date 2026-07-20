@@ -88,7 +88,10 @@ mod tests {
         let snapshot: mai_protocol::ProviderCatalogSnapshot =
             serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(snapshot.schema_version, 3);
+        assert_eq!(
+            snapshot.schema_version,
+            mai_protocol::PROVIDER_CATALOG_SCHEMA_VERSION
+        );
         for preset in &snapshot.presets {
             serde_json::from_value::<mai_protocol::ProviderWireProtocol>(serde_json::json!(
                 preset.transport.protocol

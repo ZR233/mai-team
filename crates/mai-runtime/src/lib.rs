@@ -1,9 +1,8 @@
 use crate::agents::profiles::AgentProfilesManager;
-use crate::mcp::McpAgentManager;
 use crate::skills::{SkillInjections, SkillsManager};
 use chrono::{DateTime, Utc};
 use mai_docker::{
-    ContainerHandle, DockerClient, SidecarParams, agent_workspace_volume,
+    ContainerHandle, ContainerVolumeMount, DockerClient, SidecarParams, agent_workspace_volume,
     project_agent_workspace_volume, project_cache_volume,
 };
 use mai_protocol::*;
@@ -39,9 +38,11 @@ mod runtime_product_api;
 mod runtime_project_traits;
 mod runtime_provisioning;
 mod runtime_resources;
+mod runtime_review_context;
 mod runtime_review_traits;
 mod runtime_skills;
 mod runtime_task_traits;
+mod runtime_tool_settings;
 mod runtime_workspace;
 mod skills;
 mod state;
@@ -171,8 +172,6 @@ pub enum RuntimeError {
     Docker(#[from] mai_docker::DockerError),
     #[error("model error: {0}")]
     Model(#[from] pl_protocol::PureError),
-    #[error("mcp error: {0}")]
-    Mcp(#[from] crate::mcp::McpError),
     #[error("store error: {0}")]
     Store(#[from] mai_store::StoreError),
     #[error("skill error: {0}")]
@@ -219,6 +218,7 @@ pub struct AgentRuntime {
     artifact_files_root: PathBuf,
     sidecar_image: String,
     github_api_base_url: String,
+    github_get_cache: github::GithubGetCache,
     workspace_manager: projects::workspace::LocalProjectWorkspaceManager,
 }
 

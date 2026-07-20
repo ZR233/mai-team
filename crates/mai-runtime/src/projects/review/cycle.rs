@@ -1,10 +1,10 @@
 use std::future::Future;
 
 use mai_protocol::{
-    AgentId, AgentSummary, AgentTurnOutcomeKind, ProjectId, ProjectReviewOutcome,
-    ProjectReviewRunDetail, ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewStatus,
-    TurnId, now,
+    AgentId, ProjectId, ProjectReviewOutcome, ProjectReviewRunDetail, ProjectReviewRunStatus,
+    ProjectReviewRunSummary, ProjectReviewStatus, TurnId, now,
 };
+use pl_core::{AgentWaitResult, TurnOutcomeKind};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -76,7 +76,7 @@ pub(crate) trait ProjectReviewCycleOps: Send + Sync {
         &self,
         agent_id: AgentId,
         cancellation_token: &CancellationToken,
-    ) -> impl Future<Output = Result<AgentSummary>> + Send;
+    ) -> impl Future<Output = Result<AgentWaitResult>> + Send;
 
     fn reviewer_final_response(
         &self,
@@ -220,13 +220,13 @@ pub(crate) async fn run_project_review_once(
         let turn_id = ops.start_reviewer_turn(reviewer_id, message).await?;
         ops.update_project_review_run_turn(project_id, run_id, reviewer_id, turn_id)
             .await?;
-        let summary = ops
+        let wait_result = ops
             .wait_agent_until_complete_with_cancel(reviewer_id, &cancellation_token)
             .await?;
-        if last_turn_cancelled(&summary) && cancellation_token.is_cancelled() {
+        if last_turn_cancelled(&wait_result) && cancellation_token.is_cancelled() {
             return Err(RuntimeError::TurnCancelled);
         }
-        if let Some(result) = super::project_review_cycle_result_for_reviewer_status(&summary) {
+        if let Some(result) = super::project_review_cycle_result_for_wait_result(&wait_result) {
             return Ok(result);
         }
         parse_reviewer_final_response(ops, reviewer_id, &cancellation_token).await
@@ -368,13 +368,13 @@ async fn parse_reviewer_final_response(
                 error = %first_err,
                 "project reviewer final JSON missing or invalid; requesting one repair turn"
             );
-            let summary = ops
+            let wait_result = ops
                 .wait_agent_until_complete_with_cancel(reviewer_id, cancellation_token)
                 .await?;
-            if last_turn_cancelled(&summary) && cancellation_token.is_cancelled() {
+            if last_turn_cancelled(&wait_result) && cancellation_token.is_cancelled() {
                 return Err(RuntimeError::TurnCancelled);
             }
-            if let Some(result) = super::project_review_cycle_result_for_reviewer_status(&summary) {
+            if let Some(result) = super::project_review_cycle_result_for_wait_result(&wait_result) {
                 return Ok(result);
             }
             let repaired_response = ops.reviewer_final_response(reviewer_id).await?;
@@ -383,13 +383,11 @@ async fn parse_reviewer_final_response(
     }
 }
 
-fn last_turn_cancelled(summary: &AgentSummary) -> bool {
-    summary
-        .state
-        .runtime
+fn last_turn_cancelled(wait_result: &AgentWaitResult) -> bool {
+    wait_result
         .last_turn
         .as_ref()
-        .is_some_and(|turn| turn.outcome == AgentTurnOutcomeKind::Cancelled)
+        .is_some_and(|turn| turn.kind == TurnOutcomeKind::Cancelled)
 }
 
 #[cfg(test)]
@@ -398,8 +396,8 @@ mod tests {
 
     use chrono::Utc;
     use mai_protocol::{
-        AgentLastTurn, AgentResourceState, AgentRuntimeState, AgentState, ProjectCloneStatus,
-        ProjectReviewDecision, ProjectStatus, TokenUsage,
+        AgentLastTurn, AgentResourceState, AgentRuntimeState, AgentState, AgentSummary,
+        AgentTurnOutcomeKind, ProjectCloneStatus, ProjectReviewDecision, ProjectStatus, TokenUsage,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
@@ -552,8 +550,8 @@ mod tests {
             &self,
             _agent_id: AgentId,
             _cancellation_token: &CancellationToken,
-        ) -> Result<AgentSummary> {
-            Ok(self.reviewer.clone())
+        ) -> Result<AgentWaitResult> {
+            Ok(completed_wait_result())
         }
 
         async fn reviewer_final_response(&self, _reviewer_id: AgentId) -> Result<String> {
@@ -603,6 +601,25 @@ mod tests {
             ],
             *ops.operations.lock().await
         );
+    }
+
+    #[tokio::test]
+    async fn durable_wait_outcome_wins_over_stale_agent_summary_projection() {
+        let project_id = Uuid::new_v4();
+        let reviewer_id = Uuid::new_v4();
+        let mut ops = FakeCycleOps::new(
+            project_id,
+            reviewer_id,
+            vec![r#"{"outcome":"review_submitted","review_event":"approve","pr":726,"summary":"done","error":null}"#.to_string()],
+        );
+        ops.reviewer.state.runtime.last_turn = None;
+
+        let result =
+            run_project_review_once(&ops, project_id, CancellationToken::new(), request(726))
+                .await
+                .expect("review result");
+
+        assert_eq!(ProjectReviewOutcome::ReviewSubmitted, result.outcome);
     }
 
     #[tokio::test]
@@ -809,6 +826,38 @@ mod tests {
             created_at: timestamp,
             updated_at: timestamp,
             token_usage: TokenUsage::default(),
+        }
+    }
+
+    fn completed_wait_result() -> AgentWaitResult {
+        let agent_id = pl_core::AgentId::new("reviewer").expect("agent id");
+        let turn = pl_core::AgentTurnOutcome {
+            turn_id: pl_core::TurnId::new("turn").expect("turn id"),
+            session_id: pl_core::SessionId::new("session").expect("session id"),
+            kind: TurnOutcomeKind::Completed,
+            reason: None,
+            usage: pl_model::TokenUsage::default(),
+            finished_at: 1,
+        };
+        AgentWaitResult {
+            snapshot: pl_core::AgentSnapshot {
+                identity: pl_core::AgentIdentity {
+                    id: agent_id,
+                    parent_id: None,
+                    role: pl_core::AgentRoleId::new("reviewer").expect("role"),
+                    depth: 0,
+                },
+                lifecycle: pl_core::AgentLifecycleState::Active,
+                activity: pl_core::AgentActivityState::Idle,
+                active_turn_id: None,
+                active_session_id: None,
+                pending_inputs: 0,
+                last_turn: Some(turn.clone()),
+                revision: 2,
+                event_sequence: 1,
+                updated_at: 1,
+            },
+            last_turn: Some(turn),
         }
     }
 }

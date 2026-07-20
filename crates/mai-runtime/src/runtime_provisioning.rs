@@ -129,7 +129,25 @@ impl AgentRuntime {
             project_agent_workspace_volume(&summary.id.to_string(), &agent_id.to_string());
         let repo_path = projects::workspace::AGENT_WORKSPACE_REPO_PATH.to_string();
         Ok(match source {
-            agents::ContainerSource::ProjectReviewWorkspace { target, revision } => {
+            agents::ContainerSource::ProjectReviewWorkspace {
+                target,
+                revision,
+                repository_view,
+            } => {
+                let agent = self.agent(agent_id).await?;
+                if agent.summary.read().await.role != Some(AgentRole::Reviewer) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "project repository snapshot cannot be mounted for non-reviewer agent `{agent_id}`"
+                    )));
+                }
+                if repository_view.volume != project_cache_volume(&summary.id.to_string())
+                    || repository_view.base_sha != revision.base_sha
+                {
+                    return Err(RuntimeError::InvalidInput(
+                        "project repository snapshot does not match the prepared review revision"
+                            .to_string(),
+                    ));
+                }
                 let token = self.project_git_token(summary.id).await?.ok_or_else(|| {
                     RuntimeError::InvalidInput(
                         "project git account token is not configured".to_string(),
@@ -142,10 +160,10 @@ impl AgentRuntime {
                 agents::ContainerSource::ProjectWorkspace {
                     workspace_volume,
                     repo_path,
+                    repository_view: Some(repository_view),
                 }
             }
-            agents::ContainerSource::FreshImage
-            | agents::ContainerSource::ProjectWorkspace { .. } => {
+            agents::ContainerSource::FreshImage => {
                 if !self.deps.docker.volume_exists(&workspace_volume).await? {
                     let token = self.project_git_token(summary.id).await?.ok_or_else(|| {
                         RuntimeError::InvalidInput(
@@ -158,8 +176,18 @@ impl AgentRuntime {
                 agents::ContainerSource::ProjectWorkspace {
                     workspace_volume,
                     repo_path,
+                    repository_view: None,
                 }
             }
+            agents::ContainerSource::ProjectWorkspace {
+                workspace_volume,
+                repo_path,
+                repository_view,
+            } => agents::ContainerSource::ProjectWorkspace {
+                workspace_volume,
+                repo_path,
+                repository_view,
+            },
             agents::ContainerSource::CloneFrom {
                 parent_container_id,
                 docker_image,

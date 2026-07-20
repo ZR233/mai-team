@@ -138,6 +138,7 @@ impl AgentRuntime {
             artifact_files_root: config.artifact_files_root,
             sidecar_image,
             github_api_base_url,
+            github_get_cache: github::GithubGetCache::default(),
             workspace_manager,
         });
         runtime.reconcile_project_workspaces().await?;
@@ -171,6 +172,9 @@ impl AgentRuntime {
             .await
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
         runtime.reconcile_project_review_singletons().await;
+        runtime
+            .cleanup_orphan_project_review_repository_views()
+            .await;
         let cleanup_runtime = Arc::clone(&runtime);
         tokio::spawn(async move {
             projects::review::cleanup::run_project_review_cleanup_loop(&cleanup_runtime).await;

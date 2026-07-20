@@ -142,6 +142,7 @@ impl AgentRuntime {
             *config = next;
         }
         self.refresh_agent_model_projections().await?;
+        self.reconcile_active_mcp_runtimes().await?;
         self.providers_response().await
     }
 

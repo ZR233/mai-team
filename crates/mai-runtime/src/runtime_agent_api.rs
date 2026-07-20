@@ -225,6 +225,12 @@ impl AgentRuntime {
         let agent = self.agent(agent_id).await?;
         let project_id = agent.summary.read().await.project_id;
         let volume = if let Some(project_id) = project_id {
+            let review_context = agent.review_context.read().await.clone();
+            if let Some(context) = review_context.as_deref() {
+                self.cleanup_project_review_context(project_id, context)
+                    .await?;
+                *agent.review_context.write().await = None;
+            }
             self.workspace_manager
                 .cleanup_agent_workspace(project_id, agent_id)
                 .await?;
@@ -381,18 +387,16 @@ impl AgentRuntime {
         &self,
         agent_id: AgentId,
         cancellation_token: &CancellationToken,
-    ) -> Result<AgentSummary> {
+    ) -> Result<pl_core::AgentWaitResult> {
         let agent = self.agent(agent_id).await?;
         let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
         let handle = self.framework_handle()?;
         tokio::select! {
             result = handle.wait(runtime_agent_id) => {
-                result.map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+                result.map_err(|error| RuntimeError::InvalidInput(error.to_string()))
             }
-            () = cancellation_token.cancelled() => return Err(RuntimeError::TurnCancelled),
+            () = cancellation_token.cancelled() => Err(RuntimeError::TurnCancelled),
         }
-        let summary = agent.summary.read().await.clone();
-        Ok(summary)
     }
 
     pub(super) async fn agent_recent_events(

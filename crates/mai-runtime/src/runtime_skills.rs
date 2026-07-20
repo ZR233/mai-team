@@ -236,63 +236,6 @@ impl AgentRuntime {
             .await
     }
 
-    pub(super) async fn prepare_project_review_context(
-        &self,
-        project_id: ProjectId,
-        run_id: Uuid,
-        target: projects::review::target::ResolvedProjectReviewTarget,
-        project_revision: projects::workspace::ProjectRepositoryRevision,
-    ) -> Result<Arc<projects::review::context::ProjectReviewContext>> {
-        let root = self
-            .cache_root
-            .join(projects::review::context::PROJECT_REVIEW_CONTEXT_CACHE_DIR)
-            .join(run_id.to_string());
-        let stage_root = root.join("stage");
-        let skills_cache_dir = root.join("skills");
-        let repository_volume = project_cache_volume(&project_id.to_string());
-        let result = async {
-            let skill_sources = self
-                .project_skill_sources_from_workspace_volume(
-                    project_id,
-                    &repository_volume,
-                    projects::mcp::PROJECT_WORKSPACE_PATH,
-                    &stage_root.join("skills"),
-                )
-                .await?;
-            projects::skills::refresh_cache_dir(&skills_cache_dir, &skill_sources)?;
-            let instruction_stage = stage_root.join("instructions");
-            let instruction_sources = self
-                .project_instruction_sources_from_workspace_volume(
-                    project_id,
-                    &repository_volume,
-                    projects::mcp::PROJECT_WORKSPACE_PATH,
-                    &instruction_stage,
-                )
-                .await?;
-            let workspace_instructions = if instruction_sources.is_empty() {
-                String::new()
-            } else {
-                projects::instructions::load_workspace_instructions(&instruction_stage)?
-            };
-            let _ = std::fs::remove_dir_all(&stage_root);
-            Ok(Arc::new(
-                projects::review::context::ProjectReviewContext::new(
-                    run_id,
-                    target,
-                    project_revision,
-                    root.clone(),
-                    skills_cache_dir,
-                    workspace_instructions,
-                ),
-            ))
-        }
-        .await;
-        if result.is_err() {
-            let _ = std::fs::remove_dir_all(&root);
-        }
-        result
-    }
-
     pub(super) async fn project_review_workspace_instructions_for_agent(
         &self,
         agent: &AgentRecord,
@@ -333,7 +276,11 @@ impl AgentRuntime {
         response: &mut SkillsListResponse,
     ) {
         if let Some(context) = agent.review_context.read().await.as_ref() {
-            projects::skills::apply_source_paths(&context.skills_cache_dir, response);
+            projects::skills::apply_source_paths_with_workspace_root(
+                &context.skills_cache_dir,
+                &context.repository_view.container_path,
+                response,
+            );
         } else {
             self.apply_project_skill_source_paths(project_id, response);
         }

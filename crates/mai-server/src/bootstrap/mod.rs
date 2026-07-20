@@ -261,6 +261,7 @@ mod tests {
                 protocol: ProviderWireProtocol::Responses,
                 connection_mode: ProviderConnectionMode::WebSocket,
             },
+            capabilities: mai_protocol::ProviderCapabilitySelection::Explicit(Default::default()),
             name: "OpenAI".to_string(),
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: Some("secret".to_string()),

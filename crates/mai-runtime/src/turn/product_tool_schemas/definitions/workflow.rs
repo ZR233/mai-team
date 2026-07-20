@@ -1,4 +1,6 @@
-use super::super::names::{TOOL_SAVE_ARTIFACT, TOOL_SAVE_TASK_PLAN, TOOL_SUBMIT_REVIEW_RESULT};
+use super::super::names::{
+    TOOL_READ_TOOL_ARTIFACT, TOOL_SAVE_ARTIFACT, TOOL_SAVE_TASK_PLAN, TOOL_SUBMIT_REVIEW_RESULT,
+};
 use pl_core::{ToolInputSchemaField, function_tool_schema};
 use pl_model::ToolSchema;
 use serde_json::json;
@@ -37,6 +39,30 @@ pub(crate) fn definitions() -> Vec<ToolSchema> {
                 ToolInputSchemaField::optional(
                     "name",
                     json!({ "type": "string", "description": "Display name for the artifact. Defaults to the filename from path." }),
+                ),
+            ],
+        ),
+        function_tool_schema(
+            TOOL_READ_TOOL_ARTIFACT,
+            "Read a bounded line or byte range from a full output artifact returned by an earlier tool call. Use the callId and artifactId from that tool result receipt instead of rerunning the original command.",
+            [
+                ToolInputSchemaField::required("callId", json!({ "type": "string" })),
+                ToolInputSchemaField::required("artifactId", json!({ "type": "string" })),
+                ToolInputSchemaField::optional(
+                    "startLine",
+                    json!({ "type": "integer", "minimum": 1 }),
+                ),
+                ToolInputSchemaField::optional(
+                    "maxLines",
+                    json!({ "type": "integer", "minimum": 1, "maximum": 500 }),
+                ),
+                ToolInputSchemaField::optional(
+                    "startByte",
+                    json!({ "type": "integer", "minimum": 0 }),
+                ),
+                ToolInputSchemaField::optional(
+                    "maxBytes",
+                    json!({ "type": "integer", "minimum": 1, "maximum": 65536 }),
                 ),
             ],
         ),

@@ -12,9 +12,12 @@ pub use agent_state::{
     AgentRuntimeState, AgentState, AgentTurnOutcomeKind,
 };
 pub use pl_protocol::{
-    CredentialDescriptorDto, ModelCapabilitiesDto, ModelCatalogDescriptor, ModelDescriptor,
-    ModelPricingDto, ModelReasoningDescriptor, PROVIDER_CATALOG_SCHEMA_VERSION,
-    ProviderCatalogSnapshot, ProviderConnectionModeDescriptor, ProviderPresetDescriptor,
+    CredentialDescriptorDto, McpAvailabilityDescriptor, McpHealthSnapshot, McpServerDescriptor,
+    ModelCapabilitiesDto, ModelCatalogDescriptor, ModelDescriptor, ModelPricingDto,
+    ModelReasoningDescriptor, PROVIDER_CATALOG_SCHEMA_VERSION, ProviderCatalogSnapshot,
+    ProviderConnectionModeDescriptor, ProviderPresetDescriptor,
+    ProviderServiceCapabilitiesDescriptor, WebSearchProviderCapabilitiesDescriptor,
+    WebSearchResolutionDescriptor,
 };
 
 pub type AgentId = Uuid;
@@ -1029,6 +1032,8 @@ pub struct ModelCapabilities {
     pub reasoning_replay: bool,
     #[serde(default)]
     pub strict_schema: bool,
+    #[serde(default)]
+    pub web_search: bool,
 }
 
 impl Default for ModelCapabilities {
@@ -1038,6 +1043,7 @@ impl Default for ModelCapabilities {
             parallel_tools: false,
             reasoning_replay: false,
             strict_schema: false,
+            web_search: false,
         }
     }
 }
@@ -1121,6 +1127,7 @@ pub struct ProviderConfig {
     pub preset_id: Option<String>,
     #[serde(default)]
     pub transport: ProviderTransportConfig,
+    pub capabilities: ProviderCapabilitySelection,
     pub name: String,
     pub base_url: String,
     #[serde(default)]
@@ -1134,6 +1141,14 @@ pub struct ProviderConfig {
     pub default_model: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+/// Provider 实例服务能力的配置来源。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum ProviderCapabilitySelection {
+    PresetDefaults,
+    Explicit(ProviderServiceCapabilitiesDescriptor),
 }
 
 /// mai HTTP 边界中的 provider 模型目录引用。
@@ -1156,6 +1171,8 @@ pub struct ProviderSummary {
     pub id: String,
     pub preset_id: Option<String>,
     pub transport: ProviderTransportSummary,
+    pub capability_selection: ProviderCapabilitySelection,
+    pub service_capabilities: ProviderServiceCapabilitiesDescriptor,
     pub name: String,
     pub base_url: String,
     pub api_key_env: Option<String>,
@@ -1216,6 +1233,19 @@ pub struct ProviderTestResponse {
 pub struct McpServersConfigRequest {
     #[serde(default)]
     pub servers: BTreeMap<String, McpServerConfig>,
+    /// 需要显式删除的 write-only secret；空值本身只表示保留已有值。
+    #[serde(default)]
+    pub clear_secrets: BTreeMap<String, McpServerSecretClearRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct McpServerSecretClearRequest {
+    #[serde(default)]
+    pub bearer_token: bool,
+    #[serde(default)]
+    pub env: Vec<String>,
+    #[serde(default)]
+    pub headers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1598,6 +1628,77 @@ pub struct McpServerConfig {
     pub enabled_tools: Option<Vec<String>>,
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebSearchSettings {
+    pub mode: String,
+    #[serde(default)]
+    pub context_size: Option<String>,
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    #[serde(default)]
+    pub location: Option<WebSearchLocationSettings>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebSearchLocationSettings {
+    #[serde(default)]
+    pub country: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub city: Option<String>,
+    #[serde(default)]
+    pub timezone: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebSearchSettingsResponse {
+    pub config: WebSearchSettings,
+    pub roles: BTreeMap<String, WebSearchResolutionDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerPublicConfig {
+    pub scope: McpServerScope,
+    pub enabled: bool,
+    pub required: bool,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub env_keys: Vec<String>,
+    pub cwd: Option<String>,
+    pub url: Option<String>,
+    pub header_names: Vec<String>,
+    pub bearer_token_env: Option<String>,
+    pub has_bearer_token: bool,
+    pub startup_timeout_secs: Option<u64>,
+    pub tool_timeout_secs: Option<u64>,
+    pub enabled_tools: Option<Vec<String>>,
+    pub disabled_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerAggregate {
+    pub descriptor: McpServerDescriptor,
+    pub enabled: bool,
+    pub availability: String,
+    pub ready_agents: usize,
+    pub failed_agents: usize,
+    pub checking_agents: usize,
+    pub total_agents: usize,
+    pub tool_count: usize,
+    pub config: Option<McpServerPublicConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServersResponse {
+    pub servers: Vec<McpServerAggregate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuiltinMcpServersRequest {
+    pub servers: BTreeMap<String, bool>,
 }
 
 impl Default for McpServerConfig {
