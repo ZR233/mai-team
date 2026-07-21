@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use mai_protocol::{
-    AgentId, AgentStatus, AgentSummary, ProjectId, ProjectReviewRunStatus, ProjectReviewRunSummary,
-    ProjectReviewStatus, ProjectSummary,
+    AgentId, AgentResourceState, AgentRuntimeLifecycle, AgentSummary, ProjectId,
+    ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewStatus, ProjectSummary,
 };
 
 use super::runs::FinishReviewRun;
@@ -132,7 +132,7 @@ impl ProjectReviewSingletonSnapshot {
             .reviewers
             .iter()
             .find(|reviewer| reviewer.id == current_reviewer_id)?;
-        if !project_reviewer_agent_can_continue(&reviewer.status) {
+        if !project_reviewer_agent_can_continue(reviewer) {
             return None;
         }
         (current_run.reviewer_agent_id == Some(current_reviewer_id)).then_some(current_reviewer_id)
@@ -279,38 +279,16 @@ fn project_review_run_is_active(run: &ProjectReviewRunSummary) -> bool {
         )
 }
 
-fn project_reviewer_agent_is_stale(reviewer: &AgentSummary) -> bool {
-    match reviewer.status {
-        AgentStatus::Created
-        | AgentStatus::StartingContainer
-        | AgentStatus::Idle
-        | AgentStatus::RunningTurn
-        | AgentStatus::WaitingTool
-        | AgentStatus::DeletingContainer
-        | AgentStatus::Failed
-        | AgentStatus::Cancelled => true,
-        AgentStatus::Completed | AgentStatus::Deleted => false,
-    }
-}
-
 fn reviewer_agent_should_be_deleted(
     reviewer: &AgentSummary,
     keep_reviewer_id: Option<AgentId>,
 ) -> bool {
-    Some(reviewer.id) != keep_reviewer_id && project_reviewer_agent_is_stale(reviewer)
+    Some(reviewer.id) != keep_reviewer_id
 }
 
-fn project_reviewer_agent_can_continue(status: &AgentStatus) -> bool {
-    match status {
-        AgentStatus::Created
-        | AgentStatus::StartingContainer
-        | AgentStatus::Idle
-        | AgentStatus::RunningTurn
-        | AgentStatus::WaitingTool => true,
-        AgentStatus::DeletingContainer
-        | AgentStatus::Completed
-        | AgentStatus::Failed
-        | AgentStatus::Cancelled
-        | AgentStatus::Deleted => false,
-    }
+fn project_reviewer_agent_can_continue(reviewer: &AgentSummary) -> bool {
+    matches!(
+        reviewer.state.resource,
+        AgentResourceState::Provisioning | AgentResourceState::Ready
+    ) && reviewer.state.runtime.lifecycle == AgentRuntimeLifecycle::Active
 }

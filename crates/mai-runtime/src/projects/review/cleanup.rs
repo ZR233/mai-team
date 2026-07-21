@@ -8,7 +8,7 @@ use crate::Result;
 
 pub(crate) const PROJECT_REVIEW_HISTORY_RETENTION_DAYS: i64 = 5;
 pub(crate) const PROJECT_REVIEW_CLEANUP_INTERVAL_SECS: u64 = 3600;
-pub(crate) const PROJECT_REVIEW_SERVICE_EVENT_LIMIT: usize = 50_000;
+pub(crate) const PROJECT_REVIEW_PRODUCT_EVENT_LIMIT: usize = 50_000;
 
 /// Supplies persistence, event, and workspace side effects for review retention cleanup.
 pub(crate) trait ProjectReviewCleanupOps: Send + Sync {
@@ -17,12 +17,12 @@ pub(crate) trait ProjectReviewCleanupOps: Send + Sync {
         cutoff: DateTime<Utc>,
     ) -> impl Future<Output = Result<usize>> + Send;
 
-    fn prune_service_events_before(
+    fn prune_product_events_before(
         &self,
         cutoff: DateTime<Utc>,
     ) -> impl Future<Output = Result<usize>> + Send;
 
-    fn prune_service_events_to_limit(
+    fn prune_product_events_to_limit(
         &self,
         limit: usize,
     ) -> impl Future<Output = Result<usize>> + Send;
@@ -59,9 +59,9 @@ pub(crate) async fn cleanup_project_review_history(
 ) -> Result<()> {
     let cutoff = Utc::now() - TimeDelta::days(PROJECT_REVIEW_HISTORY_RETENTION_DAYS);
     let removed_runs = ops.prune_project_review_runs_before(cutoff).await?;
-    let removed_events = ops.prune_service_events_before(cutoff).await?;
+    let removed_events = ops.prune_product_events_before(cutoff).await?;
     let removed_events_by_limit = ops
-        .prune_service_events_to_limit(PROJECT_REVIEW_SERVICE_EVENT_LIMIT)
+        .prune_product_events_to_limit(PROJECT_REVIEW_PRODUCT_EVENT_LIMIT)
         .await?;
     let removed_logs = ops.prune_agent_logs_before(cutoff).await?;
     let removed_traces = ops.prune_tool_traces_before(cutoff).await?;
@@ -96,7 +96,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeCleanupOps {
-        service_event_limits: Arc<Mutex<Vec<usize>>>,
+        product_event_limits: Arc<Mutex<Vec<usize>>>,
     }
 
     impl ProjectReviewCleanupOps for FakeCleanupOps {
@@ -104,12 +104,12 @@ mod tests {
             Ok(0)
         }
 
-        async fn prune_service_events_before(&self, _cutoff: DateTime<Utc>) -> Result<usize> {
+        async fn prune_product_events_before(&self, _cutoff: DateTime<Utc>) -> Result<usize> {
             Ok(0)
         }
 
-        async fn prune_service_events_to_limit(&self, limit: usize) -> Result<usize> {
-            self.service_event_limits.lock().await.push(limit);
+        async fn prune_product_events_to_limit(&self, limit: usize) -> Result<usize> {
+            self.product_event_limits.lock().await.push(limit);
             Ok(2)
         }
 
@@ -129,14 +129,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_caps_persisted_service_events() {
+    async fn cleanup_caps_persisted_product_events() {
         let ops = FakeCleanupOps::default();
 
         cleanup_project_review_history(&ops).await.expect("cleanup");
 
         assert_eq!(
-            *ops.service_event_limits.lock().await,
-            vec![PROJECT_REVIEW_SERVICE_EVENT_LIMIT]
+            *ops.product_event_limits.lock().await,
+            vec![PROJECT_REVIEW_PRODUCT_EVENT_LIMIT]
         );
     }
 }

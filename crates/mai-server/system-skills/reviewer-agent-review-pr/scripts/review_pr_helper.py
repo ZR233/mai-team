@@ -23,10 +23,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    prepare = subparsers.add_parser("prepare-review", help="check out the selected PR in this clone")
+    prepare = subparsers.add_parser("prepare-review", help="verify the selected PR revision")
     prepare.add_argument("--repo", default="/workspace/repo")
-    prepare.add_argument("--agent-id", required=True)
     prepare.add_argument("--pr", required=True, type=int)
+    prepare.add_argument("--head-sha", required=True)
+    prepare.add_argument("--base-ref", required=True)
 
     changed = subparsers.add_parser("changed-files", help="summarize changed files")
     changed.add_argument("--files", help="GitHub PR files JSON path")
@@ -54,7 +55,7 @@ def main() -> int:
 
     args = parser.parse_args()
     if args.command == "prepare-review":
-        write_json(prepare_review_checkout(args.repo, args.agent_id, args.pr))
+        write_json(verify_prepared_review(args.repo, args.pr, args.head_sha, args.base_ref))
     elif args.command == "changed-files":
         write_json(changed_files_summary(args.repo, files=args.files, base=args.base, head=args.head))
     elif args.command == "rust-plan":
@@ -179,22 +180,27 @@ def run_git(repo: str | Path, *args: str, check: bool = True) -> subprocess.Comp
     return completed
 
 
-def prepare_review_checkout(repo: str, agent_id: str, pr: int) -> dict[str, Any]:
+def verify_prepared_review(repo: str, pr: int, expected_head: str, base_ref: str) -> dict[str, Any]:
     repo_path = Path(repo)
     pr_ref, head = resolve_pr_ref(repo_path, pr)
-    branch = f"mai-review/{pr}/{agent_id}"
-    run_git(repo_path, "reset", "--hard", "HEAD")
-    run_git(repo_path, "clean", "-fdx")
-    run_git(repo_path, "checkout", "-B", branch, head)
-    run_git(repo_path, "reset", "--hard", head)
-    run_git(repo_path, "clean", "-fdx")
     current = run_git(repo_path, "rev-parse", "HEAD").stdout.strip()
+    if head != expected_head:
+        raise SystemExit(
+            f"prepared PR ref mismatch for #{pr}: expected {expected_head}, found {head}"
+        )
+    if current != expected_head:
+        raise SystemExit(
+            f"prepared reviewer HEAD mismatch for #{pr}: expected {expected_head}, found {current}"
+        )
+    run_git(repo_path, "rev-parse", "--verify", f"{base_ref}^{{commit}}")
+    if run_git(repo_path, "status", "--porcelain").stdout.strip():
+        raise SystemExit("prepared reviewer working tree is not clean")
     return {
         "repo": str(repo_path),
         "head_sha": current,
         "pr_ref": pr_ref,
-        "branch": branch,
-        "action": "checked_out",
+        "base_ref": base_ref,
+        "action": "verified",
     }
 
 
@@ -407,7 +413,7 @@ class ReviewPrHelperTests(unittest.TestCase):
             summary = changed_files_summary(str(root), files=str(files))
         self.assertEqual(summary["changed_crates"], [])
 
-    def test_prepare_review_checkout_uses_current_clone(self) -> None:
+    def test_prepare_review_verifies_current_clone_without_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             subprocess.run(["git", "init", "-b", "main", str(root)], check=True, stdout=subprocess.PIPE)
@@ -420,15 +426,15 @@ class ReviewPrHelperTests(unittest.TestCase):
             run_git(root, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "pr")
             pr_head = run_git(root, "rev-parse", "HEAD").stdout.strip()
             run_git(root, "update-ref", "refs/remotes/origin/pr/7", pr_head)
-            run_git(root, "checkout", "-B", "main", main_head)
+            run_git(root, "update-ref", "refs/remotes/origin/main", main_head)
 
-            result = prepare_review_checkout(str(root), "agent-1", 7)
+            result = verify_prepared_review(str(root), 7, pr_head, "origin/main")
 
         self.assertEqual(result["repo"], str(root))
         self.assertEqual(result["head_sha"], pr_head)
         self.assertEqual(result["pr_ref"], "refs/remotes/origin/pr/7")
-        self.assertEqual(result["branch"], "mai-review/7/agent-1")
-        self.assertEqual(result["action"], "checked_out")
+        self.assertEqual(result["base_ref"], "origin/main")
+        self.assertEqual(result["action"], "verified")
 
     def test_final_json_shape(self) -> None:
         result = final_result("review_submitted", "approve", 9, "Submitted APPROVE.", None)

@@ -73,11 +73,12 @@ async fn execute_with_container_backend(
     request: ContainerExecRequest,
 ) -> Result<ContainerExecOutput> {
     let container_id = container_id?;
-    let cancellation_token = request
-        .cancellation_token
-        .unwrap_or_else(tokio_util::sync::CancellationToken::new);
+    let cancellation_token = request.cancellation_token.unwrap_or_default();
     if let Some(output_bytes_cap) = request.output_bytes_cap {
-        let call_id = Uuid::new_v4().to_string();
+        let call_id = request
+            .call_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let stdout_id = Uuid::new_v4().to_string();
         let stderr_id = Uuid::new_v4().to_string();
         let namespace = agent_id.to_string();

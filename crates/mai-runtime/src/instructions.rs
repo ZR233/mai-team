@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::mcp::McpTool;
 use crate::skills::{SkillInjections, render_available_response};
-use mai_protocol::{SkillActivationInfo, SkillScope, SkillsListResponse};
-use pl_protocol::Message;
+use mai_protocol::{SkillScope, SkillsListResponse};
 
 pub(crate) const CONTAINER_SKILLS_ROOT: &str = "/tmp/.mai-team/skills";
 
@@ -14,7 +13,7 @@ General rules:
 - You execute all local work inside your own Docker container; do not assume access to a host workspace.
 - Use `container_exec` for shell commands inside your container.
 - Use `container_copy` for file transfer.
-- Use `spawn_agent`, `send_input`, `wait_agent`, `list_agents`, `close_agent`, and `resume_agent` for multi-agent collaboration.
+- Use `spawn_agent`, `send_input`, `wait_agent`, `list_agents`, and `close_agent` for multi-agent collaboration.
 - Use `list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource` to inspect MCP resources when available.
 - Keep each child agent task concrete and bounded. Multiple agents can run in parallel.
 - Child agent model selection is controlled by Research Agent settings, falling back to the service default model when unset.
@@ -64,6 +63,10 @@ pub(crate) fn build_instructions(
             instructions.push_str(&format!("\n- {warning}"));
         }
     }
+    if let Some(activated) = render_activated_skills(skill_injections, container_skill_paths) {
+        instructions.push_str("\n\n## Activated Skills\n");
+        instructions.push_str(&activated);
+    }
     instructions.push_str("\n\n## MCP Tools\n");
     if mcp_tools.is_empty() {
         instructions.push_str("No MCP tools are currently available.");
@@ -78,30 +81,10 @@ pub(crate) fn build_instructions(
     instructions
 }
 
-pub(crate) fn skill_activation_info(
+fn render_activated_skills(
     skill_injections: &SkillInjections,
     container_skill_paths: &ContainerSkillPaths,
-) -> Vec<SkillActivationInfo> {
-    skill_injections
-        .items
-        .iter()
-        .map(|skill| SkillActivationInfo {
-            name: skill.metadata.name.clone(),
-            display_name: skill
-                .metadata
-                .interface
-                .as_ref()
-                .and_then(|interface| interface.display_name.clone()),
-            path: display_skill_path(&skill.metadata.path, container_skill_paths),
-            scope: skill.metadata.scope,
-        })
-        .collect()
-}
-
-pub(crate) fn skill_user_fragment(
-    skill_injections: &SkillInjections,
-    container_skill_paths: &ContainerSkillPaths,
-) -> Option<Message> {
+) -> Option<String> {
     if skill_injections.items.is_empty() {
         return None;
     }
@@ -115,7 +98,7 @@ pub(crate) fn skill_user_fragment(
             skill.contents
         ));
     }
-    Some(pl_core::user_text_message(text))
+    Some(text)
 }
 
 pub(crate) fn container_skill_dir(skill: &mai_protocol::SkillMetadata) -> PathBuf {
@@ -170,12 +153,11 @@ fn safe_container_skill_segment(value: &str) -> String {
 mod tests {
     use super::*;
     use mai_protocol::SkillMetadata;
-    use pl_protocol::{MessageContent, MessageRole as ModelMessageRole};
 
     #[test]
-    fn skill_user_fragment_wraps_loaded_skill_contents() {
+    fn activated_skills_wrap_loaded_skill_contents() {
         let path = PathBuf::from("/tmp/demo/SKILL.md");
-        let fragment = skill_user_fragment(
+        let fragment = render_activated_skills(
             &SkillInjections {
                 items: vec![crate::skills::LoadedSkill {
                     metadata: SkillMetadata {
@@ -197,26 +179,19 @@ mod tests {
             &ContainerSkillPaths::default(),
         )
         .expect("fragment");
-        assert!(matches!(
-            fragment,
-            Message {
-                role: ModelMessageRole::User,
-                content: MessageContent::Text(ref text),
-                ..
-            } if text.contains("<skill>")
-                && text.contains("<name>demo</name>")
-                && text.contains(path.to_string_lossy().as_ref())
-                && text.contains("skill body")
-        ));
+        assert!(fragment.contains("<skill>"));
+        assert!(fragment.contains("<name>demo</name>"));
+        assert!(fragment.contains(path.to_string_lossy().as_ref()));
+        assert!(fragment.contains("skill body"));
     }
 
     #[test]
-    fn skill_user_fragment_uses_container_skill_path_when_synced() {
+    fn activated_skills_use_container_skill_path_when_synced() {
         let path = PathBuf::from("/tmp/system/demo/SKILL.md");
         let container_path = PathBuf::from("/tmp/.mai-team/skills/system/demo/SKILL.md");
         let mut paths = HashMap::new();
         paths.insert(path.clone(), container_path.clone());
-        let fragment = skill_user_fragment(
+        let fragment = render_activated_skills(
             &SkillInjections {
                 items: vec![crate::skills::LoadedSkill {
                     metadata: SkillMetadata {
@@ -239,15 +214,8 @@ mod tests {
         )
         .expect("fragment");
 
-        assert!(matches!(
-            fragment,
-            Message {
-                role: ModelMessageRole::User,
-                content: MessageContent::Text(ref text),
-                ..
-            } if text.contains(container_path.to_string_lossy().as_ref())
-                && !text.contains(path.to_string_lossy().as_ref())
-        ));
+        assert!(fragment.contains(container_path.to_string_lossy().as_ref()));
+        assert!(!fragment.contains(path.to_string_lossy().as_ref()));
     }
 
     #[test]
@@ -268,24 +236,6 @@ mod tests {
         assert_eq!(
             container_skill_dir(&skill),
             PathBuf::from("/tmp/.mai-team/skills/system/demo")
-        );
-    }
-
-    #[test]
-    fn skill_user_fragment_uses_pl_core_user_message_helper() {
-        let source = include_str!("instructions.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production section");
-
-        assert!(
-            production.contains("pl_core::user_text_message"),
-            "skill 用户片段应复用 pl-core 的用户消息构造 helper"
-        );
-        assert!(
-            !production.contains(&format!("{}{}", "role: ModelMessageRole", "::User")),
-            "生产代码不应手写 pl_protocol 用户消息 role"
         );
     }
 }

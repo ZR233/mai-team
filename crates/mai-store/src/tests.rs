@@ -1,20 +1,18 @@
 use super::*;
-use crate::events::event_session_id;
 use crate::schema::{SCHEMA_VERSION, SETTING_SCHEMA_VERSION};
 use mai_protocol::{
-    AgentStatus, McpServerScope, McpServerTransport, MessageRole, ProjectCloneStatus,
+    ErrorSeverity, McpServerScope, McpServerTransport, MessageRole, ProjectCloneStatus,
     ProjectReviewDecision, ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus,
-    ProjectStatus, ServiceEventKind, TurnStatus,
+    ProjectStatus, SessionEventKind, SessionEventPosition,
 };
-use pl_protocol::{Message, MessageContent, MessageRole as PlMessageRole};
 use serde_json::json;
 use std::collections::BTreeMap;
 use tempfile::{TempDir, tempdir};
 use tokio::time::{Duration, timeout};
 
-async fn store() -> (TempDir, ConfigStore) {
+async fn store() -> (TempDir, MaiStore) {
     let dir = tempdir().expect("tempdir");
-    let store = ConfigStore::open_with_config_and_artifact_index_path(
+    let store = MaiStore::open_with_config_and_artifact_index_path(
         dir.path().join("config.sqlite3"),
         dir.path().join("config.toml"),
         dir.path().join("artifacts/index"),
@@ -22,15 +20,6 @@ async fn store() -> (TempDir, ConfigStore) {
     .await
     .expect("open store");
     (dir, store)
-}
-
-fn pl_text_message(role: PlMessageRole, text: &str) -> Message {
-    Message {
-        role,
-        content: MessageContent::Text(text.to_string()),
-        reasoning_content: None,
-        metadata: Default::default(),
-    }
 }
 
 fn test_project_summary(project_id: ProjectId, maintainer_agent_id: AgentId) -> ProjectSummary {
@@ -70,7 +59,7 @@ async fn open_in_data_dir_uses_standard_layout() {
     let dir = tempdir().expect("tempdir");
     let data_dir = dir.path().join(".mai-team");
 
-    let store = ConfigStore::open_in_data_dir(&data_dir)
+    let store = MaiStore::open_in_data_dir(&data_dir)
         .await
         .expect("open store");
 
@@ -117,144 +106,29 @@ async fn save_project_waits_for_temporary_sqlite_write_lock() {
     );
 }
 
-fn test_service_event(
+fn test_product_event(
     sequence: u64,
     agent_id: AgentId,
-    session_id: SessionId,
-    turn_id: TurnId,
+    _session_id: SessionId,
+    _turn_id: TurnId,
     timestamp: DateTime<Utc>,
-) -> ServiceEvent {
-    ServiceEvent {
+) -> MaiProductEventEnvelope {
+    MaiProductEventEnvelope {
         sequence,
         timestamp,
-        kind: ServiceEventKind::TurnCompleted {
-            agent_id,
-            session_id: Some(session_id),
-            turn_id,
-            status: TurnStatus::Completed,
+        kind: MaiProductEventKind::OperationFailed {
+            scope: "test".to_string(),
+            agent_id: Some(agent_id),
+            message: "test failure".to_string(),
         },
     }
-}
-
-fn provider(api_key: Option<&str>) -> ProviderConfig {
-    ProviderConfig {
-        id: "openai".to_string(),
-        kind: ProviderKind::Openai,
-        name: "OpenAI".to_string(),
-        base_url: "https://api.openai.com/v1".to_string(),
-        api_key: api_key.map(str::to_string),
-        api_key_env: Some("OPENAI_API_KEY".to_string()),
-        models: vec![test_model("gpt-5.5"), test_model("gpt-5.4")],
-        default_model: "gpt-5.5".to_string(),
-        enabled: true,
-    }
-}
-
-fn test_model(id: &str) -> ModelConfig {
-    ModelConfig {
-        id: id.to_string(),
-        name: Some(id.to_string()),
-        context_tokens: 272_000,
-        max_context_tokens: None,
-        effective_context_window_percent: 95,
-        output_tokens: 128_000,
-        auto_compact_token_limit: None,
-        supports_tools: true,
-        reasoning: Some(ModelReasoningConfig {
-            default_variant: Some("medium".to_string()),
-            variants: ["minimal", "low", "medium", "high"]
-                .into_iter()
-                .map(|id| ModelReasoningVariant {
-                    id: id.to_string(),
-                    label: None,
-                    request: json!({
-                        "reasoning": {
-                            "effort": id,
-                        },
-                    }),
-                })
-                .collect(),
-        }),
-        options: serde_json::Value::Null,
-        headers: BTreeMap::new(),
-        wire_api: ModelWireApi::Responses,
-        capabilities: ModelCapabilities::default(),
-        request_policy: ModelRequestPolicy::default(),
-    }
-}
-
-#[tokio::test]
-async fn provider_response_is_redacted_and_preserves_empty_key() {
-    let (_dir, store) = store().await;
-    store
-        .save_providers(ProvidersConfigRequest {
-            providers: vec![provider(Some("secret"))],
-            default_provider_id: Some("openai".to_string()),
-        })
-        .await
-        .expect("save");
-    store
-        .save_providers(ProvidersConfigRequest {
-            providers: vec![provider(Some(""))],
-            default_provider_id: Some("openai".to_string()),
-        })
-        .await
-        .expect("save preserve");
-
-    let response = store.providers_response().await.expect("providers");
-    assert!(response.providers[0].has_api_key);
-    let resolved = store
-        .resolve_provider(Some("openai"), Some("gpt-5.4"))
-        .await
-        .expect("resolve");
-    assert_eq!(resolved.provider.api_key, "secret");
-    assert_eq!(resolved.model.id, "gpt-5.4");
-}
-
-#[tokio::test]
-async fn provider_cache_reloads_when_config_file_changes() {
-    let dir = tempdir().expect("tempdir");
-    let config_path = dir.path().join("config.toml");
-    let store = ConfigStore::open_with_config_path(dir.path().join("config.sqlite3"), &config_path)
-        .await
-        .expect("open");
-    store
-        .save_providers(ProvidersConfigRequest {
-            providers: vec![provider(Some("first-secret"))],
-            default_provider_id: Some("openai".to_string()),
-        })
-        .await
-        .expect("save");
-    assert_eq!(
-        store
-            .resolve_provider(Some("openai"), Some("gpt-5.4"))
-            .await
-            .expect("resolve")
-            .provider
-            .api_key,
-        "first-secret"
-    );
-
-    let text = std::fs::read_to_string(&config_path)
-        .expect("read config")
-        .replace("first-secret", "second-secret-longer");
-    std::fs::write(&config_path, text).expect("write config");
-    assert_eq!(
-        store
-            .resolve_provider(Some("openai"), Some("gpt-5.4"))
-            .await
-            .expect("resolve changed")
-            .provider
-            .api_key,
-        "second-secret-longer"
-    );
 }
 
 #[tokio::test]
 async fn artifacts_use_configured_index_dir() {
     let dir = tempdir().expect("tempdir");
     let index_dir = dir.path().join("artifact-index");
-    let store = ConfigStore::open_with_config_and_artifact_index_path(
+    let store = MaiStore::open_with_config_and_artifact_index_path(
         dir.path().join("config.sqlite3"),
         dir.path().join("config.toml"),
         &index_dir,
@@ -485,756 +359,7 @@ async fn git_account_delete_wins_over_late_verification_update() {
 }
 
 #[tokio::test]
-async fn rejects_unknown_model() {
-    let (_dir, store) = store().await;
-    store
-        .save_providers(ProvidersConfigRequest {
-            providers: vec![provider(Some("secret"))],
-            default_provider_id: Some("openai".to_string()),
-        })
-        .await
-        .expect("save");
-    assert!(
-        store
-            .resolve_provider(Some("openai"), Some("unknown"))
-            .await
-            .is_err()
-    );
-}
-
-#[tokio::test]
-async fn agent_config_defaults_when_missing_and_clears_invalid_json() {
-    let (_dir, store) = store().await;
-    assert_eq!(
-        store.load_agent_config().await.expect("missing config"),
-        AgentConfigRequest::default()
-    );
-    store
-        .set_setting(SETTING_AGENT_CONFIG, "{not json")
-        .await
-        .expect("write invalid");
-    assert_eq!(
-        store.load_agent_config().await.expect("invalid config"),
-        AgentConfigRequest::default()
-    );
-    assert_eq!(
-        store
-            .get_setting(SETTING_AGENT_CONFIG)
-            .await
-            .expect("setting"),
-        None
-    );
-    store
-        .set_setting(
-            SETTING_AGENT_CONFIG,
-            r#"{"research_agent":{"provider_id":"openai","model":"gpt-5.4"}}"#,
-        )
-        .await
-        .expect("write old config");
-    assert_eq!(
-        store.load_agent_config().await.expect("old config"),
-        AgentConfigRequest::default()
-    );
-    assert_eq!(
-        store
-            .get_setting(SETTING_AGENT_CONFIG)
-            .await
-            .expect("setting"),
-        None
-    );
-}
-
-#[tokio::test]
-async fn agent_config_persists_and_reloads() {
-    let (dir, store) = store().await;
-    let config = AgentConfigRequest {
-        planner: None,
-        explorer: None,
-        executor: Some(mai_protocol::AgentModelPreference {
-            provider_id: "openai".to_string(),
-            model: "gpt-5.4".to_string(),
-            reasoning_effort: Some("high".to_string()),
-        }),
-        reviewer: None,
-    };
-    store.save_agent_config(&config).await.expect("save config");
-    drop(store);
-
-    let reopened = ConfigStore::open_with_config_path(
-        dir.path().join("config.sqlite3"),
-        dir.path().join("config.toml"),
-    )
-    .await
-    .expect("reopen");
-    assert_eq!(
-        reopened.load_agent_config().await.expect("load config"),
-        config
-    );
-}
-
-#[tokio::test]
-async fn provider_presets_include_builtin_metadata() {
-    let (_dir, store) = store().await;
-    let presets = store.provider_presets_response();
-    let openai = presets
-        .providers
-        .iter()
-        .find(|provider| provider.kind == ProviderKind::Openai)
-        .expect("openai preset");
-    let deepseek = presets
-        .providers
-        .iter()
-        .find(|provider| provider.kind == ProviderKind::Deepseek)
-        .expect("deepseek preset");
-    assert_eq!(openai.default_model, "gpt-5.5");
-    let gpt_5_5 = openai
-        .models
-        .iter()
-        .find(|model| model.id == "gpt-5.5")
-        .expect("gpt-5.5 preset");
-    assert_eq!(gpt_5_5.context_tokens, 272_000);
-    assert_eq!(gpt_5_5.max_context_tokens, Some(272_000));
-    assert_eq!(gpt_5_5.effective_context_window_percent, 95);
-    assert_eq!(gpt_5_5.output_tokens, 128_000);
-    assert!(openai.models.iter().any(|model| model.id == "gpt-5.4-mini"));
-    assert_eq!(deepseek.default_model, "deepseek-v4-flash");
-    let v4_pro = deepseek
-        .models
-        .iter()
-        .find(|model| model.id == "deepseek-v4-pro")
-        .expect("deepseek v4 pro");
-    assert_eq!(v4_pro.context_tokens, DEEPSEEK_V4_CONTEXT_TOKENS);
-    assert_eq!(v4_pro.output_tokens, DEEPSEEK_V4_OUTPUT_TOKENS);
-    let reasoning = v4_pro.reasoning.as_ref().expect("reasoning variants");
-    assert_eq!(reasoning.default_variant.as_deref(), Some("high"));
-    assert_eq!(
-        reasoning
-            .variants
-            .iter()
-            .map(|variant| variant.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["high", "max"]
-    );
-    for id in ["deepseek-v4-flash", "deepseek-v4-pro"] {
-        let model = deepseek
-            .models
-            .iter()
-            .find(|model| model.id == id)
-            .expect("deepseek v4 model");
-        assert_eq!(model.context_tokens, DEEPSEEK_V4_CONTEXT_TOKENS);
-        assert_eq!(model.output_tokens, DEEPSEEK_V4_OUTPUT_TOKENS);
-    }
-    let v4_flash = deepseek
-        .models
-        .iter()
-        .find(|model| model.id == "deepseek-v4-flash")
-        .expect("deepseek v4 flash");
-    assert!(v4_flash.reasoning.is_some());
-    assert!(v4_flash.capabilities.reasoning_replay);
-    assert_eq!(deepseek.models.len(), 2);
-    let mimo_presets: Vec<_> = presets
-        .providers
-        .iter()
-        .filter(|provider| provider.kind == ProviderKind::Mimo)
-        .collect();
-    assert_eq!(
-        mimo_presets.len(),
-        2,
-        "expected mimo-api and mimo-token-plan presets"
-    );
-    let mimo_api = mimo_presets
-        .iter()
-        .find(|p| p.id == "mimo-api")
-        .expect("mimo-api preset");
-    let mimo_tp = mimo_presets
-        .iter()
-        .find(|p| p.id == "mimo-token-plan")
-        .expect("mimo-token-plan preset");
-    assert_eq!(mimo_api.base_url, "https://api.xiaomimimo.com/v1");
-    assert_eq!(mimo_tp.base_url, "https://token-plan-cn.xiaomimimo.com/v1");
-    assert_eq!(mimo_api.default_model, "mimo-v2.5-pro");
-
-    for (id, context_tokens, output_tokens) in [
-        ("mimo-v2.5-pro", 1_000_000, 131_072),
-        ("mimo-v2.5", 1_000_000, 131_072),
-        ("mimo-v2-pro", 1_000_000, 131_072),
-        ("mimo-v2-omni", 256_000, 131_072),
-        ("mimo-v2-flash", 256_000, 65_536),
-    ] {
-        let model = mimo_api
-            .models
-            .iter()
-            .find(|model| model.id == id)
-            .expect("mimo model");
-        assert_eq!(model.context_tokens, context_tokens);
-        assert_eq!(model.output_tokens, output_tokens);
-    }
-
-    let mimo_pro = mimo_api
-        .models
-        .iter()
-        .find(|model| model.id == "mimo-v2.5-pro")
-        .expect("mimo-v2.5-pro");
-    assert!(mimo_pro.reasoning.is_some());
-    assert_eq!(
-        mimo_pro.request_policy.max_tokens_field,
-        "max_completion_tokens"
-    );
-    let mimo_flash = mimo_api
-        .models
-        .iter()
-        .find(|model| model.id == "mimo-v2-flash")
-        .expect("mimo-v2-flash");
-    assert!(mimo_flash.reasoning.is_none());
-
-    let zhipu = presets
-        .providers
-        .iter()
-        .find(|provider| provider.kind == ProviderKind::Zhipu)
-        .expect("zhipu preset");
-    assert_eq!(zhipu.id, "zhipu");
-    assert_eq!(zhipu.name, "Zhipu BigModel");
-    assert_eq!(zhipu.base_url, "https://open.bigmodel.cn/api/paas/v4");
-    assert_eq!(zhipu.default_model, "glm-5.1");
-    assert_eq!(
-        zhipu
-            .models
-            .iter()
-            .map(|model| model.id.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "glm-5.1",
-            "glm-5",
-            "glm-5-turbo",
-            "glm-4.7",
-            "glm-4.7-flashx",
-            "glm-4.6",
-            "glm-4.5-air",
-            "glm-4.5-airx",
-        ]
-    );
-    for model in &zhipu.models {
-        assert_eq!(model.wire_api, ModelWireApi::ChatCompletions);
-        assert_eq!(model.request_policy.max_tokens_field, "max_tokens");
-        assert!(model.supports_tools);
-        assert!(model.capabilities.tools);
-        assert!(!model.capabilities.parallel_tools);
-        assert!(!model.capabilities.continuation);
-        assert!(!model.capabilities.strict_schema);
-        let reasoning = model.reasoning.as_ref().expect("zhipu reasoning");
-        assert_eq!(reasoning.default_variant.as_deref(), Some("enabled"));
-        assert_eq!(
-            reasoning
-                .variants
-                .iter()
-                .map(|variant| variant.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["enabled", "disabled"]
-        );
-        assert_eq!(
-            reasoning.variants[0].request,
-            json!({ "thinking": { "type": "enabled" } })
-        );
-        assert_eq!(
-            reasoning.variants[1].request,
-            json!({ "thinking": { "type": "disabled" } })
-        );
-    }
-    for (id, context_tokens, output_tokens) in [
-        ("glm-5.1", 200_000, 131_072),
-        ("glm-5", 200_000, 131_072),
-        ("glm-5-turbo", 200_000, 131_072),
-        ("glm-4.7", 200_000, 131_072),
-        ("glm-4.7-flashx", 200_000, 131_072),
-        ("glm-4.6", 200_000, 131_072),
-        ("glm-4.5-air", 128_000, 98_304),
-        ("glm-4.5-airx", 128_000, 98_304),
-    ] {
-        let model = zhipu
-            .models
-            .iter()
-            .find(|model| model.id == id)
-            .expect("zhipu model");
-        assert_eq!(model.context_tokens, context_tokens);
-        assert_eq!(model.output_tokens, output_tokens);
-    }
-}
-
-#[tokio::test]
-async fn provider_toml_preserves_custom_model_metadata() {
-    let (_dir, store) = store().await;
-    let mut provider = provider(Some("secret"));
-    let mut custom = test_model("custom-chat");
-    custom.context_tokens = 123_456;
-    custom.output_tokens = 4_096;
-    custom.auto_compact_token_limit = Some(98_765);
-    custom.supports_tools = false;
-    custom.reasoning = None;
-    custom.options = json!({ "temperature": 0.2 });
-    custom
-        .headers
-        .insert("X-Test-Model".to_string(), "custom".to_string());
-    provider.models.push(custom);
-    provider.default_model = "custom-chat".to_string();
-    store
-        .save_providers(ProvidersConfigRequest {
-            providers: vec![provider],
-            default_provider_id: Some("openai".to_string()),
-        })
-        .await
-        .expect("save");
-
-    let response = store.providers_response().await.expect("providers");
-    let model = response.providers[0]
-        .models
-        .iter()
-        .find(|model| model.id == "custom-chat")
-        .expect("custom model");
-    assert_eq!(model.context_tokens, 123_456);
-    assert_eq!(model.max_context_tokens, None);
-    assert_eq!(model.auto_compact_token_limit, Some(98_765));
-    assert!(!model.supports_tools);
-    assert_eq!(model.options["temperature"], json!(0.2));
-    assert_eq!(model.headers["X-Test-Model"], "custom");
-}
-
-#[tokio::test]
-async fn legacy_openai_gpt_5_5_context_tokens_migrate_to_272k() {
-    let dir = tempdir().expect("tempdir");
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"
-            default_provider_id = "openai"
-
-            [providers.openai]
-            kind = "openai"
-            name = "OpenAI"
-            base_url = "https://api.openai.com/v1"
-            api_key = "secret"
-            default_model = "gpt-5.5"
-            enabled = true
-
-            [providers.openai.models."gpt-5.5"]
-            name = "gpt-5.5"
-            context_tokens = 400000
-            output_tokens = 128000
-            supports_tools = true
-            wire_api = "responses"
-        "#,
-    )
-    .expect("write config");
-    let store = ConfigStore::open_with_config_path(dir.path().join("config.sqlite3"), &config_path)
-        .await
-        .expect("open");
-
-    let response = store.providers_response().await.expect("providers");
-    let model = response.providers[0]
-        .models
-        .iter()
-        .find(|model| model.id == "gpt-5.5")
-        .expect("gpt-5.5");
-    assert_eq!(model.context_tokens, 272_000);
-    let selection = store
-        .resolve_provider(Some("openai"), Some("gpt-5.5"))
-        .await
-        .expect("resolve");
-    assert_eq!(selection.model.context_tokens, 272_000);
-}
-
-#[tokio::test]
-async fn custom_openai_gpt_5_5_context_tokens_are_preserved() {
-    let (_dir, store) = store().await;
-    let mut provider = provider(Some("secret"));
-    provider.models[0].context_tokens = 123_456;
-    store
-        .save_providers(ProvidersConfigRequest {
-            providers: vec![provider],
-            default_provider_id: Some("openai".to_string()),
-        })
-        .await
-        .expect("save");
-
-    let response = store.providers_response().await.expect("providers");
-    let model = response.providers[0]
-        .models
-        .iter()
-        .find(|model| model.id == "gpt-5.5")
-        .expect("gpt-5.5");
-    assert_eq!(model.context_tokens, 123_456);
-    assert_eq!(model.effective_context_window_percent, 95);
-}
-
-#[tokio::test]
-async fn legacy_deepseek_models_migrate_to_chat_policy() {
-    let dir = tempdir().expect("tempdir");
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"
-            default_provider_id = "deepseek"
-
-            [providers.deepseek]
-            kind = "deepseek"
-            name = "DeepSeek"
-            base_url = "https://api.deepseek.com"
-            api_key = "secret"
-            default_model = "deepseek-v4-pro"
-            enabled = true
-
-            [providers.deepseek.models.deepseek-v4-pro]
-            name = "deepseek-v4-pro"
-            context_tokens = 1000000
-            output_tokens = 384000
-            supports_tools = true
-        "#,
-    )
-    .expect("write config");
-    let store = ConfigStore::open_with_config_path(dir.path().join("config.sqlite3"), &config_path)
-        .await
-        .expect("open");
-
-    let response = store.providers_response().await.expect("providers");
-    let model = response.providers[0].models.first().expect("model");
-    assert_eq!(model.wire_api, ModelWireApi::ChatCompletions);
-    assert!(!model.capabilities.continuation);
-    assert!(model.capabilities.reasoning_replay);
-    assert_eq!(model.request_policy.store, None);
-    assert_eq!(model.request_policy.max_tokens_field, "max_tokens");
-}
-
-#[tokio::test]
-async fn legacy_mimo_models_migrate_to_official_chat_policy() {
-    let dir = tempdir().expect("tempdir");
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"
-            default_provider_id = "mimo-token-plan"
-
-            [providers.mimo-token-plan]
-            kind = "mimo"
-            name = "MiMo Token Plan"
-            base_url = "https://token-plan-cn.xiaomimimo.com/v1"
-            api_key = "secret"
-            default_model = "mimo-v2.5-pro"
-            enabled = true
-
-            [providers.mimo-token-plan.models."mimo-v2.5-pro"]
-            name = "mimo-v2.5-pro"
-            context_tokens = 1000000
-            output_tokens = 131072
-            supports_tools = true
-            wire_api = "chat_completions"
-
-            [providers.mimo-token-plan.models."mimo-v2.5-pro".request_policy]
-            max_tokens_field = "max_tokens"
-        "#,
-    )
-    .expect("write config");
-    let store = ConfigStore::open_with_config_path(dir.path().join("config.sqlite3"), &config_path)
-        .await
-        .expect("open");
-
-    let response = store.providers_response().await.expect("providers");
-    let model = response.providers[0].models.first().expect("model");
-    assert_eq!(model.wire_api, ModelWireApi::ChatCompletions);
-    assert_eq!(
-        model.request_policy.max_tokens_field,
-        "max_completion_tokens"
-    );
-}
-
-#[tokio::test]
-async fn legacy_zhipu_models_migrate_to_openai_compatible_chat_policy() {
-    let dir = tempdir().expect("tempdir");
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"
-            default_provider_id = "zhipu"
-
-            [providers.zhipu]
-            kind = "zhipu"
-            name = "Zhipu BigModel"
-            base_url = "https://open.bigmodel.cn/api/paas/v4"
-            api_key = "secret"
-            default_model = "glm-5.1"
-            enabled = true
-
-            [providers.zhipu.models."glm-5.1"]
-            name = "glm-5.1"
-            context_tokens = 128000
-            output_tokens = 131072
-            supports_tools = true
-            wire_api = "responses"
-
-            [providers.zhipu.models."glm-5.1".capabilities]
-            continuation = true
-
-            [providers.zhipu.models."glm-5.1".request_policy]
-            store = true
-        "#,
-    )
-    .expect("write config");
-    let store = ConfigStore::open_with_config_path(dir.path().join("config.sqlite3"), &config_path)
-        .await
-        .expect("open");
-
-    let response = store.providers_response().await.expect("providers");
-    let provider = response.providers.first().expect("provider");
-    assert_eq!(provider.kind, ProviderKind::Zhipu);
-    let model = provider.models.first().expect("model");
-    assert_eq!(model.wire_api, ModelWireApi::ChatCompletions);
-    assert!(!model.capabilities.continuation);
-    assert_eq!(model.request_policy.store, None);
-    assert_eq!(model.request_policy.max_tokens_field, "max_tokens");
-}
-
-#[tokio::test]
-async fn old_provider_toml_schema_is_rebuilt() {
-    let dir = tempdir().expect("tempdir");
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"
-            [mcp_servers.demo]
-            command = "demo-mcp"
-        "#,
-    )
-    .expect("write old config");
-    let store = ConfigStore::open_with_config_path(dir.path().join("config.sqlite3"), &config_path)
-        .await
-        .expect("open");
-
-    assert_eq!(store.provider_count().await.expect("count"), 0);
-    assert!(!config_path.exists());
-}
-
-#[tokio::test]
-async fn old_reasoning_toml_schema_is_rebuilt() {
-    let dir = tempdir().expect("tempdir");
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"
-            default_provider_id = "deepseek"
-
-            [providers.deepseek]
-            kind = "deepseek"
-            name = "DeepSeek"
-            base_url = "https://api.deepseek.com"
-            api_key = "secret"
-            default_model = "deepseek-v4-pro"
-            enabled = true
-
-            [providers.deepseek.models.deepseek-v4-pro]
-            name = "deepseek-v4-pro"
-            context_tokens = 128000
-            output_tokens = 8192
-            supports_tools = true
-            supports_reasoning = true
-            reasoning_efforts = ["high", "max"]
-            default_reasoning_effort = "high"
-        "#,
-    )
-    .expect("write old config");
-    let store = ConfigStore::open_with_config_path(dir.path().join("config.sqlite3"), &config_path)
-        .await
-        .expect("open");
-
-    assert_eq!(store.provider_count().await.expect("count"), 0);
-    assert!(!config_path.exists());
-}
-
-#[tokio::test]
-async fn runtime_snapshot_survives_reopen() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("config.sqlite3");
-    let store = ConfigStore::open_with_config_path(&db_path, dir.path().join("config.toml"))
-        .await
-        .expect("open");
-    let agent_id = Uuid::new_v4();
-    let session_id = Uuid::new_v4();
-    let turn_id = Uuid::new_v4();
-    let now = Utc::now();
-    let summary = AgentSummary {
-        id: agent_id,
-        parent_id: None,
-        task_id: None,
-        project_id: None,
-        role: None,
-        name: "agent-test".to_string(),
-        status: AgentStatus::Completed,
-        container_id: Some("container".to_string()),
-        docker_image: "ghcr.io/rcore-os/tgoskits-container:latest".to_string(),
-        provider_id: "openai".to_string(),
-        provider_name: "OpenAI".to_string(),
-        model: "gpt-5.2".to_string(),
-        reasoning_effort: Some("high".to_string()),
-        created_at: now,
-        updated_at: now,
-        current_turn: Some(turn_id),
-        last_error: None,
-        token_usage: TokenUsage {
-            input_tokens: 1,
-            cached_input_tokens: 4,
-            output_tokens: 2,
-            reasoning_output_tokens: 5,
-            total_tokens: 3,
-        },
-    };
-    let session = AgentSessionSummary {
-        id: session_id,
-        title: "Chat 1".to_string(),
-        created_at: now,
-        updated_at: now,
-        message_count: 0,
-        token_usage: TokenUsage {
-            input_tokens: 10,
-            cached_input_tokens: 6,
-            output_tokens: 4,
-            reasoning_output_tokens: 2,
-            total_tokens: 14,
-        },
-    };
-    let message = AgentMessage {
-        role: MessageRole::User,
-        content: "hello".to_string(),
-        created_at: now,
-    };
-    let mut tool_call = pl_text_message(PlMessageRole::Assistant, "");
-    tool_call
-        .metadata
-        .insert("tool_calls".to_string(), r#"[{"id":"call_1"}]"#.to_string());
-    let history = [
-        pl_text_message(PlMessageRole::User, "hello"),
-        Message {
-            role: PlMessageRole::Assistant,
-            content: MessageContent::Text("answer".to_string()),
-            reasoning_content: Some("thinking".to_string()),
-            metadata: Default::default(),
-        },
-        tool_call,
-    ];
-    let event = ServiceEvent {
-        sequence: 7,
-        timestamp: now,
-        kind: ServiceEventKind::AgentMessage {
-            agent_id,
-            session_id: Some(session_id),
-            turn_id: Some(turn_id),
-            role: MessageRole::User,
-            content: "hello".to_string(),
-        },
-    };
-
-    store
-        .save_agent(&summary, Some("system"))
-        .await
-        .expect("save agent");
-    store
-        .save_agent_session(agent_id, &session)
-        .await
-        .expect("save session");
-    store
-        .append_agent_message(agent_id, session_id, 0, &message)
-        .await
-        .expect("message");
-    store
-        .append_agent_history_item(agent_id, session_id, 0, &history[0])
-        .await
-        .expect("history");
-    store
-        .append_agent_history_item(agent_id, session_id, 1, &history[1])
-        .await
-        .expect("history");
-    store
-        .append_agent_history_item(agent_id, session_id, 2, &history[2])
-        .await
-        .expect("history");
-    store.append_service_event(&event).await.expect("event");
-    drop(store);
-
-    let reopened = ConfigStore::open_with_config_path(&db_path, dir.path().join("config.toml"))
-        .await
-        .expect("reopen");
-    let snapshot = reopened.load_runtime_snapshot(500).await.expect("snapshot");
-    assert_eq!(snapshot.next_sequence, 8);
-    assert_eq!(snapshot.agents.len(), 1);
-    assert_eq!(snapshot.agents[0].summary.name, "agent-test");
-    assert_eq!(snapshot.agents[0].summary.token_usage.input_tokens, 1);
-    assert_eq!(
-        snapshot.agents[0].summary.token_usage.cached_input_tokens,
-        4
-    );
-    assert_eq!(snapshot.agents[0].summary.token_usage.output_tokens, 2);
-    assert_eq!(
-        snapshot.agents[0]
-            .summary
-            .token_usage
-            .reasoning_output_tokens,
-        5
-    );
-    assert_eq!(snapshot.agents[0].summary.token_usage.total_tokens, 3);
-    assert_eq!(
-        snapshot.agents[0].summary.docker_image,
-        "ghcr.io/rcore-os/tgoskits-container:latest"
-    );
-    assert_eq!(snapshot.agents[0].system_prompt.as_deref(), Some("system"));
-    assert_eq!(snapshot.agents[0].sessions.len(), 1);
-    assert_eq!(snapshot.agents[0].sessions[0].summary.title, "Chat 1");
-    assert_eq!(snapshot.agents[0].sessions[0].summary.message_count, 1);
-    assert_eq!(
-        snapshot.agents[0].sessions[0].summary.token_usage,
-        TokenUsage {
-            input_tokens: 10,
-            cached_input_tokens: 6,
-            output_tokens: 4,
-            reasoning_output_tokens: 2,
-            total_tokens: 14,
-        }
-    );
-    assert_eq!(snapshot.agents[0].sessions[0].last_context_tokens, None);
-    let loaded_history = reopened
-        .load_agent_history(agent_id, session_id)
-        .await
-        .expect("load history");
-    assert_eq!(loaded_history, history);
-    assert_eq!(snapshot.recent_events.len(), 1);
-    assert_eq!(
-        event_session_id(&snapshot.recent_events[0]),
-        Some(session_id)
-    );
-
-    reopened.delete_agent(agent_id).await.expect("delete agent");
-    let snapshot = reopened.load_runtime_snapshot(500).await.expect("snapshot");
-    assert!(snapshot.agents.is_empty());
-    assert!(
-        reopened
-            .load_agent_sessions(agent_id)
-            .await
-            .expect("sessions")
-            .is_empty()
-    );
-    assert!(
-        reopened
-            .load_agent_messages(agent_id, session_id)
-            .await
-            .expect("messages")
-            .is_empty()
-    );
-    assert!(
-        reopened
-            .load_agent_history(agent_id, session_id)
-            .await
-            .expect("history")
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn service_event_replay_and_snapshot_keep_recent_events() {
+async fn product_event_replay_and_snapshot_keep_recent_events() {
     let (_dir, store) = store().await;
     let agent_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
@@ -1242,7 +367,7 @@ async fn service_event_replay_and_snapshot_keep_recent_events() {
 
     for sequence in 1..=5 {
         store
-            .append_service_event(&test_service_event(
+            .append_product_event(&test_product_event(
                 sequence,
                 agent_id,
                 session_id,
@@ -1253,7 +378,7 @@ async fn service_event_replay_and_snapshot_keep_recent_events() {
             .expect("append event");
     }
 
-    let replay = store.service_events_after(2, 2).await.expect("replay");
+    let replay = store.product_events_after(2, 2).await.expect("replay");
     assert_eq!(
         replay
             .iter()
@@ -1275,7 +400,7 @@ async fn service_event_replay_and_snapshot_keep_recent_events() {
 }
 
 #[tokio::test]
-async fn service_event_count_pruning_keeps_newest_events() {
+async fn product_event_count_pruning_keeps_newest_events() {
     let (_dir, store) = store().await;
     let agent_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
@@ -1283,7 +408,7 @@ async fn service_event_count_pruning_keeps_newest_events() {
 
     for sequence in 1..=5 {
         store
-            .append_service_event(&test_service_event(
+            .append_product_event(&test_product_event(
                 sequence,
                 agent_id,
                 session_id,
@@ -1295,12 +420,12 @@ async fn service_event_count_pruning_keeps_newest_events() {
     }
 
     let removed = store
-        .prune_service_events_to_limit(3)
+        .prune_product_events_to_limit(3)
         .await
         .expect("prune by limit");
     assert_eq!(removed, 2);
 
-    let replay = store.service_events_after(0, 10).await.expect("replay");
+    let replay = store.product_events_after(0, 10).await.expect("replay");
     assert_eq!(
         replay
             .iter()
@@ -1309,464 +434,22 @@ async fn service_event_count_pruning_keeps_newest_events() {
         vec![3, 4, 5]
     );
     assert_eq!(
-        store.prune_service_events_to_limit(3).await.expect("noop"),
+        store.prune_product_events_to_limit(3).await.expect("noop"),
         0
     );
     assert_eq!(
         store
-            .prune_service_events_to_limit(0)
+            .prune_product_events_to_limit(0)
             .await
             .expect("zero limit"),
         3
     );
     assert!(
         store
-            .service_events_after(0, 10)
+            .product_events_after(0, 10)
             .await
             .expect("empty replay")
             .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn session_token_usage_is_isolated_per_session() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("config.sqlite3");
-    let config_path = dir.path().join("config.toml");
-    let store = ConfigStore::open_with_config_path(&db_path, &config_path)
-        .await
-        .expect("open");
-    let agent_id = Uuid::new_v4();
-    let first_session_id = Uuid::new_v4();
-    let second_session_id = Uuid::new_v4();
-    let now = Utc::now();
-    store
-        .save_agent(
-            &AgentSummary {
-                id: agent_id,
-                parent_id: None,
-                task_id: None,
-                project_id: None,
-                role: None,
-                name: "agent-test".to_string(),
-                status: AgentStatus::Completed,
-                container_id: None,
-                docker_image: "ubuntu:latest".to_string(),
-                provider_id: "openai".to_string(),
-                provider_name: "OpenAI".to_string(),
-                model: "gpt-5.2".to_string(),
-                reasoning_effort: None,
-                created_at: now,
-                updated_at: now,
-                current_turn: None,
-                last_error: None,
-                token_usage: TokenUsage::default(),
-            },
-            None,
-        )
-        .await
-        .expect("save agent");
-    store
-        .save_agent_session(
-            agent_id,
-            &AgentSessionSummary {
-                id: first_session_id,
-                title: "Chat 1".to_string(),
-                created_at: now,
-                updated_at: now,
-                message_count: 0,
-                token_usage: TokenUsage {
-                    input_tokens: 100,
-                    cached_input_tokens: 40,
-                    output_tokens: 20,
-                    reasoning_output_tokens: 5,
-                    total_tokens: 120,
-                },
-            },
-        )
-        .await
-        .expect("save first session");
-    store
-        .save_agent_session(
-            agent_id,
-            &AgentSessionSummary {
-                id: second_session_id,
-                title: "Chat 2".to_string(),
-                created_at: now,
-                updated_at: now,
-                message_count: 0,
-                token_usage: TokenUsage {
-                    input_tokens: 7,
-                    cached_input_tokens: 0,
-                    output_tokens: 3,
-                    reasoning_output_tokens: 1,
-                    total_tokens: 10,
-                },
-            },
-        )
-        .await
-        .expect("save second session");
-
-    let snapshot = store.load_runtime_snapshot(10).await.expect("snapshot");
-
-    let sessions = snapshot.agents[0]
-        .sessions
-        .iter()
-        .map(|session| (session.summary.id, session.summary.token_usage.clone()))
-        .collect::<BTreeMap<_, _>>();
-    assert_eq!(
-        sessions.get(&first_session_id),
-        Some(&TokenUsage {
-            input_tokens: 100,
-            cached_input_tokens: 40,
-            output_tokens: 20,
-            reasoning_output_tokens: 5,
-            total_tokens: 120,
-        })
-    );
-    assert_eq!(
-        sessions.get(&second_session_id),
-        Some(&TokenUsage {
-            input_tokens: 7,
-            cached_input_tokens: 0,
-            output_tokens: 3,
-            reasoning_output_tokens: 1,
-            total_tokens: 10,
-        })
-    );
-}
-
-#[tokio::test]
-async fn replace_agent_history_only_replaces_target_session() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("config.sqlite3");
-    let store = ConfigStore::open_with_config_path(&db_path, dir.path().join("config.toml"))
-        .await
-        .expect("open");
-    let agent_id = Uuid::new_v4();
-    let first_session_id = Uuid::new_v4();
-    let second_session_id = Uuid::new_v4();
-    let now = Utc::now();
-    let summary = AgentSummary {
-        id: agent_id,
-        parent_id: None,
-        task_id: None,
-        project_id: None,
-        role: None,
-        name: "agent-test".to_string(),
-        status: AgentStatus::Completed,
-        container_id: None,
-        docker_image: "ubuntu:latest".to_string(),
-        provider_id: "openai".to_string(),
-        provider_name: "OpenAI".to_string(),
-        model: "gpt-5.2".to_string(),
-        reasoning_effort: None,
-        created_at: now,
-        updated_at: now,
-        current_turn: None,
-        last_error: None,
-        token_usage: TokenUsage::default(),
-    };
-    store.save_agent(&summary, None).await.expect("save agent");
-    for session_id in [first_session_id, second_session_id] {
-        store
-            .save_agent_session(
-                agent_id,
-                &AgentSessionSummary {
-                    id: session_id,
-                    title: "Chat".to_string(),
-                    created_at: now,
-                    updated_at: now,
-                    message_count: 0,
-                    token_usage: TokenUsage::default(),
-                },
-            )
-            .await
-            .expect("save session");
-    }
-    store
-        .append_agent_history_item(
-            agent_id,
-            first_session_id,
-            0,
-            &pl_text_message(PlMessageRole::User, "old first"),
-        )
-        .await
-        .expect("first history");
-    store
-        .append_agent_history_item(
-            agent_id,
-            second_session_id,
-            0,
-            &pl_text_message(PlMessageRole::User, "old second"),
-        )
-        .await
-        .expect("second history");
-
-    store
-        .replace_agent_history(
-            agent_id,
-            first_session_id,
-            &[pl_text_message(PlMessageRole::User, "new")],
-        )
-        .await
-        .expect("replace");
-    let first = store
-        .load_agent_history(agent_id, first_session_id)
-        .await
-        .expect("first");
-    let second = store
-        .load_agent_history(agent_id, second_session_id)
-        .await
-        .expect("second");
-    assert_eq!(first, vec![pl_text_message(PlMessageRole::User, "new")]);
-    assert_eq!(
-        second,
-        vec![pl_text_message(PlMessageRole::User, "old second")]
-    );
-}
-
-#[tokio::test]
-async fn agent_history_uses_native_pl_messages() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("config.sqlite3");
-    let store = ConfigStore::open_with_config_path(&db_path, dir.path().join("config.toml"))
-        .await
-        .expect("open");
-    let agent_id = Uuid::new_v4();
-    let session_id = Uuid::new_v4();
-    let now = Utc::now();
-    let summary = AgentSummary {
-        id: agent_id,
-        parent_id: None,
-        task_id: None,
-        project_id: None,
-        role: None,
-        name: "agent-test".to_string(),
-        status: AgentStatus::Completed,
-        container_id: None,
-        docker_image: "ubuntu:latest".to_string(),
-        provider_id: "openai".to_string(),
-        provider_name: "OpenAI".to_string(),
-        model: "gpt-5.2".to_string(),
-        reasoning_effort: None,
-        created_at: now,
-        updated_at: now,
-        current_turn: None,
-        last_error: None,
-        token_usage: TokenUsage::default(),
-    };
-    store.save_agent(&summary, None).await.expect("save agent");
-    store
-        .save_agent_session(
-            agent_id,
-            &AgentSessionSummary {
-                id: session_id,
-                title: "Chat".to_string(),
-                created_at: now,
-                updated_at: now,
-                message_count: 0,
-                token_usage: TokenUsage::default(),
-            },
-        )
-        .await
-        .expect("save session");
-    let history = vec![
-        Message {
-            role: PlMessageRole::User,
-            content: MessageContent::Text("hello".to_string()),
-            reasoning_content: None,
-            metadata: Default::default(),
-        },
-        Message {
-            role: PlMessageRole::Assistant,
-            content: MessageContent::Text("answer".to_string()),
-            reasoning_content: Some("thinking".to_string()),
-            metadata: Default::default(),
-        },
-    ];
-
-    store
-        .replace_agent_history(agent_id, session_id, &history)
-        .await
-        .expect("replace history");
-
-    assert_eq!(
-        store
-            .load_agent_history(agent_id, session_id)
-            .await
-            .expect("load history"),
-        history
-    );
-}
-
-#[tokio::test]
-async fn session_context_tokens_survive_reopen_and_clear() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("config.sqlite3");
-    let config_path = dir.path().join("config.toml");
-    let store = ConfigStore::open_with_config_path(&db_path, &config_path)
-        .await
-        .expect("open");
-    let agent_id = Uuid::new_v4();
-    let session_id = Uuid::new_v4();
-    let now = Utc::now();
-    store
-        .save_agent(
-            &AgentSummary {
-                id: agent_id,
-                parent_id: None,
-                task_id: None,
-                project_id: None,
-                role: None,
-                name: "agent-test".to_string(),
-                status: AgentStatus::Completed,
-                container_id: None,
-                docker_image: "ubuntu:latest".to_string(),
-                provider_id: "openai".to_string(),
-                provider_name: "OpenAI".to_string(),
-                model: "gpt-5.2".to_string(),
-                reasoning_effort: None,
-                created_at: now,
-                updated_at: now,
-                current_turn: None,
-                last_error: None,
-                token_usage: TokenUsage::default(),
-            },
-            None,
-        )
-        .await
-        .expect("save agent");
-    store
-        .save_agent_session(
-            agent_id,
-            &AgentSessionSummary {
-                id: session_id,
-                title: "Chat".to_string(),
-                created_at: now,
-                updated_at: now,
-                message_count: 0,
-                token_usage: TokenUsage::default(),
-            },
-        )
-        .await
-        .expect("save session");
-    store
-        .save_session_context_tokens(agent_id, session_id, 1234)
-        .await
-        .expect("save tokens");
-    drop(store);
-
-    let reopened = ConfigStore::open_with_config_path(&db_path, &config_path)
-        .await
-        .expect("reopen");
-    let snapshot = reopened.load_runtime_snapshot(10).await.expect("snapshot");
-    assert_eq!(
-        snapshot.agents[0].sessions[0].last_context_tokens,
-        Some(1234)
-    );
-    reopened
-        .clear_session_context_tokens(agent_id, session_id)
-        .await
-        .expect("clear");
-    let snapshot = reopened.load_runtime_snapshot(10).await.expect("snapshot");
-    assert_eq!(snapshot.agents[0].sessions[0].last_context_tokens, None);
-}
-
-#[tokio::test]
-async fn agent_history_len_counts_only_target_session() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("config.sqlite3");
-    let store = ConfigStore::open_with_config_path(&db_path, dir.path().join("config.toml"))
-        .await
-        .expect("open");
-    let agent_id = Uuid::new_v4();
-    let first_session_id = Uuid::new_v4();
-    let second_session_id = Uuid::new_v4();
-    let now = Utc::now();
-    store
-        .save_agent(
-            &AgentSummary {
-                id: agent_id,
-                parent_id: None,
-                task_id: None,
-                project_id: None,
-                role: None,
-                name: "agent-test".to_string(),
-                status: AgentStatus::Completed,
-                container_id: None,
-                docker_image: "ubuntu:latest".to_string(),
-                provider_id: "openai".to_string(),
-                provider_name: "OpenAI".to_string(),
-                model: "gpt-5.2".to_string(),
-                reasoning_effort: None,
-                created_at: now,
-                updated_at: now,
-                current_turn: None,
-                last_error: None,
-                token_usage: TokenUsage::default(),
-            },
-            None,
-        )
-        .await
-        .expect("save agent");
-    for session_id in [first_session_id, second_session_id] {
-        store
-            .save_agent_session(
-                agent_id,
-                &AgentSessionSummary {
-                    id: session_id,
-                    title: "Chat".to_string(),
-                    created_at: now,
-                    updated_at: now,
-                    message_count: 0,
-                    token_usage: TokenUsage::default(),
-                },
-            )
-            .await
-            .expect("save session");
-    }
-    store
-        .append_agent_history_item(
-            agent_id,
-            first_session_id,
-            0,
-            &pl_text_message(PlMessageRole::User, "a"),
-        )
-        .await
-        .expect("first history");
-    store
-        .append_agent_history_item(
-            agent_id,
-            first_session_id,
-            1,
-            &pl_text_message(PlMessageRole::User, "b"),
-        )
-        .await
-        .expect("first history");
-    store
-        .append_agent_history_item(
-            agent_id,
-            second_session_id,
-            0,
-            &pl_text_message(PlMessageRole::User, "other"),
-        )
-        .await
-        .expect("second history");
-
-    assert_eq!(
-        store
-            .agent_history_len(agent_id, first_session_id)
-            .await
-            .expect("first len"),
-        2
-    );
-    assert_eq!(
-        store
-            .agent_history_len(agent_id, second_session_id)
-            .await
-            .expect("second len"),
-        1
     );
 }
 
@@ -1807,14 +490,16 @@ async fn project_review_runs_round_trip_and_prune() {
                 content: "done".to_string(),
                 created_at: finished_at,
             }],
-            events: vec![ServiceEvent {
-                sequence: 1,
-                timestamp: finished_at,
-                kind: ServiceEventKind::TurnCompleted {
-                    agent_id: reviewer_agent_id,
-                    session_id: None,
-                    turn_id,
-                    status: TurnStatus::Completed,
+            events: vec![SessionEventEnvelope {
+                event_id: "event-1".to_string(),
+                session_id: Uuid::new_v4().to_string(),
+                source_agent_id: Some(reviewer_agent_id.to_string()),
+                turn_id: Some(turn_id.to_string()),
+                emitted_at: finished_at.timestamp_millis(),
+                position: SessionEventPosition::Durable { sequence: 1 },
+                kind: SessionEventKind::ErrorOccurred {
+                    message: "historical test event".to_string(),
+                    severity: ErrorSeverity::Recoverable,
                 },
             }],
         })
@@ -2192,17 +877,23 @@ async fn invalid_sqlite_file_is_rebuilt() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("config.sqlite3");
     std::fs::write(&path, b"not sqlite").expect("write invalid old db");
-    let store = ConfigStore::open_with_config_path(&path, dir.path().join("config.toml"))
+    let store = MaiStore::open_with_config_path(&path, dir.path().join("config.toml"))
         .await
         .expect("rebuild");
-    assert_eq!(store.provider_count().await.expect("count"), 0);
+    assert_eq!(
+        store
+            .get_setting(SETTING_SCHEMA_VERSION)
+            .await
+            .expect("schema"),
+        Some(SCHEMA_VERSION.to_string())
+    );
 }
 
 #[tokio::test]
 async fn sqlite_store_uses_wal_journal_mode() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("config.sqlite3");
-    let store = ConfigStore::open_with_config_path(&db_path, dir.path().join("config.toml"))
+    let store = MaiStore::open_with_config_path(&db_path, dir.path().join("config.toml"))
         .await
         .expect("open");
     drop(store);
@@ -2219,7 +910,7 @@ async fn skills_config_persists_in_settings() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("config.sqlite3");
     let config_path = dir.path().join("config.toml");
-    let store = ConfigStore::open_with_config_path(&db_path, &config_path)
+    let store = MaiStore::open_with_config_path(&db_path, &config_path)
         .await
         .expect("open");
     let config = SkillsConfigRequest {
@@ -2235,7 +926,7 @@ async fn skills_config_persists_in_settings() {
         .expect("save skills config");
     drop(store);
 
-    let reopened = ConfigStore::open_with_config_path(&db_path, &config_path)
+    let reopened = MaiStore::open_with_config_path(&db_path, &config_path)
         .await
         .expect("reopen");
     assert_eq!(
@@ -2256,7 +947,7 @@ async fn schema_version_mismatch_rebuilds_database() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("config.sqlite3");
     let config_path = dir.path().join("config.toml");
-    let store = ConfigStore::open_with_config_path(&db_path, &config_path)
+    let store = MaiStore::open_with_config_path(&db_path, &config_path)
         .await
         .expect("open");
     store
@@ -2275,7 +966,7 @@ async fn schema_version_mismatch_rebuilds_database() {
         .expect("mark old schema");
     drop(store);
 
-    let reopened = ConfigStore::open_with_config_path(&db_path, &config_path)
+    let reopened = MaiStore::open_with_config_path(&db_path, &config_path)
         .await
         .expect("reopen");
     assert_eq!(

@@ -1,9 +1,5 @@
 use crate::*;
 
-pub(crate) fn session_context_tokens_key(agent_id: AgentId, session_id: SessionId) -> String {
-    format!("session_context_tokens:{agent_id}:{session_id}")
-}
-
 pub(crate) fn parse_agent_id(value: &str) -> Result<AgentId> {
     Uuid::parse_str(value)
         .map_err(|err| StoreError::InvalidConfig(format!("invalid agent id `{value}`: {err}")))

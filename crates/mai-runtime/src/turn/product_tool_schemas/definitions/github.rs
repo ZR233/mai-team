@@ -33,6 +33,15 @@ pub(crate) fn definitions() -> Vec<ToolSchema> {
                     "description": "Optional JSON object request body passed to gh api via stdin. Do not provide this field as a JSON-encoded string."
                 }),
             ),
+            ToolInputSchemaField::optional(
+                "fields",
+                json!({
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "maxItems": 32,
+                    "description": "Optional top-level response fields to retain. For array responses the selection is applied to each object. Error and pagination metadata are always retained."
+                }),
+            ),
         ],
     )]
 }

@@ -82,7 +82,7 @@ async fn execute_git_tool_via_registry(
                 }),
             );
     let kernel = pl_core::AgentKernel::builder(
-        pl_core::PureCoreBuilder::from_provider_info(pl_model::ProviderInfo::deepseek(None))
+        pl_core::TurnEngineBuilder::from_provider_info(pl_model::ProviderInfo::deepseek(None))
             .map_err(runtime_error_from_pure)?,
     )
     .with_profile(pl_core::CoreAgentProfile::host_provided(

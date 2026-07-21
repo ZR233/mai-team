@@ -6,11 +6,12 @@ use mai_protocol::{
     GitAccountsResponse, GitProvider, GitTokenKind, GithubRepositoriesResponse,
     GithubRepositorySummary, RepositoryPackagesResponse,
 };
-use mai_store::ConfigStore;
+use mai_store::MaiStore;
 
 use super::{
     GithubRepositoryApi, GithubUserApi, decode_github_response, git_token_kind, github_api_url,
     github_headers, github_repository_summary, github_scopes, repository_packages_with_token,
+    retry_github_request,
 };
 use crate::{GithubAppBackend, Result, RuntimeError};
 
@@ -43,7 +44,7 @@ impl GitAccountTokenUse {
 
 #[derive(Clone)]
 pub(crate) struct GitAccountService {
-    store: Arc<ConfigStore>,
+    store: Arc<MaiStore>,
     http: reqwest::Client,
     api_base_url: String,
     github_backend: Arc<dyn GithubAppBackend>,
@@ -51,7 +52,7 @@ pub(crate) struct GitAccountService {
 
 impl GitAccountService {
     pub(crate) fn new(
-        store: Arc<ConfigStore>,
+        store: Arc<MaiStore>,
         http: reqwest::Client,
         api_base_url: String,
         github_backend: Arc<dyn GithubAppBackend>,
@@ -287,10 +288,14 @@ impl GitAccountService {
                     "relay git account installation_id is missing".to_string(),
                 )
             })?;
-            let response = self
-                .github_backend
-                .github_installation_token(installation_id, None, token_use.include_packages())
-                .await?;
+            let response = retry_github_request("create installation token", || {
+                self.github_backend.github_installation_token(
+                    installation_id,
+                    None,
+                    token_use.include_packages(),
+                )
+            })
+            .await?;
             return Ok(GitAccountToken {
                 token: response.token,
                 expires_at: Some(response.expires_at),
@@ -334,6 +339,7 @@ mod tests {
     struct MockGithubAppBackend {
         token_requests: Mutex<Vec<(u64, Option<u64>, bool)>>,
         repository_requests: Mutex<Vec<u64>>,
+        transient_token_failures: Mutex<usize>,
         token_expires_at: chrono::DateTime<Utc>,
     }
 
@@ -342,7 +348,17 @@ mod tests {
             Self {
                 token_requests: Mutex::new(Vec::new()),
                 repository_requests: Mutex::new(Vec::new()),
+                transient_token_failures: Mutex::new(0),
                 token_expires_at: Utc::now() + TimeDelta::hours(1),
+            }
+        }
+    }
+
+    impl MockGithubAppBackend {
+        fn with_transient_token_failures(count: usize) -> Self {
+            Self {
+                transient_token_failures: Mutex::new(count),
+                ..Self::default()
             }
         }
     }
@@ -423,6 +439,14 @@ mod tests {
                 repository_id,
                 include_packages,
             ));
+            let mut transient_failures = self.transient_token_failures.lock().await;
+            if *transient_failures > 0 {
+                *transient_failures -= 1;
+                return Err(RuntimeError::InvalidInput(
+                    "relay invalid_input failed: invalid input: create installation token failed with 503 Service Unavailable"
+                        .to_string(),
+                ));
+            }
             Ok(RelayGithubInstallationTokenResponse {
                 token: if include_packages {
                     "packages-token".to_string()
@@ -434,9 +458,9 @@ mod tests {
         }
     }
 
-    async fn test_store(dir: &tempfile::TempDir) -> Arc<ConfigStore> {
+    async fn test_store(dir: &tempfile::TempDir) -> Arc<MaiStore> {
         Arc::new(
-            ConfigStore::open_with_config_and_artifact_index_path(
+            MaiStore::open_with_config_and_artifact_index_path(
                 dir.path().join("runtime.sqlite3"),
                 dir.path().join("config.toml"),
                 dir.path().join("data/artifacts/index"),
@@ -641,6 +665,41 @@ mod tests {
         assert_eq!(
             github_backend.token_requests.lock().await.as_slice(),
             &[(42, None, false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_git_account_token_retries_transient_github_failure() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(&dir).await;
+        store
+            .upsert_git_account(GitAccountRequest {
+                id: Some("relay-account".to_string()),
+                provider: GitProvider::GithubAppRelay,
+                label: "Relay".to_string(),
+                installation_id: Some(42),
+                installation_account: Some("octo".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("save account");
+        let github_backend = Arc::new(MockGithubAppBackend::with_transient_token_failures(1));
+        let service = GitAccountService::new(
+            Arc::clone(&store),
+            reqwest::Client::new(),
+            "http://127.0.0.1".to_string(),
+            github_backend.clone(),
+        );
+
+        let token = service
+            .token_details("relay-account")
+            .await
+            .expect("token details after retry");
+
+        assert_eq!(token.token, "default-token");
+        assert_eq!(
+            github_backend.token_requests.lock().await.as_slice(),
+            &[(42, None, false), (42, None, false)]
         );
     }
 }

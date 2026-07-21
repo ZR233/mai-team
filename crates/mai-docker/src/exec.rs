@@ -13,6 +13,7 @@ use crate::args::{HOST_NETWORK, validate_image};
 use crate::capture::{await_capture_task, capture_stream};
 use crate::client::DockerClient;
 use crate::error::{DockerError, Result};
+use crate::mount::{ContainerVolumeMount, validate_additional_mounts};
 use crate::naming::MANAGED_LABEL;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,7 +55,7 @@ pub struct SidecarParams<'a> {
     pub cwd: Option<&'a str>,
     pub env: &'a [(String, String)],
     pub workspace_volume: Option<&'a str>,
-    pub mounts: &'a [(&'a str, &'a str)],
+    pub mounts: &'a [ContainerVolumeMount],
     pub timeout_secs: Option<u64>,
 }
 
@@ -267,6 +268,7 @@ impl DockerClient {
 
     pub async fn run_sidecar_shell_env(&self, params: &SidecarParams<'_>) -> Result<ExecOutput> {
         let image = validate_image(params.image)?;
+        validate_additional_mounts(params.mounts)?;
         let shell_command = shell_command_with_timeout(
             params.command,
             ShellCommandTimeout::from_optional_seconds(params.timeout_secs),
@@ -281,8 +283,8 @@ impl DockerClient {
             let mount = format!("{volume}:/workspace");
             cmd.args(["-v", &mount]);
         }
-        for (volume, target) in params.mounts {
-            cmd.args(["-v", &format!("{volume}:{target}")]);
+        for mount in params.mounts {
+            cmd.args(["--mount", &mount.docker_mount_spec()]);
         }
         if let Some(cwd) = params.cwd {
             cmd.args(["-w", cwd]);
@@ -333,6 +335,7 @@ impl DockerClient {
 
     pub fn spawn_sidecar(&self, params: &SidecarParams<'_>) -> Result<Child> {
         let image = validate_image(params.image)?;
+        validate_additional_mounts(params.mounts)?;
         let mut cmd = Command::new(&self.binary);
         cmd.arg("run")
             .arg("--rm")
@@ -343,8 +346,8 @@ impl DockerClient {
         if let Some(volume) = params.workspace_volume {
             cmd.args(["-v", &format!("{volume}:/workspace")]);
         }
-        for (volume, target) in params.mounts {
-            cmd.args(["-v", &format!("{volume}:{target}")]);
+        for mount in params.mounts {
+            cmd.args(["--mount", &mount.docker_mount_spec()]);
         }
         if let Some(cwd) = params.cwd {
             cmd.args(["-w", cwd]);

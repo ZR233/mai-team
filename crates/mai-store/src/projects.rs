@@ -1,7 +1,7 @@
 use crate::records::*;
 use crate::*;
 
-impl ConfigStore {
+impl MaiStore {
     pub async fn save_project(&self, project: &ProjectSummary) -> Result<()> {
         crate::sqlite_busy::retry_sqlite_busy(|| async { self.save_project_once(project).await })
             .await
@@ -84,13 +84,14 @@ impl ConfigStore {
 
     pub async fn save_project_review_run(&self, run: &ProjectReviewRunDetail) -> Result<()> {
         let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
         Query::<List<ProjectReviewRunRecord>>::filter(
             ProjectReviewRunRecord::fields()
                 .id()
                 .eq(run.summary.id.to_string()),
         )
         .delete()
-        .exec(&mut db)
+        .exec(&mut tx)
         .await?;
         toasty::create!(ProjectReviewRunRecord {
             id: run.summary.id.to_string(),
@@ -121,8 +122,9 @@ impl ConfigStore {
             messages_json: serde_json::to_string(&run.messages)?,
             events_json: serde_json::to_string(&run.events)?,
         })
-        .exec(&mut db)
+        .exec(&mut tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 

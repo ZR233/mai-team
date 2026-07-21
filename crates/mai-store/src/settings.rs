@@ -1,7 +1,7 @@
 use crate::records::*;
 use crate::*;
 
-impl ConfigStore {
+impl MaiStore {
     pub async fn list_mcp_servers(&self) -> Result<BTreeMap<String, McpServerConfig>> {
         let mut db = self.db.clone();
         let mut rows = Query::<List<McpServerRecord>>::all().exec(&mut db).await?;
@@ -53,27 +53,6 @@ impl ConfigStore {
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         let mut db = self.db.clone();
         set_setting_on(&mut db, key, value).await
-    }
-
-    pub async fn load_agent_config(&self) -> Result<AgentConfigRequest> {
-        let Some(value) = self.get_setting(SETTING_AGENT_CONFIG).await? else {
-            return Ok(AgentConfigRequest::default());
-        };
-        match serde_json::from_str(&value) {
-            Ok(config) => Ok(config),
-            Err(_) => {
-                let mut db = self.db.clone();
-                let mut tx = db.transaction().await?;
-                delete_setting_in_tx(&mut tx, SETTING_AGENT_CONFIG).await?;
-                tx.commit().await?;
-                Ok(AgentConfigRequest::default())
-            }
-        }
-    }
-
-    pub async fn save_agent_config(&self, config: &AgentConfigRequest) -> Result<()> {
-        self.set_setting(SETTING_AGENT_CONFIG, &serde_json::to_string(config)?)
-            .await
     }
 
     pub async fn load_skills_config(&self) -> Result<SkillsConfigRequest> {

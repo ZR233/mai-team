@@ -5,7 +5,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use mai_protocol::{ArtifactInfo, TaskId};
 use mai_runtime::AgentRuntime;
-use mai_store::ConfigStore;
+use mai_store::MaiStore;
 
 #[derive(Debug)]
 pub(crate) enum ArtifactError {
@@ -41,12 +41,12 @@ impl From<mai_store::StoreError> for ArtifactError {
 }
 
 pub(crate) struct ArtifactService {
-    store: Arc<ConfigStore>,
+    store: Arc<MaiStore>,
     runtime: Arc<AgentRuntime>,
 }
 
 impl ArtifactService {
-    pub(crate) fn new(store: Arc<ConfigStore>, runtime: Arc<AgentRuntime>) -> Self {
+    pub(crate) fn new(store: Arc<MaiStore>, runtime: Arc<AgentRuntime>) -> Self {
         Self { store, runtime }
     }
 

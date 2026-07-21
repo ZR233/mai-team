@@ -1,6 +1,6 @@
 use crate::*;
 
-impl ConfigStore {
+impl MaiStore {
     pub fn save_artifact(&self, info: &ArtifactInfo) -> Result<()> {
         let dir = self.artifact_index_dir();
         std::fs::create_dir_all(dir)?;

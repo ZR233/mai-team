@@ -1,16 +1,8 @@
-pub(crate) mod accounting;
-pub(crate) mod agent_control;
-pub(crate) mod completion;
 pub(crate) mod container;
 pub(crate) mod core_adapter;
-pub(crate) mod history;
-pub(crate) mod hosted_runtime;
-pub(crate) mod kernel_tools;
 pub(crate) mod mcp_resources;
-pub(crate) mod mcp_tools;
-pub(crate) mod orchestrator;
-pub(crate) mod persistence;
 pub(crate) mod product_tool_schemas;
 pub(crate) mod product_tools;
+mod tool_artifact;
 pub(crate) mod tool_output;
 pub(crate) mod tool_visibility;

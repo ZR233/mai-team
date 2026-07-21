@@ -10,7 +10,7 @@ use crate::services::relay_manager::RelayManager;
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) runtime: Arc<mai_runtime::AgentRuntime>,
-    pub(crate) store: Arc<mai_store::ConfigStore>,
+    pub(crate) store: Arc<mai_store::MaiStore>,
     pub(crate) relay: Arc<RelayManager>,
 }
 
@@ -30,12 +30,14 @@ impl From<mai_runtime::RuntimeError> for ApiError {
             | ProjectReviewRunNotFound(_) => StatusCode::NOT_FOUND,
             TurnNotFound { .. } => StatusCode::NOT_FOUND,
             SessionNotFound { .. } => StatusCode::NOT_FOUND,
+            SessionEventNotFound(_) => StatusCode::NOT_FOUND,
             ToolTraceNotFound { .. } => StatusCode::NOT_FOUND,
             AgentBusy(_) | TaskBusy(_) => StatusCode::CONFLICT,
             InvalidInput(_) => StatusCode::BAD_REQUEST,
             MissingContainer(_) => StatusCode::CONFLICT,
             TurnCancelled => StatusCode::CONFLICT,
-            Docker(_) | Model(_) | Mcp(_) | Store(_) | Skill(_) | Io(_) | Http(_) | Jwt(_) => {
+            GithubUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Docker(_) | Model(_) | Store(_) | Skill(_) | Io(_) | Http(_) | Jwt(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         };
@@ -135,5 +137,17 @@ mod tests {
         let err = RuntimeError::TurnCancelled;
         let api: ApiError = err.into();
         assert_eq!(api.status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn runtime_error_github_unavailable_maps_to_503() {
+        let err = RuntimeError::GithubUnavailable {
+            operation: "read project GitHub API".to_string(),
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            message: "temporarily unavailable".to_string(),
+            retry_after: None,
+        };
+        let api: ApiError = err.into();
+        assert_eq!(api.status, StatusCode::SERVICE_UNAVAILABLE);
     }
 }

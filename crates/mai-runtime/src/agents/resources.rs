@@ -1,15 +1,11 @@
-use std::borrow::Cow;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use crate::mcp::McpAgentManager;
 use crate::skills::SkillsManager;
-use mai_protocol::{AgentId, SkillScope, SkillsConfigRequest, SkillsListResponse};
+use mai_protocol::{SkillScope, SkillsConfigRequest, SkillsListResponse};
 use serde_json::{Value, json};
 use tokio::sync::OwnedRwLockReadGuard;
-use tokio_util::sync::CancellationToken;
 
 use crate::state::AgentRecord;
 use crate::{Result, RuntimeError};
@@ -19,8 +15,6 @@ pub(crate) const PROJECT_SKILL_RESOURCE_SERVER: &str = "project-skill";
 pub(crate) const SKILL_RESOURCE_SCHEME: &str = "skill:///";
 
 pub(crate) struct AgentResourceBroker {
-    pub(crate) agent_mcp: Option<Arc<McpAgentManager>>,
-    pub(crate) project_mcp: Option<Arc<McpAgentManager>>,
     pub(crate) skills: SkillsListResponse,
     pub(crate) _project_skill_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
@@ -28,13 +22,6 @@ pub(crate) struct AgentResourceBroker {
 /// Provides MCP and skill resources needed to build an agent resource broker
 /// without exposing the runtime facade to resource listing code.
 pub(crate) trait AgentResourceBrokerOps: Send + Sync {
-    fn project_mcp_manager_for_agent(
-        &self,
-        agent: &AgentRecord,
-        agent_id: AgentId,
-        cancellation_token: &CancellationToken,
-    ) -> impl Future<Output = Result<Option<Arc<McpAgentManager>>>> + Send;
-
     fn project_skill_read_guard(
         &self,
         agent: &AgentRecord,
@@ -51,17 +38,7 @@ pub(crate) trait AgentResourceBrokerOps: Send + Sync {
 pub(crate) async fn agent_resource_broker(
     ops: &impl AgentResourceBrokerOps,
     agent: &AgentRecord,
-    agent_id: AgentId,
-    cancellation_token: &CancellationToken,
 ) -> Result<AgentResourceBroker> {
-    let agent_mcp = agent.mcp.read().await.clone();
-    let project_mcp = if agent.summary.read().await.project_id.is_some() {
-        ops.project_mcp_manager_for_agent(agent, agent_id, cancellation_token)
-            .await
-            .unwrap_or(None)
-    } else {
-        None
-    };
     let project_skill_guard = ops.project_skill_read_guard(agent).await;
     let skills_config = ops.skills_config().await?;
     let skills = ops
@@ -69,8 +46,6 @@ pub(crate) async fn agent_resource_broker(
         .await?
         .list(&skills_config)?;
     Ok(AgentResourceBroker {
-        agent_mcp,
-        project_mcp,
         skills,
         _project_skill_guard: project_skill_guard,
     })
@@ -93,28 +68,15 @@ impl AgentResourceBroker {
             return Ok(skill_resources_value(server, &self.skills.skills));
         }
         if let Some(server) = server {
-            let normalized = normalize_mcp_resource_server(server);
-            if let Some(manager) = self.manager_for_server(&normalized).await {
-                return Ok(manager.list_resources(Some(&normalized), cursor).await?);
-            }
             return Err(resource_provider_not_found(server));
         }
-
-        let mut resources = Vec::new();
-        resources.extend(skill_resource_values(&self.skills.skills));
-        for manager in self.mcp_managers() {
-            let value = manager.list_resources(None, None).await?;
-            if let Some(items) = value.get("resources").and_then(Value::as_array) {
-                resources.extend(items.iter().cloned());
-            }
-        }
-        Ok(json!({ "resources": resources }))
+        Ok(json!({ "resources": skill_resource_values(&self.skills.skills) }))
     }
 
     pub(crate) async fn list_resource_templates(
         &self,
         server: Option<&str>,
-        cursor: Option<String>,
+        _cursor: Option<String>,
     ) -> Result<Value> {
         if is_skill_resource_server(server) {
             return Ok(json!({
@@ -124,32 +86,14 @@ impl AgentResourceBroker {
             }));
         }
         if let Some(server) = server {
-            let normalized = normalize_mcp_resource_server(server);
-            if let Some(manager) = self.manager_for_server(&normalized).await {
-                return Ok(manager
-                    .list_resource_templates(Some(&normalized), cursor)
-                    .await?);
-            }
             return Err(resource_provider_not_found(server));
         }
-
-        let mut templates = Vec::new();
-        for manager in self.mcp_managers() {
-            let value = manager.list_resource_templates(None, None).await?;
-            if let Some(items) = value.get("resourceTemplates").and_then(Value::as_array) {
-                templates.extend(items.iter().cloned());
-            }
-        }
-        Ok(json!({ "resourceTemplates": templates }))
+        Ok(json!({ "resourceTemplates": [] }))
     }
 
     pub(crate) async fn read_resource(&self, server: &str, uri: &str) -> Result<Value> {
         if is_skill_resource_server(Some(server)) || uri.starts_with(SKILL_RESOURCE_SCHEME) {
             return self.read_skill_resource(uri);
-        }
-        let normalized = normalize_mcp_resource_server(server);
-        if let Some(manager) = self.manager_for_server(&normalized).await {
-            return Ok(manager.read_resource(&normalized, uri).await?);
         }
         Err(resource_provider_not_found(server))
     }
@@ -206,35 +150,6 @@ impl AgentResourceBroker {
                 "text": contents,
             }]
         }))
-    }
-
-    async fn manager_for_server(&self, server: &str) -> Option<Arc<McpAgentManager>> {
-        for manager in self.mcp_managers() {
-            if manager
-                .resource_servers()
-                .await
-                .iter()
-                .any(|resource_server| resource_server == server)
-            {
-                return Some(manager);
-            }
-        }
-        None
-    }
-
-    fn mcp_managers(&self) -> Vec<Arc<McpAgentManager>> {
-        let mut managers = Vec::new();
-        if let Some(manager) = &self.agent_mcp {
-            managers.push(Arc::clone(manager));
-        }
-        if let Some(manager) = &self.project_mcp
-            && !managers
-                .iter()
-                .any(|existing| Arc::ptr_eq(existing, manager))
-        {
-            managers.push(Arc::clone(manager));
-        }
-        managers
     }
 }
 
@@ -315,13 +230,6 @@ fn is_skill_resource_server(server: Option<&str>) -> bool {
             || server == format!("mcp:{SKILL_RESOURCE_SERVER}")
             || server == format!("mcp:{PROJECT_SKILL_RESOURCE_SERVER}")
     })
-}
-
-fn normalize_mcp_resource_server(server: &str) -> Cow<'_, str> {
-    server
-        .strip_prefix("mcp:")
-        .map(Cow::Borrowed)
-        .unwrap_or_else(|| Cow::Borrowed(server))
 }
 
 fn resource_provider_not_found(server: &str) -> RuntimeError {

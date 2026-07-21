@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::time::Duration;
 
 use tokio::process::Command;
 
@@ -12,6 +13,7 @@ use crate::error::{DockerError, Result};
 use crate::inspect::{
     ManagedContainer, ManagedVolume, managed_containers_from_inspect, managed_volumes_from_inspect,
 };
+use crate::mount::{ContainerVolumeMount, validate_additional_mounts};
 use crate::naming::{
     MANAGED_LABEL, agent_container_name, agent_label, agent_workspace_volume,
     project_sidecar_container_name, snapshot_image_name,
@@ -21,6 +23,9 @@ use crate::selection::{
     find_reusable_project_sidecar_container, orphaned_container_ids,
     project_sidecar_container_delete_ids,
 };
+
+const VOLUME_DELETE_RETRY_ATTEMPTS: usize = 50;
+const VOLUME_DELETE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerHandle {
@@ -212,39 +217,43 @@ impl DockerClient {
         image: &str,
         workspace_volume: Option<&str>,
     ) -> Result<ContainerHandle> {
-        let image = validate_image(image)?;
-        if let Some(container) = self
-            .reusable_agent_container(agent_id, preferred_container_id)
-            .await?
-        {
-            return self.prepare_existing_container(container).await;
-        }
-
-        self.create_agent_container_from_image_with_workspace(agent_id, image, workspace_volume)
-            .await
+        self.ensure_agent_container_from_image_with_workspace_and_mounts(
+            agent_id,
+            preferred_container_id,
+            image,
+            workspace_volume,
+            &[],
+        )
+        .await
     }
 
-    pub async fn ensure_agent_container_from_image_with_workspace_and_repo_mount(
+    pub async fn ensure_agent_container_from_image_with_workspace_and_mounts(
         &self,
         agent_id: &str,
         preferred_container_id: Option<&str>,
         image: &str,
         workspace_volume: Option<&str>,
-        repo_mount: Option<&str>,
+        mounts: &[ContainerVolumeMount],
     ) -> Result<ContainerHandle> {
         let image = validate_image(image)?;
-        if let Some(container) = self
-            .reusable_agent_container(agent_id, preferred_container_id)
-            .await?
-        {
-            return self.prepare_existing_container(container).await;
+        validate_additional_mounts(mounts)?;
+        if mounts.is_empty() {
+            if let Some(container) = self
+                .reusable_agent_container(agent_id, preferred_container_id)
+                .await?
+            {
+                return self.prepare_existing_container(container).await;
+            }
+        } else {
+            self.delete_agent_containers(agent_id, preferred_container_id)
+                .await?;
         }
 
-        self.create_agent_container_from_image_with_workspace_and_repo_mount(
+        self.create_agent_container_from_image_with_workspace_and_mounts(
             agent_id,
             image,
             workspace_volume,
-            repo_mount,
+            mounts,
         )
         .await
     }
@@ -269,22 +278,13 @@ impl DockerClient {
         parent_container_id: &str,
         workspace_volume: Option<&str>,
     ) -> Result<ContainerHandle> {
-        let image = snapshot_image_name(agent_id);
-        let commit = Command::new(&self.binary)
-            .args(["commit", parent_container_id, &image])
-            .output()
-            .await?;
-        if !commit.status.success() {
-            return Err(DockerError::CommandFailed(stderr_or_stdout(&commit)));
-        }
-
-        let result = self
-            .create_agent_container_from_image_with_workspace(agent_id, &image, workspace_volume)
-            .await;
-        if let Err(err) = self.delete_image(&image).await {
-            tracing::warn!(image = %image, "failed to remove temporary snapshot image: {err}");
-        }
-        result
+        self.create_agent_container_from_parent_with_workspace_and_mounts(
+            agent_id,
+            parent_container_id,
+            workspace_volume,
+            &[],
+        )
+        .await
     }
 
     async fn create_agent_container_from_image(
@@ -296,13 +296,14 @@ impl DockerClient {
             .await
     }
 
-    pub async fn create_agent_container_from_parent_with_workspace_and_repo_mount(
+    pub async fn create_agent_container_from_parent_with_workspace_and_mounts(
         &self,
         agent_id: &str,
         parent_container_id: &str,
         workspace_volume: Option<&str>,
-        repo_mount: Option<&str>,
+        mounts: &[ContainerVolumeMount],
     ) -> Result<ContainerHandle> {
+        validate_additional_mounts(mounts)?;
         let image = snapshot_image_name(agent_id);
         let commit = Command::new(&self.binary)
             .args(["commit", parent_container_id, &image])
@@ -313,11 +314,11 @@ impl DockerClient {
         }
 
         let result = self
-            .create_agent_container_from_image_with_workspace_and_repo_mount(
+            .create_agent_container_from_image_with_workspace_and_mounts(
                 agent_id,
                 &image,
                 workspace_volume,
-                repo_mount,
+                mounts,
             )
             .await;
         if let Err(err) = self.delete_image(&image).await {
@@ -332,23 +333,24 @@ impl DockerClient {
         image: &str,
         workspace_volume: Option<&str>,
     ) -> Result<ContainerHandle> {
-        self.create_agent_container_from_image_with_workspace_and_repo_mount(
+        self.create_agent_container_from_image_with_workspace_and_mounts(
             agent_id,
             image,
             workspace_volume,
-            None,
+            &[],
         )
         .await
     }
 
-    async fn create_agent_container_from_image_with_workspace_and_repo_mount(
+    async fn create_agent_container_from_image_with_workspace_and_mounts(
         &self,
         agent_id: &str,
         image: &str,
         workspace_volume: Option<&str>,
-        repo_mount: Option<&str>,
+        mounts: &[ContainerVolumeMount],
     ) -> Result<ContainerHandle> {
         let image = validate_image(image)?;
+        validate_additional_mounts(mounts)?;
         let name = agent_container_name(agent_id);
         let label = agent_label(agent_id);
         let default_workspace_volume;
@@ -359,14 +361,13 @@ impl DockerClient {
                 &default_workspace_volume
             }
         };
-        if let Some(repo_mount) = repo_mount {
-            tracing::warn!(
-                repo_mount,
-                "ignoring host repo bind mount; project agents use workspace volumes"
-            );
-        }
-        let args =
-            create_agent_container_args_with_workspace(&name, &label, image, workspace_volume);
+        let args = create_agent_container_args_with_workspace(
+            &name,
+            &label,
+            image,
+            workspace_volume,
+            mounts,
+        );
         let create = Command::new(&self.binary)
             .args(args.iter().map(String::as_str))
             .output()
@@ -513,14 +514,21 @@ impl DockerClient {
     }
 
     pub async fn delete_volume(&self, volume: &str) -> Result<()> {
-        let output = Command::new(&self.binary)
-            .args(["volume", "rm", "-f", volume])
-            .output()
-            .await?;
-        if !output.status.success() {
+        for attempt in 0..VOLUME_DELETE_RETRY_ATTEMPTS {
+            let output = Command::new(&self.binary)
+                .args(["volume", "rm", "-f", volume])
+                .output()
+                .await?;
+            if output.status.success() {
+                return Ok(());
+            }
             let message = stderr_or_stdout(&output);
             if is_missing_volume_error(&message) {
                 return Ok(());
+            }
+            if is_volume_in_use_error(&message) && attempt + 1 < VOLUME_DELETE_RETRY_ATTEMPTS {
+                tokio::time::sleep(VOLUME_DELETE_RETRY_DELAY).await;
+                continue;
             }
             return Err(DockerError::CommandFailed(message));
         }
@@ -642,6 +650,10 @@ fn is_missing_volume_error(message: &str) -> bool {
     message.contains("no such volume") || message.contains("no such object")
 }
 
+fn is_volume_in_use_error(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("volume is in use")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,6 +676,13 @@ mod tests {
     fn missing_object_during_volume_inspect_is_idempotent() {
         assert!(is_missing_volume_error(
             "Error response from daemon: no such object: mai-team-project-1-cache"
+        ));
+    }
+
+    #[test]
+    fn volume_in_use_is_retryable_during_container_removal() {
+        assert!(is_volume_in_use_error(
+            "Error response from daemon: remove workspace: volume is in use - [container]"
         ));
     }
 }

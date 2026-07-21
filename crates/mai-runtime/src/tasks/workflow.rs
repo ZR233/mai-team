@@ -1,7 +1,9 @@
 use std::future::Future;
 use std::time::Duration;
 
-use mai_protocol::{AgentId, AgentRole, AgentStatus, AgentSummary, TaskId, TaskStatus, TurnId};
+use mai_protocol::{
+    AgentId, AgentRole, AgentSummary, AgentTurnOutcomeKind, TaskId, TaskStatus, TurnId,
+};
 
 use crate::state::RuntimeState;
 use crate::{Result, RuntimeError};
@@ -67,13 +69,9 @@ pub(crate) async fn run_task_workflow(
     .await?;
     let mut executor_summary = ops.wait_agent(executor.id, TASK_AGENT_WAIT_TIMEOUT).await?;
     for round in 1..=REVIEW_ROUND_LIMIT {
-        if matches!(
-            executor_summary.status,
-            AgentStatus::Failed | AgentStatus::Cancelled
-        ) {
+        if let Some(outcome) = failed_turn_outcome(&executor_summary) {
             return Err(RuntimeError::InvalidInput(format!(
-                "executor ended with status {:?}",
-                executor_summary.status
+                "executor turn ended with outcome {outcome:?}"
             )));
         }
         let reviewer = ops
@@ -93,13 +91,9 @@ pub(crate) async fn run_task_workflow(
         )
         .await?;
         let reviewer_summary = ops.wait_agent(reviewer.id, TASK_AGENT_WAIT_TIMEOUT).await?;
-        if matches!(
-            reviewer_summary.status,
-            AgentStatus::Failed | AgentStatus::Cancelled
-        ) {
+        if let Some(outcome) = failed_turn_outcome(&reviewer_summary) {
             return Err(RuntimeError::InvalidInput(format!(
-                "reviewer ended with status {:?}",
-                reviewer_summary.status
+                "reviewer turn ended with outcome {outcome:?}"
             )));
         }
         let latest_review = task.reviews.read().await.last().cloned();
@@ -144,4 +138,21 @@ pub(crate) async fn run_task_workflow(
         executor_summary = ops.wait_agent(executor.id, TASK_AGENT_WAIT_TIMEOUT).await?;
     }
     Ok(())
+}
+
+fn failed_turn_outcome(summary: &AgentSummary) -> Option<AgentTurnOutcomeKind> {
+    summary
+        .state
+        .runtime
+        .last_turn
+        .as_ref()
+        .map(|turn| turn.outcome)
+        .filter(|outcome| {
+            matches!(
+                outcome,
+                AgentTurnOutcomeKind::Failed
+                    | AgentTurnOutcomeKind::Cancelled
+                    | AgentTurnOutcomeKind::BudgetLimited
+            )
+        })
 }

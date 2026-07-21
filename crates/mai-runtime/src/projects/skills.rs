@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::skills::SkillsManager;
 use mai_protocol::{ProjectId, SkillScope, SkillsListResponse};
-use mai_store::ConfigStore;
+use mai_store::MaiStore;
 use pl_core::shell_quote_word;
 use tokio::sync::RwLock;
 
@@ -47,7 +47,7 @@ pub(crate) fn roots_for_project(
 }
 
 pub(crate) async fn list_from_cache(
-    store: &ConfigStore,
+    store: &MaiStore,
     cache_root: &Path,
     lock: &Arc<RwLock<()>>,
     project_id: ProjectId,
@@ -60,11 +60,11 @@ pub(crate) async fn list_from_cache(
     Ok(response)
 }
 
-pub(crate) fn detect_existing_dirs_command() -> String {
+pub(crate) fn detect_existing_dirs_command(workspace_root: &str) -> String {
     PROJECT_SKILL_CANDIDATE_DIRS
         .iter()
         .map(|(relative, cache_name)| {
-            let container_path = format!("{PROJECT_WORKSPACE_PATH}/{relative}");
+            let container_path = format!("{workspace_root}/{relative}");
             format!(
                 "if [ -d {path} ]; then printf '%s\\t%s\\t%s\\n' {relative} {cache_name} {path}; fi",
                 relative = shell_quote_word(relative),
@@ -76,16 +76,19 @@ pub(crate) fn detect_existing_dirs_command() -> String {
         .join("\n")
 }
 
-pub(crate) fn detected_dirs_from_stdout(stdout: &str) -> Result<Vec<ProjectSkillSourceDir>> {
+pub(crate) fn detected_dirs_from_stdout(
+    workspace_root: &str,
+    stdout: &str,
+) -> Result<Vec<ProjectSkillSourceDir>> {
     stdout
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(detected_dir_from_line)
+        .map(|line| detected_dir_from_line(workspace_root, line))
         .collect()
 }
 
-fn detected_dir_from_line(line: &str) -> Result<ProjectSkillSourceDir> {
+fn detected_dir_from_line(workspace_root: &str, line: &str) -> Result<ProjectSkillSourceDir> {
     let parts = line.split('\t').collect::<Vec<_>>();
     let [relative, cache_name, container_path] = parts.as_slice() else {
         return Err(RuntimeError::InvalidInput(format!(
@@ -102,7 +105,7 @@ fn detected_dir_from_line(line: &str) -> Result<ProjectSkillSourceDir> {
             "unsupported project skill source listing: {line}"
         )));
     }
-    let expected_path = format!("{PROJECT_WORKSPACE_PATH}/{relative}");
+    let expected_path = format!("{workspace_root}/{relative}");
     if *container_path != expected_path {
         return Err(RuntimeError::InvalidInput(format!(
             "unexpected project skill source path: {container_path}"
@@ -122,11 +125,14 @@ pub(crate) async fn refresh_cache(
     sources: &[ProjectSkillSourceDir],
 ) -> Result<()> {
     let _guard = lock.write().await;
-    let cache_dir = cache_dir(cache_root, project_id);
+    refresh_cache_dir(&cache_dir(cache_root, project_id), sources)
+}
+
+pub(crate) fn refresh_cache_dir(cache_dir: &Path, sources: &[ProjectSkillSourceDir]) -> Result<()> {
     if cache_dir.exists() {
-        fs::remove_dir_all(&cache_dir)?;
+        fs::remove_dir_all(cache_dir)?;
     }
-    fs::create_dir_all(&cache_dir)?;
+    fs::create_dir_all(cache_dir)?;
     for project_source in sources {
         let target = cache_dir.join(&project_source.cache_name);
         let host_source = project_source.host_path.as_ref().ok_or_else(|| {
@@ -162,16 +168,24 @@ pub(crate) fn apply_project_source_paths(
 }
 
 pub(crate) fn apply_source_paths(cache_dir: &Path, response: &mut SkillsListResponse) {
+    apply_source_paths_with_workspace_root(cache_dir, PROJECT_WORKSPACE_PATH, response);
+}
+
+pub(crate) fn apply_source_paths_with_workspace_root(
+    cache_dir: &Path,
+    workspace_root: &str,
+    response: &mut SkillsListResponse,
+) {
     for skill in &mut response.skills {
         if skill.scope != SkillScope::Project {
             continue;
         }
-        if let Some(source_path) = source_path(cache_dir, &skill.path) {
+        if let Some(source_path) = source_path(cache_dir, workspace_root, &skill.path) {
             skill.source_path = Some(source_path);
         }
     }
     for error in &mut response.errors {
-        if let Some(source_path) = source_path(cache_dir, &error.path) {
+        if let Some(source_path) = source_path(cache_dir, workspace_root, &error.path) {
             error.path = source_path;
         }
     }
@@ -180,7 +194,7 @@ pub(crate) fn apply_source_paths(cache_dir: &Path, response: &mut SkillsListResp
         .filter_map(|(relative, cache_name)| {
             let root = cache_dir.join(cache_name);
             root.exists()
-                .then(|| PathBuf::from(PROJECT_WORKSPACE_PATH).join(relative))
+                .then(|| PathBuf::from(workspace_root).join(relative))
         })
         .collect();
 }
@@ -199,7 +213,7 @@ pub(crate) fn normalize_copied_dir(target: &Path, cache_name: &str) -> Result<()
     Ok(())
 }
 
-fn source_path(cache_dir: &Path, path: &Path) -> Option<PathBuf> {
+fn source_path(cache_dir: &Path, workspace_root: &str, path: &Path) -> Option<PathBuf> {
     let relative = path.strip_prefix(cache_dir).ok()?;
     let mut components = relative.components();
     let cache_name = match components.next()? {
@@ -210,7 +224,7 @@ fn source_path(cache_dir: &Path, path: &Path) -> Option<PathBuf> {
         .iter()
         .find(|(_, name)| *name == cache_name.as_ref())
         .map(|(relative, _)| *relative)?;
-    let mut source_path = PathBuf::from(PROJECT_WORKSPACE_PATH).join(source_relative);
+    let mut source_path = PathBuf::from(workspace_root).join(source_relative);
     for component in components {
         match component {
             std::path::Component::Normal(part) => source_path.push(part),
@@ -229,6 +243,7 @@ mod tests {
     #[test]
     fn parses_detected_dirs_from_sidecar_stdout() {
         let sources = detected_dirs_from_stdout(
+            "/workspace/repo",
             ".claude/skills\tclaude\t/workspace/repo/.claude/skills\n\
              skills\tskills\t/workspace/repo/skills\n",
         )
@@ -253,9 +268,32 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_detected_dir() {
-        let err = detected_dirs_from_stdout(".ssh\tssh\t/workspace/repo/.ssh\n")
+        let err = detected_dirs_from_stdout("/workspace/repo", ".ssh\tssh\t/workspace/repo/.ssh\n")
             .expect_err("reject source");
 
         assert!(err.to_string().contains("unsupported project skill source"));
+    }
+
+    #[test]
+    fn reviewer_skill_roots_point_to_read_only_project_view() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cache = temp.path().join("cache");
+        std::fs::create_dir_all(cache.join("agents")).expect("skill cache");
+        let mut response = SkillsListResponse {
+            roots: Vec::new(),
+            skills: Vec::new(),
+            errors: Vec::new(),
+        };
+
+        apply_source_paths_with_workspace_root(&cache, "/project/repo", &mut response);
+
+        assert_eq!(
+            response,
+            SkillsListResponse {
+                roots: vec![PathBuf::from("/project/repo/.agents/skills")],
+                skills: Vec::new(),
+                errors: Vec::new(),
+            }
+        );
     }
 }

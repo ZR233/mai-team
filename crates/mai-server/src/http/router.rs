@@ -28,6 +28,18 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
             get(handlers::providers::get_mcp_servers).put(handlers::providers::save_mcp_servers),
         )
         .route(
+            "/mcp-servers/builtins",
+            axum::routing::put(handlers::providers::save_builtin_mcp_servers),
+        )
+        .route(
+            "/mcp-servers/recheck",
+            post(handlers::providers::recheck_mcp_servers),
+        )
+        .route(
+            "/settings/web-search",
+            get(handlers::providers::get_web_search).put(handlers::providers::save_web_search),
+        )
+        .route(
             "/git/accounts",
             get(handlers::git_accounts::list_git_accounts)
                 .post(handlers::git_accounts::save_git_account),
@@ -119,8 +131,8 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
             get(handlers::github_app::list_github_repository_packages),
         )
         .route(
-            "/provider-presets",
-            get(handlers::config::get_provider_presets),
+            "/provider-catalog",
+            get(handlers::config::get_provider_catalog),
         )
         .route("/skills", get(handlers::config::list_skills))
         .route(
@@ -139,7 +151,11 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
             "/agent-config",
             get(handlers::config::get_agent_config).put(handlers::config::save_agent_config),
         )
-        .route("/events", get(handlers::events::events))
+        .route("/events/product", get(handlers::events::events))
+        .route(
+            "/sessions/{session_id}/events",
+            get(handlers::events::session_events),
+        )
         .route(
             "/environments",
             get(handlers::environments::list_environments)
@@ -160,6 +176,35 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/environments/{id}/conversations/{session_id}/messages",
             post(handlers::environments::send_conversation_message),
+        )
+        .route(
+            "/tasks",
+            get(handlers::tasks::list_tasks).post(handlers::tasks::create_task),
+        )
+        .route(
+            "/tasks:ensure-default",
+            post(handlers::tasks::ensure_default_task),
+        )
+        .route(
+            "/tasks/{id}",
+            get(handlers::tasks::get_task).delete(handlers::tasks::delete_task),
+        )
+        .route(
+            "/tasks/{id}/messages",
+            post(handlers::tasks::send_task_message),
+        )
+        .route(
+            "/tasks/{id}/plan:approve",
+            post(handlers::tasks::approve_task_plan),
+        )
+        .route(
+            "/tasks/{id}/plan:request-revision",
+            post(handlers::tasks::request_plan_revision),
+        )
+        .route("/tasks/{id}/cancel", post(handlers::tasks::cancel_task))
+        .route(
+            "/tasks/{id}/artifacts",
+            get(handlers::tasks::list_artifacts),
         )
         .route(
             "/projects",
@@ -257,6 +302,7 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/agents/{id}/cancel", post(handlers::agents::cancel_agent))
         .fallback(get(routes::assets::static_fallback))
+        .layer(axum::middleware::from_fn(super::spa::serve_spa_navigation))
         .layer(PropagateRequestIdLayer::new(HeaderName::from_static(
             "x-request-id",
         )))

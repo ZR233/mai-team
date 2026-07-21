@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use mai_protocol::AgentId;
 use serde_json::Value;
-use tokio_util::sync::CancellationToken;
 
 use crate::state::AgentRecord;
 use crate::{AgentRuntime, RuntimeError};
@@ -15,14 +13,12 @@ use crate::{AgentRuntime, RuntimeError};
 pub(crate) struct MaiMcpResourceBackend {
     runtime: Arc<AgentRuntime>,
     agent: Arc<AgentRecord>,
-    agent_id: AgentId,
-    cancellation_token: CancellationToken,
+    mcp: Option<pl_core::McpTurnLease>,
 }
 
 impl std::fmt::Debug for MaiMcpResourceBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MaiMcpResourceBackend")
-            .field("agent_id", &self.agent_id)
             .finish_non_exhaustive()
     }
 }
@@ -31,21 +27,29 @@ impl MaiMcpResourceBackend {
     pub(crate) fn new(
         runtime: Arc<AgentRuntime>,
         agent: Arc<AgentRecord>,
-        agent_id: AgentId,
-        cancellation_token: CancellationToken,
+        mcp: Option<pl_core::McpTurnLease>,
     ) -> Self {
         Self {
             runtime,
             agent,
-            agent_id,
-            cancellation_token,
+            mcp,
         }
     }
 
     async fn broker(&self) -> crate::Result<crate::agents::AgentResourceBroker> {
-        self.runtime
-            .agent_resource_broker(&self.agent, self.agent_id, &self.cancellation_token)
-            .await
+        self.runtime.agent_resource_broker(&self.agent).await
+    }
+
+    fn is_skill_request(server: Option<&str>, uri: Option<&str>) -> bool {
+        server.is_some_and(|server| {
+            matches!(
+                server,
+                crate::agents::SKILL_RESOURCE_SERVER
+                    | crate::agents::PROJECT_SKILL_RESOURCE_SERVER
+                    | "mcp:skill"
+                    | "mcp:project-skill"
+            )
+        }) || uri.is_some_and(|uri| uri.starts_with(crate::agents::SKILL_RESOURCE_SCHEME))
     }
 }
 
@@ -56,31 +60,91 @@ impl pl_core::McpResourceBackend for MaiMcpResourceBackend {
         &self,
         request: pl_core::McpListResourcesRequest,
     ) -> std::result::Result<Value, Self::Error> {
-        self.broker()
-            .await?
-            .list_resources(request.server.as_deref(), request.cursor)
-            .await
+        if Self::is_skill_request(request.server.as_deref(), None) || self.mcp.is_none() {
+            return self
+                .broker()
+                .await?
+                .list_resources(request.server.as_deref(), request.cursor)
+                .await;
+        }
+        if request.server.is_some() {
+            return Ok(self
+                .mcp
+                .as_ref()
+                .expect("checked above")
+                .list_resources(request)
+                .await?);
+        }
+        let skills = self.broker().await?.list_resources(None, None).await?;
+        let mcp = self
+            .mcp
+            .as_ref()
+            .expect("checked above")
+            .list_resources(request)
+            .await?;
+        Ok(combine_resource_views(skills, mcp, "skills"))
     }
 
     async fn list_resource_templates(
         &self,
         request: pl_core::McpListResourceTemplatesRequest,
     ) -> std::result::Result<Value, Self::Error> {
-        self.broker()
+        if Self::is_skill_request(request.server.as_deref(), None) || self.mcp.is_none() {
+            return self
+                .broker()
+                .await?
+                .list_resource_templates(request.server.as_deref(), request.cursor)
+                .await;
+        }
+        if request.server.is_some() {
+            return Ok(self
+                .mcp
+                .as_ref()
+                .expect("checked above")
+                .list_resource_templates(request)
+                .await?);
+        }
+        let skills = self
+            .broker()
             .await?
-            .list_resource_templates(request.server.as_deref(), request.cursor)
-            .await
+            .list_resource_templates(None, None)
+            .await?;
+        let mcp = self
+            .mcp
+            .as_ref()
+            .expect("checked above")
+            .list_resource_templates(request)
+            .await?;
+        Ok(combine_resource_views(skills, mcp, "skills"))
     }
 
     async fn read_resource(
         &self,
         request: pl_core::McpReadResourceRequest,
     ) -> std::result::Result<Value, Self::Error> {
-        self.broker()
-            .await?
-            .read_resource(&request.server, &request.uri)
-            .await
+        if Self::is_skill_request(Some(&request.server), Some(&request.uri)) || self.mcp.is_none() {
+            return self
+                .broker()
+                .await?
+                .read_resource(&request.server, &request.uri)
+                .await;
+        }
+        Ok(self
+            .mcp
+            .as_ref()
+            .expect("checked above")
+            .read_resource(request)
+            .await?)
     }
+}
+
+fn combine_resource_views(skills: Value, mcp: Value, skills_key: &str) -> Value {
+    let mut values = match mcp {
+        Value::Object(values) => values,
+        value => serde_json::Map::from_iter([("mcp".to_string(), value)]),
+    };
+    values.insert(skills_key.to_string(), skills);
+    Value::Object(values)
 }
 
 #[cfg(test)]

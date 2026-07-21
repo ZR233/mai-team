@@ -2,24 +2,24 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use mai_protocol::{AgentId, ServiceEvent, ServiceEventKind, SessionId, now};
-use mai_store::ConfigStore;
+use mai_protocol::{MaiProductEventEnvelope, MaiProductEventKind, now};
+use mai_store::MaiStore;
 use tokio::sync::{Mutex, broadcast};
 
 pub(crate) const RECENT_EVENT_LIMIT: usize = 500;
 
 pub(crate) struct RuntimeEvents {
-    tx: broadcast::Sender<ServiceEvent>,
+    tx: broadcast::Sender<MaiProductEventEnvelope>,
     sequence: AtomicU64,
-    recent: Mutex<VecDeque<ServiceEvent>>,
-    store: Arc<ConfigStore>,
+    recent: Mutex<VecDeque<MaiProductEventEnvelope>>,
+    store: Arc<MaiStore>,
 }
 
 impl RuntimeEvents {
     pub(crate) fn new(
-        store: Arc<ConfigStore>,
+        store: Arc<MaiStore>,
         next_sequence: u64,
-        recent_events: Vec<ServiceEvent>,
+        recent_events: Vec<MaiProductEventEnvelope>,
     ) -> Self {
         let (tx, _) = broadcast::channel(1024);
         Self {
@@ -30,20 +30,18 @@ impl RuntimeEvents {
         }
     }
 
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ServiceEvent> {
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<MaiProductEventEnvelope> {
         self.tx.subscribe()
     }
 
-    pub(crate) async fn publish(&self, kind: ServiceEventKind) {
-        let event = ServiceEvent {
+    pub(crate) async fn publish(&self, kind: MaiProductEventKind) {
+        let event = MaiProductEventEnvelope {
             sequence: self.sequence.fetch_add(1, Ordering::SeqCst),
             timestamp: now(),
             kind,
         };
-        if should_persist_event(&event)
-            && let Err(err) = self.store.append_service_event(&event).await
-        {
-            tracing::warn!("failed to persist service event: {err}");
+        if let Err(err) = self.store.append_product_event(&event).await {
+            tracing::warn!("failed to persist product event: {err}");
         }
         {
             let mut recent = self.recent.lock().await;
@@ -55,32 +53,6 @@ impl RuntimeEvents {
         let _ = self.tx.send(event);
     }
 
-    pub(crate) async fn for_agent(&self, agent_id: AgentId) -> Vec<ServiceEvent> {
-        let events = self.recent.lock().await;
-        events
-            .iter()
-            .filter(|event| event_agent_id(event) == Some(agent_id))
-            .cloned()
-            .collect()
-    }
-
-    pub(crate) async fn recent_for_agent(
-        &self,
-        agent_id: AgentId,
-        limit: usize,
-    ) -> Vec<ServiceEvent> {
-        let events = self.recent.lock().await;
-        let mut selected = events
-            .iter()
-            .rev()
-            .filter(|event| event_agent_id(event) == Some(agent_id))
-            .take(limit)
-            .cloned()
-            .collect::<Vec<_>>();
-        selected.reverse();
-        selected
-    }
-
     pub(crate) async fn retain_since(&self, cutoff: chrono::DateTime<chrono::Utc>) {
         self.recent
             .lock()
@@ -88,83 +60,9 @@ impl RuntimeEvents {
             .retain(|event| event.timestamp >= cutoff);
     }
 
-    pub(crate) async fn tool_metadata(
-        &self,
-        agent_id: AgentId,
-        session_id: SessionId,
-        call_id: &str,
-    ) -> (Option<bool>, Option<u64>) {
-        let events = self.recent.lock().await;
-        events
-            .iter()
-            .rev()
-            .find_map(|event| match &event.kind {
-                ServiceEventKind::ToolCompleted {
-                    agent_id: event_agent_id,
-                    session_id: event_session_id,
-                    call_id: event_call_id,
-                    success,
-                    duration_ms,
-                    ..
-                } if *event_agent_id == agent_id
-                    && event_session_id == &Some(session_id)
-                    && event_call_id == call_id =>
-                {
-                    Some((Some(*success), *duration_ms))
-                }
-                _ => None,
-            })
-            .unwrap_or((None, None))
-    }
-
     #[cfg(test)]
-    pub(crate) async fn snapshot(&self) -> Vec<ServiceEvent> {
+    pub(crate) async fn snapshot(&self) -> Vec<MaiProductEventEnvelope> {
         self.recent.lock().await.iter().cloned().collect()
-    }
-}
-
-fn should_persist_event(event: &ServiceEvent) -> bool {
-    !matches!(
-        event.kind,
-        ServiceEventKind::AgentMessageDelta { .. }
-            | ServiceEventKind::ReasoningDelta { .. }
-            | ServiceEventKind::ToolCallDelta { .. }
-    )
-}
-
-pub(crate) fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
-    match &event.kind {
-        ServiceEventKind::AgentCreated { agent } | ServiceEventKind::AgentUpdated { agent } => {
-            Some(agent.id)
-        }
-        ServiceEventKind::AgentStatusChanged { agent_id, .. }
-        | ServiceEventKind::AgentDeleted { agent_id }
-        | ServiceEventKind::TurnStarted { agent_id, .. }
-        | ServiceEventKind::TurnCompleted { agent_id, .. }
-        | ServiceEventKind::ToolStarted { agent_id, .. }
-        | ServiceEventKind::ToolCompleted { agent_id, .. }
-        | ServiceEventKind::ContextCompacted { agent_id, .. }
-        | ServiceEventKind::AgentMessage { agent_id, .. }
-        | ServiceEventKind::AgentMessageDelta { agent_id, .. }
-        | ServiceEventKind::AgentMessageCompleted { agent_id, .. }
-        | ServiceEventKind::ReasoningDelta { agent_id, .. }
-        | ServiceEventKind::ReasoningCompleted { agent_id, .. }
-        | ServiceEventKind::ToolCallDelta { agent_id, .. }
-        | ServiceEventKind::SkillsActivated { agent_id, .. }
-        | ServiceEventKind::TodoListUpdated { agent_id, .. }
-        | ServiceEventKind::McpServerStatusChanged { agent_id, .. }
-        | ServiceEventKind::UserInputRequested { agent_id, .. } => Some(*agent_id),
-        ServiceEventKind::TaskCreated { .. }
-        | ServiceEventKind::TaskUpdated { .. }
-        | ServiceEventKind::TaskDeleted { .. }
-        | ServiceEventKind::ProjectCreated { .. }
-        | ServiceEventKind::ProjectUpdated { .. }
-        | ServiceEventKind::ProjectDeleted { .. }
-        | ServiceEventKind::GithubWebhookReceived { .. }
-        | ServiceEventKind::ProjectReviewQueued { .. }
-        | ServiceEventKind::PlanUpdated { .. } => None,
-        ServiceEventKind::ArtifactCreated { artifact } => Some(artifact.agent_id),
-        ServiceEventKind::Error { agent_id, .. } => *agent_id,
     }
 }
 
@@ -172,17 +70,17 @@ pub(crate) fn event_agent_id(event: &ServiceEvent) -> Option<AgentId> {
 mod tests {
     use std::sync::Arc;
 
-    use mai_protocol::{MessageRole, TurnStatus};
+    use mai_protocol::AgentResourceState;
     use tempfile::tempdir;
     use uuid::Uuid;
 
     use super::*;
 
     #[tokio::test]
-    async fn delta_events_are_recent_and_broadcast_but_not_persisted() {
+    async fn product_events_are_broadcast_and_persisted() {
         let dir = tempdir().expect("tempdir");
         let store = Arc::new(
-            ConfigStore::open_with_config_path(
+            MaiStore::open_with_config_path(
                 dir.path().join("runtime.sqlite3"),
                 dir.path().join("config.toml"),
             )
@@ -192,53 +90,33 @@ mod tests {
         let events = RuntimeEvents::new(Arc::clone(&store), 1, Vec::new());
         let mut stream = events.subscribe();
         let agent_id = Uuid::new_v4();
-        let session_id = Uuid::new_v4();
-        let turn_id = Uuid::new_v4();
-
         events
-            .publish(ServiceEventKind::AgentMessageDelta {
-                agent_id,
-                session_id: Some(session_id),
-                turn_id,
-                message_id: "m1".to_string(),
-                role: MessageRole::Assistant,
-                channel: "final".to_string(),
-                delta: "hi".to_string(),
-            })
-            .await;
-        events
-            .publish(ServiceEventKind::TurnCompleted {
-                agent_id,
-                session_id: Some(session_id),
-                turn_id,
-                status: TurnStatus::Completed,
+            .publish(MaiProductEventKind::OperationFailed {
+                scope: "agent_resource".to_string(),
+                agent_id: Some(agent_id),
+                message: AgentResourceState::Failed.to_string(),
             })
             .await;
 
-        let broadcast_delta = stream.recv().await.expect("delta event");
-        assert!(matches!(
-            broadcast_delta.kind,
-            ServiceEventKind::AgentMessageDelta { .. }
-        ));
-        let broadcast_completed = stream.recv().await.expect("completed event");
+        let broadcast_completed = stream.recv().await.expect("product event");
         assert!(matches!(
             broadcast_completed.kind,
-            ServiceEventKind::TurnCompleted { .. }
+            MaiProductEventKind::OperationFailed { .. }
         ));
 
         let snapshot = events.snapshot().await;
-        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot.len(), 1);
         assert!(matches!(
             snapshot[0].kind,
-            ServiceEventKind::AgentMessageDelta { .. }
+            MaiProductEventKind::OperationFailed { .. }
         ));
 
-        let persisted = store.service_events_after(0, 10).await.expect("persisted");
+        let persisted = store.product_events_after(0, 10).await.expect("persisted");
         assert_eq!(persisted.len(), 1);
         assert!(matches!(
             persisted[0].kind,
-            ServiceEventKind::TurnCompleted { .. }
+            MaiProductEventKind::OperationFailed { .. }
         ));
-        assert_eq!(persisted[0].sequence, 2);
+        assert_eq!(persisted[0].sequence, 1);
     }
 }

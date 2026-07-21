@@ -35,14 +35,14 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     fs::create_dir_all(&paths.artifact_files_root)?;
     fs::create_dir_all(&paths.artifact_index_root)?;
 
-    let store = Arc::new(mai_store::ConfigStore::open_in_data_dir(&paths.data_dir).await?);
-    store
-        .seed_default_provider_from_env(
-            config.provider_seed.api_key,
-            config.provider_seed.base_url,
-            config.provider_seed.model,
-        )
-        .await?;
+    let store = Arc::new(mai_store::MaiStore::open_in_data_dir(&paths.data_dir).await?);
+    mai_runtime::seed_default_provider_from_env(
+        store.as_ref(),
+        config.provider_seed.api_key,
+        config.provider_seed.base_url,
+        config.provider_seed.model,
+    )
+    .await?;
 
     let system_skills_root = paths.system_skills_root.clone();
     crate::infrastructure::system_resources::release_embedded_system_skills(&system_skills_root)?;
@@ -130,7 +130,7 @@ async fn bind_server_listener(addr: SocketAddr) -> Result<tokio::net::TcpListene
 }
 
 async fn seed_relay_settings_from_env(
-    store: &Arc<mai_store::ConfigStore>,
+    store: &Arc<mai_store::MaiStore>,
     mode: RelayMode,
 ) -> mai_store::Result<()> {
     if store.relay_settings().await?.has_token {
@@ -161,7 +161,10 @@ async fn ensure_startup_chat_environment(
 mod tests {
     use super::*;
     use mai_docker::DockerClient;
-    use mai_protocol::{ModelConfig, ProviderConfig, ProviderKind, ProvidersConfigRequest};
+    use mai_protocol::{
+        ModelConfig, ProviderConfig, ProviderConnectionMode, ProviderTransportConfig,
+        ProviderWireProtocol, ProvidersConfigRequest,
+    };
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
@@ -185,7 +188,7 @@ mod tests {
     async fn startup_ensures_default_chat_environment_with_default_image() {
         let dir = tempdir().expect("tempdir");
         let store = Arc::new(
-            mai_store::ConfigStore::open_with_config_and_artifact_index_path(
+            mai_store::MaiStore::open_with_config_and_artifact_index_path(
                 dir.path().join("runtime.sqlite3"),
                 dir.path().join("config.toml"),
                 dir.path().join("artifacts/index"),
@@ -193,13 +196,23 @@ mod tests {
             .await
             .expect("store"),
         );
-        store
-            .save_providers(ProvidersConfigRequest {
+        let models = mai_runtime::model_config_from_api(
+            &ProvidersConfigRequest {
                 providers: vec![test_provider()],
                 default_provider_id: Some("openai".to_string()),
-            })
+            },
+            &mai_protocol::AgentConfigRequest::default(),
+        )
+        .expect("model config");
+        let mai_config = mai_runtime::MaiConfig {
+            models,
+            ..mai_runtime::MaiConfig::default()
+        };
+        store
+            .config_documents()
+            .save(&mai_config)
             .await
-            .expect("save providers");
+            .expect("save config");
         let runtime = mai_runtime::AgentRuntime::new(
             DockerClient::new_with_binary("ubuntu:latest", fake_docker_path(&dir)),
             Arc::clone(&store),
@@ -243,27 +256,34 @@ mod tests {
     fn test_provider() -> ProviderConfig {
         ProviderConfig {
             id: "openai".to_string(),
-            kind: ProviderKind::Openai,
+            preset_id: None,
+            transport: ProviderTransportConfig {
+                protocol: ProviderWireProtocol::Responses,
+                connection_mode: ProviderConnectionMode::WebSocket,
+            },
+            capabilities: mai_protocol::ProviderCapabilitySelection::Explicit(Default::default()),
             name: "OpenAI".to_string(),
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: Some("secret".to_string()),
             api_key_env: None,
-            models: vec![ModelConfig {
-                id: "gpt-test".to_string(),
-                name: Some("gpt-test".to_string()),
-                context_tokens: 128_000,
-                max_context_tokens: None,
-                effective_context_window_percent: 95,
-                output_tokens: 16_000,
-                auto_compact_token_limit: None,
-                supports_tools: true,
-                reasoning: None,
-                options: serde_json::Value::Null,
-                headers: Default::default(),
-                wire_api: Default::default(),
-                capabilities: Default::default(),
-                request_policy: Default::default(),
-            }],
+            http_headers: None,
+            catalog: mai_protocol::ProviderModelCatalogConfig::Explicit {
+                models: vec![ModelConfig {
+                    id: "gpt-test".to_string(),
+                    name: Some("gpt-test".to_string()),
+                    context_tokens: 128_000,
+                    max_context_tokens: None,
+                    effective_context_window_percent: 95,
+                    output_tokens: 16_000,
+                    auto_compact_token_limit: None,
+                    supports_tools: true,
+                    reasoning: None,
+                    options: serde_json::Value::Null,
+                    headers: Default::default(),
+                    capabilities: Default::default(),
+                    request_policy: Default::default(),
+                }],
+            },
             default_model: "gpt-test".to_string(),
             enabled: true,
         }

@@ -5,30 +5,34 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+mod agent_state;
+
+pub use agent_state::{
+    AgentLastTurn, AgentResourceState, AgentRuntimeActivity, AgentRuntimeLifecycle,
+    AgentRuntimeState, AgentState, AgentTurnOutcomeKind,
+};
+pub use pl_protocol::{
+    CredentialDescriptorDto, ErrorSeverity, McpAvailabilityDescriptor, McpHealthSnapshot,
+    McpServerDescriptor, ModelCapabilitiesDto, ModelCatalogDescriptor, ModelDescriptor,
+    ModelPricingDto, ModelReasoningDescriptor, PROVIDER_CATALOG_SCHEMA_VERSION,
+    ProviderCatalogSnapshot, ProviderConnectionModeDescriptor, ProviderPresetDescriptor,
+    ProviderServiceCapabilitiesDescriptor, SESSION_EVENT_SCHEMA_VERSION, SessionAgentPart,
+    SessionAgentSnapshot, SessionAttachment, SessionContextCompaction, SessionEventEnvelope,
+    SessionEventKind, SessionEventPosition, SessionMessage, SessionMessageRole,
+    SessionMessageStatus, SessionPart, SessionPartContent, SessionPartDelta, SessionPartDeltaField,
+    SessionPartStatus, SessionResyncReason, SessionRuntimeSnapshot, SessionRuntimeUsage,
+    SessionStreamFrame, SessionSubscriptionRequest, SessionTextChannel, SessionTimelineEvent,
+    SessionTimelineEventKind, SessionToolPart, SessionTurn, SessionTurnStatus, SessionViewSnapshot,
+    WebSearchProviderCapabilitiesDescriptor, WebSearchResolutionDescriptor,
+    session_events_typescript,
+};
+
 pub type AgentId = Uuid;
 pub type EnvironmentId = Uuid;
 pub type ProjectId = Uuid;
 pub type SessionId = Uuid;
 pub type TaskId = Uuid;
 pub type TurnId = Uuid;
-
-#[derive(
-    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum AgentStatus {
-    Created,
-    StartingContainer,
-    Idle,
-    RunningTurn,
-    WaitingTool,
-    Completed,
-    Failed,
-    Cancelled,
-    DeletingContainer,
-    Deleted,
-}
 
 #[derive(
     Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString,
@@ -133,15 +137,6 @@ pub enum PlanStatus {
     Approved,
 }
 
-impl AgentStatus {
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::Completed | Self::Failed | Self::Cancelled | Self::Deleted
-        )
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum McpStartupStatus {
@@ -201,7 +196,7 @@ pub struct UserInputQuestion {
     pub options: Vec<UserInputOption>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentMessage {
     pub role: MessageRole,
     pub content: String,
@@ -242,13 +237,6 @@ impl TokenUsage {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ContextUsage {
-    pub used_tokens: u64,
-    pub context_tokens: u64,
-    pub threshold_percent: u64,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSummary {
     pub id: AgentId,
@@ -260,7 +248,7 @@ pub struct AgentSummary {
     #[serde(default)]
     pub role: Option<AgentRole>,
     pub name: String,
-    pub status: AgentStatus,
+    pub state: AgentState,
     pub container_id: Option<String>,
     #[serde(default)]
     pub docker_image: String,
@@ -271,8 +259,6 @@ pub struct AgentSummary {
     pub reasoning_effort: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub current_turn: Option<TurnId>,
-    pub last_error: Option<String>,
     pub token_usage: TokenUsage,
 }
 
@@ -282,10 +268,6 @@ pub struct AgentDetail {
     pub summary: AgentSummary,
     pub sessions: Vec<AgentSessionSummary>,
     pub selected_session_id: SessionId,
-    #[serde(default)]
-    pub context_usage: Option<ContextUsage>,
-    pub messages: Vec<AgentMessage>,
-    pub recent_events: Vec<ServiceEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -479,7 +461,7 @@ pub struct ProjectReviewRunDetail {
     #[serde(default)]
     pub messages: Vec<AgentMessage>,
     #[serde(default)]
-    pub events: Vec<ServiceEvent>,
+    pub events: Vec<SessionEventEnvelope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -968,12 +950,31 @@ pub struct ErrorResponse {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ProviderKind {
+pub enum ProviderWireProtocol {
     #[default]
-    Openai,
-    Deepseek,
-    Mimo,
-    Zhipu,
+    Responses,
+    ChatCompletions,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderConnectionMode {
+    WebSocket,
+    #[default]
+    Http,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderTransportConfig {
+    pub protocol: ProviderWireProtocol,
+    pub connection_mode: ProviderConnectionMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderTransportSummary {
+    pub protocol: ProviderWireProtocol,
+    pub connection_mode: ProviderConnectionMode,
+    pub connection_modes: Vec<ProviderConnectionModeDescriptor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -991,8 +992,6 @@ pub struct ModelConfig {
     pub auto_compact_token_limit: Option<u64>,
     #[serde(default = "default_true")]
     pub supports_tools: bool,
-    #[serde(default)]
-    pub wire_api: ModelWireApi,
     #[serde(default)]
     pub capabilities: ModelCapabilities,
     #[serde(default)]
@@ -1019,14 +1018,6 @@ impl ModelConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelWireApi {
-    #[default]
-    Responses,
-    ChatCompletions,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelCapabilities {
     #[serde(default = "default_true")]
@@ -1038,7 +1029,7 @@ pub struct ModelCapabilities {
     #[serde(default)]
     pub strict_schema: bool,
     #[serde(default)]
-    pub continuation: bool,
+    pub web_search: bool,
 }
 
 impl Default for ModelCapabilities {
@@ -1048,7 +1039,7 @@ impl Default for ModelCapabilities {
             parallel_tools: false,
             reasoning_replay: false,
             strict_schema: false,
-            continuation: false,
+            web_search: false,
         }
     }
 }
@@ -1063,8 +1054,8 @@ pub enum ToolSchemaPolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelRequestPolicy {
-    #[serde(default = "default_chat_max_tokens_field")]
-    pub max_tokens_field: String,
+    #[serde(default)]
+    pub max_tokens_field: ModelMaxTokensField,
     #[serde(default)]
     pub store: Option<bool>,
     #[serde(default)]
@@ -1078,7 +1069,7 @@ pub struct ModelRequestPolicy {
 impl Default for ModelRequestPolicy {
     fn default() -> Self {
         Self {
-            max_tokens_field: default_chat_max_tokens_field(),
+            max_tokens_field: ModelMaxTokensField::default(),
             store: None,
             tool_schema: ToolSchemaPolicy::Standard,
             extra_body: Value::Null,
@@ -1087,8 +1078,17 @@ impl Default for ModelRequestPolicy {
     }
 }
 
-fn default_chat_max_tokens_field() -> String {
-    "max_tokens".to_string()
+/// 模型请求允许使用的输出 token 字段。
+///
+/// `Omit` 是有意义的协议策略，不能退化成 Chat Completions 的默认字段。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelMaxTokensField {
+    Omit,
+    MaxOutputTokens,
+    MaxCompletionTokens,
+    #[default]
+    MaxTokens,
 }
 
 fn default_effective_context_window_percent() -> u64 {
@@ -1120,27 +1120,60 @@ pub struct ModelReasoningVariant {
 pub struct ProviderConfig {
     pub id: String,
     #[serde(default)]
-    pub kind: ProviderKind,
+    pub preset_id: Option<String>,
+    #[serde(default)]
+    pub transport: ProviderTransportConfig,
+    pub capabilities: ProviderCapabilitySelection,
     pub name: String,
     pub base_url: String,
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
-    #[serde(default)]
-    pub models: Vec<ModelConfig>,
+    /// 只写的 provider 请求头；实例边界未变化时，`None` 表示由服务端保留原值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_headers: Option<BTreeMap<String, String>>,
+    pub catalog: ProviderModelCatalogConfig,
     pub default_model: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
 
+/// Provider 实例服务能力的配置来源。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum ProviderCapabilitySelection {
+    PresetDefaults,
+    Explicit(ProviderServiceCapabilitiesDescriptor),
+}
+
+/// mai HTTP 边界中的 provider 模型目录引用。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum ProviderModelCatalogConfig {
+    Bundled {
+        catalog_id: String,
+        #[serde(default)]
+        additional_models: Vec<ModelConfig>,
+    },
+    Explicit {
+        #[serde(default)]
+        models: Vec<ModelConfig>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderSummary {
     pub id: String,
-    pub kind: ProviderKind,
+    pub preset_id: Option<String>,
+    pub transport: ProviderTransportSummary,
+    pub capability_selection: ProviderCapabilitySelection,
+    pub service_capabilities: ProviderServiceCapabilitiesDescriptor,
     pub name: String,
     pub base_url: String,
     pub api_key_env: Option<String>,
+    pub catalog: ProviderModelCatalogConfig,
+    /// 服务端通过 PL 目录解析后的唯一有效模型列表。
     pub models: Vec<ModelConfig>,
     pub default_model: String,
     pub enabled: bool,
@@ -1183,7 +1216,7 @@ pub struct ProviderTestResponse {
     pub ok: bool,
     pub provider_id: String,
     pub provider_name: String,
-    pub provider_kind: ProviderKind,
+    pub transport: ProviderTransportConfig,
     pub model: String,
     pub base_url: String,
     pub latency_ms: u64,
@@ -1196,6 +1229,19 @@ pub struct ProviderTestResponse {
 pub struct McpServersConfigRequest {
     #[serde(default)]
     pub servers: BTreeMap<String, McpServerConfig>,
+    /// 需要显式删除的 write-only secret；空值本身只表示保留已有值。
+    #[serde(default)]
+    pub clear_secrets: BTreeMap<String, McpServerSecretClearRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct McpServerSecretClearRequest {
+    #[serde(default)]
+    pub bearer_token: bool,
+    #[serde(default)]
+    pub env: Vec<String>,
+    #[serde(default)]
+    pub headers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1232,7 +1278,7 @@ pub enum AgentRole {
 pub struct ResolvedAgentModelPreference {
     pub provider_id: String,
     pub provider_name: String,
-    pub provider_kind: ProviderKind,
+    pub transport: ProviderTransportConfig,
     pub model: String,
     #[serde(default)]
     pub model_name: Option<String>,
@@ -1282,50 +1328,33 @@ pub struct AgentConfigResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ProviderPreset {
-    pub id: String,
-    pub kind: ProviderKind,
-    pub name: String,
-    pub base_url: String,
-    pub default_model: String,
-    pub models: Vec<ModelConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ProviderPresetsResponse {
-    pub providers: Vec<ProviderPreset>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderSecret {
     pub id: String,
-    pub kind: ProviderKind,
+    pub transport: ProviderTransportConfig,
     pub name: String,
     pub base_url: String,
     pub api_key: String,
     pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub http_headers: BTreeMap<String, String>,
     pub models: Vec<ModelConfig>,
     pub default_model: String,
     pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServiceEvent {
+pub struct MaiProductEventEnvelope {
     pub sequence: u64,
     pub timestamp: DateTime<Utc>,
     #[serde(flatten)]
-    pub kind: ServiceEventKind,
+    pub kind: MaiProductEventKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServiceEventKind {
+pub enum MaiProductEventKind {
     AgentCreated {
         agent: AgentSummary,
-    },
-    AgentStatusChanged {
-        agent_id: AgentId,
-        status: AgentStatus,
     },
     AgentUpdated {
         agent: AgentSummary,
@@ -1364,135 +1393,14 @@ pub enum ServiceEventKind {
         pr: u64,
         reason: String,
     },
-    TurnStarted {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-    },
-    TurnCompleted {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        status: TurnStatus,
-    },
-    ToolStarted {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        call_id: String,
-        tool_name: String,
-        #[serde(default)]
-        arguments_preview: Option<String>,
-        #[serde(default)]
-        arguments: Option<Value>,
-    },
-    ToolCompleted {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        call_id: String,
-        tool_name: String,
-        success: bool,
-        output_preview: String,
-        #[serde(default)]
-        duration_ms: Option<u64>,
-    },
-    ContextCompacted {
-        agent_id: AgentId,
-        session_id: SessionId,
-        turn_id: TurnId,
-        tokens_before: u64,
-        summary_preview: String,
-    },
-    AgentMessage {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: Option<TurnId>,
-        role: MessageRole,
-        content: String,
-    },
-    AgentMessageDelta {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        message_id: String,
-        role: MessageRole,
-        channel: String,
-        delta: String,
-    },
-    AgentMessageCompleted {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        message_id: String,
-        role: MessageRole,
-        channel: String,
-        content: String,
-    },
-    ReasoningDelta {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        message_id: String,
-        delta: String,
-    },
-    ReasoningCompleted {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        message_id: String,
-        content: String,
-    },
-    ToolCallDelta {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        call_id: String,
-        tool_name: String,
-        arguments_delta: String,
-    },
-    SkillsActivated {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        skills: Vec<SkillActivationInfo>,
-    },
-    Error {
+    OperationFailed {
+        scope: String,
         agent_id: Option<AgentId>,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: Option<TurnId>,
         message: String,
-    },
-    TodoListUpdated {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        items: Vec<TodoItem>,
     },
     PlanUpdated {
         task_id: TaskId,
         plan: TaskPlan,
-    },
-    UserInputRequested {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        header: String,
-        questions: Vec<UserInputQuestion>,
     },
     ArtifactCreated {
         artifact: ArtifactInfo,
@@ -1591,6 +1499,77 @@ pub struct McpServerConfig {
     pub enabled_tools: Option<Vec<String>>,
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebSearchSettings {
+    pub mode: String,
+    #[serde(default)]
+    pub context_size: Option<String>,
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    #[serde(default)]
+    pub location: Option<WebSearchLocationSettings>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebSearchLocationSettings {
+    #[serde(default)]
+    pub country: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub city: Option<String>,
+    #[serde(default)]
+    pub timezone: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebSearchSettingsResponse {
+    pub config: WebSearchSettings,
+    pub roles: BTreeMap<String, WebSearchResolutionDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerPublicConfig {
+    pub scope: McpServerScope,
+    pub enabled: bool,
+    pub required: bool,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub env_keys: Vec<String>,
+    pub cwd: Option<String>,
+    pub url: Option<String>,
+    pub header_names: Vec<String>,
+    pub bearer_token_env: Option<String>,
+    pub has_bearer_token: bool,
+    pub startup_timeout_secs: Option<u64>,
+    pub tool_timeout_secs: Option<u64>,
+    pub enabled_tools: Option<Vec<String>>,
+    pub disabled_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerAggregate {
+    pub descriptor: McpServerDescriptor,
+    pub enabled: bool,
+    pub availability: String,
+    pub ready_agents: usize,
+    pub failed_agents: usize,
+    pub checking_agents: usize,
+    pub total_agents: usize,
+    pub tool_count: usize,
+    pub config: Option<McpServerPublicConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServersResponse {
+    pub servers: Vec<McpServerAggregate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuiltinMcpServersRequest {
+    pub servers: BTreeMap<String, bool>,
 }
 
 impl Default for McpServerConfig {
@@ -2132,14 +2111,28 @@ mod tests {
     }
 
     #[test]
-    fn provider_kind_serializes_zhipu() {
+    fn provider_wire_protocol_serializes_canonical_names() {
         assert_eq!(
-            serde_json::to_string(&ProviderKind::Zhipu).expect("serialize"),
-            "\"zhipu\""
+            serde_json::to_string(&ProviderWireProtocol::Responses).expect("serialize"),
+            "\"responses\""
         );
         assert_eq!(
-            serde_json::from_str::<ProviderKind>("\"zhipu\"").expect("deserialize"),
-            ProviderKind::Zhipu
+            serde_json::from_str::<ProviderWireProtocol>("\"chat_completions\"")
+                .expect("deserialize"),
+            ProviderWireProtocol::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn provider_transport_keeps_protocol_and_connection_orthogonal() {
+        let transport = ProviderTransportConfig {
+            protocol: ProviderWireProtocol::Responses,
+            connection_mode: ProviderConnectionMode::WebSocket,
+        };
+
+        assert_eq!(
+            serde_json::to_value(transport).expect("serialize provider transport"),
+            json!({ "protocol": "responses", "connection_mode": "web_socket" })
         );
     }
 

@@ -135,11 +135,6 @@ impl LocalProjectWorkspaceManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn agent_clone_path(&self, project_id: ProjectId, agent_id: AgentId) -> PathBuf {
-        agent_clone_path(&self.projects_root, project_id, agent_id)
-    }
-
-    #[cfg(test)]
     fn repo_cache_handle(&self, project_id: ProjectId) -> RepoCacheHandle {
         RepoCacheHandle {
             project_id,
@@ -412,7 +407,8 @@ mod tests {
 
     use chrono::Utc;
     use mai_protocol::{
-        AgentStatus, AgentSummary, ProjectCloneStatus, ProjectStatus, ProjectSummary,
+        AgentResourceState, AgentState, AgentSummary, ProjectCloneStatus, ProjectStatus,
+        ProjectSummary,
     };
     use pretty_assertions::assert_eq;
 
@@ -679,7 +675,7 @@ mod tests {
         let agent_id = uuid::Uuid::new_v4();
         let project = test_project(project_id, agent_id);
         let mut live_agent = test_agent(agent_id, project_id);
-        live_agent.status = AgentStatus::Deleted;
+        live_agent.state.resource = AgentResourceState::Deleted;
         let legacy_worktrees = project_paths(dir.path(), project_id)
             .project_dir
             .join("worktrees");
@@ -809,7 +805,10 @@ mod tests {
             project_id: Some(project_id),
             parent_id: None,
             role: None,
-            status: AgentStatus::Idle,
+            state: AgentState {
+                resource: AgentResourceState::Ready,
+                ..AgentState::default()
+            },
             model: "model".to_string(),
             provider_id: "provider".to_string(),
             provider_name: "provider".to_string(),
@@ -818,8 +817,6 @@ mod tests {
             container_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            last_error: None,
-            current_turn: None,
             token_usage: Default::default(),
         }
     }

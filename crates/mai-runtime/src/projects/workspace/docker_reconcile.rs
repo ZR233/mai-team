@@ -4,7 +4,7 @@ use mai_docker::{
     DockerClient, ManagedVolume, project_agent_workspace_volume, project_cache_volume,
 };
 use mai_protocol::{
-    AgentId, AgentStatus, AgentSummary, ProjectCloneStatus, ProjectId, ProjectStatus,
+    AgentId, AgentResourceState, AgentSummary, ProjectCloneStatus, ProjectId, ProjectStatus,
     ProjectSummary,
 };
 
@@ -262,24 +262,13 @@ fn project_workspace_should_exist(project: &ProjectSummary) -> bool {
 }
 
 fn agent_workspace_should_exist(agent: &AgentSummary) -> bool {
-    match agent.status {
-        AgentStatus::Created
-        | AgentStatus::StartingContainer
-        | AgentStatus::Idle
-        | AgentStatus::RunningTurn
-        | AgentStatus::WaitingTool
-        | AgentStatus::Completed
-        | AgentStatus::Failed
-        | AgentStatus::Cancelled
-        | AgentStatus::DeletingContainer => true,
-        AgentStatus::Deleted => false,
-    }
+    agent.state.resource != AgentResourceState::Deleted
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mai_protocol::{AgentRole, TokenUsage, now};
+    use mai_protocol::{AgentResourceState, AgentRole, AgentState, TokenUsage, now};
     use pretty_assertions::assert_eq;
     use uuid::Uuid;
 
@@ -423,7 +412,10 @@ mod tests {
             project_id: Some(project_id),
             role: Some(AgentRole::Executor),
             name: "agent".to_string(),
-            status: AgentStatus::Idle,
+            state: AgentState {
+                resource: AgentResourceState::Ready,
+                ..AgentState::default()
+            },
             container_id: None,
             docker_image: "ubuntu:latest".to_string(),
             provider_id: "provider".to_string(),
@@ -432,8 +424,6 @@ mod tests {
             reasoning_effort: None,
             created_at: now,
             updated_at: now,
-            current_turn: None,
-            last_error: None,
             token_usage: TokenUsage::default(),
         }
     }

@@ -159,17 +159,18 @@ async fn project_still_ready(ops: &impl ProjectReviewWorkerOps, project_id: Proj
         | Err(RuntimeError::TaskBusy(_))
         | Err(RuntimeError::MissingContainer(_))
         | Err(RuntimeError::SessionNotFound { .. })
+        | Err(RuntimeError::SessionEventNotFound(_))
         | Err(RuntimeError::ToolTraceNotFound { .. })
         | Err(RuntimeError::TurnNotFound { .. })
         | Err(RuntimeError::TurnCancelled)
         | Err(RuntimeError::Docker(_))
         | Err(RuntimeError::Model(_))
-        | Err(RuntimeError::Mcp(_))
         | Err(RuntimeError::Store(_))
         | Err(RuntimeError::Skill(_))
         | Err(RuntimeError::InvalidInput(_))
         | Err(RuntimeError::Io(_))
         | Err(RuntimeError::Http(_))
+        | Err(RuntimeError::GithubUnavailable { .. })
         | Err(RuntimeError::Jwt(_)) => false,
     }
 }

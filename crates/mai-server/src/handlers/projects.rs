@@ -160,9 +160,11 @@ mod tests {
     use axum::extract::{Path, State};
     use chrono::Utc;
     use mai_docker::DockerClient;
-    use mai_protocol::{AgentRole, AgentStatus, ProjectCloneStatus, ProjectStatus};
+    use mai_protocol::{
+        AgentResourceState, AgentRole, AgentState, ProjectCloneStatus, ProjectStatus,
+    };
     use mai_runtime::{AgentRuntime, RuntimeConfig};
-    use mai_store::ConfigStore;
+    use mai_store::MaiStore;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
@@ -191,7 +193,7 @@ mod tests {
     async fn test_app_state(project_id: ProjectId, maintainer_id: AgentId) -> Arc<AppState> {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(
-            ConfigStore::open_with_config_and_artifact_index_path(
+            MaiStore::open_with_config_and_artifact_index_path(
                 dir.path().join("runtime.sqlite3"),
                 dir.path().join("config.toml"),
                 dir.path().join("artifacts/index"),
@@ -199,7 +201,7 @@ mod tests {
             .await
             .expect("store"),
         );
-        save_test_project(&store, project_id, maintainer_id, true).await;
+        save_test_project(&store, project_id, maintainer_id, false).await;
         let runtime = AgentRuntime::new(
             DockerClient::new_with_binary("unused", fake_docker_path(&dir)),
             Arc::clone(&store),
@@ -226,7 +228,7 @@ mod tests {
     }
 
     async fn save_test_project(
-        store: &ConfigStore,
+        store: &MaiStore,
         project_id: ProjectId,
         maintainer_id: AgentId,
         auto_review_enabled: bool,
@@ -238,7 +240,10 @@ mod tests {
                     id: maintainer_id,
                     parent_id: None,
                     name: "Maintainer".to_string(),
-                    status: AgentStatus::Idle,
+                    state: AgentState {
+                        resource: AgentResourceState::Ready,
+                        ..AgentState::default()
+                    },
                     task_id: None,
                     project_id: Some(project_id),
                     role: Some(AgentRole::Planner),
@@ -248,10 +253,8 @@ mod tests {
                     reasoning_effort: None,
                     docker_image: "unused".to_string(),
                     container_id: None,
-                    current_turn: None,
                     created_at: now,
                     updated_at: now,
-                    last_error: None,
                     token_usage: Default::default(),
                 },
                 None,

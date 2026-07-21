@@ -2,21 +2,28 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use crate::mcp::McpAgentManager;
+use crate::mcp::ContainerMcpRuntime;
 use mai_docker::ContainerHandle;
-use mai_protocol::{AgentId, AgentStatus, McpServerConfig, McpStartupStatus, TurnId, now};
-use pl_core::{AgentTurnCurrentGuard, AgentTurnCurrentOutcome};
-use tokio_util::sync::CancellationToken;
+use mai_protocol::{AgentId, AgentResourceState, McpServerConfig, McpStartupStatus, now};
+use pl_core::{AgentModelConfig, BuiltinMcpServerState};
 
-use crate::state::{AgentRecord, TurnGuard};
+use crate::projects::review::context::ProjectRepositoryView;
+use crate::projects::workspace::{ProjectRepositoryReviewTarget, ProjectRepositoryRevision};
+use crate::state::AgentRecord;
 use crate::{Result, RuntimeError};
 
 #[derive(Debug, Clone)]
 pub(crate) enum ContainerSource {
     FreshImage,
+    ProjectReviewWorkspace {
+        target: ProjectRepositoryReviewTarget,
+        revision: ProjectRepositoryRevision,
+        repository_view: ProjectRepositoryView,
+    },
     ProjectWorkspace {
         workspace_volume: String,
         repo_path: String,
+        repository_view: Option<ProjectRepositoryView>,
     },
     CloneFrom {
         parent_container_id: String,
@@ -39,8 +46,15 @@ pub(crate) struct AgentMcpStatusChange {
     pub(crate) error: Option<String>,
 }
 
+pub(crate) struct AgentMcpRuntimeConfig {
+    pub(crate) enabled: bool,
+    pub(crate) user_servers: BTreeMap<String, McpServerConfig>,
+    pub(crate) builtin_servers: BTreeMap<String, BuiltinMcpServerState>,
+    pub(crate) models: AgentModelConfig,
+}
+
 pub(crate) struct AgentContainerStatusChange {
-    pub(crate) status: AgentStatus,
+    pub(crate) state: AgentResourceState,
     pub(crate) error: Option<String>,
 }
 
@@ -58,17 +72,18 @@ pub(crate) trait AgentContainerOps: Send + Sync {
         container_id: String,
     ) -> impl Future<Output = ()> + Send;
 
-    fn agent_mcp_server_configs(
+    fn agent_mcp_runtime_config(
         &self,
-    ) -> impl Future<Output = Result<BTreeMap<String, McpServerConfig>>> + Send;
+        agent: &AgentRecord,
+    ) -> impl Future<Output = Result<AgentMcpRuntimeConfig>> + Send;
 
-    fn start_agent_mcp_manager(
+    fn start_agent_mcp_runtime(
         &self,
         container_id: String,
-        configs: BTreeMap<String, McpServerConfig>,
-    ) -> impl Future<Output = McpAgentManager> + Send;
+        config: AgentMcpRuntimeConfig,
+    ) -> impl Future<Output = Result<ContainerMcpRuntime>> + Send;
 
-    fn set_agent_status(
+    fn set_agent_resource_state(
         &self,
         agent: Arc<AgentRecord>,
         change: AgentContainerStatusChange,
@@ -82,67 +97,15 @@ pub(crate) trait AgentContainerOps: Send + Sync {
 pub(crate) async fn ensure_agent_container(
     ops: &impl AgentContainerOps,
     agent: &Arc<AgentRecord>,
-    ready_status: AgentStatus,
 ) -> Result<String> {
-    ensure_agent_container_with_source(ops, agent, ready_status, &ContainerSource::FreshImage, None)
-        .await
-}
-
-pub(crate) async fn ensure_agent_container_for_turn(
-    ops: &impl AgentContainerOps,
-    agent: &Arc<AgentRecord>,
-    ready_status: AgentStatus,
-    turn_id: TurnId,
-    cancellation_token: &CancellationToken,
-) -> Result<String> {
-    let current_turn = agent.summary.read().await.current_turn;
-    let current_turn_guard = AgentTurnCurrentGuard::new(turn_id);
-    let guarded_turn = current_turn.as_ref().or(Some(&turn_id));
-    match current_turn_guard.evaluate_with_token(cancellation_token, guarded_turn) {
-        AgentTurnCurrentOutcome::Current => {}
-        AgentTurnCurrentOutcome::Interrupted => return Err(RuntimeError::TurnCancelled),
-    }
-    let turn_guard = (current_turn == Some(turn_id)).then(|| TurnGuard {
-        current_turn: current_turn_guard,
-        cancellation_token: cancellation_token.clone(),
-    });
-    let container_id = ensure_agent_container_with_source(
-        ops,
-        agent,
-        ready_status.clone(),
-        &ContainerSource::FreshImage,
-        turn_guard,
-    )
-    .await?;
-    let current_turn = agent.summary.read().await.current_turn;
-    let current_turn_guard = AgentTurnCurrentGuard::new(turn_id);
-    let guarded_turn = current_turn.as_ref().or(Some(&turn_id));
-    match current_turn_guard.evaluate_with_token(cancellation_token, guarded_turn) {
-        AgentTurnCurrentOutcome::Current => {}
-        AgentTurnCurrentOutcome::Interrupted => {
-            if let Some(manager) = agent.mcp.write().await.take() {
-                manager.shutdown().await;
-            }
-            return Err(RuntimeError::TurnCancelled);
-        }
-    }
-    let needs_status_restore = agent.summary.read().await.status != ready_status;
-    if needs_status_restore {
-        set_status(ops, agent, ready_status, None).await?;
-    }
-    Ok(container_id)
+    ensure_agent_container_with_source(ops, agent, &ContainerSource::FreshImage).await
 }
 
 pub(crate) async fn ensure_agent_container_with_source(
     ops: &impl AgentContainerOps,
     agent: &Arc<AgentRecord>,
-    ready_status: AgentStatus,
     container_source: &ContainerSource,
-    turn_guard: Option<TurnGuard>,
 ) -> Result<String> {
-    if let Some(guard) = &turn_guard {
-        ensure_turn_current(agent, guard).await?;
-    }
     if let Some(container_id) = agent
         .container
         .read()
@@ -169,10 +132,13 @@ pub(crate) async fn ensure_agent_container_with_source(
         return Ok(container_id);
     }
 
-    set_status(ops, agent, AgentStatus::StartingContainer, None).await?;
-    if let Some(guard) = &turn_guard {
-        ensure_turn_current(agent, guard).await?;
+    // 容器缺失即代表 transport identity 已变化；必须先关闭旧 MCP handle，
+    // 避免旧 stdio 进程或 HTTP session 在新容器 generation 建立后继续存活。
+    if let Some(previous) = agent.mcp.write().await.take() {
+        previous.shutdown().await;
     }
+
+    set_resource_state(ops, agent, AgentResourceState::Provisioning, None).await?;
     let container = match ops
         .start_agent_container(AgentContainerStartRequest {
             agent_id,
@@ -186,7 +152,8 @@ pub(crate) async fn ensure_agent_container_with_source(
         Err(err) => {
             let message = err.to_string();
             drop(container_guard);
-            if let Err(store_err) = set_status(ops, agent, AgentStatus::Failed, Some(message)).await
+            if let Err(store_err) =
+                set_resource_state(ops, agent, AgentResourceState::Failed, Some(message)).await
             {
                 tracing::warn!("failed to persist container startup failure: {store_err}");
             }
@@ -195,13 +162,6 @@ pub(crate) async fn ensure_agent_container_with_source(
     };
 
     let container_id = container.id.clone();
-    if let Some(guard) = &turn_guard
-        && let Err(err) = ensure_turn_current(agent, guard).await
-    {
-        drop(container_guard);
-        ops.remove_agent_container(agent_id, container_id).await;
-        return Err(err);
-    }
     {
         let mut summary = agent.summary.write().await;
         summary.container_id = Some(container_id.clone());
@@ -211,8 +171,9 @@ pub(crate) async fn ensure_agent_container_with_source(
     *container_guard = Some(container.clone());
     drop(container_guard);
 
-    let mcp_configs = ops.agent_mcp_server_configs().await?;
-    for server in mcp_configs
+    let mcp_config = ops.agent_mcp_runtime_config(agent).await?;
+    for server in mcp_config
+        .user_servers
         .iter()
         .filter_map(|(server, config)| config.enabled.then_some(server))
     {
@@ -224,19 +185,9 @@ pub(crate) async fn ensure_agent_container_with_source(
         })
         .await;
     }
-    let mcp = ops.start_agent_mcp_manager(container.id, mcp_configs).await;
-    if let Some(guard) = &turn_guard
-        && let Err(err) = ensure_turn_current(agent, guard).await
-    {
-        mcp.shutdown().await;
-        *agent.container.write().await = None;
-        {
-            let mut summary = agent.summary.write().await;
-            summary.container_id = None;
-        }
-        ops.remove_agent_container(agent_id, container_id).await;
-        return Err(err);
-    }
+    let mcp = ops
+        .start_agent_mcp_runtime(container.id, mcp_config)
+        .await?;
     for status in mcp.statuses().await {
         ops.publish_mcp_status(AgentMcpStatusChange {
             agent_id,
@@ -269,39 +220,31 @@ pub(crate) async fn ensure_agent_container_with_source(
             summary.container_id = None;
         }
         ops.remove_agent_container(agent_id, container_id).await;
-        set_status(ops, agent, AgentStatus::Failed, Some(message.clone())).await?;
+        set_resource_state(
+            ops,
+            agent,
+            AgentResourceState::Failed,
+            Some(message.clone()),
+        )
+        .await?;
         return Err(RuntimeError::InvalidInput(format!(
             "required MCP server startup failed: {message}"
         )));
     }
-    if let Some(guard) = &turn_guard {
-        ensure_turn_current(agent, guard).await?;
-    }
     *agent.mcp.write().await = Some(Arc::new(mcp));
-    set_status(ops, agent, ready_status, None).await?;
+    set_resource_state(ops, agent, AgentResourceState::Ready, None).await?;
     Ok(container_id)
 }
 
-async fn set_status(
+async fn set_resource_state(
     ops: &impl AgentContainerOps,
     agent: &Arc<AgentRecord>,
-    status: AgentStatus,
+    state: AgentResourceState,
     error: Option<String>,
 ) -> Result<()> {
-    ops.set_agent_status(
+    ops.set_agent_resource_state(
         Arc::clone(agent),
-        AgentContainerStatusChange { status, error },
+        AgentContainerStatusChange { state, error },
     )
     .await
-}
-
-async fn ensure_turn_current(agent: &AgentRecord, guard: &TurnGuard) -> Result<()> {
-    let current_turn = agent.summary.read().await.current_turn;
-    match guard
-        .current_turn
-        .evaluate_with_token(&guard.cancellation_token, current_turn.as_ref())
-    {
-        AgentTurnCurrentOutcome::Current => Ok(()),
-        AgentTurnCurrentOutcome::Interrupted => Err(RuntimeError::TurnCancelled),
-    }
 }

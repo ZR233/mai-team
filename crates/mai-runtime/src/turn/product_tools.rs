@@ -28,6 +28,8 @@ pub(crate) struct GithubApiRequest {
     pub(crate) path: String,
     #[serde(default, deserialize_with = "deserialize_optional_json_object")]
     pub(crate) body: Option<Value>,
+    #[serde(default)]
+    pub(crate) fields: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,11 +122,26 @@ impl MaiProductToolRegistry {
                     async move { executor.save_artifact(input).await }
                 })
             }
+            crate::turn::product_tool_schemas::TOOL_READ_TOOL_ARTIFACT => {
+                let executor = self.clone();
+                Self::registered_schema_tool(
+                    schema,
+                    move |input: super::tool_artifact::ReadToolArtifactInput, _context| {
+                        let executor = executor.clone();
+                        async move { executor.read_tool_artifact(input).await }
+                    },
+                )
+                .map(|tool| tool.with_cache_policy(pl_core::ToolCachePolicy::WithinTurn))
+            }
             crate::turn::product_tool_schemas::TOOL_GITHUB_API_REQUEST => {
                 let executor = self.clone();
-                Self::registered_schema_tool(schema, move |input: GithubApiRequest, _context| {
+                Self::registered_schema_tool(schema, move |input: GithubApiRequest, context| {
                     let executor = executor.clone();
-                    async move { executor.github_api_request(input).await }
+                    async move { executor.github_api_request(input, context).await }
+                })
+                .map(|tool| {
+                    tool.with_cache_policy_resolver(github_api_cache_policy)
+                        .with_cache_invalidation_resolver(github_api_invalidates_cache)
                 })
             }
             crate::turn::product_tool_schemas::TOOL_QUEUE_PROJECT_REVIEW_PRS => {
@@ -183,10 +200,52 @@ impl MaiProductToolRegistry {
         Ok(ToolExecution::json(&artifact)?)
     }
 
-    async fn github_api_request(&self, request: GithubApiRequest) -> crate::Result<ToolExecution> {
-        self.runtime
+    async fn read_tool_artifact(
+        &self,
+        input: super::tool_artifact::ReadToolArtifactInput,
+    ) -> crate::Result<ToolExecution> {
+        let output = super::tool_artifact::read(&self.runtime, self.agent_id, input).await?;
+        Ok(ToolExecution::json(output)?)
+    }
+
+    async fn github_api_request(
+        &self,
+        request: GithubApiRequest,
+        context: pl_core::ToolContext,
+    ) -> crate::Result<ToolExecution> {
+        let mut execution = self
+            .runtime
             .execute_project_github_api_request(&self.agent, &request)
-            .await
+            .await?;
+        if execution.output.len() > execution.model_output.len() {
+            let call_id = context
+                .provider_call_id
+                .unwrap_or_else(|| format!("github-{}", uuid::Uuid::new_v4()));
+            let artifact_id = uuid::Uuid::new_v4().to_string();
+            let name = "github-api-response.json";
+            let path = self.runtime.tool_output_artifact_file_path(
+                self.agent_id,
+                &call_id,
+                &artifact_id,
+                name,
+            );
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&path, execution.output.as_bytes()).await?;
+            execution
+                .output_artifacts
+                .push(mai_protocol::ToolOutputArtifactInfo {
+                    id: artifact_id,
+                    call_id,
+                    agent_id: self.agent_id,
+                    name: name.to_string(),
+                    stream: "response".to_string(),
+                    size_bytes: execution.output.len() as u64,
+                    created_at: mai_protocol::now(),
+                });
+        }
+        Ok(execution)
     }
 
     async fn queue_project_review_prs(
@@ -247,6 +306,26 @@ impl MaiProductToolRegistry {
     }
 }
 
+fn github_api_cache_policy(arguments: &Value) -> pl_core::ToolCachePolicy {
+    match arguments
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(str::to_ascii_uppercase)
+        .as_deref()
+    {
+        Some("GET") => pl_core::ToolCachePolicy::WithinTurn,
+        Some(_) | None => pl_core::ToolCachePolicy::Never,
+    }
+}
+
+fn github_api_invalidates_cache(arguments: &Value) -> bool {
+    arguments
+        .get("method")
+        .and_then(Value::as_str)
+        .is_some_and(|method| !method.trim().eq_ignore_ascii_case("GET"))
+}
+
 fn deserialize_optional_json_object<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
 where
     D: Deserializer<'de>,
@@ -267,6 +346,20 @@ where
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn github_cache_is_read_only_and_writes_invalidate_reads() {
+        assert_eq!(
+            github_api_cache_policy(&json!({"method": "get"})),
+            pl_core::ToolCachePolicy::WithinTurn
+        );
+        assert_eq!(
+            github_api_cache_policy(&json!({"method": "POST"})),
+            pl_core::ToolCachePolicy::Never
+        );
+        assert!(!github_api_invalidates_cache(&json!({"method": "GET"})));
+        assert!(github_api_invalidates_cache(&json!({"method": "PATCH"})));
+    }
 
     #[test]
     fn product_tools_register_as_pl_core_tools() {

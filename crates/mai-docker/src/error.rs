@@ -14,6 +14,8 @@ pub enum DockerError {
     Json(#[from] serde_json::Error),
     #[error("invalid docker image: {0}")]
     InvalidImage(String),
+    #[error("invalid docker mount: {0}")]
+    InvalidMount(String),
     #[error("docker command cancelled")]
     Cancelled,
 }

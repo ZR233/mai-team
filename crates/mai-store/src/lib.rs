@@ -1,37 +1,33 @@
 pub(crate) use chrono::{DateTime, Utc};
 pub(crate) use mai_protocol::{
-    AgentConfigRequest, AgentId, AgentLogEntry, AgentMessage, AgentSessionSummary, AgentSummary,
-    ArtifactInfo, GitAccountRequest, GitAccountStatus, GitAccountSummary, GitAccountsResponse,
-    GitProvider, GitTokenKind, GithubAppSettingsRequest, GithubAppSettingsResponse,
-    GithubSettingsResponse, McpServerConfig, ModelCapabilities, ModelConfig, ModelReasoningConfig,
-    ModelReasoningVariant, ModelRequestPolicy, ModelWireApi, PlanHistoryEntry, ProjectId,
-    ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary, ProviderConfig, ProviderKind,
-    ProviderPreset, ProviderPresetsResponse, ProviderSecret, ProviderSummary,
-    ProvidersConfigRequest, ProvidersResponse, RelaySettingsRequest, RelaySettingsResponse,
-    ServiceEvent, ServiceEventKind, SessionId, SkillsConfigRequest, TaskId, TaskPlan, TaskReview,
-    TaskSummary, TokenUsage, ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceSummary, TurnId,
-    default_true,
+    AgentId, AgentLogEntry, AgentMessage, AgentSummary, ArtifactInfo, GitAccountRequest,
+    GitAccountStatus, GitAccountSummary, GitAccountsResponse, GitProvider, GitTokenKind,
+    GithubAppSettingsRequest, GithubAppSettingsResponse, GithubSettingsResponse,
+    MaiProductEventEnvelope, MaiProductEventKind, McpServerConfig, PlanHistoryEntry, ProjectId,
+    ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary, RelaySettingsRequest,
+    RelaySettingsResponse, SessionEventEnvelope, SessionId, SkillsConfigRequest, TaskId, TaskPlan,
+    TaskReview, TaskSummary, TokenUsage, ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceSummary,
+    TurnId,
 };
-pub(crate) use pl_protocol::Message as ModelMessage;
 pub(crate) use serde::{Deserialize, Serialize};
-pub(crate) use std::collections::{BTreeMap, BTreeSet};
+pub(crate) use std::collections::BTreeMap;
 pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::str::FromStr;
-pub(crate) use std::time::SystemTime;
 pub(crate) use toasty::Db;
 pub(crate) use toasty::stmt::{List, Query};
 pub(crate) use uuid::Uuid;
 
 use thiserror::Error;
 
+mod agent_runtime;
 mod artifacts;
+mod config_document;
 mod convert;
 mod events;
 mod git_accounts;
 mod github_app;
 mod logs;
 mod projects;
-mod providers;
 mod records;
 mod relay;
 mod runtime_state;
@@ -42,14 +38,21 @@ mod store;
 mod tasks;
 
 #[cfg(test)]
+mod agent_runtime_tests;
+#[cfg(test)]
 mod tests;
 
-pub use providers::ProviderSelection;
-pub use store::ConfigStore;
+pub use agent_runtime::{
+    AgentRuntimeCommitDocument, AgentRuntimeCommitOutcome, StoredAgentPendingInput,
+    StoredAgentRuntime, StoredAgentRuntimeEvent, StoredAgentRuntimeMutation,
+    StoredAgentRuntimeSession, StoredAgentRuntimeState, StoredAgentRuntimeTrace, StoredAgentTurn,
+    StoredSessionEvent, StoredSessionProjection, StoredTokenUsage,
+};
+pub use config_document::ConfigDocumentStore;
+pub use store::MaiStore;
 
 pub(crate) use convert::*;
 
-const SETTING_AGENT_CONFIG: &str = "agent_config";
 const SETTING_SKILLS_CONFIG: &str = "skills_config";
 const SETTING_GITHUB_TOKEN: &str = "github_token";
 const SETTING_GITHUB_APP_CONFIG: &str = "github_app_config";
@@ -58,8 +61,6 @@ const SETTING_RELAY_CONFIG: &str = "relay_config";
 const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const DEFAULT_RELAY_URL: &str = "http://127.0.0.1:8090";
 const DEFAULT_RELAY_NODE_ID: &str = "mai-server";
-const DEEPSEEK_V4_CONTEXT_TOKENS: u64 = 1_000_000;
-const DEEPSEEK_V4_OUTPUT_TOKENS: u64 = 384_000;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -88,14 +89,8 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 #[derive(Debug, Clone)]
 pub struct PersistedAgent {
     pub summary: AgentSummary,
-    pub sessions: Vec<PersistedAgentSession>,
     pub system_prompt: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PersistedAgentSession {
-    pub summary: AgentSessionSummary,
-    pub last_context_tokens: Option<u64>,
+    pub runtime_agent_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -103,7 +98,7 @@ pub struct RuntimeSnapshot {
     pub agents: Vec<PersistedAgent>,
     pub tasks: Vec<PersistedTask>,
     pub projects: Vec<ProjectSummary>,
-    pub recent_events: Vec<ServiceEvent>,
+    pub recent_events: Vec<MaiProductEventEnvelope>,
     pub next_sequence: u64,
 }
 
