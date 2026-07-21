@@ -1,8 +1,11 @@
+#[path = "build/frontend.rs"]
+mod frontend;
+
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 const ANTHROPIC_SKILLS_REPO: &str = "https://github.com/anthropics/skills.git";
 const ANTHROPIC_SKILLS_BRANCH: &str = "main";
@@ -33,30 +36,7 @@ fn main() {
     watch_dir(&system_agents_dir);
     prepare_system_agents_dir(&system_agents_dir, &embedded_system_agents_dir);
 
-    watch_frontend(&web_dir);
-    prepare_frontend_build_dir(&web_dir, &frontend_build_dir);
-    ensure_npm(&frontend_build_dir, &npm_cache_dir);
-
-    let static_arg = static_dir.to_string_lossy().to_string();
-    run_npm(
-        &frontend_build_dir,
-        &npm_cache_dir,
-        [
-            "run",
-            "build",
-            "--",
-            "--outDir",
-            static_arg.as_str(),
-            "--emptyOutDir",
-        ],
-    );
-
-    if !static_dir.join("index.html").exists() {
-        panic!(
-            "frontend build did not produce {}; expected npm run build to create embedded static output",
-            static_dir.join("index.html").display()
-        );
-    }
+    frontend::build(&web_dir, &frontend_build_dir, &static_dir, &npm_cache_dir);
 }
 
 fn prepare_system_skills_dir(source_dir: &Path, target_dir: &Path, anthropic_repo_dir: &Path) {
@@ -268,62 +248,6 @@ fn copy_anthropic_skills(repo_dir: &Path, target_dir: &Path) {
     );
 }
 
-fn watch_frontend(web_dir: &Path) {
-    for path in [
-        web_dir.join("index.html"),
-        web_dir.join("package.json"),
-        web_dir.join("package-lock.json"),
-        web_dir.join("vite.config.js"),
-    ] {
-        println!("cargo:rerun-if-changed={}", path.display());
-    }
-    watch_dir(&web_dir.join("src"));
-    watch_dir(&web_dir.join("public"));
-}
-
-fn prepare_frontend_build_dir(source_dir: &Path, target_dir: &Path) {
-    fs::create_dir_all(target_dir).unwrap_or_else(|err| {
-        panic!(
-            "failed to create frontend build dir {}: {err}",
-            target_dir.display()
-        )
-    });
-    remove_frontend_build_inputs(target_dir);
-    copy_dir(source_dir, target_dir, should_skip_frontend_build_entry);
-}
-
-fn remove_frontend_build_inputs(target_dir: &Path) {
-    for entry in fs::read_dir(target_dir).unwrap_or_else(|err| {
-        panic!(
-            "failed to read frontend build dir {}: {err}",
-            target_dir.display()
-        )
-    }) {
-        let entry =
-            entry.unwrap_or_else(|err| panic!("failed to read frontend build entry: {err}"));
-        let file_name = entry.file_name();
-        if matches!(file_name.to_str(), Some("node_modules")) {
-            continue;
-        }
-        let path = entry.path();
-        if path.is_dir() {
-            fs::remove_dir_all(&path).unwrap_or_else(|err| {
-                panic!(
-                    "failed to remove frontend build dir {}: {err}",
-                    path.display()
-                )
-            });
-        } else {
-            fs::remove_file(&path).unwrap_or_else(|err| {
-                panic!(
-                    "failed to remove frontend build file {}: {err}",
-                    path.display()
-                )
-            });
-        }
-    }
-}
-
 fn watch_dir(path: &Path) {
     if !path.exists() {
         return;
@@ -341,77 +265,6 @@ fn watch_dir(path: &Path) {
         } else {
             println!("cargo:rerun-if-changed={}", path.display());
         }
-    }
-}
-
-fn ensure_npm(web_dir: &Path, npm_cache_dir: &Path) {
-    run_npm(web_dir, npm_cache_dir, ["--version"]);
-    if frontend_dependencies_missing(web_dir, npm_cache_dir) {
-        install_frontend_dependencies(web_dir, npm_cache_dir);
-    }
-}
-
-fn frontend_dependencies_missing(web_dir: &Path, npm_cache_dir: &Path) -> bool {
-    !web_dir.join("node_modules").is_dir()
-        || !local_npm_bin_exists(web_dir, "vite")
-        || !npm_command_succeeds(web_dir, npm_cache_dir, ["ls", "--depth=0", "--silent"])
-}
-
-fn local_npm_bin_exists(web_dir: &Path, name: &str) -> bool {
-    let bin_dir = web_dir.join("node_modules").join(".bin");
-    if cfg!(windows) {
-        bin_dir.join(format!("{name}.cmd")).exists()
-    } else {
-        bin_dir.join(name).exists()
-    }
-}
-
-fn install_frontend_dependencies(web_dir: &Path, npm_cache_dir: &Path) {
-    if web_dir.join("package-lock.json").exists() {
-        run_npm(web_dir, npm_cache_dir, ["ci"]);
-    } else {
-        run_npm(web_dir, npm_cache_dir, ["install"]);
-    }
-}
-
-fn npm_command_succeeds<const N: usize>(
-    web_dir: &Path,
-    npm_cache_dir: &Path,
-    args: [&str; N],
-) -> bool {
-    Command::new("npm")
-        .args(args)
-        .current_dir(web_dir)
-        .env("npm_config_cache", npm_cache_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap_or_else(|err| {
-            panic!(
-                "failed to execute npm in {}; install Node.js/npm first: {err}",
-                web_dir.display()
-            )
-        })
-        .success()
-}
-
-fn run_npm<const N: usize>(web_dir: &Path, npm_cache_dir: &Path, args: [&str; N]) {
-    let status = Command::new("npm")
-        .args(args)
-        .current_dir(web_dir)
-        .env("npm_config_cache", npm_cache_dir)
-        .status()
-        .unwrap_or_else(|err| {
-            panic!(
-                "failed to execute npm in {}; install Node.js/npm first: {err}",
-                web_dir.display()
-            )
-        });
-    if !status.success() {
-        panic!(
-            "npm command failed in {} with status {status}",
-            web_dir.display()
-        );
     }
 }
 
@@ -455,13 +308,6 @@ fn should_skip_anthropic_skill_entry(file_name: &OsStr) -> bool {
         return false;
     };
     name == ".DS_Store" || name.starts_with('.')
-}
-
-fn should_skip_frontend_build_entry(file_name: &OsStr) -> bool {
-    matches!(
-        file_name.to_str(),
-        Some(".DS_Store" | "dist" | "node_modules")
-    )
 }
 
 fn env_flag_enabled(name: &str) -> bool {

@@ -2318,6 +2318,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "pl-core"
 version = "0.1.0"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=main#e1deeb1f588b5c563957dc8038b20ee30b47774d"
 dependencies = [
  "anyhow",
  "base64",
@@ -2345,6 +2346,7 @@ dependencies = [
 [[package]]
 name = "pl-lsp"
 version = "0.1.0"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=main#e1deeb1f588b5c563957dc8038b20ee30b47774d"
 dependencies = [
  "futures",
  "lsp-types",
@@ -2358,6 +2360,7 @@ dependencies = [
 [[package]]
 name = "pl-model"
 version = "0.1.0"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=main#e1deeb1f588b5c563957dc8038b20ee30b47774d"
 dependencies = [
  "async-openai",
  "bitflags 2.11.1",
@@ -2376,6 +2379,7 @@ dependencies = [
 [[package]]
 name = "pl-output"
 version = "0.1.0"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=main#e1deeb1f588b5c563957dc8038b20ee30b47774d"
 dependencies = [
  "serde",
 ]
@@ -2383,10 +2387,12 @@ dependencies = [
 [[package]]
 name = "pl-patch"
 version = "0.1.0"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=main#e1deeb1f588b5c563957dc8038b20ee30b47774d"
 
 [[package]]
 name = "pl-protocol"
 version = "0.1.0"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=main#e1deeb1f588b5c563957dc8038b20ee30b47774d"
 dependencies = [
  "serde",
  "serde_json",
@@ -2396,6 +2402,7 @@ dependencies = [
 [[package]]
 name = "pl-skill-core"
 version = "0.1.0"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=main#e1deeb1f588b5c563957dc8038b20ee30b47774d"
 dependencies = [
  "serde",
  "serde_norway",
@@ -2404,6 +2411,7 @@ dependencies = [
 [[package]]
 name = "pl-trace"
 version = "0.1.0"
+source = "git+ssh://git@github.com/ZR233/pure-lang.git?branch=main#e1deeb1f588b5c563957dc8038b20ee30b47774d"
 dependencies = [
  "pl-protocol",
  "serde",
