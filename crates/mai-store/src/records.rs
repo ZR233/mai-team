@@ -173,6 +173,7 @@ pub(crate) struct AgentSessionRecord {
     pub(crate) total_tokens: i64,
     pub(crate) last_context_tokens: Option<i64>,
     pub(crate) trace_sequence: i64,
+    pub(crate) session_event_sequence: i64,
 }
 
 #[derive(Debug, Clone, toasty::Model)]
@@ -252,6 +253,28 @@ pub(crate) struct AgentRuntimeTraceRecord {
 }
 
 #[derive(Debug, Clone, toasty::Model)]
+#[table = "session_view_snapshots"]
+pub(crate) struct SessionViewSnapshotRecord {
+    #[key]
+    pub(crate) session_id: String,
+    pub(crate) through_sequence: i64,
+    pub(crate) snapshot_json: String,
+    pub(crate) updated_at: i64,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "session_event_journal"]
+pub(crate) struct SessionEventJournalRecord {
+    #[key]
+    pub(crate) id: String,
+    #[index]
+    pub(crate) session_id: String,
+    pub(crate) sequence: i64,
+    pub(crate) emitted_at: i64,
+    pub(crate) event_json: String,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
 #[table = "agent_messages"]
 pub(crate) struct AgentMessageRecord {
     #[key]
@@ -280,13 +303,12 @@ pub(crate) struct AgentHistoryRecord {
 }
 
 #[derive(Debug, Clone, toasty::Model)]
-#[table = "service_events"]
-pub(crate) struct ServiceEventRecord {
+#[table = "product_events"]
+pub(crate) struct MaiProductEventRecord {
     #[key]
     pub(crate) sequence: i64,
     pub(crate) timestamp: String,
     pub(crate) agent_id: Option<String>,
-    pub(crate) session_id: Option<String>,
     pub(crate) event_json: String,
 }
 
@@ -533,7 +555,7 @@ impl ProjectReviewRunRecord {
 
     pub(crate) fn into_detail(self) -> Result<ProjectReviewRunDetail> {
         let messages = serde_json::from_str::<Vec<AgentMessage>>(&self.messages_json)?;
-        let events = serde_json::from_str::<Vec<ServiceEvent>>(&self.events_json)?;
+        let events = serde_json::from_str::<Vec<SessionEventEnvelope>>(&self.events_json)?;
         Ok(ProjectReviewRunDetail {
             summary: self.into_summary()?,
             messages,

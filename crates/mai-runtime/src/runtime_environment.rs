@@ -46,10 +46,9 @@ impl AgentRuntime {
                     tracing::warn!("failed to persist environment root agent failure: {store_err}");
                 }
                 self.events
-                    .publish(ServiceEventKind::Error {
+                    .publish(MaiProductEventKind::OperationFailed {
+                        scope: "environment_provisioning".to_string(),
                         agent_id: Some(agent_id),
-                        session_id: None,
-                        turn_id: None,
                         message,
                     })
                     .await;
@@ -105,7 +104,7 @@ impl AgentRuntime {
             .await
             .insert(id, Arc::clone(&agent));
         self.events
-            .publish(ServiceEventKind::AgentCreated { agent: summary })
+            .publish(MaiProductEventKind::AgentCreated { agent: summary })
             .await;
         Ok(agent)
     }

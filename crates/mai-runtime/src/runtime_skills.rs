@@ -38,17 +38,16 @@ impl AgentRuntime {
         state: AgentResourceState,
         error: Option<String>,
     ) -> Result<()> {
-        let agent_id = {
+        {
             let mut summary = agent.summary.write().await;
             summary.state.resource = state;
             summary.state.resource_error = error;
             summary.updated_at = now();
-            summary.id
-        };
+        }
         self.persist_agent(agent).await?;
-        let state = agent.summary.read().await.state.clone();
+        let summary = agent.summary.read().await.clone();
         self.events
-            .publish(ServiceEventKind::AgentStateChanged { agent_id, state })
+            .publish(MaiProductEventKind::AgentUpdated { agent: summary })
             .await;
         Ok(())
     }

@@ -30,6 +30,7 @@ impl From<mai_runtime::RuntimeError> for ApiError {
             | ProjectReviewRunNotFound(_) => StatusCode::NOT_FOUND,
             TurnNotFound { .. } => StatusCode::NOT_FOUND,
             SessionNotFound { .. } => StatusCode::NOT_FOUND,
+            SessionEventNotFound(_) => StatusCode::NOT_FOUND,
             ToolTraceNotFound { .. } => StatusCode::NOT_FOUND,
             AgentBusy(_) | TaskBusy(_) => StatusCode::CONFLICT,
             InvalidInput(_) => StatusCode::BAD_REQUEST,

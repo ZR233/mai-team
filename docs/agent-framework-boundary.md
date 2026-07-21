@@ -9,10 +9,12 @@ mai 是基于 `pl-core` 的定制化 agent 产品。`pl-core` 唯一拥有 agent
 
 `MaiAgentHost` 在 `mai-runtime::agent_host` 中实现：
 
-- repository：将 `AgentCommit` 原子写入 mai-store，并执行 revision CAS。
+- repository：将 `AgentCommit`、canonical session projection 与 durable session event journal
+  原子写入 mai-store，并执行 revision CAS；提供 PL subscription bootstrap 所需的 snapshot/replay。
 - turn factory：解析 `MaiConfig` 的动态角色路由，组合 instructions、skills、MCP 和工具。
 - lifecycle：创建/回滚容器与 workspace，关闭时清理 descendants、MCP 和资源。
-- events：把已提交的 PL event 投影为 ServiceEvent、日志、tool trace 和 UI read model。
+- observer：在 PL session channel 广播后，只投影产品 read model、日志、tool trace 和低频
+  `MaiProductEvent`；不再把 trace 映射成另一套 UI session event。
 - policy：把 maintainer、parent 和 task role 规则编译为 `AgentExecutionPolicy`。
 
 mai 公共 `AgentRuntime` 仅为产品 facade，内部持有
@@ -61,11 +63,26 @@ AgentState
 事件使用携带完整快照的 `AgentStateChanged`。任务、项目和 review 的完成判断读取 last turn
 outcome，不把 agent 自身标记为 Completed。
 
+## 统一会话事件
+
+消息、tool、Todo、context、usage、interaction、agent activity 和 turn lifecycle 统一使用
+`pl-protocol::SessionStreamFrame`。`pl-core::SessionEventHub` 按 session 持有独立 bounded channel；
+Mai Server 的 `GET /sessions/{sessionId}/events` 只桥接该 channel，不解析 raw trace。
+
+稳定状态先与 agent transaction 一起持久化，再广播；文本、reasoning 和 tool 参数的 delta
+只实时广播并用 part revision 校验。subscription 首帧是 snapshot 或 replay；channel lag、cursor
+过期或 revision gap 返回 resync，Web 以无 cursor 重新订阅。
+
+project、task、review、provider、settings 和资源列表使用独立 `MaiProductEventEnvelope`，通过
+`GET /events/product` 推送。产品事件不得承载 session timeline，也不得触发整页 AgentDetail
+重拉。旧 `/events` 与混合 `ServiceEventKind` 删除，不保留兼容入口。
+
 ## 持久化与恢复
 
-mai-store schema 21 分离产品 metadata 与 framework runtime state，并持久化 sessions、
-canonical history、pending inputs 和 turns。一个 `AgentCommit` transaction 同时写 snapshot、
-session/history、turn/usage、queue、durable events 和 traces。版本不一致直接重建数据库，
+mai-store schema 22 分离产品 metadata 与 framework runtime state，并持久化 sessions、
+canonical history、pending inputs、turns、session projection 与 durable journal。一个
+`AgentCommit` transaction 同时写 snapshot、session/history、turn/usage、queue、session
+events 和 traces。版本不一致直接重建数据库，
 不读取旧 schema。
 
 启动时先 reconcile 容器和 workspace，再注册恢复的 agent actors；遗留 Running turn标记为

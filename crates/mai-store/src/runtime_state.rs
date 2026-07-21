@@ -1,4 +1,4 @@
-use crate::events::{next_service_event_sequence_on_path, recent_service_events_on_path};
+use crate::events::{next_product_event_sequence_on_path, recent_product_events_on_path};
 use crate::records::*;
 use crate::*;
 
@@ -122,8 +122,8 @@ impl MaiStore {
         }
         let projects = self.load_projects().await?;
 
-        let next_sequence = next_service_event_sequence_on_path(&self.path).await?;
-        let recent_events = recent_service_events_on_path(&self.path, recent_event_limit).await?;
+        let next_sequence = next_product_event_sequence_on_path(&self.path).await?;
+        let recent_events = recent_product_events_on_path(&self.path, recent_event_limit).await?;
 
         Ok(RuntimeSnapshot {
             agents,

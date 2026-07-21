@@ -7,9 +7,9 @@ use crate::state::{ProjectRecord, RuntimeState};
 use crate::{Result, RuntimeError};
 use mai_protocol::{
     AgentDetail, AgentId, AgentModelPreference, AgentRole, AgentSummary, CreateProjectRequest,
-    GitAccountSummary, GithubInstallationsResponse, ProjectCloneStatus, ProjectDetail, ProjectId,
-    ProjectReviewStatus, ProjectStatus, ProjectSummary, SendMessageRequest, ServiceEventKind,
-    SessionId, TurnId, UpdateProjectRequest, now,
+    GitAccountSummary, GithubInstallationsResponse, MaiProductEventKind, ProjectCloneStatus,
+    ProjectDetail, ProjectId, ProjectReviewStatus, ProjectStatus, ProjectSummary,
+    SendMessageRequest, SessionId, TurnId, UpdateProjectRequest, now,
 };
 use uuid::Uuid;
 
@@ -35,7 +35,7 @@ pub(crate) trait ProjectLifecycleOps: Send + Sync {
         &self,
         project_id: ProjectId,
     ) -> impl Future<Output = Result<()>> + Send;
-    fn publish_project_event(&self, event: ServiceEventKind) -> impl Future<Output = ()> + Send;
+    fn publish_project_event(&self, event: MaiProductEventKind) -> impl Future<Output = ()> + Send;
     fn start_project_review_loop_if_ready(
         &self,
         project_id: ProjectId,
@@ -96,7 +96,7 @@ pub(crate) trait ProjectCreateOps: Send + Sync {
     ) -> impl Future<Output = Result<AgentSummary>> + Send;
     fn save_project(&self, project: &ProjectSummary) -> impl Future<Output = Result<()>> + Send;
     fn insert_project(&self, project: ProjectSummary) -> impl Future<Output = ()> + Send;
-    fn publish_project_event(&self, event: ServiceEventKind) -> impl Future<Output = ()> + Send;
+    fn publish_project_event(&self, event: MaiProductEventKind) -> impl Future<Output = ()> + Send;
     fn start_project_workspace(
         &self,
         project_id: ProjectId,
@@ -279,7 +279,7 @@ pub(crate) async fn create_project(
     };
     ops.save_project(&project).await?;
     ops.insert_project(project.clone()).await;
-    ops.publish_project_event(ServiceEventKind::ProjectCreated {
+    ops.publish_project_event(MaiProductEventKind::ProjectCreated {
         project: project.clone(),
     })
     .await;
@@ -388,7 +388,7 @@ pub(crate) async fn update_project(
         summary.clone()
     };
     ops.save_project(&updated).await?;
-    ops.publish_project_event(ServiceEventKind::ProjectUpdated {
+    ops.publish_project_event(MaiProductEventKind::ProjectUpdated {
         project: updated.clone(),
     })
     .await;
@@ -418,7 +418,7 @@ pub(crate) async fn delete_project(
         summary.status = ProjectStatus::Deleting;
         summary.updated_at = now();
         ops.save_project(&summary).await?;
-        ops.publish_project_event(ServiceEventKind::ProjectUpdated {
+        ops.publish_project_event(MaiProductEventKind::ProjectUpdated {
             project: summary.clone(),
         })
         .await;
@@ -431,7 +431,7 @@ pub(crate) async fn delete_project(
     ops.delete_project_from_store(project_id).await?;
     ops.remove_project_from_memory(project_id).await;
     ops.remove_project_skill_lock(project_id).await;
-    ops.publish_project_event(ServiceEventKind::ProjectDeleted { project_id })
+    ops.publish_project_event(MaiProductEventKind::ProjectDeleted { project_id })
         .await;
     let _ = std::fs::remove_dir_all(ops.project_skill_cache_dir(project_id));
     Ok(())
@@ -457,7 +457,7 @@ pub(crate) async fn cancel_project(
         summary.clone()
     };
     ops.save_project(&updated).await?;
-    ops.publish_project_event(ServiceEventKind::ProjectUpdated { project: updated })
+    ops.publish_project_event(MaiProductEventKind::ProjectUpdated { project: updated })
         .await;
     let _ = ops.delete_project_sidecar(project_id).await;
     Ok(())

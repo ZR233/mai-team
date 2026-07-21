@@ -40,6 +40,7 @@ mod runtime_provisioning;
 mod runtime_resources;
 mod runtime_review_context;
 mod runtime_review_traits;
+mod runtime_session_events;
 mod runtime_skills;
 mod runtime_task_traits;
 mod runtime_tool_settings;
@@ -77,9 +78,9 @@ use projects::review::runs::FinishReviewRun;
 use projects::review::state::ReviewStateUpdate;
 use projects::skills::ProjectSkillSourceDir;
 use projects::workspace::ProjectWorkspaceManager;
+pub use runtime_session_events::MaiSessionEventSubscription;
 use state::{AgentRecord, ProjectRecord, RuntimeState, TaskRecord};
 
-const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 90;
 const PROJECT_REVIEW_RUN_LIST_LIMIT: usize = 50;
 const PROJECT_REVIEW_SNAPSHOT_MESSAGE_LIMIT: usize = 40;
 const PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT: usize = 80;
@@ -162,6 +163,8 @@ pub enum RuntimeError {
         agent_id: AgentId,
         session_id: SessionId,
     },
+    #[error("session event stream not found: {0}")]
+    SessionEventNotFound(SessionId),
     #[error("tool trace not found: {agent_id}/{call_id}")]
     ToolTraceNotFound { agent_id: AgentId, call_id: String },
     #[error("turn not found: {agent_id}/{turn_id}")]

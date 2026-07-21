@@ -397,8 +397,8 @@ pub(crate) fn provider_test_model(id: &str) -> ModelConfig {
 mod tests {
     use super::*;
     use mai_protocol::{
-        ProviderConnectionMode, ProviderTestRequest, ProviderWireProtocol, ServiceEvent,
-        ServiceEventKind, TokenUsage,
+        MaiProductEventEnvelope, MaiProductEventKind, ProviderConnectionMode, ProviderTestRequest,
+        ProviderWireProtocol, TokenUsage,
     };
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, VecDeque};
@@ -879,7 +879,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_event_replay_returns_events_after_sequence() {
+    async fn product_event_replay_returns_events_after_sequence() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = mai_store::MaiStore::open_with_config_path(
             dir.path().join("server.sqlite3"),
@@ -889,13 +889,12 @@ mod tests {
         .expect("open store");
         for sequence in 1..=3 {
             store
-                .append_service_event(&ServiceEvent {
+                .append_product_event(&MaiProductEventEnvelope {
                     sequence,
                     timestamp: mai_protocol::now(),
-                    kind: ServiceEventKind::Error {
+                    kind: MaiProductEventKind::OperationFailed {
+                        scope: "test".to_string(),
                         agent_id: None,
-                        session_id: None,
-                        turn_id: None,
                         message: format!("event {sequence}"),
                     },
                 })
@@ -903,7 +902,7 @@ mod tests {
                 .expect("append event");
         }
 
-        let replay = store.service_events_after(1, 10).await.expect("replay");
+        let replay = store.product_events_after(1, 10).await.expect("replay");
         assert_eq!(
             replay
                 .iter()

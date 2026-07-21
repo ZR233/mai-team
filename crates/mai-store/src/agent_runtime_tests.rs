@@ -248,6 +248,7 @@ fn document(
                 usage: StoredTokenUsage::default(),
                 last_context_tokens: Some(42),
                 trace_sequence: 7,
+                session_event_sequence: 0,
             }],
             pending_inputs: vec![StoredAgentPendingInput {
                 turn_id: "turn-1".to_string(),
@@ -256,6 +257,7 @@ fn document(
                 metadata: serde_json::json!({ "skills": ["rust"] }),
                 queued_at: 1_700_000_000,
             }],
+            session_projections: Vec::new(),
         },
         turns: vec![StoredAgentTurn {
             turn_id: "turn-1".to_string(),
@@ -275,5 +277,6 @@ fn document(
             sequence: revision,
             payload: serde_json::json!({ "trace": activity }),
         }],
+        session_projection: None,
     }
 }

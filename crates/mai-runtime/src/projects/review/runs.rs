@@ -4,7 +4,7 @@ use chrono::{TimeDelta, Utc};
 use mai_protocol::{
     AgentId, AgentMessage, ProjectId, ProjectReviewDecision, ProjectReviewOutcome,
     ProjectReviewRunDetail, ProjectReviewRunStatus, ProjectReviewRunSummary,
-    ProjectReviewRunsResponse, ServiceEvent, TokenUsage, TurnId, now,
+    ProjectReviewRunsResponse, SessionEventEnvelope, TokenUsage, TurnId, now,
 };
 use mai_store::MaiStore;
 use uuid::Uuid;
@@ -24,7 +24,7 @@ pub(crate) trait ReviewRunSnapshotSource: Send + Sync {
 pub(crate) struct ReviewRunSnapshot {
     pub(crate) token_usage: TokenUsage,
     pub(crate) messages: Vec<AgentMessage>,
-    pub(crate) events: Vec<ServiceEvent>,
+    pub(crate) events: Vec<SessionEventEnvelope>,
 }
 
 #[derive(Debug, Clone)]
@@ -140,7 +140,7 @@ pub(crate) async fn save_project_review_run_status(
     store: &MaiStore,
     summary: ProjectReviewRunSummary,
     messages: Vec<AgentMessage>,
-    events: Vec<ServiceEvent>,
+    events: Vec<SessionEventEnvelope>,
 ) -> Result<()> {
     store
         .save_project_review_run(&ProjectReviewRunDetail {

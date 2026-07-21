@@ -48,16 +48,6 @@ impl AgentRuntime {
         })?;
         let mut summary = agent.summary.read().await.clone();
         summary.token_usage = agent_host::aggregate_usage(&runtime);
-        let context_usage = self
-            .resolve_provider_selection(Some(&summary.provider_id), Some(&summary.model))
-            .await
-            .ok()
-            .map(|selection| selection.model.effective_context_tokens())
-            .map(|context_tokens| ContextUsage {
-                used_tokens: selected.last_context_tokens.unwrap_or_default(),
-                context_tokens,
-                threshold_percent: AUTO_COMPACT_THRESHOLD_PERCENT,
-            });
         Ok(AgentDetail {
             summary,
             sessions: sessions
@@ -65,12 +55,6 @@ impl AgentRuntime {
                 .map(|session| session.summary.clone())
                 .collect(),
             selected_session_id: selected.summary.id,
-            context_usage,
-            messages: selected.messages.clone(),
-            recent_events: self
-                .events
-                .recent_for_agent(agent_id, RECENT_EVENT_LIMIT)
-                .await,
         })
     }
 
@@ -397,14 +381,6 @@ impl AgentRuntime {
             }
             () = cancellation_token.cancelled() => Err(RuntimeError::TurnCancelled),
         }
-    }
-
-    pub(super) async fn agent_recent_events(
-        &self,
-        agent_id: AgentId,
-        limit: usize,
-    ) -> Vec<ServiceEvent> {
-        self.events.recent_for_agent(agent_id, limit).await
     }
 
     pub(super) async fn agent_recent_messages(

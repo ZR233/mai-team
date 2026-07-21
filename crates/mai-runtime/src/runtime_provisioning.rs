@@ -81,10 +81,9 @@ impl AgentRuntime {
                     tracing::warn!("failed to persist agent failure: {store_err}");
                 }
                 self.events
-                    .publish(ServiceEventKind::Error {
+                    .publish(MaiProductEventKind::OperationFailed {
+                        scope: "agent_provisioning".to_string(),
                         agent_id: Some(agent_id),
-                        session_id: None,
-                        turn_id: None,
                         message,
                     })
                     .await;

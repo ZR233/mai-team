@@ -230,7 +230,7 @@ impl AgentRuntime {
         projects::service::send_project_message(&self.state, self, project_id, request).await
     }
 
-    pub async fn publish_external_event(&self, kind: ServiceEventKind) {
+    pub async fn publish_external_event(&self, kind: MaiProductEventKind) {
         self.events.publish(kind).await;
     }
 
@@ -273,7 +273,7 @@ impl AgentRuntime {
             self.refresh_project_skill_cache_from_project_repository(project_id)
                 .await?;
             self.events
-                .publish(ServiceEventKind::ProjectUpdated { project: summary })
+                .publish(MaiProductEventKind::ProjectUpdated { project: summary })
                 .await;
         }
         Ok(())
@@ -418,7 +418,7 @@ impl AgentRuntime {
                 summary.queued.contains(&signal.pr) || summary.deduped.contains(&signal.pr)
             }) {
                 self.events
-                    .publish(ServiceEventKind::ProjectReviewQueued {
+                    .publish(MaiProductEventKind::ProjectReviewQueued {
                         project_id,
                         delivery_id: signal.delivery_id.clone().unwrap_or_default(),
                         pr: signal.pr,

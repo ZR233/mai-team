@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use mai_protocol::{ProjectId, RelayAckStatus, RelayEvent, RelayEventKind, ServiceEventKind};
+use mai_protocol::{MaiProductEventKind, ProjectId, RelayAckStatus, RelayEvent, RelayEventKind};
 use mai_relay_client::RelayClient;
 use mai_runtime::{
     AgentRuntime, ProjectReviewQueueRequest, ProjectReviewQueueSummary, RuntimeError,
@@ -29,7 +29,7 @@ pub(crate) async fn install_relay_event_handler(
 /// 实现方需要发布收到的 webhook 事件、解析目标项目、只把 PR 相关信号放入
 /// relay 队列，并通过显式方法处理 push 同步等非 PR 副作用。
 trait RelayEventRuntime: Send + Sync {
-    fn publish_external_event(&self, kind: ServiceEventKind) -> impl Future<Output = ()> + Send;
+    fn publish_external_event(&self, kind: MaiProductEventKind) -> impl Future<Output = ()> + Send;
 
     fn find_project_for_github_event(
         &self,
@@ -51,7 +51,7 @@ trait RelayEventRuntime: Send + Sync {
 }
 
 impl RelayEventRuntime for Arc<AgentRuntime> {
-    fn publish_external_event(&self, kind: ServiceEventKind) -> impl Future<Output = ()> + Send {
+    fn publish_external_event(&self, kind: MaiProductEventKind) -> impl Future<Output = ()> + Send {
         AgentRuntime::publish_external_event(self, kind)
     }
 
@@ -115,7 +115,7 @@ async fn process_event(
         .and_then(Value::as_u64);
 
     runtime
-        .publish_external_event(ServiceEventKind::GithubWebhookReceived {
+        .publish_external_event(MaiProductEventKind::GithubWebhookReceived {
             delivery_id: event.delivery_id.clone(),
             event: event_name.clone(),
             action: action.clone(),
@@ -223,7 +223,7 @@ mod tests {
         project_id: ProjectId,
         relay_requests: Mutex<Vec<ProjectReviewQueueRequest>>,
         push_events: Mutex<Vec<ProjectId>>,
-        external_events: Mutex<Vec<ServiceEventKind>>,
+        external_events: Mutex<Vec<MaiProductEventKind>>,
     }
 
     impl FakeRelayRuntime {
@@ -238,7 +238,7 @@ mod tests {
     }
 
     impl RelayEventRuntime for FakeRelayRuntime {
-        async fn publish_external_event(&self, kind: ServiceEventKind) {
+        async fn publish_external_event(&self, kind: MaiProductEventKind) {
             self.external_events.lock().await.push(kind);
         }
 

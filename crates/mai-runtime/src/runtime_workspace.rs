@@ -19,7 +19,7 @@ impl AgentRuntime {
         };
         self.deps.store.save_project(&updated).await?;
         self.events
-            .publish(ServiceEventKind::ProjectUpdated {
+            .publish(MaiProductEventKind::ProjectUpdated {
                 project: updated.clone(),
             })
             .await;

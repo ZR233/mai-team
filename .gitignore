@@ -1,5 +1,7 @@
 /target
 crates/mai-server/web/dist
+crates/mai-server/web/playwright-report
+crates/mai-server/web/test-results
 crates/mai-server/web/node_modules
 /.mai-team
 /artifacts

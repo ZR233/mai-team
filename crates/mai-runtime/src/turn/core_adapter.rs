@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use mai_protocol::{AgentId, ServiceEventKind, SessionId, TurnId};
+use mai_protocol::AgentId;
 use pl_core::{
     AgentExecutionPolicy, AgentId as FrameworkAgentId, AgentKernel, AgentRuntimeHandle,
     CoreAgentProfile, TurnEngineBuilder,
@@ -21,28 +21,11 @@ pub(crate) struct MaiFrameworkKernelBuildContext {
     pub(crate) mcp_lease: Option<pl_core::McpTurnLease>,
 }
 
-pub(crate) fn mai_user_input_interaction_callback(
-    runtime: Arc<AgentRuntime>,
-    agent_id: AgentId,
-    session_id: SessionId,
-    turn_id: TurnId,
-) -> pl_core::InteractionCallback {
+pub(crate) fn mai_user_input_interaction_callback() -> pl_core::InteractionCallback {
     Arc::new(move |interaction| {
-        let runtime = runtime.clone();
         Box::pin(async move {
             match interaction.payload {
-                pl_protocol::InteractionPayload::UserInput { questions } => {
-                    let (header, questions) = user_input_questions_from_pl(questions);
-                    runtime
-                        .events
-                        .publish(ServiceEventKind::UserInputRequested {
-                            agent_id,
-                            session_id: Some(session_id),
-                            turn_id,
-                            header,
-                            questions,
-                        })
-                        .await;
+                pl_protocol::InteractionPayload::UserInput { .. } => {
                     pl_protocol::InteractionResolution::UserInput {
                         answers: Default::default(),
                     }
@@ -67,29 +50,6 @@ pub(crate) fn mai_user_input_interaction_callback(
             }
         })
     })
-}
-
-fn user_input_questions_from_pl(
-    questions: Vec<pl_protocol::UserQuestion>,
-) -> (String, Vec<mai_protocol::UserInputQuestion>) {
-    let projection = pl_core::project_user_input_questions(questions);
-    let questions = projection
-        .questions()
-        .iter()
-        .map(|question| mai_protocol::UserInputQuestion {
-            id: question.id().to_string(),
-            question: question.question().to_string(),
-            options: question
-                .options()
-                .iter()
-                .map(|option| mai_protocol::UserInputOption {
-                    label: option.label().to_string(),
-                    description: Some(option.description().to_string()),
-                })
-                .collect(),
-        })
-        .collect();
-    (projection.header().to_string(), questions)
 }
 
 /// 为 PL Agent Runtime 构造 mai kernel；协作工具直接持有 runtime handle。
@@ -155,15 +115,6 @@ pub(crate) async fn build_mai_framework_kernel(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn user_input_projection_uses_pl_core_projection() {
-        let source = include_str!("core_adapter.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap();
-
-        assert!(production.contains("pl_core::project_user_input_questions"));
-        assert!(!production.contains("question.header.trim()"));
-    }
-
     #[test]
     fn collaboration_tools_only_receive_non_generic_runtime_handle() {
         let source = include_str!("core_adapter.rs");

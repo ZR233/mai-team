@@ -158,6 +158,7 @@ impl AgentRuntime {
                         .turn_cancel_grace_ms,
                 ),
                 restored_inputs: pl_core::RestoredInputPolicy::Hold,
+                session_events: pl_core::SessionEventOptions::default(),
             },
         )
         .await

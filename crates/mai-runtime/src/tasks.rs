@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use mai_protocol::{
     AgentDetail, AgentId, AgentModelPreference, AgentRole, AgentSessionSummary, AgentSummary,
-    EnvironmentDetail, EnvironmentId, EnvironmentSummary, PlanHistoryEntry, PlanStatus,
-    ServiceEventKind, SessionId, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary,
+    EnvironmentDetail, EnvironmentId, EnvironmentSummary, MaiProductEventKind, PlanHistoryEntry,
+    PlanStatus, SessionId, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary,
     TurnId, now,
 };
 use tokio::sync::{Mutex, RwLock};
@@ -138,7 +138,7 @@ pub(crate) trait TaskCreateOps: Send + Sync {
         plan: &TaskPlan,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    fn publish_task_event(&self, event: ServiceEventKind) -> impl Future<Output = ()> + Send;
+    fn publish_task_event(&self, event: MaiProductEventKind) -> impl Future<Output = ()> + Send;
 
     fn send_task_message(
         &self,
@@ -249,7 +249,7 @@ pub(crate) async fn create_task(
             workflow_lock: Mutex::new(()),
         }),
     );
-    ops.publish_task_event(ServiceEventKind::TaskCreated {
+    ops.publish_task_event(MaiProductEventKind::TaskCreated {
         task: summary.clone(),
     })
     .await;

@@ -12,12 +12,19 @@ pub use agent_state::{
     AgentRuntimeState, AgentState, AgentTurnOutcomeKind,
 };
 pub use pl_protocol::{
-    CredentialDescriptorDto, McpAvailabilityDescriptor, McpHealthSnapshot, McpServerDescriptor,
-    ModelCapabilitiesDto, ModelCatalogDescriptor, ModelDescriptor, ModelPricingDto,
-    ModelReasoningDescriptor, PROVIDER_CATALOG_SCHEMA_VERSION, ProviderCatalogSnapshot,
-    ProviderConnectionModeDescriptor, ProviderPresetDescriptor,
-    ProviderServiceCapabilitiesDescriptor, WebSearchProviderCapabilitiesDescriptor,
-    WebSearchResolutionDescriptor,
+    CredentialDescriptorDto, ErrorSeverity, McpAvailabilityDescriptor, McpHealthSnapshot,
+    McpServerDescriptor, ModelCapabilitiesDto, ModelCatalogDescriptor, ModelDescriptor,
+    ModelPricingDto, ModelReasoningDescriptor, PROVIDER_CATALOG_SCHEMA_VERSION,
+    ProviderCatalogSnapshot, ProviderConnectionModeDescriptor, ProviderPresetDescriptor,
+    ProviderServiceCapabilitiesDescriptor, SESSION_EVENT_SCHEMA_VERSION, SessionAgentPart,
+    SessionAgentSnapshot, SessionAttachment, SessionContextCompaction, SessionEventEnvelope,
+    SessionEventKind, SessionEventPosition, SessionMessage, SessionMessageRole,
+    SessionMessageStatus, SessionPart, SessionPartContent, SessionPartDelta, SessionPartDeltaField,
+    SessionPartStatus, SessionResyncReason, SessionRuntimeSnapshot, SessionRuntimeUsage,
+    SessionStreamFrame, SessionSubscriptionRequest, SessionTextChannel, SessionTimelineEvent,
+    SessionTimelineEventKind, SessionToolPart, SessionTurn, SessionTurnStatus, SessionViewSnapshot,
+    WebSearchProviderCapabilitiesDescriptor, WebSearchResolutionDescriptor,
+    session_events_typescript,
 };
 
 pub type AgentId = Uuid;
@@ -230,13 +237,6 @@ impl TokenUsage {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ContextUsage {
-    pub used_tokens: u64,
-    pub context_tokens: u64,
-    pub threshold_percent: u64,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSummary {
     pub id: AgentId,
@@ -268,10 +268,6 @@ pub struct AgentDetail {
     pub summary: AgentSummary,
     pub sessions: Vec<AgentSessionSummary>,
     pub selected_session_id: SessionId,
-    #[serde(default)]
-    pub context_usage: Option<ContextUsage>,
-    pub messages: Vec<AgentMessage>,
-    pub recent_events: Vec<ServiceEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -465,7 +461,7 @@ pub struct ProjectReviewRunDetail {
     #[serde(default)]
     pub messages: Vec<AgentMessage>,
     #[serde(default)]
-    pub events: Vec<ServiceEvent>,
+    pub events: Vec<SessionEventEnvelope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1347,22 +1343,18 @@ pub struct ProviderSecret {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServiceEvent {
+pub struct MaiProductEventEnvelope {
     pub sequence: u64,
     pub timestamp: DateTime<Utc>,
     #[serde(flatten)]
-    pub kind: ServiceEventKind,
+    pub kind: MaiProductEventKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServiceEventKind {
+pub enum MaiProductEventKind {
     AgentCreated {
         agent: AgentSummary,
-    },
-    AgentStateChanged {
-        agent_id: AgentId,
-        state: AgentState,
     },
     AgentUpdated {
         agent: AgentSummary,
@@ -1401,135 +1393,14 @@ pub enum ServiceEventKind {
         pr: u64,
         reason: String,
     },
-    TurnStarted {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-    },
-    TurnCompleted {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        status: TurnStatus,
-    },
-    ToolStarted {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        call_id: String,
-        tool_name: String,
-        #[serde(default)]
-        arguments_preview: Option<String>,
-        #[serde(default)]
-        arguments: Option<Value>,
-    },
-    ToolCompleted {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        call_id: String,
-        tool_name: String,
-        success: bool,
-        output_preview: String,
-        #[serde(default)]
-        duration_ms: Option<u64>,
-    },
-    ContextCompacted {
-        agent_id: AgentId,
-        session_id: SessionId,
-        turn_id: TurnId,
-        tokens_before: u64,
-        summary_preview: String,
-    },
-    AgentMessage {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: Option<TurnId>,
-        role: MessageRole,
-        content: String,
-    },
-    AgentMessageDelta {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        message_id: String,
-        role: MessageRole,
-        channel: String,
-        delta: String,
-    },
-    AgentMessageCompleted {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        message_id: String,
-        role: MessageRole,
-        channel: String,
-        content: String,
-    },
-    ReasoningDelta {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        message_id: String,
-        delta: String,
-    },
-    ReasoningCompleted {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        message_id: String,
-        content: String,
-    },
-    ToolCallDelta {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        call_id: String,
-        tool_name: String,
-        arguments_delta: String,
-    },
-    SkillsActivated {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        skills: Vec<SkillActivationInfo>,
-    },
-    Error {
+    OperationFailed {
+        scope: String,
         agent_id: Option<AgentId>,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: Option<TurnId>,
         message: String,
-    },
-    TodoListUpdated {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        items: Vec<TodoItem>,
     },
     PlanUpdated {
         task_id: TaskId,
         plan: TaskPlan,
-    },
-    UserInputRequested {
-        agent_id: AgentId,
-        #[serde(default)]
-        session_id: Option<SessionId>,
-        turn_id: TurnId,
-        header: String,
-        questions: Vec<UserInputQuestion>,
     },
     ArtifactCreated {
         artifact: ArtifactInfo,

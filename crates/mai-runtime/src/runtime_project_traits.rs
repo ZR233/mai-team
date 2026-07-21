@@ -11,7 +11,7 @@ impl projects::service::ProjectLifecycleOps for Arc<AgentRuntime> {
         Ok(())
     }
 
-    async fn publish_project_event(&self, event: ServiceEventKind) {
+    async fn publish_project_event(&self, event: MaiProductEventKind) {
         self.events.publish(event).await;
     }
 
@@ -168,7 +168,7 @@ impl projects::service::ProjectCreateOps for Arc<AgentRuntime> {
             .insert(project.id, Arc::new(ProjectRecord::new(project)));
     }
 
-    async fn publish_project_event(&self, event: ServiceEventKind) {
+    async fn publish_project_event(&self, event: MaiProductEventKind) {
         self.events.publish(event).await;
     }
 

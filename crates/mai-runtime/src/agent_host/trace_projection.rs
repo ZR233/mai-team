@@ -1,10 +1,9 @@
 use chrono::{DateTime, Utc};
 use mai_protocol::{
-    AgentId, AgentLogEntry, MessageRole, ServiceEventKind, SessionId, ToolOutputArtifactInfo,
-    ToolTraceDetail, TurnId,
+    AgentId, AgentLogEntry, SessionId, ToolOutputArtifactInfo, ToolTraceDetail, TurnId,
 };
 use pl_core::{ToolLifecyclePhase, ToolLifecycleProjection};
-use pl_trace::{TraceEvent, TraceEventKind, TracePart, TracePartKind, TraceTextChannel};
+use pl_trace::TraceEvent;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -21,7 +20,7 @@ pub(super) struct AgentLogProjection {
     pub(super) timestamp: DateTime<Utc>,
 }
 
-/// 将同一 framework transaction 已持久化的 trace 投影为 mai read model 和事件。
+/// 将同一 framework transaction 已持久化的 trace 投影为产品观测记录。
 pub(super) async fn project_trace_events(
     runtime: &AgentRuntime,
     agent_id: AgentId,
@@ -46,86 +45,6 @@ pub(super) async fn project_trace_events(
                 .await;
             }
         }
-    }
-
-    for event in events {
-        match &event.kind {
-            TraceEventKind::TracePartCompleted { item } => {
-                project_completed_part(runtime, agent_id, session_id, turn_id, item).await;
-            }
-            TraceEventKind::TracePartStarted { .. }
-            | TraceEventKind::TracePartDelta { .. }
-            | TraceEventKind::TracePartFailed { .. }
-            | TraceEventKind::PlanLifecycleChanged { .. }
-            | TraceEventKind::InteractionChanged { .. }
-            | TraceEventKind::SkillActivated { .. }
-            | TraceEventKind::EnabledToolsRecorded { .. } => {}
-        }
-    }
-}
-
-async fn project_completed_part(
-    runtime: &AgentRuntime,
-    agent_id: AgentId,
-    session_id: SessionId,
-    turn_id: TurnId,
-    item: &TracePart,
-) {
-    match item.kind {
-        TracePartKind::Text => {
-            let Some(channel) = item.text_channel else {
-                return;
-            };
-            if channel == TraceTextChannel::User || item.content.is_empty() {
-                return;
-            }
-            runtime
-                .events
-                .publish(ServiceEventKind::AgentMessageCompleted {
-                    agent_id,
-                    session_id: Some(session_id),
-                    turn_id,
-                    message_id: item.item_id.clone(),
-                    role: MessageRole::Assistant,
-                    channel: channel.as_str().to_string(),
-                    content: item.content.clone(),
-                })
-                .await;
-            runtime
-                .events
-                .publish(ServiceEventKind::AgentMessage {
-                    agent_id,
-                    session_id: Some(session_id),
-                    turn_id: Some(turn_id),
-                    role: MessageRole::Assistant,
-                    content: item.content.clone(),
-                })
-                .await;
-        }
-        TracePartKind::Thinking => {
-            let content = item
-                .thinking_chunks
-                .iter()
-                .map(|chunk| chunk.content.as_str())
-                .collect::<String>();
-            if !content.is_empty() {
-                runtime
-                    .events
-                    .publish(ServiceEventKind::ReasoningCompleted {
-                        agent_id,
-                        session_id: Some(session_id),
-                        turn_id,
-                        message_id: item.item_id.clone(),
-                        content,
-                    })
-                    .await;
-            }
-        }
-        TracePartKind::Tool
-        | TracePartKind::Agent
-        | TracePartKind::Turn
-        | TracePartKind::Inference
-        | TracePartKind::Plan => {}
     }
 }
 
@@ -178,18 +97,6 @@ async fn project_tool_started(
         },
     )
     .await;
-    runtime
-        .events
-        .publish(ServiceEventKind::ToolStarted {
-            agent_id,
-            session_id: Some(session_id),
-            turn_id,
-            call_id: projection.call_id().to_string(),
-            tool_name: projection.tool_name().to_string(),
-            arguments_preview: Some(projection.arguments_preview().to_string()),
-            arguments: Some(projection.arguments().clone()),
-        })
-        .await;
 }
 
 async fn project_tool_completed(
@@ -250,19 +157,6 @@ async fn project_tool_completed(
         },
     )
     .await;
-    runtime
-        .events
-        .publish(ServiceEventKind::ToolCompleted {
-            agent_id,
-            session_id: Some(session_id),
-            turn_id,
-            call_id: projection.call_id().to_string(),
-            tool_name: projection.tool_name().to_string(),
-            success,
-            output_preview: projection.output_preview().to_string(),
-            duration_ms: projection.duration_ms(),
-        })
-        .await;
 }
 
 pub(super) async fn record_agent_log(runtime: &AgentRuntime, projection: AgentLogProjection) {

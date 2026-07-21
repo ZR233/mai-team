@@ -4,6 +4,7 @@ mod policy;
 mod protocol;
 mod repository;
 mod review_manifest;
+mod session_wire;
 mod sessions;
 mod trace_projection;
 mod turn_factory;
@@ -15,11 +16,14 @@ use tokio::sync::RwLock;
 
 use crate::{AgentRuntime, MaiConfig, RuntimeError};
 
-pub(crate) use events::{MaiAgentEventSink, synchronize_runtime_state};
+pub(crate) use events::{MaiAgentCommitObserver, synchronize_runtime_state};
 pub(crate) use lifecycle::MaiAgentLifecycle;
 pub(crate) use policy::{MaiPolicyContext, compile_execution_policy};
 pub(crate) use protocol::{protocol_uuid, runtime_state};
 pub(crate) use repository::MaiAgentRepository;
+pub(crate) use session_wire::{
+    project_session_event_envelope, project_session_stream_frame, project_session_view_snapshot,
+};
 pub(crate) use sessions::{
     ResolvedAgentSessionId, aggregate_usage, history_messages, last_assistant_response,
     load_runtime, project_sessions, selected_session, session_state,
@@ -32,7 +36,7 @@ pub(crate) struct MaiAgentHost {
     repository: MaiAgentRepository,
     turn_factory: MaiAgentTurnFactory,
     lifecycle: MaiAgentLifecycle,
-    events: MaiAgentEventSink,
+    observer: MaiAgentCommitObserver,
 }
 
 impl MaiAgentHost {
@@ -45,7 +49,7 @@ impl MaiAgentHost {
             repository: MaiAgentRepository::new(store),
             turn_factory: MaiAgentTurnFactory::new(runtime.clone(), config),
             lifecycle: MaiAgentLifecycle::new(runtime.clone()),
-            events: MaiAgentEventSink::new(runtime),
+            observer: MaiAgentCommitObserver::new(runtime),
         }
     }
 }
@@ -55,7 +59,7 @@ impl AgentRuntimeHost for MaiAgentHost {
     type Repository = MaiAgentRepository;
     type TurnFactory = MaiAgentTurnFactory;
     type Lifecycle = MaiAgentLifecycle;
-    type Events = MaiAgentEventSink;
+    type Observer = MaiAgentCommitObserver;
 
     fn repository(&self) -> &Self::Repository {
         &self.repository
@@ -69,7 +73,7 @@ impl AgentRuntimeHost for MaiAgentHost {
         &self.lifecycle
     }
 
-    fn events(&self) -> &Self::Events {
-        &self.events
+    fn observer(&self) -> &Self::Observer {
+        &self.observer
     }
 }

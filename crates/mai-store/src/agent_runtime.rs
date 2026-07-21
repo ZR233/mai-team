@@ -1,12 +1,15 @@
 use std::collections::BTreeMap;
 
+mod projection;
 mod state;
 
+use projection::load_session_projections;
 use state::{stored_state, unix_timestamp_rfc3339, usize_to_i64};
 
 use crate::records::{
     AgentHistoryRecord, AgentMessageRecord, AgentPendingInputRecord, AgentRuntimeEventRecord,
     AgentRuntimeStateRecord, AgentRuntimeTraceRecord, AgentSessionRecord, AgentTurnRecord,
+    SessionEventJournalRecord, SessionViewSnapshotRecord,
 };
 use crate::*;
 
@@ -50,6 +53,7 @@ pub struct StoredAgentRuntimeSession {
     pub usage: StoredTokenUsage,
     pub last_context_tokens: Option<u64>,
     pub trace_sequence: u64,
+    pub session_event_sequence: u64,
 }
 
 /// 可恢复的 FIFO 输入。
@@ -89,12 +93,30 @@ pub struct StoredAgentRuntimeTrace {
     pub payload: serde_json::Value,
 }
 
+/// 不依赖 pl-protocol 的 canonical session event journal 条目。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredSessionEvent {
+    pub sequence: u64,
+    pub emitted_at: i64,
+    pub payload: serde_json::Value,
+}
+
+/// runtime 重启时重建 session hub 所需的 projection 与有界 journal。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredSessionProjection {
+    pub session_id: String,
+    pub through_sequence: u64,
+    pub snapshot: serde_json::Value,
+    pub durable_events: Vec<StoredSessionEvent>,
+}
+
 /// repository 恢复一个 actor 所需的完整文档。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredAgentRuntime {
     pub state: StoredAgentRuntimeState,
     pub sessions: Vec<StoredAgentRuntimeSession>,
     pub pending_inputs: Vec<StoredAgentPendingInput>,
+    pub session_projections: Vec<StoredSessionProjection>,
 }
 
 /// mai-runtime 提交给 store 的原子 CAS 文档。
@@ -106,6 +128,7 @@ pub struct AgentRuntimeCommitDocument {
     pub turns: Vec<StoredAgentTurn>,
     pub events: Vec<StoredAgentRuntimeEvent>,
     pub traces: Vec<StoredAgentRuntimeTrace>,
+    pub session_projection: Option<StoredSessionProjection>,
 }
 
 /// 与 PL repository mutation 对齐，但不让 mai-store 反向依赖 pl-core。
@@ -115,6 +138,7 @@ pub enum StoredAgentRuntimeMutation {
     SnapshotAndQueue,
     ReplaceSession { session_id: String },
     AppendTrace,
+    AppendSessionEvents { session_id: String },
 }
 
 /// CAS 提交结果；冲突不会写入任何记录。
@@ -135,10 +159,13 @@ impl MaiStore {
         let mut runtimes = Vec::with_capacity(state_rows.len());
         for row in state_rows {
             let agent_id = row.agent_id.clone();
+            let sessions = load_sessions(&mut db, &agent_id).await?;
+            let session_projections = load_session_projections(&mut db, &sessions).await?;
             runtimes.push(StoredAgentRuntime {
                 state: stored_state(row)?,
-                sessions: load_sessions(&mut db, &agent_id).await?,
+                sessions,
                 pending_inputs: load_pending_inputs(&mut db, &agent_id).await?,
+                session_projections,
             });
         }
         Ok(runtimes)
@@ -157,10 +184,13 @@ impl MaiStore {
         let Some(row) = rows.pop() else {
             return Ok(None);
         };
+        let sessions = load_sessions(&mut db, agent_id).await?;
+        let session_projections = load_session_projections(&mut db, &sessions).await?;
         Ok(Some(StoredAgentRuntime {
             state: stored_state(row)?,
-            sessions: load_sessions(&mut db, agent_id).await?,
+            sessions,
             pending_inputs: load_pending_inputs(&mut db, agent_id).await?,
+            session_projections,
         }))
     }
 
@@ -248,10 +278,32 @@ impl MaiStore {
                     .await?;
                 }
             }
+            StoredAgentRuntimeMutation::AppendSessionEvents { session_id } => {
+                let session = document
+                    .runtime
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == *session_id)
+                    .ok_or_else(|| {
+                        StoreError::InvalidConfig(format!(
+                            "session event target `{session_id}` is missing from runtime commit"
+                        ))
+                    })?;
+                replace_session_record(
+                    &mut tx,
+                    &agent_id,
+                    existing_sessions.get(session_id),
+                    session,
+                )
+                .await?;
+            }
         }
         upsert_turns(&mut tx, &agent_id, &document.turns).await?;
         append_events(&mut tx, &agent_id, &document.events).await?;
         append_traces(&mut tx, &agent_id, &document.traces).await?;
+        if let Some(projection) = &document.session_projection {
+            replace_session_projection(&mut tx, projection).await?;
+        }
         tx.commit().await?;
         Ok(AgentRuntimeCommitOutcome::Applied)
     }
@@ -408,6 +460,7 @@ async fn insert_session_record(
         total_tokens: u64_to_i64(session.usage.total_tokens),
         last_context_tokens: session.last_context_tokens.map(u64_to_i64),
         trace_sequence: u64_to_i64(session.trace_sequence),
+        session_event_sequence: u64_to_i64(session.session_event_sequence),
     })
     .exec(&mut *tx)
     .await?;
@@ -545,6 +598,69 @@ async fn append_traces(
     Ok(())
 }
 
+async fn replace_session_projection(
+    tx: &mut toasty::Transaction<'_>,
+    projection: &StoredSessionProjection,
+) -> Result<()> {
+    Query::<List<SessionViewSnapshotRecord>>::filter(
+        SessionViewSnapshotRecord::fields()
+            .session_id()
+            .eq(projection.session_id.clone()),
+    )
+    .delete()
+    .exec(&mut *tx)
+    .await?;
+    toasty::create!(SessionViewSnapshotRecord {
+        session_id: projection.session_id.clone(),
+        through_sequence: u64_to_i64(projection.through_sequence),
+        snapshot_json: serde_json::to_string(&projection.snapshot)?,
+        updated_at: projection
+            .durable_events
+            .last()
+            .map_or(0, |event| event.emitted_at),
+    })
+    .exec(&mut *tx)
+    .await?;
+
+    for event in &projection.durable_events {
+        let id = format!("{}:{}", projection.session_id, event.sequence);
+        Query::<List<SessionEventJournalRecord>>::filter(
+            SessionEventJournalRecord::fields().id().eq(id.clone()),
+        )
+        .delete()
+        .exec(&mut *tx)
+        .await?;
+        toasty::create!(SessionEventJournalRecord {
+            id,
+            session_id: projection.session_id.clone(),
+            sequence: u64_to_i64(event.sequence),
+            emitted_at: event.emitted_at,
+            event_json: serde_json::to_string(&event.payload)?,
+        })
+        .exec(&mut *tx)
+        .await?;
+    }
+
+    let mut journal = Query::<List<SessionEventJournalRecord>>::filter(
+        SessionEventJournalRecord::fields()
+            .session_id()
+            .eq(projection.session_id.clone()),
+    )
+    .exec(&mut *tx)
+    .await?;
+    journal.sort_by_key(|event| event.sequence);
+    let stale_count = journal.len().saturating_sub(4096);
+    for stale in journal.into_iter().take(stale_count) {
+        Query::<List<SessionEventJournalRecord>>::filter(
+            SessionEventJournalRecord::fields().id().eq(stale.id),
+        )
+        .delete()
+        .exec(&mut *tx)
+        .await?;
+    }
+    Ok(())
+}
+
 async fn load_sessions(db: &mut Db, agent_id: &str) -> Result<Vec<StoredAgentRuntimeSession>> {
     let mut rows = Query::<List<AgentSessionRecord>>::filter(
         AgentSessionRecord::fields()
@@ -592,6 +708,7 @@ async fn load_sessions(db: &mut Db, agent_id: &str) -> Result<Vec<StoredAgentRun
             },
             last_context_tokens: row.last_context_tokens.map(i64_to_u64),
             trace_sequence: i64_to_u64(row.trace_sequence),
+            session_event_sequence: i64_to_u64(row.session_event_sequence),
         });
     }
     Ok(sessions)

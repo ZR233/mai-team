@@ -1,7 +1,7 @@
 use super::*;
 
 impl AgentRuntime {
-    pub fn subscribe(&self) -> broadcast::Receiver<ServiceEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<MaiProductEventEnvelope> {
         self.events.subscribe()
     }
 
@@ -222,7 +222,7 @@ impl AgentRuntime {
                 )
                 .await?;
             self.events
-                .publish(ServiceEventKind::AgentUpdated { agent: summary })
+                .publish(MaiProductEventKind::AgentUpdated { agent: summary })
                 .await;
         }
         Ok(())

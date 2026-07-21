@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::mcp::McpTool;
 use crate::skills::{SkillInjections, render_available_response};
-use mai_protocol::{SkillActivationInfo, SkillScope, SkillsListResponse};
+use mai_protocol::{SkillScope, SkillsListResponse};
 
 pub(crate) const CONTAINER_SKILLS_ROOT: &str = "/tmp/.mai-team/skills";
 
@@ -79,26 +79,6 @@ pub(crate) fn build_instructions(
         }
     }
     instructions
-}
-
-pub(crate) fn skill_activation_info(
-    skill_injections: &SkillInjections,
-    container_skill_paths: &ContainerSkillPaths,
-) -> Vec<SkillActivationInfo> {
-    skill_injections
-        .items
-        .iter()
-        .map(|skill| SkillActivationInfo {
-            name: skill.metadata.name.clone(),
-            display_name: skill
-                .metadata
-                .interface
-                .as_ref()
-                .and_then(|interface| interface.display_name.clone()),
-            path: display_skill_path(&skill.metadata.path, container_skill_paths),
-            scope: skill.metadata.scope,
-        })
-        .collect()
 }
 
 fn render_activated_skills(

@@ -1,9 +1,9 @@
 use super::*;
 use crate::schema::{SCHEMA_VERSION, SETTING_SCHEMA_VERSION};
 use mai_protocol::{
-    McpServerScope, McpServerTransport, MessageRole, ProjectCloneStatus, ProjectReviewDecision,
-    ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus, ProjectStatus,
-    ServiceEventKind, TurnStatus,
+    ErrorSeverity, McpServerScope, McpServerTransport, MessageRole, ProjectCloneStatus,
+    ProjectReviewDecision, ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus,
+    ProjectStatus, SessionEventKind, SessionEventPosition,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -106,21 +106,20 @@ async fn save_project_waits_for_temporary_sqlite_write_lock() {
     );
 }
 
-fn test_service_event(
+fn test_product_event(
     sequence: u64,
     agent_id: AgentId,
-    session_id: SessionId,
-    turn_id: TurnId,
+    _session_id: SessionId,
+    _turn_id: TurnId,
     timestamp: DateTime<Utc>,
-) -> ServiceEvent {
-    ServiceEvent {
+) -> MaiProductEventEnvelope {
+    MaiProductEventEnvelope {
         sequence,
         timestamp,
-        kind: ServiceEventKind::TurnCompleted {
-            agent_id,
-            session_id: Some(session_id),
-            turn_id,
-            status: TurnStatus::Completed,
+        kind: MaiProductEventKind::OperationFailed {
+            scope: "test".to_string(),
+            agent_id: Some(agent_id),
+            message: "test failure".to_string(),
         },
     }
 }
@@ -360,7 +359,7 @@ async fn git_account_delete_wins_over_late_verification_update() {
 }
 
 #[tokio::test]
-async fn service_event_replay_and_snapshot_keep_recent_events() {
+async fn product_event_replay_and_snapshot_keep_recent_events() {
     let (_dir, store) = store().await;
     let agent_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
@@ -368,7 +367,7 @@ async fn service_event_replay_and_snapshot_keep_recent_events() {
 
     for sequence in 1..=5 {
         store
-            .append_service_event(&test_service_event(
+            .append_product_event(&test_product_event(
                 sequence,
                 agent_id,
                 session_id,
@@ -379,7 +378,7 @@ async fn service_event_replay_and_snapshot_keep_recent_events() {
             .expect("append event");
     }
 
-    let replay = store.service_events_after(2, 2).await.expect("replay");
+    let replay = store.product_events_after(2, 2).await.expect("replay");
     assert_eq!(
         replay
             .iter()
@@ -401,7 +400,7 @@ async fn service_event_replay_and_snapshot_keep_recent_events() {
 }
 
 #[tokio::test]
-async fn service_event_count_pruning_keeps_newest_events() {
+async fn product_event_count_pruning_keeps_newest_events() {
     let (_dir, store) = store().await;
     let agent_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
@@ -409,7 +408,7 @@ async fn service_event_count_pruning_keeps_newest_events() {
 
     for sequence in 1..=5 {
         store
-            .append_service_event(&test_service_event(
+            .append_product_event(&test_product_event(
                 sequence,
                 agent_id,
                 session_id,
@@ -421,12 +420,12 @@ async fn service_event_count_pruning_keeps_newest_events() {
     }
 
     let removed = store
-        .prune_service_events_to_limit(3)
+        .prune_product_events_to_limit(3)
         .await
         .expect("prune by limit");
     assert_eq!(removed, 2);
 
-    let replay = store.service_events_after(0, 10).await.expect("replay");
+    let replay = store.product_events_after(0, 10).await.expect("replay");
     assert_eq!(
         replay
             .iter()
@@ -435,19 +434,19 @@ async fn service_event_count_pruning_keeps_newest_events() {
         vec![3, 4, 5]
     );
     assert_eq!(
-        store.prune_service_events_to_limit(3).await.expect("noop"),
+        store.prune_product_events_to_limit(3).await.expect("noop"),
         0
     );
     assert_eq!(
         store
-            .prune_service_events_to_limit(0)
+            .prune_product_events_to_limit(0)
             .await
             .expect("zero limit"),
         3
     );
     assert!(
         store
-            .service_events_after(0, 10)
+            .product_events_after(0, 10)
             .await
             .expect("empty replay")
             .is_empty()
@@ -491,14 +490,16 @@ async fn project_review_runs_round_trip_and_prune() {
                 content: "done".to_string(),
                 created_at: finished_at,
             }],
-            events: vec![ServiceEvent {
-                sequence: 1,
-                timestamp: finished_at,
-                kind: ServiceEventKind::TurnCompleted {
-                    agent_id: reviewer_agent_id,
-                    session_id: None,
-                    turn_id,
-                    status: TurnStatus::Completed,
+            events: vec![SessionEventEnvelope {
+                event_id: "event-1".to_string(),
+                session_id: Uuid::new_v4().to_string(),
+                source_agent_id: Some(reviewer_agent_id.to_string()),
+                turn_id: Some(turn_id.to_string()),
+                emitted_at: finished_at.timestamp_millis(),
+                position: SessionEventPosition::Durable { sequence: 1 },
+                kind: SessionEventKind::ErrorOccurred {
+                    message: "historical test event".to_string(),
+                    severity: ErrorSeverity::Recoverable,
                 },
             }],
         })

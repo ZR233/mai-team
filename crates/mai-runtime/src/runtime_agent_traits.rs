@@ -38,7 +38,7 @@ impl agents::AgentPurgeOps for AgentRuntime {
 
     async fn publish_agent_deleted(&self, agent_id: AgentId) {
         self.events
-            .publish(ServiceEventKind::AgentDeleted { agent_id })
+            .publish(MaiProductEventKind::AgentDeleted { agent_id })
             .await;
     }
 }
@@ -104,9 +104,19 @@ impl agents::AgentObservabilityOps for AgentRuntime {
         session_id: SessionId,
         call_id: String,
     ) -> (Option<bool>, Option<u64>) {
-        self.events
-            .tool_metadata(agent_id, session_id, &call_id)
+        match self
+            .deps
+            .store
+            .load_tool_trace(agent_id, Some(session_id), &call_id)
             .await
+        {
+            Ok(Some(trace)) => (Some(trace.success), trace.duration_ms),
+            Ok(None) => (None, None),
+            Err(error) => {
+                tracing::warn!(%agent_id, %call_id, "failed to load tool metadata: {error}");
+                (None, None)
+            }
+        }
     }
 
     async fn list_agent_logs(
@@ -203,7 +213,7 @@ impl agents::AgentUpdateOps for AgentRuntime {
 
     async fn publish_agent_updated(&self, agent: AgentSummary) {
         self.events
-            .publish(ServiceEventKind::AgentUpdated { agent })
+            .publish(MaiProductEventKind::AgentUpdated { agent })
             .await;
     }
 }
@@ -235,7 +245,7 @@ impl agents::AgentCreateOps for AgentRuntime {
 
     async fn publish_agent_created(&self, agent: AgentSummary) {
         self.events
-            .publish(ServiceEventKind::AgentCreated { agent })
+            .publish(MaiProductEventKind::AgentCreated { agent })
             .await;
     }
 }
@@ -409,7 +419,7 @@ impl agents::AgentContainerOps for AgentRuntime {
 
     async fn publish_mcp_status(&self, change: agents::AgentMcpStatusChange) {
         self.events
-            .publish(ServiceEventKind::McpServerStatusChanged {
+            .publish(MaiProductEventKind::McpServerStatusChanged {
                 agent_id: change.agent_id,
                 server: change.server,
                 status: change.status,

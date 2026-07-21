@@ -1,17 +1,18 @@
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
 use serde::Deserialize;
 
 use super::state::{ApiError, AppState};
-use crate::services::events::EventStreamService;
+use crate::services::events::{EventStreamService, SessionEventStreamService};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct EventsQuery {
     last_event_id: Option<u64>,
+    after_sequence: Option<u64>,
 }
 
 pub(crate) async fn events(
@@ -23,6 +24,22 @@ pub(crate) async fn events(
     let service = EventStreamService::new(Arc::clone(&state.store), Arc::clone(&state.runtime));
     let stream = service
         .stream_after(last_event_id_from_request(query, &headers))
+        .await?;
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+pub(crate) async fn session_events(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<mai_protocol::SessionId>,
+    Query(query): Query<EventsQuery>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+    let after_sequence = query
+        .after_sequence
+        .or_else(|| last_event_id_from_request(query, &headers));
+    tracing::debug!(%session_id, ?after_sequence, "session SSE connection opened");
+    let stream = SessionEventStreamService::new(Arc::clone(&state.runtime))
+        .stream(session_id, after_sequence)
         .await?;
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }

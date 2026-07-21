@@ -4,7 +4,8 @@ use mai_protocol::AgentId;
 use pl_core::{
     AgentTurnFactory, AgentTurnPreparationContext, ContextCompactionConfig,
     ContextCompactionReplacement, CoreAgentProfile, InstructionSnapshot, PreparedAgentTurn,
-    RecentInteractionTailConfig, TurnEngineBuilder, TurnOptions, TurnRequest,
+    PreparedSessionRuntime, RecentInteractionTailConfig, TurnEngineBuilder, TurnOptions,
+    TurnRequest,
 };
 use pl_model::{OpenAiCompactionMode, create_provider_with_catalog};
 use tokio::sync::RwLock;
@@ -15,8 +16,6 @@ use crate::turn::core_adapter::{
     MaiFrameworkKernelBuildContext, build_mai_framework_kernel, mai_user_input_interaction_callback,
 };
 use crate::{AgentRuntime, MaiConfig, Result, RuntimeError};
-
-use super::protocol_uuid;
 
 /// 由 MaiConfig 和产品资源为一次 PL turn 准备 kernel/policy。
 #[derive(Clone)]
@@ -66,6 +65,17 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
             .sync_agent_skills_to_container(&agent, &skills_manager, &skills_config)
             .await?;
         let mcp_lease = runtime.prepare_agent_mcp_lease(&agent, &config).await?;
+        let active_mcp_servers = mcp_lease
+            .as_ref()
+            .map_or_else(Vec::new, |lease| lease.server_ids().to_vec());
+        let mcp_health = if config.mcp.enabled {
+            match agent.mcp.read().await.clone() {
+                Some(runtime) => Some(runtime.handle().health_snapshot().await?),
+                None => None,
+            }
+        } else {
+            None
+        };
         let mcp_tools: Vec<crate::mcp::McpTool> = mcp_lease
             .as_ref()
             .map(|lease| lease.tools().iter().map(mcp_tool).collect::<Vec<_>>())
@@ -101,22 +111,6 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
                 &skills_config,
             )?
         };
-        let product_session_id = protocol_uuid(context.session_id.as_str());
-        let product_turn_id = protocol_uuid(context.turn_id.as_str());
-        if !skill_injections.items.is_empty() {
-            runtime
-                .events
-                .publish(mai_protocol::ServiceEventKind::SkillsActivated {
-                    agent_id: product_agent_id,
-                    session_id: Some(product_session_id),
-                    turn_id: product_turn_id,
-                    skills: crate::instructions::skill_activation_info(
-                        &skill_injections,
-                        &container_skill_paths,
-                    ),
-                })
-                .await;
-        }
         let mut policy = super::compile_execution_policy(
             &context.snapshot,
             configured_roles,
@@ -190,13 +184,17 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
                 "agent:{}:session:{}",
                 context.snapshot.identity.id, context.session_id
             ))
-            .with_interaction_callback(mai_user_input_interaction_callback(
-                runtime,
-                product_agent_id,
-                product_session_id,
-                product_turn_id,
-            ));
-        let mut prepared = PreparedAgentTurn::new(kernel, request, options, policy);
+            .with_interaction_callback(mai_user_input_interaction_callback());
+        let mut session_runtime = PreparedSessionRuntime::new(route.model.slug.clone())
+            .with_mcp_servers(active_mcp_servers);
+        if let Some(context_window) = route.model.resolved_context_window() {
+            session_runtime = session_runtime.with_context_window(context_window);
+        }
+        if let Some(mcp_health) = mcp_health {
+            session_runtime = session_runtime.with_mcp_health(mcp_health);
+        }
+        let mut prepared = PreparedAgentTurn::new(kernel, request, options, policy)
+            .with_session_runtime(session_runtime);
         if let Some(review_manifest) = review_manifest {
             prepared = prepared.with_pinned_context(review_manifest);
         }

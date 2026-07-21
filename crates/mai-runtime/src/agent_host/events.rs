@@ -1,26 +1,26 @@
 use std::sync::{Arc, Weak};
 
-use mai_protocol::{ServiceEventKind, TurnStatus};
+use mai_protocol::MaiProductEventKind;
 use pl_core::{
-    AgentCommittedEvent, AgentEventSink, AgentLifecycleState, AgentRuntimeEventKind, AgentSnapshot,
-    TurnOutcomeKind,
+    AgentCommitObserver, AgentCommittedEvent, AgentLifecycleState, AgentRuntimeEventKind,
+    AgentSnapshot, TurnOutcomeKind,
 };
 
 use crate::AgentRuntime;
 
-/// 将已持久化的 PL event 投影到 mai 内存状态和 ServiceEvent 广播。
+/// 将已持久化的 PL event 投影到 mai 产品状态和只读观测记录。
 #[derive(Clone)]
-pub(crate) struct MaiAgentEventSink {
+pub(crate) struct MaiAgentCommitObserver {
     runtime: Weak<AgentRuntime>,
 }
 
-impl MaiAgentEventSink {
+impl MaiAgentCommitObserver {
     pub(crate) fn new(runtime: Weak<AgentRuntime>) -> Self {
         Self { runtime }
     }
 }
 
-impl AgentEventSink for MaiAgentEventSink {
+impl AgentCommitObserver for MaiAgentCommitObserver {
     async fn publish(&self, committed: AgentCommittedEvent) {
         let Some(runtime) = self.runtime.upgrade() else {
             return;
@@ -41,6 +41,7 @@ async fn project_event(
         turn_id,
         runtime_events,
         trace_events,
+        session_events: _,
     } = committed;
     if !trace_events.is_empty() {
         let session_id = session_id.ok_or_else(|| {
@@ -77,14 +78,14 @@ async fn project_runtime_event(
         | AgentRuntimeEventKind::StateChanged { snapshot }
         | AgentRuntimeEventKind::TurnQueued { snapshot, .. }
         | AgentRuntimeEventKind::SessionOpened { snapshot, .. } => {
-            publish_state(runtime, snapshot).await?;
+            persist_state(runtime, snapshot).await?;
         }
         AgentRuntimeEventKind::TurnStarted {
             turn_id,
             session_id,
             snapshot,
         } => {
-            let agent_id = publish_state(runtime, snapshot).await?;
+            let agent_id = persist_state(runtime, snapshot).await?;
             super::trace_projection::record_agent_log(
                 runtime,
                 super::trace_projection::AgentLogProjection {
@@ -99,18 +100,10 @@ async fn project_runtime_event(
                 },
             )
             .await;
-            runtime
-                .events
-                .publish(ServiceEventKind::TurnStarted {
-                    agent_id,
-                    session_id: Some(super::protocol_uuid(session_id.as_str())),
-                    turn_id: super::protocol_uuid(turn_id.as_str()),
-                })
-                .await;
         }
         AgentRuntimeEventKind::TurnFinished { outcome, snapshot }
         | AgentRuntimeEventKind::RecoveryCancelledTurn { outcome, snapshot } => {
-            let agent_id = publish_state(runtime, snapshot).await?;
+            let agent_id = persist_state(runtime, snapshot).await?;
             let session_id = super::protocol_uuid(outcome.session_id.as_str());
             let turn_id = super::protocol_uuid(outcome.turn_id.as_str());
             super::trace_projection::record_agent_log(
@@ -134,24 +127,9 @@ async fn project_runtime_event(
                 },
             )
             .await;
-            runtime
-                .events
-                .publish(ServiceEventKind::TurnCompleted {
-                    agent_id,
-                    session_id: Some(session_id),
-                    turn_id,
-                    status: match outcome.kind {
-                        TurnOutcomeKind::Completed => TurnStatus::Completed,
-                        TurnOutcomeKind::Cancelled => TurnStatus::Cancelled,
-                        TurnOutcomeKind::Failed | TurnOutcomeKind::BudgetLimited => {
-                            TurnStatus::Failed
-                        }
-                    },
-                })
-                .await;
         }
         AgentRuntimeEventKind::Faulted { reason, snapshot } => {
-            let agent_id = publish_state(runtime, snapshot).await?;
+            let agent_id = persist_state(runtime, snapshot).await?;
             super::trace_projection::record_agent_log(
                 runtime,
                 super::trace_projection::AgentLogProjection {
@@ -171,10 +149,9 @@ async fn project_runtime_event(
             .await;
             runtime
                 .events
-                .publish(ServiceEventKind::Error {
+                .publish(MaiProductEventKind::OperationFailed {
+                    scope: "agent_runtime".to_string(),
                     agent_id: Some(agent_id),
-                    session_id: None,
-                    turn_id: None,
                     message: reason,
                 })
                 .await;
@@ -183,18 +160,15 @@ async fn project_runtime_event(
     Ok(())
 }
 
-async fn publish_state(
+/// 持久化 PL runtime 的兼容产品投影，但不把高频 session/turn 状态重新广播为产品事件。
+///
+/// 当前会话的 UI 状态只由 PL session stream 驱动；产品事件仅用于 agent 资源、配置等
+/// 低频变化，避免每个 turn transition 都触发 AgentDetail 和项目/任务查询失效。
+async fn persist_state(
     runtime: &Arc<AgentRuntime>,
     snapshot: AgentSnapshot,
 ) -> crate::Result<mai_protocol::AgentId> {
-    let (agent_id, summary) = project_state(runtime, snapshot).await?;
-    runtime
-        .events
-        .publish(ServiceEventKind::AgentStateChanged {
-            agent_id,
-            state: summary.state,
-        })
-        .await;
+    let (agent_id, _) = project_state(runtime, snapshot).await?;
     Ok(agent_id)
 }
 

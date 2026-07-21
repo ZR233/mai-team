@@ -2,11 +2,12 @@ pub(crate) use chrono::{DateTime, Utc};
 pub(crate) use mai_protocol::{
     AgentId, AgentLogEntry, AgentMessage, AgentSummary, ArtifactInfo, GitAccountRequest,
     GitAccountStatus, GitAccountSummary, GitAccountsResponse, GitProvider, GitTokenKind,
-    GithubAppSettingsRequest, GithubAppSettingsResponse, GithubSettingsResponse, McpServerConfig,
-    PlanHistoryEntry, ProjectId, ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary,
-    RelaySettingsRequest, RelaySettingsResponse, ServiceEvent, ServiceEventKind, SessionId,
-    SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskSummary, TokenUsage,
-    ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceSummary, TurnId,
+    GithubAppSettingsRequest, GithubAppSettingsResponse, GithubSettingsResponse,
+    MaiProductEventEnvelope, MaiProductEventKind, McpServerConfig, PlanHistoryEntry, ProjectId,
+    ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary, RelaySettingsRequest,
+    RelaySettingsResponse, SessionEventEnvelope, SessionId, SkillsConfigRequest, TaskId, TaskPlan,
+    TaskReview, TaskSummary, TokenUsage, ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceSummary,
+    TurnId,
 };
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use std::collections::BTreeMap;
@@ -45,7 +46,7 @@ pub use agent_runtime::{
     AgentRuntimeCommitDocument, AgentRuntimeCommitOutcome, StoredAgentPendingInput,
     StoredAgentRuntime, StoredAgentRuntimeEvent, StoredAgentRuntimeMutation,
     StoredAgentRuntimeSession, StoredAgentRuntimeState, StoredAgentRuntimeTrace, StoredAgentTurn,
-    StoredTokenUsage,
+    StoredSessionEvent, StoredSessionProjection, StoredTokenUsage,
 };
 pub use config_document::ConfigDocumentStore;
 pub use store::MaiStore;
@@ -97,7 +98,7 @@ pub struct RuntimeSnapshot {
     pub agents: Vec<PersistedAgent>,
     pub tasks: Vec<PersistedTask>,
     pub projects: Vec<ProjectSummary>,
-    pub recent_events: Vec<ServiceEvent>,
+    pub recent_events: Vec<MaiProductEventEnvelope>,
     pub next_sequence: u64,
 }
 

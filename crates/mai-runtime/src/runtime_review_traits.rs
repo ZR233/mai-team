@@ -9,14 +9,17 @@ impl projects::review::runs::ReviewRunSnapshotSource for AgentRuntime {
             Ok(agent) => agent.summary.read().await.token_usage.clone(),
             Err(_) => Default::default(),
         };
-        let messages = self
+        let (session_id, messages) = self
             .agent_recent_messages(reviewer_agent_id, PROJECT_REVIEW_SNAPSHOT_MESSAGE_LIMIT)
             .await
-            .map(|(_, messages)| messages)
             .unwrap_or_default();
-        let events = self
-            .agent_recent_events(reviewer_agent_id, PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT)
-            .await;
+        let events = match session_id {
+            Some(session_id) => self
+                .session_recent_events(session_id, PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
         projects::review::runs::ReviewRunSnapshot {
             token_usage,
             messages,
@@ -40,7 +43,7 @@ impl projects::review::state::ProjectReviewStateOps for AgentRuntime {
 
     async fn publish_project_updated(&self, project: ProjectSummary) {
         self.events
-            .publish(ServiceEventKind::ProjectUpdated { project })
+            .publish(MaiProductEventKind::ProjectUpdated { project })
             .await;
     }
 }
@@ -54,12 +57,12 @@ impl projects::review::cleanup::ProjectReviewCleanupOps for Arc<AgentRuntime> {
             .await?)
     }
 
-    async fn prune_service_events_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
-        Ok(self.deps.store.prune_service_events_before(cutoff).await?)
+    async fn prune_product_events_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+        Ok(self.deps.store.prune_product_events_before(cutoff).await?)
     }
 
-    async fn prune_service_events_to_limit(&self, limit: usize) -> Result<usize> {
-        Ok(self.deps.store.prune_service_events_to_limit(limit).await?)
+    async fn prune_product_events_to_limit(&self, limit: usize) -> Result<usize> {
+        Ok(self.deps.store.prune_product_events_to_limit(limit).await?)
     }
 
     async fn prune_agent_logs_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {

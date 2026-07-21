@@ -11,7 +11,6 @@ pub(crate) struct SessionProjection {
     pub(crate) framework_id: String,
     pub(crate) summary: AgentSessionSummary,
     pub(crate) messages: Vec<AgentMessage>,
-    pub(crate) last_context_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,7 +124,6 @@ fn project_session(session: &StoredAgentRuntimeSession) -> SessionProjection {
             token_usage: project_usage(&session.usage),
         },
         messages: session.messages.clone(),
-        last_context_tokens: session.last_context_tokens,
     }
 }
 

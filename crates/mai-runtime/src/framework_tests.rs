@@ -74,6 +74,17 @@ fn product_facade_uses_pl_agent_runtime_as_the_only_executor() {
 }
 
 #[test]
+fn framework_session_transitions_do_not_invalidate_product_agent_queries() {
+    let observer = include_str!("agent_host/events.rs");
+
+    assert!(observer.contains("persist_state(runtime, snapshot).await?"));
+    assert!(
+        !observer.contains("MaiProductEventKind::AgentUpdated"),
+        "PL turn/session transitions must remain on the canonical session stream"
+    );
+}
+
+#[test]
 fn framework_module_boundary_is_stable() {
     let host = include_str!("agent_host/mod.rs");
     let expected_modules = [

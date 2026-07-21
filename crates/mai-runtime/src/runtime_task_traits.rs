@@ -38,7 +38,7 @@ impl tasks::TaskUpdateOps for AgentRuntime {
 
     async fn publish_task_updated(&self, task: TaskSummary) {
         self.events
-            .publish(ServiceEventKind::TaskUpdated { task })
+            .publish(MaiProductEventKind::TaskUpdated { task })
             .await;
     }
 }
@@ -58,7 +58,7 @@ impl tasks::TaskPlanOps for AgentRuntime {
 
     async fn publish_plan_updated(&self, task_id: TaskId, plan: TaskPlan) {
         self.events
-            .publish(ServiceEventKind::PlanUpdated { task_id, plan })
+            .publish(MaiProductEventKind::PlanUpdated { task_id, plan })
             .await;
     }
 }
@@ -119,7 +119,7 @@ impl tasks::TaskLifecycleOps for Arc<AgentRuntime> {
 
     async fn publish_task_deleted(&self, task_id: TaskId) {
         self.events
-            .publish(ServiceEventKind::TaskDeleted { task_id })
+            .publish(MaiProductEventKind::TaskDeleted { task_id })
             .await;
     }
 }
@@ -177,7 +177,7 @@ impl tasks::TaskArtifactOps for AgentRuntime {
 
     async fn publish_artifact_created(&self, info: ArtifactInfo) {
         self.events
-            .publish(ServiceEventKind::ArtifactCreated { artifact: info })
+            .publish(MaiProductEventKind::ArtifactCreated { artifact: info })
             .await;
     }
 }
@@ -219,7 +219,7 @@ impl tasks::TaskCreateOps for Arc<AgentRuntime> {
         Ok(())
     }
 
-    async fn publish_task_event(&self, event: ServiceEventKind) {
+    async fn publish_task_event(&self, event: MaiProductEventKind) {
         self.events.publish(event).await;
     }
 

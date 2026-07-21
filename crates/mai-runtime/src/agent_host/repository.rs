@@ -7,13 +7,14 @@ use mai_store::{
     AgentRuntimeCommitDocument, AgentRuntimeCommitOutcome as StoreCommitOutcome, MaiStore,
     StoredAgentPendingInput, StoredAgentRuntime, StoredAgentRuntimeEvent,
     StoredAgentRuntimeMutation, StoredAgentRuntimeSession, StoredAgentRuntimeState,
-    StoredAgentRuntimeTrace, StoredAgentTurn, StoredTokenUsage,
+    StoredAgentRuntimeTrace, StoredAgentTurn, StoredSessionEvent, StoredSessionProjection,
+    StoredTokenUsage,
 };
 use pl_core::{
     AgentActivityState, AgentCommit, AgentCommitOutcome, AgentDurableState, AgentId, AgentIdentity,
     AgentLifecycleState, AgentSession, AgentSessionState, AgentSnapshot, AgentStateMutation,
-    AgentStateRepository, AgentTurnOutcome, PendingAgentInput, RestoredAgentRuntime, SessionId,
-    TurnId, TurnOutcomeKind,
+    AgentStateRepository, AgentTurnOutcome, PendingAgentInput, RestoredAgentRuntime,
+    RestoredSessionProjection, SessionId, TurnId, TurnOutcomeKind,
 };
 use pl_protocol::{Message as ModelMessage, MessageRole as ModelMessageRole, ModelContextItem};
 
@@ -60,6 +61,7 @@ fn commit_to_store(commit: AgentCommit) -> Result<AgentRuntimeCommitDocument> {
         next_state,
         events,
         trace_events,
+        session_projection,
         mutation,
         ..
     } = commit;
@@ -104,19 +106,33 @@ fn commit_to_store(commit: AgentCommit) -> Result<AgentRuntimeCommitDocument> {
                 }
             }
             AgentStateMutation::AppendTrace => StoredAgentRuntimeMutation::AppendTrace,
+            AgentStateMutation::AppendSessionEvents { session_id } => {
+                StoredAgentRuntimeMutation::AppendSessionEvents {
+                    session_id: session_id.to_string(),
+                }
+            }
         },
         runtime: StoredAgentRuntime {
             state: snapshot_to_store(&next_state.snapshot)?,
             sessions,
             pending_inputs,
+            session_projections: Vec::new(),
         },
         turns,
         events: runtime_events,
         traces,
+        session_projection: session_projection
+            .map(session_projection_to_store)
+            .transpose()?,
     })
 }
 
 fn runtime_from_store(runtime: StoredAgentRuntime) -> Result<RestoredAgentRuntime> {
+    let session_projections = runtime
+        .session_projections
+        .into_iter()
+        .map(session_projection_from_store)
+        .collect::<Result<_>>()?;
     let sessions = runtime
         .sessions
         .into_iter()
@@ -140,6 +156,7 @@ fn runtime_from_store(runtime: StoredAgentRuntime) -> Result<RestoredAgentRuntim
                     usage: usage_from_store(session.usage),
                     last_context_tokens: session.last_context_tokens,
                     trace_sequence: session.trace_sequence,
+                    session_event_sequence: session.session_event_sequence,
                 },
             ))
         })
@@ -155,6 +172,47 @@ fn runtime_from_store(runtime: StoredAgentRuntime) -> Result<RestoredAgentRuntim
             sessions,
             pending_inputs,
         },
+        session_projections,
+    })
+}
+
+fn session_projection_to_store(
+    projection: pl_core::SessionProjectionCommit,
+) -> Result<StoredSessionProjection> {
+    let session_id = projection.snapshot.session_id.clone();
+    Ok(StoredSessionProjection {
+        session_id,
+        through_sequence: projection.snapshot.through_sequence,
+        snapshot: serde_json::to_value(projection.snapshot).map_err(json_error)?,
+        durable_events: projection
+            .durable_events
+            .into_iter()
+            .map(|event| {
+                let sequence = event.position.durable_sequence().ok_or_else(|| {
+                    RuntimeError::InvalidInput(
+                        "session projection commit contains transient event".to_string(),
+                    )
+                })?;
+                Ok(StoredSessionEvent {
+                    sequence,
+                    emitted_at: event.emitted_at,
+                    payload: serde_json::to_value(event).map_err(json_error)?,
+                })
+            })
+            .collect::<Result<_>>()?,
+    })
+}
+
+fn session_projection_from_store(
+    projection: StoredSessionProjection,
+) -> Result<RestoredSessionProjection> {
+    Ok(RestoredSessionProjection {
+        snapshot: serde_json::from_value(projection.snapshot).map_err(json_error)?,
+        durable_events: projection
+            .durable_events
+            .into_iter()
+            .map(|event| serde_json::from_value(event.payload).map_err(json_error))
+            .collect::<Result<_>>()?,
     })
 }
 
@@ -253,6 +311,7 @@ fn session_to_store(
         usage: usage_to_store(&session.usage),
         last_context_tokens: session.last_context_tokens,
         trace_sequence: session.trace_sequence,
+        session_event_sequence: session.session_event_sequence,
     })
 }
 
