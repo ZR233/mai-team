@@ -65,9 +65,22 @@ pub(crate) async fn build_mai_framework_kernel(
         ctx.product_tool_schemas,
     );
     let product_tools = product_tool_registry.registered_tools()?;
-    let backend = Arc::new(super::container::MaiContainerBackend::new(
+    let workspace_root = if ctx.agent.summary.read().await.project_id.is_some() {
+        crate::projects::workspace::AGENT_WORKSPACE_REPO_PATH
+    } else {
+        "/workspace"
+    };
+    let workspace_backend = Arc::new(super::container::MaiContainerBackend::new(
         ctx.runtime.clone(),
         ctx.agent_id,
+    ));
+    let workspace_file_backend = Arc::new(pl_core::ContainerWorkspaceFileBackend::new(
+        workspace_backend,
+    ));
+    let command_backend = Arc::new(super::command::MaiCommandBackend::new(
+        ctx.runtime.clone(),
+        ctx.agent_id,
+        workspace_root,
     ));
     let git_runtime =
         crate::tools::git::native_git_tool_runtime(ctx.runtime.clone(), &ctx.agent, |name| {
@@ -75,15 +88,16 @@ pub(crate) async fn build_mai_framework_kernel(
         })
         .await?;
     let capabilities =
-        pl_core::ToolCapabilityConfig::container_workspace().with_git(git_runtime.is_some());
+        pl_core::ToolCapabilityConfig::hosted_workspace().with_git(git_runtime.is_some());
     let mcp_backend = Arc::new(super::mcp_resources::MaiMcpResourceBackend::new(
         ctx.runtime.clone(),
         ctx.agent.clone(),
         ctx.mcp_lease.clone(),
     ));
-    let tool_set = pl_core::ToolSetBuilder::from_capabilities(capabilities)
+    let tool_set = pl_core::ToolSetBuilder::host_provided(capabilities)
         .with_allowed_tools(ctx.policy.visible_tools.iter().cloned())
-        .with_container_tools(backend)
+        .with_command_backend(command_backend)
+        .with_workspace_file_backend(workspace_file_backend)
         .with_mcp_resource_tools(mcp_backend);
     let collaboration_tools = pl_core::AgentCollaborationTools::new(
         ctx.framework_runtime,

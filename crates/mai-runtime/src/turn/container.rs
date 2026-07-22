@@ -187,7 +187,7 @@ async fn copy_to_container_backend(
     Ok(())
 }
 
-fn artifact_records_from_descriptors(
+pub(super) fn artifact_records_from_descriptors(
     agent_id: AgentId,
     descriptors: Vec<ToolOutputArtifactDescriptor>,
 ) -> Vec<ToolOutputArtifactInfo> {

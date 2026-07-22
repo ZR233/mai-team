@@ -149,7 +149,7 @@ mod tests {
         let policy = compile_execution_policy(
             &snapshot(Some("maintainer"), "reviewer"),
             std::iter::empty(),
-            ToolVisibilitySet::from_tool_names(["read_file", "write_file", "container_exec"]),
+            ToolVisibilitySet::from_tool_names(["read_file", "write_file", "exec"]),
             MaiPolicyContext {
                 can_manage_agents: false,
             },

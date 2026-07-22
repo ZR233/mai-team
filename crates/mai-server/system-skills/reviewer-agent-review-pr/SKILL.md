@@ -7,7 +7,7 @@ metadata:
 
 # Reviewer Agent - Review PR
 
-Review exactly one target GitHub pull request for the current project. Mai's system selector is responsible for choosing the PR before this skill starts. Use Mai's visible `github_api_request` tool for GitHub reads/writes, local shell commands for git/test work, and the bundled helper for deterministic revision verification.
+Review exactly one target GitHub pull request for the current project. Mai's system selector is responsible for choosing the PR before this skill starts. Use Mai's visible `github_api_request` tool for GitHub reads/writes, `exec` plus `write_stdin` for git/test work, and the bundled helper for deterministic revision verification.
 
 Before this skill starts, Mai prepares two fixed views:
 
@@ -69,7 +69,7 @@ Preferred invocation:
 python3 scripts/review_pr_helper.py test
 ```
 
-If `scripts/review_pr_helper.py` is not directly readable from the container, read the skill resource `skill:///reviewer-agent-review-pr/scripts/review_pr_helper.py`, copy its text to `/tmp/review_pr_helper.py`, and run:
+If `scripts/review_pr_helper.py` is not directly readable from the workspace, read the skill resource `skill:///reviewer-agent-review-pr/scripts/review_pr_helper.py`, write its text to `/tmp/review_pr_helper.py`, and run it with `exec`:
 
 ```bash
 python3 /tmp/review_pr_helper.py test

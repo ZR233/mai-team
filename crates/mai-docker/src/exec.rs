@@ -330,7 +330,80 @@ impl DockerClient {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
         Ok(cmd.spawn()?)
+    }
+
+    /// 通过 `spawn_exec` 启动带容器内 PID 台账的命令，供统一 Agent 进程管理器使用。
+    pub fn spawn_managed_exec(
+        &self,
+        container_id: &str,
+        process_id: &str,
+        command: &str,
+        cwd: Option<&str>,
+    ) -> Result<Child> {
+        let pid_file = managed_exec_pid_file(process_id)?;
+        let wrapped = managed_exec_shell_command(&pid_file, command);
+        self.spawn_exec(
+            container_id,
+            "/bin/sh",
+            &["-lc".to_string(), wrapped],
+            cwd,
+            &[],
+        )
+    }
+
+    /// 同时终止容器内命令进程组和宿主 Docker CLI 进程树。
+    pub async fn terminate_managed_exec(
+        &self,
+        container_id: &str,
+        process_id: &str,
+        host_pid: Option<u32>,
+    ) {
+        if let Ok(pid_file) = managed_exec_pid_file(process_id) {
+            let _ = self
+                .exec_shell(
+                    container_id,
+                    &managed_exec_kill_command(&pid_file),
+                    Some("/"),
+                    Some(5),
+                )
+                .await;
+        }
+        terminate_spawned_exec(host_pid).await;
+    }
+
+    /// 在 Drop 等同步兜底路径触发容器内清理，并终止宿主 Docker CLI 进程树。
+    pub fn terminate_managed_exec_sync(
+        &self,
+        container_id: &str,
+        process_id: &str,
+        host_pid: Option<u32>,
+    ) {
+        if let Ok(pid_file) = managed_exec_pid_file(process_id) {
+            let _ = std::process::Command::new(&self.binary)
+                .arg("exec")
+                .arg(container_id)
+                .arg("/bin/sh")
+                .args(["-lc", &managed_exec_kill_command(&pid_file)])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+        terminate_spawned_exec_sync(host_pid);
+    }
+
+    /// 在容器身份不可用时至少终止宿主 Docker CLI 进程树。
+    pub async fn terminate_exec_host(&self, host_pid: Option<u32>) {
+        terminate_spawned_exec(host_pid).await;
+    }
+
+    /// 在同步兜底路径至少终止宿主 Docker CLI 进程树。
+    pub fn terminate_exec_host_sync(&self, host_pid: Option<u32>) {
+        terminate_spawned_exec_sync(host_pid);
     }
 
     pub fn spawn_sidecar(&self, params: &SidecarParams<'_>) -> Result<Child> {
@@ -362,6 +435,111 @@ impl DockerClient {
             .stderr(Stdio::piped());
         Ok(cmd.spawn()?)
     }
+}
+
+fn managed_exec_shell_command(pid_file: &str, command: &str) -> String {
+    format!(
+        "pid_file={pid_file}; printf '%s\\n' \"$$\" > \"$pid_file\"; trap 'rm -f \"$pid_file\"' EXIT; eval {command}",
+        pid_file = pl_core::shell_quote_word(pid_file),
+        command = pl_core::shell_quote_word(command),
+    )
+}
+
+/// 终止 `spawn_exec` 启动的宿主 Docker CLI 进程树。
+async fn terminate_spawned_exec(host_pid: Option<u32>) {
+    let Some(host_pid) = host_pid else { return };
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{host_pid}");
+        let mut terminate = Command::new("kill");
+        terminate
+            .args(["-TERM", "--", &process_group])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let delivered = terminate
+            .status()
+            .await
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if delivered {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let mut kill = Command::new("kill");
+        kill.args(["-KILL", "--", &process_group])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let _ = kill.status().await;
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &host_pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status()
+            .await;
+    }
+}
+
+/// 在 Drop 等同步兜底路径终止 `spawn_exec` 的宿主 Docker CLI 进程树。
+fn terminate_spawned_exec_sync(host_pid: Option<u32>) {
+    let Some(host_pid) = host_pid else { return };
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{host_pid}");
+        let delivered = std::process::Command::new("kill")
+            .args(["-TERM", "--", &process_group])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if delivered {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", &process_group])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &host_pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+fn managed_exec_pid_file(process_id: &str) -> Result<String> {
+    if process_id.is_empty()
+        || !process_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(DockerError::CommandFailed(
+            "invalid managed exec process id".to_string(),
+        ));
+    }
+    Ok(format!("/tmp/mai-{process_id}.pid"))
+}
+
+fn managed_exec_kill_command(pid_file: &str) -> String {
+    let pid_file = pl_core::shell_quote_word(pid_file);
+    format!(
+        "if test -r {pid_file}; then pid=$(cat {pid_file}); kill -TERM -- \"-$pid\" 2>/dev/null || kill -TERM \"$pid\" 2>/dev/null || true; sleep 1; kill -KILL -- \"-$pid\" 2>/dev/null || kill -KILL \"$pid\" 2>/dev/null || true; rm -f {pid_file}; fi"
+    )
 }
 
 async fn wait_child_with_optional_timeout(
@@ -587,6 +765,77 @@ mod tests {
             .await;
 
         assert_timed_out(result);
+    }
+
+    #[tokio::test]
+    async fn managed_exec_uses_spawn_exec_with_pid_ledger_and_workspace_cwd() {
+        let dir = tempfile_dir();
+        let args_file = dir.join("args.txt");
+        let script = fake_docker_script(&format!(
+            "printf '%s\\n' \"$@\" > {}\nprintf ready\n",
+            pl_core::shell_quote_word(&args_file.display().to_string())
+        ));
+        let client = DockerClient::new_with_binary("unused-image", script.to_string_lossy());
+
+        let child = client
+            .spawn_managed_exec(
+                "container-1",
+                "proc-7",
+                "printf 'hello world'",
+                Some("/workspace/repo"),
+            )
+            .unwrap();
+        let output = child.wait_with_output().await.unwrap();
+        let args = fs::read_to_string(args_file).unwrap();
+
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "ready");
+        assert!(args.contains("-w\n/workspace/repo"), "{args}");
+        assert!(args.contains("container-1"), "{args}");
+        assert!(args.contains("/tmp/mai-proc-7.pid"), "{args}");
+        assert!(
+            args.contains("eval ") && args.contains("hello world"),
+            "{args}"
+        );
+    }
+
+    #[test]
+    fn managed_exec_wrapper_preserves_multiline_heredocs_and_quotes() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "mai-managed-exec-wrapper-{}.pid",
+            unique_test_path_id()
+        ));
+        let command = "set -e\ncat <<'FIRST'\nalpha 'beta'\nFIRST\nprintf '%s\\n' separator\ncat <<'SECOND'\ngamma\nSECOND";
+        let wrapped = managed_exec_shell_command(&pid_file.display().to_string(), command);
+
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-lc", &wrapped])
+            .output()
+            .expect("run managed command wrapper");
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "alpha 'beta'\nseparator\ngamma\n"
+        );
+        assert!(!pid_file.exists());
+    }
+
+    #[test]
+    fn managed_exec_rejects_untrusted_process_id() {
+        let client = DockerClient::new("unused-image");
+        let error = client
+            .spawn_managed_exec("container", "../escape", "true", Some("/workspace"))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid managed exec process id")
+        );
     }
 
     fn fake_docker_script(body: &str) -> std::path::PathBuf {

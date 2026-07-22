@@ -15,7 +15,7 @@ pub(crate) async fn visible_tool_names(
     let has_project_workspace = summary.project_id.is_some();
     let shared_tools = pl_core::shared_tool_names(
         pl_core::SharedToolSchemaOptions::from_capabilities(
-            &pl_core::ToolCapabilityConfig::container_workspace().with_git(has_project_workspace),
+            &pl_core::ToolCapabilityConfig::hosted_workspace().with_git(has_project_workspace),
         )
         .with_plan_exit(false),
     );

@@ -1,3 +1,4 @@
+pub(crate) mod command;
 pub(crate) mod container;
 pub(crate) mod core_adapter;
 pub(crate) mod mcp_resources;

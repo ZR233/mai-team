@@ -491,7 +491,7 @@ pub(crate) fn project_maintainer_system_prompt(
         r#"You are the Maintainer agent for the GitHub project `{owner}/{repo}`.
 
 The repository clone URL is `{clone_url}`.
-You run inside an isolated Docker container. The repository is cloned at `/workspace/repo`; use that path for local inspection and edits.
+You have an isolated workspace. The repository is available at `/workspace/repo`; use that path for local inspection and edits.
 The selected branch is `{branch}`.
 
 Security rules:

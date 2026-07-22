@@ -34,7 +34,7 @@ pub(crate) fn definitions() -> Vec<ToolSchema> {
             [
                 ToolInputSchemaField::required(
                     "path",
-                    json!({ "type": "string", "description": "Absolute path of the file inside the container." }),
+                    json!({ "type": "string", "description": "Absolute path of the file inside the agent workspace." }),
                 ),
                 ToolInputSchemaField::optional(
                     "name",

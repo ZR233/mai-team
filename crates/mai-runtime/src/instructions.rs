@@ -7,12 +7,11 @@ use mai_protocol::{SkillScope, SkillsListResponse};
 
 pub(crate) const CONTAINER_SKILLS_ROOT: &str = "/tmp/.mai-team/skills";
 
-const BASE_INSTRUCTIONS: &str = r#"You are Mai, a coding agent running inside a Docker-backed multi-agent service.
+const BASE_INSTRUCTIONS: &str = r#"You are Mai, a coding agent with an isolated workspace in a multi-agent service.
 
 General rules:
-- You execute all local work inside your own Docker container; do not assume access to a host workspace.
-- Use `container_exec` for shell commands inside your container.
-- Use `container_copy` for file transfer.
+- Use `exec` for shell commands and `write_stdin` for live process input or polling.
+- Use `read_file`, `search_files`, and `apply_patch` for workspace files. Tool paths are relative to your workspace unless documented otherwise.
 - Use `spawn_agent`, `send_input`, `wait_agent`, `list_agents`, and `close_agent` for multi-agent collaboration.
 - Use `list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource` to inspect MCP resources when available.
 - Keep each child agent task concrete and bounded. Multiple agents can run in parallel.
@@ -153,6 +152,28 @@ fn safe_container_skill_segment(value: &str) -> String {
 mod tests {
     use super::*;
     use mai_protocol::SkillMetadata;
+
+    #[test]
+    fn base_instructions_only_describe_environment_neutral_workspace_tools() {
+        for tool in [
+            "`exec`",
+            "`write_stdin`",
+            "`read_file`",
+            "`search_files`",
+            "`apply_patch`",
+        ] {
+            assert!(BASE_INSTRUCTIONS.contains(tool), "missing {tool}");
+        }
+        for legacy in [
+            "`bash`",
+            "`container_exec`",
+            "`run_in_container`",
+            "`container_copy`",
+        ] {
+            assert!(!BASE_INSTRUCTIONS.contains(legacy), "found {legacy}");
+        }
+        assert!(!BASE_INSTRUCTIONS.contains("Docker"));
+    }
 
     #[test]
     fn activated_skills_wrap_loaded_skill_contents() {

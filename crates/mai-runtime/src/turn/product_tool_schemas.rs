@@ -59,21 +59,37 @@ mod tests {
     }
 
     #[test]
-    fn pure_lang_shared_tools_include_session_note_contract() {
+    fn pure_lang_shared_tools_use_unified_workspace_contract() {
         let names = pl_core::shared_tool_names(
             pl_core::SharedToolSchemaOptions::from_capabilities(
-                &pl_core::ToolCapabilityConfig::container_workspace(),
+                &pl_core::ToolCapabilityConfig::hosted_workspace(),
             )
             .with_plan_exit(false),
         );
 
         for name in [
+            pl_core::TOOL_EXEC,
+            pl_core::TOOL_WRITE_STDIN,
+            pl_core::WorkspaceFileToolKind::ReadFile.name(),
+            pl_core::WorkspaceFileToolKind::SearchFiles.name(),
+            pl_core::WorkspaceFileToolKind::ApplyPatch.name(),
             pl_core::TOOL_READ_SESSION_NOTE,
             pl_core::TOOL_SEARCH_SESSION_NOTE,
             pl_core::TOOL_WRITE_SESSION_NOTE,
             pl_core::TOOL_APPLY_SESSION_NOTE_PATCH,
         ] {
             assert!(names.iter().any(|candidate| candidate == name), "{name}");
+        }
+        for legacy in [
+            "bash",
+            "container_exec",
+            "run_in_container",
+            "container_copy",
+        ] {
+            assert!(
+                !names.iter().any(|candidate| candidate == legacy),
+                "{legacy}"
+            );
         }
     }
 
@@ -85,7 +101,8 @@ mod tests {
         assert!(names.contains(&TOOL_GITHUB_API_REQUEST));
         assert!(names.contains(&TOOL_SAVE_ARTIFACT));
         for legacy in [
-            pl_core::TOOL_CONTAINER_EXEC,
+            pl_core::TOOL_EXEC,
+            pl_core::TOOL_WRITE_STDIN,
             pl_core::WorkspaceFileToolKind::ReadFile.name(),
             pl_core::WorkspaceFileToolKind::ListFiles.name(),
             pl_core::WorkspaceFileToolKind::SearchFiles.name(),
@@ -109,6 +126,10 @@ mod tests {
             "git_worktree_info",
             "container_cp_upload",
             "container_cp_download",
+            "bash",
+            "container_exec",
+            "run_in_container",
+            "container_copy",
         ] {
             assert!(
                 !names.contains(&legacy),
