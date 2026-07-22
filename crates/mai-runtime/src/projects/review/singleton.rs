@@ -206,6 +206,7 @@ async fn cancel_project_review_runs<Ops: ProjectReviewWorkerOps>(
                 pr: run.pr,
                 summary_text: run.summary,
                 error: Some(error.to_string()),
+                failure: None,
             })
             .await
         {

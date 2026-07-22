@@ -21,6 +21,7 @@ pub(crate) struct ReviewStateUpdate {
 pub(crate) enum ReviewerAgentUpdate {
     #[default]
     Clear,
+    Keep,
     Set(AgentId),
 }
 
@@ -52,6 +53,7 @@ pub(crate) async fn set_project_review_state(
                 summary.current_reviewer_agent_id = None;
                 false
             }
+            ReviewerAgentUpdate::Keep => false,
             ReviewerAgentUpdate::Set(reviewer_id) => {
                 summary.current_reviewer_agent_id = Some(reviewer_id);
                 true

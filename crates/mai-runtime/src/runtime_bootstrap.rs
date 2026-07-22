@@ -172,7 +172,6 @@ impl AgentRuntime {
             .start_restored_inputs()
             .await
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        runtime.reconcile_project_review_singletons().await;
         runtime
             .cleanup_orphan_project_review_repository_views()
             .await;

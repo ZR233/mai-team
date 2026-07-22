@@ -7,6 +7,8 @@ import type {
   EnvironmentDetail,
   EnvironmentSummary,
   ProjectDetail,
+  ReviewJobDetail,
+  ReviewJobsResponse,
   ReviewRunDetail,
   ReviewRunsResponse,
   ProjectSummary,
@@ -26,6 +28,8 @@ export const queryKeys = {
     ["projects", id, agentId ?? "maintainer", sessionId ?? "selected"] as const,
   projectReviewRuns: (id: string) => ["projects", id, "review-runs"] as const,
   projectReviewRun: (id: string, runId: string) => ["projects", id, "review-runs", runId] as const,
+  projectReviewJobs: (id: string) => ["projects", id, "review-jobs"] as const,
+  projectReviewJob: (id: string, jobId: string) => ["projects", id, "review-jobs", jobId] as const,
   tasks: ["tasks"] as const,
   providers: ["providers"] as const,
   providerCatalog: ["provider-catalog"] as const,
@@ -89,6 +93,18 @@ export const projectReviewRunQuery = (projectId: string, runId?: string | null) 
   queryKey: queryKeys.projectReviewRun(projectId, runId || "none"),
   queryFn: () => api<ReviewRunDetail>(`/projects/${projectId}/review-runs/${runId}`),
   enabled: Boolean(projectId && runId),
+})
+
+export const projectReviewJobsQuery = (id: string) => queryOptions({
+  queryKey: queryKeys.projectReviewJobs(id),
+  queryFn: () => api<ReviewJobsResponse>(`/projects/${id}/review-jobs?offset=0&limit=50`),
+  enabled: Boolean(id),
+})
+
+export const projectReviewJobQuery = (projectId: string, jobId?: string | null) => queryOptions({
+  queryKey: queryKeys.projectReviewJob(projectId, jobId || "none"),
+  queryFn: () => api<ReviewJobDetail>(`/projects/${projectId}/review-jobs/${jobId}`),
+  enabled: Boolean(projectId && jobId),
 })
 
 export const tasksQuery = () => queryOptions({

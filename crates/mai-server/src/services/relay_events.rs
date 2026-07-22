@@ -261,6 +261,7 @@ mod tests {
                 queued: vec![pr],
                 deduped: Vec::new(),
                 ignored: Vec::new(),
+                jobs: Vec::new(),
             })
         }
 

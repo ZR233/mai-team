@@ -39,6 +39,7 @@ pub(crate) struct FinishReviewRun {
     pub(crate) pr: Option<u64>,
     pub(crate) summary_text: Option<String>,
     pub(crate) error: Option<String>,
+    pub(crate) failure: Option<mai_protocol::ProjectReviewFailure>,
 }
 
 pub(crate) async fn list_project_review_runs(
@@ -76,6 +77,8 @@ pub(crate) async fn record_project_review_startup_failure(
         store,
         ProjectReviewRunSummary {
             id: run_id,
+            job_id: None,
+            attempt_index: 1,
             project_id,
             reviewer_agent_id: None,
             turn_id: None,
@@ -87,6 +90,7 @@ pub(crate) async fn record_project_review_startup_failure(
             pr: None,
             summary: None,
             error: Some(error),
+            failure: None,
             token_usage: TokenUsage::default(),
         },
         Vec::new(),
@@ -129,6 +133,7 @@ pub(crate) async fn cancel_active_project_review_runs(
                 pr: run.pr,
                 summary_text: run.summary,
                 error: Some("review cancelled".to_string()),
+                failure: None,
             },
         )
         .await;
@@ -193,6 +198,8 @@ pub(crate) async fn finish_project_review_run(
         .save_project_review_run(&ProjectReviewRunDetail {
             summary: ProjectReviewRunSummary {
                 id: request.run_id,
+                job_id: existing.summary.job_id,
+                attempt_index: existing.summary.attempt_index,
                 project_id: request.project_id,
                 reviewer_agent_id,
                 turn_id,
@@ -204,6 +211,7 @@ pub(crate) async fn finish_project_review_run(
                 pr: request.pr.or(existing.summary.pr),
                 summary: request.summary_text,
                 error: request.error,
+                failure: request.failure,
                 token_usage: snapshot.token_usage,
             },
             messages: snapshot.messages,

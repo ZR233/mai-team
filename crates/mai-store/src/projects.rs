@@ -69,6 +69,14 @@ impl MaiStore {
         .delete()
         .exec(&mut tx)
         .await?;
+        Query::<List<ProjectReviewJobRecord>>::filter(
+            ProjectReviewJobRecord::fields()
+                .project_id()
+                .eq(project_id.to_string()),
+        )
+        .delete()
+        .exec(&mut tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -96,6 +104,8 @@ impl MaiStore {
         toasty::create!(ProjectReviewRunRecord {
             id: run.summary.id.to_string(),
             project_id: run.summary.project_id.to_string(),
+            job_id: run.summary.job_id.map(|id| id.to_string()),
+            attempt_index: i64::from(run.summary.attempt_index),
             reviewer_agent_id: run.summary.reviewer_agent_id.map(|id| id.to_string()),
             turn_id: run.summary.turn_id.map(|id| id.to_string()),
             started_at: run.summary.started_at.to_rfc3339(),
@@ -114,6 +124,12 @@ impl MaiStore {
             pr: run.summary.pr.map(u64_to_i64),
             summary: run.summary.summary.clone(),
             error: run.summary.error.clone(),
+            failure_json: run
+                .summary
+                .failure
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
             input_tokens: u64_to_i64(run.summary.token_usage.input_tokens),
             cached_input_tokens: u64_to_i64(run.summary.token_usage.cached_input_tokens),
             output_tokens: u64_to_i64(run.summary.token_usage.output_tokens),

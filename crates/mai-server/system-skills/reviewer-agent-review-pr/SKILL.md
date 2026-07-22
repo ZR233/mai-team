@@ -229,6 +229,8 @@ Set `event` to `REQUEST_CHANGES`, `APPROVE`, or `COMMENT`. If GitHub rejects the
 
 Handle an ambiguous network failure on the review `POST` without risking duplicate side effects: first read `/repos/OWNER/REPO/pulls/PR/reviews` and check whether a review with the same head, event, and body was created. Treat a matching review as success. Only when it is absent may you retry the same request once.
 
+Mai automatically appends `<!-- mai-review-job:CURRENT_JOB_ID -->` to the submitted review body; do not add or alter this marker yourself. On a continuation, only an existing review with the exact Job ID from the system prompt and the fixed head SHA proves that this logical Job already submitted. An unmarked review, or a review for another head, is prior context and does not fulfill the current Job. Never return `review_submitted` merely because some earlier Mai review remains applicable.
+
 If GitHub returns `Line could not be resolved`, do not guess another line and do not retry another inline variant. Remove the `comments` array, append each finding to the main review body with its path and intended line, and retry exactly once as a body-only review. This is the sole extra final-review request allowed for an invalid inline location.
 
 ### 8. Final Response
@@ -242,6 +244,8 @@ Submitted:
 ```
 
 Set `review_event` to `approve`, `request_changes`, or `comment` to match the submitted GitHub review event.
+
+Return `review_submitted` only after the current Job's final submission succeeds or after an ambiguous result is reconciled by finding its exact hidden Job marker at the fixed head. Otherwise return `failed`; the scheduler rejects unreceipted submission claims.
 
 Failed:
 

@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::projects::review::context::ProjectReviewContext;
 use crate::projects::review::pool::ProjectReviewPool;
+#[cfg(test)]
 use crate::projects::review::relay_queue::ProjectReviewRelayQueue;
 
 pub(crate) struct RuntimeState {
@@ -44,7 +45,9 @@ pub(crate) struct ProjectRecord {
     pub(crate) review_worker: Mutex<Option<ProjectReviewWorker>>,
     pub(crate) review_pool: Mutex<ProjectReviewPool>,
     pub(crate) review_notify: Arc<Notify>,
+    #[cfg(test)]
     pub(crate) relay_review_queue: Mutex<ProjectReviewRelayQueue>,
+    #[cfg(test)]
     pub(crate) relay_review_notify: Arc<Notify>,
 }
 
@@ -58,7 +61,9 @@ impl ProjectRecord {
             review_worker: Mutex::new(None),
             review_pool: Mutex::new(ProjectReviewPool::default()),
             review_notify: Arc::new(Notify::new()),
+            #[cfg(test)]
             relay_review_queue: Mutex::new(ProjectReviewRelayQueue::default()),
+            #[cfg(test)]
             relay_review_notify: Arc::new(Notify::new()),
         }
     }
@@ -68,6 +73,7 @@ pub(crate) struct ProjectReviewWorker {
     pub(crate) cancellation_token: CancellationToken,
     pub(crate) pool_abort_handle: futures::future::AbortHandle,
     pub(crate) selector_abort_handle: Option<futures::future::AbortHandle>,
+    #[cfg(test)]
     pub(crate) relay_selector_abort_handle: Option<futures::future::AbortHandle>,
 }
 

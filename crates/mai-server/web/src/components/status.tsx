@@ -4,14 +4,14 @@ import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { cn } from "@/lib/utils"
 
-const healthy = new Set(["ready", "active", "completed", "idle", "live"])
-const pending = new Set(["provisioning", "queued", "running", "streaming", "connecting", "resyncing"])
+const healthy = new Set(["ready", "active", "completed", "succeeded", "idle", "live"])
+const pending = new Set(["provisioning", "preparing", "queued", "running", "retry_waiting", "submission_pending", "reconciling", "streaming", "connecting", "resyncing"])
 const failed = new Set(["failed", "error", "errored", "faulted", "offline", "cancelled"])
 
 export function StatusBadge({ status, className }: { status?: string | null; className?: string }) {
   const value = status || "unknown"
   const variant = failed.has(value) ? "destructive" : pending.has(value) ? "secondary" : healthy.has(value) ? "outline" : "secondary"
-  return <Badge variant={variant} className={cn("capitalize", className)}>{value}</Badge>
+  return <Badge variant={variant} className={cn("capitalize", className)}>{value.replaceAll("_", " ")}</Badge>
 }
 
 export function StatusDot({ status }: { status?: string | null }) {

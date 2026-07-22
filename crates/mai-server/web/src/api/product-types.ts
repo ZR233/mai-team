@@ -93,6 +93,8 @@ export type ReviewDecision = "approve" | "request_changes" | "comment"
 
 export interface ReviewRunSummary {
   id: Id
+  job_id?: Id | null
+  attempt_index?: number
   status: string
   pr?: number | null
   summary?: string | null
@@ -105,6 +107,63 @@ export interface ReviewRunSummary {
   turn_id?: string | null
   token_usage?: TokenUsage
   [key: string]: unknown
+}
+
+export type ReviewJobStatus = "queued" | "preparing" | "running" | "retry_waiting" | "submission_pending" | "reconciling" | "succeeded" | "failed" | "cancelled" | "superseded"
+
+export interface ReviewFailure {
+  category: string
+  code?: string | null
+  http_status?: number | null
+  message: string
+  retry: unknown
+}
+
+export interface ReviewSubmissionReceipt {
+  github_review_id: number
+  event: ReviewDecision
+  head_sha: string
+  html_url?: string | null
+  submitted_at: string
+}
+
+export interface ReviewSubmissionIntent {
+  job_id: Id
+  head_sha: string
+  event: ReviewDecision
+  body_hash: string
+  comment_count: number
+  created_at: string
+}
+
+export interface ReviewJobSummary {
+  id: Id
+  project_id: Id
+  pr: number
+  head_sha: string
+  source: string
+  reason: string
+  status: ReviewJobStatus
+  attempt_count: number
+  max_attempts: number
+  first_retryable_failure_at?: string | null
+  next_attempt_at?: string | null
+  reviewer_agent_id?: Id | null
+  active_run_id?: Id | null
+  failure?: ReviewFailure | null
+  submission_intent?: ReviewSubmissionIntent | null
+  submission_receipt?: ReviewSubmissionReceipt | null
+  created_at: string
+  updated_at: string
+  finished_at?: string | null
+}
+
+export interface ReviewJobDetail extends ReviewJobSummary {
+  attempts: ReviewRunSummary[]
+}
+
+export interface ReviewJobsResponse {
+  jobs: ReviewJobSummary[]
 }
 
 export interface ReviewRunDetail extends ReviewRunSummary {

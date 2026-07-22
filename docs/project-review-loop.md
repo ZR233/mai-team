@@ -1,128 +1,120 @@
-# Project Review Loop
+# Project Review 生命周期
 
-本文档记录自动项目 PR 审查的运行时契约。
+本文档记录项目 PR 审查的持久化生命周期、重试和 GitHub 提交契约。
 
-## 职责划分
+## 领域对象
 
-每个已就绪且启用自动审查的项目拥有一个可取消的审查任务上下文。该上下文会启动：
+一次逻辑审查由 `ProjectReviewJob` 表示。Job 固定绑定项目、PR 和目标 head SHA，是排队、恢复、重试和最终提交的唯一事实源。一个 Job 可以产生多条 `ProjectReviewRun`；每条 Run 只表示一次 Agent turn 尝试，并通过 `job_id`、`attempt_index` 关联 Job。
 
-- PR 池 worker：只消费已经确认合格的 PR，并一次审查一个 PR。
-- provider selector：按 Git provider 的节奏扫描 GitHub open PR。
-- relay select-pr loop：消费 relay PR 队列，复用 selector 条件过滤单个 PR。
+Job 状态机为：
 
-reviewer 是普通 project agent：由项目 agent 机制创建，使用 FreeRootSandbox、agent workspace volume 和 gh sidecar 执行一次 PR 审查。它不拥有独立于 project agent 生命周期的特殊运行时通道。
+```text
+Queued -> Preparing -> Running -> SubmissionPending -> Reconciling -> Succeeded
+                     \-> RetryWaiting ----------------------/
+                     \-> Failed | Cancelled | Superseded
+```
 
-禁用、取消和删除项目审查时，运行时会取消该上下文、终止子任务、清空 relay PR 队列和现有 PR 池，并清理活跃 reviewer agent。
+`RetryWaiting` 是活跃状态，不是最终失败。`ProjectSummary.review_status` 只是当前活跃 Job 的只读投影，不能反向驱动 Job，也不能被 selector 状态覆盖。
 
-## 队列契约
+## 持久化入队与幂等
 
-项目审查有两级队列：
+周期 selector 和 webhook 都必须先执行确定性的 eligibility 判断，再把合格 PR 直接写入持久化 Job 队列。生产路径不使用内存 relay 队列或内存 PR 池保存执行意图。
 
-- relay PR 队列：接收 relay webhook 归一化出的 PR 信号，按项目内 `pr id` 去重。
-- PR 池：只接收 selector 或 relay select-pr loop 确认为合格的 PR。
+- 同一 `project + PR + head SHA` 只保留一个活跃 Job。
+- 新 head 到达时，旧 head 的未完成 Job 进入 `Superseded`。
+- 同一 webhook delivery 对同一 PR 幂等；一个 check suite delivery 可以分别为多个关联 PR 建立 Job。
+- 手动重新审查遇到同一 PR 的活跃 Job 时直接返回该 Job，不访问 GitHub、也不创建重复 generation。
+- 历史 Job 已终止时，手动重新审查可以创建新 Job。
+- webhook 单 PR eligibility 读取失败时不写内存队列，由 relay 的失败确认机制重投；当前事件尚不满足 eligibility 时返回 `Ignored`，等待后续 check 或 PR 事件。
 
-relay handler 只处理 PR 相关事件：
-
-- `pull_request` 的 `opened`、`reopened`、`synchronize`、`ready_for_review`。
-- `check_run` 和 `check_suite` 的 `completed`。
-
-这些事件能解析出 PR id 时进入 relay PR 队列；重复 PR 保留最新的 `head_sha`、`delivery_id`、`reason` 和更新时间。relay handler 在成功入队或去重后立即 ack `Processed`，不会等待 GitHub API 读取或 selector 过滤。无法解析 PR、非目标事件、未匹配项目或自动审查关闭时 ack `Ignored`。
-
-`push` 不进入 relay PR 队列，仍按现有逻辑同步项目默认分支和 project cache volume。
+`pull_request` 的 `opened`、`reopened`、`synchronize`、`ready_for_review`，以及 `check_run`、`check_suite` 的 `completed` 会触发单 PR eligibility。`push` 不创建 Review Job，仍只同步默认分支与项目缓存。
 
 ## Selector 契约
 
-selector 是确定性的 Rust 代码。它不创建 agent、不提交 GitHub review、不调用模型 API。selector 只读取 GitHub、评估 PR 是否满足审查条件，并把合格 PR 放入 PR 池。
+selector 是确定性的 Rust 代码，只读取 GitHub 并写入合格 Job，不创建 Agent、不调用模型、不提交 review。
 
-全量 selector 扫描 open PR 时使用：
+周期扫描使用：
 
 ```text
 state=open&sort=created&direction=asc&per_page=20&page=N
 ```
 
-全量 selector 会持续扫描到 GitHub 返回空页或短页。每页先按 PR number 升序排列，再以最多 4 个候选 PR 并发评估；合格 PR 在评估完成后立即入 PR 池，入池信号使用 `reason = "selector"` 且没有 `delivery_id`。由于页内并发，入池完成顺序不作为排序契约；PR 池自身按最小 PR number 消费。
+每页按 PR number 升序评估，最多并发检查四个候选。单 PR webhook 路径复用相同规则：
 
-单 PR selector 由 relay select-pr loop 调用。`pr = 0` 时直接判定不合格；其他 PR 会读取 GitHub PR 详情，relay 信号中的 `head_sha` 只在 PR 详情缺少 `head.sha` 时作为 fallback。单 PR selector 复用同一套 eligibility 规则；合格后由 relay select-pr loop 用 relay 信号的 `delivery_id` 和 `reason` 放入 PR 池。
+1. draft 跳过。
+2. `queued`、`requested`、`waiting`、`pending`、`in_progress` 等未完成 CI 状态会阻塞；CI conclusion 不参与阻塞判断。
+3. 查找当前 reviewer login 最近一次带 `submitted_at` 的 review。
+4. 能读取当前 head 提交时间时，仅当该时间晚于最近 review 才允许重审。
+5. 无法读取提交时间时，以 review `commit_id` 是否等于当前 head 兜底。
+6. PR 作者、其他人的 review 状态和 `mergeable_state` 不参与过滤。
 
-### Select PR 完整规则
+周期 selector 成功后等待 30 分钟；读取失败按 1 秒起步、最高 600 秒的指数退避重试。selector 的 UI 状态不得覆盖活跃 Job 投影。
 
-候选数据由 `eligibility.rs` 从 GitHub 读取：
+## Claim、租约与启动恢复
 
-1. 先读取 PR 详情 `/repos/{owner}/{repo}/pulls/{pr}`。如果详情显示 `draft = true`，不再读取 review、commit 或 CI 信息，直接交给选择规则跳过。
-2. 非 draft PR 会读取最近最多 100 条 PR review：`/repos/{owner}/{repo}/pulls/{pr}/reviews?per_page=100`。
-3. 如果有 head sha，会读取该 commit 的 author/committer 时间，作为当前 head 的提交时间。这个请求失败时不阻断 selector，后续改用 review `commit_id` 与 head sha 的匹配关系兜底。
-4. 如果有 head sha，会读取 check runs 和 legacy combined status contexts。读取失败或响应无法解析时按没有对应信号处理，不把未知 CI 当成 pending。
+worker 只从数据库原子 claim 到期 Job。claim 写入实例 owner，租约为 60 秒，每 15 秒续租。数据库事务保证同一 Job 只有一个 owner；项目内任一仍存活的执行租约会阻止另一个实例启动新 Job。
 
-选择规则位于 `selection.rs`，按 PR number 升序对候选排序后逐个判断：
+同一项目只允许一个逻辑 Review 占用 Reviewer。尚未到期的 `RetryWaiting` 或 `Reconciling` Job 会阻塞后续排队 Job；到期后优先恢复原 Job，再处理新 Job，避免保留 Session 的 Reviewer 与新任务竞争。
 
-1. draft PR 跳过。
-2. CI 中仍有 pending 状态时跳过。pending 状态只看 check run 的 `status` 和 legacy status context 的 `state`，大小写和首尾空白不敏感；以下值会阻塞：`queued`、`requested`、`waiting`、`pending`、`in_progress`。
-3. CI conclusion 不参与阻塞判断。`failure`、`success`、`skipped` 等已完成结果都不会阻止入池，失败的 CI 由 reviewer 在审查中判断影响。
-4. legacy combined status 的顶层 `state` 只持久到候选对象中用于观察；如果没有具体 status contexts，即使顶层 `state = "pending"` 也不会阻塞入池。
-5. 查找当前 reviewer login 提交过且带 `submitted_at` 的最新 PR review。review 的 `state` 不参与去重判断，`APPROVED`、`CHANGES_REQUESTED`、`COMMENTED` 等都表示 reviewer 已在某个时间点审过。
-6. 如果当前 reviewer 没有提交过 review，则在 draft 和 pending CI 规则通过后可入池。
-7. 如果能读取到当前 head 的提交时间，则只用时间判断是否需要重审：`latest_commit_at <= latest_reviewer_review.submitted_at` 时跳过；只有 `latest_commit_at > latest_reviewer_review.submitted_at` 才重新入池。
-8. 如果读取不到当前 head 的提交时间，则用 review `commit_id` 兜底：最新 reviewer review 的 `commit_id` 等于当前 head sha 时跳过；否则允许入池。
-9. 后续其他人的 review、comment 或 `CHANGES_REQUESTED` 不会让同一个 head 重新入池；只有当前 reviewer review 之后出现新 commit 才会重新入池。
-10. PR 作者不参与过滤。reviewer 自己创建的 PR 与其他 PR 使用同一套规则。
-11. 当前 selector 不读取也不按 `mergeable_state` 过滤。合并冲突、分支落后或受保护分支状态不是入池条件，属于 reviewer 审查阶段需要报告的问题。
+新 head 将运行中的旧 Job 标为 `Superseded` 时保留其租约。旧 worker 在下一次心跳发现失去有效状态后取消 Agent turn、清理 reviewer 并主动释放租约；若旧实例消失，新 Job 最多等待旧租约自然过期。
 
-## Provider 节奏
+server 启动时：
 
-GitHub token 项目和 GitHub App relay 项目都会运行周期性 selector。server 启动、启用审查或入队信号启动 worker 后，selector loop 会开始运行；Git provider 为空时不启动 provider selector。
+- 已有 GitHub 回执的 Job 直接视为成功。
+- 有提交意图但无回执的 Job 进入 `Reconciling`。
+- 无提交副作用的过期 `Preparing`、`Running` Job 进入立即到期的 `RetryWaiting`，对应 Run 标为 `Interrupted`。
+- 尚未过期的租约继续等待，支持滚动部署时的跨实例排他。
 
-selector 失败时使用指数退避重试，初始 1 秒，之后翻倍，最高 600 秒。一次 selector 成功后等待 30 分钟再进行下一次扫描；成功但没有合格 PR 时状态显示 `Waiting` 并设置下一次扫描时间，成功且有 PR 入池时状态回到 `Idle`。
+## Reviewer 与 Session 生命周期
 
-selector 状态更新只是尽力而为的 UI 信号，不能覆盖活跃审查。当项目正在 syncing 或 running reviewer 时，selector 状态更新会被跳过，Web UI 继续显示活跃审查。
+Reviewer 是普通 project agent，但生命周期绑定 Job，而不是单次 Run。
 
-## Relay Select-PR Loop
+- 首次尝试创建 Reviewer、AgentSession、精确 head 工作区和只读默认分支上下文。
+- Reviewer system prompt 带有不可变的 Job ID、PR 和 head marker。若服务在 Agent 已持久化、但 `reviewer_agent_id` 尚未回写 Job 的窄窗口重启，只能由 marker 完全匹配的同一 Job 认领；不同 head 或不同 generation 不得复用。
+- 可重试失败保留同一个 Reviewer、Session 和会话笔记；下一次尝试启动新的 continuation turn，不重放失败 turn。
+- 重启后恢复持久化 AgentSession，并按 Job 固定的 head SHA 重建工作区和 Review 上下文。
+- Session 丢失或损坏是永久失败，不以空 Session 静默重审。
+- 只有 Job 进入 `Succeeded`、`Failed`、`Cancelled` 或 `Superseded` 后才删除 Reviewer、Session、上下文和工作区；终态清理也使用 marker 找回尚未写入 Job 的 Reviewer。
 
-relay select-pr loop 与 PR 池 worker 独立运行：
+## 结构化错误与重试
 
-1. 从 relay PR 队列 claim 最小 PR number。
-2. relay 队列为空时等待 `relay_review_notify` 或取消信号。
-3. 对 claimed PR 运行单 PR selector。
-4. 合格时放入 PR 池，并发布现有 `ProjectReviewQueued` 事件。
-5. 不合格时丢弃该 relay 信号。
-6. GitHub API、鉴权、网络失败或 PR 池入队失败时记录 warn，将 relay 信号放回 relay PR 队列，并按 1 秒起步、最高 600 秒的指数退避重试。
-7. 返回 relay PR 队列继续处理。
+PL 通过 `TurnFailure` 传递错误类别、provider code、HTTP status、用户可读消息与 `RetryDisposition`。Mai 不解析模型错误字符串来识别 `server_is_overloaded`。
 
-relay select-pr loop 不直接审查 PR，也不阻塞 PR 池 worker。它只是把异步 relay 事件转换成经过 selector 过滤的 PR 池信号。
+PL 在单次模型请求内部仍可重试瞬态 provider 错误，但仅限尚未产生工具副作用的阶段。内部重试耗尽后，结构化失败交给 Job scheduler。
 
-## 工作区与 Volume 契约
+每个 Job 最多五次尝试。第一次可重试失败开启 30 分钟窗口，后续四次本地退避依次为 5 秒、30 秒、2 分钟、5 分钟，并加入确定性的正负 20% jitter。Provider `Retry-After` 更长时优先使用，但不能把新尝试安排到窗口之外。窗口只限制启动新尝试，不中断已经正常运行的尝试。
 
-project cache volume 保存项目级仓库缓存和默认分支同步结果。它属于项目运行时的共享缓存，不是 reviewer 的工作目录，也不承载单次 PR 审查中的文件修改。
+鉴权、权限、输入校验、目标不存在和 Session 损坏立即永久失败。head 变化进入 `Superseded`。瞬态 GitHub、relay 和工作区错误可进入 Job 重试，但同样必须持久化为结构化失败。
 
-reviewer agent workspace volume 是单个 reviewer agent 的隔离工作区。审查开始时，reviewer 通过 helper 在自己的 workspace volume 中准备 `/workspace/repo` 克隆和目标 PR checkout；本地验证、diff 检查和审查脚本都只在这个 agent workspace volume 内执行。
+## Watchdog
 
-gh sidecar 提供 GitHub CLI 访问能力。reviewer 通过 helper 和 gh sidecar 读取 PR 元数据、提交 inline review comments 和最终 review；不依赖旧 MCP 响应形状作为运行时契约。
+- `Preparing` 最长 5 分钟。
+- `Running` 连续 10 分钟没有模型、工具或进程 revision 进展时取消 turn。
+- 活跃 `exec` 使用其 `timeoutSeconds + 60 秒` 与 10 分钟中的较大值。
+- GitHub 提交 sidecar 最长 2 分钟。
+- `Reconciling` 最长 5 分钟，每 10 秒查询一次。
+- 终态 Reviewer 清理最长 2 分钟。
 
-## Review Run 结果契约
+租约心跳更新失败时重新读取 Job：如果当前 Job 已有有效提交回执，则只停止心跳并允许 turn 正常完成收尾；其他租约丢失或读取失败场景立即取消本地尝试，避免无法确认 owner 时继续产生副作用。取消 Agent turn 会同时触发 PL 对受管 exec 进程的清理。
 
-reviewer agent 的最终回复必须是单个 JSON 对象，运行时只以这个对象作为 Recent Runs 的结果来源，不从 summary 文本或 GitHub tool trace 反推 review 类型。
+## GitHub 最终提交幂等
 
-`outcome = "review_submitted"` 时，必须同时提供 `review_event`：
+Reviewer 调查期间不得提交单条评论。最终 review POST 前，Mai 必须先持久化 `SubmissionIntent`，包括 Job ID、head SHA、event、正文 hash、评论数量和创建时间。服务端自动在 review 正文追加：
 
-- `approve`：已提交 APPROVE review，Recent Runs 显示 `Approved`。
-- `request_changes`：已提交 REQUEST_CHANGES review，Recent Runs 显示 `Changes Requested`。
-- `comment`：已提交 COMMENT review，Recent Runs 显示 `Commented`。
-
-`outcome = "failed"` 时，`review_event` 必须为 `null`。旧记录没有 `review_event` 时，UI 继续显示 `Review Submitted` 等 outcome fallback，不做历史文本推断。
-
-最终 JSON 形状固定为：
-
-```text
-{"outcome":"review_submitted|failed","review_event":"approve|request_changes|comment"|null,"pr":123|null,"summary":"short result","error":null|"failure reason"}
+```html
+<!-- mai-review-job:{job_id} -->
 ```
 
-## PR 池 Worker 契约
+POST 成功后持久化 GitHub review ID、event、commit SHA、URL 和提交时间。若请求结果不确定、响应解析失败、回执落盘失败或服务重启，Job 只能进入 `Reconciling`：按隐藏标记和 head SHA 查询 GitHub，找到后补写回执，不得再次发送完整 POST。
 
-PR 池 worker 启动时先确保 project cache volume 可用，然后循环：
+Continuation 只允许把同时包含当前 Job 隐藏标记、且 commit SHA 等于固定 head 的 review 视为本 Job 已提交。其他 Job、其他 head 或无标记的历史 review 仅作为审查上下文，不能据此返回 `review_submitted`。
 
-1. 从 PR 池 claim 最小 PR number。
-2. PR 池为空时等待 `review_notify` 或取消信号。
-3. 对 claimed PR 创建普通 reviewer project agent，并在该 agent 的 workspace volume 中运行一次 review cycle。
-4. 仅在可重试审查错误时把 claimed PR 放回 PR 池。
-5. 返回 PR 池继续处理。
+GitHub 明确返回 `Line could not be resolved` 时，允许同一 SubmissionIntent 去掉 `comments` 后执行一次 body-only 恢复；正文、event 和 head 必须保持一致。除此之外，未解决 intent 不允许第二次 POST。
 
-PR 池 worker 不触发 selector 扫描，也不读取 relay PR 队列。selector 调度、relay 事件过滤和实际审查执行保持解耦，避免长时间 GitHub 读取让 Web UI 看起来像 reviewer 卡住。
+GitHub 回执是成功的硬条件：已有回执时，即使最终模型 JSON 或 turn 收尾失败，Job 仍成功；模型声称 `review_submitted` 但没有持久化回执时，Job 以 `missing_submission_receipt` 永久失败。
+
+## API 与展示
+
+列表和详情 API 以 Job 为主对象，详情按 `attempt_index` 展示各次 Run。Web 必须把 `RetryWaiting`、`Reconciling` 显示为活跃阶段，并展示结构化错误、下次重试时间、SubmissionIntent 和 GitHub receipt。旧 Review Run API 只用于读取单次尝试的消息与 Timeline activity。
+
+历史 schema 迁移为每条旧 Run 创建一个对应 Job。历史终态不自动重放；部署时仍活跃的 Run 标为 `Interrupted`，其 Job 进入启动协调流程。

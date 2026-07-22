@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
+#[cfg(test)]
 use mai_protocol::now;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +36,7 @@ pub(crate) struct ProjectReviewPool {
 }
 
 impl ProjectReviewPool {
+    #[cfg(test)]
     pub(crate) fn enqueue_many(
         &mut self,
         signals: impl IntoIterator<Item = ProjectReviewSignalInput>,
@@ -46,11 +48,13 @@ impl ProjectReviewPool {
         summary
     }
 
+    #[cfg(test)]
     pub(crate) fn next(&mut self) -> Option<PendingProjectReview> {
         let pr = self.pending.first_key_value().map(|(pr, _)| *pr)?;
         self.pending.remove(&pr)
     }
 
+    #[cfg(test)]
     pub(crate) fn requeue(&mut self, pending: PendingProjectReview) {
         self.pending.entry(pending.pr).or_insert(pending);
     }
@@ -59,10 +63,12 @@ impl ProjectReviewPool {
         self.pending.clear();
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
 
+    #[cfg(test)]
     fn enqueue(
         &mut self,
         signal: ProjectReviewSignalInput,

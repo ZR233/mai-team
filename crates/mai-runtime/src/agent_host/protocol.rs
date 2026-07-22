@@ -94,6 +94,7 @@ mod tests {
                 session_id: SessionId::new("session").unwrap(),
                 kind: TurnOutcomeKind::BudgetLimited,
                 reason: Some("token budget".to_string()),
+                failure: None,
                 usage: pl_model::TokenUsage::default(),
                 finished_at: 1,
             }),

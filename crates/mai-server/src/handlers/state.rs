@@ -27,7 +27,8 @@ impl From<mai_runtime::RuntimeError> for ApiError {
             AgentNotFound(_)
             | TaskNotFound(_)
             | ProjectNotFound(_)
-            | ProjectReviewRunNotFound(_) => StatusCode::NOT_FOUND,
+            | ProjectReviewRunNotFound(_)
+            | ProjectReviewJobNotFound(_) => StatusCode::NOT_FOUND,
             TurnNotFound { .. } => StatusCode::NOT_FOUND,
             SessionNotFound { .. } => StatusCode::NOT_FOUND,
             SessionEventNotFound(_) => StatusCode::NOT_FOUND,

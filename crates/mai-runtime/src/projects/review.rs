@@ -1,4 +1,7 @@
-use mai_protocol::{AgentRole, ProjectReviewDecision, ProjectReviewOutcome, ProjectReviewStatus};
+use mai_protocol::{
+    AgentRole, ProjectReviewDecision, ProjectReviewFailure, ProjectReviewOutcome,
+    ProjectReviewStatus,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::time::Duration;
@@ -10,18 +13,25 @@ pub(crate) mod cleanup;
 pub(crate) mod context;
 pub(crate) mod cycle;
 pub(crate) mod eligibility;
+pub(crate) mod job;
+pub(crate) mod job_attempt;
+pub(crate) mod job_worker;
 pub(crate) mod pool;
+#[cfg(test)]
 pub(crate) mod relay_queue;
+#[cfg(test)]
 pub(crate) mod relay_selector;
 pub(crate) mod reviewer;
 pub(crate) mod runs;
 pub(crate) mod selection;
 pub(crate) mod selector;
+#[cfg(test)]
 pub(crate) mod singleton;
 pub(crate) mod state;
 pub(crate) mod target;
 pub(crate) mod worker;
 
+#[cfg(test)]
 const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;
 const PROJECT_REVIEW_SELECTOR_INTERVAL_SECS: u64 = 1800;
 const PROJECT_REVIEW_RETRY_INITIAL_SECS: u64 = 1;
@@ -55,6 +65,7 @@ pub(crate) struct ProjectReviewCycleResult {
     pub(crate) pr: Option<u64>,
     pub(crate) summary: Option<String>,
     pub(crate) error: Option<String>,
+    pub(crate) failure: Option<ProjectReviewFailure>,
 }
 
 pub(crate) struct ProjectReviewLoopDecision {
@@ -69,6 +80,8 @@ pub(crate) fn project_reviewer_system_prompt(context: &context::ProjectReviewCon
     format!(
         r#"You are an autonomous project pull request reviewer. Review exactly PR #{pr} at head `{head_sha}` against base `{base_sha}`.
 
+Review lifecycle owner: job `{job_id}`, PR #{pr}, head `{head_sha}`. This immutable marker is used only to recover the same reviewer after a service restart.
+
 You have two repository views with different authority:
 - `/project/repo` is a read-only file view of the exact default-branch base snapshot `{base_sha}`. At the start of the review, search it first for `AGENTS*.md`, `CONTRIBUTING*`, `GUIDELINES*`, `DEVELOPMENT*`, README files, `.github` guidance, and any documents they reference. Use it first when looking for existing implementation patterns, project skills, and project memory.
 - `/workspace/repo` is the writable isolated PR-head workspace at `{head_sha}`. Read changed code and PR-only files here, and run every Git command, diff, HEAD verification, build, and test here.
@@ -77,10 +90,13 @@ Default-branch constraints from `/project/repo` are authoritative for this revie
 
 Before investigating the review, initialize the persistent session note with `write_session_note` using `expectedRevision: 0`, recording only immutable metadata: the target PR and head SHA. Do not add progress checkboxes, mutable status, or placeholder findings. Whenever you identify a potential finding, immediately append its complete record to the end of `session-note.md` with `apply_session_note_patch`; do not rely on conversation context to retain it. After initialization, never overwrite the note or use a patch that changes or removes an existing line: every status or disposition update must append a new complete block with the same finding ID. Before submitting anything to GitHub, reconcile the entire ledger with paginated `read_session_note` calls: start at line 1 with at most 500 lines, keep the returned revision fixed as `expectedRevision`, and follow every non-empty `nextStartLine` until it is absent. Reconcile the latest status of every finding from those pages. If reconciliation appends a status update and changes the revision, restart reading from line 1 at the new revision. `search_session_note` remains available for targeted investigation, but do not use its optional cursor for this mandatory final reconciliation. Submit all active findings together in one logical final pull request review and never submit findings individually as they are discovered. If any required note operation or revision reconciliation fails, return a failed result without submitting a review; never fall back to a temporary file.
 
+Mai automatically appends the hidden marker `<!-- mai-review-job:{job_id} -->` to this Job's review body. Do not add or alter that marker yourself. An existing GitHub review fulfills this Job only when it contains that exact marker and targets `{head_sha}`; reviews without the marker or from another head are context only. Never report `review_submitted` without either a successful final submission for this Job or reconciliation of that exact marker and head.
+
 Never modify, checkout, fetch, clean, or run Git commands in `/project/repo`; its `.git` metadata is intentionally unavailable. Do not checkout another revision in `/workspace/repo`, look for GitHub tokens in the environment, or write credentials. Use only visible Mai GitHub API tools for GitHub reads/writes. Finish with only the required JSON object so the project scheduler can decide the next cycle."#,
         pr = context.target.pr,
         head_sha = context.target.head_sha,
         base_sha = context.project_revision.base_sha,
+        job_id = context.run_id,
     )
 }
 
@@ -128,6 +144,7 @@ pub(crate) fn parse_project_review_cycle_report(text: &str) -> Result<ProjectRev
             .error
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
+        failure: None,
     })
 }
 
@@ -220,6 +237,7 @@ pub(crate) fn validate_project_reviewer_github_api_request(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn project_review_loop_decision_for_result(
     result: ProjectReviewCycleResult,
 ) -> ProjectReviewLoopDecision {
@@ -287,8 +305,7 @@ pub(crate) fn project_review_error_is_retryable(error: &str) -> bool {
     if crate::github::github_error_message_is_retryable(error) {
         return true;
     }
-
-    pl_core::is_retryable_model_error(error)
+    false
 }
 
 pub(crate) fn project_review_cycle_result_for_wait_result(
@@ -301,6 +318,7 @@ pub(crate) fn project_review_cycle_result_for_wait_result(
             pr: None,
             summary: Some("Review could not be completed.".to_string()),
             error: Some("reviewer became idle without a turn outcome".to_string()),
+            failure: None,
         });
     };
     if last_turn.kind == pl_core::TurnOutcomeKind::Completed {
@@ -313,6 +331,7 @@ pub(crate) fn project_review_cycle_result_for_wait_result(
         pr: None,
         summary: Some("Review could not be completed.".to_string()),
         error: Some(normalize_optional_text(last_turn.reason.clone()).unwrap_or(outcome_error)),
+        failure: last_turn.failure.clone().map(Into::into),
     })
 }
 
@@ -838,6 +857,7 @@ mod tests {
             pr: Some(123),
             summary: Some("submitted".to_string()),
             error: None,
+            failure: None,
         });
 
         assert_eq!(decision.delay, Duration::ZERO);
@@ -858,6 +878,7 @@ mod tests {
             pr: None,
             summary: Some("nothing to review".to_string()),
             error: None,
+            failure: None,
         });
 
         assert_eq!(decision.delay, Duration::from_secs(120));
@@ -875,6 +896,7 @@ mod tests {
             pr: None,
             summary: Some("failed".to_string()),
             error: None,
+            failure: None,
         });
 
         assert_eq!(decision.delay, Duration::from_secs(600));
@@ -912,114 +934,6 @@ mod tests {
             decision.error.as_deref(),
             Some("invalid input: relay request timed out")
         );
-    }
-
-    #[test]
-    fn model_gateway_failure_is_retryable() {
-        let error = "model error: request to https://token-plan-cn.xiaomimimo.com/v1/chat/completions returned 500 Internal Server Error: {\"error\":{\"message\":\"<html><body><h1>502 Bad Gateway</h1></body></html>\"}}";
-
-        let decision = project_review_loop_decision_for_error(error.to_string());
-
-        assert_eq!(decision.delay, Duration::from_secs(1));
-        assert_eq!(decision.status, ProjectReviewStatus::Waiting);
-        assert_eq!(decision.outcome, None);
-        assert_eq!(decision.summary, None);
-        assert_eq!(decision.error.as_deref(), Some(error));
-    }
-
-    #[test]
-    fn model_response_decode_failure_is_retryable() {
-        let error = "model error: request to https://token-plan-cn.xiaomimimo.com/v1/chat/completions failed: error decoding response body";
-
-        let decision = project_review_loop_decision_for_error(error.to_string());
-
-        assert_eq!(decision.delay, Duration::from_secs(1));
-        assert_eq!(decision.status, ProjectReviewStatus::Waiting);
-        assert_eq!(decision.outcome, None);
-        assert_eq!(decision.summary, None);
-        assert_eq!(decision.error.as_deref(), Some(error));
-    }
-
-    #[test]
-    fn model_incomplete_sse_frame_is_retryable() {
-        let error = "model error: stream error: stream closed with incomplete SSE frame";
-
-        let decision = project_review_loop_decision_for_error(error.to_string());
-
-        assert_eq!(decision.delay, Duration::from_secs(1));
-        assert_eq!(decision.status, ProjectReviewStatus::Waiting);
-        assert_eq!(decision.outcome, None);
-        assert_eq!(decision.summary, None);
-        assert_eq!(decision.error.as_deref(), Some(error));
-    }
-
-    #[test]
-    fn responses_websocket_disconnect_is_retryable() {
-        let error = "transient model transport error: Responses WebSocket stream failed: server closed the connection";
-
-        let decision = project_review_loop_decision_for_error(error.to_string());
-
-        assert_eq!(decision.delay, Duration::from_secs(1));
-        assert_eq!(decision.status, ProjectReviewStatus::Waiting);
-        assert_eq!(decision.outcome, None);
-        assert_eq!(decision.summary, None);
-        assert_eq!(decision.error.as_deref(), Some(error));
-    }
-
-    #[test]
-    fn model_response_incomplete_output_limit_is_retryable() {
-        let error =
-            "model error: stream error: response.incomplete event received: max_output_tokens";
-
-        let decision = project_review_loop_decision_for_error(error.to_string());
-
-        assert_eq!(decision.delay, Duration::from_secs(1));
-        assert_eq!(decision.status, ProjectReviewStatus::Waiting);
-        assert_eq!(decision.outcome, None);
-        assert_eq!(decision.summary, None);
-        assert_eq!(decision.error.as_deref(), Some(error));
-    }
-
-    #[test]
-    fn model_retryable_error_classification_delegates_to_pl_core() {
-        let source = include_str!("review.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production source");
-
-        assert!(
-            production.contains("pl_core::is_retryable_model_error"),
-            "模型 provider/stream 瞬态错误分类应由 pl-core 统一提供"
-        );
-        for forbidden in [
-            "stream closed with incomplete SSE frame",
-            "stream closed before response.completed",
-            "idle timeout waiting for SSE",
-            "response.incomplete event received",
-            "error decoding response body",
-            " returned 429 ",
-            " returned 500 ",
-            " returned 502 ",
-        ] {
-            assert!(
-                !production.contains(forbidden),
-                "mai-runtime 不应复制模型错误重试分类 `{forbidden}`"
-            );
-        }
-    }
-
-    #[test]
-    fn model_bad_request_is_not_retryable() {
-        let error = "model error: request to https://example.test/v1/chat/completions returned 400 Bad Request: invalid request";
-
-        let decision = project_review_loop_decision_for_error(error.to_string());
-
-        assert_eq!(decision.delay, Duration::from_secs(600));
-        assert_eq!(decision.status, ProjectReviewStatus::Failed);
-        assert_eq!(decision.outcome, Some(ProjectReviewOutcome::Failed));
-        assert_eq!(decision.summary, None);
-        assert_eq!(decision.error.as_deref(), Some(error));
     }
 
     #[test]
@@ -1083,6 +997,46 @@ mod tests {
     }
 
     #[test]
+    fn overloaded_turn_failure_stays_structured_across_runtime_boundary() {
+        let failure = pl_protocol::TurnFailure {
+            category: pl_protocol::TurnFailureCategory::ProviderCapacity,
+            code: Some("server_is_overloaded".to_string()),
+            http_status: None,
+            message: "The server is overloaded".to_string(),
+            retry: pl_protocol::RetryDisposition::Retryable {
+                retry_after_ms: Some(30_000),
+            },
+        };
+        let mut wait_result = test_wait_result(
+            pl_core::TurnOutcomeKind::Failed,
+            Some("The server is overloaded"),
+        );
+        wait_result.last_turn.as_mut().expect("last turn").failure = Some(failure.clone());
+        wait_result
+            .snapshot
+            .last_turn
+            .as_mut()
+            .expect("snapshot last turn")
+            .failure = Some(failure);
+
+        let result = project_review_cycle_result_for_wait_result(&wait_result)
+            .expect("failed reviewer should produce failed review result");
+
+        assert_eq!(
+            result.failure,
+            Some(ProjectReviewFailure {
+                category: mai_protocol::ProjectReviewFailureCategory::ProviderCapacity,
+                code: Some("server_is_overloaded".to_string()),
+                http_status: None,
+                message: "The server is overloaded".to_string(),
+                retry: pl_protocol::RetryDisposition::Retryable {
+                    retry_after_ms: Some(30_000),
+                },
+            })
+        );
+    }
+
+    #[test]
     fn completed_reviewer_turn_does_not_skip_final_json_parsing() {
         let wait_result = test_wait_result(pl_core::TurnOutcomeKind::Completed, None);
 
@@ -1098,6 +1052,7 @@ mod tests {
             session_id: pl_core::SessionId::new("session").expect("session"),
             kind,
             reason: reason.map(str::to_string),
+            failure: None,
             usage: pl_model::TokenUsage::default(),
             finished_at: 1,
         };

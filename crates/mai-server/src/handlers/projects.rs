@@ -6,9 +6,10 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 
 use mai_protocol::{
-    AgentId, CreateProjectRequest, CreateProjectResponse, ProjectId, ProjectReviewQueueResponse,
-    ProjectReviewRunDetail, ProjectReviewRunsResponse, SendMessageRequest, SendMessageResponse,
-    SessionId, SkillsListResponse, UpdateProjectRequest, UpdateProjectResponse,
+    AgentId, CreateProjectRequest, CreateProjectResponse, ProjectId, ProjectReviewJobDetail,
+    ProjectReviewJobsResponse, ProjectReviewQueueResponse, ProjectReviewRunDetail,
+    ProjectReviewRunsResponse, SendMessageRequest, SendMessageResponse, SessionId,
+    SkillsListResponse, UpdateProjectRequest, UpdateProjectResponse,
 };
 use mai_runtime::ProjectReviewQueueRequest;
 
@@ -103,6 +104,36 @@ pub(crate) async fn get_project_review_run(
     ))
 }
 
+pub(crate) async fn list_project_review_jobs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<ProjectId>,
+    Query(query): Query<ProjectReviewRunsQuery>,
+) -> std::result::Result<Json<ProjectReviewJobsResponse>, ApiError> {
+    Ok(Json(
+        state
+            .runtime
+            .list_project_review_jobs(
+                id,
+                query.offset.unwrap_or(0),
+                query.limit.unwrap_or(DEFAULT_REVIEW_RUNS_PAGE_SIZE),
+            )
+            .await?,
+    ))
+}
+
+pub(crate) async fn get_project_review_job(
+    State(state): State<Arc<AppState>>,
+    Path((id, job_id)): Path<(ProjectId, String)>,
+) -> std::result::Result<Json<ProjectReviewJobDetail>, ApiError> {
+    let job_id = job_id.parse().map_err(|err| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("invalid review job id: {err}"),
+    })?;
+    Ok(Json(
+        state.runtime.get_project_review_job(id, job_id).await?,
+    ))
+}
+
 pub(crate) async fn request_project_pull_request_review(
     State(state): State<Arc<AppState>>,
     Path((id, pr)): Path<(ProjectId, u64)>,
@@ -121,6 +152,7 @@ pub(crate) async fn request_project_pull_request_review(
         queued: summary.queued,
         deduped: summary.deduped,
         ignored: summary.ignored,
+        jobs: summary.jobs,
     }))
 }
 
@@ -172,7 +204,37 @@ mod tests {
     async fn request_project_pull_request_review_queues_manual_rereview() {
         let project_id = ProjectId::new_v4();
         let maintainer_id = AgentId::new_v4();
-        let state = test_app_state(project_id, maintainer_id).await;
+        let (state, _dir) = test_app_state(project_id, maintainer_id).await;
+        let now = Utc::now();
+        let active_job = mai_protocol::ProjectReviewJobSummary {
+            id: uuid::Uuid::new_v4(),
+            project_id,
+            pr: 17,
+            head_sha: "fixed-head".to_string(),
+            source: mai_protocol::ProjectReviewJobSource::Manual,
+            delivery_id: None,
+            reason: "existing_manual_review".to_string(),
+            status: mai_protocol::ProjectReviewJobStatus::RetryWaiting,
+            attempt_count: 1,
+            max_attempts: 5,
+            first_retryable_failure_at: Some(now),
+            next_attempt_at: Some(now),
+            reviewer_agent_id: Some(maintainer_id),
+            active_run_id: None,
+            lease_owner: None,
+            lease_expires_at: None,
+            failure: None,
+            submission_intent: None,
+            submission_receipt: None,
+            created_at: now,
+            updated_at: now,
+            finished_at: None,
+        };
+        state
+            .store
+            .enqueue_project_review_job(active_job.clone())
+            .await
+            .expect("seed active review job");
 
         let response =
             request_project_pull_request_review(State(Arc::clone(&state)), Path((project_id, 17)))
@@ -182,15 +244,19 @@ mod tests {
 
         assert_eq!(
             ProjectReviewQueueResponse {
-                queued: vec![17],
-                deduped: vec![],
+                queued: vec![],
+                deduped: vec![17],
                 ignored: vec![],
+                jobs: vec![active_job],
             },
             response
         );
     }
 
-    async fn test_app_state(project_id: ProjectId, maintainer_id: AgentId) -> Arc<AppState> {
+    async fn test_app_state(
+        project_id: ProjectId,
+        maintainer_id: AgentId,
+    ) -> (Arc<AppState>, TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(
             MaiStore::open_with_config_and_artifact_index_path(
@@ -220,11 +286,14 @@ mod tests {
         .await
         .expect("runtime");
         let relay = crate::services::relay_manager::RelayManager::new(Arc::clone(&store));
-        Arc::new(AppState {
-            runtime,
-            store,
-            relay,
-        })
+        (
+            Arc::new(AppState {
+                runtime,
+                store,
+                relay,
+            }),
+            dir,
+        )
     }
 
     async fn save_test_project(

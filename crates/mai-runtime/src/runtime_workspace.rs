@@ -80,14 +80,6 @@ impl AgentRuntime {
         projects::review::worker::start_enabled_project_review_workers(Arc::clone(self)).await
     }
 
-    pub(super) async fn reconcile_project_review_singletons(self: &Arc<Self>) {
-        projects::review::worker::reconcile_project_review_singletons(
-            Arc::clone(self),
-            PROJECT_REVIEW_RUN_LIST_LIMIT,
-        )
-        .await
-    }
-
     pub(super) async fn start_project_review_loop_if_ready(
         self: &Arc<Self>,
         project_id: ProjectId,
@@ -105,6 +97,7 @@ impl AgentRuntime {
         .await
     }
 
+    #[cfg(test)]
     pub(super) async fn run_project_review_once(
         self: &Arc<Self>,
         project_id: ProjectId,
@@ -118,6 +111,23 @@ impl AgentRuntime {
             project_id,
             cancellation_token,
             request,
+        )
+        .await
+    }
+
+    pub(super) async fn run_project_review_job_attempt(
+        self: &Arc<Self>,
+        job: ProjectReviewJobSummary,
+        owner: String,
+        cancellation_token: CancellationToken,
+    ) -> Result<ProjectReviewCycleResult> {
+        let project = self.project(job.project_id).await?;
+        let _review_cycle_guard = project.review_cycle_lock.lock().await;
+        projects::review::job_attempt::run_project_review_job_attempt(
+            self,
+            job,
+            owner,
+            cancellation_token,
         )
         .await
     }

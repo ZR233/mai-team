@@ -116,16 +116,16 @@ test("review actions remain available at each configured viewport", async ({ pag
   await expect(page.getByRole("link", { name: "Open PR #1631" })).toBeVisible()
   const approved = page.getByText("Approved", { exact: true })
   const requestChanges = page.getByText("Request changes", { exact: true })
-  await expect(testInfo.project.name === "mobile" ? approved.last() : approved.first()).toBeVisible()
-  await expect(testInfo.project.name === "mobile" ? requestChanges.last() : requestChanges.first()).toBeVisible()
+  await expect(testInfo.project.name === "desktop" ? approved.first() : approved.last()).toBeVisible()
+  await expect(testInfo.project.name === "desktop" ? requestChanges.first() : requestChanges.last()).toBeVisible()
   await expect(page).toHaveScreenshot(`review-list-${testInfo.project.name}.png`, { animations: "disabled" })
 
   await page.getByRole("button", { name: "Actions for PR #1631" }).click()
   await page.getByRole("menuitem", { name: "View details" }).click()
-  await expect(page.getByRole("heading", { name: "Review run · PR #1631", exact: true })).toBeVisible()
+  await expect(page.getByRole("heading", { name: "Review job · PR #1631", exact: true })).toBeVisible()
   await expect(page.getByRole("link", { name: "Open pull request" })).toBeVisible()
   await expect(page.getByRole("button", { name: "Re-review" })).toBeVisible()
-  await expect(page.getByRole("heading", { name: "Review activity" })).toBeVisible()
+  await expect(page.getByRole("heading", { name: "Attempt activity" })).toBeVisible()
   await expect(page.getByText("Run command", { exact: true })).toBeVisible()
   await expect(page.getByText("Read session note", { exact: true })).toBeVisible()
   await expect(page.getByText("GitHub API request", { exact: true })).toBeVisible()
@@ -160,8 +160,8 @@ test("project review, repository settings, and default-branch skills remain func
   await review
   await page.getByRole("button", { name: "Actions for PR #1631" }).click()
   await page.getByRole("menuitem", { name: "View details" }).click()
-  await expect(page.getByRole("heading", { name: "Review run · PR #1631", exact: true })).toBeVisible()
-  await expect(page.getByRole("heading", { name: "Review activity", exact: true })).toBeVisible()
+  await expect(page.getByRole("heading", { name: "Review job · PR #1631", exact: true })).toBeVisible()
+  await expect(page.getByRole("heading", { name: "Attempt activity", exact: true })).toBeVisible()
   await expect(page.getByRole("button", { name: "Re-review" })).toBeVisible()
   await page.keyboard.press("Escape")
 
@@ -227,6 +227,10 @@ async function installApiFixture(page: Page) {
     if (path === "/skills") return json(route, skills)
     if (path === "/projects") return json(route, [projectSummary])
     if (path === "/projects/project-1") return json(route, projectDetail)
+    if (path === "/projects/project-1/review-jobs") return json(route, { jobs: [reviewJob, retryWaitingReviewJob, changesRequestedReviewJob] })
+    if (path === "/projects/project-1/review-jobs/job-1") return json(route, reviewJobDetail)
+    if (path === "/projects/project-1/review-jobs/job-retry") return json(route, { ...retryWaitingReviewJob, attempts: [retryableReviewRun] })
+    if (path === "/projects/project-1/review-jobs/job-2") return json(route, { ...changesRequestedReviewJob, attempts: [changesRequestedReviewRun] })
     if (path === "/projects/project-1/review-runs") return json(route, { runs: [reviewRun, changesRequestedReviewRun] })
     if (path === "/projects/project-1/review-runs/review-1") return json(route, reviewRunDetail)
     if (path === "/projects/project-1/skills") return json(route, projectSkills)
@@ -234,7 +238,7 @@ async function installApiFixture(page: Page) {
     if (path === "/tasks/task-1") return json(route, taskDetail)
     if (path === "/settings/web-search") return json(route, webSearchSettings)
     if (path === "/mcp-servers") return json(route, mcpServers)
-    if (/^\/projects\/project-1\/pull-requests\/\d+\/review$/.test(path) && request.method() === "POST") return json(route, { queued: [1631], deduped: [], ignored: [] })
+    if (/^\/projects\/project-1\/pull-requests\/\d+\/review$/.test(path) && request.method() === "POST") return json(route, { queued: [1631], deduped: [], ignored: [], jobs: [reviewJob] })
     if (request.method() !== "GET" && (
       path.startsWith("/projects/project-1")
       || path.startsWith("/tasks/task-1")
@@ -299,7 +303,9 @@ const projectAgent = {
 }
 const reviewRun = {
   id: "review-1",
-  status: "completed",
+  job_id: "job-1",
+  attempt_index: 1,
+  status: "succeeded",
   pr: 1631,
   summary: "Canonical session events are correctly isolated.",
   started_at: "2026-07-20T00:00:00Z",
@@ -313,12 +319,72 @@ const reviewRun = {
 const changesRequestedReviewRun = {
   ...reviewRun,
   id: "review-2",
+  job_id: "job-2",
   pr: 1563,
   summary: "Requested changes for a release blocker.",
   review_event: "request_changes",
   started_at: "2026-07-19T23:50:00Z",
   finished_at: "2026-07-19T23:58:00Z",
 }
+const retryableReviewRun = {
+  ...reviewRun,
+  id: "review-retry-1",
+  job_id: "job-retry",
+  pr: 1665,
+  status: "retryable_failed",
+  outcome: "failed",
+  review_event: null,
+  summary: "The provider was temporarily overloaded; the same reviewer session will continue.",
+  error: "The server is overloaded",
+  failure: { category: "provider_capacity", code: "server_is_overloaded", http_status: 503, message: "The server is overloaded", retry: { retryable: { retry_after_ms: 30000 } } },
+}
+const reviewJob = {
+  id: "job-1",
+  project_id: "project-1",
+  pr: 1631,
+  head_sha: "abc123abc123abc123abc123abc123abc123abc1",
+  source: "automatic",
+  reason: "eligible pull request",
+  status: "succeeded",
+  attempt_count: 1,
+  max_attempts: 5,
+  reviewer_agent_id: "reviewer-1",
+  submission_intent: { job_id: "job-1", head_sha: "abc123abc123abc123abc123abc123abc123abc1", event: "approve", body_hash: "sha256:review-body", comment_count: 0, created_at: "2026-07-20T00:03:30Z" },
+  submission_receipt: { github_review_id: 4512, event: "approve", head_sha: "abc123abc123abc123abc123abc123abc123abc1", html_url: "https://github.com/rcore-os/tgoskits/pull/1631#pullrequestreview-4512", submitted_at: "2026-07-20T00:04:00Z" },
+  created_at: "2026-07-20T00:00:00Z",
+  updated_at: "2026-07-20T00:05:00Z",
+  finished_at: "2026-07-20T00:05:00Z",
+}
+const changesRequestedReviewJob = {
+  ...reviewJob,
+  id: "job-2",
+  pr: 1563,
+  head_sha: "def456def456def456def456def456def456def4",
+  attempt_count: 1,
+  submission_intent: { ...reviewJob.submission_intent, job_id: "job-2", head_sha: "def456def456def456def456def456def456def4", event: "request_changes", comment_count: 2 },
+  submission_receipt: { ...reviewJob.submission_receipt, github_review_id: 4511, event: "request_changes", head_sha: "def456def456def456def456def456def456def4" },
+  created_at: "2026-07-19T23:50:00Z",
+  updated_at: "2026-07-19T23:58:00Z",
+  finished_at: "2026-07-19T23:58:00Z",
+}
+const retryWaitingReviewJob = {
+  ...reviewJob,
+  id: "job-retry",
+  pr: 1665,
+  head_sha: "fedcba9876543210fedcba9876543210fedcba98",
+  source: "webhook",
+  reason: "pull request synchronized",
+  status: "retry_waiting",
+  attempt_count: 1,
+  next_attempt_at: "2026-07-20T00:06:00Z",
+  failure: { category: "provider_capacity", code: "server_is_overloaded", http_status: 503, message: "The server is overloaded", retry: { retryable: { retry_after_ms: 30000 } } },
+  submission_intent: null,
+  submission_receipt: null,
+  created_at: "2026-07-20T00:01:00Z",
+  updated_at: "2026-07-20T00:05:30Z",
+  finished_at: null,
+}
+const reviewJobDetail = { ...reviewJob, attempts: [reviewRun] }
 const projectSummary = {
   id: "project-1",
   name: "TGOS Kits",

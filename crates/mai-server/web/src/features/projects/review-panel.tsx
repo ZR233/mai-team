@@ -4,8 +4,8 @@ import { useMemo, useState } from "react"
 import { toast } from "sonner"
 
 import { api } from "@/api/client"
-import type { ProjectDetail, ReviewRunDetail, ReviewRunSummary } from "@/api/product-types"
-import { projectReviewRunQuery, projectReviewRunsQuery, queryKeys } from "@/api/queries"
+import type { ProjectDetail, ReviewJobDetail, ReviewJobSummary, ReviewRunDetail, ReviewRunSummary } from "@/api/product-types"
+import { projectReviewJobQuery, projectReviewJobsQuery, projectReviewRunQuery, queryKeys } from "@/api/queries"
 import { Markdown } from "@/components/markdown"
 import { EmptyState, ErrorState, LoadingState } from "@/components/page-state"
 import { StatusBadge } from "@/components/status"
@@ -26,254 +26,140 @@ import { cn } from "@/lib/utils"
 
 import { buildReviewActivity } from "./review-activity"
 import { ReviewActivityList } from "./review-activity-list"
-
-interface ReviewPanelProps {
-  project: ProjectDetail
-}
+import { latestReviewAttempt, summarizeReviewJobs } from "./review-job-model"
 
 interface QueueResponse {
   queued: number[]
   deduped: number[]
   ignored: number[]
+  jobs: ReviewJobSummary[]
 }
 
-export function ReviewPanel({ project }: ReviewPanelProps) {
+export function ReviewPanel({ project }: { project: ProjectDetail }) {
   const queryClient = useQueryClient()
-  const runs = useQuery(projectReviewRunsQuery(project.id))
-  const [selectedRun, setSelectedRun] = useState<ReviewRunSummary | null>(null)
+  const jobs = useQuery(projectReviewJobsQuery(project.id))
+  const [selectedJob, setSelectedJob] = useState<ReviewJobSummary | null>(null)
   const [runDialogOpen, setRunDialogOpen] = useState(false)
   const [pr, setPr] = useState("")
   const queue = useMutation({
     mutationFn: (number: number) => api<QueueResponse>(`/projects/${project.id}/pull-requests/${number}/review`, { method: "POST" }),
     onSuccess: async (response, number) => {
       if (response.queued.includes(number)) toast.success(`Review queued for PR #${number}`)
-      else if (response.deduped.includes(number)) toast.info(`PR #${number} is already queued or running`)
+      else if (response.deduped.includes(number)) toast.info(`PR #${number} already has an active review job`)
       else toast.info(`PR #${number} was not queued`)
       setPr("")
       setRunDialogOpen(false)
-      await queryClient.invalidateQueries({ queryKey: queryKeys.projectReviewRuns(project.id) })
+      await queryClient.invalidateQueries({ queryKey: queryKeys.projectReviewJobs(project.id) })
     },
     onError: (error) => toast.error(error.message),
   })
-  const summary = useMemo(() => summarizeRuns(runs.data?.runs ?? []), [runs.data])
+  const summary = useMemo(() => summarizeReviewJobs(jobs.data?.jobs ?? []), [jobs.data])
   const repository = String(project.repository_full_name || project.repository || "")
 
-  return (
-    <div className="min-h-0 flex-1 overflow-auto">
-      <div className="mx-auto flex max-w-6xl flex-col gap-5 p-4 md:p-6">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div>
-            <h2 className="text-base font-semibold">Pull request reviews</h2>
-            <p className="text-sm text-muted-foreground">Run and inspect agent reviews for this project.</p>
-          </div>
-          <Dialog open={runDialogOpen} onOpenChange={setRunDialogOpen}>
-            <DialogTrigger asChild><Button><Play data-icon="inline-start" /> Run review</Button></DialogTrigger>
-            <DialogContent>
-              <DialogHeader><DialogTitle>Run pull request review</DialogTitle><DialogDescription>Queue a manual review even when automatic review is disabled.</DialogDescription></DialogHeader>
-              <FieldGroup>
-                <Field>
-                  <FieldLabel htmlFor="review-pr">Pull request number</FieldLabel>
-                  <Input id="review-pr" inputMode="numeric" value={pr} onChange={(event) => setPr(event.target.value.replace(/\D/g, ""))} placeholder="1631" />
-                  <FieldDescription>The latest head SHA is resolved by the server before review starts.</FieldDescription>
-                </Field>
-              </FieldGroup>
-              <DialogFooter><Button variant="outline" onClick={() => setRunDialogOpen(false)}>Cancel</Button><Button disabled={!pr || queue.isPending} onClick={() => queue.mutate(Number(pr))}><Play data-icon="inline-start" /> Queue review</Button></DialogFooter>
-            </DialogContent>
-          </Dialog>
-        </div>
-
-        <div className="flex flex-wrap gap-2" aria-label="Review run summary">
-          <Badge variant="secondary">{summary.running} running</Badge>
-          <Badge variant="outline">{summary.completed} completed</Badge>
-          <Badge variant={summary.failed ? "destructive" : "outline"}>{summary.failed} failed</Badge>
-        </div>
-
-        {runs.isLoading && <LoadingState rows={5} />}
-        {runs.error && <ErrorState error={runs.error} retry={() => void runs.refetch()} />}
-        {runs.data && runs.data.runs.length === 0 && <EmptyState title="No review runs yet" description="Queue a pull request review to see its status and result here." action={<Button onClick={() => setRunDialogOpen(true)}><Play data-icon="inline-start" /> Run review</Button>} />}
-        {runs.data && runs.data.runs.length > 0 && <>
-          <ReviewTable runs={runs.data.runs} repository={repository} onDetails={setSelectedRun} onRereview={(number) => queue.mutate(number)} pending={queue.isPending} />
-          <ReviewMobileList runs={runs.data.runs} repository={repository} onDetails={setSelectedRun} onRereview={(number) => queue.mutate(number)} pending={queue.isPending} />
-        </>}
+  return <div className="min-h-0 flex-1 overflow-auto">
+    <div className="mx-auto flex max-w-6xl flex-col gap-5 p-4 md:p-6">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div><h2 className="text-base font-semibold">Pull request reviews</h2><p className="text-sm text-muted-foreground">Logical review jobs and their retry attempts.</p></div>
+        <Dialog open={runDialogOpen} onOpenChange={setRunDialogOpen}>
+          <DialogTrigger asChild><Button><Play data-icon="inline-start" /> Run review</Button></DialogTrigger>
+          <DialogContent>
+            <DialogHeader><DialogTitle>Run pull request review</DialogTitle><DialogDescription>Queue a manual review even when automatic review is disabled.</DialogDescription></DialogHeader>
+            <FieldGroup><Field><FieldLabel htmlFor="review-pr">Pull request number</FieldLabel><Input id="review-pr" inputMode="numeric" value={pr} onChange={(event) => setPr(event.target.value.replace(/\D/g, ""))} placeholder="1631" /><FieldDescription>The server fixes the logical job to the current head SHA.</FieldDescription></Field></FieldGroup>
+            <DialogFooter><Button variant="outline" onClick={() => setRunDialogOpen(false)}>Cancel</Button><Button disabled={!pr || queue.isPending} onClick={() => queue.mutate(Number(pr))}><Play data-icon="inline-start" /> Queue review</Button></DialogFooter>
+          </DialogContent>
+        </Dialog>
       </div>
-      <ReviewDetailsOverlay projectId={project.id} repository={repository} run={selectedRun} onClose={() => setSelectedRun(null)} onRereview={(number) => queue.mutate(number)} pending={queue.isPending} />
+      <div className="flex flex-wrap gap-2" aria-label="Review job summary"><Badge variant="secondary">{summary.active} active</Badge><Badge variant="outline">{summary.succeeded} succeeded</Badge><Badge variant={summary.failed ? "destructive" : "outline"}>{summary.failed} failed</Badge></div>
+      {jobs.isLoading && <LoadingState rows={5} />}
+      {jobs.error && <ErrorState error={jobs.error} retry={() => void jobs.refetch()} />}
+      {jobs.data?.jobs.length === 0 && <EmptyState title="No review jobs yet" description="Queue a pull request review to see its lifecycle and attempts here." action={<Button onClick={() => setRunDialogOpen(true)}><Play data-icon="inline-start" /> Run review</Button>} />}
+      {jobs.data && jobs.data.jobs.length > 0 && <><ReviewTable jobs={jobs.data.jobs} repository={repository} onDetails={setSelectedJob} onRereview={(number) => queue.mutate(number)} pending={queue.isPending} /><ReviewMobileList jobs={jobs.data.jobs} repository={repository} onDetails={setSelectedJob} onRereview={(number) => queue.mutate(number)} pending={queue.isPending} /></>}
     </div>
-  )
-}
-
-function ReviewTable({ runs, repository, onDetails, onRereview, pending }: ReviewRunListProps) {
-  return (
-    <div className="hidden overflow-hidden rounded-lg border md:block">
-      <Table>
-        <TableHeader><TableRow><TableHead>Status</TableHead><TableHead>Pull request</TableHead><TableHead>Result</TableHead><TableHead>Started</TableHead><TableHead>Duration</TableHead><TableHead>Usage</TableHead><TableHead className="w-24 text-right">Actions</TableHead></TableRow></TableHeader>
-        <TableBody>{runs.map((run) => <TableRow key={run.id} className="cursor-pointer" onClick={() => onDetails(run)}>
-          <TableCell><StatusBadge status={run.status} /></TableCell>
-          <TableCell className="font-medium">PR #{run.pr ?? "—"}</TableCell>
-          <TableCell><ReviewOutcome run={run} /></TableCell>
-          <TableCell className="text-muted-foreground">{formatDate(run.started_at)}</TableCell>
-          <TableCell className="text-muted-foreground">{formatDuration(run.started_at, run.finished_at)}</TableCell>
-          <TableCell className="text-muted-foreground">{formatUsage(run)}</TableCell>
-          <TableCell onClick={(event) => event.stopPropagation()}><ReviewActions run={run} repository={repository} onDetails={onDetails} onRereview={onRereview} pending={pending} /></TableCell>
-        </TableRow>)}</TableBody>
-      </Table>
-    </div>
-  )
-}
-
-function ReviewMobileList({ runs, repository, onDetails, onRereview, pending }: ReviewRunListProps) {
-  return <div className="divide-y overflow-hidden rounded-lg border md:hidden">{runs.map((run) => <div key={run.id} className="flex items-center gap-3 p-3">
-    <StatusBadge status={run.status} />
-    <button type="button" className="min-w-0 flex-1 text-left" onClick={() => onDetails(run)}>
-      <span className="flex flex-wrap items-center gap-2"><span className="font-medium">PR #{run.pr ?? "—"}</span><ReviewOutcome run={run} /></span>
-      <span className="block truncate text-xs text-muted-foreground">{run.error || formatDate(run.started_at)} · {formatDuration(run.started_at, run.finished_at)}</span>
-    </button>
-    <ReviewActions run={run} repository={repository} onDetails={onDetails} onRereview={onRereview} pending={pending} />
-  </div>)}</div>
-}
-
-interface ReviewRunListProps {
-  runs: ReviewRunSummary[]
-  repository: string
-  onDetails(run: ReviewRunSummary): void
-  onRereview(pr: number): void
-  pending: boolean
-}
-
-function ReviewActions({ run, repository, onDetails, onRereview, pending }: Omit<ReviewRunListProps, "runs"> & { run: ReviewRunSummary }) {
-  const url = pullRequestUrl(repository, run.pr)
-  return <div className="flex justify-end gap-1">
-    {url && <Button asChild variant="ghost" size="icon" aria-label={`Open PR #${run.pr}`}><a href={url} target="_blank" rel="noreferrer"><ExternalLink data-icon="inline-start" /></a></Button>}
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild><Button variant="ghost" size="icon" aria-label={`Actions for PR #${run.pr ?? "unknown"}`}><MoreHorizontal data-icon="inline-start" /></Button></DropdownMenuTrigger>
-      <DropdownMenuContent align="end"><DropdownMenuGroup>
-        <DropdownMenuItem onSelect={() => onDetails(run)}><Eye /> View details</DropdownMenuItem>
-        <DropdownMenuItem disabled={!run.pr || pending} onSelect={() => { if (run.pr) onRereview(run.pr) }}><RefreshCw /> Re-review</DropdownMenuItem>
-      </DropdownMenuGroup></DropdownMenuContent>
-    </DropdownMenu>
+    <ReviewDetailsOverlay projectId={project.id} repository={repository} job={selectedJob} onClose={() => setSelectedJob(null)} onRereview={(number) => queue.mutate(number)} pending={queue.isPending} />
   </div>
 }
 
-function ReviewDetailsOverlay({ projectId, repository, run, onClose, onRereview, pending }: {
-  projectId: string
+interface ReviewJobListProps {
+  jobs: ReviewJobSummary[]
   repository: string
-  run: ReviewRunSummary | null
-  onClose(): void
+  onDetails(job: ReviewJobSummary): void
   onRereview(pr: number): void
   pending: boolean
-}) {
-  const mobile = useIsMobile()
-  const detail = useQuery(projectReviewRunQuery(projectId, run?.id))
-  const content = <ReviewDetailContent run={run} detail={detail.data} loading={detail.isLoading} error={detail.error} retry={() => void detail.refetch()} />
-  const actions = <ReviewDetailActions run={run} repository={repository} onRereview={onRereview} pending={pending} />
-  if (mobile) return <Drawer open={Boolean(run)} onOpenChange={(open: boolean) => { if (!open) onClose() }}><DrawerContent className="max-h-[92svh]! overflow-hidden"><DrawerHeader className="shrink-0"><DrawerTitle>Review run · PR #{run?.pr ?? "—"}</DrawerTitle><DrawerDescription>{run ? formatDate(run.started_at) : ""}</DrawerDescription></DrawerHeader><ScrollArea className="min-h-0 flex-1 overflow-hidden px-4">{content}</ScrollArea><DrawerFooter className="shrink-0 border-t bg-background">{actions}</DrawerFooter></DrawerContent></Drawer>
-  return <Sheet open={Boolean(run)} onOpenChange={(open: boolean) => { if (!open) onClose() }}><SheetContent className="w-full! sm:max-w-2xl!"><SheetHeader><SheetTitle>Review run · PR #{run?.pr ?? "—"}</SheetTitle><SheetDescription>{run ? formatDate(run.started_at) : ""}</SheetDescription></SheetHeader><ScrollArea className="min-h-0 flex-1 px-4">{content}</ScrollArea><SheetFooter>{actions}</SheetFooter></SheetContent></Sheet>
 }
 
-function ReviewDetailContent({ run, detail, loading, error, retry }: { run: ReviewRunSummary | null; detail?: ReviewRunDetail; loading: boolean; error: unknown; retry(): void }) {
+function ReviewTable({ jobs, repository, onDetails, onRereview, pending }: ReviewJobListProps) {
+  return <div className="hidden overflow-hidden rounded-lg border lg:block"><Table><TableHeader><TableRow><TableHead>Status</TableHead><TableHead>Pull request</TableHead><TableHead>Result</TableHead><TableHead>Attempts</TableHead><TableHead>Created</TableHead><TableHead>Next action</TableHead><TableHead className="w-24 text-right">Actions</TableHead></TableRow></TableHeader><TableBody>{jobs.map((job) => <TableRow key={job.id} className="cursor-pointer" onClick={() => onDetails(job)}><TableCell><StatusBadge status={job.status} /></TableCell><TableCell className="font-medium">PR #{job.pr}</TableCell><TableCell><ReviewOutcome job={job} /></TableCell><TableCell className="text-muted-foreground tabular-nums">{job.attempt_count}/{job.max_attempts}</TableCell><TableCell className="text-muted-foreground">{formatDate(job.created_at)}</TableCell><TableCell className="text-muted-foreground">{job.next_attempt_at ? formatDate(job.next_attempt_at) : "—"}</TableCell><TableCell onClick={(event) => event.stopPropagation()}><ReviewActions job={job} repository={repository} onDetails={onDetails} onRereview={onRereview} pending={pending} /></TableCell></TableRow>)}</TableBody></Table></div>
+}
+
+function ReviewMobileList({ jobs, repository, onDetails, onRereview, pending }: ReviewJobListProps) {
+  return <div className="divide-y overflow-hidden rounded-lg border lg:hidden">{jobs.map((job) => <div key={job.id} className="flex items-center gap-3 p-3"><StatusBadge status={job.status} /><button type="button" className="min-w-0 flex-1 text-left" onClick={() => onDetails(job)}><span className="flex flex-wrap items-center gap-2"><span className="font-medium">PR #{job.pr}</span><ReviewOutcome job={job} /></span><span className="block truncate text-xs text-muted-foreground">{job.failure?.message || `${job.attempt_count}/${job.max_attempts} attempts · ${formatDate(job.created_at)}`}</span></button><ReviewActions job={job} repository={repository} onDetails={onDetails} onRereview={onRereview} pending={pending} /></div>)}</div>
+}
+
+function ReviewActions({ job, repository, onDetails, onRereview, pending }: Omit<ReviewJobListProps, "jobs"> & { job: ReviewJobSummary }) {
+  const url = pullRequestUrl(repository, job.pr)
+  return <div className="flex justify-end gap-1">{url && <Button asChild variant="ghost" size="icon" aria-label={`Open PR #${job.pr}`}><a href={url} target="_blank" rel="noreferrer"><ExternalLink data-icon="inline-start" /></a></Button>}<DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon" aria-label={`Actions for PR #${job.pr}`}><MoreHorizontal data-icon="inline-start" /></Button></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup><DropdownMenuItem onSelect={() => onDetails(job)}><Eye /> View details</DropdownMenuItem><DropdownMenuItem disabled={pending} onSelect={() => onRereview(job.pr)}><RefreshCw /> Re-review</DropdownMenuItem></DropdownMenuGroup></DropdownMenuContent></DropdownMenu></div>
+}
+
+function ReviewDetailsOverlay({ projectId, repository, job, onClose, onRereview, pending }: { projectId: string; repository: string; job: ReviewJobSummary | null; onClose(): void; onRereview(pr: number): void; pending: boolean }) {
+  const mobile = useIsMobile()
+  const detail = useQuery(projectReviewJobQuery(projectId, job?.id))
+  const content = <ReviewDetailContent projectId={projectId} job={job} detail={detail.data} loading={detail.isLoading} error={detail.error} retry={() => void detail.refetch()} />
+  const actions = <ReviewDetailActions job={job} repository={repository} onRereview={onRereview} pending={pending} />
+  if (mobile) return <Drawer open={Boolean(job)} onOpenChange={(open: boolean) => { if (!open) onClose() }}><DrawerContent className="max-h-[92svh]! overflow-hidden"><DrawerHeader className="shrink-0"><DrawerTitle>Review job · PR #{job?.pr ?? "—"}</DrawerTitle><DrawerDescription>{job ? formatDate(job.created_at) : ""}</DrawerDescription></DrawerHeader><ScrollArea className="min-h-0 min-w-0 max-w-full flex-1 overflow-hidden px-4 [&_[data-slot=scroll-area-viewport]>div]:!block">{content}</ScrollArea><DrawerFooter className="shrink-0 border-t bg-background">{actions}</DrawerFooter></DrawerContent></Drawer>
+  return <Sheet open={Boolean(job)} onOpenChange={(open: boolean) => { if (!open) onClose() }}><SheetContent className="w-full! sm:max-w-2xl!"><SheetHeader><SheetTitle>Review job · PR #{job?.pr ?? "—"}</SheetTitle><SheetDescription>{job ? formatDate(job.created_at) : ""}</SheetDescription></SheetHeader><ScrollArea className="min-h-0 flex-1 px-4">{content}</ScrollArea><SheetFooter>{actions}</SheetFooter></SheetContent></Sheet>
+}
+
+function ReviewDetailContent({ projectId, job, detail, loading, error, retry }: { projectId: string; job: ReviewJobSummary | null; detail?: ReviewJobDetail; loading: boolean; error: unknown; retry(): void }) {
   const [metadataOpen, setMetadataOpen] = useState(false)
-  const activity = useMemo(() => detail ? buildReviewActivity(detail) : [], [detail])
-  if (!run) return null
+  if (!job) return null
   if (loading) return <LoadingState rows={5} />
   if (error) return <ErrorState error={error} retry={retry} />
-  const value = detail ?? run
+  const value = detail ?? job
   return <div className="flex flex-col gap-5 pb-4">
-    <div className="flex flex-wrap items-center gap-2"><StatusBadge status={value.status} /><ReviewOutcome run={value} /></div>
-    <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-4">
-      <Metric label="Started" value={formatDate(value.started_at)} />
-      <Metric label="Duration" value={formatDuration(value.started_at, value.finished_at)} />
-      <Metric label="Tokens" value={(value.token_usage?.total_tokens ?? 0).toLocaleString()} />
-      <Metric label="Cached input" value={(value.token_usage?.cached_input_tokens ?? 0).toLocaleString()} />
-    </dl>
-    {value.summary && <section className="space-y-2"><h3 className="text-sm font-medium">Summary</h3><div className="rounded-lg border bg-muted/35 p-3"><Markdown>{value.summary}</Markdown></div></section>}
-    {value.error && <Alert variant="destructive"><CircleAlert /><AlertTitle>Review failed</AlertTitle><AlertDescription>{value.error}</AlertDescription></Alert>}
-    {detail && <section className="space-y-2.5"><div><h3 className="text-sm font-medium">Review activity</h3><p className="text-xs text-muted-foreground">Messages and tool calls from this review, with duplicate revisions removed.</p></div><ReviewActivityList activity={activity} /></section>}
-    <Collapsible open={metadataOpen} onOpenChange={setMetadataOpen} className="rounded-lg border">
-      <CollapsibleTrigger asChild><Button variant="ghost" className="w-full justify-between rounded-lg px-3" aria-label={`${metadataOpen ? "Hide" : "Show"} technical details`}>Technical details<ChevronDown className={cn("size-4 transition-transform motion-reduce:transition-none", metadataOpen && "rotate-180")} /></Button></CollapsibleTrigger>
-      <CollapsibleContent className="border-t"><dl className="divide-y">
-        <DetailRow label="Reviewer" value={value.reviewer_agent_id || "—"} mono />
-        <DetailRow label="Turn" value={value.turn_id || "—"} mono />
-        {detail && <><DetailRow label="Messages" value={String(detail.messages.length)} /><DetailRow label="Events" value={String(detail.events.length)} /></>}
-      </dl></CollapsibleContent>
-    </Collapsible>
+    <div className="flex flex-wrap items-center gap-2"><StatusBadge status={value.status} /><ReviewOutcome job={value} />{value.status === "retry_waiting" && <Badge variant="outline">Retry scheduled</Badge>}</div>
+    <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-4"><Metric label="Attempts" value={`${value.attempt_count}/${value.max_attempts}`} /><Metric label="Created" value={formatDate(value.created_at)} /><Metric label="Duration" value={formatDuration(value.created_at, value.finished_at)} /><Metric label="Next attempt" value={value.next_attempt_at ? formatDate(value.next_attempt_at) : "—"} /></dl>
+    {value.failure && <Alert variant="destructive"><CircleAlert /><AlertTitle>{value.status === "retry_waiting" ? "Attempt failed; retry pending" : "Review failed"}</AlertTitle><AlertDescription><span className="block">{value.failure.message}</span><span className="mt-1 block text-xs opacity-80">{value.failure.category}{value.failure.code ? ` · ${value.failure.code}` : ""}{value.failure.http_status ? ` · HTTP ${value.failure.http_status}` : ""}</span></AlertDescription></Alert>}
+    {value.submission_intent && !value.submission_receipt && <section className="rounded-lg border bg-muted/35 p-3"><h3 className="text-sm font-medium">GitHub submission pending</h3><p className="mt-1 text-xs text-muted-foreground">The server is reconciling one {value.submission_intent.event.replaceAll("_", " ")} review at head {shortSha(value.submission_intent.head_sha)} with {value.submission_intent.comment_count} inline comments.</p></section>}
+    {value.submission_receipt && <section className="rounded-lg border bg-muted/35 p-3"><div className="flex items-center justify-between gap-3"><div><h3 className="text-sm font-medium">GitHub receipt</h3><p className="text-xs text-muted-foreground">Review #{value.submission_receipt.github_review_id} · {formatDate(value.submission_receipt.submitted_at)}</p></div>{value.submission_receipt.html_url && <Button asChild variant="outline" size="sm"><a href={value.submission_receipt.html_url} target="_blank" rel="noreferrer"><ExternalLink /> Open</a></Button>}</div></section>}
+    {detail && <Attempts projectId={projectId} attempts={detail.attempts} />}
+    <Collapsible open={metadataOpen} onOpenChange={setMetadataOpen} className="rounded-lg border"><CollapsibleTrigger asChild><Button variant="ghost" className="w-full justify-between rounded-lg px-3" aria-label={`${metadataOpen ? "Hide" : "Show"} technical details`}>Technical details<ChevronDown className={cn("size-4 transition-transform motion-reduce:transition-none", metadataOpen && "rotate-180")} /></Button></CollapsibleTrigger><CollapsibleContent className="border-t"><dl className="divide-y"><DetailRow label="Job" value={value.id} mono /><DetailRow label="Head SHA" value={value.head_sha} mono /><DetailRow label="Reviewer" value={value.reviewer_agent_id || "—"} mono /><DetailRow label="Source" value={value.source} /></dl></CollapsibleContent></Collapsible>
   </div>
 }
 
-function ReviewDetailActions({ run, repository, onRereview, pending }: { run: ReviewRunSummary | null; repository: string; onRereview(pr: number): void; pending: boolean }) {
-  const url = pullRequestUrl(repository, run?.pr)
-  return <div className="grid grid-cols-2 gap-2">{url ? <Button asChild variant="outline"><a href={url} target="_blank" rel="noreferrer"><ExternalLink data-icon="inline-start" /> Open pull request</a></Button> : <Button variant="outline" disabled>Open pull request</Button>}<Button disabled={!run?.pr || pending} onClick={() => { if (run?.pr) onRereview(run.pr) }}><RefreshCw data-icon="inline-start" /> Re-review</Button></div>
+function Attempts({ projectId, attempts }: { projectId: string; attempts: ReviewRunSummary[] }) {
+  const [selected, setSelected] = useState<ReviewRunSummary | null>(() => latestReviewAttempt(attempts))
+  const selectedAttempt = attempts.find((attempt) => attempt.id === selected?.id) ?? latestReviewAttempt(attempts)
+  return <section className="space-y-2.5"><div><h3 className="text-sm font-medium">Attempts</h3><p className="text-xs text-muted-foreground">Each row is one Agent turn; retry-waiting is part of the same logical review.</p></div>{attempts.length === 0 ? <p className="rounded-lg border p-3 text-sm text-muted-foreground">No attempt has started yet.</p> : <div className="space-y-2">{attempts.map((attempt) => <button key={attempt.id} type="button" className={cn("flex w-full items-center justify-between gap-3 rounded-lg border p-3 text-left", selectedAttempt?.id === attempt.id && "border-primary/50 bg-muted/40")} onClick={() => setSelected(attempt)}><span className="min-w-0"><span className="block text-sm font-medium">Attempt {attempt.attempt_index || 1}</span><span className="block text-xs text-muted-foreground">{formatDate(attempt.started_at)} · {formatDuration(attempt.started_at, attempt.finished_at)}</span>{attempt.error && <span className="mt-1 block truncate text-xs text-destructive">{attempt.error}</span>}</span><StatusBadge status={attempt.status} /></button>)}</div>}{selectedAttempt?.summary && <section className="rounded-lg border bg-muted/35 p-3"><h4 className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Attempt summary</h4><Markdown>{selectedAttempt.summary}</Markdown></section>}<ReviewAttemptActivity projectId={projectId} attempt={selectedAttempt} /></section>
 }
 
-function ReviewOutcome({ run }: { run: ReviewRunSummary }) {
-  const result = reviewResult(run)
-  if (!result) return <span className="text-sm text-muted-foreground">—</span>
-  return <Badge variant={result.variant}>{result.label}</Badge>
+function ReviewAttemptActivity({ projectId, attempt }: { projectId: string; attempt: ReviewRunSummary | null }) {
+  const detail = useQuery(projectReviewRunQuery(projectId, attempt?.id))
+  if (!attempt) return null
+  if (detail.isLoading) return <LoadingState rows={3} />
+  if (detail.error) return <ErrorState error={detail.error} retry={() => void detail.refetch()} />
+  const activity = detail.data ? buildReviewActivity(detail.data as ReviewRunDetail) : []
+  return <div className="space-y-2"><h4 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Attempt activity</h4><ReviewActivityList activity={activity} /></div>
 }
 
-function reviewResult(run: ReviewRunSummary) {
-  switch (run.review_event) {
-    case "approve":
-      return { label: "Approved", variant: "secondary" as const }
-    case "request_changes":
-      return { label: "Request changes", variant: "destructive" as const }
-    case "comment":
-      return { label: "Commented", variant: "outline" as const }
-    case null:
-    case undefined:
-      break
-  }
-
-  switch (run.outcome) {
-    case "failed":
-      return { label: "Failed", variant: "destructive" as const }
-    case "no_eligible_pr":
-      return { label: "No eligible pull request", variant: "outline" as const }
-    case "review_submitted":
-      return { label: "Review submitted", variant: "outline" as const }
-    case null:
-    case undefined:
-      return null
-  }
+function ReviewDetailActions({ job, repository, onRereview, pending }: { job: ReviewJobSummary | null; repository: string; onRereview(pr: number): void; pending: boolean }) {
+  const url = pullRequestUrl(repository, job?.pr)
+  return <div className="grid grid-cols-2 gap-2">{url ? <Button asChild variant="outline"><a href={url} target="_blank" rel="noreferrer"><ExternalLink data-icon="inline-start" /> Open pull request</a></Button> : <Button variant="outline" disabled>Open pull request</Button>}<Button disabled={!job?.pr || pending} onClick={() => { if (job?.pr) onRereview(job.pr) }}><RefreshCw data-icon="inline-start" /> Re-review</Button></div>
 }
 
-function DetailRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
-  return <div className="grid gap-1 px-3 py-2.5 sm:grid-cols-[7rem_1fr]"><dt className="text-xs text-muted-foreground">{label}</dt><dd className={mono ? "break-all font-mono text-xs" : "text-sm"}>{value}</dd></div>
+function ReviewOutcome({ job }: { job: ReviewJobSummary }) {
+  const event = job.submission_receipt?.event
+  if (event === "approve") return <Badge variant="secondary">Approved</Badge>
+  if (event === "request_changes") return <Badge variant="destructive">Request changes</Badge>
+  if (event === "comment") return <Badge variant="outline">Commented</Badge>
+  if (job.status === "failed") return <Badge variant="destructive">Failed</Badge>
+  if (job.status === "superseded") return <Badge variant="outline">Superseded</Badge>
+  if (job.status === "cancelled") return <Badge variant="outline">Cancelled</Badge>
+  return <span className="text-sm text-muted-foreground">—</span>
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
-  return <div className="min-w-0 bg-card p-3"><dt className="text-[11px] text-muted-foreground">{label}</dt><dd className="mt-1 break-words text-sm font-medium tabular-nums">{value}</dd></div>
-}
-
-function summarizeRuns(runs: ReviewRunSummary[]) {
-  return runs.reduce((summary, run) => {
-    if (run.status === "running" || run.status === "queued") summary.running += 1
-    else if (run.status === "completed") summary.completed += 1
-    else summary.failed += 1
-    return summary
-  }, { running: 0, completed: 0, failed: 0 })
-}
-
-function pullRequestUrl(repository: string, pr?: number | null) {
-  return repository && pr ? `https://github.com/${repository}/pull/${pr}` : null
-}
-
-function formatDate(value: string) {
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date)
-}
-
-function formatDuration(startedAt: string, finishedAt?: string | null) {
-  const start = new Date(startedAt).getTime()
-  const end = finishedAt ? new Date(finishedAt).getTime() : Date.now()
-  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return "—"
-  const seconds = Math.floor((end - start) / 1000)
-  if (seconds < 60) return `${seconds}s`
-  const minutes = Math.floor(seconds / 60)
-  return minutes < 60 ? `${minutes}m ${seconds % 60}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`
-}
-
-function formatUsage(run: ReviewRunSummary) {
-  const usage = run.token_usage
-  if (!usage?.total_tokens) return "—"
-  const cache = usage.input_tokens > 0 ? Math.round((usage.cached_input_tokens / usage.input_tokens) * 100) : 0
-  return `${usage.total_tokens.toLocaleString()} · ${cache}% cached`
-}
+function DetailRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) { return <div className="grid gap-1 px-3 py-2.5 sm:grid-cols-[7rem_1fr]"><dt className="text-xs text-muted-foreground">{label}</dt><dd className={mono ? "break-all font-mono text-xs" : "text-sm"}>{value}</dd></div> }
+function Metric({ label, value }: { label: string; value: string }) { return <div className="min-w-0 bg-card p-3"><dt className="text-[11px] text-muted-foreground">{label}</dt><dd className="mt-1 break-words text-sm font-medium tabular-nums">{value}</dd></div> }
+function pullRequestUrl(repository: string, pr?: number | null) { return repository && pr ? `https://github.com/${repository}/pull/${pr}` : null }
+function shortSha(value: string) { return value.slice(0, 8) }
+function formatDate(value: string) { const date = new Date(value); return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date) }
+function formatDuration(startedAt: string, finishedAt?: string | null) { const start = new Date(startedAt).getTime(); const end = finishedAt ? new Date(finishedAt).getTime() : Date.now(); if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return "—"; const seconds = Math.floor((end - start) / 1000); if (seconds < 60) return `${seconds}s`; const minutes = Math.floor(seconds / 60); return minutes < 60 ? `${minutes}m ${seconds % 60}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m` }

@@ -199,6 +199,41 @@ impl AgentRuntime {
         projects::review::runs::get_project_review_run(&self.deps.store, project_id, run_id).await
     }
 
+    pub async fn list_project_review_jobs(
+        &self,
+        project_id: ProjectId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<ProjectReviewJobsResponse> {
+        self.project(project_id).await?;
+        Ok(ProjectReviewJobsResponse {
+            jobs: self
+                .deps
+                .store
+                .load_project_review_jobs(project_id, offset, limit)
+                .await?,
+        })
+    }
+
+    pub async fn get_project_review_job(
+        &self,
+        project_id: ProjectId,
+        job_id: Uuid,
+    ) -> Result<ProjectReviewJobDetail> {
+        let summary = self
+            .deps
+            .store
+            .load_project_review_job(project_id, job_id)
+            .await?
+            .ok_or(RuntimeError::ProjectReviewJobNotFound(job_id))?;
+        let attempts = self
+            .deps
+            .store
+            .load_project_review_job_attempts(job_id)
+            .await?;
+        Ok(ProjectReviewJobDetail { summary, attempts })
+    }
+
     pub async fn create_project(
         self: &Arc<Self>,
         request: CreateProjectRequest,
@@ -315,18 +350,40 @@ impl AgentRuntime {
         request: ProjectReviewQueueRequest,
     ) -> Result<ProjectReviewQueueSummary> {
         let project_id = request.project_id;
-        let summary = self
-            .enqueue_project_review_relay_signals(
-                project_id,
-                vec![ProjectReviewRelaySignalInput {
-                    pr: request.pr,
-                    head_sha: request.head_sha.clone(),
-                    delivery_id: request.delivery_id.clone(),
-                    reason: request.reason.clone(),
-                }],
-                true,
-            )
-            .await?;
+        let project = self.project(project_id).await?;
+        if !project.summary.read().await.auto_review_enabled {
+            return Ok(ProjectReviewQueueSummary {
+                ignored: vec![request.pr],
+                ..Default::default()
+            });
+        }
+        let selected = projects::review::eligibility::select_project_review_pr(
+            self,
+            project_id,
+            request.pr,
+            request.head_sha,
+        )
+        .await?;
+        let summary = match selected {
+            Some(selected) => {
+                self.enqueue_project_review_signals_with_admission(
+                    project_id,
+                    vec![ProjectReviewSignalInput {
+                        pr: selected.pr,
+                        head_sha: selected.head_sha,
+                        delivery_id: request.delivery_id.clone(),
+                        reason: request.reason.clone(),
+                    }],
+                    ProjectReviewEnqueueAdmission::RequireAutoReviewEnabled,
+                    true,
+                )
+                .await?
+            }
+            None => ProjectReviewQueueSummary {
+                ignored: vec![request.pr],
+                ..Default::default()
+            },
+        };
         tracing::info!(
             project_id = %project_id,
             pr = request.pr,
@@ -338,40 +395,6 @@ impl AgentRuntime {
             "queued project review relay signal"
         );
         Ok(summary)
-    }
-
-    pub(super) async fn enqueue_project_review_relay_signals(
-        self: &Arc<Self>,
-        project_id: ProjectId,
-        signals: Vec<ProjectReviewRelaySignalInput>,
-        start_worker: bool,
-    ) -> Result<ProjectReviewQueueSummary> {
-        let project = self.project(project_id).await?;
-        {
-            let summary = project.summary.read().await;
-            if !summary.auto_review_enabled {
-                return Ok(ProjectReviewQueueSummary {
-                    ignored: signals.iter().map(|signal| signal.pr).collect(),
-                    ..Default::default()
-                });
-            }
-        }
-        let summary = {
-            let mut queue = project.relay_review_queue.lock().await;
-            queue.enqueue_many(signals)
-        };
-        if !summary.queued.is_empty() || !summary.deduped.is_empty() {
-            project.relay_review_notify.notify_one();
-            if start_worker
-                && let Err(err) = self.start_project_review_loop_if_ready(project_id).await
-            {
-                tracing::warn!(
-                    project_id = %project_id,
-                    "failed to start project review loop after queueing relay PR signal: {err}"
-                );
-            }
-        }
-        Ok(summary.into())
     }
 
     pub(super) async fn enqueue_project_review_signals(
@@ -409,10 +432,78 @@ impl AgentRuntime {
             }
         }
         let signals_for_events = signals.clone();
-        let summary = {
-            let mut pool = project.review_pool.lock().await;
-            pool.enqueue_many(signals)
+        let mut summary = ProjectReviewQueueSummary::default();
+        let source = match admission {
+            ProjectReviewEnqueueAdmission::ManualRequest => ProjectReviewJobSource::Manual,
+            ProjectReviewEnqueueAdmission::RequireAutoReviewEnabled => {
+                ProjectReviewJobSource::Automatic
+            }
         };
+        for signal in signals {
+            if signal.pr == 0 {
+                summary.ignored.push(signal.pr);
+                continue;
+            }
+            if admission == ProjectReviewEnqueueAdmission::ManualRequest
+                && let Some(job) = self
+                    .deps
+                    .store
+                    .load_active_project_review_job_for_pr(project_id, signal.pr)
+                    .await?
+            {
+                summary.deduped.push(job.pr);
+                summary.jobs.push(job);
+                continue;
+            }
+            let head_sha = match signal
+                .head_sha
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(head_sha) => head_sha.to_string(),
+                None => {
+                    projects::review::target::resolve_project_review_target(
+                        self,
+                        project_id,
+                        projects::review::target::ProjectReviewRequest {
+                            pr: signal.pr,
+                            head_sha_hint: None,
+                        },
+                    )
+                    .await?
+                    .head_sha
+                }
+            };
+            let job_source = if signal.delivery_id.is_some() {
+                ProjectReviewJobSource::Webhook
+            } else {
+                source.clone()
+            };
+            let queued = self
+                .deps
+                .store
+                .enqueue_project_review_job(projects::review::job::new_project_review_job(
+                    projects::review::job::NewProjectReviewJob {
+                        project_id,
+                        pr: signal.pr,
+                        head_sha,
+                        source: job_source,
+                        delivery_id: signal.delivery_id,
+                        reason: signal.reason,
+                    },
+                ))
+                .await?;
+            match queued.disposition {
+                mai_store::ProjectReviewJobEnqueueDisposition::Queued => {
+                    summary.queued.push(queued.job.pr);
+                }
+                mai_store::ProjectReviewJobEnqueueDisposition::Deduped => {
+                    summary.deduped.push(queued.job.pr);
+                }
+            }
+            summary.jobs.push(queued.job);
+        }
         if !summary.queued.is_empty() || !summary.deduped.is_empty() {
             for signal in signals_for_events.iter().filter(|signal| {
                 summary.queued.contains(&signal.pr) || summary.deduped.contains(&signal.pr)
@@ -426,6 +517,27 @@ impl AgentRuntime {
                     })
                     .await;
             }
+            if let Some(job) = self
+                .deps
+                .store
+                .load_active_project_review_job(project_id)
+                .await?
+            {
+                self.set_project_review_state(
+                    project_id,
+                    projects::review::job::project_review_status_for_job(true, Some(&job)),
+                    projects::review::state::ReviewStateUpdate {
+                        current_reviewer_agent_id: job.reviewer_agent_id.map_or(
+                            projects::review::state::ReviewerAgentUpdate::Keep,
+                            projects::review::state::ReviewerAgentUpdate::Set,
+                        ),
+                        next_review_at: job.next_attempt_at,
+                        error: job.failure.as_ref().map(|failure| failure.message.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            }
             project.review_notify.notify_one();
             if start_worker
                 && let Err(err) = self.start_project_review_loop_if_ready(project_id).await
@@ -436,7 +548,7 @@ impl AgentRuntime {
                 );
             }
         }
-        Ok(summary.into())
+        Ok(summary)
     }
 
     pub async fn send_task_message(

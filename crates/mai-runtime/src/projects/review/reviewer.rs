@@ -24,6 +24,11 @@ pub(crate) trait ProjectReviewerAgentOps: ProjectReviewTargetOps + Send + Sync {
     fn agent_summary(&self, agent_id: AgentId)
     -> impl Future<Output = Result<AgentSummary>> + Send;
 
+    fn agent_system_prompt(
+        &self,
+        agent_id: AgentId,
+    ) -> impl Future<Output = Result<Option<String>>> + Send;
+
     fn reviewer_model(&self) -> impl Future<Output = Result<AgentModelPreference>> + Send;
 
     fn project_reviewer_agents(
@@ -60,6 +65,24 @@ pub(crate) trait ProjectReviewerAgentOps: ProjectReviewTargetOps + Send + Sync {
         context: Arc<ProjectReviewContext>,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    fn attached_project_review_context(
+        &self,
+        agent_id: AgentId,
+    ) -> impl Future<Output = Result<Option<Arc<ProjectReviewContext>>>> + Send;
+
+    fn ensure_project_reviewer_session(
+        &self,
+        agent_id: AgentId,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    fn ensure_project_reviewer_container(
+        &self,
+        agent_id: AgentId,
+        target: ResolvedProjectReviewTarget,
+        project_revision: ProjectRepositoryRevision,
+        repository_view: crate::projects::review::context::ProjectRepositoryView,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     fn delete_project_review_context(
         &self,
         project_id: ProjectId,
@@ -94,12 +117,13 @@ pub(crate) async fn prepare_project_reviewer(
     run_id: Uuid,
     request: ProjectReviewRequest,
 ) -> Result<PreparedProjectReviewer> {
-    let existing_reviewer_id = ops
-        .project_reviewer_agents(project_id)
-        .await
-        .first()
-        .map(|reviewer| reviewer.id);
-    ensure_project_reviewer_slot_available(existing_reviewer_id)?;
+    if let Some(existing_reviewer) = ops.project_reviewer_agents(project_id).await.first() {
+        if reviewer_belongs_to_job(ops, existing_reviewer.id, run_id, &request).await? {
+            return resume_project_reviewer(ops, project_id, run_id, existing_reviewer.id, request)
+                .await;
+        }
+        ensure_project_reviewer_slot_available(Some(existing_reviewer.id))?;
+    }
     let target = resolve_project_review_target(ops, project_id, request).await?;
     let project_revision = ops
         .sync_project_repository_for_review(project_id, target.clone())
@@ -174,6 +198,90 @@ pub(crate) async fn prepare_project_reviewer(
     }
     Ok(PreparedProjectReviewer {
         agent,
+        target,
+        project_revision,
+    })
+}
+
+pub(crate) async fn reviewer_belongs_to_job(
+    ops: &impl ProjectReviewerAgentOps,
+    reviewer_id: AgentId,
+    job_id: Uuid,
+    request: &ProjectReviewRequest,
+) -> Result<bool> {
+    if let Some(context) = ops.attached_project_review_context(reviewer_id).await? {
+        return Ok(context.run_id == job_id
+            && context.target.pr == request.pr
+            && request
+                .head_sha_hint
+                .as_deref()
+                .is_none_or(|head_sha| context.target.head_sha == head_sha));
+    }
+    let Some(head_sha) = request.head_sha_hint.as_deref() else {
+        return Ok(false);
+    };
+    let Some(prompt) = ops.agent_system_prompt(reviewer_id).await? else {
+        return Ok(false);
+    };
+    let ownership_marker = format!(
+        "Review lifecycle owner: job `{job_id}`, PR #{}, head `{head_sha}`.",
+        request.pr
+    );
+    Ok(prompt.contains(&ownership_marker))
+}
+
+pub(crate) async fn resume_project_reviewer(
+    ops: &impl ProjectReviewerAgentOps,
+    project_id: ProjectId,
+    job_id: Uuid,
+    reviewer_id: AgentId,
+    request: ProjectReviewRequest,
+) -> Result<PreparedProjectReviewer> {
+    ops.ensure_project_reviewer_session(reviewer_id).await?;
+    let target = resolve_project_review_target(ops, project_id, request.clone()).await?;
+    if request
+        .head_sha_hint
+        .as_deref()
+        .is_some_and(|expected| expected != target.head_sha)
+    {
+        return Err(RuntimeError::InvalidInput(format!(
+            "{} for PR #{}",
+            super::REVIEW_TARGET_HEAD_CHANGED,
+            target.pr
+        )));
+    }
+    if let Some(context) = ops.attached_project_review_context(reviewer_id).await? {
+        if context.run_id != job_id
+            || context.target.pr != target.pr
+            || context.target.head_sha != target.head_sha
+        {
+            return Err(RuntimeError::InvalidInput(
+                "reviewer is attached to a different review job".to_string(),
+            ));
+        }
+        return Ok(PreparedProjectReviewer {
+            agent: ops.agent_summary(reviewer_id).await?,
+            target: context.target.clone(),
+            project_revision: context.project_revision.clone(),
+        });
+    }
+    let project_revision = ops
+        .sync_project_repository_for_review(project_id, target.clone())
+        .await?;
+    let context = ops
+        .create_project_review_context(project_id, job_id, target.clone(), project_revision.clone())
+        .await?;
+    ops.attach_project_review_context(reviewer_id, Arc::clone(&context))
+        .await?;
+    ops.ensure_project_reviewer_container(
+        reviewer_id,
+        target.clone(),
+        project_revision.clone(),
+        context.repository_view.clone(),
+    )
+    .await?;
+    Ok(PreparedProjectReviewer {
+        agent: ops.agent_summary(reviewer_id).await?,
         target,
         project_revision,
     })
@@ -285,7 +393,9 @@ mod tests {
         project: ProjectSummary,
         maintainer: mai_protocol::AgentSummary,
         reviewer: mai_protocol::AgentSummary,
+        reviewer_system_prompt: Option<String>,
         context: Arc<ProjectReviewContext>,
+        attached_context: Option<Arc<ProjectReviewContext>>,
         failure: PreparationFailure,
         operations: Arc<Mutex<Vec<&'static str>>>,
         _temp: Arc<tempfile::TempDir>,
@@ -311,9 +421,20 @@ mod tests {
     impl ProjectReviewerAgentOps for FakeReviewerOps {
         async fn agent_summary(
             &self,
-            _agent_id: mai_protocol::AgentId,
+            agent_id: mai_protocol::AgentId,
         ) -> Result<mai_protocol::AgentSummary> {
-            Ok(self.maintainer.clone())
+            if agent_id == self.reviewer.id {
+                Ok(self.reviewer.clone())
+            } else {
+                Ok(self.maintainer.clone())
+            }
+        }
+
+        async fn agent_system_prompt(
+            &self,
+            _agent_id: mai_protocol::AgentId,
+        ) -> Result<Option<String>> {
+            Ok(self.reviewer_system_prompt.clone())
         }
 
         async fn reviewer_model(&self) -> Result<AgentModelPreference> {
@@ -328,7 +449,10 @@ mod tests {
             &self,
             _project_id: mai_protocol::ProjectId,
         ) -> Vec<mai_protocol::AgentSummary> {
-            Vec::new()
+            self.reviewer_system_prompt
+                .as_ref()
+                .map(|_| vec![self.reviewer.clone()])
+                .unwrap_or_default()
         }
 
         async fn sync_project_repository_for_review(
@@ -367,6 +491,7 @@ mod tests {
             assert!(prompt.contains("`/workspace/repo`"));
             assert!(prompt.contains("base snapshot `base-sha`"));
             assert!(prompt.contains("PR #24 at head `head-sha`"));
+            assert!(prompt.contains("Review lifecycle owner: job `"));
             assert!(prompt.contains("`write_session_note` using `expectedRevision: 0`"));
             assert!(prompt.contains("recording only immutable metadata"));
             assert!(prompt.contains("Do not add progress checkboxes"));
@@ -382,6 +507,11 @@ mod tests {
             assert!(prompt.contains("do not use its optional cursor"));
             assert!(prompt.contains("one logical final pull request review"));
             assert!(prompt.contains("never fall back to a temporary file"));
+            assert!(prompt.contains("<!-- mai-review-job:"));
+            assert!(
+                prompt.contains("reviews without the marker or from another head are context only")
+            );
+            assert!(prompt.contains("Never report `review_submitted`"));
             assert!(!prompt.contains("POSIX `sh`"));
             assert!(!prompt.contains("`bash -lc`"));
             assert!(!prompt.contains("/tmp/mai-review-findings.md"));
@@ -405,6 +535,32 @@ mod tests {
             if matches!(self.failure, PreparationFailure::Attach) {
                 return Err(RuntimeError::InvalidInput("attach failed".to_string()));
             }
+            Ok(())
+        }
+
+        async fn attached_project_review_context(
+            &self,
+            _agent_id: mai_protocol::AgentId,
+        ) -> Result<Option<Arc<ProjectReviewContext>>> {
+            Ok(self.attached_context.clone())
+        }
+
+        async fn ensure_project_reviewer_session(
+            &self,
+            _agent_id: mai_protocol::AgentId,
+        ) -> Result<()> {
+            self.operations.lock().await.push("ensure_session");
+            Ok(())
+        }
+
+        async fn ensure_project_reviewer_container(
+            &self,
+            _agent_id: mai_protocol::AgentId,
+            _target: ResolvedProjectReviewTarget,
+            _project_revision: ProjectRepositoryRevision,
+            _repository_view: crate::projects::review::context::ProjectRepositoryView,
+        ) -> Result<()> {
+            self.operations.lock().await.push("ensure_container");
             Ok(())
         }
 
@@ -532,6 +688,121 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn retry_reuses_reviewer_session_and_attached_job_context() {
+        let mut ops = fake_reviewer_ops(PreparationFailure::Create);
+        ops.attached_context = Some(Arc::clone(&ops.context));
+        let reviewer_id = ops.reviewer.id;
+        let job_id = ops.context.run_id;
+
+        let prepared = super::resume_project_reviewer(
+            &ops,
+            ops.project.id,
+            job_id,
+            reviewer_id,
+            ProjectReviewRequest {
+                pr: 24,
+                head_sha_hint: Some("head-sha".to_string()),
+            },
+        )
+        .await
+        .expect("resume reviewer");
+
+        assert_eq!(reviewer_id, prepared.agent.id);
+        assert_eq!(job_id, ops.context.run_id);
+        assert_eq!(*ops.operations.lock().await, vec!["ensure_session"]);
+    }
+
+    #[tokio::test]
+    async fn restart_adopts_matching_reviewer_created_before_job_link_was_saved() {
+        let mut ops = fake_reviewer_ops(PreparationFailure::Create);
+        let job_id = ops.context.run_id;
+        ops.reviewer_system_prompt = Some(crate::projects::review::project_reviewer_system_prompt(
+            &ops.context,
+        ));
+
+        let prepared = prepare_project_reviewer(
+            &ops,
+            ops.project.id,
+            job_id,
+            ProjectReviewRequest {
+                pr: 24,
+                head_sha_hint: Some("head-sha".to_string()),
+            },
+        )
+        .await
+        .expect("matching provisional reviewer is resumed");
+
+        assert_eq!(ops.reviewer.id, prepared.agent.id);
+        assert_eq!(
+            *ops.operations.lock().await,
+            vec![
+                "ensure_session",
+                "create_context",
+                "attach_context",
+                "ensure_container",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_does_not_adopt_reviewer_for_another_head() {
+        let mut ops = fake_reviewer_ops(PreparationFailure::Create);
+        ops.reviewer_system_prompt = Some(format!(
+            "Review lifecycle owner: job `{}`, PR #24, head `another-head`.",
+            ops.context.run_id
+        ));
+
+        let error = prepare_project_reviewer(
+            &ops,
+            ops.project.id,
+            ops.context.run_id,
+            ProjectReviewRequest {
+                pr: 24,
+                head_sha_hint: Some("head-sha".to_string()),
+            },
+        )
+        .await
+        .expect_err("reviewer for another head must not be adopted");
+
+        assert_eq!(
+            format!(
+                "invalid input: project already owns reviewer agent `{}`",
+                ops.reviewer.id
+            ),
+            error.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_does_not_adopt_reviewer_for_another_job_generation() {
+        let mut ops = fake_reviewer_ops(PreparationFailure::Create);
+        ops.reviewer_system_prompt = Some(format!(
+            "Review lifecycle owner: job `{}`, PR #24, head `head-sha`.",
+            Uuid::new_v4()
+        ));
+
+        let error = prepare_project_reviewer(
+            &ops,
+            ops.project.id,
+            ops.context.run_id,
+            ProjectReviewRequest {
+                pr: 24,
+                head_sha_hint: Some("head-sha".to_string()),
+            },
+        )
+        .await
+        .expect_err("reviewer for another generation must not be adopted");
+
+        assert_eq!(
+            format!(
+                "invalid input: project already owns reviewer agent `{}`",
+                ops.reviewer.id
+            ),
+            error.to_string()
+        );
+    }
+
     fn fake_reviewer_ops(failure: PreparationFailure) -> FakeReviewerOps {
         let temp = Arc::new(tempfile::tempdir().expect("tempdir"));
         let project = test_project_summary();
@@ -571,8 +842,10 @@ mod tests {
                 Uuid::new_v4(),
                 mai_protocol::AgentRole::Reviewer,
             ),
+            reviewer_system_prompt: None,
             project,
             context,
+            attached_context: None,
             failure,
             operations: Arc::new(Mutex::new(Vec::new())),
             _temp: temp,

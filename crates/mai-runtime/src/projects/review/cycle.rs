@@ -1,9 +1,8 @@
 use std::future::Future;
 
-use mai_protocol::{
-    AgentId, ProjectId, ProjectReviewOutcome, ProjectReviewRunDetail, ProjectReviewRunStatus,
-    ProjectReviewRunSummary, ProjectReviewStatus, TurnId, now,
-};
+use mai_protocol::{AgentId, ProjectId, ProjectReviewRunDetail, ProjectReviewRunSummary, TurnId};
+#[cfg(test)]
+use mai_protocol::{ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus, now};
 use pl_core::{AgentWaitResult, TurnOutcomeKind};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -11,15 +10,23 @@ use uuid::Uuid;
 use super::ProjectReviewCycleResult;
 use super::reviewer::PreparedProjectReviewer;
 use super::runs::FinishReviewRun;
+#[cfg(test)]
 use super::state::{ReviewStateUpdate, ReviewerAgentUpdate};
 use super::target::ProjectReviewRequest;
 use crate::{Result, RuntimeError};
 
 const REVIEWER_FINAL_JSON_REPAIR_PROMPT: &str = "The previous response did not include the required final JSON object, so the project review scheduler could not record the result. Continue from the existing review state. If the GitHub review has already been submitted, do not submit a duplicate review. If it has not been submitted yet, submit it now using the available GitHub API tool. Then reply with only one JSON object matching this schema exactly and no surrounding text: {\"outcome\":\"review_submitted|failed\",\"review_event\":\"approve|request_changes|comment\"|null,\"pr\":123|null,\"summary\":\"short result\",\"error\":null|\"failure reason\"}";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReviewerProgress {
+    pub(crate) revision: u64,
+    pub(crate) inactivity_timeout: std::time::Duration,
+}
+
 /// Provides the review cycle dependencies needed to sync a project workspace,
 /// run a reviewer agent turn, persist run state, and clean up afterwards.
 pub(crate) trait ProjectReviewCycleOps: Send + Sync {
+    #[cfg(test)]
     fn set_project_review_state(
         &self,
         project_id: ProjectId,
@@ -78,6 +85,17 @@ pub(crate) trait ProjectReviewCycleOps: Send + Sync {
         cancellation_token: &CancellationToken,
     ) -> impl Future<Output = Result<AgentWaitResult>> + Send;
 
+    fn reviewer_progress(
+        &self,
+        reviewer_id: AgentId,
+    ) -> impl Future<Output = Result<ReviewerProgress>> + Send;
+
+    fn cancel_reviewer_turn(
+        &self,
+        reviewer_id: AgentId,
+        turn_id: TurnId,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     fn reviewer_final_response(
         &self,
         reviewer_id: AgentId,
@@ -88,9 +106,11 @@ pub(crate) trait ProjectReviewCycleOps: Send + Sync {
         reviewer_id: AgentId,
     ) -> impl Future<Output = Result<bool>> + Send;
 
+    #[cfg(test)]
     fn delete_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<()>> + Send;
 }
 
+#[cfg(test)]
 pub(crate) async fn run_project_review_once(
     ops: &impl ProjectReviewCycleOps,
     project_id: ProjectId,
@@ -107,6 +127,8 @@ pub(crate) async fn run_project_review_once(
     .await?;
     ops.save_project_review_run_status(ProjectReviewRunSummary {
         id: run_id,
+        job_id: None,
+        attempt_index: 1,
         project_id,
         reviewer_agent_id: None,
         turn_id: None,
@@ -118,6 +140,7 @@ pub(crate) async fn run_project_review_once(
         pr: target_pr,
         summary: None,
         error: None,
+        failure: None,
         token_usage: Default::default(),
     })
     .await?;
@@ -133,6 +156,7 @@ pub(crate) async fn run_project_review_once(
             pr: target_pr,
             summary_text: None,
             error: Some("review cancelled".to_string()),
+            failure: None,
         })
         .await?;
         return Err(RuntimeError::TurnCancelled);
@@ -154,6 +178,7 @@ pub(crate) async fn run_project_review_once(
                 pr: target_pr,
                 summary_text: None,
                 error: Some(err.to_string()),
+                failure: None,
             })
             .await?;
             return Err(err);
@@ -189,6 +214,8 @@ pub(crate) async fn run_project_review_once(
     if let Err(err) = ops
         .save_project_review_run_status(ProjectReviewRunSummary {
             id: run_id,
+            job_id: None,
+            attempt_index: 1,
             project_id,
             reviewer_agent_id: Some(reviewer_id),
             turn_id: None,
@@ -200,6 +227,7 @@ pub(crate) async fn run_project_review_once(
             pr: target_pr,
             summary: None,
             error: None,
+            failure: None,
             token_usage: Default::default(),
         })
         .await
@@ -264,7 +292,7 @@ pub(crate) async fn run_project_review_once(
             None
         }
     };
-    let (status, outcome, review_event, summary, error) = match &cycle_result {
+    let (status, outcome, review_event, summary, error, failure) = match &cycle_result {
         Ok(result) => {
             let status = if result.outcome == ProjectReviewOutcome::Failed {
                 ProjectReviewRunStatus::Failed
@@ -277,6 +305,7 @@ pub(crate) async fn run_project_review_once(
                 result.review_event.clone(),
                 result.summary.clone(),
                 result.error.clone(),
+                result.failure.clone(),
             )
         }
         Err(RuntimeError::TurnCancelled) if cancellation_token.is_cancelled() => (
@@ -285,6 +314,7 @@ pub(crate) async fn run_project_review_once(
             None,
             None,
             Some("review cancelled".to_string()),
+            None,
         ),
         Err(err) => (
             ProjectReviewRunStatus::Failed,
@@ -292,6 +322,7 @@ pub(crate) async fn run_project_review_once(
             None,
             None,
             Some(err.to_string()),
+            None,
         ),
     };
     let _ = ops
@@ -306,6 +337,7 @@ pub(crate) async fn run_project_review_once(
             pr: target_pr,
             summary_text: summary,
             error,
+            failure,
         })
         .await;
     let _ = ops.delete_agent(reviewer_id).await;
@@ -318,6 +350,7 @@ pub(crate) async fn run_project_review_once(
     cycle_result
 }
 
+#[cfg(test)]
 async fn finish_spawned_reviewer_error(
     ops: &impl ProjectReviewCycleOps,
     project_id: ProjectId,
@@ -338,6 +371,7 @@ async fn finish_spawned_reviewer_error(
             pr: target_pr,
             summary_text: None,
             error: Some(error),
+            failure: None,
         })
         .await;
     let _ = ops.delete_agent(reviewer_id).await;
@@ -350,7 +384,7 @@ async fn finish_spawned_reviewer_error(
         .await;
 }
 
-async fn parse_reviewer_final_response(
+pub(crate) async fn parse_reviewer_final_response(
     ops: &impl ProjectReviewCycleOps,
     reviewer_id: AgentId,
     cancellation_token: &CancellationToken,
@@ -383,7 +417,7 @@ async fn parse_reviewer_final_response(
     }
 }
 
-fn last_turn_cancelled(wait_result: &AgentWaitResult) -> bool {
+pub(crate) fn last_turn_cancelled(wait_result: &AgentWaitResult) -> bool {
     wait_result
         .last_turn
         .as_ref()
@@ -552,6 +586,21 @@ mod tests {
             _cancellation_token: &CancellationToken,
         ) -> Result<AgentWaitResult> {
             Ok(completed_wait_result())
+        }
+
+        async fn reviewer_progress(&self, _reviewer_id: AgentId) -> Result<ReviewerProgress> {
+            Ok(ReviewerProgress {
+                revision: self.reviewer.state.runtime.revision,
+                inactivity_timeout: std::time::Duration::from_secs(600),
+            })
+        }
+
+        async fn cancel_reviewer_turn(
+            &self,
+            _reviewer_id: AgentId,
+            _turn_id: TurnId,
+        ) -> Result<()> {
+            Ok(())
         }
 
         async fn reviewer_final_response(&self, _reviewer_id: AgentId) -> Result<String> {
@@ -836,6 +885,7 @@ mod tests {
             session_id: pl_core::SessionId::new("session").expect("session id"),
             kind: TurnOutcomeKind::Completed,
             reason: None,
+            failure: None,
             usage: pl_model::TokenUsage::default(),
             finished_at: 1,
         };

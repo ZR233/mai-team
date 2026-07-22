@@ -87,6 +87,10 @@ pub enum ProjectReviewStatus {
     Syncing,
     Running,
     Waiting,
+    Queued,
+    Preparing,
+    RetryWaiting,
+    Reconciling,
     Failed,
 }
 
@@ -122,7 +126,119 @@ pub enum ProjectReviewRunStatus {
     Running,
     Completed,
     Failed,
+    Succeeded,
+    RetryableFailed,
+    PermanentFailed,
+    Interrupted,
     Cancelled,
+}
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ProjectReviewJobStatus {
+    Queued,
+    Preparing,
+    Running,
+    RetryWaiting,
+    SubmissionPending,
+    Reconciling,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Superseded,
+}
+
+impl ProjectReviewJobStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Superseded
+        )
+    }
+}
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ProjectReviewJobSource {
+    Automatic,
+    Webhook,
+    Manual,
+    Legacy,
+}
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ProjectReviewFailureCategory {
+    Provider,
+    ProviderCapacity,
+    Github,
+    Workspace,
+    Validation,
+    Timeout,
+    Internal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectReviewFailure {
+    pub category: ProjectReviewFailureCategory,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub http_status: Option<u16>,
+    pub message: String,
+    pub retry: pl_protocol::RetryDisposition,
+}
+
+impl From<pl_protocol::TurnFailure> for ProjectReviewFailure {
+    fn from(failure: pl_protocol::TurnFailure) -> Self {
+        let category = match failure.category {
+            pl_protocol::TurnFailureCategory::Provider => ProjectReviewFailureCategory::Provider,
+            pl_protocol::TurnFailureCategory::ProviderCapacity => {
+                ProjectReviewFailureCategory::ProviderCapacity
+            }
+            pl_protocol::TurnFailureCategory::Tool => ProjectReviewFailureCategory::Internal,
+            pl_protocol::TurnFailureCategory::Validation => {
+                ProjectReviewFailureCategory::Validation
+            }
+            pl_protocol::TurnFailureCategory::Internal => ProjectReviewFailureCategory::Internal,
+        };
+        Self {
+            category,
+            code: failure.code,
+            http_status: failure.http_status,
+            message: failure.message,
+            retry: failure.retry,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectReviewSubmissionIntent {
+    pub job_id: Uuid,
+    pub head_sha: String,
+    pub event: ProjectReviewDecision,
+    pub body_hash: String,
+    pub comment_count: u64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectReviewSubmissionReceipt {
+    pub github_review_id: u64,
+    pub event: ProjectReviewDecision,
+    pub head_sha: String,
+    #[serde(default)]
+    pub html_url: Option<String>,
+    pub submitted_at: DateTime<Utc>,
 }
 
 #[derive(
@@ -431,6 +547,10 @@ pub struct ProjectSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectReviewRunSummary {
     pub id: Uuid,
+    #[serde(default)]
+    pub job_id: Option<Uuid>,
+    #[serde(default)]
+    pub attempt_index: u32,
     pub project_id: ProjectId,
     #[serde(default)]
     pub reviewer_agent_id: Option<AgentId>,
@@ -451,7 +571,59 @@ pub struct ProjectReviewRunSummary {
     #[serde(default)]
     pub error: Option<String>,
     #[serde(default)]
+    pub failure: Option<ProjectReviewFailure>,
+    #[serde(default)]
     pub token_usage: TokenUsage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectReviewJobSummary {
+    pub id: Uuid,
+    pub project_id: ProjectId,
+    pub pr: u64,
+    pub head_sha: String,
+    pub source: ProjectReviewJobSource,
+    #[serde(default)]
+    pub delivery_id: Option<String>,
+    pub reason: String,
+    pub status: ProjectReviewJobStatus,
+    pub attempt_count: u32,
+    pub max_attempts: u32,
+    #[serde(default)]
+    pub first_retryable_failure_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub reviewer_agent_id: Option<AgentId>,
+    #[serde(default)]
+    pub active_run_id: Option<Uuid>,
+    #[serde(default)]
+    pub lease_owner: Option<String>,
+    #[serde(default)]
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub failure: Option<ProjectReviewFailure>,
+    #[serde(default)]
+    pub submission_intent: Option<ProjectReviewSubmissionIntent>,
+    #[serde(default)]
+    pub submission_receipt: Option<ProjectReviewSubmissionReceipt>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectReviewJobDetail {
+    #[serde(flatten)]
+    pub summary: ProjectReviewJobSummary,
+    #[serde(default)]
+    pub attempts: Vec<ProjectReviewRunSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectReviewJobsResponse {
+    pub jobs: Vec<ProjectReviewJobSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -474,6 +646,8 @@ pub struct ProjectReviewQueueResponse {
     pub queued: Vec<u64>,
     pub deduped: Vec<u64>,
     pub ignored: Vec<u64>,
+    #[serde(default)]
+    pub jobs: Vec<ProjectReviewJobSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2142,6 +2316,7 @@ mod tests {
             queued: vec![7],
             deduped: vec![8],
             ignored: vec![9],
+            jobs: Vec::new(),
         };
 
         assert_eq!(
@@ -2149,9 +2324,69 @@ mod tests {
                 "queued": [7],
                 "deduped": [8],
                 "ignored": [9],
+                "jobs": [],
             }),
             serde_json::to_value(response).expect("serialize response")
         );
+    }
+
+    #[test]
+    fn project_review_job_round_trip_preserves_failure_intent_and_receipt() {
+        let created_at = DateTime::parse_from_rfc3339("2026-07-22T00:00:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let job_id = Uuid::new_v4();
+        let job = ProjectReviewJobSummary {
+            id: job_id,
+            project_id: Uuid::new_v4(),
+            pr: 1665,
+            head_sha: "abc123".to_string(),
+            source: ProjectReviewJobSource::Webhook,
+            delivery_id: Some("delivery-1".to_string()),
+            reason: "pull_request_synchronize".to_string(),
+            status: ProjectReviewJobStatus::Reconciling,
+            attempt_count: 2,
+            max_attempts: 5,
+            first_retryable_failure_at: Some(created_at),
+            next_attempt_at: None,
+            reviewer_agent_id: Some(Uuid::new_v4()),
+            active_run_id: Some(Uuid::new_v4()),
+            lease_owner: Some("mai-review:1".to_string()),
+            lease_expires_at: Some(created_at),
+            failure: Some(ProjectReviewFailure {
+                category: ProjectReviewFailureCategory::ProviderCapacity,
+                code: Some("server_is_overloaded".to_string()),
+                http_status: Some(503),
+                message: "provider overloaded".to_string(),
+                retry: pl_protocol::RetryDisposition::Retryable {
+                    retry_after_ms: Some(30_000),
+                },
+            }),
+            submission_intent: Some(ProjectReviewSubmissionIntent {
+                job_id,
+                head_sha: "abc123".to_string(),
+                event: ProjectReviewDecision::Approve,
+                body_hash: "body-hash".to_string(),
+                comment_count: 0,
+                created_at,
+            }),
+            submission_receipt: Some(ProjectReviewSubmissionReceipt {
+                github_review_id: 42,
+                event: ProjectReviewDecision::Approve,
+                head_sha: "abc123".to_string(),
+                html_url: Some("https://github.example/review/42".to_string()),
+                submitted_at: created_at,
+            }),
+            created_at,
+            updated_at: created_at,
+            finished_at: None,
+        };
+
+        let decoded: ProjectReviewJobSummary =
+            serde_json::from_value(serde_json::to_value(&job).expect("serialize job"))
+                .expect("deserialize job");
+
+        assert_eq!(decoded, job);
     }
 
     #[test]

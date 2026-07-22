@@ -6,24 +6,24 @@ use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::{AbortHandle, Abortable};
 use mai_protocol::{
     AgentId, AgentResourceState, AgentRuntimeLifecycle, AgentSummary, GitProvider,
-    ProjectCloneStatus, ProjectId, ProjectReviewOutcome, ProjectReviewRunStatus,
-    ProjectReviewStatus, ProjectStatus, ProjectSummary, TurnId,
+    ProjectCloneStatus, ProjectId, ProjectReviewJobSummary, ProjectReviewOutcome,
+    ProjectReviewRunStatus, ProjectReviewStatus, ProjectStatus, ProjectSummary, TurnId,
 };
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
 use super::ProjectReviewCycleResult;
+#[cfg(test)]
 use super::eligibility::SelectedProjectReviewPr;
-use super::pool::PendingProjectReview;
 use super::project_review_retry_backoff;
+#[cfg(test)]
 use super::runs::FinishReviewRun;
 use super::selector::ProjectReviewSelectorRunResult;
+#[cfg(test)]
 use super::singleton::{ProjectReviewRepairReason, repair_project_review_singleton};
 use super::state::ReviewStateUpdate;
 use crate::state::{ProjectRecord, ProjectReviewWorker};
 use crate::{Result, RuntimeError};
-
-const PROJECT_REVIEW_WORKER_REPAIR_RUN_LIST_LIMIT: usize = 50;
 
 /// Provides project review worker lifecycle side effects while keeping the
 /// background loop independent of the full runtime facade.
@@ -47,6 +47,7 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<mai_protocol::ProjectReviewRunSummary>>> + Send;
 
+    #[cfg(test)]
     fn finish_project_review_run(
         &self,
         request: FinishReviewRun,
@@ -88,6 +89,7 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         cancellation_token: CancellationToken,
     ) -> impl Future<Output = Result<ProjectReviewSelectorRunResult>> + Send;
 
+    #[cfg(test)]
     fn select_project_review_pr(
         &self,
         project_id: ProjectId,
@@ -95,18 +97,81 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         head_sha_hint: Option<String>,
     ) -> impl Future<Output = Result<Option<SelectedProjectReviewPr>>> + Send;
 
+    #[cfg(test)]
     fn enqueue_project_review_signals(
         &self,
         project_id: ProjectId,
         signals: Vec<crate::projects::review::pool::ProjectReviewSignalInput>,
     ) -> impl Future<Output = Result<crate::ProjectReviewQueueSummary>> + Send;
 
+    #[cfg(test)]
     fn run_project_review_once(
         &self,
         project_id: ProjectId,
         cancellation_token: CancellationToken,
         request: super::target::ProjectReviewRequest,
     ) -> impl Future<Output = Result<ProjectReviewCycleResult>> + Send;
+
+    fn project_has_active_review_jobs(
+        &self,
+        project_id: ProjectId,
+    ) -> impl Future<Output = Result<bool>> + Send;
+
+    fn claim_due_project_review_job(
+        &self,
+        project_id: ProjectId,
+        owner: String,
+        now: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Option<ProjectReviewJobSummary>>> + Send;
+
+    fn load_project_review_job(
+        &self,
+        project_id: ProjectId,
+        job_id: uuid::Uuid,
+    ) -> impl Future<Output = Result<Option<ProjectReviewJobSummary>>> + Send;
+
+    fn load_active_project_review_job(
+        &self,
+        project_id: ProjectId,
+    ) -> impl Future<Output = Result<Option<ProjectReviewJobSummary>>> + Send;
+
+    fn save_claimed_project_review_job(
+        &self,
+        job: ProjectReviewJobSummary,
+        owner: String,
+    ) -> impl Future<Output = Result<bool>> + Send;
+
+    fn heartbeat_project_review_job(
+        &self,
+        job_id: uuid::Uuid,
+        owner: String,
+        updated_at: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+    ) -> impl Future<Output = Result<bool>> + Send;
+
+    fn recover_expired_project_review_jobs(
+        &self,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<usize>> + Send;
+
+    fn cancel_active_project_review_jobs(
+        &self,
+        project_id: ProjectId,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<usize>> + Send;
+
+    fn run_project_review_job_attempt(
+        &self,
+        job: ProjectReviewJobSummary,
+        owner: String,
+        cancellation_token: CancellationToken,
+    ) -> impl Future<Output = Result<ProjectReviewCycleResult>> + Send;
+
+    fn reconcile_project_review_job(
+        &self,
+        job: ProjectReviewJobSummary,
+    ) -> impl Future<Output = Result<Option<mai_protocol::ProjectReviewSubmissionReceipt>>> + Send;
 
     fn agent_current_turn(
         &self,
@@ -119,42 +184,23 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         turn_id: TurnId,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    fn find_project_review_job_reviewer(
+        &self,
+        job: ProjectReviewJobSummary,
+    ) -> impl Future<Output = Result<Option<AgentId>>> + Send;
+
     fn delete_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<()>> + Send;
 }
 
 pub(crate) async fn start_enabled_project_review_workers(ops: impl ProjectReviewWorkerOps) {
+    if let Err(error) = ops.recover_expired_project_review_jobs(Utc::now()).await {
+        tracing::warn!("failed to recover expired project review jobs: {error}");
+    }
     for project_id in ops.project_ids().await {
         if let Err(err) = start_project_review_loop_if_ready(ops.clone(), project_id).await {
             tracing::warn!(project_id = %project_id, "failed to start project review loop: {err}");
         }
     }
-}
-
-pub(crate) async fn reconcile_project_review_singletons(
-    ops: impl ProjectReviewWorkerOps,
-    run_list_limit: usize,
-) {
-    for project_id in ops.project_ids().await {
-        if let Err(err) =
-            reconcile_project_review_singleton(ops.clone(), project_id, run_list_limit).await
-        {
-            tracing::warn!(project_id = %project_id, "failed to reconcile project reviewer singleton: {err}");
-        }
-    }
-}
-
-pub(crate) async fn reconcile_project_review_singleton(
-    ops: impl ProjectReviewWorkerOps,
-    project_id: ProjectId,
-    run_list_limit: usize,
-) -> Result<()> {
-    repair_project_review_singleton(
-        &ops,
-        project_id,
-        run_list_limit,
-        ProjectReviewRepairReason::Startup,
-    )
-    .await
 }
 
 pub(crate) async fn start_project_review_loop_if_ready(
@@ -169,7 +215,7 @@ pub(crate) async fn start_project_review_loop_if_ready(
             summary.auto_review_enabled,
         )
     };
-    let has_pending_manual_review = !project.review_pool.lock().await.is_empty();
+    let has_pending_manual_review = ops.project_has_active_review_jobs(project_id).await?;
     if !resources_ready || (!auto_review_enabled && !has_pending_manual_review) {
         return Ok(());
     }
@@ -193,6 +239,7 @@ pub(crate) async fn start_project_review_loop_if_ready(
                 project_id,
                 cancellation_token: worker.cancellation_token.clone(),
             };
+            #[cfg(test)]
             if worker.relay_selector_abort_handle.is_none() {
                 worker.relay_selector_abort_handle = Some(spawn_project_review_child(
                     super::relay_selector::run_project_review_relay_selector_loop(
@@ -223,6 +270,7 @@ pub(crate) async fn start_project_review_loop_if_ready(
     };
     let pool_abort_handle =
         spawn_project_review_child(run_project_review_pool_worker(context.clone()));
+    #[cfg(test)]
     let relay_selector_abort_handle = auto_review_enabled.then(|| {
         spawn_project_review_child(
             super::relay_selector::run_project_review_relay_selector_loop(
@@ -245,6 +293,7 @@ pub(crate) async fn start_project_review_loop_if_ready(
         cancellation_token,
         pool_abort_handle,
         selector_abort_handle,
+        #[cfg(test)]
         relay_selector_abort_handle,
     });
     Ok(())
@@ -266,14 +315,21 @@ pub(crate) async fn stop_project_review_loop(
         if let Some(selector_abort_handle) = worker.selector_abort_handle {
             selector_abort_handle.abort();
         }
+        #[cfg(test)]
         if let Some(relay_selector_abort_handle) = worker.relay_selector_abort_handle {
             relay_selector_abort_handle.abort();
         }
     }
+    let _ = ops
+        .cancel_active_project_review_jobs(project_id, Utc::now())
+        .await;
     project.review_pool.lock().await.clear();
-    project.relay_review_queue.lock().await.clear();
     project.review_notify.notify_waiters();
-    project.relay_review_notify.notify_waiters();
+    #[cfg(test)]
+    {
+        project.relay_review_queue.lock().await.clear();
+        project.relay_review_notify.notify_waiters();
+    }
     let mut reviewer_ids = active_project_reviewer_ids(&ops, project_id, run_list_limit).await;
     let reviewer_id = project.summary.read().await.current_reviewer_agent_id;
     if let Some(reviewer_id) = reviewer_id {
@@ -329,10 +385,10 @@ pub(crate) async fn run_project_review_relay_selector_loop_for_test(
 }
 
 #[derive(Clone)]
-struct ProjectReviewTaskContext<Ops> {
-    ops: Ops,
-    project_id: ProjectId,
-    cancellation_token: CancellationToken,
+pub(super) struct ProjectReviewTaskContext<Ops> {
+    pub(super) ops: Ops,
+    pub(super) project_id: ProjectId,
+    pub(super) cancellation_token: CancellationToken,
 }
 
 fn spawn_project_review_child(future: impl Future<Output = ()> + Send + 'static) -> AbortHandle {
@@ -399,7 +455,7 @@ async fn run_project_review_pool_worker(
             }
         }
     }
-    let mut review_backoff = project_review_retry_backoff();
+    let owner = format!("mai-review:{}:{}", std::process::id(), uuid::Uuid::new_v4());
     loop {
         if ops.cancellation_token.is_cancelled() {
             break;
@@ -408,121 +464,43 @@ async fn run_project_review_pool_worker(
             break;
         }
 
-        let signal = match next_project_review_signal(&ops.ops, ops.project_id).await {
-            Ok(Some(signal)) => signal,
+        let claimed_at = Utc::now();
+        if let Err(err) = ops
+            .ops
+            .recover_expired_project_review_jobs(claimed_at)
+            .await
+        {
+            tracing::warn!(project_id = %ops.project_id, "failed to recover expired project review leases: {err}");
+            if !wait_or_cancel(&ops.cancellation_token, Duration::from_secs(1)).await {
+                break;
+            }
+            continue;
+        }
+        let job = match ops
+            .ops
+            .claim_due_project_review_job(
+                ops.project_id,
+                owner.clone(),
+                claimed_at,
+                claimed_at + TimeDelta::seconds(super::job::REVIEW_JOB_LEASE_SECONDS),
+            )
+            .await
+        {
+            Ok(Some(job)) => job,
             Ok(None) => {
                 wait_for_project_review_signal(&ops.ops, ops.project_id, &ops.cancellation_token)
                     .await;
                 continue;
             }
             Err(err) => {
-                tracing::warn!(project_id = %ops.project_id, "failed to read project review pool: {err}");
+                tracing::warn!(project_id = %ops.project_id, "failed to claim project review job: {err}");
                 if !wait_or_cancel(&ops.cancellation_token, Duration::from_secs(1)).await {
                     break;
                 }
                 continue;
             }
         };
-        if let Err(err) = repair_project_review_singleton(
-            &ops.ops,
-            ops.project_id,
-            PROJECT_REVIEW_WORKER_REPAIR_RUN_LIST_LIMIT,
-            ProjectReviewRepairReason::Runtime,
-        )
-        .await
-        {
-            tracing::warn!(
-                project_id = %ops.project_id,
-                "failed to repair project reviewer singleton before review signal: {err}"
-            );
-        }
-        if let Some(reviewer) = active_project_reviewer_agent(&ops.ops, ops.project_id).await {
-            tracing::warn!(
-                project_id = %ops.project_id,
-                reviewer_id = %reviewer.id,
-                resource = %reviewer.state.resource,
-                lifecycle = ?reviewer.state.runtime.lifecycle,
-                activity = ?reviewer.state.runtime.activity,
-                "project review signal delayed because another reviewer agent is still active"
-            );
-            requeue_project_review_signal(&ops.ops, ops.project_id, signal).await;
-            if !wait_or_cancel(&ops.cancellation_token, Duration::from_secs(1)).await {
-                break;
-            }
-            continue;
-        }
-
-        let decision = ops
-            .ops
-            .run_project_review_once(
-                ops.project_id,
-                ops.cancellation_token.clone(),
-                super::target::ProjectReviewRequest {
-                    pr: signal.pr,
-                    head_sha_hint: signal.head_sha.clone(),
-                },
-            )
-            .await;
-        let mut decision = match decision {
-            Ok(result) => {
-                if result.outcome == ProjectReviewOutcome::Failed
-                    && result
-                        .error
-                        .as_deref()
-                        .is_some_and(super::project_review_error_is_retryable)
-                {
-                    requeue_project_review_signal(&ops.ops, ops.project_id, signal).await;
-                    let mut decision = super::project_review_loop_decision_for_error(
-                        result.error.clone().unwrap_or_default(),
-                    );
-                    decision.summary = result.summary;
-                    decision.delay = review_backoff.next_delay();
-                    decision
-                } else {
-                    review_backoff.reset();
-                    super::project_review_loop_decision_for_result(result)
-                }
-            }
-            Err(RuntimeError::TurnCancelled) if ops.cancellation_token.is_cancelled() => break,
-            Err(err) => {
-                let error = err.to_string();
-                let retryable = super::project_review_error_is_retryable(&error);
-                if retryable {
-                    requeue_project_review_signal(&ops.ops, ops.project_id, signal).await;
-                    let mut decision = super::project_review_loop_decision_for_error(error);
-                    decision.delay = review_backoff.next_delay();
-                    decision
-                } else {
-                    review_backoff.reset();
-                    let mut decision = super::project_review_loop_decision_for_error(error);
-                    decision.delay = Duration::ZERO;
-                    decision
-                }
-            }
-        };
-        if matches!(decision.outcome, Some(ProjectReviewOutcome::NoEligiblePr)) {
-            decision.delay = Duration::ZERO;
-            decision.status = ProjectReviewStatus::Idle;
-        }
-        let next_review_at = (decision.delay.as_secs() > 0)
-            .then(|| Utc::now() + TimeDelta::seconds(decision.delay.as_secs() as i64));
-        let _ = ops
-            .ops
-            .set_project_review_state(
-                ops.project_id,
-                decision.status,
-                ReviewStateUpdate {
-                    next_review_at,
-                    outcome: decision.outcome,
-                    summary_text: decision.summary,
-                    error: decision.error,
-                    ..Default::default()
-                },
-            )
-            .await;
-        if !decision.delay.is_zero()
-            && !wait_or_cancel(&ops.cancellation_token, decision.delay).await
-        {
+        if !super::job_worker::run_claimed_project_review_job(&ops, job, owner.clone()).await {
             break;
         }
     }
@@ -672,6 +650,14 @@ async fn set_selector_state_if_visible(
 async fn selector_state_visible(
     ops: &ProjectReviewTaskContext<impl ProjectReviewWorkerOps>,
 ) -> bool {
+    if ops
+        .ops
+        .project_has_active_review_jobs(ops.project_id)
+        .await
+        .unwrap_or(true)
+    {
+        return false;
+    }
     let Ok(project) = ops.ops.project(ops.project_id).await else {
         return false;
     };
@@ -700,25 +686,6 @@ async fn wait_or_cancel(cancellation_token: &CancellationToken, delay: Duration)
     tokio::select! {
         _ = sleep(delay) => true,
         _ = cancellation_token.cancelled() => false,
-    }
-}
-
-async fn next_project_review_signal(
-    ops: &impl ProjectReviewWorkerOps,
-    project_id: ProjectId,
-) -> Result<Option<PendingProjectReview>> {
-    let project = ops.project(project_id).await?;
-    Ok(project.review_pool.lock().await.next())
-}
-
-async fn requeue_project_review_signal(
-    ops: &impl ProjectReviewWorkerOps,
-    project_id: ProjectId,
-    signal: PendingProjectReview,
-) {
-    if let Ok(project) = ops.project(project_id).await {
-        project.review_pool.lock().await.requeue(signal);
-        project.review_notify.notify_waiters();
     }
 }
 
@@ -752,16 +719,6 @@ async fn active_project_reviewer_ids(
         }
     }
     reviewer_ids
-}
-
-async fn active_project_reviewer_agent(
-    ops: &impl ProjectReviewWorkerOps,
-    project_id: ProjectId,
-) -> Option<AgentSummary> {
-    ops.project_auto_reviewer_agents(project_id)
-        .await
-        .into_iter()
-        .find(project_reviewer_agent_is_active)
 }
 
 fn project_reviewer_agent_is_active(agent: &AgentSummary) -> bool {
@@ -817,9 +774,10 @@ mod tests {
 
     use mai_protocol::{
         AgentResourceState, AgentRole, AgentRuntimeActivity, AgentRuntimeState, AgentState,
-        ProjectCloneStatus, ProjectReviewDecision, ProjectReviewOutcome, ProjectReviewRunStatus,
-        ProjectReviewRunSummary, ProjectReviewStatus, ProjectStatus, ProjectSummary, TokenUsage,
-        now,
+        ProjectCloneStatus, ProjectReviewDecision, ProjectReviewFailureCategory,
+        ProjectReviewJobSource, ProjectReviewJobStatus, ProjectReviewJobSummary,
+        ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewStatus,
+        ProjectStatus, ProjectSummary, TokenUsage, now,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::{Mutex, Notify};
@@ -870,6 +828,7 @@ mod tests {
         review_errors: Arc<Mutex<Vec<String>>>,
         auto_reviewers: Arc<Mutex<Vec<mai_protocol::AgentSummary>>>,
         review_runs: Arc<Mutex<Vec<ProjectReviewRunSummary>>>,
+        review_jobs: Arc<Mutex<Vec<ProjectReviewJobSummary>>>,
         finished_runs: Arc<Mutex<Vec<FinishReviewRun>>>,
         cancelled_turns: Arc<Mutex<Vec<(Uuid, Uuid)>>>,
         deleted_agents: Arc<Mutex<Vec<Uuid>>>,
@@ -894,6 +853,7 @@ mod tests {
                 review_errors: Arc::new(Mutex::new(Vec::new())),
                 auto_reviewers: Arc::new(Mutex::new(Vec::new())),
                 review_runs: Arc::new(Mutex::new(Vec::new())),
+                review_jobs: Arc::new(Mutex::new(Vec::new())),
                 finished_runs: Arc::new(Mutex::new(Vec::new())),
                 cancelled_turns: Arc::new(Mutex::new(Vec::new())),
                 deleted_agents: Arc::new(Mutex::new(Vec::new())),
@@ -992,6 +952,15 @@ mod tests {
             });
             let mut summary = self.project.summary.write().await;
             summary.review_status = status;
+            match update.current_reviewer_agent_id {
+                crate::projects::review::state::ReviewerAgentUpdate::Clear => {
+                    summary.current_reviewer_agent_id = None;
+                }
+                crate::projects::review::state::ReviewerAgentUpdate::Keep => {}
+                crate::projects::review::state::ReviewerAgentUpdate::Set(reviewer_id) => {
+                    summary.current_reviewer_agent_id = Some(reviewer_id);
+                }
+            }
             summary.next_review_at = update.next_review_at;
             if let Some(outcome) = update.outcome {
                 summary.last_review_outcome = Some(outcome);
@@ -1106,6 +1075,7 @@ mod tests {
                     pr: target_pr,
                     summary: Some("Review could not be completed.".to_string()),
                     error: Some(error),
+                    failure: None,
                 });
             }
             Ok(ProjectReviewCycleResult {
@@ -1114,7 +1084,232 @@ mod tests {
                 pr: target_pr,
                 summary: None,
                 error: None,
+                failure: None,
             })
+        }
+
+        async fn project_has_active_review_jobs(&self, _project_id: Uuid) -> crate::Result<bool> {
+            Ok(self
+                .review_jobs
+                .lock()
+                .await
+                .iter()
+                .any(|job| !job.status.is_terminal())
+                || !self.project.review_pool.lock().await.is_empty())
+        }
+
+        async fn claim_due_project_review_job(
+            &self,
+            project_id: Uuid,
+            owner: String,
+            current_time: chrono::DateTime<chrono::Utc>,
+            lease_expires_at: chrono::DateTime<chrono::Utc>,
+        ) -> crate::Result<Option<ProjectReviewJobSummary>> {
+            let mut jobs = self.review_jobs.lock().await;
+            let position = jobs.iter().position(|job| {
+                !job.status.is_terminal()
+                    && job
+                        .next_attempt_at
+                        .is_none_or(|next_attempt_at| next_attempt_at <= current_time)
+            });
+            let position = match position {
+                Some(position) => position,
+                None => {
+                    let Some(signal) = self.project.review_pool.lock().await.next() else {
+                        return Ok(None);
+                    };
+                    jobs.push(crate::projects::review::job::new_project_review_job(
+                        crate::projects::review::job::NewProjectReviewJob {
+                            project_id,
+                            pr: signal.pr,
+                            head_sha: signal.head_sha.unwrap_or_else(|| "head".to_string()),
+                            source: ProjectReviewJobSource::Manual,
+                            delivery_id: signal.delivery_id,
+                            reason: signal.reason,
+                        },
+                    ));
+                    jobs.len() - 1
+                }
+            };
+            let job = &mut jobs[position];
+            job.status = ProjectReviewJobStatus::Preparing;
+            job.attempt_count += 1;
+            job.next_attempt_at = None;
+            job.lease_owner = Some(owner);
+            job.lease_expires_at = Some(lease_expires_at);
+            Ok(Some(job.clone()))
+        }
+
+        async fn load_project_review_job(
+            &self,
+            _project_id: Uuid,
+            job_id: Uuid,
+        ) -> crate::Result<Option<ProjectReviewJobSummary>> {
+            Ok(self
+                .review_jobs
+                .lock()
+                .await
+                .iter()
+                .find(|job| job.id == job_id)
+                .cloned())
+        }
+
+        async fn load_active_project_review_job(
+            &self,
+            _project_id: Uuid,
+        ) -> crate::Result<Option<ProjectReviewJobSummary>> {
+            Ok(self
+                .review_jobs
+                .lock()
+                .await
+                .iter()
+                .filter(|job| !job.status.is_terminal())
+                .min_by_key(|job| {
+                    let priority = match job.status {
+                        ProjectReviewJobStatus::Reconciling => 0,
+                        ProjectReviewJobStatus::SubmissionPending => 1,
+                        ProjectReviewJobStatus::Running => 2,
+                        ProjectReviewJobStatus::Preparing => 3,
+                        ProjectReviewJobStatus::Queued => 4,
+                        ProjectReviewJobStatus::RetryWaiting => 5,
+                        ProjectReviewJobStatus::Succeeded
+                        | ProjectReviewJobStatus::Failed
+                        | ProjectReviewJobStatus::Cancelled
+                        | ProjectReviewJobStatus::Superseded => 6,
+                    };
+                    (priority, job.created_at)
+                })
+                .cloned())
+        }
+
+        async fn save_claimed_project_review_job(
+            &self,
+            job: ProjectReviewJobSummary,
+            _owner: String,
+        ) -> crate::Result<bool> {
+            let mut jobs = self.review_jobs.lock().await;
+            if let Some(existing) = jobs.iter_mut().find(|existing| existing.id == job.id) {
+                *existing = job;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+
+        async fn heartbeat_project_review_job(
+            &self,
+            _job_id: Uuid,
+            _owner: String,
+            _updated_at: chrono::DateTime<chrono::Utc>,
+            _lease_expires_at: chrono::DateTime<chrono::Utc>,
+        ) -> crate::Result<bool> {
+            Ok(true)
+        }
+
+        async fn recover_expired_project_review_jobs(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> crate::Result<usize> {
+            let mut jobs = self.review_jobs.lock().await;
+            let mut recovered = 0;
+            for job in jobs.iter_mut() {
+                if matches!(
+                    job.status,
+                    ProjectReviewJobStatus::Preparing
+                        | ProjectReviewJobStatus::Running
+                        | ProjectReviewJobStatus::SubmissionPending
+                        | ProjectReviewJobStatus::Reconciling
+                ) && job
+                    .lease_expires_at
+                    .is_none_or(|expires_at| expires_at <= now)
+                {
+                    job.status = if job.submission_intent.is_some() {
+                        ProjectReviewJobStatus::Reconciling
+                    } else {
+                        ProjectReviewJobStatus::RetryWaiting
+                    };
+                    job.next_attempt_at = Some(now);
+                    job.lease_owner = None;
+                    job.lease_expires_at = None;
+                    job.updated_at = now;
+                    recovered += 1;
+                }
+            }
+            Ok(recovered)
+        }
+
+        async fn cancel_active_project_review_jobs(
+            &self,
+            _project_id: Uuid,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> crate::Result<usize> {
+            Ok(0)
+        }
+
+        async fn run_project_review_job_attempt(
+            &self,
+            job: ProjectReviewJobSummary,
+            _owner: String,
+            cancellation_token: CancellationToken,
+        ) -> crate::Result<ProjectReviewCycleResult> {
+            let job_id = job.id;
+            let job_head = job.head_sha.clone();
+            let mut result = self
+                .run_project_review_once(
+                    job.project_id,
+                    cancellation_token,
+                    crate::projects::review::target::ProjectReviewRequest {
+                        pr: job.pr,
+                        head_sha_hint: Some(job.head_sha),
+                    },
+                )
+                .await?;
+            if result.error.is_some() {
+                let code = result
+                    .error
+                    .as_deref()
+                    .filter(|message| *message == "server_is_overloaded")
+                    .map(str::to_string);
+                result.failure = Some(mai_protocol::ProjectReviewFailure {
+                    category: ProjectReviewFailureCategory::ProviderCapacity,
+                    code,
+                    http_status: None,
+                    message: result.error.clone().unwrap_or_default(),
+                    retry: pl_protocol::RetryDisposition::Retryable {
+                        retry_after_ms: None,
+                    },
+                });
+            }
+            if result.outcome == ProjectReviewOutcome::ReviewSubmitted
+                && let Some(stored) = self
+                    .review_jobs
+                    .lock()
+                    .await
+                    .iter_mut()
+                    .find(|stored| stored.id == job_id)
+            {
+                stored.status = ProjectReviewJobStatus::Succeeded;
+                stored.submission_receipt = Some(mai_protocol::ProjectReviewSubmissionReceipt {
+                    github_review_id: 42,
+                    event: result
+                        .review_event
+                        .clone()
+                        .unwrap_or(ProjectReviewDecision::Comment),
+                    head_sha: job_head,
+                    html_url: None,
+                    submitted_at: now(),
+                });
+                stored.finished_at = Some(now());
+                stored.lease_owner = None;
+                stored.lease_expires_at = None;
+            }
+            Ok(result)
+        }
+
+        async fn reconcile_project_review_job(
+            &self,
+            _job: ProjectReviewJobSummary,
+        ) -> crate::Result<Option<mai_protocol::ProjectReviewSubmissionReceipt>> {
+            Ok(None)
         }
 
         async fn agent_current_turn(&self, agent_id: Uuid) -> crate::Result<Option<Uuid>> {
@@ -1130,6 +1325,13 @@ mod tests {
         async fn cancel_agent_turn(&self, agent_id: Uuid, turn_id: Uuid) -> crate::Result<()> {
             self.cancelled_turns.lock().await.push((agent_id, turn_id));
             Ok(())
+        }
+
+        async fn find_project_review_job_reviewer(
+            &self,
+            job: ProjectReviewJobSummary,
+        ) -> crate::Result<Option<Uuid>> {
+            Ok(job.reviewer_agent_id)
         }
 
         async fn delete_agent(&self, agent_id: Uuid) -> crate::Result<()> {
@@ -1401,7 +1603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_worker_requeues_pr_after_retryable_model_failure() {
+    async fn pool_worker_persists_retry_waiting_after_retryable_model_failure() {
         let project_id = Uuid::new_v4();
         let ops = FakeWorkerOps::new(project_id);
         ops.push_review_error("model error: request to https://token-plan-cn.xiaomimimo.com/v1/chat/completions returned 500 Internal Server Error: {\"error\":{\"message\":\"<html><body><h1>502 Bad Gateway</h1></body></html>\"}}")
@@ -1431,22 +1633,18 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(vec![Some(42)], *ops.reviewed_prs.lock().await);
-        let requeued = ops
-            .project
-            .review_pool
-            .lock()
-            .await
-            .next()
-            .expect("retryable model failure should requeue PR");
-        assert_eq!(42, requeued.pr);
-        assert_eq!(Some("head-42".to_string()), requeued.head_sha);
-        assert_eq!(Some("delivery-42".to_string()), requeued.delivery_id);
-        assert_eq!("test", requeued.reason);
+        let jobs = ops.review_jobs.lock().await.clone();
+        assert_eq!(1, jobs.len());
+        assert_eq!(ProjectReviewJobStatus::RetryWaiting, jobs[0].status);
+        assert_eq!(42, jobs[0].pr);
+        assert_eq!("head-42", jobs[0].head_sha);
+        assert_eq!(Some("delivery-42"), jobs[0].delivery_id.as_deref());
+        assert!(jobs[0].next_attempt_at.is_some());
 
         let states = ops.states.lock().await.clone();
         let last = states.last().expect("review state");
-        assert_eq!(ProjectReviewStatus::Waiting, last.status);
-        assert_eq!(None, last.outcome);
+        assert_eq!(ProjectReviewStatus::RetryWaiting, last.status);
+        assert_eq!(Some(ProjectReviewOutcome::Failed), last.outcome);
         assert!(last.next_review_at_set);
         assert!(
             last.error
@@ -1459,7 +1657,187 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_worker_does_not_start_second_reviewer_when_active_reviewer_exists() {
+    async fn pool_worker_recovers_after_repeated_provider_overload_without_replacing_job() {
+        let project_id = Uuid::new_v4();
+        let reviewer_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        for _ in 0..3 {
+            ops.push_review_error("server_is_overloaded").await;
+        }
+        let mut job = crate::projects::review::job::new_project_review_job(
+            crate::projects::review::job::NewProjectReviewJob {
+                project_id,
+                pr: 42,
+                head_sha: "head-42".to_string(),
+                source: ProjectReviewJobSource::Manual,
+                delivery_id: None,
+                reason: "overload fault injection".to_string(),
+            },
+        );
+        let job_id = job.id;
+        job.reviewer_agent_id = Some(reviewer_id);
+        ops.review_jobs.lock().await.push(job);
+
+        let token = CancellationToken::new();
+        let task_ops = ops.clone();
+        let task_token = token.clone();
+        let worker_task = tokio::spawn(async move {
+            super::run_project_review_loop(task_ops, project_id, task_token).await;
+        });
+
+        for expected_attempts in 1..=3 {
+            for _ in 0..100 {
+                let jobs = ops.review_jobs.lock().await;
+                if jobs[0].attempt_count == expected_attempts
+                    && jobs[0].status == ProjectReviewJobStatus::RetryWaiting
+                {
+                    break;
+                }
+                drop(jobs);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let mut jobs = ops.review_jobs.lock().await;
+            assert_eq!(expected_attempts, jobs[0].attempt_count);
+            assert_eq!(ProjectReviewJobStatus::RetryWaiting, jobs[0].status);
+            assert_eq!(Some(reviewer_id), jobs[0].reviewer_agent_id);
+            assert_eq!(
+                Some("server_is_overloaded"),
+                jobs[0]
+                    .failure
+                    .as_ref()
+                    .and_then(|failure| failure.code.as_deref())
+            );
+            jobs[0].next_attempt_at = Some(now() - chrono::TimeDelta::seconds(1));
+            drop(jobs);
+            ops.project.review_notify.notify_waiters();
+        }
+
+        for _ in 0..100 {
+            if ops.review_jobs.lock().await[0].status == ProjectReviewJobStatus::Succeeded {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let jobs = ops.review_jobs.lock().await;
+        assert_eq!(1, jobs.len());
+        assert_eq!(job_id, jobs[0].id);
+        assert_eq!(4, jobs[0].attempt_count);
+        assert_eq!(Some(reviewer_id), jobs[0].reviewer_agent_id);
+        assert_eq!(ProjectReviewJobStatus::Succeeded, jobs[0].status);
+        assert_eq!(
+            Some(42),
+            jobs[0]
+                .submission_receipt
+                .as_ref()
+                .map(|receipt| receipt.github_review_id)
+        );
+        drop(jobs);
+        assert_eq!(vec![Some(42); 4], *ops.reviewed_prs.lock().await);
+
+        token.cancel();
+        worker_task.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn project_projection_keeps_running_job_visible_when_another_job_is_queued() {
+        let project_id = Uuid::new_v4();
+        let reviewer_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        let mut running = crate::projects::review::job::new_project_review_job(
+            crate::projects::review::job::NewProjectReviewJob {
+                project_id,
+                pr: 41,
+                head_sha: "head-running".to_string(),
+                source: ProjectReviewJobSource::Automatic,
+                delivery_id: None,
+                reason: "running".to_string(),
+            },
+        );
+        running.status = ProjectReviewJobStatus::Running;
+        running.reviewer_agent_id = Some(reviewer_id);
+        let queued = crate::projects::review::job::new_project_review_job(
+            crate::projects::review::job::NewProjectReviewJob {
+                project_id,
+                pr: 42,
+                head_sha: "head-queued".to_string(),
+                source: ProjectReviewJobSource::Automatic,
+                delivery_id: None,
+                reason: "queued".to_string(),
+            },
+        );
+        *ops.review_jobs.lock().await = vec![running.clone(), queued.clone()];
+
+        crate::projects::review::job_worker::refresh_project_review_job_projection(
+            &ops, project_id, &queued, None, None,
+        )
+        .await;
+        {
+            let project = ops.project.summary.read().await;
+            assert_eq!(ProjectReviewStatus::Running, project.review_status);
+            assert_eq!(Some(reviewer_id), project.current_reviewer_agent_id);
+        }
+
+        ops.review_jobs.lock().await[0].status = ProjectReviewJobStatus::Succeeded;
+        crate::projects::review::job_worker::refresh_project_review_job_projection(
+            &ops, project_id, &running, None, None,
+        )
+        .await;
+        let project = ops.project.summary.read().await;
+        assert_eq!(ProjectReviewStatus::Queued, project.review_status);
+        assert_eq!(None, project.current_reviewer_agent_id);
+    }
+
+    #[tokio::test]
+    async fn pool_worker_recovers_lease_that_expires_after_scheduler_startup() {
+        let project_id = Uuid::new_v4();
+        let reviewer_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        let mut interrupted = crate::projects::review::job::new_project_review_job(
+            crate::projects::review::job::NewProjectReviewJob {
+                project_id,
+                pr: 42,
+                head_sha: "head-42".to_string(),
+                source: ProjectReviewJobSource::Automatic,
+                delivery_id: None,
+                reason: "restart recovery".to_string(),
+            },
+        );
+        let job_id = interrupted.id;
+        interrupted.status = ProjectReviewJobStatus::Running;
+        interrupted.attempt_count = 1;
+        interrupted.reviewer_agent_id = Some(reviewer_id);
+        interrupted.lease_owner = Some("stopped-instance".to_string());
+        interrupted.lease_expires_at = Some(now() - chrono::TimeDelta::milliseconds(1));
+        ops.review_jobs.lock().await.push(interrupted);
+
+        let token = CancellationToken::new();
+        let task_ops = ops.clone();
+        let task_token = token.clone();
+        let worker_task = tokio::spawn(async move {
+            super::run_project_review_loop(task_ops, project_id, task_token).await;
+        });
+
+        for _ in 0..100 {
+            if ops.review_jobs.lock().await[0].status == ProjectReviewJobStatus::Succeeded {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let jobs = ops.review_jobs.lock().await;
+        assert_eq!(1, jobs.len());
+        assert_eq!(job_id, jobs[0].id);
+        assert_eq!(2, jobs[0].attempt_count);
+        assert_eq!(Some(reviewer_id), jobs[0].reviewer_agent_id);
+        assert_eq!(ProjectReviewJobStatus::Succeeded, jobs[0].status);
+        assert!(jobs[0].submission_receipt.is_some());
+        drop(jobs);
+
+        token.cancel();
+        worker_task.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn pool_worker_uses_persisted_job_instead_of_projection_as_queue_lock() {
         let project_id = Uuid::new_v4();
         let ops = FakeWorkerOps::new(project_id);
         let reviewer = test_reviewer_agent(
@@ -1501,25 +1879,14 @@ mod tests {
         ops.project.review_notify.notify_waiters();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(Vec::<Option<u64>>::new(), *ops.reviewed_prs.lock().await);
-        let requeued = ops
-            .project
-            .review_pool
-            .lock()
-            .await
-            .next()
-            .expect("active reviewer should leave pending PR in the pool");
-        assert_eq!(42, requeued.pr);
-        assert_eq!(Some("head-42".to_string()), requeued.head_sha);
-        assert_eq!(Some("delivery-42".to_string()), requeued.delivery_id);
-        assert_eq!("test", requeued.reason);
+        assert_eq!(vec![Some(42)], *ops.reviewed_prs.lock().await);
 
         token.cancel();
         worker_task.await.expect("worker task");
     }
 
     #[tokio::test]
-    async fn pool_worker_repairs_orphan_deleting_reviewer_and_reviews_next_signal() {
+    async fn pool_worker_does_not_opportunistically_destroy_unowned_reviewer() {
         let project_id = Uuid::new_v4();
         let ops = FakeWorkerOps::new(project_id);
         let maintainer_agent_id = ops.project.summary.read().await.maintainer_agent_id;
@@ -1563,17 +1930,11 @@ mod tests {
 
         assert_eq!(vec![Some(42)], *ops.reviewed_prs.lock().await);
         assert_eq!(
-            vec![(reviewer_id, turn_id)],
+            Vec::<(Uuid, Uuid)>::new(),
             *ops.cancelled_turns.lock().await
         );
-        assert_eq!(vec![reviewer_id], *ops.deleted_agents.lock().await);
-        let finished = ops.finished_runs.lock().await.clone();
-        assert_eq!(1, finished.len());
-        assert_eq!(ProjectReviewRunStatus::Cancelled, finished[0].status);
-        assert_eq!(
-            Some("review interrupted by project reviewer self repair".to_string()),
-            finished[0].error
-        );
+        assert_eq!(Vec::<Uuid>::new(), *ops.deleted_agents.lock().await);
+        assert!(ops.finished_runs.lock().await.is_empty());
 
         token.cancel();
         worker_task.await.expect("worker task");
@@ -2053,6 +2414,8 @@ mod tests {
     ) -> ProjectReviewRunSummary {
         ProjectReviewRunSummary {
             id: Uuid::new_v4(),
+            job_id: None,
+            attempt_index: 1,
             project_id,
             reviewer_agent_id,
             turn_id,
@@ -2064,6 +2427,7 @@ mod tests {
             pr: Some(42),
             summary: None,
             error: None,
+            failure: None,
             token_usage: TokenUsage::default(),
         }
     }

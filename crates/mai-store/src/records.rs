@@ -120,6 +120,9 @@ pub(crate) struct ProjectReviewRunRecord {
     pub(crate) id: String,
     #[index]
     pub(crate) project_id: String,
+    #[index]
+    pub(crate) job_id: Option<String>,
+    pub(crate) attempt_index: i64,
     pub(crate) reviewer_agent_id: Option<String>,
     pub(crate) turn_id: Option<String>,
     #[index]
@@ -131,6 +134,7 @@ pub(crate) struct ProjectReviewRunRecord {
     pub(crate) pr: Option<i64>,
     pub(crate) summary: Option<String>,
     pub(crate) error: Option<String>,
+    pub(crate) failure_json: Option<String>,
     pub(crate) input_tokens: i64,
     pub(crate) cached_input_tokens: i64,
     pub(crate) output_tokens: i64,
@@ -138,6 +142,36 @@ pub(crate) struct ProjectReviewRunRecord {
     pub(crate) total_tokens: i64,
     pub(crate) messages_json: String,
     pub(crate) events_json: String,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "project_review_jobs"]
+pub(crate) struct ProjectReviewJobRecord {
+    #[key]
+    pub(crate) id: String,
+    #[index]
+    pub(crate) project_id: String,
+    pub(crate) pr: i64,
+    pub(crate) head_sha: String,
+    pub(crate) source: String,
+    pub(crate) delivery_id: Option<String>,
+    pub(crate) reason: String,
+    pub(crate) status: String,
+    pub(crate) attempt_count: i64,
+    pub(crate) max_attempts: i64,
+    pub(crate) first_retryable_failure_at: Option<String>,
+    #[index]
+    pub(crate) next_attempt_at: Option<String>,
+    pub(crate) reviewer_agent_id: Option<String>,
+    pub(crate) active_run_id: Option<String>,
+    pub(crate) lease_owner: Option<String>,
+    pub(crate) lease_expires_at: Option<String>,
+    pub(crate) failure_json: Option<String>,
+    pub(crate) submission_intent_json: Option<String>,
+    pub(crate) submission_receipt_json: Option<String>,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) finished_at: Option<String>,
 }
 
 #[derive(Debug, Clone, toasty::Model)]
@@ -524,6 +558,10 @@ impl ProjectReviewRunRecord {
     pub(crate) fn into_summary(self) -> Result<ProjectReviewRunSummary> {
         Ok(ProjectReviewRunSummary {
             id: parse_uuid(&self.id)?,
+            job_id: self.job_id.as_deref().map(parse_uuid).transpose()?,
+            attempt_index: u32::try_from(self.attempt_index).map_err(|_| {
+                StoreError::InvalidConfig("review attempt index exceeds u32".to_string())
+            })?,
             project_id: parse_project_id(&self.project_id)?,
             reviewer_agent_id: self
                 .reviewer_agent_id
@@ -543,6 +581,11 @@ impl ProjectReviewRunRecord {
             pr: self.pr.map(i64_to_u64),
             summary: self.summary,
             error: self.error,
+            failure: self
+                .failure_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?,
             token_usage: TokenUsage {
                 input_tokens: i64_to_u64(self.input_tokens),
                 cached_input_tokens: i64_to_u64(self.cached_input_tokens),
@@ -560,6 +603,63 @@ impl ProjectReviewRunRecord {
             summary: self.into_summary()?,
             messages,
             events,
+        })
+    }
+}
+
+impl ProjectReviewJobRecord {
+    pub(crate) fn into_summary(self) -> Result<ProjectReviewJobSummary> {
+        Ok(ProjectReviewJobSummary {
+            id: parse_uuid(&self.id)?,
+            project_id: parse_project_id(&self.project_id)?,
+            pr: i64_to_u64(self.pr),
+            head_sha: self.head_sha,
+            source: parse_store_enum(&self.source)?,
+            delivery_id: self.delivery_id,
+            reason: self.reason,
+            status: parse_store_enum(&self.status)?,
+            attempt_count: u32::try_from(self.attempt_count).map_err(|_| {
+                StoreError::InvalidConfig("review attempt count exceeds u32".to_string())
+            })?,
+            max_attempts: u32::try_from(self.max_attempts).map_err(|_| {
+                StoreError::InvalidConfig("review max attempts exceeds u32".to_string())
+            })?,
+            first_retryable_failure_at: self
+                .first_retryable_failure_at
+                .as_deref()
+                .map(parse_utc)
+                .transpose()?,
+            next_attempt_at: self.next_attempt_at.as_deref().map(parse_utc).transpose()?,
+            reviewer_agent_id: self
+                .reviewer_agent_id
+                .as_deref()
+                .map(parse_agent_id)
+                .transpose()?,
+            active_run_id: self.active_run_id.as_deref().map(parse_uuid).transpose()?,
+            lease_owner: self.lease_owner,
+            lease_expires_at: self
+                .lease_expires_at
+                .as_deref()
+                .map(parse_utc)
+                .transpose()?,
+            failure: self
+                .failure_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?,
+            submission_intent: self
+                .submission_intent_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?,
+            submission_receipt: self
+                .submission_receipt_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?,
+            created_at: parse_utc(&self.created_at)?,
+            updated_at: parse_utc(&self.updated_at)?,
+            finished_at: self.finished_at.as_deref().map(parse_utc).transpose()?,
         })
     }
 }

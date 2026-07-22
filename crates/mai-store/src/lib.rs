@@ -4,10 +4,10 @@ pub(crate) use mai_protocol::{
     GitAccountStatus, GitAccountSummary, GitAccountsResponse, GitProvider, GitTokenKind,
     GithubAppSettingsRequest, GithubAppSettingsResponse, GithubSettingsResponse,
     MaiProductEventEnvelope, MaiProductEventKind, McpServerConfig, PlanHistoryEntry, ProjectId,
-    ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary, RelaySettingsRequest,
-    RelaySettingsResponse, SessionEventEnvelope, SessionId, SkillsConfigRequest, TaskId, TaskPlan,
-    TaskReview, TaskSummary, TokenUsage, ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceSummary,
-    TurnId,
+    ProjectReviewJobSummary, ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary,
+    RelaySettingsRequest, RelaySettingsResponse, SessionEventEnvelope, SessionId,
+    SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskSummary, TokenUsage,
+    ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceSummary, TurnId,
 };
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use std::collections::BTreeMap;
@@ -30,6 +30,7 @@ mod logs;
 mod projects;
 mod records;
 mod relay;
+mod review_jobs;
 mod runtime_state;
 mod schema;
 mod settings;
@@ -49,6 +50,7 @@ pub use agent_runtime::{
     StoredSessionEvent, StoredSessionProjection, StoredTokenUsage,
 };
 pub use config_document::ConfigDocumentStore;
+pub use review_jobs::{ProjectReviewJobEnqueueDisposition, ProjectReviewJobEnqueueResult};
 pub use store::MaiStore;
 
 pub(crate) use convert::*;

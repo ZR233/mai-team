@@ -1,4 +1,6 @@
-use crate::schema::{SCHEMA_VERSION, SETTING_SCHEMA_VERSION, build_db, has_sqlite_header};
+use crate::schema::{
+    SCHEMA_VERSION, SETTING_SCHEMA_VERSION, build_db, has_sqlite_header, migrate_supported_schema,
+};
 use crate::settings::{get_setting_on, set_setting_on};
 use crate::*;
 use std::io::ErrorKind;
@@ -53,6 +55,11 @@ impl MaiStore {
         let mut was_empty =
             !path.exists() || path.metadata().is_ok_and(|metadata| metadata.len() == 0);
         if !was_empty && !has_sqlite_header(&path)? {
+            remove_database_files(&path)?;
+            was_empty = true;
+        }
+
+        if !was_empty && !migrate_supported_schema(&path)? {
             remove_database_files(&path)?;
             was_empty = true;
         }

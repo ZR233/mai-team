@@ -71,9 +71,6 @@ use pl_core::{
 use projects::instructions::ProjectInstructionSourceFile;
 use projects::review::ProjectReviewCycleResult;
 use projects::review::pool::{ProjectReviewPoolEnqueueSummary, ProjectReviewSignalInput};
-use projects::review::relay_queue::{
-    ProjectReviewRelayQueueEnqueueSummary, ProjectReviewRelaySignalInput,
-};
 use projects::review::runs::FinishReviewRun;
 use projects::review::state::ReviewStateUpdate;
 use projects::skills::ProjectSkillSourceDir;
@@ -120,6 +117,7 @@ pub struct ProjectReviewQueueSummary {
     pub queued: Vec<u64>,
     pub deduped: Vec<u64>,
     pub ignored: Vec<u64>,
+    pub jobs: Vec<mai_protocol::ProjectReviewJobSummary>,
 }
 
 impl From<ProjectReviewPoolEnqueueSummary> for ProjectReviewQueueSummary {
@@ -128,16 +126,7 @@ impl From<ProjectReviewPoolEnqueueSummary> for ProjectReviewQueueSummary {
             queued: value.queued,
             deduped: value.deduped,
             ignored: value.ignored,
-        }
-    }
-}
-
-impl From<ProjectReviewRelayQueueEnqueueSummary> for ProjectReviewQueueSummary {
-    fn from(value: ProjectReviewRelayQueueEnqueueSummary) -> Self {
-        Self {
-            queued: value.queued,
-            deduped: value.deduped,
-            ignored: value.ignored,
+            jobs: Vec::new(),
         }
     }
 }
@@ -152,6 +141,8 @@ pub enum RuntimeError {
     ProjectNotFound(ProjectId),
     #[error("project review run not found: {0}")]
     ProjectReviewRunNotFound(Uuid),
+    #[error("project review job not found: {0}")]
+    ProjectReviewJobNotFound(Uuid),
     #[error("agent is busy: {0}")]
     AgentBusy(AgentId),
     #[error("task is busy: {0}")]

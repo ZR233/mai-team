@@ -105,6 +105,11 @@ impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
         Ok(agent.summary.read().await.clone())
     }
 
+    async fn agent_system_prompt(&self, agent_id: AgentId) -> Result<Option<String>> {
+        let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
+        Ok(agent.system_prompt.clone())
+    }
+
     async fn reviewer_model(&self) -> Result<AgentModelPreference> {
         Ok(self
             .resolve_role_agent_model(AgentRole::Reviewer)
@@ -185,6 +190,50 @@ impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
         Ok(())
     }
 
+    async fn attached_project_review_context(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<Option<Arc<projects::review::context::ProjectReviewContext>>> {
+        let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
+        Ok(agent.review_context.read().await.clone())
+    }
+
+    async fn ensure_project_reviewer_session(&self, agent_id: AgentId) -> Result<()> {
+        AgentRuntime::resolve_session_id(self.as_ref(), agent_id, None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn ensure_project_reviewer_container(
+        &self,
+        agent_id: AgentId,
+        target: projects::review::target::ResolvedProjectReviewTarget,
+        project_revision: projects::workspace::ProjectRepositoryRevision,
+        repository_view: projects::review::context::ProjectRepositoryView,
+    ) -> Result<()> {
+        let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
+        let project_id = agent.summary.read().await.project_id.ok_or_else(|| {
+            RuntimeError::InvalidInput("project reviewer is not attached to a project".to_string())
+        })?;
+        let source = self
+            .agent_container_source_for_project(
+                agent_id,
+                Some(project_id),
+                agents::ContainerSource::ProjectReviewWorkspace {
+                    target: projects::workspace::ProjectRepositoryReviewTarget {
+                        pr: target.pr,
+                        head_sha: target.head_sha,
+                    },
+                    revision: project_revision,
+                    repository_view,
+                },
+            )
+            .await?;
+        agents::ensure_agent_container_with_source(self.as_ref(), &agent, &source)
+            .await
+            .map(|_| ())
+    }
+
     async fn delete_project_review_context(
         &self,
         project_id: ProjectId,
@@ -228,6 +277,7 @@ impl projects::review::selector::ProjectReviewSelectorOps for Arc<AgentRuntime> 
 }
 
 impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
+    #[cfg(test)]
     async fn set_project_review_state(
         &self,
         project_id: ProjectId,
@@ -328,6 +378,32 @@ impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
         )
     }
 
+    async fn reviewer_progress(
+        &self,
+        reviewer_id: AgentId,
+    ) -> Result<projects::review::cycle::ReviewerProgress> {
+        let agent = AgentRuntime::agent(self.as_ref(), reviewer_id).await?;
+        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
+        let snapshot = self
+            .framework_handle()?
+            .snapshot(runtime_agent_id)
+            .await
+            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        let inactivity_timeout = reviewer_inactivity_timeout(self, &snapshot)?;
+        Ok(projects::review::cycle::ReviewerProgress {
+            revision: snapshot.revision,
+            inactivity_timeout,
+        })
+    }
+
+    fn cancel_reviewer_turn(
+        &self,
+        reviewer_id: AgentId,
+        turn_id: TurnId,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        AgentRuntime::cancel_agent_turn(self, reviewer_id, turn_id)
+    }
+
     fn reviewer_final_response(
         &self,
         reviewer_id: AgentId,
@@ -345,12 +421,110 @@ impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
             .is_some_and(|context| context.target_is_stale()))
     }
 
+    #[cfg(test)]
     fn delete_agent(
         &self,
         agent_id: AgentId,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         AgentRuntime::delete_agent(self.as_ref(), agent_id)
     }
+}
+
+impl projects::review::job_attempt::ProjectReviewJobAttemptOps for Arc<AgentRuntime> {
+    async fn save_claimed_project_review_job(
+        &self,
+        job: ProjectReviewJobSummary,
+        owner: String,
+    ) -> Result<bool> {
+        Ok(self
+            .deps
+            .store
+            .save_claimed_project_review_job(job, owner)
+            .await?)
+    }
+
+    fn resume_project_reviewer(
+        &self,
+        job: ProjectReviewJobSummary,
+        reviewer_id: AgentId,
+    ) -> impl std::future::Future<
+        Output = Result<projects::review::reviewer::PreparedProjectReviewer>,
+    > + Send {
+        projects::review::reviewer::resume_project_reviewer(
+            self,
+            job.project_id,
+            job.id,
+            reviewer_id,
+            projects::review::target::ProjectReviewRequest {
+                pr: job.pr,
+                head_sha_hint: Some(job.head_sha),
+            },
+        )
+    }
+
+    async fn cleanup_timed_out_review_preparation(&self, project_id: ProjectId) -> Result<()> {
+        for reviewer in self.project_auto_reviewer_agents(project_id).await {
+            AgentRuntime::delete_agent(self.as_ref(), reviewer.id).await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_project_review_job_projection(&self, job: ProjectReviewJobSummary) {
+        projects::review::job_worker::refresh_project_review_job_projection(
+            self,
+            job.project_id,
+            &job,
+            None,
+            None,
+        )
+        .await;
+    }
+}
+
+fn reviewer_inactivity_timeout(
+    runtime: &AgentRuntime,
+    snapshot: &pl_core::AgentSnapshot,
+) -> Result<std::time::Duration> {
+    const RUNNING_INACTIVITY_SECS: u64 = 10 * 60;
+    const TOOL_TIMEOUT_GRACE_SECS: u64 = 60;
+    let mut timeout = std::time::Duration::from_secs(RUNNING_INACTIVITY_SECS);
+    if snapshot.activity != pl_core::AgentActivityState::WaitingTool {
+        return Ok(timeout);
+    }
+    let Some(session_id) = snapshot.active_session_id.as_ref() else {
+        return Ok(timeout);
+    };
+    let view = runtime
+        .framework_handle()?
+        .session_snapshot(session_id)
+        .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+    let declared_timeout = view.parts.iter().rev().find_map(|part| {
+        if !matches!(
+            part.status,
+            pl_protocol::SessionPartStatus::Running
+                | pl_protocol::SessionPartStatus::Approved
+                | pl_protocol::SessionPartStatus::AwaitingApproval
+        ) {
+            return None;
+        }
+        let pl_protocol::SessionPartContent::Tool { tool } = &part.content else {
+            return None;
+        };
+        (tool.name == pl_core::TOOL_EXEC)
+            .then(|| serde_json::from_str::<serde_json::Value>(&tool.arguments).ok())
+            .flatten()
+            .and_then(|arguments| {
+                arguments
+                    .get("timeoutSeconds")
+                    .and_then(|value| value.as_u64())
+            })
+    });
+    if let Some(declared_timeout) = declared_timeout {
+        timeout = timeout.max(std::time::Duration::from_secs(
+            declared_timeout.saturating_add(TOOL_TIMEOUT_GRACE_SECS),
+        ));
+    }
+    Ok(timeout)
 }
 
 impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
@@ -386,6 +560,7 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
             .await?)
     }
 
+    #[cfg(test)]
     async fn finish_project_review_run(&self, request: FinishReviewRun) -> Result<()> {
         projects::review::runs::finish_project_review_run(&self.deps.store, self.as_ref(), request)
             .await
@@ -460,6 +635,7 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
         )
     }
 
+    #[cfg(test)]
     fn select_project_review_pr(
         &self,
         project_id: ProjectId,
@@ -471,6 +647,7 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
         projects::review::eligibility::select_project_review_pr(self, project_id, pr, head_sha_hint)
     }
 
+    #[cfg(test)]
     fn enqueue_project_review_signals(
         &self,
         project_id: ProjectId,
@@ -479,6 +656,7 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
         AgentRuntime::enqueue_project_review_signals(self, project_id, signals, false)
     }
 
+    #[cfg(test)]
     fn run_project_review_once(
         &self,
         project_id: ProjectId,
@@ -486,6 +664,130 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
         request: projects::review::target::ProjectReviewRequest,
     ) -> impl std::future::Future<Output = Result<ProjectReviewCycleResult>> + Send {
         AgentRuntime::run_project_review_once(self, project_id, cancellation_token, request)
+    }
+
+    async fn project_has_active_review_jobs(&self, project_id: ProjectId) -> Result<bool> {
+        Ok(self
+            .deps
+            .store
+            .project_has_active_review_jobs(project_id)
+            .await?)
+    }
+
+    async fn claim_due_project_review_job(
+        &self,
+        project_id: ProjectId,
+        owner: String,
+        now: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+    ) -> Result<Option<ProjectReviewJobSummary>> {
+        Ok(self
+            .deps
+            .store
+            .claim_due_project_review_job(project_id, owner, now, lease_expires_at)
+            .await?)
+    }
+
+    async fn load_project_review_job(
+        &self,
+        project_id: ProjectId,
+        job_id: Uuid,
+    ) -> Result<Option<ProjectReviewJobSummary>> {
+        Ok(self
+            .deps
+            .store
+            .load_project_review_job(project_id, job_id)
+            .await?)
+    }
+
+    async fn load_active_project_review_job(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Option<ProjectReviewJobSummary>> {
+        Ok(self
+            .deps
+            .store
+            .load_active_project_review_job(project_id)
+            .await?)
+    }
+
+    async fn save_claimed_project_review_job(
+        &self,
+        job: ProjectReviewJobSummary,
+        owner: String,
+    ) -> Result<bool> {
+        Ok(self
+            .deps
+            .store
+            .save_claimed_project_review_job(job, owner)
+            .await?)
+    }
+
+    async fn heartbeat_project_review_job(
+        &self,
+        job_id: Uuid,
+        owner: String,
+        updated_at: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        Ok(self
+            .deps
+            .store
+            .heartbeat_project_review_job(job_id, owner, updated_at, lease_expires_at)
+            .await?)
+    }
+
+    async fn recover_expired_project_review_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
+        Ok(self
+            .deps
+            .store
+            .recover_expired_project_review_jobs(now)
+            .await?)
+    }
+
+    async fn cancel_active_project_review_jobs(
+        &self,
+        project_id: ProjectId,
+        now: DateTime<Utc>,
+    ) -> Result<usize> {
+        Ok(self
+            .deps
+            .store
+            .cancel_active_project_review_jobs(project_id, now)
+            .await?)
+    }
+
+    fn run_project_review_job_attempt(
+        &self,
+        job: ProjectReviewJobSummary,
+        owner: String,
+        cancellation_token: CancellationToken,
+    ) -> impl std::future::Future<Output = Result<ProjectReviewCycleResult>> + Send {
+        AgentRuntime::run_project_review_job_attempt(self, job, owner, cancellation_token)
+    }
+
+    async fn reconcile_project_review_job(
+        &self,
+        job: ProjectReviewJobSummary,
+    ) -> Result<Option<ProjectReviewSubmissionReceipt>> {
+        let intent = job.submission_intent.as_ref().ok_or_else(|| {
+            RuntimeError::InvalidInput(format!(
+                "review job {} has no submission intent to reconcile",
+                job.id
+            ))
+        })?;
+        let project = AgentRuntime::project(self.as_ref(), job.project_id).await?;
+        let project_summary = project.summary.read().await.clone();
+        let token = self
+            .project_git_token(job.project_id)
+            .await?
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(
+                    "project git account token is not configured".to_string(),
+                )
+            })?;
+        self.reconcile_project_review_submission(&token, &project_summary, intent)
+            .await
     }
 
     async fn agent_current_turn(&self, agent_id: AgentId) -> Result<Option<TurnId>> {
@@ -499,6 +801,32 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
         turn_id: TurnId,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         AgentRuntime::cancel_agent_turn(self, agent_id, turn_id)
+    }
+
+    async fn find_project_review_job_reviewer(
+        &self,
+        job: ProjectReviewJobSummary,
+    ) -> Result<Option<AgentId>> {
+        if job.reviewer_agent_id.is_some() {
+            return Ok(job.reviewer_agent_id);
+        }
+        let request = projects::review::target::ProjectReviewRequest {
+            pr: job.pr,
+            head_sha_hint: Some(job.head_sha.clone()),
+        };
+        for reviewer in self.project_auto_reviewer_agents(job.project_id).await {
+            if projects::review::reviewer::reviewer_belongs_to_job(
+                self,
+                reviewer.id,
+                job.id,
+                &request,
+            )
+            .await?
+            {
+                return Ok(Some(reviewer.id));
+            }
+        }
+        Ok(None)
     }
 
     fn delete_agent(
