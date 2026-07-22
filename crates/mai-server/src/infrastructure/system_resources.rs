@@ -242,6 +242,8 @@ mod tests {
         assert!(contents.contains("restart paginated reading from line 1"));
         assert!(contents.contains("do not use its optional cursor"));
         assert!(contents.contains("one logical final review request"));
+        assert!(!contents.contains("POSIX `sh`"));
+        assert!(!contents.contains("`bash -lc`"));
         assert!(!contents.contains("/tmp/mai-review-findings.md"));
     }
 
@@ -262,6 +264,8 @@ mod tests {
         assert!(reviewer_contents.contains("`search_session_note`"));
         assert!(reviewer_contents.contains("`read_session_note`"));
         assert!(reviewer_contents.contains("one logical final pull request review"));
+        assert!(!reviewer_contents.contains("POSIX `sh`"));
+        assert!(!reviewer_contents.contains("`bash -lc`"));
         assert!(!reviewer_contents.contains("/tmp/mai-review-findings.md"));
     }
 

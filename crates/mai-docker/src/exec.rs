@@ -336,7 +336,10 @@ impl DockerClient {
         Ok(cmd.spawn()?)
     }
 
-    /// 通过 `spawn_exec` 启动带容器内 PID 台账的命令，供统一 Agent 进程管理器使用。
+    /// 通过固定生命周期启动器执行原始 `/bin/sh -c` 命令，并维护容器内 PID 台账。
+    ///
+    /// 原始命令作为独立 argv 传给内层 shell，不经过登录 shell、拼接或 `eval`，
+    /// 因而与 PL Unix 本地后端保持相同的单次解析语义。
     pub fn spawn_managed_exec(
         &self,
         container_id: &str,
@@ -345,14 +348,8 @@ impl DockerClient {
         cwd: Option<&str>,
     ) -> Result<Child> {
         let pid_file = managed_exec_pid_file(process_id)?;
-        let wrapped = managed_exec_shell_command(&pid_file, command);
-        self.spawn_exec(
-            container_id,
-            "/bin/sh",
-            &["-lc".to_string(), wrapped],
-            cwd,
-            &[],
-        )
+        let args = managed_exec_shell_args(&pid_file, command);
+        self.spawn_exec(container_id, "/bin/sh", &args, cwd, &[])
     }
 
     /// 同时终止容器内命令进程组和宿主 Docker CLI 进程树。
@@ -363,14 +360,16 @@ impl DockerClient {
         host_pid: Option<u32>,
     ) {
         if let Ok(pid_file) = managed_exec_pid_file(process_id) {
-            let _ = self
-                .exec_shell(
+            let _ = timeout(
+                Duration::from_secs(5),
+                self.exec_shell(
                     container_id,
                     &managed_exec_kill_command(&pid_file),
                     Some("/"),
-                    Some(5),
-                )
-                .await;
+                    None,
+                ),
+            )
+            .await;
         }
         terminate_spawned_exec(host_pid).await;
     }
@@ -387,7 +386,7 @@ impl DockerClient {
                 .arg("exec")
                 .arg(container_id)
                 .arg("/bin/sh")
-                .args(["-lc", &managed_exec_kill_command(&pid_file)])
+                .args(["-c", &managed_exec_kill_command(&pid_file)])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -437,12 +436,22 @@ impl DockerClient {
     }
 }
 
-fn managed_exec_shell_command(pid_file: &str, command: &str) -> String {
-    format!(
-        "pid_file={pid_file}; printf '%s\\n' \"$$\" > \"$pid_file\"; trap 'rm -f \"$pid_file\"' EXIT; eval {command}",
-        pid_file = pl_core::shell_quote_word(pid_file),
-        command = pl_core::shell_quote_word(command),
-    )
+const MANAGED_EXEC_LAUNCHER: &str = r#"pid_file=$1
+shift
+printf '%s\n' "$$" > "$pid_file" || exit 125
+trap 'rm -f "$pid_file"' 0
+"$@""#;
+
+fn managed_exec_shell_args(pid_file: &str, command: &str) -> Vec<String> {
+    vec![
+        "-c".to_string(),
+        MANAGED_EXEC_LAUNCHER.to_string(),
+        "mai-managed-exec".to_string(),
+        pid_file.to_string(),
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        command.to_string(),
+    ]
 }
 
 /// 终止 `spawn_exec` 启动的宿主 Docker CLI 进程树。
@@ -792,10 +801,30 @@ mod tests {
         assert!(args.contains("-w\n/workspace/repo"), "{args}");
         assert!(args.contains("container-1"), "{args}");
         assert!(args.contains("/tmp/mai-proc-7.pid"), "{args}");
-        assert!(
-            args.contains("eval ") && args.contains("hello world"),
-            "{args}"
+        assert!(args.contains("hello world"), "{args}");
+        assert!(!args.contains("eval "), "{args}");
+        assert!(!args.lines().any(|arg| arg == "-lc"), "{args}");
+    }
+
+    #[test]
+    fn managed_exec_passes_the_original_command_as_one_argv() {
+        let command = "set -e\nprintf '%s\\n' \"$HOME\"\ncat <<'EOF'\nquoted ' content\nEOF";
+
+        let args = managed_exec_shell_args("/tmp/mai-proc-8.pid", command);
+
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                MANAGED_EXEC_LAUNCHER,
+                "mai-managed-exec",
+                "/tmp/mai-proc-8.pid",
+                "/bin/sh",
+                "-c",
+                command,
+            ]
         );
+        assert!(!MANAGED_EXEC_LAUNCHER.contains("eval"));
     }
 
     #[test]
@@ -805,10 +834,10 @@ mod tests {
             unique_test_path_id()
         ));
         let command = "set -e\ncat <<'FIRST'\nalpha 'beta'\nFIRST\nprintf '%s\\n' separator\ncat <<'SECOND'\ngamma\nSECOND";
-        let wrapped = managed_exec_shell_command(&pid_file.display().to_string(), command);
+        let args = managed_exec_shell_args(&pid_file.display().to_string(), command);
 
         let output = std::process::Command::new("/bin/sh")
-            .args(["-lc", &wrapped])
+            .args(args)
             .output()
             .expect("run managed command wrapper");
 
@@ -822,6 +851,194 @@ mod tests {
             "alpha 'beta'\nseparator\ngamma\n"
         );
         assert!(!pid_file.exists());
+    }
+
+    #[test]
+    fn managed_exec_user_exit_trap_cannot_override_pid_cleanup() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "mai-managed-exec-wrapper-{}.pid",
+            unique_test_path_id()
+        ));
+        let command = r#"trap 'printf "%s\n" user-exit' 0; printf "%s\n" body"#;
+        let args = managed_exec_shell_args(&pid_file.display().to_string(), command);
+
+        let output = std::process::Command::new("/bin/sh")
+            .args(args)
+            .output()
+            .expect("run managed command wrapper");
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "body\nuser-exit\n"
+        );
+        assert!(!pid_file.exists(), "managed PID ledger must be removed");
+    }
+
+    #[test]
+    fn managed_exec_matches_direct_posix_sh_contract() {
+        for command in [
+            r#"value="alpha beta"; printf '<%s>\n' "$value""#,
+            r#"printf '%s\n' "$(printf command-substitution)" | tr a-z A-Z"#,
+            "cat <<'EOF'\nfirst 'quoted' line\nsecond line\nEOF",
+            r#"printf '%s\n' redirected >&2"#,
+            "set -e; false; printf '%s\\n' unreachable",
+            "exit 7",
+            r#"exec /bin/sh -c 'printf "%s\n" exec-ok'"#,
+        ] {
+            let pid_file = std::env::temp_dir().join(format!(
+                "mai-managed-exec-contract-{}.pid",
+                unique_test_path_id()
+            ));
+            let direct = std::process::Command::new("/bin/sh")
+                .args(["-c", command])
+                .output()
+                .expect("run direct sh command");
+            let managed = std::process::Command::new("/bin/sh")
+                .args(managed_exec_shell_args(
+                    &pid_file.display().to_string(),
+                    command,
+                ))
+                .output()
+                .expect("run managed sh command");
+
+            assert_eq!(managed.status.code(), direct.status.code(), "{command}");
+            assert_eq!(managed.stdout, direct.stdout, "{command}");
+            assert_eq!(managed.stderr, direct.stderr, "{command}");
+            assert!(!pid_file.exists(), "{command}");
+        }
+    }
+
+    #[test]
+    fn managed_exec_forwards_stdin_to_inner_shell() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "mai-managed-exec-stdin-{}.pid",
+            unique_test_path_id()
+        ));
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(managed_exec_shell_args(
+                &pid_file.display().to_string(),
+                "IFS= read -r line; printf 'got:%s\\n' \"$line\"",
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn managed stdin command");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(b"hello world\n")
+            .expect("write stdin");
+
+        let output = child.wait_with_output().expect("wait for managed command");
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "got:hello world\n"
+        );
+        assert!(!pid_file.exists());
+    }
+
+    #[tokio::test]
+    async fn managed_exec_real_container_matches_posix_sh_when_configured() {
+        let Some(container_id) = std::env::var_os("MAI_DOCKER_TEST_CONTAINER") else {
+            return;
+        };
+        let container_id = container_id.to_string_lossy();
+        let process_id = format!("integration-{}", unique_test_path_id());
+        let client = DockerClient::new("unused-image");
+        let command = r#"trap 'printf "%s\n" user-exit' 0
+cat <<'EOF'
+alpha 'beta'
+EOF
+printf '%s\n' "$(printf command-substitution)""#;
+
+        let child = client
+            .spawn_managed_exec(&container_id, &process_id, command, Some("/tmp"))
+            .expect("spawn managed command in real container");
+        let output = child.wait_with_output().await.expect("wait for command");
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "alpha 'beta'\ncommand-substitution\nuser-exit\n"
+        );
+        let cleanup = client
+            .exec_shell(
+                &container_id,
+                &format!("test ! -e /tmp/mai-{process_id}.pid"),
+                Some("/tmp"),
+                None,
+            )
+            .await
+            .expect("check PID cleanup");
+        assert_eq!(cleanup.status, 0, "{}", cleanup.stderr);
+    }
+
+    #[tokio::test]
+    async fn managed_exec_real_container_termination_cleans_the_process_group_when_configured() {
+        let Some(container_id) = std::env::var_os("MAI_DOCKER_TEST_CONTAINER") else {
+            return;
+        };
+        let container_id = container_id.to_string_lossy();
+        let process_id = format!("termination-{}", unique_test_path_id());
+        let pid_file = format!("/tmp/mai-{process_id}.pid");
+        let client = DockerClient::new("unused-image");
+        let mut child = client
+            .spawn_managed_exec(
+                &container_id,
+                &process_id,
+                "while :; do sleep 30; done",
+                Some("/tmp"),
+            )
+            .expect("spawn long managed command");
+        let host_pid = child.id();
+        let mut container_pid = None;
+        for _ in 0..20 {
+            let pid = client
+                .exec_shell(
+                    &container_id,
+                    &format!("cat {pid_file}"),
+                    Some("/tmp"),
+                    None,
+                )
+                .await
+                .expect("read managed PID ledger");
+            if pid.status == 0 && !pid.stdout.trim().is_empty() {
+                container_pid = Some(pid.stdout.trim().to_string());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let container_pid = container_pid.expect("managed PID ledger");
+
+        client
+            .terminate_managed_exec(&container_id, &process_id, host_pid)
+            .await;
+        let status = timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("docker exec must terminate")
+            .expect("wait for docker exec");
+        assert!(!status.success());
+
+        let cleanup = client
+            .exec_shell(
+                &container_id,
+                &format!(
+                    "test ! -e {pid_file} && ! kill -0 -- -{container_pid} 2>/dev/null && ! kill -0 {container_pid} 2>/dev/null"
+                ),
+                Some("/tmp"),
+                None,
+            )
+            .await
+            .expect("check process group cleanup");
+        assert_eq!(cleanup.status, 0, "{}", cleanup.stderr);
     }
 
     #[test]

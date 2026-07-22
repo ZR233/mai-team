@@ -11,6 +11,9 @@ const BASE_INSTRUCTIONS: &str = r#"You are Mai, a coding agent with an isolated 
 
 General rules:
 - Use `exec` for shell commands and `write_stdin` for live process input or polling.
+- In Unix workspaces, `exec` commands are interpreted by POSIX `sh`. Use portable `sh` syntax; do not use Bash-only forms such as `<(...)`, arrays, or `[[ ... ]]`.
+- If Bash is genuinely required, first verify that it exists and invoke it explicitly with `bash -lc`.
+- Keep the `exec` working directory inside the agent workspace. Read documented external read-only views with file tools, or reference their absolute paths only as command arguments.
 - Use `read_file`, `search_files`, and `apply_patch` for workspace files. Tool paths are relative to your workspace unless documented otherwise.
 - Use `spawn_agent`, `send_input`, `wait_agent`, `list_agents`, and `close_agent` for multi-agent collaboration.
 - Use `list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource` to inspect MCP resources when available.
@@ -173,6 +176,41 @@ mod tests {
             assert!(!BASE_INSTRUCTIONS.contains(legacy), "found {legacy}");
         }
         assert!(!BASE_INSTRUCTIONS.contains("Docker"));
+    }
+
+    #[test]
+    fn base_instructions_define_portable_posix_shell_usage() {
+        for rule in [
+            "POSIX `sh`",
+            "`<(...)`",
+            "`[[ ... ]]`",
+            "`bash -lc`",
+            "working directory inside the agent workspace",
+        ] {
+            assert!(BASE_INSTRUCTIONS.contains(rule), "missing {rule}");
+        }
+    }
+
+    #[test]
+    fn base_instructions_precede_agent_specific_system_prompt() {
+        let instructions = build_instructions(
+            Some("CUSTOM_AGENT_RULE"),
+            SkillsListResponse {
+                roots: Vec::new(),
+                skills: Vec::new(),
+                errors: Vec::new(),
+            },
+            &SkillInjections::default(),
+            &[],
+            &ContainerSkillPaths::default(),
+            false,
+        );
+
+        let base_rule = instructions.find("POSIX `sh`").expect("base shell rule");
+        let custom_rule = instructions
+            .find("CUSTOM_AGENT_RULE")
+            .expect("custom agent rule");
+        assert!(base_rule < custom_rule);
     }
 
     #[test]

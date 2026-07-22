@@ -382,6 +382,8 @@ mod tests {
             assert!(prompt.contains("do not use its optional cursor"));
             assert!(prompt.contains("one logical final pull request review"));
             assert!(prompt.contains("never fall back to a temporary file"));
+            assert!(!prompt.contains("POSIX `sh`"));
+            assert!(!prompt.contains("`bash -lc`"));
             assert!(!prompt.contains("/tmp/mai-review-findings.md"));
             assert!(matches!(
                 source,
