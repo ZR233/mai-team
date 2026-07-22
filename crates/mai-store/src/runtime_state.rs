@@ -18,6 +18,19 @@ impl MaiStore {
         system_prompt: Option<&str>,
         runtime_agent_id: &str,
     ) -> Result<()> {
+        crate::sqlite_busy::retry_sqlite_busy(|| async {
+            self.save_agent_with_runtime_id_once(summary, system_prompt, runtime_agent_id)
+                .await
+        })
+        .await
+    }
+
+    async fn save_agent_with_runtime_id_once(
+        &self,
+        summary: &AgentSummary,
+        system_prompt: Option<&str>,
+        runtime_agent_id: &str,
+    ) -> Result<()> {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         delete_agent_row_in_tx(&mut tx, summary.id).await?;
@@ -48,6 +61,11 @@ impl MaiStore {
     }
 
     pub async fn delete_agent(&self, agent_id: AgentId) -> Result<()> {
+        crate::sqlite_busy::retry_sqlite_busy(|| async { self.delete_agent_once(agent_id).await })
+            .await
+    }
+
+    async fn delete_agent_once(&self, agent_id: AgentId) -> Result<()> {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         let runtime_agent_id = Query::<List<AgentRecordRow>>::filter(

@@ -199,6 +199,16 @@ impl MaiStore {
         &self,
         document: AgentRuntimeCommitDocument,
     ) -> Result<AgentRuntimeCommitOutcome> {
+        crate::sqlite_busy::retry_sqlite_busy(|| async {
+            self.commit_agent_runtime_once(&document).await
+        })
+        .await
+    }
+
+    async fn commit_agent_runtime_once(
+        &self,
+        document: &AgentRuntimeCommitDocument,
+    ) -> Result<AgentRuntimeCommitOutcome> {
         let agent_id = document.runtime.state.agent_id.clone();
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;

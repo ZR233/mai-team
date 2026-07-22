@@ -42,18 +42,38 @@ mod tests {
     }
 
     #[test]
-    fn pure_lang_dependencies_use_local_pr_checkout() {
+    fn pure_lang_dependencies_use_upstream_main() {
         let manifest = include_str!("../../../../Cargo.toml");
         for package in ["pl-core", "pl-model", "pl-protocol", "pl-trace"] {
             let line = manifest
                 .lines()
                 .find(|line| line.starts_with(&format!("{package} = ")))
                 .expect("workspace dependency must exist");
-            let expected_path = format!("path = \"../pure-lang-pr/code/{package}\"");
             assert!(
-                line.contains(&expected_path),
-                "{package} must use the local pure-lang-pr checkout"
+                line.contains("git = \"ssh://git@github.com/ZR233/pure-lang.git\"")
+                    && line.contains("branch = \"main\"")
+                    && !line.contains("path ="),
+                "{package} must use the pure-lang upstream main branch"
             );
+        }
+    }
+
+    #[test]
+    fn pure_lang_shared_tools_include_session_note_contract() {
+        let names = pl_core::shared_tool_names(
+            pl_core::SharedToolSchemaOptions::from_capabilities(
+                &pl_core::ToolCapabilityConfig::container_workspace(),
+            )
+            .with_plan_exit(false),
+        );
+
+        for name in [
+            pl_core::TOOL_READ_SESSION_NOTE,
+            pl_core::TOOL_SEARCH_SESSION_NOTE,
+            pl_core::TOOL_WRITE_SESSION_NOTE,
+            pl_core::TOOL_APPLY_SESSION_NOTE_PATCH,
+        ] {
+            assert!(names.iter().any(|candidate| candidate == name), "{name}");
         }
     }
 

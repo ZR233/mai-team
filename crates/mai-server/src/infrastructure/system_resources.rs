@@ -212,6 +212,37 @@ mod tests {
         let skill_path = target.join("reviewer-agent-review-pr").join("SKILL.md");
         let contents = fs::read_to_string(skill_path).expect("skill contents");
         assert!(contents.contains("name: reviewer-agent-review-pr"));
+        assert!(contents.contains("`write_session_note` once with `expectedRevision: 0`"));
+        assert!(contents.contains("Initialize the note with immutable metadata only"));
+        assert!(contents.contains("Do not add progress checkboxes"));
+        assert!(contents.contains("immediately append one complete Markdown block"));
+        assert!(contents.contains("`apply_session_note_patch`"));
+        for field in [
+            "- Status:",
+            "- Severity:",
+            "- File:",
+            "- Lines:",
+            "- Inline disposition:",
+            "- Problem:",
+            "- Impact and evidence:",
+            "- Suggested fix:",
+            "- Proposed review text:",
+        ] {
+            assert!(contents.contains(field), "missing finding field {field}");
+        }
+        assert!(contents.contains("must never replace or delete an existing line"));
+        assert!(contents.contains("using the real current head line"));
+        assert!(contents.contains("Never update a progress checklist"));
+        assert!(contents.contains("never patch the earlier block in place"));
+        assert!(contents.contains("read the entire findings ledger"));
+        assert!(contents.contains("`startLine: 1`"));
+        assert!(contents.contains("`maxLines: 500`"));
+        assert!(contents.contains("latest known revision as `expectedRevision`"));
+        assert!(contents.contains("each non-empty `nextStartLine`"));
+        assert!(contents.contains("restart paginated reading from line 1"));
+        assert!(contents.contains("do not use its optional cursor"));
+        assert!(contents.contains("one logical final review request"));
+        assert!(!contents.contains("/tmp/mai-review-findings.md"));
     }
 
     #[test]
@@ -225,7 +256,13 @@ mod tests {
         let reviewer_path = target.join("project-reviewer").join("AGENT.md");
         let contents = fs::read_to_string(maintainer_path).expect("agent contents");
         assert!(contents.contains("id: project-maintainer"));
-        assert!(reviewer_path.exists());
+        let reviewer_contents = fs::read_to_string(reviewer_path).expect("reviewer contents");
+        assert!(reviewer_contents.contains("`write_session_note`"));
+        assert!(reviewer_contents.contains("`apply_session_note_patch`"));
+        assert!(reviewer_contents.contains("`search_session_note`"));
+        assert!(reviewer_contents.contains("`read_session_note`"));
+        assert!(reviewer_contents.contains("one logical final pull request review"));
+        assert!(!reviewer_contents.contains("/tmp/mai-review-findings.md"));
     }
 
     #[test]

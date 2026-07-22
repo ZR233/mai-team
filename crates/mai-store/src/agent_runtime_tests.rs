@@ -3,6 +3,8 @@ use mai_protocol::{
     AgentMessage, AgentResourceState, AgentState, AgentSummary, MessageRole, TokenUsage,
 };
 use pretty_assertions::assert_eq;
+use std::path::PathBuf;
+use tokio::time::{Duration, timeout};
 
 use crate::records::{AgentRuntimeEventRecord, AgentRuntimeTraceRecord};
 use crate::{
@@ -40,6 +42,30 @@ async fn runtime_commit_is_atomic_and_revision_checked() {
         vec![first.runtime]
     );
     assert_eq!(runtime_projection_counts(&store).await, (1, 1));
+}
+
+#[tokio::test]
+async fn runtime_commit_waits_for_temporary_sqlite_write_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = MaiStore::open_with_config_path(
+        temp.path().join("mai.sqlite3"),
+        temp.path().join("config.toml"),
+    )
+    .await
+    .unwrap();
+    let holder = hold_sqlite_write_lock(store.path().to_path_buf());
+
+    assert_eq!(
+        timeout(
+            Duration::from_secs(12),
+            store.commit_agent_runtime(document(None, 1, "queued")),
+        )
+        .await
+        .expect("runtime commit timeout")
+        .expect("runtime commit"),
+        AgentRuntimeCommitOutcome::Applied
+    );
+    holder.join().expect("lock holder");
 }
 
 #[tokio::test]
@@ -160,33 +186,8 @@ async fn deleting_product_agent_removes_mapped_framework_state() {
     .await
     .unwrap();
     let product_agent_id = uuid::Uuid::new_v4();
-    let now = Utc::now();
     store
-        .save_agent_with_runtime_id(
-            &AgentSummary {
-                id: product_agent_id,
-                parent_id: None,
-                task_id: None,
-                project_id: None,
-                role: None,
-                name: "agent".to_string(),
-                state: AgentState {
-                    resource: AgentResourceState::Ready,
-                    ..AgentState::default()
-                },
-                container_id: None,
-                docker_image: "ubuntu:latest".to_string(),
-                provider_id: "openai".to_string(),
-                provider_name: "OpenAI".to_string(),
-                model: "gpt-5".to_string(),
-                reasoning_effort: None,
-                created_at: now,
-                updated_at: now,
-                token_usage: TokenUsage::default(),
-            },
-            None,
-            "agent-1",
-        )
+        .save_agent_with_runtime_id(&agent_summary(product_agent_id), None, "agent-1")
         .await
         .unwrap();
     store
@@ -205,6 +206,82 @@ async fn deleting_product_agent_removes_mapped_framework_state() {
             .agents
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn delete_agent_waits_for_temporary_sqlite_write_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = MaiStore::open_with_config_path(
+        temp.path().join("mai.sqlite3"),
+        temp.path().join("config.toml"),
+    )
+    .await
+    .unwrap();
+    let product_agent_id = uuid::Uuid::new_v4();
+    store
+        .save_agent_with_runtime_id(&agent_summary(product_agent_id), None, "agent-1")
+        .await
+        .unwrap();
+    store
+        .commit_agent_runtime(document(None, 1, "queued"))
+        .await
+        .unwrap();
+    let holder = hold_sqlite_write_lock(store.path().to_path_buf());
+
+    timeout(
+        Duration::from_secs(12),
+        store.delete_agent(product_agent_id),
+    )
+    .await
+    .expect("delete agent timeout")
+    .expect("delete agent");
+    holder.join().expect("lock holder");
+
+    assert_eq!(store.load_agent_runtimes().await.unwrap(), Vec::new());
+}
+
+fn hold_sqlite_write_lock(path: PathBuf) -> std::thread::JoinHandle<()> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let connection = rusqlite::Connection::open(path).expect("open lock holder");
+        connection
+            .execute("BEGIN IMMEDIATE", [])
+            .expect("hold write lock");
+        ready_tx.send(()).expect("signal write lock");
+        std::thread::sleep(Duration::from_secs(6));
+        connection
+            .execute("COMMIT", [])
+            .expect("release write lock");
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("write lock is held");
+    holder
+}
+
+fn agent_summary(id: uuid::Uuid) -> AgentSummary {
+    let now = Utc::now();
+    AgentSummary {
+        id,
+        parent_id: None,
+        task_id: None,
+        project_id: None,
+        role: None,
+        name: "agent".to_string(),
+        state: AgentState {
+            resource: AgentResourceState::Ready,
+            ..AgentState::default()
+        },
+        container_id: None,
+        docker_image: "ubuntu:latest".to_string(),
+        provider_id: "openai".to_string(),
+        provider_name: "OpenAI".to_string(),
+        model: "gpt-5".to_string(),
+        reasoning_effort: None,
+        created_at: now,
+        updated_at: now,
+        token_usage: TokenUsage::default(),
+    }
 }
 
 fn document(

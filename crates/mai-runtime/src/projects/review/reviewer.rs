@@ -367,6 +367,22 @@ mod tests {
             assert!(prompt.contains("`/workspace/repo`"));
             assert!(prompt.contains("base snapshot `base-sha`"));
             assert!(prompt.contains("PR #24 at head `head-sha`"));
+            assert!(prompt.contains("`write_session_note` using `expectedRevision: 0`"));
+            assert!(prompt.contains("recording only immutable metadata"));
+            assert!(prompt.contains("Do not add progress checkboxes"));
+            assert!(prompt.contains("immediately append its complete record"));
+            assert!(prompt.contains("`apply_session_note_patch`"));
+            assert!(prompt.contains("never overwrite the note"));
+            assert!(prompt.contains("changes or removes an existing line"));
+            assert!(prompt.contains("entire ledger with paginated `read_session_note` calls"));
+            assert!(prompt.contains("start at line 1 with at most 500 lines"));
+            assert!(prompt.contains("keep the returned revision fixed as `expectedRevision`"));
+            assert!(prompt.contains("every non-empty `nextStartLine`"));
+            assert!(prompt.contains("restart reading from line 1"));
+            assert!(prompt.contains("do not use its optional cursor"));
+            assert!(prompt.contains("one logical final pull request review"));
+            assert!(prompt.contains("never fall back to a temporary file"));
+            assert!(!prompt.contains("/tmp/mai-review-findings.md"));
             assert!(matches!(
                 source,
                 ContainerSource::ProjectReviewWorkspace { repository_view, .. }
