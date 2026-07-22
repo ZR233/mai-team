@@ -7,12 +7,11 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import type { NormalizedSession } from "@/events/session-reducer"
-import type { SessionPart, SessionTimelineEvent } from "@/events/session-events.generated"
+import type { SessionPart } from "@/events/session-events.generated"
 import { cn } from "@/lib/utils"
 
 export function SessionTimeline({ view }: { view: NormalizedSession }) {
-  const hasTimeline = view.messageOrder.length > 0 || view.timelineEvents.length > 0
-  if (!hasTimeline) {
+  if (view.messageOrder.length === 0) {
     return <EmptyState title="No messages yet" description="Send a message to start this session." />
   }
   return (
@@ -23,7 +22,6 @@ export function SessionTimeline({ view }: { view: NormalizedSession }) {
         const parts = (view.partOrderByMessage[messageId] ?? []).map((partId) => view.parts[partId]).filter(Boolean)
         return <MessageRow key={messageId} role={message.role} parts={parts} status={message.status} />
       })}
-      {view.timelineEvents.map((event) => <TimelineFact key={event.eventId} event={event.kind} />)}
     </div>
   )
 }
@@ -115,24 +113,4 @@ function ToolArtifact({ artifact }: { artifact: Record<string, unknown> }) {
   return id
     ? <a href={`/artifacts/${encodeURIComponent(id)}/download`} download className="flex items-center gap-2 rounded-md border px-2.5 py-2 text-xs hover:bg-muted">{content}</a>
     : <div className="flex items-center gap-2 rounded-md border px-2.5 py-2 text-xs text-muted-foreground">{content}</div>
-}
-
-function TimelineFact({ event }: { event: SessionTimelineEvent["kind"] }) {
-  if (event.type === "todoListChanged") {
-    const snapshot = event.snapshot
-    return (
-      <div className="ml-11 rounded-lg border bg-muted/40 px-4 py-3">
-        <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Working list</div>
-        <div className="flex flex-col gap-1.5">
-          {snapshot.items.map((item, index) => (
-            <div key={`${item.step}:${index}`} className="flex items-start gap-2 text-sm">
-              <CheckCircle2 className={cn("mt-0.5 size-4 text-muted-foreground", item.status === "inProgress" && "animate-pulse text-foreground", item.status === "completed" && "text-foreground")} />
-              <span>{item.step}</span>
-            </div>
-          ))}
-        </div>
-      </div>
-    )
-  }
-  return null
 }

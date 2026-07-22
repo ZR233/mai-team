@@ -14,7 +14,9 @@ import { useSessionEvents } from "@/events/use-session-events"
 import { useSessionStore } from "@/events/session-store"
 import { AgentModelDialog } from "@/features/agents/agent-model-dialog"
 import { SessionTimeline } from "@/features/session/session-timeline"
+import { SessionTodoDrawer, SessionTodoRail, latestTodoSnapshot } from "@/features/session/session-todo-panel"
 import { SkillMentionPicker } from "@/features/session/skill-mention-picker"
+import { cn } from "@/lib/utils"
 
 interface SessionWorkspaceProps {
   agent: AgentDetail
@@ -51,9 +53,11 @@ export function SessionWorkspace({
   const [draft, setDraft] = useState("")
   const [sending, setSending] = useState(false)
   const [selectedSkills, setSelectedSkills] = useState<string[]>([])
+  const [todoExpanded, setTodoExpanded] = useState(true)
   const scroller = useRef<HTMLDivElement>(null)
   const canonicalTurn = view.sessionId === effectiveSessionId ? view.turn : undefined
   const activeTurnId = activeSessionTurnId(canonicalTurn)
+  const todoSnapshot = view.sessionId === effectiveSessionId ? latestTodoSnapshot(view.timelineEvents) : null
 
   useEffect(() => {
     const viewport = scroller.current?.querySelector("[data-radix-scroll-area-viewport]") as HTMLElement | null
@@ -77,7 +81,7 @@ export function SessionWorkspace({
   }
 
   return (
-    <section className="flex h-full min-h-0 flex-1 flex-col bg-background">
+    <section className="@container/session-workspace flex h-full min-h-0 flex-1 flex-col bg-background">
       {workspaceCrumbs ? (
         <WorkspaceHeader
           crumbs={workspaceCrumbs}
@@ -97,13 +101,27 @@ export function SessionWorkspace({
 
       {showSessions && <SessionTabs sessions={agent.sessions} selectedId={effectiveSessionId} onSelect={onSelectSession} onCreate={onCreateSession} />}
 
-      <ScrollArea ref={scroller} className="min-h-0 flex-1">
-        <div className="mx-auto w-full max-w-5xl px-5 md:px-8">
+      <ScrollArea ref={scroller} className="min-h-0 flex-1" data-session-timeline-scroll>
+        <div className={cn(
+          "mx-auto grid w-full max-w-5xl px-5 md:px-8",
+          todoSnapshot && "pb-12 transition-[grid-template-columns] duration-200 motion-reduce:transition-none @min-[52rem]/session-workspace:max-w-7xl @min-[52rem]/session-workspace:gap-6 @min-[52rem]/session-workspace:pb-0",
+          todoSnapshot && (todoExpanded
+            ? "@min-[52rem]/session-workspace:grid-cols-[minmax(0,1fr)_17rem]"
+            : "@min-[52rem]/session-workspace:grid-cols-[minmax(0,1fr)_3rem]"),
+        )}>
           <SessionTimeline view={view} />
+          {todoSnapshot && (
+            <SessionTodoRail
+              snapshot={todoSnapshot}
+              expanded={todoExpanded}
+              onExpandedChange={setTodoExpanded}
+            />
+          )}
         </div>
       </ScrollArea>
 
-      <div className="shrink-0 border-t bg-background px-3 py-3 md:px-6">
+      <div className="relative shrink-0 border-t bg-background px-3 py-3 md:px-6">
+        {todoSnapshot && <SessionTodoDrawer key={effectiveSessionId} snapshot={todoSnapshot} />}
         <div className="mx-auto max-w-5xl">
           <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
             <ConnectionStatus status={connection} message={connectionMessage} />

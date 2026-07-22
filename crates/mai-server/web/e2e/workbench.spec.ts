@@ -43,7 +43,11 @@ test("chat snapshot, skill mention, and route navigation stay functional", async
   await expect(page).toHaveTitle("Mai Team")
   await expect(page.getByRole("heading", { name: "Review", exact: true })).toBeVisible()
   await expect(page.getByText("Inspect the canonical session stream")).toBeVisible()
-  await expect(page.getByText("Read project constraints", { exact: true })).toBeVisible()
+  if (testInfo.project.name === "desktop") {
+    await expect(page.getByText("Read project constraints", { exact: true })).toBeVisible()
+  } else {
+    await expect(page.getByRole("button", { name: "Open working list" })).toBeVisible()
+  }
 
   await page.getByRole("button", { name: "Select skills" }).click()
   await page.getByRole("menuitemcheckbox", { name: /review-helper/i }).click()
@@ -77,7 +81,25 @@ test("chat workbench is usable at each configured viewport", async ({ page }, te
   await page.goto("/chat/env-1")
   await expect(page.getByRole("heading", { name: "Review", exact: true })).toBeVisible()
   await expect(page.getByPlaceholder(/Send a command/)).toBeVisible()
+  await expect(page.getByText("Outdated task", { exact: true })).toHaveCount(0)
   await expect(page).toHaveScreenshot(`chat-${testInfo.project.name}.png`, { animations: "disabled" })
+
+  if (testInfo.project.name === "desktop") {
+    const rail = page.locator("[data-session-todo-rail]")
+    await expect(rail).toBeVisible()
+    await expect(rail).toHaveCSS("position", "sticky")
+    await page.getByRole("button", { name: "Collapse working list" }).click()
+    await expect(page.getByRole("button", { name: "Expand working list" })).toBeVisible()
+    await expect(page).toHaveScreenshot("chat-todo-collapsed-desktop.png", { animations: "disabled" })
+  } else {
+    await page.getByRole("button", { name: "Open working list" }).click()
+    const drawer = page.locator('[data-slot="drawer-content"]')
+    await expect(drawer.getByRole("heading", { name: "Working list" })).toBeVisible()
+    await expect(drawer.getByText("Run focused checks", { exact: true })).toBeVisible()
+    await expect(page).toHaveScreenshot(`chat-todo-drawer-${testInfo.project.name}.png`, { animations: "disabled" })
+    await drawer.getByRole("button", { name: "Close working list" }).click()
+    await expect(drawer).not.toBeVisible()
+  }
 })
 
 test("review actions remain available at each configured viewport", async ({ page }, testInfo) => {
@@ -227,7 +249,7 @@ const environmentSummary = { id: "env-1", name: "TGOS review", status: "ready", 
 const environmentDetail = { ...environmentSummary, root_agent: rootAgent, conversations: [session], selected_conversation_id: "session-1" }
 
 const sessionFrame = { type: "snapshot", snapshot: {
-  schemaVersion: 1, sessionId: "session-1", throughSequence: 3,
+  schemaVersion: 1, sessionId: "session-1", throughSequence: 6,
   messages: [
     { messageId: "message-1", sessionId: "session-1", turnId: "turn-1", role: "user", status: "completed", createdAt: 1, updatedAt: 1 },
     { messageId: "message-2", sessionId: "session-1", turnId: "turn-1", role: "assistant", status: "completed", createdAt: 2, updatedAt: 3 },
@@ -237,7 +259,11 @@ const sessionFrame = { type: "snapshot", snapshot: {
     { partId: "part-2", messageId: "message-2", sessionId: "session-1", turnId: "turn-1", order: 0, revision: 0, status: "completed", createdAt: 2, updatedAt: 3, content: { type: "text", channel: "final", text: "The unified event channel is active and the review workspace is ready." } },
   ],
   interactions: [], agents: [],
-  timelineEvents: [{ eventId: "todo-1", sessionId: "session-1", sequence: 3, createdAt: 3, kind: { type: "todoListChanged", snapshot: { callId: "todo-call", explanation: "Review flow", items: [{ step: "Read project constraints", status: "completed" }, { step: "Inspect PR changes", status: "inProgress" }] } } }],
+  timelineEvents: [
+    { eventId: "todo-latest", sessionId: "session-1", sequence: 5, createdAt: 5, kind: { type: "todoListChanged", snapshot: { callId: "todo-call-latest", explanation: "Review flow", items: [{ step: "Read project constraints", status: "completed" }, { step: "Inspect PR changes", status: "inProgress" }, { step: "Run focused checks", status: "pending" }] } } },
+    { eventId: "activity-1", sessionId: "session-1", sequence: 6, createdAt: 6, kind: { type: "subAgentActivity", callId: "agent-call", kind: "spawned" } },
+    { eventId: "todo-old", sessionId: "session-1", sequence: 3, createdAt: 3, kind: { type: "todoListChanged", snapshot: { callId: "todo-call-old", explanation: "Old flow", items: [{ step: "Outdated task", status: "pending" }] } } },
+  ],
   runtime: { sessionId: "session-1", usage: { model: "future-model", contextWindow: 200000, latestContextTokens: 1200, promptTokens: 1200, completionTokens: 180, cachedPromptTokens: 400, totalTokens: 1380, estimatedCosts: [], hasUnpricedUsage: false, updatedAt: 3 }, activeSkills: ["review-helper"], activeMcpServers: [], activeLspServers: [], agentCount: 1, updatedAt: 3 },
   activatedSkills: [], planEvents: [],
 } }
