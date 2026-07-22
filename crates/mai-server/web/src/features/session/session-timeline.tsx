@@ -1,4 +1,4 @@
-import { Bot, Brain, CheckCircle2, ChevronDown, CircleDot, Download, FileOutput, TerminalSquare, User } from "lucide-react"
+import { Bot, Brain, ChevronDown, User } from "lucide-react"
 import { memo, useState } from "react"
 
 import { Markdown } from "@/components/markdown"
@@ -9,6 +9,8 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import type { NormalizedSession } from "@/events/session-reducer"
 import type { SessionPart } from "@/events/session-events.generated"
 import { cn } from "@/lib/utils"
+
+import { ToolCallDetails } from "./tool-call-details"
 
 export function SessionTimeline({ view }: { view: NormalizedSession }) {
   if (view.messageOrder.length === 0) {
@@ -82,35 +84,7 @@ function ReasoningRow({ text, status }: { text: string; status: string }) {
 }
 
 function ToolRow({ part }: { part: SessionPart }) {
-  const [open, setOpen] = useState(false)
   if (part.content.type !== "tool") return null
   const tool = part.content.tool
-  const complete = part.status === "completed"
-  return (
-    <Collapsible open={open} onOpenChange={setOpen} className="rounded-lg border bg-card">
-      <CollapsibleTrigger className="flex w-full items-center gap-2 px-3 py-2 text-left">
-        <TerminalSquare className="size-4 text-muted-foreground" />
-        <code className="min-w-0 flex-1 truncate text-xs font-medium">{tool.name}</code>
-        <Badge variant={complete ? "outline" : "secondary"} className="capitalize">{part.status}</Badge>
-        {complete ? <CheckCircle2 className="size-3.5" /> : <CircleDot className="size-3.5 animate-pulse" />}
-        <ChevronDown className={cn("size-3.5 text-muted-foreground transition-transform", open && "rotate-180")} />
-      </CollapsibleTrigger>
-      <CollapsibleContent className="border-t px-3 py-3">
-        <div className="flex flex-col gap-2">
-          {tool.arguments && <pre className="max-h-52 overflow-auto whitespace-pre-wrap break-words rounded-md bg-foreground p-3 text-xs text-background">{tool.arguments}</pre>}
-          {tool.result && <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted p-3 text-xs text-foreground">{tool.result}</pre>}
-          {tool.outputArtifacts && tool.outputArtifacts.length > 0 && <div className="flex flex-col gap-1">{tool.outputArtifacts.map((artifact, index) => <ToolArtifact key={`${artifact.id || artifact.path || "artifact"}:${index}`} artifact={artifact} />)}</div>}
-        </div>
-      </CollapsibleContent>
-    </Collapsible>
-  )
-}
-
-function ToolArtifact({ artifact }: { artifact: Record<string, unknown> }) {
-  const id = typeof artifact.id === "string" ? artifact.id : null
-  const label = String(artifact.name || artifact.path || artifact.filename || "Tool output")
-  const content = <><FileOutput className="size-3.5" /><span className="min-w-0 flex-1 truncate">{label}</span>{id && <Download className="size-3.5" />}</>
-  return id
-    ? <a href={`/artifacts/${encodeURIComponent(id)}/download`} download className="flex items-center gap-2 rounded-md border px-2.5 py-2 text-xs hover:bg-muted">{content}</a>
-    : <div className="flex items-center gap-2 rounded-md border px-2.5 py-2 text-xs text-muted-foreground">{content}</div>
+  return <ToolCallDetails tool={{ ...tool, status: part.status, error: part.error }} />
 }

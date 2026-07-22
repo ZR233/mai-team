@@ -84,6 +84,13 @@ test("chat workbench is usable at each configured viewport", async ({ page }, te
   await expect(page.getByText("Outdated task", { exact: true })).toHaveCount(0)
   await expect(page).toHaveScreenshot(`chat-${testInfo.project.name}.png`, { animations: "disabled" })
 
+  await page.getByRole("button", { name: "Expand Run command" }).click()
+  await expect(page.getByText("Standard output")).toBeVisible()
+  await expect(page.getByText("Finished focused review checks")).toBeVisible()
+  await expect(page.getByText(/"command":/)).toHaveCount(0)
+  await expect(page).toHaveScreenshot(`chat-tool-${testInfo.project.name}.png`, { animations: "disabled" })
+  await page.getByRole("button", { name: "Collapse Run command" }).click()
+
   if (testInfo.project.name === "desktop") {
     const rail = page.locator("[data-session-todo-rail]")
     await expect(rail).toBeVisible()
@@ -118,7 +125,16 @@ test("review actions remain available at each configured viewport", async ({ pag
   await expect(page.getByRole("heading", { name: "Review run · PR #1631", exact: true })).toBeVisible()
   await expect(page.getByRole("link", { name: "Open pull request" })).toBeVisible()
   await expect(page.getByRole("button", { name: "Re-review" })).toBeVisible()
+  await expect(page.getByRole("heading", { name: "Review activity" })).toBeVisible()
+  await expect(page.getByText("Run command", { exact: true })).toBeVisible()
+  await expect(page.getByText("Read session note", { exact: true })).toBeVisible()
+  await expect(page.getByText("GitHub API request", { exact: true })).toBeVisible()
+  await expect(page.getByText(/"stdout":/)).toHaveCount(0)
   await expect(page).toHaveScreenshot(`review-${testInfo.project.name}.png`, { animations: "disabled" })
+  await page.getByRole("button", { name: "Expand Run command" }).click()
+  await expect(page.getByText("All reviewer checks passed")).toBeVisible()
+  await expect(page.getByText(/"exitCode":/)).toHaveCount(0)
+  await expect(page).toHaveScreenshot(`review-tool-${testInfo.project.name}.png`, { animations: "disabled" })
   await page.keyboard.press("Escape")
 
   const review = page.waitForRequest((candidate) => candidate.url().endsWith("/projects/project-1/pull-requests/1631/review") && candidate.method() === "POST")
@@ -145,7 +161,7 @@ test("project review, repository settings, and default-branch skills remain func
   await page.getByRole("button", { name: "Actions for PR #1631" }).click()
   await page.getByRole("menuitem", { name: "View details" }).click()
   await expect(page.getByRole("heading", { name: "Review run · PR #1631", exact: true })).toBeVisible()
-  await expect(page.getByRole("heading", { name: "Session events", exact: true })).toBeVisible()
+  await expect(page.getByRole("heading", { name: "Review activity", exact: true })).toBeVisible()
   await expect(page.getByRole("button", { name: "Re-review" })).toBeVisible()
   await page.keyboard.press("Escape")
 
@@ -256,7 +272,8 @@ const sessionFrame = { type: "snapshot", snapshot: {
   ],
   parts: [
     { partId: "part-1", messageId: "message-1", sessionId: "session-1", turnId: "turn-1", order: 0, revision: 0, status: "completed", createdAt: 1, updatedAt: 1, content: { type: "text", channel: "user", text: "Inspect the canonical session stream" } },
-    { partId: "part-2", messageId: "message-2", sessionId: "session-1", turnId: "turn-1", order: 0, revision: 0, status: "completed", createdAt: 2, updatedAt: 3, content: { type: "text", channel: "final", text: "The unified event channel is active and the review workspace is ready." } },
+    { partId: "part-tool", messageId: "message-2", sessionId: "session-1", turnId: "turn-1", order: 0, revision: 1, status: "completed", createdAt: 2, updatedAt: 3, content: { type: "tool", tool: { toolCallId: "tool-call-1", name: "exec", arguments: JSON.stringify({ command: "cargo test -p mai-server projects::review", cwd: "/workspace/mai-team" }), result: JSON.stringify({ status: "completed", exitCode: 0, timedOut: false, stdout: "Finished focused review checks", stderr: "", outputFile: ".mai/tool-output/tool-call-1.log" }), exitCode: 0, workingDirectory: "/workspace/mai-team" } } },
+    { partId: "part-2", messageId: "message-2", sessionId: "session-1", turnId: "turn-1", order: 1, revision: 0, status: "completed", createdAt: 2, updatedAt: 3, content: { type: "text", channel: "final", text: "The unified event channel is active and the review workspace is ready." } },
   ],
   interactions: [], agents: [],
   timelineEvents: [
@@ -324,18 +341,48 @@ const projectDetail = {
   selected_agent: projectAgent,
   review_runs: [reviewRun, changesRequestedReviewRun],
 }
+const reviewExecResult = JSON.stringify({ status: "completed", exitCode: 0, timedOut: false, stdout: "All reviewer checks passed", stderr: "", outputFile: ".mai/tool-output/review-exec.log" })
+const reviewNoteResult = JSON.stringify({ revision: 4, contentHash: "sha256:notes", totalBytes: 168, totalLines: 9, startLine: 1, endLine: 9, text: "## F-1\n\n**Status:** resolved\n\nThe focused test disproved the initial concern." })
+const reviewGithubArguments = JSON.stringify({ method: "POST", path: "/repos/rcore-os/tgoskits/pulls/1631/reviews", body: { event: "APPROVE", body: "Focused checks passed; approving this change.", commit_id: "abc123" } })
+const reviewGithubResult = JSON.stringify({ id: 4512, state: "APPROVED", submitted_at: "2026-07-20T00:04:00Z", html_url: "https://github.com/rcore-os/tgoskits/pull/1631#pullrequestreview-4512", body: "Focused checks passed; approving this change.", user: { login: "reviewer" }, pull_request_url: "https://api.github.com/repos/rcore-os/tgoskits/pulls/1631", repository: { omitted: "large nested response" } })
 const reviewRunDetail = {
   ...reviewRun,
-  messages: [{ role: "assistant", content: "Review completed.", created_at: "2026-07-20T00:05:00Z" }],
-  events: [{
-    eventId: "session-1:3",
+  messages: [
+    { role: "assistant", content: "Reviewed the changed files and ran focused validation.", created_at: "2026-07-20T00:01:00Z" },
+    { role: "tool", content: reviewExecResult, created_at: "2026-07-20T00:02:00Z" },
+    { role: "tool", content: reviewNoteResult, created_at: "2026-07-20T00:03:00Z" },
+    { role: "tool", content: reviewGithubResult, created_at: "2026-07-20T00:04:00Z" },
+    { role: "assistant", content: JSON.stringify({ outcome: "review_submitted", review_event: "approve", summary: "All checks passed and the review was submitted atomically." }), created_at: "2026-07-20T00:05:00Z" },
+  ],
+  events: [
+    reviewToolEvent("review-exec", 1, 1, "exec", JSON.stringify({ command: "cargo test -p mai-server projects::review", cwd: "/workspace/mai-team" }), reviewExecResult),
+    reviewToolEvent("review-note", 0, 2, "read_session_note", JSON.stringify({ startLine: 1, maxLines: 40, expectedRevision: 3 }), JSON.stringify({ revision: 2, totalLines: 3, text: "Outdated note" })),
+    reviewToolEvent("review-note", 2, 3, "read_session_note", JSON.stringify({ startLine: 1, maxLines: 40, expectedRevision: 4 }), reviewNoteResult),
+    reviewToolEvent("review-github", 1, 4, "github_api_request", reviewGithubArguments, reviewGithubResult),
+  ],
+}
+
+function reviewToolEvent(partId: string, revision: number, sequence: number, name: string, argumentsValue: string, result: string) {
+  return {
+    eventId: `review-event-${sequence}`,
     sessionId: "session-1",
     sourceAgentId: "reviewer-1",
     turnId: "review-turn-1",
-    emittedAt: 3,
-    position: { persistence: "durable", sequence: 3 },
-    kind: { type: "turnChanged", turn: { turnId: "review-turn-1", sessionId: "session-1", status: "completed", updatedAt: 3 } },
-  }],
+    emittedAt: sequence,
+    position: { persistence: "durable", sequence },
+    kind: { type: "partChanged", part: {
+      partId,
+      messageId: `review-message-${partId}`,
+      sessionId: "session-1",
+      turnId: "review-turn-1",
+      order: sequence,
+      revision,
+      status: "completed",
+      createdAt: sequence,
+      updatedAt: sequence,
+      content: { type: "tool", tool: { toolCallId: `${partId}-call`, name, arguments: argumentsValue, result } },
+    } },
+  }
 }
 const projectSkills = {
   roots: ["/project/repo/.agents/skills"],

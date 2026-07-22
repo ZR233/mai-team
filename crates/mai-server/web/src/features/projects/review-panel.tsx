@@ -1,15 +1,18 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { ExternalLink, Eye, MoreHorizontal, Play, RefreshCw } from "lucide-react"
+import { ChevronDown, CircleAlert, ExternalLink, Eye, MoreHorizontal, Play, RefreshCw } from "lucide-react"
 import { useMemo, useState } from "react"
 import { toast } from "sonner"
 
 import { api } from "@/api/client"
 import type { ProjectDetail, ReviewRunDetail, ReviewRunSummary } from "@/api/product-types"
 import { projectReviewRunQuery, projectReviewRunsQuery, queryKeys } from "@/api/queries"
+import { Markdown } from "@/components/markdown"
 import { EmptyState, ErrorState, LoadingState } from "@/components/page-state"
 import { StatusBadge } from "@/components/status"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Drawer, DrawerContent, DrawerDescription, DrawerFooter, DrawerHeader, DrawerTitle } from "@/components/ui/drawer"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
@@ -19,6 +22,10 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { useIsMobile } from "@/hooks/use-mobile"
+import { cn } from "@/lib/utils"
+
+import { buildReviewActivity } from "./review-activity"
+import { ReviewActivityList } from "./review-activity-list"
 
 interface ReviewPanelProps {
   project: ProjectDetail
@@ -159,27 +166,35 @@ function ReviewDetailsOverlay({ projectId, repository, run, onClose, onRereview,
   const content = <ReviewDetailContent run={run} detail={detail.data} loading={detail.isLoading} error={detail.error} retry={() => void detail.refetch()} />
   const actions = <ReviewDetailActions run={run} repository={repository} onRereview={onRereview} pending={pending} />
   if (mobile) return <Drawer open={Boolean(run)} onOpenChange={(open: boolean) => { if (!open) onClose() }}><DrawerContent className="max-h-[92svh]! overflow-hidden"><DrawerHeader className="shrink-0"><DrawerTitle>Review run · PR #{run?.pr ?? "—"}</DrawerTitle><DrawerDescription>{run ? formatDate(run.started_at) : ""}</DrawerDescription></DrawerHeader><ScrollArea className="min-h-0 flex-1 overflow-hidden px-4">{content}</ScrollArea><DrawerFooter className="shrink-0 border-t bg-background">{actions}</DrawerFooter></DrawerContent></Drawer>
-  return <Sheet open={Boolean(run)} onOpenChange={(open: boolean) => { if (!open) onClose() }}><SheetContent className="w-full sm:max-w-xl"><SheetHeader><SheetTitle>Review run · PR #{run?.pr ?? "—"}</SheetTitle><SheetDescription>{run ? formatDate(run.started_at) : ""}</SheetDescription></SheetHeader><ScrollArea className="min-h-0 flex-1 px-4">{content}</ScrollArea><SheetFooter>{actions}</SheetFooter></SheetContent></Sheet>
+  return <Sheet open={Boolean(run)} onOpenChange={(open: boolean) => { if (!open) onClose() }}><SheetContent className="w-full! sm:max-w-2xl!"><SheetHeader><SheetTitle>Review run · PR #{run?.pr ?? "—"}</SheetTitle><SheetDescription>{run ? formatDate(run.started_at) : ""}</SheetDescription></SheetHeader><ScrollArea className="min-h-0 flex-1 px-4">{content}</ScrollArea><SheetFooter>{actions}</SheetFooter></SheetContent></Sheet>
 }
 
 function ReviewDetailContent({ run, detail, loading, error, retry }: { run: ReviewRunSummary | null; detail?: ReviewRunDetail; loading: boolean; error: unknown; retry(): void }) {
+  const [metadataOpen, setMetadataOpen] = useState(false)
+  const activity = useMemo(() => detail ? buildReviewActivity(detail) : [], [detail])
   if (!run) return null
   if (loading) return <LoadingState rows={5} />
   if (error) return <ErrorState error={error} retry={retry} />
   const value = detail ?? run
   return <div className="flex flex-col gap-5 pb-4">
-    <div className="flex items-center gap-2"><StatusBadge status={value.status} /><ReviewOutcome run={value} /></div>
-    <dl className="divide-y rounded-lg border">
-      <DetailRow label="Started" value={formatDate(value.started_at)} />
-      <DetailRow label="Duration" value={formatDuration(value.started_at, value.finished_at)} />
-      <DetailRow label="Reviewer" value={value.reviewer_agent_id || "—"} mono />
-      <DetailRow label="Turn" value={value.turn_id || "—"} mono />
-      <DetailRow label="Tokens" value={(value.token_usage?.total_tokens ?? 0).toLocaleString()} />
-      <DetailRow label="Cached input" value={(value.token_usage?.cached_input_tokens ?? 0).toLocaleString()} />
+    <div className="flex flex-wrap items-center gap-2"><StatusBadge status={value.status} /><ReviewOutcome run={value} /></div>
+    <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-4">
+      <Metric label="Started" value={formatDate(value.started_at)} />
+      <Metric label="Duration" value={formatDuration(value.started_at, value.finished_at)} />
+      <Metric label="Tokens" value={(value.token_usage?.total_tokens ?? 0).toLocaleString()} />
+      <Metric label="Cached input" value={(value.token_usage?.cached_input_tokens ?? 0).toLocaleString()} />
     </dl>
-    {(value.summary || value.error) && <section className="flex flex-col gap-2"><h3 className="text-sm font-medium">Summary</h3><p className="whitespace-pre-wrap rounded-lg border bg-muted/40 p-3 text-sm">{value.error || value.summary}</p></section>}
-    {detail && detail.messages.length > 0 && <section className="flex flex-col gap-2"><h3 className="text-sm font-medium">Messages</h3><div className="divide-y rounded-lg border">{detail.messages.map((message, index) => <div key={`${message.created_at}:${index}`} className="grid gap-1 p-3 sm:grid-cols-[5rem_1fr]"><span className="text-xs capitalize text-muted-foreground">{message.role}</span><p className="whitespace-pre-wrap text-sm">{message.content}</p></div>)}</div></section>}
-    {detail && detail.events.length > 0 && <section className="flex flex-col gap-2"><h3 className="text-sm font-medium">Session events</h3><div className="max-h-64 divide-y overflow-auto rounded-lg border">{detail.events.map((event) => <div key={event.eventId} className="flex items-center gap-3 px-3 py-2 text-xs"><code className="min-w-0 flex-1 truncate">{event.kind.type}</code><span className="text-muted-foreground">{event.position.persistence === "durable" ? `#${event.position.sequence}` : `r${event.position.revision}`}</span></div>)}</div></section>}
+    {value.summary && <section className="space-y-2"><h3 className="text-sm font-medium">Summary</h3><div className="rounded-lg border bg-muted/35 p-3"><Markdown>{value.summary}</Markdown></div></section>}
+    {value.error && <Alert variant="destructive"><CircleAlert /><AlertTitle>Review failed</AlertTitle><AlertDescription>{value.error}</AlertDescription></Alert>}
+    {detail && <section className="space-y-2.5"><div><h3 className="text-sm font-medium">Review activity</h3><p className="text-xs text-muted-foreground">Messages and tool calls from this review, with duplicate revisions removed.</p></div><ReviewActivityList activity={activity} /></section>}
+    <Collapsible open={metadataOpen} onOpenChange={setMetadataOpen} className="rounded-lg border">
+      <CollapsibleTrigger asChild><Button variant="ghost" className="w-full justify-between rounded-lg px-3" aria-label={`${metadataOpen ? "Hide" : "Show"} technical details`}>Technical details<ChevronDown className={cn("size-4 transition-transform motion-reduce:transition-none", metadataOpen && "rotate-180")} /></Button></CollapsibleTrigger>
+      <CollapsibleContent className="border-t"><dl className="divide-y">
+        <DetailRow label="Reviewer" value={value.reviewer_agent_id || "—"} mono />
+        <DetailRow label="Turn" value={value.turn_id || "—"} mono />
+        {detail && <><DetailRow label="Messages" value={String(detail.messages.length)} /><DetailRow label="Events" value={String(detail.events.length)} /></>}
+      </dl></CollapsibleContent>
+    </Collapsible>
   </div>
 }
 
@@ -222,6 +237,10 @@ function reviewResult(run: ReviewRunSummary) {
 
 function DetailRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
   return <div className="grid gap-1 px-3 py-2.5 sm:grid-cols-[7rem_1fr]"><dt className="text-xs text-muted-foreground">{label}</dt><dd className={mono ? "break-all font-mono text-xs" : "text-sm"}>{value}</dd></div>
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return <div className="min-w-0 bg-card p-3"><dt className="text-[11px] text-muted-foreground">{label}</dt><dd className="mt-1 break-words text-sm font-medium tabular-nums">{value}</dd></div>
 }
 
 function summarizeRuns(runs: ReviewRunSummary[]) {
