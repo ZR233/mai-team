@@ -11,6 +11,8 @@ struct GithubAppConfig {
     #[serde(default)]
     public_url: Option<String>,
     #[serde(default)]
+    github_name: Option<String>,
+    #[serde(default)]
     app_slug: Option<String>,
     #[serde(default)]
     app_html_url: Option<String>,
@@ -18,6 +20,21 @@ struct GithubAppConfig {
     owner_login: Option<String>,
     #[serde(default)]
     owner_type: Option<String>,
+    #[serde(default)]
+    bot_login: Option<String>,
+    #[serde(default)]
+    bot_user_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubAppIdentity {
+    pub github_name: String,
+    pub app_slug: String,
+    pub app_html_url: String,
+    pub owner_login: Option<String>,
+    pub owner_type: Option<String>,
+    pub bot_login: String,
+    pub bot_user_id: u64,
 }
 
 impl MaiStore {
@@ -36,10 +53,18 @@ impl MaiStore {
                 .as_deref()
                 .is_some_and(|key| !key.trim().is_empty()),
             app_slug: config.app_slug.clone(),
+            github_name: config.github_name.clone(),
             app_html_url: config.app_html_url.clone(),
             owner_login: config.owner_login.clone(),
             owner_type: config.owner_type.clone(),
+            bot_login: config.bot_login.clone(),
+            bot_user_id: config.bot_user_id,
             install_url: github_app_install_url(config.app_slug.as_deref()),
+            manage_url: github_app_manage_url(
+                config.app_slug.as_deref(),
+                config.owner_login.as_deref(),
+                config.owner_type.as_deref(),
+            ),
         })
     }
 
@@ -68,9 +93,12 @@ impl MaiStore {
         if let Some(app_id) = request.app_id {
             current.app_id = Some(app_id.trim().to_string()).filter(|value| !value.is_empty());
         }
-        if let Some(private_key) = request.private_key {
-            current.private_key =
-                Some(private_key.trim().to_string()).filter(|value| !value.is_empty());
+        if let Some(private_key) = request
+            .private_key
+            .map(|private_key| private_key.trim().to_string())
+            .filter(|private_key| !private_key.is_empty())
+        {
+            current.private_key = Some(private_key);
         }
         if let Some(base_url) = request.base_url {
             current.base_url = Some(base_url.trim().trim_end_matches('/').to_string())
@@ -80,21 +108,23 @@ impl MaiStore {
             current.public_url = Some(public_url.trim().trim_end_matches('/').to_string())
                 .filter(|value| !value.is_empty());
         }
-        if let Some(app_slug) = request.app_slug {
-            current.app_slug = Some(app_slug.trim().to_string()).filter(|value| !value.is_empty());
-        }
-        if let Some(app_html_url) = request.app_html_url {
-            current.app_html_url =
-                Some(app_html_url.trim().to_string()).filter(|value| !value.is_empty());
-        }
-        if let Some(owner_login) = request.owner_login {
-            current.owner_login =
-                Some(owner_login.trim().to_string()).filter(|value| !value.is_empty());
-        }
-        if let Some(owner_type) = request.owner_type {
-            current.owner_type =
-                Some(owner_type.trim().to_string()).filter(|value| !value.is_empty());
-        }
+        self.set_setting(SETTING_GITHUB_APP_CONFIG, &serde_json::to_string(&current)?)
+            .await?;
+        self.get_github_app_settings().await
+    }
+
+    pub async fn save_github_app_identity(
+        &self,
+        identity: GithubAppIdentity,
+    ) -> Result<GithubAppSettingsResponse> {
+        let mut current = self.github_app_config().await?;
+        current.github_name = normalized_identity_text(identity.github_name);
+        current.app_slug = normalized_identity_text(identity.app_slug);
+        current.app_html_url = normalized_identity_text(identity.app_html_url);
+        current.owner_login = identity.owner_login.and_then(normalized_identity_text);
+        current.owner_type = identity.owner_type.and_then(normalized_identity_text);
+        current.bot_login = normalized_identity_text(identity.bot_login);
+        current.bot_user_id = Some(identity.bot_user_id);
         self.set_setting(SETTING_GITHUB_APP_CONFIG, &serde_json::to_string(&current)?)
             .await?;
         self.get_github_app_settings().await
@@ -108,9 +138,30 @@ impl MaiStore {
     }
 }
 
+fn normalized_identity_text(value: String) -> Option<String> {
+    Some(value.trim().to_string()).filter(|value| !value.is_empty())
+}
+
 fn github_app_install_url(app_slug: Option<&str>) -> Option<String> {
     app_slug
         .map(str::trim)
         .filter(|slug| !slug.is_empty())
         .map(|slug| format!("https://github.com/apps/{slug}/installations/select_target"))
+}
+
+fn github_app_manage_url(
+    app_slug: Option<&str>,
+    owner_login: Option<&str>,
+    owner_type: Option<&str>,
+) -> Option<String> {
+    let slug = app_slug.map(str::trim).filter(|value| !value.is_empty())?;
+    match (
+        owner_type.map(str::trim),
+        owner_login.map(str::trim).filter(|value| !value.is_empty()),
+    ) {
+        (Some("Organization"), Some(owner)) => Some(format!(
+            "https://github.com/organizations/{owner}/settings/apps/{slug}"
+        )),
+        _ => Some(format!("https://github.com/settings/apps/{slug}")),
+    }
 }

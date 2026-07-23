@@ -674,6 +674,29 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
             .await?)
     }
 
+    async fn evaluate_project_review_pr(
+        &self,
+        project_id: ProjectId,
+        pr: u64,
+        head_sha_hint: Option<String>,
+    ) -> Result<projects::review::eligibility::EvaluatedProjectReviewPr> {
+        projects::review::eligibility::evaluate_project_review_pr(
+            self,
+            project_id,
+            pr,
+            head_sha_hint,
+        )
+        .await
+    }
+
+    async fn enqueue_project_review_replacement(
+        &self,
+        job: ProjectReviewJobSummary,
+        head_sha: String,
+    ) -> Result<ProjectReviewQueueSummary> {
+        AgentRuntime::enqueue_project_review_replacement(self, job, head_sha).await
+    }
+
     async fn claim_due_project_review_job(
         &self,
         project_id: ProjectId,

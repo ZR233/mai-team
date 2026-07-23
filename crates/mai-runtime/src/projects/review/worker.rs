@@ -13,6 +13,7 @@ use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
 use super::ProjectReviewCycleResult;
+use super::eligibility::EvaluatedProjectReviewPr;
 #[cfg(test)]
 use super::eligibility::SelectedProjectReviewPr;
 use super::project_review_retry_backoff;
@@ -116,6 +117,19 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         &self,
         project_id: ProjectId,
     ) -> impl Future<Output = Result<bool>> + Send;
+
+    fn evaluate_project_review_pr(
+        &self,
+        project_id: ProjectId,
+        pr: u64,
+        head_sha_hint: Option<String>,
+    ) -> impl Future<Output = Result<EvaluatedProjectReviewPr>> + Send;
+
+    fn enqueue_project_review_replacement(
+        &self,
+        job: ProjectReviewJobSummary,
+        head_sha: String,
+    ) -> impl Future<Output = Result<crate::ProjectReviewQueueSummary>> + Send;
 
     fn claim_due_project_review_job(
         &self,
@@ -784,7 +798,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
-    use crate::projects::review::eligibility::SelectedProjectReviewPr;
+    use crate::projects::review::eligibility::{EvaluatedProjectReviewPr, SelectedProjectReviewPr};
     use crate::projects::review::pool::ProjectReviewSignalInput;
     use crate::projects::review::relay_queue::ProjectReviewRelaySignalInput;
     use crate::state::ProjectRecord;
@@ -822,6 +836,7 @@ mod tests {
         relay_selection_calls: Arc<Mutex<Vec<u64>>>,
         failed_relay_prs: Arc<Mutex<Vec<u64>>>,
         ineligible_relay_prs: Arc<Mutex<Vec<u64>>>,
+        current_relay_heads: Arc<Mutex<Vec<(u64, String)>>>,
         failed_enqueue_prs: Arc<Mutex<Vec<u64>>>,
         cache_ready_errors: Arc<Mutex<Vec<String>>>,
         reviewed_prs: Arc<Mutex<Vec<Option<u64>>>>,
@@ -847,6 +862,7 @@ mod tests {
                 relay_selection_calls: Arc::new(Mutex::new(Vec::new())),
                 failed_relay_prs: Arc::new(Mutex::new(Vec::new())),
                 ineligible_relay_prs: Arc::new(Mutex::new(Vec::new())),
+                current_relay_heads: Arc::new(Mutex::new(Vec::new())),
                 failed_enqueue_prs: Arc::new(Mutex::new(Vec::new())),
                 cache_ready_errors: Arc::new(Mutex::new(Vec::new())),
                 reviewed_prs: Arc::new(Mutex::new(Vec::new())),
@@ -1098,6 +1114,62 @@ mod tests {
                 || !self.project.review_pool.lock().await.is_empty())
         }
 
+        async fn evaluate_project_review_pr(
+            &self,
+            _project_id: Uuid,
+            pr: u64,
+            head_sha_hint: Option<String>,
+        ) -> crate::Result<EvaluatedProjectReviewPr> {
+            self.relay_selection_calls.lock().await.push(pr);
+            if self.failed_relay_prs.lock().await.contains(&pr) {
+                return Err(crate::RuntimeError::InvalidInput(format!(
+                    "failed relay pr {pr}"
+                )));
+            }
+            let skip_reason = self
+                .ineligible_relay_prs
+                .lock()
+                .await
+                .contains(&pr)
+                .then_some(mai_protocol::ProjectReviewSkipReason::AlreadyReviewedCurrentHead);
+            let current_head = self
+                .current_relay_heads
+                .lock()
+                .await
+                .iter()
+                .find(|(number, _)| *number == pr)
+                .map(|(_, head)| head.clone())
+                .or(head_sha_hint);
+            Ok(EvaluatedProjectReviewPr {
+                pr,
+                head_sha: current_head,
+                skip_reason,
+            })
+        }
+
+        async fn enqueue_project_review_replacement(
+            &self,
+            job: ProjectReviewJobSummary,
+            head_sha: String,
+        ) -> crate::Result<crate::ProjectReviewQueueSummary> {
+            let replacement = crate::projects::review::job::new_project_review_job(
+                crate::projects::review::job::NewProjectReviewJob {
+                    project_id: job.project_id,
+                    pr: job.pr,
+                    head_sha,
+                    source: job.source,
+                    delivery_id: None,
+                    reason: "preflight_head_changed".to_string(),
+                },
+            );
+            self.review_jobs.lock().await.push(replacement.clone());
+            Ok(crate::ProjectReviewQueueSummary {
+                queued: vec![replacement.pr],
+                jobs: vec![replacement],
+                ..Default::default()
+            })
+        }
+
         async fn claim_due_project_review_job(
             &self,
             project_id: Uuid,
@@ -1175,7 +1247,8 @@ mod tests {
                         ProjectReviewJobStatus::Succeeded
                         | ProjectReviewJobStatus::Failed
                         | ProjectReviewJobStatus::Cancelled
-                        | ProjectReviewJobStatus::Superseded => 6,
+                        | ProjectReviewJobStatus::Superseded
+                        | ProjectReviewJobStatus::Skipped => 6,
                     };
                     (priority, job.created_at)
                 })
@@ -1654,6 +1727,103 @@ mod tests {
 
         token.cancel();
         worker_task.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn final_preflight_skips_ineligible_automatic_job_without_starting_attempt() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        ops.ineligible_relay_prs.lock().await.push(42);
+        let mut job = crate::projects::review::job::new_project_review_job(
+            crate::projects::review::job::NewProjectReviewJob {
+                project_id,
+                pr: 42,
+                head_sha: "head-42".to_string(),
+                source: ProjectReviewJobSource::Webhook,
+                delivery_id: Some("delivery-42".to_string()),
+                reason: "pull_request_synchronize".to_string(),
+            },
+        );
+        job.status = ProjectReviewJobStatus::Preparing;
+        job.attempt_count = 1;
+        job.lease_owner = Some("worker-1".to_string());
+        ops.review_jobs.lock().await.push(job.clone());
+        let context = ProjectReviewTaskContext {
+            ops: ops.clone(),
+            project_id,
+            cancellation_token: CancellationToken::new(),
+        };
+
+        assert!(
+            crate::projects::review::job_worker::run_claimed_project_review_job(
+                &context,
+                job,
+                "worker-1".to_string(),
+            )
+            .await
+        );
+
+        let jobs = ops.review_jobs.lock().await;
+        assert_eq!(1, jobs.len());
+        assert_eq!(ProjectReviewJobStatus::Skipped, jobs[0].status);
+        assert_eq!(
+            Some(mai_protocol::ProjectReviewSkipReason::AlreadyReviewedCurrentHead),
+            jobs[0].skip_reason
+        );
+        assert_eq!(None, jobs[0].reviewer_agent_id);
+        drop(jobs);
+        assert!(ops.reviewed_prs.lock().await.is_empty());
+        assert!(ops.review_runs.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn final_preflight_supersedes_changed_head_and_queues_replacement() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        ops.current_relay_heads
+            .lock()
+            .await
+            .push((42, "head-new".to_string()));
+        let mut job = crate::projects::review::job::new_project_review_job(
+            crate::projects::review::job::NewProjectReviewJob {
+                project_id,
+                pr: 42,
+                head_sha: "head-old".to_string(),
+                source: ProjectReviewJobSource::Automatic,
+                delivery_id: None,
+                reason: "selector".to_string(),
+            },
+        );
+        job.status = ProjectReviewJobStatus::Preparing;
+        job.attempt_count = 1;
+        job.lease_owner = Some("worker-1".to_string());
+        let original_id = job.id;
+        ops.review_jobs.lock().await.push(job.clone());
+        let context = ProjectReviewTaskContext {
+            ops: ops.clone(),
+            project_id,
+            cancellation_token: CancellationToken::new(),
+        };
+
+        assert!(
+            crate::projects::review::job_worker::run_claimed_project_review_job(
+                &context,
+                job,
+                "worker-1".to_string(),
+            )
+            .await
+        );
+
+        let jobs = ops.review_jobs.lock().await;
+        assert_eq!(2, jobs.len());
+        assert_eq!(original_id, jobs[0].id);
+        assert_eq!(ProjectReviewJobStatus::Superseded, jobs[0].status);
+        assert_eq!("head-new", jobs[1].head_sha);
+        assert_eq!(ProjectReviewJobStatus::Queued, jobs[1].status);
+        assert_eq!(ProjectReviewJobSource::Automatic, jobs[1].source);
+        assert_eq!("preflight_head_changed", jobs[1].reason);
+        drop(jobs);
+        assert!(ops.reviewed_prs.lock().await.is_empty());
     }
 
     #[tokio::test]

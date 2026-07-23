@@ -167,6 +167,7 @@ pub(crate) struct ProjectReviewJobRecord {
     pub(crate) lease_owner: Option<String>,
     pub(crate) lease_expires_at: Option<String>,
     pub(crate) failure_json: Option<String>,
+    pub(crate) skip_reason: Option<String>,
     pub(crate) submission_intent_json: Option<String>,
     pub(crate) submission_receipt_json: Option<String>,
     pub(crate) created_at: String,
@@ -646,6 +647,11 @@ impl ProjectReviewJobRecord {
                 .failure_json
                 .as_deref()
                 .map(serde_json::from_str)
+                .transpose()?,
+            skip_reason: self
+                .skip_reason
+                .as_deref()
+                .map(parse_store_enum)
                 .transpose()?,
             submission_intent: self
                 .submission_intent_json

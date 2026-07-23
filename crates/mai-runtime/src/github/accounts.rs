@@ -376,6 +376,10 @@ mod tests {
             unimplemented!("not needed by this test")
         }
 
+        async fn refresh_github_app_settings(&self) -> Result<GithubAppSettingsResponse> {
+            unimplemented!("not needed by this test")
+        }
+
         async fn start_github_app_manifest(
             &self,
             _request: GithubAppManifestStartRequest,

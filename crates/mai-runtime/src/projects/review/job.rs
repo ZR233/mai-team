@@ -1,7 +1,7 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use mai_protocol::{
     ProjectId, ProjectReviewFailure, ProjectReviewJobSource, ProjectReviewJobStatus,
-    ProjectReviewJobSummary, ProjectReviewStatus, now,
+    ProjectReviewJobSummary, ProjectReviewSkipReason, ProjectReviewStatus, now,
 };
 use uuid::Uuid;
 
@@ -40,6 +40,7 @@ pub(crate) fn new_project_review_job(input: NewProjectReviewJob) -> ProjectRevie
         lease_owner: None,
         lease_expires_at: None,
         failure: None,
+        skip_reason: None,
         submission_intent: None,
         submission_receipt: None,
         created_at,
@@ -93,17 +94,31 @@ pub(crate) fn fail_job(
 ) {
     job.status = ProjectReviewJobStatus::Failed;
     job.failure = Some(failure);
+    job.skip_reason = None;
     finish_job(job, current_time);
 }
 
 pub(crate) fn succeed_job(job: &mut ProjectReviewJobSummary, current_time: DateTime<Utc>) {
     job.status = ProjectReviewJobStatus::Succeeded;
     job.failure = None;
+    job.skip_reason = None;
     finish_job(job, current_time);
 }
 
 pub(crate) fn supersede_job(job: &mut ProjectReviewJobSummary, current_time: DateTime<Utc>) {
     job.status = ProjectReviewJobStatus::Superseded;
+    job.skip_reason = None;
+    finish_job(job, current_time);
+}
+
+pub(crate) fn skip_job(
+    job: &mut ProjectReviewJobSummary,
+    reason: ProjectReviewSkipReason,
+    current_time: DateTime<Utc>,
+) {
+    job.status = ProjectReviewJobStatus::Skipped;
+    job.failure = None;
+    job.skip_reason = Some(reason);
     finish_job(job, current_time);
 }
 
@@ -128,7 +143,8 @@ pub(crate) fn project_review_status_for_job(
         ProjectReviewJobStatus::Reconciling => ProjectReviewStatus::Reconciling,
         ProjectReviewJobStatus::Succeeded
         | ProjectReviewJobStatus::Cancelled
-        | ProjectReviewJobStatus::Superseded => ProjectReviewStatus::Idle,
+        | ProjectReviewJobStatus::Superseded
+        | ProjectReviewJobStatus::Skipped => ProjectReviewStatus::Idle,
         ProjectReviewJobStatus::Failed => ProjectReviewStatus::Failed,
     }
 }

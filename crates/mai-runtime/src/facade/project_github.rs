@@ -14,9 +14,7 @@ use uuid::Uuid;
 use crate::github::GitAccountToken;
 use crate::state::AgentRecord;
 use crate::turn::tool_output::ToolExecution;
-use crate::{
-    AgentRuntime, Result, RuntimeError, github, normalized_text, projects, redact_secret, turn,
-};
+use crate::{AgentRuntime, Result, RuntimeError, github, projects, redact_secret, turn};
 
 const INVALID_INLINE_POSITION_CODE: &str = "invalid_inline_position";
 
@@ -407,42 +405,35 @@ impl projects::review::eligibility::ProjectReviewEligibilityOps for Arc<AgentRun
             RuntimeError::InvalidInput("project git account is not configured".to_string())
         })?;
         let account = self.deps.git_accounts.summary(&account_id).await?;
-        let login = match account.provider {
-            GitProvider::Github => match normalized_text(account.login) {
-                Some(login) => login,
-                None => {
-                    let value = github::project_github_api_get_json(
-                        &self.deps.github_http,
-                        &self.github_api_base_url,
-                        self.project_git_token(project_id).await?,
-                        "/user",
+        let user_id = match account.provider {
+            GitProvider::Github => {
+                let value = github::project_github_api_get_json(
+                    &self.deps.github_http,
+                    &self.github_api_base_url,
+                    self.project_git_token(project_id).await?,
+                    "/user",
+                )
+                .await?;
+                value.get("id").and_then(Value::as_u64).ok_or_else(|| {
+                    RuntimeError::InvalidInput(
+                        "GitHub /user response missing durable user ID".to_string(),
                     )
-                    .await?;
-                    value
-                        .get("login")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .ok_or_else(|| {
-                            RuntimeError::InvalidInput(
-                                "GitHub /user response missing login".to_string(),
-                            )
-                        })?
-                }
-            },
-            GitProvider::GithubAppRelay => {
-                let settings = self.deps.github_backend.github_app_settings().await?;
-                normalized_text(settings.app_slug)
-                    .map(|slug| format!("{slug}[bot]"))
-                    .or_else(|| normalized_text(account.login))
-                    .or_else(|| normalized_text(account.installation_account))
-                    .ok_or_else(|| {
-                        RuntimeError::InvalidInput(
-                            "GitHub App reviewer identity is not configured".to_string(),
-                        )
-                    })?
+                })?
             }
+            GitProvider::GithubAppRelay => self
+                .deps
+                .github_backend
+                .github_app_settings()
+                .await?
+                .bot_user_id
+                .ok_or_else(|| {
+                    RuntimeError::InvalidInput(
+                        "GitHub App bot user ID is not configured; refresh the verified identity"
+                            .to_string(),
+                    )
+                })?,
         };
-        Ok(projects::review::selector::ProjectReviewIdentity { login })
+        Ok(projects::review::selector::ProjectReviewIdentity { user_id })
     }
 
     async fn github_api_get_json(&self, project_id: ProjectId, path: String) -> Result<Value> {

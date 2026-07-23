@@ -224,6 +224,7 @@ mod tests {
             lease_owner: None,
             lease_expires_at: None,
             failure: None,
+            skip_reason: None,
             submission_intent: None,
             submission_receipt: None,
             created_at: now,

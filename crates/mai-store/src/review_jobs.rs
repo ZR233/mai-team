@@ -153,7 +153,7 @@ impl MaiStore {
             let mut statement = connection.prepare(
                 "SELECT id, project_id, pr, head_sha, source, delivery_id, reason, status, \
                  attempt_count, max_attempts, first_retryable_failure_at, next_attempt_at, \
-                 reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, \
+                 reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, skip_reason, \
                  submission_intent_json, submission_receipt_json, created_at, updated_at, finished_at \
                  FROM project_review_jobs WHERE project_id = ?1 \
                  ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3",
@@ -593,7 +593,7 @@ fn record_submission_receipt_on_path(
     transaction.execute(
         "UPDATE project_review_jobs SET status = 'succeeded', submission_receipt_json = ?1, \
          finished_at = ?2, updated_at = ?2, next_attempt_at = NULL, active_run_id = NULL, \
-         lease_owner = NULL, lease_expires_at = NULL, failure_json = NULL \
+         lease_owner = NULL, lease_expires_at = NULL, failure_json = NULL, skip_reason = NULL \
          WHERE id = ?3",
         params![
             serde_json::to_string(&receipt)?,
@@ -612,9 +612,9 @@ fn upsert_job(connection: &Connection, job: &ProjectReviewJobSummary) -> Result<
     connection.execute(
         "INSERT INTO project_review_jobs (id, project_id, pr, head_sha, source, delivery_id, \
          reason, status, attempt_count, max_attempts, first_retryable_failure_at, next_attempt_at, \
-         reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, \
+         reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, skip_reason, \
          submission_intent_json, submission_receipt_json, created_at, updated_at, finished_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23) \
          ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, pr=excluded.pr, \
          head_sha=excluded.head_sha, source=excluded.source, delivery_id=excluded.delivery_id, \
          reason=excluded.reason, status=excluded.status, attempt_count=excluded.attempt_count, \
@@ -622,6 +622,7 @@ fn upsert_job(connection: &Connection, job: &ProjectReviewJobSummary) -> Result<
          next_attempt_at=excluded.next_attempt_at, reviewer_agent_id=excluded.reviewer_agent_id, \
          active_run_id=excluded.active_run_id, lease_owner=excluded.lease_owner, \
          lease_expires_at=excluded.lease_expires_at, failure_json=excluded.failure_json, \
+         skip_reason=excluded.skip_reason, \
          submission_intent_json=excluded.submission_intent_json, \
          submission_receipt_json=excluded.submission_receipt_json, updated_at=excluded.updated_at, \
          finished_at=excluded.finished_at",
@@ -643,6 +644,7 @@ fn upsert_job(connection: &Connection, job: &ProjectReviewJobSummary) -> Result<
             job.lease_owner,
             job.lease_expires_at.map(|value| value.to_rfc3339()),
             job.failure.as_ref().map(serde_json::to_string).transpose()?,
+            job.skip_reason.as_ref().map(ToString::to_string),
             job.submission_intent.as_ref().map(serde_json::to_string).transpose()?,
             job.submission_receipt.as_ref().map(serde_json::to_string).transpose()?,
             job.created_at.to_rfc3339(),

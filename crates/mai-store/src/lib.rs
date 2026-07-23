@@ -26,6 +26,7 @@ mod convert;
 mod events;
 mod git_accounts;
 mod github_app;
+pub use github_app::GithubAppIdentity;
 mod logs;
 mod projects;
 mod records;

@@ -1,7 +1,7 @@
 use chrono::{TimeDelta, Utc};
 use mai_protocol::{
-    ProjectReviewFailure, ProjectReviewFailureCategory, ProjectReviewJobSummary,
-    ProjectReviewOutcome,
+    ProjectReviewFailure, ProjectReviewFailureCategory, ProjectReviewJobSource,
+    ProjectReviewJobSummary, ProjectReviewOutcome,
 };
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
@@ -36,6 +36,11 @@ pub(super) async fn run_claimed_project_review_job(
         let _ = heartbeat.await;
         return result;
     }
+    let job = match preflight_project_review_job(ops, job, &owner).await {
+        ProjectReviewPreflight::Continue(job) => *job,
+        ProjectReviewPreflight::Finished => return true,
+        ProjectReviewPreflight::Cancelled => return false,
+    };
     let heartbeat_cancel = CancellationToken::new();
     let attempt_cancel = ops.cancellation_token.child_token();
     let heartbeat = tokio::spawn(run_project_review_job_heartbeat(
@@ -151,6 +156,121 @@ pub(super) async fn run_claimed_project_review_job(
     }
     project_job_state_projection(ops, &current, outcome, summary).await;
     true
+}
+
+enum ProjectReviewPreflight {
+    Continue(Box<ProjectReviewJobSummary>),
+    Finished,
+    Cancelled,
+}
+
+async fn preflight_project_review_job(
+    ops: &ProjectReviewTaskContext<impl ProjectReviewWorkerOps>,
+    mut job: ProjectReviewJobSummary,
+    owner: &str,
+) -> ProjectReviewPreflight {
+    if job.source == ProjectReviewJobSource::Manual {
+        return ProjectReviewPreflight::Continue(Box::new(job));
+    }
+    if ops.cancellation_token.is_cancelled() {
+        return ProjectReviewPreflight::Cancelled;
+    }
+    let evaluated = match ops
+        .ops
+        .evaluate_project_review_pr(job.project_id, job.pr, Some(job.head_sha.clone()))
+        .await
+    {
+        Ok(evaluated) => evaluated,
+        Err(error) => {
+            let failure = runtime_failure(&error);
+            apply_review_failure(&mut job, failure);
+            let _ = ops
+                .ops
+                .save_claimed_project_review_job(job.clone(), owner.to_string())
+                .await;
+            project_job_state_projection(ops, &job, Some(ProjectReviewOutcome::Failed), None).await;
+            tracing::warn!(
+                job_id = %job.id,
+                pr = job.pr,
+                error = %error,
+                "project review final eligibility check failed; scheduled retry"
+            );
+            return ProjectReviewPreflight::Finished;
+        }
+    };
+    let Some(current_head) = evaluated.head_sha.clone() else {
+        let error = RuntimeError::InvalidInput(
+            "GitHub pull request response is missing the current head SHA".to_string(),
+        );
+        apply_review_failure(&mut job, runtime_failure(&error));
+        let _ = ops
+            .ops
+            .save_claimed_project_review_job(job.clone(), owner.to_string())
+            .await;
+        project_job_state_projection(ops, &job, Some(ProjectReviewOutcome::Failed), None).await;
+        return ProjectReviewPreflight::Finished;
+    };
+    if current_head != job.head_sha {
+        super::job::supersede_job(&mut job, Utc::now());
+        let saved = ops
+            .ops
+            .save_claimed_project_review_job(job.clone(), owner.to_string())
+            .await;
+        if !matches!(saved, Ok(true)) {
+            tracing::warn!(
+                job_id = %job.id,
+                pr = job.pr,
+                "failed to persist superseded review job during final eligibility check"
+            );
+            return ProjectReviewPreflight::Finished;
+        }
+        if evaluated.skip_reason.is_none()
+            && let Err(error) = ops
+                .ops
+                .enqueue_project_review_replacement(job.clone(), current_head.clone())
+                .await
+        {
+            tracing::warn!(
+                job_id = %job.id,
+                pr = job.pr,
+                head_sha = %current_head,
+                error = %error,
+                "failed to enqueue replacement review job for the current head"
+            );
+        }
+        project_job_state_projection(ops, &job, None, None).await;
+        tracing::info!(
+            job_id = %job.id,
+            pr = job.pr,
+            old_head_sha = %job.head_sha,
+            current_head_sha = %current_head,
+            "superseded stale review job during final eligibility check"
+        );
+        return ProjectReviewPreflight::Finished;
+    }
+    if let Some(reason) = evaluated.skip_reason {
+        super::job::skip_job(&mut job, reason.clone(), Utc::now());
+        let saved = ops
+            .ops
+            .save_claimed_project_review_job(job.clone(), owner.to_string())
+            .await;
+        if !matches!(saved, Ok(true)) {
+            tracing::warn!(
+                job_id = %job.id,
+                pr = job.pr,
+                "failed to persist skipped review job during final eligibility check"
+            );
+        }
+        project_job_state_projection(ops, &job, None, None).await;
+        tracing::info!(
+            job_id = %job.id,
+            pr = job.pr,
+            skip_reason = %reason,
+            "skipped review job during final eligibility check"
+        );
+        return ProjectReviewPreflight::Finished;
+    }
+    ProjectReviewPreflight::Continue(Box::new(job))
 }
 
 fn apply_review_cycle_result(

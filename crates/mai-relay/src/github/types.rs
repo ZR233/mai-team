@@ -30,10 +30,16 @@ pub(crate) struct GithubAppConfig {
     pub(crate) private_key: String,
     #[serde(default)]
     pub(crate) webhook_secret: String,
+    #[serde(default)]
+    pub(crate) github_name: Option<String>,
     pub(crate) app_slug: Option<String>,
     pub(crate) app_html_url: Option<String>,
     pub(crate) owner_login: Option<String>,
     pub(crate) owner_type: Option<String>,
+    #[serde(default)]
+    pub(crate) bot_login: Option<String>,
+    #[serde(default)]
+    pub(crate) bot_user_id: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +60,7 @@ pub(crate) struct InstallationState {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct GithubAccountApi {
+    pub(crate) id: u64,
     pub(crate) login: String,
     #[serde(rename = "type")]
     pub(crate) account_type: String,
@@ -154,6 +161,7 @@ pub(crate) struct GithubManifestConversionResponse {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct GithubAppApi {
+    pub(crate) name: String,
     pub(crate) slug: String,
     pub(crate) html_url: String,
     #[serde(default)]

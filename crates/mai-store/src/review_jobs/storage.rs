@@ -23,7 +23,7 @@ pub(super) fn load_job(
         .query_row(
             "SELECT id, project_id, pr, head_sha, source, delivery_id, reason, status, \
              attempt_count, max_attempts, first_retryable_failure_at, next_attempt_at, \
-             reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, \
+             reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, skip_reason, \
              submission_intent_json, submission_receipt_json, created_at, updated_at, finished_at \
              FROM project_review_jobs WHERE id = ?1",
             params![job_id.to_string()],
@@ -42,7 +42,7 @@ pub(super) fn load_job_by_delivery(
         .query_row(
             "SELECT id, project_id, pr, head_sha, source, delivery_id, reason, status, \
              attempt_count, max_attempts, first_retryable_failure_at, next_attempt_at, \
-             reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, \
+             reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, skip_reason, \
              submission_intent_json, submission_receipt_json, created_at, updated_at, finished_at \
              FROM project_review_jobs WHERE project_id = ?1 AND pr = ?2 AND delivery_id = ?3 LIMIT 1",
             params![project_id.to_string(), u64_to_i64(pr), delivery_id],
@@ -62,7 +62,7 @@ pub(super) fn load_active_job(
     let sql = format!(
         "SELECT id, project_id, pr, head_sha, source, delivery_id, reason, status, \
          attempt_count, max_attempts, first_retryable_failure_at, next_attempt_at, \
-         reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, \
+         reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, skip_reason, \
          submission_intent_json, submission_receipt_json, created_at, updated_at, finished_at \
          FROM project_review_jobs WHERE project_id = ?1 AND pr = ?2 AND status IN ({placeholders}) \
          ORDER BY created_at DESC LIMIT 1"
@@ -86,7 +86,7 @@ pub(super) fn load_first_active_job(
     let sql = format!(
         "SELECT id, project_id, pr, head_sha, source, delivery_id, reason, status, \
          attempt_count, max_attempts, first_retryable_failure_at, next_attempt_at, \
-         reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, \
+         reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, skip_reason, \
          submission_intent_json, submission_receipt_json, created_at, updated_at, finished_at \
          FROM project_review_jobs WHERE project_id = ?1 AND status IN ({placeholders}) \
          ORDER BY CASE status \
@@ -126,11 +126,12 @@ pub(super) fn project_review_job_record(row: &Row<'_>) -> rusqlite::Result<Proje
         lease_owner: row.get(14)?,
         lease_expires_at: row.get(15)?,
         failure_json: row.get(16)?,
-        submission_intent_json: row.get(17)?,
-        submission_receipt_json: row.get(18)?,
-        created_at: row.get(19)?,
-        updated_at: row.get(20)?,
-        finished_at: row.get(21)?,
+        skip_reason: row.get(17)?,
+        submission_intent_json: row.get(18)?,
+        submission_receipt_json: row.get(19)?,
+        created_at: row.get(20)?,
+        updated_at: row.get(21)?,
+        finished_at: row.get(22)?,
     })
 }
 

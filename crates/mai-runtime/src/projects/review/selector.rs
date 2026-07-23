@@ -75,7 +75,7 @@ pub(crate) async fn run_project_review_selector(
                 project_id,
                 owner: &owner,
                 repo: &repo,
-                reviewer_login: &identity.login,
+                reviewer_user_id: identity.user_id,
                 pull_requests: &pull_requests,
                 cancellation_token: cancellation_token.clone(),
             },
@@ -114,7 +114,7 @@ struct PullRequestPageSelection<'a> {
     project_id: ProjectId,
     owner: &'a str,
     repo: &'a str,
-    reviewer_login: &'a str,
+    reviewer_user_id: u64,
     pull_requests: &'a [super::eligibility::GithubPullRequest],
     cancellation_token: CancellationToken,
 }
@@ -140,7 +140,7 @@ async fn select_and_queue_pull_request_page(
                 page.project_id,
                 page.owner,
                 page.repo,
-                page.reviewer_login,
+                page.reviewer_user_id,
                 pull_request,
             ));
             next_index += 1;
@@ -253,9 +253,7 @@ mod tests {
             &self,
             _project_id: mai_protocol::ProjectId,
         ) -> crate::Result<ProjectReviewIdentity> {
-            Ok(ProjectReviewIdentity {
-                login: "mai-bot".to_string(),
-            })
+            Ok(ProjectReviewIdentity { user_id: 42 })
         }
 
         async fn github_api_get_json(
@@ -294,25 +292,25 @@ mod tests {
     struct LiveSelectorOps {
         client: reqwest::Client,
         token: Option<String>,
-        reviewer_login: String,
+        reviewer_user_id: u64,
         requested_paths: Mutex<Vec<String>>,
     }
 
     impl LiveSelectorOps {
-        fn new(reviewer_login: impl Into<String>) -> Self {
+        fn new(reviewer_user_id: u64) -> Self {
             Self {
                 client: reqwest::Client::builder()
                     .timeout(Duration::from_secs(20))
                     .build()
                     .expect("build reqwest client"),
                 token: local_github_token(),
-                reviewer_login: reviewer_login.into(),
+                reviewer_user_id,
                 requested_paths: Mutex::new(Vec::new()),
             }
         }
 
-        fn new_with_required_local_token(reviewer_login: impl Into<String>) -> Self {
-            let ops = Self::new(reviewer_login);
+        fn new_with_required_local_token(reviewer_user_id: u64) -> Self {
+            let ops = Self::new(reviewer_user_id);
             if ops.token.is_none() {
                 panic!(
                     "live selector test requires MAI_LIVE_GITHUB_TOKEN/GITHUB_TOKEN/GH_TOKEN or `gh auth token`"
@@ -340,7 +338,7 @@ mod tests {
             _project_id: mai_protocol::ProjectId,
         ) -> crate::Result<ProjectReviewIdentity> {
             Ok(ProjectReviewIdentity {
-                login: self.reviewer_login.clone(),
+                user_id: self.reviewer_user_id,
             })
         }
 
@@ -463,9 +461,7 @@ mod tests {
             &self,
             _project_id: mai_protocol::ProjectId,
         ) -> crate::Result<ProjectReviewIdentity> {
-            Ok(ProjectReviewIdentity {
-                login: "mai-bot".to_string(),
-            })
+            Ok(ProjectReviewIdentity { user_id: 42 })
         }
 
         async fn github_api_get_json(
@@ -735,7 +731,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "reads live GitHub data from rcore-os/tgoskits"]
     async fn live_selector_reads_rcore_os_tgoskits_without_enqueueing() {
-        let ops = Arc::new(LiveSelectorOps::new(live_reviewer_login()));
+        let ops = Arc::new(LiveSelectorOps::new(live_reviewer_user_id()));
 
         let selected = select_project_review_candidates(ops.as_ref(), Uuid::new_v4())
             .await
@@ -776,20 +772,20 @@ mod tests {
     #[tokio::test]
     #[ignore = "uses local GitHub token and reads live rcore-os/tgoskits data"]
     async fn live_selector_diagnoses_rcore_os_tgoskits_with_local_github_token() {
-        let reviewer_login = live_reviewer_login();
+        let reviewer_user_id = live_reviewer_user_id();
         let ops = Arc::new(LiveSelectorOps::new_with_required_local_token(
-            reviewer_login.clone(),
+            reviewer_user_id,
         ));
 
-        let selected = diagnose_live_selection(ops.as_ref(), Uuid::new_v4(), &reviewer_login)
+        let selected = diagnose_live_selection(ops.as_ref(), Uuid::new_v4(), reviewer_user_id)
             .await
             .expect("diagnose live selection");
 
         let requested_paths = ops.requested_paths.lock().await;
         println!(
-            "diagnostic requested {} GitHub API paths for reviewer {}",
+            "diagnostic requested {} GitHub API paths for reviewer user ID {}",
             requested_paths.len(),
-            reviewer_login
+            reviewer_user_id
         );
         if selected.is_empty() {
             println!("diagnostic found no eligible rcore-os/tgoskits PR");
@@ -811,7 +807,7 @@ mod tests {
     async fn diagnose_live_selection(
         ops: &impl ProjectReviewSelectorOps,
         project_id: mai_protocol::ProjectId,
-        reviewer_login: &str,
+        reviewer_user_id: u64,
     ) -> crate::Result<Vec<SelectedProjectReviewPr>> {
         let owner = crate::github::github_path_segment("rcore-os");
         let repo = crate::github::github_path_segment("tgoskits");
@@ -829,7 +825,7 @@ mod tests {
                 let candidate =
                     pull_request_candidate(ops, project_id, &owner, &repo, pull_request).await?;
                 let selections = super::super::selection::select_review_prs(
-                    reviewer_login,
+                    reviewer_user_id,
                     vec![candidate.clone()],
                 );
                 if let Some(selection) = selections.first() {
@@ -844,7 +840,7 @@ mod tests {
                 println!(
                     "#{} skip {}",
                     candidate.number,
-                    skip_reason(reviewer_login, &candidate)
+                    skip_reason(reviewer_user_id, &candidate)
                 );
             }
             if pull_requests.len() < SELECTOR_PAGE_SIZE as usize {
@@ -859,7 +855,7 @@ mod tests {
     }
 
     fn skip_reason(
-        reviewer_login: &str,
+        reviewer_user_id: u64,
         candidate: &super::super::selection::PullRequestCandidate,
     ) -> String {
         if candidate.draft {
@@ -873,7 +869,7 @@ mod tests {
         if !pending_ci.is_empty() {
             return format!("ci_pending [{}]", pending_ci.join(", "));
         }
-        if let Some(review) = latest_reviewer_review(reviewer_login, &candidate.reviews) {
+        if let Some(review) = latest_reviewer_review(reviewer_user_id, &candidate.reviews) {
             if let (Some(submitted_at), Some(latest_commit_at)) =
                 (review.submitted_at, candidate.latest_commit_at)
                 && latest_commit_at <= submitted_at
@@ -895,13 +891,13 @@ mod tests {
         "not selected by unknown rule".to_string()
     }
 
-    fn latest_reviewer_review<'a>(
-        reviewer_login: &str,
-        reviews: &'a [super::super::selection::PullRequestReview],
-    ) -> Option<&'a super::super::selection::PullRequestReview> {
+    fn latest_reviewer_review(
+        reviewer_user_id: u64,
+        reviews: &[super::super::selection::PullRequestReview],
+    ) -> Option<&super::super::selection::PullRequestReview> {
         reviews
             .iter()
-            .filter(|review| review.author_login.as_deref() == Some(reviewer_login))
+            .filter(|review| review.author_user_id == Some(reviewer_user_id))
             .filter(|review| review.submitted_at.is_some())
             .max_by_key(|review| review.submitted_at)
     }
@@ -913,8 +909,11 @@ mod tests {
         )
     }
 
-    fn live_reviewer_login() -> String {
-        env::var("MAI_LIVE_REVIEWER_LOGIN").unwrap_or_else(|_| "mai-team-app[bot]".to_string())
+    fn live_reviewer_user_id() -> u64 {
+        env::var("MAI_LIVE_REVIEWER_USER_ID")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(283_045_312)
     }
 
     fn local_github_token() -> Option<String> {

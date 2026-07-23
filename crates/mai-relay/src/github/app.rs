@@ -21,10 +21,14 @@ pub(crate) fn github_app_settings(state: &AppState) -> RelayResult<GithubAppSett
             public_url: Some(state.public_url.clone()),
             has_private_key: false,
             app_slug: None,
+            github_name: None,
             app_html_url: None,
             owner_login: None,
             owner_type: None,
+            bot_login: None,
+            bot_user_id: None,
             install_url: None,
+            manage_url: None,
         });
     };
     Ok(github_app_settings_response(
@@ -67,6 +71,24 @@ pub(crate) async fn save_github_app_settings(
         None,
     ))
 }
+
+pub(crate) async fn refresh_github_app_settings(
+    state: &AppState,
+) -> RelayResult<GithubAppSettingsResponse> {
+    let mut config = state
+        .store
+        .github_app_config()?
+        .ok_or_else(|| RelayErrorKind::InvalidInput("GitHub App is not configured".to_string()))?;
+    hydrate_github_app_metadata(&state.http, &state.github_api_base_url, &mut config).await?;
+    state.store.save_github_app_config(&config)?;
+    Ok(github_app_settings_response(
+        &config,
+        &state.github_api_base_url,
+        &state.github_web_base_url,
+        &relay_public_url(state)?,
+        None,
+    ))
+}
 pub(crate) async fn bootstrap_github_app_config(
     store: &RelayStore,
     http: &reqwest::Client,
@@ -79,9 +101,16 @@ pub(crate) async fn bootstrap_github_app_config(
     let Some(mut config) = merge_github_app_config(env_config, stored_config) else {
         return Ok(());
     };
-    hydrate_github_app_metadata(http, github_api_base_url, &mut config)
-        .await
-        .context("loading GitHub App metadata")?;
+    if let Err(err) = hydrate_github_app_metadata(http, github_api_base_url, &mut config).await {
+        if config.bot_user_id.is_none() {
+            return Err(anyhow::Error::new(err).context("loading GitHub App metadata"));
+        }
+        warn!(
+            app_id = %config.app_id,
+            error = %err,
+            "could not refresh GitHub App metadata; using the persisted bot user ID"
+        );
+    }
     let mut generated_secret = false;
     if config.webhook_secret.trim().is_empty() {
         let webhook_secret = Uuid::new_v4().to_string();
@@ -118,9 +147,6 @@ pub(crate) async fn hydrate_github_app_metadata(
     github_api_base_url: &str,
     config: &mut GithubAppConfig,
 ) -> RelayResult<()> {
-    if github_app_config_has_metadata(config) {
-        return Ok(());
-    }
     let jwt = super::api::github_app_jwt_for_config(config)?;
     let url = super::api::github_api_url(github_api_base_url, "/app");
     let response = http
@@ -132,39 +158,36 @@ pub(crate) async fn hydrate_github_app_metadata(
     let app =
         super::api::decode_github_response::<GithubAppApi>(response, "get GitHub App metadata")
             .await?;
-    apply_github_app_metadata(config, app);
+    let bot_url = super::api::github_api_url(
+        github_api_base_url,
+        &format!("/users/{}%5Bbot%5D", app.slug),
+    );
+    let bot_response = http
+        .get(bot_url)
+        .headers(super::api::github_headers())
+        .send()
+        .await?;
+    let bot = super::api::decode_github_response::<super::types::GithubAccountApi>(
+        bot_response,
+        "get GitHub App bot identity",
+    )
+    .await?;
+    apply_github_app_metadata(config, app, bot);
     Ok(())
 }
 
-pub(crate) fn github_app_config_has_metadata(config: &GithubAppConfig) -> bool {
-    config
-        .app_slug
-        .as_deref()
-        .is_some_and(|slug| !is_placeholder_github_app_slug(slug))
-        && config.app_html_url.is_some()
-        && config.owner_login.is_some()
-        && config.owner_type.is_some()
-}
-
-pub(crate) fn apply_github_app_metadata(config: &mut GithubAppConfig, app: GithubAppApi) {
-    if config
-        .app_slug
-        .as_deref()
-        .is_none_or(is_placeholder_github_app_slug)
-    {
-        config.app_slug = Some(app.slug);
-    }
-    if config.app_html_url.is_none() {
-        config.app_html_url = Some(app.html_url);
-    }
-    if let Some(owner) = app.owner {
-        if config.owner_login.is_none() {
-            config.owner_login = Some(owner.login);
-        }
-        if config.owner_type.is_none() {
-            config.owner_type = Some(owner.account_type);
-        }
-    }
+pub(crate) fn apply_github_app_metadata(
+    config: &mut GithubAppConfig,
+    app: GithubAppApi,
+    bot: super::types::GithubAccountApi,
+) {
+    config.github_name = Some(app.name);
+    config.app_slug = Some(app.slug);
+    config.app_html_url = Some(app.html_url);
+    config.owner_login = app.owner.as_ref().map(|owner| owner.login.clone());
+    config.owner_type = app.owner.map(|owner| owner.account_type);
+    config.bot_login = Some(bot.login);
+    config.bot_user_id = Some(bot.id);
 }
 
 pub(crate) fn merge_github_app_config(
@@ -186,6 +209,11 @@ pub(crate) fn merge_github_app_config(
                     .as_ref()
                     .and_then(|config| config.app_html_url.clone());
             }
+            if env.github_name.is_none() {
+                env.github_name = stored
+                    .as_ref()
+                    .and_then(|config| config.github_name.clone());
+            }
             if env.owner_login.is_none() {
                 env.owner_login = stored
                     .as_ref()
@@ -193,6 +221,12 @@ pub(crate) fn merge_github_app_config(
             }
             if env.owner_type.is_none() {
                 env.owner_type = stored.as_ref().and_then(|config| config.owner_type.clone());
+            }
+            if env.bot_login.is_none() {
+                env.bot_login = stored.as_ref().and_then(|config| config.bot_login.clone());
+            }
+            if env.bot_user_id.is_none() {
+                env.bot_user_id = stored.as_ref().and_then(|config| config.bot_user_id);
             }
             Some(env)
         }
@@ -303,10 +337,13 @@ pub(crate) fn github_app_config_from_env() -> Result<Option<GithubAppConfig>> {
         app_id,
         private_key,
         webhook_secret: String::new(),
+        github_name: None,
         app_slug,
         app_html_url: optional_env("MAI_RELAY_GITHUB_APP_HTML_URL"),
         owner_login: optional_env("MAI_RELAY_GITHUB_APP_OWNER_LOGIN"),
         owner_type: optional_env("MAI_RELAY_GITHUB_APP_OWNER_TYPE"),
+        bot_login: None,
+        bot_user_id: None,
     }))
 }
 
@@ -332,10 +369,13 @@ pub(crate) fn compiled_github_app_config() -> RelayResult<Option<GithubAppConfig
         app_id: app_id.to_string(),
         private_key: private_key.to_string(),
         webhook_secret: String::new(),
+        github_name: None,
         app_slug: compiled_optional_env("MAI_RELAY_GITHUB_APP_SLUG"),
         app_html_url: compiled_optional_env("MAI_RELAY_GITHUB_APP_HTML_URL"),
         owner_login: compiled_optional_env("MAI_RELAY_GITHUB_APP_OWNER_LOGIN"),
         owner_type: compiled_optional_env("MAI_RELAY_GITHUB_APP_OWNER_TYPE"),
+        bot_login: None,
+        bot_user_id: None,
     }))
 }
 
@@ -370,21 +410,23 @@ fn merge_github_app_settings(
     current: Option<GithubAppConfig>,
     current_public_url: &str,
 ) -> RelayResult<(GithubAppConfig, String)> {
+    let GithubAppSettingsRequest {
+        app_id,
+        private_key,
+        public_url,
+        ..
+    } = request;
     let app_id = required_text_update(
-        request.app_id,
+        app_id,
         current.as_ref().map(|config| config.app_id.as_str()),
         "GitHub App ID",
     )?;
     let private_key = required_text_update(
-        request.private_key,
+        private_key,
         current.as_ref().map(|config| config.private_key.as_str()),
         "GitHub App private key",
     )?;
-    let public_url = required_url_update(
-        request.public_url,
-        Some(current_public_url),
-        "relay public URL",
-    )?;
+    let public_url = required_url_update(public_url, Some(current_public_url), "relay public URL")?;
     let config = GithubAppConfig {
         app_id,
         private_key,
@@ -393,28 +435,21 @@ fn merge_github_app_settings(
             .map(|config| config.webhook_secret.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| Uuid::new_v4().to_string()),
-        app_slug: merge_optional_setting(
-            request.app_slug,
-            current.as_ref().and_then(|config| config.app_slug.clone()),
-        ),
-        app_html_url: merge_optional_setting(
-            request.app_html_url,
-            current
-                .as_ref()
-                .and_then(|config| config.app_html_url.clone()),
-        ),
-        owner_login: merge_optional_setting(
-            request.owner_login,
-            current
-                .as_ref()
-                .and_then(|config| config.owner_login.clone()),
-        ),
-        owner_type: merge_optional_setting(
-            request.owner_type,
-            current
-                .as_ref()
-                .and_then(|config| config.owner_type.clone()),
-        ),
+        github_name: current
+            .as_ref()
+            .and_then(|config| config.github_name.clone()),
+        app_slug: current.as_ref().and_then(|config| config.app_slug.clone()),
+        app_html_url: current
+            .as_ref()
+            .and_then(|config| config.app_html_url.clone()),
+        owner_login: current
+            .as_ref()
+            .and_then(|config| config.owner_login.clone()),
+        owner_type: current
+            .as_ref()
+            .and_then(|config| config.owner_type.clone()),
+        bot_login: current.as_ref().and_then(|config| config.bot_login.clone()),
+        bot_user_id: current.as_ref().and_then(|config| config.bot_user_id),
     };
     Ok((config, public_url))
 }
@@ -450,13 +485,6 @@ fn normalized_text(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn merge_optional_setting(requested: Option<String>, current: Option<String>) -> Option<String> {
-    match requested {
-        Some(value) => normalized_text(Some(&value)),
-        None => current,
-    }
-}
-
 fn relay_public_url(state: &AppState) -> RelayResult<String> {
     Ok(state.store.relay_config(&state.public_url)?.url)
 }
@@ -477,13 +505,34 @@ pub(crate) fn github_app_settings_response(
         public_url: Some(public_url.to_string()),
         has_private_key: !config.private_key.trim().is_empty(),
         app_slug: config.app_slug.clone(),
+        github_name: config.github_name.clone(),
         app_html_url: config.app_html_url.clone(),
         owner_login: config.owner_login.clone(),
         owner_type: config.owner_type.clone(),
+        bot_login: config.bot_login.clone(),
+        bot_user_id: config.bot_user_id,
         install_url: config
             .app_slug
             .as_deref()
             .map(|slug| github_app_install_url(web_base_url, slug, install_state)),
+        manage_url: github_app_manage_url(web_base_url, config),
+    }
+}
+
+fn github_app_manage_url(web_base_url: &str, config: &GithubAppConfig) -> Option<String> {
+    let slug = config.app_slug.as_deref()?.trim();
+    if slug.is_empty() {
+        return None;
+    }
+    let base = web_base_url.trim_end_matches('/');
+    match (
+        config.owner_type.as_deref(),
+        config.owner_login.as_deref().map(str::trim),
+    ) {
+        (Some("Organization"), Some(owner)) if !owner.is_empty() => {
+            Some(format!("{base}/organizations/{owner}/settings/apps/{slug}"))
+        }
+        _ => Some(format!("{base}/settings/apps/{slug}")),
     }
 }
 
@@ -543,6 +592,7 @@ pub(crate) fn github_app_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::types::GithubAccountApi;
     use serde_json::json;
 
     #[test]
@@ -574,10 +624,13 @@ mod tests {
             app_id: "123".to_string(),
             private_key: "pem".to_string(),
             webhook_secret: "secret".to_string(),
+            github_name: Some("Mai Test".to_string()),
             app_slug: Some("mai-test".to_string()),
             app_html_url: Some("https://github.com/apps/mai-test".to_string()),
             owner_login: Some("owner".to_string()),
             owner_type: Some("User".to_string()),
+            bot_login: Some("mai-test[bot]".to_string()),
+            bot_user_id: Some(42),
         };
         let settings = github_app_settings_response(
             &config,
@@ -616,19 +669,25 @@ mod tests {
             app_id: "456".to_string(),
             private_key: "env-pem".to_string(),
             webhook_secret: String::new(),
+            github_name: None,
             app_slug: Some("env-slug".to_string()),
             app_html_url: None,
             owner_login: None,
             owner_type: None,
+            bot_login: None,
+            bot_user_id: None,
         };
         let stored = GithubAppConfig {
             app_id: "123".to_string(),
             private_key: "stored-pem".to_string(),
             webhook_secret: "stored-secret".to_string(),
+            github_name: Some("Stored App".to_string()),
             app_slug: Some("stored-slug".to_string()),
             app_html_url: Some("https://github.com/apps/stored".to_string()),
             owner_login: Some("owner".to_string()),
             owner_type: Some("User".to_string()),
+            bot_login: Some("stored-slug[bot]".to_string()),
+            bot_user_id: Some(42),
         };
 
         let merged = merge_github_app_config(Some(env), Some(stored)).expect("merged");
@@ -645,20 +704,19 @@ mod tests {
             app_id: "123".to_string(),
             private_key: "stored-pem".to_string(),
             webhook_secret: "stored-secret".to_string(),
+            github_name: Some("Stored App".to_string()),
             app_slug: Some("stored-slug".to_string()),
             app_html_url: Some("https://github.com/apps/stored".to_string()),
             owner_login: Some("owner".to_string()),
             owner_type: Some("Organization".to_string()),
+            bot_login: Some("stored-slug[bot]".to_string()),
+            bot_user_id: Some(42),
         };
         let request = GithubAppSettingsRequest {
             app_id: Some("456".to_string()),
             private_key: Some(" \n ".to_string()),
             base_url: None,
             public_url: Some("https://relay-two.example/".to_string()),
-            app_slug: None,
-            app_html_url: None,
-            owner_login: None,
-            owner_type: None,
         };
 
         let (config, public_url) =
@@ -671,10 +729,13 @@ mod tests {
                 app_id: "456".to_string(),
                 private_key: "stored-pem".to_string(),
                 webhook_secret: "stored-secret".to_string(),
+                github_name: Some("Stored App".to_string()),
                 app_slug: Some("stored-slug".to_string()),
                 app_html_url: Some("https://github.com/apps/stored".to_string()),
                 owner_login: Some("owner".to_string()),
                 owner_type: Some("Organization".to_string()),
+                bot_login: Some("stored-slug[bot]".to_string()),
+                bot_user_id: Some(42),
             }
         );
         assert_eq!(public_url, "https://relay-two.example");
@@ -686,20 +747,19 @@ mod tests {
             app_id: "123".to_string(),
             private_key: "stored-pem".to_string(),
             webhook_secret: "stored-secret".to_string(),
+            github_name: None,
             app_slug: None,
             app_html_url: None,
             owner_login: None,
             owner_type: None,
+            bot_login: None,
+            bot_user_id: None,
         };
         let request = GithubAppSettingsRequest {
             app_id: None,
             private_key: Some(" new-pem ".to_string()),
             base_url: None,
             public_url: None,
-            app_slug: None,
-            app_html_url: None,
-            owner_login: None,
-            owner_type: None,
         };
 
         let (config, public_url) =
@@ -718,10 +778,6 @@ mod tests {
             private_key: None,
             base_url: None,
             public_url: Some("https://relay.example".to_string()),
-            app_slug: None,
-            app_html_url: None,
-            owner_login: None,
-            owner_type: None,
         };
 
         let error = merge_github_app_settings(request, None, "https://relay.example")
@@ -745,27 +801,38 @@ mod tests {
     #[test]
     fn github_app_api_metadata_fills_config_fields() {
         let app: GithubAppApi = serde_json::from_value(json!({
+            "name": "Mai Team",
             "slug": "mai-team-app",
             "html_url": "https://github.com/apps/mai-team-app",
             "owner": {
+                "id": 7,
                 "login": "mai-team",
                 "type": "Organization"
             }
         }))
         .expect("app");
+        let bot: GithubAccountApi = serde_json::from_value(json!({
+            "id": 283045312,
+            "login": "mai-team-app[bot]",
+            "type": "Bot"
+        }))
+        .expect("bot");
 
         let mut config = GithubAppConfig {
             app_id: "123".to_string(),
             private_key: "pem".to_string(),
             webhook_secret: "secret".to_string(),
+            github_name: None,
             app_slug: Some("github-app-slug".to_string()),
             app_html_url: None,
             owner_login: None,
             owner_type: None,
+            bot_login: None,
+            bot_user_id: None,
         };
-        assert!(!github_app_config_has_metadata(&config));
-        apply_github_app_metadata(&mut config, app);
+        apply_github_app_metadata(&mut config, app, bot);
 
+        assert_eq!(config.github_name.as_deref(), Some("Mai Team"));
         assert_eq!(config.app_slug.as_deref(), Some("mai-team-app"));
         assert_eq!(
             config.app_html_url.as_deref(),
@@ -773,6 +840,7 @@ mod tests {
         );
         assert_eq!(config.owner_login.as_deref(), Some("mai-team"));
         assert_eq!(config.owner_type.as_deref(), Some("Organization"));
-        assert!(github_app_config_has_metadata(&config));
+        assert_eq!(config.bot_login.as_deref(), Some("mai-team-app[bot]"));
+        assert_eq!(config.bot_user_id, Some(283045312));
     }
 }

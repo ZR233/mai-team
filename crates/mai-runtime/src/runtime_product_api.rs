@@ -1,9 +1,10 @@
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ProjectReviewEnqueueAdmission {
     RequireAutoReviewEnabled,
     ManualRequest,
+    Replacement(ProjectReviewJobSource),
 }
 
 impl AgentRuntime {
@@ -357,20 +358,20 @@ impl AgentRuntime {
                 ..Default::default()
             });
         }
-        let selected = projects::review::eligibility::select_project_review_pr(
+        let evaluated = projects::review::eligibility::evaluate_project_review_pr(
             self,
             project_id,
             request.pr,
             request.head_sha,
         )
         .await?;
-        let summary = match selected {
-            Some(selected) => {
+        let summary = match evaluated.skip_reason.as_ref() {
+            None => {
                 self.enqueue_project_review_signals_with_admission(
                     project_id,
                     vec![ProjectReviewSignalInput {
-                        pr: selected.pr,
-                        head_sha: selected.head_sha,
+                        pr: evaluated.pr,
+                        head_sha: evaluated.head_sha,
                         delivery_id: request.delivery_id.clone(),
                         reason: request.reason.clone(),
                     }],
@@ -379,10 +380,19 @@ impl AgentRuntime {
                 )
                 .await?
             }
-            None => ProjectReviewQueueSummary {
-                ignored: vec![request.pr],
-                ..Default::default()
-            },
+            Some(reason) => {
+                tracing::info!(
+                    project_id = %project_id,
+                    pr = request.pr,
+                    delivery_id = request.delivery_id.as_deref().unwrap_or_default(),
+                    skip_reason = %reason,
+                    "ignored ineligible project review relay signal"
+                );
+                ProjectReviewQueueSummary {
+                    ignored: vec![request.pr],
+                    ..Default::default()
+                }
+            }
         };
         tracing::info!(
             project_id = %project_id,
@@ -392,6 +402,7 @@ impl AgentRuntime {
             queued = ?summary.queued,
             deduped = ?summary.deduped,
             ignored = ?summary.ignored,
+            job_ids = ?summary.jobs.iter().map(|job| job.id).collect::<Vec<_>>(),
             "queued project review relay signal"
         );
         Ok(summary)
@@ -412,6 +423,25 @@ impl AgentRuntime {
         .await
     }
 
+    pub(crate) async fn enqueue_project_review_replacement(
+        self: &Arc<Self>,
+        job: ProjectReviewJobSummary,
+        head_sha: String,
+    ) -> Result<ProjectReviewQueueSummary> {
+        self.enqueue_project_review_signals_with_admission(
+            job.project_id,
+            vec![ProjectReviewSignalInput {
+                pr: job.pr,
+                head_sha: Some(head_sha),
+                delivery_id: None,
+                reason: "preflight_head_changed".to_string(),
+            }],
+            ProjectReviewEnqueueAdmission::Replacement(job.source),
+            false,
+        )
+        .await
+    }
+
     async fn enqueue_project_review_signals_with_admission(
         self: &Arc<Self>,
         project_id: ProjectId,
@@ -422,7 +452,7 @@ impl AgentRuntime {
         let project = self.project(project_id).await?;
         {
             let summary = project.summary.read().await;
-            if admission == ProjectReviewEnqueueAdmission::RequireAutoReviewEnabled
+            if !matches!(&admission, ProjectReviewEnqueueAdmission::ManualRequest)
                 && !summary.auto_review_enabled
             {
                 return Ok(ProjectReviewQueueSummary {
@@ -433,11 +463,12 @@ impl AgentRuntime {
         }
         let signals_for_events = signals.clone();
         let mut summary = ProjectReviewQueueSummary::default();
-        let source = match admission {
+        let source = match &admission {
             ProjectReviewEnqueueAdmission::ManualRequest => ProjectReviewJobSource::Manual,
             ProjectReviewEnqueueAdmission::RequireAutoReviewEnabled => {
                 ProjectReviewJobSource::Automatic
             }
+            ProjectReviewEnqueueAdmission::Replacement(source) => source.clone(),
         };
         for signal in signals {
             if signal.pr == 0 {

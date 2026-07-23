@@ -14,6 +14,10 @@ impl GithubAppBackend for RelayClient {
         RelayClient::github_app_settings(self).await
     }
 
+    async fn refresh_github_app_settings(&self) -> Result<GithubAppSettingsResponse> {
+        RelayClient::refresh_github_app_settings(self).await
+    }
+
     async fn save_github_app_settings(
         &self,
         request: mai_protocol::GithubAppSettingsRequest,

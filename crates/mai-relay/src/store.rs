@@ -538,10 +538,13 @@ mod tests {
                 app_id: "persisted-app-id".to_string(),
                 private_key: "persisted-private-key".to_string(),
                 webhook_secret: "persisted-webhook-secret".to_string(),
+                github_name: Some("Persisted App".to_string()),
                 app_slug: Some("persisted-slug".to_string()),
                 app_html_url: Some("https://github.com/apps/persisted".to_string()),
                 owner_login: Some("persisted-owner".to_string()),
                 owner_type: Some("Organization".to_string()),
+                bot_login: Some("persisted-slug[bot]".to_string()),
+                bot_user_id: Some(42),
             })
             .expect("save persisted app config");
 

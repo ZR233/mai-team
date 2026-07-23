@@ -149,15 +149,28 @@ pub enum ProjectReviewJobStatus {
     Failed,
     Cancelled,
     Superseded,
+    Skipped,
 }
 
 impl ProjectReviewJobStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Superseded
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Superseded | Self::Skipped
         )
     }
+}
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ProjectReviewSkipReason {
+    PullRequestClosed,
+    Draft,
+    CiPending,
+    AlreadyReviewedCurrentHead,
 }
 
 #[derive(
@@ -603,6 +616,8 @@ pub struct ProjectReviewJobSummary {
     pub lease_expires_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub failure: Option<ProjectReviewFailure>,
+    #[serde(default)]
+    pub skip_reason: Option<ProjectReviewSkipReason>,
     #[serde(default)]
     pub submission_intent: Option<ProjectReviewSubmissionIntent>,
     #[serde(default)]
@@ -1789,13 +1804,21 @@ pub struct GithubAppSettingsResponse {
     #[serde(default)]
     pub app_slug: Option<String>,
     #[serde(default)]
+    pub github_name: Option<String>,
+    #[serde(default)]
     pub app_html_url: Option<String>,
     #[serde(default)]
     pub owner_login: Option<String>,
     #[serde(default)]
     pub owner_type: Option<String>,
     #[serde(default)]
+    pub bot_login: Option<String>,
+    #[serde(default)]
+    pub bot_user_id: Option<u64>,
+    #[serde(default)]
     pub install_url: Option<String>,
+    #[serde(default)]
+    pub manage_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1822,14 +1845,6 @@ pub struct GithubAppSettingsRequest {
     pub base_url: Option<String>,
     #[serde(default)]
     pub public_url: Option<String>,
-    #[serde(default)]
-    pub app_slug: Option<String>,
-    #[serde(default)]
-    pub app_html_url: Option<String>,
-    #[serde(default)]
-    pub owner_login: Option<String>,
-    #[serde(default)]
-    pub owner_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -2362,6 +2377,7 @@ mod tests {
                     retry_after_ms: Some(30_000),
                 },
             }),
+            skip_reason: None,
             submission_intent: Some(ProjectReviewSubmissionIntent {
                 job_id,
                 head_sha: "abc123".to_string(),
@@ -2449,9 +2465,13 @@ mod tests {
                 app_html_url: None,
                 owner_login: None,
                 owner_type: None,
+                github_name: Some("Mai".to_string()),
+                bot_login: Some("mai[bot]".to_string()),
+                bot_user_id: Some(42),
                 install_url: Some(
                     "https://github.com/apps/mai/installations/select_target".to_string(),
                 ),
+                manage_url: Some("https://github.com/settings/apps/mai".to_string()),
             },
         };
         let value = serde_json::to_value(&response).expect("serialize");
@@ -2518,10 +2538,6 @@ mod tests {
             private_key: None,
             base_url: Some("https://api.github.com".to_string()),
             public_url: Some("https://relay.example".to_string()),
-            app_slug: Some("mai".to_string()),
-            app_html_url: None,
-            owner_login: None,
-            owner_type: None,
         })
         .expect("serialize GitHub App settings");
         assert_eq!(
@@ -2529,11 +2545,7 @@ mod tests {
             json!({
                 "app_id": "123",
                 "base_url": "https://api.github.com",
-                "public_url": "https://relay.example",
-                "app_slug": "mai",
-                "app_html_url": null,
-                "owner_login": null,
-                "owner_type": null
+                "public_url": "https://relay.example"
             })
         );
     }

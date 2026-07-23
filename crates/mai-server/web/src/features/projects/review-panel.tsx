@@ -26,7 +26,7 @@ import { cn } from "@/lib/utils"
 
 import { buildReviewActivity } from "./review-activity"
 import { ReviewActivityList } from "./review-activity-list"
-import { latestReviewAttempt, summarizeReviewJobs } from "./review-job-model"
+import { latestReviewAttempt, reviewSkipReasonLabel, summarizeReviewJobs } from "./review-job-model"
 
 interface QueueResponse {
   queued: number[]
@@ -69,7 +69,7 @@ export function ReviewPanel({ project }: { project: ProjectDetail }) {
           </DialogContent>
         </Dialog>
       </div>
-      <div className="flex flex-wrap gap-2" aria-label="Review job summary"><Badge variant="secondary">{summary.active} active</Badge><Badge variant="outline">{summary.succeeded} succeeded</Badge><Badge variant={summary.failed ? "destructive" : "outline"}>{summary.failed} failed</Badge></div>
+      <div className="flex flex-wrap gap-2" aria-label="Review job summary"><Badge variant="secondary">{summary.active} active</Badge><Badge variant="outline">{summary.succeeded} succeeded</Badge><Badge variant="outline">{summary.skipped} skipped</Badge><Badge variant={summary.failed ? "destructive" : "outline"}>{summary.failed} failed</Badge></div>
       {jobs.isLoading && <LoadingState rows={5} />}
       {jobs.error && <ErrorState error={jobs.error} retry={() => void jobs.refetch()} />}
       {jobs.data?.jobs.length === 0 && <EmptyState title="No review jobs yet" description="Queue a pull request review to see its lifecycle and attempts here." action={<Button onClick={() => setRunDialogOpen(true)}><Play data-icon="inline-start" /> Run review</Button>} />}
@@ -92,7 +92,7 @@ function ReviewTable({ jobs, repository, onDetails, onRereview, pending }: Revie
 }
 
 function ReviewMobileList({ jobs, repository, onDetails, onRereview, pending }: ReviewJobListProps) {
-  return <div className="divide-y overflow-hidden rounded-lg border lg:hidden">{jobs.map((job) => <div key={job.id} className="flex items-center gap-3 p-3"><StatusBadge status={job.status} /><button type="button" className="min-w-0 flex-1 text-left" onClick={() => onDetails(job)}><span className="flex flex-wrap items-center gap-2"><span className="font-medium">PR #{job.pr}</span><ReviewOutcome job={job} /></span><span className="block truncate text-xs text-muted-foreground">{job.failure?.message || `${job.attempt_count}/${job.max_attempts} attempts · ${formatDate(job.created_at)}`}</span></button><ReviewActions job={job} repository={repository} onDetails={onDetails} onRereview={onRereview} pending={pending} /></div>)}</div>
+  return <div className="divide-y overflow-hidden rounded-lg border lg:hidden">{jobs.map((job) => <div key={job.id} className="flex items-center gap-3 p-3"><StatusBadge status={job.status} /><button type="button" className="min-w-0 flex-1 text-left" onClick={() => onDetails(job)}><span className="flex flex-wrap items-center gap-2"><span className="font-medium">PR #{job.pr}</span><ReviewOutcome job={job} /></span><span className="block truncate text-xs text-muted-foreground">{job.failure?.message || (job.status === "skipped" ? reviewSkipReasonLabel(job.skip_reason) : `${job.attempt_count}/${job.max_attempts} attempts · ${formatDate(job.created_at)}`)}</span></button><ReviewActions job={job} repository={repository} onDetails={onDetails} onRereview={onRereview} pending={pending} /></div>)}</div>
 }
 
 function ReviewActions({ job, repository, onDetails, onRereview, pending }: Omit<ReviewJobListProps, "jobs"> & { job: ReviewJobSummary }) {
@@ -118,6 +118,7 @@ function ReviewDetailContent({ projectId, job, detail, loading, error, retry }: 
   return <div className="flex flex-col gap-5 pb-4">
     <div className="flex flex-wrap items-center gap-2"><StatusBadge status={value.status} /><ReviewOutcome job={value} />{value.status === "retry_waiting" && <Badge variant="outline">Retry scheduled</Badge>}</div>
     <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-4"><Metric label="Attempts" value={`${value.attempt_count}/${value.max_attempts}`} /><Metric label="Created" value={formatDate(value.created_at)} /><Metric label="Duration" value={formatDuration(value.created_at, value.finished_at)} /><Metric label="Next attempt" value={value.next_attempt_at ? formatDate(value.next_attempt_at) : "—"} /></dl>
+    {value.status === "skipped" && <Alert><CircleAlert /><AlertTitle>Review skipped before an Agent was created</AlertTitle><AlertDescription>{reviewSkipReasonLabel(value.skip_reason)}</AlertDescription></Alert>}
     {value.failure && <Alert variant="destructive"><CircleAlert /><AlertTitle>{value.status === "retry_waiting" ? "Attempt failed; retry pending" : "Review failed"}</AlertTitle><AlertDescription><span className="block">{value.failure.message}</span><span className="mt-1 block text-xs opacity-80">{value.failure.category}{value.failure.code ? ` · ${value.failure.code}` : ""}{value.failure.http_status ? ` · HTTP ${value.failure.http_status}` : ""}</span></AlertDescription></Alert>}
     {value.submission_intent && !value.submission_receipt && <section className="rounded-lg border bg-muted/35 p-3"><h3 className="text-sm font-medium">GitHub submission pending</h3><p className="mt-1 text-xs text-muted-foreground">The server is reconciling one {value.submission_intent.event.replaceAll("_", " ")} review at head {shortSha(value.submission_intent.head_sha)} with {value.submission_intent.comment_count} inline comments.</p></section>}
     {value.submission_receipt && <section className="rounded-lg border bg-muted/35 p-3"><div className="flex items-center justify-between gap-3"><div><h3 className="text-sm font-medium">GitHub receipt</h3><p className="text-xs text-muted-foreground">Review #{value.submission_receipt.github_review_id} · {formatDate(value.submission_receipt.submitted_at)}</p></div>{value.submission_receipt.html_url && <Button asChild variant="outline" size="sm"><a href={value.submission_receipt.html_url} target="_blank" rel="noreferrer"><ExternalLink /> Open</a></Button>}</div></section>}
@@ -152,6 +153,7 @@ function ReviewOutcome({ job }: { job: ReviewJobSummary }) {
   if (event === "request_changes") return <Badge variant="destructive">Request changes</Badge>
   if (event === "comment") return <Badge variant="outline">Commented</Badge>
   if (job.status === "failed") return <Badge variant="destructive">Failed</Badge>
+  if (job.status === "skipped") return <Badge variant="outline">{reviewSkipReasonLabel(job.skip_reason)}</Badge>
   if (job.status === "superseded") return <Badge variant="outline">Superseded</Badge>
   if (job.status === "cancelled") return <Badge variant="outline">Cancelled</Badge>
   return <span className="text-sm text-muted-foreground">—</span>

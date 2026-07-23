@@ -148,6 +148,13 @@ pub(crate) async fn save_github_app_settings(
     Ok(Json(svc.save_app_settings(request).await?))
 }
 
+pub(crate) async fn refresh_github_app_settings(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<GithubAppSettingsResponse>, ApiError> {
+    let svc = github_service(&state);
+    Ok(Json(svc.refresh_app_settings().await?))
+}
+
 pub(crate) async fn start_github_app_manifest(
     State(state): State<Arc<AppState>>,
     Json(request): Json<GithubAppManifestStartRequest>,

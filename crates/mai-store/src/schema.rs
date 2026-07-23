@@ -6,8 +6,9 @@ use std::time::Duration;
 use toasty_driver_sqlite::Sqlite;
 
 pub(crate) const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-pub(crate) const SCHEMA_VERSION: &str = "23";
-const PREVIOUS_SCHEMA_VERSION: &str = "22";
+pub(crate) const SCHEMA_VERSION: &str = "24";
+const PREVIOUS_SCHEMA_VERSION: &str = "23";
+const LEGACY_REVIEW_SCHEMA_VERSION: &str = "22";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const SQLITE_POOL_MAX_SIZE: usize = 4;
 const SQLITE_POOL_WAIT_TIMEOUT_SECS: u64 = 30;
@@ -66,11 +67,26 @@ pub(crate) fn migrate_supported_schema(path: &Path) -> Result<bool> {
     match current.as_deref() {
         Some(SCHEMA_VERSION) => Ok(true),
         Some(PREVIOUS_SCHEMA_VERSION) => {
+            migrate_review_skip_schema(&mut connection)?;
+            Ok(true)
+        }
+        Some(LEGACY_REVIEW_SCHEMA_VERSION) => {
             migrate_review_lifecycle_schema(&mut connection)?;
             Ok(true)
         }
         None | Some(_) => Ok(false),
     }
+}
+
+fn migrate_review_skip_schema(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    add_column_if_missing(&transaction, "project_review_jobs", "skip_reason", "TEXT")?;
+    transaction.execute(
+        "UPDATE settings SET value = ?1 WHERE key = ?2",
+        params![SCHEMA_VERSION, SETTING_SCHEMA_VERSION],
+    )?;
+    transaction.commit()?;
+    Ok(())
 }
 
 fn migrate_review_lifecycle_schema(connection: &mut Connection) -> Result<()> {
@@ -102,6 +118,7 @@ fn migrate_review_lifecycle_schema(connection: &mut Connection) -> Result<()> {
             lease_owner TEXT,
             lease_expires_at TEXT,
             failure_json TEXT,
+            skip_reason TEXT,
             submission_intent_json TEXT,
             submission_receipt_json TEXT,
             created_at TEXT NOT NULL,
@@ -118,6 +135,7 @@ fn migrate_review_lifecycle_schema(connection: &mut Connection) -> Result<()> {
             id, project_id, pr, head_sha, source, delivery_id, reason, status,
             attempt_count, max_attempts, first_retryable_failure_at, next_attempt_at,
             reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json,
+            skip_reason,
             submission_intent_json, submission_receipt_json, created_at, updated_at, finished_at
         )
         SELECT id, project_id, COALESCE(pr, 0), 'legacy-unknown', 'legacy', NULL,
@@ -134,14 +152,14 @@ fn migrate_review_lifecycle_schema(connection: &mut Connection) -> Result<()> {
                 THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE NULL END,
             reviewer_agent_id,
             CASE WHEN status IN ('syncing', 'running') THEN id ELSE NULL END,
-            NULL, NULL, NULL, NULL, NULL, started_at,
+            NULL, NULL, NULL, NULL, NULL, NULL, started_at,
             COALESCE(finished_at, started_at), finished_at
         FROM project_review_runs;
         UPDATE project_review_runs SET job_id = id WHERE job_id IS NULL;
         UPDATE project_review_runs SET status = 'interrupted',
             finished_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
             WHERE status IN ('syncing', 'running') AND finished_at IS NULL;
-        UPDATE settings SET value = '23' WHERE key = 'toasty_schema_version';",
+        UPDATE settings SET value = '24' WHERE key = 'toasty_schema_version';",
     )?;
     restore_active_legacy_review_heads(&transaction)?;
     transaction.commit()?;

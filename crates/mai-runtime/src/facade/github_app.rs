@@ -76,6 +76,10 @@ impl AgentRuntime {
         github::github_app_settings(self.deps.github_backend.as_ref()).await
     }
 
+    pub async fn refresh_github_app_settings(&self) -> Result<GithubAppSettingsResponse> {
+        github::refresh_github_app_settings(self.deps.github_backend.as_ref()).await
+    }
+
     pub async fn save_github_app_settings(
         &self,
         request: GithubAppSettingsRequest,

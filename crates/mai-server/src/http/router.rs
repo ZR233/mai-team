@@ -80,6 +80,10 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
                 .put(handlers::github_app::save_github_app_settings),
         )
         .route(
+            "/settings/github-app/refresh",
+            post(handlers::github_app::refresh_github_app_settings),
+        )
+        .route(
             "/settings/relay",
             get(handlers::github_app::get_relay_settings)
                 .put(handlers::github_app::save_relay_settings),

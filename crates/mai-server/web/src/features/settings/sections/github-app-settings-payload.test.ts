@@ -38,13 +38,11 @@ describe("GitHub App settings payloads", () => {
       publicUrl: "https://relay.example",
       baseUrl: "https://api.github.com",
       appId: "123",
-      appSlug: "mai",
       privateKey: "\n  ",
     })).toEqual({
       public_url: "https://relay.example",
       base_url: "https://api.github.com",
       app_id: "123",
-      app_slug: "mai",
     })
   })
 
@@ -54,13 +52,11 @@ describe("GitHub App settings payloads", () => {
       publicUrl: "https://relay.example",
       baseUrl: "https://api.github.com",
       appId: "123",
-      appSlug: "mai",
       privateKey,
     })).toEqual({
       public_url: "https://relay.example",
       base_url: "https://api.github.com",
       app_id: "123",
-      app_slug: "mai",
       private_key: privateKey,
     })
   })

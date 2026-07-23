@@ -22,8 +22,15 @@ const githubAppSettings = {
   base_url: "https://api.github.com",
   public_url: "https://relay.example",
   has_private_key: true,
-  app_slug: "mai",
-  install_url: "https://github.com/apps/mai/installations/select_target",
+  github_name: "Mai Team",
+  app_slug: "mai-team-app",
+  app_html_url: "https://github.com/apps/mai-team-app",
+  owner_login: "mai-team",
+  owner_type: "Organization",
+  bot_login: "mai-team-app[bot]",
+  bot_user_id: 283045312,
+  install_url: "https://github.com/apps/mai-team-app/installations/select_target",
+  manage_url: "https://github.com/organizations/mai-team/settings/apps/mai-team-app",
 }
 
 afterEach(() => vi.unstubAllGlobals())
@@ -53,7 +60,6 @@ describe("GitHub App settings", () => {
           public_url: "https://relay.example",
           base_url: "https://api.github.com",
           app_id: "123",
-          app_slug: "mai",
         },
       },
     ])
@@ -78,6 +84,27 @@ describe("GitHub App settings", () => {
       expect(relayToken).toHaveValue("")
       expect(privateKey).toHaveValue("")
     })
+  })
+
+  it("renders GitHub-owned identity as read-only and refreshes it", async () => {
+    stubSettingsApi()
+    renderSettings()
+
+    expect(await screen.findByText("Verified identity")).toBeInTheDocument()
+    expect(screen.getAllByText("Mai Team")).toHaveLength(2)
+    expect(screen.getByText("mai-team-app[bot]")).toBeInTheDocument()
+    expect(screen.getByText("283045312")).toBeInTheDocument()
+    expect(screen.queryByRole("textbox", { name: "App slug" })).not.toBeInTheDocument()
+    expect(screen.getByRole("link", { name: "Manage on GitHub" })).toHaveAttribute(
+      "href",
+      githubAppSettings.manage_url,
+    )
+
+    await userEvent.click(screen.getByRole("button", { name: "Refresh identity" }))
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(
+      "/settings/github-app/refresh",
+      expect.objectContaining({ method: "POST" }),
+    ))
   })
 })
 
@@ -121,6 +148,7 @@ function responseFor(path: string) {
   }
   if (path === "/settings/relay") return relaySettings
   if (path === "/settings/github-app") return githubAppSettings
+  if (path === "/settings/github-app/refresh") return githubAppSettings
   if (path === "/github/installations") return { installations: [] }
   if (path === "/relay/update") {
     return {

@@ -27,6 +27,9 @@ pub(crate) async fn handle_client_request(
             }
         }
         "github.app.get" => github::app::github_app_settings(state).and_then(to_value),
+        "github.app.refresh" => github::app::refresh_github_app_settings(state)
+            .await
+            .and_then(to_value),
         "github.app.save" => {
             match parse_params::<mai_protocol::GithubAppSettingsRequest>(request.params).await {
                 Ok(request) => github::app::save_github_app_settings(state, request)

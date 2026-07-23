@@ -346,12 +346,6 @@ fn redact_secret(value: &str, secret: &str) -> String {
     pl_core::SecretRedaction::new([secret]).redact_str(value)
 }
 
-fn normalized_text(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 fn is_stale_agent_model_selection_error(error: &RuntimeError) -> bool {
     let RuntimeError::Store(mai_store::StoreError::InvalidConfig(message)) = error else {
         return false;

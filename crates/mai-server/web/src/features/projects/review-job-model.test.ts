@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import type { ReviewJobSummary, ReviewRunSummary } from "@/api/product-types"
 
-import { latestReviewAttempt, summarizeReviewJobs } from "./review-job-model"
+import { latestReviewAttempt, reviewSkipReasonLabel, summarizeReviewJobs } from "./review-job-model"
 
 describe("review job presentation model", () => {
   it("keeps retry waiting jobs active instead of counting them as failures", () => {
@@ -12,9 +12,15 @@ describe("review job presentation model", () => {
       job("failed"),
       job("cancelled"),
       job("superseded"),
+      job("skipped"),
     ]
 
-    expect(summarizeReviewJobs(jobs)).toEqual({ active: 1, succeeded: 1, failed: 1 })
+    expect(summarizeReviewJobs(jobs)).toEqual({ active: 1, succeeded: 1, failed: 1, skipped: 1 })
+  })
+
+  it("explains why a job was skipped before creating an attempt", () => {
+    expect(reviewSkipReasonLabel("already_reviewed_current_head")).toBe("Current head already reviewed")
+    expect(reviewSkipReasonLabel("ci_pending")).toBe("Required checks are pending")
   })
 
   it("selects the highest attempt index independently of response order", () => {

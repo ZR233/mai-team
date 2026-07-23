@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use mai_protocol::ProjectReviewSkipReason;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReviewSelection {
@@ -10,6 +11,7 @@ pub(crate) struct ReviewSelection {
 pub(crate) struct PullRequestCandidate {
     pub(crate) number: u64,
     pub(crate) author_login: Option<String>,
+    pub(crate) state: Option<String>,
     pub(crate) draft: bool,
     pub(crate) head_sha: Option<String>,
     pub(crate) latest_commit_at: Option<DateTime<Utc>>,
@@ -20,7 +22,7 @@ pub(crate) struct PullRequestCandidate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PullRequestReview {
-    pub(crate) author_login: Option<String>,
+    pub(crate) author_user_id: Option<u64>,
     pub(crate) state: Option<String>,
     pub(crate) submitted_at: Option<DateTime<Utc>>,
     pub(crate) commit_id: Option<String>,
@@ -32,26 +34,54 @@ pub(crate) struct CheckSignal {
     pub(crate) conclusion: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReviewEligibilityDecision {
+    Eligible(ReviewSelection),
+    Ineligible(ProjectReviewSkipReason),
+}
+
 pub(crate) fn select_review_prs(
-    reviewer_login: &str,
+    reviewer_user_id: u64,
     mut candidates: Vec<PullRequestCandidate>,
 ) -> Vec<ReviewSelection> {
     candidates.sort_by_key(|candidate| candidate.number);
     candidates
         .into_iter()
-        .filter_map(|candidate| {
-            if candidate.draft
-                || has_running_ci(&candidate)
-                || already_reviewed_current_head(reviewer_login, &candidate)
-            {
-                return None;
-            }
-            Some(ReviewSelection {
-                pr: candidate.number,
-                head_sha: candidate.head_sha,
-            })
-        })
+        .filter_map(
+            |candidate| match review_eligibility(reviewer_user_id, candidate) {
+                ReviewEligibilityDecision::Eligible(selection) => Some(selection),
+                ReviewEligibilityDecision::Ineligible(_) => None,
+            },
+        )
         .collect()
+}
+
+pub(crate) fn review_eligibility(
+    reviewer_user_id: u64,
+    candidate: PullRequestCandidate,
+) -> ReviewEligibilityDecision {
+    if candidate
+        .state
+        .as_deref()
+        .is_some_and(|state| !state.eq_ignore_ascii_case("open"))
+    {
+        return ReviewEligibilityDecision::Ineligible(ProjectReviewSkipReason::PullRequestClosed);
+    }
+    if candidate.draft {
+        return ReviewEligibilityDecision::Ineligible(ProjectReviewSkipReason::Draft);
+    }
+    if has_running_ci(&candidate) {
+        return ReviewEligibilityDecision::Ineligible(ProjectReviewSkipReason::CiPending);
+    }
+    if already_reviewed_current_head(reviewer_user_id, &candidate) {
+        return ReviewEligibilityDecision::Ineligible(
+            ProjectReviewSkipReason::AlreadyReviewedCurrentHead,
+        );
+    }
+    ReviewEligibilityDecision::Eligible(ReviewSelection {
+        pr: candidate.number,
+        head_sha: candidate.head_sha,
+    })
 }
 
 fn has_running_ci(candidate: &PullRequestCandidate) -> bool {
@@ -68,8 +98,8 @@ fn is_pending_ci_state(value: &str) -> bool {
     )
 }
 
-fn already_reviewed_current_head(reviewer_login: &str, candidate: &PullRequestCandidate) -> bool {
-    let Some(latest_review) = latest_reviewer_review(reviewer_login, &candidate.reviews) else {
+fn already_reviewed_current_head(reviewer_user_id: u64, candidate: &PullRequestCandidate) -> bool {
+    let Some(latest_review) = latest_reviewer_review(reviewer_user_id, &candidate.reviews) else {
         return false;
     };
     let Some(reviewed_at) = latest_review.submitted_at else {
@@ -88,13 +118,13 @@ fn already_reviewed_current_head(reviewer_login: &str, candidate: &PullRequestCa
     false
 }
 
-fn latest_reviewer_review<'a>(
-    reviewer_login: &str,
-    reviews: &'a [PullRequestReview],
-) -> Option<&'a PullRequestReview> {
+fn latest_reviewer_review(
+    reviewer_user_id: u64,
+    reviews: &[PullRequestReview],
+) -> Option<&PullRequestReview> {
     reviews
         .iter()
-        .filter(|review| review.author_login.as_deref() == Some(reviewer_login))
+        .filter(|review| review.author_user_id == Some(reviewer_user_id))
         .filter(|review| review.submitted_at.is_some())
         .max_by_key(|review| review.submitted_at)
 }
@@ -112,6 +142,7 @@ mod tests {
         PullRequestCandidate {
             number,
             author_login: None,
+            state: Some("open".to_string()),
             draft: false,
             head_sha: Some(format!("head-{number}")),
             latest_commit_at: Some(Utc::now()),
@@ -136,7 +167,7 @@ mod tests {
             conclusion: Some("success".to_string()),
         }];
 
-        let selected = select_review_prs("mai-bot", vec![third, second, first]);
+        let selected = select_review_prs(42, vec![third, second, first]);
 
         assert_eq!(
             vec![
@@ -166,7 +197,7 @@ mod tests {
             conclusion: Some("failure".to_string()),
         }];
 
-        let selected = select_review_prs("mai-bot", vec![pending, failed]);
+        let selected = select_review_prs(42, vec![pending, failed]);
 
         assert_eq!(
             vec![ReviewSelection {
@@ -182,7 +213,7 @@ mod tests {
         let mut candidate = candidate(9);
         candidate.author_login = Some("mai-bot".to_string());
 
-        let selected = select_review_prs("mai-bot", vec![candidate]);
+        let selected = select_review_prs(42, vec![candidate]);
 
         assert_eq!(
             vec![ReviewSelection {
@@ -202,7 +233,7 @@ mod tests {
         }];
         let next = candidate(11);
 
-        let selected = select_review_prs("mai-bot", vec![pending, next]);
+        let selected = select_review_prs(42, vec![pending, next]);
 
         assert_eq!(
             vec![ReviewSelection {
@@ -222,7 +253,7 @@ mod tests {
             conclusion: Some("success".to_string()),
         }];
 
-        let selected = select_review_prs("mai-bot", vec![candidate]);
+        let selected = select_review_prs(42, vec![candidate]);
 
         assert_eq!(
             vec![ReviewSelection {
@@ -239,14 +270,14 @@ mod tests {
         let mut reviewed = candidate(6);
         reviewed.latest_commit_at = Some(review_time - TimeDelta::minutes(1));
         reviewed.reviews = vec![PullRequestReview {
-            author_login: Some("mai-bot".to_string()),
+            author_user_id: Some(42),
             state: Some("APPROVED".to_string()),
             submitted_at: Some(review_time),
             commit_id: Some("head-6".to_string()),
         }];
         let next = candidate(7);
 
-        let selected = select_review_prs("mai-bot", vec![reviewed, next]);
+        let selected = select_review_prs(42, vec![reviewed, next]);
 
         assert_eq!(
             vec![ReviewSelection {
@@ -263,13 +294,13 @@ mod tests {
         let mut candidate = candidate(15);
         candidate.latest_commit_at = Some(review_time + TimeDelta::minutes(10));
         candidate.reviews = vec![PullRequestReview {
-            author_login: Some("mai-bot".to_string()),
+            author_user_id: Some(42),
             state: Some("APPROVED".to_string()),
             submitted_at: Some(review_time),
             commit_id: Some("head-15".to_string()),
         }];
 
-        let selected = select_review_prs("mai-bot", vec![candidate]);
+        let selected = select_review_prs(42, vec![candidate]);
 
         assert_eq!(
             vec![ReviewSelection {
@@ -286,14 +317,14 @@ mod tests {
         let mut reviewed = candidate(12);
         reviewed.latest_commit_at = Some(review_time - TimeDelta::minutes(1));
         reviewed.reviews = vec![PullRequestReview {
-            author_login: Some("mai-bot".to_string()),
+            author_user_id: Some(42),
             state: Some("APPROVED".to_string()),
             submitted_at: Some(review_time),
             commit_id: Some("old-head".to_string()),
         }];
         let next = candidate(13);
 
-        let selected = select_review_prs("mai-bot", vec![reviewed, next]);
+        let selected = select_review_prs(42, vec![reviewed, next]);
 
         assert_eq!(
             vec![ReviewSelection {
@@ -310,13 +341,13 @@ mod tests {
         let mut candidate = candidate(8);
         candidate.latest_commit_at = Some(review_time + TimeDelta::minutes(10));
         candidate.reviews = vec![PullRequestReview {
-            author_login: Some("mai-bot".to_string()),
+            author_user_id: Some(42),
             state: Some("APPROVED".to_string()),
             submitted_at: Some(review_time),
             commit_id: Some("old-head".to_string()),
         }];
 
-        let selected = select_review_prs("mai-bot", vec![candidate]);
+        let selected = select_review_prs(42, vec![candidate]);
 
         assert_eq!(
             vec![ReviewSelection {
@@ -334,21 +365,60 @@ mod tests {
         candidate.latest_commit_at = Some(review_time - TimeDelta::minutes(10));
         candidate.reviews = vec![
             PullRequestReview {
-                author_login: Some("mai-bot".to_string()),
+                author_user_id: Some(42),
                 state: Some("APPROVED".to_string()),
                 submitted_at: Some(review_time),
                 commit_id: Some("head-16".to_string()),
             },
             PullRequestReview {
-                author_login: Some("human-reviewer".to_string()),
+                author_user_id: Some(99),
                 state: Some("CHANGES_REQUESTED".to_string()),
                 submitted_at: Some(review_time + TimeDelta::minutes(10)),
                 commit_id: Some("head-16".to_string()),
             },
         ];
 
-        let selected = select_review_prs("mai-bot", vec![candidate]);
+        let selected = select_review_prs(42, vec![candidate]);
 
         assert_eq!(Vec::<ReviewSelection>::new(), selected);
+    }
+
+    #[test]
+    fn reviewer_login_changes_do_not_affect_user_id_dedupe() {
+        let review_time = Utc::now();
+        let mut candidate = candidate(17);
+        candidate.latest_commit_at = Some(review_time - TimeDelta::minutes(1));
+        candidate.reviews = vec![PullRequestReview {
+            author_user_id: Some(42),
+            state: Some("APPROVED".to_string()),
+            submitted_at: Some(review_time),
+            commit_id: Some("head-17".to_string()),
+        }];
+
+        assert_eq!(
+            Vec::<ReviewSelection>::new(),
+            select_review_prs(42, vec![candidate])
+        );
+    }
+
+    #[test]
+    fn different_user_id_is_not_deduped() {
+        let review_time = Utc::now();
+        let mut candidate = candidate(18);
+        candidate.latest_commit_at = Some(review_time - TimeDelta::minutes(1));
+        candidate.reviews = vec![PullRequestReview {
+            author_user_id: Some(99),
+            state: Some("APPROVED".to_string()),
+            submitted_at: Some(review_time),
+            commit_id: Some("head-18".to_string()),
+        }];
+
+        assert_eq!(
+            vec![ReviewSelection {
+                pr: 18,
+                head_sha: Some("head-18".to_string()),
+            }],
+            select_review_prs(42, vec![candidate])
+        );
     }
 }

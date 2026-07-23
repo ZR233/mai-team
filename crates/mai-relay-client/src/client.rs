@@ -188,6 +188,12 @@ impl RelayClient {
         self.request("github.app.get", json!({})).await
     }
 
+    pub async fn refresh_github_app_settings(
+        &self,
+    ) -> Result<GithubAppSettingsResponse, RuntimeError> {
+        self.request("github.app.refresh", json!({})).await
+    }
+
     pub async fn save_github_app_settings(
         &self,
         request: mai_protocol::GithubAppSettingsRequest,

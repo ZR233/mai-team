@@ -16,7 +16,6 @@ export interface GithubAppSettingsForm {
   publicUrl: string
   baseUrl: string
   appId: string
-  appSlug: string
   privateKey: string
 }
 
@@ -24,7 +23,6 @@ export interface GithubAppSettingsUpdate {
   public_url: string | null
   base_url: string | null
   app_id: string | null
-  app_slug: string | null
   private_key?: string
 }
 
@@ -42,7 +40,6 @@ export function buildGithubAppSettingsUpdate(form: GithubAppSettingsForm): Githu
     public_url: form.publicUrl || null,
     base_url: form.baseUrl || null,
     app_id: form.appId || null,
-    app_slug: form.appSlug || null,
     ...(form.privateKey.trim() ? { private_key: form.privateKey } : {}),
   }
 }

@@ -124,6 +124,8 @@ test("review actions remain available at each configured viewport", async ({ pag
   await page.getByRole("tab", { name: "Review", exact: true }).first().click()
   await expect(page.getByRole("heading", { name: "Pull request reviews" })).toBeVisible()
   await expect(page.getByRole("link", { name: "Open PR #1631" })).toBeVisible()
+  const skipped = page.getByText("Current head already reviewed", { exact: true })
+  await expect(testInfo.project.name === "desktop" ? skipped.first() : skipped.last()).toBeVisible()
   const approved = page.getByText("Approved", { exact: true })
   const requestChanges = page.getByText("Request changes", { exact: true })
   await expect(testInfo.project.name === "desktop" ? approved.first() : approved.last()).toBeVisible()
@@ -221,7 +223,7 @@ test("web search and MCP settings use push-era product APIs", async ({ page }, t
   await recheck
 })
 
-test("relay settings preserve blank secrets and submit replacements", async ({ page }) => {
+test("relay settings preserve blank secrets and submit replacements", async ({ page }, testInfo) => {
   await page.goto("/settings/github-app")
   await expect(page.getByText("Relay connection")).toBeVisible()
 
@@ -239,8 +241,17 @@ test("relay settings preserve blank secrets and submit replacements", async ({ p
     public_url: "https://relay.example",
     base_url: "https://api.github.com",
     app_id: "123",
-    app_slug: "mai",
   })
+  await expect(page.getByText("Verified identity")).toBeVisible()
+  await expect(page.getByText("mai-team-app[bot]")).toBeVisible()
+  await expect(page.getByText("283045312")).toBeVisible()
+  await expect(page.getByRole("link", { name: "Manage on GitHub" })).toHaveAttribute(
+    "href",
+    "https://github.com/organizations/mai-team/settings/apps/mai-team-app",
+  )
+  const identityRefresh = page.waitForRequest((candidate) => candidate.url().endsWith("/settings/github-app/refresh") && candidate.method() === "POST")
+  await page.getByRole("button", { name: "Refresh identity" }).click()
+  await identityRefresh
 
   await page.getByLabel("Relay token").fill("new-relay-token")
   await page.getByLabel("PEM private key").fill("new-private-key")
@@ -253,6 +264,17 @@ test("relay settings preserve blank secrets and submit replacements", async ({ p
   await page.getByRole("button", { name: "Save app" }).click()
   expect((await appSave).postDataJSON()).toMatchObject({ private_key: "new-private-key" })
   await expect(page.getByLabel("PEM private key")).toHaveValue("")
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true)
+  await expect(page.getByText("GitHub App settings saved")).toHaveCount(0, { timeout: 10_000 })
+  await page.getByText("Verified identity").evaluate((element) => {
+    element.scrollIntoView({ block: "start" })
+    let scrollParent = element.parentElement
+    while (scrollParent && scrollParent.scrollHeight <= scrollParent.clientHeight) {
+      scrollParent = scrollParent.parentElement
+    }
+    scrollParent?.scrollBy({ top: -72 })
+  })
+  await expect(page).toHaveScreenshot(`github-app-settings-${testInfo.project.name}.png`, { animations: "disabled" })
 })
 
 async function installApiFixture(page: Page) {
@@ -271,9 +293,10 @@ async function installApiFixture(page: Page) {
     if (path === "/skills") return json(route, skills)
     if (path === "/projects") return json(route, [projectSummary])
     if (path === "/projects/project-1") return json(route, projectDetail)
-    if (path === "/projects/project-1/review-jobs") return json(route, { jobs: [reviewJob, retryWaitingReviewJob, changesRequestedReviewJob] })
+    if (path === "/projects/project-1/review-jobs") return json(route, { jobs: [reviewJob, retryWaitingReviewJob, skippedReviewJob, changesRequestedReviewJob] })
     if (path === "/projects/project-1/review-jobs/job-1") return json(route, reviewJobDetail)
     if (path === "/projects/project-1/review-jobs/job-retry") return json(route, { ...retryWaitingReviewJob, attempts: [retryableReviewRun] })
+    if (path === "/projects/project-1/review-jobs/job-skipped") return json(route, { ...skippedReviewJob, attempts: [] })
     if (path === "/projects/project-1/review-jobs/job-2") return json(route, { ...changesRequestedReviewJob, attempts: [changesRequestedReviewRun] })
     if (path === "/projects/project-1/review-runs") return json(route, { runs: [reviewRun, changesRequestedReviewRun] })
     if (path === "/projects/project-1/review-runs/review-1") return json(route, reviewRunDetail)
@@ -284,6 +307,7 @@ async function installApiFixture(page: Page) {
     if (path === "/relay/status") return json(route, relayStatus)
     if (path === "/settings/relay") return json(route, relaySettings)
     if (path === "/settings/github-app") return json(route, githubAppSettings)
+    if (path === "/settings/github-app/refresh") return json(route, githubAppSettings)
     if (path === "/github/installations") return json(route, { installations: [] })
     if (path === "/relay/update") return json(route, relayUpdate)
     if (path === "/mcp-servers") return json(route, mcpServers)
@@ -315,8 +339,15 @@ const githubAppSettings = {
   base_url: "https://api.github.com",
   public_url: "https://relay.example",
   has_private_key: true,
-  app_slug: "mai",
-  install_url: "https://github.com/apps/mai/installations/select_target",
+  github_name: "Mai Team",
+  app_slug: "mai-team-app",
+  app_html_url: "https://github.com/apps/mai-team-app",
+  owner_login: "mai-team",
+  owner_type: "Organization",
+  bot_login: "mai-team-app[bot]",
+  bot_user_id: 283045312,
+  install_url: "https://github.com/apps/mai-team-app/installations/select_target",
+  manage_url: "https://github.com/organizations/mai-team/settings/apps/mai-team-app",
 }
 const relayUpdate = {
   current_version: "0.1.0",
@@ -451,6 +482,23 @@ const retryWaitingReviewJob = {
   created_at: "2026-07-20T00:01:00Z",
   updated_at: "2026-07-20T00:05:30Z",
   finished_at: null,
+}
+const skippedReviewJob = {
+  ...reviewJob,
+  id: "job-skipped",
+  pr: 1664,
+  head_sha: "beadbeadbeadbeadbeadbeadbeadbeadbeadbead",
+  source: "webhook",
+  reason: "check_run",
+  status: "skipped",
+  attempt_count: 1,
+  reviewer_agent_id: null,
+  skip_reason: "already_reviewed_current_head",
+  submission_intent: null,
+  submission_receipt: null,
+  created_at: "2026-07-20T00:02:00Z",
+  updated_at: "2026-07-20T00:02:01Z",
+  finished_at: "2026-07-20T00:02:01Z",
 }
 const reviewJobDetail = { ...reviewJob, attempts: [reviewRun] }
 const projectSummary = {

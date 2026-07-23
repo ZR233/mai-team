@@ -140,6 +140,13 @@ impl GithubAppBackend for DynamicGithubAppBackend {
         }
     }
 
+    async fn refresh_github_app_settings(&self) -> mai_runtime::Result<GithubAppSettingsResponse> {
+        match self.backend().await? {
+            ActiveGithubAppBackend::Direct(backend) => backend.refresh_github_app_settings().await,
+            ActiveGithubAppBackend::Relay(relay) => relay.refresh_github_app_settings().await,
+        }
+    }
+
     async fn save_github_app_settings(
         &self,
         request: GithubAppSettingsRequest,

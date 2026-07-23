@@ -46,8 +46,12 @@ impl MaiStore {
             .url
             .map(|url| normalize_relay_url(&url))
             .filter(|value| !value.is_empty());
-        if let Some(token) = request.token {
-            current.token = Some(token.trim().to_string()).filter(|value| !value.is_empty());
+        if let Some(token) = request
+            .token
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+        {
+            current.token = Some(token);
         }
         current.node_id = request
             .node_id

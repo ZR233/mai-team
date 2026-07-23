@@ -3,9 +3,9 @@ use crate::schema::{SCHEMA_VERSION, SETTING_SCHEMA_VERSION};
 use mai_protocol::{
     AgentResourceState, AgentRole, AgentState, ErrorSeverity, McpServerScope, McpServerTransport,
     MessageRole, ProjectCloneStatus, ProjectReviewDecision, ProjectReviewJobSource,
-    ProjectReviewJobStatus, ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus,
-    ProjectReviewSubmissionIntent, ProjectReviewSubmissionReceipt, ProjectStatus, SessionEventKind,
-    SessionEventPosition,
+    ProjectReviewJobStatus, ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewSkipReason,
+    ProjectReviewStatus, ProjectReviewSubmissionIntent, ProjectReviewSubmissionReceipt,
+    ProjectStatus, SessionEventKind, SessionEventPosition,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -280,7 +280,7 @@ async fn relay_settings_persist_without_exposing_token() {
         ))
     );
 
-    let cleared = store
+    let preserved = store
         .save_relay_settings(RelaySettingsRequest {
             enabled: false,
             url: None,
@@ -288,30 +288,38 @@ async fn relay_settings_persist_without_exposing_token() {
             node_id: None,
         })
         .await
-        .expect("clear relay token");
-    assert!(!cleared.enabled);
-    assert!(!cleared.has_token);
-    assert_eq!(cleared.url, "http://127.0.0.1:8090");
-    assert_eq!(cleared.node_id, "mai-server");
+        .expect("preserve relay token for blank update");
+    assert!(!preserved.enabled);
+    assert!(preserved.has_token);
+    assert_eq!(preserved.url, "http://127.0.0.1:8090");
+    assert_eq!(preserved.node_id, "mai-server");
 }
 
 #[tokio::test]
 async fn github_app_settings_persist_public_url() {
     let (_dir, store) = store().await;
 
-    let saved = store
+    store
         .save_github_app_settings(GithubAppSettingsRequest {
             app_id: Some("123".to_string()),
             private_key: Some("pem".to_string()),
             base_url: Some("https://api.github.com/".to_string()),
             public_url: Some(" https://relay.example/ ".to_string()),
-            app_slug: Some("mai".to_string()),
-            app_html_url: None,
-            owner_login: None,
-            owner_type: None,
         })
         .await
         .expect("save github app");
+    let saved = store
+        .save_github_app_identity(GithubAppIdentity {
+            github_name: "Mai".to_string(),
+            app_slug: "mai".to_string(),
+            app_html_url: "https://github.com/apps/mai".to_string(),
+            owner_login: Some("owner".to_string()),
+            owner_type: Some("User".to_string()),
+            bot_login: "mai[bot]".to_string(),
+            bot_user_id: 42,
+        })
+        .await
+        .expect("save GitHub App identity");
 
     assert_eq!(saved.public_url.as_deref(), Some("https://relay.example"));
     assert!(saved.has_private_key);
@@ -335,10 +343,6 @@ async fn github_app_settings_persist_public_url() {
             private_key: None,
             base_url: Some("https://github.example/api/v3".to_string()),
             public_url: Some("https://relay-two.example".to_string()),
-            app_slug: None,
-            app_html_url: None,
-            owner_login: None,
-            owner_type: None,
         })
         .await
         .expect("update GitHub App without private key");
@@ -350,6 +354,28 @@ async fn github_app_settings_persist_public_url() {
             .expect("load updated secret"),
         Some((
             "456".to_string(),
+            "pem".to_string(),
+            "https://github.example/api/v3".to_string(),
+        ))
+    );
+
+    let blank_private_key = store
+        .save_github_app_settings(GithubAppSettingsRequest {
+            app_id: Some("789".to_string()),
+            private_key: Some(" \n ".to_string()),
+            base_url: None,
+            public_url: None,
+        })
+        .await
+        .expect("update GitHub App preserving blank private key");
+    assert!(blank_private_key.has_private_key);
+    assert_eq!(
+        store
+            .github_app_secret()
+            .await
+            .expect("load secret after blank private key"),
+        Some((
+            "789".to_string(),
             "pem".to_string(),
             "https://github.example/api/v3".to_string(),
         ))
@@ -1180,6 +1206,67 @@ async fn schema_22_review_runs_migrate_without_rebuilding_user_data() {
 }
 
 #[tokio::test]
+async fn schema_23_adds_review_skip_reason_without_rebuilding_user_data() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("config.sqlite3");
+    let config_path = dir.path().join("config.toml");
+    let store = MaiStore::open_with_config_path(&db_path, &config_path)
+        .await
+        .expect("open current schema");
+    store
+        .set_setting("preserved_schema_23", "yes")
+        .await
+        .expect("seed preserved setting");
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute_batch(
+            "ALTER TABLE project_review_jobs DROP COLUMN skip_reason;
+             UPDATE settings SET value = '23' WHERE key = 'toasty_schema_version';",
+        )
+        .expect("downgrade fixture to schema 23");
+    drop(connection);
+
+    let reopened = MaiStore::open_with_config_path(&db_path, &config_path)
+        .await
+        .expect("migrate schema 23");
+    assert_eq!(
+        Some("yes".to_string()),
+        reopened
+            .get_setting("preserved_schema_23")
+            .await
+            .expect("preserved setting")
+    );
+    assert_eq!(
+        Some(SCHEMA_VERSION.to_string()),
+        reopened
+            .get_setting(SETTING_SCHEMA_VERSION)
+            .await
+            .expect("schema version")
+    );
+
+    let project_id = Uuid::new_v4();
+    let mut skipped = test_review_job(project_id, 42, "head-42", None);
+    skipped.status = ProjectReviewJobStatus::Skipped;
+    skipped.skip_reason = Some(ProjectReviewSkipReason::AlreadyReviewedCurrentHead);
+    skipped.next_attempt_at = None;
+    skipped.finished_at = Some(Utc::now());
+    let skipped_id = skipped.id;
+    reopened
+        .save_project_review_job(skipped.clone())
+        .await
+        .expect("save skipped job");
+    assert_eq!(
+        Some(skipped),
+        reopened
+            .load_project_review_job(project_id, skipped_id)
+            .await
+            .expect("load skipped job")
+    );
+}
+
+#[tokio::test]
 async fn mcp_servers_round_trip_json_config() {
     let (_dir, store) = store().await;
     let servers = BTreeMap::from([
@@ -1571,6 +1658,7 @@ fn test_review_job(
         lease_owner: None,
         lease_expires_at: None,
         failure: None,
+        skip_reason: None,
         submission_intent: None,
         submission_receipt: None,
         created_at: timestamp,

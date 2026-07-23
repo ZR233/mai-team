@@ -121,15 +121,21 @@ pub(crate) async fn complete_manifest(
             GithubAppManifestAccountType::Organization => Some("Organization".to_string()),
             GithubAppManifestAccountType::Personal => Some("User".to_string()),
         });
-    state.store.save_github_app_config(&GithubAppConfig {
+    let mut config = GithubAppConfig {
         app_id: conversion.id.to_string(),
         private_key: conversion.pem,
         webhook_secret: conversion.webhook_secret.unwrap_or(saved_webhook_secret),
+        github_name: None,
         app_slug: Some(conversion.slug),
         app_html_url: Some(conversion.html_url),
         owner_login,
         owner_type,
-    })?;
+        bot_login: None,
+        bot_user_id: None,
+    };
+    super::app::hydrate_github_app_metadata(&state.http, &state.github_api_base_url, &mut config)
+        .await?;
+    state.store.save_github_app_config(&config)?;
     Ok(())
 }
 pub(crate) async fn start_app_installation(

@@ -31,6 +31,7 @@ const GITHUB_MANIFEST_STATE_TTL_SECS: u64 = 900;
 #[async_trait]
 pub trait GithubAppBackend: Send + Sync {
     async fn github_app_settings(&self) -> Result<GithubAppSettingsResponse>;
+    async fn refresh_github_app_settings(&self) -> Result<GithubAppSettingsResponse>;
     async fn save_github_app_settings(
         &self,
         request: GithubAppSettingsRequest,
@@ -117,6 +118,44 @@ impl DirectGithubAppBackend {
         Ok((token, base_url))
     }
 
+    async fn refresh_github_app_identity(&self) -> Result<GithubAppSettingsResponse> {
+        let (jwt, base_url) = self.github_app_jwt().await?;
+        let app_response = self
+            .github_http
+            .get(github_api_url(&base_url, "/app"))
+            .bearer_auth(jwt)
+            .headers(github_headers())
+            .send()
+            .await?;
+        let app =
+            decode_github_response::<GithubAppIdentityApi>(app_response, "get GitHub App metadata")
+                .await?;
+        let bot_response = self
+            .github_http
+            .get(github_api_url(
+                &base_url,
+                &format!("/users/{}%5Bbot%5D", app.slug),
+            ))
+            .headers(github_headers())
+            .send()
+            .await?;
+        let bot =
+            decode_github_response::<GithubBotIdentityApi>(bot_response, "get GitHub App bot")
+                .await?;
+        Ok(self
+            .store
+            .save_github_app_identity(mai_store::GithubAppIdentity {
+                github_name: app.name,
+                app_slug: app.slug,
+                app_html_url: app.html_url,
+                owner_login: app.owner.as_ref().map(|owner| owner.login.clone()),
+                owner_type: app.owner.map(|owner| owner.account_type),
+                bot_login: bot.login,
+                bot_user_id: bot.id,
+            })
+            .await?)
+    }
+
     async fn prune_github_manifest_states(&self) {
         let ttl = std::time::Duration::from_secs(GITHUB_MANIFEST_STATE_TTL_SECS);
         let mut states = self.github_manifest_states.lock().await;
@@ -146,12 +185,17 @@ impl GithubAppBackend for DirectGithubAppBackend {
         Ok(self.store.get_github_app_settings().await?)
     }
 
+    async fn refresh_github_app_settings(&self) -> Result<GithubAppSettingsResponse> {
+        self.refresh_github_app_identity().await
+    }
+
     async fn save_github_app_settings(
         &self,
         request: GithubAppSettingsRequest,
     ) -> Result<GithubAppSettingsResponse> {
         self.github_tokens.lock().await.clear();
-        Ok(self.store.save_github_app_settings(request).await?)
+        self.store.save_github_app_settings(request).await?;
+        self.refresh_github_app_identity().await
     }
 
     async fn start_github_app_manifest(
@@ -221,17 +265,13 @@ impl GithubAppBackend for DirectGithubAppBackend {
             .await?;
         let conversion: GithubManifestConversionResponse =
             decode_github_response(response, "create app from manifest").await?;
-        let owner_login = github_manifest_owner_login(&conversion, &state_record);
-        let owner_type = github_manifest_owner_type(&conversion, &state_record);
+        let _owner_login = github_manifest_owner_login(&conversion, &state_record);
+        let _owner_type = github_manifest_owner_type(&conversion, &state_record);
         self.save_github_app_settings(GithubAppSettingsRequest {
             app_id: Some(conversion.id.to_string()),
             private_key: Some(conversion.pem),
             base_url: Some(DEFAULT_GITHUB_API_BASE_URL.to_string()),
             public_url: None,
-            app_slug: Some(conversion.slug),
-            app_html_url: Some(conversion.html_url),
-            owner_login,
-            owner_type,
         })
         .await
     }
@@ -419,11 +459,28 @@ struct GithubAccessTokenResponse {
 #[derive(Debug, Deserialize)]
 struct GithubManifestConversionResponse {
     id: u64,
-    slug: String,
-    html_url: String,
+    #[serde(rename = "slug")]
+    _slug: String,
+    #[serde(rename = "html_url")]
+    _html_url: String,
     pem: String,
     #[serde(default)]
     owner: Option<GithubAccountApi>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubAppIdentityApi {
+    name: String,
+    slug: String,
+    html_url: String,
+    #[serde(default)]
+    owner: Option<GithubAccountApi>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubBotIdentityApi {
+    id: u64,
+    login: String,
 }
 
 fn sanitize_origin(origin: &str) -> Result<String> {

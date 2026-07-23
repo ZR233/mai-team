@@ -47,7 +47,7 @@ export function GithubAppSection() {
   const installations = useQuery({ queryKey: [...queryKeys.githubApp, "installations"], queryFn: () => api<{ installations: Installation[] }>("/github/installations") })
   const update = useQuery({ queryKey: [...queryKeys.relay, "update"], queryFn: () => api<UpdateStatus>("/relay/update") })
   const [relayForm, setRelayForm] = useState({ enabled: false, url: "", token: "", nodeId: "mai-server" })
-  const [appForm, setAppForm] = useState({ publicUrl: "", baseUrl: "", appId: "", appSlug: "", privateKey: "" })
+  const [appForm, setAppForm] = useState({ publicUrl: "", baseUrl: "", appId: "", privateKey: "" })
 
   useEffect(() => {
     if (relaySettings.data) {
@@ -56,7 +56,7 @@ export function GithubAppSection() {
   }, [relaySettings.data])
   useEffect(() => {
     if (app.data) {
-      setAppForm((current) => ({ ...current, publicUrl: app.data.public_url || "", baseUrl: app.data.base_url || "", appId: app.data.app_id || "", appSlug: app.data.app_slug || "", privateKey: "" }))
+      setAppForm((current) => ({ ...current, publicUrl: app.data.public_url || "", baseUrl: app.data.base_url || "", appId: app.data.app_id || "", privateKey: "" }))
     }
   }, [app.data])
 
@@ -81,6 +81,14 @@ export function GithubAppSection() {
       toast.success("GitHub App settings saved")
       setAppForm((current) => ({ ...current, privateKey: "" }))
       await refresh()
+    },
+    onError: (error) => toast.error(error.message),
+  })
+  const refreshIdentity = useMutation({
+    mutationFn: () => api<GithubAppSettings>("/settings/github-app/refresh", { method: "POST" }),
+    onSuccess: (settings) => {
+      queryClient.setQueryData(queryKeys.githubApp, settings)
+      toast.success("GitHub identity refreshed")
     },
     onError: (error) => toast.error(error.message),
   })
@@ -122,7 +130,7 @@ export function GithubAppSection() {
       <SettingsBody>
         <div className="mb-5 grid gap-3 sm:grid-cols-3">
           <Metric label="Relay" value={relay.data?.connected ? "Connected" : "Unavailable"} detail={relay.data?.relay_url || relay.data?.message || "Not configured"} status={relay.data?.connected ? "connected" : "unavailable"} />
-          <Metric label="Application" value={app.data?.app_slug || "Not configured"} detail={app.data?.owner_login || app.data?.base_url || "Relay owns credentials"} status={app.data?.app_slug ? "configured" : "incomplete"} />
+          <Metric label="Application" value={app.data?.github_name || app.data?.app_slug || "Not configured"} detail={app.data?.owner_login || app.data?.base_url || "Relay owns credentials"} status={app.data?.bot_user_id ? "configured" : "incomplete"} />
           <Metric label="Installations" value={String(installations.data?.installations.length ?? 0)} detail="Repository access grants" status={installations.data?.installations.length ? "ready" : "empty"} />
         </div>
 
@@ -146,13 +154,20 @@ export function GithubAppSection() {
             <FieldGroup>
               <FormField label="Public URL"><Input value={appForm.publicUrl} onChange={(event) => setAppForm({ ...appForm, publicUrl: event.target.value })} placeholder="https://relay.example" /></FormField>
               <FormField label="GitHub API base URL"><Input value={appForm.baseUrl} onChange={(event) => setAppForm({ ...appForm, baseUrl: event.target.value })} /></FormField>
-              <div className="grid gap-4 sm:grid-cols-2"><FormField label="GitHub App ID"><Input value={appForm.appId} onChange={(event) => setAppForm({ ...appForm, appId: event.target.value })} placeholder="123456" /></FormField><FormField label="App slug"><Input value={appForm.appSlug} onChange={(event) => setAppForm({ ...appForm, appSlug: event.target.value })} placeholder="mai-team" /></FormField></div>
+              <FormField label="GitHub App ID"><Input value={appForm.appId} onChange={(event) => setAppForm({ ...appForm, appId: event.target.value })} placeholder="123456" /></FormField>
               <FormField label="PEM private key" htmlFor="github-app-private-key" hint={app.data?.has_private_key ? "Leave blank to preserve the saved private key." : "Paste or upload the GitHub App private key."}><Textarea id="github-app-private-key" className="min-h-24 font-mono text-xs" value={appForm.privateKey} onChange={(event) => setAppForm({ ...appForm, privateKey: event.target.value })} /></FormField>
               <FormField label="Upload PEM"><Input type="file" accept=".pem,.key,text/plain" onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; const reader = new FileReader(); reader.onload = () => setAppForm((current) => ({ ...current, privateKey: String(reader.result || "") })); reader.readAsText(file); event.target.value = "" }} /></FormField>
               <div className="flex gap-2"><Button disabled={saveApp.isPending} onClick={() => saveApp.mutate()}>Save app</Button><Button variant="outline" disabled={!relay.data?.connected || !app.data?.install_url} onClick={() => void install()}><ExternalLink data-icon="inline-start" /> Install app</Button></div>
             </FieldGroup>
           </section>
         </div>
+
+        <VerifiedIdentity
+          settings={app.data}
+          connected={Boolean(relay.data?.connected)}
+          refreshing={refreshIdentity.isPending}
+          onRefresh={() => refreshIdentity.mutate()}
+        />
 
         <section className="mt-5 overflow-hidden rounded-lg border">
           <div className="flex items-center justify-between border-b px-4 py-3">
@@ -181,6 +196,41 @@ export function GithubAppSection() {
       </SettingsBody>
     </>
   )
+}
+
+function VerifiedIdentity({ settings, connected, refreshing, onRefresh }: { settings?: GithubAppSettings; connected: boolean; refreshing: boolean; onRefresh(): void }) {
+  const verified = Boolean(settings?.bot_user_id && settings.bot_login && settings.app_slug)
+  return (
+    <section className="mt-5 overflow-hidden rounded-lg border" aria-labelledby="verified-github-identity">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <h2 id="verified-github-identity" className="text-sm font-semibold">Verified identity</h2>
+            <Badge variant={verified ? "outline" : "secondary"}>{verified ? "Verified by GitHub" : "Refresh required"}</Badge>
+          </div>
+          <p className="mt-1 text-xs text-muted-foreground">Review authorship is matched by the immutable GitHub Bot user ID.</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="outline" disabled={!connected || refreshing} onClick={onRefresh}>
+            <RefreshCw className={refreshing ? "animate-spin" : undefined} data-icon="inline-start" />
+            Refresh identity
+          </Button>
+          {settings?.manage_url && <Button asChild variant="outline"><a href={settings.manage_url} target="_blank" rel="noreferrer"><ExternalLink data-icon="inline-start" /> Manage on GitHub</a></Button>}
+        </div>
+      </div>
+      <dl className="grid gap-px bg-border sm:grid-cols-2 xl:grid-cols-5">
+        <IdentityValue label="GitHub App name" value={settings?.github_name} />
+        <IdentityValue label="Slug" value={settings?.app_slug} mono />
+        <IdentityValue label="Bot login" value={settings?.bot_login} mono />
+        <IdentityValue label="Bot user ID" value={settings?.bot_user_id ? String(settings.bot_user_id) : undefined} mono />
+        <IdentityValue label="Owner" value={settings?.owner_login} detail={settings?.owner_type} className="sm:col-span-2 xl:col-span-1" />
+      </dl>
+    </section>
+  )
+}
+
+function IdentityValue({ label, value, detail, mono = false, className = "" }: { label: string; value?: string | null; detail?: string | null; mono?: boolean; className?: string }) {
+  return <div className={`min-w-0 bg-card px-4 py-3 ${className}`}><dt className="text-[11px] text-muted-foreground">{label}</dt><dd className={mono ? "mt-1 break-all font-mono text-xs" : "mt-1 truncate text-sm font-medium"}>{value || "Not verified"}</dd>{detail && <span className="mt-0.5 block text-xs text-muted-foreground">{detail}</span>}</div>
 }
 
 function Metric({ label, value, detail, status }: { label: string; value: string; detail: string; status: string }) {

@@ -109,7 +109,8 @@ export interface ReviewRunSummary {
   [key: string]: unknown
 }
 
-export type ReviewJobStatus = "queued" | "preparing" | "running" | "retry_waiting" | "submission_pending" | "reconciling" | "succeeded" | "failed" | "cancelled" | "superseded"
+export type ReviewJobStatus = "queued" | "preparing" | "running" | "retry_waiting" | "submission_pending" | "reconciling" | "succeeded" | "failed" | "cancelled" | "superseded" | "skipped"
+export type ReviewSkipReason = "pull_request_closed" | "draft" | "ci_pending" | "already_reviewed_current_head"
 
 export interface ReviewFailure {
   category: string
@@ -151,6 +152,7 @@ export interface ReviewJobSummary {
   reviewer_agent_id?: Id | null
   active_run_id?: Id | null
   failure?: ReviewFailure | null
+  skip_reason?: ReviewSkipReason | null
   submission_intent?: ReviewSubmissionIntent | null
   submission_receipt?: ReviewSubmissionReceipt | null
   created_at: string
@@ -431,10 +433,14 @@ export interface GithubAppSettings {
   public_url?: string | null
   has_private_key: boolean
   app_slug?: string | null
+  github_name?: string | null
   app_html_url?: string | null
   owner_login?: string | null
   owner_type?: string | null
+  bot_login?: string | null
+  bot_user_id?: number | null
   install_url?: string | null
+  manage_url?: string | null
 }
 
 export interface GithubInstallationSummary {

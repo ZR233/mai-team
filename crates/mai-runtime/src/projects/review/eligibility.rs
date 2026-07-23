@@ -1,12 +1,13 @@
 use std::future::Future;
 
 use chrono::{DateTime, Utc};
-use mai_protocol::{ProjectId, ProjectSummary};
+use mai_protocol::{ProjectId, ProjectReviewSkipReason, ProjectSummary};
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::selection::{
-    CheckSignal, PullRequestCandidate, PullRequestReview, ReviewSelection, select_review_prs,
+    CheckSignal, PullRequestCandidate, PullRequestReview, ReviewEligibilityDecision,
+    ReviewSelection, review_eligibility, select_review_prs,
 };
 use crate::github::github_path_segment;
 use crate::{Result, RuntimeError};
@@ -16,13 +17,20 @@ const REVIEW_PAGE_SIZE: u64 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectReviewIdentity {
-    pub(crate) login: String,
+    pub(crate) user_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SelectedProjectReviewPr {
     pub(crate) pr: u64,
     pub(crate) head_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EvaluatedProjectReviewPr {
+    pub(crate) pr: u64,
+    pub(crate) head_sha: Option<String>,
+    pub(crate) skip_reason: Option<ProjectReviewSkipReason>,
 }
 
 /// 提供判断项目 PR 是否满足自动审查条件所需的只读 GitHub 数据。
@@ -78,7 +86,7 @@ pub(crate) async fn select_project_review_candidates(
                     project_id,
                     &owner,
                     &repo,
-                    &identity.login,
+                    identity.user_id,
                     pull_request,
                 )
                 .await?,
@@ -91,14 +99,33 @@ pub(crate) async fn select_project_review_candidates(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn select_project_review_pr(
     ops: &impl ProjectReviewEligibilityOps,
     project_id: ProjectId,
     pr: u64,
     head_sha_hint: Option<String>,
 ) -> Result<Option<SelectedProjectReviewPr>> {
+    let evaluated = evaluate_project_review_pr(ops, project_id, pr, head_sha_hint).await?;
+    Ok(evaluated
+        .skip_reason
+        .is_none()
+        .then_some(SelectedProjectReviewPr {
+            pr: evaluated.pr,
+            head_sha: evaluated.head_sha,
+        }))
+}
+
+pub(crate) async fn evaluate_project_review_pr(
+    ops: &impl ProjectReviewEligibilityOps,
+    project_id: ProjectId,
+    pr: u64,
+    head_sha_hint: Option<String>,
+) -> Result<EvaluatedProjectReviewPr> {
     if pr == 0 {
-        return Ok(None);
+        return Err(RuntimeError::InvalidInput(
+            "pull request number must be greater than zero".to_string(),
+        ));
     }
     let summary = ops.project_summary(project_id).await?;
     let identity = ops.project_review_identity(project_id).await?;
@@ -106,15 +133,26 @@ pub(crate) async fn select_project_review_pr(
     let repo = github_path_segment(&summary.repo);
     let pull_request = GithubPullRequest {
         number: pr,
+        state: None,
         draft: false,
         user: None,
         head: head_sha_hint.map(|sha| GithubPullRequestHead { sha: Some(sha) }),
     };
     let candidate = pull_request_candidate(ops, project_id, &owner, &repo, &pull_request).await?;
-    Ok(select_review_prs(&identity.login, vec![candidate])
-        .into_iter()
-        .map(selected_project_review_pr)
-        .next())
+    let head_sha = candidate.head_sha.clone();
+    let decision = review_eligibility(identity.user_id, candidate);
+    Ok(match decision {
+        ReviewEligibilityDecision::Eligible(selection) => EvaluatedProjectReviewPr {
+            pr: selection.pr,
+            head_sha: selection.head_sha,
+            skip_reason: None,
+        },
+        ReviewEligibilityDecision::Ineligible(reason) => EvaluatedProjectReviewPr {
+            pr,
+            head_sha,
+            skip_reason: Some(reason),
+        },
+    })
 }
 
 pub(super) async fn list_open_pull_requests(
@@ -145,6 +183,7 @@ pub(super) async fn pull_request_candidate(
         return Ok(PullRequestCandidate {
             number,
             author_login: detail.author_login(),
+            state: detail.state.clone(),
             draft: true,
             head_sha,
             latest_commit_at: None,
@@ -165,6 +204,7 @@ pub(super) async fn pull_request_candidate(
     Ok(PullRequestCandidate {
         number,
         author_login: detail.author_login(),
+        state: detail.state.clone(),
         draft: false,
         head_sha,
         latest_commit_at,
@@ -179,11 +219,11 @@ pub(super) async fn select_project_review_pull_request(
     project_id: ProjectId,
     owner: &str,
     repo: &str,
-    reviewer_login: &str,
+    reviewer_user_id: u64,
     pull_request: &GithubPullRequest,
 ) -> Result<Vec<SelectedProjectReviewPr>> {
     let candidate = pull_request_candidate(ops, project_id, owner, repo, pull_request).await?;
-    Ok(select_review_prs(reviewer_login, vec![candidate])
+    Ok(select_review_prs(reviewer_user_id, vec![candidate])
         .into_iter()
         .map(selected_project_review_pr)
         .collect())
@@ -219,7 +259,7 @@ async fn pull_request_reviews(
             decode_github_json(value, "list pull request reviews")?;
         let last_page = reviews.len() < REVIEW_PAGE_SIZE as usize;
         all_reviews.extend(reviews.into_iter().map(|review| PullRequestReview {
-            author_login: review.user.map(|user| user.login),
+            author_user_id: review.user.map(|user| user.id),
             state: review.state,
             submitted_at: review.submitted_at,
             commit_id: review.commit_id,
@@ -323,6 +363,8 @@ fn decode_github_json<T: for<'de> Deserialize<'de>>(value: Value, action: &str) 
 pub(super) struct GithubPullRequest {
     pub(super) number: u64,
     #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
     draft: bool,
     #[serde(default)]
     user: Option<GithubUser>,
@@ -359,6 +401,7 @@ struct GithubPullRequestReview {
 
 #[derive(Debug, Clone, Deserialize)]
 struct GithubUser {
+    id: u64,
     login: String,
 }
 
@@ -450,9 +493,7 @@ mod tests {
             &self,
             _project_id: Uuid,
         ) -> crate::Result<ProjectReviewIdentity> {
-            Ok(ProjectReviewIdentity {
-                login: "mai-bot".to_string(),
-            })
+            Ok(ProjectReviewIdentity { user_id: 42 })
         }
 
         async fn github_api_get_json(
@@ -555,7 +596,7 @@ mod tests {
                 "/repos/owner/repo/pulls/616/reviews?per_page=100&page=1".to_string(),
                 json!([
                     {
-                        "user": { "login": "mai-bot" },
+                        "user": { "id": 42, "login": "mai-bot-renamed" },
                         "submitted_at": "2026-05-16T07:25:36Z",
                         "commit_id": "head-616"
                     }
@@ -594,7 +635,7 @@ mod tests {
         let first_review_page = (0..100)
             .map(|index| {
                 json!({
-                    "user": { "login": "mai-bot" },
+                    "user": { "id": 42, "login": "mai-bot-renamed" },
                     "state": "APPROVED",
                     "submitted_at": format!("2026-05-15T{:02}:00:00Z", index % 24),
                     "commit_id": "old-head"
@@ -614,7 +655,7 @@ mod tests {
                 "/repos/owner/repo/pulls/777/reviews?per_page=100&page=2".to_string(),
                 json!([
                     {
-                        "user": { "login": "mai-bot" },
+                        "user": { "id": 42, "login": "mai-bot-renamed" },
                         "state": "APPROVED",
                         "submitted_at": "2026-05-16T07:25:36Z",
                         "commit_id": "head-777"
@@ -654,13 +695,13 @@ mod tests {
                 "/repos/owner/repo/pulls/520/reviews?per_page=100&page=1".to_string(),
                 json!([
                     {
-                        "user": { "login": "mai-bot" },
+                        "user": { "id": 42, "login": "mai-bot-renamed" },
                         "state": "CHANGES_REQUESTED",
                         "submitted_at": "2026-05-16T06:42:14Z",
                         "commit_id": "head-520"
                     },
                     {
-                        "user": { "login": "human-reviewer" },
+                        "user": { "id": 99, "login": "mai-bot" },
                         "state": "CHANGES_REQUESTED",
                         "submitted_at": "2026-05-19T07:17:18Z",
                         "commit_id": "head-520"
@@ -722,6 +763,7 @@ mod tests {
     fn pr_detail(number: u64, draft: bool, head_sha: &str) -> Value {
         json!({
             "number": number,
+            "state": "open",
             "draft": draft,
             "head": { "sha": head_sha },
         })

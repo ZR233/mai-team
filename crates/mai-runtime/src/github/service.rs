@@ -87,6 +87,12 @@ pub(crate) async fn github_app_settings(
     github_backend.github_app_settings().await
 }
 
+pub(crate) async fn refresh_github_app_settings(
+    backend: &dyn GithubAppBackend,
+) -> Result<GithubAppSettingsResponse> {
+    backend.refresh_github_app_settings().await
+}
+
 pub(crate) async fn save_github_app_settings(
     github_backend: &dyn GithubAppBackend,
     request: GithubAppSettingsRequest,

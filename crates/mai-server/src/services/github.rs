@@ -19,6 +19,12 @@ impl GithubService {
         self.runtime.github_app_settings().await
     }
 
+    pub(crate) async fn refresh_app_settings(
+        &self,
+    ) -> Result<GithubAppSettingsResponse, RuntimeError> {
+        self.runtime.refresh_github_app_settings().await
+    }
+
     pub(crate) async fn save_app_settings(
         &self,
         request: GithubAppSettingsRequest,
