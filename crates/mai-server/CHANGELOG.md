@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.12...mai-server-v0.1.13) - 2026-07-23
+
+### Added
+
+- 添加 max_context_tokens 和 effective_context_window_percent 字段，优化模型配置
+- enhance context compaction logic and introduce auto-compaction limits
+
+### Other
+
+- 优化 Relay 密钥按需更新
+- 优化会话 Timeline 工具调用聚合
+- 重构 Review 生命周期与可靠重试
+- 优化 Review 与工具调用展示
+- 统一 Docker exec 的 POSIX sh 语义
+- 统一 Agent 工作区工具模型
+- 将会话任务固定到可折叠侧栏
+- 使用会话笔记并强化运行时持久化
+- Use git dependencies for pure-lang crates and modularize frontend build
+- Codex/session events react web ([#41](https://github.com/ZR233/mai-team/pull/41))
+- [codex] migrate mai runtime to pl-core hosted agents ([#40](https://github.com/ZR233/mai-team/pull/40))
+- [codex] route mai agents through pl-core kernel ([#39](https://github.com/ZR233/mai-team/pull/39))
+- [codex] use pl-core agent runtime ([#38](https://github.com/ZR233/mai-team/pull/38))
+- move model sessions onto pl-core ([#35](https://github.com/ZR233/mai-team/pull/35))
+- [codex] Finish native pl-model provider migration ([#34](https://github.com/ZR233/mai-team/pull/34))
+
 ## [0.1.12](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.11...mai-server-v0.1.12) - 2026-06-09
 
 ### Added
