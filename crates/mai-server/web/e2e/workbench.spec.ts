@@ -221,6 +221,40 @@ test("web search and MCP settings use push-era product APIs", async ({ page }, t
   await recheck
 })
 
+test("relay settings preserve blank secrets and submit replacements", async ({ page }) => {
+  await page.goto("/settings/github-app")
+  await expect(page.getByText("Relay connection")).toBeVisible()
+
+  const blankRelaySave = page.waitForRequest((candidate) => candidate.url().endsWith("/settings/relay") && candidate.method() === "PUT")
+  await page.getByRole("button", { name: "Save relay" }).click()
+  expect((await blankRelaySave).postDataJSON()).toEqual({
+    enabled: true,
+    url: "https://relay.example",
+    node_id: "node-a",
+  })
+
+  const blankAppSave = page.waitForRequest((candidate) => candidate.url().endsWith("/settings/github-app") && candidate.method() === "PUT")
+  await page.getByRole("button", { name: "Save app" }).click()
+  expect((await blankAppSave).postDataJSON()).toEqual({
+    public_url: "https://relay.example",
+    base_url: "https://api.github.com",
+    app_id: "123",
+    app_slug: "mai",
+  })
+
+  await page.getByLabel("Relay token").fill("new-relay-token")
+  await page.getByLabel("PEM private key").fill("new-private-key")
+  const relaySave = page.waitForRequest((candidate) => candidate.url().endsWith("/settings/relay") && candidate.method() === "PUT")
+  await page.getByRole("button", { name: "Save relay" }).click()
+  expect((await relaySave).postDataJSON()).toMatchObject({ token: "new-relay-token" })
+  await expect(page.getByLabel("Relay token")).toHaveValue("")
+
+  const appSave = page.waitForRequest((candidate) => candidate.url().endsWith("/settings/github-app") && candidate.method() === "PUT")
+  await page.getByRole("button", { name: "Save app" }).click()
+  expect((await appSave).postDataJSON()).toMatchObject({ private_key: "new-private-key" })
+  await expect(page.getByLabel("PEM private key")).toHaveValue("")
+})
+
 async function installApiFixture(page: Page) {
   await page.route("**/*", async (route) => {
     const request = route.request()
@@ -247,6 +281,11 @@ async function installApiFixture(page: Page) {
     if (path === "/tasks") return json(route, [taskSummary])
     if (path === "/tasks/task-1") return json(route, taskDetail)
     if (path === "/settings/web-search") return json(route, webSearchSettings)
+    if (path === "/relay/status") return json(route, relayStatus)
+    if (path === "/settings/relay") return json(route, relaySettings)
+    if (path === "/settings/github-app") return json(route, githubAppSettings)
+    if (path === "/github/installations") return json(route, { installations: [] })
+    if (path === "/relay/update") return json(route, relayUpdate)
     if (path === "/mcp-servers") return json(route, mcpServers)
     if (/^\/projects\/project-1\/pull-requests\/\d+\/review$/.test(path) && request.method() === "POST") return json(route, { queued: [1631], deduped: [], ignored: [], jobs: [reviewJob] })
     if (request.method() !== "GET" && (
@@ -269,6 +308,22 @@ function stream(route: Route, body: string) {
 }
 
 const usage = { input_tokens: 1200, cached_input_tokens: 400, output_tokens: 180, reasoning_output_tokens: 80, total_tokens: 1380 }
+const relayStatus = { enabled: true, connected: true, relay_url: "https://relay.example", node_id: "node-a" }
+const relaySettings = { enabled: true, url: "https://relay.example", has_token: true, node_id: "node-a" }
+const githubAppSettings = {
+  app_id: "123",
+  base_url: "https://api.github.com",
+  public_url: "https://relay.example",
+  has_private_key: true,
+  app_slug: "mai",
+  install_url: "https://github.com/apps/mai/installations/select_target",
+}
+const relayUpdate = {
+  current_version: "0.1.0",
+  latest_version: "0.1.0",
+  has_update: false,
+  can_update: true,
+}
 const agent = {
   id: "agent-1", name: "Review workspace", role: "executor", state: { resource: "ready", runtime: { lifecycle: "active", activity: "idle", active_turn: null, pending_inputs: 0 } },
   provider_id: "future-provider", provider_name: "Future Cloud", model: "future-model", reasoning_effort: "balanced", created_at: "2026-07-20T00:00:00Z", updated_at: "2026-07-20T00:00:00Z", token_usage: usage,

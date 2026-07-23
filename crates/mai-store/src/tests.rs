@@ -271,6 +271,14 @@ async fn relay_settings_persist_without_exposing_token() {
     assert!(kept.has_token);
     assert_eq!(kept.url, "https://relay-two.example");
     assert_eq!(kept.node_id, "node-b");
+    assert_eq!(
+        store.relay_secret().await.expect("load relay secret"),
+        Some((
+            "https://relay-two.example".to_string(),
+            "relay-token".to_string(),
+            "node-b".to_string(),
+        ))
+    );
 
     let cleared = store
         .save_relay_settings(RelaySettingsRequest {
@@ -320,6 +328,32 @@ async fn github_app_settings_persist_public_url() {
     assert_eq!(secret.0, "123");
     assert_eq!(secret.1, "pem");
     assert_eq!(secret.2, "https://api.github.com");
+
+    let updated = store
+        .save_github_app_settings(GithubAppSettingsRequest {
+            app_id: Some("456".to_string()),
+            private_key: None,
+            base_url: Some("https://github.example/api/v3".to_string()),
+            public_url: Some("https://relay-two.example".to_string()),
+            app_slug: None,
+            app_html_url: None,
+            owner_login: None,
+            owner_type: None,
+        })
+        .await
+        .expect("update GitHub App without private key");
+    assert!(updated.has_private_key);
+    assert_eq!(
+        store
+            .github_app_secret()
+            .await
+            .expect("load updated secret"),
+        Some((
+            "456".to_string(),
+            "pem".to_string(),
+            "https://github.example/api/v3".to_string(),
+        ))
+    );
 }
 
 #[tokio::test]

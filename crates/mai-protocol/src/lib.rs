@@ -1816,7 +1816,7 @@ pub struct GithubAppInstallationStartResponse {
 pub struct GithubAppSettingsRequest {
     #[serde(default)]
     pub app_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_key: Option<String>,
     #[serde(default)]
     pub base_url: Option<String>,
@@ -1838,7 +1838,7 @@ pub struct RelaySettingsRequest {
     pub enabled: bool,
     #[serde(default)]
     pub url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     #[serde(default)]
     pub node_id: Option<String>,
@@ -2493,6 +2493,78 @@ mod tests {
         assert_eq!(decoded.url, "https://relay.example");
         assert!(decoded.has_token);
         assert_eq!(decoded.node_id, "mai-server-a");
+    }
+
+    #[test]
+    fn optional_settings_secrets_are_omitted_when_unchanged() {
+        let relay = serde_json::to_value(RelaySettingsRequest {
+            enabled: true,
+            url: Some("https://relay.example".to_string()),
+            token: None,
+            node_id: Some("mai-server-a".to_string()),
+        })
+        .expect("serialize relay settings");
+        assert_eq!(
+            relay,
+            json!({
+                "enabled": true,
+                "url": "https://relay.example",
+                "node_id": "mai-server-a"
+            })
+        );
+
+        let github_app = serde_json::to_value(GithubAppSettingsRequest {
+            app_id: Some("123".to_string()),
+            private_key: None,
+            base_url: Some("https://api.github.com".to_string()),
+            public_url: Some("https://relay.example".to_string()),
+            app_slug: Some("mai".to_string()),
+            app_html_url: None,
+            owner_login: None,
+            owner_type: None,
+        })
+        .expect("serialize GitHub App settings");
+        assert_eq!(
+            github_app,
+            json!({
+                "app_id": "123",
+                "base_url": "https://api.github.com",
+                "public_url": "https://relay.example",
+                "app_slug": "mai",
+                "app_html_url": null,
+                "owner_login": null,
+                "owner_type": null
+            })
+        );
+    }
+
+    #[test]
+    fn optional_settings_secrets_accept_missing_and_null_values() {
+        let missing_relay: RelaySettingsRequest = serde_json::from_value(json!({
+            "enabled": true,
+            "url": "https://relay.example",
+            "node_id": "mai-server-a"
+        }))
+        .expect("deserialize missing relay token");
+        let null_relay: RelaySettingsRequest = serde_json::from_value(json!({
+            "enabled": true,
+            "url": "https://relay.example",
+            "token": null,
+            "node_id": "mai-server-a"
+        }))
+        .expect("deserialize null relay token");
+        assert_eq!(missing_relay, null_relay);
+
+        let missing_private_key: GithubAppSettingsRequest =
+            serde_json::from_value(json!({ "app_id": "123" }))
+                .expect("deserialize missing private key");
+        let null_private_key: GithubAppSettingsRequest =
+            serde_json::from_value(json!({ "app_id": "123", "private_key": null }))
+                .expect("deserialize null private key");
+        assert_eq!(
+            missing_private_key.private_key,
+            null_private_key.private_key
+        );
     }
 
     #[test]

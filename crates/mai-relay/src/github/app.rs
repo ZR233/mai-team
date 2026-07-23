@@ -45,35 +45,10 @@ pub(crate) async fn save_github_app_settings(
             "compiled GitHub App config is read-only".to_string(),
         ));
     }
-    let app_id = required_setting(request.app_id, "GitHub App ID")?;
-    let private_key = required_setting(request.private_key, "GitHub App private key")?;
-    let public_url = required_setting(request.public_url, "relay public URL")?;
-    let mut config = GithubAppConfig {
-        app_id,
-        private_key,
-        webhook_secret: state
-            .store
-            .github_app_config()?
-            .map(|config| config.webhook_secret.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| Uuid::new_v4().to_string()),
-        app_slug: request
-            .app_slug
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
-        app_html_url: request
-            .app_html_url
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
-        owner_login: request
-            .owner_login
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
-        owner_type: request
-            .owner_type
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
-    };
+    let current_config = state.store.github_app_config()?;
+    let current_public_url = relay_public_url(state)?;
+    let (mut config, public_url) =
+        merge_github_app_settings(request, current_config, &current_public_url)?;
     hydrate_github_app_metadata(&state.http, &state.github_api_base_url, &mut config).await?;
     update_github_app_hook_config(
         &state.http,
@@ -390,11 +365,96 @@ fn optional_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn required_setting(value: Option<String>, label: &str) -> RelayResult<String> {
-    value
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty())
+fn merge_github_app_settings(
+    request: GithubAppSettingsRequest,
+    current: Option<GithubAppConfig>,
+    current_public_url: &str,
+) -> RelayResult<(GithubAppConfig, String)> {
+    let app_id = required_text_update(
+        request.app_id,
+        current.as_ref().map(|config| config.app_id.as_str()),
+        "GitHub App ID",
+    )?;
+    let private_key = required_text_update(
+        request.private_key,
+        current.as_ref().map(|config| config.private_key.as_str()),
+        "GitHub App private key",
+    )?;
+    let public_url = required_url_update(
+        request.public_url,
+        Some(current_public_url),
+        "relay public URL",
+    )?;
+    let config = GithubAppConfig {
+        app_id,
+        private_key,
+        webhook_secret: current
+            .as_ref()
+            .map(|config| config.webhook_secret.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        app_slug: merge_optional_setting(
+            request.app_slug,
+            current.as_ref().and_then(|config| config.app_slug.clone()),
+        ),
+        app_html_url: merge_optional_setting(
+            request.app_html_url,
+            current
+                .as_ref()
+                .and_then(|config| config.app_html_url.clone()),
+        ),
+        owner_login: merge_optional_setting(
+            request.owner_login,
+            current
+                .as_ref()
+                .and_then(|config| config.owner_login.clone()),
+        ),
+        owner_type: merge_optional_setting(
+            request.owner_type,
+            current
+                .as_ref()
+                .and_then(|config| config.owner_type.clone()),
+        ),
+    };
+    Ok((config, public_url))
+}
+
+fn required_text_update(
+    requested: Option<String>,
+    current: Option<&str>,
+    label: &str,
+) -> RelayResult<String> {
+    normalized_text(requested.as_deref())
+        .or_else(|| normalized_text(current))
         .ok_or_else(|| RelayErrorKind::InvalidInput(format!("{label} is required")))
+}
+
+fn required_url_update(
+    requested: Option<String>,
+    current: Option<&str>,
+    label: &str,
+) -> RelayResult<String> {
+    requested
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| current.map(str::trim).filter(|value| !value.is_empty()))
+        .map(|value| value.trim_end_matches('/').to_string())
+        .ok_or_else(|| RelayErrorKind::InvalidInput(format!("{label} is required")))
+}
+
+fn normalized_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn merge_optional_setting(requested: Option<String>, current: Option<String>) -> Option<String> {
+    match requested {
+        Some(value) => normalized_text(Some(&value)),
+        None => current,
+    }
 }
 
 fn relay_public_url(state: &AppState) -> RelayResult<String> {
@@ -577,6 +637,100 @@ mod tests {
         assert_eq!(merged.webhook_secret, "stored-secret");
         assert_eq!(merged.app_slug.as_deref(), Some("env-slug"));
         assert_eq!(merged.owner_login.as_deref(), Some("owner"));
+    }
+
+    #[test]
+    fn settings_update_preserves_unsubmitted_private_key_and_metadata() {
+        let current = GithubAppConfig {
+            app_id: "123".to_string(),
+            private_key: "stored-pem".to_string(),
+            webhook_secret: "stored-secret".to_string(),
+            app_slug: Some("stored-slug".to_string()),
+            app_html_url: Some("https://github.com/apps/stored".to_string()),
+            owner_login: Some("owner".to_string()),
+            owner_type: Some("Organization".to_string()),
+        };
+        let request = GithubAppSettingsRequest {
+            app_id: Some("456".to_string()),
+            private_key: Some(" \n ".to_string()),
+            base_url: None,
+            public_url: Some("https://relay-two.example/".to_string()),
+            app_slug: None,
+            app_html_url: None,
+            owner_login: None,
+            owner_type: None,
+        };
+
+        let (config, public_url) =
+            merge_github_app_settings(request, Some(current), "https://relay.example")
+                .expect("merge settings");
+
+        assert_eq!(
+            config,
+            GithubAppConfig {
+                app_id: "456".to_string(),
+                private_key: "stored-pem".to_string(),
+                webhook_secret: "stored-secret".to_string(),
+                app_slug: Some("stored-slug".to_string()),
+                app_html_url: Some("https://github.com/apps/stored".to_string()),
+                owner_login: Some("owner".to_string()),
+                owner_type: Some("Organization".to_string()),
+            }
+        );
+        assert_eq!(public_url, "https://relay-two.example");
+    }
+
+    #[test]
+    fn settings_update_replaces_submitted_private_key() {
+        let current = GithubAppConfig {
+            app_id: "123".to_string(),
+            private_key: "stored-pem".to_string(),
+            webhook_secret: "stored-secret".to_string(),
+            app_slug: None,
+            app_html_url: None,
+            owner_login: None,
+            owner_type: None,
+        };
+        let request = GithubAppSettingsRequest {
+            app_id: None,
+            private_key: Some(" new-pem ".to_string()),
+            base_url: None,
+            public_url: None,
+            app_slug: None,
+            app_html_url: None,
+            owner_login: None,
+            owner_type: None,
+        };
+
+        let (config, public_url) =
+            merge_github_app_settings(request, Some(current), "https://relay.example/")
+                .expect("merge settings");
+
+        assert_eq!(config.private_key, "new-pem");
+        assert_eq!(config.webhook_secret, "stored-secret");
+        assert_eq!(public_url, "https://relay.example");
+    }
+
+    #[test]
+    fn settings_update_requires_private_key_for_initial_configuration() {
+        let request = GithubAppSettingsRequest {
+            app_id: Some("123".to_string()),
+            private_key: None,
+            base_url: None,
+            public_url: Some("https://relay.example".to_string()),
+            app_slug: None,
+            app_html_url: None,
+            owner_login: None,
+            owner_type: None,
+        };
+
+        let error = merge_github_app_settings(request, None, "https://relay.example")
+            .expect_err("missing private key");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid input: GitHub App private key is required"
+        );
     }
 
     #[test]

@@ -24,7 +24,7 @@ pub(crate) struct GithubInstallationCallbackQuery {
     pub(crate) state: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GithubAppConfig {
     pub(crate) app_id: String,
     pub(crate) private_key: String,

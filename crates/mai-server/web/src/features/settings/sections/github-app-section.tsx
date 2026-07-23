@@ -16,6 +16,10 @@ import { Field, FieldContent, FieldDescription, FieldGroup, FieldTitle } from "@
 import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
+import {
+  buildGithubAppSettingsUpdate,
+  buildRelaySettingsUpdate,
+} from "@/features/settings/sections/github-app-settings-payload"
 import { FormField, SettingsBody, SettingsHeader } from "@/features/settings/settings-section"
 
 interface Installation {
@@ -42,7 +46,7 @@ export function GithubAppSection() {
   const app = useQuery({ queryKey: queryKeys.githubApp, queryFn: () => api<GithubAppSettings>("/settings/github-app") })
   const installations = useQuery({ queryKey: [...queryKeys.githubApp, "installations"], queryFn: () => api<{ installations: Installation[] }>("/github/installations") })
   const update = useQuery({ queryKey: [...queryKeys.relay, "update"], queryFn: () => api<UpdateStatus>("/relay/update") })
-  const [relayForm, setRelayForm] = useState({ enabled: false, url: "", token: "", clearToken: false, nodeId: "mai-server" })
+  const [relayForm, setRelayForm] = useState({ enabled: false, url: "", token: "", nodeId: "mai-server" })
   const [appForm, setAppForm] = useState({ publicUrl: "", baseUrl: "", appId: "", appSlug: "", privateKey: "" })
 
   useEffect(() => {
@@ -63,16 +67,16 @@ export function GithubAppSection() {
     ])
   }
   const saveRelay = useMutation({
-    mutationFn: () => api<RelaySettings>("/settings/relay", { method: "PUT", ...jsonBody({ enabled: relayForm.enabled, url: relayForm.url || null, token: relayForm.clearToken ? "" : relayForm.token || null, node_id: relayForm.nodeId || null }) }),
+    mutationFn: () => api<RelaySettings>("/settings/relay", { method: "PUT", ...jsonBody(buildRelaySettingsUpdate(relayForm)) }),
     onSuccess: async () => {
       toast.success("Relay settings saved")
-      setRelayForm((current) => ({ ...current, token: "", clearToken: false }))
+      setRelayForm((current) => ({ ...current, token: "" }))
       await refresh()
     },
     onError: (error) => toast.error(error.message),
   })
   const saveApp = useMutation({
-    mutationFn: () => api<GithubAppSettings>("/settings/github-app", { method: "PUT", ...jsonBody({ public_url: appForm.publicUrl || null, base_url: appForm.baseUrl || null, app_id: appForm.appId || null, app_slug: appForm.appSlug || null, private_key: appForm.privateKey || null }) }),
+    mutationFn: () => api<GithubAppSettings>("/settings/github-app", { method: "PUT", ...jsonBody(buildGithubAppSettingsUpdate(appForm)) }),
     onSuccess: async () => {
       toast.success("GitHub App settings saved")
       setAppForm((current) => ({ ...current, privateKey: "" }))
@@ -131,7 +135,7 @@ export function GithubAppSection() {
                 <Switch aria-label="Enable relay" checked={relayForm.enabled} onCheckedChange={(enabled: boolean) => setRelayForm({ ...relayForm, enabled })} />
               </Field>
               <FormField label="Relay URL"><Input value={relayForm.url} onChange={(event) => setRelayForm({ ...relayForm, url: event.target.value })} placeholder="https://relay.example" /></FormField>
-              <FormField label="Relay token" hint={relaySettings.data?.has_token ? "Leave blank to preserve the saved token." : undefined}><Input type="password" value={relayForm.token} onChange={(event) => setRelayForm({ ...relayForm, token: event.target.value })} /></FormField>
+              <FormField label="Relay token" htmlFor="relay-token" hint={relaySettings.data?.has_token ? "Leave blank to preserve the saved token." : undefined}><Input id="relay-token" type="password" value={relayForm.token} onChange={(event) => setRelayForm({ ...relayForm, token: event.target.value })} /></FormField>
               <FormField label="Node ID"><Input value={relayForm.nodeId} onChange={(event) => setRelayForm({ ...relayForm, nodeId: event.target.value })} /></FormField>
               <Button disabled={saveRelay.isPending} onClick={() => saveRelay.mutate()}>Save relay</Button>
             </FieldGroup>
@@ -143,7 +147,7 @@ export function GithubAppSection() {
               <FormField label="Public URL"><Input value={appForm.publicUrl} onChange={(event) => setAppForm({ ...appForm, publicUrl: event.target.value })} placeholder="https://relay.example" /></FormField>
               <FormField label="GitHub API base URL"><Input value={appForm.baseUrl} onChange={(event) => setAppForm({ ...appForm, baseUrl: event.target.value })} /></FormField>
               <div className="grid gap-4 sm:grid-cols-2"><FormField label="GitHub App ID"><Input value={appForm.appId} onChange={(event) => setAppForm({ ...appForm, appId: event.target.value })} placeholder="123456" /></FormField><FormField label="App slug"><Input value={appForm.appSlug} onChange={(event) => setAppForm({ ...appForm, appSlug: event.target.value })} placeholder="mai-team" /></FormField></div>
-              <FormField label="PEM private key" hint={app.data?.has_private_key ? "Leave blank to preserve the saved private key." : "Paste or upload the GitHub App private key."}><Textarea className="min-h-24 font-mono text-xs" value={appForm.privateKey} onChange={(event) => setAppForm({ ...appForm, privateKey: event.target.value })} /></FormField>
+              <FormField label="PEM private key" htmlFor="github-app-private-key" hint={app.data?.has_private_key ? "Leave blank to preserve the saved private key." : "Paste or upload the GitHub App private key."}><Textarea id="github-app-private-key" className="min-h-24 font-mono text-xs" value={appForm.privateKey} onChange={(event) => setAppForm({ ...appForm, privateKey: event.target.value })} /></FormField>
               <FormField label="Upload PEM"><Input type="file" accept=".pem,.key,text/plain" onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; const reader = new FileReader(); reader.onload = () => setAppForm((current) => ({ ...current, privateKey: String(reader.result || "") })); reader.readAsText(file); event.target.value = "" }} /></FormField>
               <div className="flex gap-2"><Button disabled={saveApp.isPending} onClick={() => saveApp.mutate()}>Save app</Button><Button variant="outline" disabled={!relay.data?.connected || !app.data?.install_url} onClick={() => void install()}><ExternalLink data-icon="inline-start" /> Install app</Button></div>
             </FieldGroup>
