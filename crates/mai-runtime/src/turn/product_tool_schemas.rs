@@ -50,7 +50,7 @@ mod tests {
                 .find(|line| line.starts_with(&format!("{package} = ")))
                 .expect("workspace dependency must exist");
             assert!(
-                line.contains("git = \"ssh://git@github.com/ZR233/pure-lang.git\"")
+                line.contains("git = \"https://github.com/ZR233/pure-lang.git\"")
                     && line.contains("branch = \"main\"")
                     && !line.contains("path ="),
                 "{package} must use the pure-lang upstream main branch"
