@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "package" ]]; then
+  echo "cargo package is intentionally disabled for git-only releases" >&2
+  exit 1
+fi
+
+exec "${REAL_CARGO:?REAL_CARGO is required}" "$@"

@@ -135,9 +135,31 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # release-plz 的 git_only 工作区仍会运行 cargo package，无法处理未发布的 Git 依赖。
+      # 固定到上游修复提交；正式版本包含该修复后可恢复使用 release-plz/action。
+      - name: Install release-plz with git-only workspace fix
+        run: >-
+          cargo install
+          --git https://github.com/structured-world/release-plz.git
+          --rev e8ca8da97dc8f472820a67eece651604887b1c7d
+          --locked
+          release-plz
+
+      - name: Configure release commit author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
       - name: Run release-plz
-        uses: release-plz/action@v0.5
-        with:
-          command: release-pr
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          real_cargo="$(command -v cargo)"
+          REAL_CARGO="$real_cargo" \
+            PATH="$GITHUB_WORKSPACE/.github/release-plz:$PATH" \
+            release-plz release-pr \
+              --repo-url "https://github.com/$GITHUB_REPOSITORY" \
+              --forge github \
+              --output json
