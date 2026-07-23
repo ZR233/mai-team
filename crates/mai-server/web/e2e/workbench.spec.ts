@@ -82,6 +82,16 @@ test("chat workbench is usable at each configured viewport", async ({ page }, te
   await expect(page.getByRole("heading", { name: "Review", exact: true })).toBeVisible()
   await expect(page.getByPlaceholder(/Send a command/)).toBeVisible()
   await expect(page.getByText("Outdated task", { exact: true })).toHaveCount(0)
+  await expect(page.getByRole("button", { name: "Expand 4 tool calls" })).toBeVisible()
+  await expect(page.getByText("18s", { exact: true })).toBeVisible()
+  const timelineViewport = page.locator("[data-session-timeline-scroll] > [data-radix-scroll-area-viewport]")
+  await expect.poll(() => timelineViewport.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true)
+  await expect(page.getByText("Run command", { exact: true })).toHaveCount(0)
+  await expect(page).toHaveScreenshot(`chat-tools-collapsed-${testInfo.project.name}.png`, { animations: "disabled" })
+  await page.getByRole("button", { name: "Expand 4 tool calls" }).click()
+  await expect(page.getByRole("button", { name: "Collapse 4 tool calls" })).toBeVisible()
+  await expect(page.getByText("Run command", { exact: true })).toBeVisible()
+  await expect.poll(() => timelineViewport.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true)
   await expect(page).toHaveScreenshot(`chat-${testInfo.project.name}.png`, { animations: "disabled" })
 
   await page.getByRole("button", { name: "Expand Run command" }).click()
@@ -276,8 +286,11 @@ const sessionFrame = { type: "snapshot", snapshot: {
   ],
   parts: [
     { partId: "part-1", messageId: "message-1", sessionId: "session-1", turnId: "turn-1", order: 0, revision: 0, status: "completed", createdAt: 1, updatedAt: 1, content: { type: "text", channel: "user", text: "Inspect the canonical session stream" } },
-    { partId: "part-tool", messageId: "message-2", sessionId: "session-1", turnId: "turn-1", order: 0, revision: 1, status: "completed", createdAt: 2, updatedAt: 3, content: { type: "tool", tool: { toolCallId: "tool-call-1", name: "exec", arguments: JSON.stringify({ command: "cargo test -p mai-server projects::review", cwd: "/workspace/mai-team" }), result: JSON.stringify({ status: "completed", exitCode: 0, timedOut: false, stdout: "Finished focused review checks", stderr: "", outputFile: ".mai/tool-output/tool-call-1.log" }), exitCode: 0, workingDirectory: "/workspace/mai-team" } } },
-    { partId: "part-2", messageId: "message-2", sessionId: "session-1", turnId: "turn-1", order: 1, revision: 0, status: "completed", createdAt: 2, updatedAt: 3, content: { type: "text", channel: "final", text: "The unified event channel is active and the review workspace is ready." } },
+    { partId: "part-search", messageId: "message-2", sessionId: "session-1", turnId: "turn-1", order: 0, revision: 1, status: "completed", createdAt: 1_000, updatedAt: 4_000, completedAt: 4_000, content: { type: "tool", tool: { toolCallId: "tool-call-search", name: "search_files", arguments: JSON.stringify({ query: "session timeline", path: "src/features/session" }), result: JSON.stringify({ query: "session timeline", count: 12, files: [{ path: "src/features/session/session-timeline.tsx", matches: [{ line: 15, text: "export function SessionTimeline" }] }] }), activityGroupId: "turn-1:tools" } } },
+    { partId: "part-read", messageId: "message-2", sessionId: "session-1", turnId: "turn-1", order: 1, revision: 1, status: "completed", createdAt: 4_000, updatedAt: 7_000, completedAt: 7_000, content: { type: "tool", tool: { toolCallId: "tool-call-read", name: "read_file", arguments: JSON.stringify({ path: "src/features/session/session-timeline.tsx" }), result: JSON.stringify({ path: "src/features/session/session-timeline.tsx", startLine: 1, endLine: 90, text: "export function SessionTimeline() {}" }), activityGroupId: "turn-1:tools" } } },
+    { partId: "part-tool", messageId: "message-2", sessionId: "session-1", turnId: "turn-1", order: 2, revision: 1, status: "completed", createdAt: 7_000, updatedAt: 15_000, completedAt: 15_000, content: { type: "tool", tool: { toolCallId: "tool-call-1", name: "exec", arguments: JSON.stringify({ command: "cargo test -p mai-server projects::review", cwd: "/workspace/mai-team" }), result: JSON.stringify({ status: "completed", exitCode: 0, timedOut: false, stdout: "Finished focused review checks", stderr: "", outputFile: ".mai/tool-output/tool-call-1.log" }), exitCode: 0, workingDirectory: "/workspace/mai-team", activityGroupId: "turn-1:tools" } } },
+    { partId: "part-patch", messageId: "message-2", sessionId: "session-1", turnId: "turn-1", order: 3, revision: 1, status: "completed", createdAt: 15_000, updatedAt: 19_000, completedAt: 19_000, content: { type: "tool", tool: { toolCallId: "tool-call-patch", name: "apply_patch", arguments: JSON.stringify({ patch: "*** Begin Patch\n*** Update File: src/features/session/session-timeline.tsx\n*** Update File: src/features/session/tool-call-details.tsx\n*** End Patch" }), result: JSON.stringify({ changedFiles: ["src/features/session/session-timeline.tsx", "src/features/session/tool-call-details.tsx"] }), activityGroupId: "turn-1:tools" } } },
+    { partId: "part-2", messageId: "message-2", sessionId: "session-1", turnId: "turn-1", order: 4, revision: 0, status: "completed", createdAt: 19_000, updatedAt: 19_000, completedAt: 19_000, content: { type: "text", channel: "final", text: "The unified event channel is active and the review workspace is ready." } },
   ],
   interactions: [], agents: [],
   timelineEvents: [

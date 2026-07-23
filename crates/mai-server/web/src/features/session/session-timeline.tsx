@@ -10,6 +10,8 @@ import type { NormalizedSession } from "@/events/session-reducer"
 import type { SessionPart } from "@/events/session-events.generated"
 import { cn } from "@/lib/utils"
 
+import { buildTimelineRenderItems, type TimelineRenderItem } from "./timeline-presentation"
+import { ToolActivityGroup } from "./tool-activity-group"
 import { ToolCallDetails } from "./tool-call-details"
 
 export function SessionTimeline({ view }: { view: NormalizedSession }) {
@@ -17,7 +19,7 @@ export function SessionTimeline({ view }: { view: NormalizedSession }) {
     return <EmptyState title="No messages yet" description="Send a message to start this session." />
   }
   return (
-    <div className="space-y-7 py-6">
+    <div className="flex w-full min-w-0 max-w-full flex-col gap-7 overflow-hidden py-6">
       {view.messageOrder.map((messageId) => {
         const message = view.messages[messageId]
         if (!message) return null
@@ -30,23 +32,32 @@ export function SessionTimeline({ view }: { view: NormalizedSession }) {
 
 const MessageRow = memo(function MessageRow({ role, parts, status }: { role: string; parts: SessionPart[]; status: string }) {
   const user = role === "user"
+  const items = buildTimelineRenderItems(parts)
   return (
-    <article className="timeline-row flex gap-3" style={{ contentVisibility: "auto", containIntrinsicSize: "120px" }}>
+    <article className="timeline-row flex w-full min-w-0 max-w-full gap-3 overflow-hidden" style={{ contentVisibility: "auto", containIntrinsicSize: "120px" }}>
       <div className={cn(
         "mt-0.5 grid size-8 shrink-0 place-items-center rounded-full",
         user ? "bg-muted text-muted-foreground" : "border bg-background text-foreground",
       )}>{user ? <User className="size-4" /> : <Bot className="size-4" />}</div>
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 max-w-full flex-1 overflow-hidden">
         <div className="mb-2 flex items-center gap-2">
           <span className="text-sm font-semibold">{user ? "You" : "Assistant"}</span>
           {status !== "completed" && <Badge variant="outline" className="h-4 px-1.5 text-[10px] capitalize">{status}</Badge>}
         </div>
-        <div className={cn("flex flex-col gap-3", user && "inline-block max-w-3xl rounded-lg bg-muted px-4 py-3")}>
-          {parts.map((part) => <PartRow key={part.partId} part={part} />)}
+        <div className={cn(
+          user ? "inline-block max-w-3xl rounded-lg bg-muted px-4 py-3" : "flex min-w-0 max-w-full flex-col gap-3 overflow-hidden",
+        )}>
+          {items.map((item) => <TimelineItemRow key={item.key} item={item} />)}
         </div>
       </div>
     </article>
   )
+})
+
+const TimelineItemRow = memo(function TimelineItemRow({ item }: { item: TimelineRenderItem }) {
+  return item.kind === "toolGroup"
+    ? <ToolActivityGroup parts={item.parts} />
+    : <PartRow part={item.part} />
 })
 
 const PartRow = memo(function PartRow({ part }: { part: SessionPart }) {

@@ -104,7 +104,7 @@ export function SessionWorkspace({
       <ScrollArea ref={scroller} className="min-h-0 flex-1" data-session-timeline-scroll>
         <div className={cn(
           "mx-auto grid w-full max-w-5xl px-5 md:px-8",
-          todoSnapshot && "pb-12 transition-[grid-template-columns] duration-200 motion-reduce:transition-none @min-[52rem]/session-workspace:max-w-7xl @min-[52rem]/session-workspace:gap-6 @min-[52rem]/session-workspace:pb-0",
+          todoSnapshot && "pb-20 transition-[grid-template-columns] duration-200 motion-reduce:transition-none @min-[52rem]/session-workspace:max-w-7xl @min-[52rem]/session-workspace:gap-6 @min-[52rem]/session-workspace:pb-0",
           todoSnapshot && (todoExpanded
             ? "@min-[52rem]/session-workspace:grid-cols-[minmax(0,1fr)_17rem]"
             : "@min-[52rem]/session-workspace:grid-cols-[minmax(0,1fr)_3rem]"),

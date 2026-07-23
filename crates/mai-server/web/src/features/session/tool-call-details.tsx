@@ -30,52 +30,68 @@ import {
 
 const CONTENT_PREVIEW_LENGTH = 1_600
 
-export function ToolCallDetails({ tool, defaultOpen = false }: { tool: ToolPresentationInput; defaultOpen?: boolean }) {
+type ToolCallDetailsVariant = "standalone" | "grouped"
+
+export function ToolCallDetails({
+  tool,
+  defaultOpen = false,
+  variant = "standalone",
+}: {
+  tool: ToolPresentationInput
+  defaultOpen?: boolean
+  variant?: ToolCallDetailsVariant
+}) {
   const [open, setOpen] = useState(defaultOpen)
   const [rawOpen, setRawOpen] = useState(false)
   const model = useMemo(() => buildToolPresentation(tool), [tool])
   const Icon = toolIcon(model.name)
-  const running = ["started", "streaming", "running", "awaiting approval"].includes(model.status)
+  const running = ["started", "streaming", "running", "awaiting approval", "approved"].includes(model.status)
+  const grouped = variant === "grouped"
 
   return (
     <Collapsible open={open} onOpenChange={setOpen} className={cn(
-      "overflow-hidden rounded-lg border bg-card",
-      model.failed && "border-destructive/30",
-    )}>
+      "w-full min-w-0 max-w-full overflow-hidden",
+      grouped ? "bg-background" : "rounded-lg border bg-card",
+      model.failed && !grouped && "border-destructive/30",
+    )} data-tool-call-variant={variant}>
       <CollapsibleTrigger
-        className="group flex w-full items-center gap-2.5 px-3 py-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+        className={cn(
+          "group flex min-h-11 w-full max-w-full items-center gap-2.5 overflow-hidden text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+          grouped ? "rounded-md px-1.5 py-2 hover:bg-muted/45" : "px-3 py-2.5",
+        )}
         aria-label={`${open ? "Collapse" : "Expand"} ${model.title}`}
       >
         <span className={cn(
-          "grid size-7 shrink-0 place-items-center rounded-md bg-muted text-muted-foreground",
-          model.failed && "bg-destructive/10 text-destructive",
+          "grid shrink-0 place-items-center rounded-md text-muted-foreground",
+          grouped ? "size-8 border bg-background sm:size-9" : "size-7 bg-muted",
+          model.failed && "border-destructive/30 bg-destructive/10 text-destructive",
         )}>
-          <Icon className="size-3.5" aria-hidden="true" />
+          <Icon className={grouped ? "size-4" : "size-3.5"} aria-hidden="true" />
         </span>
-        <span className="min-w-0 flex-1">
-          <span className="block truncate text-xs font-semibold">{model.title}</span>
+        <span className="min-w-0 flex-1 overflow-hidden">
+          <span className={cn("block truncate font-semibold", grouped ? "text-sm" : "text-xs")}>{model.title}</span>
           <span className="block truncate text-xs text-muted-foreground">{model.summary}</span>
         </span>
-        {model.facts.find((fact) => fact.label === "Exit code") && (
+        {!grouped && model.facts.find((fact) => fact.label === "Exit code") && (
           <span className="hidden text-xs tabular-nums text-muted-foreground sm:inline">
             exit {model.facts.find((fact) => fact.label === "Exit code")?.value}
           </span>
         )}
-        <StatusBadge status={model.status} failed={model.failed} />
+        {!grouped && <StatusBadge status={model.status} failed={model.failed} />}
         {model.failed
-          ? <OctagonAlert className="size-3.5 text-destructive" aria-hidden="true" />
+          ? <OctagonAlert className="size-3.5 shrink-0 text-destructive" aria-hidden="true" />
           : running
-            ? <CircleDot className="size-3.5 animate-pulse text-muted-foreground motion-reduce:animate-none" aria-hidden="true" />
-            : <CheckCircle2 className="size-3.5 text-muted-foreground" aria-hidden="true" />}
-        <ChevronDown className={cn("size-3.5 text-muted-foreground transition-transform motion-reduce:transition-none", open && "rotate-180")} aria-hidden="true" />
+            ? <CircleDot className="size-3.5 shrink-0 animate-pulse text-muted-foreground motion-reduce:animate-none" aria-hidden="true" />
+            : <CheckCircle2 className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />}
+        {!grouped && <ChevronDown className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform motion-reduce:transition-none", open && "rotate-180")} aria-hidden="true" />}
       </CollapsibleTrigger>
-      <CollapsibleContent className="border-t">
-        <div className="space-y-4 p-3 sm:p-4">
+      <CollapsibleContent className={cn("border-t", grouped && "bg-muted/20")}>
+        <div className="flex flex-col gap-4 p-3 sm:p-4">
           {model.sections.map((section, index) => <ToolSectionView key={`${section.title}:${index}`} section={section} />)}
           {model.outputArtifacts.length > 0 && (
-            <section className="space-y-2">
+            <section className="flex flex-col gap-2">
               <SectionTitle>Attachments</SectionTitle>
-              <div className="space-y-1.5">{model.outputArtifacts.map((artifact, index) => (
+              <div className="flex flex-col gap-1.5">{model.outputArtifacts.map((artifact, index) => (
                 <ToolArtifact key={`${artifact.id || artifact.path || "artifact"}:${index}`} artifact={artifact} />
               ))}</div>
             </section>
@@ -94,7 +110,7 @@ export function ToolCallDetails({ tool, defaultOpen = false }: { tool: ToolPrese
                 </Button>
               </CollapsibleTrigger>
               <CollapsibleContent>
-                {rawOpen && <div className="space-y-3 border-t border-dashed p-3">
+                {rawOpen && <div className="flex flex-col gap-3 border-t border-dashed p-3">
                   {model.rawArguments && <RawData title="Arguments" value={model.rawArguments} />}
                   {model.rawResult && <RawData title="Result" value={model.rawResult} />}
                 </div>}
@@ -112,9 +128,9 @@ function ToolSectionView({ section }: { section: ToolSection }) {
     case "fields":
       return <FactList title={section.title} items={section.items} />
     case "list":
-      return <section className="space-y-2"><SectionTitle>{section.title}</SectionTitle><ul className="space-y-1 rounded-md bg-muted/45 p-2.5 font-mono text-xs">{section.items.map((item, index) => <li key={`${item}:${index}`} className="break-all">{item}</li>)}</ul></section>
+      return <section className="flex flex-col gap-2"><SectionTitle>{section.title}</SectionTitle><ul className="flex flex-col gap-1 rounded-md bg-muted/45 p-2.5 font-mono text-xs">{section.items.map((item, index) => <li key={`${item}:${index}`} className="break-all">{item}</li>)}</ul></section>
     case "matches":
-      return <section className="space-y-2"><SectionTitle>{section.title}</SectionTitle><div className="divide-y rounded-md border">{section.items.map((item, index) => <div key={`${item.path}:${item.line}:${index}`} className="grid gap-1 p-2.5 text-xs sm:grid-cols-[minmax(7rem,auto)_1fr]"><code className="break-all text-muted-foreground">{matchLocation(item.path, item.line, item.column)}</code><span className="break-words font-mono">{item.text}</span></div>)}</div></section>
+      return <section className="flex flex-col gap-2"><SectionTitle>{section.title}</SectionTitle><div className="divide-y rounded-md border">{section.items.map((item, index) => <div key={`${item.path}:${item.line}:${index}`} className="grid gap-1 p-2.5 text-xs sm:grid-cols-[minmax(7rem,auto)_1fr]"><code className="break-all text-muted-foreground">{matchLocation(item.path, item.line, item.column)}</code><span className="break-words font-mono">{item.text}</span></div>)}</div></section>
     case "markdown":
       return <ExpandableContent title={section.title} text={section.text} markdown />
     case "code":
@@ -129,7 +145,7 @@ function ExpandableContent({ title, text, code = false, markdown = false }: { ti
   const long = text.length > CONTENT_PREVIEW_LENGTH
   const visible = long && !expanded ? `${text.slice(0, CONTENT_PREVIEW_LENGTH)}\n…` : text
   return (
-    <section className="space-y-2">
+    <section className="flex flex-col gap-2">
       <div className="flex items-center justify-between gap-3">
         <SectionTitle>{title}</SectionTitle>
         {long && <Button variant="ghost" size="xs" onClick={() => setExpanded((value) => !value)} aria-expanded={expanded}>{expanded ? "Show less" : "Show full content"}</Button>}
@@ -147,7 +163,7 @@ function ExpandableContent({ title, text, code = false, markdown = false }: { ti
 
 function FactList({ title, items }: { title: string; items: Array<{ label: string; value: string }> }) {
   return (
-    <section className="space-y-2">
+    <section className="flex flex-col gap-2">
       <SectionTitle>{title}</SectionTitle>
       <dl className="grid gap-x-5 gap-y-2 rounded-md bg-muted/45 p-2.5 sm:grid-cols-2">
         {items.map((item) => <div key={`${item.label}:${item.value}`} className="min-w-0"><dt className="text-[11px] text-muted-foreground">{item.label}</dt><dd className="break-words font-mono text-xs">{item.value}</dd></div>)}
@@ -157,7 +173,7 @@ function FactList({ title, items }: { title: string; items: Array<{ label: strin
 }
 
 function RawData({ title, value }: { title: string; value: string }) {
-  return <section className="space-y-1.5"><SectionTitle>{title}</SectionTitle><ScrollArea className="max-h-72 rounded-md"><pre className="whitespace-pre-wrap break-words bg-foreground p-3 font-mono text-xs text-background">{formatRawToolData(value)}</pre></ScrollArea></section>
+  return <section className="flex flex-col gap-1.5"><SectionTitle>{title}</SectionTitle><ScrollArea className="max-h-72 rounded-md"><pre className="whitespace-pre-wrap break-words bg-foreground p-3 font-mono text-xs text-background">{formatRawToolData(value)}</pre></ScrollArea></section>
 }
 
 function ToolArtifact({ artifact }: { artifact: Record<string, unknown> }) {
