@@ -137,11 +137,18 @@ test("review actions remain available at each configured viewport", async ({ pag
   await expect(page.getByRole("heading", { name: "Review job · PR #1631", exact: true })).toBeVisible()
   await expect(page.getByRole("link", { name: "Open pull request" })).toBeVisible()
   await expect(page.getByRole("button", { name: "Re-review" })).toBeVisible()
+  await expect(page.getByText("Token usage", { exact: true })).toBeVisible()
+  await expect(page.getByText("1.38K", { exact: true })).toBeVisible()
+  await expect(page.getByRole("progressbar", { name: "Cache hit rate 33.3%" })).toBeVisible()
+  await expect(page.getByText("780 tokens", { exact: true })).toBeVisible()
+  await expect(page.getByText("600 tokens", { exact: true })).toBeVisible()
   await expect(page.getByRole("heading", { name: "Attempt activity" })).toBeVisible()
   await expect(page.getByText("Run command", { exact: true })).toBeVisible()
   await expect(page.getByText("Read session note", { exact: true })).toBeVisible()
   await expect(page.getByText("GitHub API request", { exact: true })).toBeVisible()
   await expect(page.getByText(/"stdout":/)).toHaveCount(0)
+  const reviewOverlay = page.locator('[data-slot="drawer-content"], [data-slot="sheet-content"]').filter({ visible: true })
+  await expect.poll(() => reviewOverlay.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true)
   await expect(page).toHaveScreenshot(`review-${testInfo.project.name}.png`, { animations: "disabled" })
   await page.getByRole("button", { name: "Expand Run command" }).click()
   await expect(page.getByText("All reviewer checks passed")).toBeVisible()
@@ -400,14 +407,31 @@ const projectAgent = {
   role: "maintainer",
   project_id: "project-1",
 }
+const firstAttemptUsage = { input_tokens: 700, cached_input_tokens: 200, output_tokens: 80, reasoning_output_tokens: 30, total_tokens: 780 }
+const firstReviewAttempt = {
+  id: "review-1-attempt-1",
+  job_id: "job-1",
+  attempt_index: 1,
+  status: "retryable_failed",
+  pr: 1631,
+  summary: "The first attempt was interrupted and continued in the same reviewer session.",
+  error: "The model stream was interrupted",
+  started_at: "2026-07-20T00:00:00Z",
+  finished_at: "2026-07-20T00:01:00Z",
+  outcome: "failed",
+  review_event: null,
+  reviewer_agent_id: "reviewer-1",
+  turn_id: "review-turn-0",
+  token_usage: firstAttemptUsage,
+}
 const reviewRun = {
   id: "review-1",
   job_id: "job-1",
-  attempt_index: 1,
+  attempt_index: 2,
   status: "succeeded",
   pr: 1631,
   summary: "Canonical session events are correctly isolated.",
-  started_at: "2026-07-20T00:00:00Z",
+  started_at: "2026-07-20T00:01:00Z",
   finished_at: "2026-07-20T00:05:00Z",
   outcome: "review_submitted",
   review_event: "approve",
@@ -445,7 +469,7 @@ const reviewJob = {
   source: "automatic",
   reason: "eligible pull request",
   status: "succeeded",
-  attempt_count: 1,
+  attempt_count: 2,
   max_attempts: 5,
   reviewer_agent_id: "reviewer-1",
   submission_intent: { job_id: "job-1", head_sha: "abc123abc123abc123abc123abc123abc123abc1", event: "approve", body_hash: "sha256:review-body", comment_count: 0, created_at: "2026-07-20T00:03:30Z" },
@@ -500,7 +524,7 @@ const skippedReviewJob = {
   updated_at: "2026-07-20T00:02:01Z",
   finished_at: "2026-07-20T00:02:01Z",
 }
-const reviewJobDetail = { ...reviewJob, attempts: [reviewRun] }
+const reviewJobDetail = { ...reviewJob, attempts: [firstReviewAttempt, reviewRun] }
 const projectSummary = {
   id: "project-1",
   name: "TGOS Kits",
