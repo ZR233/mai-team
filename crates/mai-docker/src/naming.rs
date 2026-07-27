@@ -8,6 +8,7 @@ pub(crate) const ROLE_LABEL_KEY: &str = "mai.team.role";
 pub(crate) const SIDECAR_LABEL_KEY: &str = "mai.team.sidecar";
 pub(crate) const SIDECAR_KIND_LABEL_KEY: &str = "mai.team.sidecar.kind";
 pub(crate) const PROJECT_SIDECAR_KIND: &str = "project";
+pub(crate) const AGENT_MCP_SIDECAR_KIND: &str = "agent-mcp";
 
 pub fn agent_workspace_volume(agent_id: &str) -> String {
     format!("mai-team-workspace-{agent_id}")
@@ -31,6 +32,10 @@ pub(crate) fn agent_label(agent_id: &str) -> String {
 
 pub(crate) fn project_sidecar_container_name(project_id: &str) -> String {
     format!("mai-team-project-sidecar-{project_id}")
+}
+
+pub(crate) fn agent_mcp_sidecar_container_name(agent_id: &str) -> String {
+    format!("mai-team-agent-mcp-{agent_id}")
 }
 
 pub(crate) fn snapshot_image_name(agent_id: &str) -> String {
@@ -58,6 +63,14 @@ mod tests {
         assert_eq!(
             project_agent_workspace_volume("project-1", "agent-1"),
             "mai-team-project-project-1-agent-agent-1"
+        );
+    }
+
+    #[test]
+    fn agent_mcp_sidecar_container_name_uses_agent_id() {
+        assert_eq!(
+            agent_mcp_sidecar_container_name("agent-1"),
+            "mai-team-agent-mcp-agent-1"
         );
     }
 

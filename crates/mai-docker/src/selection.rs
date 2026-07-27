@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::inspect::ManagedContainer;
-use crate::naming::PROJECT_SIDECAR_KIND;
+use crate::naming::{AGENT_MCP_SIDECAR_KIND, PROJECT_SIDECAR_KIND};
 
 pub(crate) fn orphaned_container_ids(
     containers: &[ManagedContainer],
@@ -10,10 +10,17 @@ pub(crate) fn orphaned_container_ids(
 ) -> Vec<String> {
     dedupe_container_ids(containers.iter().filter_map(|container| {
         let is_orphaned = if container.sidecar {
-            container
-                .project_id
-                .as_ref()
-                .is_none_or(|project_id| !active_project_ids.contains(project_id))
+            if container.sidecar_kind.as_deref() == Some(AGENT_MCP_SIDECAR_KIND) {
+                container
+                    .agent_id
+                    .as_ref()
+                    .is_none_or(|agent_id| !active_agent_ids.contains(agent_id))
+            } else {
+                container
+                    .project_id
+                    .as_ref()
+                    .is_none_or(|project_id| !active_project_ids.contains(project_id))
+            }
         } else {
             container
                 .agent_id
@@ -47,7 +54,8 @@ pub(crate) fn find_reusable_agent_container<'a>(
 ) -> Option<&'a ManagedContainer> {
     if let Some(preferred_container_id) = preferred_container_id
         && let Some(container) = containers.iter().find(|container| {
-            container.agent_id.as_deref() == Some(agent_id)
+            !container.sidecar
+                && container.agent_id.as_deref() == Some(agent_id)
                 && container.matches_identifier(preferred_container_id)
         })
     {
@@ -56,7 +64,23 @@ pub(crate) fn find_reusable_agent_container<'a>(
 
     containers
         .iter()
-        .find(|container| container.agent_id.as_deref() == Some(agent_id))
+        .find(|container| !container.sidecar && container.agent_id.as_deref() == Some(agent_id))
+}
+
+pub(crate) fn agent_mcp_sidecar_container_delete_ids(
+    containers: &[ManagedContainer],
+    agent_id: &str,
+) -> Vec<String> {
+    dedupe_container_ids(
+        containers
+            .iter()
+            .filter(|container| {
+                container.sidecar
+                    && container.sidecar_kind.as_deref() == Some(AGENT_MCP_SIDECAR_KIND)
+                    && container.agent_id.as_deref() == Some(agent_id)
+            })
+            .map(|container| container.id.clone()),
+    )
 }
 
 pub(crate) fn project_sidecar_container_delete_ids(
@@ -146,6 +170,21 @@ mod tests {
     }
 
     #[test]
+    fn orphaned_container_ids_use_agent_lifecycle_for_mcp_sidecars() {
+        let containers = vec![
+            managed_agent_mcp_sidecar("mcp-keep", Some("agent-1")),
+            managed_agent_mcp_sidecar("mcp-orphan", Some("deleted-agent")),
+            managed_agent_mcp_sidecar("mcp-missing-label", None),
+        ];
+        let active_agent_ids = HashSet::from(["agent-1".to_string()]);
+
+        assert_eq!(
+            orphaned_container_ids(&containers, &active_agent_ids, &HashSet::new()),
+            vec!["mcp-orphan".to_string(), "mcp-missing-label".to_string()]
+        );
+    }
+
+    #[test]
     fn agent_container_delete_ids_use_preferred_id_and_label_fallback() {
         let containers = vec![
             managed("owned-1", Some("agent-1")),
@@ -185,6 +224,20 @@ mod tests {
             find_reusable_agent_container(&containers, "agent-1", Some("wrong-owner"))
                 .map(|container| container.id.as_str()),
             Some("owned-fallback")
+        );
+    }
+
+    #[test]
+    fn reusable_container_never_selects_agent_mcp_sidecar() {
+        let containers = vec![
+            managed_agent_mcp_sidecar("mcp-sidecar", Some("agent-1")),
+            managed("agent-container", Some("agent-1")),
+        ];
+
+        assert_eq!(
+            find_reusable_agent_container(&containers, "agent-1", Some("mcp-sidecar"))
+                .map(|container| container.id.as_str()),
+            Some("agent-container")
         );
     }
 
@@ -261,6 +314,19 @@ mod tests {
             project_id: Some(project_id.to_string()),
             sidecar: true,
             sidecar_kind: Some(PROJECT_SIDECAR_KIND.to_string()),
+        }
+    }
+
+    fn managed_agent_mcp_sidecar(id: &str, agent_id: Option<&str>) -> ManagedContainer {
+        ManagedContainer {
+            id: id.to_string(),
+            name: format!("mai-team-agent-mcp-{}", agent_id.unwrap_or("unknown")),
+            image: "ghcr.io/zr233/mai-team-sidecar:latest".to_string(),
+            state: "running".to_string(),
+            agent_id: agent_id.map(str::to_string),
+            project_id: None,
+            sidecar: true,
+            sidecar_kind: Some(AGENT_MCP_SIDECAR_KIND.to_string()),
         }
     }
 }

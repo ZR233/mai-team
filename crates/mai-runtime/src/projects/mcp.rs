@@ -8,7 +8,7 @@ pub(crate) const PROJECT_WORKSPACE_PATH: &str = "/workspace/repo";
 
 /// 清理旧版本可能遗留的项目 MCP sidecar。
 ///
-/// 新 MCP runtime 直接绑定 agent 容器，不再创建项目级执行状态机或 sidecar。
+/// 新 MCP runtime 使用 agent 专属 sidecar，不再创建项目级共享执行状态机或 sidecar。
 pub(crate) async fn delete_sidecar(
     state: &RuntimeState,
     docker: &DockerClient,

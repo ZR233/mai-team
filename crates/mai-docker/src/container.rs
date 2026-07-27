@@ -6,7 +6,7 @@ use tokio::process::Command;
 
 use crate::args::{
     ContainerCreateOptions, create_agent_container_args_with_workspace,
-    create_project_sidecar_container_args, validate_image,
+    create_agent_mcp_sidecar_container_args, create_project_sidecar_container_args, validate_image,
 };
 use crate::client::{DockerClient, stderr_or_stdout};
 use crate::error::{DockerError, Result};
@@ -15,12 +15,12 @@ use crate::inspect::{
 };
 use crate::mount::{ContainerVolumeMount, validate_additional_mounts};
 use crate::naming::{
-    MANAGED_LABEL, agent_container_name, agent_label, agent_workspace_volume,
-    project_sidecar_container_name, snapshot_image_name,
+    MANAGED_LABEL, agent_container_name, agent_label, agent_mcp_sidecar_container_name,
+    agent_workspace_volume, project_sidecar_container_name, snapshot_image_name,
 };
 use crate::selection::{
-    agent_container_delete_ids, find_reusable_agent_container,
-    find_reusable_project_sidecar_container, orphaned_container_ids,
+    agent_container_delete_ids, agent_mcp_sidecar_container_delete_ids,
+    find_reusable_agent_container, find_reusable_project_sidecar_container, orphaned_container_ids,
     project_sidecar_container_delete_ids,
 };
 
@@ -449,6 +449,43 @@ impl DockerClient {
             return Err(err);
         }
 
+        Ok(ContainerHandle {
+            id,
+            name,
+            image: image.to_string(),
+        })
+    }
+
+    pub async fn create_agent_mcp_sidecar_container(
+        &self,
+        agent_id: &str,
+        source_container_id: &str,
+        image: &str,
+    ) -> Result<ContainerHandle> {
+        let image = validate_image(image)?;
+        let containers = self.list_managed_containers().await?;
+        for id in agent_mcp_sidecar_container_delete_ids(&containers, agent_id) {
+            self.delete_container(&id).await?;
+        }
+        let name = agent_mcp_sidecar_container_name(agent_id);
+        let args =
+            create_agent_mcp_sidecar_container_args(&name, agent_id, image, source_container_id);
+        let create = Command::new(&self.binary)
+            .args(args.iter().map(String::as_str))
+            .output()
+            .await?;
+        if !create.status.success() {
+            return Err(DockerError::CommandFailed(stderr_or_stdout(&create)));
+        }
+        let id = String::from_utf8(create.stdout)?.trim().to_string();
+        if let Err(err) = self.start_container(&id).await {
+            let _ = self.delete_container(&id).await;
+            return Err(err);
+        }
+        if let Err(err) = self.ensure_workspace(&id).await {
+            let _ = self.delete_container(&id).await;
+            return Err(err);
+        }
         Ok(ContainerHandle {
             id,
             name,

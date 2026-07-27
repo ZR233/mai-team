@@ -11,10 +11,19 @@ use tokio::sync::RwLock;
 use super::{McpServerStatus, container_host::ContainerMcpRuntimeHost};
 use crate::{Result, RuntimeError};
 
+pub(crate) struct ContainerMcpSettings {
+    pub(crate) enabled: bool,
+    pub(crate) user_servers: BTreeMap<String, McpServerConfig>,
+    pub(crate) builtin_servers: BTreeMap<String, BuiltinMcpServerState>,
+    pub(crate) models: AgentModelConfig,
+}
+
 /// 单个 agent 容器对应的 PL MCP runtime 产品包装。
 ///
 /// 包装只保留 Mai 的 required provisioning 语义；所有执行状态均由 PL handle 持有。
 pub(crate) struct ContainerMcpRuntime {
+    docker: DockerClient,
+    sidecar_container_id: String,
     handle: McpRuntimeHandle,
     required_servers: RwLock<BTreeSet<String>>,
 }
@@ -22,21 +31,38 @@ pub(crate) struct ContainerMcpRuntime {
 impl ContainerMcpRuntime {
     pub(crate) async fn start(
         docker: DockerClient,
-        container_id: String,
-        enabled: bool,
-        user_servers: &BTreeMap<String, McpServerConfig>,
-        builtin_states: &BTreeMap<String, BuiltinMcpServerState>,
-        models: &AgentModelConfig,
+        agent_id: mai_protocol::AgentId,
+        agent_container_id: String,
+        sidecar_image: &str,
+        settings: ContainerMcpSettings,
     ) -> Result<Self> {
-        let host = ContainerMcpRuntimeHost::new(docker, container_id);
+        let sidecar = docker
+            .create_agent_mcp_sidecar_container(
+                &agent_id.to_string(),
+                &agent_container_id,
+                sidecar_image,
+            )
+            .await?;
+        let host = ContainerMcpRuntimeHost::new(docker.clone(), sidecar.id.clone());
         let handle = McpRuntime::new(host).handle();
         let runtime = Self {
+            docker,
+            sidecar_container_id: sidecar.id,
             handle,
             required_servers: RwLock::new(BTreeSet::new()),
         };
-        runtime
-            .reconcile(enabled, user_servers, builtin_states, models)
-            .await?;
+        if let Err(error) = runtime
+            .reconcile(
+                settings.enabled,
+                &settings.user_servers,
+                &settings.builtin_servers,
+                &settings.models,
+            )
+            .await
+        {
+            runtime.shutdown().await;
+            return Err(error);
+        }
         Ok(runtime)
     }
 
@@ -120,6 +146,16 @@ impl ContainerMcpRuntime {
 
     pub(crate) async fn shutdown(&self) {
         self.handle.shutdown().await;
+        if let Err(error) = self
+            .docker
+            .delete_container(&self.sidecar_container_id)
+            .await
+        {
+            tracing::warn!(
+                container_id = %self.sidecar_container_id,
+                "failed to delete agent MCP sidecar: {error}"
+            );
+        }
     }
 }
 

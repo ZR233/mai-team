@@ -1,12 +1,11 @@
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
 use crate::mcp::ContainerMcpRuntime;
 use mai_docker::ContainerHandle;
-use mai_protocol::{AgentId, AgentResourceState, McpServerConfig, McpStartupStatus, now};
-use pl_core::{AgentModelConfig, BuiltinMcpServerState};
+use mai_protocol::{AgentId, AgentResourceState, McpStartupStatus, now};
 
+use crate::mcp::ContainerMcpSettings;
 use crate::projects::review::context::ProjectRepositoryView;
 use crate::projects::workspace::{ProjectRepositoryReviewTarget, ProjectRepositoryRevision};
 use crate::state::AgentRecord;
@@ -46,13 +45,6 @@ pub(crate) struct AgentMcpStatusChange {
     pub(crate) error: Option<String>,
 }
 
-pub(crate) struct AgentMcpRuntimeConfig {
-    pub(crate) enabled: bool,
-    pub(crate) user_servers: BTreeMap<String, McpServerConfig>,
-    pub(crate) builtin_servers: BTreeMap<String, BuiltinMcpServerState>,
-    pub(crate) models: AgentModelConfig,
-}
-
 pub(crate) struct AgentContainerStatusChange {
     pub(crate) state: AgentResourceState,
     pub(crate) error: Option<String>,
@@ -75,12 +67,13 @@ pub(crate) trait AgentContainerOps: Send + Sync {
     fn agent_mcp_runtime_config(
         &self,
         agent: &AgentRecord,
-    ) -> impl Future<Output = Result<AgentMcpRuntimeConfig>> + Send;
+    ) -> impl Future<Output = Result<ContainerMcpSettings>> + Send;
 
     fn start_agent_mcp_runtime(
         &self,
+        agent_id: AgentId,
         container_id: String,
-        config: AgentMcpRuntimeConfig,
+        config: ContainerMcpSettings,
     ) -> impl Future<Output = Result<ContainerMcpRuntime>> + Send;
 
     fn set_agent_resource_state(
@@ -186,7 +179,7 @@ pub(crate) async fn ensure_agent_container_with_source(
         .await;
     }
     let mcp = ops
-        .start_agent_mcp_runtime(container.id, mcp_config)
+        .start_agent_mcp_runtime(agent_id, container.id, mcp_config)
         .await?;
     for status in mcp.statuses().await {
         ops.publish_mcp_status(AgentMcpStatusChange {

@@ -367,7 +367,7 @@ impl agents::AgentContainerOps for AgentRuntime {
     async fn agent_mcp_runtime_config(
         &self,
         agent: &AgentRecord,
-    ) -> Result<agents::AgentMcpRuntimeConfig> {
+    ) -> Result<crate::mcp::ContainerMcpSettings> {
         let has_project = agent.summary.read().await.project_id.is_some();
         let user_servers = self
             .deps
@@ -381,7 +381,7 @@ impl agents::AgentContainerOps for AgentRuntime {
             })
             .collect();
         let config = self.mai_config.read().await;
-        Ok(agents::AgentMcpRuntimeConfig {
+        Ok(crate::mcp::ContainerMcpSettings {
             enabled: config.mcp.enabled,
             user_servers,
             builtin_servers: config.mcp.builtin_servers.clone(),
@@ -391,16 +391,16 @@ impl agents::AgentContainerOps for AgentRuntime {
 
     async fn start_agent_mcp_runtime(
         &self,
+        agent_id: AgentId,
         container_id: String,
-        config: agents::AgentMcpRuntimeConfig,
+        config: crate::mcp::ContainerMcpSettings,
     ) -> Result<crate::mcp::ContainerMcpRuntime> {
         crate::mcp::ContainerMcpRuntime::start(
             self.deps.docker.clone(),
+            agent_id,
             container_id,
-            config.enabled,
-            &config.user_servers,
-            &config.builtin_servers,
-            &config.models,
+            &self.sidecar_image,
+            config,
         )
         .await
     }

@@ -1,8 +1,8 @@
 use crate::error::{DockerError, Result};
 use crate::mount::ContainerVolumeMount;
 use crate::naming::{
-    MANAGED_LABEL, PROJECT_LABEL_KEY, PROJECT_SIDECAR_KIND, SIDECAR_KIND_LABEL_KEY,
-    SIDECAR_LABEL_KEY,
+    AGENT_LABEL_KEY, AGENT_MCP_SIDECAR_KIND, MANAGED_LABEL, PROJECT_LABEL_KEY,
+    PROJECT_SIDECAR_KIND, SIDECAR_KIND_LABEL_KEY, SIDECAR_LABEL_KEY,
 };
 
 pub(crate) const HOST_NETWORK: &str = "host";
@@ -119,6 +119,34 @@ pub(crate) fn create_project_sidecar_container_args(
         "infinity".to_string(),
     ]);
     args
+}
+
+pub(crate) fn create_agent_mcp_sidecar_container_args(
+    name: &str,
+    agent_id: &str,
+    image: &str,
+    source_container_id: &str,
+) -> Vec<String> {
+    vec![
+        "create".to_string(),
+        "--name".to_string(),
+        name.to_string(),
+        "--label".to_string(),
+        MANAGED_LABEL.to_string(),
+        "--label".to_string(),
+        format!("{SIDECAR_LABEL_KEY}=true"),
+        "--label".to_string(),
+        format!("{SIDECAR_KIND_LABEL_KEY}={AGENT_MCP_SIDECAR_KIND}"),
+        "--label".to_string(),
+        format!("{AGENT_LABEL_KEY}={agent_id}"),
+        "--volumes-from".to_string(),
+        source_container_id.to_string(),
+        "-w".to_string(),
+        "/workspace/repo".to_string(),
+        image.to_string(),
+        "sleep".to_string(),
+        "infinity".to_string(),
+    ]
 }
 
 pub(crate) fn create_workspace_copy_container_args(
@@ -306,6 +334,51 @@ mod tests {
         assert!(
             args.windows(3)
                 .any(|window| { window == [image, "sleep", "infinity"] })
+        );
+    }
+
+    #[test]
+    fn create_agent_mcp_sidecar_args_share_agent_workspace_and_identity() {
+        let image = "ghcr.io/zr233/mai-team-sidecar:latest";
+        let args = create_agent_mcp_sidecar_container_args(
+            "mai-team-agent-mcp-agent-1",
+            "agent-1",
+            image,
+            "agent-container-id",
+        );
+
+        assert_eq!(args[0], "create");
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--name", "mai-team-agent-mcp-agent-1"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--label", MANAGED_LABEL])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--label", "mai.team.sidecar=true"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--label", "mai.team.sidecar.kind=agent-mcp"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--label", "mai.team.agent=agent-1"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--volumes-from", "agent-container-id"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-w", "/workspace/repo"])
+        );
+        assert!(
+            args.windows(3)
+                .any(|window| window == [image, "sleep", "infinity"])
         );
     }
 

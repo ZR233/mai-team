@@ -17,7 +17,7 @@ mod update;
 
 pub(crate) use container::{
     AgentContainerOps, AgentContainerStartRequest, AgentContainerStatusChange,
-    AgentMcpRuntimeConfig, AgentMcpStatusChange, ContainerSource, ensure_agent_container,
+    AgentMcpStatusChange, ContainerSource, ensure_agent_container,
     ensure_agent_container_with_source,
 };
 pub(crate) use create::{AgentCreateOps, CreateAgentRecordContext, create_agent_record};

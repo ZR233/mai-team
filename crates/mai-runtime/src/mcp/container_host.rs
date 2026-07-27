@@ -4,7 +4,7 @@ use pl_core::{
 };
 use pl_protocol::PureError;
 
-/// 在 Mai agent 容器内创建 stdio 字节流，并在 server 进程中建立 HTTP 连接。
+/// 在 Mai agent 专属 MCP sidecar 内创建 stdio 字节流，并在 server 进程中建立 HTTP 连接。
 ///
 /// Host 只拥有执行环境：MCP 握手、JSON-RPC、工具与资源协议全部复用 PL 的
 /// `LocalMcpSession`，generation、探测、命名和健康状态也仍由 PL runtime 管理。
