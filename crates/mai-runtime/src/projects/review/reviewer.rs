@@ -2,8 +2,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use mai_protocol::{
-    AgentId, AgentModelPreference, AgentRole, AgentSummary, CreateAgentRequest, ProjectId,
-    ProjectSummary, TurnId,
+    AgentId, AgentModelPreference, AgentResourceState, AgentRole, AgentRuntimeLifecycle,
+    AgentSummary, CreateAgentRequest, ProjectId, ProjectSummary, TurnId,
 };
 
 use crate::agents::ContainerSource;
@@ -117,7 +117,17 @@ pub(crate) async fn prepare_project_reviewer(
     run_id: Uuid,
     request: ProjectReviewRequest,
 ) -> Result<PreparedProjectReviewer> {
-    if let Some(existing_reviewer) = ops.project_reviewer_agents(project_id).await.first() {
+    let existing_reviewers = ops.project_reviewer_agents(project_id).await;
+    for reviewer in existing_reviewers
+        .iter()
+        .filter(|reviewer| project_reviewer_is_tombstone(reviewer))
+    {
+        ops.delete_agent(reviewer.id).await?;
+    }
+    for existing_reviewer in existing_reviewers
+        .iter()
+        .filter(|reviewer| !project_reviewer_is_tombstone(reviewer))
+    {
         if reviewer_belongs_to_job(ops, existing_reviewer.id, run_id, &request).await? {
             return resume_project_reviewer(ops, project_id, run_id, existing_reviewer.id, request)
                 .await;
@@ -201,6 +211,11 @@ pub(crate) async fn prepare_project_reviewer(
         target,
         project_revision,
     })
+}
+
+fn project_reviewer_is_tombstone(reviewer: &AgentSummary) -> bool {
+    reviewer.state.resource == AgentResourceState::Deleted
+        || reviewer.state.runtime.lifecycle == AgentRuntimeLifecycle::Closed
 }
 
 pub(crate) async fn reviewer_belongs_to_job(
@@ -366,8 +381,9 @@ mod tests {
     use std::sync::Arc;
 
     use mai_protocol::{
-        AgentModelPreference, AgentState, ProjectCloneStatus, ProjectReviewOutcome,
-        ProjectReviewStatus, ProjectStatus, ProjectSummary, TokenUsage, now,
+        AgentModelPreference, AgentResourceState, AgentRuntimeLifecycle, AgentState,
+        ProjectCloneStatus, ProjectReviewOutcome, ProjectReviewStatus, ProjectStatus,
+        ProjectSummary, TokenUsage, now,
     };
     use serde_json::{Value, json};
     use tokio::sync::Mutex;
@@ -656,6 +672,37 @@ mod tests {
         assert_eq!(
             *ops.operations.lock().await,
             vec!["create_context", "create_agent", "delete_context"]
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_reviewer_tombstone_is_removed_before_creating_replacement() {
+        let mut ops = fake_reviewer_ops(PreparationFailure::Create);
+        ops.reviewer_system_prompt = Some("stale reviewer".to_string());
+        ops.reviewer.state.resource = AgentResourceState::Deleted;
+        ops.reviewer.state.runtime.lifecycle = AgentRuntimeLifecycle::Closed;
+
+        let error = prepare_project_reviewer(
+            &ops,
+            ops.project.id,
+            Uuid::new_v4(),
+            ProjectReviewRequest {
+                pr: 24,
+                head_sha_hint: None,
+            },
+        )
+        .await
+        .expect_err("replacement creation must reach the configured failure");
+
+        assert!(error.to_string().contains("create failed"));
+        assert_eq!(
+            *ops.operations.lock().await,
+            vec![
+                "delete_agent",
+                "create_context",
+                "create_agent",
+                "delete_context",
+            ]
         );
     }
 
