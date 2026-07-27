@@ -20,6 +20,9 @@ BIN_PATH="$BIN_DIR/mai-server"
 LEGACY_BIN_PATH="/usr/local/bin/mai-server"
 SERVICE_FILE="/etc/systemd/system/mai-server.service"
 ASSET="mai-server-x86_64-unknown-linux-gnu.tar.gz"
+DB_PATH="$DATA_DIR/mai-team.sqlite3"
+CONFIG_PATH="$DATA_DIR/config.toml"
+DEPLOY_BACKUP_DIR="$DATA_DIR/deploy-backups"
 
 usage() {
   cat <<'USAGE'
@@ -356,6 +359,99 @@ write_env_file() {
   install -m 0600 "$target" "$ENV_FILE"
 }
 
+stop_server_for_maintenance() {
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "DRY RUN: systemctl stop mai-server"
+    return 0
+  fi
+  systemctl stop mai-server
+}
+
+create_deploy_backup() {
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "DRY RUN: create mode 0700 deploy backup under $DEPLOY_BACKUP_DIR"
+    echo "DRY RUN: use Python 3 sqlite3 backup API for $DB_PATH"
+    echo "DRY RUN: back up current $BIN_PATH, $CONFIG_PATH, and $ENV_FILE when present"
+    return 0
+  fi
+
+  install -d -m 0700 -o root -g root "$DEPLOY_BACKUP_DIR"
+  DEPLOY_BACKUP_PATH="$DEPLOY_BACKUP_DIR/$(date -u +%Y%m%dT%H%M%SZ)"
+  install -d -m 0700 -o root -g root "$DEPLOY_BACKUP_PATH"
+  if [[ -f "$DB_PATH" ]]; then
+    SOURCE_DB="$DB_PATH" BACKUP_DB="$DEPLOY_BACKUP_PATH/mai-team.sqlite3" python3 - <<'PY'
+import os
+import sqlite3
+
+source = sqlite3.connect(f"file:{os.environ['SOURCE_DB']}?mode=ro", uri=True)
+backup = sqlite3.connect(os.environ["BACKUP_DB"])
+try:
+    source.backup(backup)
+finally:
+    backup.close()
+    source.close()
+PY
+  fi
+  for source in "$BIN_PATH" "$CONFIG_PATH" "$ENV_FILE"; do
+    if [[ -f "$source" ]]; then
+      install -m 0600 "$source" "$DEPLOY_BACKUP_PATH/$(basename "$source")"
+    fi
+  done
+}
+
+health_check() {
+  local url
+  url="$(server_url)/health"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "DRY RUN: wait up to 300 seconds for $url to return HTTP 200"
+    return 0
+  fi
+  for _ in $(seq 1 300); do
+    if curl -fsS "$url" >/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "mai-server health check failed: $url" >&2
+  return 1
+}
+
+vacuum_database() {
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "DRY RUN: stop server after schema/startup cleanup and VACUUM $DB_PATH with Python 3"
+    return 0
+  fi
+  systemctl stop mai-server
+  if [[ -f "$DB_PATH" ]]; then
+    VACUUM_DB="$DB_PATH" python3 - <<'PY'
+import os
+import sqlite3
+
+connection = sqlite3.connect(os.environ["VACUUM_DB"])
+try:
+    connection.execute("VACUUM")
+finally:
+    connection.close()
+PY
+  fi
+}
+
+prune_deploy_backups() {
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "DRY RUN: after successful health checks, retain the newest deploy backup and none older than 7 days"
+    return 0
+  fi
+  [[ -d "$DEPLOY_BACKUP_DIR" ]] || return 0
+  find "$DEPLOY_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf -- {} +
+  mapfile -t backups < <(find "$DEPLOY_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -r)
+  if (( ${#backups[@]} > 1 )); then
+    local backup_name
+    for backup_name in "${backups[@]:1}"; do
+      rm -rf -- "$DEPLOY_BACKUP_DIR/$backup_name"
+    done
+  fi
+}
+
 check_host
 
 if [[ $EUID -ne 0 && "$DRY_RUN" != "true" ]]; then
@@ -388,15 +484,23 @@ run install -d -m 0755 "$ENV_DIR" "$DATA_DIR" "$BIN_DIR"
 
 if [[ -n "$SOURCE_DIR" ]]; then
   build_source_binary
-  install_source_binary
 elif [[ "$DRY_RUN" != "true" ]]; then
   curl -fsSL "$DOWNLOAD_URL" -o "$tmpdir/$ASSET"
   tar -xzf "$tmpdir/$ASSET" -C "$tmpdir"
+else
+  echo "DRY RUN: download $DOWNLOAD_URL"
+fi
+
+stop_server_for_maintenance
+create_deploy_backup
+
+if [[ -n "$SOURCE_DIR" ]]; then
+  install_source_binary
+elif [[ "$DRY_RUN" != "true" ]]; then
   install -m 0755 "$tmpdir/mai-server" "$BIN_PATH"
   chown -R mai-server:mai-server "$BIN_DIR"
   ln -sfn "$BIN_PATH" "$LEGACY_BIN_PATH"
 else
-  echo "DRY RUN: download $DOWNLOAD_URL"
   echo "DRY RUN: install extracted mai-server to $BIN_PATH"
   echo "DRY RUN: chown -R mai-server:mai-server $BIN_DIR"
   echo "DRY RUN: ln -sfn $BIN_PATH $LEGACY_BIN_PATH"
@@ -437,20 +541,33 @@ SERVICE
 if [[ "$DRY_RUN" != "true" ]]; then
   printf '%s\n' "$service_content" > "$tmpdir/mai-server.service"
   install -m 0644 "$tmpdir/mai-server.service" "$SERVICE_FILE"
-  chown -R mai-server:mai-server "$DATA_DIR"
+  chown mai-server:mai-server "$DATA_DIR"
+  find "$DATA_DIR" -mindepth 1 -maxdepth 1 ! -name deploy-backups \
+    -exec chown -R mai-server:mai-server -- {} +
+  chown -R root:root "$DEPLOY_BACKUP_DIR"
+  chmod 0700 "$DEPLOY_BACKUP_DIR"
   systemctl daemon-reload
   systemctl enable --now mai-server
   systemctl restart mai-server
 else
   echo "DRY RUN: write $SERVICE_FILE:"
   printf '%s\n' "$service_content"
-  echo "DRY RUN: chown -R mai-server:mai-server $DATA_DIR"
+  echo "DRY RUN: chown mai-server data while preserving root-only $DEPLOY_BACKUP_DIR"
   echo "DRY RUN: systemctl daemon-reload"
   echo "DRY RUN: systemctl enable --now mai-server"
   echo "DRY RUN: systemctl restart mai-server"
 fi
 
 SERVER_URL="$(server_url)"
+health_check
+vacuum_database
+if [[ "$DRY_RUN" != "true" ]]; then
+  systemctl start mai-server
+else
+  echo "DRY RUN: systemctl start mai-server"
+fi
+health_check
+prune_deploy_backups
 
 cat <<INFO
 mai-server updated.

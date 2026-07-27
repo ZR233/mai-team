@@ -137,7 +137,111 @@ impl AgentRuntime {
         Ok(())
     }
 
+    pub(super) async fn cleanup_project_review_context_by_run_id(
+        &self,
+        project_id: ProjectId,
+        run_id: Uuid,
+    ) -> Result<()> {
+        let root = self
+            .cache_root
+            .join(PROJECT_REVIEW_CONTEXT_CACHE_DIR)
+            .join(run_id.to_string());
+        let view = ProjectRepositoryView::for_run(
+            project_cache_volume(&project_id.to_string()),
+            run_id,
+            String::new(),
+        );
+        match self.project(project_id).await {
+            Ok(project) => {
+                let _repo_sync_guard = project.repo_sync_lock.lock().await;
+                self.remove_project_review_repository_view(project_id, &view)
+                    .await?;
+            }
+            Err(RuntimeError::ProjectNotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        match tokio::fs::remove_dir_all(root).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(super) async fn cleanup_orphan_project_review_host_contexts(&self) {
+        let root = self.cache_root.join(PROJECT_REVIEW_CONTEXT_CACHE_DIR);
+        let live_run_ids = match self
+            .deps
+            .store
+            .load_live_project_review_context_run_ids()
+            .await
+        {
+            Ok(run_ids) => run_ids.into_iter().collect::<HashSet<_>>(),
+            Err(error) => {
+                tracing::warn!(
+                    "failed to load live project review contexts during startup cleanup: {error}"
+                );
+                return;
+            }
+        };
+        let mut entries = match tokio::fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(error) = tokio::fs::create_dir_all(&root).await {
+                    tracing::warn!(
+                        path = %root.display(),
+                        "failed to create project review host context root: {error}"
+                    );
+                }
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %root.display(),
+                    "failed to scan project review host contexts during startup: {error}"
+                );
+                return;
+            }
+        };
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %root.display(),
+                        "failed to continue project review host context scan: {error}"
+                    );
+                    break;
+                }
+            };
+            let run_id = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| Uuid::parse_str(name).ok());
+            if run_id.is_some_and(|run_id| live_run_ids.contains(&run_id)) {
+                continue;
+            }
+            if let Err(error) = tokio::fs::remove_dir_all(entry.path()).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    "failed to remove orphan project review host context: {error}"
+                );
+            }
+        }
+    }
+
     pub(super) async fn cleanup_orphan_project_review_repository_views(&self) {
+        let live_contexts = match self.deps.store.load_live_project_review_contexts().await {
+            Ok(contexts) => contexts,
+            Err(error) => {
+                tracing::warn!(
+                    "failed to load live review contexts before repository cleanup: {error}"
+                );
+                return;
+            }
+        };
         for summary in self.list_projects().await {
             let volume = project_cache_volume(&summary.id.to_string());
             match self.deps.docker.volume_exists(&volume).await {
@@ -155,11 +259,15 @@ impl AgentRuntime {
                 continue;
             };
             let _repo_sync_guard = project.repo_sync_lock.lock().await;
+            let live_run_ids = live_contexts
+                .iter()
+                .filter_map(|(project_id, run_id)| (*project_id == summary.id).then_some(*run_id))
+                .collect::<Vec<_>>();
             if let Err(error) = self
                 .run_project_repository_command(
                     summary.id,
                     &volume,
-                    &orphan_review_snapshot_cleanup_command(),
+                    &orphan_review_snapshot_cleanup_command(&live_run_ids),
                     "orphan review snapshot cleanup",
                 )
                 .await
@@ -554,18 +662,37 @@ rmdir "$(dirname "$snapshot")" >/dev/null 2>&1 || true
     )
 }
 
-fn orphan_review_snapshot_cleanup_command() -> String {
+fn orphan_review_snapshot_cleanup_command(live_run_ids: &[Uuid]) -> String {
+    let live_run_ids = shell_quote_word(
+        &live_run_ids
+            .iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
     format!(
         r#"set -eu
 root=/workspace/{PROJECT_REVIEW_SNAPSHOT_ROOT}
+live_run_ids={live_run_ids}
 if [ -d "$root" ] && [ -d /workspace/repo.git ]; then
   for snapshot in "$root"/*/repo; do
     [ -e "$snapshot" ] || continue
+    run_id="$(basename "$(dirname "$snapshot")")"
+    keep=false
+    for live_run_id in $live_run_ids; do
+      if [ "$live_run_id" = "$run_id" ]; then
+        keep=true
+        break
+      fi
+    done
+    [ "$keep" = true ] && continue
     git --git-dir=/workspace/repo.git worktree remove --force "$snapshot" >/dev/null 2>&1 || rm -rf "$snapshot"
   done
   git --git-dir=/workspace/repo.git worktree prune
 fi
-rm -rf "$root"
+if [ -d "$root" ]; then
+  find "$root" -depth -type d -empty -delete
+fi
 "#
     )
 }
@@ -721,7 +848,18 @@ mod tests {
             &volume_root,
         ));
         run_shell(&host_command(
-            &orphan_review_snapshot_cleanup_command(),
+            &orphan_review_snapshot_cleanup_command(&[Uuid::from_u128(1)]),
+            &volume_root,
+        ));
+        assert!(!snapshot.exists());
+        assert!(
+            volume_root
+                .join(&second_view.volume_subpath)
+                .try_exists()
+                .expect("live review snapshot")
+        );
+        run_shell(&host_command(
+            &orphan_review_snapshot_cleanup_command(&[]),
             &volume_root,
         ));
         assert!(!volume_root.join(PROJECT_REVIEW_SNAPSHOT_ROOT).exists());

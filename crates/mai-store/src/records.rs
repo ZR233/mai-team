@@ -176,6 +176,30 @@ pub(crate) struct ProjectReviewJobRecord {
 }
 
 #[derive(Debug, Clone, toasty::Model)]
+#[table = "project_review_cleanup_tasks"]
+pub(crate) struct ProjectReviewCleanupTaskRecord {
+    #[key]
+    pub(crate) id: String,
+    #[index]
+    pub(crate) job_id: String,
+    #[index]
+    pub(crate) project_id: String,
+    pub(crate) resource_kind: String,
+    pub(crate) resource_id: String,
+    #[index]
+    pub(crate) status: String,
+    pub(crate) attempt_count: i64,
+    #[index]
+    pub(crate) next_attempt_at: Option<String>,
+    pub(crate) lease_owner: Option<String>,
+    pub(crate) lease_expires_at: Option<String>,
+    pub(crate) last_error: Option<String>,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
 #[table = "plan_history"]
 pub(crate) struct PlanHistoryRecord {
     #[key]

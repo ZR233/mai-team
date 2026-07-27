@@ -168,6 +168,31 @@ async fn delete_agent_runtime_in_tx(
     tx: &mut toasty::Transaction<'_>,
     runtime_agent_id: &str,
 ) -> Result<()> {
+    let sessions = Query::<List<AgentSessionRecord>>::filter(
+        AgentSessionRecord::fields()
+            .agent_id()
+            .eq(runtime_agent_id.to_string()),
+    )
+    .exec(&mut *tx)
+    .await?;
+    for session in &sessions {
+        Query::<List<SessionEventJournalRecord>>::filter(
+            SessionEventJournalRecord::fields()
+                .session_id()
+                .eq(session.id.clone()),
+        )
+        .delete()
+        .exec(&mut *tx)
+        .await?;
+        Query::<List<SessionViewSnapshotRecord>>::filter(
+            SessionViewSnapshotRecord::fields()
+                .session_id()
+                .eq(session.id.clone()),
+        )
+        .delete()
+        .exec(&mut *tx)
+        .await?;
+    }
     Query::<List<AgentRuntimeStateRecord>>::filter(
         AgentRuntimeStateRecord::fields()
             .agent_id()

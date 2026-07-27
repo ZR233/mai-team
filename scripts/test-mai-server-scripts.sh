@@ -92,6 +92,18 @@ for output in "$install_output" "$update_output"; do
 done
 
 assert_contains "$update_output" "DRY RUN: systemctl restart mai-server"
+assert_contains "$update_output" "DRY RUN: systemctl stop mai-server"
+assert_contains "$update_output" "DRY RUN: use Python 3 sqlite3 backup API for /var/lib/mai-server/mai-team.sqlite3"
+assert_contains "$update_output" "DRY RUN: stop server after schema/startup cleanup and VACUUM /var/lib/mai-server/mai-team.sqlite3 with Python 3"
+assert_contains "$update_output" "DRY RUN: after successful health checks, retain the newest deploy backup and none older than 7 days"
+assert_line_before \
+  "$update_output" \
+  "DRY RUN: use Python 3 sqlite3 backup API" \
+  "DRY RUN: install extracted mai-server"
+assert_line_before \
+  "$update_output" \
+  "DRY RUN: systemctl restart mai-server" \
+  "DRY RUN: stop server after schema/startup cleanup and VACUUM"
 assert_line_before \
   "$update_output" \
   "DRY RUN: systemctl daemon-reload" \

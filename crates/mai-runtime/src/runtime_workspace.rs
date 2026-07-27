@@ -508,27 +508,8 @@ printf '{base_marker}%s\n' "$base_sha"
         self.workspace_manager
             .delete_project_workspace(project_id)
             .await?;
-        self.delete_project_agent_workspace_volumes(project_id)
-            .await?;
-        let cache_volume = project_cache_volume(&project_id.to_string());
-        self.deps.docker.delete_volume(&cache_volume).await?;
-        Ok(())
-    }
-
-    pub(super) async fn delete_project_agent_workspace_volumes(
-        &self,
-        project_id: ProjectId,
-    ) -> Result<()> {
-        let project_id_label = project_id.to_string();
-        let volumes = self.deps.docker.list_managed_volumes().await?;
-        for volume in volumes {
-            if volume.kind.as_deref() == Some("agent-workspace")
-                && volume.project_id.as_deref() == Some(project_id_label.as_str())
-            {
-                self.deps.docker.delete_volume(&volume.name).await?;
-            }
-        }
-        Ok(())
+        projects::workspace::docker_reconcile::delete_project_volumes(&self.deps.docker, project_id)
+            .await
     }
 
     pub(super) async fn agent_resource_broker(

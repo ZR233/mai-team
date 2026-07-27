@@ -8,7 +8,7 @@ use mai_protocol::{
     ProjectSummary,
 };
 
-use crate::Result;
+use crate::{Result, RuntimeError};
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct DockerVolumeReconcileReport {
@@ -18,6 +18,8 @@ pub(crate) struct DockerVolumeReconcileReport {
     pub(crate) orphan_project_cache_volume_removal_failed: Vec<String>,
     pub(crate) legacy_agent_workspace_volumes_present: Vec<String>,
     pub(crate) legacy_project_cache_volumes_present: Vec<String>,
+    pub(crate) quarantined_volumes: Vec<String>,
+    pub(crate) attached_orphan_volumes: Vec<String>,
     pub(crate) missing_project_cache_volumes: Vec<ProjectId>,
     pub(crate) missing_agent_workspace_volumes: Vec<AgentId>,
 }
@@ -26,8 +28,18 @@ pub(crate) struct DockerVolumeReconcileReport {
 struct DockerVolumeReconcilePlan {
     orphan_agent_workspace_volumes: Vec<String>,
     orphan_project_cache_volumes: Vec<String>,
+    quarantined_volumes: Vec<String>,
     missing_project_cache_volumes: Vec<ProjectId>,
     missing_agent_workspace_volumes: Vec<AgentId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaiVolumeOwner {
+    ProjectCache(ProjectId),
+    ProjectAgentWorkspace(ProjectId, AgentId),
+    LegacyAgentWorkspace(AgentId),
+    LegacyProject(ProjectId),
+    LegacyProjectReview(ProjectId),
 }
 
 pub(crate) async fn reconcile_project_volumes(
@@ -69,12 +81,21 @@ pub(crate) async fn reconcile_project_volumes(
     let mut report = DockerVolumeReconcileReport {
         legacy_agent_workspace_volumes_present,
         legacy_project_cache_volumes_present,
+        quarantined_volumes: plan.quarantined_volumes,
         missing_project_cache_volumes,
         missing_agent_workspace_volumes,
         ..DockerVolumeReconcileReport::default()
     };
 
     for volume in plan.orphan_agent_workspace_volumes {
+        if docker.volume_is_attached(&volume).await? {
+            tracing::warn!(
+                volume,
+                "quarantined attached orphan Mai agent workspace volume"
+            );
+            report.attached_orphan_volumes.push(volume);
+            continue;
+        }
         match docker.delete_volume(&volume).await {
             Ok(()) => report.orphan_agent_workspace_volumes_removed.push(volume),
             Err(err) => {
@@ -89,6 +110,11 @@ pub(crate) async fn reconcile_project_volumes(
         }
     }
     for volume in plan.orphan_project_cache_volumes {
+        if docker.volume_is_attached(&volume).await? {
+            tracing::warn!(volume, "quarantined attached orphan Mai project volume");
+            report.attached_orphan_volumes.push(volume);
+            continue;
+        }
         match docker.delete_volume(&volume).await {
             Ok(()) => report.orphan_project_cache_volumes_removed.push(volume),
             Err(err) => {
@@ -109,9 +135,45 @@ pub(crate) async fn reconcile_project_volumes(
     report.orphan_project_cache_volume_removal_failed.sort();
     report.legacy_agent_workspace_volumes_present.sort();
     report.legacy_project_cache_volumes_present.sort();
+    report.quarantined_volumes.sort();
+    report.attached_orphan_volumes.sort();
     report.missing_project_cache_volumes.sort();
     report.missing_agent_workspace_volumes.sort();
     Ok(report)
+}
+
+pub(crate) async fn delete_project_volumes(
+    docker: &DockerClient,
+    project_id: ProjectId,
+) -> Result<()> {
+    for volume in docker.list_managed_volumes().await? {
+        let Some(owner) = parse_mai_volume_owner(&volume.name) else {
+            continue;
+        };
+        if !volume_labels_match_owner(&volume, owner) || owner.project_id() != Some(project_id) {
+            continue;
+        }
+        if docker.volume_is_attached(&volume.name).await? {
+            return Err(RuntimeError::InvalidInput(format!(
+                "refusing to delete attached project volume {}",
+                volume.name
+            )));
+        }
+        docker.delete_volume(&volume.name).await?;
+    }
+    Ok(())
+}
+
+impl MaiVolumeOwner {
+    fn project_id(self) -> Option<ProjectId> {
+        match self {
+            Self::ProjectCache(project_id)
+            | Self::ProjectAgentWorkspace(project_id, _)
+            | Self::LegacyProject(project_id)
+            | Self::LegacyProjectReview(project_id) => Some(project_id),
+            Self::LegacyAgentWorkspace(_) => None,
+        }
+    }
 }
 
 fn plan_project_volume_reconcile(
@@ -131,69 +193,47 @@ fn plan_project_volume_reconcile(
         .iter()
         .filter_map(|agent| agent.project_id.map(|project_id| (agent.id, project_id)))
         .collect::<HashMap<_, _>>();
-    let mut expected_project_cache_volumes = HashMap::new();
-    let mut expected_agent_workspace_volumes = HashMap::new();
-
-    for project in live_projects {
-        expected_project_cache_volumes
-            .insert(project_cache_volume(&project.id.to_string()), project.id);
-    }
-    for agent in live_agents {
-        let Some(project_id) = agent.project_id else {
-            continue;
-        };
-        if !agent_workspace_should_exist(agent) || !live_projects_by_id.contains_key(&project_id) {
-            continue;
-        };
-        expected_agent_workspace_volumes.insert(
-            project_agent_workspace_volume(&project_id.to_string(), &agent.id.to_string()),
-            agent.id,
-        );
-    }
-
     let mut present_project_cache_volumes = HashSet::new();
     let mut present_agent_workspace_volumes = HashSet::new();
     let mut orphan_project_cache_volumes = Vec::new();
     let mut orphan_agent_workspace_volumes = Vec::new();
+    let mut quarantined_volumes = Vec::new();
 
     for volume in volumes {
-        match volume.kind.as_deref() {
-            Some("project-cache") => {
-                let Some(project_id) = parse_project_id(volume.project_id.as_deref()) else {
-                    orphan_project_cache_volumes.push(volume.name.clone());
-                    continue;
-                };
-                let expected_name = project_cache_volume(&project_id.to_string());
-                if live_project_ids.contains(&project_id)
-                    && expected_project_cache_volumes.contains_key(&volume.name)
-                    && volume.name == expected_name
-                {
+        let Some(owner) = parse_mai_volume_owner(&volume.name) else {
+            quarantined_volumes.push(volume.name.clone());
+            continue;
+        };
+        if !volume_labels_match_owner(volume, owner) {
+            quarantined_volumes.push(volume.name.clone());
+            continue;
+        }
+        match owner {
+            MaiVolumeOwner::ProjectCache(project_id) => {
+                if live_project_ids.contains(&project_id) {
                     present_project_cache_volumes.insert(volume.name.clone());
                 } else {
                     orphan_project_cache_volumes.push(volume.name.clone());
                 }
             }
-            Some("agent-workspace") => {
-                let Some(project_id) = parse_project_id(volume.project_id.as_deref()) else {
-                    orphan_agent_workspace_volumes.push(volume.name.clone());
-                    continue;
-                };
-                let Some(agent_id) = parse_agent_id(volume.agent_id.as_deref()) else {
-                    orphan_agent_workspace_volumes.push(volume.name.clone());
-                    continue;
-                };
-                let expected_name =
-                    project_agent_workspace_volume(&project_id.to_string(), &agent_id.to_string());
-                if live_agent_projects.get(&agent_id) == Some(&project_id)
-                    && expected_agent_workspace_volumes.contains_key(&volume.name)
-                    && volume.name == expected_name
-                {
+            MaiVolumeOwner::ProjectAgentWorkspace(project_id, agent_id) => {
+                if live_agent_projects.get(&agent_id) == Some(&project_id) {
                     present_agent_workspace_volumes.insert(volume.name.clone());
                 } else {
                     orphan_agent_workspace_volumes.push(volume.name.clone());
                 }
             }
-            Some(_) | None => {}
+            MaiVolumeOwner::LegacyAgentWorkspace(agent_id) => {
+                if !live_agents.iter().any(|agent| agent.id == agent_id) {
+                    orphan_agent_workspace_volumes.push(volume.name.clone());
+                }
+            }
+            MaiVolumeOwner::LegacyProject(project_id)
+            | MaiVolumeOwner::LegacyProjectReview(project_id) => {
+                if !live_project_ids.contains(&project_id) {
+                    orphan_project_cache_volumes.push(volume.name.clone());
+                }
+            }
         }
     }
 
@@ -221,23 +261,72 @@ fn plan_project_volume_reconcile(
 
     orphan_project_cache_volumes.sort();
     orphan_agent_workspace_volumes.sort();
+    quarantined_volumes.sort();
     missing_project_cache_volumes.sort();
     missing_agent_workspace_volumes.sort();
 
     DockerVolumeReconcilePlan {
         orphan_agent_workspace_volumes,
         orphan_project_cache_volumes,
+        quarantined_volumes,
         missing_project_cache_volumes,
         missing_agent_workspace_volumes,
     }
 }
 
-fn parse_project_id(value: Option<&str>) -> Option<ProjectId> {
-    value.and_then(|value| ProjectId::parse_str(value).ok())
+fn parse_mai_volume_owner(name: &str) -> Option<MaiVolumeOwner> {
+    if let Some(agent_id) = name.strip_prefix("mai-team-workspace-") {
+        return AgentId::parse_str(agent_id)
+            .ok()
+            .map(MaiVolumeOwner::LegacyAgentWorkspace);
+    }
+    if let Some(project_id) = name.strip_prefix("mai-team-project-review-") {
+        return ProjectId::parse_str(project_id)
+            .ok()
+            .map(MaiVolumeOwner::LegacyProjectReview);
+    }
+    let remainder = name.strip_prefix("mai-team-project-")?;
+    let project_id_text = remainder.get(..36)?;
+    let project_id = ProjectId::parse_str(project_id_text).ok()?;
+    match remainder.get(36..)? {
+        "" => Some(MaiVolumeOwner::LegacyProject(project_id)),
+        "-cache" => Some(MaiVolumeOwner::ProjectCache(project_id)),
+        agent_suffix if agent_suffix.starts_with("-agent-") => {
+            let agent_id = AgentId::parse_str(agent_suffix.trim_start_matches("-agent-")).ok()?;
+            Some(MaiVolumeOwner::ProjectAgentWorkspace(project_id, agent_id))
+        }
+        _ => None,
+    }
 }
 
-fn parse_agent_id(value: Option<&str>) -> Option<AgentId> {
-    value.and_then(|value| AgentId::parse_str(value).ok())
+fn volume_labels_match_owner(volume: &ManagedVolume, owner: MaiVolumeOwner) -> bool {
+    let (expected_kind, project_id, agent_id) = match owner {
+        MaiVolumeOwner::ProjectCache(project_id) => (Some("project-cache"), Some(project_id), None),
+        MaiVolumeOwner::ProjectAgentWorkspace(project_id, agent_id) => {
+            (Some("agent-workspace"), Some(project_id), Some(agent_id))
+        }
+        MaiVolumeOwner::LegacyAgentWorkspace(agent_id) => {
+            (Some("agent-workspace"), None, Some(agent_id))
+        }
+        MaiVolumeOwner::LegacyProject(project_id)
+        | MaiVolumeOwner::LegacyProjectReview(project_id) => (None, Some(project_id), None),
+    };
+    if let Some(kind) = volume.kind.as_deref()
+        && Some(kind) != expected_kind
+    {
+        return false;
+    }
+    if let Some(label) = volume.project_id.as_deref()
+        && Some(label) != project_id.map(|id| id.to_string()).as_deref()
+    {
+        return false;
+    }
+    if let Some(label) = volume.agent_id.as_deref()
+        && Some(label) != agent_id.map(|id| id.to_string()).as_deref()
+    {
+        return false;
+    }
+    true
 }
 
 fn project_workspace_should_exist(project: &ProjectSummary) -> bool {
@@ -318,6 +407,7 @@ mod tests {
                     &orphan_agent_id.to_string()
                 )],
                 orphan_project_cache_volumes: Vec::new(),
+                quarantined_volumes: Vec::new(),
                 missing_project_cache_volumes: Vec::new(),
                 missing_agent_workspace_volumes: Vec::new(),
             }
@@ -338,6 +428,7 @@ mod tests {
             DockerVolumeReconcilePlan {
                 orphan_agent_workspace_volumes: Vec::new(),
                 orphan_project_cache_volumes: Vec::new(),
+                quarantined_volumes: Vec::new(),
                 missing_project_cache_volumes: vec![project_id],
                 missing_agent_workspace_volumes: vec![agent_id],
             }
@@ -365,9 +456,52 @@ mod tests {
             DockerVolumeReconcilePlan {
                 orphan_agent_workspace_volumes: Vec::new(),
                 orphan_project_cache_volumes: vec![volume],
+                quarantined_volumes: Vec::new(),
                 missing_project_cache_volumes: Vec::new(),
                 missing_agent_workspace_volumes: Vec::new(),
             }
+        );
+    }
+
+    #[test]
+    fn reconcile_plan_handles_unlabelled_historical_names_and_quarantines_invalid_names() {
+        let live_project_id = Uuid::new_v4();
+        let orphan_project_id = Uuid::new_v4();
+        let live_agent_id = Uuid::new_v4();
+        let orphan_agent_id = Uuid::new_v4();
+        let project = project_summary(live_project_id);
+        let agent = agent_summary(live_project_id, live_agent_id);
+        let volume = |name: String| ManagedVolume {
+            name,
+            kind: None,
+            project_id: None,
+            agent_id: None,
+            role: None,
+        };
+
+        let plan = plan_project_volume_reconcile(
+            &[
+                volume(format!("mai-team-workspace-{live_agent_id}")),
+                volume(format!("mai-team-workspace-{orphan_agent_id}")),
+                volume(format!("mai-team-project-{live_project_id}")),
+                volume(format!("mai-team-project-review-{orphan_project_id}")),
+                volume("mai-team-workspace-not-a-uuid".to_string()),
+            ],
+            &[project],
+            &[agent],
+        );
+
+        assert_eq!(
+            vec![format!("mai-team-workspace-{orphan_agent_id}")],
+            plan.orphan_agent_workspace_volumes
+        );
+        assert_eq!(
+            vec![format!("mai-team-project-review-{orphan_project_id}")],
+            plan.orphan_project_cache_volumes
+        );
+        assert_eq!(
+            vec!["mai-team-workspace-not-a-uuid".to_string()],
+            plan.quarantined_volumes
         );
     }
 

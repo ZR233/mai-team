@@ -21,6 +21,7 @@ use thiserror::Error;
 
 mod agent_runtime;
 mod artifacts;
+mod cleanup_tasks;
 mod config_document;
 mod convert;
 mod events;
@@ -49,6 +50,9 @@ pub use agent_runtime::{
     StoredAgentRuntime, StoredAgentRuntimeEvent, StoredAgentRuntimeMutation,
     StoredAgentRuntimeSession, StoredAgentRuntimeState, StoredAgentRuntimeTrace, StoredAgentTurn,
     StoredSessionEvent, StoredSessionProjection, StoredTokenUsage,
+};
+pub use cleanup_tasks::{
+    ProjectReviewCleanupResourceKind, ProjectReviewCleanupTask, ProjectReviewCleanupTaskStatus,
 };
 pub use config_document::ConfigDocumentStore;
 pub use review_jobs::{ProjectReviewJobEnqueueDisposition, ProjectReviewJobEnqueueResult};

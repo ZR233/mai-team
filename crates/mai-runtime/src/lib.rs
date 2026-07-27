@@ -54,8 +54,8 @@ mod turn;
 use agents::AgentResourceBroker;
 pub use config::{
     MAI_CONFIG_SCHEMA_VERSION, MaiConfig, MaiContainerConfig, MaiGithubConfig,
-    MaiInstructionsConfig, MaiMcpConfig, MaiReviewConfig, MaiSkillsConfig, model_config_from_api,
-    provider_catalog_snapshot, seed_default_provider_from_env,
+    MaiInstructionsConfig, MaiMcpConfig, MaiRetentionConfig, MaiReviewConfig, MaiSkillsConfig,
+    model_config_from_api, provider_catalog_snapshot, seed_default_provider_from_env,
 };
 use deps::RuntimeDeps;
 use events::{RECENT_EVENT_LIMIT, RuntimeEvents};

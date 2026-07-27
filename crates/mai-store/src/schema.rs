@@ -6,8 +6,9 @@ use std::time::Duration;
 use toasty_driver_sqlite::Sqlite;
 
 pub(crate) const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-pub(crate) const SCHEMA_VERSION: &str = "24";
-const PREVIOUS_SCHEMA_VERSION: &str = "23";
+pub(crate) const SCHEMA_VERSION: &str = "25";
+const PREVIOUS_SCHEMA_VERSION: &str = "24";
+const REVIEW_SKIP_SCHEMA_VERSION: &str = "23";
 const LEGACY_REVIEW_SCHEMA_VERSION: &str = "22";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const SQLITE_POOL_MAX_SIZE: usize = 4;
@@ -24,6 +25,7 @@ pub(crate) async fn build_db(path: &Path) -> Result<Db> {
         TaskReviewRecord,
         ProjectReviewRunRecord,
         ProjectReviewJobRecord,
+        ProjectReviewCleanupTaskRecord,
         PlanHistoryRecord,
         AgentRecordRow,
         AgentRuntimeStateRecord,
@@ -67,11 +69,17 @@ pub(crate) fn migrate_supported_schema(path: &Path) -> Result<bool> {
     match current.as_deref() {
         Some(SCHEMA_VERSION) => Ok(true),
         Some(PREVIOUS_SCHEMA_VERSION) => {
+            migrate_resource_cleanup_schema(&mut connection)?;
+            Ok(true)
+        }
+        Some(REVIEW_SKIP_SCHEMA_VERSION) => {
             migrate_review_skip_schema(&mut connection)?;
+            migrate_resource_cleanup_schema(&mut connection)?;
             Ok(true)
         }
         Some(LEGACY_REVIEW_SCHEMA_VERSION) => {
             migrate_review_lifecycle_schema(&mut connection)?;
+            migrate_resource_cleanup_schema(&mut connection)?;
             Ok(true)
         }
         None | Some(_) => Ok(false),
@@ -83,7 +91,7 @@ fn migrate_review_skip_schema(connection: &mut Connection) -> Result<()> {
     add_column_if_missing(&transaction, "project_review_jobs", "skip_reason", "TEXT")?;
     transaction.execute(
         "UPDATE settings SET value = ?1 WHERE key = ?2",
-        params![SCHEMA_VERSION, SETTING_SCHEMA_VERSION],
+        params![PREVIOUS_SCHEMA_VERSION, SETTING_SCHEMA_VERSION],
     )?;
     transaction.commit()?;
     Ok(())
@@ -162,6 +170,52 @@ fn migrate_review_lifecycle_schema(connection: &mut Connection) -> Result<()> {
         UPDATE settings SET value = '24' WHERE key = 'toasty_schema_version';",
     )?;
     restore_active_legacy_review_heads(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_resource_cleanup_schema(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS project_review_cleanup_tasks (
+            id TEXT PRIMARY KEY NOT NULL,
+            job_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            resource_kind TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL,
+            next_attempt_at TEXT,
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS project_review_cleanup_tasks_job_id_idx
+            ON project_review_cleanup_tasks(job_id);
+        CREATE INDEX IF NOT EXISTS project_review_cleanup_tasks_project_id_idx
+            ON project_review_cleanup_tasks(project_id);
+        CREATE INDEX IF NOT EXISTS project_review_cleanup_tasks_status_idx
+            ON project_review_cleanup_tasks(status);
+        CREATE INDEX IF NOT EXISTS project_review_cleanup_tasks_next_attempt_at_idx
+            ON project_review_cleanup_tasks(next_attempt_at);
+        DELETE FROM session_event_journal
+            WHERE NOT EXISTS (
+                SELECT 1 FROM agent_sessions
+                WHERE agent_sessions.id = session_event_journal.session_id
+            );
+        DELETE FROM session_view_snapshots
+            WHERE NOT EXISTS (
+                SELECT 1 FROM agent_sessions
+                WHERE agent_sessions.id = session_view_snapshots.session_id
+            );",
+    )?;
+    transaction.execute(
+        "UPDATE settings SET value = ?1 WHERE key = ?2",
+        params![SCHEMA_VERSION, SETTING_SCHEMA_VERSION],
+    )?;
     transaction.commit()?;
     Ok(())
 }

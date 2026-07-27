@@ -188,25 +188,42 @@ impl MaiStore {
     }
 
     pub async fn prune_project_review_runs_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
-        let mut db = self.db.clone();
-        let cutoff = cutoff.to_rfc3339();
-        let rows = Query::<List<ProjectReviewRunRecord>>::all()
-            .exec(&mut db)
-            .await?;
-        let old_ids = rows
-            .into_iter()
-            .filter(|row| row.started_at < cutoff)
-            .map(|row| row.id)
-            .collect::<Vec<_>>();
-        for id in &old_ids {
-            Query::<List<ProjectReviewRunRecord>>::filter(
-                ProjectReviewRunRecord::fields().id().eq(id.clone()),
-            )
-            .delete()
-            .exec(&mut db)
-            .await?;
-        }
-        Ok(old_ids.len())
+        self.prune_project_review_runs_before_batch(cutoff, 500)
+            .await
+    }
+
+    pub async fn prune_project_review_runs_before_batch(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> Result<usize> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = rusqlite::Connection::open(path)?;
+            connection.busy_timeout(std::time::Duration::from_secs(30))?;
+            let transaction = connection.transaction()?;
+            let removed = transaction.execute(
+                "DELETE FROM project_review_runs WHERE id IN (
+                    SELECT run.id FROM project_review_runs run
+                    WHERE run.started_at < ?1
+                      AND NOT EXISTS (
+                          SELECT 1 FROM project_review_jobs job
+                          WHERE job.id = run.job_id
+                            AND job.status NOT IN (
+                                'succeeded','failed','cancelled','superseded','skipped'
+                            )
+                      )
+                    ORDER BY run.started_at ASC, run.id ASC LIMIT ?2
+                 )",
+                rusqlite::params![cutoff.to_rfc3339(), usize_to_i64(batch_size)],
+            )?;
+            transaction.commit()?;
+            Ok(removed)
+        })
+        .await
+        .map_err(|error| {
+            StoreError::InvalidConfig(format!("review run retention task failed: {error}"))
+        })?
     }
 
     async fn load_project_review_run_records(

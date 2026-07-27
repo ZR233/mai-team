@@ -1,5 +1,8 @@
 use crate::records::*;
 use crate::*;
+use rusqlite::{Connection, params};
+
+const RETENTION_BATCH_SIZE: usize = 500;
 
 impl MaiStore {
     pub async fn append_agent_log_entry(&self, entry: &AgentLogEntry) -> Result<()> {
@@ -67,21 +70,23 @@ impl MaiStore {
     }
 
     pub async fn prune_agent_logs_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
-        let mut db = self.db.clone();
-        let cutoff = cutoff.to_rfc3339();
-        let rows = Query::<List<AgentLogRecord>>::all().exec(&mut db).await?;
-        let old_ids = rows
-            .into_iter()
-            .filter(|row| row.timestamp < cutoff)
-            .map(|row| row.id)
-            .collect::<Vec<_>>();
-        for id in &old_ids {
-            Query::<List<AgentLogRecord>>::filter(AgentLogRecord::fields().id().eq(id.clone()))
-                .delete()
-                .exec(&mut db)
-                .await?;
-        }
-        Ok(old_ids.len())
+        self.prune_agent_logs_before_batch(cutoff, RETENTION_BATCH_SIZE)
+            .await
+    }
+
+    pub async fn prune_agent_logs_before_batch(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> Result<usize> {
+        prune_observability_rows(
+            self.path.clone(),
+            "agent_log_entries",
+            "timestamp",
+            cutoff,
+            batch_size,
+        )
+        .await
     }
 
     pub async fn save_tool_trace_started(
@@ -201,22 +206,58 @@ impl MaiStore {
     }
 
     pub async fn prune_tool_traces_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
-        let mut db = self.db.clone();
-        let cutoff = cutoff.to_rfc3339();
-        let rows = Query::<List<ToolTraceRecord>>::all().exec(&mut db).await?;
-        let old_ids = rows
-            .into_iter()
-            .filter(|row| row.started_at < cutoff)
-            .map(|row| row.id)
-            .collect::<Vec<_>>();
-        for id in &old_ids {
-            Query::<List<ToolTraceRecord>>::filter(ToolTraceRecord::fields().id().eq(id.clone()))
-                .delete()
-                .exec(&mut db)
-                .await?;
-        }
-        Ok(old_ids.len())
+        self.prune_tool_traces_before_batch(cutoff, RETENTION_BATCH_SIZE)
+            .await
     }
+
+    pub async fn prune_tool_traces_before_batch(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> Result<usize> {
+        prune_observability_rows(
+            self.path.clone(),
+            "tool_trace_records",
+            "started_at",
+            cutoff,
+            batch_size,
+        )
+        .await
+    }
+}
+
+async fn prune_observability_rows(
+    path: PathBuf,
+    table: &'static str,
+    timestamp_column: &'static str,
+    cutoff: DateTime<Utc>,
+    batch_size: usize,
+) -> Result<usize> {
+    tokio::task::spawn_blocking(move || {
+        let mut connection = Connection::open(path)?;
+        connection.busy_timeout(std::time::Duration::from_secs(30))?;
+        let transaction = connection.transaction()?;
+        let sql = format!(
+            "DELETE FROM {table} WHERE id IN (
+                SELECT observed.id FROM {table} observed
+                WHERE observed.{timestamp_column} < ?1
+                  AND (observed.session_id IS NULL OR NOT EXISTS (
+                      SELECT 1 FROM agent_sessions live
+                      WHERE live.id = observed.session_id
+                  ))
+                ORDER BY observed.{timestamp_column} ASC, observed.id ASC
+                LIMIT ?2
+             )"
+        );
+        let removed =
+            transaction.execute(&sql, params![cutoff.to_rfc3339(), usize_to_i64(batch_size)])?;
+        transaction.commit()?;
+        Ok(removed)
+    })
+    .await
+    .map_err(|error| {
+        StoreError::InvalidConfig(format!("observability retention task failed: {error}"))
+    })?
 }
 
 async fn delete_matching_tool_trace(db: &mut Db, trace: &ToolTraceDetail) -> Result<()> {

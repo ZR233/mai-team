@@ -19,7 +19,7 @@ pub(crate) use conversion::{
     agent_config_from_models, preserve_provider_private_fields, provider_selection_from_models,
     providers_request_from_models, providers_response_from_models,
 };
-pub const MAI_CONFIG_SCHEMA_VERSION: u32 = 5;
+pub const MAI_CONFIG_SCHEMA_VERSION: u32 = 6;
 
 const REQUIRED_ROLES: [&str; 4] = ["planner", "explorer", "executor", "reviewer"];
 
@@ -42,6 +42,8 @@ pub struct MaiConfig {
     pub github: MaiGithubConfig,
     #[serde(default)]
     pub review: MaiReviewConfig,
+    #[serde(default)]
+    pub retention: MaiRetentionConfig,
 }
 
 /// 容器与 turn 资源参数。
@@ -90,6 +92,19 @@ pub struct MaiReviewConfig {
     pub max_concurrent_reviews: usize,
 }
 
+/// 服务器历史数据与临时资源的保留策略。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MaiRetentionConfig {
+    pub review_jobs_days: i64,
+    pub review_runs_days: i64,
+    pub product_events_days: i64,
+    pub agent_logs_days: i64,
+    pub tool_traces_days: i64,
+    pub tool_output_days: i64,
+    pub cleanup_interval_secs: u64,
+    pub cleanup_batch_size: usize,
+}
+
 impl MaiConfig {
     /// 校验 schema、PL 模型引用和 mai 必需角色。
     pub fn validate(&self) -> Result<()> {
@@ -114,6 +129,26 @@ impl MaiConfig {
         if self.review.max_concurrent_reviews == 0 {
             return Err(RuntimeError::InvalidInput(
                 "max_concurrent_reviews must be greater than zero".to_string(),
+            ));
+        }
+        if [
+            self.retention.review_jobs_days,
+            self.retention.review_runs_days,
+            self.retention.product_events_days,
+            self.retention.agent_logs_days,
+            self.retention.tool_traces_days,
+            self.retention.tool_output_days,
+        ]
+        .into_iter()
+        .any(|days| days <= 0)
+        {
+            return Err(RuntimeError::InvalidInput(
+                "retention day values must be greater than zero".to_string(),
+            ));
+        }
+        if self.retention.cleanup_interval_secs == 0 || self.retention.cleanup_batch_size == 0 {
+            return Err(RuntimeError::InvalidInput(
+                "retention cleanup interval and batch size must be greater than zero".to_string(),
             ));
         }
         Ok(())
@@ -255,6 +290,7 @@ impl Default for MaiConfig {
             mcp: MaiMcpConfig::default(),
             github: MaiGithubConfig::default(),
             review: MaiReviewConfig::default(),
+            retention: MaiRetentionConfig::default(),
         }
     }
 }
@@ -302,6 +338,21 @@ impl Default for MaiReviewConfig {
     }
 }
 
+impl Default for MaiRetentionConfig {
+    fn default() -> Self {
+        Self {
+            review_jobs_days: 30,
+            review_runs_days: 7,
+            product_events_days: 7,
+            agent_logs_days: 7,
+            tool_traces_days: 7,
+            tool_output_days: 14,
+            cleanup_interval_secs: 3600,
+            cleanup_batch_size: 500,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -319,6 +370,23 @@ mod tests {
 
         assert_eq!(restored, config);
         restored.validate().unwrap();
+    }
+
+    #[test]
+    fn retention_defaults_match_server_storage_policy() {
+        assert_eq!(
+            MaiRetentionConfig {
+                review_jobs_days: 30,
+                review_runs_days: 7,
+                product_events_days: 7,
+                agent_logs_days: 7,
+                tool_traces_days: 7,
+                tool_output_days: 14,
+                cleanup_interval_secs: 3600,
+                cleanup_batch_size: 500,
+            },
+            MaiRetentionConfig::default()
+        );
     }
 
     #[test]

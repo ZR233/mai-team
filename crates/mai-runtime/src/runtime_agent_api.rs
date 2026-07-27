@@ -201,6 +201,78 @@ impl AgentRuntime {
         agents::purge_agent_tree(self, agent_id).await
     }
 
+    pub(super) async fn cleanup_agent_tool_output_namespace(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<()> {
+        let namespace = self
+            .artifact_files_root
+            .join("tool-output")
+            .join(agent_id.to_string());
+        match tokio::fs::remove_dir_all(namespace).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(super) async fn cleanup_tool_output_namespaces(
+        &self,
+        cutoff: std::time::SystemTime,
+        batch_size: usize,
+    ) -> Result<usize> {
+        let root = self.artifact_files_root.join("tool-output");
+        let live_agents = self
+            .list_agents()
+            .await
+            .into_iter()
+            .map(|agent| agent.id)
+            .collect::<std::collections::HashSet<_>>();
+        let mut namespaces = match tokio::fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        let mut removed = 0;
+        while let Some(namespace) = namespaces.next_entry().await? {
+            if removed >= batch_size {
+                break;
+            }
+            let Some(name) = namespace.file_name().to_str().map(ToString::to_string) else {
+                tracing::warn!(path = %namespace.path().display(), "tool-output namespace is not valid UTF-8");
+                continue;
+            };
+            let Ok(agent_id) = Uuid::parse_str(&name) else {
+                tracing::warn!(path = %namespace.path().display(), "tool-output namespace has an invalid agent id");
+                continue;
+            };
+            if !live_agents.contains(&agent_id) {
+                tokio::fs::remove_dir_all(namespace.path()).await?;
+                removed += 1;
+                continue;
+            }
+            let mut calls = match tokio::fs::read_dir(namespace.path()).await {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            while removed < batch_size {
+                let Some(call) = calls.next_entry().await? else {
+                    break;
+                };
+                if call.metadata().await?.modified()? < cutoff {
+                    if call.file_type().await?.is_dir() {
+                        tokio::fs::remove_dir_all(call.path()).await?;
+                    } else {
+                        tokio::fs::remove_file(call.path()).await?;
+                    }
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     pub(super) async fn close_agent(&self, agent_id: AgentId) -> Result<()> {
         agents::close_agent(self, agent_id).await
     }

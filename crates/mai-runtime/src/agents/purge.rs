@@ -15,6 +15,8 @@ pub(crate) trait AgentPurgeOps: Send + Sync {
     fn delete_agent_from_store(&self, agent_id: AgentId)
     -> impl Future<Output = Result<()>> + Send;
 
+    fn delete_agent_artifacts(&self, agent_id: AgentId) -> impl Future<Output = Result<()>> + Send;
+
     fn remove_agent_from_memory(&self, agent_id: AgentId) -> impl Future<Output = ()> + Send;
 
     fn publish_agent_deleted(&self, agent_id: AgentId) -> impl Future<Output = ()> + Send;
@@ -24,6 +26,7 @@ pub(crate) async fn purge_agent_tree(ops: &impl AgentPurgeOps, root_id: AgentId)
     let summaries = ops.agent_summaries().await;
     let targets = descendant_delete_order(root_id, &summaries)?;
     for agent_id in targets {
+        ops.delete_agent_artifacts(agent_id).await?;
         ops.delete_agent_from_store(agent_id).await?;
         ops.remove_agent_from_memory(agent_id).await;
         ops.publish_agent_deleted(agent_id).await;
@@ -66,9 +69,13 @@ fn push_delete_order(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
     use chrono::{DateTime, Utc};
     use mai_protocol::{AgentState, TokenUsage};
     use pretty_assertions::assert_eq;
+    use tokio::sync::Mutex;
     use uuid::Uuid;
 
     use super::*;
@@ -100,6 +107,65 @@ mod tests {
         assert_eq!(
             descendant_delete_order(root, &summaries).expect("delete order"),
             vec![grandchild, older_child, younger_child, root]
+        );
+    }
+
+    struct FakePurgeOps {
+        summaries: Vec<AgentSummary>,
+        artifact_root: PathBuf,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl AgentPurgeOps for FakePurgeOps {
+        async fn agent_summaries(&self) -> Vec<AgentSummary> {
+            self.summaries.clone()
+        }
+
+        async fn delete_agent_from_store(&self, _agent_id: AgentId) -> Result<()> {
+            self.calls.lock().await.push("store");
+            Ok(())
+        }
+
+        async fn delete_agent_artifacts(&self, agent_id: AgentId) -> Result<()> {
+            tokio::fs::remove_dir_all(self.artifact_root.join(agent_id.to_string())).await?;
+            self.calls.lock().await.push("artifacts");
+            Ok(())
+        }
+
+        async fn remove_agent_from_memory(&self, _agent_id: AgentId) {
+            self.calls.lock().await.push("memory");
+        }
+
+        async fn publish_agent_deleted(&self, _agent_id: AgentId) {
+            self.calls.lock().await.push("event");
+        }
+    }
+
+    #[tokio::test]
+    async fn purge_removes_tool_output_before_persisting_agent_deletion() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let agent_id = Uuid::new_v4();
+        let artifact_root = directory.path().join("tool-output");
+        let namespace = artifact_root.join(agent_id.to_string());
+        tokio::fs::create_dir_all(&namespace)
+            .await
+            .expect("create artifact namespace");
+        tokio::fs::write(namespace.join("output.txt"), "leaked")
+            .await
+            .expect("write artifact");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let ops = FakePurgeOps {
+            summaries: vec![summary(agent_id, None, Utc::now())],
+            artifact_root,
+            calls: Arc::clone(&calls),
+        };
+
+        purge_agent_tree(&ops, agent_id).await.expect("purge agent");
+
+        assert!(!namespace.exists());
+        assert_eq!(
+            vec!["artifacts", "store", "memory", "event"],
+            *calls.lock().await
         );
     }
 

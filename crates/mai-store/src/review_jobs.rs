@@ -4,6 +4,7 @@ use mai_protocol::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::cleanup_tasks::ensure_project_review_cleanup_tasks;
 use crate::records::ProjectReviewJobRecord;
 use crate::*;
 
@@ -24,6 +25,63 @@ pub struct ProjectReviewJobEnqueueResult {
 }
 
 impl MaiStore {
+    pub async fn prune_project_review_jobs_before_batch(
+        &self,
+        cutoff: DateTime<Utc>,
+        now: DateTime<Utc>,
+        batch_size: usize,
+    ) -> Result<usize> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = open_review_job_connection(&path)?;
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let job_ids = {
+                let mut statement = transaction.prepare(
+                    "SELECT job.id FROM project_review_jobs job
+                     WHERE job.status IN (
+                         'succeeded','failed','cancelled','superseded','skipped'
+                     )
+                       AND job.finished_at IS NOT NULL
+                       AND job.finished_at < ?1
+                       AND (job.lease_expires_at IS NULL OR job.lease_expires_at <= ?2)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM project_review_cleanup_tasks cleanup
+                           WHERE cleanup.job_id = job.id
+                             AND cleanup.status != 'succeeded'
+                       )
+                     ORDER BY job.finished_at ASC, job.id ASC LIMIT ?3",
+                )?;
+                statement
+                    .query_map(
+                        params![
+                            cutoff.to_rfc3339(),
+                            now.to_rfc3339(),
+                            usize_to_i64(batch_size)
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for job_id in &job_ids {
+                transaction.execute(
+                    "DELETE FROM project_review_cleanup_tasks WHERE job_id = ?1",
+                    params![job_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM project_review_jobs WHERE id = ?1",
+                    params![job_id],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(job_ids.len())
+        })
+        .await
+        .map_err(|error| {
+            StoreError::InvalidConfig(format!("review job retention task failed: {error}"))
+        })?
+    }
+
     pub async fn load_active_project_review_job_for_pr(
         &self,
         project_id: ProjectId,
@@ -86,8 +144,11 @@ impl MaiStore {
     pub async fn save_project_review_job(&self, job: ProjectReviewJobSummary) -> Result<()> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
-            let connection = open_review_job_connection(&path)?;
-            upsert_job(&connection, &job)?;
+            let mut connection = open_review_job_connection(&path)?;
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            upsert_job(&transaction, &job)?;
+            transaction.commit()?;
             Ok(())
         })
         .await
@@ -267,14 +328,34 @@ impl MaiStore {
     ) -> Result<usize> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
-            let connection = open_review_job_connection(&path)?;
-            Ok(connection.execute(
+            let mut connection = open_review_job_connection(&path)?;
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let job_ids = {
+                let mut statement = transaction.prepare(
+                    "SELECT id FROM project_review_jobs WHERE project_id = ?1 AND status IN
+                     ('queued','preparing','running','retry_waiting','submission_pending','reconciling')",
+                )?;
+                statement
+                    .query_map(params![project_id.to_string()], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let changed = transaction.execute(
                 "UPDATE project_review_jobs SET status = 'cancelled', finished_at = ?1, \
                  updated_at = ?1, lease_owner = NULL, lease_expires_at = NULL \
                  WHERE project_id = ?2 AND status IN \
                  ('queued','preparing','running','retry_waiting','submission_pending','reconciling')",
                 params![now.to_rfc3339(), project_id.to_string()],
-            )?)
+            )?;
+            for job_id in job_ids {
+                ensure_project_review_cleanup_tasks(
+                    &transaction,
+                    parse_uuid(&job_id)?,
+                    now,
+                )?;
+            }
+            transaction.commit()?;
+            Ok(changed)
         })
         .await
         .map_err(|error| {
@@ -423,6 +504,11 @@ fn enqueue_on_path(
             "UPDATE project_review_jobs SET status = 'superseded', finished_at = ?1, \
              updated_at = ?1 WHERE id = ?2",
             params![candidate.created_at.to_rfc3339(), existing.id],
+        )?;
+        ensure_project_review_cleanup_tasks(
+            &transaction,
+            parse_uuid(&existing.id)?,
+            candidate.created_at,
         )?;
     }
     upsert_job(&transaction, &candidate)?;
@@ -604,6 +690,7 @@ fn record_submission_receipt_on_path(
     let job = load_job(&transaction, job_id)?
         .ok_or_else(|| StoreError::InvalidConfig("review job vanished".to_string()))?
         .into_summary()?;
+    ensure_project_review_cleanup_tasks(&transaction, job_id, receipt.submitted_at)?;
     transaction.commit()?;
     Ok(job)
 }
@@ -652,5 +739,8 @@ fn upsert_job(connection: &Connection, job: &ProjectReviewJobSummary) -> Result<
             job.finished_at.map(|value| value.to_rfc3339()),
         ],
     )?;
+    if job.status.is_terminal() {
+        ensure_project_review_cleanup_tasks(connection, job.id, job.updated_at)?;
+    }
     Ok(())
 }

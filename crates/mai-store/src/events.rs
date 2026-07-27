@@ -36,11 +36,27 @@ impl MaiStore {
     }
 
     pub async fn prune_product_events_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
-        prune_product_events_before_on_path(&self.path, cutoff).await
+        self.prune_product_events_before_batch(cutoff, 500).await
+    }
+
+    pub async fn prune_product_events_before_batch(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> Result<usize> {
+        prune_product_events_before_on_path(&self.path, cutoff, batch_size).await
     }
 
     pub async fn prune_product_events_to_limit(&self, limit: usize) -> Result<usize> {
-        prune_product_events_to_limit_on_path(&self.path, limit).await
+        self.prune_product_events_to_limit_batch(limit, 500).await
+    }
+
+    pub async fn prune_product_events_to_limit_batch(
+        &self,
+        limit: usize,
+        batch_size: usize,
+    ) -> Result<usize> {
+        prune_product_events_to_limit_on_path(&self.path, limit, batch_size).await
     }
 }
 
@@ -116,14 +132,22 @@ pub(crate) async fn next_product_event_sequence_on_path(path: &Path) -> Result<u
     .map_err(|err| StoreError::InvalidConfig(format!("product event query task failed: {err}")))?
 }
 
-async fn prune_product_events_before_on_path(path: &Path, cutoff: DateTime<Utc>) -> Result<usize> {
+async fn prune_product_events_before_on_path(
+    path: &Path,
+    cutoff: DateTime<Utc>,
+    batch_size: usize,
+) -> Result<usize> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut connection = open_product_event_connection(&path)?;
         let transaction = connection.transaction()?;
         let removed = transaction.execute(
-            "DELETE FROM product_events WHERE timestamp < ?1",
-            params![cutoff.to_rfc3339()],
+            "DELETE FROM product_events WHERE sequence IN (
+                SELECT sequence FROM product_events
+                WHERE timestamp < ?1
+                ORDER BY timestamp ASC, sequence ASC LIMIT ?2
+             )",
+            params![cutoff.to_rfc3339(), usize_to_i64(batch_size)],
         )?;
         transaction.commit()?;
         Ok(removed)
@@ -132,7 +156,11 @@ async fn prune_product_events_before_on_path(path: &Path, cutoff: DateTime<Utc>)
     .map_err(|err| StoreError::InvalidConfig(format!("product event prune task failed: {err}")))?
 }
 
-async fn prune_product_events_to_limit_on_path(path: &Path, limit: usize) -> Result<usize> {
+async fn prune_product_events_to_limit_on_path(
+    path: &Path,
+    limit: usize,
+    batch_size: usize,
+) -> Result<usize> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut connection = open_product_event_connection(&path)?;
@@ -141,7 +169,10 @@ async fn prune_product_events_to_limit_on_path(path: &Path, limit: usize) -> Res
             row.get::<_, i64>(0)
         })?;
         let keep = usize_to_i64(limit);
-        let remove_count = total.saturating_sub(keep).max(0);
+        let remove_count = total
+            .saturating_sub(keep)
+            .max(0)
+            .min(usize_to_i64(batch_size));
         if remove_count == 0 {
             return Ok(0);
         }

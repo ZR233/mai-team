@@ -175,9 +175,18 @@ impl AgentRuntime {
         runtime
             .cleanup_orphan_project_review_repository_views()
             .await;
+        runtime.cleanup_orphan_project_review_host_contexts().await;
         let cleanup_runtime = Arc::clone(&runtime);
+        projects::review::cleanup::cleanup_project_review_history(&cleanup_runtime).await?;
         tokio::spawn(async move {
             projects::review::cleanup::run_project_review_cleanup_loop(&cleanup_runtime).await;
+        });
+        let resource_cleanup_runtime = Arc::clone(&runtime);
+        tokio::spawn(async move {
+            projects::review::cleanup::run_project_review_resource_cleanup_loop(
+                &resource_cleanup_runtime,
+            )
+            .await;
         });
         runtime.start_enabled_project_review_workers().await;
         Ok(runtime)

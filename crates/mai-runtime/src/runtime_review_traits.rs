@@ -49,36 +49,183 @@ impl projects::review::state::ProjectReviewStateOps for AgentRuntime {
 }
 
 impl projects::review::cleanup::ProjectReviewCleanupOps for Arc<AgentRuntime> {
-    async fn prune_project_review_runs_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+    async fn retention_config(&self) -> MaiRetentionConfig {
+        self.mai_config.read().await.retention.clone()
+    }
+
+    async fn prune_project_review_jobs_before(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> Result<usize> {
         Ok(self
             .deps
             .store
-            .prune_project_review_runs_before(cutoff)
+            .prune_project_review_jobs_before_batch(cutoff, Utc::now(), batch_size)
             .await?)
     }
 
-    async fn prune_product_events_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
-        Ok(self.deps.store.prune_product_events_before(cutoff).await?)
+    async fn prune_project_review_runs_before(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> Result<usize> {
+        Ok(self
+            .deps
+            .store
+            .prune_project_review_runs_before_batch(cutoff, batch_size)
+            .await?)
     }
 
-    async fn prune_product_events_to_limit(&self, limit: usize) -> Result<usize> {
-        Ok(self.deps.store.prune_product_events_to_limit(limit).await?)
+    async fn prune_product_events_before(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> Result<usize> {
+        Ok(self
+            .deps
+            .store
+            .prune_product_events_before_batch(cutoff, batch_size)
+            .await?)
     }
 
-    async fn prune_agent_logs_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
-        Ok(self.deps.store.prune_agent_logs_before(cutoff).await?)
+    async fn prune_product_events_to_limit(
+        &self,
+        limit: usize,
+        batch_size: usize,
+    ) -> Result<usize> {
+        Ok(self
+            .deps
+            .store
+            .prune_product_events_to_limit_batch(limit, batch_size)
+            .await?)
     }
 
-    async fn prune_tool_traces_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
-        Ok(self.deps.store.prune_tool_traces_before(cutoff).await?)
+    async fn prune_agent_logs_before(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> Result<usize> {
+        Ok(self
+            .deps
+            .store
+            .prune_agent_logs_before_batch(cutoff, batch_size)
+            .await?)
+    }
+
+    async fn prune_tool_traces_before(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> Result<usize> {
+        Ok(self
+            .deps
+            .store
+            .prune_tool_traces_before_batch(cutoff, batch_size)
+            .await?)
+    }
+
+    async fn cleanup_tool_output_namespaces(
+        &self,
+        cutoff: std::time::SystemTime,
+        batch_size: usize,
+    ) -> Result<usize> {
+        AgentRuntime::cleanup_tool_output_namespaces(self.as_ref(), cutoff, batch_size).await
     }
 
     async fn retain_events_since(&self, cutoff: DateTime<Utc>) {
         self.events.retain_since(cutoff).await;
     }
 
-    async fn list_projects(&self) -> Vec<ProjectSummary> {
-        AgentRuntime::list_projects(self.as_ref()).await
+    async fn reconcile_project_volumes(&self) -> Result<()> {
+        let projects = AgentRuntime::list_projects(self.as_ref()).await;
+        let agents = AgentRuntime::list_agents(self.as_ref()).await;
+        let _ = projects::workspace::docker_reconcile::reconcile_project_volumes(
+            &self.deps.docker,
+            &projects,
+            &agents,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn claim_due_project_review_cleanup_task(
+        &self,
+        owner: String,
+        now: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+    ) -> Result<Option<mai_store::ProjectReviewCleanupTask>> {
+        Ok(self
+            .deps
+            .store
+            .claim_due_project_review_cleanup_task(owner, now, lease_expires_at)
+            .await?)
+    }
+
+    async fn execute_project_review_cleanup_task(
+        &self,
+        task: mai_store::ProjectReviewCleanupTask,
+    ) -> Result<()> {
+        match task.resource_kind {
+            mai_store::ProjectReviewCleanupResourceKind::ReviewerAgent => {
+                let agent_id = Uuid::parse_str(&task.resource_id).map_err(|error| {
+                    RuntimeError::InvalidInput(format!(
+                        "invalid cleanup reviewer agent id {}: {error}",
+                        task.resource_id
+                    ))
+                })?;
+                match AgentRuntime::delete_agent(self.as_ref(), agent_id).await {
+                    Ok(()) | Err(RuntimeError::AgentNotFound(_)) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+            mai_store::ProjectReviewCleanupResourceKind::ReviewContext => {
+                let run_id = Uuid::parse_str(&task.resource_id).map_err(|error| {
+                    RuntimeError::InvalidInput(format!(
+                        "invalid cleanup review run id {}: {error}",
+                        task.resource_id
+                    ))
+                })?;
+                self.cleanup_project_review_context_by_run_id(task.project_id, run_id)
+                    .await
+            }
+            mai_store::ProjectReviewCleanupResourceKind::ToolOutputNamespace => {
+                let agent_id = Uuid::parse_str(&task.resource_id).map_err(|error| {
+                    RuntimeError::InvalidInput(format!(
+                        "invalid cleanup tool-output agent id {}: {error}",
+                        task.resource_id
+                    ))
+                })?;
+                self.cleanup_agent_tool_output_namespace(agent_id).await
+            }
+        }
+    }
+
+    async fn complete_project_review_cleanup_task(
+        &self,
+        task_id: String,
+        owner: String,
+        finished_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        Ok(self
+            .deps
+            .store
+            .complete_project_review_cleanup_task(task_id, owner, finished_at)
+            .await?)
+    }
+
+    async fn retry_project_review_cleanup_task(
+        &self,
+        task_id: String,
+        owner: String,
+        next_attempt_at: DateTime<Utc>,
+        error: String,
+    ) -> Result<bool> {
+        Ok(self
+            .deps
+            .store
+            .retry_project_review_cleanup_task(task_id, owner, next_attempt_at, error)
+            .await?)
     }
 }
 

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     MAI_CONFIG_SCHEMA_VERSION, MaiConfig, MaiContainerConfig, MaiGithubConfig,
-    MaiInstructionsConfig, MaiMcpConfig, MaiReviewConfig, MaiSkillsConfig,
+    MaiInstructionsConfig, MaiMcpConfig, MaiRetentionConfig, MaiReviewConfig, MaiSkillsConfig,
 };
 use crate::{Result, RuntimeError};
 
@@ -120,12 +120,15 @@ struct LegacyCatalogProviderConfig {
 
 pub(super) async fn migrate(documents: &ConfigDocumentStore) -> Result<MaiConfig> {
     if let Ok(Some(mut config)) = documents.load::<MaiConfig>().await
-        && config.schema_version == 4
+        && matches!(config.schema_version, 4 | 5)
     {
-        migrate_v4_provider_capabilities(&mut config.models);
+        let previous_version = config.schema_version;
+        if previous_version == 4 {
+            migrate_v4_provider_capabilities(&mut config.models);
+        }
         config.schema_version = MAI_CONFIG_SCHEMA_VERSION;
         config.validate()?;
-        backup_document(documents.path(), 4).await?;
+        backup_document(documents.path(), previous_version).await?;
         documents.save(&config).await?;
         return Ok(config);
     }
@@ -174,6 +177,7 @@ async fn migrate_catalog_config(
         mcp: legacy.mcp,
         github: legacy.github,
         review: legacy.review,
+        retention: MaiRetentionConfig::default(),
     };
     config.validate()?;
     backup_document(documents.path(), previous_version).await?;
@@ -253,6 +257,7 @@ async fn migrate_v1(documents: &ConfigDocumentStore) -> Result<MaiConfig> {
         mcp: legacy.mcp,
         github: legacy.github,
         review: legacy.review,
+        retention: MaiRetentionConfig::default(),
     };
     config.validate()?;
     backup_document(documents.path(), 1).await?;
@@ -440,6 +445,26 @@ mod tests {
             models.providers[&custom_id].capabilities,
             ProviderCapabilitySelection::Explicit(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn schema_five_adds_default_retention_and_creates_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let documents = ConfigDocumentStore::new(path.clone());
+        let mut value = toml::Value::try_from(MaiConfig::default()).unwrap();
+        let table = value.as_table_mut().unwrap();
+        table.insert("schema_version".to_string(), toml::Value::Integer(5));
+        table.remove("retention");
+        tokio::fs::write(&path, toml::to_string_pretty(&value).unwrap())
+            .await
+            .unwrap();
+
+        let migrated = migrate(&documents).await.unwrap();
+
+        assert_eq!(MAI_CONFIG_SCHEMA_VERSION, migrated.schema_version);
+        assert_eq!(MaiRetentionConfig::default(), migrated.retention);
+        assert!(tokio::fs::try_exists(backup_path(&path, 5)).await.unwrap());
     }
 
     #[test]

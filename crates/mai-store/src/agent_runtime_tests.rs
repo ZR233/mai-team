@@ -6,12 +6,15 @@ use pretty_assertions::assert_eq;
 use std::path::PathBuf;
 use tokio::time::{Duration, timeout};
 
-use crate::records::{AgentRuntimeEventRecord, AgentRuntimeTraceRecord};
+use crate::records::{
+    AgentRuntimeEventRecord, AgentRuntimeTraceRecord, SessionEventJournalRecord,
+    SessionViewSnapshotRecord,
+};
 use crate::{
     AgentRuntimeCommitDocument, AgentRuntimeCommitOutcome, MaiStore, StoredAgentPendingInput,
     StoredAgentRuntime, StoredAgentRuntimeEvent, StoredAgentRuntimeMutation,
     StoredAgentRuntimeSession, StoredAgentRuntimeState, StoredAgentRuntimeTrace, StoredAgentTurn,
-    StoredTokenUsage,
+    StoredSessionEvent, StoredSessionProjection, StoredTokenUsage,
 };
 use toasty::stmt::{List, Query};
 
@@ -190,14 +193,24 @@ async fn deleting_product_agent_removes_mapped_framework_state() {
         .save_agent_with_runtime_id(&agent_summary(product_agent_id), None, "agent-1")
         .await
         .unwrap();
-    store
-        .commit_agent_runtime(document(None, 1, "queued"))
-        .await
-        .unwrap();
+    let mut runtime = document(None, 1, "queued");
+    runtime.session_projection = Some(StoredSessionProjection {
+        session_id: "session-1".to_string(),
+        through_sequence: 1,
+        snapshot: serde_json::json!({"title": "review"}),
+        durable_events: vec![StoredSessionEvent {
+            sequence: 1,
+            emitted_at: 1_700_000_000,
+            payload: serde_json::json!({"type": "message"}),
+        }],
+    });
+    store.commit_agent_runtime(runtime).await.unwrap();
+    assert_eq!(session_projection_counts(&store).await, (1, 1));
 
     store.delete_agent(product_agent_id).await.unwrap();
 
     assert_eq!(store.load_agent_runtimes().await.unwrap(), Vec::new());
+    assert_eq!(session_projection_counts(&store).await, (0, 0));
     assert!(
         store
             .load_runtime_snapshot(10)
@@ -206,6 +219,19 @@ async fn deleting_product_agent_removes_mapped_framework_state() {
             .agents
             .is_empty()
     );
+}
+
+async fn session_projection_counts(store: &MaiStore) -> (usize, usize) {
+    let mut db = store.db.clone();
+    let snapshots = Query::<List<SessionViewSnapshotRecord>>::all()
+        .exec(&mut db)
+        .await
+        .unwrap();
+    let events = Query::<List<SessionEventJournalRecord>>::all()
+        .exec(&mut db)
+        .await
+        .unwrap();
+    (snapshots.len(), events.len())
 }
 
 #[tokio::test]

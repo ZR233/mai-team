@@ -124,13 +124,7 @@ impl DockerClient {
 
     pub async fn list_managed_volumes(&self) -> Result<Vec<ManagedVolume>> {
         let output = Command::new(&self.binary)
-            .args([
-                "volume",
-                "ls",
-                "-q",
-                "--filter",
-                &format!("label={MANAGED_LABEL}"),
-            ])
+            .args(["volume", "ls", "-q"])
             .output()
             .await?;
         if !output.status.success() {
@@ -140,7 +134,7 @@ impl DockerClient {
         let names = String::from_utf8(output.stdout)?
             .lines()
             .map(str::trim)
-            .filter(|line| !line.is_empty())
+            .filter(|line| line.starts_with("mai-team-"))
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>();
         if names.is_empty() {
@@ -148,6 +142,19 @@ impl DockerClient {
         }
 
         self.inspect_managed_volumes(&names).await
+    }
+
+    pub async fn volume_is_attached(&self, volume: &str) -> Result<bool> {
+        let output = Command::new(&self.binary)
+            .args(["ps", "-aq", "--filter", &format!("volume={volume}")])
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(DockerError::CommandFailed(stderr_or_stdout(&output)));
+        }
+        Ok(String::from_utf8(output.stdout)?
+            .lines()
+            .any(|line| !line.trim().is_empty()))
     }
 
     async fn inspect_managed_volumes(&self, names: &[String]) -> Result<Vec<ManagedVolume>> {

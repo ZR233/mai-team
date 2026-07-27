@@ -32,6 +32,10 @@ impl agents::AgentPurgeOps for AgentRuntime {
         Ok(())
     }
 
+    async fn delete_agent_artifacts(&self, agent_id: AgentId) -> Result<()> {
+        self.cleanup_agent_tool_output_namespace(agent_id).await
+    }
+
     async fn remove_agent_from_memory(&self, agent_id: AgentId) {
         self.state.agents.write().await.remove(&agent_id);
     }

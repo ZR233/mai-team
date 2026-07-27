@@ -314,6 +314,20 @@ impl AgentRuntime {
                 "accepted legacy project cache volumes without managed labels during startup reconcile"
             );
         }
+        if !volume_report.quarantined_volumes.is_empty() {
+            tracing::warn!(
+                count = volume_report.quarantined_volumes.len(),
+                volumes = ?volume_report.quarantined_volumes,
+                "quarantined Mai volumes with invalid names or conflicting ownership labels"
+            );
+        }
+        if !volume_report.attached_orphan_volumes.is_empty() {
+            tracing::warn!(
+                count = volume_report.attached_orphan_volumes.len(),
+                volumes = ?volume_report.attached_orphan_volumes,
+                "quarantined orphan Mai volumes that are still attached"
+            );
+        }
         let workspace_projects_to_resume = projects
             .iter()
             .filter(|project| project_workspace_needs_startup_resume(project))

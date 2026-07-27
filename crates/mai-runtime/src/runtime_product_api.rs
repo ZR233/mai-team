@@ -181,10 +181,11 @@ impl AgentRuntime {
         limit: usize,
     ) -> Result<ProjectReviewRunsResponse> {
         self.project(project_id).await?;
+        let retention_days = self.mai_config.read().await.retention.review_runs_days;
         projects::review::runs::list_project_review_runs(
             &self.deps.store,
             project_id,
-            projects::review::cleanup::PROJECT_REVIEW_HISTORY_RETENTION_DAYS,
+            retention_days,
             offset,
             limit,
         )

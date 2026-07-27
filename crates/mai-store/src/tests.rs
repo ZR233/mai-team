@@ -517,6 +517,38 @@ async fn product_event_count_pruning_keeps_newest_events() {
 }
 
 #[tokio::test]
+async fn product_event_retention_never_exceeds_configured_batch() {
+    let (_dir, store) = store().await;
+    let agent_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let turn_id = Uuid::new_v4();
+    let timestamp = Utc::now() - chrono::TimeDelta::days(30);
+    for sequence in 1..=501 {
+        store
+            .append_product_event(&test_product_event(
+                sequence, agent_id, session_id, turn_id, timestamp,
+            ))
+            .await
+            .expect("append event");
+    }
+
+    assert_eq!(
+        500,
+        store
+            .prune_product_events_before_batch(Utc::now(), 500)
+            .await
+            .expect("first retention batch")
+    );
+    assert_eq!(
+        1,
+        store
+            .prune_product_events_before_batch(Utc::now(), 500)
+            .await
+            .expect("second retention batch")
+    );
+}
+
+#[tokio::test]
 async fn project_review_runs_round_trip_and_prune() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
@@ -690,6 +722,62 @@ async fn agent_logs_round_trip_filter_and_prune() {
         .expect("remaining logs");
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].category, "tool");
+}
+
+#[tokio::test]
+async fn agent_log_retention_preserves_rows_owned_by_a_live_session() {
+    let (_dir, store) = store().await;
+    let agent_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let timestamp = Utc::now() - chrono::TimeDelta::days(30);
+    let connection = rusqlite::Connection::open(&store.path).expect("open sqlite");
+    connection
+        .execute(
+            "INSERT INTO agent_sessions (
+                id, agent_id, title, created_at, updated_at, input_tokens,
+                cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
+                last_context_tokens, trace_sequence, session_event_sequence
+             ) VALUES (?1, ?2, '', '', '', 0, 0, 0, 0, 0, NULL, 0, 0)",
+            rusqlite::params![session_id.to_string(), agent_id.to_string()],
+        )
+        .expect("insert live session");
+    drop(connection);
+    for session_id in [Some(session_id), None] {
+        store
+            .append_agent_log_entry(&AgentLogEntry {
+                id: Uuid::new_v4(),
+                agent_id,
+                session_id,
+                turn_id: None,
+                level: "info".to_string(),
+                category: "retention".to_string(),
+                message: "old".to_string(),
+                details: json!({}),
+                timestamp,
+            })
+            .await
+            .expect("append log");
+    }
+
+    assert_eq!(
+        1,
+        store
+            .prune_agent_logs_before_batch(Utc::now(), 500)
+            .await
+            .expect("prune")
+    );
+    let remaining = store
+        .list_agent_logs(
+            agent_id,
+            AgentLogFilter {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("remaining");
+    assert_eq!(1, remaining.len());
+    assert_eq!(Some(session_id), remaining[0].session_id);
 }
 
 #[tokio::test]
@@ -1267,6 +1355,139 @@ async fn schema_23_adds_review_skip_reason_without_rebuilding_user_data() {
 }
 
 #[tokio::test]
+async fn schema_24_removes_orphan_session_projection_rows() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("config.sqlite3");
+    let config_path = dir.path().join("config.toml");
+    let store = MaiStore::open_with_config_path(&db_path, &config_path)
+        .await
+        .expect("open current schema");
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute_batch(
+            "INSERT INTO agent_sessions (
+                id, agent_id, title, created_at, updated_at, input_tokens,
+                cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
+                last_context_tokens, trace_sequence, session_event_sequence
+             ) VALUES ('session-1', 'agent-1', '', '', '', 0, 0, 0, 0, 0, NULL, 0, 0);
+             INSERT INTO session_view_snapshots (
+                session_id, through_sequence, snapshot_json, updated_at
+             ) VALUES ('session-1', 1, '{}', 1);
+             INSERT INTO session_event_journal (
+                id, session_id, sequence, emitted_at, event_json
+             ) VALUES ('session-1:1', 'session-1', 1, 1, '{}');
+             INSERT INTO session_view_snapshots (
+                session_id, through_sequence, snapshot_json, updated_at
+             ) VALUES ('orphan-session', 1, '{}', 1);
+             INSERT INTO session_event_journal (
+                id, session_id, sequence, emitted_at, event_json
+             ) VALUES ('orphan-session:1', 'orphan-session', 1, 1, '{}');
+             UPDATE settings SET value = '24' WHERE key = 'toasty_schema_version';",
+        )
+        .expect("downgrade fixture to schema 24");
+    drop(connection);
+
+    let reopened = MaiStore::open_with_config_path(&db_path, &config_path)
+        .await
+        .expect("migrate schema 24");
+    assert_eq!(
+        Some(SCHEMA_VERSION.to_string()),
+        reopened
+            .get_setting(SETTING_SCHEMA_VERSION)
+            .await
+            .expect("schema version")
+    );
+    drop(reopened);
+
+    let connection = rusqlite::Connection::open(&db_path).expect("inspect migrated sqlite");
+    let orphan_snapshots: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM session_view_snapshots WHERE session_id = 'orphan-session'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count orphan snapshots");
+    let orphan_events: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM session_event_journal WHERE session_id = 'orphan-session'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count orphan journal");
+    let live_sessions: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_sessions WHERE id = 'session-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count live sessions");
+    let cleanup_table: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'project_review_cleanup_tasks'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("cleanup table");
+    assert_eq!(
+        (
+            orphan_snapshots,
+            orphan_events,
+            live_sessions,
+            cleanup_table
+        ),
+        (0, 0, 1, 1)
+    );
+}
+
+#[tokio::test]
+async fn schema_24_cleanup_migration_rolls_back_on_failure_and_is_idempotent() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("config.sqlite3");
+    let store = MaiStore::open_with_config_path(&db_path, dir.path().join("config.toml"))
+        .await
+        .expect("open current schema");
+    drop(store);
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute_batch(
+            "INSERT INTO session_event_journal (
+                id, session_id, sequence, emitted_at, event_json
+             ) VALUES ('orphan:1', 'orphan', 1, 1, '{}');
+             UPDATE settings SET value = '24' WHERE key = 'toasty_schema_version';
+             CREATE TRIGGER fail_orphan_cleanup
+             BEFORE DELETE ON session_event_journal
+             BEGIN
+               SELECT RAISE(ABORT, 'injected migration failure');
+             END;",
+        )
+        .expect("prepare failing migration");
+    drop(connection);
+
+    assert!(crate::schema::migrate_supported_schema(&db_path).is_err());
+    let connection = rusqlite::Connection::open(&db_path).expect("inspect rollback");
+    let state: (String, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT value FROM settings WHERE key = 'toasty_schema_version'),
+                (SELECT COUNT(*) FROM session_event_journal WHERE session_id = 'orphan')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("rollback state");
+    assert_eq!(("24".to_string(), 1), state);
+    connection
+        .execute("DROP TRIGGER fail_orphan_cleanup", [])
+        .expect("remove failure trigger");
+    drop(connection);
+
+    assert!(crate::schema::migrate_supported_schema(&db_path).expect("retry migration"));
+    assert!(crate::schema::migrate_supported_schema(&db_path).expect("repeat migration"));
+}
+
+#[tokio::test]
 async fn mcp_servers_round_trip_json_config() {
     let (_dir, store) = store().await;
     let servers = BTreeMap::from([
@@ -1631,6 +1852,171 @@ async fn submission_intent_is_idempotent_and_receipt_completes_job() {
     assert_eq!(None, completed.active_run_id);
     assert_eq!(None, completed.next_attempt_at);
     assert_eq!(None, completed.failure);
+}
+
+#[tokio::test]
+async fn terminal_review_job_persists_idempotent_retryable_cleanup_tasks() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let reviewer_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let timestamp = Utc::now();
+    let mut job = test_review_job(project_id, 12, "head", None);
+    job.status = ProjectReviewJobStatus::Failed;
+    job.reviewer_agent_id = Some(reviewer_id);
+    job.active_run_id = Some(run_id);
+    job.next_attempt_at = None;
+    job.finished_at = Some(timestamp);
+    job.updated_at = timestamp;
+
+    store
+        .save_project_review_job(job.clone())
+        .await
+        .expect("save terminal job");
+    let tasks = store
+        .load_project_review_cleanup_tasks(job.id)
+        .await
+        .expect("load cleanup tasks");
+    assert_eq!(
+        vec![
+            ProjectReviewCleanupResourceKind::ReviewContext,
+            ProjectReviewCleanupResourceKind::ReviewerAgent,
+            ProjectReviewCleanupResourceKind::ToolOutputNamespace,
+        ],
+        tasks
+            .iter()
+            .map(|task| task.resource_kind)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        vec![ProjectReviewCleanupTaskStatus::Pending; 3],
+        tasks.iter().map(|task| task.status).collect::<Vec<_>>()
+    );
+
+    let owner = "cleanup-worker".to_string();
+    let claimed = store
+        .claim_due_project_review_cleanup_task(
+            owner.clone(),
+            timestamp + chrono::TimeDelta::seconds(1),
+            timestamp + chrono::TimeDelta::minutes(2),
+        )
+        .await
+        .expect("claim cleanup task")
+        .expect("due cleanup task");
+    assert_eq!(ProjectReviewCleanupTaskStatus::Running, claimed.status);
+    assert_eq!(1, claimed.attempt_count);
+
+    let retry_at = timestamp + chrono::TimeDelta::seconds(30);
+    assert!(
+        store
+            .retry_project_review_cleanup_task(
+                claimed.id.clone(),
+                owner.clone(),
+                retry_at,
+                "temporary failure".to_string(),
+            )
+            .await
+            .expect("schedule retry")
+    );
+    let reclaimed = store
+        .claim_due_project_review_cleanup_task(
+            owner.clone(),
+            retry_at,
+            retry_at + chrono::TimeDelta::minutes(2),
+        )
+        .await
+        .expect("reclaim cleanup task")
+        .expect("retry is due");
+    assert_eq!(claimed.id, reclaimed.id);
+    assert_eq!(2, reclaimed.attempt_count);
+    assert!(
+        store
+            .complete_project_review_cleanup_task(reclaimed.id, owner, retry_at)
+            .await
+            .expect("complete cleanup task")
+    );
+
+    store
+        .save_project_review_job(job.clone())
+        .await
+        .expect("save terminal job again");
+    let tasks = store
+        .load_project_review_cleanup_tasks(job.id)
+        .await
+        .expect("reload cleanup tasks");
+    assert_eq!(3, tasks.len());
+    assert_eq!(
+        1,
+        tasks
+            .iter()
+            .filter(|task| task.status == ProjectReviewCleanupTaskStatus::Succeeded)
+            .count()
+    );
+}
+
+#[tokio::test]
+async fn review_job_retention_preserves_active_and_leased_jobs() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let old = Utc::now() - chrono::TimeDelta::days(60);
+    let mut removable = test_review_job(project_id, 20, "head-20", None);
+    removable.status = ProjectReviewJobStatus::Succeeded;
+    removable.created_at = old;
+    removable.updated_at = old;
+    removable.finished_at = Some(old);
+    removable.next_attempt_at = None;
+    let mut leased = test_review_job(project_id, 21, "head-21", None);
+    leased.status = ProjectReviewJobStatus::Failed;
+    leased.created_at = old;
+    leased.updated_at = old;
+    leased.finished_at = Some(old);
+    leased.next_attempt_at = None;
+    leased.lease_owner = Some("worker".to_string());
+    leased.lease_expires_at = Some(Utc::now() + chrono::TimeDelta::hours(1));
+    let mut active = test_review_job(project_id, 22, "head-22", None);
+    active.status = ProjectReviewJobStatus::Running;
+    active.created_at = old;
+    active.updated_at = old;
+    active.next_attempt_at = None;
+    for job in [&removable, &leased, &active] {
+        store
+            .save_project_review_job(job.clone())
+            .await
+            .expect("save review job");
+    }
+
+    assert_eq!(
+        1,
+        store
+            .prune_project_review_jobs_before_batch(
+                Utc::now() - chrono::TimeDelta::days(30),
+                Utc::now(),
+                500,
+            )
+            .await
+            .expect("prune jobs")
+    );
+    assert!(
+        store
+            .load_project_review_job(project_id, removable.id)
+            .await
+            .expect("load removable")
+            .is_none()
+    );
+    assert!(
+        store
+            .load_project_review_job(project_id, leased.id)
+            .await
+            .expect("load leased")
+            .is_some()
+    );
+    assert!(
+        store
+            .load_project_review_job(project_id, active.id)
+            .await
+            .expect("load active")
+            .is_some()
+    );
 }
 
 fn test_review_job(

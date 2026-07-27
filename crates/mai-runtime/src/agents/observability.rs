@@ -128,6 +128,11 @@ pub(crate) async fn tool_output_artifact(
         &artifact.id,
         &artifact.name,
     );
+    if !tokio::fs::try_exists(&path).await? {
+        return Err(RuntimeError::InvalidInput(
+            "tool output artifact has expired".to_string(),
+        ));
+    }
     Ok((artifact, path))
 }
 
