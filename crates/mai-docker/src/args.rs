@@ -141,6 +141,8 @@ pub(crate) fn create_agent_mcp_sidecar_container_args(
         format!("{AGENT_LABEL_KEY}={agent_id}"),
         "--volumes-from".to_string(),
         source_container_id.to_string(),
+        "--network".to_string(),
+        HOST_NETWORK.to_string(),
         "-w".to_string(),
         "/workspace/repo".to_string(),
         image.to_string(),
@@ -371,6 +373,10 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|window| window == ["--volumes-from", "agent-container-id"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--network", HOST_NETWORK])
         );
         assert!(
             args.windows(2)
