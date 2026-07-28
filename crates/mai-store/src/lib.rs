@@ -55,7 +55,10 @@ pub use cleanup_tasks::{
     ProjectReviewCleanupResourceKind, ProjectReviewCleanupTask, ProjectReviewCleanupTaskStatus,
 };
 pub use config_document::ConfigDocumentStore;
-pub use review_jobs::{ProjectReviewJobEnqueueDisposition, ProjectReviewJobEnqueueResult};
+pub use review_jobs::{
+    ProjectReviewCiPendingSkipResult, ProjectReviewJobEnqueueDisposition,
+    ProjectReviewJobEnqueueResult,
+};
 pub use store::MaiStore;
 
 pub(crate) use convert::*;

@@ -24,6 +24,13 @@ pub struct ProjectReviewJobEnqueueResult {
     pub job: ProjectReviewJobSummary,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectReviewCiPendingSkipResult {
+    Skipped,
+    SignalChanged,
+    LostLease,
+}
+
 impl MaiStore {
     pub async fn prune_project_review_jobs_before_batch(
         &self,
@@ -180,6 +187,55 @@ impl MaiStore {
         .await
         .map_err(|error| {
             StoreError::InvalidConfig(format!("claimed review job save task failed: {error}"))
+        })?
+    }
+
+    pub async fn skip_claimed_project_review_job_for_ci_pending(
+        &self,
+        job_id: Uuid,
+        owner: String,
+        expected_delivery_id: Option<String>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<ProjectReviewCiPendingSkipResult> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = open_review_job_connection(&path)?;
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let Some(existing) = load_job(&transaction, job_id)? else {
+                transaction.commit()?;
+                return Ok(ProjectReviewCiPendingSkipResult::LostLease);
+            };
+            if existing.lease_owner.as_deref() != Some(owner.as_str())
+                || existing.status != ProjectReviewJobStatus::Preparing.to_string()
+            {
+                transaction.commit()?;
+                return Ok(ProjectReviewCiPendingSkipResult::LostLease);
+            }
+            if existing.delivery_id != expected_delivery_id {
+                transaction.commit()?;
+                return Ok(ProjectReviewCiPendingSkipResult::SignalChanged);
+            }
+            let changed = transaction.execute(
+                "UPDATE project_review_jobs SET status = 'skipped', failure_json = NULL, \
+                 skip_reason = 'ci_pending', next_attempt_at = NULL, active_run_id = NULL, \
+                 lease_owner = NULL, lease_expires_at = NULL, updated_at = ?1, finished_at = ?1 \
+                 WHERE id = ?2 AND lease_owner = ?3 AND status = 'preparing'",
+                params![updated_at.to_rfc3339(), job_id.to_string(), owner,],
+            )?;
+            if changed != 1 {
+                transaction.commit()?;
+                return Ok(ProjectReviewCiPendingSkipResult::LostLease);
+            }
+            ensure_project_review_cleanup_tasks(&transaction, job_id, updated_at)?;
+            transaction.commit()?;
+            Ok(ProjectReviewCiPendingSkipResult::Skipped)
+        })
+        .await
+        .map_err(|error| {
+            StoreError::InvalidConfig(format!(
+                "claimed review job CI pending skip task failed: {error}"
+            ))
         })?
     }
 

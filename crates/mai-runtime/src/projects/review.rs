@@ -15,6 +15,7 @@ pub(crate) mod cycle;
 pub(crate) mod eligibility;
 pub(crate) mod job;
 pub(crate) mod job_attempt;
+mod job_preflight;
 pub(crate) mod job_worker;
 pub(crate) mod pool;
 #[cfg(test)]

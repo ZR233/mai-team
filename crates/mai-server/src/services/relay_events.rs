@@ -43,6 +43,11 @@ trait RelayEventRuntime: Send + Sync {
         request: ProjectReviewQueueRequest,
     ) -> impl Future<Output = Result<ProjectReviewQueueSummary, RuntimeError>> + Send;
 
+    fn enqueue_project_review_completed_check_signal(
+        &self,
+        request: ProjectReviewQueueRequest,
+    ) -> impl Future<Output = Result<ProjectReviewQueueSummary, RuntimeError>> + Send;
+
     fn handle_project_push_event(
         &self,
         project_id: ProjectId,
@@ -74,6 +79,13 @@ impl RelayEventRuntime for Arc<AgentRuntime> {
         request: ProjectReviewQueueRequest,
     ) -> impl Future<Output = Result<ProjectReviewQueueSummary, RuntimeError>> + Send {
         AgentRuntime::enqueue_project_review_relay_signal(self, request)
+    }
+
+    fn enqueue_project_review_completed_check_signal(
+        &self,
+        request: ProjectReviewQueueRequest,
+    ) -> impl Future<Output = Result<ProjectReviewQueueSummary, RuntimeError>> + Send {
+        AgentRuntime::enqueue_project_review_completed_check_signal(self, request)
     }
 
     fn handle_project_push_event(
@@ -165,7 +177,7 @@ async fn process_event(
             let head_sha = mai_relay_client::head_sha(&event.payload);
             for pr in mai_relay_client::associated_pull_requests(&event.payload) {
                 let summary = runtime
-                    .enqueue_project_review_relay_signal(ProjectReviewQueueRequest {
+                    .enqueue_project_review_completed_check_signal(ProjectReviewQueueRequest {
                         project_id,
                         pr,
                         head_sha: head_sha.clone(),
@@ -222,6 +234,7 @@ mod tests {
     struct FakeRelayRuntime {
         project_id: ProjectId,
         relay_requests: Mutex<Vec<ProjectReviewQueueRequest>>,
+        completed_check_requests: Mutex<Vec<ProjectReviewQueueRequest>>,
         push_events: Mutex<Vec<ProjectId>>,
         external_events: Mutex<Vec<MaiProductEventKind>>,
     }
@@ -231,6 +244,7 @@ mod tests {
             Self {
                 project_id,
                 relay_requests: Mutex::new(Vec::new()),
+                completed_check_requests: Mutex::new(Vec::new()),
                 push_events: Mutex::new(Vec::new()),
                 external_events: Mutex::new(Vec::new()),
             }
@@ -257,6 +271,20 @@ mod tests {
         ) -> Result<ProjectReviewQueueSummary, RuntimeError> {
             let pr = request.pr;
             self.relay_requests.lock().await.push(request);
+            Ok(ProjectReviewQueueSummary {
+                queued: vec![pr],
+                deduped: Vec::new(),
+                ignored: Vec::new(),
+                jobs: Vec::new(),
+            })
+        }
+
+        async fn enqueue_project_review_completed_check_signal(
+            &self,
+            request: ProjectReviewQueueRequest,
+        ) -> Result<ProjectReviewQueueSummary, RuntimeError> {
+            let pr = request.pr;
+            self.completed_check_requests.lock().await.push(request);
             Ok(ProjectReviewQueueSummary {
                 queued: vec![pr],
                 deduped: Vec::new(),
@@ -310,6 +338,7 @@ mod tests {
         assert_eq!(Some("head-9".to_string()), request.head_sha);
         assert_eq!(Some("delivery-1".to_string()), request.delivery_id);
         assert_eq!("pull_request", request.reason);
+        assert_eq!(0, runtime.completed_check_requests.lock().await.len());
         assert_eq!(Vec::<ProjectId>::new(), *runtime.push_events.lock().await);
     }
 
@@ -370,12 +399,53 @@ mod tests {
             .expect("process event");
 
         assert_eq!(RelayAckStatus::Processed, ack);
-        let requests = runtime.relay_requests.lock().await;
+        assert_eq!(0, runtime.relay_requests.lock().await.len());
+        let requests = runtime.completed_check_requests.lock().await;
         let mut prs = requests
             .iter()
             .map(|request| (request.pr, request.head_sha.as_deref()))
             .collect::<Vec<_>>();
         prs.sort_by_key(|(pr, _)| *pr);
         assert_eq!(vec![(21, Some("head-21")), (22, Some("head-21"))], prs);
+        assert!(requests.iter().all(|request| request.reason == "check_run"));
+    }
+
+    #[tokio::test]
+    async fn completed_check_suite_event_uses_completed_signal_admission() {
+        let project_id = Uuid::new_v4();
+        let runtime = FakeRelayRuntime::new(project_id);
+        let event = RelayEvent {
+            sequence: 1,
+            delivery_id: "delivery-4".to_string(),
+            kind: RelayEventKind::CheckSuite,
+            payload: json!({
+                "action": "completed",
+                "installation": { "id": 123 },
+                "repository": {
+                    "id": 42,
+                    "full_name": "owner/repo"
+                },
+                "check_suite": {
+                    "head_sha": "head-23",
+                    "pull_requests": [
+                        { "number": 23 }
+                    ]
+                }
+            }),
+        };
+
+        let ack = process_event(&runtime, &event)
+            .await
+            .expect("process event");
+
+        assert_eq!(RelayAckStatus::Processed, ack);
+        assert_eq!(0, runtime.relay_requests.lock().await.len());
+        let requests = runtime.completed_check_requests.lock().await;
+        assert_eq!(1, requests.len());
+        let request = requests.first().expect("completed check request");
+        assert_eq!(23, request.pr);
+        assert_eq!(Some("head-23".to_string()), request.head_sha);
+        assert_eq!(Some("delivery-4".to_string()), request.delivery_id);
+        assert_eq!("check_suite", request.reason);
     }
 }

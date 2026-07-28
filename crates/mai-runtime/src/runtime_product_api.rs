@@ -409,6 +409,41 @@ impl AgentRuntime {
         Ok(summary)
     }
 
+    pub async fn enqueue_project_review_completed_check_signal(
+        self: &Arc<Self>,
+        request: ProjectReviewQueueRequest,
+    ) -> Result<ProjectReviewQueueSummary> {
+        let project_id = request.project_id;
+        let pr = request.pr;
+        let delivery_id = request.delivery_id.clone();
+        let reason = request.reason.clone();
+        let summary = self
+            .enqueue_project_review_signals_with_admission(
+                project_id,
+                vec![ProjectReviewSignalInput {
+                    pr,
+                    head_sha: request.head_sha,
+                    delivery_id: request.delivery_id,
+                    reason: request.reason,
+                }],
+                ProjectReviewEnqueueAdmission::RequireAutoReviewEnabled,
+                true,
+            )
+            .await?;
+        tracing::info!(
+            project_id = %project_id,
+            pr,
+            delivery_id = delivery_id.as_deref().unwrap_or_default(),
+            reason,
+            queued = ?summary.queued,
+            deduped = ?summary.deduped,
+            ignored = ?summary.ignored,
+            job_ids = ?summary.jobs.iter().map(|job| job.id).collect::<Vec<_>>(),
+            "queued completed check project review signal"
+        );
+        Ok(summary)
+    }
+
     pub(super) async fn enqueue_project_review_signals(
         self: &Arc<Self>,
         project_id: ProjectId,

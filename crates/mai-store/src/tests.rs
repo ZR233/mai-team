@@ -1608,6 +1608,134 @@ async fn review_jobs_dedupe_same_head_and_supersede_old_head() {
 }
 
 #[tokio::test]
+async fn completed_review_signals_keep_one_active_job_per_pr() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let first = store
+        .enqueue_project_review_job(test_review_job(
+            project_id,
+            42,
+            "head-42",
+            Some("delivery-1"),
+        ))
+        .await
+        .expect("enqueue first completed signal");
+    let repeated = store
+        .enqueue_project_review_job(test_review_job(
+            project_id,
+            42,
+            "head-42",
+            Some("delivery-2"),
+        ))
+        .await
+        .expect("dedupe second completed signal");
+
+    assert_eq!(
+        ProjectReviewJobEnqueueDisposition::Queued,
+        first.disposition
+    );
+    assert_eq!(
+        ProjectReviewJobEnqueueDisposition::Deduped,
+        repeated.disposition
+    );
+    assert_eq!(first.job.id, repeated.job.id);
+    assert_eq!(Some("delivery-2"), repeated.job.delivery_id.as_deref());
+    let jobs = store
+        .load_project_review_jobs(project_id, 0, 10)
+        .await
+        .expect("load review jobs");
+    assert_eq!(1, jobs.len());
+    assert_eq!(
+        1,
+        jobs.iter().filter(|job| !job.status.is_terminal()).count()
+    );
+}
+
+#[tokio::test]
+async fn ci_pending_skip_rechecks_changed_delivery_and_allows_next_generation() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let first = store
+        .enqueue_project_review_job(test_review_job(
+            project_id,
+            42,
+            "head-42",
+            Some("delivery-1"),
+        ))
+        .await
+        .expect("enqueue first completed signal");
+    let now = Utc::now();
+    store
+        .claim_due_project_review_job(
+            project_id,
+            "worker-1".to_string(),
+            now,
+            now + chrono::TimeDelta::seconds(60),
+        )
+        .await
+        .expect("claim review job")
+        .expect("review job is due");
+    let refreshed = store
+        .enqueue_project_review_job(test_review_job(
+            project_id,
+            42,
+            "head-42",
+            Some("delivery-2"),
+        ))
+        .await
+        .expect("refresh active job delivery");
+    assert_eq!(
+        ProjectReviewJobEnqueueDisposition::Deduped,
+        refreshed.disposition
+    );
+    assert_eq!(
+        ProjectReviewCiPendingSkipResult::SignalChanged,
+        store
+            .skip_claimed_project_review_job_for_ci_pending(
+                first.job.id,
+                "worker-1".to_string(),
+                Some("delivery-1".to_string()),
+                now + chrono::TimeDelta::seconds(1),
+            )
+            .await
+            .expect("compare stale delivery")
+    );
+    assert_eq!(
+        ProjectReviewCiPendingSkipResult::Skipped,
+        store
+            .skip_claimed_project_review_job_for_ci_pending(
+                first.job.id,
+                "worker-1".to_string(),
+                Some("delivery-2".to_string()),
+                now + chrono::TimeDelta::seconds(2),
+            )
+            .await
+            .expect("skip unchanged delivery")
+    );
+
+    let next = store
+        .enqueue_project_review_job(test_review_job(
+            project_id,
+            42,
+            "head-42",
+            Some("delivery-3"),
+        ))
+        .await
+        .expect("enqueue next generation");
+    assert_eq!(ProjectReviewJobEnqueueDisposition::Queued, next.disposition);
+    assert_ne!(first.job.id, next.job.id);
+    let jobs = store
+        .load_project_review_jobs(project_id, 0, 10)
+        .await
+        .expect("load review jobs");
+    assert_eq!(2, jobs.len());
+    assert_eq!(
+        1,
+        jobs.iter().filter(|job| !job.status.is_terminal()).count()
+    );
+}
+
+#[tokio::test]
 async fn active_review_job_projection_prioritizes_execution_over_waiting() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();

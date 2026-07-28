@@ -893,6 +893,25 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
             .await?)
     }
 
+    async fn skip_claimed_project_review_job_for_ci_pending(
+        &self,
+        job_id: Uuid,
+        owner: String,
+        expected_delivery_id: Option<String>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<mai_store::ProjectReviewCiPendingSkipResult> {
+        Ok(self
+            .deps
+            .store
+            .skip_claimed_project_review_job_for_ci_pending(
+                job_id,
+                owner,
+                expected_delivery_id,
+                updated_at,
+            )
+            .await?)
+    }
+
     async fn heartbeat_project_review_job(
         &self,
         job_id: Uuid,

@@ -156,6 +156,14 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         owner: String,
     ) -> impl Future<Output = Result<bool>> + Send;
 
+    fn skip_claimed_project_review_job_for_ci_pending(
+        &self,
+        job_id: uuid::Uuid,
+        owner: String,
+        expected_delivery_id: Option<String>,
+        updated_at: DateTime<Utc>,
+    ) -> impl Future<Output = Result<mai_store::ProjectReviewCiPendingSkipResult>> + Send;
+
     fn heartbeat_project_review_job(
         &self,
         job_id: uuid::Uuid,
@@ -836,6 +844,8 @@ mod tests {
         relay_selection_calls: Arc<Mutex<Vec<u64>>>,
         failed_relay_prs: Arc<Mutex<Vec<u64>>>,
         ineligible_relay_prs: Arc<Mutex<Vec<u64>>>,
+        evaluation_skip_reasons: Arc<Mutex<Vec<Option<mai_protocol::ProjectReviewSkipReason>>>>,
+        ci_skip_delivery_changes: Arc<Mutex<Vec<String>>>,
         current_relay_heads: Arc<Mutex<Vec<(u64, String)>>>,
         failed_enqueue_prs: Arc<Mutex<Vec<u64>>>,
         cache_ready_errors: Arc<Mutex<Vec<String>>>,
@@ -862,6 +872,8 @@ mod tests {
                 relay_selection_calls: Arc::new(Mutex::new(Vec::new())),
                 failed_relay_prs: Arc::new(Mutex::new(Vec::new())),
                 ineligible_relay_prs: Arc::new(Mutex::new(Vec::new())),
+                evaluation_skip_reasons: Arc::new(Mutex::new(Vec::new())),
+                ci_skip_delivery_changes: Arc::new(Mutex::new(Vec::new())),
                 current_relay_heads: Arc::new(Mutex::new(Vec::new())),
                 failed_enqueue_prs: Arc::new(Mutex::new(Vec::new())),
                 cache_ready_errors: Arc::new(Mutex::new(Vec::new())),
@@ -1126,12 +1138,20 @@ mod tests {
                     "failed relay pr {pr}"
                 )));
             }
-            let skip_reason = self
-                .ineligible_relay_prs
-                .lock()
-                .await
-                .contains(&pr)
-                .then_some(mai_protocol::ProjectReviewSkipReason::AlreadyReviewedCurrentHead);
+            let skip_reason = {
+                let mut reasons = self.evaluation_skip_reasons.lock().await;
+                if reasons.is_empty() {
+                    self.ineligible_relay_prs
+                        .lock()
+                        .await
+                        .contains(&pr)
+                        .then_some(
+                            mai_protocol::ProjectReviewSkipReason::AlreadyReviewedCurrentHead,
+                        )
+                } else {
+                    reasons.remove(0)
+                }
+            };
             let current_head = self
                 .current_relay_heads
                 .lock()
@@ -1266,6 +1286,41 @@ mod tests {
                 return Ok(true);
             }
             Ok(false)
+        }
+
+        async fn skip_claimed_project_review_job_for_ci_pending(
+            &self,
+            job_id: Uuid,
+            owner: String,
+            expected_delivery_id: Option<String>,
+            updated_at: chrono::DateTime<chrono::Utc>,
+        ) -> crate::Result<mai_store::ProjectReviewCiPendingSkipResult> {
+            let mut jobs = self.review_jobs.lock().await;
+            let Some(job) = jobs.iter_mut().find(|job| job.id == job_id) else {
+                return Ok(mai_store::ProjectReviewCiPendingSkipResult::LostLease);
+            };
+            if job.lease_owner.as_deref() != Some(owner.as_str())
+                || job.status != ProjectReviewJobStatus::Preparing
+            {
+                return Ok(mai_store::ProjectReviewCiPendingSkipResult::LostLease);
+            }
+            let changed_delivery = {
+                let mut deliveries = self.ci_skip_delivery_changes.lock().await;
+                (!deliveries.is_empty()).then(|| deliveries.remove(0))
+            };
+            if let Some(delivery_id) = changed_delivery {
+                job.delivery_id = Some(delivery_id);
+                return Ok(mai_store::ProjectReviewCiPendingSkipResult::SignalChanged);
+            }
+            if job.delivery_id != expected_delivery_id {
+                return Ok(mai_store::ProjectReviewCiPendingSkipResult::SignalChanged);
+            }
+            crate::projects::review::job::skip_job(
+                job,
+                mai_protocol::ProjectReviewSkipReason::CiPending,
+                updated_at,
+            );
+            Ok(mai_store::ProjectReviewCiPendingSkipResult::Skipped)
         }
 
         async fn heartbeat_project_review_job(
@@ -1774,6 +1829,104 @@ mod tests {
         drop(jobs);
         assert!(ops.reviewed_prs.lock().await.is_empty());
         assert!(ops.review_runs.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn final_preflight_skips_ci_pending_job_without_starting_attempt() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        ops.evaluation_skip_reasons
+            .lock()
+            .await
+            .push(Some(mai_protocol::ProjectReviewSkipReason::CiPending));
+        let mut job = crate::projects::review::job::new_project_review_job(
+            crate::projects::review::job::NewProjectReviewJob {
+                project_id,
+                pr: 42,
+                head_sha: "head-42".to_string(),
+                source: ProjectReviewJobSource::Webhook,
+                delivery_id: Some("delivery-1".to_string()),
+                reason: "check_run".to_string(),
+            },
+        );
+        job.status = ProjectReviewJobStatus::Preparing;
+        job.attempt_count = 1;
+        job.lease_owner = Some("worker-1".to_string());
+        ops.review_jobs.lock().await.push(job.clone());
+        let context = ProjectReviewTaskContext {
+            ops: ops.clone(),
+            project_id,
+            cancellation_token: CancellationToken::new(),
+        };
+
+        assert!(
+            crate::projects::review::job_worker::run_claimed_project_review_job(
+                &context,
+                job,
+                "worker-1".to_string(),
+            )
+            .await
+        );
+
+        let jobs = ops.review_jobs.lock().await;
+        assert_eq!(1, jobs.len());
+        assert_eq!(ProjectReviewJobStatus::Skipped, jobs[0].status);
+        assert_eq!(
+            Some(mai_protocol::ProjectReviewSkipReason::CiPending),
+            jobs[0].skip_reason
+        );
+        assert_eq!(None, jobs[0].reviewer_agent_id);
+        drop(jobs);
+        assert!(ops.reviewed_prs.lock().await.is_empty());
+        assert!(ops.review_runs.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn final_preflight_rechecks_ci_after_completed_delivery_changes() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        ops.evaluation_skip_reasons
+            .lock()
+            .await
+            .extend([Some(mai_protocol::ProjectReviewSkipReason::CiPending), None]);
+        ops.ci_skip_delivery_changes
+            .lock()
+            .await
+            .push("delivery-2".to_string());
+        let mut job = crate::projects::review::job::new_project_review_job(
+            crate::projects::review::job::NewProjectReviewJob {
+                project_id,
+                pr: 42,
+                head_sha: "head-42".to_string(),
+                source: ProjectReviewJobSource::Webhook,
+                delivery_id: Some("delivery-1".to_string()),
+                reason: "check_run".to_string(),
+            },
+        );
+        job.status = ProjectReviewJobStatus::Preparing;
+        job.attempt_count = 1;
+        job.lease_owner = Some("worker-1".to_string());
+        ops.review_jobs.lock().await.push(job.clone());
+        let context = ProjectReviewTaskContext {
+            ops: ops.clone(),
+            project_id,
+            cancellation_token: CancellationToken::new(),
+        };
+
+        assert!(
+            crate::projects::review::job_worker::run_claimed_project_review_job(
+                &context,
+                job,
+                "worker-1".to_string(),
+            )
+            .await
+        );
+
+        assert_eq!(vec![42, 42], *ops.relay_selection_calls.lock().await);
+        assert_eq!(vec![Some(42)], *ops.reviewed_prs.lock().await);
+        let jobs = ops.review_jobs.lock().await;
+        assert_eq!(Some("delivery-2"), jobs[0].delivery_id.as_deref());
+        assert_ne!(ProjectReviewJobStatus::Skipped, jobs[0].status);
     }
 
     #[tokio::test]

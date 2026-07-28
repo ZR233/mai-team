@@ -18,14 +18,21 @@ Queued -> Preparing -> Running -> SubmissionPending -> Reconciling -> Succeeded
 
 ## 持久化入队与幂等
 
-周期 selector 和 webhook 都必须先执行确定性的 eligibility 判断，再把合格 PR 直接写入持久化 Job 队列。生产路径不使用内存 relay 队列或内存 PR 池保存执行意图。
+周期 selector 和 `pull_request` webhook 必须先执行确定性的 eligibility 判断，再把
+合格 PR 直接写入持久化 Job 队列。`check_run`、`check_suite` 的 `completed`
+事件是持久化唤醒信号：只要项目仍启用自动审查，就直接写入或命中现有 Job，
+最终 eligibility 留到 Job 被 claim 后、创建 Reviewer 前执行。生产路径不使用内存
+relay 队列或内存 PR 池保存执行意图。
 
-- 同一 `project + PR + head SHA` 只保留一个活跃 Job。
+- 同一 `project + PR` 只保留一个非终态 Job；相同 head 的后续 completed delivery
+  更新现有 Job，不重复排队。
 - 新 head 到达时，旧 head 的未完成 Job 进入 `Superseded`。
 - 同一 webhook delivery 对同一 PR 幂等；一个 check suite delivery 可以分别为多个关联 PR 建立 Job。
 - 手动重新审查遇到同一 PR 的活跃 Job 时直接返回该 Job，不访问 GitHub、也不创建重复 generation。
 - 历史 Job 已终止时，手动重新审查可以创建新 Job。
-- webhook 单 PR eligibility 读取失败时不写内存队列，由 relay 的失败确认机制重投；当前事件尚不满足 eligibility 时返回 `Ignored`，等待后续 check 或 PR 事件。
+- `pull_request` webhook 单 PR eligibility 读取失败时不写内存队列，由 relay
+  的失败确认机制重投；当前事件尚不满足 eligibility 时返回 `Ignored`，等待后续
+  check 或 PR 事件。
 
 `pull_request` 的 `opened`、`reopened`、`synchronize`、`ready_for_review`，以及 `check_run`、`check_suite` 的 `completed` 会触发单 PR eligibility。`push` 不创建 Review Job，仍只同步默认分支与项目缓存。
 
@@ -53,6 +60,12 @@ state=open&sort=created&direction=asc&per_page=20&page=N
 ## Claim、租约与启动恢复
 
 worker 只从数据库原子 claim 到期 Job。claim 写入实例 owner，租约为 60 秒，每 15 秒续租。数据库事务保证同一 Job 只有一个 owner；项目内任一仍存活的执行租约会阻止另一个实例启动新 Job。
+
+非手动 Job 被 claim 后必须再次读取当前 head、review 历史和 CI。此时 CI 仍在运行
+则进入 `Skipped(CiPending)`，不创建 Reviewer；下一条不同 completed delivery
+可以建立下一代 Job。若最终检查与跳过事务之间有新 completed delivery 更新了当前
+Job，delivery 条件写入失败，worker 必须重新读取同一个 Job 并再次检查，不能丢失
+这个唤醒信号。
 
 同一项目只允许一个逻辑 Review 占用 Reviewer。尚未到期的 `RetryWaiting` 或 `Reconciling` Job 会阻塞后续排队 Job；到期后优先恢复原 Job，再处理新 Job，避免保留 Session 的 Reviewer 与新任务竞争。
 
