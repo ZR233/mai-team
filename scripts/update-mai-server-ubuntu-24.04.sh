@@ -442,8 +442,14 @@ prune_deploy_backups() {
     return 0
   fi
   [[ -d "$DEPLOY_BACKUP_DIR" ]] || return 0
-  find "$DEPLOY_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf -- {} +
-  mapfile -t backups < <(find "$DEPLOY_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -r)
+  find "$DEPLOY_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d \
+    -regextype posix-extended -regex '.*/[0-9]{8}T[0-9]{6}Z' \
+    -mtime +7 -exec rm -rf -- {} +
+  mapfile -t backups < <(
+    find "$DEPLOY_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+      | awk '/^[0-9]{8}T[0-9]{6}Z$/' \
+      | sort -r
+  )
   if (( ${#backups[@]} > 1 )); then
     local backup_name
     for backup_name in "${backups[@]:1}"; do

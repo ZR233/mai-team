@@ -59,6 +59,8 @@ UPDATE_SCRIPT="$ROOT_DIR/scripts/update-mai-server-ubuntu-24.04.sh"
 
 bash -n "$INSTALL_SCRIPT"
 bash -n "$UPDATE_SCRIPT"
+assert_contains "$(sed -n '/prune_deploy_backups()/,/^}/p' "$UPDATE_SCRIPT")" \
+  "awk '/^[0-9]{8}T[0-9]{6}Z$/'"
 
 install_output="$(MAI_RELEASES_JSON_FILE="$release_fixture" "$INSTALL_SCRIPT" --dry-run)"
 update_output="$(MAI_RELEASES_JSON_FILE="$release_fixture" "$UPDATE_SCRIPT" --dry-run)"
