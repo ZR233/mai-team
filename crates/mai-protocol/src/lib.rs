@@ -2088,6 +2088,7 @@ pub enum RelayEventKind {
     Push,
     CheckRun,
     CheckSuite,
+    WorkflowRun,
     Installation,
     InstallationRepositories,
     Other(String),
@@ -2100,6 +2101,7 @@ impl RelayEventKind {
             "push" => Self::Push,
             "check_run" => Self::CheckRun,
             "check_suite" => Self::CheckSuite,
+            "workflow_run" => Self::WorkflowRun,
             "installation" => Self::Installation,
             "installation_repositories" => Self::InstallationRepositories,
             other => Self::Other(other.to_string()),
@@ -2112,6 +2114,7 @@ impl RelayEventKind {
             Self::Push => "push",
             Self::CheckRun => "check_run",
             Self::CheckSuite => "check_suite",
+            Self::WorkflowRun => "workflow_run",
             Self::Installation => "installation",
             Self::InstallationRepositories => "installation_repositories",
             Self::Other(value) => value,
@@ -2640,6 +2643,10 @@ mod tests {
         assert_eq!(
             RelayEventKind::from_github_event("pull_request").as_github_event(),
             "pull_request"
+        );
+        assert_eq!(
+            RelayEventKind::from_github_event("workflow_run").as_github_event(),
+            "workflow_run"
         );
         assert_eq!(
             RelayEventKind::from_github_event("workflow_job").as_github_event(),

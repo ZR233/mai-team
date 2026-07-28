@@ -22,7 +22,7 @@ pub(crate) fn relay_connect_url(url: &str) -> String {
 
 pub fn associated_pull_requests(payload: &Value) -> Vec<u64> {
     let mut prs = HashSet::new();
-    for key in ["check_run", "check_suite"] {
+    for key in ["check_run", "check_suite", "workflow_run"] {
         if let Some(items) = payload
             .get(key)
             .and_then(|value| value.get("pull_requests"))
@@ -56,6 +56,12 @@ pub fn head_sha(payload: &Value) -> Option<String> {
                 .and_then(|check_suite| check_suite.get("head_sha"))
                 .and_then(Value::as_str)
         })
+        .or_else(|| {
+            payload
+                .get("workflow_run")
+                .and_then(|workflow_run| workflow_run.get("head_sha"))
+                .and_then(Value::as_str)
+        })
         .map(str::to_string)
 }
 
@@ -74,5 +80,28 @@ pub(crate) fn relay_response(id: String, result: Result<Value, RuntimeError>) ->
                 message: error.to_string(),
             }),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn workflow_run_payload_exposes_pull_requests_and_head_sha() {
+        let payload = json!({
+            "workflow_run": {
+                "head_sha": "head-1705",
+                "pull_requests": [
+                    { "number": 1705 }
+                ]
+            }
+        });
+
+        assert_eq!(vec![1705], associated_pull_requests(&payload));
+        assert_eq!(Some("head-1705".to_string()), head_sha(&payload));
     }
 }

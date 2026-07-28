@@ -444,6 +444,22 @@ impl AgentRuntime {
         Ok(summary)
     }
 
+    pub async fn project_review_prs_for_head(
+        &self,
+        project_id: ProjectId,
+        head_sha: String,
+    ) -> Result<Vec<u64>> {
+        let head_sha = head_sha.trim();
+        if head_sha.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .deps
+            .store
+            .load_project_review_prs_for_head(project_id, head_sha.to_string())
+            .await?)
+    }
+
     pub(super) async fn enqueue_project_review_signals(
         self: &Arc<Self>,
         project_id: ProjectId,

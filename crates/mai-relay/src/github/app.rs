@@ -578,6 +578,7 @@ pub(crate) fn github_app_manifest(
             "push",
             "check_run",
             "check_suite",
+            "workflow_run",
             "installation",
             "installation_repositories"
         ],
@@ -614,6 +615,12 @@ mod tests {
         assert_eq!(manifest["default_permissions"]["checks"], "read");
         assert_eq!(manifest["default_permissions"]["statuses"], "read");
         assert_eq!(manifest["default_events"][0], "pull_request");
+        assert!(
+            manifest["default_events"]
+                .as_array()
+                .expect("default events")
+                .contains(&json!("workflow_run"))
+        );
         assert_eq!(manifest["public"], true);
         assert_eq!(manifest["webhook_secret"], "secret");
     }

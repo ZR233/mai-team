@@ -48,6 +48,12 @@ trait RelayEventRuntime: Send + Sync {
         request: ProjectReviewQueueRequest,
     ) -> impl Future<Output = Result<ProjectReviewQueueSummary, RuntimeError>> + Send;
 
+    fn project_review_prs_for_head(
+        &self,
+        project_id: ProjectId,
+        head_sha: String,
+    ) -> impl Future<Output = Result<Vec<u64>, RuntimeError>> + Send;
+
     fn handle_project_push_event(
         &self,
         project_id: ProjectId,
@@ -86,6 +92,14 @@ impl RelayEventRuntime for Arc<AgentRuntime> {
         request: ProjectReviewQueueRequest,
     ) -> impl Future<Output = Result<ProjectReviewQueueSummary, RuntimeError>> + Send {
         AgentRuntime::enqueue_project_review_completed_check_signal(self, request)
+    }
+
+    fn project_review_prs_for_head(
+        &self,
+        project_id: ProjectId,
+        head_sha: String,
+    ) -> impl Future<Output = Result<Vec<u64>, RuntimeError>> + Send {
+        AgentRuntime::project_review_prs_for_head(self, project_id, head_sha)
     }
 
     fn handle_project_push_event(
@@ -147,6 +161,20 @@ async fn process_event(
         return Ok(RelayAckStatus::Ignored);
     };
 
+    if matches!(
+        event_name.as_str(),
+        "check_run" | "check_suite" | "workflow_run"
+    ) {
+        return process_completed_review_signal(
+            runtime,
+            event,
+            project_id,
+            action.as_deref(),
+            &event_name,
+        )
+        .await;
+    }
+
     match event.kind {
         RelayEventKind::PullRequest => {
             if !matches!(
@@ -169,40 +197,70 @@ async fn process_event(
                 .await?;
             Ok(ack_status_for_queue(summary))
         }
-        RelayEventKind::CheckRun | RelayEventKind::CheckSuite => {
-            if action.as_deref() != Some("completed") {
-                return Ok(RelayAckStatus::Ignored);
-            }
-            let mut processed = false;
-            let head_sha = mai_relay_client::head_sha(&event.payload);
-            for pr in mai_relay_client::associated_pull_requests(&event.payload) {
-                let summary = runtime
-                    .enqueue_project_review_completed_check_signal(ProjectReviewQueueRequest {
-                        project_id,
-                        pr,
-                        head_sha: head_sha.clone(),
-                        delivery_id: Some(event.delivery_id.clone()),
-                        reason: event_name.clone(),
-                    })
-                    .await?;
-                processed = processed || ack_status_for_queue(summary) == RelayAckStatus::Processed;
-            }
-            Ok(if processed {
-                RelayAckStatus::Processed
-            } else {
-                RelayAckStatus::Ignored
-            })
-        }
         RelayEventKind::Push => {
             runtime
                 .handle_project_push_event(project_id, &event.payload)
                 .await?;
             Ok(RelayAckStatus::Processed)
         }
-        RelayEventKind::Installation
+        RelayEventKind::CheckRun
+        | RelayEventKind::CheckSuite
+        | RelayEventKind::WorkflowRun
+        | RelayEventKind::Installation
         | RelayEventKind::InstallationRepositories
         | RelayEventKind::Other(_) => Ok(RelayAckStatus::Ignored),
     }
+}
+
+async fn process_completed_review_signal(
+    runtime: &impl RelayEventRuntime,
+    event: &RelayEvent,
+    project_id: ProjectId,
+    action: Option<&str>,
+    event_name: &str,
+) -> Result<RelayAckStatus, RuntimeError> {
+    if action != Some("completed") {
+        return Ok(RelayAckStatus::Ignored);
+    }
+    let head_sha = mai_relay_client::head_sha(&event.payload);
+    let mut prs = mai_relay_client::associated_pull_requests(&event.payload);
+    if prs.is_empty()
+        && let Some(head_sha) = head_sha.as_deref()
+    {
+        prs = runtime
+            .project_review_prs_for_head(project_id, head_sha.to_string())
+            .await?;
+        if !prs.is_empty() {
+            tracing::info!(
+                project_id = %project_id,
+                delivery_id = %event.delivery_id,
+                head_sha,
+                prs = ?prs,
+                event = event_name,
+                "recovered completed review signal PRs from persisted job head"
+            );
+        }
+    }
+    prs.sort_unstable();
+    prs.dedup();
+    let mut processed = false;
+    for pr in prs {
+        let summary = runtime
+            .enqueue_project_review_completed_check_signal(ProjectReviewQueueRequest {
+                project_id,
+                pr,
+                head_sha: head_sha.clone(),
+                delivery_id: Some(event.delivery_id.clone()),
+                reason: event_name.to_string(),
+            })
+            .await?;
+        processed = processed || ack_status_for_queue(summary) == RelayAckStatus::Processed;
+    }
+    Ok(if processed {
+        RelayAckStatus::Processed
+    } else {
+        RelayAckStatus::Ignored
+    })
 }
 
 fn pull_request_number(payload: &Value) -> Option<u64> {
@@ -235,6 +293,7 @@ mod tests {
         project_id: ProjectId,
         relay_requests: Mutex<Vec<ProjectReviewQueueRequest>>,
         completed_check_requests: Mutex<Vec<ProjectReviewQueueRequest>>,
+        resolved_head_prs: Mutex<Vec<u64>>,
         push_events: Mutex<Vec<ProjectId>>,
         external_events: Mutex<Vec<MaiProductEventKind>>,
     }
@@ -245,6 +304,7 @@ mod tests {
                 project_id,
                 relay_requests: Mutex::new(Vec::new()),
                 completed_check_requests: Mutex::new(Vec::new()),
+                resolved_head_prs: Mutex::new(Vec::new()),
                 push_events: Mutex::new(Vec::new()),
                 external_events: Mutex::new(Vec::new()),
             }
@@ -291,6 +351,14 @@ mod tests {
                 ignored: Vec::new(),
                 jobs: Vec::new(),
             })
+        }
+
+        async fn project_review_prs_for_head(
+            &self,
+            _project_id: ProjectId,
+            _head_sha: String,
+        ) -> Result<Vec<u64>, RuntimeError> {
+            Ok(self.resolved_head_prs.lock().await.clone())
         }
 
         async fn handle_project_push_event(
@@ -447,5 +515,42 @@ mod tests {
         assert_eq!(Some("head-23".to_string()), request.head_sha);
         assert_eq!(Some("delivery-4".to_string()), request.delivery_id);
         assert_eq!("check_suite", request.reason);
+    }
+
+    #[tokio::test]
+    async fn completed_workflow_run_event_uses_completed_signal_admission() {
+        let project_id = Uuid::new_v4();
+        let runtime = FakeRelayRuntime::new(project_id);
+        *runtime.resolved_head_prs.lock().await = vec![1705];
+        let event = RelayEvent {
+            sequence: 1,
+            delivery_id: "delivery-5".to_string(),
+            kind: RelayEventKind::Other("workflow_run".to_string()),
+            payload: json!({
+                "action": "completed",
+                "installation": { "id": 123 },
+                "repository": {
+                    "id": 42,
+                    "full_name": "owner/repo"
+                },
+                "workflow_run": {
+                    "head_sha": "head-1705",
+                    "pull_requests": []
+                }
+            }),
+        };
+
+        let ack = process_event(&runtime, &event)
+            .await
+            .expect("process event");
+
+        assert_eq!(RelayAckStatus::Processed, ack);
+        let requests = runtime.completed_check_requests.lock().await;
+        assert_eq!(1, requests.len());
+        let request = requests.first().expect("completed workflow request");
+        assert_eq!(1705, request.pr);
+        assert_eq!(Some("head-1705".to_string()), request.head_sha);
+        assert_eq!(Some("delivery-5".to_string()), request.delivery_id);
+        assert_eq!("workflow_run", request.reason);
     }
 }

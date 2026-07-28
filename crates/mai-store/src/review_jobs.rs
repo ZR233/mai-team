@@ -124,6 +124,33 @@ impl MaiStore {
         })?
     }
 
+    pub async fn load_project_review_prs_for_head(
+        &self,
+        project_id: ProjectId,
+        head_sha: String,
+    ) -> Result<Vec<u64>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = open_review_job_connection(&path)?;
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT pr FROM project_review_jobs \
+                 WHERE project_id = ?1 AND head_sha = ?2 ORDER BY pr ASC",
+            )?;
+            let rows = statement.query_map(params![project_id.to_string(), head_sha], |row| {
+                row.get::<_, i64>(0)
+            })?;
+            let mut prs = Vec::new();
+            for row in rows {
+                prs.push(i64_to_u64(row?));
+            }
+            Ok(prs)
+        })
+        .await
+        .map_err(|error| {
+            StoreError::InvalidConfig(format!("review job PR-by-head lookup task failed: {error}"))
+        })?
+    }
+
     pub async fn project_has_active_review_jobs(&self, project_id: ProjectId) -> Result<bool> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {

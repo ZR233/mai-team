@@ -1652,6 +1652,38 @@ async fn completed_review_signals_keep_one_active_job_per_pr() {
 }
 
 #[tokio::test]
+async fn completed_review_signal_recovers_pr_from_persisted_head() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    store
+        .enqueue_project_review_job(test_review_job(
+            project_id,
+            1705,
+            "head-1705",
+            Some("synchronize-delivery"),
+        ))
+        .await
+        .expect("persist synchronize job");
+    store
+        .enqueue_project_review_job(test_review_job(
+            project_id,
+            1706,
+            "different-head",
+            Some("other-delivery"),
+        ))
+        .await
+        .expect("persist unrelated job");
+
+    assert_eq!(
+        vec![1705],
+        store
+            .load_project_review_prs_for_head(project_id, "head-1705".to_string())
+            .await
+            .expect("recover PR from head")
+    );
+}
+
+#[tokio::test]
 async fn ci_pending_skip_rechecks_changed_delivery_and_allows_next_generation() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
