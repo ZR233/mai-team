@@ -1490,6 +1490,50 @@ async fn schema_25_adds_review_environment_warning_without_rebuilding_jobs() {
 }
 
 #[tokio::test]
+async fn schema_26_adds_persistent_review_ci_watches() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("config.sqlite3");
+    let config_path = dir.path().join("config.toml");
+    let store = MaiStore::open_with_config_path(&db_path, &config_path)
+        .await
+        .expect("open current schema");
+    store
+        .set_setting("preserved_schema_26", "yes")
+        .await
+        .expect("seed preserved setting");
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute_batch(
+            "DROP TABLE project_review_ci_watches;
+             UPDATE settings SET value = '26' WHERE key = 'toasty_schema_version';",
+        )
+        .expect("downgrade fixture to schema 26");
+    drop(connection);
+
+    let reopened = MaiStore::open_with_config_path(&db_path, &config_path)
+        .await
+        .expect("migrate schema 26");
+    assert_eq!(
+        Some("yes".to_string()),
+        reopened
+            .get_setting("preserved_schema_26")
+            .await
+            .expect("preserved setting")
+    );
+    assert_eq!(
+        Some(SCHEMA_VERSION.to_string()),
+        reopened
+            .get_setting(SETTING_SCHEMA_VERSION)
+            .await
+            .expect("schema version")
+    );
+    drop(reopened);
+    assert!(crate::schema::migrate_supported_schema(&db_path).expect("repeat migration"));
+}
+
+#[tokio::test]
 async fn schema_24_cleanup_migration_rolls_back_on_failure_and_is_idempotent() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("config.sqlite3");
@@ -1759,6 +1803,303 @@ async fn completed_review_signal_recovers_pr_from_persisted_head() {
 }
 
 #[tokio::test]
+async fn review_ci_watch_persists_latest_head_and_recovers_pr_mapping() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let now = Utc::now();
+    let initial = ProjectReviewCiWatch {
+        project_id,
+        pr: 1520,
+        head_sha: "old-head".to_string(),
+        delivery_id: Some("delivery-1".to_string()),
+        reason: "synchronize".to_string(),
+        next_check_at: now,
+        created_at: now,
+        updated_at: now,
+    };
+    store
+        .upsert_project_review_ci_watch(initial)
+        .await
+        .expect("persist initial CI watch");
+    let updated = ProjectReviewCiWatch {
+        project_id,
+        pr: 1520,
+        head_sha: "current-head".to_string(),
+        delivery_id: Some("delivery-2".to_string()),
+        reason: "new synchronize".to_string(),
+        next_check_at: now + chrono::TimeDelta::seconds(60),
+        created_at: now + chrono::TimeDelta::seconds(1),
+        updated_at: now + chrono::TimeDelta::seconds(1),
+    };
+    store
+        .upsert_project_review_ci_watch(updated.clone())
+        .await
+        .expect("replace CI watch head");
+    store
+        .upsert_project_review_ci_watch(ProjectReviewCiWatch {
+            project_id,
+            pr: 1520,
+            head_sha: "current-head".to_string(),
+            delivery_id: Some("delayed-old-delivery".to_string()),
+            reason: "delayed old synchronize".to_string(),
+            next_check_at: now + chrono::TimeDelta::seconds(120),
+            created_at: now,
+            updated_at: now + chrono::TimeDelta::seconds(2),
+        })
+        .await
+        .expect("merge same-head delayed signal");
+
+    let persisted = store
+        .load_project_review_ci_watch(project_id, 1520)
+        .await
+        .expect("load CI watch")
+        .expect("CI watch exists");
+    assert_eq!(updated.head_sha, persisted.head_sha);
+    assert_eq!(updated.delivery_id, persisted.delivery_id);
+    assert_eq!(updated.reason, persisted.reason);
+    assert_eq!(now, persisted.created_at);
+    assert_eq!(
+        vec![1520],
+        store
+            .load_project_review_prs_for_head(project_id, "current-head".to_string())
+            .await
+            .expect("recover watched PR from head")
+    );
+    assert!(
+        store
+            .load_project_review_prs_for_head(project_id, "old-head".to_string())
+            .await
+            .expect("old head has no PR mapping")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn review_ci_watch_updates_use_expected_head_cas() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let now = Utc::now();
+    store
+        .upsert_project_review_ci_watch(ProjectReviewCiWatch {
+            project_id,
+            pr: 42,
+            head_sha: "current-head".to_string(),
+            delivery_id: None,
+            reason: "synchronize".to_string(),
+            next_check_at: now,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("persist CI watch");
+
+    assert!(
+        !store
+            .reschedule_project_review_ci_watch(
+                project_id,
+                42,
+                "stale-head".to_string(),
+                now + chrono::TimeDelta::seconds(60),
+                now,
+            )
+            .await
+            .expect("stale reschedule")
+    );
+    assert!(
+        !store
+            .replace_project_review_ci_watch_head(
+                project_id,
+                42,
+                "stale-head".to_string(),
+                "replacement-head".to_string(),
+                now + chrono::TimeDelta::seconds(60),
+                now,
+            )
+            .await
+            .expect("stale head replacement")
+    );
+    assert!(
+        !store
+            .delete_project_review_ci_watch(project_id, 42, "stale-head".to_string())
+            .await
+            .expect("stale delete")
+    );
+    assert!(
+        store
+            .delete_project_review_ci_watch(project_id, 42, "current-head".to_string())
+            .await
+            .expect("current delete")
+    );
+}
+
+#[tokio::test]
+async fn stale_ci_watch_cannot_supersede_newer_head_job() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let now = Utc::now();
+    let stale_watch = ProjectReviewCiWatch {
+        project_id,
+        pr: 1520,
+        head_sha: "old-head".to_string(),
+        delivery_id: Some("old-delivery".to_string()),
+        reason: "old synchronize".to_string(),
+        next_check_at: now,
+        created_at: now,
+        updated_at: now,
+    };
+    store
+        .upsert_project_review_ci_watch(stale_watch.clone())
+        .await
+        .expect("persist old watch");
+    store
+        .upsert_project_review_ci_watch(ProjectReviewCiWatch {
+            project_id,
+            pr: 1520,
+            head_sha: "new-head".to_string(),
+            delivery_id: Some("new-delivery".to_string()),
+            reason: "new synchronize".to_string(),
+            next_check_at: now,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("replace watch with new head");
+    let new_job = store
+        .enqueue_project_review_job(test_review_job(
+            project_id,
+            1520,
+            "new-head",
+            Some("new-completed-delivery"),
+        ))
+        .await
+        .expect("enqueue new head");
+
+    let result = store
+        .enqueue_project_review_job_from_ci_watch(
+            stale_watch,
+            test_review_job(project_id, 1520, "old-head", Some("old-delivery")),
+        )
+        .await
+        .expect("reject stale watch enqueue");
+    assert!(matches!(
+        result,
+        ProjectReviewCiWatchEnqueueResult::SignalChanged
+    ));
+    assert_eq!(
+        Some(new_job.job),
+        store
+            .load_active_project_review_job_for_pr(project_id, 1520)
+            .await
+            .expect("load active new head")
+    );
+}
+
+#[tokio::test]
+async fn watched_signal_does_not_replace_newer_delivery_on_same_head() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let now = Utc::now();
+    let watch = ProjectReviewCiWatch {
+        project_id,
+        pr: 1520,
+        head_sha: "current-head".to_string(),
+        delivery_id: Some("old-synchronize".to_string()),
+        reason: "old synchronize".to_string(),
+        next_check_at: now,
+        created_at: now,
+        updated_at: now,
+    };
+    store
+        .upsert_project_review_ci_watch(watch.clone())
+        .await
+        .expect("persist watch");
+    let active = store
+        .enqueue_project_review_job(test_review_job(
+            project_id,
+            1520,
+            "current-head",
+            Some("new-completed"),
+        ))
+        .await
+        .expect("enqueue completed signal");
+
+    let watched = store
+        .enqueue_project_review_job_from_ci_watch(
+            watch,
+            test_review_job(project_id, 1520, "current-head", Some("old-synchronize")),
+        )
+        .await
+        .expect("dedupe watched signal");
+    let ProjectReviewCiWatchEnqueueResult::Enqueued(watched) = watched else {
+        panic!("watch should still match");
+    };
+    let watched = *watched;
+    assert_eq!(active.job, watched.job);
+    assert_eq!(Some("new-completed"), watched.job.delivery_id.as_deref());
+}
+
+#[tokio::test]
+async fn old_job_preflight_cannot_overwrite_new_head_watch() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let old_job = store
+        .enqueue_project_review_job(test_review_job(
+            project_id,
+            1520,
+            "old-head",
+            Some("old-delivery"),
+        ))
+        .await
+        .expect("enqueue old job");
+    let now = Utc::now();
+    store
+        .claim_due_project_review_job(
+            project_id,
+            "worker-1".to_string(),
+            now,
+            now + chrono::TimeDelta::seconds(60),
+        )
+        .await
+        .expect("claim old job")
+        .expect("old job due");
+    let new_watch = ProjectReviewCiWatch {
+        project_id,
+        pr: 1520,
+        head_sha: "new-head".to_string(),
+        delivery_id: Some("new-delivery".to_string()),
+        reason: "new synchronize".to_string(),
+        next_check_at: now,
+        created_at: now,
+        updated_at: now,
+    };
+    store
+        .upsert_project_review_ci_watch(new_watch.clone())
+        .await
+        .expect("persist new head watch");
+
+    assert_eq!(
+        ProjectReviewCiPendingSkipResult::Skipped,
+        store
+            .skip_claimed_project_review_job_for_ci_pending(
+                old_job.job.id,
+                "worker-1".to_string(),
+                Some("old-delivery".to_string()),
+                now + chrono::TimeDelta::seconds(1),
+                now + chrono::TimeDelta::seconds(61),
+            )
+            .await
+            .expect("skip old job")
+    );
+    assert_eq!(
+        Some(new_watch),
+        store
+            .load_project_review_ci_watch(project_id, 1520)
+            .await
+            .expect("load preserved new head watch")
+    );
+}
+
+#[tokio::test]
 async fn ci_pending_skip_rechecks_changed_delivery_and_allows_next_generation() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
@@ -1803,6 +2144,7 @@ async fn ci_pending_skip_rechecks_changed_delivery_and_allows_next_generation() 
                 "worker-1".to_string(),
                 Some("delivery-1".to_string()),
                 now + chrono::TimeDelta::seconds(1),
+                now + chrono::TimeDelta::seconds(61),
             )
             .await
             .expect("compare stale delivery")
@@ -1815,10 +2157,18 @@ async fn ci_pending_skip_rechecks_changed_delivery_and_allows_next_generation() 
                 "worker-1".to_string(),
                 Some("delivery-2".to_string()),
                 now + chrono::TimeDelta::seconds(2),
+                now + chrono::TimeDelta::seconds(62),
             )
             .await
             .expect("skip unchanged delivery")
     );
+    let watch = store
+        .load_project_review_ci_watch(project_id, 42)
+        .await
+        .expect("load CI watch")
+        .expect("CI watch persisted atomically with skip");
+    assert_eq!("head-42", watch.head_sha);
+    assert_eq!(None, watch.delivery_id);
 
     let next = store
         .enqueue_project_review_job(test_review_job(

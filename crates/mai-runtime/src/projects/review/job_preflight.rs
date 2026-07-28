@@ -151,18 +151,20 @@ async fn skip_ci_pending_job(
     job: &mut ProjectReviewJobSummary,
     owner: &str,
 ) -> CiPendingPreflight {
+    let now = Utc::now();
     match ops
         .ops
         .skip_claimed_project_review_job_for_ci_pending(
             job.id,
             owner.to_string(),
             job.delivery_id.clone(),
-            Utc::now(),
+            now,
+            now + chrono::TimeDelta::seconds(super::PROJECT_REVIEW_CI_WATCH_INTERVAL_SECS as i64),
         )
         .await
     {
         Ok(ProjectReviewCiPendingSkipResult::Skipped) => {
-            super::job::skip_job(job, ProjectReviewSkipReason::CiPending, Utc::now());
+            super::job::skip_job(job, ProjectReviewSkipReason::CiPending, now);
             project_job_state_projection(ops, job, None, None).await;
             tracing::info!(
                 job_id = %job.id,

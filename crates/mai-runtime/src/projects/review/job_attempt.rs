@@ -19,7 +19,7 @@ use super::target::ProjectReviewRequest;
 use crate::{Result, RuntimeError};
 
 const REVIEW_CONTINUATION_PROMPT: &str = "Continue the same pull request review after a retryable interruption. Keep using the existing session note as the append-only findings ledger. Re-check the fixed PR head before submission and do not repeat completed investigation unnecessarily. Treat a GitHub review as already submitted by this logical Job only when it targets the fixed head and contains the exact `mai-review-job:<current job UUID>` marker identified by your system prompt, or when this same Job's final submission call returned an ambiguous network result that you are actively reconciling. Existing reviews without that exact marker, including reviews from another Job or another head, are context only and do not fulfill this Job. Never return `review_submitted` unless this Job submitted the review or you confirmed its exact marker and head. Complete the review and return only the required final JSON object.";
-const REVIEW_PREPARING_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const REVIEW_PREPARING_TIMEOUT: Duration = Duration::from_secs(16 * 60);
 const REVIEW_RUNNING_WATCHDOG_POLL: Duration = Duration::from_secs(30);
 const REVIEW_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
@@ -176,7 +176,7 @@ pub(crate) async fn run_project_review_job_attempt(
                 .await;
             }
             let result =
-                retryable_timeout_result("review preparation made no progress for five minutes");
+                retryable_timeout_result("review preparation made no progress for sixteen minutes");
             finish_attempt(
                 ops,
                 &job,

@@ -29,16 +29,23 @@ Queued -> Preparing -> Running -> SubmissionPending -> Reconciling -> Succeeded
 - 新 head 到达时，旧 head 的未完成 Job 进入 `Superseded`。
 - 同一 webhook delivery 对同一 PR 幂等；一个 check suite delivery 可以分别为多个关联 PR 建立 Job。
 - GitHub 对 fork PR 发送的 `workflow_run` 可能没有 `pull_requests`；此时使用同项目、
-  同 head 的持久化 Job 历史恢复 PR，不把完成信号静默确认为 `Ignored`。
+  同 head 的持久化 Job 历史或 CI watch 恢复 PR，不把完成信号静默确认为
+  `Ignored`。
 - 手动重新审查遇到同一 PR 的活跃 Job 时直接返回该 Job，不访问 GitHub、也不创建重复 generation。
 - 历史 Job 已终止时，手动重新审查可以创建新 Job。
 - `pull_request` webhook 单 PR eligibility 读取失败时不写内存队列，由 relay
-  的失败确认机制重投；当前事件尚不满足 eligibility 时返回 `Ignored`，等待后续
-  check 或 PR 事件。
+  的失败确认机制重投；当前事件仅因 CI 尚未完成而不满足 eligibility 时，按
+  `project + PR` 持久化 CI watch。相同 PR 的后续 delivery 更新同一 watch，新
+  head 原子替换旧 head。
 
 `pull_request` 的 `opened`、`reopened`、`synchronize`、`ready_for_review`，以及
 `check_run`、`check_suite`、`workflow_run` 的 `completed` 会唤醒对应 PR。`push`
 不创建 Review Job，仍只同步默认分支与项目缓存。
+
+server 启动后每分钟只复核到期的 CI watch，不缩短 30 分钟全量 selector 周期。
+CI 仍运行时 CAS 延期；变为合格时走同一个 PR 单活入队事务并删除 watch；PR 已
+关闭、变为 draft 或当前 head 已审查时删除 watch。GitHub 读取失败保留 watch
+等待重试。这样 completed webhook 偶发丢失或 server 重启都不会丢失待审查意图。
 
 ## Selector 契约
 
@@ -66,10 +73,11 @@ state=open&sort=created&direction=asc&per_page=20&page=N
 worker 只从数据库原子 claim 到期 Job。claim 写入实例 owner，租约为 60 秒，每 15 秒续租。数据库事务保证同一 Job 只有一个 owner；项目内任一仍存活的执行租约会阻止另一个实例启动新 Job。
 
 非手动 Job 被 claim 后必须再次读取当前 head、review 历史和 CI。此时 CI 仍在运行
-则进入 `Skipped(CiPending)`，不创建 Reviewer；下一条不同 completed delivery
-可以建立下一代 Job。若最终检查与跳过事务之间有新 completed delivery 更新了当前
-Job，delivery 条件写入失败，worker 必须重新读取同一个 Job 并再次检查，不能丢失
-这个唤醒信号。
+则在同一事务中进入 `Skipped(CiPending)` 并登记 CI watch，不创建 Reviewer；
+下一条不同 completed delivery 可以建立下一代 Job，completed delivery 丢失时由
+watch 复核补入。若最终检查与跳过事务之间有新 completed delivery 更新了当前 Job，
+delivery 条件写入失败，worker 必须重新读取同一个 Job 并再次检查，不能丢失这个
+唤醒信号。
 
 同一项目只允许一个逻辑 Review 占用 Reviewer。尚未到期的 `RetryWaiting` 或 `Reconciling` Job 会阻塞后续排队 Job；到期后优先恢复原 Job，再处理新 Job，避免保留 Session 的 Reviewer 与新任务竞争。
 

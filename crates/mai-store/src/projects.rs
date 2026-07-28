@@ -77,6 +77,14 @@ impl MaiStore {
         .delete()
         .exec(&mut tx)
         .await?;
+        Query::<List<ProjectReviewCiWatchRecord>>::filter(
+            ProjectReviewCiWatchRecord::fields()
+                .project_id()
+                .eq(project_id.to_string()),
+        )
+        .delete()
+        .exec(&mut tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }

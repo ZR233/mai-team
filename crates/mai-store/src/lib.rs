@@ -32,6 +32,7 @@ mod logs;
 mod projects;
 mod records;
 mod relay;
+mod review_ci_watches;
 mod review_jobs;
 mod runtime_state;
 mod schema;
@@ -55,9 +56,10 @@ pub use cleanup_tasks::{
     ProjectReviewCleanupResourceKind, ProjectReviewCleanupTask, ProjectReviewCleanupTaskStatus,
 };
 pub use config_document::ConfigDocumentStore;
+pub use review_ci_watches::ProjectReviewCiWatch;
 pub use review_jobs::{
-    ProjectReviewCiPendingSkipResult, ProjectReviewJobEnqueueDisposition,
-    ProjectReviewJobEnqueueResult,
+    ProjectReviewCiPendingSkipResult, ProjectReviewCiWatchEnqueueResult,
+    ProjectReviewJobEnqueueDisposition, ProjectReviewJobEnqueueResult,
 };
 pub use store::MaiStore;
 

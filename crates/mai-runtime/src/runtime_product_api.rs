@@ -366,6 +366,7 @@ impl AgentRuntime {
             request.head_sha,
         )
         .await?;
+        let evaluated_head_sha = evaluated.head_sha.clone();
         let summary = match evaluated.skip_reason.as_ref() {
             None => {
                 self.enqueue_project_review_signals_with_admission(
@@ -381,7 +382,45 @@ impl AgentRuntime {
                 )
                 .await?
             }
+            Some(ProjectReviewSkipReason::CiPending) => {
+                if let Some(head_sha) = evaluated_head_sha {
+                    let now = Utc::now();
+                    self.deps
+                        .store
+                        .upsert_project_review_ci_watch(mai_store::ProjectReviewCiWatch {
+                            project_id,
+                            pr: request.pr,
+                            head_sha,
+                            delivery_id: request.delivery_id.clone(),
+                            reason: request.reason.clone(),
+                            next_check_at: now
+                                + chrono::TimeDelta::seconds(
+                                    projects::review::PROJECT_REVIEW_CI_WATCH_INTERVAL_SECS as i64,
+                                ),
+                            created_at: now,
+                            updated_at: now,
+                        })
+                        .await?;
+                }
+                tracing::info!(
+                    project_id = %project_id,
+                    pr = request.pr,
+                    delivery_id = request.delivery_id.as_deref().unwrap_or_default(),
+                    "persisted project review relay signal while CI is pending"
+                );
+                ProjectReviewQueueSummary {
+                    ignored: vec![request.pr],
+                    ..Default::default()
+                }
+            }
             Some(reason) => {
+                if let Some(head_sha) = evaluated_head_sha {
+                    let _ = self
+                        .deps
+                        .store
+                        .delete_project_review_ci_watch(project_id, request.pr, head_sha)
+                        .await;
+                }
                 tracing::info!(
                     project_id = %project_id,
                     pr = request.pr,
@@ -442,6 +481,71 @@ impl AgentRuntime {
             "queued completed check project review signal"
         );
         Ok(summary)
+    }
+
+    pub(crate) async fn enqueue_project_review_ci_watch(
+        self: &Arc<Self>,
+        watch: mai_store::ProjectReviewCiWatch,
+        head_sha: String,
+    ) -> Result<projects::review::ci_watch::ProjectReviewCiWatchAdmission> {
+        let project = self.project(watch.project_id).await?;
+        if !project.summary.read().await.auto_review_enabled {
+            let _ = self
+                .deps
+                .store
+                .delete_project_review_ci_watch(watch.project_id, watch.pr, watch.head_sha)
+                .await?;
+            return Ok(projects::review::ci_watch::ProjectReviewCiWatchAdmission::Enqueued);
+        }
+        let signal = ProjectReviewSignalInput {
+            pr: watch.pr,
+            head_sha: Some(head_sha.clone()),
+            delivery_id: watch.delivery_id.clone(),
+            reason: format!("{}; CI watch became eligible", watch.reason),
+        };
+        let source = if signal.delivery_id.is_some() {
+            ProjectReviewJobSource::Webhook
+        } else {
+            ProjectReviewJobSource::Automatic
+        };
+        let queued = self
+            .deps
+            .store
+            .enqueue_project_review_job_from_ci_watch(
+                watch,
+                projects::review::job::new_project_review_job(
+                    projects::review::job::NewProjectReviewJob {
+                        project_id: project.summary.read().await.id,
+                        pr: signal.pr,
+                        head_sha,
+                        source,
+                        delivery_id: signal.delivery_id.clone(),
+                        reason: signal.reason.clone(),
+                    },
+                ),
+            )
+            .await?;
+        let queued = match queued {
+            mai_store::ProjectReviewCiWatchEnqueueResult::SignalChanged => {
+                return Ok(
+                    projects::review::ci_watch::ProjectReviewCiWatchAdmission::SignalChanged,
+                );
+            }
+            mai_store::ProjectReviewCiWatchEnqueueResult::Enqueued(queued) => *queued,
+        };
+        let mut summary = ProjectReviewQueueSummary::default();
+        match queued.disposition {
+            mai_store::ProjectReviewJobEnqueueDisposition::Queued => {
+                summary.queued.push(queued.job.pr);
+            }
+            mai_store::ProjectReviewJobEnqueueDisposition::Deduped => {
+                summary.deduped.push(queued.job.pr);
+            }
+        }
+        summary.jobs.push(queued.job);
+        self.finish_project_review_queue(project, vec![signal], &summary, true)
+            .await?;
+        Ok(projects::review::ci_watch::ProjectReviewCiWatchAdmission::Enqueued)
     }
 
     pub async fn project_review_prs_for_head(
@@ -587,51 +691,64 @@ impl AgentRuntime {
             }
             summary.jobs.push(queued.job);
         }
-        if !summary.queued.is_empty() || !summary.deduped.is_empty() {
-            for signal in signals_for_events.iter().filter(|signal| {
-                summary.queued.contains(&signal.pr) || summary.deduped.contains(&signal.pr)
-            }) {
-                self.events
-                    .publish(MaiProductEventKind::ProjectReviewQueued {
-                        project_id,
-                        delivery_id: signal.delivery_id.clone().unwrap_or_default(),
-                        pr: signal.pr,
-                        reason: signal.reason.clone(),
-                    })
-                    .await;
-            }
-            if let Some(job) = self
-                .deps
-                .store
-                .load_active_project_review_job(project_id)
-                .await?
-            {
-                self.set_project_review_state(
-                    project_id,
-                    projects::review::job::project_review_status_for_job(true, Some(&job)),
-                    projects::review::state::ReviewStateUpdate {
-                        current_reviewer_agent_id: job.reviewer_agent_id.map_or(
-                            projects::review::state::ReviewerAgentUpdate::Keep,
-                            projects::review::state::ReviewerAgentUpdate::Set,
-                        ),
-                        next_review_at: job.next_attempt_at,
-                        error: job.failure.as_ref().map(|failure| failure.message.clone()),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-            }
-            project.review_notify.notify_one();
-            if start_worker
-                && let Err(err) = self.start_project_review_loop_if_ready(project_id).await
-            {
-                tracing::warn!(
-                    project_id = %project_id,
-                    "failed to start project review loop after queueing PR signal: {err}"
-                );
-            }
-        }
+        self.finish_project_review_queue(project, signals_for_events, &summary, start_worker)
+            .await?;
         Ok(summary)
+    }
+
+    async fn finish_project_review_queue(
+        self: &Arc<Self>,
+        project: Arc<ProjectRecord>,
+        signals: Vec<ProjectReviewSignalInput>,
+        summary: &ProjectReviewQueueSummary,
+        start_worker: bool,
+    ) -> Result<()> {
+        if summary.queued.is_empty() && summary.deduped.is_empty() {
+            return Ok(());
+        }
+        let project_id = project.summary.read().await.id;
+        for signal in signals.iter().filter(|signal| {
+            summary.queued.contains(&signal.pr) || summary.deduped.contains(&signal.pr)
+        }) {
+            self.events
+                .publish(MaiProductEventKind::ProjectReviewQueued {
+                    project_id,
+                    delivery_id: signal.delivery_id.clone().unwrap_or_default(),
+                    pr: signal.pr,
+                    reason: signal.reason.clone(),
+                })
+                .await;
+        }
+        if let Some(job) = self
+            .deps
+            .store
+            .load_active_project_review_job(project_id)
+            .await?
+        {
+            self.set_project_review_state(
+                project_id,
+                projects::review::job::project_review_status_for_job(true, Some(&job)),
+                projects::review::state::ReviewStateUpdate {
+                    current_reviewer_agent_id: job.reviewer_agent_id.map_or(
+                        projects::review::state::ReviewerAgentUpdate::Keep,
+                        projects::review::state::ReviewerAgentUpdate::Set,
+                    ),
+                    next_review_at: job.next_attempt_at,
+                    error: job.failure.as_ref().map(|failure| failure.message.clone()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+        project.review_notify.notify_one();
+        if start_worker && let Err(err) = self.start_project_review_loop_if_ready(project_id).await
+        {
+            tracing::warn!(
+                project_id = %project_id,
+                "failed to start project review loop after queueing PR signal: {err}"
+            );
+        }
+        Ok(())
     }
 
     pub async fn send_task_message(

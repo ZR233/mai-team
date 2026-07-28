@@ -614,7 +614,7 @@ impl projects::review::job_attempt::ProjectReviewJobAttemptOps for Arc<AgentRunt
         &self,
         project_id: ProjectId,
     ) -> Result<projects::review::reviewer::PreparedProjectReviewerImage> {
-        const IMAGE_REFRESH_TIMEOUT: Duration = Duration::from_secs(4 * 60);
+        const IMAGE_REFRESH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
         let project = AgentRuntime::project(self.as_ref(), project_id).await?;
         let project = project.summary.read().await.clone();
         let maintainer = AgentRuntime::agent(self.as_ref(), project.maintainer_agent_id).await?;
@@ -773,23 +773,6 @@ fn redact_url_userinfo(word: &str) -> String {
     format!("{}[redacted]{}", &word[..scheme_end], &word[at..])
 }
 
-#[cfg(test)]
-mod image_warning_tests {
-    use super::sanitize_review_environment_warning;
-
-    #[test]
-    fn image_warning_diagnostic_is_bounded_and_redacts_credentials() {
-        let message = sanitize_review_environment_warning(
-            "pull https://user:secret@registry.example failed Authorization: Bearer-secret token=abc ghp_secret",
-        );
-
-        assert_eq!(
-            "pull https://[redacted]@registry.example failed Authorization: [redacted] [redacted] [redacted]",
-            message
-        );
-    }
-}
-
 fn reviewer_inactivity_timeout(
     runtime: &AgentRuntime,
     snapshot: &pl_core::AgentSnapshot,
@@ -834,6 +817,97 @@ fn reviewer_inactivity_timeout(
         ));
     }
     Ok(timeout)
+}
+
+impl projects::review::ci_watch::ProjectReviewCiWatchOps for Arc<AgentRuntime> {
+    async fn load_due_project_review_ci_watches(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<mai_store::ProjectReviewCiWatch>> {
+        Ok(self
+            .deps
+            .store
+            .load_due_project_review_ci_watches(now, limit)
+            .await?)
+    }
+
+    fn evaluate_project_review_pr(
+        &self,
+        project_id: ProjectId,
+        pr: u64,
+        head_sha_hint: Option<String>,
+    ) -> impl std::future::Future<
+        Output = Result<projects::review::eligibility::EvaluatedProjectReviewPr>,
+    > + Send {
+        projects::review::eligibility::evaluate_project_review_pr(
+            self,
+            project_id,
+            pr,
+            head_sha_hint,
+        )
+    }
+
+    fn enqueue_project_review_ci_watch(
+        &self,
+        watch: mai_store::ProjectReviewCiWatch,
+        head_sha: String,
+    ) -> impl std::future::Future<
+        Output = Result<projects::review::ci_watch::ProjectReviewCiWatchAdmission>,
+    > + Send {
+        AgentRuntime::enqueue_project_review_ci_watch(self, watch, head_sha)
+    }
+
+    async fn replace_project_review_ci_watch_head(
+        &self,
+        watch: mai_store::ProjectReviewCiWatch,
+        head_sha: String,
+        next_check_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        Ok(self
+            .deps
+            .store
+            .replace_project_review_ci_watch_head(
+                watch.project_id,
+                watch.pr,
+                watch.head_sha,
+                head_sha,
+                next_check_at,
+                updated_at,
+            )
+            .await?)
+    }
+
+    async fn reschedule_project_review_ci_watch(
+        &self,
+        watch: mai_store::ProjectReviewCiWatch,
+        next_check_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        Ok(self
+            .deps
+            .store
+            .reschedule_project_review_ci_watch(
+                watch.project_id,
+                watch.pr,
+                watch.head_sha,
+                next_check_at,
+                updated_at,
+            )
+            .await?)
+    }
+
+    async fn delete_project_review_ci_watch(
+        &self,
+        watch: mai_store::ProjectReviewCiWatch,
+    ) -> Result<bool> {
+        Ok(self
+            .deps
+            .store
+            .delete_project_review_ci_watch(watch.project_id, watch.pr, watch.head_sha)
+            .await?)
+    }
 }
 
 impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
@@ -1061,6 +1135,7 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
         owner: String,
         expected_delivery_id: Option<String>,
         updated_at: DateTime<Utc>,
+        next_check_at: DateTime<Utc>,
     ) -> Result<mai_store::ProjectReviewCiPendingSkipResult> {
         Ok(self
             .deps
@@ -1070,6 +1145,7 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
                 owner,
                 expected_delivery_id,
                 updated_at,
+                next_check_at,
             )
             .await?)
     }
@@ -1185,5 +1261,22 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
         agent_id: AgentId,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         AgentRuntime::delete_agent(self.as_ref(), agent_id)
+    }
+}
+
+#[cfg(test)]
+mod image_warning_tests {
+    use super::sanitize_review_environment_warning;
+
+    #[test]
+    fn image_warning_diagnostic_is_bounded_and_redacts_credentials() {
+        let message = sanitize_review_environment_warning(
+            "pull https://user:secret@registry.example failed Authorization: Bearer-secret token=abc ghp_secret",
+        );
+
+        assert_eq!(
+            "pull https://[redacted]@registry.example failed Authorization: [redacted] [redacted] [redacted]",
+            message
+        );
     }
 }

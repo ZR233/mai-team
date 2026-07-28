@@ -188,6 +188,10 @@ impl AgentRuntime {
             )
             .await;
         });
+        let ci_watch_runtime = Arc::clone(&runtime);
+        tokio::spawn(async move {
+            projects::review::ci_watch::run_project_review_ci_watch_loop(&ci_watch_runtime).await;
+        });
         runtime.start_enabled_project_review_workers().await;
         Ok(runtime)
     }

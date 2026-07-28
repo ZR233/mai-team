@@ -177,6 +177,23 @@ pub(crate) struct ProjectReviewJobRecord {
 }
 
 #[derive(Debug, Clone, toasty::Model)]
+#[table = "project_review_ci_watches"]
+pub(crate) struct ProjectReviewCiWatchRecord {
+    #[key]
+    pub(crate) id: String,
+    #[index]
+    pub(crate) project_id: String,
+    pub(crate) pr: i64,
+    pub(crate) head_sha: String,
+    pub(crate) delivery_id: Option<String>,
+    pub(crate) reason: String,
+    #[index]
+    pub(crate) next_check_at: String,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
 #[table = "project_review_cleanup_tasks"]
 pub(crate) struct ProjectReviewCleanupTaskRecord {
     #[key]

@@ -6,7 +6,8 @@ use std::time::Duration;
 use toasty_driver_sqlite::Sqlite;
 
 pub(crate) const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-pub(crate) const SCHEMA_VERSION: &str = "26";
+pub(crate) const SCHEMA_VERSION: &str = "27";
+const REVIEW_ENVIRONMENT_WARNING_SCHEMA_VERSION: &str = "26";
 const PREVIOUS_SCHEMA_VERSION: &str = "25";
 const RESOURCE_CLEANUP_SCHEMA_VERSION: &str = "24";
 const REVIEW_SKIP_SCHEMA_VERSION: &str = "23";
@@ -26,6 +27,7 @@ pub(crate) async fn build_db(path: &Path) -> Result<Db> {
         TaskReviewRecord,
         ProjectReviewRunRecord,
         ProjectReviewJobRecord,
+        ProjectReviewCiWatchRecord,
         ProjectReviewCleanupTaskRecord,
         PlanHistoryRecord,
         AgentRecordRow,
@@ -69,25 +71,33 @@ pub(crate) fn migrate_supported_schema(path: &Path) -> Result<bool> {
         .optional()?;
     match current.as_deref() {
         Some(SCHEMA_VERSION) => Ok(true),
+        Some(REVIEW_ENVIRONMENT_WARNING_SCHEMA_VERSION) => {
+            migrate_review_ci_watch_schema(&mut connection)?;
+            Ok(true)
+        }
         Some(PREVIOUS_SCHEMA_VERSION) => {
             migrate_review_environment_warning_schema(&mut connection)?;
+            migrate_review_ci_watch_schema(&mut connection)?;
             Ok(true)
         }
         Some(RESOURCE_CLEANUP_SCHEMA_VERSION) => {
             migrate_resource_cleanup_schema(&mut connection)?;
             migrate_review_environment_warning_schema(&mut connection)?;
+            migrate_review_ci_watch_schema(&mut connection)?;
             Ok(true)
         }
         Some(REVIEW_SKIP_SCHEMA_VERSION) => {
             migrate_review_skip_schema(&mut connection)?;
             migrate_resource_cleanup_schema(&mut connection)?;
             migrate_review_environment_warning_schema(&mut connection)?;
+            migrate_review_ci_watch_schema(&mut connection)?;
             Ok(true)
         }
         Some(LEGACY_REVIEW_SCHEMA_VERSION) => {
             migrate_review_lifecycle_schema(&mut connection)?;
             migrate_resource_cleanup_schema(&mut connection)?;
             migrate_review_environment_warning_schema(&mut connection)?;
+            migrate_review_ci_watch_schema(&mut connection)?;
             Ok(true)
         }
         None | Some(_) => Ok(false),
@@ -235,6 +245,36 @@ fn migrate_review_environment_warning_schema(connection: &mut Connection) -> Res
         "project_review_jobs",
         "environment_warning_json",
         "TEXT",
+    )?;
+    transaction.execute(
+        "UPDATE settings SET value = ?1 WHERE key = ?2",
+        params![
+            REVIEW_ENVIRONMENT_WARNING_SCHEMA_VERSION,
+            SETTING_SCHEMA_VERSION
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_review_ci_watch_schema(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS project_review_ci_watches (
+            id TEXT PRIMARY KEY NOT NULL,
+            project_id TEXT NOT NULL,
+            pr INTEGER NOT NULL,
+            head_sha TEXT NOT NULL,
+            delivery_id TEXT,
+            reason TEXT NOT NULL,
+            next_check_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS project_review_ci_watches_project_id_idx
+            ON project_review_ci_watches(project_id);
+        CREATE INDEX IF NOT EXISTS project_review_ci_watches_next_check_at_idx
+            ON project_review_ci_watches(next_check_at);",
     )?;
     transaction.execute(
         "UPDATE settings SET value = ?1 WHERE key = ?2",

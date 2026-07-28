@@ -162,6 +162,7 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         owner: String,
         expected_delivery_id: Option<String>,
         updated_at: DateTime<Utc>,
+        next_check_at: DateTime<Utc>,
     ) -> impl Future<Output = Result<mai_store::ProjectReviewCiPendingSkipResult>> + Send;
 
     fn heartbeat_project_review_job(
@@ -1294,6 +1295,7 @@ mod tests {
             owner: String,
             expected_delivery_id: Option<String>,
             updated_at: chrono::DateTime<chrono::Utc>,
+            _next_check_at: chrono::DateTime<chrono::Utc>,
         ) -> crate::Result<mai_store::ProjectReviewCiPendingSkipResult> {
             let mut jobs = self.review_jobs.lock().await;
             let Some(job) = jobs.iter_mut().find(|job| job.id == job_id) else {

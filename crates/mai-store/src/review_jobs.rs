@@ -24,6 +24,18 @@ pub struct ProjectReviewJobEnqueueResult {
     pub job: ProjectReviewJobSummary,
 }
 
+#[derive(Debug, Clone)]
+pub enum ProjectReviewCiWatchEnqueueResult {
+    Enqueued(Box<ProjectReviewJobEnqueueResult>),
+    SignalChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectReviewSignalFreshness {
+    Current,
+    Watched,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectReviewCiPendingSkipResult {
     Skipped,
@@ -133,8 +145,13 @@ impl MaiStore {
         tokio::task::spawn_blocking(move || {
             let connection = open_review_job_connection(&path)?;
             let mut statement = connection.prepare(
-                "SELECT DISTINCT pr FROM project_review_jobs \
-                 WHERE project_id = ?1 AND head_sha = ?2 ORDER BY pr ASC",
+                "SELECT DISTINCT pr FROM (
+                    SELECT pr FROM project_review_jobs
+                    WHERE project_id = ?1 AND head_sha = ?2
+                    UNION ALL
+                    SELECT pr FROM project_review_ci_watches
+                    WHERE project_id = ?1 AND head_sha = ?2
+                 ) ORDER BY pr ASC",
             )?;
             let rows = statement.query_map(params![project_id.to_string(), head_sha], |row| {
                 row.get::<_, i64>(0)
@@ -173,6 +190,51 @@ impl MaiStore {
             .map_err(|error| {
                 StoreError::InvalidConfig(format!("review job enqueue task failed: {error}"))
             })?
+    }
+
+    pub async fn enqueue_project_review_job_from_ci_watch(
+        &self,
+        watch: ProjectReviewCiWatch,
+        candidate: ProjectReviewJobSummary,
+    ) -> Result<ProjectReviewCiWatchEnqueueResult> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = open_review_job_connection(&path)?;
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let persisted_head = transaction
+                .query_row(
+                    "SELECT head_sha FROM project_review_ci_watches WHERE id = ?1",
+                    params![format!("{}:{}", watch.project_id, watch.pr)],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if persisted_head.as_deref() != Some(watch.head_sha.as_str()) {
+                transaction.commit()?;
+                return Ok(ProjectReviewCiWatchEnqueueResult::SignalChanged);
+            }
+            let deleted = transaction.execute(
+                "DELETE FROM project_review_ci_watches WHERE id = ?1 AND head_sha = ?2",
+                params![format!("{}:{}", watch.project_id, watch.pr), watch.head_sha],
+            )?;
+            if deleted != 1 {
+                transaction.commit()?;
+                return Ok(ProjectReviewCiWatchEnqueueResult::SignalChanged);
+            }
+            let queued = enqueue_in_transaction(
+                &transaction,
+                candidate,
+                ProjectReviewSignalFreshness::Watched,
+            )?;
+            transaction.commit()?;
+            Ok(ProjectReviewCiWatchEnqueueResult::Enqueued(Box::new(
+                queued,
+            )))
+        })
+        .await
+        .map_err(|error| {
+            StoreError::InvalidConfig(format!("CI watch review job enqueue task failed: {error}"))
+        })?
     }
 
     pub async fn save_project_review_job(&self, job: ProjectReviewJobSummary) -> Result<()> {
@@ -223,6 +285,7 @@ impl MaiStore {
         owner: String,
         expected_delivery_id: Option<String>,
         updated_at: DateTime<Utc>,
+        next_check_at: DateTime<Utc>,
     ) -> Result<ProjectReviewCiPendingSkipResult> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
@@ -254,6 +317,26 @@ impl MaiStore {
                 transaction.commit()?;
                 return Ok(ProjectReviewCiPendingSkipResult::LostLease);
             }
+            transaction.execute(
+                "INSERT INTO project_review_ci_watches (
+                    id, project_id, pr, head_sha, delivery_id, reason,
+                    next_check_at, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+                 ON CONFLICT(id) DO UPDATE SET
+                    next_check_at = excluded.next_check_at,
+                    updated_at = excluded.updated_at
+                 WHERE project_review_ci_watches.head_sha = excluded.head_sha",
+                params![
+                    format!("{}:{}", existing.project_id, existing.pr),
+                    existing.project_id,
+                    existing.pr,
+                    existing.head_sha,
+                    Option::<String>::None,
+                    format!("{}; preflight CI pending", existing.reason),
+                    next_check_at.to_rfc3339(),
+                    updated_at.to_rfc3339(),
+                ],
+            )?;
             ensure_project_review_cleanup_tasks(&transaction, job_id, updated_at)?;
             transaction.commit()?;
             Ok(ProjectReviewCiPendingSkipResult::Skipped)
@@ -545,22 +628,37 @@ fn enqueue_on_path(
     let mut connection = open_review_job_connection(path)?;
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let result = enqueue_in_transaction(
+        &transaction,
+        candidate,
+        ProjectReviewSignalFreshness::Current,
+    )?;
+    transaction.commit()?;
+    Ok(result)
+}
+
+fn enqueue_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    candidate: ProjectReviewJobSummary,
+    freshness: ProjectReviewSignalFreshness,
+) -> Result<ProjectReviewJobEnqueueResult> {
     if let Some(delivery_id) = candidate.delivery_id.as_deref()
-        && let Some(existing) = load_job_by_delivery(
-            &transaction,
-            candidate.project_id,
-            candidate.pr,
-            delivery_id,
-        )?
+        && let Some(existing) =
+            load_job_by_delivery(transaction, candidate.project_id, candidate.pr, delivery_id)?
     {
-        transaction.commit()?;
         return Ok(ProjectReviewJobEnqueueResult {
             disposition: ProjectReviewJobEnqueueDisposition::Deduped,
             job: existing.into_summary()?,
         });
     }
-    if let Some(existing) = load_active_job(&transaction, candidate.project_id, candidate.pr)? {
+    if let Some(existing) = load_active_job(transaction, candidate.project_id, candidate.pr)? {
         if existing.head_sha == candidate.head_sha {
+            if freshness == ProjectReviewSignalFreshness::Watched {
+                return Ok(ProjectReviewJobEnqueueResult {
+                    disposition: ProjectReviewJobEnqueueDisposition::Deduped,
+                    job: existing.into_summary()?,
+                });
+            }
             transaction.execute(
                 "UPDATE project_review_jobs SET delivery_id = COALESCE(?1, delivery_id), \
                  reason = ?2, updated_at = ?3 WHERE id = ?4",
@@ -572,12 +670,11 @@ fn enqueue_on_path(
                 ],
             )?;
             let existing_id = parse_uuid(&existing.id)?;
-            let job = load_job(&transaction, existing_id)?
+            let job = load_job(transaction, existing_id)?
                 .ok_or_else(|| {
                     StoreError::InvalidConfig("deduped review job vanished".to_string())
                 })?
                 .into_summary()?;
-            transaction.commit()?;
             return Ok(ProjectReviewJobEnqueueResult {
                 disposition: ProjectReviewJobEnqueueDisposition::Deduped,
                 job,
@@ -589,13 +686,12 @@ fn enqueue_on_path(
             params![candidate.created_at.to_rfc3339(), existing.id],
         )?;
         ensure_project_review_cleanup_tasks(
-            &transaction,
+            transaction,
             parse_uuid(&existing.id)?,
             candidate.created_at,
         )?;
     }
-    upsert_job(&transaction, &candidate)?;
-    transaction.commit()?;
+    upsert_job(transaction, &candidate)?;
     Ok(ProjectReviewJobEnqueueResult {
         disposition: ProjectReviewJobEnqueueDisposition::Queued,
         job: candidate,
