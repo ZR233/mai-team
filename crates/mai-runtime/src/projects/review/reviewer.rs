@@ -799,6 +799,16 @@ mod tests {
         assert_eq!(*ops.operations.lock().await, vec!["ensure_session"]);
     }
 
+    #[test]
+    fn reviewer_prompt_requires_changed_runtime_entrypoints_to_run() {
+        let ops = fake_reviewer_ops(PreparationFailure::Create);
+        let prompt = crate::projects::review::project_reviewer_system_prompt(&ops.context);
+
+        assert!(prompt.contains("execute that exact entrypoint end to end"));
+        assert!(prompt.contains("A blocking static finding does not excuse skipping"));
+        assert!(prompt.contains("decisive build, launch, and guest output"));
+    }
+
     #[tokio::test]
     async fn restart_adopts_matching_reviewer_created_before_job_link_was_saved() {
         let mut ops = fake_reviewer_ops(PreparationFailure::Create);
