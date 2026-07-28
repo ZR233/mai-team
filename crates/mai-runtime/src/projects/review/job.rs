@@ -40,6 +40,7 @@ pub(crate) fn new_project_review_job(input: NewProjectReviewJob) -> ProjectRevie
         lease_owner: None,
         lease_expires_at: None,
         failure: None,
+        environment_warning: None,
         skip_reason: None,
         submission_intent: None,
         submission_receipt: None,

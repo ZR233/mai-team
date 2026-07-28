@@ -211,6 +211,15 @@ pub struct ProjectReviewFailure {
     pub retry: pl_protocol::RetryDisposition,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectReviewEnvironmentWarning {
+    pub code: String,
+    pub image: String,
+    pub cached_image_id: String,
+    pub message: String,
+    pub observed_at: DateTime<Utc>,
+}
+
 impl From<pl_protocol::TurnFailure> for ProjectReviewFailure {
     fn from(failure: pl_protocol::TurnFailure) -> Self {
         let category = match failure.category {
@@ -616,6 +625,8 @@ pub struct ProjectReviewJobSummary {
     pub lease_expires_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub failure: Option<ProjectReviewFailure>,
+    #[serde(default)]
+    pub environment_warning: Option<ProjectReviewEnvironmentWarning>,
     #[serde(default)]
     pub skip_reason: Option<ProjectReviewSkipReason>,
     #[serde(default)]
@@ -2379,6 +2390,13 @@ mod tests {
                 retry: pl_protocol::RetryDisposition::Retryable {
                     retry_after_ms: Some(30_000),
                 },
+            }),
+            environment_warning: Some(ProjectReviewEnvironmentWarning {
+                code: "latest_image_refresh_failed".to_string(),
+                image: "ghcr.io/example/reviewer:latest".to_string(),
+                cached_image_id: "sha256:cached".to_string(),
+                message: "using cached image".to_string(),
+                observed_at: created_at,
             }),
             skip_reason: None,
             submission_intent: Some(ProjectReviewSubmissionIntent {

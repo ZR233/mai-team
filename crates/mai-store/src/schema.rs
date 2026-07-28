@@ -6,8 +6,9 @@ use std::time::Duration;
 use toasty_driver_sqlite::Sqlite;
 
 pub(crate) const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-pub(crate) const SCHEMA_VERSION: &str = "25";
-const PREVIOUS_SCHEMA_VERSION: &str = "24";
+pub(crate) const SCHEMA_VERSION: &str = "26";
+const PREVIOUS_SCHEMA_VERSION: &str = "25";
+const RESOURCE_CLEANUP_SCHEMA_VERSION: &str = "24";
 const REVIEW_SKIP_SCHEMA_VERSION: &str = "23";
 const LEGACY_REVIEW_SCHEMA_VERSION: &str = "22";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
@@ -69,17 +70,24 @@ pub(crate) fn migrate_supported_schema(path: &Path) -> Result<bool> {
     match current.as_deref() {
         Some(SCHEMA_VERSION) => Ok(true),
         Some(PREVIOUS_SCHEMA_VERSION) => {
+            migrate_review_environment_warning_schema(&mut connection)?;
+            Ok(true)
+        }
+        Some(RESOURCE_CLEANUP_SCHEMA_VERSION) => {
             migrate_resource_cleanup_schema(&mut connection)?;
+            migrate_review_environment_warning_schema(&mut connection)?;
             Ok(true)
         }
         Some(REVIEW_SKIP_SCHEMA_VERSION) => {
             migrate_review_skip_schema(&mut connection)?;
             migrate_resource_cleanup_schema(&mut connection)?;
+            migrate_review_environment_warning_schema(&mut connection)?;
             Ok(true)
         }
         Some(LEGACY_REVIEW_SCHEMA_VERSION) => {
             migrate_review_lifecycle_schema(&mut connection)?;
             migrate_resource_cleanup_schema(&mut connection)?;
+            migrate_review_environment_warning_schema(&mut connection)?;
             Ok(true)
         }
         None | Some(_) => Ok(false),
@@ -91,7 +99,7 @@ fn migrate_review_skip_schema(connection: &mut Connection) -> Result<()> {
     add_column_if_missing(&transaction, "project_review_jobs", "skip_reason", "TEXT")?;
     transaction.execute(
         "UPDATE settings SET value = ?1 WHERE key = ?2",
-        params![PREVIOUS_SCHEMA_VERSION, SETTING_SCHEMA_VERSION],
+        params![RESOURCE_CLEANUP_SCHEMA_VERSION, SETTING_SCHEMA_VERSION],
     )?;
     transaction.commit()?;
     Ok(())
@@ -211,6 +219,22 @@ fn migrate_resource_cleanup_schema(connection: &mut Connection) -> Result<()> {
                 SELECT 1 FROM agent_sessions
                 WHERE agent_sessions.id = session_view_snapshots.session_id
             );",
+    )?;
+    transaction.execute(
+        "UPDATE settings SET value = ?1 WHERE key = ?2",
+        params![PREVIOUS_SCHEMA_VERSION, SETTING_SCHEMA_VERSION],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_review_environment_warning_schema(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    add_column_if_missing(
+        &transaction,
+        "project_review_jobs",
+        "environment_warning_json",
+        "TEXT",
     )?;
     transaction.execute(
         "UPDATE settings SET value = ?1 WHERE key = ?2",

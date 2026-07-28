@@ -478,6 +478,7 @@ impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
             .await
     }
 
+    #[cfg(test)]
     fn prepare_project_reviewer(
         &self,
         project_id: ProjectId,
@@ -609,6 +610,107 @@ impl projects::review::job_attempt::ProjectReviewJobAttemptOps for Arc<AgentRunt
         )
     }
 
+    async fn prepare_project_reviewer_image(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<projects::review::reviewer::PreparedProjectReviewerImage> {
+        const IMAGE_REFRESH_TIMEOUT: Duration = Duration::from_secs(4 * 60);
+        let project = AgentRuntime::project(self.as_ref(), project_id).await?;
+        let project = project.summary.read().await.clone();
+        let maintainer = AgentRuntime::agent(self.as_ref(), project.maintainer_agent_id).await?;
+        let maintainer = maintainer.summary.read().await.clone();
+        let outcome = self
+            .deps
+            .docker
+            .refresh_floating_latest_image(&maintainer.docker_image, IMAGE_REFRESH_TIMEOUT)
+            .await?;
+        let (docker_image, environment_warning) = match outcome {
+            mai_docker::ImageRefreshOutcome::NotRequired { image } => {
+                tracing::debug!(project_id = %project_id, image, "reviewer image refresh not required");
+                (image, None)
+            }
+            mai_docker::ImageRefreshOutcome::UpToDate {
+                image,
+                image_id,
+                elapsed,
+            } => {
+                tracing::info!(
+                    project_id = %project_id,
+                    image,
+                    image_id,
+                    elapsed_ms = elapsed.as_millis(),
+                    "reviewer latest image is up to date"
+                );
+                (image, None)
+            }
+            mai_docker::ImageRefreshOutcome::Updated {
+                image,
+                previous_image_id,
+                image_id,
+                elapsed,
+            } => {
+                tracing::info!(
+                    project_id = %project_id,
+                    image,
+                    previous_image_id,
+                    image_id,
+                    elapsed_ms = elapsed.as_millis(),
+                    "reviewer latest image was updated"
+                );
+                (image, None)
+            }
+            mai_docker::ImageRefreshOutcome::CachedFallback {
+                image,
+                image_id,
+                elapsed,
+                error,
+            } => {
+                let message = sanitize_review_environment_warning(&error);
+                tracing::warn!(
+                    project_id = %project_id,
+                    image,
+                    image_id,
+                    elapsed_ms = elapsed.as_millis(),
+                    error = message,
+                    "reviewer latest image refresh failed; using cached image"
+                );
+                let cached_image_id = image_id.clone();
+                (
+                    cached_image_id.clone(),
+                    Some(ProjectReviewEnvironmentWarning {
+                        code: "latest_image_refresh_failed".to_string(),
+                        image,
+                        cached_image_id,
+                        message,
+                        observed_at: now(),
+                    }),
+                )
+            }
+        };
+        Ok(projects::review::reviewer::PreparedProjectReviewerImage {
+            docker_image,
+            environment_warning,
+        })
+    }
+
+    fn prepare_project_reviewer_with_image(
+        &self,
+        project_id: ProjectId,
+        run_id: Uuid,
+        request: projects::review::target::ProjectReviewRequest,
+        docker_image: String,
+    ) -> impl std::future::Future<
+        Output = Result<projects::review::reviewer::PreparedProjectReviewer>,
+    > + Send {
+        projects::review::reviewer::prepare_project_reviewer_with_image(
+            self,
+            project_id,
+            run_id,
+            request,
+            docker_image,
+        )
+    }
+
     async fn cleanup_timed_out_review_preparation(&self, project_id: ProjectId) -> Result<()> {
         for reviewer in self.project_auto_reviewer_agents(project_id).await {
             AgentRuntime::delete_agent(self.as_ref(), reviewer.id).await?;
@@ -625,6 +727,66 @@ impl projects::review::job_attempt::ProjectReviewJobAttemptOps for Arc<AgentRunt
             None,
         )
         .await;
+    }
+}
+
+fn sanitize_review_environment_warning(error: &str) -> String {
+    const MAX_WARNING_CHARS: usize = 512;
+    let mut redact_next = false;
+    let compact = error
+        .split_whitespace()
+        .map(|word| {
+            if redact_next {
+                redact_next = false;
+                return "[redacted]".to_string();
+            }
+            let lowercase = word.to_ascii_lowercase();
+            if lowercase == "bearer" || lowercase == "authorization:" {
+                redact_next = true;
+                return word.to_string();
+            }
+            if lowercase.contains("token=")
+                || lowercase.contains("password=")
+                || lowercase.starts_with("ghp_")
+                || lowercase.starts_with("github_pat_")
+                || lowercase.starts_with("gho_")
+                || lowercase.starts_with("ghs_")
+                || lowercase.starts_with("glpat-")
+            {
+                return "[redacted]".to_string();
+            }
+            redact_url_userinfo(word)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    compact.chars().take(MAX_WARNING_CHARS).collect()
+}
+
+fn redact_url_userinfo(word: &str) -> String {
+    let Some(scheme_end) = word.find("://").map(|index| index + 3) else {
+        return word.to_string();
+    };
+    let Some(relative_at) = word[scheme_end..].find('@') else {
+        return word.to_string();
+    };
+    let at = scheme_end + relative_at;
+    format!("{}[redacted]{}", &word[..scheme_end], &word[at..])
+}
+
+#[cfg(test)]
+mod image_warning_tests {
+    use super::sanitize_review_environment_warning;
+
+    #[test]
+    fn image_warning_diagnostic_is_bounded_and_redacts_credentials() {
+        let message = sanitize_review_environment_warning(
+            "pull https://user:secret@registry.example failed Authorization: Bearer-secret token=abc ghp_secret",
+        );
+
+        assert_eq!(
+            "pull https://[redacted]@registry.example failed Authorization: [redacted] [redacted] [redacted]",
+            message
+        );
     }
 }
 

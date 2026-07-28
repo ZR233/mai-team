@@ -13,6 +13,7 @@ use super::cycle::{
     ProjectReviewCycleOps, ReviewerProgress, last_turn_cancelled, parse_reviewer_final_response,
 };
 use super::reviewer::PreparedProjectReviewer;
+use super::reviewer::PreparedProjectReviewerImage;
 use super::runs::FinishReviewRun;
 use super::target::ProjectReviewRequest;
 use crate::{Result, RuntimeError};
@@ -43,6 +44,19 @@ pub(crate) trait ProjectReviewJobAttemptOps: ProjectReviewCycleOps {
         &self,
         job: ProjectReviewJobSummary,
         reviewer_id: AgentId,
+    ) -> impl Future<Output = Result<PreparedProjectReviewer>> + Send;
+
+    fn prepare_project_reviewer_image(
+        &self,
+        project_id: mai_protocol::ProjectId,
+    ) -> impl Future<Output = Result<PreparedProjectReviewerImage>> + Send;
+
+    fn prepare_project_reviewer_with_image(
+        &self,
+        project_id: mai_protocol::ProjectId,
+        run_id: Uuid,
+        request: ProjectReviewRequest,
+        docker_image: String,
     ) -> impl Future<Output = Result<PreparedProjectReviewer>> + Send;
 
     fn cleanup_timed_out_review_preparation(
@@ -112,13 +126,18 @@ pub(crate) async fn run_project_review_job_attempt(
         match job.reviewer_agent_id {
             Some(reviewer_id) => ops.resume_project_reviewer(job.clone(), reviewer_id).await,
             None => {
-                ops.prepare_project_reviewer(
+                let image = ops.prepare_project_reviewer_image(job.project_id).await?;
+                job.environment_warning = image.environment_warning;
+                job.updated_at = now();
+                save_claimed_job(ops, &job, &owner).await?;
+                ops.prepare_project_reviewer_with_image(
                     job.project_id,
                     job.id,
                     ProjectReviewRequest {
                         pr: job.pr,
                         head_sha_hint: Some(job.head_sha.clone()),
                     },
+                    image.docker_image,
                 )
                 .await
             }

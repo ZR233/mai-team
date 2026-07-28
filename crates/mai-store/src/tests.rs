@@ -2,10 +2,10 @@ use super::*;
 use crate::schema::{SCHEMA_VERSION, SETTING_SCHEMA_VERSION};
 use mai_protocol::{
     AgentResourceState, AgentRole, AgentState, ErrorSeverity, McpServerScope, McpServerTransport,
-    MessageRole, ProjectCloneStatus, ProjectReviewDecision, ProjectReviewJobSource,
-    ProjectReviewJobStatus, ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewSkipReason,
-    ProjectReviewStatus, ProjectReviewSubmissionIntent, ProjectReviewSubmissionReceipt,
-    ProjectStatus, SessionEventKind, SessionEventPosition,
+    MessageRole, ProjectCloneStatus, ProjectReviewDecision, ProjectReviewEnvironmentWarning,
+    ProjectReviewJobSource, ProjectReviewJobStatus, ProjectReviewOutcome, ProjectReviewRunStatus,
+    ProjectReviewSkipReason, ProjectReviewStatus, ProjectReviewSubmissionIntent,
+    ProjectReviewSubmissionReceipt, ProjectStatus, SessionEventKind, SessionEventPosition,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -1443,6 +1443,53 @@ async fn schema_24_removes_orphan_session_projection_rows() {
 }
 
 #[tokio::test]
+async fn schema_25_adds_review_environment_warning_without_rebuilding_jobs() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("config.sqlite3");
+    let config_path = dir.path().join("config.toml");
+    let store = MaiStore::open_with_config_path(&db_path, &config_path)
+        .await
+        .expect("open current schema");
+    let project_id = Uuid::new_v4();
+    let job = test_review_job(project_id, 1520, "head-1520", None);
+    let job_id = job.id;
+    store
+        .save_project_review_job(job.clone())
+        .await
+        .expect("save review job");
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute_batch(
+            "ALTER TABLE project_review_jobs DROP COLUMN environment_warning_json;
+             UPDATE settings SET value = '25' WHERE key = 'toasty_schema_version';",
+        )
+        .expect("downgrade fixture to schema 25");
+    drop(connection);
+
+    let reopened = MaiStore::open_with_config_path(&db_path, &config_path)
+        .await
+        .expect("migrate schema 25");
+    assert_eq!(
+        Some(SCHEMA_VERSION.to_string()),
+        reopened
+            .get_setting(SETTING_SCHEMA_VERSION)
+            .await
+            .expect("schema version")
+    );
+    assert_eq!(
+        Some(job),
+        reopened
+            .load_project_review_job(project_id, job_id)
+            .await
+            .expect("load preserved review job")
+    );
+    drop(reopened);
+    assert!(crate::schema::migrate_supported_schema(&db_path).expect("repeat migration"));
+}
+
+#[tokio::test]
 async fn schema_24_cleanup_migration_rolls_back_on_failure_and_is_idempotent() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("config.sqlite3");
@@ -1605,6 +1652,34 @@ async fn review_jobs_dedupe_same_head_and_supersede_old_head() {
         .expect("claim after old lease expires")
         .expect("new head is due");
     assert_eq!("head-b", new_head.head_sha);
+}
+
+#[tokio::test]
+async fn review_job_environment_warning_round_trips_independently_of_failure() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let mut job = test_review_job(project_id, 1520, "head-1520", None);
+    job.environment_warning = Some(ProjectReviewEnvironmentWarning {
+        code: "latest_image_refresh_failed".to_string(),
+        image: "ghcr.io/rcore-os/tgoskits-container:latest".to_string(),
+        cached_image_id: "sha256:cached".to_string(),
+        message: "registry unavailable; using cached image".to_string(),
+        observed_at: Utc::now(),
+    });
+    let job_id = job.id;
+
+    store
+        .save_project_review_job(job.clone())
+        .await
+        .expect("save warning");
+
+    assert_eq!(
+        Some(job),
+        store
+            .load_project_review_job(project_id, job_id)
+            .await
+            .expect("load warning")
+    );
 }
 
 #[tokio::test]
@@ -2204,6 +2279,7 @@ fn test_review_job(
         lease_owner: None,
         lease_expires_at: None,
         failure: None,
+        environment_warning: None,
         skip_reason: None,
         submission_intent: None,
         submission_receipt: None,

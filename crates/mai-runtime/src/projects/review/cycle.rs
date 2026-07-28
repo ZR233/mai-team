@@ -8,10 +8,12 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::ProjectReviewCycleResult;
+#[cfg(test)]
 use super::reviewer::PreparedProjectReviewer;
 use super::runs::FinishReviewRun;
 #[cfg(test)]
 use super::state::{ReviewStateUpdate, ReviewerAgentUpdate};
+#[cfg(test)]
 use super::target::ProjectReviewRequest;
 use crate::{Result, RuntimeError};
 
@@ -58,6 +60,7 @@ pub(crate) trait ProjectReviewCycleOps: Send + Sync {
         request: FinishReviewRun,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    #[cfg(test)]
     fn prepare_project_reviewer(
         &self,
         project_id: ProjectId,

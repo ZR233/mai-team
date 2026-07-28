@@ -120,6 +120,14 @@ export interface ReviewFailure {
   retry: unknown
 }
 
+export interface ReviewEnvironmentWarning {
+  code: string
+  image: string
+  cached_image_id: string
+  message: string
+  observed_at: string
+}
+
 export interface ReviewSubmissionReceipt {
   github_review_id: number
   event: ReviewDecision
@@ -152,6 +160,7 @@ export interface ReviewJobSummary {
   reviewer_agent_id?: Id | null
   active_run_id?: Id | null
   failure?: ReviewFailure | null
+  environment_warning?: ReviewEnvironmentWarning | null
   skip_reason?: ReviewSkipReason | null
   submission_intent?: ReviewSubmissionIntent | null
   submission_receipt?: ReviewSubmissionReceipt | null

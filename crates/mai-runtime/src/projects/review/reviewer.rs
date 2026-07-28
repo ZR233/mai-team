@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use mai_protocol::{
     AgentId, AgentModelPreference, AgentResourceState, AgentRole, AgentRuntimeLifecycle,
-    AgentSummary, CreateAgentRequest, ProjectId, ProjectSummary, TurnId,
+    AgentSummary, CreateAgentRequest, ProjectId, ProjectReviewEnvironmentWarning, ProjectSummary,
+    TurnId,
 };
 
 use crate::agents::ContainerSource;
@@ -111,11 +112,49 @@ pub(crate) struct PreparedProjectReviewer {
     pub(crate) project_revision: ProjectRepositoryRevision,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedProjectReviewerImage {
+    pub(crate) docker_image: String,
+    pub(crate) environment_warning: Option<ProjectReviewEnvironmentWarning>,
+}
+
+#[cfg(test)]
 pub(crate) async fn prepare_project_reviewer(
     ops: &impl ProjectReviewerAgentOps,
     project_id: ProjectId,
     run_id: Uuid,
     request: ProjectReviewRequest,
+) -> Result<PreparedProjectReviewer> {
+    let project_summary = ops.project_summary(project_id).await?;
+    let maintainer_summary = ops
+        .agent_summary(project_summary.maintainer_agent_id)
+        .await?;
+    prepare_project_reviewer_inner(
+        ops,
+        project_id,
+        run_id,
+        request,
+        maintainer_summary.docker_image,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_project_reviewer_with_image(
+    ops: &impl ProjectReviewerAgentOps,
+    project_id: ProjectId,
+    run_id: Uuid,
+    request: ProjectReviewRequest,
+    docker_image: String,
+) -> Result<PreparedProjectReviewer> {
+    prepare_project_reviewer_inner(ops, project_id, run_id, request, docker_image).await
+}
+
+async fn prepare_project_reviewer_inner(
+    ops: &impl ProjectReviewerAgentOps,
+    project_id: ProjectId,
+    run_id: Uuid,
+    request: ProjectReviewRequest,
+    docker_image: String,
 ) -> Result<PreparedProjectReviewer> {
     let existing_reviewers = ops.project_reviewer_agents(project_id).await;
     for reviewer in existing_reviewers
@@ -153,7 +192,7 @@ pub(crate) async fn prepare_project_reviewer(
                 provider_id: Some(model.provider_id),
                 model: Some(model.model),
                 reasoning_effort: model.reasoning_effort,
-                docker_image: Some(maintainer_summary.docker_image.clone()),
+                docker_image: Some(docker_image),
                 parent_id: Some(project_summary.maintainer_agent_id),
                 system_prompt: Some(super::project_reviewer_system_prompt(&context)),
             },
