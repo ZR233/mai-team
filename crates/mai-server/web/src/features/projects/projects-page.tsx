@@ -18,6 +18,7 @@ import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { WorkspaceHeader } from "@/components/workspace-header"
+import { agentPresentationStatus } from "@/features/agents/agent-lifecycle"
 import { ReviewPanel } from "@/features/projects/review-panel"
 import { SessionWorkspace } from "@/features/session/session-workspace"
 import { CreateProjectDialog } from "@/features/projects/create-project-dialog"
@@ -143,7 +144,7 @@ function ProjectWorkspace({ detail, view, setView, selectedSessionId, selectAgen
 
 function AgentStrip({ agents, selectedId, onSelect }: { agents: ProjectDetail["agents"]; selectedId: string; onSelect(id: string): void }) {
   return (
-    <div className="shrink-0 overflow-x-auto border-b bg-muted/20 p-2"><Tabs value={selectedId} onValueChange={onSelect}><TabsList>{agents.map((agent) => <TabsTrigger key={agent.id} value={agent.id} className="min-w-52 justify-start"><Bot data-icon="inline-start" /><span className="min-w-0 flex-1 text-left"><span className="block truncate text-xs font-medium">{agent.name}</span><span className="block truncate text-[11px] text-muted-foreground">{agent.role} · {agent.model}</span></span><StatusDot status={agent.state.runtime?.activity || agent.state.resource} /></TabsTrigger>)}</TabsList></Tabs></div>
+    <div className="shrink-0 overflow-x-auto border-b bg-muted/20 p-2"><Tabs value={selectedId} onValueChange={onSelect}><TabsList>{agents.map((agent) => <TabsTrigger key={agent.id} value={agent.id} className="min-w-52 justify-start"><Bot data-icon="inline-start" /><span className="min-w-0 flex-1 text-left"><span className="block truncate text-xs font-medium">{agent.name}</span><span className="block truncate text-[11px] text-muted-foreground">{agent.role} · {agent.model}</span></span><StatusDot status={agentPresentationStatus(agent)} /></TabsTrigger>)}</TabsList></Tabs></div>
   )
 }
 

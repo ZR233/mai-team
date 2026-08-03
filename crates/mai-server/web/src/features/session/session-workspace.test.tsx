@@ -47,6 +47,24 @@ describe("session workspace canonical turn controls", () => {
     expect(onStop).toHaveBeenCalledWith("turn-from-session-stream")
   })
 
+  it("keeps the live session turn when ready agent detail has no runtime projection yet", () => {
+    const agent = agentWithoutActiveTurn()
+    agent.state.runtime = null
+
+    render(
+      <SessionWorkspace
+        agent={agent}
+        sessionId="session-1"
+        onSelectSession={() => undefined}
+        onCreateSession={async () => undefined}
+        onSend={async () => undefined}
+        onStop={async () => undefined}
+      />,
+    )
+
+    expect(screen.getByRole("button", { name: /stop/i })).toBeInTheDocument()
+  })
+
   it("does not treat terminal canonical phases as running", () => {
     expect(activeSessionTurnId({
       turnId: "turn",
@@ -54,6 +72,31 @@ describe("session workspace canonical turn controls", () => {
       status: "completed",
       updatedAt: 8,
     })).toBeNull()
+  })
+
+  it("does not expose a stale session turn after the agent starts closing", () => {
+    const agent = agentWithoutActiveTurn()
+    agent.state.resource = "deleting"
+    agent.state.runtime = {
+      lifecycle: "closing",
+      activity: "idle",
+      active_turn: null,
+      pending_inputs: 0,
+    }
+
+    render(
+      <SessionWorkspace
+        agent={agent}
+        sessionId="session-1"
+        onSelectSession={() => undefined}
+        onCreateSession={async () => undefined}
+        onSend={async () => undefined}
+        onStop={async () => undefined}
+      />,
+    )
+
+    expect(screen.queryByRole("button", { name: /stop/i })).not.toBeInTheDocument()
+    expect(screen.getByText("deleting")).toBeInTheDocument()
   })
 })
 

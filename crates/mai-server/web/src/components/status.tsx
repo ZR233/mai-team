@@ -5,7 +5,7 @@ import { Badge } from "@/components/ui/badge"
 import { cn } from "@/lib/utils"
 
 const healthy = new Set(["ready", "active", "completed", "succeeded", "idle", "live"])
-const pending = new Set(["provisioning", "preparing", "queued", "running", "retry_waiting", "submission_pending", "reconciling", "streaming", "connecting", "resyncing"])
+const pending = new Set(["provisioning", "preparing", "queued", "running", "retry_waiting", "submission_pending", "reconciling", "streaming", "connecting", "resyncing", "closing", "deleting"])
 const failed = new Set(["failed", "error", "errored", "faulted", "offline", "cancelled"])
 
 export function StatusBadge({ status, className }: { status?: string | null; className?: string }) {

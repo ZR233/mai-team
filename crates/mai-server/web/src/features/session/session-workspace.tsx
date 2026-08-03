@@ -12,6 +12,7 @@ import { WorkspaceHeader, type WorkspaceCrumb } from "@/components/workspace-hea
 import type { SessionViewSnapshot } from "@/events/session-events.generated"
 import { useSessionEvents } from "@/events/use-session-events"
 import { useSessionStore } from "@/events/session-store"
+import { agentCanRunSessionTurn, agentPresentationStatus } from "@/features/agents/agent-lifecycle"
 import { AgentModelDialog } from "@/features/agents/agent-model-dialog"
 import { SessionTimeline } from "@/features/session/session-timeline"
 import { SessionTodoDrawer, SessionTodoRail, latestTodoSnapshot } from "@/features/session/session-todo-panel"
@@ -55,8 +56,10 @@ export function SessionWorkspace({
   const [selectedSkills, setSelectedSkills] = useState<string[]>([])
   const [todoExpanded, setTodoExpanded] = useState(true)
   const scroller = useRef<HTMLDivElement>(null)
-  const canonicalTurn = view.sessionId === effectiveSessionId ? view.turn : undefined
+  const canRunSessionTurn = agentCanRunSessionTurn(agent)
+  const canonicalTurn = canRunSessionTurn && view.sessionId === effectiveSessionId ? view.turn : undefined
   const activeTurnId = activeSessionTurnId(canonicalTurn)
+  const presentationStatus = agentPresentationStatus(agent, canonicalTurn?.status)
   const todoSnapshot = view.sessionId === effectiveSessionId ? latestTodoSnapshot(view.timelineEvents) : null
 
   useEffect(() => {
@@ -85,12 +88,12 @@ export function SessionWorkspace({
       {workspaceCrumbs ? (
         <WorkspaceHeader
           crumbs={workspaceCrumbs}
-          actions={<><StatusBadge status={canonicalTurn?.status || agent.state.resource} />{onAgentUpdated && <AgentModelDialog agent={agent} onSaved={onAgentUpdated} />}{headerActions}</>}
+          actions={<><StatusBadge status={presentationStatus} />{onAgentUpdated && <AgentModelDialog agent={agent} onSaved={onAgentUpdated} />}{headerActions}</>}
         />
       ) : <header className="flex min-h-14 shrink-0 items-center gap-3 border-b px-4 md:px-6">
         <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary font-semibold text-primary-foreground">{agent.name.slice(0, 1).toUpperCase()}</div>
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2"><h2 className="truncate text-sm font-semibold">{agent.name}</h2><StatusBadge status={canonicalTurn?.status || agent.state.resource} /></div>
+          <div className="flex items-center gap-2"><h2 className="truncate text-sm font-semibold">{agent.name}</h2><StatusBadge status={presentationStatus} /></div>
           <p className="truncate text-xs text-muted-foreground">{agent.role || "agent"} · {agent.provider_name} / {agent.model}</p>
         </div>
         <div className="flex items-center gap-1">
@@ -152,7 +155,7 @@ export function SessionWorkspace({
               <span className="ml-auto flex items-center gap-2">
               {activeTurnId && onStop
                 ? <Button variant="outline" className="shrink-0 text-destructive" onClick={() => void onStop(activeTurnId)}><CircleStop data-icon="inline-start" /> Stop</Button>
-                : <Button className="shrink-0" disabled={!draft.trim() || sending} onClick={() => void submit()}>{sending ? <Sparkles data-icon="inline-start" className="animate-pulse" /> : <Send data-icon="inline-start" />} Send</Button>}
+                : <Button className="shrink-0" disabled={!canRunSessionTurn || !draft.trim() || sending} onClick={() => void submit()}>{sending ? <Sparkles data-icon="inline-start" className="animate-pulse" /> : <Send data-icon="inline-start" />} Send</Button>}
               </span>
             </InputGroupAddon>
           </InputGroup>
