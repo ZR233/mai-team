@@ -144,6 +144,57 @@ pub(crate) struct ProjectReviewRunRecord {
     pub(crate) events_json: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectReviewRunSummaryRecord {
+    pub(crate) id: String,
+    pub(crate) project_id: String,
+    pub(crate) job_id: Option<String>,
+    pub(crate) attempt_index: i64,
+    pub(crate) reviewer_agent_id: Option<String>,
+    pub(crate) turn_id: Option<String>,
+    pub(crate) started_at: String,
+    pub(crate) finished_at: Option<String>,
+    pub(crate) status: String,
+    pub(crate) outcome: Option<String>,
+    pub(crate) review_event: Option<String>,
+    pub(crate) pr: Option<i64>,
+    pub(crate) summary: Option<String>,
+    pub(crate) error: Option<String>,
+    pub(crate) failure_json: Option<String>,
+    pub(crate) input_tokens: i64,
+    pub(crate) cached_input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) reasoning_output_tokens: i64,
+    pub(crate) total_tokens: i64,
+}
+
+impl From<ProjectReviewRunRecord> for ProjectReviewRunSummaryRecord {
+    fn from(record: ProjectReviewRunRecord) -> Self {
+        Self {
+            id: record.id,
+            project_id: record.project_id,
+            job_id: record.job_id,
+            attempt_index: record.attempt_index,
+            reviewer_agent_id: record.reviewer_agent_id,
+            turn_id: record.turn_id,
+            started_at: record.started_at,
+            finished_at: record.finished_at,
+            status: record.status,
+            outcome: record.outcome,
+            review_event: record.review_event,
+            pr: record.pr,
+            summary: record.summary,
+            error: record.error,
+            failure_json: record.failure_json,
+            input_tokens: record.input_tokens,
+            cached_input_tokens: record.cached_input_tokens,
+            output_tokens: record.output_tokens,
+            reasoning_output_tokens: record.reasoning_output_tokens,
+            total_tokens: record.total_tokens,
+        }
+    }
+}
+
 #[derive(Debug, Clone, toasty::Model)]
 #[table = "project_review_jobs"]
 pub(crate) struct ProjectReviewJobRecord {
@@ -599,6 +650,22 @@ impl TaskReviewRecord {
 
 impl ProjectReviewRunRecord {
     pub(crate) fn into_summary(self) -> Result<ProjectReviewRunSummary> {
+        ProjectReviewRunSummaryRecord::from(self).into_summary()
+    }
+
+    pub(crate) fn into_detail(self) -> Result<ProjectReviewRunDetail> {
+        let messages = serde_json::from_str::<Vec<AgentMessage>>(&self.messages_json)?;
+        let events = serde_json::from_str::<Vec<SessionEventEnvelope>>(&self.events_json)?;
+        Ok(ProjectReviewRunDetail {
+            summary: self.into_summary()?,
+            messages,
+            events,
+        })
+    }
+}
+
+impl ProjectReviewRunSummaryRecord {
+    pub(crate) fn into_summary(self) -> Result<ProjectReviewRunSummary> {
         Ok(ProjectReviewRunSummary {
             id: parse_uuid(&self.id)?,
             job_id: self.job_id.as_deref().map(parse_uuid).transpose()?,
@@ -636,16 +703,6 @@ impl ProjectReviewRunRecord {
                 reasoning_output_tokens: i64_to_u64(self.reasoning_output_tokens),
                 total_tokens: i64_to_u64(self.total_tokens),
             },
-        })
-    }
-
-    pub(crate) fn into_detail(self) -> Result<ProjectReviewRunDetail> {
-        let messages = serde_json::from_str::<Vec<AgentMessage>>(&self.messages_json)?;
-        let events = serde_json::from_str::<Vec<SessionEventEnvelope>>(&self.events_json)?;
-        Ok(ProjectReviewRunDetail {
-            summary: self.into_summary()?,
-            messages,
-            events,
         })
     }
 }

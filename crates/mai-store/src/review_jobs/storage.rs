@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::records::{ProjectReviewJobRecord, ProjectReviewRunRecord};
+use crate::records::{ProjectReviewJobRecord, ProjectReviewRunSummaryRecord};
 use crate::*;
 
 const REVIEW_JOB_SQLITE_BUSY_TIMEOUT_SECS: u64 = 30;
@@ -136,8 +136,10 @@ pub(super) fn project_review_job_record(row: &Row<'_>) -> rusqlite::Result<Proje
     })
 }
 
-pub(super) fn project_review_run_record(row: &Row<'_>) -> rusqlite::Result<ProjectReviewRunRecord> {
-    Ok(ProjectReviewRunRecord {
+pub(crate) fn project_review_run_summary_record(
+    row: &Row<'_>,
+) -> rusqlite::Result<ProjectReviewRunSummaryRecord> {
+    Ok(ProjectReviewRunSummaryRecord {
         id: row.get(0)?,
         project_id: row.get(1)?,
         job_id: row.get(2)?,
@@ -158,12 +160,10 @@ pub(super) fn project_review_run_record(row: &Row<'_>) -> rusqlite::Result<Proje
         output_tokens: row.get(17)?,
         reasoning_output_tokens: row.get(18)?,
         total_tokens: row.get(19)?,
-        messages_json: row.get(20)?,
-        events_json: row.get(21)?,
     })
 }
 
-pub(super) fn open_review_job_connection(path: &Path) -> Result<Connection> {
+pub(crate) fn open_review_job_connection(path: &Path) -> Result<Connection> {
     let connection = Connection::open(path)?;
     connection.busy_timeout(Duration::from_secs(REVIEW_JOB_SQLITE_BUSY_TIMEOUT_SECS))?;
     Ok(connection)

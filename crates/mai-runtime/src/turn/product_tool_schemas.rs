@@ -42,8 +42,9 @@ mod tests {
     }
 
     #[test]
-    fn pure_lang_dependencies_use_upstream_main() {
+    fn pure_lang_dependencies_pin_the_verified_runtime_revision() {
         let manifest = include_str!("../../../../Cargo.toml");
+        let verified_revision = "9430fa9e52d2cbc6666aa9fb8ac94d00c062561f";
         for package in ["pl-core", "pl-model", "pl-protocol", "pl-trace"] {
             let line = manifest
                 .lines()
@@ -51,9 +52,9 @@ mod tests {
                 .expect("workspace dependency must exist");
             assert!(
                 line.contains("git = \"https://github.com/ZR233/pure-lang.git\"")
-                    && line.contains("branch = \"main\"")
+                    && line.contains(&format!("rev = \"{verified_revision}\""))
                     && !line.contains("path ="),
-                "{package} must use the pure-lang upstream main branch"
+                "{package} 必须锁定经过现网数据兼容验证的 pure-lang runtime revision"
             );
         }
     }

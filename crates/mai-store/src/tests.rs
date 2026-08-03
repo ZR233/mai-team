@@ -630,6 +630,37 @@ async fn project_review_runs_round_trip_and_prune() {
     assert_eq!(detail.messages[0].content, "done");
     assert_eq!(detail.events.len(), 1);
 
+    let connection = rusqlite::Connection::open(store.path()).expect("open sqlite");
+    connection
+        .execute(
+            "UPDATE project_review_runs SET messages_json = X'80', events_json = X'81' \
+             WHERE id = ?1",
+            rusqlite::params![run_id.to_string()],
+        )
+        .expect("replace detail payloads with non-text blobs");
+    let summaries = store
+        .load_project_review_runs(project_id, None, 0, 10)
+        .await
+        .expect("summary listing must not read detail payloads");
+    assert_eq!(
+        serde_json::to_value(&summaries).expect("serialize summaries"),
+        serde_json::to_value(&runs).expect("serialize original summaries")
+    );
+    connection
+        .execute(
+            "UPDATE project_review_runs SET messages_json = 'not-json', events_json = '[]' \
+             WHERE id = ?1",
+            rusqlite::params![run_id.to_string()],
+        )
+        .expect("replace detail payload with invalid JSON text");
+    assert!(
+        store
+            .load_project_review_run(project_id, run_id)
+            .await
+            .is_err(),
+        "detail loading must still read and validate its payload columns"
+    );
+
     let removed = store
         .prune_project_review_runs_before(Utc::now() - chrono::TimeDelta::days(2))
         .await

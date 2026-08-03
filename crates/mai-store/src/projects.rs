@@ -1,5 +1,7 @@
 use crate::records::*;
+use crate::review_jobs::storage::{open_review_job_connection, project_review_run_summary_record};
 use crate::*;
+use rusqlite::params;
 
 impl MaiStore {
     pub async fn save_project(&self, project: &ProjectSummary) -> Result<()> {
@@ -159,23 +161,58 @@ impl MaiStore {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<ProjectReviewRunSummary>> {
-        let mut rows = self.load_project_review_run_records(project_id).await?;
-        if let Some(since) = since {
-            let cutoff = since.to_rfc3339();
-            rows.retain(|row| row.started_at >= cutoff);
-        }
-        rows.sort_by(|left, right| {
-            right
-                .started_at
-                .cmp(&left.started_at)
-                .then_with(|| right.id.cmp(&left.id))
-        });
-        let limit = limit.max(1);
-        rows.into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(ProjectReviewRunRecord::into_summary)
-            .collect()
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = open_review_job_connection(&path)?;
+            let mut runs = Vec::new();
+            if let Some(since) = since {
+                let mut statement = connection.prepare(
+                    "SELECT id, project_id, job_id, attempt_index, reviewer_agent_id, turn_id, \
+                     started_at, finished_at, status, outcome, review_event, pr, summary, error, \
+                     failure_json, input_tokens, cached_input_tokens, output_tokens, \
+                     reasoning_output_tokens, total_tokens \
+                     FROM project_review_runs WHERE project_id = ?1 AND started_at >= ?2 \
+                     ORDER BY started_at DESC, id DESC LIMIT ?3 OFFSET ?4",
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        project_id.to_string(),
+                        since.to_rfc3339(),
+                        usize_to_i64(limit.max(1)),
+                        usize_to_i64(offset)
+                    ],
+                    project_review_run_summary_record,
+                )?;
+                for row in rows {
+                    runs.push(row?.into_summary()?);
+                }
+            } else {
+                let mut statement = connection.prepare(
+                    "SELECT id, project_id, job_id, attempt_index, reviewer_agent_id, turn_id, \
+                     started_at, finished_at, status, outcome, review_event, pr, summary, error, \
+                     failure_json, input_tokens, cached_input_tokens, output_tokens, \
+                     reasoning_output_tokens, total_tokens \
+                     FROM project_review_runs WHERE project_id = ?1 \
+                     ORDER BY started_at DESC, id DESC LIMIT ?2 OFFSET ?3",
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        project_id.to_string(),
+                        usize_to_i64(limit.max(1)),
+                        usize_to_i64(offset)
+                    ],
+                    project_review_run_summary_record,
+                )?;
+                for row in rows {
+                    runs.push(row?.into_summary()?);
+                }
+            }
+            Ok(runs)
+        })
+        .await
+        .map_err(|error| {
+            StoreError::InvalidConfig(format!("review run list task failed: {error}"))
+        })?
     }
 
     pub async fn load_project_review_run(
@@ -232,19 +269,5 @@ impl MaiStore {
         .map_err(|error| {
             StoreError::InvalidConfig(format!("review run retention task failed: {error}"))
         })?
-    }
-
-    async fn load_project_review_run_records(
-        &self,
-        project_id: ProjectId,
-    ) -> Result<Vec<ProjectReviewRunRecord>> {
-        let mut db = self.db.clone();
-        Ok(Query::<List<ProjectReviewRunRecord>>::filter(
-            ProjectReviewRunRecord::fields()
-                .project_id()
-                .eq(project_id.to_string()),
-        )
-        .exec(&mut db)
-        .await?)
     }
 }

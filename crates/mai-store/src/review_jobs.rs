@@ -8,7 +8,7 @@ use crate::cleanup_tasks::ensure_project_review_cleanup_tasks;
 use crate::records::ProjectReviewJobRecord;
 use crate::*;
 
-mod storage;
+pub(crate) mod storage;
 
 use storage::*;
 
@@ -416,10 +416,13 @@ impl MaiStore {
                 "SELECT id, project_id, job_id, attempt_index, reviewer_agent_id, turn_id, \
                  started_at, finished_at, status, outcome, review_event, pr, summary, error, \
                  failure_json, input_tokens, cached_input_tokens, output_tokens, \
-                 reasoning_output_tokens, total_tokens, messages_json, events_json \
+                 reasoning_output_tokens, total_tokens \
                  FROM project_review_runs WHERE job_id = ?1 ORDER BY attempt_index ASC, started_at ASC",
             )?;
-            let rows = statement.query_map(params![job_id.to_string()], project_review_run_record)?;
+            let rows = statement.query_map(
+                params![job_id.to_string()],
+                project_review_run_summary_record,
+            )?;
             let mut attempts = Vec::new();
             for row in rows {
                 attempts.push(row?.into_summary()?);
