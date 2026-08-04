@@ -262,7 +262,7 @@ impl tasks::EnvironmentOps for Arc<AgentRuntime> {
         &self,
         request: tasks::CreateEnvironmentRootAgentRequest,
     ) -> Result<AgentSummary> {
-        let agent = match request.model {
+        let created = match request.model {
             Some(model) => {
                 agents::create_agent_record(
                     self.as_ref(),
@@ -288,8 +288,9 @@ impl tasks::EnvironmentOps for Arc<AgentRuntime> {
                     .await?
             }
         };
-        let summary = agent.summary.read().await.clone();
-        self.register_framework_agent(summary.id).await?;
+        let agent = Arc::clone(&created.record);
+        let resource = runtime_agent_creation::PreparedAgentResource::new(self, created.summary);
+        let summary = self.register_prepared_agent(resource).await?;
         self.start_environment_container_in_background(agent).await;
         Ok(summary)
     }

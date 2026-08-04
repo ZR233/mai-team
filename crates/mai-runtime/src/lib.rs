@@ -30,6 +30,7 @@ mod model_profile;
 mod model_projection;
 mod projects;
 mod runtime_agent_api;
+mod runtime_agent_creation;
 mod runtime_agent_traits;
 mod runtime_bootstrap;
 mod runtime_config;

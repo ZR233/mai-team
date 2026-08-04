@@ -47,6 +47,31 @@ impl agents::AgentPurgeOps for AgentRuntime {
     }
 }
 
+impl agents::AgentDeleteOps for AgentRuntime {
+    async fn close_canonical_agent(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<agents::CanonicalAgentClose> {
+        let agent = self.agent(agent_id).await?;
+        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
+        match self.framework_handle()?.close(runtime_agent_id).await {
+            Ok(_) => Ok(agents::CanonicalAgentClose::Closed),
+            Err(pl_core::AgentRuntimeError::NotFound(_)) => {
+                Ok(agents::CanonicalAgentClose::Missing)
+            }
+            Err(error) => Err(RuntimeError::InvalidInput(error.to_string())),
+        }
+    }
+
+    async fn close_product_agent_resources(&self, agent_id: AgentId) -> Result<()> {
+        AgentRuntime::close_agent(self, agent_id).await
+    }
+
+    async fn cleanup_agent_workspace(&self, agent_id: AgentId) -> Result<()> {
+        AgentRuntime::cleanup_agent_workspace(self, agent_id).await
+    }
+}
+
 impl agents::AgentFileOps for AgentRuntime {
     fn container_id(
         &self,

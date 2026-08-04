@@ -109,6 +109,7 @@ fn framework_module_boundary_is_stable() {
 #[test]
 fn project_maintainer_is_registered_with_framework_runtime() {
     let project_traits = include_str!("runtime_project_traits.rs");
+    let provisioning = include_str!("runtime_provisioning.rs");
     let create_maintainer = project_traits
         .split("async fn create_project_maintainer_agent")
         .nth(1)
@@ -117,7 +118,30 @@ fn project_maintainer_is_registered_with_framework_runtime() {
         .next()
         .expect("project maintainer implementation body");
 
-    assert!(create_maintainer.contains("self.register_framework_agent(summary.id).await?;"));
+    assert!(create_maintainer.contains("self.register_prepared_agent(resource).await"));
+    assert!(provisioning.contains("self.register_framework_agent(resource.id()).await"));
+}
+
+#[test]
+fn agent_creation_owner_covers_provisioning_and_framework_registration() {
+    let provisioning = include_str!("runtime_provisioning.rs");
+    let creation_owner = include_str!("runtime_agent_creation.rs");
+
+    assert!(provisioning.contains("let provisioning: Result<AgentSummary> = async"));
+    assert!(provisioning.contains("resource.rollback().await"));
+    assert!(provisioning.contains("resource.include_canonical_runtime();"));
+    assert!(creation_owner.contains("impl Drop for AgentCreationLease"));
+    assert!(creation_owner.contains("rollback_unregistered_agent"));
+    assert!(creation_owner.contains("agents::delete_agent"));
+}
+
+#[test]
+fn framework_spawn_rollback_only_deletes_resources_created_by_its_lease() {
+    let lifecycle = include_str!("agent_host/lifecycle.rs");
+
+    assert!(lifecycle.contains("ownership: SpawnProductOwnership"));
+    assert!(lifecycle.contains("SpawnProductOwnership::Existing => return Ok(())"));
+    assert!(lifecycle.contains("SpawnProductOwnership::Created => {}"));
 }
 
 #[test]
@@ -137,17 +161,13 @@ fn product_session_projection_is_not_submitted_as_framework_identity() {
 
 #[test]
 fn framework_close_is_followed_by_product_record_purge() {
-    let agent_api = include_str!("runtime_agent_api.rs");
-    let delete_agent = agent_api
-        .split("pub async fn delete_agent")
-        .nth(1)
-        .expect("delete_agent implementation")
-        .split("pub(super) async fn close_agent")
-        .next()
-        .expect("delete_agent implementation body");
+    let delete = include_str!("agents/delete.rs");
+    let runtime_ports = include_str!("runtime_agent_traits.rs");
 
-    assert!(delete_agent.contains(".close(runtime_agent_id)"));
-    assert!(delete_agent.contains("agents::purge_agent_tree(self, agent_id).await"));
+    assert!(runtime_ports.contains(".close(runtime_agent_id).await"));
+    assert!(runtime_ports.contains("AgentRuntimeError::NotFound"));
+    assert!(delete.contains("CanonicalAgentClose::Closed => purge_agent_tree"));
+    assert!(delete.contains("CanonicalAgentClose::Missing => rollback_unregistered_agent"));
 }
 
 #[test]

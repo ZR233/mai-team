@@ -61,7 +61,7 @@ impl AgentRuntime {
     pub(super) async fn create_unconfigured_environment_root_agent(
         &self,
         request: tasks::CreateEnvironmentRootAgentRequest,
-    ) -> Result<Arc<AgentRecord>> {
+    ) -> Result<agents::CreatedAgentRecord> {
         let id = Uuid::new_v4();
         let created_at = now();
         let docker_image = request
@@ -104,8 +104,13 @@ impl AgentRuntime {
             .await
             .insert(id, Arc::clone(&agent));
         self.events
-            .publish(MaiProductEventKind::AgentCreated { agent: summary })
+            .publish(MaiProductEventKind::AgentCreated {
+                agent: summary.clone(),
+            })
             .await;
-        Ok(agent)
+        Ok(agents::CreatedAgentRecord {
+            summary,
+            record: agent,
+        })
     }
 }

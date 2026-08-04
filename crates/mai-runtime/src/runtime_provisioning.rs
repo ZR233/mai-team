@@ -23,7 +23,7 @@ impl AgentRuntime {
         project_id: Option<ProjectId>,
         role: Option<AgentRole>,
     ) -> Result<AgentSummary> {
-        let summary = self
+        let resource = self
             .create_agent_resource_with_container_source(
                 request,
                 container_source,
@@ -32,8 +32,23 @@ impl AgentRuntime {
                 role,
             )
             .await?;
-        self.register_framework_agent(summary.id).await?;
-        Ok(summary)
+        self.register_prepared_agent(resource).await
+    }
+
+    pub(super) async fn register_prepared_agent(
+        self: &Arc<Self>,
+        mut resource: runtime_agent_creation::PreparedAgentResource,
+    ) -> Result<AgentSummary> {
+        resource.include_canonical_runtime();
+        match self.register_framework_agent(resource.id()).await {
+            Ok(()) => Ok(resource.commit()),
+            Err(error) => match resource.rollback().await {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(RuntimeError::InvalidInput(format!(
+                    "agent framework registration failed: {error}; creation rollback failed: {rollback_error}"
+                ))),
+            },
+        }
     }
 
     pub(super) async fn create_agent_resource_with_container_source(
@@ -43,9 +58,8 @@ impl AgentRuntime {
         task_id: Option<TaskId>,
         project_id: Option<ProjectId>,
         role: Option<AgentRole>,
-    ) -> Result<AgentSummary> {
-        let is_provisional_reviewer = role == Some(AgentRole::Reviewer);
-        let agent = agents::create_agent_record(
+    ) -> Result<runtime_agent_creation::PreparedAgentResource> {
+        let created = agents::create_agent_record(
             self.as_ref(),
             request,
             agents::CreateAgentRecordContext {
@@ -55,21 +69,27 @@ impl AgentRuntime {
             },
         )
         .await?;
-        let container_source = self
-            .agent_container_source_for_project(
-                agent.summary.read().await.id,
-                project_id,
-                container_source,
-            )
-            .await?;
+        let agent_id = created.summary.id;
+        let agent = created.record;
+        let mut resource =
+            runtime_agent_creation::PreparedAgentResource::new(self, created.summary);
+        let provisioning: Result<AgentSummary> = async {
+            let container_source = self
+                .agent_container_source_for_project(agent_id, project_id, container_source)
+                .await?;
+            agents::ensure_agent_container_with_source(self.as_ref(), &agent, &container_source)
+                .await?;
+            Ok(agent.summary.read().await.clone())
+        }
+        .await;
 
-        match agents::ensure_agent_container_with_source(self.as_ref(), &agent, &container_source)
-            .await
-        {
-            Ok(_) => Ok(agent.summary.read().await.clone()),
+        match provisioning {
+            Ok(summary) => {
+                resource.replace_summary(summary);
+                Ok(resource)
+            }
             Err(err) => {
                 let message = err.to_string();
-                let agent_id = agent.summary.read().await.id;
                 if let Err(store_err) = self
                     .set_agent_resource_state(
                         &agent,
@@ -87,21 +107,10 @@ impl AgentRuntime {
                         message,
                     })
                     .await;
-                if is_provisional_reviewer {
-                    if let Err(cleanup_error) = self.cleanup_agent_workspace(agent_id).await {
-                        tracing::warn!(
-                            agent_id = %agent_id,
-                            "failed to clean provisional reviewer workspace: {cleanup_error}"
-                        );
-                    }
-                    if let Err(purge_error) =
-                        agents::purge_agent_tree(self.as_ref(), agent_id).await
-                    {
-                        tracing::warn!(
-                            agent_id = %agent_id,
-                            "failed to purge provisional reviewer record: {purge_error}"
-                        );
-                    }
+                if let Err(rollback_error) = resource.rollback().await {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "agent provisioning failed: {err}; creation rollback failed: {rollback_error}"
+                    )));
                 }
                 Err(err)
             }

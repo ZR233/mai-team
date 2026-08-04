@@ -192,13 +192,7 @@ impl AgentRuntime {
     }
 
     pub async fn delete_agent(&self, agent_id: AgentId) -> Result<()> {
-        let agent = self.agent(agent_id).await?;
-        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
-        self.framework_handle()?
-            .close(runtime_agent_id)
-            .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        agents::purge_agent_tree(self, agent_id).await
+        agents::delete_agent(self, agent_id).await
     }
 
     pub(super) async fn cleanup_agent_tool_output_namespace(

@@ -26,6 +26,12 @@ impl MaiAgentLifecycle {
 
 pub(crate) struct MaiSpawnLease {
     product_agent_id: mai_protocol::AgentId,
+    ownership: SpawnProductOwnership,
+}
+
+enum SpawnProductOwnership {
+    Existing,
+    Created,
 }
 
 pub(crate) struct MaiCloseLease {
@@ -43,7 +49,10 @@ impl AgentLifecycleAdapter for MaiAgentLifecycle {
         if let Ok((product_agent_id, _)) =
             super::turn_factory::product_agent(&runtime, &request.child.identity.id).await
         {
-            return Ok(MaiSpawnLease { product_agent_id });
+            return Ok(MaiSpawnLease {
+                product_agent_id,
+                ownership: SpawnProductOwnership::Existing,
+            });
         }
         let (parent_id, parent) =
             super::turn_factory::product_agent(&runtime, &request.parent.identity.id).await?;
@@ -61,7 +70,7 @@ impl AgentLifecycleAdapter for MaiAgentLifecycle {
             .or_else(|| request.metadata.get("name"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
-        let summary = runtime
+        let resource = runtime
             .create_agent_resource_with_container_source(
                 CreateAgentRequest {
                     name,
@@ -82,7 +91,9 @@ impl AgentLifecycleAdapter for MaiAgentLifecycle {
                 Some(role),
             )
             .await?;
-        let agent = runtime.agent(summary.id).await?;
+        let summary = resource.summary().clone();
+        let product_agent_id = resource.id();
+        let agent = runtime.agent(product_agent_id).await?;
         *agent.runtime_agent_id.write().await = request.child.identity.id.clone();
         runtime
             .deps
@@ -93,8 +104,10 @@ impl AgentLifecycleAdapter for MaiAgentLifecycle {
                 request.child.identity.id.as_str(),
             )
             .await?;
+        resource.commit();
         Ok(MaiSpawnLease {
-            product_agent_id: summary.id,
+            product_agent_id,
+            ownership: SpawnProductOwnership::Created,
         })
     }
 
@@ -104,19 +117,14 @@ impl AgentLifecycleAdapter for MaiAgentLifecycle {
     }
 
     async fn rollback_spawn(&self, lease: Self::SpawnLease) -> Result<()> {
-        let runtime = self.runtime()?;
-        match runtime.close_agent(lease.product_agent_id).await {
-            Ok(_) | Err(RuntimeError::AgentNotFound(_)) => {}
-            Err(error) => return Err(error),
+        match lease.ownership {
+            SpawnProductOwnership::Existing => return Ok(()),
+            SpawnProductOwnership::Created => {}
         }
-        if runtime.agent(lease.product_agent_id).await.is_ok() {
-            runtime
-                .cleanup_agent_workspace(lease.product_agent_id)
-                .await?;
-            let agent = runtime.agent(lease.product_agent_id).await?;
-            runtime
-                .set_agent_resource_state(&agent, mai_protocol::AgentResourceState::Deleted, None)
-                .await?;
+        let runtime = self.runtime()?;
+        match agents::rollback_unregistered_agent(runtime.as_ref(), lease.product_agent_id).await {
+            Ok(()) | Err(RuntimeError::AgentNotFound(_)) => {}
+            Err(error) => return Err(error),
         }
         Ok(())
     }

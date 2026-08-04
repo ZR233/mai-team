@@ -132,7 +132,7 @@ impl projects::service::ProjectCreateOps for Arc<AgentRuntime> {
         &self,
         request: projects::service::ProjectMaintainerAgentRequest,
     ) -> Result<AgentSummary> {
-        let maintainer = agents::create_agent_record(
+        let created = agents::create_agent_record(
             self.as_ref(),
             CreateAgentRequest {
                 name: Some(request.name),
@@ -150,9 +150,8 @@ impl projects::service::ProjectCreateOps for Arc<AgentRuntime> {
             },
         )
         .await?;
-        let summary = maintainer.summary.read().await.clone();
-        self.register_framework_agent(summary.id).await?;
-        Ok(summary)
+        let resource = runtime_agent_creation::PreparedAgentResource::new(self, created.summary);
+        self.register_prepared_agent(resource).await
     }
 
     async fn save_project(&self, project: &ProjectSummary) -> Result<()> {

@@ -18,6 +18,12 @@ pub(crate) struct CreateAgentRecordContext {
     pub(crate) role: Option<AgentRole>,
 }
 
+/// 已写入产品状态、等待后续生命周期所有者接管的新 agent。
+pub(crate) struct CreatedAgentRecord {
+    pub(crate) summary: AgentSummary,
+    pub(crate) record: Arc<AgentRecord>,
+}
+
 /// Provides the narrow persistence/state/event capabilities needed to create
 /// an agent record and its initial session.
 pub(crate) trait AgentCreateOps: Send + Sync {
@@ -45,7 +51,7 @@ pub(crate) async fn create_agent_record(
     ops: &impl AgentCreateOps,
     request: CreateAgentRequest,
     context: CreateAgentRecordContext,
-) -> Result<Arc<AgentRecord>> {
+) -> Result<CreatedAgentRecord> {
     let id = Uuid::new_v4();
     let created_at = now();
     let name = request
@@ -95,8 +101,11 @@ pub(crate) async fn create_agent_record(
     });
 
     ops.insert_agent(Arc::clone(&agent)).await;
-    ops.publish_agent_created(summary).await;
-    Ok(agent)
+    ops.publish_agent_created(summary.clone()).await;
+    Ok(CreatedAgentRecord {
+        summary,
+        record: agent,
+    })
 }
 
 fn resolve_docker_image(default_image: &str, requested: Option<&str>) -> String {
