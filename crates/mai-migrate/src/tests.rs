@@ -26,6 +26,13 @@ fn v27_migration_is_atomic_and_review_history_is_deeply_equal() {
     assert_eq!(report.archived_review_runs, 1);
 
     let connection = Connection::open(&path).expect("open migrated fixture");
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM product_events", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count migrated product events"),
+        0
+    );
     let history_json: String = connection
         .query_row(
             "SELECT history_json FROM project_review_runs WHERE id = 'review-run'",
@@ -147,6 +154,25 @@ fn unknown_review_status_is_rejected_instead_of_projected() {
 }
 
 #[test]
+fn current_schema_rejects_legacy_product_event_payloads() {
+    let (_directory, path) = fixture(false);
+    migrate_path(&path).expect("migrate fixture");
+    let connection = Connection::open(&path).expect("open migrated fixture");
+    connection
+        .execute(
+            "INSERT INTO product_events VALUES (47267, ?1, NULL, ?2)",
+            params![STARTED_AT, legacy_product_event_json()],
+        )
+        .expect("insert incompatible event");
+    drop(connection);
+
+    let error = validate_path(&path).expect_err("legacy event must fail target validation");
+    let message = format!("{error:#}");
+    assert!(message.contains("product event 47267 不符合当前协议"));
+    assert!(message.contains("missing field `thread_id`"));
+}
+
+#[test]
 fn nested_agent_depth_is_derived_from_the_complete_parent_chain() {
     let (_directory, path) = fixture(false);
     let child = "eab03925-fbda-44ea-87d3-44078a39acb3";
@@ -248,6 +274,10 @@ fn create_v27(path: &Path, inject_failure: bool) {
                 id TEXT PRIMARY KEY NOT NULL, agent_id TEXT NOT NULL,
                 sequence BIGINT NOT NULL, trace_json TEXT NOT NULL
              );
+             CREATE TABLE product_events (
+                sequence BIGINT PRIMARY KEY NOT NULL, timestamp TEXT NOT NULL,
+                agent_id TEXT, event_json TEXT NOT NULL
+             );
              CREATE TABLE session_event_journal (id TEXT PRIMARY KEY NOT NULL);
              CREATE TABLE session_view_snapshots (session_id TEXT PRIMARY KEY NOT NULL);",
         )
@@ -307,6 +337,12 @@ fn create_v27(path: &Path, inject_failure: bool) {
             ],
         )
         .expect("review run");
+    connection
+        .execute(
+            "INSERT INTO product_events VALUES (47267, ?1, NULL, ?2)",
+            params![STARTED_AT, legacy_product_event_json()],
+        )
+        .expect("legacy product event");
     if inject_failure {
         connection
             .execute_batch(
@@ -316,4 +352,8 @@ fn create_v27(path: &Path, inject_failure: bool) {
             )
             .expect("failure trigger");
     }
+}
+
+fn legacy_product_event_json() -> &'static str {
+    r#"{"sequence":47267,"timestamp":"2026-08-11T04:08:10Z","type":"agent_updated","agent":{"id":"7f16fb92-8166-45e1-b6b4-29c6a9536a10","parent_id":null,"task_id":null,"project_id":null,"role":"reviewer","name":"reviewer","state":{"resource":"deleted","resource_error":null,"runtime":{"lifecycle":"closing","activity":"idle","active_turn":null,"pending_inputs":0,"last_turn":{"turn_id":"review-turn","session_id":"legacy-session","outcome":"completed","reason":null,"usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":2},"finished_at":"2026-08-11T04:08:08Z"},"revision":1}},"container_id":null,"docker_image":"test","provider_id":"openai","provider_name":"OpenAI","model":"test","reasoning_effort":null,"created_at":"2026-08-11T04:00:00Z","updated_at":"2026-08-11T04:08:10Z","token_usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":2}}}"#
 }

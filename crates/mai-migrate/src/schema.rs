@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail};
+use mai_protocol::MaiProductEventEnvelope;
 use pl_protocol::ThreadTurnHistory;
 use rusqlite::{OptionalExtension, Transaction, params};
 
@@ -52,6 +53,10 @@ pub(crate) fn validate_source(transaction: &Transaction<'_>) -> Result<()> {
         ),
         ("agent_log_entries", &["id", "session_id"][..]),
         ("tool_trace_records", &["id", "session_id"][..]),
+        (
+            "product_events",
+            &["sequence", "timestamp", "agent_id", "event_json"][..],
+        ),
     ] {
         require_columns(transaction, table, columns)?;
     }
@@ -206,6 +211,7 @@ pub(crate) fn install_target(
          DROP TABLE session_view_snapshots;
          DROP TABLE agent_sessions;
          DROP TABLE agent_runtime_states;
+         DELETE FROM product_events;
          UPDATE settings SET value = '28' WHERE key = 'toasty_schema_version';",
     )?;
     Ok(())
@@ -249,6 +255,10 @@ pub(crate) fn validate_target(
             "thread_runtime_traces",
             &["id", "thread_id", "sequence", "trace_json"][..],
         ),
+        (
+            "product_events",
+            &["sequence", "timestamp", "agent_id", "event_json"][..],
+        ),
         ("project_review_runs", &["id", "history_json"][..]),
         ("agent_log_entries", &["id", "thread_id"][..]),
         ("tool_trace_records", &["id", "thread_id"][..]),
@@ -285,6 +295,7 @@ pub(crate) fn validate_target(
     }
     validate_runtime_documents(transaction)?;
     validate_thread_history(transaction)?;
+    validate_product_events(transaction)?;
     let archived_review_runs = validate_review_history(transaction)?;
     Ok(MigrationReport {
         source_schema: if already_current { "28" } else { "27" }.to_string(),
@@ -296,6 +307,25 @@ pub(crate) fn validate_target(
         items: count(transaction, "thread_items")?,
         archived_review_runs,
     })
+}
+
+fn validate_product_events(transaction: &Transaction<'_>) -> Result<()> {
+    let mut statement = transaction
+        .prepare("SELECT sequence, event_json FROM product_events ORDER BY sequence ASC")?;
+    for row in statement.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (sequence, raw) = row?;
+        let event = serde_json::from_str::<MaiProductEventEnvelope>(&raw)
+            .with_context(|| format!("product event {sequence} 不符合当前协议"))?;
+        if event.sequence != u64::try_from(sequence)? {
+            bail!(
+                "product event row sequence {sequence} 与 JSON sequence {} 不一致",
+                event.sequence
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_runtime_documents(transaction: &Transaction<'_>) -> Result<()> {

@@ -12,6 +12,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+mai-protocol = { path = "../mai-protocol" }
 pl-core.workspace = true
 pl-model.workspace = true
 pl-protocol.workspace = true

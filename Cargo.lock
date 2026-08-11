@@ -1888,6 +1888,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "mai-protocol",
  "pl-core",
  "pl-model",
  "pl-protocol",
