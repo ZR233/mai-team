@@ -31,85 +31,34 @@ impl AgentRuntime {
             .await?)
     }
 
-    pub async fn get_agent(
-        &self,
-        agent_id: AgentId,
-        session_id: Option<SessionId>,
-    ) -> Result<AgentDetail> {
+    pub async fn get_agent(&self, agent_id: AgentId) -> Result<AgentDetail> {
         let agent = self.agent(agent_id).await?;
-        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
-        let runtime = agent_host::load_runtime(&self.deps.store, &runtime_agent_id).await?;
-        let sessions = agent_host::project_sessions(&runtime);
-        let selected = agent_host::selected_session(&sessions, session_id).ok_or_else(|| {
-            RuntimeError::SessionNotFound {
-                agent_id,
-                session_id: session_id.unwrap_or_default(),
-            }
-        })?;
+        let canonical_id = agent_host::canonical_id(agent_id)?;
+        let runtime = agent_host::load_runtime(&self.deps.store, &canonical_id).await?;
+        let snapshot = self
+            .framework_handle()?
+            .snapshot(canonical_id)
+            .await
+            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
         let mut summary = agent.summary.read().await.clone();
         summary.token_usage = agent_host::aggregate_usage(&runtime);
         Ok(AgentDetail {
+            thread: agent_host::thread_metadata(&summary, &snapshot),
             summary,
-            sessions: sessions
-                .iter()
-                .map(|session| session.summary.clone())
-                .collect(),
-            selected_session_id: selected.summary.id,
         })
     }
 
-    pub async fn create_session(&self, agent_id: AgentId) -> Result<AgentSessionSummary> {
-        let agent = self.agent(agent_id).await?;
-        let summary = agent.summary.read().await;
-        if summary.task_id.is_some()
-            && matches!(
-                summary.role,
-                Some(AgentRole::Explorer | AgentRole::Executor | AgentRole::Reviewer)
-            )
-        {
-            return Err(RuntimeError::InvalidInput(
-                "workflow child agents use a single internal task session".to_string(),
-            ));
-        }
-        drop(summary);
-        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
-        let runtime = agent_host::load_runtime(&self.deps.store, &runtime_agent_id).await?;
-        let session_id = pl_core::SessionId::generate();
-        let protocol_session_id = agent_host::protocol_uuid(session_id.as_str());
-        let framework_session =
-            agent_host::session_state(session_id, format!("Chat {}", runtime.sessions.len() + 1));
-        self.framework_handle()?
-            .open_session(runtime_agent_id.clone(), framework_session)
-            .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        let runtime = agent_host::load_runtime(&self.deps.store, &runtime_agent_id).await?;
-        agent_host::project_sessions(&runtime)
-            .into_iter()
-            .find(|session| session.summary.id == protocol_session_id)
-            .map(|session| session.summary)
-            .ok_or_else(|| RuntimeError::SessionNotFound {
-                agent_id,
-                session_id: protocol_session_id,
-            })
-    }
-
-    pub async fn tool_trace(
-        &self,
-        agent_id: AgentId,
-        session_id: Option<SessionId>,
-        call_id: String,
-    ) -> Result<ToolTraceDetail> {
-        agents::tool_trace(self, agent_id, session_id, call_id).await
+    pub async fn tool_trace(&self, agent_id: AgentId, call_id: String) -> Result<ToolTraceDetail> {
+        agents::tool_trace(self, agent_id, call_id).await
     }
 
     pub async fn tool_output_artifact(
         &self,
         agent_id: AgentId,
-        session_id: Option<SessionId>,
         call_id: String,
         artifact_id: String,
     ) -> Result<(ToolOutputArtifactInfo, PathBuf)> {
-        agents::tool_output_artifact(self, agent_id, session_id, call_id, artifact_id).await
+        agents::tool_output_artifact(self, agent_id, call_id, artifact_id).await
     }
 
     pub async fn agent_logs(
@@ -131,36 +80,41 @@ impl AgentRuntime {
     pub async fn send_message(
         self: &Arc<Self>,
         agent_id: AgentId,
-        session_id: Option<SessionId>,
         message: String,
         skill_mentions: Vec<String>,
     ) -> Result<TurnId> {
-        let session_id = self.resolve_session_id(agent_id, session_id).await?;
         let agent = self.agent(agent_id).await?;
-        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
-        let turn_id = self
-            .framework_handle()?
+        let summary = agent.summary.read().await.clone();
+        let thread_id = agent_host::canonical_id(agent_id)?;
+        let framework = self.framework_handle()?;
+        let snapshot = framework
+            .snapshot(thread_id.clone())
+            .await
+            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        runtime_thread_events::ensure_live_message_target(&summary, &snapshot)?;
+        let turn_id = framework
             .submit(
-                runtime_agent_id,
-                pl_core::AgentSubmitRequest::start(session_id.framework, message)
+                thread_id.clone(),
+                pl_core::AgentSubmitRequest::start(thread_id, message)
+                    .with_mail_id(Uuid::new_v4().to_string())
                     .with_metadata(json!({ "skillMentions": skill_mentions })),
             )
             .await
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        Ok(agent_host::protocol_uuid(turn_id.as_str()))
+        Ok(turn_id.into_string())
     }
 
     pub async fn cancel_agent(self: &Arc<Self>, agent_id: AgentId) -> Result<()> {
-        let agent = self.agent(agent_id).await?;
-        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
+        self.agent(agent_id).await?;
+        let canonical_id = agent_host::canonical_id(agent_id)?;
         let handle = self.framework_handle()?;
         let snapshot = handle
-            .snapshot(runtime_agent_id.clone())
+            .snapshot(canonical_id.clone())
             .await
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
         if let Some(turn_id) = snapshot.active_turn_id {
             handle
-                .cancel_turn(runtime_agent_id, turn_id)
+                .cancel_turn(canonical_id, turn_id)
                 .await
                 .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
         }
@@ -172,21 +126,21 @@ impl AgentRuntime {
         agent_id: AgentId,
         turn_id: TurnId,
     ) -> Result<()> {
-        let agent = self.agent(agent_id).await?;
-        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
+        self.agent(agent_id).await?;
+        let canonical_id = agent_host::canonical_id(agent_id)?;
         let handle = self.framework_handle()?;
         let snapshot = handle
-            .snapshot(runtime_agent_id.clone())
+            .snapshot(canonical_id.clone())
             .await
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
         let Some(active_turn_id) = snapshot.active_turn_id else {
             return Ok(());
         };
-        if agent_host::protocol_uuid(active_turn_id.as_str()) != turn_id {
+        if active_turn_id.as_str() != turn_id {
             return Ok(());
         }
         handle
-            .cancel_turn(runtime_agent_id, active_turn_id)
+            .cancel_turn(canonical_id, active_turn_id)
             .await
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))
     }
@@ -391,15 +345,18 @@ impl AgentRuntime {
         role: AgentRole,
         name: Option<String>,
     ) -> Result<AgentSummary> {
-        let parent = self.agent(parent_agent_id).await?;
-        let parent_runtime_id = parent.runtime_agent_id.read().await.clone();
-        let session_id = pl_core::SessionId::generate();
+        self.agent(parent_agent_id).await?;
+        let parent_runtime_id = agent_host::canonical_id(parent_agent_id)?;
+        let child_id = AgentId::new_v4();
+        let thread_id = pl_core::ThreadId::new(child_id.to_string())?;
         let result = self
             .framework_handle()?
             .spawn(pl_core::AgentSpawnRequest {
+                thread_id,
                 parent_id: parent_runtime_id,
                 role: pl_core::AgentRoleId::new(role.to_string())?,
-                session: pl_core::AgentSessionState::empty(session_id),
+                session: pl_core::ThreadContextState::empty(),
+                initial_turn_id: None,
                 initial_message: None,
                 metadata: json!({ "name": name.clone(), "taskName": name }),
             })
@@ -415,7 +372,7 @@ impl AgentRuntime {
         agent_id: AgentId,
         message: String,
     ) -> Result<TurnId> {
-        self.send_message(agent_id, None, message, Vec::new()).await
+        self.send_message(agent_id, message, Vec::new()).await
     }
 
     pub(super) async fn wait_agent(
@@ -424,11 +381,14 @@ impl AgentRuntime {
         timeout: Duration,
     ) -> Result<AgentSummary> {
         let agent = self.agent(agent_id).await?;
-        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
-        self.framework_handle()?
-            .wait_timeout(runtime_agent_id, timeout)
-            .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        let canonical_id = agent_host::canonical_id(agent_id)?;
+        tokio::time::timeout(
+            timeout,
+            self.framework_handle()?.wait_until_idle(canonical_id),
+        )
+        .await
+        .map_err(|_| RuntimeError::InvalidInput("waiting for agent timed out".to_string()))?
+        .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
         let summary = agent.summary.read().await.clone();
         Ok(summary)
     }
@@ -438,30 +398,27 @@ impl AgentRuntime {
         agent_id: AgentId,
         cancellation_token: &CancellationToken,
     ) -> Result<pl_core::AgentWaitResult> {
-        let agent = self.agent(agent_id).await?;
-        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
+        self.agent(agent_id).await?;
+        let canonical_id = agent_host::canonical_id(agent_id)?;
         let handle = self.framework_handle()?;
         tokio::select! {
-            result = handle.wait(runtime_agent_id) => {
+            result = handle.wait_until_idle(canonical_id) => {
                 result.map_err(|error| RuntimeError::InvalidInput(error.to_string()))
             }
             () = cancellation_token.cancelled() => Err(RuntimeError::TurnCancelled),
         }
     }
 
-    pub(super) async fn agent_recent_messages(
+    pub(super) async fn thread_history(
         &self,
         agent_id: AgentId,
-        limit: usize,
-    ) -> Result<(Option<SessionId>, Vec<AgentMessage>)> {
-        let agent = self.agent(agent_id).await?;
-        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
-        let runtime = agent_host::load_runtime(&self.deps.store, &runtime_agent_id).await?;
-        let sessions = agent_host::project_sessions(&runtime);
-        let Some(session) = agent_host::selected_session(&sessions, None) else {
-            return Ok((None, Vec::new()));
-        };
-        let start = session.messages.len().saturating_sub(limit);
-        Ok((Some(session.summary.id), session.messages[start..].to_vec()))
+    ) -> Result<pl_protocol::ThreadTurnPage> {
+        self.agent(agent_id).await?;
+        let thread_id = agent_id.to_string();
+        Ok(self
+            .deps
+            .store
+            .list_thread_turns(&thread_id, None, 200)
+            .await?)
     }
 }

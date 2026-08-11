@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use mai_protocol::AgentId;
 use pl_core::{
-    AgentExecutionPolicy, AgentId as FrameworkAgentId, AgentKernel, AgentRuntimeHandle,
-    CoreAgentProfile, TurnEngineBuilder,
+    AgentExecutionPolicy, AgentId as FrameworkAgentId, AgentRuntimeHandle, CoreRuntimeProfile,
+    TurnEngine, TurnEngineBuilder,
 };
 use pl_model::ToolSchema;
 
@@ -52,12 +52,12 @@ pub(crate) fn mai_user_input_interaction_callback() -> pl_core::InteractionCallb
     })
 }
 
-/// 为 PL Agent Runtime 构造 mai kernel；协作工具直接持有 runtime handle。
-pub(crate) async fn build_mai_framework_kernel(
+/// 为 PL Agent Runtime 构造 mai turn engine；协作工具直接持有 runtime handle。
+pub(crate) async fn build_mai_turn_engine(
     builder: TurnEngineBuilder,
-    runtime_profile: CoreAgentProfile,
+    runtime_profile: CoreRuntimeProfile,
     ctx: MaiFrameworkKernelBuildContext,
-) -> Result<AgentKernel> {
+) -> Result<TurnEngine> {
     let product_tool_registry = super::product_tools::MaiProductToolRegistry::new(
         ctx.runtime.clone(),
         ctx.agent.clone(),
@@ -105,26 +105,29 @@ pub(crate) async fn build_mai_framework_kernel(
         ctx.policy.collaboration,
     )
     .tools();
-    let kernel_builder = AgentKernel::builder(builder)
-        .with_profile(runtime_profile)
-        .with_tools(collaboration_tools)
-        .with_registered_tools(product_tools);
-    let mut kernel = if let Some(git_runtime) = git_runtime {
-        kernel_builder
-            .with_tool_set(tool_set.with_git_tools(
+    let mut engine = builder.with_runtime_profile(runtime_profile).build();
+    if let Some(git_runtime) = git_runtime {
+        tool_set
+            .with_git_tools(
                 git_runtime.config,
                 git_runtime.backend,
                 git_runtime.credential_provider,
-            ))
-            .build()
-            .await
+            )
+            .register(&mut engine, workspace_root, None)
+            .await;
     } else {
-        kernel_builder.with_tool_set(tool_set).build().await
-    };
-    if let Some(lease) = ctx.mcp_lease {
-        lease.install_tools(kernel.core_mut())?;
+        tool_set.register(&mut engine, workspace_root, None).await;
     }
-    Ok(kernel)
+    for tool in collaboration_tools {
+        engine.register_tool(tool);
+    }
+    for tool in product_tools {
+        engine.register_tool(tool);
+    }
+    if let Some(lease) = ctx.mcp_lease {
+        lease.install(&mut engine)?;
+    }
+    Ok(engine)
 }
 
 #[cfg(test)]

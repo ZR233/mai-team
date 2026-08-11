@@ -1003,6 +1003,7 @@ mod tests {
     fn overloaded_turn_failure_stays_structured_across_runtime_boundary() {
         let failure = pl_protocol::TurnFailure {
             category: pl_protocol::TurnFailureCategory::ProviderCapacity,
+            provider_kind: None,
             code: Some("server_is_overloaded".to_string()),
             http_status: None,
             message: "The server is overloaded".to_string(),
@@ -1052,10 +1053,13 @@ mod tests {
     ) -> pl_core::AgentWaitResult {
         let outcome = pl_core::AgentTurnOutcome {
             turn_id: pl_core::TurnId::new("turn").expect("turn"),
-            session_id: pl_core::SessionId::new("session").expect("session"),
+            thread_id: pl_core::ThreadId::new("reviewer").expect("thread"),
             kind,
             reason: reason.map(str::to_string),
             failure: None,
+            budget_limit: None,
+            rollover_compacted: false,
+            rollover_compaction_error: None,
             usage: pl_model::TokenUsage::default(),
             finished_at: 1,
         };
@@ -1070,8 +1074,8 @@ mod tests {
                 lifecycle: pl_core::AgentLifecycleState::Active,
                 activity: pl_core::AgentActivityState::Idle,
                 active_turn_id: None,
-                active_session_id: None,
                 pending_inputs: 0,
+                progress: None,
                 last_turn: Some(outcome.clone()),
                 revision: 1,
                 event_sequence: 1,

@@ -3,7 +3,7 @@ use std::sync::{Arc, Weak};
 use mai_protocol::AgentId;
 use pl_core::{
     AgentTurnFactory, AgentTurnPreparationContext, ContextCompactionConfig,
-    ContextCompactionReplacement, CoreAgentProfile, InstructionSnapshot, PreparedAgentTurn,
+    ContextCompactionReplacement, CoreRuntimeProfile, InstructionSnapshot, PreparedAgentTurn,
     PreparedSessionRuntime, RecentInteractionTailConfig, TurnEngineBuilder, TurnOptions,
     TurnRequest,
 };
@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 use crate::skills::{SkillInput, SkillSelection};
 use crate::state::AgentRecord;
 use crate::turn::core_adapter::{
-    MaiFrameworkKernelBuildContext, build_mai_framework_kernel, mai_user_input_interaction_callback,
+    MaiFrameworkKernelBuildContext, build_mai_turn_engine, mai_user_input_interaction_callback,
 };
 use crate::{AgentRuntime, MaiConfig, Result, RuntimeError};
 
@@ -51,8 +51,8 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
         let provider = create_provider_with_catalog(route.provider_info, route.models)
             .map_err(RuntimeError::Model)?;
         let mut builder = TurnEngineBuilder::new(provider);
-        if let Some(effort) = &route.reasoning_effort {
-            builder = builder.with_reasoning_effort(pl_core::ReasoningEffort::new(effort.as_str()));
+        if let Some(effort) = route.effort {
+            builder = builder.with_effort(effort);
         }
 
         if let Err(error) = runtime.refresh_project_skills_for_agent(&agent).await {
@@ -150,11 +150,11 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
             None,
             workspace_instructions.as_deref(),
         );
-        let profile = CoreAgentProfile::host_provided(
+        let profile = CoreRuntimeProfile::host_provided(
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         )
         .with_context_compaction(context_compaction());
-        let mut kernel = build_mai_framework_kernel(
+        let mut engine = build_mai_turn_engine(
             builder,
             profile,
             MaiFrameworkKernelBuildContext {
@@ -169,7 +169,7 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
             },
         )
         .await?;
-        web_search.install(kernel.core_mut(), &config.web_search)?;
+        web_search.install(&mut engine, &config.web_search)?;
         let request = TurnRequest::new(context.input.message)
             .with_turn_id(context.turn_id.to_string())
             .with_instruction_snapshot(InstructionSnapshot::profile_base_override(
@@ -180,10 +180,7 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
             // mai 的文件和进程工具都在 agent 容器内执行；产品级 effect policy
             // 已经完成授权，因此不能再按 server 主机路径触发人工审批。
             .with_permission_mode(pl_core::PermissionMode::FullAccess)
-            .with_prompt_cache_key(format!(
-                "agent:{}:session:{}",
-                context.snapshot.identity.id, context.session_id
-            ))
+            .with_prompt_cache_namespace(context.thread_id.to_string())
             .with_interaction_callback(mai_user_input_interaction_callback());
         let mut session_runtime = PreparedSessionRuntime::new(route.model.slug.clone())
             .with_mcp_servers(active_mcp_servers);
@@ -193,7 +190,7 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
         if let Some(mcp_health) = mcp_health {
             session_runtime = session_runtime.with_mcp_health(mcp_health);
         }
-        let mut prepared = PreparedAgentTurn::new(kernel, request, options, policy)
+        let mut prepared = PreparedAgentTurn::new(engine, request, options, policy)
             .with_session_runtime(session_runtime);
         if let Some(review_manifest) = review_manifest {
             prepared = prepared.with_pinned_context(review_manifest);
@@ -206,23 +203,12 @@ pub(crate) async fn product_agent(
     runtime: &AgentRuntime,
     framework_id: &pl_core::AgentId,
 ) -> Result<(AgentId, Arc<AgentRecord>)> {
-    let agents = runtime
-        .state
-        .agents
-        .read()
-        .await
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-    for agent in agents {
-        if &*agent.runtime_agent_id.read().await == framework_id {
-            let id = agent.summary.read().await.id;
-            return Ok((id, agent));
-        }
-    }
-    Err(RuntimeError::InvalidInput(format!(
-        "product agent mapping not found for `{framework_id}`"
-    )))
+    let id = framework_id.as_str().parse::<AgentId>().map_err(|error| {
+        RuntimeError::InvalidInput(format!(
+            "invalid canonical thread id `{framework_id}`: {error}"
+        ))
+    })?;
+    runtime.agent(id).await.map(|agent| (id, agent))
 }
 
 fn instructions_for_turn(

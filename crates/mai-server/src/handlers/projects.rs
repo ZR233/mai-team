@@ -8,8 +8,8 @@ use serde::Deserialize;
 use mai_protocol::{
     AgentId, CreateProjectRequest, CreateProjectResponse, ProjectId, ProjectReviewJobDetail,
     ProjectReviewJobsResponse, ProjectReviewQueueResponse, ProjectReviewRunDetail,
-    ProjectReviewRunsResponse, SendMessageRequest, SendMessageResponse, SessionId,
-    SkillsListResponse, UpdateProjectRequest, UpdateProjectResponse,
+    ProjectReviewRunsResponse, SendMessageRequest, SendMessageResponse, SkillsListResponse,
+    UpdateProjectRequest, UpdateProjectResponse,
 };
 use mai_runtime::ProjectReviewQueueRequest;
 
@@ -20,7 +20,6 @@ const DEFAULT_REVIEW_RUNS_PAGE_SIZE: usize = 50;
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProjectDetailQuery {
     agent_id: Option<AgentId>,
-    session_id: Option<SessionId>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,12 +47,7 @@ pub(crate) async fn get_project(
     Path(id): Path<ProjectId>,
     Query(query): Query<ProjectDetailQuery>,
 ) -> std::result::Result<Json<mai_protocol::ProjectDetail>, ApiError> {
-    Ok(Json(
-        state
-            .runtime
-            .get_project(id, query.agent_id, query.session_id)
-            .await?,
-    ))
+    Ok(Json(state.runtime.get_project(id, query.agent_id).await?))
 }
 
 pub(crate) async fn update_project(

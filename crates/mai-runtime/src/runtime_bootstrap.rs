@@ -28,10 +28,6 @@ impl AgentRuntime {
         for persisted in snapshot.agents {
             let summary = persisted.summary;
             let agent = Arc::new(AgentRecord {
-                runtime_agent_id: RwLock::new(
-                    pl_core::AgentId::new(persisted.runtime_agent_id)
-                        .map_err(RuntimeError::Model)?,
-                ),
                 summary: RwLock::new(summary.clone()),
                 container: RwLock::new(None),
                 mcp: RwLock::new(None),
@@ -158,7 +154,7 @@ impl AgentRuntime {
                         .turn_cancel_grace_ms,
                 ),
                 restored_inputs: pl_core::RestoredInputPolicy::Hold,
-                session_events: pl_core::SessionEventOptions::default(),
+                thread_events: pl_core::ThreadEventOptions::default(),
             },
         )
         .await
@@ -220,39 +216,35 @@ impl AgentRuntime {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let mut identity_by_product = HashMap::new();
         let mut summaries = HashMap::new();
         for agent in &records {
             let summary = agent.summary.read().await.clone();
-            identity_by_product.insert(summary.id, agent.runtime_agent_id.read().await.clone());
             summaries.insert(summary.id, summary);
         }
         let mut registrations = Vec::new();
         for agent in records {
-            let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
-            if existing.contains(&runtime_agent_id) {
+            let summary = agent.summary.read().await.clone();
+            let thread_id = pl_core::ThreadId::new(summary.id.to_string())?;
+            if existing.contains(&thread_id) {
                 continue;
             }
-            let summary = agent.summary.read().await.clone();
             let parent_id = summary
                 .parent_id
-                .and_then(|parent| identity_by_product.get(&parent).cloned());
+                .map(|parent| pl_core::ThreadId::new(parent.to_string()))
+                .transpose()?;
             let role = summary
                 .role
                 .map(|role| role.to_string())
                 .unwrap_or_else(|| "executor".to_string());
-            registrations.push((
-                framework_depth(summary.id, &summaries),
-                pl_core::AgentRegistration {
-                    identity: pl_core::AgentIdentity {
-                        id: runtime_agent_id,
-                        parent_id,
-                        role: pl_core::AgentRoleId::new(role)?,
-                        depth: framework_depth(summary.id, &summaries),
-                    },
-                    sessions: vec![initial_framework_session(&summary)],
-                },
-            ));
+            let identity = pl_core::AgentIdentity {
+                id: thread_id,
+                parent_id,
+                role: pl_core::AgentRoleId::new(role)?,
+                depth: framework_depth(summary.id, &summaries),
+            };
+            let mut registration = pl_core::AgentRegistration::new(identity);
+            registration.session = initial_thread_context(&summary);
+            registrations.push((framework_depth(summary.id, &summaries), registration));
         }
         registrations.sort_by_key(|(depth, _)| *depth);
         for (_, registration) in registrations {
@@ -277,22 +269,16 @@ impl AgentRuntime {
         };
         let handle = framework.handle();
         let agent = self.agent(product_agent_id).await?;
-        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
-        match handle.snapshot(runtime_agent_id.clone()).await {
+        let thread_id = pl_core::ThreadId::new(product_agent_id.to_string())?;
+        match handle.snapshot(thread_id.clone()).await {
             Ok(_) => return Ok(()),
             Err(pl_core::AgentRuntimeError::NotFound(_)) => {}
             Err(error) => return Err(RuntimeError::InvalidInput(error.to_string())),
         }
         let summary = agent.summary.read().await.clone();
         let parent_id = if let Some(parent_id) = summary.parent_id {
-            Some(
-                self.agent(parent_id)
-                    .await?
-                    .runtime_agent_id
-                    .read()
-                    .await
-                    .clone(),
-            )
+            self.agent(parent_id).await?;
+            Some(pl_core::ThreadId::new(parent_id.to_string())?)
         } else {
             None
         };
@@ -309,21 +295,21 @@ impl AgentRuntime {
             let summary = record.summary.read().await.clone();
             summaries.insert(summary.id, summary);
         }
+        let identity = pl_core::AgentIdentity {
+            id: thread_id,
+            parent_id,
+            role: pl_core::AgentRoleId::new(
+                summary
+                    .role
+                    .map(|role| role.to_string())
+                    .unwrap_or_else(|| "executor".to_string()),
+            )?,
+            depth: framework_depth(product_agent_id, &summaries),
+        };
+        let mut registration = pl_core::AgentRegistration::new(identity);
+        registration.session = initial_thread_context(&summary);
         handle
-            .register(pl_core::AgentRegistration {
-                identity: pl_core::AgentIdentity {
-                    id: runtime_agent_id,
-                    parent_id,
-                    role: pl_core::AgentRoleId::new(
-                        summary
-                            .role
-                            .map(|role| role.to_string())
-                            .unwrap_or_else(|| "executor".to_string()),
-                    )?,
-                    depth: framework_depth(product_agent_id, &summaries),
-                },
-                sessions: vec![initial_framework_session(&summary)],
-            })
+            .register(registration)
             .await
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
         Ok(())

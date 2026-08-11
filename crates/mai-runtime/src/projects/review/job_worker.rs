@@ -457,8 +457,7 @@ pub(super) fn runtime_failure(error: &RuntimeError) -> ProjectReviewFailure {
         | RuntimeError::ProjectNotFound(_)
         | RuntimeError::ProjectReviewRunNotFound(_)
         | RuntimeError::ProjectReviewJobNotFound(_)
-        | RuntimeError::SessionNotFound { .. }
-        | RuntimeError::SessionEventNotFound(_)
+        | RuntimeError::ThreadNotFound(_)
         | RuntimeError::ToolTraceNotFound { .. }
         | RuntimeError::TurnNotFound { .. }
         | RuntimeError::Skill(_)
@@ -490,6 +489,12 @@ fn model_runtime_failure(
     pl_protocol::RetryDisposition,
 ) {
     match error {
+        pl_protocol::PureError::Provider(failure) => (
+            ProjectReviewFailureCategory::Provider,
+            failure.code.clone(),
+            failure.http_status,
+            failure.retry.clone(),
+        ),
         pl_protocol::PureError::ProviderCapacity { .. } => (
             ProjectReviewFailureCategory::ProviderCapacity,
             Some("provider_capacity".to_string()),

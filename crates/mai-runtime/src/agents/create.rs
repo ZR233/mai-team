@@ -2,10 +2,9 @@ use std::future::Future;
 use std::sync::Arc;
 
 use mai_protocol::{
-    AgentRole, AgentSummary, CreateAgentRequest, ProjectId, TaskId, TokenUsage, now,
+    AgentId, AgentRole, AgentSummary, CreateAgentRequest, ProjectId, TaskId, TokenUsage, now,
 };
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 use super::normalize_reasoning_effort;
 use crate::state::AgentRecord;
@@ -13,6 +12,7 @@ use crate::{ProviderSelection, Result};
 
 /// Context supplied when creating an agent record.
 pub(crate) struct CreateAgentRecordContext {
+    pub(crate) id: AgentId,
     pub(crate) task_id: Option<TaskId>,
     pub(crate) project_id: Option<ProjectId>,
     pub(crate) role: Option<AgentRole>,
@@ -24,8 +24,7 @@ pub(crate) struct CreatedAgentRecord {
     pub(crate) record: Arc<AgentRecord>,
 }
 
-/// Provides the narrow persistence/state/event capabilities needed to create
-/// an agent record and its initial session.
+/// Provides the narrow persistence and state capabilities needed to prepare an agent record.
 pub(crate) trait AgentCreateOps: Send + Sync {
     fn default_docker_image(&self) -> String;
 
@@ -43,8 +42,6 @@ pub(crate) trait AgentCreateOps: Send + Sync {
     ) -> impl Future<Output = Result<()>> + Send;
 
     fn insert_agent(&self, agent: Arc<AgentRecord>) -> impl Future<Output = ()> + Send;
-
-    fn publish_agent_created(&self, agent: AgentSummary) -> impl Future<Output = ()> + Send;
 }
 
 pub(crate) async fn create_agent_record(
@@ -52,7 +49,7 @@ pub(crate) async fn create_agent_record(
     request: CreateAgentRequest,
     context: CreateAgentRecordContext,
 ) -> Result<CreatedAgentRecord> {
-    let id = Uuid::new_v4();
+    let id = context.id;
     let created_at = now();
     let name = request
         .name
@@ -92,7 +89,6 @@ pub(crate) async fn create_agent_record(
     };
     ops.save_agent(&summary, system_prompt.as_deref()).await?;
     let agent = Arc::new(AgentRecord {
-        runtime_agent_id: RwLock::new(pl_core::AgentId::new(id.to_string())?),
         summary: RwLock::new(summary.clone()),
         container: RwLock::new(None),
         mcp: RwLock::new(None),
@@ -101,7 +97,6 @@ pub(crate) async fn create_agent_record(
     });
 
     ops.insert_agent(Arc::clone(&agent)).await;
-    ops.publish_agent_created(summary.clone()).await;
     Ok(CreatedAgentRecord {
         summary,
         record: agent,

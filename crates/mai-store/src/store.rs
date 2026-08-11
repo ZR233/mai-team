@@ -1,9 +1,8 @@
 use crate::schema::{
-    SCHEMA_VERSION, SETTING_SCHEMA_VERSION, build_db, has_sqlite_header, migrate_supported_schema,
+    SCHEMA_VERSION, SETTING_SCHEMA_VERSION, build_db, database_schema_version, has_sqlite_header,
 };
-use crate::settings::{get_setting_on, set_setting_on};
+use crate::settings::set_setting_on;
 use crate::*;
-use std::io::ErrorKind;
 use tokio::sync::Mutex;
 
 pub struct MaiStore {
@@ -52,34 +51,33 @@ impl MaiStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        let mut was_empty =
-            !path.exists() || path.metadata().is_ok_and(|metadata| metadata.len() == 0);
+        let was_empty = !path.exists() || path.metadata().is_ok_and(|metadata| metadata.len() == 0);
         if !was_empty && !has_sqlite_header(&path)? {
-            remove_database_files(&path)?;
-            was_empty = true;
+            return Err(StoreError::InvalidConfig(format!(
+                "数据库 `{}` 不是有效的 SQLite 文件；为避免数据丢失，mai-server 拒绝覆盖",
+                path.display()
+            )));
         }
 
-        if !was_empty && !migrate_supported_schema(&path)? {
-            remove_database_files(&path)?;
-            was_empty = true;
+        if !was_empty {
+            let version = database_schema_version(&path).map_err(|error| {
+                StoreError::InvalidConfig(format!(
+                    "无法读取数据库 `{}` 的 schema 版本: {error}",
+                    path.display()
+                ))
+            })?;
+            if version.as_deref() != Some(SCHEMA_VERSION) {
+                return Err(StoreError::InvalidConfig(format!(
+                    "数据库 schema 为 {}，mai-server 仅支持 {SCHEMA_VERSION}；请先停止服务并运行 mai-migrate-v27",
+                    version.as_deref().unwrap_or("未标记")
+                )));
+            }
         }
 
         let mut db = build_db(&path).await?;
         if was_empty {
             db.push_schema().await?;
             set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
-        } else {
-            let current_schema_version = get_setting_on(&db, SETTING_SCHEMA_VERSION)
-                .await
-                .ok()
-                .flatten();
-            if current_schema_version.as_deref() != Some(SCHEMA_VERSION) {
-                drop(db);
-                remove_database_files(&path)?;
-                db = build_db(&path).await?;
-                db.push_schema().await?;
-                set_setting_on(&mut db, SETTING_SCHEMA_VERSION, SCHEMA_VERSION).await?;
-            }
         }
 
         let store = Self {
@@ -124,25 +122,4 @@ impl MaiStore {
     pub fn artifact_index_dir(&self) -> &Path {
         &self.artifact_index_dir
     }
-}
-
-fn remove_database_files(path: &Path) -> Result<()> {
-    for candidate in [
-        path.to_path_buf(),
-        sqlite_sidecar_path(path, "-wal"),
-        sqlite_sidecar_path(path, "-shm"),
-    ] {
-        match std::fs::remove_file(candidate) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
-}
-
-fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = path.as_os_str().to_os_string();
-    value.push(suffix);
-    PathBuf::from(value)
 }

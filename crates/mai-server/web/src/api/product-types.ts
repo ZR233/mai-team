@@ -1,5 +1,7 @@
 export type Id = string
 
+import type { Thread, ThreadTurnHistory } from "@/events/thread-events.generated"
+
 export interface TokenUsage {
   input_tokens: number
   cached_input_tokens: number
@@ -39,24 +41,8 @@ export interface AgentSummary {
   token_usage: TokenUsage
 }
 
-export interface SessionSummary {
-  id: Id
-  title: string
-  created_at: string
-  updated_at: string
-  message_count: number
-  token_usage: TokenUsage
-}
-
-export interface AgentMessage {
-  role: "user" | "assistant" | "system" | "tool"
-  content: string
-  created_at: string
-}
-
 export interface AgentDetail extends AgentSummary {
-  sessions: SessionSummary[]
-  selected_session_id: Id
+  thread: Thread
 }
 
 export interface EnvironmentSummary {
@@ -70,11 +56,6 @@ export interface EnvironmentSummary {
 
 export interface EnvironmentDetail extends EnvironmentSummary {
   root_agent: AgentDetail
-  agents?: AgentSummary[]
-  selected_agent?: AgentDetail
-  selected_agent_id?: Id
-  selected_conversation_id?: Id
-  conversations?: SessionSummary[]
 }
 
 export interface ProjectSummary {
@@ -178,8 +159,7 @@ export interface ReviewJobsResponse {
 }
 
 export interface ReviewRunDetail extends ReviewRunSummary {
-  messages: AgentMessage[]
-  events: import("@/events/session-events.generated").SessionEventEnvelope[]
+  history?: ThreadTurnHistory | null
 }
 
 export interface ReviewRunsResponse {

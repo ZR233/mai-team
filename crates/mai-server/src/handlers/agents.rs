@@ -9,9 +9,9 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use mai_protocol::{
-    AgentId, AgentLogsResponse, CreateAgentRequest, CreateAgentResponse, CreateSessionResponse,
-    FileUploadRequest, FileUploadResponse, SendMessageRequest, SendMessageResponse, SessionId,
-    ToolTraceDetail, ToolTraceListResponse, TurnId, UpdateAgentRequest, UpdateAgentResponse,
+    AgentId, AgentLogsResponse, CreateAgentRequest, CreateAgentResponse, FileUploadRequest,
+    FileUploadResponse, ThreadId, ToolTraceDetail, ToolTraceListResponse, TurnId,
+    UpdateAgentRequest, UpdateAgentResponse,
 };
 use mai_store::AgentLogFilter;
 use mai_store::ToolTraceFilter;
@@ -26,13 +26,8 @@ fn bounded_api_limit(limit: Option<usize>, default: usize, max: usize) -> usize 
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct AgentDetailQuery {
-    session_id: Option<SessionId>,
-}
-
-#[derive(Debug, Deserialize)]
 pub(crate) struct AgentLogsQuery {
-    session_id: Option<SessionId>,
+    thread_id: Option<ThreadId>,
     turn_id: Option<TurnId>,
     level: Option<String>,
     category: Option<String>,
@@ -44,7 +39,7 @@ pub(crate) struct AgentLogsQuery {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ToolTraceListQuery {
-    session_id: Option<SessionId>,
+    thread_id: Option<ThreadId>,
     turn_id: Option<TurnId>,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -72,9 +67,8 @@ pub(crate) async fn create_agent(
 pub(crate) async fn get_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<AgentId>,
-    Query(query): Query<AgentDetailQuery>,
 ) -> std::result::Result<Json<mai_protocol::AgentDetail>, ApiError> {
-    Ok(Json(state.runtime.get_agent(id, query.session_id).await?))
+    Ok(Json(state.runtime.get_agent(id).await?))
 }
 
 pub(crate) async fn update_agent(
@@ -84,43 +78,6 @@ pub(crate) async fn update_agent(
 ) -> std::result::Result<Json<UpdateAgentResponse>, ApiError> {
     let agent = state.runtime.update_agent(id, request).await?;
     Ok(Json(UpdateAgentResponse { agent }))
-}
-
-pub(crate) async fn send_message(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<AgentId>,
-    Json(request): Json<SendMessageRequest>,
-) -> std::result::Result<Json<SendMessageResponse>, ApiError> {
-    let turn_id = state
-        .runtime
-        .send_message(id, None, request.message, request.skill_mentions)
-        .await?;
-    Ok(Json(SendMessageResponse { turn_id }))
-}
-
-pub(crate) async fn create_session(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<AgentId>,
-) -> std::result::Result<Json<CreateSessionResponse>, ApiError> {
-    let session = state.runtime.create_session(id).await?;
-    Ok(Json(CreateSessionResponse { session }))
-}
-
-pub(crate) async fn send_session_message(
-    State(state): State<Arc<AppState>>,
-    Path((id, session_id)): Path<(AgentId, SessionId)>,
-    Json(request): Json<SendMessageRequest>,
-) -> std::result::Result<Json<SendMessageResponse>, ApiError> {
-    let turn_id = state
-        .runtime
-        .send_message(
-            id,
-            Some(session_id),
-            request.message,
-            request.skill_mentions,
-        )
-        .await?;
-    Ok(Json(SendMessageResponse { turn_id }))
 }
 
 pub(crate) async fn list_agent_logs(
@@ -135,7 +92,7 @@ pub(crate) async fn list_agent_logs(
             .agent_logs(
                 id,
                 AgentLogFilter {
-                    session_id: query.session_id,
+                    thread_id: query.thread_id,
                     turn_id: query.turn_id,
                     level: query.level.filter(|value| !value.trim().is_empty()),
                     category: query.category.filter(|value| !value.trim().is_empty()),
@@ -161,7 +118,7 @@ pub(crate) async fn list_tool_traces(
             .tool_traces(
                 id,
                 ToolTraceFilter {
-                    session_id: query.session_id,
+                    thread_id: query.thread_id,
                     turn_id: query.turn_id,
                     offset: query.offset.unwrap_or(0),
                     limit,
@@ -175,19 +132,7 @@ pub(crate) async fn get_tool_trace(
     State(state): State<Arc<AppState>>,
     Path((id, call_id)): Path<(AgentId, String)>,
 ) -> std::result::Result<Json<ToolTraceDetail>, ApiError> {
-    Ok(Json(state.runtime.tool_trace(id, None, call_id).await?))
-}
-
-pub(crate) async fn get_session_tool_trace(
-    State(state): State<Arc<AppState>>,
-    Path((id, session_id, call_id)): Path<(AgentId, SessionId, String)>,
-) -> std::result::Result<Json<ToolTraceDetail>, ApiError> {
-    Ok(Json(
-        state
-            .runtime
-            .tool_trace(id, Some(session_id), call_id)
-            .await?,
-    ))
+    Ok(Json(state.runtime.tool_trace(id, call_id).await?))
 }
 
 pub(crate) async fn upload_file(

@@ -23,7 +23,6 @@ pub(crate) struct SettingRecord {
 pub(crate) struct AgentRecordRow {
     #[key]
     pub(crate) id: String,
-    pub(crate) runtime_agent_id: String,
     pub(crate) parent_id: Option<String>,
     pub(crate) task_id: Option<String>,
     pub(crate) project_id: Option<String>,
@@ -140,8 +139,7 @@ pub(crate) struct ProjectReviewRunRecord {
     pub(crate) output_tokens: i64,
     pub(crate) reasoning_output_tokens: i64,
     pub(crate) total_tokens: i64,
-    pub(crate) messages_json: String,
-    pub(crate) events_json: String,
+    pub(crate) history_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -285,149 +283,80 @@ pub(crate) struct PlanHistoryRecord {
 }
 
 #[derive(Debug, Clone, toasty::Model)]
-#[table = "agent_sessions"]
-pub(crate) struct AgentSessionRecord {
+#[table = "thread_runtime_events"]
+pub(crate) struct ThreadRuntimeEventRecord {
     #[key]
     pub(crate) id: String,
     #[index]
-    pub(crate) agent_id: String,
-    pub(crate) title: String,
-    pub(crate) created_at: String,
-    pub(crate) updated_at: String,
-    pub(crate) input_tokens: i64,
-    pub(crate) cached_input_tokens: i64,
-    pub(crate) output_tokens: i64,
-    pub(crate) reasoning_output_tokens: i64,
-    pub(crate) total_tokens: i64,
-    pub(crate) last_context_tokens: Option<i64>,
-    pub(crate) trace_sequence: i64,
-    pub(crate) session_event_sequence: i64,
-}
-
-#[derive(Debug, Clone, toasty::Model)]
-#[table = "agent_runtime_states"]
-pub(crate) struct AgentRuntimeStateRecord {
-    #[key]
-    pub(crate) agent_id: String,
-    pub(crate) parent_id: Option<String>,
-    pub(crate) role: String,
-    pub(crate) depth: i64,
-    pub(crate) lifecycle: String,
-    pub(crate) activity: String,
-    pub(crate) active_turn_id: Option<String>,
-    pub(crate) active_session_id: Option<String>,
-    pub(crate) pending_inputs: i64,
-    pub(crate) last_turn_json: Option<String>,
-    pub(crate) revision: i64,
-    pub(crate) event_sequence: i64,
-    pub(crate) updated_at: i64,
-}
-
-#[derive(Debug, Clone, toasty::Model)]
-#[table = "agent_pending_inputs"]
-pub(crate) struct AgentPendingInputRecord {
-    #[key]
-    pub(crate) id: String,
-    #[index]
-    pub(crate) agent_id: String,
-    pub(crate) position: i64,
-    pub(crate) turn_id: String,
-    pub(crate) session_id: String,
-    pub(crate) message: String,
-    pub(crate) metadata_json: String,
-    pub(crate) queued_at: i64,
-}
-
-#[derive(Debug, Clone, toasty::Model)]
-#[table = "agent_turns"]
-pub(crate) struct AgentTurnRecord {
-    #[key]
-    pub(crate) turn_id: String,
-    #[index]
-    pub(crate) agent_id: String,
-    pub(crate) session_id: String,
-    pub(crate) status: String,
-    pub(crate) error: Option<String>,
-    pub(crate) prompt_tokens: i64,
-    pub(crate) cached_prompt_tokens: i64,
-    pub(crate) completion_tokens: i64,
-    pub(crate) reasoning_tokens: i64,
-    pub(crate) total_tokens: i64,
-    pub(crate) started_at: Option<i64>,
-    pub(crate) finished_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, toasty::Model)]
-#[table = "agent_runtime_events"]
-pub(crate) struct AgentRuntimeEventRecord {
-    #[key]
-    pub(crate) id: String,
-    #[index]
-    pub(crate) agent_id: String,
+    pub(crate) thread_id: String,
     pub(crate) sequence: i64,
     pub(crate) created_at: i64,
     pub(crate) event_json: String,
 }
 
 #[derive(Debug, Clone, toasty::Model)]
-#[table = "agent_runtime_traces"]
-pub(crate) struct AgentRuntimeTraceRecord {
+#[table = "thread_runtime_traces"]
+pub(crate) struct ThreadRuntimeTraceRecord {
     #[key]
     pub(crate) id: String,
     #[index]
-    pub(crate) agent_id: String,
+    pub(crate) thread_id: String,
     pub(crate) sequence: i64,
     pub(crate) trace_json: String,
 }
 
+/// PL ThreadActor 的 canonical durable document。
 #[derive(Debug, Clone, toasty::Model)]
-#[table = "session_view_snapshots"]
-pub(crate) struct SessionViewSnapshotRecord {
+#[table = "thread_runtime_documents"]
+pub(crate) struct ThreadRuntimeDocumentRecord {
     #[key]
-    pub(crate) session_id: String,
-    pub(crate) through_sequence: i64,
-    pub(crate) snapshot_json: String,
+    pub(crate) thread_id: String,
+    pub(crate) revision: i64,
+    pub(crate) document_json: String,
+    pub(crate) snapshot_json: Option<String>,
     pub(crate) updated_at: i64,
 }
 
+/// Thread 中可分页查询的 durable Turn。
 #[derive(Debug, Clone, toasty::Model)]
-#[table = "session_event_journal"]
-pub(crate) struct SessionEventJournalRecord {
+#[table = "thread_turns"]
+pub(crate) struct ThreadTurnRecord {
     #[key]
     pub(crate) id: String,
     #[index]
-    pub(crate) session_id: String,
-    pub(crate) sequence: i64,
-    pub(crate) emitted_at: i64,
-    pub(crate) event_json: String,
+    pub(crate) thread_id: String,
+    pub(crate) ordinal: i64,
+    pub(crate) turn_json: String,
+    pub(crate) model_json: Option<String>,
+    pub(crate) context_disposition: String,
 }
 
+/// Thread timeline 的 typed Item 索引。
 #[derive(Debug, Clone, toasty::Model)]
-#[table = "agent_messages"]
-pub(crate) struct AgentMessageRecord {
+#[table = "thread_items"]
+pub(crate) struct ThreadItemRecord {
     #[key]
     pub(crate) id: String,
     #[index]
-    pub(crate) agent_id: String,
+    pub(crate) thread_id: String,
     #[index]
-    pub(crate) session_id: String,
-    pub(crate) position: i64,
-    pub(crate) role: String,
-    pub(crate) content: String,
-    pub(crate) created_at: String,
-}
-
-#[derive(Debug, Clone, toasty::Model)]
-#[table = "agent_history_items"]
-pub(crate) struct AgentHistoryRecord {
-    #[key]
-    pub(crate) id: String,
-    #[index]
-    pub(crate) agent_id: String,
-    #[index]
-    pub(crate) session_id: String,
-    pub(crate) position: i64,
+    pub(crate) turn_id: String,
+    pub(crate) ordinal: i64,
+    pub(crate) revision: i64,
     pub(crate) item_json: String,
+}
+
+/// commit 后可审计的 Thread notification journal。
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "thread_notifications"]
+pub(crate) struct ThreadNotificationRecord {
+    #[key]
+    pub(crate) id: String,
+    #[index]
+    pub(crate) thread_id: String,
+    pub(crate) revision: i64,
+    pub(crate) emitted_at: i64,
+    pub(crate) notification_json: String,
 }
 
 #[derive(Debug, Clone, toasty::Model)]
@@ -448,7 +377,7 @@ pub(crate) struct AgentLogRecord {
     #[index]
     pub(crate) agent_id: String,
     #[index]
-    pub(crate) session_id: Option<String>,
+    pub(crate) thread_id: Option<String>,
     #[index]
     pub(crate) turn_id: Option<String>,
     pub(crate) level: String,
@@ -470,7 +399,7 @@ pub(crate) struct ToolTraceRecord {
     #[index]
     pub(crate) agent_id: String,
     #[index]
-    pub(crate) session_id: Option<String>,
+    pub(crate) thread_id: Option<String>,
     #[index]
     pub(crate) turn_id: Option<String>,
     pub(crate) tool_name: String,
@@ -623,16 +552,6 @@ impl TaskRecordRow {
     }
 }
 
-impl AgentMessageRecord {
-    pub(crate) fn into_message(self) -> Result<AgentMessage> {
-        Ok(AgentMessage {
-            role: parse_store_enum(&self.role)?,
-            content: self.content,
-            created_at: parse_utc(&self.created_at)?,
-        })
-    }
-}
-
 impl TaskReviewRecord {
     pub(crate) fn into_review(self) -> Result<TaskReview> {
         Ok(TaskReview {
@@ -654,12 +573,14 @@ impl ProjectReviewRunRecord {
     }
 
     pub(crate) fn into_detail(self) -> Result<ProjectReviewRunDetail> {
-        let messages = serde_json::from_str::<Vec<AgentMessage>>(&self.messages_json)?;
-        let events = serde_json::from_str::<Vec<SessionEventEnvelope>>(&self.events_json)?;
+        let history = self
+            .history_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?;
         Ok(ProjectReviewRunDetail {
             summary: self.into_summary()?,
-            messages,
-            events,
+            history,
         })
     }
 }
@@ -779,11 +700,7 @@ impl AgentLogRecord {
         Ok(AgentLogEntry {
             id: parse_uuid(&self.id)?,
             agent_id: parse_agent_id(&self.agent_id)?,
-            session_id: self
-                .session_id
-                .as_deref()
-                .map(parse_session_id)
-                .transpose()?,
+            thread_id: self.thread_id,
             turn_id: self.turn_id.as_deref().map(parse_turn_id).transpose()?,
             level: self.level,
             category: self.category,
@@ -799,11 +716,7 @@ impl ToolTraceRecord {
         Ok(ToolTraceSummary {
             call_id: self.call_id,
             agent_id: parse_agent_id(&self.agent_id)?,
-            session_id: self
-                .session_id
-                .as_deref()
-                .map(parse_session_id)
-                .transpose()?,
+            thread_id: self.thread_id,
             turn_id: self.turn_id.as_deref().map(parse_turn_id).transpose()?,
             tool_name: self.tool_name,
             success: self.success,
@@ -817,11 +730,7 @@ impl ToolTraceRecord {
     pub(crate) fn into_detail(self) -> Result<ToolTraceDetail> {
         Ok(ToolTraceDetail {
             agent_id: parse_agent_id(&self.agent_id)?,
-            session_id: self
-                .session_id
-                .as_deref()
-                .map(parse_session_id)
-                .transpose()?,
+            thread_id: self.thread_id,
             turn_id: self.turn_id.as_deref().map(parse_turn_id).transpose()?,
             call_id: self.call_id,
             tool_name: self.tool_name,

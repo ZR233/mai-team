@@ -355,7 +355,7 @@ async fn execute_turn(
         .await?
     };
     let turn_id = ops.start_reviewer_turn(reviewer_id, message).await?;
-    ops.update_project_review_run_turn(job.project_id, run_id, reviewer_id, turn_id)
+    ops.update_project_review_run_turn(job.project_id, run_id, reviewer_id, turn_id.clone())
         .await?;
     let wait_result = match wait_reviewer_with_watchdog(
         ops,

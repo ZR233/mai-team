@@ -12,27 +12,25 @@ pub use agent_state::{
     AgentRuntimeState, AgentState, AgentTurnOutcomeKind,
 };
 pub use pl_protocol::{
-    CredentialDescriptorDto, ErrorSeverity, McpAvailabilityDescriptor, McpHealthSnapshot,
-    McpServerDescriptor, ModelCapabilitiesDto, ModelCatalogDescriptor, ModelDescriptor,
-    ModelPricingDto, ModelReasoningDescriptor, PROVIDER_CATALOG_SCHEMA_VERSION,
+    AgentMessageChannel, CredentialDescriptorDto, ErrorSeverity, McpAvailabilityDescriptor,
+    McpHealthSnapshot, McpServerDescriptor, ModelCapabilitiesDto, ModelCatalogDescriptor,
+    ModelDescriptor, ModelPricingDto, ModelReasoningDescriptor, PROVIDER_CATALOG_SCHEMA_VERSION,
     ProviderCatalogSnapshot, ProviderConnectionModeDescriptor, ProviderPresetDescriptor,
-    ProviderServiceCapabilitiesDescriptor, SESSION_EVENT_SCHEMA_VERSION, SessionAgentPart,
-    SessionAgentSnapshot, SessionAttachment, SessionContextCompaction, SessionEventEnvelope,
-    SessionEventKind, SessionEventPosition, SessionMessage, SessionMessageRole,
-    SessionMessageStatus, SessionPart, SessionPartContent, SessionPartDelta, SessionPartDeltaField,
-    SessionPartStatus, SessionResyncReason, SessionRuntimeSnapshot, SessionRuntimeUsage,
-    SessionStreamFrame, SessionSubscriptionRequest, SessionTextChannel, SessionTimelineEvent,
-    SessionTimelineEventKind, SessionToolPart, SessionTurn, SessionTurnStatus, SessionViewSnapshot,
+    ProviderServiceCapabilitiesDescriptor, THREAD_SCHEMA_VERSION, Thread, ThreadAttachment,
+    ThreadContextDisposition, ThreadItem, ThreadItemContent, ThreadItemDelta, ThreadItemDeltaField,
+    ThreadItemStatus, ThreadMode, ThreadNotification, ThreadNotificationEnvelope,
+    ThreadRuntimeSnapshot, ThreadRuntimeUsage, ThreadSnapshot, ThreadStatus,
+    ThreadSubscriptionRequest, ThreadSubscriptionUpdate, ThreadToolCall, ThreadTurnHistory,
+    ThreadTurnPage, Turn, TurnBillingRecord, TurnPhase, TurnState,
     WebSearchProviderCapabilitiesDescriptor, WebSearchResolutionDescriptor,
-    session_events_typescript,
 };
 
 pub type AgentId = Uuid;
 pub type EnvironmentId = Uuid;
 pub type ProjectId = Uuid;
-pub type SessionId = Uuid;
 pub type TaskId = Uuid;
-pub type TurnId = Uuid;
+pub type ThreadId = String;
+pub type TurnId = String;
 
 #[derive(
     Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString,
@@ -294,18 +292,6 @@ pub enum TurnStatus {
     Cancelled,
 }
 
-#[derive(
-    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::Display, strum::EnumString,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum MessageRole {
-    User,
-    Assistant,
-    System,
-    Tool,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoListStatus {
@@ -332,24 +318,6 @@ pub struct UserInputQuestion {
     pub id: String,
     pub question: String,
     pub options: Vec<UserInputOption>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AgentMessage {
-    pub role: MessageRole,
-    pub content: String,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentSessionSummary {
-    pub id: SessionId,
-    pub title: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub message_count: usize,
-    #[serde(default)]
-    pub token_usage: TokenUsage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -404,8 +372,7 @@ pub struct AgentSummary {
 pub struct AgentDetail {
     #[serde(flatten)]
     pub summary: AgentSummary,
-    pub sessions: Vec<AgentSessionSummary>,
-    pub selected_session_id: SessionId,
+    pub thread: Thread,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -504,7 +471,7 @@ pub struct EnvironmentSummary {
     pub name: String,
     pub status: TaskStatus,
     pub root_agent_id: AgentId,
-    pub conversation_count: usize,
+    pub thread_count: usize,
     pub docker_image: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -517,10 +484,6 @@ pub struct EnvironmentDetail {
     #[serde(flatten)]
     pub summary: EnvironmentSummary,
     pub root_agent: AgentDetail,
-    pub current_conversation_id: SessionId,
-    #[serde(default)]
-    pub selected_conversation_id: Option<SessionId>,
-    pub conversations: Vec<AgentSessionSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -657,9 +620,7 @@ pub struct ProjectReviewRunDetail {
     #[serde(flatten)]
     pub summary: ProjectReviewRunSummary,
     #[serde(default)]
-    pub messages: Vec<AgentMessage>,
-    #[serde(default)]
-    pub events: Vec<SessionEventEnvelope>,
+    pub history: Option<ThreadTurnHistory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -818,8 +779,6 @@ pub struct SendMessageRequest {
     pub message: String,
     #[serde(default)]
     pub skill_mentions: Vec<String>,
-    #[serde(default)]
-    pub session_id: Option<SessionId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1039,16 +998,11 @@ pub struct AgentProfilesResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateSessionResponse {
-    pub session: AgentSessionSummary,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentLogEntry {
     pub id: Uuid,
     pub agent_id: AgentId,
     #[serde(default)]
-    pub session_id: Option<SessionId>,
+    pub thread_id: Option<ThreadId>,
     #[serde(default)]
     pub turn_id: Option<TurnId>,
     pub level: String,
@@ -1069,7 +1023,7 @@ pub struct ToolTraceSummary {
     pub call_id: String,
     pub agent_id: AgentId,
     #[serde(default)]
-    pub session_id: Option<SessionId>,
+    pub thread_id: Option<ThreadId>,
     #[serde(default)]
     pub turn_id: Option<TurnId>,
     pub tool_name: String,
@@ -1091,7 +1045,7 @@ pub struct ToolTraceListResponse {
 pub struct ToolTraceDetail {
     pub agent_id: AgentId,
     #[serde(default)]
-    pub session_id: Option<SessionId>,
+    pub thread_id: Option<ThreadId>,
     #[serde(default)]
     pub turn_id: Option<TurnId>,
     pub call_id: String,

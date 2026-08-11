@@ -7,9 +7,9 @@ use mai_protocol::{
 use pl_core::CoreModelTurnRequest;
 use pl_model::{
     MaxTokensField, MissingCandidatePolicy, ModelCapabilities, ModelInfo, ModelModality,
-    ModelParameter, ModelParameterCandidateRequest, ModelRequestProfile, ParameterWire,
-    ProviderInfo, ReasoningConfig, ReasoningSummary, ResponsesMaxTokensField, SharedModelProvider,
-    ToolCapabilities, ToolSchema, create_provider_with_catalog,
+    ModelParameter, ModelParameterCandidateRequest, ModelRequestProfile, ModelTransportProfile,
+    ParameterWire, ProviderInfo, ReasoningConfig, ReasoningSummary, ResponsesMaxTokensField,
+    SharedModelProvider, ToolCapabilities, ToolSchema, create_provider_with_catalog,
 };
 use pl_protocol::PureError;
 
@@ -21,13 +21,9 @@ pub fn core_provider_for_selection(
 ) -> Result<SharedModelProvider, PureError> {
     let mut info = provider_info(&selection.provider);
     info.default_model = selection.model.id.clone();
-    create_provider_with_catalog(
-        info,
-        vec![model_info(
-            &selection.model,
-            selection.provider.transport.protocol,
-        )],
-    )
+    let mut model = model_info(&selection.model, selection.provider.transport.protocol);
+    model.transport.default_connection_mode = info.connection_mode;
+    create_provider_with_catalog(info, vec![model])
 }
 
 /// 将 mai 的模型配置投影成 pl-core 的单次模型请求。
@@ -83,6 +79,10 @@ pub(crate) fn model_info(model: &ModelConfig, protocol: MaiProviderWireProtocol)
     info.capabilities = model_capabilities(&model.capabilities, model.supports_tools);
     info.capabilities.reasoning = model.reasoning.is_some();
     info.parameters = reasoning_parameters(model);
+    info.transport = match protocol {
+        MaiProviderWireProtocol::Responses => ModelTransportProfile::responses_websocket(),
+        MaiProviderWireProtocol::ChatCompletions => ModelTransportProfile::chat_completions_http(),
+    };
     info.request_profile = request_profile(model, protocol);
     info
 }
@@ -123,8 +123,11 @@ fn model_capabilities(
             parallel_tool_calls: capabilities.parallel_tools,
             custom_tools: false,
             freeform_tools: false,
+            tool_search: false,
+            programmatic_tool_calling: false,
         },
         interleaved: None,
+        prompt_cache: Default::default(),
     }
 }
 

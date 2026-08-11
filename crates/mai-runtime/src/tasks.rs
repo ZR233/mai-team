@@ -2,10 +2,9 @@ use std::future::Future;
 use std::sync::Arc;
 
 use mai_protocol::{
-    AgentDetail, AgentId, AgentModelPreference, AgentRole, AgentSessionSummary, AgentSummary,
-    EnvironmentDetail, EnvironmentId, EnvironmentSummary, MaiProductEventKind, PlanHistoryEntry,
-    PlanStatus, SessionId, TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary,
-    TurnId, now,
+    AgentDetail, AgentId, AgentModelPreference, AgentRole, AgentSummary, EnvironmentDetail,
+    EnvironmentId, EnvironmentSummary, MaiProductEventKind, PlanHistoryEntry, PlanStatus,
+    TaskDetail, TaskId, TaskPlan, TaskReview, TaskStatus, TaskSummary, TurnId, now,
 };
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -29,11 +28,7 @@ pub(crate) const DEFAULT_ENVIRONMENT_NAME: &str = "默认环境";
 
 /// Supplies agent read models needed to assemble task detail responses.
 pub(crate) trait TaskReadOps: Send + Sync {
-    fn get_agent(
-        &self,
-        agent_id: AgentId,
-        session_id: Option<mai_protocol::SessionId>,
-    ) -> impl Future<Output = Result<AgentDetail>> + Send;
+    fn get_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<AgentDetail>> + Send;
 }
 
 /// Supplies persistence and event side effects for task summary/plan updates.
@@ -165,21 +160,11 @@ pub(crate) trait EnvironmentOps: TaskUpdateOps {
         request: CreateEnvironmentRootAgentRequest,
     ) -> impl Future<Output = Result<AgentSummary>> + Send;
 
-    fn get_agent(
-        &self,
-        agent_id: AgentId,
-        session_id: Option<SessionId>,
-    ) -> impl Future<Output = Result<AgentDetail>> + Send;
-
-    fn create_agent_session(
-        &self,
-        agent_id: AgentId,
-    ) -> impl Future<Output = Result<AgentSessionSummary>> + Send;
+    fn get_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<AgentDetail>> + Send;
 
     fn send_agent_message(
         &self,
         agent_id: AgentId,
-        session_id: SessionId,
         message: String,
         skill_mentions: Vec<String>,
     ) -> impl Future<Output = Result<TurnId>> + Send;
@@ -354,59 +339,35 @@ pub(crate) async fn create_environment(
             workflow_lock: Mutex::new(()),
         }),
     );
-    Ok(environment_summary_from_root(&task, &root_agent, 1))
+    Ok(environment_summary_from_root(&task, &root_agent))
 }
 
 pub(crate) async fn get_environment(
     state: &RuntimeState,
     ops: &impl EnvironmentOps,
     environment_id: EnvironmentId,
-    session_id: Option<SessionId>,
 ) -> Result<EnvironmentDetail> {
     let task = task(state, environment_id).await?;
     let task_summary = task.summary.read().await.clone();
-    let root_agent = ops
-        .get_agent(task_summary.planner_agent_id, session_id)
-        .await?;
-    let summary = environment_summary_from_root(
-        &task_summary,
-        &root_agent.summary,
-        root_agent.sessions.len(),
-    );
-    let current_conversation_id = root_agent.selected_session_id;
+    let root_agent = ops.get_agent(task_summary.planner_agent_id).await?;
+    let summary = environment_summary_from_root(&task_summary, &root_agent.summary);
     Ok(EnvironmentDetail {
         summary,
-        conversations: root_agent.sessions.clone(),
-        current_conversation_id,
-        selected_conversation_id: Some(current_conversation_id),
         root_agent,
     })
-}
-
-pub(crate) async fn create_environment_conversation(
-    state: &RuntimeState,
-    ops: &impl EnvironmentOps,
-    environment_id: EnvironmentId,
-) -> Result<AgentSessionSummary> {
-    let task = task(state, environment_id).await?;
-    let root_agent_id = task.summary.read().await.planner_agent_id;
-    let session = ops.create_agent_session(root_agent_id).await?;
-    touch_environment(state, ops, &task).await?;
-    Ok(session)
 }
 
 pub(crate) async fn send_environment_message(
     state: &RuntimeState,
     ops: &impl EnvironmentOps,
     environment_id: EnvironmentId,
-    session_id: SessionId,
     message: String,
     skill_mentions: Vec<String>,
 ) -> Result<TurnId> {
     let task = task(state, environment_id).await?;
     let root_agent_id = task.summary.read().await.planner_agent_id;
     let turn_id = ops
-        .send_agent_message(root_agent_id, session_id, message, skill_mentions)
+        .send_agent_message(root_agent_id, message, skill_mentions)
         .await?;
     touch_environment(state, ops, &task).await?;
     Ok(turn_id)
@@ -445,7 +406,7 @@ pub(crate) async fn get_task(
         .filter(|id| agents.iter().any(|agent| agent.id == *id))
         .or(summary.current_agent_id)
         .unwrap_or(summary.planner_agent_id);
-    let selected_agent = ops.get_agent(selected_agent_id, None).await?;
+    let selected_agent = ops.get_agent(selected_agent_id).await?;
     Ok(TaskDetail {
         summary,
         plan,
@@ -468,30 +429,20 @@ pub(crate) async fn environment_summary(
         agents.get(&task.planner_agent_id).cloned()
     }?;
     let root_summary = root_agent.summary.read().await.clone();
-    let conversation_count = ops
-        .get_agent(task.planner_agent_id, None)
-        .await
-        .ok()?
-        .sessions
-        .len();
-    Some(environment_summary_from_root(
-        task,
-        &root_summary,
-        conversation_count,
-    ))
+    ops.get_agent(task.planner_agent_id).await.ok()?;
+    Some(environment_summary_from_root(task, &root_summary))
 }
 
 fn environment_summary_from_root(
     task: &TaskSummary,
     root_agent: &AgentSummary,
-    conversation_count: usize,
 ) -> EnvironmentSummary {
     EnvironmentSummary {
         id: task.id,
         name: task.title.clone(),
         status: task.status.clone(),
         root_agent_id: task.planner_agent_id,
-        conversation_count,
+        thread_count: 1,
         docker_image: root_agent.docker_image.clone(),
         created_at: task.created_at,
         updated_at: task.updated_at.max(root_agent.updated_at),

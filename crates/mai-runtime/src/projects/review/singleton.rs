@@ -234,7 +234,7 @@ async fn delete_project_reviewers<Ops: ProjectReviewWorkerOps>(
     let mut deleted_reviewer_count = 0;
     for reviewer_id in reviewer_ids {
         match ops.agent_current_turn(reviewer_id).await {
-            Ok(Some(turn_id)) => match ops.cancel_agent_turn(reviewer_id, turn_id).await {
+            Ok(Some(turn_id)) => match ops.cancel_agent_turn(reviewer_id, turn_id.clone()).await {
                 Ok(()) => {
                     cancelled_turn_count += 1;
                 }

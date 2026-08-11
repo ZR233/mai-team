@@ -25,6 +25,7 @@ impl AgentRuntime {
     ) -> Result<AgentSummary> {
         let resource = self
             .create_agent_resource_with_container_source(
+                AgentId::new_v4(),
                 request,
                 container_source,
                 task_id,
@@ -41,7 +42,15 @@ impl AgentRuntime {
     ) -> Result<AgentSummary> {
         resource.include_canonical_runtime();
         match self.register_framework_agent(resource.id()).await {
-            Ok(()) => Ok(resource.commit()),
+            Ok(()) => {
+                let summary = resource.commit();
+                self.events
+                    .publish(MaiProductEventKind::AgentCreated {
+                        agent: summary.clone(),
+                    })
+                    .await;
+                Ok(summary)
+            }
             Err(error) => match resource.rollback().await {
                 Ok(()) => Err(error),
                 Err(rollback_error) => Err(RuntimeError::InvalidInput(format!(
@@ -53,6 +62,7 @@ impl AgentRuntime {
 
     pub(super) async fn create_agent_resource_with_container_source(
         self: &Arc<Self>,
+        agent_id: AgentId,
         request: CreateAgentRequest,
         container_source: agents::ContainerSource,
         task_id: Option<TaskId>,
@@ -63,6 +73,7 @@ impl AgentRuntime {
             self.as_ref(),
             request,
             agents::CreateAgentRecordContext {
+                id: agent_id,
                 task_id,
                 project_id,
                 role,

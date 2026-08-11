@@ -1,22 +1,16 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use serde::Deserialize;
 
 use super::state::{ApiError, AppState};
 use crate::services::artifacts::{ArtifactError, ArtifactService};
 use mai_protocol::{
-    CreateEnvironmentRequest, CreateEnvironmentResponse, CreateSessionResponse, EnvironmentId,
-    SendMessageRequest, SendMessageResponse, SessionId,
+    CreateEnvironmentRequest, CreateEnvironmentResponse, EnvironmentId, SendMessageRequest,
+    SendMessageResponse,
 };
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct EnvironmentDetailQuery {
-    session_id: Option<SessionId>,
-}
 
 pub(crate) async fn list_environments(
     State(state): State<Arc<AppState>>,
@@ -44,29 +38,18 @@ pub(crate) async fn create_environment(
 pub(crate) async fn get_environment(
     State(state): State<Arc<AppState>>,
     Path(id): Path<EnvironmentId>,
-    Query(query): Query<EnvironmentDetailQuery>,
 ) -> std::result::Result<Json<mai_protocol::EnvironmentDetail>, ApiError> {
-    Ok(Json(
-        state.runtime.get_environment(id, query.session_id).await?,
-    ))
+    Ok(Json(state.runtime.get_environment(id).await?))
 }
 
-pub(crate) async fn create_conversation(
+pub(crate) async fn send_message(
     State(state): State<Arc<AppState>>,
     Path(id): Path<EnvironmentId>,
-) -> std::result::Result<Json<CreateSessionResponse>, ApiError> {
-    let session = state.runtime.create_environment_conversation(id).await?;
-    Ok(Json(CreateSessionResponse { session }))
-}
-
-pub(crate) async fn send_conversation_message(
-    State(state): State<Arc<AppState>>,
-    Path((id, session_id)): Path<(EnvironmentId, SessionId)>,
     Json(request): Json<SendMessageRequest>,
 ) -> std::result::Result<Json<SendMessageResponse>, ApiError> {
     let turn_id = state
         .runtime
-        .send_environment_message(id, session_id, request.message, request.skill_mentions)
+        .send_environment_message(id, request.message, request.skill_mentions)
         .await?;
     Ok(Json(SendMessageResponse { turn_id }))
 }

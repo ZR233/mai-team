@@ -9,7 +9,7 @@ use mai_protocol::{
     AgentDetail, AgentId, AgentModelPreference, AgentRole, AgentSummary, CreateProjectRequest,
     GitAccountSummary, GithubInstallationsResponse, MaiProductEventKind, ProjectCloneStatus,
     ProjectDetail, ProjectId, ProjectReviewStatus, ProjectStatus, ProjectSummary,
-    SendMessageRequest, SessionId, TurnId, UpdateProjectRequest, now,
+    SendMessageRequest, TurnId, UpdateProjectRequest, now,
 };
 use uuid::Uuid;
 
@@ -17,11 +17,7 @@ use uuid::Uuid;
 /// project read models without exposing the full runtime to project service
 /// queries.
 pub(crate) trait ProjectReadOps: Send + Sync {
-    fn get_agent(
-        &self,
-        agent_id: AgentId,
-        session_id: Option<SessionId>,
-    ) -> impl Future<Output = Result<AgentDetail>> + Send;
+    fn get_agent(&self, agent_id: AgentId) -> impl Future<Output = Result<AgentDetail>> + Send;
     fn recent_review_runs(
         &self,
         project_id: ProjectId,
@@ -135,28 +131,15 @@ pub(crate) async fn get_project(
     ops: &impl ProjectReadOps,
     project_id: ProjectId,
     selected_agent_id: Option<AgentId>,
-    session_id: Option<SessionId>,
 ) -> Result<ProjectDetail> {
     let project = project(state, project_id).await?;
     let summary = project.summary.read().await.clone();
     let agents = project_agents(state, project_id).await;
     let requested_agent_id =
         selected_agent_id.filter(|id| agents.iter().any(|agent| agent.id == *id));
-    let selected_session_id = if selected_agent_id.is_some() && requested_agent_id.is_none() {
-        None
-    } else {
-        session_id
-    };
     let selected_agent_id = requested_agent_id.unwrap_or(summary.maintainer_agent_id);
-    let maintainer_session_id = (selected_agent_id == summary.maintainer_agent_id)
-        .then_some(selected_session_id)
-        .flatten();
-    let maintainer_agent = ops
-        .get_agent(summary.maintainer_agent_id, maintainer_session_id)
-        .await?;
-    let selected_agent = ops
-        .get_agent(selected_agent_id, selected_session_id)
-        .await?;
+    let maintainer_agent = ops.get_agent(summary.maintainer_agent_id).await?;
+    let selected_agent = ops.get_agent(selected_agent_id).await?;
     let status = if summary.status == ProjectStatus::Ready {
         "ready"
     } else {

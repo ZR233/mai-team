@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use mai_protocol::{
-    AgentId, AgentLogEntry, SessionId, ToolOutputArtifactInfo, ToolTraceDetail, TurnId,
+    AgentId, AgentLogEntry, ThreadId, ToolOutputArtifactInfo, ToolTraceDetail, TurnId,
 };
 use pl_core::{ToolLifecyclePhase, ToolLifecycleProjection};
 use pl_trace::TraceEvent;
@@ -11,7 +11,7 @@ use crate::AgentRuntime;
 
 pub(super) struct AgentLogProjection {
     pub(super) agent_id: AgentId,
-    pub(super) session_id: Option<SessionId>,
+    pub(super) thread_id: Option<ThreadId>,
     pub(super) turn_id: Option<TurnId>,
     pub(super) level: &'static str,
     pub(super) category: &'static str,
@@ -24,21 +24,21 @@ pub(super) struct AgentLogProjection {
 pub(super) async fn project_trace_events(
     runtime: &AgentRuntime,
     agent_id: AgentId,
-    session_id: SessionId,
+    thread_id: ThreadId,
     turn_id: TurnId,
     events: &[TraceEvent],
 ) {
     for projection in pl_core::tool_lifecycle_projections(events, 500) {
         match projection.phase() {
             ToolLifecyclePhase::Started => {
-                project_tool_started(runtime, agent_id, session_id, turn_id, &projection).await;
+                project_tool_started(runtime, agent_id, &thread_id, &turn_id, &projection).await;
             }
             ToolLifecyclePhase::Finished { success } => {
                 project_tool_completed(
                     runtime,
                     agent_id,
-                    session_id,
-                    turn_id,
+                    &thread_id,
+                    &turn_id,
                     &projection,
                     *success,
                 )
@@ -51,15 +51,15 @@ pub(super) async fn project_trace_events(
 async fn project_tool_started(
     runtime: &AgentRuntime,
     agent_id: AgentId,
-    session_id: SessionId,
-    turn_id: TurnId,
+    thread_id: &ThreadId,
+    turn_id: &TurnId,
     projection: &ToolLifecycleProjection,
 ) {
     let started_at = trace_time(projection.started_at_unix());
     let trace = ToolTraceDetail {
         agent_id,
-        session_id: Some(session_id),
-        turn_id: Some(turn_id),
+        thread_id: Some(thread_id.clone()),
+        turn_id: Some(turn_id.clone()),
         call_id: projection.call_id().to_string(),
         tool_name: projection.tool_name().to_string(),
         arguments: projection.arguments().clone(),
@@ -83,8 +83,8 @@ async fn project_tool_started(
         runtime,
         AgentLogProjection {
             agent_id,
-            session_id: Some(session_id),
-            turn_id: Some(turn_id),
+            thread_id: Some(thread_id.clone()),
+            turn_id: Some(turn_id.clone()),
             level: "info",
             category: "tool",
             message: "tool started",
@@ -102,8 +102,8 @@ async fn project_tool_started(
 async fn project_tool_completed(
     runtime: &AgentRuntime,
     agent_id: AgentId,
-    session_id: SessionId,
-    turn_id: TurnId,
+    thread_id: &ThreadId,
+    turn_id: &TurnId,
     projection: &ToolLifecycleProjection,
     success: bool,
 ) {
@@ -111,8 +111,8 @@ async fn project_tool_completed(
     let completed_at = trace_time(projection.completed_at_unix_or_started());
     let trace = ToolTraceDetail {
         agent_id,
-        session_id: Some(session_id),
-        turn_id: Some(turn_id),
+        thread_id: Some(thread_id.clone()),
+        turn_id: Some(turn_id.clone()),
         call_id: projection.call_id().to_string(),
         tool_name: projection.tool_name().to_string(),
         arguments: projection.arguments().clone(),
@@ -136,8 +136,8 @@ async fn project_tool_completed(
         runtime,
         AgentLogProjection {
             agent_id,
-            session_id: Some(session_id),
-            turn_id: Some(turn_id),
+            thread_id: Some(thread_id.clone()),
+            turn_id: Some(turn_id.clone()),
             level: if success { "info" } else { "warn" },
             category: "tool",
             message: "tool completed",
@@ -162,7 +162,7 @@ async fn project_tool_completed(
 pub(super) async fn record_agent_log(runtime: &AgentRuntime, projection: AgentLogProjection) {
     let AgentLogProjection {
         agent_id,
-        session_id,
+        thread_id,
         turn_id,
         level,
         category,
@@ -173,7 +173,7 @@ pub(super) async fn record_agent_log(runtime: &AgentRuntime, projection: AgentLo
     let entry = AgentLogEntry {
         id: Uuid::new_v4(),
         agent_id,
-        session_id,
+        thread_id,
         turn_id,
         level: level.to_string(),
         category: category.to_string(),

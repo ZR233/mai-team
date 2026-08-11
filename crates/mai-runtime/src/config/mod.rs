@@ -266,7 +266,7 @@ impl Default for MaiConfig {
         let route = ModelRouteConfig {
             provider: provider_id.clone(),
             model: "deepseek-v4-flash".to_string(),
-            reasoning_effort: Some(ReasoningEffort::new("high")),
+            effort: Some(ReasoningEffort::new("high")),
         };
         let routes = REQUIRED_ROLES
             .into_iter()

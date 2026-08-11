@@ -6,21 +6,23 @@ Mai Web 是 Vite + React + TypeScript 单页应用，使用官方 shadcn/ui 组�
 语义 token、React Router、TanStack Query 和 Zustand。`App` 只组合路由、providers 与 shell；
 业务分别位于 chat、projects、providers、settings 和 event transport 模块。
 
-低频产品实体由 TanStack Query 缓存；当前可见 session 的 timeline、turn、Todo、context 和
-interaction 由 normalized Zustand store 保存。高频 delta 只订阅受影响 selector，并按
-animation frame 合批，不能使整个工作台重渲染。
+低频产品实体由 TanStack Query 缓存；每个 PL Thread 的 timeline、turn、Todo、context 和
+interaction 由独立 `ThreadStore` 保存。`ThreadStoreRegistry` 以 `ThreadId` 隔离 snapshot、
+revision、generation、连接和 delta buffer。高频 delta 只订阅受影响 selector，并按 animation
+frame 合批，不能使整个工作台重渲染。
 
 ## 事件连接
 
-浏览器始终最多持有两个 EventSource：
+浏览器持有两类 EventSource：
 
 - `/events/product`：应用生命周期内常驻，更新或精确失效项目、任务、review、provider、
   settings 和资源 query。
-- `/sessions/{sessionId}/events`：只为当前路由选中的 session 建立；切换时立即关闭旧连接。
+- `/threads/{threadId}/events`：每个已挂载的 Thread 各自建立；视图卸载时立即关闭对应连接。
 
-session stream 首帧为 snapshot 或 durable replay。客户端用 generation 隔离旧连接，按 session
-durable sequence 去重，按 part revision 应用 transient delta。`ResyncRequired`、revision gap 或
-协议不变量失败会关闭连接并以无 cursor 重订阅，不能通过整页刷新修复。
+Thread stream 首帧必须是 authoritative snapshot，随后只应用同一 `threadId` 的 notification。
+客户端用 generation 隔离旧连接，要求 Thread revision 严格连续，并按 Item revision 应用 delta。
+`Lagged`、revision gap、Item ownership 失败或协议不变量失败都会关闭当前连接并重新获取 snapshot；
+历史分页只走 `ThreadTurnPage`，不依赖 SSE replay。
 
 ## 视觉系统
 
@@ -34,7 +36,7 @@ interaction 等结构化内容使用轻量边界。
 
 ## 功能完整性
 
-重构必须保留 environment/agent/session、project/task/review、provider/model catalog、roles、
+重构必须保留 environment/agent/thread、project/task/review、provider/model catalog、roles、
 instructions、skills、MCP、Web Search、Git account、GitHub App/relay 及所有现有 CRUD 和审批。
 provider/model/reasoning 继续只消费服务端 catalog，不在 React 代码中加入厂商或模型 ID 分支。
 

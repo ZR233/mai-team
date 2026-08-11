@@ -156,9 +156,18 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
             get(handlers::config::get_agent_config).put(handlers::config::save_agent_config),
         )
         .route("/events/product", get(handlers::events::events))
+        .route("/threads/{thread_id}", get(handlers::threads::get_thread))
         .route(
-            "/sessions/{session_id}/events",
-            get(handlers::events::session_events),
+            "/threads/{thread_id}/events",
+            get(handlers::threads::events),
+        )
+        .route(
+            "/threads/{thread_id}/turns",
+            get(handlers::threads::list_thread_turns),
+        )
+        .route(
+            "/threads/{thread_id}/messages",
+            post(handlers::threads::send_message),
         )
         .route(
             "/environments",
@@ -174,12 +183,8 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
             get(handlers::environments::get_environment),
         )
         .route(
-            "/environments/{id}/conversations",
-            post(handlers::environments::create_conversation),
-        )
-        .route(
-            "/environments/{id}/conversations/{session_id}/messages",
-            post(handlers::environments::send_conversation_message),
+            "/environments/{id}/messages",
+            post(handlers::environments::send_message),
         )
         .route(
             "/tasks",
@@ -266,22 +271,6 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
                 .delete(handlers::agents::delete_agent)
                 .patch(handlers::agents::update_agent)
                 .post(handlers::agents::cancel_agent_colon),
-        )
-        .route(
-            "/agents/{id}/messages",
-            post(handlers::agents::send_message),
-        )
-        .route(
-            "/agents/{id}/sessions",
-            post(handlers::agents::create_session),
-        )
-        .route(
-            "/agents/{id}/sessions/{session_id}/messages",
-            post(handlers::agents::send_session_message),
-        )
-        .route(
-            "/agents/{id}/sessions/{session_id}/tool-calls/{call_id}",
-            get(handlers::agents::get_session_tool_trace),
         )
         .route("/agents/{id}/logs", get(handlers::agents::list_agent_logs))
         .route(

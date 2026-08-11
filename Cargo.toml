@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/mai-docker",
+    "crates/mai-migrate",
     "crates/mai-protocol",
     "crates/mai-relay",
     "crates/mai-relay-client",
@@ -22,10 +23,10 @@ ctrlc = { version = "3", features = ["termination"] }
 fnv = "1"
 percent-encoding = "2"
 pretty_assertions = "1"
-pl-core = { git = "https://github.com/ZR233/pure-lang.git", rev = "9430fa9e52d2cbc6666aa9fb8ac94d00c062561f", default-features = false }
-pl-model = { git = "https://github.com/ZR233/pure-lang.git", rev = "9430fa9e52d2cbc6666aa9fb8ac94d00c062561f" }
-pl-protocol = { git = "https://github.com/ZR233/pure-lang.git", rev = "9430fa9e52d2cbc6666aa9fb8ac94d00c062561f" }
-pl-trace = { git = "https://github.com/ZR233/pure-lang.git", rev = "9430fa9e52d2cbc6666aa9fb8ac94d00c062561f" }
+pl-core = { git = "https://github.com/ZR233/pure-lang.git", rev = "ed8c28605905ea58b1e556ced72e38a118184fee", default-features = false }
+pl-model = { git = "https://github.com/ZR233/pure-lang.git", rev = "ed8c28605905ea58b1e556ced72e38a118184fee" }
+pl-protocol = { git = "https://github.com/ZR233/pure-lang.git", rev = "ed8c28605905ea58b1e556ced72e38a118184fee" }
+pl-trace = { git = "https://github.com/ZR233/pure-lang.git", rev = "ed8c28605905ea58b1e556ced72e38a118184fee" }
 
 schemars = "1"
 shell-words = "1"

@@ -1,13 +1,12 @@
 pub(crate) use chrono::{DateTime, Utc};
 pub(crate) use mai_protocol::{
-    AgentId, AgentLogEntry, AgentMessage, AgentSummary, ArtifactInfo, GitAccountRequest,
-    GitAccountStatus, GitAccountSummary, GitAccountsResponse, GitProvider, GitTokenKind,
-    GithubAppSettingsRequest, GithubAppSettingsResponse, GithubSettingsResponse,
-    MaiProductEventEnvelope, MaiProductEventKind, McpServerConfig, PlanHistoryEntry, ProjectId,
-    ProjectReviewJobSummary, ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary,
-    RelaySettingsRequest, RelaySettingsResponse, SessionEventEnvelope, SessionId,
-    SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskSummary, TokenUsage,
-    ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceSummary, TurnId,
+    AgentId, AgentLogEntry, AgentSummary, ArtifactInfo, GitAccountRequest, GitAccountStatus,
+    GitAccountSummary, GitAccountsResponse, GitProvider, GitTokenKind, GithubAppSettingsRequest,
+    GithubAppSettingsResponse, GithubSettingsResponse, MaiProductEventEnvelope,
+    MaiProductEventKind, McpServerConfig, PlanHistoryEntry, ProjectId, ProjectReviewJobSummary,
+    ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary, RelaySettingsRequest,
+    RelaySettingsResponse, SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskSummary,
+    ThreadId, TokenUsage, ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceSummary, TurnId,
 };
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use std::collections::BTreeMap;
@@ -19,7 +18,6 @@ pub(crate) use uuid::Uuid;
 
 use thiserror::Error;
 
-mod agent_runtime;
 mod artifacts;
 mod cleanup_tasks;
 mod config_document;
@@ -40,18 +38,11 @@ mod settings;
 mod sqlite_busy;
 mod store;
 mod tasks;
+mod thread_runtime;
 
-#[cfg(test)]
-mod agent_runtime_tests;
 #[cfg(test)]
 mod tests;
 
-pub use agent_runtime::{
-    AgentRuntimeCommitDocument, AgentRuntimeCommitOutcome, StoredAgentPendingInput,
-    StoredAgentRuntime, StoredAgentRuntimeEvent, StoredAgentRuntimeMutation,
-    StoredAgentRuntimeSession, StoredAgentRuntimeState, StoredAgentRuntimeTrace, StoredAgentTurn,
-    StoredSessionEvent, StoredSessionProjection, StoredTokenUsage,
-};
 pub use cleanup_tasks::{
     ProjectReviewCleanupResourceKind, ProjectReviewCleanupTask, ProjectReviewCleanupTaskStatus,
 };
@@ -62,6 +53,10 @@ pub use review_jobs::{
     ProjectReviewJobEnqueueDisposition, ProjectReviewJobEnqueueResult,
 };
 pub use store::MaiStore;
+pub use thread_runtime::{
+    StoredThreadRuntime, StoredThreadRuntimeEvent, StoredThreadTraceEvent,
+    ThreadRuntimeCommitDocument, ThreadRuntimeCommitOutcome, ThreadRuntimeTurnCommit,
+};
 
 pub(crate) use convert::*;
 
@@ -102,7 +97,6 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct PersistedAgent {
     pub summary: AgentSummary,
     pub system_prompt: Option<String>,
-    pub runtime_agent_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -125,7 +119,7 @@ pub struct PersistedTask {
 
 #[derive(Debug, Clone, Default)]
 pub struct AgentLogFilter {
-    pub session_id: Option<SessionId>,
+    pub thread_id: Option<ThreadId>,
     pub turn_id: Option<TurnId>,
     pub level: Option<String>,
     pub category: Option<String>,
@@ -137,7 +131,7 @@ pub struct AgentLogFilter {
 
 #[derive(Debug, Clone, Default)]
 pub struct ToolTraceFilter {
-    pub session_id: Option<SessionId>,
+    pub thread_id: Option<ThreadId>,
     pub turn_id: Option<TurnId>,
     pub offset: usize,
     pub limit: usize,

@@ -10,8 +10,8 @@ impl MaiStore {
         toasty::create!(AgentLogRecord {
             id: entry.id.to_string(),
             agent_id: entry.agent_id.to_string(),
-            session_id: entry.session_id.map(|id| id.to_string()),
-            turn_id: entry.turn_id.map(|id| id.to_string()),
+            thread_id: entry.thread_id.clone(),
+            turn_id: entry.turn_id.clone(),
             level: entry.level.clone(),
             category: entry.category.clone(),
             message: entry.message.clone(),
@@ -34,9 +34,8 @@ impl MaiStore {
         )
         .exec(&mut db)
         .await?;
-        if let Some(session_id) = filter.session_id {
-            let session_id = session_id.to_string();
-            rows.retain(|row| row.session_id.as_deref() == Some(session_id.as_str()));
+        if let Some(thread_id) = filter.thread_id {
+            rows.retain(|row| row.thread_id.as_deref() == Some(thread_id.as_str()));
         }
         if let Some(turn_id) = filter.turn_id {
             let turn_id = turn_id.to_string();
@@ -100,8 +99,8 @@ impl MaiStore {
             id: tool_trace_record_id(trace),
             call_id: trace.call_id.clone(),
             agent_id: trace.agent_id.to_string(),
-            session_id: trace.session_id.map(|id| id.to_string()),
-            turn_id: trace.turn_id.map(|id| id.to_string()),
+            thread_id: trace.thread_id.clone(),
+            turn_id: trace.turn_id.clone(),
             tool_name: trace.tool_name.clone(),
             arguments_json: serde_json::to_string(&trace.arguments)?,
             output: String::new(),
@@ -129,8 +128,8 @@ impl MaiStore {
             id: tool_trace_record_id(trace),
             call_id: trace.call_id.clone(),
             agent_id: trace.agent_id.to_string(),
-            session_id: trace.session_id.map(|id| id.to_string()),
-            turn_id: trace.turn_id.map(|id| id.to_string()),
+            thread_id: trace.thread_id.clone(),
+            turn_id: trace.turn_id.clone(),
             tool_name: trace.tool_name.clone(),
             arguments_json: serde_json::to_string(&trace.arguments)?,
             output: trace.output.clone(),
@@ -149,7 +148,7 @@ impl MaiStore {
     pub async fn load_tool_trace(
         &self,
         agent_id: AgentId,
-        session_id: Option<SessionId>,
+        thread_id: Option<ThreadId>,
         call_id: &str,
     ) -> Result<Option<ToolTraceDetail>> {
         let mut db = self.db.clone();
@@ -159,14 +158,7 @@ impl MaiStore {
         .exec(&mut db)
         .await?;
         rows.into_iter()
-            .find(|row| {
-                tool_trace_belongs_to(
-                    row,
-                    agent_id,
-                    session_id.map(|id| id.to_string()).as_deref(),
-                    None,
-                )
-            })
+            .find(|row| tool_trace_belongs_to(row, agent_id, thread_id.as_deref(), None))
             .map(ToolTraceRecord::into_detail)
             .transpose()
     }
@@ -184,9 +176,8 @@ impl MaiStore {
         )
         .exec(&mut db)
         .await?;
-        if let Some(session_id) = filter.session_id {
-            let session_id = session_id.to_string();
-            rows.retain(|row| row.session_id.as_deref() == Some(session_id.as_str()));
+        if let Some(thread_id) = filter.thread_id {
+            rows.retain(|row| row.thread_id.as_deref() == Some(thread_id.as_str()));
         }
         if let Some(turn_id) = filter.turn_id {
             let turn_id = turn_id.to_string();
@@ -241,9 +232,9 @@ async fn prune_observability_rows(
             "DELETE FROM {table} WHERE id IN (
                 SELECT observed.id FROM {table} observed
                 WHERE observed.{timestamp_column} < ?1
-                  AND (observed.session_id IS NULL OR NOT EXISTS (
-                      SELECT 1 FROM agent_sessions live
-                      WHERE live.id = observed.session_id
+                  AND (observed.thread_id IS NULL OR NOT EXISTS (
+                      SELECT 1 FROM thread_runtime_documents live
+                      WHERE live.thread_id = observed.thread_id
                   ))
                 ORDER BY observed.{timestamp_column} ASC, observed.id ASC
                 LIMIT ?2
@@ -268,13 +259,13 @@ async fn delete_matching_tool_trace(db: &mut Db, trace: &ToolTraceDetail) -> Res
     )
     .exec(db)
     .await?;
-    let session_id = trace.session_id.map(|id| id.to_string());
-    let turn_id = trace.turn_id.map(|id| id.to_string());
+    let thread_id = trace.thread_id.clone();
+    let turn_id = trace.turn_id.clone();
     for row in rows {
         if tool_trace_belongs_to(
             &row,
             trace.agent_id,
-            session_id.as_deref(),
+            thread_id.as_deref(),
             turn_id.as_deref(),
         ) {
             Query::<List<ToolTraceRecord>>::filter(ToolTraceRecord::fields().id().eq(row.id))
@@ -290,11 +281,8 @@ fn tool_trace_record_id(trace: &ToolTraceDetail) -> String {
     format!(
         "{}:{}:{}:{}",
         trace.agent_id,
-        trace
-            .session_id
-            .map(|id| id.to_string())
-            .unwrap_or_default(),
-        trace.turn_id.map(|id| id.to_string()).unwrap_or_default(),
+        trace.thread_id.clone().unwrap_or_default(),
+        trace.turn_id.clone().unwrap_or_default(),
         trace.call_id
     )
 }
@@ -302,10 +290,10 @@ fn tool_trace_record_id(trace: &ToolTraceDetail) -> String {
 fn tool_trace_belongs_to(
     row: &ToolTraceRecord,
     agent_id: AgentId,
-    session_id: Option<&str>,
+    thread_id: Option<&str>,
     turn_id: Option<&str>,
 ) -> bool {
     row.agent_id == agent_id.to_string()
-        && session_id.is_none_or(|id| row.session_id.as_deref() == Some(id))
+        && thread_id.is_none_or(|id| row.thread_id.as_deref() == Some(id))
         && turn_id.is_none_or(|id| row.turn_id.as_deref() == Some(id))
 }

@@ -20,6 +20,7 @@ pub(crate) struct RuntimeState {
     pub(crate) tasks: RwLock<HashMap<TaskId, Arc<TaskRecord>>>,
     pub(crate) projects: RwLock<HashMap<ProjectId, Arc<ProjectRecord>>>,
     pub(crate) project_skill_locks: RwLock<HashMap<ProjectId, Arc<RwLock<()>>>>,
+    pub(crate) thread_subscriptions: crate::thread_subscriptions::ThreadSubscriptionRegistry,
 }
 
 impl RuntimeState {
@@ -33,6 +34,7 @@ impl RuntimeState {
             tasks: RwLock::new(tasks),
             projects: RwLock::new(projects),
             project_skill_locks: RwLock::new(HashMap::new()),
+            thread_subscriptions: Default::default(),
         }
     }
 }
@@ -87,7 +89,6 @@ pub(crate) struct TaskRecord {
 }
 
 pub(crate) struct AgentRecord {
-    pub(crate) runtime_agent_id: RwLock<pl_core::AgentId>,
     pub(crate) summary: RwLock<AgentSummary>,
     pub(crate) container: RwLock<Option<ContainerHandle>>,
     pub(crate) mcp: RwLock<Option<Arc<ContainerMcpRuntime>>>,

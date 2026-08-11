@@ -30,8 +30,7 @@ impl From<mai_runtime::RuntimeError> for ApiError {
             | ProjectReviewRunNotFound(_)
             | ProjectReviewJobNotFound(_) => StatusCode::NOT_FOUND,
             TurnNotFound { .. } => StatusCode::NOT_FOUND,
-            SessionNotFound { .. } => StatusCode::NOT_FOUND,
-            SessionEventNotFound(_) => StatusCode::NOT_FOUND,
+            ThreadNotFound(_) => StatusCode::NOT_FOUND,
             ToolTraceNotFound { .. } => StatusCode::NOT_FOUND,
             AgentBusy(_) | TaskBusy(_) => StatusCode::CONFLICT,
             InvalidInput(_) => StatusCode::BAD_REQUEST,
@@ -108,7 +107,7 @@ mod tests {
 
         let err = RuntimeError::TurnNotFound {
             agent_id: agent_id(),
-            turn_id: mai_protocol::TurnId::new_v4(),
+            turn_id: uuid::Uuid::new_v4().to_string(),
         };
         let api: ApiError = err.into();
         assert_eq!(api.status, StatusCode::NOT_FOUND);

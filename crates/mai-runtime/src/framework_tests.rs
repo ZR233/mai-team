@@ -74,13 +74,13 @@ fn product_facade_uses_pl_agent_runtime_as_the_only_executor() {
 }
 
 #[test]
-fn framework_session_transitions_do_not_invalidate_product_agent_queries() {
+fn framework_thread_transitions_do_not_invalidate_product_agent_queries() {
     let observer = include_str!("agent_host/events.rs");
 
     assert!(observer.contains("persist_state(runtime, snapshot).await?"));
     assert!(
         !observer.contains("MaiProductEventKind::AgentUpdated"),
-        "PL turn/session transitions must remain on the canonical session stream"
+        "PL Thread transitions must remain on the canonical Thread stream"
     );
 }
 
@@ -93,7 +93,7 @@ fn framework_module_boundary_is_stable() {
         "policy",
         "protocol",
         "repository",
-        "sessions",
+        "thread",
         "trace_projection",
         "turn_factory",
     ];
@@ -126,6 +126,8 @@ fn project_maintainer_is_registered_with_framework_runtime() {
 fn agent_creation_owner_covers_provisioning_and_framework_registration() {
     let provisioning = include_str!("runtime_provisioning.rs");
     let creation_owner = include_str!("runtime_agent_creation.rs");
+    let create_record = include_str!("agents/create.rs");
+    let create_environment = include_str!("runtime_environment.rs");
 
     assert!(provisioning.contains("let provisioning: Result<AgentSummary> = async"));
     assert!(provisioning.contains("resource.rollback().await"));
@@ -133,6 +135,14 @@ fn agent_creation_owner_covers_provisioning_and_framework_registration() {
     assert!(creation_owner.contains("impl Drop for AgentCreationLease"));
     assert!(creation_owner.contains("rollback_unregistered_agent"));
     assert!(creation_owner.contains("agents::delete_agent"));
+    assert!(!create_record.contains("MaiProductEventKind::AgentCreated"));
+    assert!(!create_environment.contains("MaiProductEventKind::AgentCreated"));
+    assert!(
+        provisioning.find("resource.commit()").unwrap()
+            < provisioning
+                .find("MaiProductEventKind::AgentCreated")
+                .unwrap()
+    );
 }
 
 #[test]
@@ -140,8 +150,10 @@ fn framework_spawn_rollback_only_deletes_resources_created_by_its_lease() {
     let lifecycle = include_str!("agent_host/lifecycle.rs");
 
     assert!(lifecycle.contains("ownership: SpawnProductOwnership"));
-    assert!(lifecycle.contains("SpawnProductOwnership::Existing => return Ok(())"));
-    assert!(lifecycle.contains("SpawnProductOwnership::Created => {}"));
+    assert!(lifecycle.contains("SpawnProductOwnership::Borrowed => return Ok(())"));
+    assert!(lifecycle.contains("SpawnProductOwnership::CreatedHere => {}"));
+    assert!(lifecycle.contains("impl Drop for MaiSpawnLease"));
+    assert!(lifecycle.contains("agents::delete_agent(runtime.as_ref(), agent_id)"));
 }
 
 #[test]
@@ -152,11 +164,12 @@ fn container_tools_do_not_request_host_path_approval() {
 }
 
 #[test]
-fn product_session_projection_is_not_submitted_as_framework_identity() {
+fn product_agent_id_is_submitted_as_the_canonical_thread_identity() {
     let agent_api = include_str!("runtime_agent_api.rs");
 
-    assert!(agent_api.contains("AgentSubmitRequest::start(session_id.framework, message)"));
-    assert!(!agent_api.contains("SessionId::new(session_id.to_string())"));
+    assert!(agent_api.contains("let thread_id = agent_host::canonical_id(agent_id)?"));
+    assert!(agent_api.contains("AgentSubmitRequest::start(thread_id, message)"));
+    assert!(!agent_api.contains("runtime_agent_id"));
 }
 
 #[test]
@@ -164,7 +177,7 @@ fn framework_close_is_followed_by_product_record_purge() {
     let delete = include_str!("agents/delete.rs");
     let runtime_ports = include_str!("runtime_agent_traits.rs");
 
-    assert!(runtime_ports.contains(".close(runtime_agent_id).await"));
+    assert!(runtime_ports.contains(".close(agent_host::canonical_id(agent_id)?)"));
     assert!(runtime_ports.contains("AgentRuntimeError::NotFound"));
     assert!(delete.contains("CanonicalAgentClose::Closed => purge_agent_tree"));
     assert!(delete.contains("CanonicalAgentClose::Missing => rollback_unregistered_agent"));

@@ -20,7 +20,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { WorkspaceHeader } from "@/components/workspace-header"
 import { agentPresentationStatus } from "@/features/agents/agent-lifecycle"
 import { ReviewPanel } from "@/features/projects/review-panel"
-import { SessionWorkspace } from "@/features/session/session-workspace"
+import { ThreadWorkspace } from "@/features/thread/thread-workspace"
 import { CreateProjectDialog } from "@/features/projects/create-project-dialog"
 
 type ProjectView = "agents" | "review" | "repository" | "skills"
@@ -33,9 +33,8 @@ export default function ProjectsPage() {
   const projects = useQuery(projectsQuery())
   const selectedId = projectId || projects.data?.[0]?.id || ""
   const selectedAgentId = search.get("agent")
-  const selectedSessionId = search.get("session")
   const view = (search.get("view") as ProjectView | null) || "agents"
-  const detail = useQuery(projectQuery(selectedId, selectedAgentId, selectedSessionId))
+  const detail = useQuery(projectQuery(selectedId, selectedAgentId))
   const [createOpen, setCreateOpen] = useState(false)
 
   useEffect(() => {
@@ -71,7 +70,7 @@ export default function ProjectsPage() {
           : detail.error
             ? <ProjectPageState><ErrorState error={detail.error} retry={() => void detail.refetch()} /></ProjectPageState>
             : detail.data
-              ? <ProjectWorkspace detail={detail.data} view={view} setView={(next) => changeSearch({ view: next })} selectedSessionId={selectedSessionId} selectAgent={(id) => changeSearch({ agent: id, session: null })} selectSession={(id) => changeSearch({ session: id })} refresh={() => queryClient.invalidateQueries({ queryKey: ["projects", selectedId] })} onDeleted={async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.projects }); navigate("/projects") }} />
+              ? <ProjectWorkspace detail={detail.data} view={view} setView={(next) => changeSearch({ view: next })} selectAgent={(id) => changeSearch({ agent: id })} refresh={() => queryClient.invalidateQueries({ queryKey: ["projects", selectedId] })} onDeleted={async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.projects }); navigate("/projects") }} />
               : null}
       <CreateProjectDialog open={createOpen} onOpenChange={setCreateOpen} onCreated={(project) => {
         setCreateOpen(false)
@@ -86,13 +85,11 @@ function ProjectPageState({ children }: { children: React.ReactNode }) {
   return <section className="flex min-w-0 flex-1 flex-col"><WorkspaceHeader crumbs={[{ label: "Projects" }]} /><div className="min-h-0 flex-1 overflow-auto">{children}</div></section>
 }
 
-function ProjectWorkspace({ detail, view, setView, selectedSessionId, selectAgent, selectSession, refresh, onDeleted }: {
+function ProjectWorkspace({ detail, view, setView, selectAgent, refresh, onDeleted }: {
   detail: ProjectDetail
   view: ProjectView
   setView(view: ProjectView): void
-  selectedSessionId: string | null
   selectAgent(id: string): void
-  selectSession(id: string): void
   refresh(): Promise<unknown>
   onDeleted(): Promise<void>
 }) {
@@ -115,20 +112,12 @@ function ProjectWorkspace({ detail, view, setView, selectedSessionId, selectAgen
       </div>
       {view === "agents" && <div className="flex min-h-0 flex-1 flex-col">
         <AgentStrip agents={detail.agents} selectedId={selected.id} onSelect={selectAgent} />
-        <SessionWorkspace
+        <ThreadWorkspace
           agent={selected}
-          sessionId={selectedSessionId || selected.selected_session_id}
           skillsEndpoint={`/projects/${detail.id}/skills`}
-          onSelectSession={selectSession}
           onAgentUpdated={refresh}
-          onCreateSession={async () => {
-            const response = await api<{ session?: { id: string }; id?: string }>(`/agents/${selected.id}/sessions`, { method: "POST" })
-            const id = response.session?.id || response.id
-            if (id) selectSession(id)
-            await refresh()
-          }}
           onSend={async (message, skillMentions) => {
-            await api(`/projects/${detail.id}/messages`, { method: "POST", ...jsonBody({ message, skill_mentions: skillMentions, session_id: selectedSessionId || selected.selected_session_id }) })
+            await api(`/threads/${encodeURIComponent(selected.thread.id)}/messages`, { method: "POST", ...jsonBody({ message, skill_mentions: skillMentions }) })
           }}
           onStop={async (turnId) => {
             await api(`/agents/${selected.id}/turns/${turnId}/cancel`, { method: "POST" })

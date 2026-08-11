@@ -1,11 +1,12 @@
 use super::*;
-use crate::schema::{SCHEMA_VERSION, SETTING_SCHEMA_VERSION};
+use crate::schema::SETTING_SCHEMA_VERSION;
 use mai_protocol::{
-    AgentResourceState, AgentRole, AgentState, ErrorSeverity, McpServerScope, McpServerTransport,
-    MessageRole, ProjectCloneStatus, ProjectReviewDecision, ProjectReviewEnvironmentWarning,
-    ProjectReviewJobSource, ProjectReviewJobStatus, ProjectReviewOutcome, ProjectReviewRunStatus,
-    ProjectReviewSkipReason, ProjectReviewStatus, ProjectReviewSubmissionIntent,
-    ProjectReviewSubmissionReceipt, ProjectStatus, SessionEventKind, SessionEventPosition,
+    AgentMessageChannel, McpServerScope, McpServerTransport, ProjectCloneStatus,
+    ProjectReviewDecision, ProjectReviewEnvironmentWarning, ProjectReviewJobSource,
+    ProjectReviewJobStatus, ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus,
+    ProjectReviewSubmissionIntent, ProjectReviewSubmissionReceipt, ProjectStatus,
+    ThreadContextDisposition, ThreadItem, ThreadItemContent, ThreadItemStatus, ThreadTurnHistory,
+    Turn, TurnState,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -112,8 +113,6 @@ async fn save_project_waits_for_temporary_sqlite_write_lock() {
 fn test_product_event(
     sequence: u64,
     agent_id: AgentId,
-    _session_id: SessionId,
-    _turn_id: TurnId,
     timestamp: DateTime<Utc>,
 ) -> MaiProductEventEnvelope {
     MaiProductEventEnvelope {
@@ -425,18 +424,10 @@ async fn git_account_delete_wins_over_late_verification_update() {
 async fn product_event_replay_and_snapshot_keep_recent_events() {
     let (_dir, store) = store().await;
     let agent_id = Uuid::new_v4();
-    let session_id = Uuid::new_v4();
-    let turn_id = Uuid::new_v4();
 
     for sequence in 1..=5 {
         store
-            .append_product_event(&test_product_event(
-                sequence,
-                agent_id,
-                session_id,
-                turn_id,
-                Utc::now(),
-            ))
+            .append_product_event(&test_product_event(sequence, agent_id, Utc::now()))
             .await
             .expect("append event");
     }
@@ -466,18 +457,10 @@ async fn product_event_replay_and_snapshot_keep_recent_events() {
 async fn product_event_count_pruning_keeps_newest_events() {
     let (_dir, store) = store().await;
     let agent_id = Uuid::new_v4();
-    let session_id = Uuid::new_v4();
-    let turn_id = Uuid::new_v4();
 
     for sequence in 1..=5 {
         store
-            .append_product_event(&test_product_event(
-                sequence,
-                agent_id,
-                session_id,
-                turn_id,
-                Utc::now(),
-            ))
+            .append_product_event(&test_product_event(sequence, agent_id, Utc::now()))
             .await
             .expect("append event");
     }
@@ -520,14 +503,10 @@ async fn product_event_count_pruning_keeps_newest_events() {
 async fn product_event_retention_never_exceeds_configured_batch() {
     let (_dir, store) = store().await;
     let agent_id = Uuid::new_v4();
-    let session_id = Uuid::new_v4();
-    let turn_id = Uuid::new_v4();
     let timestamp = Utc::now() - chrono::TimeDelta::days(30);
     for sequence in 1..=501 {
         store
-            .append_product_event(&test_product_event(
-                sequence, agent_id, session_id, turn_id, timestamp,
-            ))
+            .append_product_event(&test_product_event(sequence, agent_id, timestamp))
             .await
             .expect("append event");
     }
@@ -553,7 +532,7 @@ async fn project_review_runs_round_trip_and_prune() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
     let reviewer_agent_id = Uuid::new_v4();
-    let turn_id = Uuid::new_v4();
+    let turn_id = Uuid::new_v4().to_string();
     let run_id = Uuid::new_v4();
     let started_at = Utc::now() - chrono::TimeDelta::days(1);
     let finished_at = started_at + chrono::TimeDelta::minutes(3);
@@ -565,7 +544,7 @@ async fn project_review_runs_round_trip_and_prune() {
                 attempt_index: 1,
                 project_id,
                 reviewer_agent_id: Some(reviewer_agent_id),
-                turn_id: Some(turn_id),
+                turn_id: Some(turn_id.clone()),
                 started_at,
                 finished_at: Some(finished_at),
                 status: ProjectReviewRunStatus::Completed,
@@ -583,23 +562,35 @@ async fn project_review_runs_round_trip_and_prune() {
                     total_tokens: 120,
                 },
             },
-            messages: vec![AgentMessage {
-                role: MessageRole::Assistant,
-                content: "done".to_string(),
-                created_at: finished_at,
-            }],
-            events: vec![SessionEventEnvelope {
-                event_id: "event-1".to_string(),
-                session_id: Uuid::new_v4().to_string(),
-                source_agent_id: Some(reviewer_agent_id.to_string()),
-                turn_id: Some(turn_id.to_string()),
-                emitted_at: finished_at.timestamp_millis(),
-                position: SessionEventPosition::Durable { sequence: 1 },
-                kind: SessionEventKind::ErrorOccurred {
-                    message: "historical test event".to_string(),
-                    severity: ErrorSeverity::Recoverable,
+            history: Some(ThreadTurnHistory {
+                turn: Turn {
+                    id: turn_id.clone(),
+                    thread_id: reviewer_agent_id.to_string(),
+                    state: TurnState::Completed,
+                    failure: None,
+                    started_at: Some(started_at.timestamp_millis()),
+                    updated_at: finished_at.timestamp_millis(),
+                    completed_at: Some(finished_at.timestamp_millis()),
                 },
-            }],
+                items: vec![ThreadItem {
+                    id: "item-1".to_string(),
+                    thread_id: reviewer_agent_id.to_string(),
+                    turn_id: turn_id.clone(),
+                    ordinal: 0,
+                    revision: 1,
+                    status: ThreadItemStatus::Completed,
+                    created_at: finished_at.timestamp_millis(),
+                    updated_at: finished_at.timestamp_millis(),
+                    completed_at: Some(finished_at.timestamp_millis()),
+                    error: None,
+                    content: ThreadItemContent::AgentMessage {
+                        channel: AgentMessageChannel::Final,
+                        text: "done".to_string(),
+                    },
+                    usage: None,
+                }],
+                context_disposition: ThreadContextDisposition::Active,
+            }),
         })
         .await
         .expect("save run");
@@ -627,13 +618,18 @@ async fn project_review_runs_round_trip_and_prune() {
         .await
         .expect("detail")
         .expect("run exists");
-    assert_eq!(detail.messages[0].content, "done");
-    assert_eq!(detail.events.len(), 1);
+    assert_eq!(
+        detail.history.as_ref().expect("archived history").items[0].content,
+        ThreadItemContent::AgentMessage {
+            channel: AgentMessageChannel::Final,
+            text: "done".to_string(),
+        }
+    );
 
     let connection = rusqlite::Connection::open(store.path()).expect("open sqlite");
     connection
         .execute(
-            "UPDATE project_review_runs SET messages_json = X'80', events_json = X'81' \
+            "UPDATE project_review_runs SET history_json = X'80' \
              WHERE id = ?1",
             rusqlite::params![run_id.to_string()],
         )
@@ -648,7 +644,7 @@ async fn project_review_runs_round_trip_and_prune() {
     );
     connection
         .execute(
-            "UPDATE project_review_runs SET messages_json = 'not-json', events_json = '[]' \
+            "UPDATE project_review_runs SET history_json = 'not-json' \
              WHERE id = ?1",
             rusqlite::params![run_id.to_string()],
         )
@@ -684,8 +680,8 @@ async fn project_review_runs_round_trip_and_prune() {
 async fn agent_logs_round_trip_filter_and_prune() {
     let (_dir, store) = store().await;
     let agent_id = Uuid::new_v4();
-    let session_id = Uuid::new_v4();
-    let turn_id = Uuid::new_v4();
+    let thread_id = Uuid::new_v4().to_string();
+    let turn_id = Uuid::new_v4().to_string();
     let old_time = Utc::now() - chrono::TimeDelta::days(6);
     let new_time = Utc::now();
 
@@ -693,8 +689,8 @@ async fn agent_logs_round_trip_filter_and_prune() {
         .append_agent_log_entry(&AgentLogEntry {
             id: Uuid::new_v4(),
             agent_id,
-            session_id: Some(session_id),
-            turn_id: Some(turn_id),
+            thread_id: Some(thread_id.clone()),
+            turn_id: Some(turn_id.clone()),
             level: "info".to_string(),
             category: "tool".to_string(),
             message: "tool started".to_string(),
@@ -707,7 +703,7 @@ async fn agent_logs_round_trip_filter_and_prune() {
         .append_agent_log_entry(&AgentLogEntry {
             id: Uuid::new_v4(),
             agent_id,
-            session_id: None,
+            thread_id: None,
             turn_id: None,
             level: "warn".to_string(),
             category: "model".to_string(),
@@ -722,7 +718,7 @@ async fn agent_logs_round_trip_filter_and_prune() {
         .list_agent_logs(
             agent_id,
             AgentLogFilter {
-                session_id: Some(session_id),
+                thread_id: Some(thread_id),
                 turn_id: Some(turn_id),
                 level: Some("info".to_string()),
                 category: Some("tool".to_string()),
@@ -756,29 +752,27 @@ async fn agent_logs_round_trip_filter_and_prune() {
 }
 
 #[tokio::test]
-async fn agent_log_retention_preserves_rows_owned_by_a_live_session() {
+async fn agent_log_retention_preserves_rows_owned_by_a_live_thread() {
     let (_dir, store) = store().await;
     let agent_id = Uuid::new_v4();
-    let session_id = Uuid::new_v4();
+    let thread_id = Uuid::new_v4().to_string();
     let timestamp = Utc::now() - chrono::TimeDelta::days(30);
     let connection = rusqlite::Connection::open(&store.path).expect("open sqlite");
     connection
         .execute(
-            "INSERT INTO agent_sessions (
-                id, agent_id, title, created_at, updated_at, input_tokens,
-                cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
-                last_context_tokens, trace_sequence, session_event_sequence
-             ) VALUES (?1, ?2, '', '', '', 0, 0, 0, 0, 0, NULL, 0, 0)",
-            rusqlite::params![session_id.to_string(), agent_id.to_string()],
+            "INSERT INTO thread_runtime_documents (
+                thread_id, revision, document_json, snapshot_json, updated_at
+             ) VALUES (?1, 0, '{}', NULL, 0)",
+            rusqlite::params![thread_id],
         )
-        .expect("insert live session");
+        .expect("insert live thread");
     drop(connection);
-    for session_id in [Some(session_id), None] {
+    for observed_thread_id in [Some(thread_id.clone()), None] {
         store
             .append_agent_log_entry(&AgentLogEntry {
                 id: Uuid::new_v4(),
                 agent_id,
-                session_id,
+                thread_id: observed_thread_id,
                 turn_id: None,
                 level: "info".to_string(),
                 category: "retention".to_string(),
@@ -808,7 +802,7 @@ async fn agent_log_retention_preserves_rows_owned_by_a_live_session() {
         .await
         .expect("remaining");
     assert_eq!(1, remaining.len());
-    assert_eq!(Some(session_id), remaining[0].session_id);
+    assert_eq!(Some(thread_id), remaining[0].thread_id);
 }
 
 #[tokio::test]
@@ -837,15 +831,15 @@ async fn agent_log_reads_do_not_wait_for_unrelated_busy_store_operation() {
 async fn tool_traces_round_trip_filter_and_prune() {
     let (_dir, store) = store().await;
     let agent_id = Uuid::new_v4();
-    let session_id = Uuid::new_v4();
-    let turn_id = Uuid::new_v4();
+    let thread_id = Uuid::new_v4().to_string();
+    let turn_id = Uuid::new_v4().to_string();
     let old_time = Utc::now() - chrono::TimeDelta::days(6);
     let new_time = Utc::now();
 
     let trace = ToolTraceDetail {
         agent_id,
-        session_id: Some(session_id),
-        turn_id: Some(turn_id),
+        thread_id: Some(thread_id.clone()),
+        turn_id: Some(turn_id.clone()),
         call_id: "call_1".to_string(),
         tool_name: "exec".to_string(),
         arguments: json!({ "command": "printf hi" }),
@@ -892,7 +886,7 @@ async fn tool_traces_round_trip_filter_and_prune() {
         .list_tool_traces(
             agent_id,
             ToolTraceFilter {
-                session_id: Some(session_id),
+                thread_id: Some(thread_id.clone()),
                 turn_id: Some(turn_id),
                 limit: 100,
                 ..Default::default()
@@ -905,7 +899,7 @@ async fn tool_traces_round_trip_filter_and_prune() {
     assert_eq!(summaries[0].duration_ms, Some(42));
 
     let loaded = store
-        .load_tool_trace(agent_id, Some(session_id), "call_1")
+        .load_tool_trace(agent_id, Some(thread_id), "call_1")
         .await
         .expect("load trace")
         .expect("trace");
@@ -938,20 +932,20 @@ async fn tool_traces_keep_same_call_id_for_different_agents() {
     let (_dir, store) = store().await;
     let first_agent_id = Uuid::new_v4();
     let second_agent_id = Uuid::new_v4();
-    let first_session_id = Uuid::new_v4();
-    let second_session_id = Uuid::new_v4();
+    let first_thread_id = Uuid::new_v4().to_string();
+    let second_thread_id = Uuid::new_v4().to_string();
     let timestamp = Utc::now();
 
-    for (agent_id, session_id, command) in [
-        (first_agent_id, first_session_id, "pwd"),
-        (second_agent_id, second_session_id, "ls"),
+    for (agent_id, thread_id, command) in [
+        (first_agent_id, first_thread_id.clone(), "pwd"),
+        (second_agent_id, second_thread_id.clone(), "ls"),
     ] {
         store
             .save_tool_trace_completed(
                 &ToolTraceDetail {
                     agent_id,
-                    session_id: Some(session_id),
-                    turn_id: Some(Uuid::new_v4()),
+                    thread_id: Some(thread_id),
+                    turn_id: Some(Uuid::new_v4().to_string()),
                     call_id: "call_duplicate".to_string(),
                     tool_name: "exec".to_string(),
                     arguments: json!({ "command": command }),
@@ -971,12 +965,12 @@ async fn tool_traces_keep_same_call_id_for_different_agents() {
     }
 
     let first = store
-        .load_tool_trace(first_agent_id, Some(first_session_id), "call_duplicate")
+        .load_tool_trace(first_agent_id, Some(first_thread_id), "call_duplicate")
         .await
         .expect("load first")
         .expect("first trace");
     let second = store
-        .load_tool_trace(second_agent_id, Some(second_session_id), "call_duplicate")
+        .load_tool_trace(second_agent_id, Some(second_thread_id), "call_duplicate")
         .await
         .expect("load second")
         .expect("second trace");
@@ -1042,8 +1036,7 @@ async fn delete_project_removes_review_runs() {
                 failure: None,
                 token_usage: TokenUsage::default(),
             },
-            messages: Vec::new(),
-            events: Vec::new(),
+            history: None,
         })
         .await
         .expect("save run");
@@ -1061,19 +1054,18 @@ async fn delete_project_removes_review_runs() {
 }
 
 #[tokio::test]
-async fn invalid_sqlite_file_is_rebuilt() {
+async fn invalid_sqlite_file_is_rejected_without_overwrite() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("config.sqlite3");
     std::fs::write(&path, b"not sqlite").expect("write invalid old db");
-    let store = MaiStore::open_with_config_path(&path, dir.path().join("config.toml"))
+    let error = MaiStore::open_with_config_path(&path, dir.path().join("config.toml"))
         .await
-        .expect("rebuild");
+        .err()
+        .expect("invalid database must be rejected");
+    assert!(error.to_string().contains("拒绝覆盖"));
     assert_eq!(
-        store
-            .get_setting(SETTING_SCHEMA_VERSION)
-            .await
-            .expect("schema"),
-        Some(SCHEMA_VERSION.to_string())
+        std::fs::read(path).expect("database remains"),
+        b"not sqlite"
     );
 }
 
@@ -1131,7 +1123,7 @@ async fn skills_config_persists_in_settings() {
 }
 
 #[tokio::test]
-async fn schema_version_mismatch_rebuilds_database() {
+async fn schema_version_mismatch_is_rejected_without_data_loss() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("config.sqlite3");
     let config_path = dir.path().join("config.toml");
@@ -1154,459 +1146,20 @@ async fn schema_version_mismatch_rebuilds_database() {
         .expect("mark old schema");
     drop(store);
 
-    let reopened = MaiStore::open_with_config_path(&db_path, &config_path)
+    let error = MaiStore::open_with_config_path(&db_path, &config_path)
         .await
-        .expect("reopen");
-    assert_eq!(
-        reopened
-            .get_setting(SETTING_SCHEMA_VERSION)
-            .await
-            .expect("schema marker")
-            .as_deref(),
-        Some(SCHEMA_VERSION)
-    );
-    assert!(
-        reopened
-            .list_mcp_servers()
-            .await
-            .expect("servers")
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn schema_22_review_runs_migrate_without_rebuilding_user_data() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("config.sqlite3");
-    let config_path = dir.path().join("config.toml");
-    let store = MaiStore::open_with_config_path(&db_path, &config_path)
-        .await
-        .expect("open");
-    let project_id = Uuid::new_v4();
-    let run_id = Uuid::new_v4();
-    let reviewer_id = Uuid::new_v4();
-    let started_at = Utc::now() - chrono::TimeDelta::minutes(2);
-    store
-        .save_mcp_servers(&BTreeMap::from([(
-            "preserved".to_string(),
-            McpServerConfig {
-                command: Some("preserved-mcp".to_string()),
-                ..Default::default()
-            },
-        )]))
-        .await
-        .expect("save preserved data");
-    store
-        .save_agent(
-            &AgentSummary {
-                id: reviewer_id,
-                parent_id: None,
-                task_id: None,
-                project_id: Some(project_id),
-                role: Some(AgentRole::Reviewer),
-                name: "legacy reviewer".to_string(),
-                state: AgentState {
-                    resource: AgentResourceState::Ready,
-                    ..AgentState::default()
-                },
-                container_id: None,
-                docker_image: "ubuntu:latest".to_string(),
-                provider_id: "provider".to_string(),
-                provider_name: "Provider".to_string(),
-                model: "model".to_string(),
-                reasoning_effort: None,
-                created_at: started_at,
-                updated_at: started_at,
-                token_usage: TokenUsage::default(),
-            },
-            Some(
-                "You are an autonomous project pull request reviewer. Review exactly PR #42 at head `0123456789abcdef0123456789abcdef01234567` against base `base`.",
-            ),
-        )
-        .await
-        .expect("save legacy reviewer");
-    store
-        .save_project_review_run(&ProjectReviewRunDetail {
-            summary: ProjectReviewRunSummary {
-                id: run_id,
-                job_id: None,
-                attempt_index: 1,
-                project_id,
-                reviewer_agent_id: Some(reviewer_id),
-                turn_id: Some(Uuid::new_v4()),
-                started_at,
-                finished_at: None,
-                status: ProjectReviewRunStatus::Running,
-                outcome: None,
-                review_event: None,
-                pr: Some(42),
-                summary: None,
-                error: None,
-                failure: None,
-                token_usage: TokenUsage::default(),
-            },
-            messages: Vec::new(),
-            events: Vec::new(),
-        })
-        .await
-        .expect("save legacy run");
-    drop(store);
-
-    let connection = rusqlite::Connection::open(&db_path).expect("open legacy sqlite");
-    connection
-        .execute_batch(
-            "ALTER TABLE project_review_runs RENAME TO project_review_runs_v23;
-             CREATE TABLE project_review_runs (
-                id TEXT PRIMARY KEY NOT NULL,
-                project_id TEXT NOT NULL,
-                reviewer_agent_id TEXT,
-                turn_id TEXT,
-                started_at TEXT NOT NULL,
-                finished_at TEXT,
-                status TEXT NOT NULL,
-                outcome TEXT,
-                review_event TEXT,
-                pr INTEGER,
-                summary TEXT,
-                error TEXT,
-                input_tokens INTEGER NOT NULL,
-                cached_input_tokens INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL,
-                reasoning_output_tokens INTEGER NOT NULL,
-                total_tokens INTEGER NOT NULL,
-                messages_json TEXT NOT NULL,
-                events_json TEXT NOT NULL
-             );
-             INSERT INTO project_review_runs (
-                id, project_id, reviewer_agent_id, turn_id, started_at, finished_at,
-                status, outcome, review_event, pr, summary, error, input_tokens,
-                cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
-                messages_json, events_json
-             ) SELECT id, project_id, reviewer_agent_id, turn_id, started_at, finished_at,
-                status, outcome, review_event, pr, summary, error, input_tokens,
-                cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
-                messages_json, events_json FROM project_review_runs_v23;
-             DROP TABLE project_review_runs_v23;
-             DROP TABLE project_review_jobs;
-             CREATE INDEX project_review_runs_project_id_idx ON project_review_runs(project_id);
-             CREATE INDEX project_review_runs_started_at_idx ON project_review_runs(started_at);
-             UPDATE settings SET value = '22' WHERE key = 'toasty_schema_version';",
-        )
-        .expect("downgrade fixture to schema 22");
-    drop(connection);
-
-    let reopened = MaiStore::open_with_config_path(&db_path, &config_path)
-        .await
-        .expect("migrate schema 22");
-    assert!(
-        reopened
-            .list_mcp_servers()
-            .await
-            .expect("servers")
-            .contains_key("preserved")
-    );
-    let run = reopened
-        .load_project_review_run(project_id, run_id)
-        .await
-        .expect("load run")
-        .expect("migrated run");
-    assert_eq!(Some(run_id), run.summary.job_id);
-    assert_eq!(ProjectReviewRunStatus::Interrupted, run.summary.status);
-    let job = reopened
-        .load_project_review_job(project_id, run_id)
-        .await
-        .expect("load job")
-        .expect("migrated job");
-    assert_eq!(ProjectReviewJobStatus::RetryWaiting, job.status);
-    assert_eq!(Some(reviewer_id), job.reviewer_agent_id);
-    assert_eq!(Some(run_id), job.active_run_id);
-    assert_eq!(1, job.attempt_count);
-    assert_eq!("0123456789abcdef0123456789abcdef01234567", job.head_sha);
-}
-
-#[tokio::test]
-async fn schema_23_adds_review_skip_reason_without_rebuilding_user_data() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("config.sqlite3");
-    let config_path = dir.path().join("config.toml");
-    let store = MaiStore::open_with_config_path(&db_path, &config_path)
-        .await
-        .expect("open current schema");
-    store
-        .set_setting("preserved_schema_23", "yes")
-        .await
-        .expect("seed preserved setting");
-    drop(store);
-
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute_batch(
-            "ALTER TABLE project_review_jobs DROP COLUMN skip_reason;
-             UPDATE settings SET value = '23' WHERE key = 'toasty_schema_version';",
-        )
-        .expect("downgrade fixture to schema 23");
-    drop(connection);
-
-    let reopened = MaiStore::open_with_config_path(&db_path, &config_path)
-        .await
-        .expect("migrate schema 23");
-    assert_eq!(
-        Some("yes".to_string()),
-        reopened
-            .get_setting("preserved_schema_23")
-            .await
-            .expect("preserved setting")
-    );
-    assert_eq!(
-        Some(SCHEMA_VERSION.to_string()),
-        reopened
-            .get_setting(SETTING_SCHEMA_VERSION)
-            .await
-            .expect("schema version")
-    );
-
-    let project_id = Uuid::new_v4();
-    let mut skipped = test_review_job(project_id, 42, "head-42", None);
-    skipped.status = ProjectReviewJobStatus::Skipped;
-    skipped.skip_reason = Some(ProjectReviewSkipReason::AlreadyReviewedCurrentHead);
-    skipped.next_attempt_at = None;
-    skipped.finished_at = Some(Utc::now());
-    let skipped_id = skipped.id;
-    reopened
-        .save_project_review_job(skipped.clone())
-        .await
-        .expect("save skipped job");
-    assert_eq!(
-        Some(skipped),
-        reopened
-            .load_project_review_job(project_id, skipped_id)
-            .await
-            .expect("load skipped job")
-    );
-}
-
-#[tokio::test]
-async fn schema_24_removes_orphan_session_projection_rows() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("config.sqlite3");
-    let config_path = dir.path().join("config.toml");
-    let store = MaiStore::open_with_config_path(&db_path, &config_path)
-        .await
-        .expect("open current schema");
-    drop(store);
-
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute_batch(
-            "INSERT INTO agent_sessions (
-                id, agent_id, title, created_at, updated_at, input_tokens,
-                cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
-                last_context_tokens, trace_sequence, session_event_sequence
-             ) VALUES ('session-1', 'agent-1', '', '', '', 0, 0, 0, 0, 0, NULL, 0, 0);
-             INSERT INTO session_view_snapshots (
-                session_id, through_sequence, snapshot_json, updated_at
-             ) VALUES ('session-1', 1, '{}', 1);
-             INSERT INTO session_event_journal (
-                id, session_id, sequence, emitted_at, event_json
-             ) VALUES ('session-1:1', 'session-1', 1, 1, '{}');
-             INSERT INTO session_view_snapshots (
-                session_id, through_sequence, snapshot_json, updated_at
-             ) VALUES ('orphan-session', 1, '{}', 1);
-             INSERT INTO session_event_journal (
-                id, session_id, sequence, emitted_at, event_json
-             ) VALUES ('orphan-session:1', 'orphan-session', 1, 1, '{}');
-             UPDATE settings SET value = '24' WHERE key = 'toasty_schema_version';",
-        )
-        .expect("downgrade fixture to schema 24");
-    drop(connection);
-
-    let reopened = MaiStore::open_with_config_path(&db_path, &config_path)
-        .await
-        .expect("migrate schema 24");
-    assert_eq!(
-        Some(SCHEMA_VERSION.to_string()),
-        reopened
-            .get_setting(SETTING_SCHEMA_VERSION)
-            .await
-            .expect("schema version")
-    );
-    drop(reopened);
-
-    let connection = rusqlite::Connection::open(&db_path).expect("inspect migrated sqlite");
-    let orphan_snapshots: i64 = connection
+        .err()
+        .expect("old schema must be rejected");
+    assert!(error.to_string().contains("mai-migrate-v27"));
+    let connection = rusqlite::Connection::open(db_path).expect("inspect preserved database");
+    let preserved: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM session_view_snapshots WHERE session_id = 'orphan-session'",
+            "SELECT COUNT(*) FROM mcp_servers WHERE name = 'demo'",
             [],
             |row| row.get(0),
         )
-        .expect("count orphan snapshots");
-    let orphan_events: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM session_event_journal WHERE session_id = 'orphan-session'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("count orphan journal");
-    let live_sessions: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM agent_sessions WHERE id = 'session-1'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("count live sessions");
-    let cleanup_table: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master \
-             WHERE type = 'table' AND name = 'project_review_cleanup_tasks'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("cleanup table");
-    assert_eq!(
-        (
-            orphan_snapshots,
-            orphan_events,
-            live_sessions,
-            cleanup_table
-        ),
-        (0, 0, 1, 1)
-    );
-}
-
-#[tokio::test]
-async fn schema_25_adds_review_environment_warning_without_rebuilding_jobs() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("config.sqlite3");
-    let config_path = dir.path().join("config.toml");
-    let store = MaiStore::open_with_config_path(&db_path, &config_path)
-        .await
-        .expect("open current schema");
-    let project_id = Uuid::new_v4();
-    let job = test_review_job(project_id, 1520, "head-1520", None);
-    let job_id = job.id;
-    store
-        .save_project_review_job(job.clone())
-        .await
-        .expect("save review job");
-    drop(store);
-
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute_batch(
-            "ALTER TABLE project_review_jobs DROP COLUMN environment_warning_json;
-             UPDATE settings SET value = '25' WHERE key = 'toasty_schema_version';",
-        )
-        .expect("downgrade fixture to schema 25");
-    drop(connection);
-
-    let reopened = MaiStore::open_with_config_path(&db_path, &config_path)
-        .await
-        .expect("migrate schema 25");
-    assert_eq!(
-        Some(SCHEMA_VERSION.to_string()),
-        reopened
-            .get_setting(SETTING_SCHEMA_VERSION)
-            .await
-            .expect("schema version")
-    );
-    assert_eq!(
-        Some(job),
-        reopened
-            .load_project_review_job(project_id, job_id)
-            .await
-            .expect("load preserved review job")
-    );
-    drop(reopened);
-    assert!(crate::schema::migrate_supported_schema(&db_path).expect("repeat migration"));
-}
-
-#[tokio::test]
-async fn schema_26_adds_persistent_review_ci_watches() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("config.sqlite3");
-    let config_path = dir.path().join("config.toml");
-    let store = MaiStore::open_with_config_path(&db_path, &config_path)
-        .await
-        .expect("open current schema");
-    store
-        .set_setting("preserved_schema_26", "yes")
-        .await
-        .expect("seed preserved setting");
-    drop(store);
-
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute_batch(
-            "DROP TABLE project_review_ci_watches;
-             UPDATE settings SET value = '26' WHERE key = 'toasty_schema_version';",
-        )
-        .expect("downgrade fixture to schema 26");
-    drop(connection);
-
-    let reopened = MaiStore::open_with_config_path(&db_path, &config_path)
-        .await
-        .expect("migrate schema 26");
-    assert_eq!(
-        Some("yes".to_string()),
-        reopened
-            .get_setting("preserved_schema_26")
-            .await
-            .expect("preserved setting")
-    );
-    assert_eq!(
-        Some(SCHEMA_VERSION.to_string()),
-        reopened
-            .get_setting(SETTING_SCHEMA_VERSION)
-            .await
-            .expect("schema version")
-    );
-    drop(reopened);
-    assert!(crate::schema::migrate_supported_schema(&db_path).expect("repeat migration"));
-}
-
-#[tokio::test]
-async fn schema_24_cleanup_migration_rolls_back_on_failure_and_is_idempotent() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("config.sqlite3");
-    let store = MaiStore::open_with_config_path(&db_path, dir.path().join("config.toml"))
-        .await
-        .expect("open current schema");
-    drop(store);
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute_batch(
-            "INSERT INTO session_event_journal (
-                id, session_id, sequence, emitted_at, event_json
-             ) VALUES ('orphan:1', 'orphan', 1, 1, '{}');
-             UPDATE settings SET value = '24' WHERE key = 'toasty_schema_version';
-             CREATE TRIGGER fail_orphan_cleanup
-             BEFORE DELETE ON session_event_journal
-             BEGIN
-               SELECT RAISE(ABORT, 'injected migration failure');
-             END;",
-        )
-        .expect("prepare failing migration");
-    drop(connection);
-
-    assert!(crate::schema::migrate_supported_schema(&db_path).is_err());
-    let connection = rusqlite::Connection::open(&db_path).expect("inspect rollback");
-    let state: (String, i64) = connection
-        .query_row(
-            "SELECT
-                (SELECT value FROM settings WHERE key = 'toasty_schema_version'),
-                (SELECT COUNT(*) FROM session_event_journal WHERE session_id = 'orphan')",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("rollback state");
-    assert_eq!(("24".to_string(), 1), state);
-    connection
-        .execute("DROP TRIGGER fail_orphan_cleanup", [])
-        .expect("remove failure trigger");
-    drop(connection);
-
-    assert!(crate::schema::migrate_supported_schema(&db_path).expect("retry migration"));
-    assert!(crate::schema::migrate_supported_schema(&db_path).expect("repeat migration"));
+        .expect("preserved row");
+    assert_eq!(preserved, 1);
 }
 
 #[tokio::test]

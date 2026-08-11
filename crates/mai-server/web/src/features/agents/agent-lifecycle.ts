@@ -1,6 +1,6 @@
 import type { AgentSummary } from "@/api/product-types"
 
-export function agentCanRunSessionTurn(agent: AgentSummary): boolean {
+export function agentCanRunThread(agent: AgentSummary): boolean {
   const lifecycle = agent.state.runtime?.lifecycle
   return agent.state.resource === "ready" && (!lifecycle || lifecycle === "active")
 }

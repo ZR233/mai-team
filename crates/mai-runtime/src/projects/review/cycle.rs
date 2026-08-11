@@ -513,8 +513,7 @@ mod tests {
             };
             Ok(Some(ProjectReviewRunDetail {
                 summary,
-                messages: Vec::new(),
-                events: Vec::new(),
+                history: None,
             }))
         }
 
@@ -580,7 +579,7 @@ mod tests {
         ) -> Result<TurnId> {
             self.operations.lock().await.push("start_reviewer_turn");
             self.started_messages.lock().await.push(message);
-            Ok(Uuid::new_v4())
+            Ok(Uuid::new_v4().to_string())
         }
 
         async fn wait_agent_until_complete_with_cancel(
@@ -858,8 +857,8 @@ mod tests {
                 resource: AgentResourceState::Ready,
                 runtime: AgentRuntimeState {
                     last_turn: Some(AgentLastTurn {
-                        turn_id: Uuid::new_v4(),
-                        session_id: Uuid::new_v4(),
+                        turn_id: Uuid::new_v4().to_string(),
+                        thread_id: reviewer_id.to_string(),
                         outcome: AgentTurnOutcomeKind::Completed,
                         reason: None,
                         usage: TokenUsage::default(),
@@ -885,10 +884,13 @@ mod tests {
         let agent_id = pl_core::AgentId::new("reviewer").expect("agent id");
         let turn = pl_core::AgentTurnOutcome {
             turn_id: pl_core::TurnId::new("turn").expect("turn id"),
-            session_id: pl_core::SessionId::new("session").expect("session id"),
+            thread_id: agent_id.clone(),
             kind: TurnOutcomeKind::Completed,
             reason: None,
             failure: None,
+            budget_limit: None,
+            rollover_compacted: false,
+            rollover_compaction_error: None,
             usage: pl_model::TokenUsage::default(),
             finished_at: 1,
         };
@@ -903,8 +905,8 @@ mod tests {
                 lifecycle: pl_core::AgentLifecycleState::Active,
                 activity: pl_core::AgentActivityState::Idle,
                 active_turn_id: None,
-                active_session_id: None,
                 pending_inputs: 0,
+                progress: None,
                 last_turn: Some(turn.clone()),
                 revision: 2,
                 event_sequence: 1,

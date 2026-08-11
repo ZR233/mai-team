@@ -197,7 +197,6 @@ impl AgentRuntime {
             .cloned()
             .collect::<Vec<_>>();
         for agent in agents {
-            let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
             let summary = {
                 let mut summary = agent.summary.write().await;
                 let role = summary.role.unwrap_or_default().to_string();
@@ -207,19 +206,13 @@ impl AgentRuntime {
                 summary.provider_id = route.provider_id.to_string();
                 summary.provider_name = route.provider_info.name;
                 summary.model = route.model.slug;
-                summary.reasoning_effort = route
-                    .reasoning_effort
-                    .map(|effort| effort.as_str().to_string());
+                summary.reasoning_effort = route.effort.map(|effort| effort.as_str().to_string());
                 summary.updated_at = now();
                 summary.clone()
             };
             self.deps
                 .store
-                .save_agent_with_runtime_id(
-                    &summary,
-                    agent.system_prompt.as_deref(),
-                    runtime_agent_id.as_str(),
-                )
+                .save_agent(&summary, agent.system_prompt.as_deref())
                 .await?;
             self.events
                 .publish(MaiProductEventKind::AgentUpdated { agent: summary })

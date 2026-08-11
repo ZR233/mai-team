@@ -14,7 +14,7 @@ use mai_protocol::{
 use pl_core::{
     AgentModelConfig, AgentRoleId, ModelCatalogId, ModelRouteConfig, ProviderCapabilitySelection,
     ProviderConfig, ProviderId, ProviderModelCatalogConfig, ProviderPresetId, ReasoningEffort,
-    builtin_provider_catalog, provider_service_capabilities_descriptor,
+    provider_service_capabilities_descriptor,
 };
 use pl_model::{
     MaxTokensField, ModelInfo, ProviderConnectionMode, ProviderInfo, ProviderServiceCapabilities,
@@ -95,21 +95,21 @@ pub fn providers_request_from_models(models: &AgentModelConfig) -> ProvidersConf
         .providers
         .iter()
         .map(|(id, provider)| {
-            let protocol = provider
-                .protocol()
-                .expect("validated MaiConfig has a resolvable provider protocol");
             let effective_models = provider
                 .effective_models()
                 .expect("validated MaiConfig has a resolvable model catalog");
             let default_model = default_model_for_provider(models, id)
                 .or_else(|| effective_models.first().map(|model| model.slug.clone()))
                 .unwrap_or_default();
+            let provider_info = provider
+                .to_provider_info(&default_model)
+                .expect("validated MaiConfig has a resolvable provider transport");
             ApiProviderConfig {
                 id: id.to_string(),
                 preset_id: provider.preset_id().map(ToString::to_string),
                 transport: ApiProviderTransportConfig {
-                    protocol: api_protocol(protocol),
-                    connection_mode: api_connection_mode(provider.connection_mode()),
+                    protocol: api_protocol(provider_info.protocol),
+                    connection_mode: api_connection_mode(provider_info.connection_mode),
                 },
                 capabilities: api_capability_selection(&provider.capabilities),
                 name: provider.name.clone(),
@@ -122,7 +122,7 @@ pub fn providers_request_from_models(models: &AgentModelConfig) -> ProvidersConf
                         .map(|(name, value)| (name.clone(), value.clone()))
                         .collect()
                 }),
-                catalog: api_catalog(&provider.catalog, protocol),
+                catalog: api_catalog(&provider.catalog, provider_info.protocol),
                 default_model,
                 enabled: true,
             }
@@ -214,19 +214,17 @@ pub fn providers_response_from_models(models: &AgentModelConfig) -> ProvidersRes
 fn provider_connection_modes_for_instance(
     provider: &ProviderConfig,
 ) -> Vec<ProviderConnectionModeDescriptor> {
-    let protocol = provider
-        .protocol()
-        .expect("validated MaiConfig has a resolvable provider protocol");
     let modes = provider
-        .preset_id()
-        .and_then(|preset_id| {
-            builtin_provider_catalog()
-                .presets
-                .into_iter()
-                .find(|preset| &preset.id == preset_id)
-                .map(|preset| preset.connection_policy.supported_modes)
-        })
-        .unwrap_or_else(|| pl_core::provider_connection_modes(protocol));
+        .effective_models()
+        .expect("validated MaiConfig has a resolvable model catalog")
+        .into_iter()
+        .flat_map(|model| model.transport.supported_connection_modes)
+        .fold(Vec::new(), |mut modes, mode| {
+            if !modes.contains(&mode) {
+                modes.push(mode);
+            }
+            modes
+        });
     modes
         .into_iter()
         .map(|mode| ProviderConnectionModeDescriptor {
@@ -301,7 +299,10 @@ pub fn provider_selection_from_models(
                 "model `{model_id}` is not configured for provider `{provider_id}`"
             ))
         })?;
-    let protocol = provider.protocol().map_err(RuntimeError::Model)?;
+    let provider_info = provider
+        .to_provider_info(&model_id)
+        .map_err(RuntimeError::Model)?;
+    let protocol = provider_info.protocol;
     let selected_model = api_model(model, protocol);
     if selected_model.context_tokens == 0 || selected_model.output_tokens == 0 {
         return Err(RuntimeError::InvalidInput(format!(
@@ -313,7 +314,7 @@ pub fn provider_selection_from_models(
             id: provider_id.to_string(),
             transport: ApiProviderTransportConfig {
                 protocol: api_protocol(protocol),
-                connection_mode: api_connection_mode(provider.connection_mode()),
+                connection_mode: api_connection_mode(provider_info.connection_mode),
             },
             name: provider.name.clone(),
             base_url: provider.base_url.clone(),
@@ -342,49 +343,30 @@ pub fn provider_selection_from_models(
 
 pub(super) fn provider_from_api(provider: &ApiProviderConfig) -> Result<ProviderConfig> {
     let protocol = core_protocol(provider.transport.protocol);
+    let requested_connection_mode = core_connection_mode(provider.transport.connection_mode);
     let preset_id = provider
         .preset_id
         .clone()
         .map(ProviderPresetId::new)
         .transpose()
         .map_err(RuntimeError::Model)?;
-    let preset = preset_id.as_ref().and_then(|id| {
-        builtin_provider_catalog()
-            .presets
-            .into_iter()
-            .find(|preset| &preset.id == id)
-    });
-    if let Some(preset) = &preset
-        && preset.protocol != protocol
-    {
-        return Err(RuntimeError::InvalidInput(format!(
-            "provider preset `{}` requires {:?}, got {:?}",
-            preset.id, preset.protocol, protocol
-        )));
-    }
-    let mut info = match preset {
-        Some(preset) => preset
-            .provider
-            .to_provider_info(&provider.default_model)
-            .map_err(RuntimeError::Model)?,
-        None => match protocol {
-            ProviderWireProtocol::Responses => ProviderInfo::responses_compatible(
-                provider.name.clone(),
-                provider.base_url.clone(),
-                provider.default_model.clone(),
-            ),
-            ProviderWireProtocol::ChatCompletions => ProviderInfo::openai_compatible_chat(
-                provider.name.clone(),
-                provider.base_url.clone(),
-                provider.default_model.clone(),
-            ),
-        },
+    let mut info = match protocol {
+        ProviderWireProtocol::Responses => ProviderInfo::responses_compatible(
+            provider.name.clone(),
+            provider.base_url.clone(),
+            provider.default_model.clone(),
+        ),
+        ProviderWireProtocol::ChatCompletions => ProviderInfo::openai_compatible_chat(
+            provider.name.clone(),
+            provider.base_url.clone(),
+            provider.default_model.clone(),
+        ),
     };
     info.name = provider.name.clone();
     info.base_url = provider.base_url.clone();
     info.default_model = provider.default_model.clone();
     info.protocol = protocol;
-    info.connection_mode = core_connection_mode(provider.transport.connection_mode);
+    info.connection_mode = requested_connection_mode;
     info.bearer_token = provider.api_key.clone();
     if let Some(headers) = &provider.http_headers {
         info.http_headers = Some(
@@ -404,6 +386,7 @@ pub(super) fn provider_from_api(provider: &ApiProviderConfig) -> Result<Provider
                 .iter()
                 .map(|model| model_info(model, provider.transport.protocol))
                 .collect(),
+            connection_overrides: BTreeMap::new(),
         },
         ApiProviderModelCatalogConfig::Explicit { models } => {
             ProviderModelCatalogConfig::Explicit {
@@ -411,6 +394,7 @@ pub(super) fn provider_from_api(provider: &ApiProviderConfig) -> Result<Provider
                     .iter()
                     .map(|model| model_info(model, provider.transport.protocol))
                     .collect(),
+                connection_overrides: BTreeMap::new(),
             }
         }
     };
@@ -418,15 +402,18 @@ pub(super) fn provider_from_api(provider: &ApiProviderConfig) -> Result<Provider
         ProviderModelCatalogConfig::Bundled {
             catalog,
             additional_models,
+            connection_overrides: _,
         } => ProviderConfig::from_bundled_catalog(info, catalog, additional_models),
-        ProviderModelCatalogConfig::Explicit { models } => {
-            ProviderConfig::from_explicit_models(info, models)
-        }
+        ProviderModelCatalogConfig::Explicit {
+            models,
+            connection_overrides: _,
+        } => ProviderConfig::from_explicit_models(info, models),
     };
     config.bearer_token_env = provider.api_key_env.clone();
     if let Some(preset_id) = preset_id {
         config = config.with_preset(preset_id);
     }
+    super::migration::set_supported_connection_mode(&mut config, requested_connection_mode)?;
     config.capabilities = core_capability_selection(&provider.capabilities)?;
     config.effective_models().map_err(RuntimeError::Model)?;
     Ok(config)
@@ -460,7 +447,11 @@ pub(crate) fn preserve_provider_private_fields(
 
 fn same_private_config_scope(current: &ProviderConfig, requested: &ApiProviderConfig) -> bool {
     current.preset_id().map(ToString::to_string) == requested.preset_id
-        && current.protocol().ok().map(api_protocol) == Some(requested.transport.protocol)
+        && current
+            .to_provider_info(&requested.default_model)
+            .ok()
+            .map(|info| api_protocol(info.protocol))
+            == Some(requested.transport.protocol)
         && normalized_url(&current.base_url) == normalized_url(&requested.base_url)
 }
 
@@ -474,7 +465,7 @@ fn route_preference(models: &AgentModelConfig, role: &str) -> Option<AgentModelP
         provider_id: route.provider.to_string(),
         model: route.model.clone(),
         reasoning_effort: route
-            .reasoning_effort
+            .effort
             .as_ref()
             .map(|effort| effort.as_str().to_string()),
     })
@@ -538,6 +529,7 @@ fn core_capability_selection(
                         hosted_responses: capabilities.web_search.hosted_responses,
                         standalone,
                     },
+                    ..ProviderServiceCapabilities::default()
                 },
             ))
         }
@@ -635,6 +627,7 @@ fn api_catalog(
         ProviderModelCatalogConfig::Bundled {
             catalog,
             additional_models,
+            connection_overrides: _,
         } => ApiProviderModelCatalogConfig::Bundled {
             catalog_id: catalog.to_string(),
             additional_models: additional_models
@@ -642,14 +635,15 @@ fn api_catalog(
                 .map(|model| api_model(model, protocol))
                 .collect(),
         },
-        ProviderModelCatalogConfig::Explicit { models } => {
-            ApiProviderModelCatalogConfig::Explicit {
-                models: models
-                    .iter()
-                    .map(|model| api_model(model, protocol))
-                    .collect(),
-            }
-        }
+        ProviderModelCatalogConfig::Explicit {
+            models,
+            connection_overrides: _,
+        } => ApiProviderModelCatalogConfig::Explicit {
+            models: models
+                .iter()
+                .map(|model| api_model(model, protocol))
+                .collect(),
+        },
     }
 }
 
@@ -708,7 +702,7 @@ fn route_from_preference(preference: AgentModelPreference) -> Result<ModelRouteC
     Ok(ModelRouteConfig {
         provider: ProviderId::new(preference.provider_id).map_err(RuntimeError::Model)?,
         model: preference.model,
-        reasoning_effort: preference.reasoning_effort.map(ReasoningEffort::new),
+        effort: preference.reasoning_effort.map(ReasoningEffort::new),
     })
 }
 

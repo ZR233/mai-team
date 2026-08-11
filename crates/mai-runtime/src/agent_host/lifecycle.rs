@@ -25,18 +25,97 @@ impl MaiAgentLifecycle {
 }
 
 pub(crate) struct MaiSpawnLease {
+    runtime: Weak<AgentRuntime>,
     product_agent_id: mai_protocol::AgentId,
     ownership: SpawnProductOwnership,
+    armed: AtomicBool,
 }
 
 enum SpawnProductOwnership {
-    Existing,
-    Created,
+    Borrowed,
+    CreatedHere,
 }
 
 pub(crate) struct MaiCloseLease {
     product_agent_id: mai_protocol::AgentId,
     commit_started: AtomicBool,
+}
+
+impl MaiSpawnLease {
+    fn borrowed(runtime: &Arc<AgentRuntime>, product_agent_id: mai_protocol::AgentId) -> Self {
+        Self {
+            runtime: Arc::downgrade(runtime),
+            product_agent_id,
+            ownership: SpawnProductOwnership::Borrowed,
+            armed: AtomicBool::new(false),
+        }
+    }
+
+    fn created_here(runtime: &Arc<AgentRuntime>, product_agent_id: mai_protocol::AgentId) -> Self {
+        Self {
+            runtime: Arc::downgrade(runtime),
+            product_agent_id,
+            ownership: SpawnProductOwnership::CreatedHere,
+            armed: AtomicBool::new(true),
+        }
+    }
+
+    async fn rollback(&self) -> Result<()> {
+        if !self.armed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let runtime = self.runtime.upgrade().ok_or_else(|| {
+            RuntimeError::InvalidInput("spawn lease lost its runtime".to_string())
+        })?;
+        rollback_created_spawn(runtime, self.product_agent_id).await?;
+        self.armed.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn commit(&self) {
+        self.armed.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for MaiSpawnLease {
+    fn drop(&mut self) {
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(runtime) = self.runtime.upgrade() else {
+            tracing::warn!(
+                agent_id = %self.product_agent_id,
+                "spawn lease cleanup was abandoned after runtime shutdown"
+            );
+            return;
+        };
+        let agent_id = self.product_agent_id;
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                agent_id = %agent_id,
+                "spawn lease cleanup was abandoned without a Tokio runtime"
+            );
+            return;
+        };
+        handle.spawn(async move {
+            if let Err(error) = rollback_created_spawn(runtime, agent_id).await {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    "dropped spawn lease failed to release resources: {error}"
+                );
+            }
+        });
+    }
+}
+
+async fn rollback_created_spawn(
+    runtime: Arc<AgentRuntime>,
+    agent_id: mai_protocol::AgentId,
+) -> Result<()> {
+    match agents::delete_agent(runtime.as_ref(), agent_id).await {
+        Ok(()) | Err(RuntimeError::AgentNotFound(_)) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 impl AgentLifecycleAdapter for MaiAgentLifecycle {
@@ -49,10 +128,7 @@ impl AgentLifecycleAdapter for MaiAgentLifecycle {
         if let Ok((product_agent_id, _)) =
             super::turn_factory::product_agent(&runtime, &request.child.identity.id).await
         {
-            return Ok(MaiSpawnLease {
-                product_agent_id,
-                ownership: SpawnProductOwnership::Existing,
-            });
+            return Ok(MaiSpawnLease::borrowed(&runtime, product_agent_id));
         }
         let (parent_id, parent) =
             super::turn_factory::product_agent(&runtime, &request.parent.identity.id).await?;
@@ -70,8 +146,16 @@ impl AgentLifecycleAdapter for MaiAgentLifecycle {
             .or_else(|| request.metadata.get("name"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        let product_agent_id = mai_protocol::AgentId::parse_str(request.child.identity.id.as_str())
+            .map_err(|error| {
+                RuntimeError::InvalidInput(format!(
+                    "spawned Thread id `{}` is not a product UUID: {error}",
+                    request.child.identity.id
+                ))
+            })?;
         let resource = runtime
             .create_agent_resource_with_container_source(
+                product_agent_id,
                 CreateAgentRequest {
                     name,
                     provider_id: Some(parent_summary.provider_id.clone()),
@@ -91,42 +175,22 @@ impl AgentLifecycleAdapter for MaiAgentLifecycle {
                 Some(role),
             )
             .await?;
-        let summary = resource.summary().clone();
-        let product_agent_id = resource.id();
-        let agent = runtime.agent(product_agent_id).await?;
-        *agent.runtime_agent_id.write().await = request.child.identity.id.clone();
-        runtime
-            .deps
-            .store
-            .save_agent_with_runtime_id(
-                &summary,
-                agent.system_prompt.as_deref(),
-                request.child.identity.id.as_str(),
-            )
-            .await?;
         resource.commit();
-        Ok(MaiSpawnLease {
-            product_agent_id,
-            ownership: SpawnProductOwnership::Created,
-        })
+        Ok(MaiSpawnLease::created_here(&runtime, product_agent_id))
     }
 
     async fn activate_spawn(&self, lease: &Self::SpawnLease) -> Result<()> {
         self.runtime()?.agent(lease.product_agent_id).await?;
+        lease.commit();
         Ok(())
     }
 
     async fn rollback_spawn(&self, lease: Self::SpawnLease) -> Result<()> {
         match lease.ownership {
-            SpawnProductOwnership::Existing => return Ok(()),
-            SpawnProductOwnership::Created => {}
+            SpawnProductOwnership::Borrowed => return Ok(()),
+            SpawnProductOwnership::CreatedHere => {}
         }
-        let runtime = self.runtime()?;
-        match agents::rollback_unregistered_agent(runtime.as_ref(), lease.product_agent_id).await {
-            Ok(()) | Err(RuntimeError::AgentNotFound(_)) => {}
-            Err(error) => return Err(error),
-        }
-        Ok(())
+        lease.rollback().await
     }
 
     async fn prepare_close(&self, request: CloseLifecycleRequest) -> Result<Self::CloseLease> {

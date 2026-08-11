@@ -91,7 +91,6 @@ impl AgentRuntime {
         };
         self.deps.store.save_agent(&summary, None).await?;
         let agent = Arc::new(AgentRecord {
-            runtime_agent_id: RwLock::new(pl_core::AgentId::new(id.to_string())?),
             summary: RwLock::new(summary.clone()),
             container: RwLock::new(None),
             mcp: RwLock::new(None),
@@ -103,11 +102,6 @@ impl AgentRuntime {
             .write()
             .await
             .insert(id, Arc::clone(&agent));
-        self.events
-            .publish(MaiProductEventKind::AgentCreated {
-                agent: summary.clone(),
-            })
-            .await;
         Ok(agents::CreatedAgentRecord {
             summary,
             record: agent,

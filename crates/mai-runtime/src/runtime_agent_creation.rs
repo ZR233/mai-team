@@ -102,10 +102,6 @@ impl PreparedAgentResource {
         self.summary.id
     }
 
-    pub(crate) fn summary(&self) -> &AgentSummary {
-        &self.summary
-    }
-
     pub(crate) fn include_canonical_runtime(&mut self) {
         self.lease.include_canonical_runtime();
     }

@@ -30,27 +30,6 @@ impl AgentRuntime {
         tasks::set_status(&self.state, self, task, status, final_report, error).await
     }
 
-    pub(super) async fn resolve_session_id(
-        &self,
-        agent_id: AgentId,
-        session_id: Option<SessionId>,
-    ) -> Result<agent_host::ResolvedAgentSessionId> {
-        let agent = self.agent(agent_id).await?;
-        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
-        let runtime = agent_host::load_runtime(&self.deps.store, &runtime_agent_id).await?;
-        let sessions = agent_host::project_sessions(&runtime);
-        let selected = agent_host::selected_session(&sessions, session_id).ok_or_else(|| {
-            RuntimeError::SessionNotFound {
-                agent_id,
-                session_id: session_id.unwrap_or_default(),
-            }
-        })?;
-        Ok(agent_host::ResolvedAgentSessionId {
-            protocol: selected.summary.id,
-            framework: pl_core::SessionId::new(selected.framework_id.clone())?,
-        })
-    }
-
     pub(super) async fn resolve_role_agent_model(
         &self,
         role: AgentRole,

@@ -52,9 +52,13 @@ impl agents::AgentDeleteOps for AgentRuntime {
         &self,
         agent_id: AgentId,
     ) -> Result<agents::CanonicalAgentClose> {
-        let agent = self.agent(agent_id).await?;
-        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
-        match self.framework_handle()?.close(runtime_agent_id).await {
+        self.agent(agent_id).await?;
+        self.state.thread_subscriptions.invalidate(agent_id).await;
+        match self
+            .framework_handle()?
+            .close(agent_host::canonical_id(agent_id)?)
+            .await
+        {
             Ok(_) => Ok(agents::CanonicalAgentClose::Closed),
             Err(pl_core::AgentRuntimeError::NotFound(_)) => {
                 Ok(agents::CanonicalAgentClose::Missing)
@@ -117,35 +121,13 @@ impl agents::AgentObservabilityOps for AgentRuntime {
     async fn load_tool_trace(
         &self,
         agent_id: AgentId,
-        session_id: Option<SessionId>,
         call_id: String,
     ) -> Result<Option<ToolTraceDetail>> {
         Ok(self
             .deps
             .store
-            .load_tool_trace(agent_id, session_id, &call_id)
+            .load_tool_trace(agent_id, Some(agent_id.to_string()), &call_id)
             .await?)
-    }
-
-    async fn tool_metadata(
-        &self,
-        agent_id: AgentId,
-        session_id: SessionId,
-        call_id: String,
-    ) -> (Option<bool>, Option<u64>) {
-        match self
-            .deps
-            .store
-            .load_tool_trace(agent_id, Some(session_id), &call_id)
-            .await
-        {
-            Ok(Some(trace)) => (Some(trace.success), trace.duration_ms),
-            Ok(None) => (None, None),
-            Err(error) => {
-                tracing::warn!(%agent_id, %call_id, "failed to load tool metadata: {error}");
-                (None, None)
-            }
-        }
     }
 
     async fn list_agent_logs(
@@ -162,28 +144,6 @@ impl agents::AgentObservabilityOps for AgentRuntime {
         filter: ToolTraceFilter,
     ) -> Result<Vec<ToolTraceSummary>> {
         Ok(self.deps.store.list_tool_traces(agent_id, filter).await?)
-    }
-
-    async fn load_agent_history(
-        &self,
-        agent_id: AgentId,
-        session_id: SessionId,
-    ) -> Result<Vec<pl_protocol::Message>> {
-        let agent = self.agent(agent_id).await?;
-        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
-        let runtime = agent_host::load_runtime(&self.deps.store, &runtime_agent_id).await?;
-        agent_host::history_messages(&runtime, session_id)?.ok_or(RuntimeError::SessionNotFound {
-            agent_id,
-            session_id,
-        })
-    }
-
-    fn resolve_session_id(
-        &self,
-        agent_id: AgentId,
-        session_id: Option<SessionId>,
-    ) -> impl std::future::Future<Output = Result<agent_host::ResolvedAgentSessionId>> + Send {
-        AgentRuntime::resolve_session_id(self, agent_id, session_id)
     }
 
     fn tool_output_artifact_file_path(
@@ -270,12 +230,6 @@ impl agents::AgentCreateOps for AgentRuntime {
     async fn insert_agent(&self, agent: Arc<AgentRecord>) {
         let id = agent.summary.read().await.id;
         self.state.agents.write().await.insert(id, agent);
-    }
-
-    async fn publish_agent_created(&self, agent: AgentSummary) {
-        self.events
-            .publish(MaiProductEventKind::AgentCreated { agent })
-            .await;
     }
 }
 

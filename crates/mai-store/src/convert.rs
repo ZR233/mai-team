@@ -15,14 +15,13 @@ pub(crate) fn parse_project_id(value: &str) -> Result<ProjectId> {
         .map_err(|err| StoreError::InvalidConfig(format!("invalid project id `{value}`: {err}")))
 }
 
-pub(crate) fn parse_session_id(value: &str) -> Result<SessionId> {
-    Uuid::parse_str(value)
-        .map_err(|err| StoreError::InvalidConfig(format!("invalid session id `{value}`: {err}")))
-}
-
 pub(crate) fn parse_turn_id(value: &str) -> Result<TurnId> {
-    Uuid::parse_str(value)
-        .map_err(|err| StoreError::InvalidConfig(format!("invalid turn id `{value}`: {err}")))
+    if value.trim().is_empty() {
+        return Err(StoreError::InvalidConfig(
+            "turn id cannot be empty".to_string(),
+        ));
+    }
+    Ok(value.to_string())
 }
 
 pub(crate) fn parse_uuid(value: &str) -> Result<Uuid> {

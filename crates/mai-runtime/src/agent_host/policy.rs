@@ -34,7 +34,6 @@ pub(crate) fn compile_execution_policy(
         spawn_roles,
         list_targets: AgentTargetSelector::Tree,
         message_targets: AgentTargetSelector::Tree,
-        wait_targets: AgentTargetSelector::Tree,
         close_targets: if context.can_manage_agents {
             AgentTargetSelector::Tree
         } else {
@@ -173,8 +172,8 @@ mod tests {
             lifecycle: AgentLifecycleState::Active,
             activity: AgentActivityState::Idle,
             active_turn_id: None,
-            active_session_id: None,
             pending_inputs: 0,
+            progress: None,
             last_turn: None,
             revision: 1,
             event_sequence: 1,

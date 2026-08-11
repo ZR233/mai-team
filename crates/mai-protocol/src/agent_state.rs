@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{SessionId, TokenUsage, TurnId};
+use crate::{ThreadId, TokenUsage, TurnId};
 
 /// 产品外部资源（容器、workspace、MCP）的生命周期；与模型 turn 执行正交。
 #[derive(
@@ -48,6 +48,7 @@ pub enum AgentRuntimeActivity {
     Running,
     WaitingTool,
     WaitingInteraction,
+    Cancelling,
 }
 
 /// 最近一次 turn 的稳定结果类型。
@@ -64,7 +65,7 @@ pub enum AgentTurnOutcomeKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentLastTurn {
     pub turn_id: TurnId,
-    pub session_id: SessionId,
+    pub thread_id: ThreadId,
     pub outcome: AgentTurnOutcomeKind,
     pub reason: Option<String>,
     pub usage: TokenUsage,
@@ -77,7 +78,6 @@ pub struct AgentRuntimeState {
     pub lifecycle: AgentRuntimeLifecycle,
     pub activity: AgentRuntimeActivity,
     pub active_turn: Option<TurnId>,
-    pub active_session: Option<SessionId>,
     pub pending_inputs: usize,
     pub last_turn: Option<AgentLastTurn>,
     pub revision: u64,
@@ -103,6 +103,6 @@ impl AgentState {
 
     /// 返回当前由 PL runtime 管理的活动 turn。
     pub fn active_turn(&self) -> Option<TurnId> {
-        self.runtime.active_turn
+        self.runtime.active_turn.clone()
     }
 }

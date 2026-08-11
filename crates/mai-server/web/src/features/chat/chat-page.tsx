@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Boxes, ClipboardList, Plus } from "lucide-react"
 import { useEffect, useState } from "react"
-import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom"
+import { Link, useNavigate, useParams } from "react-router-dom"
 import { toast } from "sonner"
 
 import { api, jsonBody } from "@/api/client"
@@ -15,17 +15,15 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { WorkspaceHeader } from "@/components/workspace-header"
-import { SessionWorkspace } from "@/features/session/session-workspace"
+import { ThreadWorkspace } from "@/features/thread/thread-workspace"
 
 export default function ChatPage() {
   const { environmentId } = useParams()
   const navigate = useNavigate()
-  const [search, setSearch] = useSearchParams()
   const queryClient = useQueryClient()
   const environments = useQuery(environmentsQuery())
   const selectedId = environmentId || environments.data?.[0]?.id || ""
-  const selectedSessionId = search.get("session")
-  const detail = useQuery(environmentQuery(selectedId, null, selectedSessionId))
+  const detail = useQuery(environmentQuery(selectedId))
   const [createOpen, setCreateOpen] = useState(false)
 
   useEffect(() => {
@@ -37,13 +35,6 @@ export default function ChatPage() {
       queryClient.invalidateQueries({ queryKey: queryKeys.environments }),
       selectedId ? queryClient.invalidateQueries({ queryKey: ["environments", selectedId] }) : Promise.resolve(),
     ])
-  }
-
-  const createSession = async () => {
-    const response = await api<{ conversation?: { id: string }; session?: { id: string }; id?: string }>(`/environments/${selectedId}/conversations`, { method: "POST" })
-    const id = response.conversation?.id || response.session?.id || response.id
-    if (id) setSearch({ session: id })
-    await refresh()
   }
 
   if (environments.isLoading) return <LoadingState rows={6} />
@@ -74,7 +65,7 @@ export default function ChatPage() {
           : detail.error
             ? <PageState><ErrorState error={detail.error} retry={() => void detail.refetch()} /></PageState>
             : detail.data
-              ? <EnvironmentWorkspace detail={detail.data} sessionId={selectedSessionId} setSession={(id) => setSearch({ session: id })} refresh={refresh} createSession={createSession} />
+              ? <EnvironmentWorkspace detail={detail.data} refresh={refresh} />
               : null}
       <CreateEnvironmentDialog open={createOpen} onOpenChange={setCreateOpen} onCreated={(environment) => {
         setCreateOpen(false)
@@ -85,27 +76,19 @@ export default function ChatPage() {
   )
 }
 
-function EnvironmentWorkspace({ detail, sessionId, setSession, refresh, createSession }: {
+function EnvironmentWorkspace({ detail, refresh }: {
   detail: EnvironmentDetail
-  sessionId: string | null
-  setSession(id: string): void
   refresh(): Promise<void>
-  createSession(): Promise<void>
 }) {
-  const root = normalizeRootAgent(detail)
-  const selectedId = sessionId || detail.selected_conversation_id || root.selected_session_id
-  const selectedSession = root.sessions.find((session) => session.id === selectedId)
+  const root = detail.root_agent
   const environmentName = detail.name || detail.title || root.name
   return (
-    <SessionWorkspace
+    <ThreadWorkspace
       agent={root}
-      sessionId={selectedId}
-      workspaceCrumbs={[{ label: "Chat", href: "/chat" }, { label: environmentName }, { label: selectedSession?.title || "Session" }]}
-      onSelectSession={setSession}
-      onCreateSession={createSession}
+      workspaceCrumbs={[{ label: "Chat", href: "/chat" }, { label: environmentName }, { label: root.thread.title || "Thread" }]}
       onAgentUpdated={refresh}
       onSend={async (message, skillMentions) => {
-        await api(`/environments/${detail.id}/conversations/${selectedId}/messages`, {
+        await api(`/threads/${encodeURIComponent(root.thread.id)}/messages`, {
           method: "POST",
           ...jsonBody({ message, skill_mentions: skillMentions }),
         })
@@ -115,15 +98,6 @@ function EnvironmentWorkspace({ detail, sessionId, setSession, refresh, createSe
       }}
     />
   )
-}
-
-function normalizeRootAgent(detail: EnvironmentDetail) {
-  const sessions = detail.root_agent.sessions?.length ? detail.root_agent.sessions : detail.conversations ?? []
-  return {
-    ...detail.root_agent,
-    sessions,
-    selected_session_id: detail.selected_conversation_id || detail.root_agent.selected_session_id || sessions[0]?.id || "",
-  }
 }
 
 function CreateEnvironmentDialog({ open, onOpenChange, onCreated }: { open: boolean; onOpenChange(open: boolean): void; onCreated(environment: EnvironmentSummary): void }) {

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::response::sse::Event;
 use futures::{Stream, StreamExt};
-use mai_protocol::{MaiProductEventEnvelope, SessionEventPosition, SessionStreamFrame};
+use mai_protocol::{MaiProductEventEnvelope, ThreadSubscriptionUpdate};
 use tokio_stream::once;
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -12,31 +12,27 @@ const SSE_REPLAY_LIMIT: usize = 1_000;
 
 pub(crate) type EventStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 
-pub(crate) struct SessionEventStreamService {
+pub(crate) struct ThreadEventStreamService {
     runtime: Arc<mai_runtime::AgentRuntime>,
 }
 
-impl SessionEventStreamService {
+impl ThreadEventStreamService {
     pub(crate) fn new(runtime: Arc<mai_runtime::AgentRuntime>) -> Self {
         Self { runtime }
     }
 
     pub(crate) async fn stream(
         &self,
-        session_id: mai_protocol::SessionId,
-        after_sequence: Option<u64>,
+        thread_id: String,
     ) -> Result<EventStream, mai_runtime::RuntimeError> {
-        let subscription = self
-            .runtime
-            .subscribe_session_events(session_id, after_sequence)
-            .await?;
-        let frames = futures::stream::unfold(subscription, |mut subscription| async move {
-            subscription.recv().await.map(|frame| {
-                let event = session_sse_frame(frame);
+        let subscription = self.runtime.subscribe_thread(thread_id).await?;
+        let updates = futures::stream::unfold(subscription, |mut subscription| async move {
+            subscription.recv().await.map(|update| {
+                let event = thread_sse_update(update);
                 (Ok(event), subscription)
             })
         });
-        Ok(Box::pin(frames))
+        Ok(Box::pin(updates))
     }
 }
 
@@ -45,29 +41,23 @@ pub(crate) struct EventStreamService {
     runtime: Arc<mai_runtime::AgentRuntime>,
 }
 
-fn session_sse_frame(frame: SessionStreamFrame) -> Event {
-    let event_name = match &frame {
-        SessionStreamFrame::Snapshot { .. } => "snapshot",
-        SessionStreamFrame::Event { .. } => "event",
-        SessionStreamFrame::ResyncRequired { .. } => "resyncRequired",
+fn thread_sse_update(update: ThreadSubscriptionUpdate) -> Event {
+    let event_name = match &update {
+        ThreadSubscriptionUpdate::Snapshot { .. } => "snapshot",
+        ThreadSubscriptionUpdate::Notification { .. } => "notification",
     };
-    let durable_sequence = match &frame {
-        SessionStreamFrame::Event { event } => match event.position {
-            SessionEventPosition::Durable { sequence } => Some(sequence),
-            SessionEventPosition::Transient { revision: _ } => None,
-        },
-        SessionStreamFrame::Snapshot { .. } | SessionStreamFrame::ResyncRequired { .. } => None,
+    let revision = match &update {
+        ThreadSubscriptionUpdate::Snapshot { .. } => None,
+        ThreadSubscriptionUpdate::Notification { notification } => Some(notification.revision),
     };
     let event = Event::default().event(event_name);
-    let event = match durable_sequence {
-        Some(sequence) => event.id(sequence.to_string()),
+    let event = match revision {
+        Some(revision) => event.id(revision.to_string()),
         None => event,
     };
-    event.json_data(frame).unwrap_or_else(|error| {
-        tracing::error!(error = %error, "failed to serialize session SSE frame");
-        Event::default().event("resyncRequired").data(
-            r#"{"type":"resyncRequired","reason":{"type":"projectionInvariant","message":"serialization failed"}}"#,
-        )
+    event.json_data(update).unwrap_or_else(|error| {
+        tracing::error!(error = %error, "failed to serialize Thread SSE update");
+        Event::default().event("serializationError").data("{}")
     })
 }
 

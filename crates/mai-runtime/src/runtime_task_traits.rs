@@ -4,9 +4,8 @@ impl projects::service::ProjectReadOps for AgentRuntime {
     fn get_agent(
         &self,
         agent_id: AgentId,
-        session_id: Option<SessionId>,
     ) -> impl std::future::Future<Output = Result<AgentDetail>> + Send {
-        AgentRuntime::get_agent(self, agent_id, session_id)
+        AgentRuntime::get_agent(self, agent_id)
     }
 
     async fn recent_review_runs(
@@ -24,9 +23,8 @@ impl tasks::TaskReadOps for AgentRuntime {
     fn get_agent(
         &self,
         agent_id: AgentId,
-        session_id: Option<SessionId>,
     ) -> impl std::future::Future<Output = Result<AgentDetail>> + Send {
-        AgentRuntime::get_agent(self, agent_id, session_id)
+        AgentRuntime::get_agent(self, agent_id)
     }
 }
 
@@ -82,7 +80,7 @@ impl tasks::TaskPlanningOps for Arc<AgentRuntime> {
         message: String,
         skill_mentions: Vec<String>,
     ) -> Result<TurnId> {
-        AgentRuntime::send_message(self, agent_id, None, message, skill_mentions).await
+        AgentRuntime::send_message(self, agent_id, message, skill_mentions).await
     }
 
     async fn spawn_task_workflow(&self, task_id: TaskId) {
@@ -276,6 +274,7 @@ impl tasks::EnvironmentOps for Arc<AgentRuntime> {
                         system_prompt: None,
                     },
                     agents::CreateAgentRecordContext {
+                        id: AgentId::new_v4(),
                         task_id: Some(request.environment_id),
                         project_id: None,
                         role: Some(AgentRole::Planner),
@@ -298,25 +297,16 @@ impl tasks::EnvironmentOps for Arc<AgentRuntime> {
     fn get_agent(
         &self,
         agent_id: AgentId,
-        session_id: Option<SessionId>,
     ) -> impl std::future::Future<Output = Result<AgentDetail>> + Send {
-        AgentRuntime::get_agent(self.as_ref(), agent_id, session_id)
-    }
-
-    fn create_agent_session(
-        &self,
-        agent_id: AgentId,
-    ) -> impl std::future::Future<Output = Result<AgentSessionSummary>> + Send {
-        AgentRuntime::create_session(self.as_ref(), agent_id)
+        AgentRuntime::get_agent(self.as_ref(), agent_id)
     }
 
     fn send_agent_message(
         &self,
         agent_id: AgentId,
-        session_id: SessionId,
         message: String,
         skill_mentions: Vec<String>,
     ) -> impl std::future::Future<Output = Result<TurnId>> + Send {
-        AgentRuntime::send_message(self, agent_id, Some(session_id), message, skill_mentions)
+        AgentRuntime::send_message(self, agent_id, message, skill_mentions)
     }
 }

@@ -21,7 +21,7 @@ import { Input } from "@/components/ui/input"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { WorkspaceHeader } from "@/components/workspace-header"
-import { SessionWorkspace } from "@/features/session/session-workspace"
+import { ThreadWorkspace } from "@/features/thread/thread-workspace"
 
 export default function TasksPage() {
   const { taskId } = useParams()
@@ -76,7 +76,7 @@ function TaskWorkspace({ detail, selectAgent, refresh, onDeleted }: { detail: Ta
   return <section className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background">
     <WorkspaceHeader
       crumbs={[{ label: "Tasks", href: "/tasks" }, { label: detail.title }]}
-      actions={<><StatusBadge status={detail.status} /><Button variant="outline" size="sm" onClick={() => void action("cancel")}><X data-icon="inline-start" /> Cancel</Button><AlertDialog><AlertDialogTrigger asChild><Button variant="ghost" size="sm"><Trash2 data-icon="inline-start" /> Delete</Button></AlertDialogTrigger><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Delete this task?</AlertDialogTitle><AlertDialogDescription>This removes its agents, sessions, and local task state.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction variant="destructive" onClick={() => void remove()}>Delete task</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog></>}
+      actions={<><StatusBadge status={detail.status} /><Button variant="outline" size="sm" onClick={() => void action("cancel")}><X data-icon="inline-start" /> Cancel</Button><AlertDialog><AlertDialogTrigger asChild><Button variant="ghost" size="sm"><Trash2 data-icon="inline-start" /> Delete</Button></AlertDialogTrigger><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Delete this task?</AlertDialogTitle><AlertDialogDescription>This removes its agents, Threads, and local task state.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction variant="destructive" onClick={() => void remove()}>Delete task</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog></>}
     />
     <Collapsible defaultOpen={canApprove} className="shrink-0 border-b bg-muted/20">
       <CollapsibleTrigger className="flex w-full items-center gap-2 px-5 py-3 text-left text-sm font-medium">
@@ -88,7 +88,7 @@ function TaskWorkspace({ detail, selectAgent, refresh, onDeleted }: { detail: Ta
     </Collapsible>
     {detail.artifacts.length > 0 && <div className="flex shrink-0 gap-2 overflow-x-auto border-b px-4 py-2">{detail.artifacts.map((artifact) => <Button key={artifact.id} asChild variant="outline" size="sm"><a href={`/artifacts/${encodeURIComponent(artifact.id)}/download`} download><Download data-icon="inline-start" />{artifact.name}<span className="text-muted-foreground">{formatBytes(artifact.size_bytes)}</span></a></Button>)}</div>}
     <div className="shrink-0 overflow-x-auto border-b bg-muted/20 p-2"><Tabs value={selected.id} onValueChange={selectAgent}><TabsList>{detail.agents.map((agent) => <TabsTrigger key={agent.id} value={agent.id} className="min-w-48 justify-start"><Bot data-icon="inline-start" /><span className="min-w-0 flex-1 text-left"><strong className="block truncate text-xs">{agent.name}</strong><small className="block truncate text-[11px] text-muted-foreground">{agent.role} · {agent.model}</small></span><StatusDot status={agent.state.runtime?.activity || agent.state.resource} /></TabsTrigger>)}</TabsList></Tabs></div>
-    <SessionWorkspace agent={selected} sessionId={selected.selected_session_id} showSessions={false} onSelectSession={() => {}} onCreateSession={async () => {}} onAgentUpdated={refresh} onSend={(message, skillMentions) => action("messages", { message, skill_mentions: skillMentions })} onStop={async (turnId) => { await api(`/agents/${selected.id}/turns/${turnId}/cancel`, { method: "POST" }) }} />
+    <ThreadWorkspace agent={selected} onAgentUpdated={refresh} onSend={(message, skillMentions) => api(`/threads/${encodeURIComponent(selected.thread.id)}/messages`, { method: "POST", ...jsonBody({ message, skill_mentions: skillMentions }) })} onStop={async (turnId) => { await api(`/agents/${selected.id}/turns/${turnId}/cancel`, { method: "POST" }) }} />
   </section>
 }
 

@@ -30,12 +30,7 @@ pub(super) async fn read(
 ) -> Result<serde_json::Value> {
     validate_range(&input)?;
     let (artifact, path) = runtime
-        .tool_output_artifact(
-            agent_id,
-            None,
-            input.call_id.clone(),
-            input.artifact_id.clone(),
-        )
+        .tool_output_artifact(agent_id, input.call_id.clone(), input.artifact_id.clone())
         .await?;
     if input.start_byte.is_some() || input.max_bytes.is_some() {
         read_bytes(artifact, path, input).await

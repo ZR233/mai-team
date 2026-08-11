@@ -800,7 +800,7 @@ mod tests {
         ProjectCloneStatus, ProjectReviewDecision, ProjectReviewFailureCategory,
         ProjectReviewJobSource, ProjectReviewJobStatus, ProjectReviewJobSummary,
         ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewStatus,
-        ProjectStatus, ProjectSummary, TokenUsage, now,
+        ProjectStatus, ProjectSummary, TokenUsage, TurnId, now,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::{Mutex, Notify};
@@ -856,7 +856,7 @@ mod tests {
         review_runs: Arc<Mutex<Vec<ProjectReviewRunSummary>>>,
         review_jobs: Arc<Mutex<Vec<ProjectReviewJobSummary>>>,
         finished_runs: Arc<Mutex<Vec<FinishReviewRun>>>,
-        cancelled_turns: Arc<Mutex<Vec<(Uuid, Uuid)>>>,
+        cancelled_turns: Arc<Mutex<Vec<(Uuid, TurnId)>>>,
         deleted_agents: Arc<Mutex<Vec<Uuid>>>,
         git_provider: mai_protocol::GitProvider,
     }
@@ -1442,7 +1442,7 @@ mod tests {
             Ok(None)
         }
 
-        async fn agent_current_turn(&self, agent_id: Uuid) -> crate::Result<Option<Uuid>> {
+        async fn agent_current_turn(&self, agent_id: Uuid) -> crate::Result<Option<TurnId>> {
             Ok(self
                 .auto_reviewers
                 .lock()
@@ -1452,7 +1452,7 @@ mod tests {
                 .and_then(|agent| agent.state.active_turn()))
         }
 
-        async fn cancel_agent_turn(&self, agent_id: Uuid, turn_id: Uuid) -> crate::Result<()> {
+        async fn cancel_agent_turn(&self, agent_id: Uuid, turn_id: TurnId) -> crate::Result<()> {
             self.cancelled_turns.lock().await.push((agent_id, turn_id));
             Ok(())
         }
@@ -2255,7 +2255,7 @@ mod tests {
 
         assert_eq!(vec![Some(42)], *ops.reviewed_prs.lock().await);
         assert_eq!(
-            Vec::<(Uuid, Uuid)>::new(),
+            Vec::<(Uuid, String)>::new(),
             *ops.cancelled_turns.lock().await
         );
         assert_eq!(Vec::<Uuid>::new(), *ops.deleted_agents.lock().await);
@@ -2677,13 +2677,12 @@ mod tests {
         maintainer_agent_id: Uuid,
         test_state: TestReviewerState,
     ) -> mai_protocol::AgentSummary {
-        let turn_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4().to_string();
         let mut state = AgentState {
             resource: AgentResourceState::Ready,
             runtime: AgentRuntimeState {
                 activity: AgentRuntimeActivity::Running,
                 active_turn: Some(turn_id),
-                active_session: Some(Uuid::new_v4()),
                 ..AgentRuntimeState::default()
             },
             ..AgentState::default()
@@ -2701,14 +2700,12 @@ mod tests {
                 state.resource_error = Some("reviewer failed".to_string());
                 state.runtime.activity = AgentRuntimeActivity::Idle;
                 state.runtime.active_turn = None;
-                state.runtime.active_session = None;
             }
             TestReviewerState::Deleted => {
                 state.resource = AgentResourceState::Deleted;
                 state.runtime.lifecycle = mai_protocol::AgentRuntimeLifecycle::Closed;
                 state.runtime.activity = AgentRuntimeActivity::Idle;
                 state.runtime.active_turn = None;
-                state.runtime.active_session = None;
             }
         }
         mai_protocol::AgentSummary {
@@ -2734,7 +2731,7 @@ mod tests {
     fn test_review_run(
         project_id: Uuid,
         reviewer_agent_id: Option<Uuid>,
-        turn_id: Option<Uuid>,
+        turn_id: Option<TurnId>,
         status: ProjectReviewRunStatus,
     ) -> ProjectReviewRunSummary {
         ProjectReviewRunSummary {

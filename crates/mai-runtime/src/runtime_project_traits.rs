@@ -77,14 +77,7 @@ impl projects::service::ProjectLifecycleOps for Arc<AgentRuntime> {
         agent_id: AgentId,
         request: SendMessageRequest,
     ) -> Result<TurnId> {
-        AgentRuntime::send_message(
-            self,
-            agent_id,
-            request.session_id,
-            request.message,
-            request.skill_mentions,
-        )
-        .await
+        AgentRuntime::send_message(self, agent_id, request.message, request.skill_mentions).await
     }
 }
 
@@ -144,6 +137,7 @@ impl projects::service::ProjectCreateOps for Arc<AgentRuntime> {
                 system_prompt: Some(request.system_prompt),
             },
             agents::CreateAgentRecordContext {
+                id: AgentId::new_v4(),
                 task_id: None,
                 project_id: Some(request.project_id),
                 role: Some(AgentRole::Planner),

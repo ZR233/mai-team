@@ -8,35 +8,22 @@ impl MaiStore {
         summary: &AgentSummary,
         system_prompt: Option<&str>,
     ) -> Result<()> {
-        self.save_agent_with_runtime_id(summary, system_prompt, &summary.id.to_string())
-            .await
-    }
-
-    pub async fn save_agent_with_runtime_id(
-        &self,
-        summary: &AgentSummary,
-        system_prompt: Option<&str>,
-        runtime_agent_id: &str,
-    ) -> Result<()> {
         crate::sqlite_busy::retry_sqlite_busy(|| async {
-            self.save_agent_with_runtime_id_once(summary, system_prompt, runtime_agent_id)
-                .await
+            self.save_agent_once(summary, system_prompt).await
         })
         .await
     }
 
-    async fn save_agent_with_runtime_id_once(
+    async fn save_agent_once(
         &self,
         summary: &AgentSummary,
         system_prompt: Option<&str>,
-        runtime_agent_id: &str,
     ) -> Result<()> {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         delete_agent_row_in_tx(&mut tx, summary.id).await?;
         toasty::create!(AgentRecordRow {
             id: summary.id.to_string(),
-            runtime_agent_id: runtime_agent_id.to_string(),
             parent_id: summary.parent_id.map(|id| id.to_string()),
             task_id: summary.task_id.map(|id| id.to_string()),
             project_id: summary.project_id.map(|id| id.to_string()),
@@ -68,18 +55,8 @@ impl MaiStore {
     async fn delete_agent_once(&self, agent_id: AgentId) -> Result<()> {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
-        let runtime_agent_id = Query::<List<AgentRecordRow>>::filter(
-            AgentRecordRow::fields().id().eq(agent_id.to_string()),
-        )
-        .exec(&mut tx)
-        .await?
-        .into_iter()
-        .next()
-        .map(|row| row.runtime_agent_id);
         delete_agent_row_in_tx(&mut tx, agent_id).await?;
-        if let Some(runtime_agent_id) = runtime_agent_id {
-            delete_agent_runtime_in_tx(&mut tx, &runtime_agent_id).await?;
-        }
+        delete_thread_runtime_in_tx(&mut tx, &agent_id.to_string()).await?;
         Query::<List<AgentLogRecord>>::filter(
             AgentLogRecord::fields().agent_id().eq(agent_id.to_string()),
         )
@@ -109,23 +86,21 @@ impl MaiStore {
         let mut agents = Vec::with_capacity(agent_rows.len());
         for row in agent_rows {
             let system_prompt = row.system_prompt.clone();
-            let runtime_agent_id = row.runtime_agent_id.clone();
             let mut summary = row.into_summary()?;
-            if let Some(runtime) = self.load_agent_runtime(&runtime_agent_id).await? {
-                for session in runtime.sessions {
-                    summary.token_usage.add(&TokenUsage {
-                        input_tokens: session.usage.prompt_tokens,
-                        cached_input_tokens: session.usage.cached_prompt_tokens,
-                        output_tokens: session.usage.completion_tokens,
-                        reasoning_output_tokens: session.usage.reasoning_tokens,
-                        total_tokens: session.usage.total_tokens,
-                    });
-                }
+            if let Some(runtime) = self.load_thread_runtime(&summary.id.to_string()).await?
+                && let Some(usage) = runtime.snapshot.and_then(|snapshot| snapshot.runtime)
+            {
+                summary.token_usage.add(&TokenUsage {
+                    input_tokens: usage.usage.prompt_tokens,
+                    cached_input_tokens: usage.usage.cached_prompt_tokens,
+                    output_tokens: usage.usage.completion_tokens,
+                    reasoning_output_tokens: usage.usage.reasoning_tokens,
+                    total_tokens: usage.usage.total_tokens,
+                });
             }
             agents.push(PersistedAgent {
                 summary,
                 system_prompt,
-                runtime_agent_id,
             });
         }
 
@@ -164,95 +139,54 @@ pub(crate) async fn delete_agent_row_in_tx(
     Ok(())
 }
 
-async fn delete_agent_runtime_in_tx(
+async fn delete_thread_runtime_in_tx(
     tx: &mut toasty::Transaction<'_>,
-    runtime_agent_id: &str,
+    thread_id: &str,
 ) -> Result<()> {
-    let sessions = Query::<List<AgentSessionRecord>>::filter(
-        AgentSessionRecord::fields()
-            .agent_id()
-            .eq(runtime_agent_id.to_string()),
-    )
-    .exec(&mut *tx)
-    .await?;
-    for session in &sessions {
-        Query::<List<SessionEventJournalRecord>>::filter(
-            SessionEventJournalRecord::fields()
-                .session_id()
-                .eq(session.id.clone()),
-        )
-        .delete()
-        .exec(&mut *tx)
-        .await?;
-        Query::<List<SessionViewSnapshotRecord>>::filter(
-            SessionViewSnapshotRecord::fields()
-                .session_id()
-                .eq(session.id.clone()),
-        )
-        .delete()
-        .exec(&mut *tx)
-        .await?;
-    }
-    Query::<List<AgentRuntimeStateRecord>>::filter(
-        AgentRuntimeStateRecord::fields()
-            .agent_id()
-            .eq(runtime_agent_id.to_string()),
+    Query::<List<ThreadRuntimeDocumentRecord>>::filter(
+        ThreadRuntimeDocumentRecord::fields()
+            .thread_id()
+            .eq(thread_id.to_string()),
     )
     .delete()
     .exec(&mut *tx)
     .await?;
-    Query::<List<AgentSessionRecord>>::filter(
-        AgentSessionRecord::fields()
-            .agent_id()
-            .eq(runtime_agent_id.to_string()),
+    Query::<List<ThreadTurnRecord>>::filter(
+        ThreadTurnRecord::fields()
+            .thread_id()
+            .eq(thread_id.to_string()),
     )
     .delete()
     .exec(&mut *tx)
     .await?;
-    Query::<List<AgentHistoryRecord>>::filter(
-        AgentHistoryRecord::fields()
-            .agent_id()
-            .eq(runtime_agent_id.to_string()),
+    Query::<List<ThreadItemRecord>>::filter(
+        ThreadItemRecord::fields()
+            .thread_id()
+            .eq(thread_id.to_string()),
     )
     .delete()
     .exec(&mut *tx)
     .await?;
-    Query::<List<AgentMessageRecord>>::filter(
-        AgentMessageRecord::fields()
-            .agent_id()
-            .eq(runtime_agent_id.to_string()),
+    Query::<List<ThreadNotificationRecord>>::filter(
+        ThreadNotificationRecord::fields()
+            .thread_id()
+            .eq(thread_id.to_string()),
     )
     .delete()
     .exec(&mut *tx)
     .await?;
-    Query::<List<AgentPendingInputRecord>>::filter(
-        AgentPendingInputRecord::fields()
-            .agent_id()
-            .eq(runtime_agent_id.to_string()),
+    Query::<List<ThreadRuntimeEventRecord>>::filter(
+        ThreadRuntimeEventRecord::fields()
+            .thread_id()
+            .eq(thread_id.to_string()),
     )
     .delete()
     .exec(&mut *tx)
     .await?;
-    Query::<List<AgentTurnRecord>>::filter(
-        AgentTurnRecord::fields()
-            .agent_id()
-            .eq(runtime_agent_id.to_string()),
-    )
-    .delete()
-    .exec(&mut *tx)
-    .await?;
-    Query::<List<AgentRuntimeEventRecord>>::filter(
-        AgentRuntimeEventRecord::fields()
-            .agent_id()
-            .eq(runtime_agent_id.to_string()),
-    )
-    .delete()
-    .exec(&mut *tx)
-    .await?;
-    Query::<List<AgentRuntimeTraceRecord>>::filter(
-        AgentRuntimeTraceRecord::fields()
-            .agent_id()
-            .eq(runtime_agent_id.to_string()),
+    Query::<List<ThreadRuntimeTraceRecord>>::filter(
+        ThreadRuntimeTraceRecord::fields()
+            .thread_id()
+            .eq(thread_id.to_string()),
     )
     .delete()
     .exec(&mut *tx)

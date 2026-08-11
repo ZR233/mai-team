@@ -41,14 +41,15 @@ mod runtime_provisioning;
 mod runtime_resources;
 mod runtime_review_context;
 mod runtime_review_traits;
-mod runtime_session_events;
 mod runtime_skills;
 mod runtime_task_traits;
+mod runtime_thread_events;
 mod runtime_tool_settings;
 mod runtime_workspace;
 mod skills;
 mod state;
 mod tasks;
+mod thread_subscriptions;
 mod tools;
 mod turn;
 
@@ -76,12 +77,10 @@ use projects::review::runs::FinishReviewRun;
 use projects::review::state::ReviewStateUpdate;
 use projects::skills::ProjectSkillSourceDir;
 use projects::workspace::ProjectWorkspaceManager;
-pub use runtime_session_events::MaiSessionEventSubscription;
+pub use runtime_thread_events::MaiThreadEventSubscription;
 use state::{AgentRecord, ProjectRecord, RuntimeState, TaskRecord};
 
 const PROJECT_REVIEW_RUN_LIST_LIMIT: usize = 50;
-const PROJECT_REVIEW_SNAPSHOT_MESSAGE_LIMIT: usize = 40;
-const PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT: usize = 80;
 const DEFAULT_SIDECAR_IMAGE: &str = "ghcr.io/zr233/mai-team-sidecar:latest";
 const UNCONFIGURED_PROVIDER_ID: &str = "unconfigured";
 const UNCONFIGURED_PROVIDER_NAME: &str = "No provider configured";
@@ -150,13 +149,8 @@ pub enum RuntimeError {
     TaskBusy(TaskId),
     #[error("agent has no container: {0}")]
     MissingContainer(AgentId),
-    #[error("session not found: {agent_id}/{session_id}")]
-    SessionNotFound {
-        agent_id: AgentId,
-        session_id: SessionId,
-    },
-    #[error("session event stream not found: {0}")]
-    SessionEventNotFound(SessionId),
+    #[error("Thread not found: {0}")]
+    ThreadNotFound(String),
     #[error("tool trace not found: {agent_id}/{call_id}")]
     ToolTraceNotFound { agent_id: AgentId, call_id: String },
     #[error("turn not found: {agent_id}/{turn_id}")]
@@ -229,12 +223,14 @@ struct ResolvedAgentModel {
     effective: ResolvedAgentModelPreference,
 }
 
-fn initial_framework_session(summary: &AgentSummary) -> pl_core::AgentSessionState {
-    let task_owned = summary.task_id.is_some() && summary.role != Some(AgentRole::Planner);
-    agent_host::session_state(
-        pl_core::SessionId::generate(),
-        if task_owned { "Task" } else { "Chat 1" }.to_string(),
-    )
+fn initial_thread_context(summary: &AgentSummary) -> pl_core::ThreadContextState {
+    let mut context = pl_core::ThreadContextState::empty();
+    context.metadata = serde_json::json!({
+        "title": summary.name,
+        "createdAt": summary.created_at,
+        "updatedAt": summary.updated_at,
+    });
+    context
 }
 
 fn framework_depth(agent_id: AgentId, agents: &HashMap<AgentId, AgentSummary>) -> u32 {

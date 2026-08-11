@@ -79,7 +79,7 @@ watch 复核补入。若最终检查与跳过事务之间有新 completed delive
 delivery 条件写入失败，worker 必须重新读取同一个 Job 并再次检查，不能丢失这个
 唤醒信号。
 
-同一项目只允许一个逻辑 Review 占用 Reviewer。尚未到期的 `RetryWaiting` 或 `Reconciling` Job 会阻塞后续排队 Job；到期后优先恢复原 Job，再处理新 Job，避免保留 Session 的 Reviewer 与新任务竞争。
+同一项目只允许一个逻辑 Review 占用 Reviewer。尚未到期的 `RetryWaiting` 或 `Reconciling` Job 会阻塞后续排队 Job；到期后优先恢复原 Job，再处理新 Job，避免保留 Thread 的 Reviewer 与新任务竞争。
 
 新 head 将运行中的旧 Job 标为 `Superseded` 时保留其租约。旧 worker 在下一次心跳发现失去有效状态后取消 Agent turn、清理 reviewer 并主动释放租约；若旧实例消失，新 Job 最多等待旧租约自然过期。
 
@@ -90,16 +90,16 @@ server 启动时：
 - 无提交副作用的过期 `Preparing`、`Running` Job 进入立即到期的 `RetryWaiting`，对应 Run 标为 `Interrupted`。
 - 尚未过期的租约继续等待，支持滚动部署时的跨实例排他。
 
-## Reviewer 与 Session 生命周期
+## Reviewer 与 Thread 生命周期
 
 Reviewer 是普通 project agent，但生命周期绑定 Job，而不是单次 Run。
 
-- 首次尝试创建 Reviewer、AgentSession、精确 head 工作区和只读默认分支上下文。
+- 首次尝试创建 Reviewer、canonical Thread、精确 head 工作区和只读默认分支上下文。
 - Reviewer system prompt 带有不可变的 Job ID、PR 和 head marker。若服务在 Agent 已持久化、但 `reviewer_agent_id` 尚未回写 Job 的窄窗口重启，只能由 marker 完全匹配的同一 Job 认领；不同 head 或不同 generation 不得复用。
-- 可重试失败保留同一个 Reviewer、Session 和会话笔记；下一次尝试启动新的 continuation turn，不重放失败 turn。
-- 重启后恢复持久化 AgentSession，并按 Job 固定的 head SHA 重建工作区和 Review 上下文。
-- Session 丢失或损坏是永久失败，不以空 Session 静默重审。
-- 只有 Job 进入 `Succeeded`、`Failed`、`Cancelled` 或 `Superseded` 后才删除 Reviewer、Session、上下文和工作区；终态清理也使用 marker 找回尚未写入 Job 的 Reviewer。
+- 可重试失败保留同一个 Reviewer、Thread 和会话笔记；下一次尝试启动新的 continuation turn，不重放失败 turn。
+- 重启后恢复持久化 `ThreadActorState`，并按 Job 固定的 head SHA 重建工作区和 Review 上下文。
+- Thread 丢失或损坏是永久失败，不以空 Thread 静默重审。
+- 只有 Job 进入 `Succeeded`、`Failed`、`Cancelled` 或 `Superseded` 后才删除 Reviewer、live Thread、上下文和工作区；终态清理也使用 marker 找回尚未写入 Job 的 Reviewer，timeline 只保留在 Run 的不可变 `ThreadTurnHistory` 归档中。
 
 ## 结构化错误与重试
 
@@ -109,7 +109,7 @@ PL 在单次模型请求内部仍可重试瞬态 provider 错误，但仅限尚�
 
 每个 Job 最多五次尝试。第一次可重试失败开启 30 分钟窗口，后续四次本地退避依次为 5 秒、30 秒、2 分钟、5 分钟，并加入确定性的正负 20% jitter。Provider `Retry-After` 更长时优先使用，但不能把新尝试安排到窗口之外。窗口只限制启动新尝试，不中断已经正常运行的尝试。
 
-鉴权、权限、输入校验、目标不存在和 Session 损坏立即永久失败。head 变化进入 `Superseded`。瞬态 GitHub、relay 和工作区错误可进入 Job 重试，但同样必须持久化为结构化失败。
+鉴权、权限、输入校验、目标不存在和 Thread 损坏立即永久失败。head 变化进入 `Superseded`。瞬态 GitHub、relay 和工作区错误可进入 Job 重试，但同样必须持久化为结构化失败。
 
 ## Watchdog
 
@@ -140,6 +140,6 @@ GitHub 回执是成功的硬条件：已有回执时，即使最终模型 JSON �
 
 ## API 与展示
 
-列表和详情 API 以 Job 为主对象，详情按 `attempt_index` 展示各次 Run。Web 必须把 `RetryWaiting`、`Reconciling` 显示为活跃阶段，并展示结构化错误、下次重试时间、SubmissionIntent 和 GitHub receipt。旧 Review Run API 只用于读取单次尝试的消息与 Timeline activity。
+列表和详情 API 以 Job 为主对象，详情按 `attempt_index` 展示各次 Run。Web 必须把 `RetryWaiting`、`Reconciling` 显示为活跃阶段，并展示结构化错误、下次重试时间、SubmissionIntent 和 GitHub receipt。Review Run detail 只返回业务结果和不可变 `ThreadTurnHistory`，不得重新订阅已经删除的 Reviewer Thread。
 
 历史 schema 迁移为每条旧 Run 创建一个对应 Job。历史终态不自动重放；部署时仍活跃的 Run 标为 `Interrupted`，其 Job 进入启动协调流程。

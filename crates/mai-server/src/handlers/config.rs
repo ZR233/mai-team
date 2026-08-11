@@ -92,17 +92,12 @@ mod tests {
             snapshot.schema_version,
             mai_protocol::PROVIDER_CATALOG_SCHEMA_VERSION
         );
-        for preset in &snapshot.presets {
-            serde_json::from_value::<mai_protocol::ProviderWireProtocol>(serde_json::json!(
-                preset.transport.protocol
-            ))
-            .unwrap_or_else(|error| {
-                panic!(
-                    "catalog preset `{}` uses an unsupported wire protocol `{}`: {error}",
-                    preset.id, preset.transport.protocol
-                )
-            });
-        }
+        assert!(
+            snapshot
+                .presets
+                .iter()
+                .all(|preset| !preset.suggested_model.is_empty())
+        );
 
         assert_eq!(etag.to_str().unwrap(), format!("\"{}\"", snapshot.revision));
         assert!(

@@ -19,13 +19,11 @@ import type {
 
 export const queryKeys = {
   agents: ["agents"] as const,
-  agent: (id: string, sessionId?: string | null) => ["agents", id, sessionId ?? "selected"] as const,
+  agent: (id: string) => ["agents", id] as const,
   environments: ["environments"] as const,
-  environment: (id: string, agentId?: string | null, sessionId?: string | null) =>
-    ["environments", id, agentId ?? "root", sessionId ?? "selected"] as const,
+  environment: (id: string) => ["environments", id] as const,
   projects: ["projects"] as const,
-  project: (id: string, agentId?: string | null, sessionId?: string | null) =>
-    ["projects", id, agentId ?? "maintainer", sessionId ?? "selected"] as const,
+  project: (id: string, agentId?: string | null) => ["projects", id, agentId ?? "maintainer"] as const,
   projectReviewRuns: (id: string) => ["projects", id, "review-runs"] as const,
   projectReviewRun: (id: string, runId: string) => ["projects", id, "review-runs", runId] as const,
   projectReviewJobs: (id: string) => ["projects", id, "review-jobs"] as const,
@@ -55,9 +53,9 @@ export const agentsQuery = () => queryOptions({
   queryFn: () => api<AgentSummary[]>("/agents"),
 })
 
-export const agentQuery = (id: string, sessionId?: string | null) => queryOptions({
-  queryKey: queryKeys.agent(id, sessionId),
-  queryFn: () => api<AgentDetail>(`/agents/${id}${query({ session_id: sessionId })}`),
+export const agentQuery = (id: string) => queryOptions({
+  queryKey: queryKeys.agent(id),
+  queryFn: () => api<AgentDetail>(`/agents/${id}`),
   enabled: Boolean(id),
 })
 
@@ -66,9 +64,9 @@ export const environmentsQuery = () => queryOptions({
   queryFn: () => api<EnvironmentSummary[]>("/environments"),
 })
 
-export const environmentQuery = (id: string, agentId?: string | null, sessionId?: string | null) => queryOptions({
-  queryKey: queryKeys.environment(id, agentId, sessionId),
-  queryFn: () => api<EnvironmentDetail>(`/environments/${id}${query({ agent_id: agentId, session_id: sessionId })}`),
+export const environmentQuery = (id: string) => queryOptions({
+  queryKey: queryKeys.environment(id),
+  queryFn: () => api<EnvironmentDetail>(`/environments/${id}`),
   enabled: Boolean(id),
 })
 
@@ -77,9 +75,9 @@ export const projectsQuery = () => queryOptions({
   queryFn: () => api<ProjectSummary[]>("/projects"),
 })
 
-export const projectQuery = (id: string, agentId?: string | null, sessionId?: string | null) => queryOptions({
-  queryKey: queryKeys.project(id, agentId, sessionId),
-  queryFn: () => api<ProjectDetail>(`/projects/${id}${query({ agent_id: agentId, session_id: sessionId })}`),
+export const projectQuery = (id: string, agentId?: string | null) => queryOptions({
+  queryKey: queryKeys.project(id, agentId),
+  queryFn: () => api<ProjectDetail>(`/projects/${id}${query({ agent_id: agentId })}`),
   enabled: Boolean(id),
 })
 

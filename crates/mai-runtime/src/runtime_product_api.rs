@@ -69,34 +69,18 @@ impl AgentRuntime {
     pub async fn get_environment(
         self: &Arc<Self>,
         environment_id: EnvironmentId,
-        session_id: Option<SessionId>,
     ) -> Result<EnvironmentDetail> {
-        tasks::get_environment(&self.state, self, environment_id, session_id).await
-    }
-
-    pub async fn create_environment_conversation(
-        self: &Arc<Self>,
-        environment_id: EnvironmentId,
-    ) -> Result<AgentSessionSummary> {
-        tasks::create_environment_conversation(&self.state, self, environment_id).await
+        tasks::get_environment(&self.state, self, environment_id).await
     }
 
     pub async fn send_environment_message(
         self: &Arc<Self>,
         environment_id: EnvironmentId,
-        session_id: SessionId,
         message: String,
         skill_mentions: Vec<String>,
     ) -> Result<TurnId> {
-        tasks::send_environment_message(
-            &self.state,
-            self,
-            environment_id,
-            session_id,
-            message,
-            skill_mentions,
-        )
-        .await
+        tasks::send_environment_message(&self.state, self, environment_id, message, skill_mentions)
+            .await
     }
 
     pub async fn create_task(
@@ -168,10 +152,8 @@ impl AgentRuntime {
         &self,
         project_id: ProjectId,
         selected_agent_id: Option<AgentId>,
-        session_id: Option<SessionId>,
     ) -> Result<ProjectDetail> {
-        projects::service::get_project(&self.state, self, project_id, selected_agent_id, session_id)
-            .await
+        projects::service::get_project(&self.state, self, project_id, selected_agent_id).await
     }
 
     pub async fn list_project_review_runs(

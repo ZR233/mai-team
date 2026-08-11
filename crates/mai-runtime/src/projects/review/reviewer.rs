@@ -71,7 +71,7 @@ pub(crate) trait ProjectReviewerAgentOps: ProjectReviewTargetOps + Send + Sync {
         agent_id: AgentId,
     ) -> impl Future<Output = Result<Option<Arc<ProjectReviewContext>>>> + Send;
 
-    fn ensure_project_reviewer_session(
+    fn ensure_project_reviewer_thread(
         &self,
         agent_id: AgentId,
     ) -> impl Future<Output = Result<()>> + Send;
@@ -291,7 +291,7 @@ pub(crate) async fn resume_project_reviewer(
     reviewer_id: AgentId,
     request: ProjectReviewRequest,
 ) -> Result<PreparedProjectReviewer> {
-    ops.ensure_project_reviewer_session(reviewer_id).await?;
+    ops.ensure_project_reviewer_thread(reviewer_id).await?;
     let target = resolve_project_review_target(ops, project_id, request.clone()).await?;
     if request
         .head_sha_hint
@@ -600,11 +600,11 @@ mod tests {
             Ok(self.attached_context.clone())
         }
 
-        async fn ensure_project_reviewer_session(
+        async fn ensure_project_reviewer_thread(
             &self,
             _agent_id: mai_protocol::AgentId,
         ) -> Result<()> {
-            self.operations.lock().await.push("ensure_session");
+            self.operations.lock().await.push("ensure_thread");
             Ok(())
         }
 
@@ -796,7 +796,7 @@ mod tests {
 
         assert_eq!(reviewer_id, prepared.agent.id);
         assert_eq!(job_id, ops.context.run_id);
-        assert_eq!(*ops.operations.lock().await, vec!["ensure_session"]);
+        assert_eq!(*ops.operations.lock().await, vec!["ensure_thread"]);
     }
 
     #[tokio::test]
@@ -823,7 +823,7 @@ mod tests {
         assert_eq!(
             *ops.operations.lock().await,
             vec![
-                "ensure_session",
+                "ensure_thread",
                 "create_context",
                 "attach_context",
                 "ensure_container",

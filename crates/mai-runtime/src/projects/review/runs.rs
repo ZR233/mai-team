@@ -2,9 +2,9 @@ use std::future::Future;
 
 use chrono::{TimeDelta, Utc};
 use mai_protocol::{
-    AgentId, AgentMessage, ProjectId, ProjectReviewDecision, ProjectReviewOutcome,
-    ProjectReviewRunDetail, ProjectReviewRunStatus, ProjectReviewRunSummary,
-    ProjectReviewRunsResponse, SessionEventEnvelope, TokenUsage, TurnId, now,
+    AgentId, ProjectId, ProjectReviewDecision, ProjectReviewOutcome, ProjectReviewRunDetail,
+    ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewRunsResponse, ThreadTurnHistory,
+    TokenUsage, TurnId, now,
 };
 use mai_store::MaiStore;
 use uuid::Uuid;
@@ -17,14 +17,14 @@ pub(crate) trait ReviewRunSnapshotSource: Send + Sync {
     fn snapshot(
         &self,
         reviewer_agent_id: AgentId,
+        turn_id: Option<&str>,
     ) -> impl Future<Output = ReviewRunSnapshot> + Send;
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReviewRunSnapshot {
     pub(crate) token_usage: TokenUsage,
-    pub(crate) messages: Vec<AgentMessage>,
-    pub(crate) events: Vec<SessionEventEnvelope>,
+    pub(crate) history: Option<ThreadTurnHistory>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,8 +93,7 @@ pub(crate) async fn record_project_review_startup_failure(
             failure: None,
             token_usage: TokenUsage::default(),
         },
-        Vec::new(),
-        Vec::new(),
+        None,
     )
     .await
 }
@@ -144,15 +143,10 @@ pub(crate) async fn cancel_active_project_review_runs(
 pub(crate) async fn save_project_review_run_status(
     store: &MaiStore,
     summary: ProjectReviewRunSummary,
-    messages: Vec<AgentMessage>,
-    events: Vec<SessionEventEnvelope>,
+    history: Option<ThreadTurnHistory>,
 ) -> Result<()> {
     store
-        .save_project_review_run(&ProjectReviewRunDetail {
-            summary,
-            messages,
-            events,
-        })
+        .save_project_review_run(&ProjectReviewRunDetail { summary, history })
         .await?;
     Ok(())
 }
@@ -190,7 +184,9 @@ pub(crate) async fn finish_project_review_run(
         .or(existing.summary.reviewer_agent_id);
     let turn_id = request.turn_id.or(existing.summary.turn_id);
     let snapshot = if let Some(reviewer_agent_id) = reviewer_agent_id {
-        snapshot_source.snapshot(reviewer_agent_id).await
+        snapshot_source
+            .snapshot(reviewer_agent_id, turn_id.as_deref())
+            .await
     } else {
         ReviewRunSnapshot::default()
     };
@@ -214,8 +210,7 @@ pub(crate) async fn finish_project_review_run(
                 failure: request.failure,
                 token_usage: snapshot.token_usage,
             },
-            messages: snapshot.messages,
-            events: snapshot.events,
+            history: snapshot.history,
         })
         .await?;
     Ok(())

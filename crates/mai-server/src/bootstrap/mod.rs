@@ -242,10 +242,10 @@ mod tests {
         assert_eq!(environments[0].name, "默认环境");
         assert_eq!(environments[0].docker_image, "ubuntu:latest");
         let detail = runtime
-            .get_environment(environments[0].id, None)
+            .get_environment(environments[0].id)
             .await
             .expect("environment detail");
-        assert_eq!(detail.root_agent.sessions[0].title, "Chat 1");
+        assert_eq!(detail.root_agent.thread.title, "默认环境");
 
         ensure_startup_chat_environment(&runtime)
             .await

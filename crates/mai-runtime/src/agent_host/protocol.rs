@@ -6,13 +6,6 @@ use mai_protocol::{
 use pl_core::{
     AgentActivityState, AgentLifecycleState, AgentSnapshot, AgentTurnOutcome, TurnOutcomeKind,
 };
-use uuid::Uuid;
-
-/// 将 PL 字符串 ID 稳定映射为 mai wire UUID；原值为 UUID 时保持不变。
-pub(crate) fn protocol_uuid(value: &str) -> Uuid {
-    Uuid::parse_str(value).unwrap_or_else(|_| Uuid::new_v5(&Uuid::NAMESPACE_OID, value.as_bytes()))
-}
-
 /// PL snapshot 到 mai-protocol wire DTO 的唯一映射入口。
 pub(crate) fn runtime_state(snapshot: &AgentSnapshot) -> AgentRuntimeState {
     AgentRuntimeState {
@@ -28,15 +21,9 @@ pub(crate) fn runtime_state(snapshot: &AgentSnapshot) -> AgentRuntimeState {
             AgentActivityState::Running => AgentRuntimeActivity::Running,
             AgentActivityState::WaitingTool => AgentRuntimeActivity::WaitingTool,
             AgentActivityState::WaitingInteraction => AgentRuntimeActivity::WaitingInteraction,
+            AgentActivityState::Cancelling => AgentRuntimeActivity::Cancelling,
         },
-        active_turn: snapshot
-            .active_turn_id
-            .as_ref()
-            .map(|turn| protocol_uuid(turn.as_str())),
-        active_session: snapshot
-            .active_session_id
-            .as_ref()
-            .map(|session| protocol_uuid(session.as_str())),
+        active_turn: snapshot.active_turn_id.as_ref().map(ToString::to_string),
         pending_inputs: snapshot.pending_inputs,
         last_turn: snapshot.last_turn.as_ref().map(last_turn),
         revision: snapshot.revision,
@@ -45,8 +32,8 @@ pub(crate) fn runtime_state(snapshot: &AgentSnapshot) -> AgentRuntimeState {
 
 fn last_turn(outcome: &AgentTurnOutcome) -> AgentLastTurn {
     AgentLastTurn {
-        turn_id: protocol_uuid(outcome.turn_id.as_str()),
-        session_id: protocol_uuid(outcome.session_id.as_str()),
+        turn_id: outcome.turn_id.to_string(),
+        thread_id: outcome.thread_id.to_string(),
         outcome: match outcome.kind {
             TurnOutcomeKind::Completed => AgentTurnOutcomeKind::Completed,
             TurnOutcomeKind::Cancelled => AgentTurnOutcomeKind::Cancelled,
@@ -70,7 +57,7 @@ mod tests {
     use mai_protocol::{AgentRuntimeActivity, AgentRuntimeLifecycle, AgentTurnOutcomeKind};
     use pl_core::{
         AgentActivityState, AgentId, AgentIdentity, AgentLifecycleState, AgentRoleId,
-        AgentSnapshot, AgentTurnOutcome, SessionId, TurnId, TurnOutcomeKind,
+        AgentSnapshot, AgentTurnOutcome, ThreadId, TurnId, TurnOutcomeKind,
     };
 
     use super::runtime_state;
@@ -87,14 +74,17 @@ mod tests {
             lifecycle: AgentLifecycleState::Active,
             activity: AgentActivityState::Queued,
             active_turn_id: None,
-            active_session_id: None,
             pending_inputs: 2,
+            progress: None,
             last_turn: Some(AgentTurnOutcome {
                 turn_id: TurnId::new("turn").unwrap(),
-                session_id: SessionId::new("session").unwrap(),
+                thread_id: ThreadId::new("thread").unwrap(),
                 kind: TurnOutcomeKind::BudgetLimited,
                 reason: Some("token budget".to_string()),
                 failure: None,
+                budget_limit: None,
+                rollover_compacted: false,
+                rollover_compaction_error: None,
                 usage: pl_model::TokenUsage::default(),
                 finished_at: 1,
             }),

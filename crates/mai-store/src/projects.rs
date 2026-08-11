@@ -117,7 +117,7 @@ impl MaiStore {
             job_id: run.summary.job_id.map(|id| id.to_string()),
             attempt_index: i64::from(run.summary.attempt_index),
             reviewer_agent_id: run.summary.reviewer_agent_id.map(|id| id.to_string()),
-            turn_id: run.summary.turn_id.map(|id| id.to_string()),
+            turn_id: run.summary.turn_id.clone(),
             started_at: run.summary.started_at.to_rfc3339(),
             finished_at: run.summary.finished_at.map(|time| time.to_rfc3339()),
             status: run.summary.status.to_string(),
@@ -145,8 +145,11 @@ impl MaiStore {
             output_tokens: u64_to_i64(run.summary.token_usage.output_tokens),
             reasoning_output_tokens: u64_to_i64(run.summary.token_usage.reasoning_output_tokens),
             total_tokens: u64_to_i64(run.summary.token_usage.total_tokens),
-            messages_json: serde_json::to_string(&run.messages)?,
-            events_json: serde_json::to_string(&run.events)?,
+            history_json: run
+                .history
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
         })
         .exec(&mut tx)
         .await?;

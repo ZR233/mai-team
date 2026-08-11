@@ -35,7 +35,7 @@ export default defineConfig({
       "/projects": apiProxy({ spaNavigation: true }),
       "/relay": apiProxy(),
       "/runtime": apiProxy(),
-      "/sessions": apiProxy(),
+      "/threads": apiProxy(),
       "/settings": apiProxy({ spaNavigation: true }),
       "/skills": apiProxy(),
       "/tasks": apiProxy({ spaNavigation: true }),

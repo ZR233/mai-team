@@ -7,8 +7,6 @@ use mai_docker::{DockerClient, SidecarParams, project_agent_workspace_volume};
 #[cfg(test)]
 use mai_protocol::ProjectSummary;
 use mai_protocol::{AgentId, ProjectId};
-#[cfg(test)]
-use pl_core::ToolCapabilityConfig;
 use pl_core::{
     ExecutionBackend, ExecutionOutput, ExecutionRequest, GIT_TOKEN_ENV, GitCredential,
     GitCredentialProvider, GitCredentialRequest, GitPolicy, GitShellCommandRequest,
@@ -71,40 +69,40 @@ async fn execute_git_tool_via_registry(
 ) -> Result<String> {
     let config = git_workspace_config(context);
     let workspace_root = config.worktree.clone();
-    let tool_set =
-        pl_core::ToolSetBuilder::from_capabilities(ToolCapabilityConfig::git_workspace())
-            .with_allowed_tools([kind.name()])
-            .with_git_tools(
-                config,
-                Arc::new(ProjectGitExecutionBackend),
-                Arc::new(MaiGitCredentialProvider::Static {
-                    token: context.token.clone(),
-                }),
-            );
-    let kernel = pl_core::AgentKernel::builder(
-        pl_core::TurnEngineBuilder::from_provider_info(pl_model::ProviderInfo::deepseek(None))
-            .map_err(runtime_error_from_pure)?,
-    )
-    .with_profile(pl_core::CoreAgentProfile::host_provided(
-        workspace_root.clone(),
-    ))
-    .with_tool_set(tool_set)
-    .build()
-    .await;
-    let tool = kernel.tool(kind.name()).ok_or_else(|| {
-        RuntimeError::InvalidInput(format!("git tool `{}` was not registered", kind.name()))
-    })?;
+    let tool = pl_core::GitTool::new(
+        kind,
+        config,
+        Arc::new(ProjectGitExecutionBackend),
+        Arc::new(MaiGitCredentialProvider::Static {
+            token: context.token.clone(),
+        }),
+    );
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
-    let output = kernel
-        .execute_tool(pl_core::AgentKernelToolRequest::new(
-            tool.name(),
+    let output = pl_core::Tool::execute(
+        &tool,
+        pl_core::ToolInput {
             arguments,
-            "mai-project-git",
-            kind.name(),
+            session_id: "mai-project-git".to_string(),
+            tool_id: kind.name().to_string(),
+            revision_base: 0,
+        },
+        pl_core::ToolContext {
             event_tx,
-        ))
-        .await
-        .map_err(runtime_error_from_pure)?;
+            options: pl_core::TurnOptions::default(),
+            workspace_access: pl_core::WorkspaceAccess::WorkspaceOnly,
+            workspace: pl_core::AgentWorkspace::local(workspace_root),
+            workspace_instructions: None,
+            instruction_snapshot: None,
+            provider_call_id: None,
+            active_subagent: None,
+            lsp_runtime: None,
+            parent_session: Arc::new(pl_core::AgentSession::new()),
+            working_set: pl_core::TurnWorkingSetHandle::default(),
+            tool_cache: pl_core::TurnToolCacheHandle::default(),
+        },
+    )
+    .await
+    .map_err(runtime_error_from_pure)?;
     Ok(output.into_model_output())
 }
 
@@ -394,7 +392,7 @@ mod tests {
     use crate::projects::workspace;
 
     #[test]
-    fn project_git_tool_uses_pl_core_tool_set_registry() {
+    fn project_git_tool_uses_the_pl_core_typed_tool_contract() {
         let source = include_str!("git.rs");
         let start = source
             .find("pub(crate) async fn execute_git_tool")
@@ -405,32 +403,18 @@ mod tests {
         let execute_path = &source[start..end];
 
         assert!(
-            execute_path.contains("ToolSetBuilder::from_capabilities"),
-            "project git tools must be registered through pl-core ToolSetBuilder"
+            execute_path.contains("pl_core::GitTool::new"),
+            "project git tools must execute the PL typed GitTool"
         );
         assert!(
-            execute_path.contains("ToolCapabilityConfig::git_workspace()"),
-            "project git tools must reuse the pl-core git workspace capability preset"
+            execute_path.contains("pl_core::Tool::execute"),
+            "project git tools must use the canonical Tool execution contract"
         );
         assert!(
-            !execute_path.contains("ToolCapabilityConfig {"),
-            "project git tools must not hand-write a shared tool capability matrix"
-        );
-        assert!(
-            execute_path.contains(".with_tool_set("),
-            "project git tools must register their shared tool set through AgentKernelBuilder"
-        );
-        assert!(
-            execute_path.contains(".execute_tool("),
-            "project git tools must execute through AgentKernel::execute_tool"
-        );
-        assert!(
-            !execute_path.contains("GitTool::new"),
-            "project git tools must not bypass the pl-core tool registry"
+            !execute_path.contains("AgentKernel"),
+            "project git tool tests must not rebuild the removed kernel compatibility facade"
         );
         for forbidden in [
-            format!("{}{}", "Tool", "Context {"),
-            format!("{}{}", "Tool", "Input {"),
             format!("{}{}", ".register", "(kernel.core_mut"),
             "output.description".to_string(),
         ] {
@@ -445,7 +429,7 @@ mod tests {
         );
         assert!(
             !source.contains(&format!("{}{}", "GitToolBackend::", "Sidecar")),
-            "sidecar git execution must use MaiGitExecutionBackend through pl-core ToolSetBuilder"
+            "sidecar git execution must use MaiGitExecutionBackend through the PL GitTool"
         );
     }
 

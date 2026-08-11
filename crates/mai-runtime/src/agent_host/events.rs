@@ -37,16 +37,16 @@ async fn project_event(
 ) -> crate::Result<()> {
     let AgentCommittedEvent {
         agent_id,
-        session_id,
+        thread_id,
         turn_id,
         runtime_events,
         trace_events,
-        session_events: _,
+        thread_notifications: _,
     } = committed;
     if !trace_events.is_empty() {
-        let session_id = session_id.ok_or_else(|| {
+        let thread_id = thread_id.ok_or_else(|| {
             crate::RuntimeError::InvalidInput(
-                "durable trace batch is missing session id".to_string(),
+                "durable trace batch is missing thread id".to_string(),
             )
         })?;
         let turn_id = turn_id.ok_or_else(|| {
@@ -56,8 +56,8 @@ async fn project_event(
         super::trace_projection::project_trace_events(
             runtime,
             product_agent_id,
-            super::protocol_uuid(session_id.as_str()),
-            super::protocol_uuid(turn_id.as_str()),
+            thread_id.to_string(),
+            turn_id.to_string(),
             &trace_events,
         )
         .await;
@@ -77,12 +77,13 @@ async fn project_runtime_event(
         AgentRuntimeEventKind::Registered { snapshot }
         | AgentRuntimeEventKind::StateChanged { snapshot }
         | AgentRuntimeEventKind::TurnQueued { snapshot, .. }
-        | AgentRuntimeEventKind::SessionOpened { snapshot, .. } => {
+        | AgentRuntimeEventKind::ThreadOpened { snapshot, .. } => {
             persist_state(runtime, snapshot).await?;
         }
         AgentRuntimeEventKind::TurnStarted {
             turn_id,
-            session_id,
+            thread_id,
+            claimed_inputs: _,
             snapshot,
         } => {
             let agent_id = persist_state(runtime, snapshot).await?;
@@ -90,8 +91,8 @@ async fn project_runtime_event(
                 runtime,
                 super::trace_projection::AgentLogProjection {
                     agent_id,
-                    session_id: Some(super::protocol_uuid(session_id.as_str())),
-                    turn_id: Some(super::protocol_uuid(turn_id.as_str())),
+                    thread_id: Some(thread_id.to_string()),
+                    turn_id: Some(turn_id.to_string()),
                     level: "info",
                     category: "turn",
                     message: "turn started",
@@ -101,17 +102,19 @@ async fn project_runtime_event(
             )
             .await;
         }
-        AgentRuntimeEventKind::TurnFinished { outcome, snapshot }
+        AgentRuntimeEventKind::TurnFinished {
+            outcome,
+            snapshot,
+            finalized_with_tool: _,
+        }
         | AgentRuntimeEventKind::RecoveryCancelledTurn { outcome, snapshot } => {
             let agent_id = persist_state(runtime, snapshot).await?;
-            let session_id = super::protocol_uuid(outcome.session_id.as_str());
-            let turn_id = super::protocol_uuid(outcome.turn_id.as_str());
             super::trace_projection::record_agent_log(
                 runtime,
                 super::trace_projection::AgentLogProjection {
                     agent_id,
-                    session_id: Some(session_id),
-                    turn_id: Some(turn_id),
+                    thread_id: Some(outcome.thread_id.to_string()),
+                    turn_id: Some(outcome.turn_id.to_string()),
                     level: match outcome.kind {
                         TurnOutcomeKind::Completed | TurnOutcomeKind::Cancelled => "info",
                         TurnOutcomeKind::Failed | TurnOutcomeKind::BudgetLimited => "warn",
@@ -134,7 +137,7 @@ async fn project_runtime_event(
                 runtime,
                 super::trace_projection::AgentLogProjection {
                     agent_id,
-                    session_id: None,
+                    thread_id: None,
                     turn_id: None,
                     level: "error",
                     category: "runtime",
@@ -160,9 +163,9 @@ async fn project_runtime_event(
     Ok(())
 }
 
-/// 持久化 PL runtime 的兼容产品投影，但不把高频 session/turn 状态重新广播为产品事件。
+/// 持久化 PL runtime 的产品资源投影，但不把高频 Thread/Turn 状态重新广播为产品事件。
 ///
-/// 当前会话的 UI 状态只由 PL session stream 驱动；产品事件仅用于 agent 资源、配置等
+/// 当前 Thread 的 UI 状态只由 PL subscription 驱动；产品事件仅用于 agent 资源、配置等
 /// 低频变化，避免每个 turn transition 都触发 AgentDetail 和项目/任务查询失效。
 async fn persist_state(
     runtime: &Arc<AgentRuntime>,
@@ -186,10 +189,11 @@ async fn project_state(
 ) -> crate::Result<(mai_protocol::AgentId, mai_protocol::AgentSummary)> {
     let (agent_id, agent) =
         super::turn_factory::product_agent(runtime, &snapshot.identity.id).await?;
-    let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
-    let canonical = super::load_runtime(&runtime.deps.store, &runtime_agent_id).await?;
+    let canonical_id = super::canonical_id(agent_id)?;
+    let canonical = super::load_runtime(&runtime.deps.store, &canonical_id).await?;
+    let mut current = agent.summary.write().await;
     let summary = {
-        let mut summary = agent.summary.write().await;
+        let mut summary = current.clone();
         summary.state.runtime = super::runtime_state(&snapshot);
         summary.token_usage = super::aggregate_usage(&canonical);
         match snapshot.lifecycle {
@@ -204,16 +208,13 @@ async fn project_state(
         }
         summary.updated_at = chrono::DateTime::from_timestamp(snapshot.updated_at, 0)
             .unwrap_or_else(chrono::Utc::now);
-        summary.clone()
+        summary
     };
     runtime
         .deps
         .store
-        .save_agent_with_runtime_id(
-            &summary,
-            agent.system_prompt.as_deref(),
-            runtime_agent_id.as_str(),
-        )
+        .save_agent(&summary, agent.system_prompt.as_deref())
         .await?;
+    *current = summary.clone();
     Ok((agent_id, summary))
 }

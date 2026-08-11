@@ -1,4 +1,5 @@
 import { Menu, Plus } from "lucide-react"
+import { useState } from "react"
 
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { Button } from "@/components/ui/button"
@@ -77,19 +78,26 @@ function SidebarContent({ title, items, selectedId, onSelect, onCreate, footer }
 }
 
 export function ResourceSidebar(props: ResourceSidebarProps) {
+  const [mobileOpen, setMobileOpen] = useState(false)
   return (
     <>
       <aside data-resource-sidebar className="hidden h-full min-h-0 w-64 shrink-0 border-r lg:block">
         <SidebarContent {...props} />
       </aside>
       <div className="absolute top-3 left-11 z-20 lg:hidden">
-        <Sheet>
+        <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
           <SheetTrigger asChild>
             <Button variant="ghost" size="icon" aria-label={`Open ${props.title}`}><Menu data-icon="inline-start" /></Button>
           </SheetTrigger>
           <SheetContent side="left" className="w-72 gap-0 p-0">
             <SheetHeader className="sr-only"><SheetTitle>{props.title}</SheetTitle></SheetHeader>
-            <SidebarContent {...props} />
+            <SidebarContent
+              {...props}
+              onSelect={(id) => {
+                props.onSelect(id)
+                setMobileOpen(false)
+              }}
+            />
           </SheetContent>
         </Sheet>
       </div>

@@ -4,26 +4,24 @@ impl projects::review::runs::ReviewRunSnapshotSource for AgentRuntime {
     async fn snapshot(
         &self,
         reviewer_agent_id: AgentId,
+        turn_id: Option<&str>,
     ) -> projects::review::runs::ReviewRunSnapshot {
         let token_usage = match self.agent(reviewer_agent_id).await {
             Ok(agent) => agent.summary.read().await.token_usage.clone(),
             Err(_) => Default::default(),
         };
-        let (session_id, messages) = self
-            .agent_recent_messages(reviewer_agent_id, PROJECT_REVIEW_SNAPSHOT_MESSAGE_LIMIT)
+        let history = self
+            .thread_history(reviewer_agent_id)
             .await
-            .unwrap_or_default();
-        let events = match session_id {
-            Some(session_id) => self
-                .session_recent_events(session_id, PROJECT_REVIEW_SNAPSHOT_EVENT_LIMIT)
-                .await
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
+            .ok()
+            .and_then(|page| {
+                page.turns
+                    .into_iter()
+                    .find(|history| turn_id.is_none_or(|turn_id| history.turn.id == turn_id))
+            });
         projects::review::runs::ReviewRunSnapshot {
             token_usage,
-            messages,
-            events,
+            history,
         }
     }
 }
@@ -345,10 +343,12 @@ impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
         Ok(agent.review_context.read().await.clone())
     }
 
-    async fn ensure_project_reviewer_session(&self, agent_id: AgentId) -> Result<()> {
-        AgentRuntime::resolve_session_id(self.as_ref(), agent_id, None)
+    async fn ensure_project_reviewer_thread(&self, agent_id: AgentId) -> Result<()> {
+        self.framework_handle()?
+            .snapshot(agent_host::canonical_id(agent_id)?)
             .await
             .map(|_| ())
+            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))
     }
 
     async fn ensure_project_reviewer_container(
@@ -402,14 +402,15 @@ impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
         message: String,
         skill_mentions: Vec<String>,
     ) -> impl std::future::Future<Output = Result<TurnId>> + Send {
-        AgentRuntime::send_message(self, agent_id, None, message, skill_mentions)
+        AgentRuntime::send_message(self, agent_id, message, skill_mentions)
     }
 
     async fn last_turn_response(&self, agent_id: AgentId) -> Result<Option<String>> {
-        let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
-        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
-        let runtime = agent_host::load_runtime(&self.deps.store, &runtime_agent_id).await?;
-        Ok(agent_host::last_assistant_response(&runtime))
+        AgentRuntime::agent(self.as_ref(), agent_id).await?;
+        let runtime =
+            agent_host::load_runtime(&self.deps.store, &agent_host::canonical_id(agent_id)?)
+                .await?;
+        Ok(agent_host::last_agent_response(&runtime))
     }
 }
 
@@ -435,13 +436,8 @@ impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
     }
 
     async fn save_project_review_run_status(&self, summary: ProjectReviewRunSummary) -> Result<()> {
-        projects::review::runs::save_project_review_run_status(
-            &self.deps.store,
-            summary,
-            Vec::new(),
-            Vec::new(),
-        )
-        .await
+        projects::review::runs::save_project_review_run_status(&self.deps.store, summary, None)
+            .await
     }
 
     async fn load_project_review_run(
@@ -530,11 +526,10 @@ impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
         &self,
         reviewer_id: AgentId,
     ) -> Result<projects::review::cycle::ReviewerProgress> {
-        let agent = AgentRuntime::agent(self.as_ref(), reviewer_id).await?;
-        let runtime_agent_id = agent.runtime_agent_id.read().await.clone();
+        AgentRuntime::agent(self.as_ref(), reviewer_id).await?;
         let snapshot = self
             .framework_handle()?
-            .snapshot(runtime_agent_id)
+            .snapshot(agent_host::canonical_id(reviewer_id)?)
             .await
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
         let inactivity_timeout = reviewer_inactivity_timeout(self, &snapshot)?;
@@ -783,23 +778,20 @@ fn reviewer_inactivity_timeout(
     if snapshot.activity != pl_core::AgentActivityState::WaitingTool {
         return Ok(timeout);
     }
-    let Some(session_id) = snapshot.active_session_id.as_ref() else {
-        return Ok(timeout);
-    };
     let view = runtime
         .framework_handle()?
-        .session_snapshot(session_id)
+        .thread_snapshot(&snapshot.identity.id)
         .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-    let declared_timeout = view.parts.iter().rev().find_map(|part| {
+    let declared_timeout = view.items.iter().rev().find_map(|item| {
         if !matches!(
-            part.status,
-            pl_protocol::SessionPartStatus::Running
-                | pl_protocol::SessionPartStatus::Approved
-                | pl_protocol::SessionPartStatus::AwaitingApproval
+            item.status,
+            pl_protocol::ThreadItemStatus::Running
+                | pl_protocol::ThreadItemStatus::Approved
+                | pl_protocol::ThreadItemStatus::AwaitingApproval
         ) {
             return None;
         }
-        let pl_protocol::SessionPartContent::Tool { tool } = &part.content else {
+        let pl_protocol::ThreadItemContent::ToolCall { tool } = &item.content else {
             return None;
         };
         (tool.name == pl_core::TOOL_EXEC)

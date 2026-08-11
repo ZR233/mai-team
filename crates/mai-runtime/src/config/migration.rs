@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use mai_store::ConfigDocumentStore;
 use pl_core::{
     AgentModelConfig, AgentRoleId, ModelRouteConfig, ProviderCapabilitySelection, ProviderConfig,
-    ProviderId, ProviderModelCatalogConfig, ProviderPresetId, ProviderTransportSelection,
-    ReasoningEffort, builtin_provider_catalog,
+    ProviderId, ProviderModelCatalogConfig, ProviderPresetId, ReasoningEffort,
+    builtin_provider_catalog,
 };
 use pl_model::{
     ApplyPatchToolType, ModelInfo, ProviderConnectionMode, ProviderInfo, ProviderWireProtocol,
@@ -100,7 +100,8 @@ struct LegacyCatalogAgentModelConfig {
 struct LegacyCatalogProviderConfig {
     #[serde(default, alias = "preset_id")]
     preset: Option<ProviderPresetId>,
-    provider_kind: LegacyProviderKind,
+    #[serde(rename = "provider_kind")]
+    _provider_kind: LegacyProviderKind,
     #[serde(default)]
     connection_mode: Option<ProviderConnectionMode>,
     name: String,
@@ -142,13 +143,10 @@ pub(super) async fn migrate(documents: &ConfigDocumentStore) -> Result<MaiConfig
 
 fn migrate_v4_provider_capabilities(models: &mut AgentModelConfig) {
     for provider in models.providers.values_mut() {
-        provider.capabilities = match &provider.transport {
-            ProviderTransportSelection::Preset { .. } => {
-                ProviderCapabilitySelection::PresetDefaults
-            }
-            ProviderTransportSelection::Custom { .. } => {
-                ProviderCapabilitySelection::Explicit(Default::default())
-            }
+        provider.capabilities = if provider.preset.is_some() {
+            ProviderCapabilitySelection::PresetDefaults
+        } else {
+            ProviderCapabilitySelection::Explicit(Default::default())
         };
     }
 }
@@ -189,7 +187,6 @@ fn migrate_catalog_provider(
     schema_version: u32,
     legacy: LegacyCatalogProviderConfig,
 ) -> Result<ProviderConfig> {
-    let protocol = legacy.provider_kind.protocol();
     let connection_mode = if schema_version == 2 {
         migrated_preset_connection_mode(legacy.preset.as_ref(), &legacy.base_url)
     } else {
@@ -197,24 +194,13 @@ fn migrate_catalog_provider(
             migrated_preset_connection_mode(legacy.preset.as_ref(), &legacy.base_url)
         })
     };
-    let (transport, capabilities) = match legacy.preset {
-        Some(preset) => (
-            ProviderTransportSelection::Preset {
-                preset,
-                connection_mode,
-            },
-            ProviderCapabilitySelection::PresetDefaults,
-        ),
-        None => (
-            ProviderTransportSelection::Custom {
-                protocol,
-                connection_mode: ProviderConnectionMode::Http,
-            },
-            ProviderCapabilitySelection::Explicit(Default::default()),
-        ),
+    let capabilities = if legacy.preset.is_some() {
+        ProviderCapabilitySelection::PresetDefaults
+    } else {
+        ProviderCapabilitySelection::Explicit(Default::default())
     };
-    Ok(ProviderConfig {
-        transport,
+    let mut provider = ProviderConfig {
+        preset: legacy.preset,
         name: legacy.name,
         base_url: legacy.base_url,
         bearer_token: legacy.bearer_token,
@@ -224,7 +210,9 @@ fn migrate_catalog_provider(
         apply_patch_tool_type: legacy.apply_patch_tool_type,
         capabilities,
         catalog: legacy.catalog,
-    })
+    };
+    set_supported_connection_mode(&mut provider, connection_mode)?;
+    Ok(provider)
 }
 
 async fn migrate_v1(documents: &ConfigDocumentStore) -> Result<MaiConfig> {
@@ -282,7 +270,10 @@ fn migrate_provider(id: &ProviderId, legacy: LegacyProviderConfig) -> Result<Pro
     let registry = builtin_provider_catalog();
     let preset = registry.presets.into_iter().find(|preset| {
         preset.id.as_str() == id.as_str()
-            || (preset.protocol == info.protocol
+            || (preset
+                .provider
+                .to_provider_info(&preset.suggested_model)
+                .is_ok_and(|provider| provider.protocol == info.protocol)
                 && normalized_url(&preset.provider.base_url) == normalized_url(&info.base_url))
     });
     let Some(preset) = preset else {
@@ -303,14 +294,18 @@ fn migrate_provider(id: &ProviderId, legacy: LegacyProviderConfig) -> Result<Pro
         .into_iter()
         .filter(|model| model.slug != "mimo-v2-flash")
         .filter(|model| !bundled_slugs.contains(model.slug.as_str()))
-        .collect();
+        .collect::<Vec<_>>();
     let connection_mode =
         if normalized_url(&preset.provider.base_url) == normalized_url(&info.base_url) {
-            preset.connection_policy.default_mode
+            preset
+                .provider
+                .to_provider_info(&preset.suggested_model)
+                .map_err(RuntimeError::Model)?
+                .connection_mode
         } else {
             ProviderConnectionMode::Http
         };
-    let mut provider = preset.provider.with_connection_mode(connection_mode);
+    let mut provider = preset.provider;
     provider.name = info.name;
     provider.base_url = info.base_url;
     provider.bearer_token = info.bearer_token;
@@ -325,6 +320,7 @@ fn migrate_provider(id: &ProviderId, legacy: LegacyProviderConfig) -> Result<Pro
     {
         *configured = additional_models;
     }
+    set_supported_connection_mode(&mut provider, connection_mode)?;
     Ok(provider)
 }
 
@@ -334,7 +330,7 @@ fn migrate_deprecated_mimo_routes(routes: &mut BTreeMap<AgentRoleId, ModelRouteC
             continue;
         }
         route.model = "mimo-v2.5".to_string();
-        route.reasoning_effort = route.reasoning_effort.take().map(|effort| {
+        route.effort = route.effort.take().map(|effort| {
             let migrated = match effort.as_str() {
                 "none" | "disabled" => "disabled",
                 "high" | "max" | "medium" | "low" | "enabled" => "enabled",
@@ -386,9 +382,29 @@ fn migrated_preset_connection_mode(
         .filter(|candidate| {
             normalized_url(&candidate.provider.base_url) == normalized_url(base_url)
         })
-        .map_or(ProviderConnectionMode::Http, |candidate| {
-            candidate.connection_policy.default_mode
+        .and_then(|candidate| {
+            candidate
+                .provider
+                .to_provider_info(&candidate.suggested_model)
+                .ok()
+                .map(|provider| provider.connection_mode)
         })
+        .unwrap_or(ProviderConnectionMode::Http)
+}
+
+pub(super) fn set_supported_connection_mode(
+    provider: &mut ProviderConfig,
+    mode: ProviderConnectionMode,
+) -> Result<()> {
+    let models = provider.declared_models().map_err(RuntimeError::Model)?;
+    for model in models {
+        if model.transport.supported_connection_modes.contains(&mode) {
+            provider
+                .set_model_connection_mode(&model.slug, mode)
+                .map_err(RuntimeError::Model)?;
+        }
+    }
+    Ok(())
 }
 
 fn normalized_url(value: &str) -> &str {
@@ -409,17 +425,14 @@ mod tests {
             ModelRouteConfig {
                 provider: ProviderId::new("mimo-token-plan").unwrap(),
                 model: "mimo-v2-flash".to_string(),
-                reasoning_effort: Some(ReasoningEffort::new("max")),
+                effort: Some(ReasoningEffort::new("max")),
             },
         )]);
 
         migrate_deprecated_mimo_routes(&mut routes);
 
         assert_eq!(routes[&role].model, "mimo-v2.5");
-        assert_eq!(
-            routes[&role].reasoning_effort.as_ref().unwrap().as_str(),
-            "enabled"
-        );
+        assert_eq!(routes[&role].effort.as_ref().unwrap().as_str(), "enabled");
     }
 
     #[test]
@@ -476,8 +489,8 @@ mod tests {
         .unwrap();
         let custom = migrate_catalog_provider(2, legacy_catalog_provider(None, None)).unwrap();
 
-        assert_eq!(preset.connection_mode(), ProviderConnectionMode::WebSocket);
-        assert_eq!(custom.connection_mode(), ProviderConnectionMode::Http);
+        assert_eq!(connection_mode(&preset), ProviderConnectionMode::Http);
+        assert_eq!(connection_mode(&custom), ProviderConnectionMode::Http);
     }
 
     #[test]
@@ -488,7 +501,7 @@ mod tests {
 
         let provider = migrate_catalog_provider(2, legacy).unwrap();
 
-        assert_eq!(provider.connection_mode(), ProviderConnectionMode::Http);
+        assert_eq!(connection_mode(&provider), ProviderConnectionMode::Http);
     }
 
     #[test]
@@ -499,7 +512,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(provider.connection_mode(), ProviderConnectionMode::Http);
+        assert_eq!(connection_mode(&provider), ProviderConnectionMode::Http);
     }
 
     #[test]
@@ -510,10 +523,7 @@ mod tests {
 
         let provider = migrate_catalog_provider(3, legacy).unwrap();
 
-        assert_eq!(
-            provider.connection_mode(),
-            ProviderConnectionMode::WebSocket
-        );
+        assert_eq!(connection_mode(&provider), ProviderConnectionMode::Http);
     }
 
     #[test]
@@ -534,7 +544,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(provider.connection_mode(), ProviderConnectionMode::Http);
+        assert_eq!(connection_mode(&provider), ProviderConnectionMode::Http);
     }
 
     fn legacy_catalog_provider(
@@ -543,7 +553,7 @@ mod tests {
     ) -> LegacyCatalogProviderConfig {
         LegacyCatalogProviderConfig {
             preset: preset.map(|id| ProviderPresetId::new(id).unwrap()),
-            provider_kind: LegacyProviderKind::OpenAi,
+            _provider_kind: LegacyProviderKind::OpenAi,
             connection_mode,
             name: "OpenAI".to_string(),
             base_url: "https://api.openai.com/v1".to_string(),
@@ -554,7 +564,19 @@ mod tests {
             apply_patch_tool_type: Some(ApplyPatchToolType::Freeform),
             catalog: ProviderModelCatalogConfig::Explicit {
                 models: vec![ModelInfo::fallback("model")],
+                connection_overrides: BTreeMap::new(),
             },
         }
+    }
+
+    fn connection_mode(provider: &ProviderConfig) -> ProviderConnectionMode {
+        provider
+            .effective_models()
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("provider model")
+            .transport
+            .default_connection_mode
     }
 }
