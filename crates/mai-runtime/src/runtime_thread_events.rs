@@ -42,7 +42,7 @@ impl AgentRuntime {
         let product_agent_id = parse_thread_agent_id(&thread_id)?;
         let agent = self.agent(product_agent_id).await?;
         let summary = agent.summary.read().await.clone();
-        ensure_live_product_thread(&summary)?;
+        ensure_readable_product_thread(&summary)?;
         let lifecycle = self
             .state
             .thread_subscriptions
@@ -78,7 +78,7 @@ impl AgentRuntime {
         let product_agent_id = parse_thread_agent_id(&thread_id)?;
         let agent = self.agent(product_agent_id).await?;
         let summary = agent.summary.read().await.clone();
-        ensure_live_product_thread(&summary)?;
+        ensure_readable_product_thread(&summary)?;
         let framework_id = pl_core::ThreadId::new(thread_id)?;
         let snapshot = self
             .framework_handle()?
@@ -104,7 +104,7 @@ impl AgentRuntime {
         let product_agent_id = parse_thread_agent_id(&thread_id)?;
         let agent = self.agent(product_agent_id).await?;
         let summary = agent.summary.read().await;
-        ensure_live_product_thread(&summary)?;
+        ensure_readable_product_thread(&summary)?;
         Ok(self
             .deps
             .store
@@ -284,11 +284,15 @@ fn invalid_thread_update<T>(message: impl Into<String>) -> Result<T> {
     Err(RuntimeError::InvalidInput(message.into()))
 }
 
-pub(crate) fn ensure_live_product_thread(summary: &AgentSummary) -> Result<()> {
-    if summary.state.resource != AgentResourceState::Ready {
-        return Err(RuntimeError::ThreadNotFound(summary.id.to_string()));
+pub(crate) fn ensure_readable_product_thread(summary: &AgentSummary) -> Result<()> {
+    match summary.state.resource {
+        AgentResourceState::Provisioning
+        | AgentResourceState::Ready
+        | AgentResourceState::Failed => Ok(()),
+        AgentResourceState::Deleting | AgentResourceState::Deleted => {
+            Err(RuntimeError::ThreadNotFound(summary.id.to_string()))
+        }
     }
-    Ok(())
 }
 
 pub(crate) fn ensure_live_canonical_thread(snapshot: &pl_core::AgentSnapshot) -> Result<()> {
@@ -304,7 +308,9 @@ pub(crate) fn ensure_live_message_target(
     summary: &AgentSummary,
     snapshot: &pl_core::AgentSnapshot,
 ) -> Result<()> {
-    ensure_live_product_thread(summary)?;
+    if summary.state.resource != AgentResourceState::Ready {
+        return Err(RuntimeError::ThreadNotFound(summary.id.to_string()));
+    }
     ensure_live_canonical_thread(snapshot)
 }
 
@@ -330,14 +336,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn message_target_requires_ready_product_and_active_canonical_lifecycle() {
+    fn resource_recovery_keeps_thread_readable_but_blocks_messages() {
         let id = Uuid::new_v4();
         let mut summary = summary(id);
         let mut snapshot = snapshot(id);
 
+        assert!(ensure_readable_product_thread(&summary).is_ok());
         assert!(ensure_live_message_target(&summary, &snapshot).is_err());
         summary.state.resource = AgentResourceState::Ready;
+        assert!(ensure_readable_product_thread(&summary).is_ok());
         assert!(ensure_live_message_target(&summary, &snapshot).is_ok());
+        summary.state.resource = AgentResourceState::Failed;
+        assert!(ensure_readable_product_thread(&summary).is_ok());
+        assert!(ensure_live_message_target(&summary, &snapshot).is_err());
+        summary.state.resource = AgentResourceState::Deleting;
+        assert!(ensure_readable_product_thread(&summary).is_err());
+        summary.state.resource = AgentResourceState::Deleted;
+        assert!(ensure_readable_product_thread(&summary).is_err());
+        summary.state.resource = AgentResourceState::Ready;
         snapshot.lifecycle = AgentLifecycleState::Closing;
         assert!(ensure_live_message_target(&summary, &snapshot).is_err());
     }
