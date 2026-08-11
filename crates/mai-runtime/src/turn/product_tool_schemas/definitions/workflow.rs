@@ -44,7 +44,7 @@ pub(crate) fn definitions() -> Vec<ToolSchema> {
         ),
         function_tool_schema(
             TOOL_READ_TOOL_ARTIFACT,
-            "Read one bounded range from a full output artifact returned by an earlier tool call. Use the callId and artifactId from that tool result receipt instead of rerunning the original command. Select exactly one range kind: lines are UTF-8 text with a 1-based offset and a limit of at most 500; bytes are base64 with a 0-based offset and a limit of at most 65536.",
+            "Read one bounded range from a full output artifact returned by exec or write_stdin. Copy outputArtifacts[].call_id to callId and outputArtifacts[].id to artifactId exactly; use the receipt values, not outputFile, a tool item ID, or a provider call ID. Select exactly one range kind: lines are UTF-8 text with a 1-based offset and a limit of at most 500; bytes are base64 with a 0-based offset and a limit of at most 65536.",
             [
                 ToolInputSchemaField::required("callId", json!({ "type": "string" })),
                 ToolInputSchemaField::required("artifactId", json!({ "type": "string" })),

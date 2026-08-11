@@ -44,7 +44,7 @@ mod tests {
     #[test]
     fn pure_lang_dependencies_pin_the_verified_runtime_revision() {
         let manifest = include_str!("../../../../Cargo.toml");
-        let verified_revision = "ed8c28605905ea58b1e556ced72e38a118184fee";
+        let verified_revision = "7bb6999c8215b62f6e2071df77e3cd2fe0f0363f";
         for package in ["pl-core", "pl-model", "pl-protocol", "pl-trace"] {
             let line = manifest
                 .lines()
@@ -184,7 +184,12 @@ mod tests {
             .iter()
             .find(|tool| tool.name() == TOOL_READ_TOOL_ARTIFACT)
             .expect("read_tool_artifact");
-        let ToolSchema::Function { input_schema, .. } = artifact else {
+        let ToolSchema::Function {
+            description,
+            input_schema,
+            ..
+        } = artifact
+        else {
             panic!("read_tool_artifact must be a function tool");
         };
         let properties = input_schema
@@ -207,6 +212,13 @@ mod tests {
         for ambiguous in ["startLine", "maxLines", "startByte", "maxBytes"] {
             assert!(!properties.contains_key(ambiguous), "{ambiguous}");
         }
+        for receipt_field in ["outputArtifacts", "call_id", "id"] {
+            assert!(
+                description.contains(receipt_field),
+                "description must identify receipt field {receipt_field}"
+            );
+        }
+        assert!(description.contains("not outputFile"));
     }
 
     #[test]
