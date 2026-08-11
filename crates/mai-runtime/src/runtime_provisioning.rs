@@ -140,7 +140,7 @@ impl AgentRuntime {
         let project = self.project(project_id).await?;
         let summary = project.summary.read().await.clone();
         if summary.status != ProjectStatus::Ready
-            && summary.clone_status != ProjectCloneStatus::Ready
+            || summary.clone_status != ProjectCloneStatus::Ready
         {
             return Ok(source);
         }
@@ -376,13 +376,33 @@ impl AgentRuntime {
                     .await?;
             }
         }
-        if !volume_report.missing_agent_workspace_volumes.is_empty() {
-            tracing::warn!(
-                count = volume_report.missing_agent_workspace_volumes.len(),
-                "found project agents with missing workspace volumes during startup reconcile"
+        let missing_agent_workspace_volumes = volume_report
+            .missing_agent_workspace_volumes
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut agent_resources_to_recover = agents
+            .iter()
+            .filter_map(agents::agent_resource_recovery_retry_request)
+            .map(|request| (request.agent_id(), request))
+            .collect::<HashMap<_, _>>();
+        for agent_id in &missing_agent_workspace_volumes {
+            agent_resources_to_recover.insert(
+                *agent_id,
+                agents::AgentResourceRecoveryRequest::created_workspace(*agent_id),
             );
-            for agent_id in &volume_report.missing_agent_workspace_volumes {
-                let Some(agent_summary) = agents.iter().find(|agent| agent.id == *agent_id) else {
+        }
+        if !agent_resources_to_recover.is_empty() {
+            tracing::warn!(
+                count = agent_resources_to_recover.len(),
+                "found project agents requiring derived resource recovery during startup reconcile"
+            );
+            let mut recovery_requests =
+                agent_resources_to_recover.into_values().collect::<Vec<_>>();
+            recovery_requests.sort_by_key(|request| request.agent_id());
+            for request in recovery_requests {
+                let agent_id = request.agent_id();
+                let Some(agent_summary) = agents.iter().find(|agent| agent.id == agent_id) else {
                     continue;
                 };
                 let Some(project_id) = agent_summary.project_id else {
@@ -391,51 +411,14 @@ impl AgentRuntime {
                 if workspace_projects_to_resume.contains(&project_id) {
                     continue;
                 }
-                let agent = self.agent(*agent_id).await?;
-                self.set_agent_resource_state(
-                    &agent,
-                    AgentResourceState::Failed,
-                    Some(
-                        PROJECT_AGENT_WORKSPACE_VOLUME_MISSING_AFTER_STARTUP_RECONCILE.to_string(),
-                    ),
-                )
-                .await?;
+                if let Err(error) = self.recover_project_agent_resources(request).await {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        project_id = %project_id,
+                        "failed to recover project agent resources during startup: {error}"
+                    );
+                }
             }
-        }
-        let mut recovered_agent_count = 0_usize;
-        for agent_summary in &agents {
-            let error = agent_summary
-                .state
-                .resource_error
-                .as_deref()
-                .map(str::trim)
-                .map(|error| error.strip_prefix("invalid input: ").unwrap_or(error));
-            if agent_summary.state.resource != AgentResourceState::Failed
-                || agent_summary.state.runtime.active_turn.is_some()
-                || error != Some(PROJECT_AGENT_WORKSPACE_VOLUME_MISSING_AFTER_STARTUP_RECONCILE)
-            {
-                continue;
-            }
-            let Some(project_id) = agent_summary.project_id else {
-                continue;
-            };
-            let workspace_volume = project_agent_workspace_volume(
-                &project_id.to_string(),
-                &agent_summary.id.to_string(),
-            );
-            if !self.deps.docker.volume_exists(&workspace_volume).await? {
-                continue;
-            }
-            let agent = self.agent(agent_summary.id).await?;
-            self.set_agent_resource_state(&agent, AgentResourceState::Ready, None)
-                .await?;
-            recovered_agent_count += 1;
-        }
-        if recovered_agent_count > 0 {
-            tracing::warn!(
-                count = recovered_agent_count,
-                "recovered project agents failed by missing workspace volume after startup reconcile"
-            );
         }
         Ok(())
     }

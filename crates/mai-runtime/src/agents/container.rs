@@ -87,13 +87,6 @@ pub(crate) trait AgentContainerOps: Send + Sync {
     fn publish_mcp_status(&self, change: AgentMcpStatusChange) -> impl Future<Output = ()> + Send;
 }
 
-pub(crate) async fn ensure_agent_container(
-    ops: &impl AgentContainerOps,
-    agent: &Arc<AgentRecord>,
-) -> Result<String> {
-    ensure_agent_container_with_source(ops, agent, &ContainerSource::FreshImage).await
-}
-
 pub(crate) async fn ensure_agent_container_with_source(
     ops: &impl AgentContainerOps,
     agent: &Arc<AgentRecord>,
@@ -155,78 +148,99 @@ pub(crate) async fn ensure_agent_container_with_source(
     };
 
     let container_id = container.id.clone();
-    {
-        let mut summary = agent.summary.write().await;
-        summary.container_id = Some(container_id.clone());
-        summary.updated_at = now();
-    }
-    ops.persist_agent(Arc::clone(agent)).await?;
-    *container_guard = Some(container.clone());
-    drop(container_guard);
-
-    let mcp_config = ops.agent_mcp_runtime_config(agent).await?;
-    for server in mcp_config
-        .user_servers
-        .iter()
-        .filter_map(|(server, config)| config.enabled.then_some(server))
-    {
-        ops.publish_mcp_status(AgentMcpStatusChange {
-            agent_id,
-            server: server.clone(),
-            status: McpStartupStatus::Starting,
-            error: None,
-        })
-        .await;
-    }
-    let mcp = ops
-        .start_agent_mcp_runtime(agent_id, container.id, mcp_config)
-        .await?;
-    for status in mcp.statuses().await {
-        ops.publish_mcp_status(AgentMcpStatusChange {
-            agent_id,
-            server: status.server,
-            status: status.status,
-            error: status.error,
-        })
-        .await;
-    }
-    let required_failures = mcp.required_failures().await;
-    if !required_failures.is_empty() {
-        let message = required_failures
-            .iter()
-            .map(|status| {
-                format!(
-                    "{}: {}",
-                    status.server,
-                    status
-                        .error
-                        .as_deref()
-                        .unwrap_or("required MCP server failed")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        mcp.shutdown().await;
-        *agent.container.write().await = None;
+    let setup: Result<ContainerMcpRuntime> = async {
         {
             let mut summary = agent.summary.write().await;
-            summary.container_id = None;
+            summary.container_id = Some(container_id.clone());
+            summary.updated_at = now();
         }
-        ops.remove_agent_container(agent_id, container_id).await;
-        set_resource_state(
-            ops,
-            agent,
-            AgentResourceState::Failed,
-            Some(message.clone()),
-        )
-        .await?;
-        return Err(RuntimeError::InvalidInput(format!(
-            "required MCP server startup failed: {message}"
-        )));
+        ops.persist_agent(Arc::clone(agent)).await?;
+        *container_guard = Some(container.clone());
+        drop(container_guard);
+
+        let mcp_config = ops.agent_mcp_runtime_config(agent).await?;
+        for server in mcp_config
+            .user_servers
+            .iter()
+            .filter_map(|(server, config)| config.enabled.then_some(server))
+        {
+            ops.publish_mcp_status(AgentMcpStatusChange {
+                agent_id,
+                server: server.clone(),
+                status: McpStartupStatus::Starting,
+                error: None,
+            })
+            .await;
+        }
+        let mcp = ops
+            .start_agent_mcp_runtime(agent_id, container.id, mcp_config)
+            .await?;
+        for status in mcp.statuses().await {
+            ops.publish_mcp_status(AgentMcpStatusChange {
+                agent_id,
+                server: status.server,
+                status: status.status,
+                error: status.error,
+            })
+            .await;
+        }
+        let required_failures = mcp.required_failures().await;
+        if !required_failures.is_empty() {
+            let message = required_failures
+                .iter()
+                .map(|status| {
+                    format!(
+                        "{}: {}",
+                        status.server,
+                        status
+                            .error
+                            .as_deref()
+                            .unwrap_or("required MCP server failed")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            mcp.shutdown().await;
+            return Err(RuntimeError::InvalidInput(format!(
+                "required MCP server startup failed: {message}"
+            )));
+        }
+        if let Err(error) = set_resource_state(ops, agent, AgentResourceState::Ready, None).await {
+            mcp.shutdown().await;
+            return Err(error);
+        }
+        Ok(mcp)
     }
-    *agent.mcp.write().await = Some(Arc::new(mcp));
-    set_resource_state(ops, agent, AgentResourceState::Ready, None).await?;
-    Ok(container_id)
+    .await;
+
+    match setup {
+        Ok(mcp) => {
+            *agent.mcp.write().await = Some(Arc::new(mcp));
+            Ok(container_id)
+        }
+        Err(error) => {
+            let failure = error.to_string();
+            *agent.container.write().await = None;
+            {
+                let mut summary = agent.summary.write().await;
+                summary.container_id = None;
+            }
+            ops.remove_agent_container(agent_id, container_id).await;
+            if let Err(persist_error) = set_resource_state(
+                ops,
+                agent,
+                AgentResourceState::Failed,
+                Some(failure.clone()),
+            )
+            .await
+            {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "agent container startup failed: {failure}; failure persistence failed: {persist_error}"
+                )));
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn set_resource_state(
@@ -240,4 +254,163 @@ async fn set_resource_state(
         AgentContainerStatusChange { state, error },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use mai_protocol::{AgentState, TokenUsage};
+    use pretty_assertions::assert_eq;
+    use tokio::sync::RwLock;
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    enum FailurePoint {
+        Persistence,
+        McpConfig,
+    }
+
+    struct ContainerFailureOps {
+        removed: AtomicUsize,
+        failure_point: FailurePoint,
+    }
+
+    impl AgentContainerOps for ContainerFailureOps {
+        async fn start_agent_container(
+            &self,
+            request: AgentContainerStartRequest,
+        ) -> Result<ContainerHandle> {
+            Ok(ContainerHandle {
+                id: "new-container".to_string(),
+                name: format!("mai-team-{}", request.agent_id),
+                image: request.docker_image,
+            })
+        }
+
+        async fn remove_agent_container(&self, _agent_id: AgentId, _container_id: String) {
+            self.removed.fetch_add(1, Ordering::AcqRel);
+        }
+
+        async fn agent_mcp_runtime_config(
+            &self,
+            _agent: &AgentRecord,
+        ) -> Result<ContainerMcpSettings> {
+            match self.failure_point {
+                FailurePoint::Persistence => {
+                    Err(RuntimeError::InvalidInput("unreachable".to_string()))
+                }
+                FailurePoint::McpConfig => {
+                    Err(RuntimeError::InvalidInput("MCP config failed".to_string()))
+                }
+            }
+        }
+
+        async fn start_agent_mcp_runtime(
+            &self,
+            _agent_id: AgentId,
+            _container_id: String,
+            _config: ContainerMcpSettings,
+        ) -> Result<ContainerMcpRuntime> {
+            Err(RuntimeError::InvalidInput("unreachable".to_string()))
+        }
+
+        async fn set_agent_resource_state(
+            &self,
+            agent: Arc<AgentRecord>,
+            change: AgentContainerStatusChange,
+        ) -> Result<()> {
+            let mut summary = agent.summary.write().await;
+            summary.state.resource = change.state;
+            summary.state.resource_error = change.error;
+            Ok(())
+        }
+
+        async fn persist_agent(&self, _agent: Arc<AgentRecord>) -> Result<()> {
+            match self.failure_point {
+                FailurePoint::Persistence => {
+                    Err(RuntimeError::InvalidInput("persist failed".to_string()))
+                }
+                FailurePoint::McpConfig => Ok(()),
+            }
+        }
+
+        async fn publish_mcp_status(&self, _change: AgentMcpStatusChange) {}
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_after_container_creation_releases_container() {
+        let ops = ContainerFailureOps {
+            removed: AtomicUsize::new(0),
+            failure_point: FailurePoint::Persistence,
+        };
+        let agent = Arc::new(agent_record());
+
+        ensure_agent_container_with_source(&ops, &agent, &ContainerSource::FreshImage)
+            .await
+            .expect_err("persist must fail");
+
+        assert_eq!(ops.removed.load(Ordering::Acquire), 1);
+        assert!(agent.container.read().await.is_none());
+        let summary = agent.summary.read().await.clone();
+        assert_eq!(summary.container_id, None);
+        assert_eq!(summary.state.resource, AgentResourceState::Failed);
+        assert_eq!(
+            summary.state.resource_error,
+            Some("invalid input: persist failed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_setup_failure_releases_persisted_container_generation() {
+        let ops = ContainerFailureOps {
+            removed: AtomicUsize::new(0),
+            failure_point: FailurePoint::McpConfig,
+        };
+        let agent = Arc::new(agent_record());
+
+        ensure_agent_container_with_source(&ops, &agent, &ContainerSource::FreshImage)
+            .await
+            .expect_err("MCP config must fail");
+
+        assert_eq!(ops.removed.load(Ordering::Acquire), 1);
+        assert!(agent.container.read().await.is_none());
+        let summary = agent.summary.read().await.clone();
+        assert_eq!(summary.container_id, None);
+        assert_eq!(summary.state.resource, AgentResourceState::Failed);
+        assert_eq!(
+            summary.state.resource_error,
+            Some("invalid input: MCP config failed".to_string())
+        );
+    }
+
+    fn agent_record() -> AgentRecord {
+        let timestamp = now();
+        AgentRecord {
+            summary: RwLock::new(mai_protocol::AgentSummary {
+                id: Uuid::new_v4(),
+                parent_id: None,
+                task_id: None,
+                project_id: None,
+                role: None,
+                name: "agent".to_string(),
+                state: AgentState::default(),
+                container_id: None,
+                docker_image: "image".to_string(),
+                provider_id: "provider".to_string(),
+                provider_name: "Provider".to_string(),
+                model: "model".to_string(),
+                reasoning_effort: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+                token_usage: TokenUsage::default(),
+            }),
+            container: RwLock::new(None),
+            mcp: RwLock::new(None),
+            review_context: RwLock::new(None),
+            system_prompt: None,
+        }
+    }
 }

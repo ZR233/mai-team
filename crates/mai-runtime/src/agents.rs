@@ -13,13 +13,13 @@ mod model;
 mod observability;
 pub(crate) mod profiles;
 mod purge;
+mod recovery;
 mod resources;
 mod update;
 
 pub(crate) use container::{
     AgentContainerOps, AgentContainerStartRequest, AgentContainerStatusChange,
-    AgentMcpStatusChange, ContainerSource, ensure_agent_container,
-    ensure_agent_container_with_source,
+    AgentMcpStatusChange, ContainerSource, ensure_agent_container_with_source,
 };
 pub(crate) use create::{
     AgentCreateOps, CreateAgentRecordContext, CreatedAgentRecord, create_agent_record,
@@ -33,6 +33,10 @@ pub(crate) use observability::{
     AgentObservabilityOps, agent_logs, tool_output_artifact, tool_trace, tool_traces,
 };
 pub(crate) use purge::{AgentPurgeOps, purge_agent_tree};
+pub(crate) use recovery::{
+    AgentResourceRecoveryOps, AgentResourceRecoveryRequest, PreparedAgentWorkspace,
+    agent_resource_recovery_retry_request, recover_agent_resources,
+};
 pub(crate) use resources::{
     AgentResourceBroker, AgentResourceBrokerOps, PROJECT_SKILL_RESOURCE_SERVER,
     SKILL_RESOURCE_SCHEME, SKILL_RESOURCE_SERVER, agent_resource_broker,

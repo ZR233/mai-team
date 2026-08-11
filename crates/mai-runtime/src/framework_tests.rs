@@ -157,6 +157,20 @@ fn framework_spawn_rollback_only_deletes_resources_created_by_its_lease() {
 }
 
 #[test]
+fn startup_reconcile_rebuilds_missing_agent_resources_through_one_lifecycle_owner() {
+    let provisioning = include_str!("runtime_provisioning.rs");
+    let recovery = include_str!("agents/recovery.rs");
+
+    assert!(provisioning.contains("recover_project_agent_resources"));
+    assert!(
+        !provisioning
+            .contains("PROJECT_AGENT_WORKSPACE_VOLUME_MISSING_AFTER_STARTUP_RECONCILE.to_string()")
+    );
+    assert!(!provisioning.contains("recovered_agent_count"));
+    assert!(recovery.contains("Drop for AgentResourceRecoveryLease"));
+}
+
+#[test]
 fn container_tools_do_not_request_host_path_approval() {
     let turn_factory = include_str!("agent_host/turn_factory.rs");
 

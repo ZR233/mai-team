@@ -31,6 +31,7 @@ mod model_projection;
 mod projects;
 mod runtime_agent_api;
 mod runtime_agent_creation;
+mod runtime_agent_recovery;
 mod runtime_agent_traits;
 mod runtime_bootstrap;
 mod runtime_config;
@@ -87,8 +88,6 @@ const UNCONFIGURED_PROVIDER_NAME: &str = "No provider configured";
 const UNCONFIGURED_MODEL_ID: &str = "unconfigured";
 const PROJECT_CACHE_VOLUME_MISSING_AFTER_STARTUP_RECONCILE: &str =
     "project cache volume is missing after startup reconcile";
-const PROJECT_AGENT_WORKSPACE_VOLUME_MISSING_AFTER_STARTUP_RECONCILE: &str =
-    "project agent workspace volume is missing after startup reconcile";
 const RELAY_ENABLED_BUT_NOT_CONNECTED: &str = "relay is enabled but not connected";
 const RELAY_NOT_CONNECTED: &str = "relay is not connected";
 const SQLITE_DATABASE_LOCKED: &str = "database is locked";

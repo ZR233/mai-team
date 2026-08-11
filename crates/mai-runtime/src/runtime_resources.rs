@@ -113,7 +113,15 @@ impl AgentRuntime {
         {
             return Ok(container_id);
         }
-        agents::ensure_agent_container(self, &agent).await
+        let project_id = agent.summary.read().await.project_id;
+        let source = self
+            .agent_container_source_for_project(
+                agent_id,
+                project_id,
+                agents::ContainerSource::FreshImage,
+            )
+            .await?;
+        agents::ensure_agent_container_with_source(self, &agent, &source).await
     }
 
     pub(super) async fn prepare_agent_mcp_lease(
