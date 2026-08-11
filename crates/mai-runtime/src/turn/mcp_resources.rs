@@ -58,8 +58,10 @@ impl pl_core::McpResourceBackend for MaiMcpResourceBackend {
 
     async fn list_resources(
         &self,
-        request: pl_core::McpListResourcesRequest,
+        mut request: pl_core::McpListResourcesRequest,
     ) -> std::result::Result<Value, Self::Error> {
+        request.server = normalized_optional_resource_argument(request.server);
+        request.cursor = normalized_optional_resource_argument(request.cursor);
         if Self::is_skill_request(request.server.as_deref(), None) || self.mcp.is_none() {
             return self
                 .broker()
@@ -87,8 +89,10 @@ impl pl_core::McpResourceBackend for MaiMcpResourceBackend {
 
     async fn list_resource_templates(
         &self,
-        request: pl_core::McpListResourceTemplatesRequest,
+        mut request: pl_core::McpListResourceTemplatesRequest,
     ) -> std::result::Result<Value, Self::Error> {
+        request.server = normalized_optional_resource_argument(request.server);
+        request.cursor = normalized_optional_resource_argument(request.cursor);
         if Self::is_skill_request(request.server.as_deref(), None) || self.mcp.is_none() {
             return self
                 .broker()
@@ -138,6 +142,12 @@ impl pl_core::McpResourceBackend for MaiMcpResourceBackend {
     }
 }
 
+fn normalized_optional_resource_argument(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn combine_resource_views(skills: Value, mcp: Value, skills_key: &str) -> Value {
     let mut values = match mcp {
         Value::Object(values) => values,
@@ -149,6 +159,22 @@ fn combine_resource_views(skills: Value, mcp: Value, skills_key: &str) -> Value 
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn empty_optional_resource_arguments_mean_not_selected() {
+        assert_eq!(
+            normalized_optional_resource_argument(Some("  ".to_string())),
+            None
+        );
+        assert_eq!(
+            normalized_optional_resource_argument(Some(" skill ".to_string())),
+            Some("skill".to_string())
+        );
+    }
+
     #[test]
     fn mcp_resource_backend_delegates_tool_error_shape_to_pl_core() {
         let source = include_str!("mcp_resources.rs");

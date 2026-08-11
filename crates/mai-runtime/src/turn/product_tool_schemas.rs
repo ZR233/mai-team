@@ -178,6 +178,38 @@ mod tests {
     }
 
     #[test]
+    fn tool_artifact_schema_has_one_unambiguous_range_contract() {
+        let tools = build_tool_schemas();
+        let artifact = tools
+            .iter()
+            .find(|tool| tool.name() == TOOL_READ_TOOL_ARTIFACT)
+            .expect("read_tool_artifact");
+        let ToolSchema::Function { input_schema, .. } = artifact else {
+            panic!("read_tool_artifact must be a function tool");
+        };
+        let properties = input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("properties");
+
+        assert_eq!(
+            input_schema.get("required"),
+            Some(&json!(["callId", "artifactId", "range"]))
+        );
+        assert_eq!(
+            properties
+                .get("range")
+                .and_then(|schema| schema.get("enum")),
+            Some(&json!(["lines", "bytes"]))
+        );
+        assert!(properties.contains_key("offset"));
+        assert!(properties.contains_key("limit"));
+        for ambiguous in ["startLine", "maxLines", "startByte", "maxBytes"] {
+            assert!(!properties.contains_key(ambiguous), "{ambiguous}");
+        }
+    }
+
+    #[test]
     fn product_tool_schemas_use_codex_camel_case_fields() {
         let tools = build_tool_schemas();
         let queue = tools

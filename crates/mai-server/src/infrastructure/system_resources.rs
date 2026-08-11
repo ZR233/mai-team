@@ -242,6 +242,12 @@ mod tests {
         assert!(contents.contains("restart paginated reading from line 1"));
         assert!(contents.contains("do not use its optional cursor"));
         assert!(contents.contains("one logical final review request"));
+        assert!(contents.contains(
+            "/tmp/.mai-team/skills/system/reviewer-agent-review-pr/scripts/review_pr_helper.py"
+        ));
+        assert!(contents.contains("Do not probe `/workspace/repo/scripts`"));
+        assert!(contents.contains("Every `exec` call must use `/workspace/repo` as its `cwd`"));
+        assert!(!contents.contains("skill:///reviewer-agent-review-pr/scripts"));
         assert!(contents.contains("<!-- mai-review-job:CURRENT_JOB_ID -->"));
         assert!(contents.contains("An unmarked review, or a review for another head"));
         assert!(contents.contains("Never return `review_submitted` merely because"));
@@ -268,6 +274,10 @@ mod tests {
         assert!(reviewer_contents.contains("`read_session_note`"));
         assert!(reviewer_contents.contains("one logical final pull request review"));
         assert!(reviewer_contents.contains("exact current Job marker"));
+        assert!(
+            reviewer_contents
+                .contains("Every `exec` call must keep `/workspace/repo` as its `cwd`")
+        );
         assert!(
             reviewer_contents.contains("must never be reported as this Job's `review_submitted`")
         );

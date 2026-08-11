@@ -16,6 +16,8 @@ Before this skill starts, Mai prepares two fixed views:
 
 The default branch remains available in the PR workspace as `refs/remotes/origin/<default-branch>`. Do not checkout another revision, fetch credentials, read `GITHUB_TOKEN`, write credential files, or add model footers. Never modify, checkout, fetch, clean, or run Git commands in `/project/repo`; its Git metadata is intentionally unavailable. Mai appends the model footer to submitted project reviews.
 
+Every `exec` call must use `/workspace/repo` as its `cwd`. To inspect the read-only base snapshot, use `read_file`, `list_files`, or `search_files`, or reference an absolute `/project/repo/...` path from a command whose `cwd` remains `/workspace/repo`. Never use `/project/repo` itself as an `exec` working directory.
+
 ## Keep a Persistent Findings Ledger
 
 Before investigating the PR, call `write_session_note` once with `expectedRevision: 0`. Initialize the note with immutable metadata only: a title, the target PR number, and the head SHA. Do not add progress checkboxes, mutable status fields, or placeholder finding sections; task progress belongs in `update_todo_list`, not in the ledger. The note belongs to this reviewer session, stays out of `/workspace/repo`, survives context compaction, and is deleted with the reviewer agent. After initialization, never replace or clear it with `write_session_note` and never fall back to a temporary file.
@@ -59,29 +61,27 @@ Reconcile repeated IDs by line order, resolve every remaining `candidate` or `un
 
 ## Use Bundled Scripts First
 
-Use `scripts/review_pr_helper.py` for deterministic local steps before doing review judgment. The script has no third-party dependencies and does not access the network.
+Use the helper materialized by the Mai harness at `/tmp/.mai-team/skills/system/reviewer-agent-review-pr/scripts/review_pr_helper.py` for deterministic local steps before doing review judgment. The script has no third-party dependencies and does not access the network.
 
 Important: save changed-file JSON responses from `github_api_request` exactly as returned and feed those files directly to the helper. Do not hand-normalize file lists, GraphQL `nodes`/`edges`, or response wrappers before invoking the helper.
 
-Preferred invocation:
+In Mai, use the materialized absolute path directly:
 
 ```bash
-python3 scripts/review_pr_helper.py test
+REVIEW_HELPER=/tmp/.mai-team/skills/system/reviewer-agent-review-pr/scripts/review_pr_helper.py
+python3 "$REVIEW_HELPER" test
 ```
 
-If `scripts/review_pr_helper.py` is not directly readable from the workspace, read the skill resource `skill:///reviewer-agent-review-pr/scripts/review_pr_helper.py`, write its text to `/tmp/review_pr_helper.py`, and run it with `exec`:
-
-```bash
-python3 /tmp/review_pr_helper.py test
-```
+Do not probe `/workspace/repo/scripts`, call MCP resource tools, or copy the helper to another temporary path first. The reviewed repository does not own this harness dependency. If the materialized path is missing, report a harness provisioning failure instead of searching the reviewed repository.
 
 The helper commands are:
 
 ```bash
-python3 scripts/review_pr_helper.py prepare-review --repo /workspace/repo --pr "$PR" --head-sha "$HEAD_SHA" --base-ref "origin/$DEFAULT_BRANCH"
-python3 scripts/review_pr_helper.py changed-files --repo "$REVIEW_REPO" --files files.json
-python3 scripts/review_pr_helper.py rust-plan --repo "$REVIEW_REPO" --changed changed.json
-python3 scripts/review_pr_helper.py final-json --outcome review_submitted --review-event approve --pr "$PR" --summary "Submitted APPROVE for owner/repo#$PR after validation passed."
+REVIEW_HELPER=/tmp/.mai-team/skills/system/reviewer-agent-review-pr/scripts/review_pr_helper.py
+python3 "$REVIEW_HELPER" prepare-review --repo /workspace/repo --pr "$PR" --head-sha "$HEAD_SHA" --base-ref "origin/$DEFAULT_BRANCH"
+python3 "$REVIEW_HELPER" changed-files --repo "$REVIEW_REPO" --files files.json
+python3 "$REVIEW_HELPER" rust-plan --repo "$REVIEW_REPO" --changed changed.json
+python3 "$REVIEW_HELPER" final-json --outcome review_submitted --review-event approve --pr "$PR" --summary "Submitted APPROVE for owner/repo#$PR after validation passed."
 ```
 
 Treat helper output as structured facts and command suggestions. You still own code understanding, finding severity, inline comment wording, and the final GitHub review decision.
@@ -142,8 +142,9 @@ Before submitting the review, confirm the PR head SHA still matches the checked-
 Use visible Mai GitHub API tools to inspect PR metadata, changed files, diff, existing comments, review threads, and checks context. Save changed files JSON and run:
 
 ```bash
-python3 scripts/review_pr_helper.py changed-files --repo "$REVIEW_REPO" --files files.json > changed.json
-python3 scripts/review_pr_helper.py rust-plan --repo "$REVIEW_REPO" --changed changed.json > rust-plan.json
+REVIEW_HELPER=/tmp/.mai-team/skills/system/reviewer-agent-review-pr/scripts/review_pr_helper.py
+python3 "$REVIEW_HELPER" changed-files --repo "$REVIEW_REPO" --files files.json > changed.json
+python3 "$REVIEW_HELPER" rust-plan --repo "$REVIEW_REPO" --changed changed.json > rust-plan.json
 ```
 
 Run the commands in `rust-plan.json` when present. For Rust PRs, always run `cargo fmt --check` and clippy commands suggested by the helper; run tests for changed crates unless the repository clearly cannot support them in the current environment.

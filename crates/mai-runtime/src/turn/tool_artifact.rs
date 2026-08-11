@@ -17,10 +17,16 @@ const MAX_BYTES: usize = 64 * 1024;
 pub(super) struct ReadToolArtifactInput {
     call_id: String,
     artifact_id: String,
-    start_line: Option<usize>,
-    max_lines: Option<usize>,
-    start_byte: Option<u64>,
-    max_bytes: Option<usize>,
+    range: ToolArtifactRange,
+    offset: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ToolArtifactRange {
+    Lines,
+    Bytes,
 }
 
 pub(super) async fn read(
@@ -32,41 +38,39 @@ pub(super) async fn read(
     let (artifact, path) = runtime
         .tool_output_artifact(agent_id, input.call_id.clone(), input.artifact_id.clone())
         .await?;
-    if input.start_byte.is_some() || input.max_bytes.is_some() {
-        read_bytes(artifact, path, input).await
-    } else {
-        read_lines(artifact, path, input).await
+    match input.range {
+        ToolArtifactRange::Lines => read_lines(artifact, path, input).await,
+        ToolArtifactRange::Bytes => read_bytes(artifact, path, input).await,
     }
 }
 
 fn validate_range(input: &ReadToolArtifactInput) -> Result<()> {
-    let line_range = input.start_line.is_some() || input.max_lines.is_some();
-    let byte_range = input.start_byte.is_some() || input.max_bytes.is_some();
-    if line_range && byte_range {
-        return Err(RuntimeError::InvalidInput(
-            "read_tool_artifact accepts either a line range or a byte range, not both".to_string(),
-        ));
-    }
-    if input.start_line == Some(0) {
-        return Err(RuntimeError::InvalidInput(
-            "read_tool_artifact startLine is 1-based".to_string(),
-        ));
-    }
-    if input
-        .max_lines
-        .is_some_and(|value| value == 0 || value > MAX_LINES)
-    {
-        return Err(RuntimeError::InvalidInput(format!(
-            "read_tool_artifact maxLines must be between 1 and {MAX_LINES}"
-        )));
-    }
-    if input
-        .max_bytes
-        .is_some_and(|value| value == 0 || value > MAX_BYTES)
-    {
-        return Err(RuntimeError::InvalidInput(format!(
-            "read_tool_artifact maxBytes must be between 1 and {MAX_BYTES}"
-        )));
+    match input.range {
+        ToolArtifactRange::Lines => {
+            if input.offset == Some(0) {
+                return Err(RuntimeError::InvalidInput(
+                    "read_tool_artifact line offset is 1-based".to_string(),
+                ));
+            }
+            if input
+                .limit
+                .is_some_and(|value| value == 0 || value > MAX_LINES)
+            {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "read_tool_artifact line limit must be between 1 and {MAX_LINES}"
+                )));
+            }
+        }
+        ToolArtifactRange::Bytes => {
+            if input
+                .limit
+                .is_some_and(|value| value == 0 || value > MAX_BYTES)
+            {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "read_tool_artifact byte limit must be between 1 and {MAX_BYTES}"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -77,8 +81,10 @@ async fn read_lines(
     input: ReadToolArtifactInput,
 ) -> Result<serde_json::Value> {
     tokio::task::spawn_blocking(move || {
-        let start_line = input.start_line.unwrap_or(1);
-        let max_lines = input.max_lines.unwrap_or(DEFAULT_MAX_LINES);
+        let start_line = usize::try_from(input.offset.unwrap_or(1)).map_err(|_| {
+            RuntimeError::InvalidInput("read_tool_artifact line offset is too large".to_string())
+        })?;
+        let max_lines = input.limit.unwrap_or(DEFAULT_MAX_LINES);
         let file = std::fs::File::open(&path)?;
         let mut lines = std::io::BufReader::new(file).lines().skip(start_line - 1);
         let mut selected = Vec::new();
@@ -110,8 +116,8 @@ async fn read_bytes(
     input: ReadToolArtifactInput,
 ) -> Result<serde_json::Value> {
     tokio::task::spawn_blocking(move || {
-        let start_byte = input.start_byte.unwrap_or(0);
-        let max_bytes = input.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+        let start_byte = input.offset.unwrap_or(0);
+        let max_bytes = input.limit.unwrap_or(DEFAULT_MAX_BYTES);
         let mut file = std::fs::File::open(&path)?;
         let total_bytes = file.metadata()?.len();
         file.seek(SeekFrom::Start(start_byte))?;
@@ -159,10 +165,9 @@ mod tests {
         ReadToolArtifactInput {
             call_id: "call-1".to_string(),
             artifact_id: "artifact-1".to_string(),
-            start_line: None,
-            max_lines: None,
-            start_byte: None,
-            max_bytes: None,
+            range: ToolArtifactRange::Lines,
+            offset: None,
+            limit: None,
         }
     }
 
@@ -171,8 +176,8 @@ mod tests {
         let temp = tempfile::NamedTempFile::new().expect("artifact file");
         std::fs::write(temp.path(), "one\ntwo\nthree\n").expect("write artifact");
         let mut request = input();
-        request.start_line = Some(2);
-        request.max_lines = Some(1);
+        request.offset = Some(2);
+        request.limit = Some(1);
 
         let value = read_lines(
             artifact(temp.path().metadata().expect("metadata").len()),
@@ -193,8 +198,9 @@ mod tests {
         let temp = tempfile::NamedTempFile::new().expect("artifact file");
         std::fs::write(temp.path(), b"abcdef").expect("write artifact");
         let mut request = input();
-        request.start_byte = Some(1);
-        request.max_bytes = Some(2);
+        request.range = ToolArtifactRange::Bytes;
+        request.offset = Some(1);
+        request.limit = Some(2);
 
         let value = read_bytes(
             artifact(temp.path().metadata().expect("metadata").len()),
@@ -211,11 +217,32 @@ mod tests {
     }
 
     #[test]
-    fn mixed_line_and_byte_ranges_are_rejected() {
-        let mut request = input();
-        request.start_line = Some(1);
-        request.start_byte = Some(0);
+    fn legacy_ambiguous_range_fields_are_rejected_at_the_protocol_boundary() {
+        let error = serde_json::from_value::<ReadToolArtifactInput>(serde_json::json!({
+            "callId": "call-1",
+            "artifactId": "artifact-1",
+            "startLine": 1,
+            "maxLines": 300,
+            "startByte": 0,
+            "maxBytes": 30000
+        }))
+        .expect_err("旧的歧义范围协议必须被删除");
 
-        assert!(validate_range(&request).is_err());
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn line_range_limit_is_validated_by_the_selected_range() {
+        let mut request = input();
+        request.limit = Some(MAX_LINES + 1);
+        let RuntimeError::InvalidInput(message) = validate_range(&request).expect_err("line limit")
+        else {
+            panic!("line limit must be an invalid-input error");
+        };
+
+        assert_eq!(
+            message,
+            format!("read_tool_artifact line limit must be between 1 and {MAX_LINES}")
+        );
     }
 }

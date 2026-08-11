@@ -44,25 +44,34 @@ pub(crate) fn definitions() -> Vec<ToolSchema> {
         ),
         function_tool_schema(
             TOOL_READ_TOOL_ARTIFACT,
-            "Read a bounded line or byte range from a full output artifact returned by an earlier tool call. Use the callId and artifactId from that tool result receipt instead of rerunning the original command.",
+            "Read one bounded range from a full output artifact returned by an earlier tool call. Use the callId and artifactId from that tool result receipt instead of rerunning the original command. Select exactly one range kind: lines are UTF-8 text with a 1-based offset and a limit of at most 500; bytes are base64 with a 0-based offset and a limit of at most 65536.",
             [
                 ToolInputSchemaField::required("callId", json!({ "type": "string" })),
                 ToolInputSchemaField::required("artifactId", json!({ "type": "string" })),
-                ToolInputSchemaField::optional(
-                    "startLine",
-                    json!({ "type": "integer", "minimum": 1 }),
+                ToolInputSchemaField::required(
+                    "range",
+                    json!({
+                        "type": "string",
+                        "enum": ["lines", "bytes"],
+                        "description": "Use lines for text output and bytes for binary output."
+                    }),
                 ),
                 ToolInputSchemaField::optional(
-                    "maxLines",
-                    json!({ "type": "integer", "minimum": 1, "maximum": 500 }),
+                    "offset",
+                    json!({
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "1-based first line for range=lines; 0-based first byte for range=bytes. Defaults to 1 or 0 respectively."
+                    }),
                 ),
                 ToolInputSchemaField::optional(
-                    "startByte",
-                    json!({ "type": "integer", "minimum": 0 }),
-                ),
-                ToolInputSchemaField::optional(
-                    "maxBytes",
-                    json!({ "type": "integer", "minimum": 1, "maximum": 65536 }),
+                    "limit",
+                    json!({
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 65536,
+                        "description": "Maximum lines (at most 500) or bytes (at most 65536) to return."
+                    }),
                 ),
             ],
         ),
