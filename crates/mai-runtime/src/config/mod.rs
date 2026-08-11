@@ -19,7 +19,7 @@ pub(crate) use conversion::{
     agent_config_from_models, preserve_provider_private_fields, provider_selection_from_models,
     providers_request_from_models, providers_response_from_models,
 };
-pub const MAI_CONFIG_SCHEMA_VERSION: u32 = 6;
+pub const MAI_CONFIG_SCHEMA_VERSION: u32 = 7;
 
 const REQUIRED_ROLES: [&str; 4] = ["planner", "explorer", "executor", "reviewer"];
 
@@ -183,9 +183,7 @@ pub async fn seed_default_provider_from_env(
     model: String,
 ) -> Result<()> {
     let documents = store.config_documents();
-    if let Ok(Some(config)) = documents.load::<MaiConfig>().await
-        && config.validate().is_ok()
-    {
+    if tokio::fs::try_exists(documents.path()).await? {
         return Ok(());
     }
     let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) else {

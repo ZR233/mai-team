@@ -19,6 +19,8 @@ use super::{
 };
 use crate::{Result, RuntimeError};
 
+mod v6;
+
 #[derive(Debug, Deserialize)]
 struct LegacyMaiConfig {
     schema_version: u32,
@@ -120,6 +122,11 @@ struct LegacyCatalogProviderConfig {
 }
 
 pub(super) async fn migrate(documents: &ConfigDocumentStore) -> Result<MaiConfig> {
+    if let Ok(Some(legacy)) = documents.load::<v6::SchemaSixMaiConfig>().await
+        && legacy.schema_version == 6
+    {
+        return v6::migrate(documents, legacy).await;
+    }
     if let Ok(Some(mut config)) = documents.load::<MaiConfig>().await
         && matches!(config.schema_version, 4 | 5)
     {
@@ -341,7 +348,7 @@ fn migrate_deprecated_mimo_routes(routes: &mut BTreeMap<AgentRoleId, ModelRouteC
     }
 }
 
-async fn backup_document(path: &Path, version: u32) -> Result<()> {
+pub(super) async fn backup_document(path: &Path, version: u32) -> Result<()> {
     let backup = backup_path(path, version);
     if !tokio::fs::try_exists(&backup).await? {
         tokio::fs::copy(path, backup).await?;
