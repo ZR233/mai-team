@@ -460,7 +460,9 @@ fn validate_review_history(transaction: &Transaction<'_>) -> Result<usize> {
         Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
     })? {
         let (id, raw) = row?;
-        let raw = raw.with_context(|| format!("review run {id} 缺少 history"))?;
+        let Some(raw) = raw else {
+            continue;
+        };
         let history = serde_json::from_str::<ThreadTurnHistory>(&raw)
             .with_context(|| format!("review run {id} history 非法"))?;
         for item in &history.items {

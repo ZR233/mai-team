@@ -136,6 +136,29 @@ fn v28_migration_adds_merged_pull_request_terminal_state_table() {
 }
 
 #[test]
+fn v28_migration_preserves_review_runs_without_archive_history() {
+    let (_directory, path) = fixture(false);
+    migrate_fixture_to_v28(&path);
+    let connection = Connection::open(&path).expect("open v28 fixture");
+    connection
+        .execute("UPDATE project_review_runs SET history_json = NULL", [])
+        .expect("remove historical archive");
+    drop(connection);
+
+    let report = migrate_path(&path).expect("migrate v28 fixture with missing archive");
+    assert_eq!(report.source_schema, "28");
+    assert_eq!(report.target_schema, "29");
+    assert_eq!(report.archived_review_runs, 0);
+    let connection = Connection::open(&path).expect("open v29 fixture");
+    let history: Option<String> = connection
+        .query_row("SELECT history_json FROM project_review_runs", [], |row| {
+            row.get(0)
+        })
+        .expect("load preserved review run");
+    assert_eq!(history, None);
+}
+
+#[test]
 fn v28_migration_failure_rolls_back_schema_and_table() {
     let (_directory, path) = fixture(false);
     migrate_fixture_to_v28(&path);
