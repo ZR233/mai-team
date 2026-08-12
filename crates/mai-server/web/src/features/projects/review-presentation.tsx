@@ -1,12 +1,13 @@
 import { CircleAlert } from "lucide-react"
 
-import type { ReviewJobSummary } from "@/api/product-types"
+import type { PullRequestReviewSummary, ReviewJobSummary } from "@/api/product-types"
 import { Badge } from "@/components/ui/badge"
 
 import { reviewSkipReasonLabel } from "./review-job-model"
 
-export function ReviewOutcome({ job, merged = false }: { job: ReviewJobSummary; merged?: boolean }) {
-  if (merged) return <Badge variant="secondary">Merged</Badge>
+export function ReviewOutcome({ job, lifecycleState = "open" }: { job: ReviewJobSummary; lifecycleState?: PullRequestReviewSummary["lifecycle_state"] }) {
+  if (lifecycleState === "merged") return <Badge variant="secondary">Merged</Badge>
+  if (lifecycleState === "closed") return <Badge variant="outline">Closed</Badge>
   const event = job.submission_receipt?.event
   if (event === "approve") return <Badge variant="secondary">Approved</Badge>
   if (event === "request_changes") return <Badge variant="destructive">Request changes</Badge>

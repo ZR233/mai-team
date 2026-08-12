@@ -242,8 +242,8 @@ pub(crate) fn create_router(state: Arc<AppState>) -> Router {
             get(handlers::projects::list_project_pull_request_reviews),
         )
         .route(
-            "/projects/{id}/pull-request-reviews/merge-status/refresh",
-            post(handlers::projects::refresh_project_pull_request_merge_status),
+            "/projects/{id}/pull-request-reviews/lifecycle-status/refresh",
+            post(handlers::projects::refresh_project_pull_request_state),
         )
         .route(
             "/projects/{id}/pull-request-reviews/{pr}/history",

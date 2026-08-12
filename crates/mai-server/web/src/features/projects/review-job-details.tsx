@@ -64,8 +64,12 @@ export function ReviewJobDetails({ projectId, repository, review, onClose, onRer
     setSelectedJobId(null)
     setHistoryPage(page)
   }
-  const merged = review?.merge_state === "merged"
-  const content = <>{merged && <Alert className="mx-0 mb-4"><CircleAlert /><AlertTitle>Pull request merged</AlertTitle><AlertDescription>This PR is in its terminal merged state. Retained Review history remains unchanged.</AlertDescription></Alert>}<ReviewDetailsContent
+  const lifecycleState = review?.lifecycle_state ?? "open"
+  const reviewable = lifecycleState === "open"
+  const lifecycleDescription = lifecycleState === "merged"
+    ? "This PR is merged. Retained Review history remains unchanged."
+    : "This PR is currently closed. Retained Review history remains unchanged."
+  const content = <>{!reviewable && <Alert className="mx-0 mb-4"><CircleAlert /><AlertTitle>Pull request {lifecycleState}</AlertTitle><AlertDescription>{lifecycleDescription}</AlertDescription></Alert>}<ReviewDetailsContent
     projectId={projectId}
     history={history}
     historyPage={historyPage}
@@ -78,7 +82,7 @@ export function ReviewJobDetails({ projectId, repository, review, onClose, onRer
     detailError={detail.error}
     retryDetail={() => void detail.refetch()}
   /></>
-  const actions = <ReviewDetailActions pr={review?.pr} repository={repository} merged={merged} onRereview={onRereview} pending={pending} />
+  const actions = <ReviewDetailActions pr={review?.pr} repository={repository} reviewable={reviewable} onRereview={onRereview} pending={pending} />
   const description = review ? `${review.history_count} retained history ${review.history_count === 1 ? "record" : "records"}` : ""
   if (mobile) return <Drawer open={Boolean(review)} onOpenChange={(open: boolean) => { if (!open) onClose() }}><DrawerContent className="max-h-[92svh]! overflow-hidden"><DrawerHeader className="shrink-0"><DrawerTitle>Pull request review · PR #{review?.pr ?? "—"}</DrawerTitle><DrawerDescription>{description}</DrawerDescription></DrawerHeader><ScrollArea className="min-h-0 min-w-0 max-w-full flex-1 overflow-hidden px-4 [&_[data-slot=scroll-area-viewport]>div]:!block">{content}</ScrollArea><DrawerFooter className="shrink-0 border-t bg-background">{actions}</DrawerFooter></DrawerContent></Drawer>
   return <Sheet open={Boolean(review)} onOpenChange={(open: boolean) => { if (!open) onClose() }}><SheetContent className="w-full! sm:max-w-2xl!"><SheetHeader><SheetTitle>Pull request review · PR #{review?.pr ?? "—"}</SheetTitle><SheetDescription>{description}</SheetDescription></SheetHeader><ScrollArea className="min-h-0 flex-1 px-4">{content}</ScrollArea><SheetFooter>{actions}</SheetFooter></SheetContent></Sheet>
@@ -161,9 +165,9 @@ function ReviewAttemptActivity({ projectId, attempt }: { projectId: string; atte
   return <div className="space-y-2"><h4 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Attempt activity</h4><ReviewActivityList activity={activity} /></div>
 }
 
-function ReviewDetailActions({ pr, repository, merged, onRereview, pending }: { pr?: number; repository: string; merged: boolean; onRereview(pr: number): void; pending: boolean }) {
+function ReviewDetailActions({ pr, repository, reviewable, onRereview, pending }: { pr?: number; repository: string; reviewable: boolean; onRereview(pr: number): void; pending: boolean }) {
   const url = pullRequestUrl(repository, pr)
-  return <div className={cn("grid gap-2", !merged && "grid-cols-2")}>{url ? <Button asChild variant="outline"><a href={url} target="_blank" rel="noreferrer"><ExternalLink data-icon="inline-start" /> Open pull request</a></Button> : <Button variant="outline" disabled>Open pull request</Button>}{!merged && <Button disabled={!pr || pending} onClick={() => { if (pr) onRereview(pr) }}><RefreshCw data-icon="inline-start" /> Re-review</Button>}</div>
+  return <div className={cn("grid gap-2", reviewable && "grid-cols-2")}>{url ? <Button asChild variant="outline"><a href={url} target="_blank" rel="noreferrer"><ExternalLink data-icon="inline-start" /> Open pull request</a></Button> : <Button variant="outline" disabled>Open pull request</Button>}{reviewable && <Button disabled={!pr || pending} onClick={() => { if (pr) onRereview(pr) }}><RefreshCw data-icon="inline-start" /> Re-review</Button>}</div>
 }
 
 function DetailRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {

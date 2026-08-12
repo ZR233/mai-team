@@ -84,7 +84,7 @@ pub(crate) fn validate_convertible(transaction: &Transaction<'_>) -> Result<Migr
     let converted = convert(transaction)?;
     Ok(MigrationReport {
         source_schema: "27".to_string(),
-        target_schema: "29".to_string(),
+        target_schema: "30".to_string(),
         already_current: false,
         agents: converted.agents,
         canonical_threads: converted.runtimes.len(),

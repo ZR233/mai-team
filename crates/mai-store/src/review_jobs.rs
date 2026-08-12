@@ -26,8 +26,8 @@ pub struct ProjectReviewJobEnqueueResult {
 }
 
 #[derive(Debug, Clone)]
-pub enum ProjectReviewUnmergedJobEnqueueResult {
-    Merged,
+pub enum ProjectReviewReviewableJobEnqueueResult {
+    NotOpen(ProjectPullRequestLifecycleState),
     Enqueued(Box<ProjectReviewJobEnqueueResult>),
 }
 
@@ -199,27 +199,34 @@ impl MaiStore {
             })?
     }
 
-    pub async fn enqueue_unmerged_project_review_job(
+    pub async fn enqueue_reviewable_project_review_job(
         &self,
         candidate: ProjectReviewJobSummary,
-    ) -> Result<ProjectReviewUnmergedJobEnqueueResult> {
+    ) -> Result<ProjectReviewReviewableJobEnqueueResult> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let mut connection = open_review_job_connection(&path)?;
             let transaction =
                 connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let merged = transaction
+            let lifecycle_state = transaction
                 .query_row(
-                    "SELECT 1 FROM project_merged_pull_requests \
+                    "SELECT state FROM project_pull_request_states \
                      WHERE project_id = ?1 AND pr = ?2",
                     params![candidate.project_id.to_string(), u64_to_i64(candidate.pr)],
-                    |row| row.get::<_, i64>(0),
+                    |row| row.get::<_, String>(0),
                 )
                 .optional()?
-                .is_some();
-            if merged {
+                .map(|value| {
+                    ProjectPullRequestLifecycleState::from_str(&value).map_err(|error| {
+                        StoreError::InvalidConfig(format!(
+                            "invalid persisted pull request lifecycle state `{value}`: {error}"
+                        ))
+                    })
+                })
+                .transpose()?;
+            if let Some(state) = lifecycle_state {
                 transaction.commit()?;
-                return Ok(ProjectReviewUnmergedJobEnqueueResult::Merged);
+                return Ok(ProjectReviewReviewableJobEnqueueResult::NotOpen(state));
             }
             let result = enqueue_in_transaction(
                 &transaction,
@@ -227,7 +234,7 @@ impl MaiStore {
                 ProjectReviewSignalFreshness::Current,
             )?;
             transaction.commit()?;
-            Ok(ProjectReviewUnmergedJobEnqueueResult::Enqueued(Box::new(
+            Ok(ProjectReviewReviewableJobEnqueueResult::Enqueued(Box::new(
                 result,
             )))
         })

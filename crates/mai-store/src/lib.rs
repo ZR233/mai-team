@@ -4,7 +4,7 @@ pub(crate) use mai_protocol::{
     GitAccountSummary, GitAccountsResponse, GitProvider, GitTokenKind, GithubAppSettingsRequest,
     GithubAppSettingsResponse, GithubSettingsResponse, MaiProductEventEnvelope,
     MaiProductEventKind, McpServerConfig, PlanHistoryEntry, ProjectId,
-    ProjectPullRequestMergeState, ProjectPullRequestReviewHistoryItem,
+    ProjectPullRequestLifecycleState, ProjectPullRequestReviewHistoryItem,
     ProjectPullRequestReviewHistoryPage, ProjectPullRequestReviewPage,
     ProjectPullRequestReviewStatusSummary, ProjectPullRequestReviewSummary,
     ProjectReviewJobSummary, ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary,
@@ -31,7 +31,7 @@ mod git_accounts;
 mod github_app;
 pub use github_app::GithubAppIdentity;
 mod logs;
-mod project_merged_pull_requests;
+mod project_pull_request_states;
 mod projects;
 mod records;
 mod relay;
@@ -56,7 +56,7 @@ pub use review_ci_watches::ProjectReviewCiWatch;
 pub use review_jobs::{
     ProjectReviewCiPendingSkipResult, ProjectReviewCiWatchEnqueueResult,
     ProjectReviewJobEnqueueDisposition, ProjectReviewJobEnqueueResult,
-    ProjectReviewUnmergedJobEnqueueResult,
+    ProjectReviewReviewableJobEnqueueResult,
 };
 pub use store::MaiStore;
 pub use thread_runtime::{
@@ -124,10 +124,17 @@ pub struct PersistedTask {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PersistedMergedPullRequest {
+pub struct PersistedPullRequestStateObservation {
     pub pr: u64,
-    pub merged_at: DateTime<Utc>,
+    pub state: ProjectPullRequestLifecycleState,
+    pub state_changed_at: Option<DateTime<Utc>>,
     pub detected_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PersistedPullRequestStateSaveSummary {
+    pub newly_merged: usize,
+    pub newly_closed: usize,
 }
 
 #[derive(Debug, Clone, Default)]

@@ -6,7 +6,7 @@ use pl_protocol::ThreadTurnHistory;
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use crate::legacy::ConvertedData;
-use crate::{LEGACY_SCHEMA, MigrationReport, SOURCE_SCHEMA, TARGET_SCHEMA};
+use crate::{LEGACY_SCHEMA, MERGED_STATE_SCHEMA, MigrationReport, TARGET_SCHEMA, THREAD_SCHEMA};
 
 const VERSION_KEY: &str = "toasty_schema_version";
 
@@ -230,13 +230,57 @@ pub(crate) fn install_v29(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn install_v30(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE project_pull_request_states (
+            project_id TEXT NOT NULL,
+            pr BIGINT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('merged', 'closed')),
+            state_changed_at TEXT NOT NULL,
+            detected_at TEXT NOT NULL,
+            PRIMARY KEY (project_id, pr)
+         );
+         INSERT INTO project_pull_request_states (
+            project_id, pr, state, state_changed_at, detected_at
+         )
+         SELECT project_id, pr, 'merged', merged_at, detected_at
+         FROM project_merged_pull_requests;
+         DROP TABLE project_merged_pull_requests;
+         CREATE INDEX index_project_pull_request_states_by_project
+            ON project_pull_request_states(project_id, state, state_changed_at);
+         UPDATE settings SET value = '30' WHERE key = 'toasty_schema_version';",
+    )?;
+    Ok(())
+}
+
 pub(crate) fn validate_v28(transaction: &Transaction<'_>) -> Result<()> {
-    if schema_version(transaction)? != SOURCE_SCHEMA {
-        bail!("源数据库不是 schema {SOURCE_SCHEMA}");
+    if schema_version(transaction)? != THREAD_SCHEMA {
+        bail!("源数据库不是 schema {THREAD_SCHEMA}");
     }
     validate_thread_schema(transaction)?;
     if table_exists(transaction, "project_merged_pull_requests")? {
-        bail!("schema {SOURCE_SCHEMA} 意外包含 v29 merged PR 表");
+        bail!("schema {THREAD_SCHEMA} 意外包含 v29 merged PR 表");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_v29(transaction: &Transaction<'_>) -> Result<()> {
+    if schema_version(transaction)? != MERGED_STATE_SCHEMA {
+        bail!("源数据库不是 schema {MERGED_STATE_SCHEMA}");
+    }
+    validate_thread_schema(transaction)?;
+    require_columns(
+        transaction,
+        "project_merged_pull_requests",
+        &["project_id", "pr", "merged_at", "detected_at"],
+    )?;
+    require_composite_primary_key(
+        transaction,
+        "project_merged_pull_requests",
+        &["project_id", "pr"],
+    )?;
+    if table_exists(transaction, "project_pull_request_states")? {
+        bail!("schema {MERGED_STATE_SCHEMA} 意外包含 v30 PR 生命周期状态表");
     }
     Ok(())
 }
@@ -252,14 +296,23 @@ pub(crate) fn validate_target(
     validate_thread_schema(transaction)?;
     require_columns(
         transaction,
-        "project_merged_pull_requests",
-        &["project_id", "pr", "merged_at", "detected_at"],
+        "project_pull_request_states",
+        &[
+            "project_id",
+            "pr",
+            "state",
+            "state_changed_at",
+            "detected_at",
+        ],
     )?;
     require_composite_primary_key(
         transaction,
-        "project_merged_pull_requests",
+        "project_pull_request_states",
         &["project_id", "pr"],
     )?;
+    if table_exists(transaction, "project_merged_pull_requests")? {
+        bail!("schema {TARGET_SCHEMA} 仍包含已废弃的 v29 merged PR 表");
+    }
     report(transaction, source_schema, already_current)
 }
 

@@ -61,6 +61,12 @@ test("Merged 覆盖主列表结果并保留原始 review 历史", async ({ page 
   await expect(page.getByText("Pull request merged")).toBeVisible()
   await expect(page.getByText("Approved", { exact: true })).toBeVisible()
   await expect(page.getByRole("button", { name: "Re-review" })).toHaveCount(0)
+
+  await page.keyboard.press("Escape")
+  await pullRequestEntry(page, 40).click()
+  await expect(page.getByText("Pull request closed")).toBeVisible()
+  await expect(page.getByText("Approved", { exact: true })).toBeVisible()
+  await expect(page.getByRole("button", { name: "Re-review" })).toHaveCount(0)
 })
 
 function pullRequestEntry(page: Page, pr: number) {
@@ -81,11 +87,18 @@ async function installReviewFixture(page: Page) {
       const pageNumber = Number(url.searchParams.get("page") || "1")
       return json(route, reviewPage(pageNumber))
     }
-    if (path === "/projects/project-1/pull-request-reviews/merge-status/refresh") {
-      return json(route, { checked: 2, newly_merged: 0 })
+    if (path === "/projects/project-1/pull-request-reviews/lifecycle-status/refresh") {
+      return json(route, { checked: 2, newly_merged: 0, newly_closed: 0 })
     }
     if (path === "/projects/project-1/pull-request-reviews/41/history") return json(route, {
       items: [{ job: approvedReviewJob("approved-job", 41), has_attempts: false }],
+      page: 1,
+      page_size: 20,
+      total_items: 1,
+      total_pages: 1,
+    })
+    if (path === "/projects/project-1/pull-request-reviews/40/history") return json(route, {
+      items: [{ job: approvedReviewJob("closed-job", 40), has_attempts: false }],
       page: 1,
       page_size: 20,
       total_items: 1,
@@ -112,8 +125,11 @@ async function installReviewFixture(page: Page) {
 
 function reviewPage(page: number) {
   const reviews = page === 2
-    ? [{ pr: 41, latest_job: approvedReviewJob("approved-job", 41), history_count: 1, merge_state: "merged", merged_at: "2026-08-12T00:00:00Z" }]
-    : [{ pr: 42, latest_job: reviewJob("skipped-job", 42, "skipped", 0), history_count: 2, merge_state: "not_merged", merged_at: null }]
+    ? [
+      { pr: 41, latest_job: approvedReviewJob("approved-job", 41), history_count: 1, lifecycle_state: "merged", state_changed_at: "2026-08-12T00:00:00Z" },
+      { pr: 40, latest_job: approvedReviewJob("closed-job", 40), history_count: 1, lifecycle_state: "closed", state_changed_at: "2026-08-12T00:30:00Z" },
+    ]
+    : [{ pr: 42, latest_job: reviewJob("skipped-job", 42, "skipped", 0), history_count: 2, lifecycle_state: "open", state_changed_at: null }]
   return {
     reviews,
     page,

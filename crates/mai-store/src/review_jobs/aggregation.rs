@@ -78,7 +78,8 @@ fn load_review_summary(
     transaction: &rusqlite::Transaction<'_>,
     project_id: ProjectId,
 ) -> Result<(usize, ProjectPullRequestReviewStatusSummary)> {
-    let values = transaction.query_row(
+    let active_statuses = active_review_job_statuses_sql();
+    let sql = format!(
         "WITH ranked AS (
              SELECT status,
                     ROW_NUMBER() OVER (
@@ -88,25 +89,21 @@ fn load_review_summary(
              WHERE project_id = ?1
          )
          SELECT COUNT(*),
-                COALESCE(SUM(CASE WHEN status IN (
-                    'queued','preparing','running','retry_waiting',
-                    'submission_pending','reconciling'
-                ) THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status IN ({active_statuses}) THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
-         FROM ranked WHERE review_rank = 1",
-        params![project_id.to_string()],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        },
-    )?;
+         FROM ranked WHERE review_rank = 1"
+    );
+    let values = transaction.query_row(&sql, params![project_id.to_string()], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    })?;
     Ok((
         count_to_usize(values.0, "review total")?,
         ProjectPullRequestReviewStatusSummary {
@@ -129,6 +126,7 @@ fn load_review_page(
         .map(|column| format!("ranked.{}", column.trim()))
         .collect::<Vec<_>>()
         .join(", ");
+    let active_statuses = active_review_job_statuses_sql();
     let sql = format!(
         "WITH ranked AS (
              SELECT {PROJECT_REVIEW_JOB_COLUMNS},
@@ -139,15 +137,18 @@ fn load_review_page(
              FROM project_review_jobs
              WHERE project_id = ?1
          )
-         SELECT {ranked_columns}, ranked.history_count, merged.merged_at
+         SELECT {ranked_columns}, ranked.history_count,
+                lifecycle.state, lifecycle.state_changed_at
          FROM ranked
-         LEFT JOIN project_merged_pull_requests merged
-           ON merged.project_id = ranked.project_id AND merged.pr = ranked.pr
+         LEFT JOIN project_pull_request_states lifecycle
+           ON lifecycle.project_id = ranked.project_id AND lifecycle.pr = ranked.pr
          WHERE review_rank = 1
          ORDER BY CASE
-                    WHEN merged.project_id IS NOT NULL THEN 2
-                    WHEN json_extract(ranked.submission_receipt_json, '$.event') = 'approve' THEN 0
-                    ELSE 1
+                    WHEN lifecycle.state = 'closed' THEN 4
+                    WHEN lifecycle.state = 'merged' THEN 3
+                    WHEN ranked.status IN ({active_statuses}) THEN 0
+                    WHEN json_extract(ranked.submission_receipt_json, '$.event') = 'approve' THEN 1
+                    ELSE 2
                   END ASC,
                   ranked.created_at DESC, ranked.id DESC
          LIMIT ?2 OFFSET ?3"
@@ -158,13 +159,24 @@ fn load_review_page(
             project_review_job_record(row)?,
             row.get::<_, i64>(24)?,
             row.get::<_, Option<String>>(25)?,
+            row.get::<_, Option<String>>(26)?,
         ))
     })?;
     let mut reviews = Vec::new();
     for row in rows {
-        let (record, history_count, merged_at) = row?;
+        let (record, history_count, lifecycle_state, state_changed_at) = row?;
         let latest_job = record.into_summary()?;
-        let merged_at = merged_at
+        let lifecycle_state = lifecycle_state
+            .map(|value| {
+                ProjectPullRequestLifecycleState::from_str(&value).map_err(|error| {
+                    StoreError::InvalidConfig(format!(
+                        "invalid persisted pull request lifecycle state `{value}`: {error}"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let state_changed_at = state_changed_at
             .map(|value| {
                 DateTime::parse_from_rfc3339(&value).map(|value| value.with_timezone(&Utc))
             })
@@ -173,15 +185,19 @@ fn load_review_page(
             pr: latest_job.pr,
             latest_job,
             history_count: count_to_usize(history_count, "review history total")?,
-            merge_state: if merged_at.is_some() {
-                ProjectPullRequestMergeState::Merged
-            } else {
-                ProjectPullRequestMergeState::NotMerged
-            },
-            merged_at,
+            lifecycle_state,
+            state_changed_at,
         });
     }
     Ok(reviews)
+}
+
+fn active_review_job_statuses_sql() -> String {
+    ProjectReviewJobStatus::ACTIVE
+        .iter()
+        .map(|status| format!("'{status}'"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn load_history_count(

@@ -29,7 +29,7 @@ impl From<mai_runtime::RuntimeError> for ApiError {
             | ProjectNotFound(_)
             | ProjectReviewRunNotFound(_)
             | ProjectReviewJobNotFound(_) => StatusCode::NOT_FOUND,
-            PullRequestMerged { .. } => StatusCode::CONFLICT,
+            PullRequestNotOpen { .. } => StatusCode::CONFLICT,
             TurnNotFound { .. } => StatusCode::NOT_FOUND,
             ThreadNotFound(_) => StatusCode::NOT_FOUND,
             ToolTraceNotFound { .. } => StatusCode::NOT_FOUND,
@@ -45,7 +45,7 @@ impl From<mai_runtime::RuntimeError> for ApiError {
             | Io(_)
             | Http(_)
             | Jwt(_)
-            | MergedPullRequestRefresh(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            | PullRequestStateRefresh(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
             status,
@@ -98,10 +98,11 @@ mod tests {
     }
 
     #[test]
-    fn merged_pull_request_maps_to_conflict() {
-        let error = ApiError::from(RuntimeError::PullRequestMerged {
+    fn non_open_pull_request_maps_to_conflict() {
+        let error = ApiError::from(RuntimeError::PullRequestNotOpen {
             project_id: mai_protocol::ProjectId::new_v4(),
             pr: 42,
+            state: mai_protocol::ProjectPullRequestLifecycleState::Closed,
         });
         assert_eq!(error.status, StatusCode::CONFLICT);
     }

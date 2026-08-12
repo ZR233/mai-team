@@ -2351,15 +2351,15 @@ async fn pull_request_review_pages_aggregate_latest_jobs_and_preserve_attempt_hi
                     pr: 45,
                     latest_job: active,
                     history_count: 1,
-                    merge_state: ProjectPullRequestMergeState::NotMerged,
-                    merged_at: None,
+                    lifecycle_state: ProjectPullRequestLifecycleState::Open,
+                    state_changed_at: None,
                 },
                 ProjectPullRequestReviewSummary {
                     pr: 44,
                     latest_job: second_succeeded,
                     history_count: 1,
-                    merge_state: ProjectPullRequestMergeState::NotMerged,
-                    merged_at: None,
+                    lifecycle_state: ProjectPullRequestLifecycleState::Open,
+                    state_changed_at: None,
                 },
             ],
             page: 1,
@@ -2386,15 +2386,15 @@ async fn pull_request_review_pages_aggregate_latest_jobs_and_preserve_attempt_hi
                     pr: 43,
                     latest_job: failed,
                     history_count: 1,
-                    merge_state: ProjectPullRequestMergeState::NotMerged,
-                    merged_at: None,
+                    lifecycle_state: ProjectPullRequestLifecycleState::Open,
+                    state_changed_at: None,
                 },
                 ProjectPullRequestReviewSummary {
                     pr: 42,
                     latest_job: skipped.clone(),
                     history_count: 3,
-                    merge_state: ProjectPullRequestMergeState::NotMerged,
-                    merged_at: None,
+                    lifecycle_state: ProjectPullRequestLifecycleState::Open,
+                    state_changed_at: None,
                 },
             ],
             page: 2,
@@ -2453,29 +2453,51 @@ async fn pull_request_review_pages_aggregate_latest_jobs_and_preserve_attempt_hi
 }
 
 #[tokio::test]
-async fn pull_request_review_pages_prioritize_unmerged_approvals_and_place_merged_last() {
+async fn pull_request_review_pages_sort_active_approved_other_merged_then_closed() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
     let timestamp = DateTime::parse_from_rfc3339("2026-08-11T12:00:00Z")
         .expect("timestamp")
         .with_timezone(&Utc);
-    for (index, (pr, event)) in [
-        (10, Some(ProjectReviewDecision::Approve)),
-        (11, Some(ProjectReviewDecision::Approve)),
-        (12, Some(ProjectReviewDecision::RequestChanges)),
-        (13, Some(ProjectReviewDecision::Approve)),
-        (14, Some(ProjectReviewDecision::Comment)),
+    for (index, (pr, status, event)) in [
+        (
+            10,
+            ProjectReviewJobStatus::Succeeded,
+            Some(ProjectReviewDecision::Approve),
+        ),
+        (
+            11,
+            ProjectReviewJobStatus::Succeeded,
+            Some(ProjectReviewDecision::Approve),
+        ),
+        (
+            12,
+            ProjectReviewJobStatus::Succeeded,
+            Some(ProjectReviewDecision::RequestChanges),
+        ),
+        (
+            13,
+            ProjectReviewJobStatus::Succeeded,
+            Some(ProjectReviewDecision::Approve),
+        ),
+        (
+            14,
+            ProjectReviewJobStatus::Succeeded,
+            Some(ProjectReviewDecision::Comment),
+        ),
+        (15, ProjectReviewJobStatus::Queued, None),
+        (16, ProjectReviewJobStatus::Running, None),
     ]
     .into_iter()
     .enumerate()
     {
         let mut job = test_review_job(project_id, pr, &format!("head-{pr}"), None);
         job.id = Uuid::from_u128(u128::try_from(index + 1).expect("job id"));
-        job.status = ProjectReviewJobStatus::Succeeded;
+        job.status = status;
         job.created_at =
             timestamp + chrono::TimeDelta::minutes(i64::try_from(index).expect("timestamp offset"));
         job.updated_at = job.created_at;
-        job.finished_at = Some(job.created_at);
+        job.finished_at = job.status.is_terminal().then_some(job.created_at);
         job.next_attempt_at = None;
         job.submission_receipt = event.map(|event| ProjectReviewSubmissionReceipt {
             github_review_id: pr,
@@ -2491,87 +2513,114 @@ async fn pull_request_review_pages_prioritize_unmerged_approvals_and_place_merge
     }
     let detected_at = timestamp + chrono::TimeDelta::hours(1);
     let inserted = store
-        .save_merged_project_pull_requests(
+        .save_pull_request_state_observations(
             project_id,
             vec![
-                PersistedMergedPullRequest {
+                PersistedPullRequestStateObservation {
                     pr: 13,
-                    merged_at: detected_at,
+                    state: ProjectPullRequestLifecycleState::Merged,
+                    state_changed_at: Some(detected_at),
                     detected_at,
                 },
-                PersistedMergedPullRequest {
+                PersistedPullRequestStateObservation {
                     pr: 14,
-                    merged_at: detected_at,
+                    state: ProjectPullRequestLifecycleState::Closed,
+                    state_changed_at: Some(detected_at),
                     detected_at,
                 },
             ],
         )
         .await
         .expect("save merged pull requests");
-    assert_eq!(inserted, 2);
+    assert_eq!(
+        inserted,
+        PersistedPullRequestStateSaveSummary {
+            newly_merged: 1,
+            newly_closed: 1,
+        }
+    );
     assert_eq!(
         store
-            .save_merged_project_pull_requests(
+            .save_pull_request_state_observations(
                 project_id,
-                vec![PersistedMergedPullRequest {
+                vec![PersistedPullRequestStateObservation {
                     pr: 13,
-                    merged_at: detected_at + chrono::TimeDelta::hours(1),
+                    state: ProjectPullRequestLifecycleState::Merged,
+                    state_changed_at: Some(detected_at + chrono::TimeDelta::hours(1)),
                     detected_at: detected_at + chrono::TimeDelta::hours(1),
                 }],
             )
             .await
             .expect("repeat merged save"),
-        0
+        PersistedPullRequestStateSaveSummary::default()
     );
 
     let first_page = store
-        .load_project_pull_request_reviews(project_id, 1, 3)
+        .load_project_pull_request_reviews(project_id, 1, 4)
         .await
         .expect("first page");
     let second_page = store
-        .load_project_pull_request_reviews(project_id, 2, 3)
+        .load_project_pull_request_reviews(project_id, 2, 4)
         .await
         .expect("second page");
     assert_eq!(
         first_page
             .reviews
             .iter()
-            .map(|review| (review.pr, review.merge_state))
+            .map(|review| (review.pr, review.lifecycle_state))
             .collect::<Vec<_>>(),
         vec![
-            (11, ProjectPullRequestMergeState::NotMerged),
-            (10, ProjectPullRequestMergeState::NotMerged),
-            (12, ProjectPullRequestMergeState::NotMerged),
+            (16, ProjectPullRequestLifecycleState::Open),
+            (15, ProjectPullRequestLifecycleState::Open),
+            (11, ProjectPullRequestLifecycleState::Open),
+            (10, ProjectPullRequestLifecycleState::Open),
         ]
     );
     assert_eq!(
         second_page
             .reviews
             .iter()
-            .map(|review| (review.pr, review.merge_state, review.merged_at))
+            .map(|review| (review.pr, review.lifecycle_state, review.state_changed_at))
             .collect::<Vec<_>>(),
         vec![
-            (14, ProjectPullRequestMergeState::Merged, Some(detected_at)),
-            (13, ProjectPullRequestMergeState::Merged, Some(detected_at)),
+            (12, ProjectPullRequestLifecycleState::Open, None),
+            (
+                13,
+                ProjectPullRequestLifecycleState::Merged,
+                Some(detected_at)
+            ),
+            (
+                14,
+                ProjectPullRequestLifecycleState::Closed,
+                Some(detected_at)
+            ),
         ]
     );
     assert_eq!(
         store
-            .load_unmerged_project_review_prs(project_id)
+            .load_refreshable_project_review_prs(project_id)
             .await
             .expect("load unmerged pull requests"),
-        vec![10, 11, 12]
+        vec![10, 11, 12, 14, 15, 16]
     );
-    assert!(
+    assert_eq!(
         store
-            .is_project_pull_request_merged(project_id, 13)
+            .load_project_pull_request_state(project_id, 13)
             .await
-            .expect("merged lookup")
+            .expect("merged lookup"),
+        Some(ProjectPullRequestLifecycleState::Merged)
+    );
+    assert_eq!(
+        store
+            .load_project_pull_request_state(project_id, 14)
+            .await
+            .expect("closed lookup"),
+        Some(ProjectPullRequestLifecycleState::Closed)
     );
 }
 
 #[tokio::test]
-async fn merged_pull_request_state_is_isolated_by_project() {
+async fn pull_request_lifecycle_state_is_isolated_by_project() {
     let (_dir, store) = store().await;
     let merged_project = Uuid::new_v4();
     let open_project = Uuid::new_v4();
@@ -2583,11 +2632,12 @@ async fn merged_pull_request_state_is_isolated_by_project() {
     }
     let timestamp = Utc::now();
     store
-        .save_merged_project_pull_requests(
+        .save_pull_request_state_observations(
             merged_project,
-            vec![PersistedMergedPullRequest {
+            vec![PersistedPullRequestStateObservation {
                 pr: 42,
-                merged_at: timestamp,
+                state: ProjectPullRequestLifecycleState::Merged,
+                state_changed_at: Some(timestamp),
                 detected_at: timestamp,
             }],
         )
@@ -2596,29 +2646,31 @@ async fn merged_pull_request_state_is_isolated_by_project() {
 
     assert_eq!(
         store
-            .load_unmerged_project_review_prs(merged_project)
+            .load_refreshable_project_review_prs(merged_project)
             .await
             .expect("merged project"),
         Vec::<u64>::new()
     );
     assert_eq!(
         store
-            .load_unmerged_project_review_prs(open_project)
+            .load_refreshable_project_review_prs(open_project)
             .await
             .expect("open project"),
         vec![42]
     );
-    assert!(
+    assert_eq!(
         store
-            .is_project_pull_request_merged(merged_project, 42)
+            .load_project_pull_request_state(merged_project, 42)
             .await
-            .expect("merged lookup")
+            .expect("merged lookup"),
+        Some(ProjectPullRequestLifecycleState::Merged)
     );
-    assert!(
-        !store
-            .is_project_pull_request_merged(open_project, 42)
+    assert_eq!(
+        store
+            .load_project_pull_request_state(open_project, 42)
             .await
-            .expect("open lookup")
+            .expect("open lookup"),
+        None
     );
     assert_eq!(
         store
@@ -2626,43 +2678,110 @@ async fn merged_pull_request_state_is_isolated_by_project() {
             .await
             .expect("open aggregate")
             .reviews[0]
-            .merge_state,
-        ProjectPullRequestMergeState::NotMerged
+            .lifecycle_state,
+        ProjectPullRequestLifecycleState::Open
     );
 }
 
 #[tokio::test]
-async fn merged_pull_request_cannot_be_enqueued_through_atomic_admission() {
+async fn non_open_pull_requests_cannot_be_enqueued_through_atomic_admission() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let timestamp = Utc::now();
+    for (pr, state) in [
+        (42, ProjectPullRequestLifecycleState::Merged),
+        (43, ProjectPullRequestLifecycleState::Closed),
+    ] {
+        store
+            .save_pull_request_state_observations(
+                project_id,
+                vec![PersistedPullRequestStateObservation {
+                    pr,
+                    state,
+                    state_changed_at: Some(timestamp),
+                    detected_at: timestamp,
+                }],
+            )
+            .await
+            .expect("save terminal state");
+
+        let result = store
+            .enqueue_reviewable_project_review_job(test_review_job(
+                project_id,
+                pr,
+                "terminal-head",
+                None,
+            ))
+            .await
+            .expect("terminal admission");
+        assert!(matches!(
+            result,
+            ProjectReviewReviewableJobEnqueueResult::NotOpen(actual) if actual == state
+        ));
+        assert!(
+            store
+                .load_project_pull_request_review_history(project_id, pr, 1, 20)
+                .await
+                .expect("review history")
+                .items
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn reopened_pull_request_clears_closed_state_and_becomes_reviewable() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
     let timestamp = Utc::now();
     store
-        .save_merged_project_pull_requests(
+        .save_pull_request_state_observations(
             project_id,
-            vec![PersistedMergedPullRequest {
+            vec![PersistedPullRequestStateObservation {
                 pr: 42,
-                merged_at: timestamp,
+                state: ProjectPullRequestLifecycleState::Closed,
+                state_changed_at: Some(timestamp),
                 detected_at: timestamp,
             }],
         )
         .await
-        .expect("save merged state");
-
-    let result = store
-        .enqueue_unmerged_project_review_job(test_review_job(project_id, 42, "merged-head", None))
-        .await
-        .expect("merged admission");
-    assert!(matches!(
-        result,
-        ProjectReviewUnmergedJobEnqueueResult::Merged
-    ));
-    assert!(
+        .expect("save closed state");
+    assert_eq!(
         store
-            .load_project_pull_request_review_history(project_id, 42, 1, 20)
+            .load_refreshable_project_review_prs(project_id)
             .await
-            .expect("review history")
-            .items
-            .is_empty()
+            .expect("refreshable before a job exists"),
+        Vec::<u64>::new()
+    );
+    store
+        .save_project_review_job(test_review_job(project_id, 42, "reopened-head", None))
+        .await
+        .expect("save review history");
+    assert_eq!(
+        store
+            .load_refreshable_project_review_prs(project_id)
+            .await
+            .expect("closed state remains refreshable"),
+        vec![42]
+    );
+    store
+        .save_pull_request_state_observations(
+            project_id,
+            vec![PersistedPullRequestStateObservation {
+                pr: 42,
+                state: ProjectPullRequestLifecycleState::Open,
+                state_changed_at: None,
+                detected_at: timestamp,
+            }],
+        )
+        .await
+        .expect("save reopened state");
+    assert_eq!(
+        store
+            .load_project_pull_request_state(project_id, 42)
+            .await
+            .expect("reopened state"),
+        None
     );
 }
 

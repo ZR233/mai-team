@@ -627,15 +627,16 @@ impl AgentRuntime {
                 continue;
             }
             if admission == ProjectReviewEnqueueAdmission::ManualRequest
-                && self
+                && let Some(state) = self
                     .deps
                     .store
-                    .is_project_pull_request_merged(project_id, signal.pr)
+                    .load_project_pull_request_state(project_id, signal.pr)
                     .await?
             {
-                return Err(RuntimeError::PullRequestMerged {
+                return Err(RuntimeError::PullRequestNotOpen {
                     project_id,
                     pr: signal.pr,
+                    state,
                 });
             }
             if admission == ProjectReviewEnqueueAdmission::ManualRequest
@@ -688,16 +689,17 @@ impl AgentRuntime {
                 match self
                     .deps
                     .store
-                    .enqueue_unmerged_project_review_job(candidate)
+                    .enqueue_reviewable_project_review_job(candidate)
                     .await?
                 {
-                    mai_store::ProjectReviewUnmergedJobEnqueueResult::Merged => {
-                        return Err(RuntimeError::PullRequestMerged {
+                    mai_store::ProjectReviewReviewableJobEnqueueResult::NotOpen(state) => {
+                        return Err(RuntimeError::PullRequestNotOpen {
                             project_id,
                             pr: signal.pr,
+                            state,
                         });
                     }
-                    mai_store::ProjectReviewUnmergedJobEnqueueResult::Enqueued(queued) => *queued,
+                    mai_store::ProjectReviewReviewableJobEnqueueResult::Enqueued(queued) => *queued,
                 }
             } else {
                 self.deps

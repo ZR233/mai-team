@@ -56,7 +56,7 @@ describe("pull request review pagination", () => {
   it("shows merged as the aggregate result and removes re-review actions", async () => {
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input)
-      if (path.endsWith("/merge-status/refresh")) return jsonResponse({ checked: 0, newly_merged: 0 })
+      if (path.endsWith("/lifecycle-status/refresh")) return jsonResponse({ checked: 0, newly_merged: 0, newly_closed: 0 })
       if (path.includes("/pull-request-reviews/42/history")) return jsonResponse({
         items: [{ job: approvedJob("approved-job", 42), has_attempts: false }],
         page: 1,
@@ -81,7 +81,35 @@ describe("pull request review pagination", () => {
     expect(screen.queryByRole("button", { name: "Re-review" })).not.toBeInTheDocument()
   })
 
-  it("renders local results before the background merge refresh and refetches once complete", async () => {
+  it("shows closed after refresh and removes re-review actions while retaining history", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.endsWith("/lifecycle-status/refresh")) return jsonResponse({ checked: 0, newly_merged: 0, newly_closed: 0 })
+      if (path.includes("/pull-request-reviews/43/history")) return jsonResponse({
+        items: [{ job: approvedJob("closed-job", 43), has_attempts: false }],
+        page: 1,
+        page_size: 20,
+        total_items: 1,
+        total_pages: 1,
+      })
+      return jsonResponse({
+        ...reviewPage([review(43, approvedJob("closed-job", 43), 1, "closed")], 1),
+        total_items: 1,
+        total_pages: 1,
+      })
+    }))
+    renderWithQuery(<ReviewPanelHarness />)
+
+    expect(await screen.findAllByText("Closed")).not.toHaveLength(0)
+    await userEvent.click(screen.getAllByRole("button", { name: "Actions for PR #43" })[0])
+    expect(screen.queryByRole("menuitem", { name: "Re-review" })).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole("menuitem", { name: "View details" }))
+    expect(await screen.findByText("Pull request closed")).toBeVisible()
+    expect(screen.getByText("Approved")).toBeVisible()
+    expect(screen.queryByRole("button", { name: "Re-review" })).not.toBeInTheDocument()
+  })
+
+  it("renders local results before the background lifecycle refresh and refetches once complete", async () => {
     let merged = false
     let listRequests = 0
     let refreshRequests = 0
@@ -89,15 +117,15 @@ describe("pull request review pagination", () => {
     const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve })
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input)
-      if (path.endsWith("/merge-status/refresh")) {
+      if (path.endsWith("/lifecycle-status/refresh")) {
         refreshRequests += 1
         await refreshGate
         merged = true
-        return jsonResponse({ checked: 1, newly_merged: 1 })
+        return jsonResponse({ checked: 1, newly_merged: 1, newly_closed: 0 })
       }
       listRequests += 1
       return jsonResponse({
-        ...reviewPage([review(42, approvedJob("approved-job", 42), 1, merged ? "merged" : "not_merged")], 1),
+        ...reviewPage([review(42, approvedJob("approved-job", 42), 1, merged ? "merged" : "open")], 1),
         total_items: 1,
         total_pages: 1,
       })
@@ -112,11 +140,11 @@ describe("pull request review pagination", () => {
     expect(refreshRequests).toBe(1)
   })
 
-  it("keeps local review data and refetches after a merge refresh failure", async () => {
+  it("keeps local review data and refetches after a lifecycle refresh failure", async () => {
     let listRequests = 0
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input)
-      if (path.endsWith("/merge-status/refresh")) return jsonResponse({ error: "GitHub unavailable" }, 503)
+      if (path.endsWith("/lifecycle-status/refresh")) return jsonResponse({ error: "GitHub unavailable" }, 503)
       listRequests += 1
       return jsonResponse({
         ...reviewPage([review(42, approvedJob("approved-job", 42))], 1),
@@ -135,7 +163,7 @@ describe("pull request review pagination", () => {
     let queueRequests = 0
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)
-      if (path.endsWith("/merge-status/refresh")) return jsonResponse({ checked: 1, newly_merged: 0 })
+      if (path.endsWith("/lifecycle-status/refresh")) return jsonResponse({ checked: 1, newly_merged: 0, newly_closed: 0 })
       if (path.endsWith("/pull-requests/42/review") && init?.method === "POST") {
         queueRequests += 1
         return jsonResponse({ error: "pull request #42 is already merged" }, 409)
@@ -261,8 +289,8 @@ function approvedJob(id: string, pr: number): ReviewJobSummary {
   return value
 }
 
-function review(pr: number, latestJob: ReviewJobSummary, historyCount = 1, mergeState: PullRequestReviewSummary["merge_state"] = "not_merged"): PullRequestReviewSummary {
-  return { pr, latest_job: latestJob, history_count: historyCount, merge_state: mergeState, merged_at: mergeState === "merged" ? "2026-08-12T00:00:00Z" : null }
+function review(pr: number, latestJob: ReviewJobSummary, historyCount = 1, lifecycleState: PullRequestReviewSummary["lifecycle_state"] = "open"): PullRequestReviewSummary {
+  return { pr, latest_job: latestJob, history_count: historyCount, lifecycle_state: lifecycleState, state_changed_at: lifecycleState === "open" ? null : "2026-08-12T00:00:00Z" }
 }
 
 function reviewPage(reviews: PullRequestReviewSummary[], page: number) {

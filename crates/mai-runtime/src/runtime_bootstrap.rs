@@ -135,7 +135,7 @@ impl AgentRuntime {
             sidecar_image,
             github_api_base_url,
             github_get_cache: github::GithubGetCache::default(),
-            merged_pull_request_refreshes: github::MergedPullRequestRefreshCoordinator::default(),
+            pull_request_state_refreshes: github::PullRequestStateRefreshCoordinator::default(),
             workspace_manager,
         });
         runtime.reconcile_project_workspaces().await?;

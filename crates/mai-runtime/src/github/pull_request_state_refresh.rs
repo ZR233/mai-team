@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use mai_protocol::{ProjectId, ProjectPullRequestMergeRefreshSummary};
+use mai_protocol::{ProjectId, ProjectPullRequestStateRefreshSummary};
 use reqwest::StatusCode;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
@@ -44,23 +44,23 @@ enum SharedRefreshError {
 }
 
 type SharedRefreshResult =
-    std::result::Result<ProjectPullRequestMergeRefreshSummary, SharedRefreshError>;
+    std::result::Result<ProjectPullRequestStateRefreshSummary, SharedRefreshError>;
 
 enum RefreshRole {
     Leader { generation: u64 },
     Follower { generation: u64 },
 }
 
-/// 协调同一项目的 merged 状态刷新，并限制跨项目的 GitHub 查询并发。
+/// 协调同一项目的 PR 生命周期状态刷新，并限制跨项目的 GitHub 查询并发。
 ///
 /// 每个项目同时只有一个 leader；完成或取消时由 guard 原子发布结果、移除
 /// flight 并唤醒所有 follower，防止请求取消后留下永久等待的订阅者。
-pub(crate) struct MergedPullRequestRefreshCoordinator {
+pub(crate) struct PullRequestStateRefreshCoordinator {
     entries: Mutex<HashMap<ProjectId, Arc<RefreshEntry>>>,
     github_queries: Arc<Semaphore>,
 }
 
-impl Default for MergedPullRequestRefreshCoordinator {
+impl Default for PullRequestStateRefreshCoordinator {
     fn default() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
@@ -69,15 +69,15 @@ impl Default for MergedPullRequestRefreshCoordinator {
     }
 }
 
-impl MergedPullRequestRefreshCoordinator {
+impl PullRequestStateRefreshCoordinator {
     pub(crate) async fn run<Operation, OperationFuture>(
         &self,
         project_id: ProjectId,
         operation: Operation,
-    ) -> Result<ProjectPullRequestMergeRefreshSummary>
+    ) -> Result<ProjectPullRequestStateRefreshSummary>
     where
         Operation: FnOnce() -> OperationFuture,
-        OperationFuture: Future<Output = Result<ProjectPullRequestMergeRefreshSummary>>,
+        OperationFuture: Future<Output = Result<ProjectPullRequestStateRefreshSummary>>,
     {
         let entry = {
             let mut entries = lock(&self.entries);
@@ -117,7 +117,7 @@ impl MergedPullRequestRefreshCoordinator {
     async fn wait_for_result(
         entry: &RefreshEntry,
         generation: u64,
-    ) -> Result<ProjectPullRequestMergeRefreshSummary> {
+    ) -> Result<ProjectPullRequestStateRefreshSummary> {
         loop {
             let notified = entry.notify.notified();
             tokio::pin!(notified);
@@ -138,7 +138,7 @@ impl MergedPullRequestRefreshCoordinator {
         Arc::clone(&self.github_queries)
             .acquire_owned()
             .await
-            .map_err(|error| RuntimeError::MergedPullRequestRefresh(error.to_string()))
+            .map_err(|error| RuntimeError::PullRequestStateRefresh(error.to_string()))
     }
 
     fn finish(
@@ -166,7 +166,7 @@ impl MergedPullRequestRefreshCoordinator {
 }
 
 struct RefreshLeaderGuard<'a> {
-    coordinator: &'a MergedPullRequestRefreshCoordinator,
+    coordinator: &'a PullRequestStateRefreshCoordinator,
     project_id: ProjectId,
     entry: Arc<RefreshEntry>,
     generation: u64,
@@ -175,7 +175,7 @@ struct RefreshLeaderGuard<'a> {
 
 impl<'a> RefreshLeaderGuard<'a> {
     fn new(
-        coordinator: &'a MergedPullRequestRefreshCoordinator,
+        coordinator: &'a PullRequestStateRefreshCoordinator,
         project_id: ProjectId,
         entry: Arc<RefreshEntry>,
         generation: u64,
@@ -206,7 +206,7 @@ impl Drop for RefreshLeaderGuard<'_> {
             &self.entry,
             self.generation,
             Err(SharedRefreshError::Internal(
-                "merged pull request refresh was cancelled".to_string(),
+                "pull request state refresh was cancelled".to_string(),
             )),
         );
     }
@@ -232,7 +232,7 @@ impl From<RuntimeError> for SharedRefreshError {
     }
 }
 
-fn shared_result(result: SharedRefreshResult) -> Result<ProjectPullRequestMergeRefreshSummary> {
+fn shared_result(result: SharedRefreshResult) -> Result<ProjectPullRequestStateRefreshSummary> {
     result.map_err(|error| match error {
         SharedRefreshError::GithubUnavailable {
             operation,
@@ -246,7 +246,7 @@ fn shared_result(result: SharedRefreshResult) -> Result<ProjectPullRequestMergeR
             retry_after,
         },
         SharedRefreshError::InvalidInput(message) => RuntimeError::InvalidInput(message),
-        SharedRefreshError::Internal(message) => RuntimeError::MergedPullRequestRefresh(message),
+        SharedRefreshError::Internal(message) => RuntimeError::PullRequestStateRefresh(message),
     })
 }
 
@@ -264,7 +264,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_project_refreshes_share_the_same_execution() {
-        let coordinator = Arc::new(MergedPullRequestRefreshCoordinator::default());
+        let coordinator = Arc::new(PullRequestStateRefreshCoordinator::default());
         let project_id = ProjectId::new_v4();
         let calls = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
@@ -306,7 +306,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_leader_releases_followers_and_allows_retry() {
-        let coordinator = Arc::new(MergedPullRequestRefreshCoordinator::default());
+        let coordinator = Arc::new(PullRequestStateRefreshCoordinator::default());
         let project_id = ProjectId::new_v4();
         let calls = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
@@ -335,7 +335,7 @@ mod tests {
             .expect("follower must be released")
             .expect("follower task")
             .expect_err("cancelled refresh must fail");
-        assert!(matches!(error, RuntimeError::MergedPullRequestRefresh(_)));
+        assert!(matches!(error, RuntimeError::PullRequestStateRefresh(_)));
         assert_eq!(
             coordinator
                 .run(project_id, || async { Ok(summary(4, 2)) })
@@ -347,7 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_execution_is_shared_and_next_request_retries() {
-        let coordinator = Arc::new(MergedPullRequestRefreshCoordinator::default());
+        let coordinator = Arc::new(PullRequestStateRefreshCoordinator::default());
         let project_id = ProjectId::new_v4();
         let calls = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
@@ -403,12 +403,12 @@ mod tests {
     }
 
     fn spawn_refresh(
-        coordinator: Arc<MergedPullRequestRefreshCoordinator>,
+        coordinator: Arc<PullRequestStateRefreshCoordinator>,
         project_id: ProjectId,
         calls: Arc<AtomicUsize>,
         started: Arc<Notify>,
         release: Arc<Notify>,
-    ) -> tokio::task::JoinHandle<Result<ProjectPullRequestMergeRefreshSummary>> {
+    ) -> tokio::task::JoinHandle<Result<ProjectPullRequestStateRefreshSummary>> {
         tokio::spawn(async move {
             coordinator
                 .run(project_id, || async move {
@@ -421,10 +421,11 @@ mod tests {
         })
     }
 
-    fn summary(checked: usize, newly_merged: usize) -> ProjectPullRequestMergeRefreshSummary {
-        ProjectPullRequestMergeRefreshSummary {
+    fn summary(checked: usize, newly_merged: usize) -> ProjectPullRequestStateRefreshSummary {
+        ProjectPullRequestStateRefreshSummary {
             checked,
             newly_merged,
+            newly_closed: 0,
         }
     }
 }

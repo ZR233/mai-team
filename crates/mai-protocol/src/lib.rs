@@ -151,11 +151,27 @@ pub enum ProjectReviewJobStatus {
 }
 
 impl ProjectReviewJobStatus {
+    pub const ACTIVE: [Self; 6] = [
+        Self::Queued,
+        Self::Preparing,
+        Self::Running,
+        Self::RetryWaiting,
+        Self::SubmissionPending,
+        Self::Reconciling,
+    ];
+
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Superseded | Self::Skipped
-        )
+        match self {
+            Self::Queued
+            | Self::Preparing
+            | Self::Running
+            | Self::RetryWaiting
+            | Self::SubmissionPending
+            | Self::Reconciling => false,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Superseded | Self::Skipped => {
+                true
+            }
+        }
     }
 }
 
@@ -618,12 +634,25 @@ pub struct ProjectPullRequestReviewStatusSummary {
     pub failed: usize,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    Default,
+    strum::Display,
+    strum::EnumString,
+)]
 #[serde(rename_all = "snake_case")]
-pub enum ProjectPullRequestMergeState {
+#[strum(serialize_all = "snake_case")]
+pub enum ProjectPullRequestLifecycleState {
     #[default]
-    NotMerged,
+    Open,
     Merged,
+    Closed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -632,15 +661,16 @@ pub struct ProjectPullRequestReviewSummary {
     pub latest_job: ProjectReviewJobSummary,
     pub history_count: usize,
     #[serde(default)]
-    pub merge_state: ProjectPullRequestMergeState,
+    pub lifecycle_state: ProjectPullRequestLifecycleState,
     #[serde(default)]
-    pub merged_at: Option<DateTime<Utc>>,
+    pub state_changed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProjectPullRequestMergeRefreshSummary {
+pub struct ProjectPullRequestStateRefreshSummary {
     pub checked: usize,
     pub newly_merged: usize,
+    pub newly_closed: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

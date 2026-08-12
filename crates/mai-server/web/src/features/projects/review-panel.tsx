@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
 
 import { api } from "@/api/client"
-import type { ProjectDetail, PullRequestMergeRefreshSummary, PullRequestReviewSummary, ReviewJobSummary } from "@/api/product-types"
+import type { ProjectDetail, PullRequestStateRefreshSummary, PullRequestReviewSummary, ReviewJobSummary } from "@/api/product-types"
 import { projectPullRequestReviewsQuery, queryKeys } from "@/api/queries"
 import { PagePagination } from "@/components/page-pagination"
 import { EmptyState, ErrorState, LoadingState } from "@/components/page-state"
@@ -61,19 +61,19 @@ export function ReviewPanel({ project, page, onPageChange }: ReviewPanelProps) {
       await queryClient.invalidateQueries({ queryKey: ["projects", project.id], exact: false })
     },
   })
-  const refreshMergeStatus = useMutation({
-    mutationFn: () => api<PullRequestMergeRefreshSummary>(`/projects/${project.id}/pull-request-reviews/merge-status/refresh`, { method: "POST" }),
-    onError: (error) => toast.error(`Merged status refresh failed: ${error.message}`),
+  const refreshLifecycleStatus = useMutation({
+    mutationFn: () => api<PullRequestStateRefreshSummary>(`/projects/${project.id}/pull-request-reviews/lifecycle-status/refresh`, { method: "POST" }),
+    onError: (error) => toast.error(`Pull request status refresh failed: ${error.message}`),
     onSettled: async () => {
       await queryClient.invalidateQueries({ queryKey: queryKeys.projectPullRequestReviews(project.id), exact: false })
     },
   })
-  const startMergeRefresh = refreshMergeStatus.mutate
+  const startLifecycleRefresh = refreshLifecycleStatus.mutate
   useEffect(() => {
     if (refreshedProject.current === project.id) return
     refreshedProject.current = project.id
-    startMergeRefresh()
-  }, [project.id, startMergeRefresh])
+    startLifecycleRefresh()
+  }, [project.id, startLifecycleRefresh])
   useEffect(() => {
     setSelectedReview(null)
   }, [page])

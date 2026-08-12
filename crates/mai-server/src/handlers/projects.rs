@@ -7,8 +7,8 @@ use serde::Deserialize;
 
 use mai_protocol::{
     AgentId, CreateProjectRequest, CreateProjectResponse, ProjectId,
-    ProjectPullRequestMergeRefreshSummary, ProjectPullRequestReviewHistoryPage,
-    ProjectPullRequestReviewPage, ProjectReviewJobDetail, ProjectReviewQueueResponse,
+    ProjectPullRequestReviewHistoryPage, ProjectPullRequestReviewPage,
+    ProjectPullRequestStateRefreshSummary, ProjectReviewJobDetail, ProjectReviewQueueResponse,
     ProjectReviewRunDetail, ProjectReviewRunsResponse, SendMessageRequest, SendMessageResponse,
     SkillsListResponse, UpdateProjectRequest, UpdateProjectResponse,
 };
@@ -135,15 +135,12 @@ pub(crate) async fn list_project_pull_request_review_history(
     ))
 }
 
-pub(crate) async fn refresh_project_pull_request_merge_status(
+pub(crate) async fn refresh_project_pull_request_state(
     State(state): State<Arc<AppState>>,
     Path(id): Path<ProjectId>,
-) -> std::result::Result<Json<ProjectPullRequestMergeRefreshSummary>, ApiError> {
+) -> std::result::Result<Json<ProjectPullRequestStateRefreshSummary>, ApiError> {
     Ok(Json(
-        state
-            .runtime
-            .refresh_project_pull_request_merge_status(id)
-            .await?,
+        state.runtime.refresh_project_pull_request_state(id).await?,
     ))
 }
 

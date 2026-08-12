@@ -1,55 +1,58 @@
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
-use mai_protocol::{ProjectId, ProjectPullRequestMergeRefreshSummary};
-use mai_store::{MaiStore, PersistedMergedPullRequest};
+use mai_protocol::{
+    ProjectId, ProjectPullRequestLifecycleState, ProjectPullRequestStateRefreshSummary,
+};
+use mai_store::{MaiStore, PersistedPullRequestStateObservation};
 use reqwest::StatusCode;
 use serde_json::{Map, Value, json};
 
 use super::{
-    MergedPullRequestRefreshCoordinator, decode_github_response, github_api_url, github_headers,
+    PullRequestStateRefreshCoordinator, decode_github_response, github_api_url, github_headers,
     retry_github_request,
 };
 use crate::{AgentRuntime, Result, RuntimeError};
 
-const MERGE_QUERY_BATCH_SIZE: usize = 50;
+const STATE_QUERY_BATCH_SIZE: usize = 50;
 const PROJECT_QUERY_CONCURRENCY: usize = 2;
 impl AgentRuntime {
-    pub async fn refresh_project_pull_request_merge_status(
+    pub async fn refresh_project_pull_request_state(
         &self,
         project_id: ProjectId,
-    ) -> Result<ProjectPullRequestMergeRefreshSummary> {
-        self.merged_pull_request_refreshes
+    ) -> Result<ProjectPullRequestStateRefreshSummary> {
+        self.pull_request_state_refreshes
             .run(project_id, || {
-                self.refresh_project_pull_request_merge_status_inner(project_id)
+                self.refresh_project_pull_request_state_inner(project_id)
             })
             .await
     }
 
-    async fn refresh_project_pull_request_merge_status_inner(
+    async fn refresh_project_pull_request_state_inner(
         &self,
         project_id: ProjectId,
-    ) -> Result<ProjectPullRequestMergeRefreshSummary> {
+    ) -> Result<ProjectPullRequestStateRefreshSummary> {
         let project = self.project(project_id).await?;
         let project = project.summary.read().await.clone();
         let pull_requests = self
             .deps
             .store
-            .load_unmerged_project_review_prs(project_id)
+            .load_refreshable_project_review_prs(project_id)
             .await?;
         let checked = pull_requests.len();
         if pull_requests.is_empty() {
-            return Ok(ProjectPullRequestMergeRefreshSummary {
+            return Ok(ProjectPullRequestStateRefreshSummary {
                 checked,
                 newly_merged: 0,
+                newly_closed: 0,
             });
         }
         let token = self.project_git_token(project_id).await?.ok_or_else(|| {
             RuntimeError::InvalidInput("project git account token is not configured".to_string())
         })?;
         refresh_known_pull_requests(
-            MergeRefreshContext {
+            StateRefreshContext {
                 store: &self.deps.store,
-                coordinator: &self.merged_pull_request_refreshes,
+                coordinator: &self.pull_request_state_refreshes,
                 http: &self.deps.github_http,
                 github_api_base_url: &self.github_api_base_url,
                 project_id,
@@ -63,9 +66,9 @@ impl AgentRuntime {
     }
 }
 
-struct MergeRefreshContext<'a> {
+struct StateRefreshContext<'a> {
     store: &'a MaiStore,
-    coordinator: &'a MergedPullRequestRefreshCoordinator,
+    coordinator: &'a PullRequestStateRefreshCoordinator,
     http: &'a reqwest::Client,
     github_api_base_url: &'a str,
     project_id: ProjectId,
@@ -75,12 +78,12 @@ struct MergeRefreshContext<'a> {
 }
 
 async fn refresh_known_pull_requests(
-    context: MergeRefreshContext<'_>,
+    context: StateRefreshContext<'_>,
     pull_requests: Vec<u64>,
-) -> Result<ProjectPullRequestMergeRefreshSummary> {
+) -> Result<ProjectPullRequestStateRefreshSummary> {
     let checked = pull_requests.len();
     let batches = pull_requests
-        .chunks(MERGE_QUERY_BATCH_SIZE)
+        .chunks(STATE_QUERY_BATCH_SIZE)
         .map(<[u64]>::to_vec)
         .collect::<Vec<_>>();
     let results = stream::iter(batches)
@@ -90,7 +93,7 @@ async fn refresh_known_pull_requests(
             let repo = context.repo.to_string();
             async move {
                 let _permit = context.coordinator.acquire_github_query().await?;
-                query_merged_pull_requests(
+                query_pull_request_states(
                     context.http,
                     context.github_api_base_url,
                     &token,
@@ -105,61 +108,63 @@ async fn refresh_known_pull_requests(
         .collect::<Vec<_>>()
         .await;
     let detected_at = Utc::now();
-    let mut merged = Vec::new();
+    let mut observations = Vec::new();
     let mut incomplete = false;
     for result in results {
         match result {
             Ok(batch) => {
                 incomplete |= !batch.complete;
-                merged.extend(batch.merged.into_iter().map(|(pr, merged_at)| {
-                    PersistedMergedPullRequest {
+                observations.extend(batch.observations.into_iter().map(
+                    |(pr, state, state_changed_at)| PersistedPullRequestStateObservation {
                         pr,
-                        merged_at,
+                        state,
+                        state_changed_at,
                         detected_at,
-                    }
-                }));
+                    },
+                ));
             }
             Err(error) => {
-                tracing::warn!(project_id = %context.project_id, error = %error, "merged PR batch refresh failed");
+                tracing::warn!(project_id = %context.project_id, error = %error, "PR state batch refresh failed");
                 incomplete = true;
             }
         }
     }
-    let newly_merged = context
+    let saved = context
         .store
-        .save_merged_project_pull_requests(context.project_id, merged)
+        .save_pull_request_state_observations(context.project_id, observations)
         .await?;
     if incomplete {
         return Err(RuntimeError::GithubUnavailable {
-            operation: "refresh merged pull requests".to_string(),
+            operation: "refresh pull request states".to_string(),
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: "one or more GitHub GraphQL batches were incomplete".to_string(),
             retry_after: None,
         });
     }
-    Ok(ProjectPullRequestMergeRefreshSummary {
+    Ok(ProjectPullRequestStateRefreshSummary {
         checked,
-        newly_merged,
+        newly_merged: saved.newly_merged,
+        newly_closed: saved.newly_closed,
     })
 }
 
 #[derive(Debug)]
-struct MergedPullRequestBatch {
-    merged: Vec<(u64, DateTime<Utc>)>,
+struct PullRequestStateBatch {
+    observations: Vec<(u64, ProjectPullRequestLifecycleState, Option<DateTime<Utc>>)>,
     complete: bool,
 }
 
-async fn query_merged_pull_requests(
+async fn query_pull_request_states(
     http: &reqwest::Client,
     api_base_url: &str,
     token: &str,
     owner: &str,
     repo: &str,
     pull_requests: &[u64],
-) -> Result<MergedPullRequestBatch> {
-    let (query, variables) = merge_query(owner, repo, pull_requests)?;
+) -> Result<PullRequestStateBatch> {
+    let (query, variables) = state_query(owner, repo, pull_requests)?;
     let url = github_api_url(api_base_url, "/graphql");
-    let response = retry_github_request("refresh merged pull requests", || async {
+    let response = retry_github_request("refresh pull request states", || async {
         let response = http
             .post(&url)
             .bearer_auth(token)
@@ -167,13 +172,13 @@ async fn query_merged_pull_requests(
             .json(&json!({ "query": query, "variables": variables }))
             .send()
             .await?;
-        decode_github_response::<Value>(response, "refresh merged pull requests").await
+        decode_github_response::<Value>(response, "refresh pull request states").await
     })
     .await?;
-    decode_merge_query(response, pull_requests)
+    decode_state_query(response, pull_requests)
 }
 
-fn merge_query(owner: &str, repo: &str, pull_requests: &[u64]) -> Result<(String, Value)> {
+fn state_query(owner: &str, repo: &str, pull_requests: &[u64]) -> Result<(String, Value)> {
     let mut declarations = vec!["$owner: String!".to_string(), "$repo: String!".to_string()];
     let mut selections = Vec::new();
     let mut variables = Map::new();
@@ -185,13 +190,13 @@ fn merge_query(owner: &str, repo: &str, pull_requests: &[u64]) -> Result<(String
         })?;
         declarations.push(format!("$pr_{index}: Int!"));
         selections.push(format!(
-            "pr_{index}: pullRequest(number: $pr_{index}) {{ number state mergedAt }}"
+            "pr_{index}: pullRequest(number: $pr_{index}) {{ number state mergedAt closedAt }}"
         ));
         variables.insert(format!("pr_{index}"), Value::from(pr));
     }
     Ok((
         format!(
-            "query PullRequestMergeStates({}) {{ repository(owner: $owner, name: $repo) {{ {} }} }}",
+            "query PullRequestLifecycleStates({}) {{ repository(owner: $owner, name: $repo) {{ {} }} }}",
             declarations.join(", "),
             selections.join(" ")
         ),
@@ -199,7 +204,7 @@ fn merge_query(owner: &str, repo: &str, pull_requests: &[u64]) -> Result<(String
     ))
 }
 
-fn decode_merge_query(response: Value, pull_requests: &[u64]) -> Result<MergedPullRequestBatch> {
+fn decode_state_query(response: Value, pull_requests: &[u64]) -> Result<PullRequestStateBatch> {
     let mut complete = response
         .get("errors")
         .and_then(Value::as_array)
@@ -207,7 +212,7 @@ fn decode_merge_query(response: Value, pull_requests: &[u64]) -> Result<MergedPu
     let repository = response
         .pointer("/data/repository")
         .and_then(Value::as_object);
-    let mut merged = Vec::new();
+    let mut observations = Vec::new();
     for (index, expected_pr) in pull_requests.iter().enumerate() {
         let Some(value) = repository.and_then(|repository| repository.get(&format!("pr_{index}")))
         else {
@@ -222,28 +227,50 @@ fn decode_merge_query(response: Value, pull_requests: &[u64]) -> Result<MergedPu
             complete = false;
             continue;
         }
-        if object.get("state").and_then(Value::as_str) == Some("MERGED") {
-            let merged_at = object
-                .get("mergedAt")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    RuntimeError::InvalidInput(format!(
-                        "merged pull request #{expected_pr} is missing mergedAt"
-                    ))
-                })?;
-            merged.push((
-                *expected_pr,
-                DateTime::parse_from_rfc3339(merged_at)
+        let (state, timestamp_field) = match object.get("state").and_then(Value::as_str) {
+            Some("OPEN") => {
+                observations.push((*expected_pr, ProjectPullRequestLifecycleState::Open, None));
+                continue;
+            }
+            Some("MERGED") => (ProjectPullRequestLifecycleState::Merged, "mergedAt"),
+            Some("CLOSED") => (ProjectPullRequestLifecycleState::Closed, "closedAt"),
+            Some(state) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "pull request #{expected_pr} has unsupported lifecycle state `{state}`"
+                )));
+            }
+            None => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "pull request #{expected_pr} is missing lifecycle state"
+                )));
+            }
+        };
+        let timestamp = object
+            .get(timestamp_field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(format!(
+                    "{state} pull request #{expected_pr} is missing {timestamp_field}"
+                ))
+            })?;
+        observations.push((
+            *expected_pr,
+            state,
+            Some(
+                DateTime::parse_from_rfc3339(timestamp)
                     .map_err(|error| {
                         RuntimeError::InvalidInput(format!(
-                            "merged pull request #{expected_pr} has invalid mergedAt: {error}"
+                            "{state} pull request #{expected_pr} has invalid {timestamp_field}: {error}"
                         ))
                     })?
                     .with_timezone(&Utc),
-            ));
-        }
+            ),
+        ));
     }
-    Ok(MergedPullRequestBatch { merged, complete })
+    Ok(PullRequestStateBatch {
+        observations,
+        complete,
+    })
 }
 
 #[cfg(test)]
@@ -260,11 +287,12 @@ mod tests {
     use crate::projects::review::job::{NewProjectReviewJob, new_project_review_job};
 
     #[test]
-    fn merge_query_uses_typed_variables_for_every_pull_request() {
-        let pull_requests = (1..=MERGE_QUERY_BATCH_SIZE as u64).collect::<Vec<_>>();
-        let (query, variables) = merge_query("owner", "repo", &pull_requests).expect("query");
+    fn state_query_uses_typed_variables_for_every_pull_request() {
+        let pull_requests = (1..=STATE_QUERY_BATCH_SIZE as u64).collect::<Vec<_>>();
+        let (query, variables) = state_query("owner", "repo", &pull_requests).expect("query");
         assert!(query.contains("$pr_49: Int!"));
         assert!(query.contains("pr_49: pullRequest(number: $pr_49)"));
+        assert!(query.contains("state mergedAt closedAt"));
         assert_eq!(variables["owner"], "owner");
         assert_eq!(variables["repo"], "repo");
         assert_eq!(variables["pr_49"], 50);
@@ -273,7 +301,7 @@ mod tests {
     #[test]
     fn partial_graphql_response_retains_confirmed_merged_results() {
         let merged_at = "2026-08-12T02:00:00Z";
-        let batch = decode_merge_query(
+        let batch = decode_state_query(
             json!({
                 "data": { "repository": {
                     "pr_0": { "number": 10, "state": "MERGED", "mergedAt": merged_at },
@@ -285,36 +313,59 @@ mod tests {
         )
         .expect("partial response");
         assert_eq!(
-            batch.merged,
-            vec![(
-                10,
-                DateTime::parse_from_rfc3339(merged_at)
-                    .expect("merged at")
-                    .with_timezone(&Utc),
-            )]
+            batch.observations,
+            vec![
+                (
+                    10,
+                    ProjectPullRequestLifecycleState::Merged,
+                    Some(
+                        DateTime::parse_from_rfc3339(merged_at)
+                            .expect("merged at")
+                            .with_timezone(&Utc),
+                    ),
+                ),
+                (11, ProjectPullRequestLifecycleState::Open, None),
+            ]
         );
         assert!(!batch.complete);
     }
 
     #[test]
-    fn closed_without_merge_remains_eligible_for_future_refreshes() {
-        let batch = decode_merge_query(
+    fn closed_response_becomes_a_persisted_lifecycle_state() {
+        let closed_at = "2026-08-12T02:30:00Z";
+        let batch = decode_state_query(
             json!({
                 "data": { "repository": {
-                    "pr_0": { "number": 10, "state": "CLOSED", "mergedAt": null }
+                    "pr_0": {
+                        "number": 10,
+                        "state": "CLOSED",
+                        "mergedAt": null,
+                        "closedAt": closed_at
+                    }
                 }}
             }),
             &[10],
         )
         .expect("closed response");
-        assert_eq!(batch.merged, Vec::new());
+        assert_eq!(
+            batch.observations,
+            vec![(
+                10,
+                ProjectPullRequestLifecycleState::Closed,
+                Some(
+                    DateTime::parse_from_rfc3339(closed_at)
+                        .expect("closed at")
+                        .with_timezone(&Utc),
+                ),
+            )]
+        );
         assert!(batch.complete);
     }
 
     #[test]
     fn merged_response_requires_a_valid_merged_timestamp() {
         for merged_at in [Value::Null, Value::String("not-a-timestamp".to_string())] {
-            let error = decode_merge_query(
+            let error = decode_state_query(
                 json!({
                     "data": { "repository": {
                         "pr_0": { "number": 10, "state": "MERGED", "mergedAt": merged_at }
@@ -328,8 +379,43 @@ mod tests {
     }
 
     #[test]
+    fn closed_response_requires_a_valid_closed_timestamp() {
+        for closed_at in [Value::Null, Value::String("not-a-timestamp".to_string())] {
+            let error = decode_state_query(
+                json!({
+                    "data": { "repository": {
+                        "pr_0": {
+                            "number": 10,
+                            "state": "CLOSED",
+                            "mergedAt": null,
+                            "closedAt": closed_at
+                        }
+                    }}
+                }),
+                &[10],
+            )
+            .expect_err("invalid closedAt must fail");
+            assert!(matches!(error, RuntimeError::InvalidInput(_)));
+        }
+    }
+
+    #[test]
+    fn unsupported_lifecycle_state_is_rejected() {
+        let error = decode_state_query(
+            json!({
+                "data": { "repository": {
+                    "pr_0": { "number": 10, "state": "UNKNOWN" }
+                }}
+            }),
+            &[10],
+        )
+        .expect_err("unsupported state must fail");
+        assert!(matches!(error, RuntimeError::InvalidInput(_)));
+    }
+
+    #[test]
     fn mismatched_pull_request_number_marks_batch_incomplete() {
-        let batch = decode_merge_query(
+        let batch = decode_state_query(
             json!({
                 "data": { "repository": {
                     "pr_0": {
@@ -342,12 +428,12 @@ mod tests {
             &[10],
         )
         .expect("mismatched response");
-        assert_eq!(batch.merged, Vec::new());
+        assert_eq!(batch.observations, Vec::new());
         assert!(!batch.complete);
     }
 
     #[tokio::test]
-    async fn refresh_persists_confirmed_merges_and_excludes_them_from_next_query() {
+    async fn refresh_excludes_merged_but_rechecks_closed_and_clears_it_when_reopened() {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = test_store(&directory).await;
         let project_id = ProjectId::new_v4();
@@ -366,16 +452,26 @@ mod tests {
             }),
             json!({
                 "data": { "repository": {
-                    "pr_0": { "number": 11, "state": "CLOSED", "mergedAt": null }
+                    "pr_0": {
+                        "number": 11,
+                        "state": "CLOSED",
+                        "mergedAt": null,
+                        "closedAt": "2026-08-12T03:00:00Z"
+                    }
+                }}
+            }),
+            json!({
+                "data": { "repository": {
+                    "pr_0": { "number": 11, "state": "OPEN", "mergedAt": null, "closedAt": null }
                 }}
             }),
         ])
         .await;
-        let coordinator = MergedPullRequestRefreshCoordinator::default();
+        let coordinator = PullRequestStateRefreshCoordinator::default();
         let http = reqwest::Client::new();
 
         let first_pull_requests = store
-            .load_unmerged_project_review_prs(project_id)
+            .load_refreshable_project_review_prs(project_id)
             .await
             .expect("initial pull requests");
         let first = refresh_known_pull_requests(
@@ -386,20 +482,22 @@ mod tests {
         .expect("first refresh");
         assert_eq!(
             first,
-            ProjectPullRequestMergeRefreshSummary {
+            ProjectPullRequestStateRefreshSummary {
                 checked: 2,
                 newly_merged: 1,
+                newly_closed: 0,
             }
         );
-        assert!(
+        assert_eq!(
             store
-                .is_project_pull_request_merged(project_id, 10)
+                .load_project_pull_request_state(project_id, 10)
                 .await
-                .expect("merged lookup")
+                .expect("merged lookup"),
+            Some(ProjectPullRequestLifecycleState::Merged)
         );
 
         let remaining = store
-            .load_unmerged_project_review_prs(project_id)
+            .load_refreshable_project_review_prs(project_id)
             .await
             .expect("remaining pull requests");
         assert_eq!(remaining, vec![11]);
@@ -411,17 +509,51 @@ mod tests {
         .expect("second refresh");
         assert_eq!(
             second,
-            ProjectPullRequestMergeRefreshSummary {
+            ProjectPullRequestStateRefreshSummary {
                 checked: 1,
                 newly_merged: 0,
+                newly_closed: 1,
             }
         );
+        assert_eq!(
+            store
+                .load_project_pull_request_state(project_id, 11)
+                .await
+                .expect("closed lookup"),
+            Some(ProjectPullRequestLifecycleState::Closed)
+        );
+        let closed = store
+            .load_refreshable_project_review_prs(project_id)
+            .await
+            .expect("closed pull request remains refreshable");
+        assert_eq!(closed, vec![11]);
+        assert_eq!(
+            refresh_known_pull_requests(
+                refresh_context(&store, &coordinator, &http, &base_url, project_id),
+                closed,
+            )
+            .await
+            .expect("reopen refresh"),
+            ProjectPullRequestStateRefreshSummary {
+                checked: 1,
+                newly_merged: 0,
+                newly_closed: 0,
+            }
+        );
+        assert_eq!(
+            store
+                .load_project_pull_request_state(project_id, 11)
+                .await
+                .expect("reopened lookup"),
+            None
+        );
         let requests = requests.lock().await;
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert_eq!(requests[0]["variables"]["pr_0"], 10);
         assert_eq!(requests[0]["variables"]["pr_1"], 11);
         assert_eq!(requests[1]["variables"]["pr_0"], 11);
         assert!(requests[1]["variables"].get("pr_1").is_none());
+        assert_eq!(requests[2]["variables"]["pr_0"], 11);
     }
 
     #[tokio::test]
@@ -442,10 +574,10 @@ mod tests {
             "errors": [{ "message": "alias failed", "path": ["repository", "pr_1"] }]
         })])
         .await;
-        let coordinator = MergedPullRequestRefreshCoordinator::default();
+        let coordinator = PullRequestStateRefreshCoordinator::default();
         let http = reqwest::Client::new();
         let pull_requests = store
-            .load_unmerged_project_review_prs(project_id)
+            .load_refreshable_project_review_prs(project_id)
             .await
             .expect("pull requests");
 
@@ -458,15 +590,16 @@ mod tests {
         assert!(
             matches!(error, RuntimeError::GithubUnavailable { status, .. } if status == StatusCode::SERVICE_UNAVAILABLE)
         );
-        assert!(
+        assert_eq!(
             store
-                .is_project_pull_request_merged(project_id, 20)
+                .load_project_pull_request_state(project_id, 20)
                 .await
-                .expect("confirmed merge")
+                .expect("confirmed merge"),
+            Some(ProjectPullRequestLifecycleState::Merged)
         );
         assert_eq!(
             store
-                .load_unmerged_project_review_prs(project_id)
+                .load_refreshable_project_review_prs(project_id)
                 .await
                 .expect("unconfirmed pull requests"),
             vec![21]
@@ -475,12 +608,12 @@ mod tests {
 
     fn refresh_context<'a>(
         store: &'a MaiStore,
-        coordinator: &'a MergedPullRequestRefreshCoordinator,
+        coordinator: &'a PullRequestStateRefreshCoordinator,
         http: &'a reqwest::Client,
         base_url: &'a str,
         project_id: ProjectId,
-    ) -> MergeRefreshContext<'a> {
-        MergeRefreshContext {
+    ) -> StateRefreshContext<'a> {
+        StateRefreshContext {
             store,
             coordinator,
             http,

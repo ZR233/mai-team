@@ -226,12 +226,13 @@ pub(crate) struct ProjectReviewJobRecord {
 }
 
 #[derive(Debug, Clone, toasty::Model)]
-#[table = "project_merged_pull_requests"]
+#[table = "project_pull_request_states"]
 #[key(project_id, pr)]
-pub(crate) struct ProjectMergedPullRequestRecord {
+pub(crate) struct ProjectPullRequestStateRecord {
     pub(crate) project_id: String,
     pub(crate) pr: i64,
-    pub(crate) merged_at: String,
+    pub(crate) state: String,
+    pub(crate) state_changed_at: String,
     pub(crate) detected_at: String,
 }
 
