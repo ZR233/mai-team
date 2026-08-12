@@ -82,10 +82,11 @@ project、task、review、provider、settings 和资源列表使用独立 `MaiPr
 
 ## 持久化与恢复
 
-mai-store schema 28 分离产品 metadata 与 framework runtime state，并持久化 Thread actor、
+mai-store schema 29 分离产品 metadata 与 framework runtime state，持久化 Thread actor、
 mailbox、Turn、Item、interaction、transcript、inference、trace、notification 和 snapshot。一个
-Thread commit transaction 原子写入全部运行事实。生产服务不读取旧 schema；v27 数据只能在
-停服后通过 `mai-migrate-v27` 单事务迁移，失败时整体回滚。
+Thread commit transaction 原子写入全部运行事实，并以独立表保存 PR merged 终态。生产服务
+不读取旧 schema；v27 或 v28 数据只能在停服后通过 `mai-migrate-v27` 单事务迁移，失败时整体
+回滚。
 
 启动时先 reconcile 容器和 workspace，再注册恢复的 agent actors；遗留 Running turn标记为
 runtime restart 取消，资源 ready 后按 FIFO 恢复输入。

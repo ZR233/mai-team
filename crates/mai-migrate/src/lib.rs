@@ -11,8 +11,9 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, TransactionBehavior};
 use serde::Serialize;
 
-const SOURCE_SCHEMA: &str = "27";
-const TARGET_SCHEMA: &str = "28";
+const LEGACY_SCHEMA: &str = "27";
+const SOURCE_SCHEMA: &str = "28";
+const TARGET_SCHEMA: &str = "29";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,18 +35,23 @@ pub fn migrate_path(path: &Path) -> Result<MigrationReport> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version = schema::schema_version(&transaction)?;
     if version == TARGET_SCHEMA {
-        let report = schema::validate_target(&transaction, true)?;
+        let report = schema::validate_target(&transaction, TARGET_SCHEMA.to_string(), true)?;
         transaction.rollback()?;
         return Ok(report);
     }
-    if version != SOURCE_SCHEMA {
-        bail!("只支持从 schema {SOURCE_SCHEMA} 迁移，当前为 {version}");
+    let source_schema = version.clone();
+    match version.as_str() {
+        LEGACY_SCHEMA => {
+            schema::validate_legacy_source(&transaction)?;
+            let converted = legacy::convert(&transaction)?;
+            schema::install_v28(&transaction, &converted)?;
+            schema::validate_v28(&transaction)?;
+        }
+        SOURCE_SCHEMA => schema::validate_v28(&transaction)?,
+        _ => bail!("只支持从 schema {LEGACY_SCHEMA} 或 {SOURCE_SCHEMA} 迁移，当前为 {version}"),
     }
-
-    schema::validate_source(&transaction)?;
-    let converted = legacy::convert(&transaction)?;
-    schema::install_target(&transaction, &converted)?;
-    let report = schema::validate_target(&transaction, false)?;
+    schema::install_v29(&transaction)?;
+    let report = schema::validate_target(&transaction, source_schema, false)?;
     transaction.commit()?;
     Ok(report)
 }
@@ -56,12 +62,18 @@ pub fn validate_path(path: &Path) -> Result<MigrationReport> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
     let version = schema::schema_version(&transaction)?;
     let report = match version.as_str() {
-        TARGET_SCHEMA => schema::validate_target(&transaction, true)?,
+        TARGET_SCHEMA => schema::validate_target(&transaction, TARGET_SCHEMA.to_string(), true)?,
         SOURCE_SCHEMA => {
-            schema::validate_source(&transaction)?;
+            schema::validate_v28(&transaction)?;
+            schema::report(&transaction, SOURCE_SCHEMA.to_string(), false)?
+        }
+        LEGACY_SCHEMA => {
+            schema::validate_legacy_source(&transaction)?;
             legacy::validate_convertible(&transaction)?
         }
-        _ => bail!("只支持校验 schema {SOURCE_SCHEMA} 或 {TARGET_SCHEMA}，当前为 {version}"),
+        _ => bail!(
+            "只支持校验 schema {LEGACY_SCHEMA}、{SOURCE_SCHEMA} 或 {TARGET_SCHEMA}，当前为 {version}"
+        ),
     };
     transaction.rollback()?;
     Ok(report)

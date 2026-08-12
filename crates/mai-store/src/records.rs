@@ -226,6 +226,16 @@ pub(crate) struct ProjectReviewJobRecord {
 }
 
 #[derive(Debug, Clone, toasty::Model)]
+#[table = "project_merged_pull_requests"]
+#[key(project_id, pr)]
+pub(crate) struct ProjectMergedPullRequestRecord {
+    pub(crate) project_id: String,
+    pub(crate) pr: i64,
+    pub(crate) merged_at: String,
+    pub(crate) detected_at: String,
+}
+
+#[derive(Debug, Clone, toasty::Model)]
 #[table = "project_review_ci_watches"]
 pub(crate) struct ProjectReviewCiWatchRecord {
     #[key]

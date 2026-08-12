@@ -165,6 +165,13 @@ export interface PullRequestReviewSummary {
   pr: number
   latest_job: ReviewJobSummary
   history_count: number
+  merge_state: "not_merged" | "merged"
+  merged_at?: string | null
+}
+
+export interface PullRequestMergeRefreshSummary {
+  checked: number
+  newly_merged: number
 }
 
 export interface PullRequestReviewPage {

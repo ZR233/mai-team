@@ -618,11 +618,29 @@ pub struct ProjectPullRequestReviewStatusSummary {
     pub failed: usize,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectPullRequestMergeState {
+    #[default]
+    NotMerged,
+    Merged,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectPullRequestReviewSummary {
     pub pr: u64,
     pub latest_job: ProjectReviewJobSummary,
     pub history_count: usize,
+    #[serde(default)]
+    pub merge_state: ProjectPullRequestMergeState,
+    #[serde(default)]
+    pub merged_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectPullRequestMergeRefreshSummary {
+    pub checked: usize,
+    pub newly_merged: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

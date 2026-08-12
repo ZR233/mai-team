@@ -6,7 +6,7 @@ use pl_protocol::ThreadTurnHistory;
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use crate::legacy::ConvertedData;
-use crate::{MigrationReport, SOURCE_SCHEMA, TARGET_SCHEMA};
+use crate::{LEGACY_SCHEMA, MigrationReport, SOURCE_SCHEMA, TARGET_SCHEMA};
 
 const VERSION_KEY: &str = "toasty_schema_version";
 
@@ -21,9 +21,9 @@ pub(crate) fn schema_version(transaction: &Transaction<'_>) -> Result<String> {
         .context("数据库缺少 toasty_schema_version")
 }
 
-pub(crate) fn validate_source(transaction: &Transaction<'_>) -> Result<()> {
-    if schema_version(transaction)? != SOURCE_SCHEMA {
-        bail!("源数据库不是 schema {SOURCE_SCHEMA}");
+pub(crate) fn validate_legacy_source(transaction: &Transaction<'_>) -> Result<()> {
+    if schema_version(transaction)? != LEGACY_SCHEMA {
+        bail!("源数据库不是 schema {LEGACY_SCHEMA}");
     }
     for (table, columns) in [
         ("agents", &["id", "runtime_agent_id"][..]),
@@ -73,10 +73,7 @@ pub(crate) fn validate_source(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn install_target(
-    transaction: &Transaction<'_>,
-    converted: &ConvertedData,
-) -> Result<()> {
+pub(crate) fn install_v28(transaction: &Transaction<'_>, converted: &ConvertedData) -> Result<()> {
     transaction.execute_batch(
         "CREATE TABLE thread_runtime_documents (
             thread_id TEXT NOT NULL PRIMARY KEY,
@@ -217,13 +214,56 @@ pub(crate) fn install_target(
     Ok(())
 }
 
+pub(crate) fn install_v29(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE project_merged_pull_requests (
+            project_id TEXT NOT NULL,
+            pr BIGINT NOT NULL,
+            merged_at TEXT NOT NULL,
+            detected_at TEXT NOT NULL,
+            PRIMARY KEY (project_id, pr)
+         );
+         CREATE INDEX index_project_merged_pull_requests_by_project
+            ON project_merged_pull_requests(project_id, merged_at);
+         UPDATE settings SET value = '29' WHERE key = 'toasty_schema_version';",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn validate_v28(transaction: &Transaction<'_>) -> Result<()> {
+    if schema_version(transaction)? != SOURCE_SCHEMA {
+        bail!("源数据库不是 schema {SOURCE_SCHEMA}");
+    }
+    validate_thread_schema(transaction)?;
+    if table_exists(transaction, "project_merged_pull_requests")? {
+        bail!("schema {SOURCE_SCHEMA} 意外包含 v29 merged PR 表");
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_target(
     transaction: &Transaction<'_>,
+    source_schema: String,
     already_current: bool,
 ) -> Result<MigrationReport> {
     if schema_version(transaction)? != TARGET_SCHEMA {
         bail!("目标数据库不是 schema {TARGET_SCHEMA}");
     }
+    validate_thread_schema(transaction)?;
+    require_columns(
+        transaction,
+        "project_merged_pull_requests",
+        &["project_id", "pr", "merged_at", "detected_at"],
+    )?;
+    require_composite_primary_key(
+        transaction,
+        "project_merged_pull_requests",
+        &["project_id", "pr"],
+    )?;
+    report(transaction, source_schema, already_current)
+}
+
+fn validate_thread_schema(transaction: &Transaction<'_>) -> Result<()> {
     for (table, columns) in [
         (
             "thread_runtime_documents",
@@ -288,6 +328,14 @@ pub(crate) fn validate_target(
         bail!("目标 review run 仍包含旧消息投影列");
     }
 
+    Ok(())
+}
+
+pub(crate) fn report(
+    transaction: &Transaction<'_>,
+    source_schema: String,
+    already_current: bool,
+) -> Result<MigrationReport> {
     let agents = count(transaction, "agents")?;
     let runtimes = count(transaction, "thread_runtime_documents")?;
     if agents != runtimes {
@@ -298,8 +346,8 @@ pub(crate) fn validate_target(
     validate_product_events(transaction)?;
     let archived_review_runs = validate_review_history(transaction)?;
     Ok(MigrationReport {
-        source_schema: if already_current { "28" } else { "27" }.to_string(),
-        target_schema: "28".to_string(),
+        source_schema,
+        target_schema: TARGET_SCHEMA.to_string(),
         already_current,
         agents,
         canonical_threads: runtimes,
@@ -434,6 +482,23 @@ fn require_columns(transaction: &Transaction<'_>, table: &str, required: &[&str]
         if !columns.contains(*column) {
             bail!("表 `{table}` 缺少列 `{column}`");
         }
+    }
+    Ok(())
+}
+
+fn require_composite_primary_key(
+    transaction: &Transaction<'_>,
+    table: &str,
+    expected: &[&str],
+) -> Result<()> {
+    let mut statement = transaction.prepare(&format!(
+        "SELECT name FROM pragma_table_info('{table}') WHERE pk > 0 ORDER BY pk"
+    ))?;
+    let actual = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if actual != expected {
+        bail!("表 `{table}` 主键应为 {expected:?}，实际为 {actual:?}");
     }
     Ok(())
 }

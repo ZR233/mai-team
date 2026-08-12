@@ -26,6 +26,12 @@ pub struct ProjectReviewJobEnqueueResult {
 }
 
 #[derive(Debug, Clone)]
+pub enum ProjectReviewUnmergedJobEnqueueResult {
+    Merged,
+    Enqueued(Box<ProjectReviewJobEnqueueResult>),
+}
+
+#[derive(Debug, Clone)]
 pub enum ProjectReviewCiWatchEnqueueResult {
     Enqueued(Box<ProjectReviewJobEnqueueResult>),
     SignalChanged,
@@ -191,6 +197,44 @@ impl MaiStore {
             .map_err(|error| {
                 StoreError::InvalidConfig(format!("review job enqueue task failed: {error}"))
             })?
+    }
+
+    pub async fn enqueue_unmerged_project_review_job(
+        &self,
+        candidate: ProjectReviewJobSummary,
+    ) -> Result<ProjectReviewUnmergedJobEnqueueResult> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = open_review_job_connection(&path)?;
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let merged = transaction
+                .query_row(
+                    "SELECT 1 FROM project_merged_pull_requests \
+                     WHERE project_id = ?1 AND pr = ?2",
+                    params![candidate.project_id.to_string(), u64_to_i64(candidate.pr)],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some();
+            if merged {
+                transaction.commit()?;
+                return Ok(ProjectReviewUnmergedJobEnqueueResult::Merged);
+            }
+            let result = enqueue_in_transaction(
+                &transaction,
+                candidate,
+                ProjectReviewSignalFreshness::Current,
+            )?;
+            transaction.commit()?;
+            Ok(ProjectReviewUnmergedJobEnqueueResult::Enqueued(Box::new(
+                result,
+            )))
+        })
+        .await
+        .map_err(|error| {
+            StoreError::InvalidConfig(format!("unmerged review job enqueue task failed: {error}"))
+        })?
     }
 
     pub async fn enqueue_project_review_job_from_ci_watch(
@@ -859,7 +903,10 @@ fn upsert_job(connection: &Connection, job: &ProjectReviewJobSummary) -> Result<
          skip_reason=excluded.skip_reason, \
          submission_intent_json=excluded.submission_intent_json, \
          submission_receipt_json=excluded.submission_receipt_json, updated_at=excluded.updated_at, \
-         finished_at=excluded.finished_at",
+         finished_at=excluded.finished_at \
+         WHERE project_review_jobs.status NOT IN \
+           ('succeeded', 'failed', 'cancelled', 'superseded', 'skipped') \
+           AND project_review_jobs.updated_at <= excluded.updated_at",
         params![
             job.id.to_string(),
             job.project_id.to_string(),

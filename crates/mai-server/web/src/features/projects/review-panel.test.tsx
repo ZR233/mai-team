@@ -9,7 +9,13 @@ import type { ProjectDetail, PullRequestReviewSummary, ReviewJobSummary } from "
 import { ReviewJobDetails } from "./review-job-details"
 import { ReviewPanel } from "./review-panel"
 
-afterEach(() => vi.unstubAllGlobals())
+const toast = vi.hoisted(() => ({ error: vi.fn(), info: vi.fn(), success: vi.fn() }))
+vi.mock("sonner", () => ({ toast }))
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.clearAllMocks()
+})
 
 describe("pull request review pagination", () => {
   it("requests the selected page and replaces the aggregate rows", async () => {
@@ -45,6 +51,109 @@ describe("pull request review pagination", () => {
     await waitFor(() => expect(screen.queryByRole("dialog", { name: /Pull request review/ })).not.toBeInTheDocument())
     expect(await screen.findAllByText("PR #41")).not.toHaveLength(0)
     expect(requested).toContain("/projects/project-1/pull-request-reviews?page=2&page_size=20")
+  })
+
+  it("shows merged as the aggregate result and removes re-review actions", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.endsWith("/merge-status/refresh")) return jsonResponse({ checked: 0, newly_merged: 0 })
+      if (path.includes("/pull-request-reviews/42/history")) return jsonResponse({
+        items: [{ job: approvedJob("approved-job", 42), has_attempts: false }],
+        page: 1,
+        page_size: 20,
+        total_items: 1,
+        total_pages: 1,
+      })
+      return jsonResponse({
+        ...reviewPage([review(42, approvedJob("approved-job", 42), 1, "merged")], 1),
+        total_items: 1,
+        total_pages: 1,
+      })
+    }))
+    renderWithQuery(<ReviewPanelHarness />)
+
+    expect(await screen.findAllByText("Merged")).not.toHaveLength(0)
+    await userEvent.click(screen.getAllByRole("button", { name: "Actions for PR #42" })[0])
+    expect(screen.queryByRole("menuitem", { name: "Re-review" })).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole("menuitem", { name: "View details" }))
+    expect(await screen.findByText("Pull request merged")).toBeVisible()
+    expect(screen.getByText("Approved")).toBeVisible()
+    expect(screen.queryByRole("button", { name: "Re-review" })).not.toBeInTheDocument()
+  })
+
+  it("renders local results before the background merge refresh and refetches once complete", async () => {
+    let merged = false
+    let listRequests = 0
+    let refreshRequests = 0
+    let releaseRefresh: () => void = () => undefined
+    const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve })
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.endsWith("/merge-status/refresh")) {
+        refreshRequests += 1
+        await refreshGate
+        merged = true
+        return jsonResponse({ checked: 1, newly_merged: 1 })
+      }
+      listRequests += 1
+      return jsonResponse({
+        ...reviewPage([review(42, approvedJob("approved-job", 42), 1, merged ? "merged" : "not_merged")], 1),
+        total_items: 1,
+        total_pages: 1,
+      })
+    }))
+    renderWithQuery(<ReviewPanelHarness />)
+
+    expect(await screen.findAllByText("Approved")).not.toHaveLength(0)
+    expect(refreshRequests).toBe(1)
+    releaseRefresh()
+    expect(await screen.findAllByText("Merged")).not.toHaveLength(0)
+    expect(listRequests).toBeGreaterThanOrEqual(2)
+    expect(refreshRequests).toBe(1)
+  })
+
+  it("keeps local review data and refetches after a merge refresh failure", async () => {
+    let listRequests = 0
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.endsWith("/merge-status/refresh")) return jsonResponse({ error: "GitHub unavailable" }, 503)
+      listRequests += 1
+      return jsonResponse({
+        ...reviewPage([review(42, approvedJob("approved-job", 42))], 1),
+        total_items: 1,
+        total_pages: 1,
+      })
+    }))
+    renderWithQuery(<ReviewPanelHarness />)
+
+    expect(await screen.findAllByText("Approved")).not.toHaveLength(0)
+    await waitFor(() => expect(listRequests).toBeGreaterThanOrEqual(2))
+    expect(screen.getAllByText("PR #42").length).toBeGreaterThan(0)
+  })
+
+  it("surfaces a merged conflict from re-review without retrying the mutation", async () => {
+    let queueRequests = 0
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path.endsWith("/merge-status/refresh")) return jsonResponse({ checked: 1, newly_merged: 0 })
+      if (path.endsWith("/pull-requests/42/review") && init?.method === "POST") {
+        queueRequests += 1
+        return jsonResponse({ error: "pull request #42 is already merged" }, 409)
+      }
+      return jsonResponse({
+        ...reviewPage([review(42, approvedJob("approved-job", 42))], 1),
+        total_items: 1,
+        total_pages: 1,
+      })
+    }))
+    renderWithQuery(<ReviewPanelHarness />)
+
+    expect(await screen.findAllByText("Approved")).not.toHaveLength(0)
+    await userEvent.click(screen.getAllByRole("button", { name: "Actions for PR #42" })[0])
+    await userEvent.click(screen.getByRole("menuitem", { name: "Re-review" }))
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("pull request #42 is already merged"))
+    expect(queueRequests).toBe(1)
   })
 })
 
@@ -141,8 +250,19 @@ function job(id: string, pr: number, status: ReviewJobSummary["status"], attempt
   }
 }
 
-function review(pr: number, latestJob: ReviewJobSummary, historyCount = 1): PullRequestReviewSummary {
-  return { pr, latest_job: latestJob, history_count: historyCount }
+function approvedJob(id: string, pr: number): ReviewJobSummary {
+  const value = job(id, pr, "succeeded", 1)
+  value.submission_receipt = {
+    github_review_id: pr,
+    event: "approve",
+    head_sha: value.head_sha,
+    submitted_at: value.updated_at,
+  }
+  return value
+}
+
+function review(pr: number, latestJob: ReviewJobSummary, historyCount = 1, mergeState: PullRequestReviewSummary["merge_state"] = "not_merged"): PullRequestReviewSummary {
+  return { pr, latest_job: latestJob, history_count: historyCount, merge_state: mergeState, merged_at: mergeState === "merged" ? "2026-08-12T00:00:00Z" : null }
 }
 
 function reviewPage(reviews: PullRequestReviewSummary[], page: number) {

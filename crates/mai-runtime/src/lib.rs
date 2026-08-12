@@ -142,6 +142,8 @@ pub enum RuntimeError {
     ProjectReviewRunNotFound(Uuid),
     #[error("project review job not found: {0}")]
     ProjectReviewJobNotFound(Uuid),
+    #[error("pull request #{pr} in project {project_id} is already merged")]
+    PullRequestMerged { project_id: ProjectId, pr: u64 },
     #[error("agent is busy: {0}")]
     AgentBusy(AgentId),
     #[error("task is busy: {0}")]
@@ -179,6 +181,8 @@ pub enum RuntimeError {
     },
     #[error("jwt error: {0}")]
     Jwt(#[from] jsonwebtoken::errors::Error),
+    #[error("merged pull request refresh failed: {0}")]
+    MergedPullRequestRefresh(String),
 }
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
@@ -214,6 +218,7 @@ pub struct AgentRuntime {
     sidecar_image: String,
     github_api_base_url: String,
     github_get_cache: github::GithubGetCache,
+    merged_pull_request_refreshes: github::MergedPullRequestRefreshCoordinator,
     workspace_manager: projects::workspace::LocalProjectWorkspaceManager,
 }
 

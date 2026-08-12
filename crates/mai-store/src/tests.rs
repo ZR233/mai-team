@@ -2038,6 +2038,45 @@ async fn submission_intent_is_idempotent_and_receipt_completes_job() {
 }
 
 #[tokio::test]
+async fn stale_worker_snapshot_cannot_overwrite_terminal_submission_receipt() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let mut stale_worker_snapshot = test_review_job(project_id, 111, "head", None);
+    stale_worker_snapshot.status = ProjectReviewJobStatus::Running;
+    stale_worker_snapshot.updated_at = Utc::now();
+    store
+        .save_project_review_job(stale_worker_snapshot.clone())
+        .await
+        .expect("save running job");
+    let receipt = ProjectReviewSubmissionReceipt {
+        github_review_id: 456,
+        event: ProjectReviewDecision::Approve,
+        head_sha: "head".to_string(),
+        html_url: Some("https://example.test/review/456".to_string()),
+        submitted_at: stale_worker_snapshot.updated_at + chrono::TimeDelta::seconds(1),
+    };
+    let completed = store
+        .record_project_review_submission_receipt(stale_worker_snapshot.id, receipt.clone())
+        .await
+        .expect("record receipt");
+
+    stale_worker_snapshot.updated_at = receipt.submitted_at + chrono::TimeDelta::seconds(1);
+    store
+        .save_project_review_job(stale_worker_snapshot)
+        .await
+        .expect("stale write is ignored");
+
+    assert_eq!(
+        store
+            .load_project_review_job(project_id, completed.id)
+            .await
+            .expect("load completed job")
+            .expect("completed job"),
+        completed
+    );
+}
+
+#[tokio::test]
 async fn terminal_review_job_persists_idempotent_retryable_cleanup_tasks() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
@@ -2312,11 +2351,15 @@ async fn pull_request_review_pages_aggregate_latest_jobs_and_preserve_attempt_hi
                     pr: 45,
                     latest_job: active,
                     history_count: 1,
+                    merge_state: ProjectPullRequestMergeState::NotMerged,
+                    merged_at: None,
                 },
                 ProjectPullRequestReviewSummary {
                     pr: 44,
                     latest_job: second_succeeded,
                     history_count: 1,
+                    merge_state: ProjectPullRequestMergeState::NotMerged,
+                    merged_at: None,
                 },
             ],
             page: 1,
@@ -2343,11 +2386,15 @@ async fn pull_request_review_pages_aggregate_latest_jobs_and_preserve_attempt_hi
                     pr: 43,
                     latest_job: failed,
                     history_count: 1,
+                    merge_state: ProjectPullRequestMergeState::NotMerged,
+                    merged_at: None,
                 },
                 ProjectPullRequestReviewSummary {
                     pr: 42,
                     latest_job: skipped.clone(),
                     history_count: 3,
+                    merge_state: ProjectPullRequestMergeState::NotMerged,
+                    merged_at: None,
                 },
             ],
             page: 2,
@@ -2402,6 +2449,220 @@ async fn pull_request_review_pages_aggregate_latest_jobs_and_preserve_attempt_hi
             total_items: 3,
             total_pages: 2,
         }
+    );
+}
+
+#[tokio::test]
+async fn pull_request_review_pages_prioritize_unmerged_approvals_and_place_merged_last() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let timestamp = DateTime::parse_from_rfc3339("2026-08-11T12:00:00Z")
+        .expect("timestamp")
+        .with_timezone(&Utc);
+    for (index, (pr, event)) in [
+        (10, Some(ProjectReviewDecision::Approve)),
+        (11, Some(ProjectReviewDecision::Approve)),
+        (12, Some(ProjectReviewDecision::RequestChanges)),
+        (13, Some(ProjectReviewDecision::Approve)),
+        (14, Some(ProjectReviewDecision::Comment)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut job = test_review_job(project_id, pr, &format!("head-{pr}"), None);
+        job.id = Uuid::from_u128(u128::try_from(index + 1).expect("job id"));
+        job.status = ProjectReviewJobStatus::Succeeded;
+        job.created_at =
+            timestamp + chrono::TimeDelta::minutes(i64::try_from(index).expect("timestamp offset"));
+        job.updated_at = job.created_at;
+        job.finished_at = Some(job.created_at);
+        job.next_attempt_at = None;
+        job.submission_receipt = event.map(|event| ProjectReviewSubmissionReceipt {
+            github_review_id: pr,
+            event,
+            head_sha: job.head_sha.clone(),
+            html_url: None,
+            submitted_at: job.created_at,
+        });
+        store
+            .save_project_review_job(job.clone())
+            .await
+            .expect("save review job");
+    }
+    let detected_at = timestamp + chrono::TimeDelta::hours(1);
+    let inserted = store
+        .save_merged_project_pull_requests(
+            project_id,
+            vec![
+                PersistedMergedPullRequest {
+                    pr: 13,
+                    merged_at: detected_at,
+                    detected_at,
+                },
+                PersistedMergedPullRequest {
+                    pr: 14,
+                    merged_at: detected_at,
+                    detected_at,
+                },
+            ],
+        )
+        .await
+        .expect("save merged pull requests");
+    assert_eq!(inserted, 2);
+    assert_eq!(
+        store
+            .save_merged_project_pull_requests(
+                project_id,
+                vec![PersistedMergedPullRequest {
+                    pr: 13,
+                    merged_at: detected_at + chrono::TimeDelta::hours(1),
+                    detected_at: detected_at + chrono::TimeDelta::hours(1),
+                }],
+            )
+            .await
+            .expect("repeat merged save"),
+        0
+    );
+
+    let first_page = store
+        .load_project_pull_request_reviews(project_id, 1, 3)
+        .await
+        .expect("first page");
+    let second_page = store
+        .load_project_pull_request_reviews(project_id, 2, 3)
+        .await
+        .expect("second page");
+    assert_eq!(
+        first_page
+            .reviews
+            .iter()
+            .map(|review| (review.pr, review.merge_state))
+            .collect::<Vec<_>>(),
+        vec![
+            (11, ProjectPullRequestMergeState::NotMerged),
+            (10, ProjectPullRequestMergeState::NotMerged),
+            (12, ProjectPullRequestMergeState::NotMerged),
+        ]
+    );
+    assert_eq!(
+        second_page
+            .reviews
+            .iter()
+            .map(|review| (review.pr, review.merge_state, review.merged_at))
+            .collect::<Vec<_>>(),
+        vec![
+            (14, ProjectPullRequestMergeState::Merged, Some(detected_at)),
+            (13, ProjectPullRequestMergeState::Merged, Some(detected_at)),
+        ]
+    );
+    assert_eq!(
+        store
+            .load_unmerged_project_review_prs(project_id)
+            .await
+            .expect("load unmerged pull requests"),
+        vec![10, 11, 12]
+    );
+    assert!(
+        store
+            .is_project_pull_request_merged(project_id, 13)
+            .await
+            .expect("merged lookup")
+    );
+}
+
+#[tokio::test]
+async fn merged_pull_request_state_is_isolated_by_project() {
+    let (_dir, store) = store().await;
+    let merged_project = Uuid::new_v4();
+    let open_project = Uuid::new_v4();
+    for project_id in [merged_project, open_project] {
+        store
+            .save_project_review_job(test_review_job(project_id, 42, "head-42", None))
+            .await
+            .expect("save review job");
+    }
+    let timestamp = Utc::now();
+    store
+        .save_merged_project_pull_requests(
+            merged_project,
+            vec![PersistedMergedPullRequest {
+                pr: 42,
+                merged_at: timestamp,
+                detected_at: timestamp,
+            }],
+        )
+        .await
+        .expect("save merged state");
+
+    assert_eq!(
+        store
+            .load_unmerged_project_review_prs(merged_project)
+            .await
+            .expect("merged project"),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        store
+            .load_unmerged_project_review_prs(open_project)
+            .await
+            .expect("open project"),
+        vec![42]
+    );
+    assert!(
+        store
+            .is_project_pull_request_merged(merged_project, 42)
+            .await
+            .expect("merged lookup")
+    );
+    assert!(
+        !store
+            .is_project_pull_request_merged(open_project, 42)
+            .await
+            .expect("open lookup")
+    );
+    assert_eq!(
+        store
+            .load_project_pull_request_reviews(open_project, 1, 20)
+            .await
+            .expect("open aggregate")
+            .reviews[0]
+            .merge_state,
+        ProjectPullRequestMergeState::NotMerged
+    );
+}
+
+#[tokio::test]
+async fn merged_pull_request_cannot_be_enqueued_through_atomic_admission() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let timestamp = Utc::now();
+    store
+        .save_merged_project_pull_requests(
+            project_id,
+            vec![PersistedMergedPullRequest {
+                pr: 42,
+                merged_at: timestamp,
+                detected_at: timestamp,
+            }],
+        )
+        .await
+        .expect("save merged state");
+
+    let result = store
+        .enqueue_unmerged_project_review_job(test_review_job(project_id, 42, "merged-head", None))
+        .await
+        .expect("merged admission");
+    assert!(matches!(
+        result,
+        ProjectReviewUnmergedJobEnqueueResult::Merged
+    ));
+    assert!(
+        store
+            .load_project_pull_request_review_history(project_id, 42, 1, 20)
+            .await
+            .expect("review history")
+            .items
+            .is_empty()
     );
 }
 

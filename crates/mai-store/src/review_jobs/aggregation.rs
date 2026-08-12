@@ -124,6 +124,11 @@ fn load_review_page(
     page_size: i64,
     offset: i64,
 ) -> Result<Vec<ProjectPullRequestReviewSummary>> {
+    let ranked_columns = PROJECT_REVIEW_JOB_COLUMNS
+        .split(',')
+        .map(|column| format!("ranked.{}", column.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
     let sql = format!(
         "WITH ranked AS (
              SELECT {PROJECT_REVIEW_JOB_COLUMNS},
@@ -134,22 +139,46 @@ fn load_review_page(
              FROM project_review_jobs
              WHERE project_id = ?1
          )
-         SELECT {PROJECT_REVIEW_JOB_COLUMNS}, history_count
-         FROM ranked WHERE review_rank = 1
-         ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3"
+         SELECT {ranked_columns}, ranked.history_count, merged.merged_at
+         FROM ranked
+         LEFT JOIN project_merged_pull_requests merged
+           ON merged.project_id = ranked.project_id AND merged.pr = ranked.pr
+         WHERE review_rank = 1
+         ORDER BY CASE
+                    WHEN merged.project_id IS NOT NULL THEN 2
+                    WHEN json_extract(ranked.submission_receipt_json, '$.event') = 'approve' THEN 0
+                    ELSE 1
+                  END ASC,
+                  ranked.created_at DESC, ranked.id DESC
+         LIMIT ?2 OFFSET ?3"
     );
     let mut statement = transaction.prepare(&sql)?;
     let rows = statement.query_map(params![project_id.to_string(), page_size, offset], |row| {
-        Ok((project_review_job_record(row)?, row.get::<_, i64>(24)?))
+        Ok((
+            project_review_job_record(row)?,
+            row.get::<_, i64>(24)?,
+            row.get::<_, Option<String>>(25)?,
+        ))
     })?;
     let mut reviews = Vec::new();
     for row in rows {
-        let (record, history_count) = row?;
+        let (record, history_count, merged_at) = row?;
         let latest_job = record.into_summary()?;
+        let merged_at = merged_at
+            .map(|value| {
+                DateTime::parse_from_rfc3339(&value).map(|value| value.with_timezone(&Utc))
+            })
+            .transpose()?;
         reviews.push(ProjectPullRequestReviewSummary {
             pr: latest_job.pr,
             latest_job,
             history_count: count_to_usize(history_count, "review history total")?,
+            merge_state: if merged_at.is_some() {
+                ProjectPullRequestMergeState::Merged
+            } else {
+                ProjectPullRequestMergeState::NotMerged
+            },
+            merged_at,
         });
     }
     Ok(reviews)

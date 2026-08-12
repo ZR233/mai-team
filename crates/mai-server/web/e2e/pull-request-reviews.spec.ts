@@ -49,6 +49,20 @@ test("PR 聚合列表分页并在详情切换执行和未执行历史", async ({
   await expect(page.getByText("PR #42")).toHaveCount(0)
 })
 
+test("Merged 覆盖主列表结果并保留原始 review 历史", async ({ page }) => {
+  await page.goto("/projects/project-1?view=review&review_page=2")
+
+  await expect(pullRequestEntry(page, 41)).toBeVisible()
+  const merged = (page.viewportSize()?.width ?? 0) < 1024
+    ? pullRequestEntry(page, 41).getByText("Merged")
+    : page.getByRole("table").getByText("Merged")
+  await expect(merged).toBeVisible()
+  await pullRequestEntry(page, 41).click()
+  await expect(page.getByText("Pull request merged")).toBeVisible()
+  await expect(page.getByText("Approved", { exact: true })).toBeVisible()
+  await expect(page.getByRole("button", { name: "Re-review" })).toHaveCount(0)
+})
+
 function pullRequestEntry(page: Page, pr: number) {
   return (page.viewportSize()?.width ?? 0) < 1024
     ? page.locator("button.min-w-0").filter({ hasText: `PR #${pr}` }).first()
@@ -67,6 +81,16 @@ async function installReviewFixture(page: Page) {
       const pageNumber = Number(url.searchParams.get("page") || "1")
       return json(route, reviewPage(pageNumber))
     }
+    if (path === "/projects/project-1/pull-request-reviews/merge-status/refresh") {
+      return json(route, { checked: 2, newly_merged: 0 })
+    }
+    if (path === "/projects/project-1/pull-request-reviews/41/history") return json(route, {
+      items: [{ job: approvedReviewJob("approved-job", 41), has_attempts: false }],
+      page: 1,
+      page_size: 20,
+      total_items: 1,
+      total_pages: 1,
+    })
     if (path === "/projects/project-1/pull-request-reviews/42/history") return json(route, {
       items: [
         { job: reviewJob("skipped-job", 42, "skipped", 0), has_attempts: false },
@@ -88,8 +112,8 @@ async function installReviewFixture(page: Page) {
 
 function reviewPage(page: number) {
   const reviews = page === 2
-    ? [{ pr: 41, latest_job: reviewJob("failed-job", 41, "failed", 1), history_count: 1 }]
-    : [{ pr: 42, latest_job: reviewJob("skipped-job", 42, "skipped", 0), history_count: 2 }]
+    ? [{ pr: 41, latest_job: approvedReviewJob("approved-job", 41), history_count: 1, merge_state: "merged", merged_at: "2026-08-12T00:00:00Z" }]
+    : [{ pr: 42, latest_job: reviewJob("skipped-job", 42, "skipped", 0), history_count: 2, merge_state: "not_merged", merged_at: null }]
   return {
     reviews,
     page,
@@ -113,6 +137,19 @@ function reviewJob(id: string, pr: number, status: string, attemptCount: number)
     max_attempts: 5,
     created_at: `2026-08-11T1${attemptCount}:00:00Z`,
     updated_at: `2026-08-11T1${attemptCount}:00:00Z`,
+  }
+}
+
+function approvedReviewJob(id: string, pr: number) {
+  const value = reviewJob(id, pr, "succeeded", 1)
+  return {
+    ...value,
+    submission_receipt: {
+      github_review_id: pr,
+      event: "approve",
+      head_sha: value.head_sha,
+      submitted_at: value.updated_at,
+    },
   }
 }
 

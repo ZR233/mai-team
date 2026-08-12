@@ -627,6 +627,18 @@ impl AgentRuntime {
                 continue;
             }
             if admission == ProjectReviewEnqueueAdmission::ManualRequest
+                && self
+                    .deps
+                    .store
+                    .is_project_pull_request_merged(project_id, signal.pr)
+                    .await?
+            {
+                return Err(RuntimeError::PullRequestMerged {
+                    project_id,
+                    pr: signal.pr,
+                });
+            }
+            if admission == ProjectReviewEnqueueAdmission::ManualRequest
                 && let Some(job) = self
                     .deps
                     .store
@@ -662,20 +674,37 @@ impl AgentRuntime {
             } else {
                 source.clone()
             };
-            let queued = self
-                .deps
-                .store
-                .enqueue_project_review_job(projects::review::job::new_project_review_job(
-                    projects::review::job::NewProjectReviewJob {
-                        project_id,
-                        pr: signal.pr,
-                        head_sha,
-                        source: job_source,
-                        delivery_id: signal.delivery_id,
-                        reason: signal.reason,
-                    },
-                ))
-                .await?;
+            let candidate = projects::review::job::new_project_review_job(
+                projects::review::job::NewProjectReviewJob {
+                    project_id,
+                    pr: signal.pr,
+                    head_sha,
+                    source: job_source,
+                    delivery_id: signal.delivery_id,
+                    reason: signal.reason,
+                },
+            );
+            let queued = if admission == ProjectReviewEnqueueAdmission::ManualRequest {
+                match self
+                    .deps
+                    .store
+                    .enqueue_unmerged_project_review_job(candidate)
+                    .await?
+                {
+                    mai_store::ProjectReviewUnmergedJobEnqueueResult::Merged => {
+                        return Err(RuntimeError::PullRequestMerged {
+                            project_id,
+                            pr: signal.pr,
+                        });
+                    }
+                    mai_store::ProjectReviewUnmergedJobEnqueueResult::Enqueued(queued) => *queued,
+                }
+            } else {
+                self.deps
+                    .store
+                    .enqueue_project_review_job(candidate)
+                    .await?
+            };
             match queued.disposition {
                 mai_store::ProjectReviewJobEnqueueDisposition::Queued => {
                     summary.queued.push(queued.job.pr);

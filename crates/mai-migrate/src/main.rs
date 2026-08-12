@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(about = "离线迁移 mai-team v27 数据库到唯一 PL Thread schema")]
+#[command(about = "离线迁移 mai-team 数据库到当前 schema")]
 struct Args {
     /// 待迁移的 SQLite 数据库。运行前必须停止 mai-server 并完成备份。
     #[arg(long)]

@@ -4,12 +4,13 @@ pub(crate) use mai_protocol::{
     GitAccountSummary, GitAccountsResponse, GitProvider, GitTokenKind, GithubAppSettingsRequest,
     GithubAppSettingsResponse, GithubSettingsResponse, MaiProductEventEnvelope,
     MaiProductEventKind, McpServerConfig, PlanHistoryEntry, ProjectId,
-    ProjectPullRequestReviewHistoryItem, ProjectPullRequestReviewHistoryPage,
-    ProjectPullRequestReviewPage, ProjectPullRequestReviewStatusSummary,
-    ProjectPullRequestReviewSummary, ProjectReviewJobSummary, ProjectReviewRunDetail,
-    ProjectReviewRunSummary, ProjectSummary, RelaySettingsRequest, RelaySettingsResponse,
-    SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskSummary, ThreadId, TokenUsage,
-    ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceSummary, TurnId,
+    ProjectPullRequestMergeState, ProjectPullRequestReviewHistoryItem,
+    ProjectPullRequestReviewHistoryPage, ProjectPullRequestReviewPage,
+    ProjectPullRequestReviewStatusSummary, ProjectPullRequestReviewSummary,
+    ProjectReviewJobSummary, ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary,
+    RelaySettingsRequest, RelaySettingsResponse, SkillsConfigRequest, TaskId, TaskPlan, TaskReview,
+    TaskSummary, ThreadId, TokenUsage, ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceSummary,
+    TurnId,
 };
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use std::collections::BTreeMap;
@@ -30,6 +31,7 @@ mod git_accounts;
 mod github_app;
 pub use github_app::GithubAppIdentity;
 mod logs;
+mod project_merged_pull_requests;
 mod projects;
 mod records;
 mod relay;
@@ -54,6 +56,7 @@ pub use review_ci_watches::ProjectReviewCiWatch;
 pub use review_jobs::{
     ProjectReviewCiPendingSkipResult, ProjectReviewCiWatchEnqueueResult,
     ProjectReviewJobEnqueueDisposition, ProjectReviewJobEnqueueResult,
+    ProjectReviewUnmergedJobEnqueueResult,
 };
 pub use store::MaiStore;
 pub use thread_runtime::{
@@ -118,6 +121,13 @@ pub struct PersistedTask {
     pub plan_history: Vec<PlanHistoryEntry>,
     pub reviews: Vec<TaskReview>,
     pub artifacts: Vec<ArtifactInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedMergedPullRequest {
+    pub pr: u64,
+    pub merged_at: DateTime<Utc>,
+    pub detected_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Default)]

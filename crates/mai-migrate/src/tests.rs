@@ -19,7 +19,7 @@ fn v27_migration_is_atomic_and_review_history_is_deeply_equal() {
     let (directory, path) = fixture(false);
     let report = migrate_path(&path).expect("migrate fixture");
     assert_eq!(report.source_schema, "27");
-    assert_eq!(report.target_schema, "28");
+    assert_eq!(report.target_schema, "29");
     assert_eq!(report.canonical_threads, 1);
     assert_eq!(report.turns, 1);
     assert_eq!(report.items, 1);
@@ -81,6 +81,120 @@ fn v27_migration_is_atomic_and_review_history_is_deeply_equal() {
     assert!(repeated.already_current);
     assert_eq!(validate_path(&path).expect("validate current"), repeated);
     drop(directory);
+}
+
+#[test]
+fn v28_migration_adds_merged_pull_request_terminal_state_table() {
+    let (_directory, path) = fixture(false);
+    migrate_fixture_to_v28(&path);
+
+    let report = migrate_path(&path).expect("migrate v28 fixture");
+    assert_eq!(report.source_schema, "28");
+    assert_eq!(report.target_schema, "29");
+    assert!(!report.already_current);
+    let connection = Connection::open(&path).expect("open v29 fixture");
+    let version: String = connection
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'toasty_schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema version");
+    assert_eq!(version, "29");
+    let columns = connection
+        .prepare("SELECT name FROM pragma_table_info('project_merged_pull_requests')")
+        .expect("prepare merged columns")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query merged columns")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect merged columns");
+    assert_eq!(
+        columns,
+        vec!["project_id", "pr", "merged_at", "detected_at"]
+    );
+    let primary_key = connection
+        .prepare(
+            "SELECT name FROM pragma_table_info('project_merged_pull_requests') \
+             WHERE pk > 0 ORDER BY pk",
+        )
+        .expect("prepare merged primary key")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query merged primary key")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect merged primary key");
+    assert_eq!(primary_key, vec!["project_id", "pr"]);
+    let project_index: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'index' \
+               AND name = 'index_project_merged_pull_requests_by_project'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("merged project index");
+    assert_eq!(project_index, 1);
+}
+
+#[test]
+fn v28_migration_failure_rolls_back_schema_and_table() {
+    let (_directory, path) = fixture(false);
+    migrate_fixture_to_v28(&path);
+    let connection = Connection::open(&path).expect("open v28 fixture");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_v29_version
+             BEFORE UPDATE OF value ON settings
+             WHEN OLD.value = '28'
+             BEGIN SELECT RAISE(ABORT, 'injected v29 migration failure'); END;",
+        )
+        .expect("install failure trigger");
+    drop(connection);
+
+    let error = migrate_path(&path).expect_err("v29 migration must fail");
+    assert!(error.to_string().contains("injected v29 migration failure"));
+    let connection = Connection::open(&path).expect("inspect rollback");
+    let version: String = connection
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'toasty_schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema version");
+    assert_eq!(version, "28");
+    let table = connection
+        .query_row(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name = 'project_merged_pull_requests'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .expect("merged table lookup");
+    assert_eq!(table, None);
+}
+
+#[test]
+fn malformed_v29_merged_table_is_rejected_as_not_current() {
+    let (_directory, path) = fixture(false);
+    migrate_fixture_to_v28(&path);
+    migrate_path(&path).expect("migrate v29 fixture");
+    let connection = Connection::open(&path).expect("open v29 fixture");
+    connection
+        .execute_batch(
+            "DROP TABLE project_merged_pull_requests;
+             CREATE TABLE project_merged_pull_requests (
+                project_id TEXT NOT NULL,
+                pr BIGINT NOT NULL,
+                merged_at TEXT NOT NULL,
+                detected_at TEXT NOT NULL,
+                PRIMARY KEY (project_id)
+             );",
+        )
+        .expect("corrupt merged table");
+    drop(connection);
+
+    let error = migrate_path(&path).expect_err("malformed v29 table must fail validation");
+    assert!(error.to_string().contains("project_merged_pull_requests"));
 }
 
 #[test]
@@ -210,6 +324,16 @@ fn fixture(inject_failure: bool) -> (TempDir, std::path::PathBuf) {
     let path = directory.path().join("v27.sqlite3");
     create_v27(&path, inject_failure);
     (directory, path)
+}
+
+fn migrate_fixture_to_v28(path: &Path) {
+    let mut connection = Connection::open(path).expect("open v27 fixture");
+    let transaction = connection.transaction().expect("v28 transaction");
+    crate::schema::validate_legacy_source(&transaction).expect("validate v27");
+    let converted = crate::legacy::convert(&transaction).expect("convert v27");
+    crate::schema::install_v28(&transaction, &converted).expect("install v28");
+    crate::schema::validate_v28(&transaction).expect("validate v28");
+    transaction.commit().expect("commit v28 fixture");
 }
 
 fn create_v27(path: &Path, inject_failure: bool) {

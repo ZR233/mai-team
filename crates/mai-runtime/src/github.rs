@@ -12,6 +12,8 @@ const GITHUB_API_VERSION: &str = "2022-11-28";
 mod accounts;
 mod app;
 mod etag_cache;
+mod merged_pull_request_refresh;
+mod merged_pull_requests;
 mod packages;
 mod retry;
 mod service;
@@ -20,6 +22,7 @@ pub(crate) use accounts::{GitAccountService, GitAccountToken, VerifiedGithubRepo
 pub use app::DirectGithubAppBackend;
 pub use app::GithubAppBackend;
 pub(crate) use etag_cache::GithubGetCache;
+pub(crate) use merged_pull_request_refresh::MergedPullRequestRefreshCoordinator;
 pub(crate) use packages::repository_packages_with_token;
 pub(crate) use retry::{github_error_message_is_retryable, retry_github_request};
 pub(crate) use service::*;

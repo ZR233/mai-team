@@ -5,7 +5,8 @@ import { Badge } from "@/components/ui/badge"
 
 import { reviewSkipReasonLabel } from "./review-job-model"
 
-export function ReviewOutcome({ job }: { job: ReviewJobSummary }) {
+export function ReviewOutcome({ job, merged = false }: { job: ReviewJobSummary; merged?: boolean }) {
+  if (merged) return <Badge variant="secondary">Merged</Badge>
   const event = job.submission_receipt?.event
   if (event === "approve") return <Badge variant="secondary">Approved</Badge>
   if (event === "request_changes") return <Badge variant="destructive">Request changes</Badge>

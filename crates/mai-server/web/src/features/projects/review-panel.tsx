@@ -1,11 +1,11 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Play } from "lucide-react"
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
 
 import { api } from "@/api/client"
-import type { ProjectDetail, PullRequestReviewSummary, ReviewJobSummary } from "@/api/product-types"
-import { projectPullRequestReviewsQuery } from "@/api/queries"
+import type { ProjectDetail, PullRequestMergeRefreshSummary, PullRequestReviewSummary, ReviewJobSummary } from "@/api/product-types"
+import { projectPullRequestReviewsQuery, queryKeys } from "@/api/queries"
 import { PagePagination } from "@/components/page-pagination"
 import { EmptyState, ErrorState, LoadingState } from "@/components/page-state"
 import { Badge } from "@/components/ui/badge"
@@ -41,6 +41,7 @@ export function ReviewPanel({ project, page, onPageChange }: ReviewPanelProps) {
   const [selectedReview, setSelectedReview] = useState<PullRequestReviewSummary | null>(null)
   const [runDialogOpen, setRunDialogOpen] = useState(false)
   const [pr, setPr] = useState("")
+  const refreshedProject = useRef<string | null>(null)
   const changePage = useCallback((nextPage: number) => {
     setSelectedReview(null)
     onPageChange(nextPage)
@@ -54,13 +55,34 @@ export function ReviewPanel({ project, page, onPageChange }: ReviewPanelProps) {
       setPr("")
       setRunDialogOpen(false)
       changePage(1)
-      await queryClient.invalidateQueries({ queryKey: ["projects", project.id], exact: false })
     },
     onError: (error) => toast.error(error.message),
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["projects", project.id], exact: false })
+    },
   })
+  const refreshMergeStatus = useMutation({
+    mutationFn: () => api<PullRequestMergeRefreshSummary>(`/projects/${project.id}/pull-request-reviews/merge-status/refresh`, { method: "POST" }),
+    onError: (error) => toast.error(`Merged status refresh failed: ${error.message}`),
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.projectPullRequestReviews(project.id), exact: false })
+    },
+  })
+  const startMergeRefresh = refreshMergeStatus.mutate
+  useEffect(() => {
+    if (refreshedProject.current === project.id) return
+    refreshedProject.current = project.id
+    startMergeRefresh()
+  }, [project.id, startMergeRefresh])
   useEffect(() => {
     setSelectedReview(null)
   }, [page])
+  useEffect(() => {
+    setSelectedReview((selected) => {
+      if (!selected || !reviews.data) return selected
+      return reviews.data.reviews.find((review) => review.pr === selected.pr) ?? null
+    })
+  }, [reviews.data])
   useEffect(() => {
     if (!reviews.data) return
     if (reviews.data.total_pages === 0 && page !== 1) changePage(1)

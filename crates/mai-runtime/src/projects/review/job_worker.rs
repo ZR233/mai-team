@@ -412,7 +412,7 @@ pub(super) fn runtime_failure(error: &RuntimeError) -> ProjectReviewFailure {
             ),
         },
         RuntimeError::Model(error) => model_runtime_failure(error),
-        RuntimeError::Store(_) => (
+        RuntimeError::Store(_) | RuntimeError::MergedPullRequestRefresh(_) => (
             ProjectReviewFailureCategory::Internal,
             Some("store_unavailable".to_string()),
             None,
@@ -457,6 +457,7 @@ pub(super) fn runtime_failure(error: &RuntimeError) -> ProjectReviewFailure {
         | RuntimeError::ProjectNotFound(_)
         | RuntimeError::ProjectReviewRunNotFound(_)
         | RuntimeError::ProjectReviewJobNotFound(_)
+        | RuntimeError::PullRequestMerged { .. }
         | RuntimeError::ThreadNotFound(_)
         | RuntimeError::ToolTraceNotFound { .. }
         | RuntimeError::TurnNotFound { .. }

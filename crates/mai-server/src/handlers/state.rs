@@ -29,6 +29,7 @@ impl From<mai_runtime::RuntimeError> for ApiError {
             | ProjectNotFound(_)
             | ProjectReviewRunNotFound(_)
             | ProjectReviewJobNotFound(_) => StatusCode::NOT_FOUND,
+            PullRequestMerged { .. } => StatusCode::CONFLICT,
             TurnNotFound { .. } => StatusCode::NOT_FOUND,
             ThreadNotFound(_) => StatusCode::NOT_FOUND,
             ToolTraceNotFound { .. } => StatusCode::NOT_FOUND,
@@ -37,9 +38,14 @@ impl From<mai_runtime::RuntimeError> for ApiError {
             MissingContainer(_) => StatusCode::CONFLICT,
             TurnCancelled => StatusCode::CONFLICT,
             GithubUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            Docker(_) | Model(_) | Store(_) | Skill(_) | Io(_) | Http(_) | Jwt(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Docker(_)
+            | Model(_)
+            | Store(_)
+            | Skill(_)
+            | Io(_)
+            | Http(_)
+            | Jwt(_)
+            | MergedPullRequestRefresh(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
             status,
@@ -89,6 +95,15 @@ mod tests {
 
     fn agent_id() -> mai_protocol::AgentId {
         mai_protocol::AgentId::new_v4()
+    }
+
+    #[test]
+    fn merged_pull_request_maps_to_conflict() {
+        let error = ApiError::from(RuntimeError::PullRequestMerged {
+            project_id: mai_protocol::ProjectId::new_v4(),
+            pr: 42,
+        });
+        assert_eq!(error.status, StatusCode::CONFLICT);
     }
 
     fn task_id() -> mai_protocol::TaskId {
