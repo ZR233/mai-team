@@ -8,6 +8,7 @@ use mai_protocol::{
     ThreadContextDisposition, ThreadItem, ThreadItemContent, ThreadItemStatus, ThreadTurnHistory,
     Turn, TurnState,
 };
+use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -1249,9 +1250,13 @@ async fn review_jobs_dedupe_same_head_and_supersede_old_head() {
     );
 
     let jobs = store
-        .load_project_review_jobs(project_id, 0, 10)
+        .load_project_pull_request_review_history(project_id, 42, 1, 10)
         .await
-        .expect("load jobs");
+        .expect("load jobs")
+        .items
+        .into_iter()
+        .map(|item| item.job)
+        .collect::<Vec<_>>();
     assert_eq!(2, jobs.len());
     assert_eq!(ProjectReviewJobStatus::Queued, jobs[0].status);
     assert_eq!("head-b", jobs[0].head_sha);
@@ -1344,9 +1349,13 @@ async fn completed_review_signals_keep_one_active_job_per_pr() {
     assert_eq!(first.job.id, repeated.job.id);
     assert_eq!(Some("delivery-2"), repeated.job.delivery_id.as_deref());
     let jobs = store
-        .load_project_review_jobs(project_id, 0, 10)
+        .load_project_pull_request_review_history(project_id, 42, 1, 10)
         .await
-        .expect("load review jobs");
+        .expect("load review jobs")
+        .items
+        .into_iter()
+        .map(|item| item.job)
+        .collect::<Vec<_>>();
     assert_eq!(1, jobs.len());
     assert_eq!(
         1,
@@ -1766,9 +1775,13 @@ async fn ci_pending_skip_rechecks_changed_delivery_and_allows_next_generation() 
     assert_eq!(ProjectReviewJobEnqueueDisposition::Queued, next.disposition);
     assert_ne!(first.job.id, next.job.id);
     let jobs = store
-        .load_project_review_jobs(project_id, 0, 10)
+        .load_project_pull_request_review_history(project_id, 42, 1, 10)
         .await
-        .expect("load review jobs");
+        .expect("load review jobs")
+        .items
+        .into_iter()
+        .map(|item| item.job)
+        .collect::<Vec<_>>();
     assert_eq!(2, jobs.len());
     assert_eq!(
         1,
@@ -1910,9 +1923,10 @@ async fn webhook_delivery_is_idempotent_per_pull_request() {
     assert_eq!(
         2,
         store
-            .load_project_review_jobs(project_id, 0, 10)
+            .load_project_pull_request_reviews(project_id, 1, 10)
             .await
             .expect("load webhook jobs")
+            .reviews
             .len()
     );
 }
@@ -2185,6 +2199,209 @@ async fn review_job_retention_preserves_active_and_leased_jobs() {
             .await
             .expect("load active")
             .is_some()
+    );
+}
+
+#[tokio::test]
+async fn pull_request_review_pages_aggregate_latest_jobs_and_preserve_attempt_history() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let earlier = DateTime::parse_from_rfc3339("2026-08-11T10:00:00Z")
+        .expect("earlier timestamp")
+        .with_timezone(&Utc);
+    let shared = DateTime::parse_from_rfc3339("2026-08-11T11:00:00Z")
+        .expect("shared timestamp")
+        .with_timezone(&Utc);
+    let latest = DateTime::parse_from_rfc3339("2026-08-11T12:00:00Z")
+        .expect("latest timestamp")
+        .with_timezone(&Utc);
+
+    let mut succeeded = test_review_job(project_id, 42, "head-a", None);
+    succeeded.id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("job id");
+    succeeded.status = ProjectReviewJobStatus::Succeeded;
+    succeeded.created_at = earlier;
+    succeeded.updated_at = earlier;
+    succeeded.finished_at = Some(earlier);
+    succeeded.next_attempt_at = None;
+
+    let mut cancelled = test_review_job(project_id, 42, "head-b", None);
+    cancelled.id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").expect("job id");
+    cancelled.status = ProjectReviewJobStatus::Cancelled;
+    cancelled.attempt_count = 1;
+    cancelled.created_at = shared;
+    cancelled.updated_at = shared;
+    cancelled.finished_at = Some(shared);
+    cancelled.next_attempt_at = None;
+
+    let mut skipped = test_review_job(project_id, 42, "head-c", None);
+    skipped.id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").expect("job id");
+    skipped.status = ProjectReviewJobStatus::Skipped;
+    skipped.created_at = shared;
+    skipped.updated_at = shared;
+    skipped.finished_at = Some(shared);
+    skipped.next_attempt_at = None;
+
+    let mut failed = test_review_job(project_id, 43, "head-d", None);
+    failed.id = Uuid::parse_str("00000000-0000-0000-0000-000000000004").expect("job id");
+    failed.status = ProjectReviewJobStatus::Failed;
+    failed.created_at = latest;
+    failed.updated_at = latest;
+    failed.finished_at = Some(latest);
+    failed.next_attempt_at = None;
+
+    let mut second_succeeded = test_review_job(project_id, 44, "head-e", None);
+    second_succeeded.id = Uuid::parse_str("00000000-0000-0000-0000-000000000005").expect("job id");
+    second_succeeded.status = ProjectReviewJobStatus::Succeeded;
+    second_succeeded.created_at = latest;
+    second_succeeded.updated_at = latest;
+    second_succeeded.finished_at = Some(latest);
+    second_succeeded.next_attempt_at = None;
+
+    let mut active = test_review_job(project_id, 45, "head-f", None);
+    active.id = Uuid::parse_str("00000000-0000-0000-0000-000000000006").expect("job id");
+    active.created_at = latest + chrono::TimeDelta::hours(1);
+    active.updated_at = active.created_at;
+
+    for job in [
+        &succeeded,
+        &cancelled,
+        &skipped,
+        &failed,
+        &second_succeeded,
+        &active,
+    ] {
+        store
+            .save_project_review_job(job.clone())
+            .await
+            .expect("save review job");
+    }
+    store
+        .save_project_review_run(&ProjectReviewRunDetail {
+            summary: ProjectReviewRunSummary {
+                id: Uuid::new_v4(),
+                job_id: Some(cancelled.id),
+                attempt_index: 1,
+                project_id,
+                reviewer_agent_id: None,
+                turn_id: None,
+                started_at: shared,
+                finished_at: Some(shared),
+                status: ProjectReviewRunStatus::Cancelled,
+                outcome: None,
+                review_event: None,
+                pr: Some(42),
+                summary: None,
+                error: None,
+                failure: None,
+                token_usage: TokenUsage::default(),
+            },
+            history: None,
+        })
+        .await
+        .expect("save cancelled attempt");
+
+    let first_page = store
+        .load_project_pull_request_reviews(project_id, 1, 2)
+        .await
+        .expect("load first review page");
+    assert_eq!(
+        first_page,
+        ProjectPullRequestReviewPage {
+            reviews: vec![
+                ProjectPullRequestReviewSummary {
+                    pr: 45,
+                    latest_job: active,
+                    history_count: 1,
+                },
+                ProjectPullRequestReviewSummary {
+                    pr: 44,
+                    latest_job: second_succeeded,
+                    history_count: 1,
+                },
+            ],
+            page: 1,
+            page_size: 2,
+            total_items: 4,
+            total_pages: 2,
+            summary: ProjectPullRequestReviewStatusSummary {
+                active: 1,
+                succeeded: 1,
+                skipped: 1,
+                failed: 1,
+            },
+        }
+    );
+    let second_page = store
+        .load_project_pull_request_reviews(project_id, 2, 2)
+        .await
+        .expect("load second review page");
+    assert_eq!(
+        second_page,
+        ProjectPullRequestReviewPage {
+            reviews: vec![
+                ProjectPullRequestReviewSummary {
+                    pr: 43,
+                    latest_job: failed,
+                    history_count: 1,
+                },
+                ProjectPullRequestReviewSummary {
+                    pr: 42,
+                    latest_job: skipped.clone(),
+                    history_count: 3,
+                },
+            ],
+            page: 2,
+            page_size: 2,
+            total_items: 4,
+            total_pages: 2,
+            summary: ProjectPullRequestReviewStatusSummary {
+                active: 1,
+                succeeded: 1,
+                skipped: 1,
+                failed: 1,
+            },
+        }
+    );
+
+    let history = store
+        .load_project_pull_request_review_history(project_id, 42, 1, 2)
+        .await
+        .expect("load first history page");
+    assert_eq!(
+        history,
+        ProjectPullRequestReviewHistoryPage {
+            items: vec![
+                ProjectPullRequestReviewHistoryItem {
+                    job: skipped,
+                    has_attempts: false,
+                },
+                ProjectPullRequestReviewHistoryItem {
+                    job: cancelled,
+                    has_attempts: true,
+                },
+            ],
+            page: 1,
+            page_size: 2,
+            total_items: 3,
+            total_pages: 2,
+        }
+    );
+    let history_tail = store
+        .load_project_pull_request_review_history(project_id, 42, 2, 2)
+        .await
+        .expect("load second history page");
+    assert_eq!(
+        history_tail,
+        ProjectPullRequestReviewHistoryPage {
+            items: vec![ProjectPullRequestReviewHistoryItem {
+                job: succeeded,
+                has_attempts: false,
+            }],
+            page: 2,
+            page_size: 2,
+            total_items: 3,
+            total_pages: 2,
+        }
     );
 }
 

@@ -610,9 +610,44 @@ pub struct ProjectReviewJobDetail {
     pub attempts: Vec<ProjectReviewRunSummary>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProjectReviewJobsResponse {
-    pub jobs: Vec<ProjectReviewJobSummary>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProjectPullRequestReviewStatusSummary {
+    pub active: usize,
+    pub succeeded: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectPullRequestReviewSummary {
+    pub pr: u64,
+    pub latest_job: ProjectReviewJobSummary,
+    pub history_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectPullRequestReviewPage {
+    pub reviews: Vec<ProjectPullRequestReviewSummary>,
+    pub page: usize,
+    pub page_size: usize,
+    pub total_items: usize,
+    pub total_pages: usize,
+    pub summary: ProjectPullRequestReviewStatusSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectPullRequestReviewHistoryItem {
+    pub job: ProjectReviewJobSummary,
+    pub has_attempts: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectPullRequestReviewHistoryPage {
+    pub items: Vec<ProjectPullRequestReviewHistoryItem>,
+    pub page: usize,
+    pub page_size: usize,
+    pub total_items: usize,
+    pub total_pages: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -154,8 +154,39 @@ export interface ReviewJobDetail extends ReviewJobSummary {
   attempts: ReviewRunSummary[]
 }
 
-export interface ReviewJobsResponse {
-  jobs: ReviewJobSummary[]
+export interface PullRequestReviewStatusSummary {
+  active: number
+  succeeded: number
+  skipped: number
+  failed: number
+}
+
+export interface PullRequestReviewSummary {
+  pr: number
+  latest_job: ReviewJobSummary
+  history_count: number
+}
+
+export interface PullRequestReviewPage {
+  reviews: PullRequestReviewSummary[]
+  page: number
+  page_size: number
+  total_items: number
+  total_pages: number
+  summary: PullRequestReviewStatusSummary
+}
+
+export interface PullRequestReviewHistoryItem {
+  job: ReviewJobSummary
+  has_attempts: boolean
+}
+
+export interface PullRequestReviewHistoryPage {
+  items: PullRequestReviewHistoryItem[]
+  page: number
+  page_size: number
+  total_items: number
+  total_pages: number
 }
 
 export interface ReviewRunDetail extends ReviewRunSummary {

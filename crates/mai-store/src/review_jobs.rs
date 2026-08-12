@@ -8,6 +8,7 @@ use crate::cleanup_tasks::ensure_project_review_cleanup_tasks;
 use crate::records::ProjectReviewJobRecord;
 use crate::*;
 
+mod aggregation;
 pub(crate) mod storage;
 
 use storage::*;
@@ -365,43 +366,6 @@ impl MaiStore {
         .await
         .map_err(|error| {
             StoreError::InvalidConfig(format!("review job load task failed: {error}"))
-        })?
-    }
-
-    pub async fn load_project_review_jobs(
-        &self,
-        project_id: ProjectId,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Vec<ProjectReviewJobSummary>> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
-            let connection = open_review_job_connection(&path)?;
-            let mut statement = connection.prepare(
-                "SELECT id, project_id, pr, head_sha, source, delivery_id, reason, status, \
-                 attempt_count, max_attempts, first_retryable_failure_at, next_attempt_at, \
-                 reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, environment_warning_json, skip_reason, \
-                 submission_intent_json, submission_receipt_json, created_at, updated_at, finished_at \
-                 FROM project_review_jobs WHERE project_id = ?1 \
-                 ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3",
-            )?;
-            let rows = statement.query_map(
-                params![
-                    project_id.to_string(),
-                    usize_to_i64(limit.max(1)),
-                    usize_to_i64(offset)
-                ],
-                project_review_job_record,
-            )?;
-            let mut jobs = Vec::new();
-            for row in rows {
-                jobs.push(row?.into_summary()?);
-            }
-            Ok(jobs)
-        })
-        .await
-        .map_err(|error| {
-            StoreError::InvalidConfig(format!("review job list task failed: {error}"))
         })?
     }
 

@@ -183,20 +183,33 @@ impl AgentRuntime {
         projects::review::runs::get_project_review_run(&self.deps.store, project_id, run_id).await
     }
 
-    pub async fn list_project_review_jobs(
+    pub async fn list_project_pull_request_reviews(
         &self,
         project_id: ProjectId,
-        offset: usize,
-        limit: usize,
-    ) -> Result<ProjectReviewJobsResponse> {
+        page: usize,
+        page_size: usize,
+    ) -> Result<ProjectPullRequestReviewPage> {
         self.project(project_id).await?;
-        Ok(ProjectReviewJobsResponse {
-            jobs: self
-                .deps
-                .store
-                .load_project_review_jobs(project_id, offset, limit)
-                .await?,
-        })
+        self.deps
+            .store
+            .load_project_pull_request_reviews(project_id, page, page_size)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn list_project_pull_request_review_history(
+        &self,
+        project_id: ProjectId,
+        pr: u64,
+        page: usize,
+        page_size: usize,
+    ) -> Result<ProjectPullRequestReviewHistoryPage> {
+        self.project(project_id).await?;
+        self.deps
+            .store
+            .load_project_pull_request_review_history(project_id, pr, page, page_size)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn get_project_review_job(

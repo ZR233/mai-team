@@ -6,9 +6,10 @@ import type {
   AgentSummary,
   EnvironmentDetail,
   EnvironmentSummary,
+  PullRequestReviewHistoryPage,
+  PullRequestReviewPage,
   ProjectDetail,
   ReviewJobDetail,
-  ReviewJobsResponse,
   ReviewRunDetail,
   ReviewRunsResponse,
   ProjectSummary,
@@ -26,7 +27,10 @@ export const queryKeys = {
   project: (id: string, agentId?: string | null) => ["projects", id, agentId ?? "maintainer"] as const,
   projectReviewRuns: (id: string) => ["projects", id, "review-runs"] as const,
   projectReviewRun: (id: string, runId: string) => ["projects", id, "review-runs", runId] as const,
-  projectReviewJobs: (id: string) => ["projects", id, "review-jobs"] as const,
+  projectPullRequestReviews: (id: string) => ["projects", id, "pull-request-reviews"] as const,
+  projectPullRequestReviewPage: (id: string, page: number, pageSize: number) => ["projects", id, "pull-request-reviews", page, pageSize] as const,
+  projectPullRequestReviewHistory: (id: string, pr: number) => ["projects", id, "pull-request-reviews", pr, "history"] as const,
+  projectPullRequestReviewHistoryPage: (id: string, pr: number, page: number, pageSize: number) => ["projects", id, "pull-request-reviews", pr, "history", page, pageSize] as const,
   projectReviewJob: (id: string, jobId: string) => ["projects", id, "review-jobs", jobId] as const,
   tasks: ["tasks"] as const,
   providers: ["providers"] as const,
@@ -93,10 +97,16 @@ export const projectReviewRunQuery = (projectId: string, runId?: string | null) 
   enabled: Boolean(projectId && runId),
 })
 
-export const projectReviewJobsQuery = (id: string) => queryOptions({
-  queryKey: queryKeys.projectReviewJobs(id),
-  queryFn: () => api<ReviewJobsResponse>(`/projects/${id}/review-jobs?offset=0&limit=50`),
+export const projectPullRequestReviewsQuery = (id: string, page: number, pageSize = 20) => queryOptions({
+  queryKey: queryKeys.projectPullRequestReviewPage(id, page, pageSize),
+  queryFn: () => api<PullRequestReviewPage>(`/projects/${id}/pull-request-reviews${query({ page: String(page), page_size: String(pageSize) })}`),
   enabled: Boolean(id),
+})
+
+export const projectPullRequestReviewHistoryQuery = (id: string, pr: number, page: number, pageSize = 20) => queryOptions({
+  queryKey: queryKeys.projectPullRequestReviewHistoryPage(id, pr, page, pageSize),
+  queryFn: () => api<PullRequestReviewHistoryPage>(`/projects/${id}/pull-request-reviews/${pr}/history${query({ page: String(page), page_size: String(pageSize) })}`),
+  enabled: Boolean(id && pr),
 })
 
 export const projectReviewJobQuery = (projectId: string, jobId?: string | null) => queryOptions({

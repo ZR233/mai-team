@@ -17,4 +17,20 @@ Object.defineProperty(window, "matchMedia", {
   }),
 })
 
+Object.defineProperties(Element.prototype, {
+  hasPointerCapture: { configurable: true, value: () => false },
+  setPointerCapture: { configurable: true, value: () => undefined },
+  releasePointerCapture: { configurable: true, value: () => undefined },
+  scrollIntoView: { configurable: true, value: () => undefined },
+})
+
+Object.defineProperty(window, "ResizeObserver", {
+  configurable: true,
+  value: class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  },
+})
+
 afterEach(() => cleanup())

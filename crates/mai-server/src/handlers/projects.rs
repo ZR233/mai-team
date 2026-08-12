@@ -6,16 +6,19 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 
 use mai_protocol::{
-    AgentId, CreateProjectRequest, CreateProjectResponse, ProjectId, ProjectReviewJobDetail,
-    ProjectReviewJobsResponse, ProjectReviewQueueResponse, ProjectReviewRunDetail,
-    ProjectReviewRunsResponse, SendMessageRequest, SendMessageResponse, SkillsListResponse,
-    UpdateProjectRequest, UpdateProjectResponse,
+    AgentId, CreateProjectRequest, CreateProjectResponse, ProjectId,
+    ProjectPullRequestReviewHistoryPage, ProjectPullRequestReviewPage, ProjectReviewJobDetail,
+    ProjectReviewQueueResponse, ProjectReviewRunDetail, ProjectReviewRunsResponse,
+    SendMessageRequest, SendMessageResponse, SkillsListResponse, UpdateProjectRequest,
+    UpdateProjectResponse,
 };
 use mai_runtime::ProjectReviewQueueRequest;
 
 use super::state::{ApiError, AppState};
 
 const DEFAULT_REVIEW_RUNS_PAGE_SIZE: usize = 50;
+const DEFAULT_PULL_REQUEST_REVIEWS_PAGE_SIZE: usize = 20;
+const MAX_PULL_REQUEST_REVIEWS_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProjectDetailQuery {
@@ -26,6 +29,12 @@ pub(crate) struct ProjectDetailQuery {
 pub(crate) struct ProjectReviewRunsQuery {
     offset: Option<usize>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ProjectPullRequestReviewsQuery {
+    page: Option<usize>,
+    page_size: Option<usize>,
 }
 
 pub(crate) async fn list_projects(
@@ -98,21 +107,62 @@ pub(crate) async fn get_project_review_run(
     ))
 }
 
-pub(crate) async fn list_project_review_jobs(
+pub(crate) async fn list_project_pull_request_reviews(
     State(state): State<Arc<AppState>>,
     Path(id): Path<ProjectId>,
-    Query(query): Query<ProjectReviewRunsQuery>,
-) -> std::result::Result<Json<ProjectReviewJobsResponse>, ApiError> {
+    Query(query): Query<ProjectPullRequestReviewsQuery>,
+) -> std::result::Result<Json<ProjectPullRequestReviewPage>, ApiError> {
+    let (page, page_size) = pull_request_review_page(query)?;
     Ok(Json(
         state
             .runtime
-            .list_project_review_jobs(
-                id,
-                query.offset.unwrap_or(0),
-                query.limit.unwrap_or(DEFAULT_REVIEW_RUNS_PAGE_SIZE),
-            )
+            .list_project_pull_request_reviews(id, page, page_size)
             .await?,
     ))
+}
+
+pub(crate) async fn list_project_pull_request_review_history(
+    State(state): State<Arc<AppState>>,
+    Path((id, pr)): Path<(ProjectId, u64)>,
+    Query(query): Query<ProjectPullRequestReviewsQuery>,
+) -> std::result::Result<Json<ProjectPullRequestReviewHistoryPage>, ApiError> {
+    let (page, page_size) = pull_request_review_page(query)?;
+    Ok(Json(
+        state
+            .runtime
+            .list_project_pull_request_review_history(id, pr, page, page_size)
+            .await?,
+    ))
+}
+
+fn pull_request_review_page(
+    query: ProjectPullRequestReviewsQuery,
+) -> std::result::Result<(usize, usize), ApiError> {
+    let page = query.page.unwrap_or(1);
+    let page_size = query
+        .page_size
+        .unwrap_or(DEFAULT_PULL_REQUEST_REVIEWS_PAGE_SIZE);
+    if page == 0 {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "page must be at least 1".to_string(),
+        });
+    }
+    if !(1..=MAX_PULL_REQUEST_REVIEWS_PAGE_SIZE).contains(&page_size) {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!(
+                "page_size must be between 1 and {MAX_PULL_REQUEST_REVIEWS_PAGE_SIZE}"
+            ),
+        });
+    }
+    page.checked_sub(1)
+        .and_then(|index| index.checked_mul(page_size))
+        .ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "page offset is too large".to_string(),
+        })?;
+    Ok((page, page_size))
 }
 
 pub(crate) async fn get_project_review_job(
@@ -193,6 +243,51 @@ mod tests {
     use mai_store::MaiStore;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
+
+    #[test]
+    fn pull_request_review_page_defaults_and_rejects_invalid_bounds() {
+        assert_eq!(
+            pull_request_review_page(ProjectPullRequestReviewsQuery {
+                page: None,
+                page_size: None,
+            })
+            .expect("default page"),
+            (1, 20)
+        );
+        assert_eq!(
+            pull_request_review_page(ProjectPullRequestReviewsQuery {
+                page: Some(7),
+                page_size: Some(100),
+            })
+            .expect("maximum page size"),
+            (7, 100)
+        );
+        for query in [
+            ProjectPullRequestReviewsQuery {
+                page: Some(0),
+                page_size: Some(20),
+            },
+            ProjectPullRequestReviewsQuery {
+                page: Some(1),
+                page_size: Some(0),
+            },
+            ProjectPullRequestReviewsQuery {
+                page: Some(1),
+                page_size: Some(101),
+            },
+            ProjectPullRequestReviewsQuery {
+                page: Some(usize::MAX),
+                page_size: Some(100),
+            },
+        ] {
+            assert_eq!(
+                pull_request_review_page(query)
+                    .expect_err("invalid page")
+                    .status,
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
 
     #[tokio::test]
     async fn request_project_pull_request_review_queues_manual_rereview() {

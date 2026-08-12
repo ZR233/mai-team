@@ -34,6 +34,7 @@ export default function ProjectsPage() {
   const selectedId = projectId || projects.data?.[0]?.id || ""
   const selectedAgentId = search.get("agent")
   const view = (search.get("view") as ProjectView | null) || "agents"
+  const reviewPage = positivePage(search.get("review_page"))
   const detail = useQuery(projectQuery(selectedId, selectedAgentId))
   const [createOpen, setCreateOpen] = useState(false)
 
@@ -70,7 +71,7 @@ export default function ProjectsPage() {
           : detail.error
             ? <ProjectPageState><ErrorState error={detail.error} retry={() => void detail.refetch()} /></ProjectPageState>
             : detail.data
-              ? <ProjectWorkspace detail={detail.data} view={view} setView={(next) => changeSearch({ view: next })} selectAgent={(id) => changeSearch({ agent: id })} refresh={() => queryClient.invalidateQueries({ queryKey: ["projects", selectedId] })} onDeleted={async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.projects }); navigate("/projects") }} />
+              ? <ProjectWorkspace detail={detail.data} view={view} setView={(next) => changeSearch({ view: next })} selectAgent={(id) => changeSearch({ agent: id })} reviewPage={reviewPage} setReviewPage={(page) => changeSearch({ review_page: page === 1 ? null : String(page) })} refresh={() => queryClient.invalidateQueries({ queryKey: ["projects", selectedId] })} onDeleted={async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.projects }); navigate("/projects") }} />
               : null}
       <CreateProjectDialog open={createOpen} onOpenChange={setCreateOpen} onCreated={(project) => {
         setCreateOpen(false)
@@ -85,11 +86,13 @@ function ProjectPageState({ children }: { children: React.ReactNode }) {
   return <section className="flex min-w-0 flex-1 flex-col"><WorkspaceHeader crumbs={[{ label: "Projects" }]} /><div className="min-h-0 flex-1 overflow-auto">{children}</div></section>
 }
 
-function ProjectWorkspace({ detail, view, setView, selectAgent, refresh, onDeleted }: {
+function ProjectWorkspace({ detail, view, setView, selectAgent, reviewPage, setReviewPage, refresh, onDeleted }: {
   detail: ProjectDetail
   view: ProjectView
   setView(view: ProjectView): void
   selectAgent(id: string): void
+  reviewPage: number
+  setReviewPage(page: number): void
   refresh(): Promise<unknown>
   onDeleted(): Promise<void>
 }) {
@@ -124,11 +127,16 @@ function ProjectWorkspace({ detail, view, setView, selectAgent, refresh, onDelet
           }}
         />
       </div>}
-      {view === "review" && <ReviewPanel project={detail} />}
+      {view === "review" && <ReviewPanel key={detail.id} project={detail} page={reviewPage} onPageChange={setReviewPage} />}
       {view === "repository" && <RepositoryPanel project={detail} refresh={refresh} onDeleted={onDeleted} />}
       {view === "skills" && <SkillsPanel projectId={detail.id} />}
     </section>
   )
+}
+
+function positivePage(value: string | null) {
+  const page = Number(value)
+  return Number.isSafeInteger(page) && page > 0 ? page : 1
 }
 
 function AgentStrip({ agents, selectedId, onSelect }: { agents: ProjectDetail["agents"]; selectedId: string; onSelect(id: string): void }) {

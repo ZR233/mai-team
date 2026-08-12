@@ -3,10 +3,13 @@ pub(crate) use mai_protocol::{
     AgentId, AgentLogEntry, AgentSummary, ArtifactInfo, GitAccountRequest, GitAccountStatus,
     GitAccountSummary, GitAccountsResponse, GitProvider, GitTokenKind, GithubAppSettingsRequest,
     GithubAppSettingsResponse, GithubSettingsResponse, MaiProductEventEnvelope,
-    MaiProductEventKind, McpServerConfig, PlanHistoryEntry, ProjectId, ProjectReviewJobSummary,
-    ProjectReviewRunDetail, ProjectReviewRunSummary, ProjectSummary, RelaySettingsRequest,
-    RelaySettingsResponse, SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskSummary,
-    ThreadId, TokenUsage, ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceSummary, TurnId,
+    MaiProductEventKind, McpServerConfig, PlanHistoryEntry, ProjectId,
+    ProjectPullRequestReviewHistoryItem, ProjectPullRequestReviewHistoryPage,
+    ProjectPullRequestReviewPage, ProjectPullRequestReviewStatusSummary,
+    ProjectPullRequestReviewSummary, ProjectReviewJobSummary, ProjectReviewRunDetail,
+    ProjectReviewRunSummary, ProjectSummary, RelaySettingsRequest, RelaySettingsResponse,
+    SkillsConfigRequest, TaskId, TaskPlan, TaskReview, TaskSummary, ThreadId, TokenUsage,
+    ToolOutputArtifactInfo, ToolTraceDetail, ToolTraceSummary, TurnId,
 };
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use std::collections::BTreeMap;

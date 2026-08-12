@@ -8,16 +8,6 @@ export interface ReviewUsageProjection {
   attempts: Record<string, TokenUsage>
 }
 
-export function summarizeReviewJobs(jobs: ReviewJobSummary[]) {
-  return jobs.reduce((summary, job) => {
-    if (activeStatuses.has(job.status)) summary.active += 1
-    else if (job.status === "succeeded") summary.succeeded += 1
-    else if (job.status === "failed") summary.failed += 1
-    else if (job.status === "skipped") summary.skipped += 1
-    return summary
-  }, { active: 0, succeeded: 0, failed: 0, skipped: 0 })
-}
-
 export function reviewJobIsActive(job: ReviewJobSummary) {
   return activeStatuses.has(job.status)
 }

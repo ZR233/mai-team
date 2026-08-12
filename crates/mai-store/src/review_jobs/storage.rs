@@ -6,6 +6,11 @@ use crate::records::{ProjectReviewJobRecord, ProjectReviewRunSummaryRecord};
 use crate::*;
 
 const REVIEW_JOB_SQLITE_BUSY_TIMEOUT_SECS: u64 = 30;
+pub(super) const PROJECT_REVIEW_JOB_COLUMNS: &str = "id, project_id, pr, head_sha, source, delivery_id, reason, status, \
+     attempt_count, max_attempts, first_retryable_failure_at, next_attempt_at, \
+     reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, \
+     environment_warning_json, skip_reason, submission_intent_json, submission_receipt_json, \
+     created_at, updated_at, finished_at";
 const ACTIVE_JOB_STATUSES: [&str; 6] = [
     "queued",
     "preparing",
@@ -19,16 +24,9 @@ pub(super) fn load_job(
     connection: &Connection,
     job_id: Uuid,
 ) -> Result<Option<ProjectReviewJobRecord>> {
+    let sql = format!("SELECT {PROJECT_REVIEW_JOB_COLUMNS} FROM project_review_jobs WHERE id = ?1");
     Ok(connection
-        .query_row(
-            "SELECT id, project_id, pr, head_sha, source, delivery_id, reason, status, \
-             attempt_count, max_attempts, first_retryable_failure_at, next_attempt_at, \
-             reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, environment_warning_json, skip_reason, \
-             submission_intent_json, submission_receipt_json, created_at, updated_at, finished_at \
-             FROM project_review_jobs WHERE id = ?1",
-            params![job_id.to_string()],
-            project_review_job_record,
-        )
+        .query_row(&sql, params![job_id.to_string()], project_review_job_record)
         .optional()?)
 }
 
@@ -38,13 +36,13 @@ pub(super) fn load_job_by_delivery(
     pr: u64,
     delivery_id: &str,
 ) -> Result<Option<ProjectReviewJobRecord>> {
+    let sql = format!(
+        "SELECT {PROJECT_REVIEW_JOB_COLUMNS} FROM project_review_jobs \
+         WHERE project_id = ?1 AND pr = ?2 AND delivery_id = ?3 LIMIT 1"
+    );
     Ok(connection
         .query_row(
-            "SELECT id, project_id, pr, head_sha, source, delivery_id, reason, status, \
-             attempt_count, max_attempts, first_retryable_failure_at, next_attempt_at, \
-             reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, environment_warning_json, skip_reason, \
-             submission_intent_json, submission_receipt_json, created_at, updated_at, finished_at \
-             FROM project_review_jobs WHERE project_id = ?1 AND pr = ?2 AND delivery_id = ?3 LIMIT 1",
+            &sql,
             params![project_id.to_string(), u64_to_i64(pr), delivery_id],
             project_review_job_record,
         )
@@ -60,11 +58,8 @@ pub(super) fn load_active_job(
         .map(|status| format!("'{status}'"))
         .join(",");
     let sql = format!(
-        "SELECT id, project_id, pr, head_sha, source, delivery_id, reason, status, \
-         attempt_count, max_attempts, first_retryable_failure_at, next_attempt_at, \
-         reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, environment_warning_json, skip_reason, \
-         submission_intent_json, submission_receipt_json, created_at, updated_at, finished_at \
-         FROM project_review_jobs WHERE project_id = ?1 AND pr = ?2 AND status IN ({placeholders}) \
+        "SELECT {PROJECT_REVIEW_JOB_COLUMNS} FROM project_review_jobs \
+         WHERE project_id = ?1 AND pr = ?2 AND status IN ({placeholders}) \
          ORDER BY created_at DESC LIMIT 1"
     );
     Ok(connection
@@ -84,11 +79,8 @@ pub(super) fn load_first_active_job(
         .map(|status| format!("'{status}'"))
         .join(",");
     let sql = format!(
-        "SELECT id, project_id, pr, head_sha, source, delivery_id, reason, status, \
-         attempt_count, max_attempts, first_retryable_failure_at, next_attempt_at, \
-         reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, environment_warning_json, skip_reason, \
-         submission_intent_json, submission_receipt_json, created_at, updated_at, finished_at \
-         FROM project_review_jobs WHERE project_id = ?1 AND status IN ({placeholders}) \
+        "SELECT {PROJECT_REVIEW_JOB_COLUMNS} FROM project_review_jobs \
+         WHERE project_id = ?1 AND status IN ({placeholders}) \
          ORDER BY CASE status \
              WHEN 'reconciling' THEN 0 \
              WHEN 'submission_pending' THEN 1 \

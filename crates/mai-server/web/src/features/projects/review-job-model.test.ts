@@ -2,10 +2,10 @@ import { describe, expect, it } from "vitest"
 
 import type { ReviewJobSummary, ReviewRunSummary, TokenUsage } from "@/api/product-types"
 
-import { cacheHitRate, latestReviewAttempt, projectReviewUsage, reviewJobIsActive, reviewSkipReasonLabel, summarizeReviewJobs } from "./review-job-model"
+import { cacheHitRate, latestReviewAttempt, projectReviewUsage, reviewJobIsActive, reviewSkipReasonLabel } from "./review-job-model"
 
 describe("review job presentation model", () => {
-  it("keeps retry waiting jobs active instead of counting them as failures", () => {
+  it("keeps retry waiting jobs active", () => {
     const jobs = [
       job("retry_waiting"),
       job("succeeded"),
@@ -15,7 +15,6 @@ describe("review job presentation model", () => {
       job("skipped"),
     ]
 
-    expect(summarizeReviewJobs(jobs)).toEqual({ active: 1, succeeded: 1, failed: 1, skipped: 1 })
     expect(reviewJobIsActive(jobs[0])).toBe(true)
     expect(reviewJobIsActive(jobs[1])).toBe(false)
   })
