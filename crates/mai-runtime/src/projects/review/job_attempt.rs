@@ -23,6 +23,7 @@ const REVIEW_PREPARING_TIMEOUT: Duration = Duration::from_secs(16 * 60);
 const REVIEW_RUNNING_WATCHDOG_POLL: Duration = Duration::from_secs(30);
 const REVIEW_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
+#[derive(Debug, PartialEq)]
 struct AttemptCompletion {
     status: ProjectReviewRunStatus,
     outcome: Option<ProjectReviewOutcome>,
@@ -32,8 +33,34 @@ struct AttemptCompletion {
     failure: Option<mai_protocol::ProjectReviewFailure>,
 }
 
+fn completion_for_persisted_submission(
+    completion: AttemptCompletion,
+    receipt: Option<&mai_protocol::ProjectReviewSubmissionReceipt>,
+) -> AttemptCompletion {
+    let Some(receipt) = receipt else {
+        return completion;
+    };
+    AttemptCompletion {
+        status: ProjectReviewRunStatus::Succeeded,
+        outcome: Some(ProjectReviewOutcome::ReviewSubmitted),
+        review_event: Some(receipt.event.clone()),
+        summary: completion
+            .summary
+            .or_else(|| Some("GitHub review submission recorded.".to_string())),
+        error: None,
+        failure: None,
+    }
+}
+
 /// 为持久化 review job 执行一次 continuation turn 所需的边界。
 pub(crate) trait ProjectReviewJobAttemptOps: ProjectReviewCycleOps {
+    /// 读取 Job 的最新持久化状态，用于让提交回执覆盖随后到达的取消或关闭结果。
+    fn load_project_review_job(
+        &self,
+        project_id: mai_protocol::ProjectId,
+        job_id: Uuid,
+    ) -> impl Future<Output = Result<Option<ProjectReviewJobSummary>>> + Send;
+
     fn save_claimed_project_review_job(
         &self,
         job: ProjectReviewJobSummary,
@@ -493,7 +520,20 @@ async fn finish_attempt(
     turn_id: Option<TurnId>,
     completion: AttemptCompletion,
 ) {
-    let _ = ops
+    let receipt = match ops.load_project_review_job(job.project_id, job.id).await {
+        Ok(Some(current)) => current.submission_receipt,
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(
+                job_id = %job.id,
+                run_id = %run_id,
+                "failed to reload review receipt before finishing attempt: {error}"
+            );
+            None
+        }
+    };
+    let completion = completion_for_persisted_submission(completion, receipt.as_ref());
+    if let Err(error) = ops
         .finish_project_review_run(FinishReviewRun {
             run_id,
             project_id: job.project_id,
@@ -507,11 +547,20 @@ async fn finish_attempt(
             error: completion.error,
             failure: completion.failure,
         })
-        .await;
+        .await
+    {
+        tracing::warn!(
+            job_id = %job.id,
+            run_id = %run_id,
+            "failed to persist review attempt completion: {error}"
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use mai_protocol::{ProjectReviewDecision, ProjectReviewSubmissionReceipt};
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -575,6 +624,43 @@ mod tests {
         assert!(
             REVIEW_CONTINUATION_PROMPT
                 .contains("Never return `review_submitted` unless this Job submitted")
+        );
+    }
+
+    #[test]
+    fn persisted_submission_receipt_wins_over_late_agent_close() {
+        let receipt = ProjectReviewSubmissionReceipt {
+            github_review_id: 42,
+            event: ProjectReviewDecision::RequestChanges,
+            head_sha: "head".to_string(),
+            html_url: Some("https://example.test/review/42".to_string()),
+            submitted_at: Utc::now(),
+        };
+        let interrupted = AttemptCompletion {
+            status: ProjectReviewRunStatus::PermanentFailed,
+            outcome: Some(ProjectReviewOutcome::Failed),
+            review_event: None,
+            summary: None,
+            error: Some("agent_close_requested".to_string()),
+            failure: Some(mai_protocol::ProjectReviewFailure {
+                category: mai_protocol::ProjectReviewFailureCategory::Provider,
+                code: None,
+                http_status: None,
+                message: "agent_close_requested".to_string(),
+                retry: pl_protocol::RetryDisposition::Permanent,
+            }),
+        };
+
+        assert_eq!(
+            completion_for_persisted_submission(interrupted, Some(&receipt)),
+            AttemptCompletion {
+                status: ProjectReviewRunStatus::Succeeded,
+                outcome: Some(ProjectReviewOutcome::ReviewSubmitted),
+                review_event: Some(ProjectReviewDecision::RequestChanges),
+                summary: Some("GitHub review submission recorded.".to_string()),
+                error: None,
+                failure: None,
+            }
         );
     }
 }

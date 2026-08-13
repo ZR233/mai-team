@@ -1837,7 +1837,7 @@ async fn active_review_job_projection_prioritizes_execution_over_waiting() {
 }
 
 #[tokio::test]
-async fn delayed_review_job_blocks_newer_job_until_its_retry_is_due() {
+async fn delayed_review_retry_does_not_block_a_ready_queued_job() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
     let current_time = Utc::now();
@@ -1853,34 +1853,24 @@ async fn delayed_review_job_blocks_newer_job_until_its_retry_is_due() {
     let mut queued = test_review_job(project_id, 42, "head-queued", None);
     queued.created_at += chrono::TimeDelta::seconds(1);
     queued.updated_at = queued.created_at;
+    queued.next_attempt_at = Some(current_time);
+    let queued_id = queued.id;
     store
         .save_project_review_job(queued)
         .await
         .expect("save queued job");
 
-    assert!(
-        store
-            .claim_due_project_review_job(
-                project_id,
-                "owner".to_string(),
-                current_time,
-                current_time + chrono::TimeDelta::seconds(60),
-            )
-            .await
-            .expect("claim before retry")
-            .is_none()
-    );
     let claimed = store
         .claim_due_project_review_job(
             project_id,
-            "owner".to_string(),
-            current_time + chrono::TimeDelta::minutes(2),
-            current_time + chrono::TimeDelta::minutes(3),
+            "queued-owner".to_string(),
+            current_time,
+            current_time + chrono::TimeDelta::seconds(60),
         )
         .await
-        .expect("claim due retry")
-        .expect("waiting job becomes due");
-    assert_eq!(waiting.id, claimed.id);
+        .expect("claim ready queued job")
+        .expect("queued job must not be blocked by retry backoff");
+    assert_eq!(queued_id, claimed.id);
 }
 
 #[tokio::test]

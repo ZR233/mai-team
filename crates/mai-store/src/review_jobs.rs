@@ -732,17 +732,13 @@ fn claim_due_job_on_path(
              AND status IN ('queued','retry_waiting','reconciling') \
              AND (next_attempt_at IS NULL OR next_attempt_at <= ?2) \
              AND (lease_expires_at IS NULL OR lease_expires_at <= ?2) \
-             AND NOT EXISTS (SELECT 1 FROM project_review_jobs AS delayed_job \
-                 WHERE delayed_job.project_id = ?1 \
-                 AND delayed_job.status IN ('retry_waiting','reconciling') \
-                 AND delayed_job.next_attempt_at > ?2) \
              AND NOT EXISTS (SELECT 1 FROM project_review_jobs AS active_lease \
                  WHERE active_lease.project_id = ?1 \
                  AND active_lease.lease_owner IS NOT NULL \
                  AND active_lease.lease_expires_at > ?2) \
              ORDER BY CASE status \
-                 WHEN 'reconciling' THEN 0 WHEN 'retry_waiting' THEN 1 ELSE 2 END, \
-                 created_at ASC LIMIT 1",
+                 WHEN 'reconciling' THEN 0 ELSE 1 END, \
+                 COALESCE(next_attempt_at, created_at) ASC, created_at ASC, id ASC LIMIT 1",
             params![project_id.to_string(), now.to_rfc3339()],
             |row| row.get::<_, String>(0),
         )

@@ -574,6 +574,18 @@ impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
 }
 
 impl projects::review::job_attempt::ProjectReviewJobAttemptOps for Arc<AgentRuntime> {
+    async fn load_project_review_job(
+        &self,
+        project_id: ProjectId,
+        job_id: Uuid,
+    ) -> Result<Option<ProjectReviewJobSummary>> {
+        Ok(self
+            .deps
+            .store
+            .load_project_review_job(project_id, job_id)
+            .await?)
+    }
+
     async fn save_claimed_project_review_job(
         &self,
         job: ProjectReviewJobSummary,
