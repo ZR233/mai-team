@@ -152,6 +152,8 @@ pub enum RuntimeError {
     AgentBusy(AgentId),
     #[error("task is busy: {0}")]
     TaskBusy(TaskId),
+    #[error("project reviewer slot is still occupied by agent: {0}")]
+    ProjectReviewerBusy(AgentId),
     #[error("agent has no container: {0}")]
     MissingContainer(AgentId),
     #[error("Thread not found: {0}")]

@@ -1979,6 +1979,68 @@ async fn expired_review_job_recovers_without_losing_reviewer() {
 }
 
 #[tokio::test]
+async fn process_restart_recovers_live_lease_and_persists_reviewer_cleanup() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let reviewer_id = Uuid::new_v4();
+    let current_time = Utc::now();
+    let mut job = test_review_job(project_id, 10, "head", None);
+    job.status = ProjectReviewJobStatus::Running;
+    job.reviewer_agent_id = Some(reviewer_id);
+    job.lease_owner = Some("stopped-process".to_string());
+    job.lease_expires_at = Some(current_time + chrono::TimeDelta::minutes(5));
+    store
+        .save_project_review_job(job.clone())
+        .await
+        .expect("save running job");
+
+    assert_eq!(
+        0,
+        store
+            .recover_expired_project_review_jobs(current_time)
+            .await
+            .expect("future lease is not expired")
+    );
+    assert_eq!(
+        1,
+        store
+            .recover_interrupted_project_review_jobs(current_time)
+            .await
+            .expect("process restart owns every old lease")
+    );
+
+    let recovered = store
+        .load_project_review_job(project_id, job.id)
+        .await
+        .expect("load recovered job")
+        .expect("recovered job");
+    let cleanup_tasks = store
+        .load_project_review_cleanup_tasks(job.id)
+        .await
+        .expect("load cleanup tasks");
+    assert_eq!(ProjectReviewJobStatus::RetryWaiting, recovered.status);
+    assert_eq!(None, recovered.lease_owner);
+    assert_eq!(None, recovered.lease_expires_at);
+    assert_eq!(
+        vec![
+            ProjectReviewCleanupResourceKind::ReviewerAgent,
+            ProjectReviewCleanupResourceKind::ToolOutputNamespace,
+        ],
+        cleanup_tasks
+            .iter()
+            .map(|task| task.resource_kind)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        vec![ProjectReviewCleanupTaskStatus::Pending; 2],
+        cleanup_tasks
+            .iter()
+            .map(|task| task.status)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn submission_intent_is_idempotent_and_receipt_completes_job() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();

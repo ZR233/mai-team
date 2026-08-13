@@ -1,9 +1,11 @@
 use std::collections::HashSet;
 
 use mai_protocol::{
-    AgentId, AgentResourceState, AgentRuntimeLifecycle, AgentSummary, ProjectId,
-    ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewStatus, ProjectSummary,
+    AgentId, AgentSummary, ProjectId, ProjectReviewRunStatus, ProjectReviewRunSummary,
+    ProjectReviewStatus, ProjectSummary,
 };
+#[cfg(test)]
+use mai_protocol::{AgentResourceState, AgentRuntimeLifecycle};
 
 use super::runs::FinishReviewRun;
 use super::state::ReviewStateUpdate;
@@ -11,11 +13,13 @@ use super::worker::ProjectReviewWorkerOps;
 use crate::Result;
 
 const STARTUP_INTERRUPTED_ERROR: &str = "review interrupted by server restart";
+#[cfg(test)]
 const SELF_REPAIR_INTERRUPTED_ERROR: &str = "review interrupted by project reviewer self repair";
 
 #[derive(Clone, Copy)]
 pub(crate) enum ProjectReviewRepairReason {
     Startup,
+    #[cfg(test)]
     Runtime,
 }
 
@@ -23,6 +27,7 @@ impl ProjectReviewRepairReason {
     fn label(self) -> &'static str {
         match self {
             ProjectReviewRepairReason::Startup => "startup",
+            #[cfg(test)]
             ProjectReviewRepairReason::Runtime => "runtime",
         }
     }
@@ -30,6 +35,7 @@ impl ProjectReviewRepairReason {
     fn interrupted_error(self) -> &'static str {
         match self {
             ProjectReviewRepairReason::Startup => STARTUP_INTERRUPTED_ERROR,
+            #[cfg(test)]
             ProjectReviewRepairReason::Runtime => SELF_REPAIR_INTERRUPTED_ERROR,
         }
     }
@@ -61,9 +67,9 @@ pub(crate) async fn repair_project_review_singleton<Ops: ProjectReviewWorkerOps>
 
     let cancelled_run_count =
         cancel_project_review_runs(ops, project_id, runs_to_cancel, reason.interrupted_error())
-            .await;
+            .await?;
     let (cancelled_turn_count, deleted_reviewer_count) =
-        delete_project_reviewers(ops, project_id, reviewer_ids_to_delete).await;
+        delete_project_reviewers(ops, project_id, reviewer_ids_to_delete).await?;
     if keep_reviewer_id.is_none() {
         let status = if snapshot.summary.auto_review_enabled {
             ProjectReviewStatus::Idle
@@ -116,26 +122,36 @@ impl ProjectReviewSingletonSnapshot {
     }
 
     fn keep_consistent_reviewer(&self, reason: ProjectReviewRepairReason) -> Option<AgentId> {
-        if matches!(reason, ProjectReviewRepairReason::Startup) {
-            return None;
+        #[cfg(not(test))]
+        {
+            match reason {
+                ProjectReviewRepairReason::Startup => None,
+            }
         }
-        let current_reviewer_id = self.summary.current_reviewer_agent_id?;
-        let mut current_runs = self
-            .active_runs
-            .iter()
-            .filter(|run| run.reviewer_agent_id == Some(current_reviewer_id));
-        let current_run = current_runs.next()?;
-        if current_runs.next().is_some() {
-            return None;
+        #[cfg(test)]
+        {
+            if matches!(reason, ProjectReviewRepairReason::Startup) {
+                return None;
+            }
+            let current_reviewer_id = self.summary.current_reviewer_agent_id?;
+            let mut current_runs = self
+                .active_runs
+                .iter()
+                .filter(|run| run.reviewer_agent_id == Some(current_reviewer_id));
+            let current_run = current_runs.next()?;
+            if current_runs.next().is_some() {
+                return None;
+            }
+            let reviewer = self
+                .reviewers
+                .iter()
+                .find(|reviewer| reviewer.id == current_reviewer_id)?;
+            if !project_reviewer_agent_can_continue(reviewer) {
+                return None;
+            }
+            (current_run.reviewer_agent_id == Some(current_reviewer_id))
+                .then_some(current_reviewer_id)
         }
-        let reviewer = self
-            .reviewers
-            .iter()
-            .find(|reviewer| reviewer.id == current_reviewer_id)?;
-        if !project_reviewer_agent_can_continue(reviewer) {
-            return None;
-        }
-        (current_run.reviewer_agent_id == Some(current_reviewer_id)).then_some(current_reviewer_id)
     }
 
     fn has_stale_activity(&self, keep_reviewer_id: Option<AgentId>) -> bool {
@@ -191,45 +207,33 @@ async fn cancel_project_review_runs<Ops: ProjectReviewWorkerOps>(
     project_id: ProjectId,
     runs: Vec<ProjectReviewRunSummary>,
     error: &str,
-) -> usize {
+) -> Result<usize> {
     let mut cancelled_run_count = 0;
     for run in runs {
-        match ops
-            .finish_project_review_run(FinishReviewRun {
-                run_id: run.id,
-                project_id,
-                reviewer_agent_id: run.reviewer_agent_id,
-                turn_id: run.turn_id,
-                status: ProjectReviewRunStatus::Cancelled,
-                outcome: None,
-                review_event: None,
-                pr: run.pr,
-                summary_text: run.summary,
-                error: Some(error.to_string()),
-                failure: None,
-            })
-            .await
-        {
-            Ok(()) => {
-                cancelled_run_count += 1;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    project_id = %project_id,
-                    run_id = %run.id,
-                    "failed to cancel stale project review run during singleton repair: {err}"
-                );
-            }
-        }
+        ops.finish_project_review_run(FinishReviewRun {
+            run_id: run.id,
+            project_id,
+            reviewer_agent_id: run.reviewer_agent_id,
+            turn_id: run.turn_id,
+            status: ProjectReviewRunStatus::Cancelled,
+            outcome: None,
+            review_event: None,
+            pr: run.pr,
+            summary_text: run.summary,
+            error: Some(error.to_string()),
+            failure: None,
+        })
+        .await?;
+        cancelled_run_count += 1;
     }
-    cancelled_run_count
+    Ok(cancelled_run_count)
 }
 
 async fn delete_project_reviewers<Ops: ProjectReviewWorkerOps>(
     ops: &Ops,
     project_id: ProjectId,
     reviewer_ids: Vec<AgentId>,
-) -> (usize, usize) {
+) -> Result<(usize, usize)> {
     let mut cancelled_turn_count = 0;
     let mut deleted_reviewer_count = 0;
     for reviewer_id in reviewer_ids {
@@ -260,16 +264,15 @@ async fn delete_project_reviewers<Ops: ProjectReviewWorkerOps>(
             Ok(()) => {
                 deleted_reviewer_count += 1;
             }
+            Err(crate::RuntimeError::AgentNotFound(missing_id)) if missing_id == reviewer_id => {
+                deleted_reviewer_count += 1;
+            }
             Err(err) => {
-                tracing::warn!(
-                    project_id = %project_id,
-                    reviewer_id = %reviewer_id,
-                    "failed to delete stale project reviewer agent during singleton repair: {err}"
-                );
+                return Err(err);
             }
         }
     }
-    (cancelled_turn_count, deleted_reviewer_count)
+    Ok((cancelled_turn_count, deleted_reviewer_count))
 }
 
 fn project_review_run_is_active(run: &ProjectReviewRunSummary) -> bool {
@@ -287,6 +290,7 @@ fn reviewer_agent_should_be_deleted(
     Some(reviewer.id) != keep_reviewer_id
 }
 
+#[cfg(test)]
 fn project_reviewer_agent_can_continue(reviewer: &AgentSummary) -> bool {
     matches!(
         reviewer.state.resource,

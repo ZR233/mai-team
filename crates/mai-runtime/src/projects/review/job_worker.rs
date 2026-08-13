@@ -430,6 +430,12 @@ pub(super) fn runtime_failure(error: &RuntimeError) -> ProjectReviewFailure {
             None,
             retryable_disposition(None),
         ),
+        RuntimeError::ProjectReviewerBusy(_) => (
+            ProjectReviewFailureCategory::Internal,
+            Some("reviewer_slot_busy".to_string()),
+            None,
+            retryable_disposition(None),
+        ),
         RuntimeError::MissingContainer(_) => (
             ProjectReviewFailureCategory::Workspace,
             Some("workspace_container_missing".to_string()),
@@ -781,6 +787,24 @@ mod tests {
 
         assert_eq!(ProjectReviewFailureCategory::Validation, failure.category);
         assert_eq!(pl_protocol::RetryDisposition::Permanent, failure.retry);
+    }
+
+    #[test]
+    fn runtime_failure_retries_occupied_reviewer_slot() {
+        let reviewer_id = uuid::Uuid::new_v4();
+
+        assert_eq!(
+            ProjectReviewFailure {
+                category: ProjectReviewFailureCategory::Internal,
+                code: Some("reviewer_slot_busy".to_string()),
+                http_status: None,
+                message: format!("project reviewer slot is still occupied by agent: {reviewer_id}"),
+                retry: pl_protocol::RetryDisposition::Retryable {
+                    retry_after_ms: None,
+                },
+            },
+            runtime_failure(&RuntimeError::ProjectReviewerBusy(reviewer_id))
+        );
     }
 
     fn job() -> ProjectReviewJobSummary {

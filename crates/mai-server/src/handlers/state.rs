@@ -33,7 +33,7 @@ impl From<mai_runtime::RuntimeError> for ApiError {
             TurnNotFound { .. } => StatusCode::NOT_FOUND,
             ThreadNotFound(_) => StatusCode::NOT_FOUND,
             ToolTraceNotFound { .. } => StatusCode::NOT_FOUND,
-            AgentBusy(_) | TaskBusy(_) => StatusCode::CONFLICT,
+            AgentBusy(_) | TaskBusy(_) | ProjectReviewerBusy(_) => StatusCode::CONFLICT,
             InvalidInput(_) => StatusCode::BAD_REQUEST,
             MissingContainer(_) => StatusCode::CONFLICT,
             TurnCancelled => StatusCode::CONFLICT,

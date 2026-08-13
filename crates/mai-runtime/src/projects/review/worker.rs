@@ -17,10 +17,8 @@ use super::eligibility::EvaluatedProjectReviewPr;
 #[cfg(test)]
 use super::eligibility::SelectedProjectReviewPr;
 use super::project_review_retry_backoff;
-#[cfg(test)]
 use super::runs::FinishReviewRun;
 use super::selector::ProjectReviewSelectorRunResult;
-#[cfg(test)]
 use super::singleton::{ProjectReviewRepairReason, repair_project_review_singleton};
 use super::state::ReviewStateUpdate;
 use crate::state::{ProjectRecord, ProjectReviewWorker};
@@ -48,7 +46,6 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<mai_protocol::ProjectReviewRunSummary>>> + Send;
 
-    #[cfg(test)]
     fn finish_project_review_run(
         &self,
         request: FinishReviewRun,
@@ -178,6 +175,11 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<usize>> + Send;
 
+    fn recover_interrupted_project_review_jobs(
+        &self,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<usize>> + Send;
+
     fn cancel_active_project_review_jobs(
         &self,
         project_id: ProjectId,
@@ -216,8 +218,21 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
 }
 
 pub(crate) async fn start_enabled_project_review_workers(ops: impl ProjectReviewWorkerOps) {
-    if let Err(error) = ops.recover_expired_project_review_jobs(Utc::now()).await {
-        tracing::warn!("failed to recover expired project review jobs: {error}");
+    match ops
+        .recover_interrupted_project_review_jobs(Utc::now())
+        .await
+    {
+        Ok(recovered) if recovered > 0 => {
+            tracing::info!(
+                recovered,
+                "recovered review jobs interrupted by server restart"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!("failed to recover review jobs interrupted by server restart: {error}");
+            return;
+        }
     }
     for project_id in ops.project_ids().await {
         if let Err(err) = start_project_review_loop_if_ready(ops.clone(), project_id).await {
@@ -423,6 +438,9 @@ fn spawn_project_review_child(future: impl Future<Output = ()> + Send + 'static)
 async fn run_project_review_pool_worker(
     ops: ProjectReviewTaskContext<impl ProjectReviewWorkerOps>,
 ) {
+    if !repair_project_review_worker_startup(&ops).await {
+        return;
+    }
     let mut workspace_backoff = project_review_retry_backoff();
     while !ops.cancellation_token.is_cancelled() {
         if !project_still_ready(&ops).await {
@@ -531,6 +549,35 @@ async fn run_project_review_pool_worker(
     if let Ok(project) = ops.ops.project(ops.project_id).await {
         let mut worker = project.review_worker.lock().await;
         *worker = None;
+    }
+}
+
+async fn repair_project_review_worker_startup(
+    ops: &ProjectReviewTaskContext<impl ProjectReviewWorkerOps>,
+) -> bool {
+    let mut backoff = project_review_retry_backoff();
+    loop {
+        match repair_project_review_singleton(
+            &ops.ops,
+            ops.project_id,
+            50,
+            ProjectReviewRepairReason::Startup,
+        )
+        .await
+        {
+            Ok(()) => return true,
+            Err(error) => {
+                let delay = backoff.next_delay();
+                tracing::warn!(
+                    project_id = %ops.project_id,
+                    retry_after_ms = delay.as_millis(),
+                    "failed to reconcile project reviewer ownership before starting worker: {error}"
+                );
+                if !wait_or_cancel(&ops.cancellation_token, delay).await {
+                    return false;
+                }
+            }
+        }
     }
 }
 
@@ -1352,6 +1399,35 @@ mod tests {
                     .lease_expires_at
                     .is_none_or(|expires_at| expires_at <= now)
                 {
+                    job.status = if job.submission_intent.is_some() {
+                        ProjectReviewJobStatus::Reconciling
+                    } else {
+                        ProjectReviewJobStatus::RetryWaiting
+                    };
+                    job.next_attempt_at = Some(now);
+                    job.lease_owner = None;
+                    job.lease_expires_at = None;
+                    job.updated_at = now;
+                    recovered += 1;
+                }
+            }
+            Ok(recovered)
+        }
+
+        async fn recover_interrupted_project_review_jobs(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> crate::Result<usize> {
+            let mut jobs = self.review_jobs.lock().await;
+            let mut recovered = 0;
+            for job in jobs.iter_mut() {
+                if matches!(
+                    job.status,
+                    ProjectReviewJobStatus::Preparing
+                        | ProjectReviewJobStatus::Running
+                        | ProjectReviewJobStatus::SubmissionPending
+                        | ProjectReviewJobStatus::Reconciling
+                ) {
                     job.status = if job.submission_intent.is_some() {
                         ProjectReviewJobStatus::Reconciling
                     } else {
@@ -2211,7 +2287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_worker_does_not_opportunistically_destroy_unowned_reviewer() {
+    async fn pool_worker_releases_stale_reviewer_before_processing_next_job() {
         let project_id = Uuid::new_v4();
         let ops = FakeWorkerOps::new(project_id);
         let maintainer_agent_id = ops.project.summary.read().await.maintainer_agent_id;
@@ -2223,7 +2299,7 @@ mod tests {
         ops.set_review_runs(vec![test_review_run(
             project_id,
             Some(reviewer_id),
-            Some(turn_id),
+            Some(turn_id.clone()),
             ProjectReviewRunStatus::Running,
         )])
         .await;
@@ -2255,11 +2331,11 @@ mod tests {
 
         assert_eq!(vec![Some(42)], *ops.reviewed_prs.lock().await);
         assert_eq!(
-            Vec::<(Uuid, String)>::new(),
+            vec![(reviewer_id, turn_id)],
             *ops.cancelled_turns.lock().await
         );
-        assert_eq!(Vec::<Uuid>::new(), *ops.deleted_agents.lock().await);
-        assert!(ops.finished_runs.lock().await.is_empty());
+        assert_eq!(vec![reviewer_id], *ops.deleted_agents.lock().await);
+        assert_eq!(1, ops.finished_runs.lock().await.len());
 
         token.cancel();
         worker_task.await.expect("worker task");

@@ -343,9 +343,7 @@ pub(crate) async fn resume_project_reviewer(
 
 fn ensure_project_reviewer_slot_available(existing_reviewer_id: Option<AgentId>) -> Result<()> {
     if let Some(existing_reviewer_id) = existing_reviewer_id {
-        return Err(RuntimeError::InvalidInput(format!(
-            "project already owns reviewer agent `{existing_reviewer_id}`"
-        )));
+        return Err(RuntimeError::ProjectReviewerBusy(existing_reviewer_id));
     }
     Ok(())
 }
@@ -659,7 +657,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            format!("invalid input: project already owns reviewer agent `{reviewer_id}`")
+            format!("project reviewer slot is still occupied by agent: {reviewer_id}")
         );
     }
 
@@ -853,7 +851,7 @@ mod tests {
 
         assert_eq!(
             format!(
-                "invalid input: project already owns reviewer agent `{}`",
+                "project reviewer slot is still occupied by agent: {}",
                 ops.reviewer.id
             ),
             error.to_string()
@@ -882,7 +880,7 @@ mod tests {
 
         assert_eq!(
             format!(
-                "invalid input: project already owns reviewer agent `{}`",
+                "project reviewer slot is still occupied by agent: {}",
                 ops.reviewer.id
             ),
             error.to_string()

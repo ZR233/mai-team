@@ -498,11 +498,29 @@ impl MaiStore {
 
     pub async fn recover_expired_project_review_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
         let path = self.path.clone();
-        tokio::task::spawn_blocking(move || recover_expired_jobs_on_path(&path, now))
-            .await
-            .map_err(|error| {
-                StoreError::InvalidConfig(format!("review job recovery task failed: {error}"))
-            })?
+        tokio::task::spawn_blocking(move || {
+            recover_jobs_on_path(&path, now, ReviewJobRecovery::ExpiredLeases)
+        })
+        .await
+        .map_err(|error| {
+            StoreError::InvalidConfig(format!("review job recovery task failed: {error}"))
+        })?
+    }
+
+    pub async fn recover_interrupted_project_review_jobs(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<usize> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            recover_jobs_on_path(&path, now, ReviewJobRecovery::InterruptedProcess)
+        })
+        .await
+        .map_err(|error| {
+            StoreError::InvalidConfig(format!(
+                "interrupted review job recovery task failed: {error}"
+            ))
+        })?
     }
 
     pub async fn cancel_active_project_review_jobs(
@@ -775,23 +793,57 @@ fn claim_due_job_on_path(
     Ok(Some(job))
 }
 
-fn recover_expired_jobs_on_path(path: &Path, now: DateTime<Utc>) -> Result<usize> {
-    let connection = open_review_job_connection(path)?;
-    let now = now.to_rfc3339();
-    let changed = connection.execute(
+#[derive(Clone, Copy)]
+enum ReviewJobRecovery {
+    ExpiredLeases,
+    InterruptedProcess,
+}
+
+fn recover_jobs_on_path(
+    path: &Path,
+    now: DateTime<Utc>,
+    recovery: ReviewJobRecovery,
+) -> Result<usize> {
+    let mut connection = open_review_job_connection(path)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let recovered_at = now;
+    let now = recovered_at.to_rfc3339();
+    let recover_all = match recovery {
+        ReviewJobRecovery::ExpiredLeases => 0,
+        ReviewJobRecovery::InterruptedProcess => 1,
+    };
+    let job_ids = {
+        let mut statement = transaction.prepare(
+            "SELECT id FROM project_review_jobs \
+             WHERE status IN ('preparing','running','submission_pending','reconciling') \
+             AND (?2 = 1 OR lease_expires_at IS NULL OR lease_expires_at <= ?1) \
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        statement
+            .query_map(params![now, recover_all], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let changed = transaction.execute(
         "UPDATE project_review_jobs SET \
          status = CASE WHEN submission_intent_json IS NULL THEN 'retry_waiting' ELSE 'reconciling' END, \
          next_attempt_at = ?1, updated_at = ?1, lease_owner = NULL, lease_expires_at = NULL \
          WHERE status IN ('preparing','running','submission_pending','reconciling') \
-         AND (lease_expires_at IS NULL OR lease_expires_at <= ?1)",
-        params![now],
+         AND (?2 = 1 OR lease_expires_at IS NULL OR lease_expires_at <= ?1)",
+        params![now, recover_all],
     )?;
-    connection.execute(
+    transaction.execute(
         "UPDATE project_review_runs SET status = 'interrupted', finished_at = ?1 \
          WHERE finished_at IS NULL AND job_id IN (SELECT id FROM project_review_jobs \
          WHERE status IN ('retry_waiting','reconciling'))",
         params![now],
     )?;
+    if matches!(recovery, ReviewJobRecovery::InterruptedProcess) {
+        for job_id in job_ids {
+            ensure_project_review_cleanup_tasks(&transaction, parse_uuid(&job_id)?, recovered_at)?;
+        }
+    }
+    transaction.commit()?;
     Ok(changed)
 }
 

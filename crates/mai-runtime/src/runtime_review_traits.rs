@@ -947,7 +947,6 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
             .await?)
     }
 
-    #[cfg(test)]
     async fn finish_project_review_run(&self, request: FinishReviewRun) -> Result<()> {
         projects::review::runs::finish_project_review_run(&self.deps.store, self.as_ref(), request)
             .await
@@ -1173,6 +1172,14 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
             .deps
             .store
             .recover_expired_project_review_jobs(now)
+            .await?)
+    }
+
+    async fn recover_interrupted_project_review_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
+        Ok(self
+            .deps
+            .store
+            .recover_interrupted_project_review_jobs(now)
             .await?)
     }
 

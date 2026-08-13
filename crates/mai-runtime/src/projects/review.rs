@@ -27,7 +27,6 @@ pub(crate) mod reviewer;
 pub(crate) mod runs;
 pub(crate) mod selection;
 pub(crate) mod selector;
-#[cfg(test)]
 pub(crate) mod singleton;
 pub(crate) mod state;
 pub(crate) mod target;

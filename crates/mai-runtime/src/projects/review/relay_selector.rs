@@ -160,6 +160,7 @@ async fn project_still_ready(ops: &impl ProjectReviewWorkerOps, project_id: Proj
         | Err(RuntimeError::ThreadNotFound(_))
         | Err(RuntimeError::AgentBusy(_))
         | Err(RuntimeError::TaskBusy(_))
+        | Err(RuntimeError::ProjectReviewerBusy(_))
         | Err(RuntimeError::MissingContainer(_))
         | Err(RuntimeError::ToolTraceNotFound { .. })
         | Err(RuntimeError::TurnNotFound { .. })
