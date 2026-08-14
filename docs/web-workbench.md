@@ -31,8 +31,11 @@ Thread stream 首帧必须是 authoritative snapshot，随后只应用同一 `th
 大面积 dashboard card 或装饰性 badge。
 
 桌面使用全局 nav rail、资源 sidebar 和主工作区；平板把资源栏放入 Sheet；手机使用顶部导航
-与 Sheet，但保留查看、发送、审批和设置主路径。timeline 使用开放阅读流，只有 tool、plan、
-interaction 等结构化内容使用轻量边界。
+与 Sheet，但保留查看、发送、审批和设置主路径。timeline 使用开放阅读流：文字消息直接阅读，
+连续的 tool 调用按"文字/思考输出之间"的相邻段折叠为单个分组行（默认收起，展示数量、
+时长与失败数，运行中显示 Using 与脉动点），单个 tool 调用渲染为紧凑可折叠行；reasoning
+默认折叠，流式生成时展开、完成后收起为一行时长摘要。chat timeline 与 review 活动列表
+复用同一投影与渲染路径，分组行为一致。
 
 ## 功能完整性
 

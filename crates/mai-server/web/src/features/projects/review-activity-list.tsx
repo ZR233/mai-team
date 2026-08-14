@@ -3,23 +3,20 @@ import { CheckCircle2, CircleAlert } from "lucide-react"
 import { Markdown } from "@/components/markdown"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
-import { ThreadTimelineItem } from "@/features/thread/thread-timeline"
+import { TimelineEntriesView } from "@/features/thread/timeline"
 
-import type { ReviewActivityItem } from "./review-activity"
+import type { ReviewActivity, ReviewConclusionView } from "./review-activity"
 
-export function ReviewActivityList({ activity }: { activity: ReviewActivityItem[] }) {
-  if (activity.length === 0) return <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">No review activity was archived.</p>
-  return <div className="space-y-2.5">{activity.map((item) => {
-    switch (item.kind) {
-      case "threadItem":
-        return <ThreadTimelineItem key={item.id} item={item.item} />
-      case "conclusion":
-        return <ReviewConclusion key={item.id} item={item} />
-    }
-  })}</div>
+export function ReviewActivityList({ activity }: { activity: ReviewActivity }) {
+  return <div className="space-y-2.5">
+    {activity.items.length === 0
+      ? <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">No review activity was archived.</p>
+      : <TimelineEntriesView items={activity.items} />}
+    <ReviewConclusion item={activity.conclusion} />
+  </div>
 }
 
-function ReviewConclusion({ item }: { item: Extract<ReviewActivityItem, { kind: "conclusion" }> }) {
+function ReviewConclusion({ item }: { item: ReviewConclusionView }) {
   const failed = item.outcome === "failed" || Boolean(item.error)
   const decision = decisionLabel(item.reviewEvent, item.outcome)
   return (

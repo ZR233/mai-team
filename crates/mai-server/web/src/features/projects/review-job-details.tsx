@@ -161,8 +161,8 @@ function ReviewAttemptActivity({ projectId, attempt }: { projectId: string; atte
   if (!attempt) return null
   if (detail.isLoading) return <LoadingState rows={3} />
   if (detail.error) return <ErrorState error={detail.error} retry={() => void detail.refetch()} />
-  const activity = detail.data ? buildReviewActivity(detail.data as ReviewRunDetail) : []
-  return <div className="space-y-2"><h4 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Attempt activity</h4><ReviewActivityList activity={activity} /></div>
+  const activity = detail.data ? buildReviewActivity(detail.data as ReviewRunDetail) : null
+  return <div className="space-y-2"><h4 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Attempt activity</h4>{activity && <ReviewActivityList activity={activity} />}</div>
 }
 
 function ReviewDetailActions({ pr, repository, reviewable, onRereview, pending }: { pr?: number; repository: string; reviewable: boolean; onRereview(pr: number): void; pending: boolean }) {

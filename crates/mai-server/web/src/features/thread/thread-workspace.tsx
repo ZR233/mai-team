@@ -12,7 +12,7 @@ import { useThreadEvents } from "@/events/use-thread-events"
 import { agentCanRunThread, agentPresentationStatus } from "@/features/agents/agent-lifecycle"
 import { AgentModelDialog } from "@/features/agents/agent-model-dialog"
 import { SkillMentionPicker } from "@/features/thread/skill-mention-picker"
-import { ThreadTimeline } from "@/features/thread/thread-timeline"
+import { ThreadTimeline } from "@/features/thread/timeline"
 
 interface ThreadWorkspaceProps {
   agent: AgentDetail
