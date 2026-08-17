@@ -2,7 +2,7 @@ use std::path::Path;
 
 use pl_protocol::{
     AgentMessageChannel, ThreadContextDisposition, ThreadItem, ThreadItemContent, ThreadItemStatus,
-    ThreadTurnHistory, Turn, TurnState,
+    ThreadToolCall, ThreadTurnHistory, Turn, TurnState,
 };
 use pretty_assertions::assert_eq;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -190,6 +190,127 @@ fn v29_migration_preserves_merged_state_in_unified_lifecycle_table() {
         .optional()
         .expect("old table lookup");
     assert_eq!(old_table, None);
+}
+
+#[test]
+fn v30_migration_restores_archived_tool_call_identity() {
+    let (_directory, path) = fixture(false);
+    migrate_fixture_to_v30(&path);
+    let connection = Connection::open(&path).expect("open v30 fixture");
+    let raw: String = connection
+        .query_row(
+            "SELECT history_json FROM project_review_runs WHERE id = 'review-run'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("load v30 review history");
+    let mut history = serde_json::from_str::<serde_json::Value>(&raw).expect("history JSON");
+    history["items"][0]["content"] = serde_json::json!({
+        "type": "toolCall",
+        "tool": {
+            "toolCallId": "review:review-turn:message:0",
+            "name": "archived_tool_output",
+            "result": "review complete",
+            "timedOut": false
+        }
+    });
+    connection
+        .execute(
+            "UPDATE project_review_runs SET history_json = ?1 WHERE id = 'review-run'",
+            [serde_json::to_string(&history).expect("serialize legacy history")],
+        )
+        .expect("write legacy v30 review history");
+    drop(connection);
+
+    let report = migrate_path(&path).expect("migrate legacy v30 tool history");
+    assert_eq!(report.source_schema, "30");
+    assert_eq!(report.target_schema, "31");
+    let connection = Connection::open(&path).expect("open v31 fixture");
+    let migrated_raw: String = connection
+        .query_row(
+            "SELECT history_json FROM project_review_runs WHERE id = 'review-run'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("load migrated review history");
+    let migrated =
+        serde_json::from_str::<ThreadTurnHistory>(&migrated_raw).expect("typed migrated history");
+    assert_eq!(
+        migrated.items[0].content,
+        ThreadItemContent::ToolCall {
+            tool: ThreadToolCall {
+                tool_call_id: "review:review-turn:message:0".to_string(),
+                call_id: "review:review-turn:message:0".to_string(),
+                provider_item_id: None,
+                name: "archived_tool_output".to_string(),
+                arguments: String::new(),
+                result: Some("review complete".to_string()),
+                output_artifacts: Vec::new(),
+                exit_code: None,
+                timed_out: false,
+                working_directory: None,
+                denial_reason: None,
+            },
+        }
+    );
+    drop(connection);
+
+    let repeated = migrate_path(&path).expect("repeat only validates");
+    assert!(repeated.already_current);
+    let connection = Connection::open(&path).expect("open repeated fixture");
+    let repeated_raw: String = connection
+        .query_row(
+            "SELECT history_json FROM project_review_runs WHERE id = 'review-run'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("load repeated review history");
+    assert_eq!(repeated_raw, migrated_raw);
+}
+
+#[test]
+fn v30_migration_restores_nested_active_activity_shape() {
+    let (_directory, path) = fixture(false);
+    migrate_fixture_to_v30(&path);
+    let connection = Connection::open(&path).expect("open v30 fixture");
+    let raw: String = connection
+        .query_row(
+            "SELECT document_json FROM thread_runtime_documents WHERE thread_id = ?1",
+            [AGENT_ID],
+            |row| row.get(0),
+        )
+        .expect("load v30 runtime document");
+    let mut document = serde_json::from_str::<serde_json::Value>(&raw).expect("document JSON");
+    document["snapshot"]["activity"] = serde_json::Value::String("running".to_string());
+    connection
+        .execute(
+            "UPDATE thread_runtime_documents SET document_json = ?1 WHERE thread_id = ?2",
+            params![
+                serde_json::to_string(&document).expect("serialize legacy document"),
+                AGENT_ID
+            ],
+        )
+        .expect("write legacy v30 runtime document");
+    drop(connection);
+
+    migrate_path(&path).expect("migrate legacy v30 runtime activity");
+    let connection = Connection::open(&path).expect("open v31 fixture");
+    let migrated_raw: String = connection
+        .query_row(
+            "SELECT document_json FROM thread_runtime_documents WHERE thread_id = ?1",
+            [AGENT_ID],
+            |row| row.get(0),
+        )
+        .expect("load migrated runtime document");
+    let migrated =
+        serde_json::from_str::<serde_json::Value>(&migrated_raw).expect("migrated document JSON");
+    assert_eq!(
+        migrated["snapshot"]["activity"],
+        serde_json::to_value(pl_core::AgentActivityState::Active(
+            pl_core::ActiveKind::Running
+        ))
+        .expect("serialize current activity")
+    );
 }
 
 #[test]
@@ -476,6 +597,15 @@ fn migrate_fixture_to_v29(path: &Path) {
         .expect("insert v29 merged row");
     crate::schema::validate_v29(&transaction).expect("validate v29");
     transaction.commit().expect("commit v29 fixture");
+}
+
+fn migrate_fixture_to_v30(path: &Path) {
+    migrate_fixture_to_v29(path);
+    let mut connection = Connection::open(path).expect("open v29 fixture");
+    let transaction = connection.transaction().expect("v30 transaction");
+    crate::schema::install_v30(&transaction).expect("install v30");
+    crate::schema::validate_v30(&transaction).expect("validate v30");
+    transaction.commit().expect("commit v30 fixture");
 }
 
 fn create_v27(path: &Path, inject_failure: bool) {

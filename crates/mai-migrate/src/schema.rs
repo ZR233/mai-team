@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail};
 use mai_protocol::MaiProductEventEnvelope;
+use pl_core::{ActiveKind, AgentActivityState};
 use pl_protocol::ThreadTurnHistory;
 use rusqlite::{OptionalExtension, Transaction, params};
 
@@ -304,6 +305,111 @@ pub(crate) fn install_v31(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn restore_v30_review_tool_call_identity(transaction: &Transaction<'_>) -> Result<()> {
+    let histories = {
+        let mut statement = transaction.prepare(
+            "SELECT id, history_json FROM project_review_runs WHERE history_json IS NOT NULL",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (run_id, raw) in histories {
+        let mut history = serde_json::from_str::<serde_json::Value>(&raw)
+            .with_context(|| format!("review run {run_id} history JSON 非法"))?;
+        let items = history
+            .get_mut("items")
+            .and_then(serde_json::Value::as_array_mut)
+            .with_context(|| format!("review run {run_id} history 缺少 items"))?;
+        let mut changed = false;
+        for item in items {
+            let item_id = item
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<unknown>")
+                .to_string();
+            let Some(content) = item
+                .get_mut("content")
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                continue;
+            };
+            if content.get("type").and_then(serde_json::Value::as_str) != Some("toolCall") {
+                continue;
+            }
+            let tool = content
+                .get_mut("tool")
+                .and_then(serde_json::Value::as_object_mut)
+                .with_context(|| format!("review run {run_id} 的工具 Item {item_id} 缺少 tool"))?;
+            if tool.contains_key("callId") {
+                continue;
+            }
+            let call_id = tool
+                .get("toolCallId")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .with_context(|| {
+                    format!(
+                        "review run {run_id} 的工具 Item {item_id} 缺少 toolCallId，无法恢复 callId"
+                    )
+                })?
+                .to_string();
+            tool.insert("callId".to_string(), serde_json::Value::String(call_id));
+            changed = true;
+        }
+        if changed {
+            transaction.execute(
+                "UPDATE project_review_runs SET history_json = ?1 WHERE id = ?2",
+                params![serde_json::to_string(&history)?, run_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn restore_v30_runtime_activity_shape(transaction: &Transaction<'_>) -> Result<()> {
+    let documents = {
+        let mut statement =
+            transaction.prepare("SELECT thread_id, document_json FROM thread_runtime_documents")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (thread_id, raw) in documents {
+        let mut document = serde_json::from_str::<serde_json::Value>(&raw)
+            .with_context(|| format!("Thread {thread_id} canonical document JSON 非法"))?;
+        let activity = document
+            .pointer_mut("/snapshot/activity")
+            .with_context(|| {
+                format!("Thread {thread_id} canonical document 缺少 snapshot.activity")
+            })?;
+        let restored = match activity.as_str() {
+            Some("running") => Some(AgentActivityState::Active(ActiveKind::Running)),
+            Some("waiting_tool" | "waitingTool") => {
+                Some(AgentActivityState::Active(ActiveKind::WaitingTool))
+            }
+            Some("waiting_interaction" | "waitingInteraction") => {
+                Some(AgentActivityState::Active(ActiveKind::WaitingInteraction))
+            }
+            Some("idle" | "queued" | "cancelling") | None => None,
+            Some(_) => None,
+        };
+        let Some(restored) = restored else {
+            continue;
+        };
+        *activity = serde_json::to_value(restored)?;
+        transaction.execute(
+            "UPDATE thread_runtime_documents SET document_json = ?1 WHERE thread_id = ?2",
+            params![serde_json::to_string(&document)?, thread_id],
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_v30(transaction: &Transaction<'_>) -> Result<()> {
     if schema_version(transaction)? != PR_STATE_SCHEMA {
         bail!("源数据库不是 schema {PR_STATE_SCHEMA}");
@@ -496,6 +602,13 @@ fn validate_runtime_documents(transaction: &Transaction<'_>) -> Result<()> {
             bail!("Thread {thread_id} revision 为负数");
         }
         let document = serde_json::from_str::<serde_json::Value>(&raw)?;
+        serde_json::from_value::<AgentActivityState>(
+            document
+                .pointer("/snapshot/activity")
+                .cloned()
+                .context("canonical document 缺少 snapshot.activity")?,
+        )
+        .with_context(|| format!("Thread {thread_id} canonical activity 不符合当前协议"))?;
         let identity = document
             .pointer("/snapshot/identity/id")
             .and_then(serde_json::Value::as_str)

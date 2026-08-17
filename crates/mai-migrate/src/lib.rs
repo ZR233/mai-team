@@ -67,6 +67,8 @@ pub fn migrate_path(path: &Path) -> Result<MigrationReport> {
             "只支持从 schema {LEGACY_SCHEMA}、{THREAD_SCHEMA}、{MERGED_STATE_SCHEMA} 或 {PR_STATE_SCHEMA} 迁移，当前为 {version}"
         ),
     }
+    schema::restore_v30_review_tool_call_identity(&transaction)?;
+    schema::restore_v30_runtime_activity_shape(&transaction)?;
     schema::install_v31(&transaction)?;
     let report = schema::validate_target(&transaction, source_schema, false)?;
     transaction.commit()?;
