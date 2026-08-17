@@ -77,7 +77,7 @@ fn product_facade_uses_pl_agent_runtime_as_the_only_executor() {
 fn framework_thread_transitions_do_not_invalidate_product_agent_queries() {
     let observer = include_str!("agent_host/events.rs");
 
-    assert!(observer.contains("persist_state(runtime, snapshot).await?"));
+    assert!(observer.contains("persist_state(runtime, *snapshot).await?"));
     assert!(
         !observer.contains("MaiProductEventKind::AgentUpdated"),
         "PL Thread transitions must remain on the canonical Thread stream"

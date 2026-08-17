@@ -1,14 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use mai_docker::DockerClient;
 use mai_protocol::{McpServerConfig, McpStartupStatus};
 use pl_core::{
     AgentModelConfig, BuiltinMcpServerState, EffectiveMcpServerConfig, McpAvailabilityKind,
-    McpRuntime, McpRuntimeHandle, McpServerTransport,
+    McpConnector, McpResetScope, McpRuntime, McpRuntimeHandle, McpServerTransport, ToolRegistry,
 };
 use tokio::sync::RwLock;
 
-use super::{McpServerStatus, container_host::ContainerMcpRuntimeHost};
+use super::McpServerStatus;
 use crate::{Result, RuntimeError};
 
 pub(crate) struct ContainerMcpSettings {
@@ -20,10 +21,13 @@ pub(crate) struct ContainerMcpSettings {
 
 /// 单个 agent 容器对应的 PL MCP runtime 产品包装。
 ///
-/// 包装只保留 Mai 的 required provisioning 语义；所有执行状态均由 PL handle 持有。
+/// PL 的 `McpConnector` 负责在宿主侧 spawn 进程与 rmcp 握手；stdio server 通过
+/// 改写为 `docker exec -i` 在 agent 专属 sidecar 内执行。工具按 generation 发布
+/// 到共享 `ToolRegistry`，由 turn engine 的共享注册表装配消费。
 pub(crate) struct ContainerMcpRuntime {
     docker: DockerClient,
     sidecar_container_id: String,
+    shared_tools: Arc<ToolRegistry>,
     handle: McpRuntimeHandle,
     required_servers: RwLock<BTreeSet<String>>,
 }
@@ -43,11 +47,13 @@ impl ContainerMcpRuntime {
                 sidecar_image,
             )
             .await?;
-        let host = ContainerMcpRuntimeHost::new(docker.clone(), sidecar.id.clone());
-        let handle = McpRuntime::new(host).handle();
+        let shared_tools = Arc::new(ToolRegistry::new());
+        let handle =
+            McpRuntime::new(McpConnector::default(), Some(shared_tools.clone())).handle();
         let runtime = Self {
             docker,
             sidecar_container_id: sidecar.id,
+            shared_tools,
             handle,
             required_servers: RwLock::new(BTreeSet::new()),
         };
@@ -66,6 +72,11 @@ impl ContainerMcpRuntime {
         Ok(runtime)
     }
 
+    /// 与 MCP worker 共享的工具注册表；MCP 工具按 generation 发布于此。
+    pub(crate) fn shared_tools(&self) -> Arc<ToolRegistry> {
+        self.shared_tools.clone()
+    }
+
     pub(crate) fn handle(&self) -> &McpRuntimeHandle {
         &self.handle
     }
@@ -77,14 +88,11 @@ impl ContainerMcpRuntime {
         builtin_states: &BTreeMap<String, BuiltinMcpServerState>,
         models: &AgentModelConfig,
     ) -> Result<()> {
-        self.update_required_servers(enabled, user_servers).await;
-        let servers = if enabled {
-            effective_servers(user_servers, builtin_states, models)?
-        } else {
-            BTreeMap::new()
-        };
         self.handle
-            .reconcile(servers)
+            .reconcile(
+                self.effective_servers(enabled, user_servers, builtin_states, models)
+                    .await?,
+            )
             .await
             .map_err(RuntimeError::Model)
     }
@@ -96,16 +104,31 @@ impl ContainerMcpRuntime {
         builtin_states: &BTreeMap<String, BuiltinMcpServerState>,
         models: &AgentModelConfig,
     ) -> Result<()> {
+        self.handle
+            .reset(
+                McpResetScope::All,
+                self.effective_servers(enabled, user_servers, builtin_states, models)
+                    .await?,
+            )
+            .await
+            .map_err(RuntimeError::Model)
+    }
+
+    async fn effective_servers(
+        &self,
+        enabled: bool,
+        user_servers: &BTreeMap<String, McpServerConfig>,
+        builtin_states: &BTreeMap<String, BuiltinMcpServerState>,
+        models: &AgentModelConfig,
+    ) -> Result<BTreeMap<String, EffectiveMcpServerConfig>> {
         self.update_required_servers(enabled, user_servers).await;
-        let servers = if enabled {
+        let mut servers = if enabled {
             effective_servers(user_servers, builtin_states, models)?
         } else {
             BTreeMap::new()
         };
-        self.handle
-            .recheck(servers)
-            .await
-            .map_err(RuntimeError::Model)
+        rewrite_sidecar_stdio(&self.docker, &self.sidecar_container_id, &mut servers);
+        Ok(servers)
     }
 
     async fn update_required_servers(
@@ -156,6 +179,43 @@ impl ContainerMcpRuntime {
                 "failed to delete agent MCP sidecar: {error}"
             );
         }
+    }
+}
+
+/// 把 sidecar 内执行的 stdio server 改写为宿主侧 `docker exec -i` 命令。
+///
+/// PL 在宿主 spawn 改写后的命令并注入 `config.env`；argv 里的 `-e KEY` 负责把
+/// 宿主环境中的值透传进容器，`-w` 承载容器内工作目录，因此改写后 `cwd` 清空。
+/// StreamableHttp server 保持宿主直连。
+fn rewrite_sidecar_stdio(
+    docker: &DockerClient,
+    sidecar_container_id: &str,
+    servers: &mut BTreeMap<String, EffectiveMcpServerConfig>,
+) {
+    for server in servers.values_mut() {
+        if server.config.transport != McpServerTransport::Stdio {
+            continue;
+        }
+        let Some(command) = server.config.command.clone() else {
+            continue;
+        };
+        let env = server
+            .config
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        let argv = docker.exec_argv(
+            sidecar_container_id,
+            &command,
+            &server.config.args,
+            server.config.cwd.as_deref(),
+            &env,
+        );
+        let (binary, args) = argv.split_first().expect("exec argv is non-empty");
+        server.config.command = Some(binary.clone());
+        server.config.args = args.to_vec();
+        server.config.cwd = None;
     }
 }
 
@@ -223,6 +283,88 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    fn docker() -> DockerClient {
+        DockerClient::new("mai-team/test:latest")
+    }
+
+    fn effective(id: &str, config: pl_core::McpServerConfig) -> EffectiveMcpServerConfig {
+        EffectiveMcpServerConfig {
+            id: id.to_string(),
+            config,
+            source_kind: pl_core::McpServerSourceKind::User,
+            source_label: id.to_string(),
+            source_detail: None,
+            status_kind: pl_core::McpServerStatusKind::Enabled,
+            status_message: None,
+            mutation_policy: pl_core::McpServerMutationPolicy::UserEditable,
+            bearer_token: None,
+            tool_effect: None,
+        }
+    }
+
+    #[test]
+    fn stdio_servers_are_rewritten_to_sidecar_docker_exec() {
+        let mut servers = BTreeMap::from([(
+            "local".to_string(),
+            effective(
+                "local",
+                pl_core::McpServerConfig {
+                    transport: McpServerTransport::Stdio,
+                    command: Some("npx".to_string()),
+                    args: vec!["-y".to_string(), "server".to_string()],
+                    env: BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]),
+                    cwd: Some("/work".to_string()),
+                    ..Default::default()
+                },
+            ),
+        )]);
+        rewrite_sidecar_stdio(&docker(), "sidecar-1", &mut servers);
+
+        let config = &servers["local"].config;
+        assert_eq!(config.command.as_deref(), Some("docker"));
+        assert_eq!(
+            config.args,
+            vec![
+                "exec".to_string(),
+                "-i".to_string(),
+                "-w".to_string(),
+                "/work".to_string(),
+                "-e".to_string(),
+                "TOKEN".to_string(),
+                "sidecar-1".to_string(),
+                "npx".to_string(),
+                "-y".to_string(),
+                "server".to_string(),
+            ]
+        );
+        assert_eq!(config.cwd, None);
+        // env 保留：PL 注入宿主进程环境后由 -e TOKEN 透传进容器。
+        assert_eq!(
+            config.env.get("TOKEN").map(String::as_str),
+            Some("secret")
+        );
+    }
+
+    #[test]
+    fn http_servers_keep_host_direct_connection() {
+        let mut servers = BTreeMap::from([(
+            "remote".to_string(),
+            effective(
+                "remote",
+                pl_core::McpServerConfig {
+                    transport: McpServerTransport::StreamableHttp,
+                    url: Some("https://mcp.example/stream".to_string()),
+                    ..Default::default()
+                },
+            ),
+        )]);
+        rewrite_sidecar_stdio(&docker(), "sidecar-1", &mut servers);
+
+        let config = &servers["remote"].config;
+        assert_eq!(config.command, None);
+        assert_eq!(config.url.as_deref(), Some("https://mcp.example/stream"));
+    }
 
     #[test]
     fn product_config_maps_transport_timeouts_filters_and_explicit_token() {

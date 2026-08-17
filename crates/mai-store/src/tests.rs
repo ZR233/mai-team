@@ -1151,7 +1151,7 @@ async fn schema_version_mismatch_is_rejected_without_data_loss() {
         .await
         .err()
         .expect("old schema must be rejected");
-    assert!(error.to_string().contains("mai-migrate-v27"));
+    assert!(error.to_string().contains("mai-migrate"));
     let connection = rusqlite::Connection::open(db_path).expect("inspect preserved database");
     let preserved: i64 = connection
         .query_row(

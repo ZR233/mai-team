@@ -19,11 +19,11 @@ fn v27_migration_is_atomic_and_review_history_is_deeply_equal() {
     let (directory, path) = fixture(false);
     let validation = validate_path(&path).expect("validate v27 fixture");
     assert_eq!(validation.source_schema, "27");
-    assert_eq!(validation.target_schema, "30");
+    assert_eq!(validation.target_schema, "31");
     assert!(!validation.already_current);
     let report = migrate_path(&path).expect("migrate fixture");
     assert_eq!(report.source_schema, "27");
-    assert_eq!(report.target_schema, "30");
+    assert_eq!(report.target_schema, "31");
     assert_eq!(report.canonical_threads, 1);
     assert_eq!(report.turns, 1);
     assert_eq!(report.items, 1);
@@ -94,9 +94,9 @@ fn v28_migration_adds_pull_request_lifecycle_state_table() {
 
     let report = migrate_path(&path).expect("migrate v28 fixture");
     assert_eq!(report.source_schema, "28");
-    assert_eq!(report.target_schema, "30");
+    assert_eq!(report.target_schema, "31");
     assert!(!report.already_current);
-    let connection = Connection::open(&path).expect("open v30 fixture");
+    let connection = Connection::open(&path).expect("open v31 fixture");
     let version: String = connection
         .query_row(
             "SELECT value FROM settings WHERE key = 'toasty_schema_version'",
@@ -104,7 +104,7 @@ fn v28_migration_adds_pull_request_lifecycle_state_table() {
             |row| row.get(0),
         )
         .expect("schema version");
-    assert_eq!(version, "30");
+    assert_eq!(version, "31");
     let columns = connection
         .prepare("SELECT name FROM pragma_table_info('project_pull_request_states')")
         .expect("prepare terminal state columns")
@@ -152,8 +152,8 @@ fn v29_migration_preserves_merged_state_in_unified_lifecycle_table() {
 
     let report = migrate_path(&path).expect("migrate v29 fixture");
     assert_eq!(report.source_schema, "29");
-    assert_eq!(report.target_schema, "30");
-    let connection = Connection::open(&path).expect("open v30 fixture");
+    assert_eq!(report.target_schema, "31");
+    let connection = Connection::open(&path).expect("open v31 fixture");
     let terminal_state = connection
         .query_row(
             "SELECT project_id, pr, state, state_changed_at, detected_at
@@ -204,9 +204,9 @@ fn v28_migration_preserves_review_runs_without_archive_history() {
 
     let report = migrate_path(&path).expect("migrate v28 fixture with missing archive");
     assert_eq!(report.source_schema, "28");
-    assert_eq!(report.target_schema, "30");
+    assert_eq!(report.target_schema, "31");
     assert_eq!(report.archived_review_runs, 0);
-    let connection = Connection::open(&path).expect("open v30 fixture");
+    let connection = Connection::open(&path).expect("open v31 fixture");
     let history: Option<String> = connection
         .query_row("SELECT history_json FROM project_review_runs", [], |row| {
             row.get(0)

@@ -10,8 +10,6 @@ use tokio::sync::OwnedRwLockReadGuard;
 use crate::state::AgentRecord;
 use crate::{Result, RuntimeError};
 
-pub(crate) const SKILL_RESOURCE_SERVER: &str = "skill";
-pub(crate) const PROJECT_SKILL_RESOURCE_SERVER: &str = "project-skill";
 pub(crate) const SKILL_RESOURCE_SCHEME: &str = "skill:///";
 
 pub(crate) struct AgentResourceBroker {
@@ -19,7 +17,7 @@ pub(crate) struct AgentResourceBroker {
     pub(crate) _project_skill_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
 
-/// Provides MCP and skill resources needed to build an agent resource broker
+/// Provides the skill catalog needed to build an agent resource broker
 /// without exposing the runtime facade to resource listing code.
 pub(crate) trait AgentResourceBrokerOps: Send + Sync {
     fn project_skill_read_guard(
@@ -52,53 +50,13 @@ pub(crate) async fn agent_resource_broker(
 }
 
 impl AgentResourceBroker {
-    pub(crate) async fn list_resources(
-        &self,
-        server: Option<&str>,
-        cursor: Option<String>,
-    ) -> Result<Value> {
-        if cursor.is_some() && is_skill_resource_server(server) {
-            return Ok(json!({
-                "server": server,
-                "resources": [],
-                "nextCursor": null,
-            }));
-        }
-        if is_skill_resource_server(server) {
-            return Ok(skill_resources_value(server, &self.skills.skills));
-        }
-        if let Some(server) = server {
-            return Err(resource_provider_not_found(server));
-        }
-        Ok(json!({ "resources": skill_resource_values(&self.skills.skills) }))
+    /// 列出当前 agent 可用的技能资源。
+    pub(crate) fn list_skill_resources(&self) -> Value {
+        json!({ "resources": skill_resource_values(&self.skills.skills) })
     }
 
-    pub(crate) async fn list_resource_templates(
-        &self,
-        server: Option<&str>,
-        _cursor: Option<String>,
-    ) -> Result<Value> {
-        if is_skill_resource_server(server) {
-            return Ok(json!({
-                "server": server,
-                "resourceTemplates": [],
-                "nextCursor": null,
-            }));
-        }
-        if let Some(server) = server {
-            return Err(resource_provider_not_found(server));
-        }
-        Ok(json!({ "resourceTemplates": [] }))
-    }
-
-    pub(crate) async fn read_resource(&self, server: &str, uri: &str) -> Result<Value> {
-        if is_skill_resource_server(Some(server)) || uri.starts_with(SKILL_RESOURCE_SCHEME) {
-            return self.read_skill_resource(uri);
-        }
-        Err(resource_provider_not_found(server))
-    }
-
-    fn read_skill_resource(&self, uri: &str) -> Result<Value> {
+    /// 读取 `skill:///<skill-name>[/relative]` 指向的技能资源。
+    pub(crate) fn read_skill_resource(&self, uri: &str) -> Result<Value> {
         let Some(resource) = uri.strip_prefix(SKILL_RESOURCE_SCHEME) else {
             return Err(RuntimeError::InvalidInput(format!(
                 "invalid skill resource uri `{uri}`; expected skill:///<skill-name>"
@@ -144,21 +102,11 @@ impl AgentResourceBroker {
         };
         let contents = fs::read_to_string(&path)?;
         Ok(json!({
-            "contents": [{
-                "uri": uri,
-                "mimeType": skill_resource_mime_type(&path),
-                "text": contents,
-            }]
+            "uri": uri,
+            "mimeType": skill_resource_mime_type(&path),
+            "text": contents,
         }))
     }
-}
-
-fn skill_resources_value(server: Option<&str>, skills: &[mai_protocol::SkillMetadata]) -> Value {
-    json!({
-        "server": server,
-        "resources": skill_resource_values(skills),
-        "nextCursor": null,
-    })
 }
 
 fn skill_resource_values(skills: &[mai_protocol::SkillMetadata]) -> Vec<Value> {
@@ -167,21 +115,21 @@ fn skill_resource_values(skills: &[mai_protocol::SkillMetadata]) -> Vec<Value> {
         .filter(|skill| skill.enabled)
         .map(|skill| {
             json!({
-                "server": skill_resource_server_for_scope(skill.scope),
                 "uri": skill_uri(&skill.name),
                 "name": skill.name,
                 "description": skill.description,
+                "scope": skill_resource_scope(skill.scope),
                 "mimeType": "text/markdown",
             })
         })
         .collect()
 }
 
-fn skill_resource_server_for_scope(scope: SkillScope) -> &'static str {
+fn skill_resource_scope(scope: SkillScope) -> &'static str {
     if scope == SkillScope::Project {
-        PROJECT_SKILL_RESOURCE_SERVER
+        "project"
     } else {
-        SKILL_RESOURCE_SERVER
+        "user"
     }
 }
 
@@ -221,17 +169,4 @@ fn skill_resource_mime_type(path: &Path) -> &'static str {
         Some("yaml" | "yml") => "application/yaml",
         _ => "text/plain",
     }
-}
-
-fn is_skill_resource_server(server: Option<&str>) -> bool {
-    server.is_some_and(|server| {
-        server == SKILL_RESOURCE_SERVER
-            || server == PROJECT_SKILL_RESOURCE_SERVER
-            || server == format!("mcp:{SKILL_RESOURCE_SERVER}")
-            || server == format!("mcp:{PROJECT_SKILL_RESOURCE_SERVER}")
-    })
-}
-
-fn resource_provider_not_found(server: &str) -> RuntimeError {
-    RuntimeError::InvalidInput(format!("resource provider not found: {server}"))
 }

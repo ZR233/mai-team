@@ -5,7 +5,7 @@ use mai_protocol::{
 
 use crate::records::{
     ThreadItemRecord, ThreadNotificationRecord, ThreadRuntimeDocumentRecord,
-    ThreadRuntimeEventRecord, ThreadRuntimeTraceRecord, ThreadTurnRecord,
+    ThreadRuntimeEventRecord, ThreadRuntimeTraceRecord, ThreadSubmissionRecord, ThreadTurnRecord,
 };
 use crate::*;
 
@@ -17,6 +17,25 @@ pub struct StoredThreadRuntime {
     pub document: serde_json::Value,
     pub snapshot: Option<ThreadSnapshot>,
     pub updated_at: i64,
+}
+
+/// 随 Thread commit 原子追加的 durable 阶段提交记录。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredThreadSubmission {
+    pub thread_id: String,
+    pub ordinal: u64,
+    pub created_at: i64,
+    pub submission: serde_json::Value,
+}
+
+/// `list_thread_submissions` 的分页结果；`submission` 是记录的原始 JSON。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredThreadSubmissionPage {
+    pub items: Vec<StoredThreadSubmission>,
+    pub offset: usize,
+    pub limit: usize,
+    pub total: usize,
+    pub has_more: bool,
 }
 
 /// 随 Thread commit 原子保存的 framework runtime event。
@@ -43,6 +62,7 @@ pub struct ThreadRuntimeCommitDocument {
     pub notifications: Vec<ThreadNotificationEnvelope>,
     pub runtime_events: Vec<StoredThreadRuntimeEvent>,
     pub trace_events: Vec<StoredThreadTraceEvent>,
+    pub submissions: Vec<StoredThreadSubmission>,
 }
 
 /// 同一 Thread transaction 中对 Turn 状态与 inference billing 的原子更新。
@@ -141,8 +161,50 @@ impl MaiStore {
         append_notifications(&mut tx, &document.notifications).await?;
         append_runtime_events(&mut tx, &thread_id, &document.runtime_events).await?;
         append_trace_events(&mut tx, &thread_id, &document.trace_events).await?;
+        append_submissions(&mut tx, &document.submissions).await?;
         tx.commit().await?;
         Ok(ThreadRuntimeCommitOutcome::Applied)
+    }
+
+    /// 按提交顺序分页读取一个 Thread 的 durable 阶段提交历史。
+    pub async fn list_thread_submissions(
+        &self,
+        thread_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<StoredThreadSubmissionPage> {
+        let limit = limit.max(1);
+        let mut db = self.db.clone();
+        let mut rows = Query::<List<ThreadSubmissionRecord>>::filter(
+            ThreadSubmissionRecord::fields()
+                .thread_id()
+                .eq(thread_id.to_string()),
+        )
+        .exec(&mut db)
+        .await?;
+        rows.sort_by_key(|row| row.ordinal);
+        let total = rows.len();
+        let has_more = offset.saturating_add(limit) < total;
+        let items = rows
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|row| {
+                Ok(StoredThreadSubmission {
+                    thread_id: row.thread_id,
+                    ordinal: i64_to_u64(row.ordinal),
+                    created_at: row.created_at,
+                    submission: serde_json::from_str(&row.submission_json)?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(StoredThreadSubmissionPage {
+            items,
+            offset,
+            limit,
+            total,
+            has_more,
+        })
     }
 
     /// 按最新优先分页读取一个 Thread 的 durable Turn 历史。
@@ -414,6 +476,31 @@ async fn append_trace_events(
     Ok(())
 }
 
+async fn append_submissions(
+    tx: &mut toasty::Transaction<'_>,
+    submissions: &[StoredThreadSubmission],
+) -> Result<()> {
+    for submission in submissions {
+        let id = format!("{}:{}", submission.thread_id, submission.ordinal);
+        Query::<List<ThreadSubmissionRecord>>::filter(
+            ThreadSubmissionRecord::fields().id().eq(id.clone()),
+        )
+        .delete()
+        .exec(&mut *tx)
+        .await?;
+        toasty::create!(ThreadSubmissionRecord {
+            id,
+            thread_id: submission.thread_id.clone(),
+            ordinal: u64_to_i64(submission.ordinal),
+            created_at: submission.created_at,
+            submission_json: serde_json::to_string(&submission.submission)?,
+        })
+        .exec(&mut *tx)
+        .await?;
+    }
+    Ok(())
+}
+
 fn parse_cursor(cursor: &str) -> Result<i64> {
     let value = cursor
         .strip_prefix("v1:")
@@ -627,6 +714,7 @@ mod tests {
             notifications: Vec::new(),
             runtime_events: Vec::new(),
             trace_events: Vec::new(),
+            submissions: Vec::new(),
         }
     }
 

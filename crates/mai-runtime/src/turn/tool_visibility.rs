@@ -23,6 +23,8 @@ pub(crate) async fn visible_tool_names(
         crate::turn::product_tool_schemas::TOOL_SAVE_ARTIFACT.to_string(),
         crate::turn::product_tool_schemas::TOOL_READ_TOOL_ARTIFACT.to_string(),
         crate::turn::product_tool_schemas::TOOL_GITHUB_API_REQUEST.to_string(),
+        crate::turn::product_tool_schemas::TOOL_LIST_SKILL_RESOURCES.to_string(),
+        crate::turn::product_tool_schemas::TOOL_READ_SKILL_RESOURCE.to_string(),
     ];
     if task_plan_tool_visible(&summary) {
         product_tools.push(crate::turn::product_tool_schemas::TOOL_SAVE_TASK_PLAN.to_string());

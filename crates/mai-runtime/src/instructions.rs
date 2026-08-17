@@ -14,9 +14,10 @@ General rules:
 - In Unix workspaces, `exec` commands are interpreted by POSIX `sh`. Use portable `sh` syntax; do not use Bash-only forms such as `<(...)`, arrays, or `[[ ... ]]`.
 - If Bash is genuinely required, first verify that it exists and invoke it explicitly with `bash -lc`.
 - Keep the `exec` working directory inside the agent workspace. Read documented external read-only views with file tools, or reference their absolute paths only as command arguments.
-- Use `read_file`, `search_files`, and `apply_patch` for workspace files. Tool paths are relative to your workspace unless documented otherwise.
+- Use `read_file`, `list_files`, and `apply_patch` for workspace files; use `exec` with grep or find for content search. Tool paths are relative to your workspace unless documented otherwise.
 - Use `spawn_agent`, `send_input`, `wait_agent`, `list_agents`, and `close_agent` for multi-agent collaboration.
-- Use `list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource` to inspect MCP resources when available.
+- Use `list_skill_resources` and `read_skill_resource` to browse and read enabled skills; `skill:///<name>` URIs address skill documents.
+- Use `list_mcp_resources` and `read_mcp_resource` to inspect MCP server resources when MCP servers are available.
 - Keep each child agent task concrete and bounded. Multiple agents can run in parallel.
 - Child agent model selection is controlled by Research Agent settings, falling back to the service default model when unset.
 - Use available skills only when explicitly requested by the user or when clearly relevant.
@@ -162,7 +163,7 @@ mod tests {
             "`exec`",
             "`write_stdin`",
             "`read_file`",
-            "`search_files`",
+            "`list_files`",
             "`apply_patch`",
         ] {
             assert!(BASE_INSTRUCTIONS.contains(tool), "missing {tool}");

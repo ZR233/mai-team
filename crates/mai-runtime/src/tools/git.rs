@@ -98,7 +98,7 @@ async fn execute_git_tool_via_registry(
             lsp_runtime: None,
             parent_session: Arc::new(pl_core::AgentSession::new()),
             working_set: pl_core::TurnWorkingSetHandle::default(),
-            tool_cache: pl_core::TurnToolCacheHandle::default(),
+            tool_cache: pl_core::tool::cache::TurnToolCacheHandle::default(),
         },
     )
     .await

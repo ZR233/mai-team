@@ -288,8 +288,8 @@ impl AgentRuntime {
         name: &str,
     ) -> PathBuf {
         let namespace = agent_id.to_string();
-        pl_core::tool_output_artifact_file_path(
-            pl_core::ToolOutputArtifactPathRequest::new(
+        pl_core::tool::output_format::capture::tool_output_artifact_file_path(
+            pl_core::tool::output_format::capture::ToolOutputArtifactPathRequest::new(
                 &self.artifact_files_root,
                 call_id,
                 artifact_id,

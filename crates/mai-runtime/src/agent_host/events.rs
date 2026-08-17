@@ -77,8 +77,9 @@ async fn project_runtime_event(
         AgentRuntimeEventKind::Registered { snapshot }
         | AgentRuntimeEventKind::StateChanged { snapshot }
         | AgentRuntimeEventKind::TurnQueued { snapshot, .. }
-        | AgentRuntimeEventKind::ThreadOpened { snapshot, .. } => {
-            persist_state(runtime, snapshot).await?;
+        | AgentRuntimeEventKind::ThreadOpened { snapshot, .. }
+        | AgentRuntimeEventKind::TurnActivityChanged { snapshot, .. } => {
+            persist_state(runtime, *snapshot).await?;
         }
         AgentRuntimeEventKind::TurnStarted {
             turn_id,
@@ -86,7 +87,7 @@ async fn project_runtime_event(
             claimed_inputs: _,
             snapshot,
         } => {
-            let agent_id = persist_state(runtime, snapshot).await?;
+            let agent_id = persist_state(runtime, *snapshot).await?;
             super::trace_projection::record_agent_log(
                 runtime,
                 super::trace_projection::AgentLogProjection {
@@ -108,7 +109,7 @@ async fn project_runtime_event(
             finalized_with_tool: _,
         }
         | AgentRuntimeEventKind::RecoveryCancelledTurn { outcome, snapshot } => {
-            let agent_id = persist_state(runtime, snapshot).await?;
+            let agent_id = persist_state(runtime, *snapshot).await?;
             super::trace_projection::record_agent_log(
                 runtime,
                 super::trace_projection::AgentLogProjection {
@@ -132,7 +133,7 @@ async fn project_runtime_event(
             .await;
         }
         AgentRuntimeEventKind::Faulted { reason, snapshot } => {
-            let agent_id = persist_state(runtime, snapshot).await?;
+            let agent_id = persist_state(runtime, *snapshot).await?;
             super::trace_projection::record_agent_log(
                 runtime,
                 super::trace_projection::AgentLogProjection {

@@ -2,7 +2,9 @@ use chrono::{DateTime, Utc};
 use mai_protocol::{
     AgentId, AgentLogEntry, ThreadId, ToolOutputArtifactInfo, ToolTraceDetail, TurnId,
 };
-use pl_core::{ToolLifecyclePhase, ToolLifecycleProjection};
+use pl_core::tool::output_format::projection::{
+    ToolLifecyclePhase, ToolLifecycleProjection, tool_lifecycle_projections,
+};
 use pl_trace::TraceEvent;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -28,7 +30,7 @@ pub(super) async fn project_trace_events(
     turn_id: TurnId,
     events: &[TraceEvent],
 ) {
-    for projection in pl_core::tool_lifecycle_projections(events, 500) {
+    for projection in tool_lifecycle_projections(events, 500) {
         match projection.phase() {
             ToolLifecyclePhase::Started => {
                 project_tool_started(runtime, agent_id, &thread_id, &turn_id, &projection).await;

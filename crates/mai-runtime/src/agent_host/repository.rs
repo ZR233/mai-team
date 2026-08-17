@@ -2,14 +2,14 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use mai_store::{
-    MaiStore, StoredThreadRuntime, StoredThreadRuntimeEvent, StoredThreadTraceEvent,
-    ThreadRuntimeCommitDocument, ThreadRuntimeCommitOutcome as StoreCommitOutcome,
-    ThreadRuntimeTurnCommit,
+    MaiStore, StoredThreadRuntime, StoredThreadRuntimeEvent, StoredThreadSubmission,
+    StoredThreadTraceEvent, ThreadRuntimeCommitDocument,
+    ThreadRuntimeCommitOutcome as StoreCommitOutcome, ThreadRuntimeTurnCommit,
 };
 use pl_core::{
-    AgentSession, AgentSnapshot, DurableMailboxEnvelope, RestoredAgentRuntime,
-    RestoredThreadSnapshot, ThreadActorState, ThreadCommit, ThreadCommitOutcome,
-    ThreadContextState, ThreadRepository,
+    AgentSession, AgentSnapshot, AgentSubmissionPage, AgentSubmissionRecord,
+    DurableMailboxEnvelope, RestoredAgentRuntime, RestoredThreadSnapshot, ThreadActorState,
+    ThreadCommit, ThreadCommitOutcome, ThreadContextState, ThreadId, ThreadRepository,
 };
 use pl_model::TokenUsage;
 use pl_protocol::{AgentSessionSnapshot, TurnBillingRecord};
@@ -41,6 +41,13 @@ impl ThreadRepository for MaiAgentRepository {
             .collect()
     }
 
+    async fn restore_thread(&self, thread_id: &ThreadId) -> Result<Option<RestoredAgentRuntime>> {
+        self.store
+            .load_thread_runtime(&thread_id.to_string())
+            .await?
+            .map(runtime_from_store)
+            .transpose()
+    }
     async fn commit(&self, commit: ThreadCommit) -> Result<ThreadCommitOutcome> {
         let document = commit_to_store(commit)?;
         match self.store.commit_thread_runtime(document).await? {
@@ -49,6 +56,40 @@ impl ThreadRepository for MaiAgentRepository {
                 Ok(ThreadCommitOutcome::RevisionConflict { actual_revision })
             }
         }
+    }
+
+    /// mai-store 在 commit 事务返回前已完成同步落库，无 write-behind 积压。
+    async fn flush_pending(&self, _thread_id: Option<&ThreadId>) -> Result<()> {
+        Ok(())
+    }
+
+    fn pending_commit_count(&self) -> usize {
+        0
+    }
+
+    async fn list_submissions(
+        &self,
+        thread_id: &ThreadId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<AgentSubmissionPage> {
+        let page = self
+            .store
+            .list_thread_submissions(&thread_id.to_string(), offset, limit)
+            .await?;
+        let items = page
+            .items
+            .iter()
+            .map(|item| serde_json::from_value::<AgentSubmissionRecord>(item.submission.clone()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(json_error)?;
+        Ok(AgentSubmissionPage {
+            items,
+            offset: page.offset,
+            limit: page.limit,
+            total: page.total,
+            has_more: page.has_more,
+        })
     }
 }
 
@@ -76,6 +117,7 @@ struct StoredThreadContextDocument {
 fn commit_to_store(commit: ThreadCommit) -> Result<ThreadRuntimeCommitDocument> {
     let ThreadCommit {
         agent_id,
+        durability: _,
         expected_revision,
         next_state,
         facts,
@@ -127,6 +169,20 @@ fn commit_to_store(commit: ThreadCommit) -> Result<ThreadRuntimeCommitDocument> 
             })
         })
         .collect::<Result<_>>()?;
+    let submissions = facts
+        .submission
+        .as_ref()
+        .map(|submission| -> Result<Vec<StoredThreadSubmission>> {
+            Ok(vec![StoredThreadSubmission {
+                thread_id: facts.thread_id.to_string(),
+                ordinal: facts.revision,
+                created_at: submission.created_at,
+                submission: serde_json::to_value(AgentSubmissionRecord::from(submission))
+                    .map_err(json_error)?,
+            }])
+        })
+        .transpose()?
+        .unwrap_or_default();
     Ok(ThreadRuntimeCommitDocument {
         expected_revision,
         runtime: StoredThreadRuntime {
@@ -140,6 +196,7 @@ fn commit_to_store(commit: ThreadCommit) -> Result<ThreadRuntimeCommitDocument> 
         notifications: facts.notifications,
         runtime_events,
         trace_events,
+        submissions,
     })
 }
 

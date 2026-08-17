@@ -350,7 +350,7 @@ fn project_workspace_start_error_is_recoverable(error: &str) -> bool {
 }
 
 fn redact_secret(value: &str, secret: &str) -> String {
-    pl_core::SecretRedaction::new([secret]).redact_str(value)
+    pl_core::tool::output_format::redaction::SecretRedaction::new([secret]).redact_str(value)
 }
 
 fn is_stale_agent_model_selection_error(error: &RuntimeError) -> bool {

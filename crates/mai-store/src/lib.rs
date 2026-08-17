@@ -60,8 +60,9 @@ pub use review_jobs::{
 };
 pub use store::MaiStore;
 pub use thread_runtime::{
-    StoredThreadRuntime, StoredThreadRuntimeEvent, StoredThreadTraceEvent,
-    ThreadRuntimeCommitDocument, ThreadRuntimeCommitOutcome, ThreadRuntimeTurnCommit,
+    StoredThreadRuntime, StoredThreadRuntimeEvent, StoredThreadSubmission,
+    StoredThreadSubmissionPage, StoredThreadTraceEvent, ThreadRuntimeCommitDocument,
+    ThreadRuntimeCommitOutcome, ThreadRuntimeTurnCommit,
 };
 
 pub(crate) use convert::*;

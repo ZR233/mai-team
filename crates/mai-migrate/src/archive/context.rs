@@ -130,7 +130,8 @@ fn append_assistant_tool_calls(
             call_id: call
                 .get("call_id")
                 .and_then(Value::as_str)
-                .map(str::to_string),
+                .map(str::to_string)
+                .unwrap_or_else(|| tool_call_id.clone()),
             provider_item_id: None,
             name,
             arguments: serde_json::to_string(&arguments)?,
@@ -188,7 +189,8 @@ fn apply_tool_result(
         call_id: metadata
             .get("tool_call_call_id")
             .and_then(Value::as_str)
-            .map(str::to_string),
+            .map(str::to_string)
+            .unwrap_or_else(|| tool_call_id.clone()),
         provider_item_id: None,
         name,
         arguments: metadata

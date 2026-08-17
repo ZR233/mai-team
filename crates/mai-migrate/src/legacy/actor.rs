@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
 use pl_core::{
-    AgentActivityState, AgentId, AgentIdentity, AgentLifecycleState, AgentRoleId, AgentSnapshot,
-    AgentTurnOutcome, TurnOutcomeKind,
+    ActiveKind, AgentActivityState, AgentId, AgentIdentity, AgentLifecycleState, AgentRoleId,
+    AgentSnapshot, AgentTurnOutcome, TurnOutcomeKind,
 };
 use pl_model::TokenUsage;
 use pl_protocol::AgentSessionSnapshot;
@@ -165,9 +165,11 @@ fn parse_activity(value: Option<&str>) -> Result<AgentActivityState> {
     Ok(match value.unwrap_or("idle") {
         "idle" => AgentActivityState::Idle,
         "queued" => AgentActivityState::Queued,
-        "running" => AgentActivityState::Running,
-        "waiting_tool" | "waitingTool" => AgentActivityState::WaitingTool,
-        "waiting_interaction" | "waitingInteraction" => AgentActivityState::WaitingInteraction,
+        "running" => AgentActivityState::Active(ActiveKind::Running),
+        "waiting_tool" | "waitingTool" => AgentActivityState::Active(ActiveKind::WaitingTool),
+        "waiting_interaction" | "waitingInteraction" => {
+            AgentActivityState::Active(ActiveKind::WaitingInteraction)
+        }
         "cancelling" => AgentActivityState::Cancelling,
         other => bail!("未知 Agent activity `{other}`"),
     })

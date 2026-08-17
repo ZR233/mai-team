@@ -33,16 +33,19 @@ Web Search 的路径选择和 MCP 的运行状态机均属于 PL，不属于产�
 
 - `pl-core::plan_web_search` 只读取已解析 provider/model 能力与产品配置，确定 standalone、
   hosted 或不可用路径。Studio 与 Mai 只能应用计划，不能按 provider ID 另写选择规则。
-- `pl-core::McpRuntime<H>` 负责 fingerprint、并行探测、增量 reconcile、工具发现、命名冲突、
-  generation、lease、health 与失败隔离。
+- `pl-core::McpRuntime` 负责 fingerprint、并行探测、增量 reconcile、工具发现、命名冲突、
+  generation、lease、health 与失败隔离，并按 generation 把当前工具整组发布到共享
+  `ToolRegistry`（来源 `mcp`）；Turn Engine 通过共享注册表消费 MCP 工具与资源工具。
 - 新 generation 在所有 server 完成探测后原子生效；准备期间旧 generation 的活动 turn 可继续
   调用。最后一个旧 lease 释放后，PL 才关闭不再复用的 session。
-- `mai-runtime::mcp::ContainerMcpRuntimeHost` 只负责 transport：Streamable HTTP 在 server 进程
-  建立，stdio 通过 Docker exec 在 agent 专属 MCP sidecar 建立。sidecar 使用
-  `MAI_SIDECAR_IMAGE` 并继承 agent 容器的 workspace mounts，不实现第二套 reconcile 或工具命名逻辑。
-- 每个 agent 拥有一个 MCP handle 和一个独立 sidecar。agent 容器销毁时先关闭 handle 并删除
-  sidecar；配置或 provider secret
-  变化时，Mai 并发要求所有活动 handle reconcile；Turn Factory 每轮只获取固定 lease。
+- `pl-core::McpConnector` 在宿主侧 spawn 进程并完成 rmcp 握手。Mai 把 stdio server 的
+  command/args 改写为宿主侧 `docker exec -i`（`-w` 承载容器内工作目录，`-e KEY` 把宿主环境
+  透传进容器），使 MCP 进程实际运行在 agent 专属 sidecar 内；Streamable HTTP 保持宿主直连。
+  sidecar 使用 `MAI_SIDECAR_IMAGE` 并继承 agent 容器的 workspace mounts，不实现第二套
+  reconcile 或工具命名逻辑。
+- 每个 agent 拥有一个 MCP handle、一个共享工具注册表和一个独立 sidecar。agent 容器销毁时
+  先关闭 handle 并删除 sidecar；配置或 provider secret 变化时，Mai 并发要求所有活动 handle
+  reconcile（强制重连走 `McpResetScope::All`）；Turn Factory 每轮从共享注册表读取冻结快照。
 
 Mai 的 MCP 配置由 agent、system 与 project scope 组合。project agent 同时获得 agent/system
 配置和当前项目配置。PL 内置 Zhipu Search、Reader、ZRead、Vision；四者有 Coding Plan 凭证时

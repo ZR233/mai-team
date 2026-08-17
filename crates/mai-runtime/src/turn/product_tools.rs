@@ -1,75 +1,38 @@
 use std::sync::Arc;
 
 use mai_protocol::{AgentId, AgentRole};
-use pl_core::RegisteredTool;
-use pl_model::ToolSchema;
-use serde::{
-    Deserialize, Deserializer,
-    de::{self, DeserializeOwned},
+use pl_core::{
+    FunctionToolDefinition, RegisteredTool, ToolVisibilitySet,
+    tool::cache::ToolCachePolicy,
 };
 use serde_json::{Value, json};
 
 use crate::state::AgentRecord;
+use crate::turn::product_tool_schemas::definitions::{
+    GITHUB_API_REQUEST_DESCRIPTION, QUEUE_PROJECT_REVIEW_PRS_DESCRIPTION,
+    READ_TOOL_ARTIFACT_DESCRIPTION, SAVE_ARTIFACT_DESCRIPTION, SAVE_TASK_PLAN_DESCRIPTION,
+    SUBMIT_REVIEW_RESULT_DESCRIPTION, QueueProjectReviewPrsInput, ReadToolArtifactInput,
+    SaveArtifactInput, SaveTaskPlanInput, SubmitReviewResultInput,
+};
+use crate::turn::product_tool_schemas::{
+    TOOL_GITHUB_API_REQUEST, TOOL_QUEUE_PROJECT_REVIEW_PRS, TOOL_READ_TOOL_ARTIFACT,
+    TOOL_SAVE_ARTIFACT, TOOL_SAVE_TASK_PLAN, TOOL_SUBMIT_REVIEW_RESULT,
+};
 use crate::turn::tool_output::ToolExecution;
 use crate::{AgentRuntime, ProjectReviewQueueRequest, RuntimeError};
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct QueueProjectReviewPr {
-    pub(crate) number: u64,
-    pub(crate) head_sha: Option<String>,
-    pub(crate) reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct GithubApiRequest {
-    pub(crate) method: String,
-    pub(crate) path: String,
-    #[serde(default, deserialize_with = "deserialize_optional_json_object")]
-    pub(crate) body: Option<Value>,
-    #[serde(default)]
-    pub(crate) fields: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SaveTaskPlanInput {
-    title: String,
-    markdown: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SubmitReviewResultInput {
-    passed: bool,
-    findings: String,
-    summary: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SaveArtifactInput {
-    path: String,
-    name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct QueueProjectReviewPrsInput {
-    prs: Vec<QueueProjectReviewPr>,
-}
+pub(crate) use crate::turn::product_tool_schemas::definitions::GithubApiRequest;
 
 /// 将 mai-team 产品工具挂入 pl-core agent kernel 的动态工具注册表。
 ///
-/// 该注册器只承载 GitHub、review queue、artifact、task plan 和 MCP 资源等产品语义；
+/// 该注册器只承载 GitHub、review queue、artifact 和 task plan 等产品语义；
 /// 工具生命周期、trace、tool result history 和模型回合调度仍由 pl-core 统一处理。
 #[derive(Clone)]
 pub(crate) struct MaiProductToolRegistry {
     runtime: Arc<AgentRuntime>,
     agent: Arc<AgentRecord>,
     agent_id: AgentId,
-    schemas: Vec<ToolSchema>,
+    visible: ToolVisibilitySet,
 }
 
 impl MaiProductToolRegistry {
@@ -77,100 +40,110 @@ impl MaiProductToolRegistry {
         runtime: Arc<AgentRuntime>,
         agent: Arc<AgentRecord>,
         agent_id: AgentId,
-        schemas: Vec<ToolSchema>,
+        visible: ToolVisibilitySet,
     ) -> Self {
         Self {
             runtime,
             agent,
             agent_id,
-            schemas,
+            visible,
         }
     }
 
     pub(crate) fn registered_tools(&self) -> crate::Result<Vec<RegisteredTool>> {
-        self.schemas
-            .iter()
-            .cloned()
-            .map(|schema| self.registered_tool(schema))
-            .collect()
+        [
+            TOOL_SAVE_TASK_PLAN,
+            TOOL_SUBMIT_REVIEW_RESULT,
+            TOOL_SAVE_ARTIFACT,
+            TOOL_READ_TOOL_ARTIFACT,
+            TOOL_GITHUB_API_REQUEST,
+            TOOL_QUEUE_PROJECT_REVIEW_PRS,
+        ]
+        .into_iter()
+        .filter(|name| self.visible.contains(name))
+        .map(|name| self.registered_tool(name))
+        .collect()
     }
 
-    fn registered_tool(&self, schema: ToolSchema) -> crate::Result<RegisteredTool> {
-        let name = schema.name().to_string();
-        match name.as_str() {
-            crate::turn::product_tool_schemas::TOOL_SAVE_TASK_PLAN => {
+    fn registered_tool(&self, name: &str) -> crate::Result<RegisteredTool> {
+        match name {
+            TOOL_SAVE_TASK_PLAN => {
                 let executor = self.clone();
-                Self::registered_schema_tool(schema, move |input: SaveTaskPlanInput, _context| {
+                Ok(FunctionToolDefinition::<SaveTaskPlanInput>::new(
+                    TOOL_SAVE_TASK_PLAN,
+                    SAVE_TASK_PLAN_DESCRIPTION,
+                )
+                .registered(move |input, _context| {
                     let executor = executor.clone();
                     async move { executor.save_task_plan(input).await }
-                })
+                }))
             }
-            crate::turn::product_tool_schemas::TOOL_SUBMIT_REVIEW_RESULT => {
+            TOOL_SUBMIT_REVIEW_RESULT => {
                 let executor = self.clone();
-                Self::registered_schema_tool(
-                    schema,
-                    move |input: SubmitReviewResultInput, _context| {
-                        let executor = executor.clone();
-                        async move { executor.submit_review_result(input).await }
-                    },
+                Ok(FunctionToolDefinition::<SubmitReviewResultInput>::new(
+                    TOOL_SUBMIT_REVIEW_RESULT,
+                    SUBMIT_REVIEW_RESULT_DESCRIPTION,
                 )
+                .registered(move |input, _context| {
+                    let executor = executor.clone();
+                    async move { executor.submit_review_result(input).await }
+                }))
             }
-            crate::turn::product_tool_schemas::TOOL_SAVE_ARTIFACT => {
+            TOOL_SAVE_ARTIFACT => {
                 let executor = self.clone();
-                Self::registered_schema_tool(schema, move |input: SaveArtifactInput, _context| {
+                Ok(FunctionToolDefinition::<SaveArtifactInput>::new(
+                    TOOL_SAVE_ARTIFACT,
+                    SAVE_ARTIFACT_DESCRIPTION,
+                )
+                .registered(move |input, _context| {
                     let executor = executor.clone();
                     async move { executor.save_artifact(input).await }
-                })
+                }))
             }
-            crate::turn::product_tool_schemas::TOOL_READ_TOOL_ARTIFACT => {
+            TOOL_READ_TOOL_ARTIFACT => {
                 let executor = self.clone();
-                Self::registered_schema_tool(
-                    schema,
-                    move |input: super::tool_artifact::ReadToolArtifactInput, _context| {
+                Ok(
+                    FunctionToolDefinition::<ReadToolArtifactInput>::new(
+                        TOOL_READ_TOOL_ARTIFACT,
+                        READ_TOOL_ARTIFACT_DESCRIPTION,
+                    )
+                    .registered(move |input, _context| {
                         let executor = executor.clone();
                         async move { executor.read_tool_artifact(input).await }
-                    },
+                    })
+                    .with_cache_policy(ToolCachePolicy::WithinTurn),
                 )
-                .map(|tool| tool.with_cache_policy(pl_core::ToolCachePolicy::WithinTurn))
             }
-            crate::turn::product_tool_schemas::TOOL_GITHUB_API_REQUEST => {
+            TOOL_GITHUB_API_REQUEST => {
                 let executor = self.clone();
-                Self::registered_schema_tool(schema, move |input: GithubApiRequest, context| {
-                    let executor = executor.clone();
-                    async move { executor.github_api_request(input, context).await }
-                })
-                .map(|tool| {
-                    tool.with_cache_policy_resolver(github_api_cache_policy)
-                        .with_cache_invalidation_resolver(github_api_invalidates_cache)
-                })
-            }
-            crate::turn::product_tool_schemas::TOOL_QUEUE_PROJECT_REVIEW_PRS => {
-                let executor = self.clone();
-                Self::registered_schema_tool(
-                    schema,
-                    move |input: QueueProjectReviewPrsInput, _context| {
+                Ok(
+                    FunctionToolDefinition::<GithubApiRequest>::new(
+                        TOOL_GITHUB_API_REQUEST,
+                        GITHUB_API_REQUEST_DESCRIPTION,
+                    )
+                    .registered(move |input, context| {
                         let executor = executor.clone();
-                        async move { executor.queue_project_review_prs(input).await }
-                    },
+                        async move { executor.github_api_request(input, context).await }
+                    })
+                    .with_cache_policy_resolver(github_api_cache_policy)
+                    .with_cache_invalidation_resolver(github_api_invalidates_cache),
                 )
             }
-            _ => Err(RuntimeError::InvalidInput(format!(
-                "tool `{name}` is not a mai-team product tool"
+            TOOL_QUEUE_PROJECT_REVIEW_PRS => {
+                let executor = self.clone();
+                Ok(FunctionToolDefinition::<QueueProjectReviewPrsInput>::new(
+                    TOOL_QUEUE_PROJECT_REVIEW_PRS,
+                    QUEUE_PROJECT_REVIEW_PRS_DESCRIPTION,
+                )
+                .registered(move |input, _context| {
+                    let executor = executor.clone();
+                    async move { executor.queue_project_review_prs(input).await }
+                }))
+            }
+            unknown => Err(RuntimeError::InvalidInput(format!(
+                "tool `{unknown}` is not a mai-team product tool"
             ))),
         }
-    }
-
-    fn registered_schema_tool<Input, F, Fut>(
-        schema: ToolSchema,
-        handler: F,
-    ) -> crate::Result<RegisteredTool>
-    where
-        Input: DeserializeOwned + Send + 'static,
-        F: Fn(Input, pl_core::ToolContext) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = crate::Result<ToolExecution>> + Send + 'static,
-    {
-        RegisteredTool::from_schema_typed_fallible_execution_result(schema, handler)
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))
     }
 
     async fn save_task_plan(&self, input: SaveTaskPlanInput) -> crate::Result<ToolExecution> {
@@ -202,7 +175,7 @@ impl MaiProductToolRegistry {
 
     async fn read_tool_artifact(
         &self,
-        input: super::tool_artifact::ReadToolArtifactInput,
+        input: ReadToolArtifactInput,
     ) -> crate::Result<ToolExecution> {
         let output = super::tool_artifact::read(&self.runtime, self.agent_id, input).await?;
         Ok(ToolExecution::json(output)?)
@@ -306,7 +279,7 @@ impl MaiProductToolRegistry {
     }
 }
 
-fn github_api_cache_policy(arguments: &Value) -> pl_core::ToolCachePolicy {
+fn github_api_cache_policy(arguments: &Value) -> ToolCachePolicy {
     match arguments
         .get("method")
         .and_then(Value::as_str)
@@ -314,8 +287,8 @@ fn github_api_cache_policy(arguments: &Value) -> pl_core::ToolCachePolicy {
         .map(str::to_ascii_uppercase)
         .as_deref()
     {
-        Some("GET") => pl_core::ToolCachePolicy::WithinTurn,
-        Some(_) | None => pl_core::ToolCachePolicy::Never,
+        Some("GET") => ToolCachePolicy::WithinTurn,
+        Some(_) | None => ToolCachePolicy::Never,
     }
 }
 
@@ -324,22 +297,6 @@ fn github_api_invalidates_cache(arguments: &Value) -> bool {
         .get("method")
         .and_then(Value::as_str)
         .is_some_and(|method| !method.trim().eq_ignore_ascii_case("GET"))
-}
-
-fn deserialize_optional_json_object<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<Value>::deserialize(deserializer)?;
-    if value
-        .as_ref()
-        .is_none_or(|value| value.is_object() || value.is_null())
-    {
-        return Ok(value);
-    }
-    Err(de::Error::custom(
-        "field `body` must be a JSON object or null",
-    ))
 }
 
 #[cfg(test)]
@@ -351,141 +308,14 @@ mod tests {
     fn github_cache_is_read_only_and_writes_invalidate_reads() {
         assert_eq!(
             github_api_cache_policy(&json!({"method": "get"})),
-            pl_core::ToolCachePolicy::WithinTurn
+            ToolCachePolicy::WithinTurn
         );
         assert_eq!(
             github_api_cache_policy(&json!({"method": "POST"})),
-            pl_core::ToolCachePolicy::Never
+            ToolCachePolicy::Never
         );
         assert!(!github_api_invalidates_cache(&json!({"method": "GET"})));
         assert!(github_api_invalidates_cache(&json!({"method": "PATCH"})));
-    }
-
-    #[test]
-    fn product_tools_register_as_pl_core_tools() {
-        let source = include_str!("product_tools.rs");
-
-        assert!(
-            source.contains(&format!("{}{}", "Registered", "Tool")),
-            "mai-team 产品工具必须作为 pl-core RegisteredTool 注册"
-        );
-        assert!(
-            !source.contains(&format!("{}{}", "ProductTool", "Router")),
-            "mai-team 不应保留产品工具 router 大分发层"
-        );
-        assert!(
-            !source.contains(&format!("{}{}", "Tool", "Definition")),
-            "mai-team 产品工具注册不应再经过 mai_protocol 旧工具定义类型"
-        );
-        assert!(
-            !source.contains(&format!("{}{}", "execute_product", "_tool")),
-            "mai-team 产品工具应在注册 RegisteredTool 时绑定具体 handler，而不是保留本地大分发入口"
-        );
-        assert!(
-            !source.contains(&format!("{}{}", "enum MaiProduct", "ToolHandler")),
-            "mai-team 产品工具不应再通过本地 handler enum 做二次 route"
-        );
-        assert!(
-            !source.contains(&format!("{}{}", "from_tool", "_name")),
-            "产品工具 schema 应直接绑定具体 RegisteredTool handler"
-        );
-        assert!(
-            source.contains(&format!(
-                "{}{}",
-                "RegisteredTool::from_schema_typed_fallible_", "execution_result"
-            )),
-            "产品工具应把 schema 解包、输入解析和 ToolExecutionResult 投影全部交给 pl-core"
-        );
-        assert!(
-            !source.contains(&format!("{}{}", "product_tool", "_error")),
-            "产品工具注册器不应在 mai-team 手动包装 pl-core 工具错误"
-        );
-        assert!(
-            !source.contains(&format!("{}{}", "into_tool", "_output")),
-            "产品工具注册器不应在 mai-team 手动映射 ToolOutput"
-        );
-        assert!(
-            !source.contains(&format!("{}{}", "TOOL_GIT_SYNC", "_DEFAULT_BRANCH")),
-            "git_sync_default_branch 是 pl-core shared git tool，不应在产品工具注册器里兜底"
-        );
-        assert!(
-            !source.contains("starts_with(\"mcp__\")"),
-            "MCP model tools 应由 pl-core shared MCP tool pack 注册，不应作为 mai 产品工具"
-        );
-        assert!(
-            !source.contains(&format!("{}{}", "execute_mcp", "_tool")),
-            "MCP model tools 应通过 pl-core ToolSetBuilder 后端执行"
-        );
-    }
-
-    #[test]
-    fn product_tools_delegate_cancellation_to_pl_core_registered_tool() {
-        let source = include_str!("product_tools.rs");
-
-        assert!(
-            !source.contains(&format!("{}{}", "ensure_not", "_cancelled")),
-            "产品工具取消检查应由 pl-core RegisteredTool 统一处理"
-        );
-        assert!(
-            !source.contains(&format!(
-                "{}{}{}",
-                "RuntimeError::Turn", "Cancelled", ".to_string()"
-            )),
-            "产品工具不应自行把 turn cancelled 映射为工具错误"
-        );
-    }
-
-    #[test]
-    fn product_tools_reuse_pl_core_json_execution_result() {
-        let source = include_str!("product_tools.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production source");
-
-        assert!(
-            production.contains("ToolExecution::json("),
-            "产品工具 JSON 输出应复用 pl-core ToolExecutionResult::json"
-        );
-        assert!(
-            !production.contains(&format!("{}{}", "fn json_tool", "_execution")),
-            "mai-team 不应保留本地 JSON 工具输出 helper"
-        );
-        assert!(
-            !production.contains("serde_json::to_string(value).unwrap_or_else"),
-            "产品工具不应自行吞掉 JSON 序列化错误"
-        );
-    }
-
-    #[test]
-    fn product_tools_use_pl_core_typed_input_registration() {
-        let source = include_str!("product_tools.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production source");
-
-        assert!(
-            production.contains("RegisteredTool::from_schema_typed_fallible_execution_result"),
-            "产品工具 schema 解包和输入反序列化应由 pl-core typed RegisteredTool 统一处理"
-        );
-        for forbidden in [
-            "ToolSchema::Function",
-            "description.clone()",
-            "input_schema.clone()",
-            "input.arguments",
-            "arguments.get(",
-            "fn required_string_argument",
-            "fn optional_string_argument",
-            "fn github_api_request_from_arguments",
-            "fn queue_project_review_prs_from_arguments",
-            "serde_json::from_value",
-        ] {
-            assert!(
-                !production.contains(forbidden),
-                "产品工具注册器不应手写输入解析 `{forbidden}`"
-            );
-        }
     }
 
     #[test]
@@ -500,7 +330,7 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("field `body` must be a JSON object or null")
-        );
+    );
     }
 
     #[test]
@@ -529,7 +359,7 @@ mod tests {
 
         assert_eq!(
             input.prs,
-            vec![QueueProjectReviewPr {
+            vec![crate::turn::product_tool_schemas::definitions::QueueProjectReviewPr {
                 number: 42,
                 head_sha: Some("abc123".to_string()),
                 reason: Some("ready".to_string()),

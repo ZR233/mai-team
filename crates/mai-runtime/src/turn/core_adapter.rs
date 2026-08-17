@@ -3,12 +3,14 @@ use std::sync::Arc;
 use mai_protocol::AgentId;
 use pl_core::{
     AgentExecutionPolicy, AgentId as FrameworkAgentId, AgentRuntimeHandle, CoreRuntimeProfile,
-    TurnEngine, TurnEngineBuilder,
+    NamespaceDescriptor, ToolEntry, ToolRegistry, ToolSourceId, ToolSourceMetadata, TurnEngine,
+    TurnEngineBuilder,
 };
-use pl_model::ToolSchema;
-
 use crate::state::AgentRecord;
 use crate::{AgentRuntime, Result};
+
+/// mai-team 产品动作工具的工具来源标识。
+pub(crate) const PRODUCT_TOOL_SOURCE: &str = "mai-product";
 
 pub(crate) struct MaiFrameworkKernelBuildContext {
     pub(crate) runtime: Arc<AgentRuntime>,
@@ -17,8 +19,7 @@ pub(crate) struct MaiFrameworkKernelBuildContext {
     pub(crate) framework_agent_id: FrameworkAgentId,
     pub(crate) framework_runtime: AgentRuntimeHandle,
     pub(crate) policy: AgentExecutionPolicy,
-    pub(crate) product_tool_schemas: Vec<ToolSchema>,
-    pub(crate) mcp_lease: Option<pl_core::McpTurnLease>,
+    pub(crate) mcp_shared_tools: Option<Arc<ToolRegistry>>,
 }
 
 pub(crate) fn mai_user_input_interaction_callback() -> pl_core::InteractionCallback {
@@ -53,6 +54,9 @@ pub(crate) fn mai_user_input_interaction_callback() -> pl_core::InteractionCallb
 }
 
 /// 为 PL Agent Runtime 构造 mai turn engine；协作工具直接持有 runtime handle。
+///
+/// MCP 工具不在这里装配：它们由 MCP runtime 按 generation 发布到共享
+/// `ToolRegistry`，engine 通过 `with_shared_tool_registry` 消费。
 pub(crate) async fn build_mai_turn_engine(
     builder: TurnEngineBuilder,
     runtime_profile: CoreRuntimeProfile,
@@ -62,9 +66,8 @@ pub(crate) async fn build_mai_turn_engine(
         ctx.runtime.clone(),
         ctx.agent.clone(),
         ctx.agent_id,
-        ctx.product_tool_schemas,
+        ctx.policy.visible_tools.clone(),
     );
-    let product_tools = product_tool_registry.registered_tools()?;
     let workspace_root = if ctx.agent.summary.read().await.project_id.is_some() {
         crate::projects::workspace::AGENT_WORKSPACE_REPO_PATH
     } else {
@@ -89,23 +92,15 @@ pub(crate) async fn build_mai_turn_engine(
         .await?;
     let capabilities =
         pl_core::ToolCapabilityConfig::hosted_workspace().with_git(git_runtime.is_some());
-    let mcp_backend = Arc::new(super::mcp_resources::MaiMcpResourceBackend::new(
-        ctx.runtime.clone(),
-        ctx.agent.clone(),
-        ctx.mcp_lease.clone(),
-    ));
     let tool_set = pl_core::ToolSetBuilder::host_provided(capabilities)
         .with_allowed_tools(ctx.policy.visible_tools.iter().cloned())
         .with_command_backend(command_backend)
-        .with_workspace_file_backend(workspace_file_backend)
-        .with_mcp_resource_tools(mcp_backend);
-    let collaboration_tools = pl_core::AgentCollaborationTools::new(
-        ctx.framework_runtime,
-        ctx.framework_agent_id,
-        ctx.policy.collaboration,
-    )
-    .tools();
-    let mut engine = builder.with_runtime_profile(runtime_profile).build();
+        .with_workspace_file_backend(workspace_file_backend);
+    let mut builder = builder.with_runtime_profile(runtime_profile);
+    if let Some(shared_tools) = ctx.mcp_shared_tools {
+        builder = builder.with_shared_tool_registry(shared_tools);
+    }
+    let mut engine = builder.build();
     if let Some(git_runtime) = git_runtime {
         tool_set
             .with_git_tools(
@@ -118,15 +113,41 @@ pub(crate) async fn build_mai_turn_engine(
     } else {
         tool_set.register(&mut engine, workspace_root, None).await;
     }
-    for tool in collaboration_tools {
-        engine.register_tool(tool);
-    }
-    for tool in product_tools {
-        engine.register_tool(tool);
-    }
-    if let Some(lease) = ctx.mcp_lease {
-        lease.install(&mut engine)?;
-    }
+    let collaboration_source = ToolSourceId::collaboration();
+    let collaboration = pl_core::AgentCollaborationTools::new(
+        ctx.framework_runtime,
+        ctx.framework_agent_id,
+        ctx.policy.collaboration.clone(),
+    );
+    let collaboration_entries = collaboration
+        .tools()
+        .into_iter()
+        .map(|tool| {
+            ToolEntry::from_arc(
+                tool,
+                ToolSourceMetadata::new(collaboration_source.clone()).with_namespace(
+                    NamespaceDescriptor::new(
+                        "agents",
+                        "Subagent discovery, messaging, waiting, and lifecycle tools.",
+                    ),
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    engine.register_source_tools(collaboration_source, collaboration_entries)?;
+    let product_source = ToolSourceId::new(PRODUCT_TOOL_SOURCE);
+    let product_entries = product_tool_registry
+        .registered_tools()?
+        .into_iter()
+        .map(|tool| ToolEntry::new(tool, ToolSourceMetadata::new(product_source.clone())))
+        .collect::<Vec<_>>();
+    engine.register_source_tools(product_source, product_entries)?;
+    let skill_source = ToolSourceId::new(super::skill_resources::SKILL_TOOL_SOURCE);
+    let skill_entries = super::skill_resources::skill_resource_entries(
+        ctx.runtime.clone(),
+        ctx.agent.clone(),
+    );
+    engine.register_source_tools(skill_source, skill_entries)?;
     Ok(engine)
 }
 

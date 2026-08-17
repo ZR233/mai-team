@@ -55,7 +55,7 @@ impl AgentRuntime {
         agent: &AgentRecord,
         request: &turn::product_tools::GithubApiRequest,
     ) -> Result<ToolExecution> {
-        let method = github::normalize_github_api_method(&request.method)?;
+        let method = github::normalize_github_api_method(request.method.as_str())?;
         let path = github::normalize_github_api_get_path(&request.path)?;
         let token = self
             .project_git_token_for_agent(agent)
@@ -95,7 +95,7 @@ impl AgentRuntime {
         let mut body = projects::review::project_review_github_api_body_with_model_footer(
             &method,
             &path,
-            request.body.clone(),
+            request.body.clone().map(serde_json::Value::Object),
             summary.role.as_ref(),
             &summary.model,
         )?;

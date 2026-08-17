@@ -315,7 +315,7 @@ impl GitAccountService {
 }
 
 fn redact_secret(value: &str, secret: &str) -> String {
-    pl_core::SecretRedaction::new([secret]).redact_str(value)
+    pl_core::tool::output_format::redaction::SecretRedaction::new([secret]).redact_str(value)
 }
 
 #[cfg(test)]

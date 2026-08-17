@@ -316,6 +316,19 @@ pub(crate) struct ThreadRuntimeTraceRecord {
     pub(crate) trace_json: String,
 }
 
+/// Thread 的 durable 阶段提交历史（`report_progress` 追加的子代理报告）。
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "thread_submissions"]
+pub(crate) struct ThreadSubmissionRecord {
+    #[key]
+    pub(crate) id: String,
+    #[index]
+    pub(crate) thread_id: String,
+    pub(crate) ordinal: i64,
+    pub(crate) created_at: i64,
+    pub(crate) submission_json: String,
+}
+
 /// PL ThreadActor 的 canonical durable document。
 #[derive(Debug, Clone, toasty::Model)]
 #[table = "thread_runtime_documents"]

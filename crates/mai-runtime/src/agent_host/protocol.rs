@@ -4,7 +4,8 @@ use mai_protocol::{
     AgentTurnOutcomeKind, TokenUsage,
 };
 use pl_core::{
-    AgentActivityState, AgentLifecycleState, AgentSnapshot, AgentTurnOutcome, TurnOutcomeKind,
+    ActiveKind, AgentActivityState, AgentLifecycleState, AgentSnapshot, AgentTurnOutcome,
+    TurnOutcomeKind,
 };
 /// PL snapshot 到 mai-protocol wire DTO 的唯一映射入口。
 pub(crate) fn runtime_state(snapshot: &AgentSnapshot) -> AgentRuntimeState {
@@ -18,9 +19,13 @@ pub(crate) fn runtime_state(snapshot: &AgentSnapshot) -> AgentRuntimeState {
         activity: match snapshot.activity {
             AgentActivityState::Idle => AgentRuntimeActivity::Idle,
             AgentActivityState::Queued => AgentRuntimeActivity::Queued,
-            AgentActivityState::Running => AgentRuntimeActivity::Running,
-            AgentActivityState::WaitingTool => AgentRuntimeActivity::WaitingTool,
-            AgentActivityState::WaitingInteraction => AgentRuntimeActivity::WaitingInteraction,
+            AgentActivityState::Active(ActiveKind::Running) => AgentRuntimeActivity::Running,
+            AgentActivityState::Active(ActiveKind::WaitingTool) => {
+                AgentRuntimeActivity::WaitingTool
+            }
+            AgentActivityState::Active(ActiveKind::WaitingInteraction) => {
+                AgentRuntimeActivity::WaitingInteraction
+            }
             AgentActivityState::Cancelling => AgentRuntimeActivity::Cancelling,
         },
         active_turn: snapshot.active_turn_id.as_ref().map(ToString::to_string),

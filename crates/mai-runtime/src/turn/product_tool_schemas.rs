@@ -1,11 +1,13 @@
-use pl_model::ToolSchema;
-
-mod definitions;
+pub(crate) mod definitions;
 mod names;
+
+#[cfg(test)]
+use pl_model::ToolSchema;
 
 pub use names::*;
 
-pub fn build_tool_schemas() -> Vec<ToolSchema> {
+#[cfg(test)]
+pub(crate) fn build_tool_schemas() -> Vec<ToolSchema> {
     definitions::builtin_tool_schemas()
 }
 
@@ -17,22 +19,23 @@ mod tests {
     #[test]
     fn product_tool_api_is_pl_schema_only() {
         let api = include_str!("product_tool_schemas.rs");
+        let production = api.split("#[cfg(test)]").next().unwrap();
         let names = include_str!("product_tool_schemas/names.rs");
 
         let mcp_tool_type = format!("{}{}", "Mcp", "Tool");
         assert!(
-            !api.contains(&mcp_tool_type),
+            !production.contains(&mcp_tool_type),
             "product_tool_schemas 只能暴露 mai-team 产品工具 schema，MCP schema 由 pl-core host MCP 工具包构造"
         );
         let mcp_visible_name = format!("{}{}", "model", "_name");
         assert!(
-            !api.contains(&mcp_visible_name),
+            !production.contains(&mcp_visible_name),
             "product_tool_schemas 不应再拼装 MCP model tool 名称"
         );
-        assert!(!api.contains(&format!("{}{}", "route", "_tool")));
-        assert!(!api.contains(&format!("{}{}", "Routed", "Tool")));
+        assert!(!production.contains(&format!("{}{}", "route", "_tool")));
+        assert!(!production.contains(&format!("{}{}", "Routed", "Tool")));
         assert!(
-            !api.contains(&format!("{}{}", "Tool", "Definition")),
+            !production.contains(&format!("{}{}", "Tool", "Definition")),
             "product_tool_schemas 产品工具 schema 应直接使用 pl_model::ToolSchema"
         );
         assert!(
@@ -44,7 +47,7 @@ mod tests {
     #[test]
     fn pure_lang_dependencies_pin_the_verified_runtime_revision() {
         let manifest = include_str!("../../../../Cargo.toml");
-        let verified_revision = "7bb6999c8215b62f6e2071df77e3cd2fe0f0363f";
+        let verified_revision = "7f8af22eb46f5f25660cb957ea059d8b941df259";
         for package in ["pl-core", "pl-model", "pl-protocol", "pl-trace"] {
             let line = manifest
                 .lines()
@@ -72,7 +75,7 @@ mod tests {
             pl_core::TOOL_EXEC,
             pl_core::TOOL_WRITE_STDIN,
             pl_core::WorkspaceFileToolKind::ReadFile.name(),
-            pl_core::WorkspaceFileToolKind::SearchFiles.name(),
+            pl_core::WorkspaceFileToolKind::ListFiles.name(),
             pl_core::WorkspaceFileToolKind::ApplyPatch.name(),
             pl_core::TOOL_READ_SESSION_NOTE,
             pl_core::TOOL_SEARCH_SESSION_NOTE,
@@ -86,6 +89,7 @@ mod tests {
             "container_exec",
             "run_in_container",
             "container_copy",
+            "search_files",
         ] {
             assert!(
                 !names.iter().any(|candidate| candidate == legacy),
@@ -106,7 +110,6 @@ mod tests {
             pl_core::TOOL_WRITE_STDIN,
             pl_core::WorkspaceFileToolKind::ReadFile.name(),
             pl_core::WorkspaceFileToolKind::ListFiles.name(),
-            pl_core::WorkspaceFileToolKind::SearchFiles.name(),
             pl_core::WorkspaceFileToolKind::ApplyPatch.name(),
             "spawn_agent",
             "send_input",
@@ -119,9 +122,10 @@ mod tests {
             pl_core::TOOL_GIT_STATUS,
             pl_core::TOOL_GIT_PUSH,
             pl_core::TOOL_GIT_SYNC_DEFAULT_BRANCH,
-            pl_core::TOOL_LIST_MCP_RESOURCES,
-            pl_core::TOOL_LIST_MCP_RESOURCE_TEMPLATES,
-            pl_core::TOOL_READ_MCP_RESOURCE,
+            // pl 的 MCP resource 工具由 MCP runtime 按需发布，不属于 mai 产品 schema。
+            "list_mcp_resources",
+            "list_mcp_resource_templates",
+            "read_mcp_resource",
             "github_api_get",
             "send_message",
             "git_worktree_info",
@@ -164,7 +168,7 @@ mod tests {
             .expect("properties");
         assert_eq!(
             properties.get("body").and_then(|schema| schema.get("type")),
-            Some(&json!("object"))
+            Some(&json!(["object", "null"]))
         );
         assert!(description.contains("single POST"));
         assert!(description.contains("event"));
@@ -202,9 +206,7 @@ mod tests {
             Some(&json!(["callId", "artifactId", "range"]))
         );
         assert_eq!(
-            properties
-                .get("range")
-                .and_then(|schema| schema.get("enum")),
+            input_schema.pointer("/$defs/ToolArtifactRange/enum"),
             Some(&json!(["lines", "bytes"]))
         );
         assert!(properties.contains_key("offset"));
@@ -232,7 +234,7 @@ mod tests {
             panic!("queue_project_review_prs must be a function tool");
         };
         let item_properties = input_schema
-            .pointer("/properties/prs/items/properties")
+            .pointer("/$defs/QueueProjectReviewPr/properties")
             .and_then(Value::as_object)
             .expect("queue item properties");
 
@@ -241,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn product_tool_schemas_use_pl_core_schema_helpers() {
+    fn product_tool_schemas_use_pl_core_typed_definitions() {
         let definitions = [
             include_str!("product_tool_schemas/definitions/workflow.rs"),
             include_str!("product_tool_schemas/definitions/github.rs"),
@@ -250,18 +252,24 @@ mod tests {
         .join("\n");
 
         assert!(
-            definitions.contains("function_tool_schema(")
-                && definitions.contains("ToolInputSchemaField::required"),
-            "product_tool_schemas 产品工具 schema 应通过 pl-core 统一 helper 构造"
+            definitions.contains("FunctionToolDefinition::<"),
+            "product_tool_schemas 产品工具 schema 应由 pl-core typed definition 派生"
+        );
+        assert!(
+            definitions.contains(".input_schema()"),
+            "typed definition 是 schema 的唯一事实源"
         );
         for forbidden in [
-            "ToolSchema::function",
+            "ToolInputSchemaField",
+            "function_tool_schema(",
             "crate::schema::object_schema",
             "object_schema(vec!",
+            "\"properties\"",
+            "\"required\"",
         ] {
             assert!(
                 !definitions.contains(forbidden),
-                "product_tool_schemas 不应保留本地工具 schema 构造 `{forbidden}`"
+                "product_tool_schemas 不应手写 JSON schema 片段 `{forbidden}`"
             );
         }
     }
@@ -272,6 +280,7 @@ mod tests {
             .filter_schemas(build_tool_schemas());
         assert_eq!(tool_names(&tools), vec![TOOL_SAVE_ARTIFACT]);
     }
+
 
     fn tool_names(tools: &[ToolSchema]) -> Vec<&str> {
         tools.iter().map(ToolSchema::name).collect()

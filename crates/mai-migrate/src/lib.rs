@@ -14,7 +14,8 @@ use serde::Serialize;
 const LEGACY_SCHEMA: &str = "27";
 const THREAD_SCHEMA: &str = "28";
 const MERGED_STATE_SCHEMA: &str = "29";
-const TARGET_SCHEMA: &str = "30";
+const PR_STATE_SCHEMA: &str = "30";
+const TARGET_SCHEMA: &str = "31";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,18 +50,24 @@ pub fn migrate_path(path: &Path) -> Result<MigrationReport> {
             schema::validate_v28(&transaction)?;
             schema::install_v29(&transaction)?;
             schema::validate_v29(&transaction)?;
+            schema::install_v30(&transaction)?;
         }
         THREAD_SCHEMA => {
             schema::validate_v28(&transaction)?;
             schema::install_v29(&transaction)?;
             schema::validate_v29(&transaction)?;
+            schema::install_v30(&transaction)?;
         }
-        MERGED_STATE_SCHEMA => schema::validate_v29(&transaction)?,
+        MERGED_STATE_SCHEMA => {
+            schema::validate_v29(&transaction)?;
+            schema::install_v30(&transaction)?;
+        }
+        PR_STATE_SCHEMA => schema::validate_v30(&transaction)?,
         _ => bail!(
-            "只支持从 schema {LEGACY_SCHEMA}、{THREAD_SCHEMA} 或 {MERGED_STATE_SCHEMA} 迁移，当前为 {version}"
+            "只支持从 schema {LEGACY_SCHEMA}、{THREAD_SCHEMA}、{MERGED_STATE_SCHEMA} 或 {PR_STATE_SCHEMA} 迁移，当前为 {version}"
         ),
     }
-    schema::install_v30(&transaction)?;
+    schema::install_v31(&transaction)?;
     let report = schema::validate_target(&transaction, source_schema, false)?;
     transaction.commit()?;
     Ok(report)
@@ -73,6 +80,10 @@ pub fn validate_path(path: &Path) -> Result<MigrationReport> {
     let version = schema::schema_version(&transaction)?;
     let report = match version.as_str() {
         TARGET_SCHEMA => schema::validate_target(&transaction, TARGET_SCHEMA.to_string(), true)?,
+        PR_STATE_SCHEMA => {
+            schema::validate_v30(&transaction)?;
+            schema::report(&transaction, PR_STATE_SCHEMA.to_string(), false)?
+        }
         MERGED_STATE_SCHEMA => {
             schema::validate_v29(&transaction)?;
             schema::report(&transaction, MERGED_STATE_SCHEMA.to_string(), false)?
@@ -86,7 +97,7 @@ pub fn validate_path(path: &Path) -> Result<MigrationReport> {
             legacy::validate_convertible(&transaction)?
         }
         _ => bail!(
-            "只支持校验 schema {LEGACY_SCHEMA}、{THREAD_SCHEMA}、{MERGED_STATE_SCHEMA} 或 {TARGET_SCHEMA}，当前为 {version}"
+            "只支持校验 schema {LEGACY_SCHEMA}、{THREAD_SCHEMA}、{MERGED_STATE_SCHEMA}、{PR_STATE_SCHEMA} 或 {TARGET_SCHEMA}，当前为 {version}"
         ),
     };
     transaction.rollback()?;

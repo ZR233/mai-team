@@ -317,16 +317,13 @@ impl DockerClient {
         cwd: Option<&str>,
         env: &[(String, String)],
     ) -> Result<Child> {
-        let mut cmd = Command::new(&self.binary);
-        cmd.arg("exec").arg("-i");
-        if let Some(cwd) = cwd {
-            cmd.args(["-w", cwd]);
-        }
+        let argv = self.exec_argv(container_id, command, args, cwd, env);
+        let (binary, exec_args) = argv.split_first().expect("exec argv is non-empty");
+        let mut cmd = Command::new(binary);
+        cmd.args(exec_args);
         for (key, value) in env {
-            cmd.arg("-e").arg(key);
             cmd.env(key, value);
         }
-        cmd.arg(container_id).arg(command).args(args);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -334,6 +331,34 @@ impl DockerClient {
         #[cfg(unix)]
         cmd.process_group(0);
         Ok(cmd.spawn()?)
+    }
+
+    /// 生成在宿主侧以 stdio 驱动容器内进程的 `docker exec -i` argv。
+    ///
+    /// argv 与 [`Self::spawn_exec`] 完全一致：`-w` 设定容器内工作目录，`-e KEY`
+    /// 声明从宿主 docker 客户端进程环境继承的变量。宿主自己 spawn 该 argv 时，
+    /// 必须同时把同名键值注入自身进程环境，值才能透传进容器。
+    pub fn exec_argv(
+        &self,
+        container_id: &str,
+        command: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+    ) -> Vec<String> {
+        let mut argv = vec![self.binary.clone(), "exec".to_string(), "-i".to_string()];
+        if let Some(cwd) = cwd {
+            argv.push("-w".to_string());
+            argv.push(cwd.to_string());
+        }
+        for (key, _) in env {
+            argv.push("-e".to_string());
+            argv.push(key.clone());
+        }
+        argv.push(container_id.to_string());
+        argv.push(command.to_string());
+        argv.extend(args.iter().cloned());
+        argv
     }
 
     /// 通过固定生命周期启动器执行原始 `/bin/sh -c` 命令，并维护容器内 PID 台账。

@@ -5,7 +5,9 @@ use mai_protocol::{
     TokenUsage,
 };
 use mai_store::{MaiStore, StoredThreadRuntime};
-use pl_core::{AgentActivityState, AgentLifecycleState, AgentSnapshot, ThreadId};
+use pl_core::{
+    ActiveKind, AgentActivityState, AgentLifecycleState, AgentSnapshot, ThreadId,
+};
 
 use crate::{Result, RuntimeError};
 
@@ -104,12 +106,12 @@ pub(crate) fn thread_metadata(summary: &AgentSummary, snapshot: &AgentSnapshot) 
             AgentLifecycleState::Closing => ThreadStatus::Waiting,
             AgentLifecycleState::Active => match snapshot.activity {
                 AgentActivityState::Idle => ThreadStatus::Idle,
-                AgentActivityState::Queued | AgentActivityState::WaitingInteraction => {
+                AgentActivityState::Queued
+                | AgentActivityState::Active(ActiveKind::WaitingInteraction) => {
                     ThreadStatus::Waiting
                 }
-                AgentActivityState::Running | AgentActivityState::WaitingTool => {
-                    ThreadStatus::Running
-                }
+                AgentActivityState::Active(ActiveKind::Running)
+                | AgentActivityState::Active(ActiveKind::WaitingTool) => ThreadStatus::Running,
                 AgentActivityState::Cancelling => ThreadStatus::Waiting,
             },
         },

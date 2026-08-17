@@ -5,8 +5,11 @@ use std::sync::{Arc, Mutex};
 use mai_protocol::{AgentId, ToolOutputArtifactInfo};
 use pl_core::{
     CommandBackend, CommandOutputSizes, CommandOutputTarget, CommandSpawnRequest,
-    ToolOutputArtifactPathRequest, ToolOutputCapture, ToolOutputCaptureRequest,
-    ToolOutputStreamSizes, command_output_model_path, tool_output_artifact_file_path,
+    command_output_model_path,
+    tool::output_format::capture::{
+        ToolOutputArtifactPathRequest, ToolOutputCapture, ToolOutputCaptureRequest,
+        ToolOutputStreamSizes, tool_output_artifact_file_path,
+    },
 };
 use uuid::Uuid;
 

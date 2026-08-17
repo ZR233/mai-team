@@ -247,7 +247,7 @@ fn archived_message(
         "tool" => ThreadItemContent::ToolCall {
             tool: ThreadToolCall {
                 tool_call_id: format!("review:{turn_id}:message:{index}"),
-                call_id: None,
+                call_id: format!("review:{turn_id}:message:{index}"),
                 provider_item_id: None,
                 name: "archived_tool_output".to_string(),
                 arguments: String::new(),

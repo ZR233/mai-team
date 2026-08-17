@@ -6,7 +6,10 @@ use pl_protocol::ThreadTurnHistory;
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use crate::legacy::ConvertedData;
-use crate::{LEGACY_SCHEMA, MERGED_STATE_SCHEMA, MigrationReport, TARGET_SCHEMA, THREAD_SCHEMA};
+use crate::{
+    LEGACY_SCHEMA, MERGED_STATE_SCHEMA, MigrationReport, PR_STATE_SCHEMA, TARGET_SCHEMA,
+    THREAD_SCHEMA,
+};
 
 const VERSION_KEY: &str = "toasty_schema_version";
 
@@ -285,6 +288,44 @@ pub(crate) fn validate_v29(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn install_v31(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE thread_submissions (
+            id TEXT NOT NULL PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            ordinal BIGINT NOT NULL,
+            created_at BIGINT NOT NULL,
+            submission_json TEXT NOT NULL
+         );
+         CREATE INDEX index_thread_submissions_by_thread
+            ON thread_submissions(thread_id, ordinal);
+         UPDATE settings SET value = '31' WHERE key = 'toasty_schema_version';",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn validate_v30(transaction: &Transaction<'_>) -> Result<()> {
+    if schema_version(transaction)? != PR_STATE_SCHEMA {
+        bail!("源数据库不是 schema {PR_STATE_SCHEMA}");
+    }
+    validate_thread_schema(transaction)?;
+    require_columns(
+        transaction,
+        "project_pull_request_states",
+        &[
+            "project_id",
+            "pr",
+            "state",
+            "state_changed_at",
+            "detected_at",
+        ],
+    )?;
+    if table_exists(transaction, "thread_submissions")? {
+        bail!("schema {PR_STATE_SCHEMA} 意外包含 v31 阶段提交历史表");
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_target(
     transaction: &Transaction<'_>,
     source_schema: String,
@@ -309,6 +350,11 @@ pub(crate) fn validate_target(
         transaction,
         "project_pull_request_states",
         &["project_id", "pr"],
+    )?;
+    require_columns(
+        transaction,
+        "thread_submissions",
+        &["id", "thread_id", "ordinal", "created_at", "submission_json"],
     )?;
     if table_exists(transaction, "project_merged_pull_requests")? {
         bail!("schema {TARGET_SCHEMA} 仍包含已废弃的 v29 merged PR 表");

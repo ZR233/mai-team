@@ -1,7 +1,7 @@
 use mai_protocol::{ModelOutputItem, ModelResponse, TokenUsage};
 
 pub fn completion_response_usage(usage: &pl_model::TokenUsage) -> TokenUsage {
-    let snapshot = pl_core::ModelTokenUsageSnapshot::from_model_usage(usage);
+    let snapshot = pl_core::ModelTokenUsageSnapshot::from(usage);
     token_usage_from_snapshot(&snapshot)
 }
 
@@ -72,7 +72,7 @@ mod tests {
             .expect("production source");
 
         assert!(
-            production.contains("pl_core::ModelTokenUsageSnapshot::from_model_usage"),
+            production.contains("pl_core::ModelTokenUsageSnapshot::from(usage)"),
             "模型 usage 字段解释应由 pl-core ModelTokenUsageSnapshot 统一提供"
         );
         for forbidden in [

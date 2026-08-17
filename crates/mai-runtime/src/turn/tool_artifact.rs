@@ -3,31 +3,14 @@ use std::path::PathBuf;
 
 use base64::Engine;
 use mai_protocol::{AgentId, ToolOutputArtifactInfo};
-use serde::Deserialize;
 
+use crate::turn::product_tool_schemas::definitions::{ReadToolArtifactInput, ToolArtifactRange};
 use crate::{AgentRuntime, Result, RuntimeError};
 
 const DEFAULT_MAX_LINES: usize = 200;
 const MAX_LINES: usize = 500;
 const DEFAULT_MAX_BYTES: usize = 12 * 1024;
 const MAX_BYTES: usize = 64 * 1024;
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct ReadToolArtifactInput {
-    call_id: String,
-    artifact_id: String,
-    range: ToolArtifactRange,
-    offset: Option<u64>,
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum ToolArtifactRange {
-    Lines,
-    Bytes,
-}
 
 pub(super) async fn read(
     runtime: &AgentRuntime,

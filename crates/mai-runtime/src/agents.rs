@@ -37,10 +37,7 @@ pub(crate) use recovery::{
     AgentResourceRecoveryOps, AgentResourceRecoveryRequest, PreparedAgentWorkspace,
     agent_resource_recovery_retry_request, recover_agent_resources,
 };
-pub(crate) use resources::{
-    AgentResourceBroker, AgentResourceBrokerOps, PROJECT_SKILL_RESOURCE_SERVER,
-    SKILL_RESOURCE_SCHEME, SKILL_RESOURCE_SERVER, agent_resource_broker,
-};
+pub(crate) use resources::{AgentResourceBroker, AgentResourceBrokerOps, agent_resource_broker};
 pub(crate) use update::{AgentUpdateOps, update_agent};
 
 /// 关闭产品资源时所需的最小端口；framework 生命周期由 PL 独占。

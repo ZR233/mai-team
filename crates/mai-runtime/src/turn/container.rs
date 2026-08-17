@@ -5,8 +5,11 @@ use mai_docker::ExecCaptureOptions;
 use mai_protocol::{AgentId, ToolOutputArtifactInfo, now};
 use pl_core::{
     ContainerBackend, ContainerCopyFromRequest, ContainerCopyToRequest, ContainerExecOutput,
-    ContainerExecRequest, ToolOutputArtifactDescriptor, ToolOutputCapture,
-    ToolOutputCaptureRequest, ToolOutputStreamSizes,
+    ContainerExecRequest,
+    tool::output_format::capture::{
+        ToolOutputArtifactDescriptor, ToolOutputCapture, ToolOutputCaptureRequest,
+        ToolOutputStreamSizes,
+    },
 };
 use uuid::Uuid;
 

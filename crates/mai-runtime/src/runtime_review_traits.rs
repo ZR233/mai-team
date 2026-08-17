@@ -787,7 +787,7 @@ fn reviewer_inactivity_timeout(
     const RUNNING_INACTIVITY_SECS: u64 = 10 * 60;
     const TOOL_TIMEOUT_GRACE_SECS: u64 = 60;
     let mut timeout = std::time::Duration::from_secs(RUNNING_INACTIVITY_SECS);
-    if snapshot.activity != pl_core::AgentActivityState::WaitingTool {
+    if snapshot.activity != pl_core::AgentActivityState::Active(pl_core::ActiveKind::WaitingTool) {
         return Ok(timeout);
     }
     let view = runtime
