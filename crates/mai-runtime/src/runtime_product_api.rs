@@ -102,12 +102,8 @@ impl AgentRuntime {
     }
 
     pub(super) async fn generate_task_title(self: &Arc<Self>, message: &str) -> Result<String> {
-        let planner_model = self.resolve_role_agent_model(AgentRole::Planner).await?;
         let selection = self
-            .resolve_provider_selection(
-                Some(&planner_model.preference.provider_id),
-                Some(&planner_model.preference.model),
-            )
+            .resolve_role_provider_selection(AgentRole::Planner, None, None)
             .await?;
         let instructions = "Generate a concise task title of 3-8 words that captures the essence of the user's request. Output only the title text, nothing else. Do not use quotes or punctuation at the end.";
         let provider = model_profile::core_provider_for_selection(&selection)?;

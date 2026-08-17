@@ -47,17 +47,15 @@ pub(crate) fn skill_resource_entries(
                 TOOL_LIST_SKILL_RESOURCES,
                 LIST_DESCRIPTION,
             )
-            .registered(
-                move |_: ListSkillResourcesInput, _: pl_core::ToolContext| {
-                    let runtime = list_runtime.clone();
-                    let agent = list_agent.clone();
-                    async move {
-                        let broker = runtime.agent_resource_broker(&agent).await?;
-                        let execution = ToolExecution::json(broker.list_skill_resources())?;
-                        Ok::<_, RuntimeError>(execution)
-                    }
-                },
-            ),
+            .registered(move |_: ListSkillResourcesInput, _: pl_core::ToolContext| {
+                let runtime = list_runtime.clone();
+                let agent = list_agent.clone();
+                async move {
+                    let broker = runtime.agent_resource_broker(&agent).await?;
+                    let execution = ToolExecution::json(broker.list_skill_resources())?;
+                    Ok::<_, RuntimeError>(execution)
+                }
+            }),
             ToolSourceMetadata::new(source.clone()),
         ),
         ToolEntry::new(

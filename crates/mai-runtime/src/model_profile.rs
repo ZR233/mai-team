@@ -1,103 +1,48 @@
-use std::collections::{BTreeMap, HashMap};
-
-use mai_protocol::{
-    ModelCapabilities as MaiModelCapabilities, ModelConfig, ModelMaxTokensField, ProviderSecret,
-    ProviderWireProtocol as MaiProviderWireProtocol,
-};
-use pl_core::CoreModelTurnRequest;
+use pl_core::{CoreModelTurnRequest, ResolvedModelRoute};
 use pl_model::{
-    MaxTokensField, MissingCandidatePolicy, ModelCapabilities, ModelInfo, ModelModality,
-    ModelParameter, ModelParameterCandidateRequest, ModelRequestProfile, ModelTransportProfile,
-    ParameterWire, ProviderInfo, ReasoningConfig, ReasoningSummary, ResponsesMaxTokensField,
-    SharedModelProvider, ToolCapabilities, ToolSchema, create_provider_with_catalog,
+    MissingCandidatePolicy, ModelInfo, ModelParameterCandidateRequest, ReasoningConfig,
+    ReasoningSummary, SharedModelProvider, ToolSchema, create_provider_with_catalog,
 };
 use pl_protocol::PureError;
 
-use crate::ProviderSelection;
-
-/// 将 mai 的 provider/model 选择投影成 pl-core 可直接执行的 provider。
+/// 使用 PL 已解析路由创建可执行 provider，不再重建 provider 或模型元数据。
 pub fn core_provider_for_selection(
-    selection: &ProviderSelection,
+    selection: &ResolvedModelRoute,
 ) -> Result<SharedModelProvider, PureError> {
-    let mut info = provider_info(&selection.provider);
-    info.default_model = selection.model.id.clone();
-    let mut model = model_info(&selection.model, selection.provider.transport.protocol);
-    model.transport.default_connection_mode = info.connection_mode;
-    create_provider_with_catalog(info, vec![model])
+    create_provider_with_catalog(selection.provider_info.clone(), selection.models.clone())
 }
 
-/// 将 mai 的模型配置投影成 pl-core 的单次模型请求。
+/// 使用 PL 模型值对象构造一次轻量模型请求。
 pub fn core_model_turn_request(
-    selection: &ProviderSelection,
+    selection: &ResolvedModelRoute,
     reasoning_effort: Option<&str>,
     instructions: impl Into<String>,
     tools: Vec<ToolSchema>,
 ) -> CoreModelTurnRequest {
-    CoreModelTurnRequest::new(selection.model.id.clone())
+    CoreModelTurnRequest::new(selection.model.slug.clone())
         .with_instructions(instructions)
         .with_tools(tools)
-        .with_parallel_tool_calls(selection.model.capabilities.parallel_tools)
-        .with_max_tokens(Some(selection.model.output_tokens))
-        .with_reasoning(reasoning_config(&selection.model, reasoning_effort))
-}
-
-pub(crate) fn provider_info(provider: &ProviderSecret) -> ProviderInfo {
-    let mut info = match provider.transport.protocol {
-        MaiProviderWireProtocol::Responses => ProviderInfo::openai(Some(provider.base_url.clone())),
-        MaiProviderWireProtocol::ChatCompletions => ProviderInfo::openai_compatible_chat(
-            provider.name.clone(),
-            provider.base_url.clone(),
-            provider.default_model.clone(),
-        ),
-    };
-    info.name = provider.name.clone();
-    info.connection_mode = match provider.transport.connection_mode {
-        mai_protocol::ProviderConnectionMode::WebSocket => {
-            pl_model::ProviderConnectionMode::WebSocket
-        }
-        mai_protocol::ProviderConnectionMode::Http => pl_model::ProviderConnectionMode::Http,
-    };
-    info.default_model = provider.default_model.clone();
-    info.bearer_token = Some(provider.api_key.clone());
-    info.http_headers = (!provider.http_headers.is_empty()).then(|| {
-        provider
-            .http_headers
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect()
-    });
-    info
-}
-
-pub(crate) fn model_info(model: &ModelConfig, protocol: MaiProviderWireProtocol) -> ModelInfo {
-    let mut info = ModelInfo::fallback(&model.id);
-    info.display_name = model.name.clone().unwrap_or_else(|| model.id.clone());
-    info.context_window = Some(model.context_tokens);
-    info.max_context_window = model.max_context_tokens.or(Some(model.context_tokens));
-    info.auto_compact_token_limit = model.auto_compact_token_limit;
-    info.max_output_tokens = Some(model.output_tokens);
-    info.capabilities = model_capabilities(&model.capabilities, model.supports_tools);
-    info.capabilities.reasoning = model.reasoning.is_some();
-    info.parameters = reasoning_parameters(model);
-    info.transport = match protocol {
-        MaiProviderWireProtocol::Responses => ModelTransportProfile::responses_websocket(),
-        MaiProviderWireProtocol::ChatCompletions => ModelTransportProfile::chat_completions_http(),
-    };
-    info.request_profile = request_profile(model, protocol);
-    info
+        .with_parallel_tool_calls(selection.model.capabilities.tools.parallel_tool_calls)
+        .with_max_tokens(selection.model.max_output_tokens)
+        .with_reasoning(reasoning_config(
+            &selection.model,
+            reasoning_effort,
+            selection.effort.as_ref().map(|effort| effort.as_str()),
+        ))
 }
 
 pub(crate) fn reasoning_config(
-    model: &ModelConfig,
-    reasoning_effort: Option<&str>,
+    model: &ModelInfo,
+    requested_effort: Option<&str>,
+    configured_effort: Option<&str>,
 ) -> Option<ReasoningConfig> {
-    let config = model.reasoning.as_ref()?;
-    let effort = reasoning_parameter(model)?
+    let parameter = model.effort_parameter()?;
+    let effort = parameter
         .resolve_candidate(ModelParameterCandidateRequest {
-            requested: reasoning_effort,
-            default_candidate: config.default_variant.as_deref(),
+            requested: requested_effort,
+            default_candidate: configured_effort,
             missing: MissingCandidatePolicy::UseDefault,
-            disabled_values: &[],
+            disabled_values: &["none"],
         })
         .ok()
         .flatten();
@@ -107,266 +52,28 @@ pub(crate) fn reasoning_config(
     })
 }
 
-fn model_capabilities(
-    capabilities: &MaiModelCapabilities,
-    supports_tools: bool,
-) -> ModelCapabilities {
-    ModelCapabilities {
-        streaming: true,
-        temperature: true,
-        reasoning: capabilities.reasoning_replay,
-        web_search: capabilities.web_search,
-        input: vec![ModelModality::Text],
-        output: vec![ModelModality::Text],
-        tools: ToolCapabilities {
-            function_calling: supports_tools && capabilities.tools,
-            parallel_tool_calls: capabilities.parallel_tools,
-            custom_tools: false,
-            freeform_tools: false,
-            tool_search: false,
-            programmatic_tool_calling: false,
-        },
-        interleaved: None,
-        prompt_cache: Default::default(),
-    }
-}
-
-fn request_profile(model: &ModelConfig, protocol: MaiProviderWireProtocol) -> ModelRequestProfile {
-    let responses_max_tokens_field = match protocol {
-        MaiProviderWireProtocol::Responses => match model.request_policy.max_tokens_field {
-            ModelMaxTokensField::Omit => ResponsesMaxTokensField::Omit,
-            ModelMaxTokensField::MaxOutputTokens => ResponsesMaxTokensField::MaxOutputTokens,
-            ModelMaxTokensField::MaxCompletionTokens => {
-                ResponsesMaxTokensField::MaxCompletionTokens
-            }
-            ModelMaxTokensField::MaxTokens => ResponsesMaxTokensField::MaxTokens,
-        },
-        MaiProviderWireProtocol::ChatCompletions => ResponsesMaxTokensField::Omit,
-    };
-    let mut profile = ModelRequestProfile {
-        api_model: Some(model.id.clone()),
-        headers: model
-            .headers
-            .iter()
-            .chain(model.request_policy.headers.iter())
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<HashMap<_, _>>(),
-        max_tokens_field: match model.request_policy.max_tokens_field {
-            ModelMaxTokensField::MaxCompletionTokens => MaxTokensField::MaxCompletionTokens,
-            ModelMaxTokensField::Omit
-            | ModelMaxTokensField::MaxOutputTokens
-            | ModelMaxTokensField::MaxTokens => MaxTokensField::MaxTokens,
-        },
-        responses_max_tokens_field,
-        ..ModelRequestProfile::default()
-    };
-    profile.extend_body_from_value(&model.options);
-    profile.extend_body_from_value(&model.request_policy.extra_body);
-    profile
-}
-
-fn reasoning_parameters(model: &ModelConfig) -> Vec<ModelParameter> {
-    reasoning_parameter(model).into_iter().collect()
-}
-
-pub(crate) fn reasoning_parameter(model: &ModelConfig) -> Option<ModelParameter> {
-    let config = model.reasoning.as_ref()?;
-    if config.variants.is_empty() {
-        return None;
-    }
-
-    let mut wire = BTreeMap::new();
-    for variant in &config.variants {
-        wire.insert(
-            variant.id.clone(),
-            ParameterWire {
-                set: pl_model::wire_assignments_from_value(&variant.request),
-                remove: Vec::new(),
-            },
-        );
-    }
-
-    Some(ModelParameter {
-        name: "effort".to_string(),
-        label: Some("Reasoning effort".to_string()),
-        candidates: config
-            .variants
-            .iter()
-            .map(|variant| variant.id.clone())
-            .collect(),
-        wire,
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use mai_protocol::{
-        ModelCapabilities as MaiModelCapabilities, ModelConfig, ModelReasoningConfig,
-        ModelReasoningVariant,
-    };
-    use pretty_assertions::assert_eq;
-    use serde_json::{Value, json};
-
-    use super::*;
-
-    fn reasoning_model() -> ModelConfig {
-        ModelConfig {
-            id: "reasoning-model".to_string(),
-            name: None,
-            context_tokens: 128_000,
-            max_context_tokens: None,
-            effective_context_window_percent: 95,
-            output_tokens: 4096,
-            auto_compact_token_limit: None,
-            supports_tools: true,
-            capabilities: MaiModelCapabilities::default(),
-            request_policy: Default::default(),
-            reasoning: Some(ModelReasoningConfig {
-                default_variant: Some("medium".to_string()),
-                variants: ["high", "medium"]
-                    .into_iter()
-                    .map(|id| ModelReasoningVariant {
-                        id: id.to_string(),
-                        label: None,
-                        request: json!({
-                            "reasoning": {
-                                "effort": id,
-                            },
-                        }),
-                    })
-                    .collect(),
-            }),
-            options: Value::Null,
-            headers: BTreeMap::new(),
-        }
-    }
-
     #[test]
-    fn continuation_policy_belongs_to_pl_model_transport_session() {
+    fn mai_does_not_rebuild_pl_provider_or_model_semantics() {
         let source = include_str!("model_profile.rs");
         let production = source
             .split("#[cfg(test)]")
             .next()
             .expect("production source");
-
         for forbidden in [
-            "CoreModelContinuation",
-            "with_continuation_config",
-            "previous_response_id",
-            "with_continuation(supports_continuation)",
-            "with_continuation_cache_key",
-            "fn continuation_cache_key",
-            "model_supports_continuation",
+            "ModelInfo::fallback",
+            "ProviderInfo::openai",
+            "responses_websocket",
+            "chat_completions_http",
+            "wire_assignments_from_value",
+            "ProviderConnectionMode",
+            "ProviderWireProtocol",
         ] {
             assert!(
                 !production.contains(forbidden),
-                "mai-runtime 不应本地维护 continuation 策略 `{forbidden}`"
+                "mai-runtime 不应重建 PL 模型语义 `{forbidden}`"
             );
         }
-    }
-
-    #[test]
-    fn reasoning_variant_wire_assignments_use_pl_model_flattener() {
-        let source = include_str!("model_profile.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production source");
-
-        assert!(
-            production.contains("pl_model::wire_assignments_from_value"),
-            "reasoning variant request JSON 到 WireAssignment 的拍平语义应由 pl-model 统一提供"
-        );
-        for forbidden in [
-            "fn wire_assignments(",
-            "fn collect_wire_assignments(",
-            "Value::Object(object)",
-            "Value::Null => {}",
-        ] {
-            assert!(
-                !production.contains(forbidden),
-                "mai-runtime 不应复制 pl-model wire assignment 拍平逻辑 `{forbidden}`"
-            );
-        }
-    }
-
-    #[test]
-    fn request_profile_body_merge_uses_pl_model_helper() {
-        let source = include_str!("model_profile.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production source");
-
-        assert!(
-            production.contains("extend_body_from_value"),
-            "模型 request profile 的 body object 合并语义应由 pl-model ModelRequestProfile 提供"
-        );
-        for forbidden in ["fn merge_object(", "value.as_object()", "target.extend("] {
-            assert!(
-                !production.contains(forbidden),
-                "mai-runtime 不应复制 request profile body 合并逻辑 `{forbidden}`"
-            );
-        }
-    }
-
-    #[test]
-    fn reasoning_config_default_effort_uses_pl_model_candidate_resolution() {
-        let source = include_str!("model_profile.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production source");
-
-        assert!(
-            production.contains("resolve_candidate"),
-            "模型请求默认 reasoning effort 应由 pl-model ModelParameter 候选值解析统一提供"
-        );
-        for forbidden in [
-            "fn default_reasoning_effort(",
-            "variants.first().map(|variant| variant.id.clone())",
-        ] {
-            assert!(
-                !production.contains(forbidden),
-                "mai-runtime 不应复制 reasoning effort 默认候选值规则 `{forbidden}`"
-            );
-        }
-    }
-
-    #[test]
-    fn reasoning_config_uses_configured_default_variant() {
-        let model = reasoning_model();
-
-        let config = reasoning_config(&model, None).expect("reasoning config");
-
-        assert_eq!(config.effort, Some("medium".to_string()));
-    }
-
-    #[test]
-    fn responses_max_tokens_policy_survives_config_conversion() {
-        let mut model = reasoning_model();
-        model.request_policy.max_tokens_field = ModelMaxTokensField::MaxOutputTokens;
-
-        let info = model_info(&model, MaiProviderWireProtocol::Responses);
-
-        assert_eq!(
-            info.request_profile.responses_max_tokens_field,
-            ResponsesMaxTokensField::MaxOutputTokens
-        );
-    }
-
-    #[test]
-    fn responses_omit_policy_does_not_fall_back_to_chat_max_tokens() {
-        let mut model = reasoning_model();
-        model.request_policy.max_tokens_field = ModelMaxTokensField::Omit;
-
-        let info = model_info(&model, MaiProviderWireProtocol::Responses);
-
-        assert_eq!(
-            info.request_profile.responses_max_tokens_field,
-            ResponsesMaxTokensField::Omit
-        );
     }
 }

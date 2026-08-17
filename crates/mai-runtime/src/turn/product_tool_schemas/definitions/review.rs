@@ -8,8 +8,7 @@ use serde::Deserialize;
 #[cfg(test)]
 use super::super::names::TOOL_QUEUE_PROJECT_REVIEW_PRS;
 
-pub(crate) const QUEUE_PROJECT_REVIEW_PRS_DESCRIPTION: &str =
-    "Queue one or more pull requests for the current Mai project's automatic review pool. \
+pub(crate) const QUEUE_PROJECT_REVIEW_PRS_DESCRIPTION: &str = "Queue one or more pull requests for the current Mai project's automatic review pool. \
      The server infers the project from the calling agent; do not provide a project id. \
      Use this only from project PR selector or reviewer workflows.";
 

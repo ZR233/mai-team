@@ -251,44 +251,41 @@ export interface TaskDetail extends TaskSummary {
 }
 
 export interface ProviderModel {
-  id: string
-  name?: string | null
-  display_name?: string
+  slug: string
+  display_name: string
   description?: string | null
-  reasoning?: {
-    default?: string
-    candidates?: string[]
-    default_variant?: string | null
-    variants?: Array<{ id: string; label?: string | null }>
-  } | null
+  context_window?: number | null
+  max_context_window?: number | null
+  max_output_tokens?: number | null
+  parameters?: Array<{ name: string; label?: string | null; candidates: string[]; wire?: Record<string, unknown> }>
+  transport: {
+    protocol: string
+    supported_connection_modes: string[]
+    default_connection_mode: string
+  }
+  [key: string]: unknown
+}
+
+export interface PlProviderConfig {
+  preset?: string | null
+  name: string
+  base_url: string
+  bearer_token?: string | null
+  bearer_token_env?: string | null
+  http_headers?: Record<string, string> | null
+  tool_wire_policy?: string
+  apply_patch_tool_type?: string | null
+  capabilities: Record<string, unknown>
+  catalog: Record<string, unknown>
   [key: string]: unknown
 }
 
 export interface ProviderInstance {
   id: string
-  name: string
-  preset_id?: string | null
-  base_url: string
-  api_key_env?: string | null
-  enabled: boolean
-  default_model: string
+  config: PlProviderConfig
   models: ProviderModel[]
   has_api_key: boolean
-  transport: {
-    protocol: string
-    connection_mode: string
-    connection_modes: Array<{ id: string; display_name: string }>
-  }
-  capability_selection:
-    | { source: "preset_defaults" }
-    | { source: "explicit"; web_search: { hosted_responses: boolean; standalone?: string | null } }
-  service_capabilities: {
-    web_search: { hosted_responses: boolean; standalone?: string | null }
-  }
-  catalog:
-    | { source: "bundled"; catalog_id: string; additional_models: ProviderModel[] }
-    | { source: "explicit"; models: ProviderModel[] }
-  [key: string]: unknown
+  has_http_headers: boolean
 }
 
 export interface ProviderPreset {
@@ -317,14 +314,13 @@ export interface ProviderCatalog {
 
 export interface ProvidersResponse {
   providers: ProviderInstance[]
-  default_provider_id?: string | null
 }
 
 export interface ProviderTestResponse {
   ok: boolean
   provider_id: string
   provider_name: string
-  transport: { protocol: string; connection_mode: string }
+  transport: ProviderModel["transport"]
   model: string
   base_url: string
   latency_ms: number
@@ -341,9 +337,9 @@ export interface ProductEventEnvelope {
 }
 
 export interface AgentModelPreference {
-  provider_id: string
+  provider: string
   model: string
-  reasoning_effort?: string | null
+  effort?: string | null
 }
 
 export interface AgentConfigResponse {

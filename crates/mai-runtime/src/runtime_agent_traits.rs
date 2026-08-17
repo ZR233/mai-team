@@ -191,7 +191,7 @@ impl agents::AgentUpdateOps for AgentRuntime {
         role: AgentRole,
         provider_id: Option<&str>,
         model: Option<&str>,
-    ) -> Result<ProviderSelection> {
+    ) -> Result<pl_core::ResolvedModelRoute> {
         self.resolve_role_provider_selection(role, provider_id, model)
             .await
     }
@@ -217,7 +217,7 @@ impl agents::AgentCreateOps for AgentRuntime {
         role: AgentRole,
         provider_id: Option<&str>,
         model: Option<&str>,
-    ) -> Result<ProviderSelection> {
+    ) -> Result<pl_core::ResolvedModelRoute> {
         self.resolve_role_provider_selection(role, provider_id, model)
             .await
     }

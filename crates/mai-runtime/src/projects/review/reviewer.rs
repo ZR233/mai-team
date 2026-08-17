@@ -189,9 +189,9 @@ async fn prepare_project_reviewer_inner(
         .create_agent_with_container_source(
             CreateAgentRequest {
                 name: Some(format!("{} Auto Reviewer", project_summary.name)),
-                provider_id: Some(model.provider_id),
+                provider_id: Some(model.provider.to_string()),
                 model: Some(model.model),
-                reasoning_effort: model.reasoning_effort,
+                reasoning_effort: model.effort.map(|effort| effort.as_str().to_string()),
                 docker_image: Some(docker_image),
                 parent_id: Some(project_summary.maintainer_agent_id),
                 system_prompt: Some(super::project_reviewer_system_prompt(&context)),
@@ -492,9 +492,9 @@ mod tests {
 
         async fn reviewer_model(&self) -> Result<AgentModelPreference> {
             Ok(AgentModelPreference {
-                provider_id: "provider".to_string(),
+                provider: pl_core::ProviderId::new("provider").unwrap(),
                 model: "model".to_string(),
-                reasoning_effort: None,
+                effort: None,
             })
         }
 

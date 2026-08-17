@@ -8,44 +8,30 @@ mai 不维护内置 provider preset 或模型元数据。canonical 数据位于 
 - `pl-core::ProviderCatalogRegistry`：preset ID、endpoint、凭证描述、协议、连接策略和 catalog 绑定。
 - `pl-protocol::ProviderCatalogSnapshot`：Web 与 Flutter 共用的无 secret、版本化 wire 快照。
 
-mai-runtime 的 `MaiConfig` 只保存 provider 实例：ID、preset/catalog 引用、凭证、endpoint
-override、连接方式、附加模型和角色路由。mai-store 不包含内置模型构造器。
-
-Provider 的厂商身份、wire protocol、连接方式和外部服务能力彼此正交。preset 在 PL registry 中
-声明默认 `ProviderServiceCapabilities`；preset 实例默认保存 `PresetDefaults`，因此重新编译即可
-继承新增能力。自定义 provider 保存显式能力，默认不宣称兼容服务；代理 endpoint（例如 muxai）
-可在通用高级设置中覆盖能力，不需要增加 endpoint 或 provider ID 分支。
+`MaiConfig.models` 直接持有 PL `AgentModelConfig`。Preset provider 每次写入都从 PL registry
+重新实例化，mai 只保留实例 ID、名称、endpoint override、凭证与 headers；catalog、transport、
+capabilities、reasoning、token 限制和 tool wire policy 不允许由 mai 覆盖。Custom provider 直接保存
+完整 PL `ProviderConfig`，mai 不解析或补齐其中的模型语义。
 
 ## 传输边界
 
-协议与连接方式正交：
-
-| Wire protocol | WebSocket | HTTP |
-| --- | --- | --- |
-| Responses | 支持 | 支持 |
-| Chat Completions | 拒绝 | 支持 |
-
-官方 OpenAI preset 使用 Responses，模式顺序为 WebSocket、HTTP，默认 WebSocket。OpenAI 的
-HTTP 选项仍调用 Responses HTTP/SSE。自定义 Responses provider 默认 HTTP，可显式选择 WS；
-MiMo、DeepSeek、Zhipu 等 Chat-compatible preset 使用 HTTP。运行时不得按厂商 ID 分支，也不得
-在 WS 失败时静默降级 HTTP。
+transport 完全由选中模型的 PL `ModelTransportProfile` 决定。即使 preset 实例覆盖 endpoint，mai
+也不得改变协议、连接模式或持久化运行时 fallback。若 Linux、WebSocket、HTTP、rmcp 或进程集成
+存在缺陷，必须在 PL 增加确定性测试并修复。
 
 同一 preset 可创建多个 provider 实例，唯一性只约束 `ProviderId`。每个实例独立保存 secret、
-endpoint、连接模式、附加模型和 routes。
-
-旧配置升级时，只有 endpoint 与 PL preset canonical endpoint 相同的官方 OpenAI 实例采用 WS
-默认值。即使实例引用 `openai` preset，只要覆盖了 endpoint（例如 muxai Responses-compatible
-网关），也按兼容供应商迁为 HTTP；升级后用户仍可显式切换到 WS。已经保存显式模式的配置原样
-保留，运行时不会根据请求结果自动改写模式。
+endpoint 与 routes；运行中的 Agent 保留创建时解析出的不可变 `ResolvedModelRoute`。
 
 ## 产品消费
 
 - `GET /provider-catalog` 返回 canonical snapshot，并以确定性 `revision` 作为 ETag。
-- `GET /providers` 返回配置实例、catalog binding、允许模式和服务端解析的 effective models。
+- `GET /providers` 返回脱敏 PL `ProviderConfig`、effective `ModelInfo` 和 secret 存在标记。
 - Web 新建表单、模型选择和 reasoning 候选完全读取上述接口，不保留本地 preset/model fallback。
-- 更新 API key 时空值表示保留现有 secret；其余 transport、catalog 和 routes 必须原样保存。
+- `PUT /providers` 只接受两种来源：`preset` 提交实例覆盖，`custom` 提交完整 PL
+  `ProviderConfig`。Provider 更新不改写角色 routes。
+- 凭证省略表示保留、非空值表示设置、空字符串表示清除。
 - `PUT /providers` 的 `http_headers` 是 write-only 可选字段：省略时，仅在 provider ID、preset、
-  protocol 与 endpoint 均未改变的情况下保留现有 headers；显式对象替换 headers，显式空对象
+  endpoint 均未改变的情况下保留现有 headers；显式对象替换 headers，显式空对象
   清空 headers。`GET /providers` 不返回 header 值，避免把可能敏感的供应商配置暴露给 Web。
 
 目录加载失败时 UI 显示错误与重试，不能退回陈旧常量。未知 preset、model、mode 或 icon 必须由

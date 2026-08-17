@@ -193,13 +193,6 @@ pub enum RuntimeError {
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
-/// mai wire provider/model 的已解析组合；PL 类型只存在于 config conversion 边界内。
-#[derive(Debug, Clone)]
-pub struct ProviderSelection {
-    pub provider: ProviderSecret,
-    pub model: ModelConfig,
-}
-
 #[derive(Clone)]
 pub struct RuntimeConfig {
     pub repo_root: PathBuf,
@@ -259,35 +252,34 @@ fn framework_depth(agent_id: AgentId, agents: &HashMap<AgentId, AgentSummary>) -
 }
 
 fn resolved_agent_model(
-    selection: ProviderSelection,
+    selection: pl_core::ResolvedModelRoute,
     reasoning_effort: Option<String>,
 ) -> ResolvedAgentModel {
     let effective = resolved_agent_model_preference(selection.clone(), reasoning_effort.clone());
     ResolvedAgentModel {
-        preference: AgentModelPreference {
-            provider_id: selection.provider.id.clone(),
-            model: selection.model.id.clone(),
-            reasoning_effort,
+        preference: pl_core::ModelRouteConfig {
+            provider: selection.provider_id.clone(),
+            model: selection.model.slug.clone(),
+            effort: reasoning_effort.map(pl_core::ReasoningEffort::new),
         },
         effective,
     }
 }
 
 fn resolved_agent_model_preference(
-    selection: ProviderSelection,
+    selection: pl_core::ResolvedModelRoute,
     reasoning_effort: Option<String>,
 ) -> ResolvedAgentModelPreference {
     ResolvedAgentModelPreference {
-        provider_id: selection.provider.id,
-        provider_name: selection.provider.name,
-        transport: selection.provider.transport,
-        model: selection.model.id,
-        model_name: selection.model.name,
+        provider_id: selection.provider_id.to_string(),
+        provider_name: selection.provider_info.name,
+        transport: selection.model.transport.clone(),
+        model: selection.model.slug,
+        model_name: selection.model.display_name,
         reasoning_effort,
-        context_tokens: selection.model.context_tokens,
-        max_context_tokens: selection.model.max_context_tokens,
-        effective_context_window_percent: selection.model.effective_context_window_percent,
-        output_tokens: selection.model.output_tokens,
+        context_tokens: selection.model.context_window,
+        max_context_tokens: selection.model.max_context_window,
+        output_tokens: selection.model.max_output_tokens,
     }
 }
 
@@ -351,15 +343,6 @@ fn project_workspace_start_error_is_recoverable(error: &str) -> bool {
 
 fn redact_secret(value: &str, secret: &str) -> String {
     pl_core::tool::output_format::redaction::SecretRedaction::new([secret]).redact_str(value)
-}
-
-fn is_stale_agent_model_selection_error(error: &RuntimeError) -> bool {
-    let RuntimeError::Store(mai_store::StoreError::InvalidConfig(message)) = error else {
-        return false;
-    };
-    (message.starts_with("provider `") && message.ends_with("` not found"))
-        || (message.starts_with("model `")
-            && message.contains("` is not configured for provider `"))
 }
 
 fn runtime_sidecar_image(image: String) -> String {

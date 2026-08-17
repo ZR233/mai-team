@@ -129,9 +129,12 @@ impl projects::service::ProjectCreateOps for Arc<AgentRuntime> {
             self.as_ref(),
             CreateAgentRequest {
                 name: Some(request.name),
-                provider_id: Some(request.model.provider_id),
+                provider_id: Some(request.model.provider.to_string()),
                 model: Some(request.model.model),
-                reasoning_effort: request.model.reasoning_effort,
+                reasoning_effort: request
+                    .model
+                    .effort
+                    .map(|effort| effort.as_str().to_string()),
                 docker_image: request.docker_image,
                 parent_id: None,
                 system_prompt: Some(request.system_prompt),

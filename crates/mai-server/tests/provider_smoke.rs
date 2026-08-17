@@ -80,23 +80,19 @@ impl SmokeServer {
             .into_iter()
             .flatten()
             .filter_map(|provider| {
-                let enabled = provider
-                    .get("enabled")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
                 let has_api_key = provider
                     .get("has_api_key")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let id = provider.get("id").and_then(Value::as_str)?;
-                let model = provider.get("default_model").and_then(Value::as_str)?;
-                if !enabled || !has_api_key || model.trim().is_empty() {
+                let model = provider.pointer("/models/0/slug").and_then(Value::as_str)?;
+                if !has_api_key || model.trim().is_empty() {
                     return None;
                 }
                 Some(SmokeProvider {
                     id: id.to_string(),
                     name: provider
-                        .get("name")
+                        .pointer("/config/name")
                         .and_then(Value::as_str)
                         .unwrap_or(id)
                         .to_string(),

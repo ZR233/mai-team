@@ -6,8 +6,8 @@ mod migration;
 use std::collections::BTreeMap;
 
 use pl_core::{
-    AgentModelConfig, AgentRoleId, BuiltinMcpServerState, ModelRouteConfig, ProviderConfig,
-    ProviderId, ReasoningEffort,
+    AgentModelConfig, AgentRoleId, BuiltinMcpServerState, ModelRouteConfig, ProviderId,
+    ReasoningEffort,
 };
 use pl_model::WebSearchConfig;
 use serde::{Deserialize, Serialize};
@@ -16,10 +16,10 @@ use crate::{Result, RuntimeError};
 
 pub use conversion::model_config_from_api;
 pub(crate) use conversion::{
-    agent_config_from_models, preserve_provider_private_fields, provider_selection_from_models,
-    providers_request_from_models, providers_response_from_models,
+    agent_config_from_models, preserve_provider_secrets, providers_request_from_models,
+    providers_response_from_models, resolve_provider_model,
 };
-pub const MAI_CONFIG_SCHEMA_VERSION: u32 = 7;
+pub const MAI_CONFIG_SCHEMA_VERSION: u32 = 8;
 
 const REQUIRED_ROLES: [&str; 4] = ["planner", "explorer", "executor", "reviewer"];
 
@@ -189,42 +189,44 @@ pub async fn seed_default_provider_from_env(
     let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) else {
         return Ok(());
     };
-    let api_provider = mai_protocol::ProviderConfig {
-        id: "openai".to_string(),
-        preset_id: None,
-        transport: mai_protocol::ProviderTransportConfig {
-            protocol: mai_protocol::ProviderWireProtocol::Responses,
-            connection_mode: mai_protocol::ProviderConnectionMode::Http,
-        },
-        capabilities: mai_protocol::ProviderCapabilitySelection::Explicit(Default::default()),
-        name: "OpenAI".to_string(),
-        base_url,
-        api_key: Some(api_key),
-        api_key_env: None,
-        http_headers: None,
-        catalog: mai_protocol::ProviderModelCatalogConfig::Explicit {
-            models: vec![seed_model(&model)],
-        },
-        default_model: model.clone(),
-        enabled: true,
-    };
-    let preference = mai_protocol::AgentModelPreference {
-        provider_id: "openai".to_string(),
+    let registry = pl_core::builtin_provider_catalog();
+    let preset = registry
+        .presets
+        .into_iter()
+        .find(|preset| preset.id.as_str() == "openai")
+        .ok_or_else(|| RuntimeError::InvalidInput("PL openai preset is missing".to_string()))?;
+    let mut provider = preset.provider;
+    provider.base_url = base_url;
+    provider.bearer_token = Some(api_key);
+    provider.bearer_token_env = None;
+    let selected = provider
+        .effective_models()
+        .map_err(RuntimeError::Model)?
+        .into_iter()
+        .find(|candidate| candidate.slug == model)
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(format!(
+                "model `{model}` is not present in the PL openai preset"
+            ))
+        })?;
+    let provider_id = ProviderId::new("openai").map_err(RuntimeError::Model)?;
+    let route = ModelRouteConfig {
+        provider: provider_id.clone(),
         model,
-        reasoning_effort: None,
+        effort: selected.default_effort().map(ReasoningEffort::new),
     };
-    let models = model_config_from_api(
-        &mai_protocol::ProvidersConfigRequest {
-            providers: vec![api_provider],
-            default_provider_id: Some("openai".to_string()),
-        },
-        &mai_protocol::AgentConfigRequest {
-            planner: Some(preference.clone()),
-            explorer: Some(preference.clone()),
-            executor: Some(preference.clone()),
-            reviewer: Some(preference),
-        },
-    )?;
+    let models = AgentModelConfig {
+        providers: BTreeMap::from([(provider_id, provider)]),
+        routes: REQUIRED_ROLES
+            .into_iter()
+            .map(|role| {
+                (
+                    AgentRoleId::new(role).expect("static role id is valid"),
+                    route.clone(),
+                )
+            })
+            .collect(),
+    };
     let config = MaiConfig {
         models,
         ..MaiConfig::default()
@@ -239,32 +241,26 @@ pub fn provider_catalog_snapshot() -> Result<pl_protocol::ProviderCatalogSnapsho
         .map_err(RuntimeError::Model)
 }
 
-fn seed_model(id: &str) -> mai_protocol::ModelConfig {
-    mai_protocol::ModelConfig {
-        id: id.to_string(),
-        name: Some(id.to_string()),
-        context_tokens: 128_000,
-        max_context_tokens: None,
-        effective_context_window_percent: 95,
-        output_tokens: 8_192,
-        auto_compact_token_limit: None,
-        supports_tools: true,
-        capabilities: mai_protocol::ModelCapabilities::default(),
-        request_policy: mai_protocol::ModelRequestPolicy::default(),
-        reasoning: None,
-        options: serde_json::Value::Null,
-        headers: BTreeMap::new(),
-    }
-}
-
 impl Default for MaiConfig {
     fn default() -> Self {
         let provider_id = ProviderId::new("deepseek").expect("static provider id is valid");
-        let provider = ProviderConfig::deepseek_preset();
+        let preset = pl_core::builtin_provider_catalog()
+            .presets
+            .into_iter()
+            .find(|preset| preset.id.as_str() == "deepseek")
+            .expect("PL deepseek preset exists");
+        let provider = preset.provider;
+        let model = provider
+            .effective_models()
+            .expect("PL deepseek catalog resolves")
+            .into_iter()
+            .find(|model| model.slug == preset.suggested_model)
+            .expect("PL deepseek suggested model exists");
+        let effort = model.default_effort().map(ReasoningEffort::new);
         let route = ModelRouteConfig {
             provider: provider_id.clone(),
-            model: "deepseek-v4-flash".to_string(),
-            effort: Some(ReasoningEffort::new("high")),
+            model: model.slug,
+            effort,
         };
         let routes = REQUIRED_ROLES
             .into_iter()

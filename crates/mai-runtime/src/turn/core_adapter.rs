@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
+use crate::state::AgentRecord;
+use crate::{AgentRuntime, Result};
 use mai_protocol::AgentId;
 use pl_core::{
     AgentExecutionPolicy, AgentId as FrameworkAgentId, AgentRuntimeHandle, CoreRuntimeProfile,
     NamespaceDescriptor, ToolEntry, ToolRegistry, ToolSourceId, ToolSourceMetadata, TurnEngine,
     TurnEngineBuilder,
 };
-use crate::state::AgentRecord;
-use crate::{AgentRuntime, Result};
 
 /// mai-team 产品动作工具的工具来源标识。
 pub(crate) const PRODUCT_TOOL_SOURCE: &str = "mai-product";
@@ -143,10 +143,8 @@ pub(crate) async fn build_mai_turn_engine(
         .collect::<Vec<_>>();
     engine.register_source_tools(product_source, product_entries)?;
     let skill_source = ToolSourceId::new(super::skill_resources::SKILL_TOOL_SOURCE);
-    let skill_entries = super::skill_resources::skill_resource_entries(
-        ctx.runtime.clone(),
-        ctx.agent.clone(),
-    );
+    let skill_entries =
+        super::skill_resources::skill_resource_entries(ctx.runtime.clone(), ctx.agent.clone());
     engine.register_source_tools(skill_source, skill_entries)?;
     Ok(engine)
 }

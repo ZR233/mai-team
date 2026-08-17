@@ -1,6 +1,14 @@
 import { expect, test, type Page, type Route } from "@playwright/test"
 
-test.beforeEach(async ({ page }) => {
+test.beforeEach(async ({ page }, testInfo) => {
+  const updates = testInfo.title.includes("连续工具调用")
+    ? { "thread-a": groupedSnapshot() }
+    : { "thread-a": snapshotUpdate("thread-a", "Alpha message"), "thread-b": snapshotUpdate("thread-b", "Beta message") }
+  await installThreadStreamFixture(page, updates)
+  await installApiFixture(page)
+})
+
+async function installThreadStreamFixture(page: Page, updates: Record<string, unknown>) {
   await page.addInitScript(({ updates }) => {
     class FixtureEventSource extends EventTarget {
       static readonly CONNECTING = 0
@@ -29,9 +37,8 @@ test.beforeEach(async ({ page }) => {
       }
     }
     Object.defineProperty(window, "EventSource", { configurable: true, value: FixtureEventSource })
-  }, { updates: { "thread-a": snapshotUpdate("thread-a", "Alpha message"), "thread-b": snapshotUpdate("thread-b", "Beta message") } })
-  await installApiFixture(page)
-})
+  }, { updates })
+}
 
 test("Thread 切换使用隔离 store，消息发送到目标 Thread", async ({ page }) => {
   await page.goto("/chat/env-a")
@@ -60,36 +67,6 @@ test("Thread timeline 在全部视口可用", async ({ page }) => {
 })
 
 test("连续工具调用折叠为分组，思考默认收起", async ({ page }) => {
-  await page.addInitScript(({ updates }) => {
-    class FixtureEventSource extends EventTarget {
-      static readonly CONNECTING = 0
-      static readonly OPEN = 1
-      static readonly CLOSED = 2
-      readonly url: string
-      readonly withCredentials = false
-      readyState = FixtureEventSource.OPEN
-      onopen: ((event: Event) => void) | null = null
-      onmessage: ((event: MessageEvent) => void) | null = null
-      onerror: ((event: Event) => void) | null = null
-
-      constructor(url: string | URL) {
-        super()
-        this.url = String(url)
-        window.setTimeout(() => {
-          if (this.readyState === FixtureEventSource.CLOSED) return
-          this.onopen?.(new Event("open"))
-          const update = Object.entries(updates).find(([threadId]) => this.url.includes(`/threads/${threadId}/events`))?.[1]
-          if (update) this.dispatchEvent(new MessageEvent("snapshot", { data: JSON.stringify(update) }))
-        }, 0)
-      }
-
-      close() {
-        this.readyState = FixtureEventSource.CLOSED
-      }
-    }
-    Object.defineProperty(window, "EventSource", { configurable: true, value: FixtureEventSource })
-  }, { updates: { "thread-a": groupedSnapshot() } })
-
   await page.goto("/chat/env-a")
 
   // 连续工具调用合并为一个分组行，工具标题收起不可见。
@@ -124,10 +101,38 @@ async function installApiFixture(page: Page) {
     if (path === "/environments") return json(route, [environment("env-a", "Environment A", "thread-a"), environment("env-b", "Environment B", "thread-b")])
     if (path === "/environments/env-a") return json(route, environment("env-a", "Environment A", "thread-a"))
     if (path === "/environments/env-b") return json(route, environment("env-b", "Environment B", "thread-b"))
+    if (path === "/providers") return json(route, providerFixture())
     if (path === "/skills") return json(route, { skills: [], roots: [], errors: [] })
     if (path.startsWith("/threads/") && path.endsWith("/messages") && request.method() === "POST") return json(route, { turn_id: "turn-next" })
     return route.continue()
   })
+}
+
+function providerFixture() {
+  return {
+    providers: [{
+      id: "future-provider",
+      config: {
+        preset: "future-provider",
+        name: "Future Cloud",
+        base_url: "https://future.invalid/v1",
+        capabilities: {},
+        catalog: {},
+      },
+      models: [{
+        slug: "future-model",
+        display_name: "Future Model",
+        parameters: [{ name: "effort", candidates: ["balanced", "max"] }],
+        transport: {
+          protocol: "responses",
+          supported_connection_modes: ["http"],
+          default_connection_mode: "http",
+        },
+      }],
+      has_api_key: true,
+      has_http_headers: false,
+    }],
+  }
 }
 
 function json(route: Route, body: unknown) {

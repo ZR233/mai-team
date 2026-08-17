@@ -7,8 +7,8 @@ use mai_protocol::{
 use tokio::sync::RwLock;
 
 use super::normalize_reasoning_effort;
+use crate::Result;
 use crate::state::AgentRecord;
-use crate::{ProviderSelection, Result};
 
 /// Context supplied when creating an agent record.
 pub(crate) struct CreateAgentRecordContext {
@@ -33,7 +33,7 @@ pub(crate) trait AgentCreateOps: Send + Sync {
         role: AgentRole,
         provider_id: Option<&str>,
         model: Option<&str>,
-    ) -> impl Future<Output = Result<ProviderSelection>> + Send;
+    ) -> impl Future<Output = Result<pl_core::ResolvedModelRoute>> + Send;
 
     fn save_agent(
         &self,
@@ -79,9 +79,9 @@ pub(crate) async fn create_agent_record(
         state: mai_protocol::AgentState::default(),
         container_id: None,
         docker_image,
-        provider_id: provider_selection.provider.id.clone(),
-        provider_name: provider_selection.provider.name.clone(),
-        model: provider_selection.model.id.clone(),
+        provider_id: provider_selection.provider_id.to_string(),
+        provider_name: provider_selection.provider_info.name.clone(),
+        model: provider_selection.model.slug.clone(),
         reasoning_effort,
         created_at,
         updated_at: created_at,

@@ -5,9 +5,7 @@ use mai_protocol::{
     TokenUsage,
 };
 use mai_store::{MaiStore, StoredThreadRuntime};
-use pl_core::{
-    ActiveKind, AgentActivityState, AgentLifecycleState, AgentSnapshot, ThreadId,
-};
+use pl_core::{ActiveKind, AgentActivityState, AgentLifecycleState, AgentSnapshot, ThreadId};
 
 use crate::{Result, RuntimeError};
 

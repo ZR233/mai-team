@@ -13,7 +13,7 @@ use pl_model::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{backup_document, set_supported_connection_mode};
+use super::{backup_document, canonicalize_preset_providers, set_supported_connection_mode};
 use crate::config::{
     MAI_CONFIG_SCHEMA_VERSION, MaiConfig, MaiContainerConfig, MaiGithubConfig,
     MaiInstructionsConfig, MaiMcpConfig, MaiRetentionConfig, MaiReviewConfig, MaiSkillsConfig,
@@ -153,7 +153,7 @@ pub(super) async fn migrate(
             )
         })
         .collect();
-    let config = MaiConfig {
+    let mut config = MaiConfig {
         schema_version: MAI_CONFIG_SCHEMA_VERSION,
         models: AgentModelConfig { providers, routes },
         web_search: legacy.web_search,
@@ -165,6 +165,7 @@ pub(super) async fn migrate(
         review: legacy.review,
         retention: legacy.retention,
     };
+    canonicalize_preset_providers(&mut config.models)?;
     config.validate()?;
     backup_document(documents.path(), 6).await?;
     documents.save(&config).await?;

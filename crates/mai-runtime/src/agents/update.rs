@@ -5,7 +5,7 @@ use mai_protocol::{AgentId, AgentRole, AgentSummary, UpdateAgentRequest, now};
 
 use super::normalize_reasoning_effort;
 use crate::state::AgentRecord;
-use crate::{ProviderSelection, Result, RuntimeError};
+use crate::{Result, RuntimeError};
 
 /// Provides the narrow runtime capabilities needed to update agent model config.
 pub(crate) trait AgentUpdateOps: Send + Sync {
@@ -16,7 +16,7 @@ pub(crate) trait AgentUpdateOps: Send + Sync {
         role: AgentRole,
         provider_id: Option<&str>,
         model: Option<&str>,
-    ) -> impl Future<Output = Result<ProviderSelection>> + Send;
+    ) -> impl Future<Output = Result<pl_core::ResolvedModelRoute>> + Send;
 
     fn persist_agent(&self, agent: Arc<AgentRecord>) -> impl Future<Output = Result<()>> + Send;
 
@@ -45,8 +45,8 @@ pub(crate) async fn update_agent(
         .resolve_provider(current.role.unwrap_or_default(), provider_id, model)
         .await?;
     let requested_reasoning_effort = if request.reasoning_effort.is_some()
-        || provider_selection.model.id != current.model
-        || provider_selection.provider.id != current.provider_id
+        || provider_selection.model.slug != current.model
+        || provider_selection.provider_id.as_str() != current.provider_id
     {
         request.reasoning_effort
     } else {
@@ -62,9 +62,9 @@ pub(crate) async fn update_agent(
         if !summary.state.can_reconfigure() {
             return Err(RuntimeError::AgentBusy(agent_id));
         }
-        summary.provider_id = provider_selection.provider.id.clone();
-        summary.provider_name = provider_selection.provider.name.clone();
-        summary.model = provider_selection.model.id.clone();
+        summary.provider_id = provider_selection.provider_id.to_string();
+        summary.provider_name = provider_selection.provider_info.name.clone();
+        summary.model = provider_selection.model.slug.clone();
         summary.reasoning_effort = reasoning_effort;
         summary.updated_at = now();
         summary.clone()

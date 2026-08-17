@@ -161,10 +161,6 @@ async fn ensure_startup_chat_environment(
 mod tests {
     use super::*;
     use mai_docker::DockerClient;
-    use mai_protocol::{
-        ModelConfig, ProviderConfig, ProviderConnectionMode, ProviderTransportConfig,
-        ProviderWireProtocol, ProvidersConfigRequest,
-    };
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
@@ -196,18 +192,7 @@ mod tests {
             .await
             .expect("store"),
         );
-        let models = mai_runtime::model_config_from_api(
-            &ProvidersConfigRequest {
-                providers: vec![test_provider()],
-                default_provider_id: Some("openai".to_string()),
-            },
-            &mai_protocol::AgentConfigRequest::default(),
-        )
-        .expect("model config");
-        let mai_config = mai_runtime::MaiConfig {
-            models,
-            ..mai_runtime::MaiConfig::default()
-        };
+        let mai_config = mai_runtime::MaiConfig::default();
         store
             .config_documents()
             .save(&mai_config)
@@ -251,42 +236,6 @@ mod tests {
             .await
             .expect("ensure chat environment again");
         assert_eq!(runtime.list_environments().await.len(), 1);
-    }
-
-    fn test_provider() -> ProviderConfig {
-        ProviderConfig {
-            id: "openai".to_string(),
-            preset_id: None,
-            transport: ProviderTransportConfig {
-                protocol: ProviderWireProtocol::Responses,
-                connection_mode: ProviderConnectionMode::WebSocket,
-            },
-            capabilities: mai_protocol::ProviderCapabilitySelection::Explicit(Default::default()),
-            name: "OpenAI".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            api_key: Some("secret".to_string()),
-            api_key_env: None,
-            http_headers: None,
-            catalog: mai_protocol::ProviderModelCatalogConfig::Explicit {
-                models: vec![ModelConfig {
-                    id: "gpt-test".to_string(),
-                    name: Some("gpt-test".to_string()),
-                    context_tokens: 128_000,
-                    max_context_tokens: None,
-                    effective_context_window_percent: 95,
-                    output_tokens: 16_000,
-                    auto_compact_token_limit: None,
-                    supports_tools: true,
-                    reasoning: None,
-                    options: serde_json::Value::Null,
-                    headers: Default::default(),
-                    capabilities: Default::default(),
-                    request_policy: Default::default(),
-                }],
-            },
-            default_model: "gpt-test".to_string(),
-            enabled: true,
-        }
     }
 
     fn fake_docker_path(dir: &tempfile::TempDir) -> String {

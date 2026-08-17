@@ -48,12 +48,12 @@ const catalog = {
 afterEach(() => vi.unstubAllGlobals())
 
 describe("provider catalog driven editor", () => {
-  it("renders and initializes a future preset and model without provider ID branches", async () => {
-    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+  it("submits a future preset as instance overrides without rebuilding PL semantics", async () => {
+    let saved: unknown
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)
-      return new Response(JSON.stringify(path.endsWith("/provider-catalog")
-        ? catalog
-        : { providers: [], default_provider_id: null }), {
+      if (init?.method === "PUT") saved = JSON.parse(String(init.body)) as unknown
+      return new Response(JSON.stringify(path.endsWith("/provider-catalog") ? catalog : { providers: [] }), {
         status: 200,
         headers: { "content-type": "application/json" },
       })
@@ -65,9 +65,22 @@ describe("provider catalog driven editor", () => {
     await userEvent.click(addButtons[0])
 
     expect(await screen.findByText("Future Cloud")).toBeInTheDocument()
-    expect(screen.getByText("Future Model")).toBeInTheDocument()
-    const modes = screen.getAllByRole("tab")
-    expect(modes.map((mode) => mode.textContent)).toEqual(["WebSocket", "HTTP"])
-    expect(modes[0]).toHaveAttribute("data-state", "active")
+    expect(screen.getByLabelText("Provider ID")).toHaveValue("future-provider")
+    expect(screen.getByLabelText("Display name")).toHaveValue("Future Cloud")
+    expect(screen.getByLabelText("Base URL override")).toHaveValue("https://future.invalid/v1")
+    expect(screen.queryByText("Connection mode")).not.toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole("button", { name: "Save provider" }))
+
+    expect(saved).toEqual({
+      providers: [{
+        id: "future-provider",
+        source: "preset",
+        preset_id: "future-provider",
+        name: "Future Cloud",
+        base_url: "https://future.invalid/v1",
+        bearer_token_env: "FUTURE_TOKEN",
+      }],
+    })
   })
 })

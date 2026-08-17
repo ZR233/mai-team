@@ -114,7 +114,6 @@ impl AgentRuntime {
             crate::config::save(&self.deps.store, &next).await?;
             *config = next;
         }
-        self.refresh_agent_model_projections().await?;
         self.agent_config().await
     }
 
@@ -132,16 +131,14 @@ impl AgentRuntime {
     ) -> Result<ProvidersResponse> {
         {
             let mut config = self.mai_config.write().await;
-            preserve_provider_secrets(&config.models, &mut request);
+            config::preserve_provider_secrets(&config.models, &mut request);
             let roles = config::agent_config_from_models(&config.models);
-            let mut models = config::model_config_from_api(&request, &roles)?;
-            config::preserve_provider_private_fields(&config.models, &request, &mut models);
+            let models = config::model_config_from_api(&request, &roles)?;
             let mut next = config.clone();
             next.models = models;
             crate::config::save(&self.deps.store, &next).await?;
             *config = next;
         }
-        self.refresh_agent_model_projections().await?;
         self.reconcile_active_mcp_runtimes().await?;
         self.providers_response().await
     }
@@ -151,11 +148,13 @@ impl AgentRuntime {
         &self,
         provider_id: Option<&str>,
         model: Option<&str>,
-    ) -> Result<ProviderSelection> {
-        config::provider_selection_from_models(
+        effort: Option<&str>,
+    ) -> Result<pl_core::ResolvedModelRoute> {
+        config::resolve_provider_model(
             &self.mai_config.read().await.models,
             provider_id,
             model,
+            effort,
         )
     }
 
@@ -164,7 +163,7 @@ impl AgentRuntime {
         role: AgentRole,
         requested_provider: Option<&str>,
         requested_model: Option<&str>,
-    ) -> Result<ProviderSelection> {
+    ) -> Result<pl_core::ResolvedModelRoute> {
         let models = self.mai_config.read().await.models.clone();
         let role_id = pl_core::AgentRoleId::new(role.to_string())?;
         let route = models.resolve(&role_id).map_err(RuntimeError::Model)?;
@@ -179,64 +178,6 @@ impl AgentRuntime {
                 "agent model is configured by the `{role_id}` role route"
             )));
         }
-        config::provider_selection_from_models(
-            &models,
-            Some(route.provider_id.as_str()),
-            Some(&route.model.slug),
-        )
-    }
-
-    async fn refresh_agent_model_projections(&self) -> Result<()> {
-        let models = self.mai_config.read().await.models.clone();
-        let agents = self
-            .state
-            .agents
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for agent in agents {
-            let summary = {
-                let mut summary = agent.summary.write().await;
-                let role = summary.role.unwrap_or_default().to_string();
-                let route = models
-                    .resolve(&pl_core::AgentRoleId::new(role)?)
-                    .map_err(RuntimeError::Model)?;
-                summary.provider_id = route.provider_id.to_string();
-                summary.provider_name = route.provider_info.name;
-                summary.model = route.model.slug;
-                summary.reasoning_effort = route.effort.map(|effort| effort.as_str().to_string());
-                summary.updated_at = now();
-                summary.clone()
-            };
-            self.deps
-                .store
-                .save_agent(&summary, agent.system_prompt.as_deref())
-                .await?;
-            self.events
-                .publish(MaiProductEventKind::AgentUpdated { agent: summary })
-                .await;
-        }
-        Ok(())
-    }
-}
-
-fn preserve_provider_secrets(
-    current: &pl_core::AgentModelConfig,
-    request: &mut ProvidersConfigRequest,
-) {
-    for provider in &mut request.providers {
-        if provider
-            .api_key
-            .as_deref()
-            .is_some_and(|key| !key.trim().is_empty())
-        {
-            continue;
-        }
-        provider.api_key = pl_core::ProviderId::new(provider.id.clone())
-            .ok()
-            .and_then(|id| current.providers.get(&id))
-            .and_then(|provider| provider.bearer_token.clone());
+        Ok(route)
     }
 }

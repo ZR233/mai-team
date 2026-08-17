@@ -1,34 +1,27 @@
 use std::collections::BTreeMap;
 
 use mai_protocol::{
-    AgentConfigRequest, AgentModelPreference, ModelCapabilities as ApiModelCapabilities,
-    ModelConfig as ApiModelConfig, ModelMaxTokensField, ModelReasoningConfig,
-    ModelReasoningVariant, ModelRequestPolicy,
-    ProviderCapabilitySelection as ApiProviderCapabilitySelection,
-    ProviderConfig as ApiProviderConfig, ProviderConnectionMode as ApiProviderConnectionMode,
-    ProviderConnectionModeDescriptor, ProviderModelCatalogConfig as ApiProviderModelCatalogConfig,
-    ProviderSecret, ProviderSummary, ProviderTransportConfig as ApiProviderTransportConfig,
-    ProviderTransportSummary, ProviderWireProtocol as ApiProviderWireProtocol,
-    ProvidersConfigRequest, ProvidersResponse,
+    AgentConfigRequest, AgentRole, ProviderConfig as ApiProviderConfig, ProviderConfigSource,
+    ProviderSummary, ProvidersConfigRequest, ProvidersResponse,
 };
 use pl_core::{
-    AgentModelConfig, AgentRoleId, ModelCatalogId, ModelRouteConfig, ProviderCapabilitySelection,
-    ProviderConfig, ProviderId, ProviderModelCatalogConfig, ProviderPresetId, ReasoningEffort,
-    provider_service_capabilities_descriptor,
-};
-use pl_model::{
-    MaxTokensField, ModelInfo, ProviderConnectionMode, ProviderInfo, ProviderServiceCapabilities,
-    ProviderWireProtocol, ResponsesMaxTokensField, WebSearchProviderCapabilities,
+    AgentModelConfig, AgentRoleId, ModelRouteConfig, ProviderConfig, ProviderId, ReasoningEffort,
+    ResolvedModelRoute, builtin_provider_catalog,
 };
 
-use crate::model_profile::model_info;
 use crate::{Result, RuntimeError};
 
-const ROLES: [&str; 4] = ["planner", "explorer", "executor", "reviewer"];
+const ROLES: [(AgentRole, &str); 4] = [
+    (AgentRole::Planner, "planner"),
+    (AgentRole::Explorer, "explorer"),
+    (AgentRole::Executor, "executor"),
+    (AgentRole::Reviewer, "reviewer"),
+];
 
-/// 将轻量 HTTP DTO 单点转换为 PL 模型配置值对象。
+/// 将 mai 的 provider 实例包装与角色配置组合为 PL 的 canonical 模型配置。
 ///
-/// `mai-protocol` 不依赖 `pl-core`；所有类型映射、默认角色选择和引用校验都集中在这里。
+/// Preset 实例始终从 PL registry 重新实例化，只接受名称、endpoint 与凭证等
+/// 实例字段；custom provider 则完整保留调用方提交的 PL `ProviderConfig`。
 pub fn model_config_from_api(
     providers_request: &ProvidersConfigRequest,
     agents_request: &AgentConfigRequest,
@@ -37,7 +30,7 @@ pub fn model_config_from_api(
     for provider in &providers_request.providers {
         let id = ProviderId::new(provider.id.clone()).map_err(RuntimeError::Model)?;
         if providers
-            .insert(id.clone(), provider_from_api(provider)?)
+            .insert(id.clone(), canonical_provider(provider)?)
             .is_some()
         {
             return Err(RuntimeError::InvalidInput(format!(
@@ -45,41 +38,12 @@ pub fn model_config_from_api(
             )));
         }
     }
-    let fallback_provider = providers_request
-        .default_provider_id
-        .as_deref()
-        .and_then(|id| {
-            providers_request
-                .providers
-                .iter()
-                .find(|provider| provider.id == id)
-        })
-        .or_else(|| {
-            providers_request
-                .providers
-                .iter()
-                .find(|provider| provider.enabled)
-        })
-        .or_else(|| providers_request.providers.first())
-        .ok_or_else(|| {
-            RuntimeError::InvalidInput("at least one provider is required".to_string())
-        })?;
-    let preferences = [
-        agents_request.planner.as_ref(),
-        agents_request.explorer.as_ref(),
-        agents_request.executor.as_ref(),
-        agents_request.reviewer.as_ref(),
-    ];
     let routes = ROLES
         .into_iter()
-        .zip(preferences)
-        .map(|(role, preference)| {
-            let preference = preference
-                .cloned()
-                .unwrap_or_else(|| fallback_preference(fallback_provider));
+        .map(|(role, id)| {
             Ok((
-                AgentRoleId::new(role).map_err(RuntimeError::Model)?,
-                route_from_preference(preference)?,
+                AgentRoleId::new(id).map_err(RuntimeError::Model)?,
+                required_route(agents_request, role)?.clone(),
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
@@ -88,883 +52,372 @@ pub fn model_config_from_api(
     Ok(models)
 }
 
-/// 将产品无关的 PL 模型配置投影回 mai 外部 provider DTO。
+/// 返回完整的内部 provider 请求值；仅用于服务端原子更新，不能直接作为 HTTP 响应。
 pub fn providers_request_from_models(models: &AgentModelConfig) -> ProvidersConfigRequest {
-    let agent_config = agent_config_from_models(models);
-    let providers = models
-        .providers
-        .iter()
-        .map(|(id, provider)| {
-            let effective_models = provider
-                .effective_models()
-                .expect("validated MaiConfig has a resolvable model catalog");
-            let default_model = default_model_for_provider(models, id)
-                .or_else(|| effective_models.first().map(|model| model.slug.clone()))
-                .unwrap_or_default();
-            let provider_info = provider
-                .to_provider_info(&default_model)
-                .expect("validated MaiConfig has a resolvable provider transport");
-            ApiProviderConfig {
-                id: id.to_string(),
-                preset_id: provider.preset_id().map(ToString::to_string),
-                transport: ApiProviderTransportConfig {
-                    protocol: api_protocol(provider_info.protocol),
-                    connection_mode: api_connection_mode(provider_info.connection_mode),
-                },
-                capabilities: api_capability_selection(&provider.capabilities),
-                name: provider.name.clone(),
-                base_url: provider.base_url.clone(),
-                api_key: provider.bearer_token.clone(),
-                api_key_env: provider.bearer_token_env.clone(),
-                http_headers: provider.http_headers.as_ref().map(|headers| {
-                    headers
-                        .iter()
-                        .map(|(name, value)| (name.clone(), value.clone()))
-                        .collect()
-                }),
-                catalog: api_catalog(&provider.catalog, provider_info.protocol),
-                default_model,
-                enabled: true,
-            }
-        })
-        .collect();
     ProvidersConfigRequest {
-        default_provider_id: agent_config
-            .executor
-            .map(|preference| preference.provider_id),
-        providers,
+        providers: models
+            .providers
+            .iter()
+            .map(|(id, config)| ApiProviderConfig {
+                id: id.to_string(),
+                source: api_source_from_provider(config),
+            })
+            .collect(),
     }
 }
 
-/// 构造不暴露 secret 的 provider HTTP response。
+/// 构造不暴露 bearer token 或私有 headers 的 provider HTTP 响应。
 pub fn providers_response_from_models(models: &AgentModelConfig) -> ProvidersResponse {
-    let request = providers_request_from_models(models);
-    let configured_secrets = models
-        .providers
-        .iter()
-        .map(|(id, provider)| (id.to_string(), provider.resolved_bearer_token().is_some()))
-        .collect::<BTreeMap<_, _>>();
-    let configured_modes = models
-        .providers
-        .iter()
-        .map(|(id, provider)| {
-            (
-                id.to_string(),
-                provider_connection_modes_for_instance(provider),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let resolved_capabilities = models
-        .providers
-        .iter()
-        .map(|(id, provider)| {
-            (
-                id.to_string(),
-                provider_service_capabilities_descriptor(
-                    &provider
-                        .service_capabilities()
-                        .expect("validated provider capabilities"),
-                ),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
     ProvidersResponse {
-        providers: request
+        providers: models
             .providers
-            .into_iter()
-            .map(|provider| {
-                let protocol = provider.transport.protocol;
-                let has_api_key = configured_secrets
-                    .get(&provider.id)
-                    .copied()
-                    .unwrap_or(false);
-                let connection_modes = configured_modes
-                    .get(&provider.id)
-                    .cloned()
-                    .unwrap_or_default();
-                let service_capabilities = resolved_capabilities
-                    .get(&provider.id)
-                    .cloned()
-                    .unwrap_or_default();
+            .iter()
+            .map(|(id, provider)| {
+                let models = provider
+                    .effective_models()
+                    .expect("validated MaiConfig has a resolvable model catalog");
+                let has_api_key = provider.resolved_bearer_token().is_some();
+                let has_http_headers = provider
+                    .http_headers
+                    .as_ref()
+                    .is_some_and(|headers| !headers.is_empty());
+                let mut config = provider.clone();
+                config.bearer_token = None;
+                config.http_headers = None;
                 ProviderSummary {
-                    id: provider.id,
-                    preset_id: provider.preset_id,
-                    transport: ProviderTransportSummary {
-                        protocol: provider.transport.protocol,
-                        connection_mode: provider.transport.connection_mode,
-                        connection_modes,
-                    },
-                    capability_selection: provider.capabilities,
-                    service_capabilities,
-                    name: provider.name,
-                    base_url: provider.base_url,
-                    api_key_env: provider.api_key_env,
-                    models: effective_api_models(&provider.catalog, protocol),
-                    catalog: provider.catalog,
-                    default_model: provider.default_model,
-                    enabled: provider.enabled,
+                    id: id.to_string(),
+                    config,
+                    models,
                     has_api_key,
+                    has_http_headers,
                 }
             })
             .collect(),
-        default_provider_id: request.default_provider_id,
     }
 }
 
-fn provider_connection_modes_for_instance(
-    provider: &ProviderConfig,
-) -> Vec<ProviderConnectionModeDescriptor> {
-    let modes = provider
-        .effective_models()
-        .expect("validated MaiConfig has a resolvable model catalog")
-        .into_iter()
-        .flat_map(|model| model.transport.supported_connection_modes)
-        .fold(Vec::new(), |mut modes, mode| {
-            if !modes.contains(&mode) {
-                modes.push(mode);
-            }
-            modes
-        });
-    modes
-        .into_iter()
-        .map(|mode| ProviderConnectionModeDescriptor {
-            id: match mode {
-                ProviderConnectionMode::WebSocket => "web_socket",
-                ProviderConnectionMode::Http => "http",
-            }
-            .to_string(),
-            display_name: match mode {
-                ProviderConnectionMode::WebSocket => "WebSocket",
-                ProviderConnectionMode::Http => "HTTP",
-            }
-            .to_string(),
-        })
-        .collect()
-}
-
-/// 从动态角色路由生成 mai 角色配置 DTO。
+/// 从 PL 配置直接投影四个 mai 产品角色。
 pub fn agent_config_from_models(models: &AgentModelConfig) -> AgentConfigRequest {
     AgentConfigRequest {
-        planner: route_preference(models, "planner"),
-        explorer: route_preference(models, "explorer"),
-        executor: route_preference(models, "executor"),
-        reviewer: route_preference(models, "reviewer"),
+        planner: route(models, "planner"),
+        explorer: route(models, "explorer"),
+        executor: route(models, "executor"),
+        reviewer: route(models, "reviewer"),
     }
 }
 
-/// 从 MaiConfig 中解析 provider/model，并只在 DTO 边界构造旧选择值对象。
-pub fn provider_selection_from_models(
+/// 解析 provider smoke 等非角色调用使用的 provider/model。
+///
+/// 该函数只建立一次临时 PL route，并仍由 `AgentModelConfig::resolve` 完成全部
+/// provider、model 与 reasoning 校验，不在 mai 重建任何模型语义。
+pub fn resolve_provider_model(
     models: &AgentModelConfig,
     provider_id: Option<&str>,
     model: Option<&str>,
-) -> Result<crate::ProviderSelection> {
-    let fallback = models
-        .resolve(&AgentRoleId::new("executor").map_err(RuntimeError::Model)?)
-        .map_err(RuntimeError::Model)?;
+    effort: Option<&str>,
+) -> Result<ResolvedModelRoute> {
+    let executor = models
+        .routes
+        .get(&AgentRoleId::new("executor").map_err(RuntimeError::Model)?);
     let provider_id = provider_id
         .filter(|value| !value.trim().is_empty())
         .map(ProviderId::new)
         .transpose()
         .map_err(RuntimeError::Model)?
-        .unwrap_or(fallback.provider_id);
+        .or_else(|| executor.map(|route| route.provider.clone()))
+        .or_else(|| models.providers.keys().next().cloned())
+        .ok_or_else(|| RuntimeError::InvalidInput("at least one provider is required".into()))?;
     let provider = models
         .providers
         .get(&provider_id)
         .ok_or_else(|| RuntimeError::InvalidInput(format!("provider `{provider_id}` not found")))?;
-    let resolved_api_key = provider.resolved_bearer_token();
-    if resolved_api_key.is_none() {
-        return Err(RuntimeError::InvalidInput(format!(
-            "provider `{provider_id}` has no API key"
-        )));
-    }
-    let model_id = model
+    let declared_models = provider.effective_models().map_err(RuntimeError::Model)?;
+    let model = model
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
-        .or_else(|| default_model_for_provider(models, &provider_id))
         .or_else(|| {
-            provider
-                .effective_models()
-                .ok()
-                .and_then(|models| models.first().map(|model| model.slug.clone()))
+            executor
+                .filter(|route| route.provider == provider_id)
+                .map(|route| route.model.clone())
         })
+        .or_else(|| declared_models.first().map(|model| model.slug.clone()))
         .ok_or_else(|| {
             RuntimeError::InvalidInput(format!("provider `{provider_id}` has no model"))
         })?;
-    let effective_models = provider.effective_models().map_err(RuntimeError::Model)?;
-    let model = effective_models
+    let selected = declared_models
         .iter()
-        .find(|candidate| candidate.slug == model_id)
+        .find(|candidate| candidate.slug == model)
         .ok_or_else(|| {
             RuntimeError::InvalidInput(format!(
-                "model `{model_id}` is not configured for provider `{provider_id}`"
+                "model `{model}` is not configured for provider `{provider_id}`"
             ))
         })?;
-    let provider_info = provider
-        .to_provider_info(&model_id)
-        .map_err(RuntimeError::Model)?;
-    let protocol = provider_info.protocol;
-    let selected_model = api_model(model, protocol);
-    if selected_model.context_tokens == 0 || selected_model.output_tokens == 0 {
+    let effort = effort
+        .map(ReasoningEffort::new)
+        .or_else(|| selected.default_effort().map(ReasoningEffort::new));
+    let role = AgentRoleId::new("provider-test").map_err(RuntimeError::Model)?;
+    let mut scoped = models.clone();
+    scoped.routes.insert(
+        role.clone(),
+        ModelRouteConfig {
+            provider: provider_id,
+            model,
+            effort,
+        },
+    );
+    let route = scoped.resolve(&role).map_err(RuntimeError::Model)?;
+    if route.provider_info.bearer_token.is_none() {
         return Err(RuntimeError::InvalidInput(format!(
-            "model `{model_id}` must configure context_tokens and output_tokens"
+            "provider `{}` has no API key",
+            route.provider_id
         )));
     }
-    Ok(crate::ProviderSelection {
-        provider: ProviderSecret {
-            id: provider_id.to_string(),
-            transport: ApiProviderTransportConfig {
-                protocol: api_protocol(protocol),
-                connection_mode: api_connection_mode(provider_info.connection_mode),
-            },
-            name: provider.name.clone(),
-            base_url: provider.base_url.clone(),
-            api_key: resolved_api_key.unwrap_or_default(),
-            api_key_env: provider.bearer_token_env.clone(),
-            http_headers: provider
-                .http_headers
-                .as_ref()
-                .map(|headers| {
-                    headers
-                        .iter()
-                        .map(|(name, value)| (name.clone(), value.clone()))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            models: effective_models
-                .iter()
-                .map(|model| api_model(model, protocol))
-                .collect(),
-            default_model: model_id,
-            enabled: true,
-        },
-        model: selected_model,
-    })
+    Ok(route)
 }
 
-pub(super) fn provider_from_api(provider: &ApiProviderConfig) -> Result<ProviderConfig> {
-    let protocol = core_protocol(provider.transport.protocol);
-    let requested_connection_mode = core_connection_mode(provider.transport.connection_mode);
-    let preset_id = provider
-        .preset_id
-        .clone()
-        .map(ProviderPresetId::new)
-        .transpose()
-        .map_err(RuntimeError::Model)?;
-    let mut info = match protocol {
-        ProviderWireProtocol::Responses => ProviderInfo::responses_compatible(
-            provider.name.clone(),
-            provider.base_url.clone(),
-            provider.default_model.clone(),
-        ),
-        ProviderWireProtocol::ChatCompletions => ProviderInfo::openai_compatible_chat(
-            provider.name.clone(),
-            provider.base_url.clone(),
-            provider.default_model.clone(),
-        ),
-    };
-    info.name = provider.name.clone();
-    info.base_url = provider.base_url.clone();
-    info.default_model = provider.default_model.clone();
-    info.protocol = protocol;
-    info.connection_mode = requested_connection_mode;
-    info.bearer_token = provider.api_key.clone();
-    if let Some(headers) = &provider.http_headers {
-        info.http_headers = Some(
-            headers
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect(),
-        );
-    }
-    let catalog = match &provider.catalog {
-        ApiProviderModelCatalogConfig::Bundled {
-            catalog_id,
-            additional_models,
-        } => ProviderModelCatalogConfig::Bundled {
-            catalog: ModelCatalogId::new(catalog_id.clone()).map_err(RuntimeError::Model)?,
-            additional_models: additional_models
-                .iter()
-                .map(|model| model_info(model, provider.transport.protocol))
-                .collect(),
-            connection_overrides: BTreeMap::new(),
-        },
-        ApiProviderModelCatalogConfig::Explicit { models } => {
-            ProviderModelCatalogConfig::Explicit {
-                models: models
-                    .iter()
-                    .map(|model| model_info(model, provider.transport.protocol))
-                    .collect(),
-                connection_overrides: BTreeMap::new(),
-            }
-        }
-    };
-    let mut config = match catalog {
-        ProviderModelCatalogConfig::Bundled {
-            catalog,
-            additional_models,
-            connection_overrides: _,
-        } => ProviderConfig::from_bundled_catalog(info, catalog, additional_models),
-        ProviderModelCatalogConfig::Explicit {
-            models,
-            connection_overrides: _,
-        } => ProviderConfig::from_explicit_models(info, models),
-    };
-    config.bearer_token_env = provider.api_key_env.clone();
-    if let Some(preset_id) = preset_id {
-        config = config.with_preset(preset_id);
-    }
-    super::migration::set_supported_connection_mode(&mut config, requested_connection_mode)?;
-    config.capabilities = core_capability_selection(&provider.capabilities)?;
-    config.effective_models().map_err(RuntimeError::Model)?;
-    Ok(config)
-}
-
-/// 保留 Web DTO 不拥有的 provider 运行时字段，同时避免把旧 header 带到新 endpoint。
-pub(crate) fn preserve_provider_private_fields(
-    current: &AgentModelConfig,
-    request: &ProvidersConfigRequest,
-    next: &mut AgentModelConfig,
-) {
-    for requested in &request.providers {
+/// 在同一 provider 身份和 endpoint 下实现 write-only secret 的 keep/set/clear。
+///
+/// `None` 表示 keep，非空值表示 set，空 token/空 headers 表示 clear。身份或
+/// endpoint 改变时不会把旧 secret 带到新作用域。
+pub fn preserve_provider_secrets(current: &AgentModelConfig, request: &mut ProvidersConfigRequest) {
+    for requested in &mut request.providers {
         let Ok(id) = ProviderId::new(requested.id.clone()) else {
             continue;
         };
-        let (Some(current_provider), Some(next_provider)) =
-            (current.providers.get(&id), next.providers.get_mut(&id))
-        else {
+        let Some(existing) = current.providers.get(&id) else {
             continue;
         };
-        if !same_private_config_scope(current_provider, requested) {
+        if !same_private_scope(existing, &requested.source) {
             continue;
         }
-        if requested.http_headers.is_none() {
-            next_provider.http_headers = current_provider.http_headers.clone();
+        let (bearer_token, http_headers) = private_fields_mut(&mut requested.source);
+        if bearer_token.is_none() {
+            *bearer_token = existing.bearer_token.clone();
+        } else if bearer_token
+            .as_deref()
+            .is_some_and(|token| token.trim().is_empty())
+        {
+            *bearer_token = None;
         }
-        next_provider.tool_wire_policy = current_provider.tool_wire_policy;
-        next_provider.apply_patch_tool_type = current_provider.apply_patch_tool_type;
-    }
-}
-
-fn same_private_config_scope(current: &ProviderConfig, requested: &ApiProviderConfig) -> bool {
-    current.preset_id().map(ToString::to_string) == requested.preset_id
-        && current
-            .to_provider_info(&requested.default_model)
-            .ok()
-            .map(|info| api_protocol(info.protocol))
-            == Some(requested.transport.protocol)
-        && normalized_url(&current.base_url) == normalized_url(&requested.base_url)
-}
-
-fn normalized_url(value: &str) -> &str {
-    value.trim().trim_end_matches('/')
-}
-
-fn route_preference(models: &AgentModelConfig, role: &str) -> Option<AgentModelPreference> {
-    let route = models.routes.get(&AgentRoleId::new(role).ok()?)?;
-    Some(AgentModelPreference {
-        provider_id: route.provider.to_string(),
-        model: route.model.clone(),
-        reasoning_effort: route
-            .effort
-            .as_ref()
-            .map(|effort| effort.as_str().to_string()),
-    })
-}
-
-fn default_model_for_provider(models: &AgentModelConfig, provider: &ProviderId) -> Option<String> {
-    ["executor", "planner", "explorer", "reviewer"]
-        .into_iter()
-        .filter_map(|role| AgentRoleId::new(role).ok())
-        .filter_map(|role| models.routes.get(&role))
-        .find(|route| &route.provider == provider)
-        .map(|route| route.model.clone())
-}
-
-fn api_protocol(protocol: ProviderWireProtocol) -> ApiProviderWireProtocol {
-    match protocol {
-        ProviderWireProtocol::Responses => ApiProviderWireProtocol::Responses,
-        ProviderWireProtocol::ChatCompletions => ApiProviderWireProtocol::ChatCompletions,
-    }
-}
-
-fn api_connection_mode(mode: ProviderConnectionMode) -> ApiProviderConnectionMode {
-    match mode {
-        ProviderConnectionMode::WebSocket => ApiProviderConnectionMode::WebSocket,
-        ProviderConnectionMode::Http => ApiProviderConnectionMode::Http,
-    }
-}
-
-fn api_capability_selection(
-    selection: &ProviderCapabilitySelection,
-) -> ApiProviderCapabilitySelection {
-    match selection {
-        ProviderCapabilitySelection::PresetDefaults => {
-            ApiProviderCapabilitySelection::PresetDefaults
-        }
-        ProviderCapabilitySelection::Explicit(capabilities) => {
-            ApiProviderCapabilitySelection::Explicit(provider_service_capabilities_descriptor(
-                capabilities,
-            ))
+        if http_headers.is_none() {
+            *http_headers = existing.http_headers.clone();
         }
     }
 }
 
-fn core_capability_selection(
-    selection: &ApiProviderCapabilitySelection,
-) -> Result<ProviderCapabilitySelection> {
-    match selection {
-        ApiProviderCapabilitySelection::PresetDefaults => {
-            Ok(ProviderCapabilitySelection::PresetDefaults)
-        }
-        ApiProviderCapabilitySelection::Explicit(capabilities) => {
-            let standalone = capabilities
-                .web_search
-                .standalone
-                .as_deref()
-                .map(|dialect| dialect.parse().map_err(RuntimeError::InvalidInput))
-                .transpose()?;
-            Ok(ProviderCapabilitySelection::Explicit(
-                ProviderServiceCapabilities {
-                    web_search: WebSearchProviderCapabilities {
-                        hosted_responses: capabilities.web_search.hosted_responses,
-                        standalone,
-                    },
-                    ..ProviderServiceCapabilities::default()
-                },
-            ))
-        }
-    }
-}
-
-fn core_connection_mode(mode: ApiProviderConnectionMode) -> ProviderConnectionMode {
-    match mode {
-        ApiProviderConnectionMode::WebSocket => ProviderConnectionMode::WebSocket,
-        ApiProviderConnectionMode::Http => ProviderConnectionMode::Http,
-    }
-}
-
-fn api_model(model: &ModelInfo, protocol: ProviderWireProtocol) -> ApiModelConfig {
-    let reasoning = model
-        .effort_parameter()
-        .map(|parameter| ModelReasoningConfig {
-            default_variant: parameter.candidates.first().cloned(),
-            variants: parameter
-                .candidates
-                .iter()
-                .map(|candidate| ModelReasoningVariant {
-                    id: candidate.clone(),
-                    label: None,
-                    request: reasoning_request(model, candidate),
-                })
-                .collect(),
-        });
-    ApiModelConfig {
-        id: model.slug.clone(),
-        name: Some(model.display_name.clone()),
-        context_tokens: model.resolved_context_window().unwrap_or(128_000),
-        max_context_tokens: model.max_context_window,
-        effective_context_window_percent: 95,
-        output_tokens: model.max_output_tokens.unwrap_or(4096),
-        auto_compact_token_limit: model.auto_compact_token_limit,
-        supports_tools: model.capabilities.tools.function_calling,
-        capabilities: ApiModelCapabilities {
-            tools: model.capabilities.tools.function_calling,
-            parallel_tools: model.capabilities.tools.parallel_tool_calls,
-            reasoning_replay: model.capabilities.reasoning,
-            strict_schema: false,
-            web_search: model.capabilities.web_search,
-        },
-        request_policy: ModelRequestPolicy {
-            max_tokens_field: match protocol {
-                ProviderWireProtocol::Responses => {
-                    match model.request_profile.responses_max_tokens_field {
-                        ResponsesMaxTokensField::Omit => ModelMaxTokensField::Omit,
-                        ResponsesMaxTokensField::MaxOutputTokens => {
-                            ModelMaxTokensField::MaxOutputTokens
-                        }
-                        ResponsesMaxTokensField::MaxCompletionTokens => {
-                            ModelMaxTokensField::MaxCompletionTokens
-                        }
-                        ResponsesMaxTokensField::MaxTokens => ModelMaxTokensField::MaxTokens,
-                    }
-                }
-                ProviderWireProtocol::ChatCompletions => {
-                    match model.request_profile.max_tokens_field {
-                        MaxTokensField::MaxTokens => ModelMaxTokensField::MaxTokens,
-                        MaxTokensField::MaxCompletionTokens => {
-                            ModelMaxTokensField::MaxCompletionTokens
-                        }
-                    }
-                }
-            },
-            store: None,
-            headers: model.request_profile.headers.clone().into_iter().collect(),
-            extra_body: serde_json::Value::Object(model.request_profile.body.clone()),
-            ..ModelRequestPolicy::default()
-        },
-        reasoning,
-        options: serde_json::Value::Object(model.request_profile.options.clone()),
-        headers: BTreeMap::new(),
-    }
-}
-
-fn reasoning_request(model: &ModelInfo, effort: &str) -> serde_json::Value {
-    let mut body = serde_json::Map::new();
-    if let Some(wire) = model
-        .effort_parameter()
-        .and_then(|parameter| parameter.wire_for(effort))
-    {
-        wire.apply_to(&mut body);
-    }
-    serde_json::Value::Object(body)
-}
-
-fn api_catalog(
-    catalog: &ProviderModelCatalogConfig,
-    protocol: ProviderWireProtocol,
-) -> ApiProviderModelCatalogConfig {
-    match catalog {
-        ProviderModelCatalogConfig::Bundled {
-            catalog,
-            additional_models,
-            connection_overrides: _,
-        } => ApiProviderModelCatalogConfig::Bundled {
-            catalog_id: catalog.to_string(),
-            additional_models: additional_models
-                .iter()
-                .map(|model| api_model(model, protocol))
-                .collect(),
-        },
-        ProviderModelCatalogConfig::Explicit {
-            models,
-            connection_overrides: _,
-        } => ApiProviderModelCatalogConfig::Explicit {
-            models: models
-                .iter()
-                .map(|model| api_model(model, protocol))
-                .collect(),
-        },
-    }
-}
-
-fn effective_api_models(
-    catalog: &ApiProviderModelCatalogConfig,
-    protocol: ApiProviderWireProtocol,
-) -> Vec<ApiModelConfig> {
-    let protocol = core_protocol(protocol);
-    match catalog {
-        ApiProviderModelCatalogConfig::Bundled {
-            catalog_id,
-            additional_models,
+fn canonical_provider(provider: &ApiProviderConfig) -> Result<ProviderConfig> {
+    match &provider.source {
+        ProviderConfigSource::Preset {
+            preset_id,
+            name,
+            base_url,
+            bearer_token,
+            bearer_token_env,
+            http_headers,
         } => {
-            let id = ModelCatalogId::new(catalog_id.clone())
-                .expect("validated catalog id can be projected");
-            let mut models = pl_core::builtin_model_catalog(&id)
-                .expect("validated bundled catalog can be projected")
-                .models
-                .iter()
-                .map(|model| api_model(model, protocol))
-                .collect::<Vec<_>>();
-            models.extend(additional_models.clone());
-            models
+            let preset = builtin_provider_catalog()
+                .presets
+                .into_iter()
+                .find(|preset| preset.id.as_str() == preset_id)
+                .ok_or_else(|| {
+                    RuntimeError::InvalidInput(format!("unknown provider preset: {preset_id}"))
+                })?;
+            let mut canonical = preset.provider;
+            canonical.name.clone_from(name);
+            canonical.base_url.clone_from(base_url);
+            canonical.bearer_token.clone_from(bearer_token);
+            canonical.bearer_token_env.clone_from(bearer_token_env);
+            canonical.http_headers.clone_from(http_headers);
+            Ok(canonical)
         }
-        ApiProviderModelCatalogConfig::Explicit { models } => models.clone(),
+        ProviderConfigSource::Custom { config } => {
+            if let Some(preset_id) = config.preset_id() {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "custom provider must not declare preset `{preset_id}`"
+                )));
+            }
+            Ok(config.clone())
+        }
     }
 }
 
-fn core_protocol(protocol: ApiProviderWireProtocol) -> ProviderWireProtocol {
-    match protocol {
-        ApiProviderWireProtocol::Responses => ProviderWireProtocol::Responses,
-        ApiProviderWireProtocol::ChatCompletions => ProviderWireProtocol::ChatCompletions,
+fn required_route(request: &AgentConfigRequest, role: AgentRole) -> Result<&ModelRouteConfig> {
+    role_route(request, role)
+        .ok_or_else(|| RuntimeError::InvalidInput(format!("missing `{role}` model route")))
+}
+
+fn role_route(request: &AgentConfigRequest, role: AgentRole) -> Option<&ModelRouteConfig> {
+    match role {
+        AgentRole::Planner => request.planner.as_ref(),
+        AgentRole::Explorer => request.explorer.as_ref(),
+        AgentRole::Executor => request.executor.as_ref(),
+        AgentRole::Reviewer => request.reviewer.as_ref(),
     }
 }
 
-fn fallback_preference(provider: &ApiProviderConfig) -> AgentModelPreference {
-    let effective_models = effective_api_models(&provider.catalog, provider.transport.protocol);
-    let reasoning_effort = effective_models
-        .iter()
-        .find(|model| model.id == provider.default_model)
-        .and_then(|model| model.reasoning.as_ref())
-        .and_then(|reasoning| reasoning.default_variant.clone());
-    AgentModelPreference {
-        provider_id: provider.id.clone(),
-        model: provider.default_model.clone(),
-        reasoning_effort,
+fn route(models: &AgentModelConfig, role: &str) -> Option<ModelRouteConfig> {
+    AgentRoleId::new(role)
+        .ok()
+        .and_then(|role| models.routes.get(&role).cloned())
+}
+
+fn api_source_from_provider(provider: &ProviderConfig) -> ProviderConfigSource {
+    if let Some(preset_id) = provider.preset_id() {
+        ProviderConfigSource::Preset {
+            preset_id: preset_id.to_string(),
+            name: provider.name.clone(),
+            base_url: provider.base_url.clone(),
+            bearer_token: provider.bearer_token.clone(),
+            bearer_token_env: provider.bearer_token_env.clone(),
+            http_headers: provider.http_headers.clone(),
+        }
+    } else {
+        ProviderConfigSource::Custom {
+            config: provider.clone(),
+        }
     }
 }
 
-fn route_from_preference(preference: AgentModelPreference) -> Result<ModelRouteConfig> {
-    if preference.model.trim().is_empty() {
-        return Err(RuntimeError::InvalidInput(
-            "agent model preference has empty model".to_string(),
-        ));
+fn same_private_scope(current: &ProviderConfig, requested: &ProviderConfigSource) -> bool {
+    let (preset_id, base_url) = match requested {
+        ProviderConfigSource::Preset {
+            preset_id,
+            base_url,
+            ..
+        } => (Some(preset_id.as_str()), base_url.as_str()),
+        ProviderConfigSource::Custom { config } => (
+            config.preset_id().map(|id| id.as_str()),
+            config.base_url.as_str(),
+        ),
+    };
+    current.preset_id().map(|id| id.as_str()) == preset_id
+        && current.base_url.trim_end_matches('/') == base_url.trim_end_matches('/')
+}
+
+fn private_fields_mut(
+    source: &mut ProviderConfigSource,
+) -> (
+    &mut Option<String>,
+    &mut Option<std::collections::HashMap<String, String>>,
+) {
+    match source {
+        ProviderConfigSource::Preset {
+            bearer_token,
+            http_headers,
+            ..
+        } => (bearer_token, http_headers),
+        ProviderConfigSource::Custom { config } => {
+            (&mut config.bearer_token, &mut config.http_headers)
+        }
     }
-    Ok(ModelRouteConfig {
-        provider: ProviderId::new(preference.provider_id).map_err(RuntimeError::Model)?,
-        model: preference.model,
-        effort: preference.reasoning_effort.map(ReasoningEffort::new),
-    })
 }
 
 #[cfg(test)]
 mod tests {
-    use mai_protocol::{ModelConfig, ProviderTransportConfig, ProviderWireProtocol};
+    use pl_core::{ModelCatalogId, ProviderModelCatalogConfig};
+    use pl_model::{ModelInfo, ProviderInfo};
     use pretty_assertions::assert_eq;
 
     use super::*;
 
+    fn routes(provider: &str, model: &str, effort: Option<&str>) -> AgentConfigRequest {
+        let route = ModelRouteConfig {
+            provider: ProviderId::new(provider).unwrap(),
+            model: model.to_string(),
+            effort: effort.map(ReasoningEffort::new),
+        };
+        AgentConfigRequest {
+            planner: Some(route.clone()),
+            explorer: Some(route.clone()),
+            executor: Some(route.clone()),
+            reviewer: Some(route),
+        }
+    }
+
     #[test]
-    fn api_conversion_creates_dynamic_routes_without_provider_default_model() {
-        let providers = ProvidersConfigRequest {
+    fn preset_provider_uses_pl_catalog_and_discards_submitted_model_overrides() {
+        let preset = builtin_provider_catalog()
+            .presets
+            .into_iter()
+            .find(|preset| preset.id.as_str() == "openai")
+            .unwrap();
+        let request = ProvidersConfigRequest {
+            providers: vec![ApiProviderConfig {
+                id: "openai".to_string(),
+                source: ProviderConfigSource::Preset {
+                    preset_id: "openai".to_string(),
+                    name: "OpenAI proxy".to_string(),
+                    base_url: "https://proxy.example/v1".to_string(),
+                    bearer_token: Some("secret".to_string()),
+                    bearer_token_env: None,
+                    http_headers: None,
+                },
+            }],
+        };
+        let models = model_config_from_api(
+            &request,
+            &routes("openai", &preset.suggested_model, Some("low")),
+        )
+        .unwrap();
+        let provider = models
+            .providers
+            .get(&ProviderId::new("openai").unwrap())
+            .unwrap();
+        assert_eq!(provider.base_url, "https://proxy.example/v1");
+        assert!(matches!(
+            provider.catalog,
+            ProviderModelCatalogConfig::Bundled { .. }
+        ));
+        assert!(provider.connection_overrides().is_empty());
+    }
+
+    #[test]
+    fn custom_provider_round_trips_without_projection() {
+        let mut model = ModelInfo::fallback("custom-model");
+        model.used_fallback = false;
+        let mut provider = ProviderConfig::from_provider_info(
+            ProviderInfo::responses_compatible("Custom", "https://example.test/v1", "custom-model"),
+            vec![model],
+        );
+        provider.bearer_token = Some("secret".to_string());
+        let request = ProvidersConfigRequest {
             providers: vec![ApiProviderConfig {
                 id: "custom".to_string(),
-                preset_id: None,
-                transport: ProviderTransportConfig {
-                    protocol: ProviderWireProtocol::Responses,
-                    connection_mode: ApiProviderConnectionMode::WebSocket,
+                source: ProviderConfigSource::Custom {
+                    config: provider.clone(),
                 },
-                capabilities: ApiProviderCapabilitySelection::Explicit(Default::default()),
-                name: "Custom".to_string(),
-                base_url: "https://example.test/v1".to_string(),
-                api_key: Some("secret".to_string()),
-                api_key_env: None,
-                http_headers: Some(BTreeMap::from([(
-                    "x-openai-actor-authorization".to_string(),
-                    "local-image-extension".to_string(),
-                )])),
-                catalog: ApiProviderModelCatalogConfig::Explicit {
-                    models: vec![ModelConfig {
-                        id: "model-a".to_string(),
-                        name: None,
-                        context_tokens: 128_000,
-                        max_context_tokens: None,
-                        effective_context_window_percent: 95,
-                        output_tokens: 4096,
-                        auto_compact_token_limit: None,
-                        supports_tools: true,
-                        capabilities: Default::default(),
-                        request_policy: Default::default(),
-                        reasoning: None,
-                        options: serde_json::Value::Null,
-                        headers: BTreeMap::new(),
-                    }],
-                },
-                default_model: "model-a".to_string(),
-                enabled: true,
             }],
-            default_provider_id: Some("custom".to_string()),
         };
-
-        let config = model_config_from_api(&providers, &AgentConfigRequest::default()).unwrap();
-        let route = config
-            .resolve(&AgentRoleId::new("executor").unwrap())
-            .unwrap();
-
-        assert_eq!(route.provider_id, ProviderId::new("custom").unwrap());
-        assert_eq!(route.model.slug, "model-a");
-        assert_eq!(route.provider_info.default_model, "model-a");
+        let models =
+            model_config_from_api(&request, &routes("custom", "custom-model", None)).unwrap();
         assert_eq!(
-            route.provider_info.http_headers,
-            Some(std::collections::HashMap::from([(
-                "x-openai-actor-authorization".to_string(),
-                "local-image-extension".to_string(),
-            )]))
+            models.providers.get(&ProviderId::new("custom").unwrap()),
+            Some(&provider)
         );
-
-        let selection =
-            provider_selection_from_models(&config, Some("custom"), Some("model-a")).unwrap();
-        assert_eq!(
-            selection.provider.http_headers,
-            BTreeMap::from([(
-                "x-openai-actor-authorization".to_string(),
-                "local-image-extension".to_string(),
-            )])
-        );
-        assert_eq!(
-            crate::model_profile::provider_info(&selection.provider).http_headers,
-            route.provider_info.http_headers
-        );
-
-        let agent_projection = agent_config_from_models(&config);
-        for preference in [
-            agent_projection.planner,
-            agent_projection.explorer,
-            agent_projection.executor,
-            agent_projection.reviewer,
-        ] {
-            let preference = preference.expect("required role projection");
-            assert_eq!(preference.provider_id, "custom");
-            assert_eq!(preference.model, "model-a");
-        }
-        let provider_projection = providers_request_from_models(&config);
-        assert_eq!(
-            provider_projection.providers[0].api_key.as_deref(),
-            Some("secret")
-        );
-        let public_projection = providers_response_from_models(&config);
-        assert!(public_projection.providers[0].has_api_key);
     }
 
     #[test]
-    fn omitted_headers_preserve_unchanged_provider_private_fields() {
-        let mut current = crate::MaiConfig::default().models;
-        let provider_id = ProviderId::new("deepseek").unwrap();
-        let current_provider = current.providers.get_mut(&provider_id).unwrap();
-        current_provider.http_headers = Some(std::collections::HashMap::from([(
-            "x-provider-scope".to_string(),
-            "configured".to_string(),
+    fn public_projection_redacts_secrets_without_losing_model_values() {
+        let mut provider = ProviderConfig::from_bundled_catalog(
+            ProviderInfo::openai(None),
+            ModelCatalogId::new("openai").unwrap(),
+            Vec::new(),
+        );
+        provider.bearer_token = Some("secret".to_string());
+        provider.http_headers = Some(std::collections::HashMap::from([(
+            "x-private".into(),
+            "value".into(),
         )]));
-        current_provider.tool_wire_policy = pl_model::ToolWirePolicy::NativeCustomTools;
-        current_provider.apply_patch_tool_type = Some(pl_model::ApplyPatchToolType::Freeform);
-        let expected_headers = current_provider.http_headers.clone();
-        let expected_tool_wire_policy = current_provider.tool_wire_policy;
-        let expected_apply_patch_tool_type = current_provider.apply_patch_tool_type;
-        let mut request = providers_request_from_models(&current);
-        request.providers[0].http_headers = None;
-        let roles = agent_config_from_models(&current);
-        let mut next = model_config_from_api(&request, &roles).unwrap();
-
-        preserve_provider_private_fields(&current, &request, &mut next);
-
-        let next_provider = next.providers.get(&provider_id).unwrap();
-        assert_eq!(next_provider.http_headers, expected_headers);
-        assert_eq!(next_provider.tool_wire_policy, expected_tool_wire_policy);
-        assert_eq!(
-            next_provider.apply_patch_tool_type,
-            expected_apply_patch_tool_type
-        );
-    }
-
-    #[test]
-    fn responses_omit_max_tokens_policy_survives_product_projection() {
-        let catalog = pl_core::builtin_model_catalog(&ModelCatalogId::new("openai").unwrap())
-            .expect("built-in OpenAI catalog");
-        let model = catalog
-            .models
-            .iter()
-            .find(|model| model.slug == "gpt-5.5")
-            .expect("built-in gpt-5.5");
-
-        let projected = api_model(model, pl_model::ProviderWireProtocol::Responses);
-        let restored = model_info(&projected, ApiProviderWireProtocol::Responses);
-
-        assert_eq!(
-            projected.request_policy.max_tokens_field,
-            ModelMaxTokensField::Omit
-        );
-        assert_eq!(
-            restored.request_profile.responses_max_tokens_field,
-            ResponsesMaxTokensField::Omit
-        );
-    }
-
-    #[test]
-    fn chat_max_tokens_policy_is_independent_from_responses_policy() {
-        let catalog = pl_core::builtin_model_catalog(&ModelCatalogId::new("deepseek").unwrap())
-            .expect("built-in DeepSeek catalog");
-        let model = catalog.models.first().expect("built-in chat model");
-
-        let projected = api_model(model, pl_model::ProviderWireProtocol::ChatCompletions);
-        let restored = model_info(&projected, ApiProviderWireProtocol::ChatCompletions);
-
-        assert_eq!(
-            projected.request_policy.max_tokens_field,
-            ModelMaxTokensField::MaxTokens
-        );
-        assert_eq!(
-            restored.request_profile.max_tokens_field,
-            MaxTokensField::MaxTokens
-        );
-        assert_eq!(
-            restored.request_profile.responses_max_tokens_field,
-            ResponsesMaxTokensField::Omit
-        );
-    }
-
-    #[test]
-    fn same_preset_supports_independent_ws_and_http_instances() {
-        let provider = |id: &str, connection_mode| ApiProviderConfig {
-            id: id.to_string(),
-            preset_id: Some("openai".to_string()),
-            transport: ProviderTransportConfig {
-                protocol: ProviderWireProtocol::Responses,
-                connection_mode,
-            },
-            capabilities: ApiProviderCapabilitySelection::PresetDefaults,
-            name: format!("OpenAI {id}"),
-            base_url: "https://api.openai.com/v1".to_string(),
-            api_key: Some(format!("secret-{id}")),
-            api_key_env: None,
-            http_headers: None,
-            catalog: ApiProviderModelCatalogConfig::Bundled {
-                catalog_id: "openai".to_string(),
-                additional_models: Vec::new(),
-            },
-            default_model: "gpt-5.6-sol".to_string(),
-            enabled: true,
+        let models = AgentModelConfig {
+            providers: BTreeMap::from([(ProviderId::new("openai").unwrap(), provider)]),
+            routes: BTreeMap::new(),
         };
-        let request = ProvidersConfigRequest {
-            providers: vec![
-                provider("openai-ws", ApiProviderConnectionMode::WebSocket),
-                provider("openai-http", ApiProviderConnectionMode::Http),
-            ],
-            default_provider_id: Some("openai-ws".to_string()),
-        };
-
-        let models = model_config_from_api(&request, &AgentConfigRequest::default()).unwrap();
         let response = providers_response_from_models(&models);
-
-        assert_eq!(response.providers.len(), 2);
-        assert_eq!(
-            response.providers[0]
-                .transport
-                .connection_modes
-                .iter()
-                .map(|mode| mode.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["web_socket", "http"]
-        );
-        assert_eq!(
-            response
-                .providers
-                .iter()
-                .find(|provider| provider.id == "openai-ws")
-                .unwrap()
-                .transport
-                .connection_mode,
-            ApiProviderConnectionMode::WebSocket
-        );
-        assert_eq!(
-            response
-                .providers
-                .iter()
-                .find(|provider| provider.id == "openai-http")
-                .unwrap()
-                .transport
-                .connection_mode,
-            ApiProviderConnectionMode::Http
-        );
-    }
-
-    #[test]
-    fn duplicate_provider_ids_are_rejected_instead_of_overwriting() {
-        let mut provider = providers_request_from_models(&crate::MaiConfig::default().models)
-            .providers
-            .into_iter()
-            .next()
-            .expect("default provider");
-        provider.id = "duplicate".to_string();
-        let request = ProvidersConfigRequest {
-            providers: vec![provider.clone(), provider],
-            default_provider_id: Some("duplicate".to_string()),
-        };
-
-        let error = model_config_from_api(&request, &AgentConfigRequest::default()).unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("duplicate provider id: duplicate")
-        );
+        let summary = &response.providers[0];
+        assert!(summary.has_api_key);
+        assert!(summary.has_http_headers);
+        assert_eq!(summary.config.bearer_token, None);
+        assert_eq!(summary.config.http_headers, None);
+        assert!(!summary.models.is_empty());
     }
 }

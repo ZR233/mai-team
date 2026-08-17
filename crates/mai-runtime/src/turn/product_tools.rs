@@ -2,16 +2,15 @@ use std::sync::Arc;
 
 use mai_protocol::{AgentId, AgentRole};
 use pl_core::{
-    FunctionToolDefinition, RegisteredTool, ToolVisibilitySet,
-    tool::cache::ToolCachePolicy,
+    FunctionToolDefinition, RegisteredTool, ToolVisibilitySet, tool::cache::ToolCachePolicy,
 };
 use serde_json::{Value, json};
 
 use crate::state::AgentRecord;
 use crate::turn::product_tool_schemas::definitions::{
     GITHUB_API_REQUEST_DESCRIPTION, QUEUE_PROJECT_REVIEW_PRS_DESCRIPTION,
-    READ_TOOL_ARTIFACT_DESCRIPTION, SAVE_ARTIFACT_DESCRIPTION, SAVE_TASK_PLAN_DESCRIPTION,
-    SUBMIT_REVIEW_RESULT_DESCRIPTION, QueueProjectReviewPrsInput, ReadToolArtifactInput,
+    QueueProjectReviewPrsInput, READ_TOOL_ARTIFACT_DESCRIPTION, ReadToolArtifactInput,
+    SAVE_ARTIFACT_DESCRIPTION, SAVE_TASK_PLAN_DESCRIPTION, SUBMIT_REVIEW_RESULT_DESCRIPTION,
     SaveArtifactInput, SaveTaskPlanInput, SubmitReviewResultInput,
 };
 use crate::turn::product_tool_schemas::{
@@ -102,32 +101,28 @@ impl MaiProductToolRegistry {
             }
             TOOL_READ_TOOL_ARTIFACT => {
                 let executor = self.clone();
-                Ok(
-                    FunctionToolDefinition::<ReadToolArtifactInput>::new(
-                        TOOL_READ_TOOL_ARTIFACT,
-                        READ_TOOL_ARTIFACT_DESCRIPTION,
-                    )
-                    .registered(move |input, _context| {
-                        let executor = executor.clone();
-                        async move { executor.read_tool_artifact(input).await }
-                    })
-                    .with_cache_policy(ToolCachePolicy::WithinTurn),
+                Ok(FunctionToolDefinition::<ReadToolArtifactInput>::new(
+                    TOOL_READ_TOOL_ARTIFACT,
+                    READ_TOOL_ARTIFACT_DESCRIPTION,
                 )
+                .registered(move |input, _context| {
+                    let executor = executor.clone();
+                    async move { executor.read_tool_artifact(input).await }
+                })
+                .with_cache_policy(ToolCachePolicy::WithinTurn))
             }
             TOOL_GITHUB_API_REQUEST => {
                 let executor = self.clone();
-                Ok(
-                    FunctionToolDefinition::<GithubApiRequest>::new(
-                        TOOL_GITHUB_API_REQUEST,
-                        GITHUB_API_REQUEST_DESCRIPTION,
-                    )
-                    .registered(move |input, context| {
-                        let executor = executor.clone();
-                        async move { executor.github_api_request(input, context).await }
-                    })
-                    .with_cache_policy_resolver(github_api_cache_policy)
-                    .with_cache_invalidation_resolver(github_api_invalidates_cache),
+                Ok(FunctionToolDefinition::<GithubApiRequest>::new(
+                    TOOL_GITHUB_API_REQUEST,
+                    GITHUB_API_REQUEST_DESCRIPTION,
                 )
+                .registered(move |input, context| {
+                    let executor = executor.clone();
+                    async move { executor.github_api_request(input, context).await }
+                })
+                .with_cache_policy_resolver(github_api_cache_policy)
+                .with_cache_invalidation_resolver(github_api_invalidates_cache))
             }
             TOOL_QUEUE_PROJECT_REVIEW_PRS => {
                 let executor = self.clone();
@@ -330,7 +325,7 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("field `body` must be a JSON object or null")
-    );
+        );
     }
 
     #[test]
@@ -359,11 +354,13 @@ mod tests {
 
         assert_eq!(
             input.prs,
-            vec![crate::turn::product_tool_schemas::definitions::QueueProjectReviewPr {
-                number: 42,
-                head_sha: Some("abc123".to_string()),
-                reason: Some("ready".to_string()),
-            }]
+            vec![
+                crate::turn::product_tool_schemas::definitions::QueueProjectReviewPr {
+                    number: 42,
+                    head_sha: Some("abc123".to_string()),
+                    reason: Some("ready".to_string()),
+                }
+            ]
         );
     }
 

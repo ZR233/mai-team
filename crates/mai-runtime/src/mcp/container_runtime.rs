@@ -48,8 +48,7 @@ impl ContainerMcpRuntime {
             )
             .await?;
         let shared_tools = Arc::new(ToolRegistry::new());
-        let handle =
-            McpRuntime::new(McpConnector::default(), Some(shared_tools.clone())).handle();
+        let handle = McpRuntime::new(McpConnector::default(), Some(shared_tools.clone())).handle();
         let runtime = Self {
             docker,
             sidecar_container_id: sidecar.id,
@@ -340,10 +339,7 @@ mod tests {
         );
         assert_eq!(config.cwd, None);
         // env 保留：PL 注入宿主进程环境后由 -e TOKEN 透传进容器。
-        assert_eq!(
-            config.env.get("TOKEN").map(String::as_str),
-            Some("secret")
-        );
+        assert_eq!(config.env.get("TOKEN").map(String::as_str), Some("secret"));
     }
 
     #[test]

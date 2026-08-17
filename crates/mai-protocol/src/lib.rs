@@ -1185,248 +1185,53 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderWireProtocol {
-    #[default]
-    Responses,
-    ChatCompletions,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderConnectionMode {
-    WebSocket,
-    #[default]
-    Http,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProviderTransportConfig {
-    pub protocol: ProviderWireProtocol,
-    pub connection_mode: ProviderConnectionMode,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProviderTransportSummary {
-    pub protocol: ProviderWireProtocol,
-    pub connection_mode: ProviderConnectionMode,
-    pub connection_modes: Vec<ProviderConnectionModeDescriptor>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ModelConfig {
-    pub id: String,
-    #[serde(default)]
-    pub name: Option<String>,
-    pub context_tokens: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_context_tokens: Option<u64>,
-    #[serde(default = "default_effective_context_window_percent")]
-    pub effective_context_window_percent: u64,
-    pub output_tokens: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_compact_token_limit: Option<u64>,
-    #[serde(default = "default_true")]
-    pub supports_tools: bool,
-    #[serde(default)]
-    pub capabilities: ModelCapabilities,
-    #[serde(default)]
-    pub request_policy: ModelRequestPolicy,
-    #[serde(default)]
-    pub reasoning: Option<ModelReasoningConfig>,
-    #[serde(default)]
-    pub options: Value,
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
-}
-
-impl ModelConfig {
-    pub fn effective_context_tokens(&self) -> u64 {
-        let percent = self.effective_context_window_percent.min(100);
-        let context_tokens = if self.context_tokens > 0 {
-            Some(self.context_tokens)
-        } else {
-            self.max_context_tokens
-        };
-        context_tokens
-            .map(|value| value.saturating_mul(percent) / 100)
-            .unwrap_or_default()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ModelCapabilities {
-    #[serde(default = "default_true")]
-    pub tools: bool,
-    #[serde(default)]
-    pub parallel_tools: bool,
-    #[serde(default)]
-    pub reasoning_replay: bool,
-    #[serde(default)]
-    pub strict_schema: bool,
-    #[serde(default)]
-    pub web_search: bool,
-}
-
-impl Default for ModelCapabilities {
-    fn default() -> Self {
-        Self {
-            tools: true,
-            parallel_tools: false,
-            reasoning_replay: false,
-            strict_schema: false,
-            web_search: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolSchemaPolicy {
-    #[default]
-    Standard,
-    Strict,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ModelRequestPolicy {
-    #[serde(default)]
-    pub max_tokens_field: ModelMaxTokensField,
-    #[serde(default)]
-    pub store: Option<bool>,
-    #[serde(default)]
-    pub tool_schema: ToolSchemaPolicy,
-    #[serde(default, skip_serializing_if = "is_null")]
-    pub extra_body: Value,
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
-}
-
-impl Default for ModelRequestPolicy {
-    fn default() -> Self {
-        Self {
-            max_tokens_field: ModelMaxTokensField::default(),
-            store: None,
-            tool_schema: ToolSchemaPolicy::Standard,
-            extra_body: Value::Null,
-            headers: BTreeMap::new(),
-        }
-    }
-}
-
-/// 模型请求允许使用的输出 token 字段。
-///
-/// `Omit` 是有意义的协议策略，不能退化成 Chat Completions 的默认字段。
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelMaxTokensField {
-    Omit,
-    MaxOutputTokens,
-    MaxCompletionTokens,
-    #[default]
-    MaxTokens,
-}
-
-fn default_effective_context_window_percent() -> u64 {
-    95
-}
-
-fn is_null(value: &Value) -> bool {
-    value.is_null()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ModelReasoningConfig {
-    #[serde(default)]
-    pub default_variant: Option<String>,
-    #[serde(default)]
-    pub variants: Vec<ModelReasoningVariant>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ModelReasoningVariant {
-    pub id: String,
-    #[serde(default)]
-    pub label: Option<String>,
-    #[serde(default)]
-    pub request: Value,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderConfig {
     pub id: String,
-    #[serde(default)]
-    pub preset_id: Option<String>,
-    #[serde(default)]
-    pub transport: ProviderTransportConfig,
-    pub capabilities: ProviderCapabilitySelection,
-    pub name: String,
-    pub base_url: String,
-    #[serde(default)]
-    pub api_key: Option<String>,
-    #[serde(default)]
-    pub api_key_env: Option<String>,
-    /// 只写的 provider 请求头；实例边界未变化时，`None` 表示由服务端保留原值。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub http_headers: Option<BTreeMap<String, String>>,
-    pub catalog: ProviderModelCatalogConfig,
-    pub default_model: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
+    /// Preset 只携带实例覆盖；custom 直接携带完整 PL provider 配置。
+    #[serde(flatten)]
+    pub source: ProviderConfigSource,
 }
 
-/// Provider 实例服务能力的配置来源。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "source", rename_all = "snake_case")]
-pub enum ProviderCapabilitySelection {
-    PresetDefaults,
-    Explicit(ProviderServiceCapabilitiesDescriptor),
-}
-
-/// mai HTTP 边界中的 provider 模型目录引用。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "source", rename_all = "snake_case")]
-pub enum ProviderModelCatalogConfig {
-    Bundled {
-        catalog_id: String,
-        #[serde(default)]
-        additional_models: Vec<ModelConfig>,
+pub enum ProviderConfigSource {
+    Preset {
+        preset_id: String,
+        name: String,
+        base_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bearer_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bearer_token_env: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        http_headers: Option<std::collections::HashMap<String, String>>,
     },
-    Explicit {
-        #[serde(default)]
-        models: Vec<ModelConfig>,
+    Custom {
+        /// Custom provider 的内容由 PL serde 与校验器直接解释。
+        config: pl_core::ProviderConfig,
     },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderSummary {
     pub id: String,
-    pub preset_id: Option<String>,
-    pub transport: ProviderTransportSummary,
-    pub capability_selection: ProviderCapabilitySelection,
-    pub service_capabilities: ProviderServiceCapabilitiesDescriptor,
-    pub name: String,
-    pub base_url: String,
-    pub api_key_env: Option<String>,
-    pub catalog: ProviderModelCatalogConfig,
-    /// 服务端通过 PL 目录解析后的唯一有效模型列表。
-    pub models: Vec<ModelConfig>,
-    pub default_model: String,
-    pub enabled: bool,
+    /// 脱敏后的 PL provider 配置。
+    pub config: pl_core::ProviderConfig,
+    /// PL 解析 bundled catalog 与 custom models 后的最终模型列表。
+    pub models: Vec<pl_model::ModelInfo>,
     pub has_api_key: bool,
+    pub has_http_headers: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProvidersResponse {
     pub providers: Vec<ProviderSummary>,
-    pub default_provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProvidersConfigRequest {
     pub providers: Vec<ProviderConfig>,
-    pub default_provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1453,7 +1258,7 @@ pub struct ProviderTestResponse {
     pub ok: bool,
     pub provider_id: String,
     pub provider_name: String,
-    pub transport: ProviderTransportConfig,
+    pub transport: pl_model::ModelTransportProfile,
     pub model: String,
     pub base_url: String,
     pub latency_ms: u64,
@@ -1481,13 +1286,7 @@ pub struct McpServerSecretClearRequest {
     pub headers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AgentModelPreference {
-    pub provider_id: String,
-    pub model: String,
-    #[serde(default)]
-    pub reasoning_effort: Option<String>,
-}
+pub type AgentModelPreference = pl_core::ModelRouteConfig;
 
 #[derive(
     Debug,
@@ -1515,18 +1314,15 @@ pub enum AgentRole {
 pub struct ResolvedAgentModelPreference {
     pub provider_id: String,
     pub provider_name: String,
-    pub transport: ProviderTransportConfig,
+    pub transport: pl_model::ModelTransportProfile,
     pub model: String,
-    #[serde(default)]
-    pub model_name: Option<String>,
+    pub model_name: String,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
-    pub context_tokens: u64,
+    pub context_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context_tokens: Option<u64>,
-    #[serde(default = "default_effective_context_window_percent")]
-    pub effective_context_window_percent: u64,
-    pub output_tokens: u64,
+    pub output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1562,21 +1358,6 @@ pub struct AgentConfigResponse {
     pub effective_reviewer: Option<ResolvedAgentModelPreference>,
     #[serde(default)]
     pub validation_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ProviderSecret {
-    pub id: String,
-    pub transport: ProviderTransportConfig,
-    pub name: String,
-    pub base_url: String,
-    pub api_key: String,
-    pub api_key_env: Option<String>,
-    #[serde(default)]
-    pub http_headers: BTreeMap<String, String>,
-    pub models: Vec<ModelConfig>,
-    pub default_model: String,
-    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2351,28 +2132,28 @@ mod tests {
     }
 
     #[test]
-    fn provider_wire_protocol_serializes_canonical_names() {
-        assert_eq!(
-            serde_json::to_string(&ProviderWireProtocol::Responses).expect("serialize"),
-            "\"responses\""
-        );
-        assert_eq!(
-            serde_json::from_str::<ProviderWireProtocol>("\"chat_completions\"")
-                .expect("deserialize"),
-            ProviderWireProtocol::ChatCompletions
-        );
-    }
-
-    #[test]
-    fn provider_transport_keeps_protocol_and_connection_orthogonal() {
-        let transport = ProviderTransportConfig {
-            protocol: ProviderWireProtocol::Responses,
-            connection_mode: ProviderConnectionMode::WebSocket,
+    fn preset_provider_request_contains_only_instance_overrides() {
+        let provider = ProviderConfig {
+            id: "openai-proxy".to_string(),
+            source: ProviderConfigSource::Preset {
+                preset_id: "openai".to_string(),
+                name: "OpenAI proxy".to_string(),
+                base_url: "https://proxy.example/v1".to_string(),
+                bearer_token: None,
+                bearer_token_env: Some("OPENAI_API_KEY".to_string()),
+                http_headers: None,
+            },
         };
-
         assert_eq!(
-            serde_json::to_value(transport).expect("serialize provider transport"),
-            json!({ "protocol": "responses", "connection_mode": "web_socket" })
+            serde_json::to_value(provider).expect("serialize provider"),
+            json!({
+                "id": "openai-proxy",
+                "source": "preset",
+                "preset_id": "openai",
+                "name": "OpenAI proxy",
+                "base_url": "https://proxy.example/v1",
+                "bearer_token_env": "OPENAI_API_KEY"
+            })
         );
     }
 

@@ -354,7 +354,13 @@ pub(crate) fn validate_target(
     require_columns(
         transaction,
         "thread_submissions",
-        &["id", "thread_id", "ordinal", "created_at", "submission_json"],
+        &[
+            "id",
+            "thread_id",
+            "ordinal",
+            "created_at",
+            "submission_json",
+        ],
     )?;
     if table_exists(transaction, "project_merged_pull_requests")? {
         bail!("schema {TARGET_SCHEMA} 仍包含已废弃的 v29 merged PR 表");

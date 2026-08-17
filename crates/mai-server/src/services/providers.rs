@@ -8,8 +8,11 @@ use mai_runtime::{
 };
 #[cfg(test)]
 use mai_store::MaiStore;
-use pl_core::{AgentSession, CoreModelTurnOptions, completion_response_preview, user_text_message};
-use pl_model::CompletionResponse;
+use pl_core::{
+    AgentSession, CoreModelTurnOptions, ResolvedModelRoute, completion_response_preview,
+    user_text_message,
+};
+use pl_model::{CompletionResponse, ModelTransportProfile};
 use pl_protocol::PureError;
 use tokio_util::sync::CancellationToken;
 
@@ -111,7 +114,11 @@ async fn run_provider_test(
 ) -> ProviderTestResult {
     let started = Instant::now();
     let selection = match runtime
-        .resolve_provider_selection(Some(provider_id), request.model.as_deref())
+        .resolve_provider_selection(
+            Some(provider_id),
+            request.model.as_deref(),
+            request.reasoning_effort.as_deref(),
+        )
         .await
     {
         Ok(selection) => selection,
@@ -129,7 +136,8 @@ async fn run_provider_test(
             let model = request.model.clone().or_else(|| {
                 provider
                     .as_ref()
-                    .map(|provider| provider.default_model.clone())
+                    .and_then(|provider| provider.models.first())
+                    .map(|model| model.slug.clone())
             });
             return ProviderTestResult {
                 status: StatusCode::BAD_REQUEST,
@@ -141,19 +149,17 @@ async fn run_provider_test(
                         .unwrap_or_else(|| provider_id.to_string()),
                     provider_name: provider
                         .as_ref()
-                        .map(|provider| provider.name.clone())
+                        .map(|provider| provider.config.name.clone())
                         .unwrap_or_default(),
                     transport: provider
                         .as_ref()
-                        .map(|provider| ProviderTransportConfig {
-                            protocol: provider.transport.protocol,
-                            connection_mode: provider.transport.connection_mode,
-                        })
-                        .unwrap_or_default(),
+                        .and_then(|provider| provider.models.first())
+                        .map(|model| model.transport.clone())
+                        .unwrap_or_else(ModelTransportProfile::default),
                     model: model.unwrap_or_default(),
                     base_url: provider
                         .as_ref()
-                        .map(|provider| provider.base_url.clone())
+                        .map(|provider| provider.config.base_url.clone())
                         .unwrap_or_default(),
                     latency_ms: elapsed_millis(started),
                     output_preview: String::new(),
@@ -164,9 +170,16 @@ async fn run_provider_test(
         }
     };
 
-    let provider = selection.provider.clone();
-    let model = selection.model.clone();
-    let base_url = provider.base_url.clone();
+    let provider_id = selection.provider_id.to_string();
+    let provider_name = selection.provider_info.name.clone();
+    let base_url = selection.provider_info.base_url.clone();
+    let api_key = selection
+        .provider_info
+        .bearer_token
+        .clone()
+        .unwrap_or_default();
+    let transport = selection.model.transport.clone();
+    let model = selection.model.slug.clone();
     let reasoning_effort = request.reasoning_effort;
     let tester = ProviderTester::new();
     let response = tester
@@ -178,10 +191,10 @@ async fn run_provider_test(
             status: StatusCode::OK,
             response: ProviderTestResponse {
                 ok: true,
-                provider_id: provider.id,
-                provider_name: provider.name,
-                transport: provider.transport,
-                model: model.id,
+                provider_id,
+                provider_name,
+                transport,
+                model,
                 base_url,
                 latency_ms,
                 output_preview: completion_response_preview(&response),
@@ -193,15 +206,15 @@ async fn run_provider_test(
             status: StatusCode::OK,
             response: ProviderTestResponse {
                 ok: false,
-                provider_id: provider.id,
-                provider_name: provider.name,
-                transport: provider.transport,
-                model: model.id,
+                provider_id,
+                provider_name,
+                transport,
+                model,
                 base_url,
                 latency_ms,
                 output_preview: String::new(),
                 usage: None,
-                error: Some(sanitize_provider_test_error(&err, &provider.api_key)),
+                error: Some(sanitize_provider_test_error(&err, &api_key)),
             },
         },
     }
@@ -216,7 +229,7 @@ impl ProviderTester {
 
     pub(crate) async fn run_test(
         &self,
-        selection: &mai_runtime::ProviderSelection,
+        selection: &ResolvedModelRoute,
         reasoning_effort: Option<&str>,
         deep: bool,
     ) -> std::result::Result<CompletionResponse, PureError> {
@@ -229,7 +242,7 @@ impl ProviderTester {
 
     async fn run_single_test(
         &self,
-        selection: &mai_runtime::ProviderSelection,
+        selection: &ResolvedModelRoute,
         reasoning_effort: Option<&str>,
     ) -> std::result::Result<CompletionResponse, PureError> {
         let mut session = AgentSession::from_messages(vec![user_text_message("ping")]);
@@ -251,7 +264,7 @@ impl ProviderTester {
 
     async fn run_deep_test(
         &self,
-        selection: &mai_runtime::ProviderSelection,
+        selection: &ResolvedModelRoute,
         reasoning_effort: Option<&str>,
     ) -> std::result::Result<CompletionResponse, PureError> {
         let provider = core_provider_for_selection(selection)?;
@@ -294,12 +307,48 @@ pub(crate) async fn provider_test_store(
         .await
         .expect("open store"),
     );
+    let provider_id = provider.id.clone();
+    let selected_model = match &provider.source {
+        ProviderConfigSource::Preset { preset_id, .. } => {
+            let preset = pl_core::builtin_provider_catalog()
+                .presets
+                .into_iter()
+                .find(|preset| preset.id.as_str() == preset_id)
+                .expect("provider preset");
+            preset
+                .provider
+                .effective_models()
+                .expect("provider models")
+                .into_iter()
+                .find(|model| model.slug == preset.suggested_model)
+                .expect("suggested model")
+        }
+        ProviderConfigSource::Custom { config } => config
+            .effective_models()
+            .expect("provider models")
+            .into_iter()
+            .next()
+            .expect("provider model"),
+    };
+    let effort = selected_model
+        .default_effort()
+        .map(pl_core::ReasoningEffort::new);
+    let route = pl_core::ModelRouteConfig {
+        provider: pl_core::ProviderId::new(&provider_id).expect("provider id"),
+        model: selected_model.slug,
+        effort,
+    };
+    let agents = AgentConfigRequest {
+        planner: Some(route.clone()),
+        explorer: Some(route.clone()),
+        executor: Some(route.clone()),
+        reviewer: Some(route),
+    };
     let models = mai_runtime::model_config_from_api(
         &ProvidersConfigRequest {
             providers: vec![provider],
-            default_provider_id: Some("openai".to_string()),
         },
-        &AgentConfigRequest::default(),
+        &agents,
     )
     .expect("model config");
     let config = mai_runtime::MaiConfig {
@@ -333,63 +382,26 @@ pub(crate) async fn provider_test_store(
 
 #[cfg(test)]
 pub(crate) fn provider_config(base_url: &str, api_key: Option<&str>) -> ProviderConfig {
+    let mut model = pl_core::builtin_provider_catalog()
+        .presets
+        .into_iter()
+        .find(|preset| preset.id.as_str() == "openai")
+        .expect("OpenAI preset")
+        .provider
+        .effective_models()
+        .expect("OpenAI models")
+        .into_iter()
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("gpt-5.5 model");
+    model.transport = pl_model::ModelTransportProfile::responses_http();
+    let mut config = pl_core::ProviderConfig::from_explicit_models(
+        pl_model::ProviderInfo::responses_compatible("OpenAI", base_url, "gpt-5.5"),
+        vec![model],
+    );
+    config.bearer_token = api_key.map(str::to_string);
     ProviderConfig {
         id: "openai".to_string(),
-        preset_id: None,
-        transport: ProviderTransportConfig {
-            protocol: ProviderWireProtocol::Responses,
-            connection_mode: ProviderConnectionMode::Http,
-        },
-        capabilities: ProviderCapabilitySelection::Explicit(Default::default()),
-        name: "OpenAI".to_string(),
-        base_url: base_url.to_string(),
-        api_key: api_key.map(str::to_string),
-        api_key_env: None,
-        http_headers: None,
-        catalog: mai_protocol::ProviderModelCatalogConfig::Explicit {
-            models: vec![provider_test_model("gpt-5.5")],
-        },
-        default_model: "gpt-5.5".to_string(),
-        enabled: true,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn provider_test_model(id: &str) -> ModelConfig {
-    use mai_protocol::{
-        ModelCapabilities, ModelReasoningConfig, ModelReasoningVariant, ModelRequestPolicy,
-    };
-    use serde_json::{Value, json};
-    use std::collections::BTreeMap;
-
-    ModelConfig {
-        id: id.to_string(),
-        name: Some(id.to_string()),
-        context_tokens: 272_000,
-        max_context_tokens: None,
-        effective_context_window_percent: 95,
-        output_tokens: 128_000,
-        auto_compact_token_limit: None,
-        supports_tools: true,
-        capabilities: ModelCapabilities::default(),
-        request_policy: ModelRequestPolicy::default(),
-        reasoning: Some(ModelReasoningConfig {
-            default_variant: Some("medium".to_string()),
-            variants: ["minimal", "medium"]
-                .into_iter()
-                .map(|variant_id| ModelReasoningVariant {
-                    id: variant_id.to_string(),
-                    label: None,
-                    request: json!({
-                        "reasoning": {
-                            "effort": variant_id
-                        }
-                    }),
-                })
-                .collect(),
-        }),
-        options: Value::Null,
-        headers: BTreeMap::new(),
+        source: ProviderConfigSource::Custom { config },
     }
 }
 
@@ -397,11 +409,11 @@ pub(crate) fn provider_test_model(id: &str) -> ModelConfig {
 mod tests {
     use super::*;
     use mai_protocol::{
-        MaiProductEventEnvelope, MaiProductEventKind, ProviderConnectionMode, ProviderTestRequest,
-        ProviderWireProtocol, TokenUsage,
+        MaiProductEventEnvelope, MaiProductEventKind, ProviderTestRequest, TokenUsage,
     };
+    use pl_model::ModelTransportProfile;
     use serde_json::{Value, json};
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -451,7 +463,7 @@ mod tests {
             "openai",
             ProviderTestRequest {
                 model: None,
-                reasoning_effort: Some("minimal".to_string()),
+                reasoning_effort: Some("low".to_string()),
                 deep: true,
             },
         )
@@ -462,13 +474,7 @@ mod tests {
         assert!(response.ok, "{:?}", response.error);
         assert_eq!(response.provider_id, "openai");
         assert_eq!(response.provider_name, "OpenAI");
-        assert_eq!(
-            response.transport,
-            ProviderTransportConfig {
-                protocol: ProviderWireProtocol::Responses,
-                connection_mode: ProviderConnectionMode::Http,
-            }
-        );
+        assert_eq!(response.transport, ModelTransportProfile::responses_http());
         assert_eq!(response.model, "gpt-5.5");
         assert_eq!(response.base_url, base_url);
         assert_eq!(response.output_preview, "ok");
@@ -492,7 +498,7 @@ mod tests {
         assert_eq!(requests[0]["body"]["store"], false);
         assert_eq!(
             requests[0]["body"].pointer("/reasoning/effort"),
-            Some(&json!("minimal"))
+            Some(&json!("low"))
         );
         assert!(requests[1]["body"].get("previous_response_id").is_none());
         assert_eq!(
@@ -504,7 +510,7 @@ mod tests {
         );
         assert_eq!(
             requests[1]["body"].pointer("/reasoning/effort"),
-            Some(&json!("minimal"))
+            Some(&json!("low"))
         );
     }
 
@@ -533,13 +539,7 @@ mod tests {
             }),
         ])
         .await;
-        let mut provider = provider_config(&base_url, Some("secret"));
-        provider.preset_id = Some("openai".to_string());
-        provider.catalog = ProviderModelCatalogConfig::Bundled {
-            catalog_id: "openai".to_string(),
-            additional_models: Vec::new(),
-        };
-        let (_dir, store) = provider_test_store(provider).await;
+        let (_dir, store) = provider_test_store(provider_config(&base_url, Some("secret"))).await;
 
         let result = run_provider_test(&store, "openai", ProviderTestRequest::default()).await;
 
@@ -667,24 +667,30 @@ mod tests {
     #[tokio::test]
     async fn provider_update_preserves_secret_headers_and_full_mai_config_document() {
         let mut original = provider_config("https://old.example/v1", Some("secret"));
-        original.http_headers = Some(BTreeMap::from([(
+        let ProviderConfigSource::Custom { config } = &mut original.source else {
+            panic!("custom provider")
+        };
+        config.http_headers = Some(HashMap::from([(
             "x-openai-actor-authorization".to_string(),
             "local-image-extension".to_string(),
         )]));
         let (directory, runtime) = provider_test_store(original).await;
-        let mut provider = provider_config("https://old.example/v1", Some(""));
-        provider.name = "Renamed OpenAI".to_string();
+        let mut provider = provider_config("https://old.example/v1", None);
+        let ProviderConfigSource::Custom { config } = &mut provider.source else {
+            panic!("custom provider")
+        };
+        config.name = "Renamed OpenAI".to_string();
+        config.http_headers = None;
 
         let response = runtime
             .update_providers(ProvidersConfigRequest {
                 providers: vec![provider],
-                default_provider_id: Some("openai".to_string()),
             })
             .await
             .expect("update providers");
 
         assert!(response.providers[0].has_api_key);
-        assert_eq!(response.providers[0].name, "Renamed OpenAI");
+        assert_eq!(response.providers[0].config.name, "Renamed OpenAI");
         let document = mai_store::ConfigDocumentStore::new(directory.path().join("config.toml"));
         let config = document
             .load::<mai_runtime::MaiConfig>()

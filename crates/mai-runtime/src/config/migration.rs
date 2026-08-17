@@ -128,12 +128,13 @@ pub(super) async fn migrate(documents: &ConfigDocumentStore) -> Result<MaiConfig
         return v6::migrate(documents, legacy).await;
     }
     if let Ok(Some(mut config)) = documents.load::<MaiConfig>().await
-        && matches!(config.schema_version, 4 | 5)
+        && matches!(config.schema_version, 4 | 5 | 7)
     {
         let previous_version = config.schema_version;
         if previous_version == 4 {
             migrate_v4_provider_capabilities(&mut config.models);
         }
+        canonicalize_preset_providers(&mut config.models)?;
         config.schema_version = MAI_CONFIG_SCHEMA_VERSION;
         config.validate()?;
         backup_document(documents.path(), previous_version).await?;
@@ -158,6 +159,34 @@ fn migrate_v4_provider_capabilities(models: &mut AgentModelConfig) {
     }
 }
 
+fn canonicalize_preset_providers(models: &mut AgentModelConfig) -> Result<()> {
+    let registry = builtin_provider_catalog();
+    for provider in models.providers.values_mut() {
+        let Some(preset_id) = provider.preset.clone() else {
+            continue;
+        };
+        let preset = registry
+            .presets
+            .iter()
+            .find(|candidate| candidate.id == preset_id)
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(format!(
+                    "schema 7 配置引用未知 provider preset: {preset_id}"
+                ))
+            })?;
+        let mut canonical = preset.provider.clone();
+        canonical.name.clone_from(&provider.name);
+        canonical.base_url.clone_from(&provider.base_url);
+        canonical.bearer_token.clone_from(&provider.bearer_token);
+        canonical
+            .bearer_token_env
+            .clone_from(&provider.bearer_token_env);
+        canonical.http_headers.clone_from(&provider.http_headers);
+        *provider = canonical;
+    }
+    Ok(())
+}
+
 async fn migrate_catalog_config(
     documents: &ConfigDocumentStore,
     legacy: LegacyCatalogMaiConfig,
@@ -169,7 +198,7 @@ async fn migrate_catalog_config(
         .into_iter()
         .map(|(id, provider)| Ok((id, migrate_catalog_provider(previous_version, provider)?)))
         .collect::<Result<BTreeMap<_, _>>>()?;
-    let config = MaiConfig {
+    let mut config = MaiConfig {
         schema_version: MAI_CONFIG_SCHEMA_VERSION,
         models: AgentModelConfig {
             providers,
@@ -184,6 +213,7 @@ async fn migrate_catalog_config(
         review: legacy.review,
         retention: MaiRetentionConfig::default(),
     };
+    canonicalize_preset_providers(&mut config.models)?;
     config.validate()?;
     backup_document(documents.path(), previous_version).await?;
     documents.save(&config).await?;
@@ -242,7 +272,7 @@ async fn migrate_v1(documents: &ConfigDocumentStore) -> Result<MaiConfig> {
         .into_iter()
         .map(|(id, provider)| Ok((id.clone(), migrate_provider(&id, provider)?)))
         .collect::<Result<BTreeMap<_, _>>>()?;
-    let config = MaiConfig {
+    let mut config = MaiConfig {
         schema_version: MAI_CONFIG_SCHEMA_VERSION,
         models: AgentModelConfig { providers, routes },
         web_search: Default::default(),
@@ -254,6 +284,7 @@ async fn migrate_v1(documents: &ConfigDocumentStore) -> Result<MaiConfig> {
         review: legacy.review,
         retention: MaiRetentionConfig::default(),
     };
+    canonicalize_preset_providers(&mut config.models)?;
     config.validate()?;
     backup_document(documents.path(), 1).await?;
     documents.save(&config).await?;
@@ -485,6 +516,83 @@ mod tests {
         assert_eq!(MAI_CONFIG_SCHEMA_VERSION, migrated.schema_version);
         assert_eq!(MaiRetentionConfig::default(), migrated.retention);
         assert!(tokio::fs::try_exists(backup_path(&path, 5)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn schema_seven_reloads_preset_semantics_and_preserves_custom_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let documents = ConfigDocumentStore::new(path.clone());
+        let mut config = MaiConfig {
+            schema_version: 7,
+            ..MaiConfig::default()
+        };
+        let preset_id = ProviderId::new("deepseek").unwrap();
+        let preset = config.models.providers.get_mut(&preset_id).unwrap();
+        preset.name = "DeepSeek proxy".to_string();
+        preset.base_url = "https://proxy.example/v1".to_string();
+        preset.bearer_token = Some("secret".to_string());
+        preset.http_headers = Some(std::collections::HashMap::from([(
+            "x-project".to_string(),
+            "mai".to_string(),
+        )]));
+        preset.tool_wire_policy = ToolWirePolicy::NativeCustomTools;
+        preset.catalog = ProviderModelCatalogConfig::Explicit {
+            models: vec![ModelInfo::fallback("fake-model")],
+            connection_overrides: BTreeMap::new(),
+        };
+        let expected_headers = preset.http_headers.clone();
+        let custom_id = ProviderId::new("custom").unwrap();
+        let mut custom_model = ModelInfo::fallback("custom");
+        custom_model.used_fallback = false;
+        let custom = ProviderConfig::from_explicit_models(
+            ProviderInfo::responses_compatible("Custom", "https://custom.example/v1", "custom"),
+            vec![custom_model],
+        );
+        config
+            .models
+            .providers
+            .insert(custom_id.clone(), custom.clone());
+        documents.save(&config).await.unwrap();
+
+        let migrated = migrate(&documents).await.unwrap();
+
+        let migrated_preset = &migrated.models.providers[&preset_id];
+        let canonical = builtin_provider_catalog()
+            .presets
+            .into_iter()
+            .find(|preset| preset.id.as_str() == "deepseek")
+            .unwrap()
+            .provider;
+        assert_eq!(migrated_preset.name, "DeepSeek proxy");
+        assert_eq!(migrated_preset.base_url, "https://proxy.example/v1");
+        assert_eq!(migrated_preset.bearer_token.as_deref(), Some("secret"));
+        assert_eq!(migrated_preset.http_headers, expected_headers);
+        assert_eq!(migrated_preset.tool_wire_policy, canonical.tool_wire_policy);
+        assert_eq!(migrated_preset.catalog, canonical.catalog);
+        assert_eq!(migrated.models.providers[&custom_id], custom);
+        assert!(tokio::fs::try_exists(backup_path(&path, 7)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn schema_seven_unknown_preset_leaves_document_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let documents = ConfigDocumentStore::new(path.clone());
+        let mut config = MaiConfig {
+            schema_version: 7,
+            ..MaiConfig::default()
+        };
+        config.models.providers.values_mut().next().unwrap().preset =
+            Some(ProviderPresetId::new("future-preset").unwrap());
+        documents.save(&config).await.unwrap();
+        let before = tokio::fs::read(&path).await.unwrap();
+
+        let error = migrate(&documents).await.unwrap_err();
+
+        assert!(error.to_string().contains("future-preset"));
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
+        assert!(!tokio::fs::try_exists(backup_path(&path, 7)).await.unwrap());
     }
 
     #[test]

@@ -47,7 +47,7 @@ mod tests {
     #[test]
     fn pure_lang_dependencies_pin_the_verified_runtime_revision() {
         let manifest = include_str!("../../../../Cargo.toml");
-        let verified_revision = "7f8af22eb46f5f25660cb957ea059d8b941df259";
+        let verified_revision = "b1501941fa467c160866dce6da070cdec254693b";
         for package in ["pl-core", "pl-model", "pl-protocol", "pl-trace"] {
             let line = manifest
                 .lines()
@@ -280,7 +280,6 @@ mod tests {
             .filter_schemas(build_tool_schemas());
         assert_eq!(tool_names(&tools), vec![TOOL_SAVE_ARTIFACT]);
     }
-
 
     fn tool_names(tools: &[ToolSchema]) -> Vec<&str> {
         tools.iter().map(ToolSchema::name).collect()

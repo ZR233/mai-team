@@ -34,20 +34,7 @@ impl AgentRuntime {
         &self,
         role: AgentRole,
     ) -> Result<ResolvedAgentModel> {
-        let config = config::agent_config_from_models(&self.mai_config.read().await.models);
-        let preference = role_preference(&config, role);
-        match self.resolve_agent_model_preference(role, preference).await {
-            Ok(resolved) => Ok(resolved),
-            Err(err) if preference.is_some() && is_stale_agent_model_selection_error(&err) => {
-                tracing::warn!(
-                    role = agent_role_label(role),
-                    error = %err,
-                    "agent role model preference is stale; falling back to the default provider"
-                );
-                self.resolve_agent_model_preference(role, None).await
-            }
-            Err(err) => Err(err),
-        }
+        self.resolve_agent_model_preference(role, None).await
     }
 
     pub(super) async fn resolve_effective_agent_model(
@@ -70,23 +57,15 @@ impl AgentRuntime {
         role: AgentRole,
         preference: Option<&AgentModelPreference>,
     ) -> Result<ResolvedAgentModel> {
-        if let Some(preference) = preference
-            && (preference.provider_id.trim().is_empty() || preference.model.trim().is_empty())
-        {
-            return Err(RuntimeError::InvalidInput(format!(
-                "{} provider and model are required",
-                agent_role_label(role)
-            )));
+        let mut models = self.mai_config.read().await.models.clone();
+        let role_id = pl_core::AgentRoleId::new(agent_role_label(role))?;
+        if let Some(preference) = preference {
+            models.routes.insert(role_id.clone(), preference.clone());
         }
-        let selection = self
-            .resolve_provider_selection(
-                preference.map(|item| item.provider_id.as_str()),
-                preference.map(|item| item.model.as_str()),
-            )
-            .await?;
+        let selection = models.resolve(&role_id).map_err(RuntimeError::Model)?;
         let reasoning_effort = agents::normalize_reasoning_effort(
             &selection.model,
-            preference.and_then(|item| item.reasoning_effort.as_deref()),
+            selection.effort.as_ref().map(|effort| effort.as_str()),
             true,
         )?;
         Ok(resolved_agent_model(selection, reasoning_effort))

@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+pl-core.workspace = true
+pl-model.workspace = true
 pl-protocol = { workspace = true, features = ["typescript"] }
 serde.workspace = true
 strum.workspace = true

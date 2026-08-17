@@ -14,8 +14,7 @@ pub(crate) const SAVE_TASK_PLAN_DESCRIPTION: &str = "Save or update the task pla
      Plans must be decision-complete: the Executor should not need to make design decisions. \
      Use request_user_input to resolve any remaining ambiguity before saving.";
 
-pub(crate) const SUBMIT_REVIEW_RESULT_DESCRIPTION: &str =
-    "Submit the structured review result for a task workflow. Only reviewer agents attached to a task may call this.";
+pub(crate) const SUBMIT_REVIEW_RESULT_DESCRIPTION: &str = "Submit the structured review result for a task workflow. Only reviewer agents attached to a task may call this.";
 
 pub(crate) const SAVE_ARTIFACT_DESCRIPTION: &str = "Register a file as a downloadable artifact for the user. \
      Use this when you have produced a deliverable file (report, code output, data export, generated document, etc.) \

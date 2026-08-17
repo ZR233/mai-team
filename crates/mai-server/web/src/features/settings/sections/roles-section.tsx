@@ -55,12 +55,12 @@ export function RolesSection() {
   }
 
   return <>
-    <SettingsHeader title="Role Models" description="Assign model profiles to planner, explorer, executor, and reviewer roles." status={<StatusBadge status={roles.every(({ id }) => form[id].provider_id && form[id].model) ? "ready" : "incomplete"} />} />
+    <SettingsHeader title="Role Models" description="Assign model profiles to planner, explorer, executor, and reviewer roles." status={<StatusBadge status={roles.every(({ id }) => form[id].provider && form[id].model) ? "ready" : "incomplete"} />} />
     <SettingsBody>
       <div className="hidden overflow-hidden rounded-lg border md:block"><Table><TableHeader><TableRow><TableHead className="w-[42%]">Role & responsibility</TableHead><TableHead>Model profile</TableHead></TableRow></TableHeader><TableBody>
         {roles.map(({ id, label, description, icon: Icon }) => {
-          const provider = instances.find((candidate) => candidate.id === form[id].provider_id) ?? instances[0]
-          const model = provider?.models.find((candidate) => candidate.id === form[id].model)
+          const provider = instances.find((candidate) => candidate.id === form[id].provider) ?? instances[0]
+          const model = provider?.models.find((candidate) => candidate.slug === form[id].model)
           return <TableRow key={id}>
             <TableCell><RoleIdentity label={label} description={description} icon={Icon} provider={provider} model={model} preference={form[id]} /></TableCell>
             <TableCell><RoleSelects preference={form[id]} instances={instances} onChange={(preference) => setForm({ ...form, [id]: preference })} /></TableCell>
@@ -69,8 +69,8 @@ export function RolesSection() {
       </TableBody></Table></div>
       <div className="grid gap-3 md:hidden">
         {roles.map(({ id, label, description, icon }) => {
-          const provider = instances.find((candidate) => candidate.id === form[id].provider_id) ?? instances[0]
-          const model = provider?.models.find((candidate) => candidate.id === form[id].model)
+          const provider = instances.find((candidate) => candidate.id === form[id].provider) ?? instances[0]
+          const model = provider?.models.find((candidate) => candidate.slug === form[id].model)
           return <section key={id} className="rounded-lg border p-4"><RoleIdentity label={label} description={description} icon={icon} provider={provider} model={model} preference={form[id]} /><RoleSelects className="mt-4" preference={form[id]} instances={instances} onChange={(preference) => setForm({ ...form, [id]: preference })} /></section>
         })}
       </div>
@@ -88,7 +88,7 @@ function RoleIdentity({ label, description, icon: Icon, provider, model, prefere
   model?: ProviderInstance["models"][number]
   preference: AgentModelPreference
 }) {
-  return <div className="flex items-start gap-3"><Avatar className="size-9 rounded-lg"><AvatarFallback className="rounded-lg"><Icon className="size-4" /></AvatarFallback></Avatar><span className="min-w-0"><strong className="text-sm">{label}</strong><small className="mt-1 block text-xs leading-5 text-muted-foreground">{description}</small><span className="mt-1 block truncate font-mono text-[11px] text-muted-foreground">{provider?.name} · {model?.name || model?.display_name || model?.id} · {preference.reasoning_effort || reasoningDefault(model) || "default"}</span></span></div>
+  return <div className="flex items-start gap-3"><Avatar className="size-9 rounded-lg"><AvatarFallback className="rounded-lg"><Icon className="size-4" /></AvatarFallback></Avatar><span className="min-w-0"><strong className="text-sm">{label}</strong><small className="mt-1 block text-xs leading-5 text-muted-foreground">{description}</small><span className="mt-1 block truncate font-mono text-[11px] text-muted-foreground">{provider?.config.name} · {model?.display_name || model?.slug} · {preference.effort || reasoningDefault(model) || "default"}</span></span></div>
 }
 
 function RoleSelects({ preference, instances, onChange, className }: {
@@ -98,19 +98,19 @@ function RoleSelects({ preference, instances, onChange, className }: {
   className?: string
 }) {
   const fieldId = useId()
-  const provider = instances.find((candidate) => candidate.id === preference.provider_id) ?? instances[0]
-  const model = provider?.models.find((candidate) => candidate.id === preference.model)
+  const provider = instances.find((candidate) => candidate.id === preference.provider) ?? instances[0]
+  const model = provider?.models.find((candidate) => candidate.slug === preference.model)
   const reasoning = reasoningOptions(model)
   const changeProvider = (providerId: string) => {
     const next = instances.find((candidate) => candidate.id === providerId)
-    const modelId = next?.models.some((candidate) => candidate.id === preference.model) ? preference.model : next?.default_model || next?.models[0]?.id || ""
-    onChange({ provider_id: providerId, model: modelId, reasoning_effort: reasoningDefault(next?.models.find((candidate) => candidate.id === modelId)) })
+    const modelId = next?.models.some((candidate) => candidate.slug === preference.model) ? preference.model : next?.models[0]?.slug || ""
+    onChange({ provider: providerId, model: modelId, effort: reasoningDefault(next?.models.find((candidate) => candidate.slug === modelId)) })
   }
-  const changeModel = (modelId: string) => onChange({ ...preference, model: modelId, reasoning_effort: reasoningDefault(provider?.models.find((candidate) => candidate.id === modelId)) })
+  const changeModel = (modelId: string) => onChange({ ...preference, model: modelId, effort: reasoningDefault(provider?.models.find((candidate) => candidate.slug === modelId)) })
   return <FieldGroup className={cn("gap-3 md:grid md:grid-cols-3", className)}>
-    <Field><FieldLabel htmlFor={`${fieldId}-provider`}>Provider</FieldLabel><Select value={provider?.id} onValueChange={changeProvider}><SelectTrigger id={`${fieldId}-provider`} className="w-full"><SelectValue /></SelectTrigger><SelectContent><SelectGroup>{instances.map((item) => <SelectItem key={item.id} value={item.id}>{item.name}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>
-    <Field><FieldLabel htmlFor={`${fieldId}-model`}>Model</FieldLabel><Select value={preference.model} onValueChange={changeModel}><SelectTrigger id={`${fieldId}-model`} className="w-full"><SelectValue /></SelectTrigger><SelectContent><SelectGroup>{provider?.models.map((item) => <SelectItem key={item.id} value={item.id}>{item.name || item.display_name || item.id}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>
-    <Field><FieldLabel htmlFor={`${fieldId}-reasoning`}>Reasoning</FieldLabel>{reasoning.length > 0 ? <Select value={preference.reasoning_effort || "default"} onValueChange={(value: string) => onChange({ ...preference, reasoning_effort: value === "default" ? null : value })}><SelectTrigger id={`${fieldId}-reasoning`} className="w-full"><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="default">Model default</SelectItem>{reasoning.map((value) => <SelectItem key={value} value={value}>{value}</SelectItem>)}</SelectGroup></SelectContent></Select> : <div className="flex h-8 items-center text-xs text-muted-foreground">Not configurable</div>}</Field>
+    <Field><FieldLabel htmlFor={`${fieldId}-provider`}>Provider</FieldLabel><Select value={provider?.id} onValueChange={changeProvider}><SelectTrigger id={`${fieldId}-provider`} className="w-full"><SelectValue /></SelectTrigger><SelectContent><SelectGroup>{instances.map((item) => <SelectItem key={item.id} value={item.id}>{item.config.name}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>
+    <Field><FieldLabel htmlFor={`${fieldId}-model`}>Model</FieldLabel><Select value={preference.model} onValueChange={changeModel}><SelectTrigger id={`${fieldId}-model`} className="w-full"><SelectValue /></SelectTrigger><SelectContent><SelectGroup>{provider?.models.map((item) => <SelectItem key={item.slug} value={item.slug}>{item.display_name || item.slug}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>
+    <Field><FieldLabel htmlFor={`${fieldId}-reasoning`}>Reasoning</FieldLabel>{reasoning.length > 0 ? <Select value={preference.effort || "default"} onValueChange={(value: string) => onChange({ ...preference, effort: value === "default" ? null : value })}><SelectTrigger id={`${fieldId}-reasoning`} className="w-full"><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="default">Model default</SelectItem>{reasoning.map((value) => <SelectItem key={value} value={value}>{value}</SelectItem>)}</SelectGroup></SelectContent></Select> : <div className="flex h-8 items-center text-xs text-muted-foreground">Not configurable</div>}</Field>
   </FieldGroup>
 }
 
@@ -118,17 +118,17 @@ function buildForm(config: AgentConfigResponse | undefined, providers: ProviderI
   if (!config && providers.length === 0) return null
   const fallback = providers[0]
   const preference = (role: RoleId): AgentModelPreference => config?.[role] ?? {
-    provider_id: fallback?.id ?? "",
-    model: fallback?.default_model ?? fallback?.models[0]?.id ?? "",
-    reasoning_effort: null,
+    provider: fallback?.id ?? "",
+    model: fallback?.models[0]?.slug ?? "",
+    effort: null,
   }
   return { planner: preference("planner"), explorer: preference("explorer"), executor: preference("executor"), reviewer: preference("reviewer") }
 }
 
 function reasoningOptions(model?: ProviderInstance["models"][number]) {
-  return model?.reasoning?.candidates ?? model?.reasoning?.variants?.map((variant) => variant.id) ?? []
+  return model?.parameters?.find((parameter) => parameter.name === "effort")?.candidates ?? []
 }
 
 function reasoningDefault(model?: ProviderInstance["models"][number]) {
-  return model?.reasoning?.default ?? model?.reasoning?.default_variant ?? null
+  return reasoningOptions(model)[0] ?? null
 }
