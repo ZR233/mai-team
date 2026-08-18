@@ -1,5 +1,5 @@
 use mai_protocol::{GitTokenKind, GithubInstallationSummary, GithubRepositorySummary, preview};
-use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
@@ -179,6 +179,23 @@ pub(crate) async fn decode_github_response<T: DeserializeOwned>(
 ) -> Result<T> {
     let status = response.status();
     if status.is_success() {
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("missing");
+        let media_type = content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if media_type != "application/json" && !media_type.ends_with("+json") {
+            return Err(RuntimeError::InvalidInput(format!(
+                "GitHub {action} returned unsupported non-JSON content type `{content_type}`; \
+                 github_api_request GET supports JSON responses only and cannot download binary endpoints"
+            )));
+        }
         return Ok(response.json::<T>().await?);
     }
     let retry_after = github_retry_after(response.headers());
@@ -254,6 +271,7 @@ impl IfEmpty for &str {
 mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
@@ -276,5 +294,42 @@ mod tests {
             summary.events,
             vec!["pull_request".to_string(), "check_suite".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn successful_non_json_response_explains_the_json_only_contract() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock GitHub API");
+        let address = listener.local_addr().expect("mock address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.expect("read request");
+            let body = b"PK\x03\x04workflow logs";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/zip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response headers");
+            stream.write_all(body).await.expect("write response body");
+        });
+        let response = reqwest::get(format!("http://{address}/logs"))
+            .await
+            .expect("request mock GitHub API");
+
+        let error =
+            decode_github_response::<serde_json::Value>(response, "read project GitHub API")
+                .await
+                .expect_err("binary response is outside the JSON tool contract");
+
+        assert_eq!(
+            "invalid input: GitHub read project GitHub API returned unsupported non-JSON content type `application/zip`; github_api_request GET supports JSON responses only and cannot download binary endpoints",
+            error.to_string()
+        );
+        server.await.expect("mock server joins");
     }
 }
