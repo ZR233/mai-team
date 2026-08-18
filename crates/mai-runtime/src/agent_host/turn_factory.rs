@@ -5,7 +5,7 @@ use pl_core::{
     AgentTurnFactory, AgentTurnPreparationContext, ContextCompactionConfig,
     ContextCompactionReplacement, CoreRuntimeProfile, PreparedAgentTurn, PreparedSessionRuntime,
     RecentInteractionTailConfig, TurnEngineBuilder, TurnOptions, TurnRequest,
-    instruction::InstructionSnapshot,
+    instruction::InstructionProfile,
 };
 use pl_model::{OpenAiCompactionMode, create_provider_with_catalog};
 use tokio::sync::RwLock;
@@ -141,15 +141,30 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
             .as_deref()
             .map(|context| super::review_manifest::section(context, &skill_injections))
             .transpose()?;
-        let instructions = instructions_for_turn(
-            &config,
-            Some(&generated_instructions),
-            None,
-            workspace_instructions.as_deref(),
-        );
+        let mut instruction_profile =
+            InstructionProfile::new().with_developer_block("mai runtime", generated_instructions);
+        if !config.instructions.base.trim().is_empty() {
+            instruction_profile =
+                instruction_profile.with_base_system_prompt(config.instructions.base.clone());
+        }
+        if !config.instructions.developer.trim().is_empty() {
+            instruction_profile = instruction_profile.with_developer_block(
+                "mai config developer",
+                config.instructions.developer.clone(),
+            );
+        }
+        if !config.instructions.user.trim().is_empty() {
+            instruction_profile = instruction_profile
+                .with_user_context_block("mai config user", config.instructions.user.clone());
+        }
+        if let Some(workspace_instructions) = workspace_instructions {
+            instruction_profile =
+                instruction_profile.with_workspace_instructions(workspace_instructions);
+        }
         let profile = CoreRuntimeProfile::host_provided(
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         )
+        .with_instruction_profile(instruction_profile)
         .with_context_compaction(context_compaction());
         let mcp_shared_tools = if config.mcp.enabled {
             agent
@@ -177,11 +192,7 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
         .await?;
         web_search.install(&mut engine, &config.web_search)?;
         let request = TurnRequest::new(context.input.payload.message)
-            .with_turn_id(context.turn_id.to_string())
-            .with_instruction_snapshot(InstructionSnapshot::profile_base_override(
-                "mai instructions",
-                instructions,
-            ));
+            .with_turn_id(context.turn_id.to_string());
         let options = TurnOptions::default()
             // mai 的文件和进程工具都在 agent 容器内执行；产品级 effect policy
             // 已经完成授权，因此不能再按 server 主机路径触发人工审批。
@@ -215,28 +226,6 @@ pub(crate) async fn product_agent(
         ))
     })?;
     runtime.agent(id).await.map(|agent| (id, agent))
-}
-
-fn instructions_for_turn(
-    config: &MaiConfig,
-    generated: Option<&str>,
-    system_prompt: Option<&str>,
-    workspace_instructions: Option<&str>,
-) -> String {
-    [
-        Some(config.instructions.base.as_str()),
-        Some(config.instructions.developer.as_str()),
-        Some(config.instructions.user.as_str()),
-        generated,
-        system_prompt,
-        workspace_instructions,
-    ]
-    .into_iter()
-    .flatten()
-    .map(str::trim)
-    .filter(|value| !value.is_empty())
-    .collect::<Vec<_>>()
-    .join("\n\n")
 }
 
 fn apply_skill_policy(

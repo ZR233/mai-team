@@ -178,6 +178,18 @@ fn container_tools_do_not_request_host_path_approval() {
 }
 
 #[test]
+fn product_instructions_are_overlays_on_the_pl_base_prompt() {
+    let turn_factory = include_str!("agent_host/turn_factory.rs");
+
+    assert!(turn_factory.contains("InstructionProfile::new()"));
+    assert!(turn_factory.contains(".with_instruction_profile(instruction_profile)"));
+    assert!(turn_factory.contains(".with_developer_block(\"mai runtime\""));
+    assert!(turn_factory.contains(".with_user_context_block(\"mai config user\""));
+    assert!(!turn_factory.contains("InstructionSnapshot::profile_base_override"));
+    assert!(!turn_factory.contains("with_instruction_snapshot"));
+}
+
+#[test]
 fn product_agent_id_is_submitted_as_the_canonical_thread_identity() {
     let agent_api = include_str!("runtime_agent_api.rs");
 

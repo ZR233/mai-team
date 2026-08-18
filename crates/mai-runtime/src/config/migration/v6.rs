@@ -13,10 +13,11 @@ use pl_model::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::v8::LegacyRetentionConfig;
 use super::{backup_document, canonicalize_preset_providers, set_supported_connection_mode};
 use crate::config::{
     MAI_CONFIG_SCHEMA_VERSION, MaiConfig, MaiContainerConfig, MaiGithubConfig,
-    MaiInstructionsConfig, MaiMcpConfig, MaiRetentionConfig, MaiReviewConfig, MaiSkillsConfig,
+    MaiInstructionsConfig, MaiMcpConfig, MaiReviewConfig, MaiSkillsConfig,
 };
 use crate::{Result, RuntimeError};
 
@@ -39,7 +40,7 @@ pub(super) struct SchemaSixMaiConfig {
     #[serde(default)]
     review: MaiReviewConfig,
     #[serde(default)]
-    retention: MaiRetentionConfig,
+    retention: LegacyRetentionConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -163,7 +164,7 @@ pub(super) async fn migrate(
         mcp: legacy.mcp,
         github: legacy.github,
         review: legacy.review,
-        retention: legacy.retention,
+        retention: legacy.retention.into_current(),
     };
     canonicalize_preset_providers(&mut config.models)?;
     config.validate()?;
@@ -354,7 +355,7 @@ mod tests {
             mcp: MaiMcpConfig::default(),
             github: MaiGithubConfig::default(),
             review: MaiReviewConfig::default(),
-            retention: MaiRetentionConfig::default(),
+            retention: LegacyRetentionConfig::default(),
         };
         documents.save(&legacy).await.expect("save schema 6");
 

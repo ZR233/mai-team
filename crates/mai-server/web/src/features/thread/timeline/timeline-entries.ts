@@ -17,6 +17,7 @@ export type TimelineEntry =
   | { kind: "item"; key: string; item: ThreadItem }
   | { kind: "tool"; key: string; activity: ToolActivity }
   | { kind: "toolGroup"; key: string; group: ToolActivityGroup }
+  | { kind: "reasoningGroup"; key: string; group: ReasoningActivityGroup }
 
 export interface ToolActivityGroup {
   activities: ToolActivity[]
@@ -28,9 +29,19 @@ export interface ToolActivityGroup {
   failedCount: number
 }
 
+export type ReasoningItem = ThreadItem & { content: Extract<ThreadItem["content"], { type: "reasoning" }> }
+
+export interface ReasoningActivityGroup {
+  items: ReasoningItem[]
+  latestSummary: string | null
+  durationLabel: string | null
+  active: boolean
+}
+
 export function buildTimelineEntries(items: ThreadItem[]): TimelineEntry[] {
   const entries: TimelineEntry[] = []
   let pendingTools: ToolCallItem[] = []
+  let pendingReasoning: ReasoningItem[] = []
 
   const flushTools = () => {
     if (pendingTools.length === 0) return
@@ -43,27 +54,100 @@ export function buildTimelineEntries(items: ThreadItem[]): TimelineEntry[] {
     pendingTools = []
   }
 
-  for (const item of items) {
+  const flushReasoning = () => {
+    if (pendingReasoning.length === 0) return
+    const [first] = pendingReasoning
+    entries.push({
+      kind: "reasoningGroup",
+      key: `reasoning-group:${first.id}`,
+      group: buildReasoningActivityGroup(pendingReasoning),
+    })
+    pendingReasoning = []
+  }
+
+  const ordered = [...items].sort((left, right) => left.ordinal - right.ordinal || left.id.localeCompare(right.id))
+  for (const item of ordered) {
+    if (!isVisibleItem(item)) continue
     const currentTurnId = pendingTools[0]?.turnId
     // 只有与当前待分组段同 turn 的 toolCall 才能继续并入。
     if (isToolCallItem(item) && (currentTurnId === undefined || item.turnId === currentTurnId)) {
+      flushReasoning()
       pendingTools.push(item)
       continue
     }
     flushTools()
     if (isToolCallItem(item)) {
+      flushReasoning()
       pendingTools.push(item)
+    } else if (isReasoningItem(item)) {
+      const reasoningTurnId = pendingReasoning[0]?.turnId
+      if (reasoningTurnId !== undefined && item.turnId !== reasoningTurnId) flushReasoning()
+      pendingReasoning.push(item)
     } else {
+      flushReasoning()
       entries.push({ kind: "item", key: item.id, item })
     }
   }
   flushTools()
+  flushReasoning()
 
   return entries
 }
 
 function isToolCallItem(item: ThreadItem): item is ToolCallItem {
   return item.content.type === "toolCall"
+}
+
+function isReasoningItem(item: ThreadItem): item is ReasoningItem {
+  return item.content.type === "reasoning"
+}
+
+function isVisibleItem(item: ThreadItem): boolean {
+  switch (item.content.type) {
+    case "file":
+    case "contextCompaction":
+      return false
+    case "reasoning":
+      return [...(item.content.summary ?? []), ...(item.content.content ?? [])].some((part) => part.trim().length > 0)
+    case "userMessage":
+    case "agentMessage":
+    case "plan":
+    case "toolCall":
+      return true
+  }
+}
+
+function buildReasoningActivityGroup(items: ReasoningItem[]): ReasoningActivityGroup {
+  const active = items.some((item) => !isTerminalItem(item))
+  const startedAt = Math.min(...items.map((item) => item.createdAt))
+  const endedAt = Math.max(...items.map((item) => item.completedAt ?? item.updatedAt))
+  return {
+    items: [...items],
+    latestSummary: [...items]
+      .reverse()
+      .flatMap((item) => [...(item.content.summary ?? [])].reverse())
+      .map((summary) => summary.trim())
+      .find(Boolean) ?? null,
+    durationLabel: active ? null : formatDuration(startedAt, endedAt),
+    active,
+  }
+}
+
+function isTerminalItem(item: ThreadItem): boolean {
+  switch (item.status) {
+    case "completed":
+    case "failed":
+    case "interrupted":
+    case "budgetLimited":
+    case "denied":
+      return true
+    case "started":
+    case "streaming":
+    case "awaitingApproval":
+    case "approved":
+    case "running":
+      return false
+  }
 }
 
 function buildToolActivityGroup(items: ToolCallItem[]): ToolActivityGroup {

@@ -11,25 +11,25 @@ import { useEffect, useState } from "react"
 import { Markdown } from "@/components/markdown"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { cn } from "@/lib/utils"
-import type { ThreadItem, ThreadItemContent } from "@/events/thread-events.generated"
+import type { ReasoningActivityGroup } from "./timeline-entries"
 
-import { formatDuration } from "./duration"
-
-/** content.type === "reasoning" 的 ThreadItem。 */
-export type ReasoningItem = ThreadItem & { content: Extract<ThreadItemContent, { type: "reasoning" }> }
-
-export function ReasoningEntry({ item }: { item: ReasoningItem }) {
-  const completed = item.status === "completed"
-  const [open, setOpen] = useState(!completed)
+export function ReasoningEntry({ group }: { group: ReasoningActivityGroup }) {
+  const [open, setOpen] = useState(group.active)
 
   // 仅在状态跳变为完成时收起一次；用户随后的手动展开不受影响。
   useEffect(() => {
-    if (completed) setOpen(false)
-  }, [completed])
+    if (!group.active) setOpen(false)
+  }, [group.active])
 
-  const duration = formatDuration(item.createdAt, item.completedAt ?? item.updatedAt)
-  const label = completed ? (duration ? `Thought for ${duration}` : "Thought") : "Thinking"
-  const text = [...(item.content.summary ?? []), ...(item.content.content ?? [])].join("\n\n")
+  const fallback = group.active ? "Thinking" : group.durationLabel ? `Thought for ${group.durationLabel}` : "Thought"
+  const label = group.latestSummary
+    ? `${group.latestSummary}${group.durationLabel ? ` · ${group.durationLabel}` : ""}`
+    : fallback
+  const text = group.items
+    .flatMap((item) => [...(item.content.summary ?? []), ...(item.content.content ?? [])])
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join("\n\n")
 
   return (
     <Collapsible open={open} onOpenChange={setOpen}>
@@ -39,7 +39,7 @@ export function ReasoningEntry({ item }: { item: ReasoningItem }) {
       >
         <Brain className="size-4 shrink-0" aria-hidden="true" />
         <span className="min-w-0 flex-1 truncate font-medium">{label}</span>
-        {!completed && <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-muted-foreground/70 motion-reduce:animate-none" aria-hidden="true" />}
+        {group.active && <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-muted-foreground/70 motion-reduce:animate-none" aria-hidden="true" />}
         <ChevronDown
           className={cn("size-3.5 shrink-0 transition-transform motion-reduce:transition-none", open && "rotate-180")}
           aria-hidden="true"
@@ -47,7 +47,7 @@ export function ReasoningEntry({ item }: { item: ReasoningItem }) {
       </CollapsibleTrigger>
       <CollapsibleContent>
         <div className="border-l-2 py-1 pr-2 pl-3 text-muted-foreground">
-          {text ? <Markdown>{text}</Markdown> : <p className="text-sm">No reasoning content was recorded.</p>}
+          <Markdown>{text}</Markdown>
         </div>
       </CollapsibleContent>
     </Collapsible>

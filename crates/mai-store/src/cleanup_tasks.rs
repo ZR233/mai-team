@@ -146,11 +146,13 @@ impl MaiStore {
                 connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let task_id = transaction
                 .query_row(
-                    "SELECT id FROM project_review_cleanup_tasks
-                     WHERE status IN ('pending','retry_waiting','running')
-                     AND (next_attempt_at IS NULL OR next_attempt_at <= ?1)
-                     AND (lease_expires_at IS NULL OR lease_expires_at <= ?1)
-                     ORDER BY created_at ASC, id ASC LIMIT 1",
+                    "SELECT task.id FROM project_review_cleanup_tasks task
+                     JOIN project_review_jobs job ON job.id = task.job_id
+                     WHERE task.status IN ('pending','retry_waiting','running')
+                     AND job.active_run_id IS NULL
+                     AND (task.next_attempt_at IS NULL OR task.next_attempt_at <= ?1)
+                     AND (task.lease_expires_at IS NULL OR task.lease_expires_at <= ?1)
+                     ORDER BY task.created_at ASC, task.id ASC LIMIT 1",
                     params![now.to_rfc3339()],
                     |row| row.get::<_, String>(0),
                 )

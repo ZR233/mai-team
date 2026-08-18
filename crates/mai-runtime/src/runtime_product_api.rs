@@ -159,11 +159,9 @@ impl AgentRuntime {
         limit: usize,
     ) -> Result<ProjectReviewRunsResponse> {
         self.project(project_id).await?;
-        let retention_days = self.mai_config.read().await.retention.review_runs_days;
         projects::review::runs::list_project_review_runs(
             &self.deps.store,
             project_id,
-            retention_days,
             offset,
             limit,
         )
@@ -222,7 +220,7 @@ impl AgentRuntime {
         let attempts = self
             .deps
             .store
-            .load_project_review_job_attempts(job_id)
+            .load_project_review_job_attempts(job_id, summary.attempt_count)
             .await?;
         Ok(ProjectReviewJobDetail { summary, attempts })
     }

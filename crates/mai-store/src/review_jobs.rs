@@ -9,6 +9,7 @@ use crate::records::ProjectReviewJobRecord;
 use crate::*;
 
 mod aggregation;
+mod attempts;
 pub(crate) mod storage;
 
 use storage::*;
@@ -58,54 +59,70 @@ impl MaiStore {
         batch_size: usize,
     ) -> Result<usize> {
         let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut connection = open_review_job_connection(&path)?;
-            let transaction =
-                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let job_ids = {
-                let mut statement = transaction.prepare(
-                    "SELECT job.id FROM project_review_jobs job
+        crate::sqlite_busy::retry_sqlite_busy(|| {
+            let path = path.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let mut connection = open_review_job_connection(&path)?;
+                    let transaction = connection
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    let job_ids = {
+                        let mut statement = transaction.prepare(
+                            "SELECT job.id FROM project_review_jobs job
                      WHERE job.status IN (
                          'succeeded','failed','cancelled','superseded','skipped'
                      )
                        AND job.finished_at IS NOT NULL
                        AND job.finished_at < ?1
-                       AND (job.lease_expires_at IS NULL OR job.lease_expires_at <= ?2)
+                       AND (
+                           job.lease_owner IS NULL
+                           OR (
+                               job.lease_expires_at IS NOT NULL
+                               AND job.lease_expires_at <= ?2
+                           )
+                       )
                        AND NOT EXISTS (
                            SELECT 1 FROM project_review_cleanup_tasks cleanup
                            WHERE cleanup.job_id = job.id
                              AND cleanup.status != 'succeeded'
                        )
                      ORDER BY job.finished_at ASC, job.id ASC LIMIT ?3",
-                )?;
-                statement
-                    .query_map(
-                        params![
-                            cutoff.to_rfc3339(),
-                            now.to_rfc3339(),
-                            usize_to_i64(batch_size)
-                        ],
-                        |row| row.get::<_, String>(0),
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            for job_id in &job_ids {
-                transaction.execute(
-                    "DELETE FROM project_review_cleanup_tasks WHERE job_id = ?1",
-                    params![job_id],
-                )?;
-                transaction.execute(
-                    "DELETE FROM project_review_jobs WHERE id = ?1",
-                    params![job_id],
-                )?;
+                        )?;
+                        statement
+                            .query_map(
+                                params![
+                                    cutoff.to_rfc3339(),
+                                    now.to_rfc3339(),
+                                    usize_to_i64(batch_size)
+                                ],
+                                |row| row.get::<_, String>(0),
+                            )?
+                            .collect::<rusqlite::Result<Vec<_>>>()?
+                    };
+                    for job_id in &job_ids {
+                        transaction.execute(
+                            "DELETE FROM project_review_runs WHERE job_id = ?1",
+                            params![job_id],
+                        )?;
+                        transaction.execute(
+                            "DELETE FROM project_review_cleanup_tasks WHERE job_id = ?1",
+                            params![job_id],
+                        )?;
+                        transaction.execute(
+                            "DELETE FROM project_review_jobs WHERE id = ?1",
+                            params![job_id],
+                        )?;
+                    }
+                    transaction.commit()?;
+                    Ok(job_ids.len())
+                })
+                .await
+                .map_err(|error| {
+                    StoreError::InvalidConfig(format!("review job retention task failed: {error}"))
+                })?
             }
-            transaction.commit()?;
-            Ok(job_ids.len())
         })
         .await
-        .map_err(|error| {
-            StoreError::InvalidConfig(format!("review job retention task failed: {error}"))
-        })?
     }
 
     pub async fn load_active_project_review_job_for_pr(
@@ -420,36 +437,6 @@ impl MaiStore {
         })?
     }
 
-    pub async fn load_project_review_job_attempts(
-        &self,
-        job_id: Uuid,
-    ) -> Result<Vec<ProjectReviewRunSummary>> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
-            let connection = open_review_job_connection(&path)?;
-            let mut statement = connection.prepare(
-                "SELECT id, project_id, job_id, attempt_index, reviewer_agent_id, turn_id, \
-                 started_at, finished_at, status, outcome, review_event, pr, summary, error, \
-                 failure_json, input_tokens, cached_input_tokens, output_tokens, \
-                 reasoning_output_tokens, total_tokens \
-                 FROM project_review_runs WHERE job_id = ?1 ORDER BY attempt_index ASC, started_at ASC",
-            )?;
-            let rows = statement.query_map(
-                params![job_id.to_string()],
-                project_review_run_summary_record,
-            )?;
-            let mut attempts = Vec::new();
-            for row in rows {
-                attempts.push(row?.into_summary()?);
-            }
-            Ok(attempts)
-        })
-        .await
-        .map_err(|error| {
-            StoreError::InvalidConfig(format!("review job attempts task failed: {error}"))
-        })?
-    }
-
     pub async fn claim_due_project_review_job(
         &self,
         project_id: ProjectId,
@@ -479,8 +466,11 @@ impl MaiStore {
             let connection = open_review_job_connection(&path)?;
             let changed = connection.execute(
                 "UPDATE project_review_jobs SET updated_at = ?1, lease_expires_at = ?2 \
-                 WHERE id = ?3 AND lease_owner = ?4 AND status IN \
-                 ('preparing','running','submission_pending','reconciling')",
+                 WHERE id = ?3 AND lease_owner = ?4 AND (status IN \
+                 ('preparing','running','submission_pending','reconciling') OR ( \
+                     status = 'succeeded' AND submission_receipt_json IS NOT NULL \
+                     AND active_run_id IS NOT NULL \
+                 ))",
                 params![
                     updated_at.to_rfc3339(),
                     lease_expires_at.to_rfc3339(),
@@ -772,14 +762,11 @@ fn claim_due_job_on_path(
     } else {
         ProjectReviewJobStatus::Preparing
     };
-    let attempt_increment = i64::from(next_status == ProjectReviewJobStatus::Preparing);
     transaction.execute(
-        "UPDATE project_review_jobs SET status = ?1, attempt_count = attempt_count + ?2, \
-         next_attempt_at = NULL, lease_owner = ?3, lease_expires_at = ?4, updated_at = ?5 \
-         WHERE id = ?6",
+        "UPDATE project_review_jobs SET status = ?1, next_attempt_at = NULL, \
+         lease_owner = ?2, lease_expires_at = ?3, updated_at = ?4 WHERE id = ?5",
         params![
             next_status.to_string(),
-            attempt_increment,
             owner,
             lease_expires_at.to_rfc3339(),
             now.to_rfc3339(),
@@ -827,13 +814,15 @@ fn recover_jobs_on_path(
     let changed = transaction.execute(
         "UPDATE project_review_jobs SET \
          status = CASE WHEN submission_intent_json IS NULL THEN 'retry_waiting' ELSE 'reconciling' END, \
-         next_attempt_at = ?1, updated_at = ?1, lease_owner = NULL, lease_expires_at = NULL \
+         next_attempt_at = ?1, updated_at = ?1, active_run_id = NULL, \
+         lease_owner = NULL, lease_expires_at = NULL \
          WHERE status IN ('preparing','running','submission_pending','reconciling') \
          AND (?2 = 1 OR lease_expires_at IS NULL OR lease_expires_at <= ?1)",
         params![now, recover_all],
     )?;
     transaction.execute(
-        "UPDATE project_review_runs SET status = 'interrupted', finished_at = ?1 \
+        "UPDATE project_review_runs SET status = 'interrupted', finished_at = ?1, \
+         error = COALESCE(error, 'review attempt was interrupted by server recovery') \
          WHERE finished_at IS NULL AND job_id IN (SELECT id FROM project_review_jobs \
          WHERE status IN ('retry_waiting','reconciling'))",
         params![now],
@@ -920,11 +909,91 @@ fn record_submission_receipt_on_path(
                 "review job already has a different submission receipt".to_string(),
             ));
         }
+        let job = existing.into_summary()?;
+        ensure_project_review_cleanup_tasks(&transaction, job_id, receipt.submitted_at)?;
+        transaction.commit()?;
+        return Ok(job);
+    }
+    let intent = existing
+        .submission_intent_json
+        .as_deref()
+        .ok_or_else(|| {
+            StoreError::DataIntegrity(format!(
+                "review job {job_id} received a submission receipt without an intent"
+            ))
+        })
+        .and_then(|intent| {
+            serde_json::from_str::<ProjectReviewSubmissionIntent>(intent).map_err(Into::into)
+        })?;
+    if intent.job_id != job_id
+        || intent.head_sha != receipt.head_sha
+        || intent.event != receipt.event
+    {
+        return Err(StoreError::DataIntegrity(format!(
+            "review job {job_id} submission receipt does not match its intent"
+        )));
+    }
+    if !matches!(
+        existing.status.as_str(),
+        "submission_pending" | "reconciling"
+    ) {
+        return Err(StoreError::DataIntegrity(format!(
+            "review job {job_id} cannot accept a receipt while {}",
+            existing.status
+        )));
+    }
+    if existing.active_run_id.is_none() {
+        let archived_run = transaction
+            .query_row(
+                "SELECT id, reviewer_agent_id, turn_id, finished_at, history_json
+                 FROM project_review_runs WHERE job_id = ?1
+                 ORDER BY attempt_index DESC, started_at DESC, id DESC LIMIT 1",
+                params![job_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match archived_run {
+            Some((run_id, reviewer_agent_id, turn_id, finished_at, history_json)) => {
+                if finished_at.is_none()
+                    || (reviewer_agent_id.is_some() && turn_id.is_some() && history_json.is_none())
+                {
+                    return Err(StoreError::DataIntegrity(format!(
+                        "review job {job_id} cannot reconcile receipt before Run {run_id} is archived"
+                    )));
+                }
+                let changed = transaction.execute(
+                    "UPDATE project_review_runs SET status = 'succeeded',
+                     outcome = 'review_submitted', review_event = ?1,
+                     summary = COALESCE(summary, 'GitHub review submission recorded.'),
+                     error = NULL, failure_json = NULL WHERE id = ?2 AND finished_at IS NOT NULL",
+                    params![receipt.event.to_string(), run_id],
+                )?;
+                if changed != 1 {
+                    return Err(StoreError::DataIntegrity(format!(
+                        "review job {job_id} archived Run changed during receipt reconciliation"
+                    )));
+                }
+            }
+            None if existing.attempt_count > 0 => {
+                return Err(StoreError::DataIntegrity(format!(
+                    "review job {job_id} has attempts but no Run for receipt reconciliation"
+                )));
+            }
+            None => {}
+        }
     }
     transaction.execute(
         "UPDATE project_review_jobs SET status = 'succeeded', submission_receipt_json = ?1, \
-         finished_at = ?2, updated_at = ?2, next_attempt_at = NULL, active_run_id = NULL, \
-         lease_owner = NULL, lease_expires_at = NULL, failure_json = NULL, skip_reason = NULL \
+         finished_at = ?2, updated_at = ?2, next_attempt_at = NULL, \
+         failure_json = NULL, skip_reason = NULL \
          WHERE id = ?3",
         params![
             serde_json::to_string(&receipt)?,

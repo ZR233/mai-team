@@ -59,9 +59,8 @@ impl From<mai_store::StoreError> for ApiError {
         use mai_store::StoreError::*;
         let status = match &value {
             InvalidConfig(_) | Parse(_) => StatusCode::BAD_REQUEST,
-            Toasty(_) | Io(_) | Json(_) | Sqlite(_) | Toml(_) | TomlSer(_) | Time(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Toasty(_) | Io(_) | Json(_) | Sqlite(_) | Toml(_) | TomlSer(_) | Time(_)
+            | DataIntegrity(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
             status,

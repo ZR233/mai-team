@@ -221,11 +221,7 @@ fn load_history_page(
     offset: i64,
 ) -> Result<Vec<ProjectPullRequestReviewHistoryItem>> {
     let sql = format!(
-        "SELECT {PROJECT_REVIEW_JOB_COLUMNS},
-                EXISTS(
-                    SELECT 1 FROM project_review_runs
-                    WHERE project_review_runs.job_id = project_review_jobs.id
-                ) AS has_attempts
+        "SELECT {PROJECT_REVIEW_JOB_COLUMNS}
          FROM project_review_jobs
          WHERE project_id = ?1 AND pr = ?2
          ORDER BY created_at DESC, id DESC LIMIT ?3 OFFSET ?4"
@@ -233,14 +229,12 @@ fn load_history_page(
     let mut statement = transaction.prepare(&sql)?;
     let rows = statement.query_map(
         params![project_id.to_string(), u64_to_i64(pr), page_size, offset],
-        |row| Ok((project_review_job_record(row)?, row.get::<_, bool>(24)?)),
+        project_review_job_record,
     )?;
     let mut items = Vec::new();
     for row in rows {
-        let (record, has_attempts) = row?;
         items.push(ProjectPullRequestReviewHistoryItem {
-            job: record.into_summary()?,
-            has_attempts,
+            job: row?.into_summary()?,
         });
     }
     Ok(items)

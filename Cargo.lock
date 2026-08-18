@@ -2505,7 +2505,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "pl-core"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b1501941fa467c160866dce6da070cdec254693b#b1501941fa467c160866dce6da070cdec254693b"
+source = "git+https://github.com/ZR233/pure-lang.git?rev=85b77bda795e10dce0f223d9f5dbb408069c9fb6#85b77bda795e10dce0f223d9f5dbb408069c9fb6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2545,7 +2545,7 @@ dependencies = [
 [[package]]
 name = "pl-lsp"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b1501941fa467c160866dce6da070cdec254693b#b1501941fa467c160866dce6da070cdec254693b"
+source = "git+https://github.com/ZR233/pure-lang.git?rev=85b77bda795e10dce0f223d9f5dbb408069c9fb6#85b77bda795e10dce0f223d9f5dbb408069c9fb6"
 dependencies = [
  "futures",
  "lsp-server",
@@ -2564,7 +2564,7 @@ dependencies = [
 [[package]]
 name = "pl-model"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b1501941fa467c160866dce6da070cdec254693b#b1501941fa467c160866dce6da070cdec254693b"
+source = "git+https://github.com/ZR233/pure-lang.git?rev=85b77bda795e10dce0f223d9f5dbb408069c9fb6#85b77bda795e10dce0f223d9f5dbb408069c9fb6"
 dependencies = [
  "async-openai",
  "bitflags 2.11.1",
@@ -2585,7 +2585,7 @@ dependencies = [
 [[package]]
 name = "pl-output"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b1501941fa467c160866dce6da070cdec254693b#b1501941fa467c160866dce6da070cdec254693b"
+source = "git+https://github.com/ZR233/pure-lang.git?rev=85b77bda795e10dce0f223d9f5dbb408069c9fb6#85b77bda795e10dce0f223d9f5dbb408069c9fb6"
 dependencies = [
  "serde",
 ]
@@ -2593,7 +2593,7 @@ dependencies = [
 [[package]]
 name = "pl-patch"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b1501941fa467c160866dce6da070cdec254693b#b1501941fa467c160866dce6da070cdec254693b"
+source = "git+https://github.com/ZR233/pure-lang.git?rev=85b77bda795e10dce0f223d9f5dbb408069c9fb6#85b77bda795e10dce0f223d9f5dbb408069c9fb6"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -2601,7 +2601,7 @@ dependencies = [
 [[package]]
 name = "pl-protocol"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b1501941fa467c160866dce6da070cdec254693b#b1501941fa467c160866dce6da070cdec254693b"
+source = "git+https://github.com/ZR233/pure-lang.git?rev=85b77bda795e10dce0f223d9f5dbb408069c9fb6#85b77bda795e10dce0f223d9f5dbb408069c9fb6"
 dependencies = [
  "serde",
  "serde_json",
@@ -2611,7 +2611,7 @@ dependencies = [
 [[package]]
 name = "pl-skill-core"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b1501941fa467c160866dce6da070cdec254693b#b1501941fa467c160866dce6da070cdec254693b"
+source = "git+https://github.com/ZR233/pure-lang.git?rev=85b77bda795e10dce0f223d9f5dbb408069c9fb6#85b77bda795e10dce0f223d9f5dbb408069c9fb6"
 dependencies = [
  "gray_matter",
  "serde",
@@ -2621,7 +2621,7 @@ dependencies = [
 [[package]]
 name = "pl-trace"
 version = "0.1.0"
-source = "git+https://github.com/ZR233/pure-lang.git?rev=b1501941fa467c160866dce6da070cdec254693b#b1501941fa467c160866dce6da070cdec254693b"
+source = "git+https://github.com/ZR233/pure-lang.git?rev=85b77bda795e10dce0f223d9f5dbb408069c9fb6#85b77bda795e10dce0f223d9f5dbb408069c9fb6"
 dependencies = [
  "pl-protocol",
  "serde",

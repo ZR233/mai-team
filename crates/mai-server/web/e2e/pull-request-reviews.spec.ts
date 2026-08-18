@@ -91,14 +91,14 @@ async function installReviewFixture(page: Page) {
       return json(route, { checked: 2, newly_merged: 0, newly_closed: 0 })
     }
     if (path === "/projects/project-1/pull-request-reviews/41/history") return json(route, {
-      items: [{ job: approvedReviewJob("approved-job", 41), has_attempts: false }],
+      items: [{ job: approvedReviewJob("approved-job", 41) }],
       page: 1,
       page_size: 20,
       total_items: 1,
       total_pages: 1,
     })
     if (path === "/projects/project-1/pull-request-reviews/40/history") return json(route, {
-      items: [{ job: approvedReviewJob("closed-job", 40), has_attempts: false }],
+      items: [{ job: approvedReviewJob("closed-job", 40) }],
       page: 1,
       page_size: 20,
       total_items: 1,
@@ -106,8 +106,8 @@ async function installReviewFixture(page: Page) {
     })
     if (path === "/projects/project-1/pull-request-reviews/42/history") return json(route, {
       items: [
-        { job: reviewJob("skipped-job", 42, "skipped", 0), has_attempts: false },
-        { job: reviewJob("executed-job", 42, "succeeded", 1), has_attempts: true },
+        { job: reviewJob("skipped-job", 42, "skipped", 0) },
+        { job: reviewJob("executed-job", 42, "succeeded", 1) },
       ],
       page: 1,
       page_size: 20,

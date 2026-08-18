@@ -23,7 +23,7 @@ pub(crate) trait ProjectReviewCleanupOps: Send + Sync {
         batch_size: usize,
     ) -> impl Future<Output = Result<usize>> + Send;
 
-    fn prune_project_review_runs_before(
+    fn prune_orphan_project_review_runs_before(
         &self,
         cutoff: DateTime<Utc>,
         batch_size: usize,
@@ -222,18 +222,29 @@ pub(crate) async fn cleanup_project_review_history(
     let now = Utc::now();
     let retention = ops.retention_config().await;
     let batch_size = retention.cleanup_batch_size;
-    let removed_jobs = ops
-        .prune_project_review_jobs_before(
-            now - TimeDelta::days(retention.review_jobs_days),
-            batch_size,
-        )
-        .await?;
-    let removed_runs = ops
-        .prune_project_review_runs_before(
-            now - TimeDelta::days(retention.review_runs_days),
-            batch_size,
-        )
-        .await?;
+    let review_cutoff = now - TimeDelta::days(retention.review_history_days);
+    let mut removed_jobs = 0;
+    loop {
+        let removed = ops
+            .prune_project_review_jobs_before(review_cutoff, batch_size)
+            .await?;
+        removed_jobs += removed;
+        if removed < batch_size {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let mut removed_orphan_runs = 0;
+    loop {
+        let removed = ops
+            .prune_orphan_project_review_runs_before(review_cutoff, batch_size)
+            .await?;
+        removed_orphan_runs += removed;
+        if removed < batch_size {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     let product_event_cutoff = now - TimeDelta::days(retention.product_events_days);
     let removed_events = ops
         .prune_product_events_before(product_event_cutoff, batch_size)
@@ -272,7 +283,7 @@ pub(crate) async fn cleanup_project_review_history(
         tokio::task::yield_now().await;
     }
     if removed_jobs > 0
-        || removed_runs > 0
+        || removed_orphan_runs > 0
         || removed_events > 0
         || removed_events_by_limit > 0
         || removed_logs > 0
@@ -281,7 +292,7 @@ pub(crate) async fn cleanup_project_review_history(
     {
         tracing::info!(
             removed_jobs,
-            removed_runs,
+            removed_orphan_runs,
             removed_events,
             removed_events_by_limit,
             removed_logs,
@@ -308,6 +319,9 @@ mod tests {
     #[derive(Default)]
     struct FakeCleanupOps {
         product_event_limits: Arc<Mutex<Vec<usize>>>,
+        review_cutoffs: Arc<Mutex<Vec<DateTime<Utc>>>>,
+        review_job_batches: Arc<Mutex<Vec<usize>>>,
+        orphan_run_batches: Arc<Mutex<Vec<usize>>>,
     }
 
     impl ProjectReviewCleanupOps for FakeCleanupOps {
@@ -317,18 +331,30 @@ mod tests {
 
         async fn prune_project_review_jobs_before(
             &self,
-            _cutoff: DateTime<Utc>,
+            cutoff: DateTime<Utc>,
             _batch_size: usize,
         ) -> Result<usize> {
-            Ok(0)
+            self.review_cutoffs.lock().await.push(cutoff);
+            let mut batches = self.review_job_batches.lock().await;
+            Ok(if batches.is_empty() {
+                0
+            } else {
+                batches.remove(0)
+            })
         }
 
-        async fn prune_project_review_runs_before(
+        async fn prune_orphan_project_review_runs_before(
             &self,
-            _cutoff: DateTime<Utc>,
+            cutoff: DateTime<Utc>,
             _batch_size: usize,
         ) -> Result<usize> {
-            Ok(0)
+            self.review_cutoffs.lock().await.push(cutoff);
+            let mut batches = self.orphan_run_batches.lock().await;
+            Ok(if batches.is_empty() {
+                0
+            } else {
+                batches.remove(0)
+            })
         }
 
         async fn prune_product_events_before(
@@ -423,6 +449,22 @@ mod tests {
             *ops.product_event_limits.lock().await,
             vec![PROJECT_REVIEW_PRODUCT_EVENT_LIMIT]
         );
+        let review_cutoffs = ops.review_cutoffs.lock().await;
+        assert_eq!(review_cutoffs.len(), 2);
+        assert_eq!(review_cutoffs[0], review_cutoffs[1]);
+    }
+
+    #[tokio::test]
+    async fn cleanup_drains_review_history_batches_in_one_cycle() {
+        let ops = FakeCleanupOps::default();
+        *ops.review_job_batches.lock().await = vec![500, 500, 13];
+        *ops.orphan_run_batches.lock().await = vec![500, 2];
+
+        cleanup_project_review_history(&ops).await.expect("cleanup");
+
+        assert_eq!(5, ops.review_cutoffs.lock().await.len());
+        assert!(ops.review_job_batches.lock().await.is_empty());
+        assert!(ops.orphan_run_batches.lock().await.is_empty());
     }
 
     #[test]

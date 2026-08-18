@@ -11,7 +11,11 @@ mai 是基于 `pl-core` 的定制化 agent 产品。`pl-core` 唯一拥有 agent
 
 - repository：将 `ThreadActorState`、mailbox、Turn、Item、interaction、transcript、inference、
   trace、notification 和 snapshot 原子写入 mai-store，并执行 revision CAS。
-- turn factory：解析 `MaiConfig` 的动态角色路由，组合 instructions、skills、MCP 和工具。
+- turn factory：解析 `MaiConfig` 的动态角色路由，通过 PL `InstructionProfile` 分层组合
+  instructions、skills、MCP 和工具。PL 始终拥有模型或内置 base prompt 的选择与 assembly；
+  Mai 只提供宿主 developer、user 和 workspace overlay。只有显式配置
+  `MaiConfig.instructions.base` 时才覆盖 base，禁止把产品指令拼成
+  `InstructionSnapshot::profile_base_override` 后整体替换 PL base。
 - lifecycle：创建/回滚容器与 workspace，关闭时清理 descendants、MCP 和资源。
 - observer：只处理 PL commit 已成功持久化后的产品 read model、日志、tool trace 和低频
   `MaiProductEvent`；不再把 trace 映射成另一套 UI Thread event。

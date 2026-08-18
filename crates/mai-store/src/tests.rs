@@ -659,12 +659,12 @@ async fn project_review_runs_round_trip_and_prune() {
     );
 
     let removed = store
-        .prune_project_review_runs_before(Utc::now() - chrono::TimeDelta::days(2))
+        .prune_orphan_project_review_runs_before(Utc::now() - chrono::TimeDelta::days(2))
         .await
         .expect("no prune");
     assert_eq!(removed, 0);
     let removed = store
-        .prune_project_review_runs_before(Utc::now())
+        .prune_orphan_project_review_runs_before(Utc::now())
         .await
         .expect("prune");
     assert_eq!(removed, 1);
@@ -673,6 +673,53 @@ async fn project_review_runs_round_trip_and_prune() {
             .load_project_review_run(project_id, run_id)
             .await
             .expect("load")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn review_run_retention_removes_reference_to_missing_job() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let finished_at = Utc::now() - chrono::TimeDelta::days(8);
+    store
+        .save_project_review_run(&ProjectReviewRunDetail {
+            summary: ProjectReviewRunSummary {
+                id: run_id,
+                job_id: Some(Uuid::new_v4()),
+                attempt_index: 1,
+                project_id,
+                reviewer_agent_id: None,
+                turn_id: None,
+                started_at: finished_at - chrono::TimeDelta::minutes(1),
+                finished_at: Some(finished_at),
+                status: ProjectReviewRunStatus::Failed,
+                outcome: Some(ProjectReviewOutcome::Failed),
+                review_event: None,
+                pr: Some(42),
+                summary: None,
+                error: Some("missing job".to_string()),
+                failure: None,
+                token_usage: TokenUsage::default(),
+            },
+            history: None,
+        })
+        .await
+        .expect("save dangling run");
+
+    assert_eq!(
+        1,
+        store
+            .prune_orphan_project_review_runs_before(Utc::now())
+            .await
+            .expect("prune dangling run")
+    );
+    assert!(
+        store
+            .load_project_review_run(project_id, run_id)
+            .await
+            .expect("load dangling run")
             .is_none()
     );
 }
@@ -1942,8 +1989,245 @@ async fn concurrent_review_job_claim_has_one_winner() {
         .collect::<Vec<_>>();
 
     assert_eq!(1, winners.len());
-    assert_eq!(1, winners[0].attempt_count);
+    assert_eq!(0, winners[0].attempt_count);
     assert_eq!(ProjectReviewJobStatus::Preparing, winners[0].status);
+}
+
+#[tokio::test]
+async fn review_attempt_start_atomically_increments_job_and_creates_run() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let job = test_review_job(project_id, 42, "head", None);
+    let job_id = job.id;
+    store
+        .enqueue_project_review_job(job)
+        .await
+        .expect("enqueue");
+    let started_at = Utc::now();
+    let owner = "worker".to_string();
+    let claimed = store
+        .claim_due_project_review_job(
+            project_id,
+            owner.clone(),
+            started_at,
+            started_at + chrono::TimeDelta::minutes(1),
+        )
+        .await
+        .expect("claim")
+        .expect("claimed job");
+    assert_eq!(0, claimed.attempt_count);
+    let run_id = Uuid::new_v4();
+
+    let started = store
+        .begin_claimed_project_review_attempt(job_id, owner.clone(), run_id, started_at)
+        .await
+        .expect("begin attempt");
+
+    assert_eq!(1, started.attempt_count);
+    assert_eq!(Some(run_id), started.active_run_id);
+    assert_eq!(
+        vec![ProjectReviewRunSummary {
+            id: run_id,
+            job_id: Some(job_id),
+            attempt_index: 1,
+            project_id,
+            reviewer_agent_id: None,
+            turn_id: None,
+            started_at,
+            finished_at: None,
+            status: ProjectReviewRunStatus::Syncing,
+            outcome: None,
+            review_event: None,
+            pr: Some(42),
+            summary: None,
+            error: None,
+            failure: None,
+            token_usage: TokenUsage::default(),
+        }],
+        store
+            .load_project_review_job_attempts(job_id, 1)
+            .await
+            .expect("load atomic attempt")
+    );
+    assert!(
+        store
+            .begin_claimed_project_review_attempt(job_id, owner, Uuid::new_v4(), started_at,)
+            .await
+            .is_err(),
+        "one claimed lease cannot create a second active attempt"
+    );
+    assert_eq!(
+        1,
+        store
+            .load_project_review_job(project_id, job_id)
+            .await
+            .expect("load job")
+            .expect("job")
+            .attempt_count
+    );
+}
+
+#[tokio::test]
+async fn submitted_attempt_archives_run_before_releasing_job_ownership() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let job = test_review_job(project_id, 43, "head", None);
+    let job_id = job.id;
+    store
+        .enqueue_project_review_job(job)
+        .await
+        .expect("enqueue job");
+    let started_at = Utc::now();
+    let owner = "worker".to_string();
+    store
+        .claim_due_project_review_job(
+            project_id,
+            owner.clone(),
+            started_at,
+            started_at + chrono::TimeDelta::minutes(1),
+        )
+        .await
+        .expect("claim")
+        .expect("claimed job");
+    let run_id = Uuid::new_v4();
+    store
+        .begin_claimed_project_review_attempt(job_id, owner.clone(), run_id, started_at)
+        .await
+        .expect("begin attempt");
+    let submitted_at = started_at + chrono::TimeDelta::seconds(10);
+    store
+        .record_project_review_submission_intent(ProjectReviewSubmissionIntent {
+            job_id,
+            head_sha: "head".to_string(),
+            event: ProjectReviewDecision::Approve,
+            body_hash: "hash-43".to_string(),
+            comment_count: 0,
+            created_at: started_at,
+        })
+        .await
+        .expect("persist intent");
+    store
+        .record_project_review_submission_receipt(
+            job_id,
+            ProjectReviewSubmissionReceipt {
+                github_review_id: 43,
+                event: ProjectReviewDecision::Approve,
+                head_sha: "head".to_string(),
+                html_url: Some("https://example.test/review/43".to_string()),
+                submitted_at,
+            },
+        )
+        .await
+        .expect("persist receipt");
+    let receipted = store
+        .load_project_review_job(project_id, job_id)
+        .await
+        .expect("load receipted job")
+        .expect("receipted job");
+    assert_eq!(ProjectReviewJobStatus::Succeeded, receipted.status);
+    assert_eq!(Some(run_id), receipted.active_run_id);
+    assert_eq!(Some(owner.clone()), receipted.lease_owner);
+    assert_eq!(
+        None,
+        store
+            .claim_due_project_review_cleanup_task(
+                "cleanup-before-archive".to_string(),
+                submitted_at,
+                submitted_at + chrono::TimeDelta::minutes(5),
+            )
+            .await
+            .expect("cleanup must wait for archive")
+    );
+
+    let turn_id = "turn-43".to_string();
+    let finished = ProjectReviewRunDetail {
+        summary: ProjectReviewRunSummary {
+            id: run_id,
+            job_id: Some(job_id),
+            attempt_index: 1,
+            project_id,
+            reviewer_agent_id: Some(Uuid::new_v4()),
+            turn_id: Some(turn_id.clone()),
+            started_at,
+            finished_at: Some(submitted_at),
+            status: ProjectReviewRunStatus::Succeeded,
+            outcome: Some(ProjectReviewOutcome::ReviewSubmitted),
+            review_event: Some(ProjectReviewDecision::Approve),
+            pr: Some(43),
+            summary: Some("approved".to_string()),
+            error: None,
+            failure: None,
+            token_usage: TokenUsage::default(),
+        },
+        history: Some(ThreadTurnHistory {
+            turn: Turn {
+                id: turn_id,
+                thread_id: "reviewer-43".to_string(),
+                state: TurnState::Completed,
+                failure: None,
+                started_at: Some(started_at.timestamp_millis()),
+                updated_at: submitted_at.timestamp_millis(),
+                completed_at: Some(submitted_at.timestamp_millis()),
+            },
+            items: Vec::new(),
+            context_disposition: ThreadContextDisposition::Active,
+        }),
+    };
+    store
+        .finish_project_review_run(&finished)
+        .await
+        .expect("archive attempt and release ownership");
+    let mut stale_completion = finished.clone();
+    stale_completion.summary.status = ProjectReviewRunStatus::Interrupted;
+    stale_completion.summary.outcome = None;
+    stale_completion.summary.error = Some("late worker".to_string());
+    stale_completion.history = None;
+    store
+        .finish_project_review_run(&stale_completion)
+        .await
+        .expect("late completion is idempotently ignored");
+    let error = store
+        .update_active_project_review_run_turn(
+            project_id,
+            run_id,
+            Uuid::new_v4(),
+            "late-turn".to_string(),
+        )
+        .await
+        .expect_err("late turn callback must not reopen archived Run");
+    assert!(
+        error
+            .to_string()
+            .contains("no longer the active unfinished attempt")
+    );
+
+    let completed = store
+        .load_project_review_job(project_id, job_id)
+        .await
+        .expect("load completed job")
+        .expect("completed job");
+    assert_eq!(None, completed.active_run_id);
+    assert_eq!(None, completed.lease_owner);
+    assert_eq!(None, completed.lease_expires_at);
+    assert!(
+        store
+            .claim_due_project_review_cleanup_task(
+                "cleanup-after-archive".to_string(),
+                submitted_at,
+                submitted_at + chrono::TimeDelta::minutes(5),
+            )
+            .await
+            .expect("cleanup may start after archive")
+            .is_some()
+    );
+    assert_eq!(
+        finished,
+        store
+            .load_project_review_run(project_id, run_id)
+            .await
+            .expect("load archived run")
+            .expect("archived run")
+    );
 }
 
 #[tokio::test]
@@ -2041,6 +2325,93 @@ async fn process_restart_recovers_live_lease_and_persists_reviewer_cleanup() {
 }
 
 #[tokio::test]
+async fn recovered_active_attempt_can_begin_the_next_attempt() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let job = test_review_job(project_id, 11, "head", None);
+    let job_id = job.id;
+    store
+        .enqueue_project_review_job(job)
+        .await
+        .expect("enqueue job");
+    let first_started_at = Utc::now();
+    store
+        .claim_due_project_review_job(
+            project_id,
+            "stopped-process".to_string(),
+            first_started_at,
+            first_started_at + chrono::TimeDelta::minutes(5),
+        )
+        .await
+        .expect("claim first attempt")
+        .expect("first attempt due");
+    let first_run_id = Uuid::new_v4();
+    store
+        .begin_claimed_project_review_attempt(
+            job_id,
+            "stopped-process".to_string(),
+            first_run_id,
+            first_started_at,
+        )
+        .await
+        .expect("begin first attempt");
+
+    let recovered_at = first_started_at + chrono::TimeDelta::seconds(1);
+    assert_eq!(
+        1,
+        store
+            .recover_interrupted_project_review_jobs(recovered_at)
+            .await
+            .expect("recover interrupted attempt")
+    );
+    let recovered = store
+        .load_project_review_job(project_id, job_id)
+        .await
+        .expect("load recovered job")
+        .expect("recovered job");
+    assert_eq!(ProjectReviewJobStatus::RetryWaiting, recovered.status);
+    assert_eq!(None, recovered.active_run_id);
+
+    let second_started_at = recovered_at + chrono::TimeDelta::seconds(1);
+    store
+        .claim_due_project_review_job(
+            project_id,
+            "new-process".to_string(),
+            second_started_at,
+            second_started_at + chrono::TimeDelta::minutes(5),
+        )
+        .await
+        .expect("claim recovered job")
+        .expect("recovered job due");
+    let second_run_id = Uuid::new_v4();
+    let started = store
+        .begin_claimed_project_review_attempt(
+            job_id,
+            "new-process".to_string(),
+            second_run_id,
+            second_started_at,
+        )
+        .await
+        .expect("begin next attempt after recovery");
+    assert_eq!(2, started.attempt_count);
+    assert_eq!(Some(second_run_id), started.active_run_id);
+    assert_eq!(None, started.failure);
+    assert_eq!(
+        vec![
+            ProjectReviewRunStatus::Interrupted,
+            ProjectReviewRunStatus::Syncing,
+        ],
+        store
+            .load_project_review_job_attempts(job_id, 2)
+            .await
+            .expect("load both immutable attempts")
+            .into_iter()
+            .map(|attempt| attempt.status)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn submission_intent_is_idempotent_and_receipt_completes_job() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
@@ -2107,6 +2478,17 @@ async fn stale_worker_snapshot_cannot_overwrite_terminal_submission_receipt() {
         html_url: Some("https://example.test/review/456".to_string()),
         submitted_at: stale_worker_snapshot.updated_at + chrono::TimeDelta::seconds(1),
     };
+    store
+        .record_project_review_submission_intent(ProjectReviewSubmissionIntent {
+            job_id: stale_worker_snapshot.id,
+            head_sha: receipt.head_sha.clone(),
+            event: receipt.event.clone(),
+            body_hash: "stale-worker-hash".to_string(),
+            comment_count: 0,
+            created_at: stale_worker_snapshot.updated_at,
+        })
+        .await
+        .expect("record intent");
     let completed = store
         .record_project_review_submission_receipt(stale_worker_snapshot.id, receipt.clone())
         .await
@@ -2129,6 +2511,41 @@ async fn stale_worker_snapshot_cannot_overwrite_terminal_submission_receipt() {
 }
 
 #[tokio::test]
+async fn submission_receipt_without_matching_intent_is_rejected() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let job = test_review_job(project_id, 112, "head", None);
+    store
+        .save_project_review_job(job.clone())
+        .await
+        .expect("save job");
+
+    let error = store
+        .record_project_review_submission_receipt(
+            job.id,
+            ProjectReviewSubmissionReceipt {
+                github_review_id: 112,
+                event: ProjectReviewDecision::Approve,
+                head_sha: job.head_sha.clone(),
+                html_url: None,
+                submitted_at: Utc::now(),
+            },
+        )
+        .await
+        .expect_err("receipt without intent must fail");
+    assert!(error.to_string().contains("without an intent"));
+    assert_eq!(
+        ProjectReviewJobStatus::Queued,
+        store
+            .load_project_review_job(project_id, job.id)
+            .await
+            .expect("load job")
+            .expect("job")
+            .status
+    );
+}
+
+#[tokio::test]
 async fn terminal_review_job_persists_idempotent_retryable_cleanup_tasks() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
@@ -2147,6 +2564,31 @@ async fn terminal_review_job_persists_idempotent_retryable_cleanup_tasks() {
         .save_project_review_job(job.clone())
         .await
         .expect("save terminal job");
+    let mut run = ProjectReviewRunDetail {
+        summary: ProjectReviewRunSummary {
+            id: run_id,
+            job_id: Some(job.id),
+            attempt_index: 1,
+            project_id,
+            reviewer_agent_id: Some(reviewer_id),
+            turn_id: None,
+            started_at: timestamp - chrono::TimeDelta::minutes(1),
+            finished_at: None,
+            status: ProjectReviewRunStatus::Running,
+            outcome: None,
+            review_event: None,
+            pr: Some(job.pr),
+            summary: None,
+            error: None,
+            failure: None,
+            token_usage: TokenUsage::default(),
+        },
+        history: None,
+    };
+    store
+        .save_project_review_run(&run)
+        .await
+        .expect("save unfinished run");
     let tasks = store
         .load_project_review_cleanup_tasks(job.id)
         .await
@@ -2168,6 +2610,38 @@ async fn terminal_review_job_persists_idempotent_retryable_cleanup_tasks() {
     );
 
     let owner = "cleanup-worker".to_string();
+    assert_eq!(
+        None,
+        store
+            .claim_due_project_review_cleanup_task(
+                owner.clone(),
+                timestamp + chrono::TimeDelta::seconds(1),
+                timestamp + chrono::TimeDelta::minutes(2),
+            )
+            .await
+            .expect("cleanup waits for Run archive")
+    );
+    run.summary.finished_at = Some(timestamp);
+    run.summary.status = ProjectReviewRunStatus::Failed;
+    run.summary.outcome = Some(ProjectReviewOutcome::Failed);
+    store
+        .save_project_review_run(&run)
+        .await
+        .expect("simulate legacy archived Run ownership");
+    assert_eq!(
+        1,
+        store
+            .release_archived_terminal_project_review_ownership()
+            .await
+            .expect("release archived ownership")
+    );
+    assert_eq!(
+        0,
+        store
+            .release_archived_terminal_project_review_ownership()
+            .await
+            .expect("release is idempotent")
+    );
     let claimed = store
         .claim_due_project_review_cleanup_task(
             owner.clone(),
@@ -2247,17 +2721,50 @@ async fn review_job_retention_preserves_active_and_leased_jobs() {
     leased.next_attempt_at = None;
     leased.lease_owner = Some("worker".to_string());
     leased.lease_expires_at = Some(Utc::now() + chrono::TimeDelta::hours(1));
+    let mut malformed_lease = test_review_job(project_id, 23, "head-23", None);
+    malformed_lease.status = ProjectReviewJobStatus::Failed;
+    malformed_lease.created_at = old;
+    malformed_lease.updated_at = old;
+    malformed_lease.finished_at = Some(old);
+    malformed_lease.next_attempt_at = None;
+    malformed_lease.lease_owner = Some("worker-without-expiry".to_string());
+    malformed_lease.lease_expires_at = None;
     let mut active = test_review_job(project_id, 22, "head-22", None);
     active.status = ProjectReviewJobStatus::Running;
     active.created_at = old;
     active.updated_at = old;
     active.next_attempt_at = None;
-    for job in [&removable, &leased, &active] {
+    for job in [&removable, &leased, &malformed_lease, &active] {
         store
             .save_project_review_job(job.clone())
             .await
             .expect("save review job");
     }
+    let removable_run_id = Uuid::new_v4();
+    store
+        .save_project_review_run(&ProjectReviewRunDetail {
+            summary: ProjectReviewRunSummary {
+                id: removable_run_id,
+                job_id: Some(removable.id),
+                attempt_index: 1,
+                project_id,
+                reviewer_agent_id: None,
+                turn_id: None,
+                started_at: old,
+                finished_at: Some(old),
+                status: ProjectReviewRunStatus::Completed,
+                outcome: Some(ProjectReviewOutcome::ReviewSubmitted),
+                review_event: Some(ProjectReviewDecision::Approve),
+                pr: Some(removable.pr),
+                summary: Some("approved".to_string()),
+                error: None,
+                failure: None,
+                token_usage: TokenUsage::default(),
+            },
+            history: None,
+        })
+        .await
+        .expect("save removable review run");
 
     assert_eq!(
         1,
@@ -2279,6 +2786,14 @@ async fn review_job_retention_preserves_active_and_leased_jobs() {
     );
     assert!(
         store
+            .load_project_review_run(project_id, removable_run_id)
+            .await
+            .expect("load removable run")
+            .is_none(),
+        "review run must be deleted atomically with its retained job"
+    );
+    assert!(
+        store
             .load_project_review_job(project_id, leased.id)
             .await
             .expect("load leased")
@@ -2286,10 +2801,80 @@ async fn review_job_retention_preserves_active_and_leased_jobs() {
     );
     assert!(
         store
+            .load_project_review_job(project_id, malformed_lease.id)
+            .await
+            .expect("load malformed lease")
+            .is_some(),
+        "an owned lease without an expiry is not proven stale and must be retained"
+    );
+    assert!(
+        store
             .load_project_review_job(project_id, active.id)
             .await
             .expect("load active")
             .is_some()
+    );
+}
+
+#[tokio::test]
+async fn review_job_retention_keeps_the_exact_seven_day_boundary() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let cutoff = Utc::now() - chrono::TimeDelta::days(7);
+    let mut expired = test_review_job(project_id, 70, "head-70", None);
+    expired.status = ProjectReviewJobStatus::Succeeded;
+    expired.finished_at = Some(cutoff - chrono::TimeDelta::milliseconds(1));
+    expired.updated_at = expired.finished_at.expect("expired timestamp");
+    expired.next_attempt_at = None;
+    let mut boundary = test_review_job(project_id, 71, "head-71", None);
+    boundary.status = ProjectReviewJobStatus::Succeeded;
+    boundary.finished_at = Some(cutoff);
+    boundary.updated_at = cutoff;
+    boundary.next_attempt_at = None;
+    for job in [&expired, &boundary] {
+        store
+            .save_project_review_job(job.clone())
+            .await
+            .expect("save terminal job");
+    }
+
+    assert_eq!(
+        1,
+        store
+            .prune_project_review_jobs_before_batch(cutoff, Utc::now(), 100)
+            .await
+            .expect("prune seven-day history")
+    );
+    assert!(
+        store
+            .load_project_review_job(project_id, expired.id)
+            .await
+            .expect("load expired job")
+            .is_none()
+    );
+    assert!(
+        store
+            .load_project_review_job(project_id, boundary.id)
+            .await
+            .expect("load boundary job")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn review_job_attempt_loader_rejects_missing_run_history() {
+    let (_dir, store) = store().await;
+    let job_id = Uuid::new_v4();
+
+    assert_eq!(
+        "data integrity error: review job ".to_string()
+            + &job_id.to_string()
+            + " declares 1 attempts but stores 0 runs",
+        store
+            .load_project_review_job_attempts(job_id, 1)
+            .await
+            .expect_err("missing immutable attempt history must fail")
+            .to_string()
     );
 }
 
@@ -2470,14 +3055,8 @@ async fn pull_request_review_pages_aggregate_latest_jobs_and_preserve_attempt_hi
         history,
         ProjectPullRequestReviewHistoryPage {
             items: vec![
-                ProjectPullRequestReviewHistoryItem {
-                    job: skipped,
-                    has_attempts: false,
-                },
-                ProjectPullRequestReviewHistoryItem {
-                    job: cancelled,
-                    has_attempts: true,
-                },
+                ProjectPullRequestReviewHistoryItem { job: skipped },
+                ProjectPullRequestReviewHistoryItem { job: cancelled },
             ],
             page: 1,
             page_size: 2,
@@ -2492,10 +3071,7 @@ async fn pull_request_review_pages_aggregate_latest_jobs_and_preserve_attempt_hi
     assert_eq!(
         history_tail,
         ProjectPullRequestReviewHistoryPage {
-            items: vec![ProjectPullRequestReviewHistoryItem {
-                job: succeeded,
-                has_attempts: false,
-            }],
+            items: vec![ProjectPullRequestReviewHistoryItem { job: succeeded }],
             page: 2,
             page_size: 2,
             total_items: 3,

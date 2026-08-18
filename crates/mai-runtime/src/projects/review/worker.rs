@@ -180,6 +180,23 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<usize>> + Send;
 
+    /// 启动时先归档仍由非终态 Job 持有的 Run，确保清理 reviewer 前保留 Thread 历史。
+    fn archive_interrupted_project_review_runs(
+        &self,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<usize>> + Send;
+
+    /// 启动时释放终态 Job 对已归档 Run 遗留的 ownership，不触碰未完成 Run。
+    fn release_archived_terminal_project_review_ownership(
+        &self,
+    ) -> impl Future<Output = Result<usize>> + Send;
+
+    /// 启动时结束已终态 Job 遗留的非终态 Run，恢复跨表生命周期不变量。
+    fn recover_terminal_project_review_runs(
+        &self,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<usize>> + Send;
+
     fn cancel_active_project_review_jobs(
         &self,
         project_id: ProjectId,
@@ -218,8 +235,54 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
 }
 
 pub(crate) async fn start_enabled_project_review_workers(ops: impl ProjectReviewWorkerOps) {
+    let recovered_at = Utc::now();
+    match ops.recover_terminal_project_review_runs(recovered_at).await {
+        Ok(recovered) if recovered > 0 => {
+            tracing::warn!(
+                recovered,
+                "recovered unfinished review runs whose jobs were already terminal"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!("failed to recover unfinished review runs for terminal jobs: {error}");
+            return;
+        }
+    }
     match ops
-        .recover_interrupted_project_review_jobs(Utc::now())
+        .archive_interrupted_project_review_runs(recovered_at)
+        .await
+    {
+        Ok(archived) if archived > 0 => {
+            tracing::warn!(
+                archived,
+                "archived review runs interrupted by server restart"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!("failed to archive review runs interrupted by server restart: {error}");
+            return;
+        }
+    }
+    match ops
+        .release_archived_terminal_project_review_ownership()
+        .await
+    {
+        Ok(released) if released > 0 => {
+            tracing::warn!(
+                released,
+                "released stale terminal Review ownership after Run archive"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!("failed to release archived terminal Review ownership: {error}");
+            return;
+        }
+    }
+    match ops
+        .recover_interrupted_project_review_jobs(recovered_at)
         .await
     {
         Ok(recovered) if recovered > 0 => {
@@ -1273,7 +1336,6 @@ mod tests {
             };
             let job = &mut jobs[position];
             job.status = ProjectReviewJobStatus::Preparing;
-            job.attempt_count += 1;
             job.next_attempt_at = None;
             job.lease_owner = Some(owner);
             job.lease_expires_at = Some(lease_expires_at);
@@ -1443,6 +1505,24 @@ mod tests {
             Ok(recovered)
         }
 
+        async fn archive_interrupted_project_review_runs(
+            &self,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> crate::Result<usize> {
+            Ok(0)
+        }
+
+        async fn release_archived_terminal_project_review_ownership(&self) -> crate::Result<usize> {
+            Ok(0)
+        }
+
+        async fn recover_terminal_project_review_runs(
+            &self,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> crate::Result<usize> {
+            Ok(0)
+        }
+
         async fn cancel_active_project_review_jobs(
             &self,
             _project_id: Uuid,
@@ -1459,6 +1539,16 @@ mod tests {
         ) -> crate::Result<ProjectReviewCycleResult> {
             let job_id = job.id;
             let job_head = job.head_sha.clone();
+            if let Some(stored) = self
+                .review_jobs
+                .lock()
+                .await
+                .iter_mut()
+                .find(|stored| stored.id == job_id)
+            {
+                stored.attempt_count += 1;
+                stored.active_run_id = Some(Uuid::new_v4());
+            }
             let mut result = self
                 .run_project_review_once(
                     job.project_id,
@@ -1505,6 +1595,7 @@ mod tests {
                     submitted_at: now(),
                 });
                 stored.finished_at = Some(now());
+                stored.active_run_id = None;
                 stored.lease_owner = None;
                 stored.lease_expires_at = None;
             }
@@ -1878,7 +1969,7 @@ mod tests {
             },
         );
         job.status = ProjectReviewJobStatus::Preparing;
-        job.attempt_count = 1;
+        job.attempt_count = 0;
         job.lease_owner = Some("worker-1".to_string());
         ops.review_jobs.lock().await.push(job.clone());
         let context = ProjectReviewTaskContext {
@@ -1904,6 +1995,7 @@ mod tests {
             jobs[0].skip_reason
         );
         assert_eq!(None, jobs[0].reviewer_agent_id);
+        assert_eq!(0, jobs[0].attempt_count);
         drop(jobs);
         assert!(ops.reviewed_prs.lock().await.is_empty());
         assert!(ops.review_runs.lock().await.is_empty());
@@ -1928,7 +2020,7 @@ mod tests {
             },
         );
         job.status = ProjectReviewJobStatus::Preparing;
-        job.attempt_count = 1;
+        job.attempt_count = 0;
         job.lease_owner = Some("worker-1".to_string());
         ops.review_jobs.lock().await.push(job.clone());
         let context = ProjectReviewTaskContext {
@@ -1954,6 +2046,7 @@ mod tests {
             jobs[0].skip_reason
         );
         assert_eq!(None, jobs[0].reviewer_agent_id);
+        assert_eq!(0, jobs[0].attempt_count);
         drop(jobs);
         assert!(ops.reviewed_prs.lock().await.is_empty());
         assert!(ops.review_runs.lock().await.is_empty());
@@ -1982,7 +2075,7 @@ mod tests {
             },
         );
         job.status = ProjectReviewJobStatus::Preparing;
-        job.attempt_count = 1;
+        job.attempt_count = 0;
         job.lease_owner = Some("worker-1".to_string());
         ops.review_jobs.lock().await.push(job.clone());
         let context = ProjectReviewTaskContext {
@@ -2005,6 +2098,7 @@ mod tests {
         let jobs = ops.review_jobs.lock().await;
         assert_eq!(Some("delivery-2"), jobs[0].delivery_id.as_deref());
         assert_ne!(ProjectReviewJobStatus::Skipped, jobs[0].status);
+        assert_eq!(1, jobs[0].attempt_count);
     }
 
     #[tokio::test]
@@ -2026,7 +2120,7 @@ mod tests {
             },
         );
         job.status = ProjectReviewJobStatus::Preparing;
-        job.attempt_count = 1;
+        job.attempt_count = 0;
         job.lease_owner = Some("worker-1".to_string());
         let original_id = job.id;
         ops.review_jobs.lock().await.push(job.clone());
@@ -2049,6 +2143,7 @@ mod tests {
         assert_eq!(2, jobs.len());
         assert_eq!(original_id, jobs[0].id);
         assert_eq!(ProjectReviewJobStatus::Superseded, jobs[0].status);
+        assert_eq!(0, jobs[0].attempt_count);
         assert_eq!("head-new", jobs[1].head_sha);
         assert_eq!(ProjectReviewJobStatus::Queued, jobs[1].status);
         assert_eq!(ProjectReviewJobSource::Automatic, jobs[1].source);

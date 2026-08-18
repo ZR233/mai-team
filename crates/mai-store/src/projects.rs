@@ -101,6 +101,13 @@ impl MaiStore {
     }
 
     pub async fn save_project_review_run(&self, run: &ProjectReviewRunDetail) -> Result<()> {
+        crate::sqlite_busy::retry_sqlite_busy(|| async {
+            self.save_project_review_run_once(run).await
+        })
+        .await
+    }
+
+    async fn save_project_review_run_once(&self, run: &ProjectReviewRunDetail) -> Result<()> {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         Query::<List<ProjectReviewRunRecord>>::filter(
@@ -235,42 +242,53 @@ impl MaiStore {
             .transpose()
     }
 
-    pub async fn prune_project_review_runs_before(&self, cutoff: DateTime<Utc>) -> Result<usize> {
-        self.prune_project_review_runs_before_batch(cutoff, 500)
+    pub async fn prune_orphan_project_review_runs_before(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<usize> {
+        self.prune_orphan_project_review_runs_before_batch(cutoff, 500)
             .await
     }
 
-    pub async fn prune_project_review_runs_before_batch(
+    pub async fn prune_orphan_project_review_runs_before_batch(
         &self,
         cutoff: DateTime<Utc>,
         batch_size: usize,
     ) -> Result<usize> {
         let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut connection = rusqlite::Connection::open(path)?;
-            connection.busy_timeout(std::time::Duration::from_secs(30))?;
-            let transaction = connection.transaction()?;
-            let removed = transaction.execute(
-                "DELETE FROM project_review_runs WHERE id IN (
+        crate::sqlite_busy::retry_sqlite_busy(|| {
+            let path = path.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let mut connection = rusqlite::Connection::open(path)?;
+                    connection.busy_timeout(std::time::Duration::from_secs(30))?;
+                    let transaction = connection.transaction()?;
+                    let removed = transaction.execute(
+                        "DELETE FROM project_review_runs WHERE id IN (
                     SELECT run.id FROM project_review_runs run
-                    WHERE run.started_at < ?1
-                      AND NOT EXISTS (
-                          SELECT 1 FROM project_review_jobs job
-                          WHERE job.id = run.job_id
-                            AND job.status NOT IN (
-                                'succeeded','failed','cancelled','superseded','skipped'
-                            )
-                      )
-                    ORDER BY run.started_at ASC, run.id ASC LIMIT ?2
+                    WHERE (
+                        run.job_id IS NULL
+                        OR NOT EXISTS (
+                            SELECT 1 FROM project_review_jobs job WHERE job.id = run.job_id
+                        )
+                    )
+                      AND run.finished_at IS NOT NULL
+                      AND run.finished_at < ?1
+                    ORDER BY run.finished_at ASC, run.id ASC LIMIT ?2
                  )",
-                rusqlite::params![cutoff.to_rfc3339(), usize_to_i64(batch_size)],
-            )?;
-            transaction.commit()?;
-            Ok(removed)
+                        rusqlite::params![cutoff.to_rfc3339(), usize_to_i64(batch_size)],
+                    )?;
+                    transaction.commit()?;
+                    Ok(removed)
+                })
+                .await
+                .map_err(|error| {
+                    StoreError::InvalidConfig(format!(
+                        "orphan review run retention task failed: {error}"
+                    ))
+                })?
+            }
         })
         .await
-        .map_err(|error| {
-            StoreError::InvalidConfig(format!("review run retention task failed: {error}"))
-        })?
     }
 }

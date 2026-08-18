@@ -186,7 +186,6 @@ export interface PullRequestReviewPage {
 
 export interface PullRequestReviewHistoryItem {
   job: ReviewJobSummary
-  has_attempts: boolean
 }
 
 export interface PullRequestReviewHistoryPage {

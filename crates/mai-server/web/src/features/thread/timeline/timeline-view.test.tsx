@@ -83,10 +83,10 @@ describe("ThreadTimeline 工具分组", () => {
 describe("ThreadTimeline 思考条目", () => {
   it("完成的思考默认折叠为一行摘要，点击展开", async () => {
     render(<ThreadTimeline snapshot={snapshot([
-      item({ type: "reasoning", content: ["let me check the config"] }),
+      item({ type: "reasoning", summary: ["Checking configuration"], content: ["let me check the config"] }),
     ])} />)
 
-    expect(screen.getByText("Thought for 18s")).toBeVisible()
+    expect(screen.getByText("Checking configuration · 18s")).toBeVisible()
     expect(screen.queryByText(/check the config/)).not.toBeInTheDocument()
 
     await userEvent.click(screen.getByRole("button", { name: "Expand reasoning" }))
@@ -101,6 +101,18 @@ describe("ThreadTimeline 思考条目", () => {
 
     expect(screen.getByText("Thinking")).toBeVisible()
     expect(screen.getByText(/still thinking/)).toBeVisible()
+  })
+
+  it("连续思考显示最新摘要并在展开后保留全部内容", async () => {
+    render(<ThreadTimeline snapshot={snapshot([
+      item({ type: "reasoning", summary: ["Inspecting repository"] }),
+      item({ type: "reasoning", summary: ["Checking cleanup ownership"] }),
+    ])} />)
+
+    expect(screen.getByText("Checking cleanup ownership · 18s")).toBeVisible()
+    await userEvent.click(screen.getByRole("button", { name: "Expand reasoning" }))
+    expect(screen.getByText("Inspecting repository")).toBeVisible()
+    expect(screen.getAllByText("Checking cleanup ownership").length).toBeGreaterThan(0)
   })
 })
 
@@ -119,5 +131,47 @@ describe("ThreadTimeline 基础条目", () => {
 
     expect(screen.getByText("please review")).toBeVisible()
     expect(screen.getByText("here is the result")).toBeVisible()
+  })
+
+  it("显示 commentary 与 plan，并隐藏内部条目", () => {
+    render(<ThreadTimeline snapshot={snapshot([
+      item({ type: "agentMessage", channel: "commentary", text: "正在检查生命周期。" }),
+      item({ type: "plan", content: "- 核对清理边界" }),
+      item({ type: "file", path: "secret.txt" }),
+      item({ type: "contextCompaction", beforeTokens: 10, afterTokens: 5, compactedAt: 1 }),
+    ])} />)
+
+    expect(screen.getByText("正在检查生命周期。")).toBeVisible()
+    expect(screen.getByText("核对清理边界")).toBeVisible()
+    expect(screen.queryByText("secret.txt")).not.toBeInTheDocument()
+    expect(screen.queryByText(/Context compacted/)).not.toBeInTheDocument()
+  })
+
+  it("仅在 turn 运行时显示尾部活动行", () => {
+    const active = snapshot([])
+    active.activeTurn = {
+      id: "turn-1",
+      threadId: "thread-1",
+      state: { status: "inProgress", phase: "runningTool" },
+      startedAt: 0,
+      updatedAt: 1,
+      completedAt: null,
+    }
+    active.runtime = {
+      threadId: "thread-1",
+      usage: { model: "test", latestContextTokens: 0, promptTokens: 0, completionTokens: 0, cachedPromptTokens: 0, cacheWriteTokens: 0, cacheMissTokens: 0, reasoningTokens: 0, inferenceCount: 0, totalTokens: 0, hasUnpricedUsage: false, updatedAt: 1 },
+      activeSkills: [],
+      activeMcpServers: [],
+      activeLspServers: [],
+      progress: "正在执行测试",
+      updatedAt: 1,
+    }
+
+    const { rerender } = render(<ThreadTimeline snapshot={active} />)
+    expect(screen.getByText("Running tools")).toBeVisible()
+    expect(screen.getByText(/正在执行测试/)).toBeVisible()
+
+    rerender(<ThreadTimeline snapshot={snapshot([])} />)
+    expect(screen.queryByText("Running tools")).not.toBeInTheDocument()
   })
 })

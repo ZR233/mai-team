@@ -19,7 +19,7 @@ pub(crate) use conversion::{
     agent_config_from_models, preserve_provider_secrets, providers_request_from_models,
     providers_response_from_models, resolve_provider_model,
 };
-pub const MAI_CONFIG_SCHEMA_VERSION: u32 = 8;
+pub const MAI_CONFIG_SCHEMA_VERSION: u32 = 9;
 
 const REQUIRED_ROLES: [&str; 4] = ["planner", "explorer", "executor", "reviewer"];
 
@@ -95,8 +95,7 @@ pub struct MaiReviewConfig {
 /// 服务器历史数据与临时资源的保留策略。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MaiRetentionConfig {
-    pub review_jobs_days: i64,
-    pub review_runs_days: i64,
+    pub review_history_days: i64,
     pub product_events_days: i64,
     pub agent_logs_days: i64,
     pub tool_traces_days: i64,
@@ -132,8 +131,7 @@ impl MaiConfig {
             ));
         }
         if [
-            self.retention.review_jobs_days,
-            self.retention.review_runs_days,
+            self.retention.review_history_days,
             self.retention.product_events_days,
             self.retention.agent_logs_days,
             self.retention.tool_traces_days,
@@ -335,8 +333,7 @@ impl Default for MaiReviewConfig {
 impl Default for MaiRetentionConfig {
     fn default() -> Self {
         Self {
-            review_jobs_days: 30,
-            review_runs_days: 7,
+            review_history_days: 7,
             product_events_days: 7,
             agent_logs_days: 7,
             tool_traces_days: 7,
@@ -370,8 +367,7 @@ mod tests {
     fn retention_defaults_match_server_storage_policy() {
         assert_eq!(
             MaiRetentionConfig {
-                review_jobs_days: 30,
-                review_runs_days: 7,
+                review_history_days: 7,
                 product_events_days: 7,
                 agent_logs_days: 7,
                 tool_traces_days: 7,

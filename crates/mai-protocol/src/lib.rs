@@ -545,7 +545,7 @@ pub struct ProjectSummary {
     pub review_last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectReviewRunSummary {
     pub id: Uuid,
     #[serde(default)]
@@ -686,7 +686,6 @@ pub struct ProjectPullRequestReviewPage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectPullRequestReviewHistoryItem {
     pub job: ProjectReviewJobSummary,
-    pub has_attempts: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -698,7 +697,7 @@ pub struct ProjectPullRequestReviewHistoryPage {
     pub total_pages: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectReviewRunDetail {
     #[serde(flatten)]
     pub summary: ProjectReviewRunSummary,

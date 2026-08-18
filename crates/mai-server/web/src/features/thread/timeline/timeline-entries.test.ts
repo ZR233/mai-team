@@ -63,7 +63,61 @@ describe("buildTimelineEntries", () => {
   it("思考输出打断分组", () => {
     const entries = buildTimelineEntries([toolCall(), item({ type: "reasoning", summary: ["thinking"] }), toolCall()])
 
-    expect(entries.map((entry) => entry.kind)).toEqual(["tool", "item", "tool"])
+    expect(entries.map((entry) => entry.kind)).toEqual(["tool", "reasoningGroup", "tool"])
+  })
+
+  it("按 ordinal 与 id 稳定排序", () => {
+    const later = message("later")
+    const sameOrdinalB = message("same-b")
+    const sameOrdinalA = message("same-a")
+    later.ordinal = 2
+    sameOrdinalB.ordinal = 1
+    sameOrdinalB.id = "b"
+    sameOrdinalA.ordinal = 1
+    sameOrdinalA.id = "a"
+
+    expect(buildTimelineEntries([later, sameOrdinalB, sameOrdinalA]).map((entry) => entry.key)).toEqual(["a", "b", later.id])
+  })
+
+  it("合并同 turn 内连续 reasoning 并保留最新摘要", () => {
+    const first = item({ type: "reasoning", summary: ["Inspecting files"] })
+    const second = item({ type: "reasoning", summary: ["Checking lifecycle"] })
+
+    const entries = buildTimelineEntries([first, second])
+
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({
+      kind: "reasoningGroup",
+      key: `reasoning-group:${first.id}`,
+      group: { latestSummary: "Checking lifecycle", durationLabel: "18s", active: false },
+    })
+  })
+
+  it("turn 边界打断 reasoning 分组", () => {
+    const entries = buildTimelineEntries([
+      item({ type: "reasoning", summary: ["one"] }, { turnId: "turn-1" }),
+      item({ type: "reasoning", summary: ["two"] }, { turnId: "turn-2" }),
+    ])
+
+    expect(entries.map((entry) => entry.kind)).toEqual(["reasoningGroup", "reasoningGroup"])
+  })
+
+  it("隐藏空 reasoning、file 与 contextCompaction", () => {
+    expect(buildTimelineEntries([
+      item({ type: "reasoning", summary: ["  "] }),
+      item({ type: "file", path: "README.md" }),
+      item({ type: "contextCompaction", beforeTokens: 10, afterTokens: 5, compactedAt: 1 }),
+    ])).toEqual([])
+  })
+
+  it("隐藏的内部条目不打断可见 Timeline 的连续分组", () => {
+    const first = toolCall()
+    const internal = item({ type: "file", path: "README.md" })
+    const second = toolCall()
+
+    expect(buildTimelineEntries([first, internal, second])).toEqual([
+      expect.objectContaining({ kind: "toolGroup", key: `tool-group:${first.id}` }),
+    ])
   })
 
   it("turn 边界打断分组", () => {

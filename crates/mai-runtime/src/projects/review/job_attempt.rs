@@ -67,6 +67,15 @@ pub(crate) trait ProjectReviewJobAttemptOps: ProjectReviewCycleOps {
         owner: String,
     ) -> impl Future<Output = Result<bool>> + Send;
 
+    /// 原子递增不可变 attempt 计数并创建对应的初始 Run。
+    fn begin_claimed_project_review_attempt(
+        &self,
+        job_id: Uuid,
+        owner: String,
+        run_id: Uuid,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> impl Future<Output = Result<ProjectReviewJobSummary>> + Send;
+
     fn resume_project_reviewer(
         &self,
         job: ProjectReviewJobSummary,
@@ -104,29 +113,9 @@ pub(crate) async fn run_project_review_job_attempt(
     cancellation_token: CancellationToken,
 ) -> Result<ProjectReviewCycleResult> {
     let run_id = Uuid::new_v4();
-    job.active_run_id = Some(run_id);
-    job.status = ProjectReviewJobStatus::Preparing;
-    job.updated_at = now();
-    save_claimed_job(ops, &job, &owner).await?;
-    ops.save_project_review_run_status(ProjectReviewRunSummary {
-        id: run_id,
-        job_id: Some(job.id),
-        attempt_index: job.attempt_count,
-        project_id: job.project_id,
-        reviewer_agent_id: job.reviewer_agent_id,
-        turn_id: None,
-        started_at: now(),
-        finished_at: None,
-        status: ProjectReviewRunStatus::Syncing,
-        outcome: None,
-        review_event: None,
-        pr: Some(job.pr),
-        summary: None,
-        error: None,
-        failure: None,
-        token_usage: Default::default(),
-    })
-    .await?;
+    job = ops
+        .begin_claimed_project_review_attempt(job.id, owner.clone(), run_id, now())
+        .await?;
 
     if cancellation_token.is_cancelled() {
         finish_attempt(
@@ -144,7 +133,7 @@ pub(crate) async fn run_project_review_job_attempt(
                 failure: None,
             },
         )
-        .await;
+        .await?;
         return Err(RuntimeError::TurnCancelled);
     }
 
@@ -188,7 +177,7 @@ pub(crate) async fn run_project_review_job_attempt(
                     failure: None,
                 },
             )
-            .await;
+            .await?;
             return Err(RuntimeError::TurnCancelled);
         }
     };
@@ -219,7 +208,7 @@ pub(crate) async fn run_project_review_job_attempt(
                     failure: result.failure.clone(),
                 },
             )
-            .await;
+            .await?;
             return Ok(result);
         }
     };
@@ -247,7 +236,7 @@ pub(crate) async fn run_project_review_job_attempt(
                     failure: Some(failure),
                 },
             )
-            .await;
+            .await?;
             return Err(error);
         }
     };
@@ -328,7 +317,7 @@ pub(crate) async fn run_project_review_job_attempt(
                     failure: cycle.failure.clone(),
                 },
             )
-            .await;
+            .await?;
         }
         Err(error) => {
             let failure = (!matches!(error, RuntimeError::TurnCancelled))
@@ -355,7 +344,7 @@ pub(crate) async fn run_project_review_job_attempt(
                     failure,
                 },
             )
-            .await;
+            .await?;
         }
     }
     result
@@ -519,42 +508,32 @@ async fn finish_attempt(
     reviewer_agent_id: Option<AgentId>,
     turn_id: Option<TurnId>,
     completion: AttemptCompletion,
-) {
+) -> Result<()> {
     let receipt = match ops.load_project_review_job(job.project_id, job.id).await {
         Ok(Some(current)) => current.submission_receipt,
-        Ok(None) => None,
-        Err(error) => {
-            tracing::warn!(
-                job_id = %job.id,
-                run_id = %run_id,
-                "failed to reload review receipt before finishing attempt: {error}"
-            );
-            None
+        Ok(None) => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "review job {} disappeared before attempt {run_id} finished",
+                job.id
+            )));
         }
+        Err(error) => return Err(error),
     };
     let completion = completion_for_persisted_submission(completion, receipt.as_ref());
-    if let Err(error) = ops
-        .finish_project_review_run(FinishReviewRun {
-            run_id,
-            project_id: job.project_id,
-            reviewer_agent_id,
-            turn_id,
-            status: completion.status,
-            outcome: completion.outcome,
-            review_event: completion.review_event,
-            pr: Some(job.pr),
-            summary_text: completion.summary,
-            error: completion.error,
-            failure: completion.failure,
-        })
-        .await
-    {
-        tracing::warn!(
-            job_id = %job.id,
-            run_id = %run_id,
-            "failed to persist review attempt completion: {error}"
-        );
-    }
+    ops.finish_project_review_run(FinishReviewRun {
+        run_id,
+        project_id: job.project_id,
+        reviewer_agent_id,
+        turn_id,
+        status: completion.status,
+        outcome: completion.outcome,
+        review_event: completion.review_event,
+        pr: Some(job.pr),
+        summary_text: completion.summary,
+        error: completion.error,
+        failure: completion.failure,
+    })
+    .await
 }
 
 #[cfg(test)]

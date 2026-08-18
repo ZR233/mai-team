@@ -94,6 +94,8 @@ pub enum StoreError {
     Time(#[from] chrono::ParseError),
     #[error("parse error: {0}")]
     Parse(#[from] strum::ParseError),
+    #[error("data integrity error: {0}")]
+    DataIntegrity(String),
     #[error("invalid config: {0}")]
     InvalidConfig(String),
 }

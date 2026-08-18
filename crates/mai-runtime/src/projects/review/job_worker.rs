@@ -78,6 +78,50 @@ pub(super) async fn run_claimed_project_review_job(
         }
     };
     if current.submission_receipt.is_some() {
+        if let Err(error) = &attempt {
+            tracing::warn!(
+                job_id = %current.id,
+                "submitted review attempt did not finish its archive normally: {error}"
+            );
+        }
+        if current.active_run_id.is_some() {
+            if let Err(error) = ops
+                .ops
+                .recover_terminal_project_review_runs(Utc::now())
+                .await
+            {
+                tracing::error!(
+                    job_id = %current.id,
+                    "failed to recover submitted review archive before reviewer cleanup: {error}"
+                );
+                return false;
+            }
+            current = match ops
+                .ops
+                .load_project_review_job(ops.project_id, current.id)
+                .await
+            {
+                Ok(Some(job)) if job.active_run_id.is_none() => job,
+                Ok(Some(_)) => {
+                    tracing::error!(
+                        job_id = %current.id,
+                        "submitted review archive recovery left an active Run"
+                    );
+                    return false;
+                }
+                Ok(None) => {
+                    tracing::error!(job_id = %current.id, "submitted review job disappeared");
+                    return false;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        job_id = %current.id,
+                        "failed to reload submitted review after archive recovery: {error}"
+                    );
+                    return false;
+                }
+            };
+        }
         cleanup_terminal_reviewer(ops, &current).await;
         project_job_state_projection(
             ops,

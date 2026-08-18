@@ -63,7 +63,7 @@ impl projects::review::cleanup::ProjectReviewCleanupOps for Arc<AgentRuntime> {
             .await?)
     }
 
-    async fn prune_project_review_runs_before(
+    async fn prune_orphan_project_review_runs_before(
         &self,
         cutoff: DateTime<Utc>,
         batch_size: usize,
@@ -71,7 +71,7 @@ impl projects::review::cleanup::ProjectReviewCleanupOps for Arc<AgentRuntime> {
         Ok(self
             .deps
             .store
-            .prune_project_review_runs_before_batch(cutoff, batch_size)
+            .prune_orphan_project_review_runs_before_batch(cutoff, batch_size)
             .await?)
     }
 
@@ -595,6 +595,20 @@ impl projects::review::job_attempt::ProjectReviewJobAttemptOps for Arc<AgentRunt
             .deps
             .store
             .save_claimed_project_review_job(job, owner)
+            .await?)
+    }
+
+    async fn begin_claimed_project_review_attempt(
+        &self,
+        job_id: Uuid,
+        owner: String,
+        run_id: Uuid,
+        started_at: DateTime<Utc>,
+    ) -> Result<ProjectReviewJobSummary> {
+        Ok(self
+            .deps
+            .store
+            .begin_claimed_project_review_attempt(job_id, owner, run_id, started_at)
             .await?)
     }
 
@@ -1181,6 +1195,32 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
             .store
             .recover_interrupted_project_review_jobs(now)
             .await?)
+    }
+
+    async fn archive_interrupted_project_review_runs(&self, now: DateTime<Utc>) -> Result<usize> {
+        projects::review::runs::archive_interrupted_project_review_runs(
+            &self.deps.store,
+            self.as_ref(),
+            now,
+        )
+        .await
+    }
+
+    async fn release_archived_terminal_project_review_ownership(&self) -> Result<usize> {
+        Ok(self
+            .deps
+            .store
+            .release_archived_terminal_project_review_ownership()
+            .await?)
+    }
+
+    async fn recover_terminal_project_review_runs(&self, now: DateTime<Utc>) -> Result<usize> {
+        projects::review::runs::recover_terminal_project_review_runs(
+            &self.deps.store,
+            self.as_ref(),
+            now,
+        )
+        .await
     }
 
     async fn cancel_active_project_review_jobs(

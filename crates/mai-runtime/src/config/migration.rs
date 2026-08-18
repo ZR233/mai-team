@@ -20,6 +20,7 @@ use super::{
 use crate::{Result, RuntimeError};
 
 mod v6;
+mod v8;
 
 #[derive(Debug, Deserialize)]
 struct LegacyMaiConfig {
@@ -127,19 +128,10 @@ pub(super) async fn migrate(documents: &ConfigDocumentStore) -> Result<MaiConfig
     {
         return v6::migrate(documents, legacy).await;
     }
-    if let Ok(Some(mut config)) = documents.load::<MaiConfig>().await
-        && matches!(config.schema_version, 4 | 5 | 7)
+    if let Ok(Some(legacy)) = documents.load::<v8::LegacyCurrentMaiConfig>().await
+        && matches!(legacy.schema_version, 4 | 5 | 7 | 8)
     {
-        let previous_version = config.schema_version;
-        if previous_version == 4 {
-            migrate_v4_provider_capabilities(&mut config.models);
-        }
-        canonicalize_preset_providers(&mut config.models)?;
-        config.schema_version = MAI_CONFIG_SCHEMA_VERSION;
-        config.validate()?;
-        backup_document(documents.path(), previous_version).await?;
-        documents.save(&config).await?;
-        return Ok(config);
+        return v8::migrate(documents, legacy).await;
     }
     if let Ok(Some(legacy)) = documents.load::<LegacyCatalogMaiConfig>().await
         && matches!(legacy.schema_version, 2 | 3)
@@ -523,10 +515,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         let documents = ConfigDocumentStore::new(path.clone());
-        let mut config = MaiConfig {
-            schema_version: 7,
-            ..MaiConfig::default()
-        };
+        let mut config = v8::legacy_current_config(7);
         let preset_id = ProviderId::new("deepseek").unwrap();
         let preset = config.models.providers.get_mut(&preset_id).unwrap();
         preset.name = "DeepSeek proxy".to_string();
@@ -579,10 +568,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         let documents = ConfigDocumentStore::new(path.clone());
-        let mut config = MaiConfig {
-            schema_version: 7,
-            ..MaiConfig::default()
-        };
+        let mut config = v8::legacy_current_config(7);
         config.models.providers.values_mut().next().unwrap().preset =
             Some(ProviderPresetId::new("future-preset").unwrap());
         documents.save(&config).await.unwrap();

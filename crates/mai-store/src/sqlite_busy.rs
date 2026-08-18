@@ -37,6 +37,7 @@ pub(crate) fn sqlite_busy_error(err: &StoreError) -> bool {
         | StoreError::TomlSer(_)
         | StoreError::Time(_)
         | StoreError::Parse(_)
+        | StoreError::DataIntegrity(_)
         | StoreError::InvalidConfig(_) => false,
     }
 }

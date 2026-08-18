@@ -44,7 +44,7 @@ export function ReviewJobDetails({ projectId, repository, review, onClose, onRer
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null)
   const history = useQuery(projectPullRequestReviewHistoryQuery(projectId, review?.pr ?? 0, historyPage, HISTORY_PAGE_SIZE))
   const selectedItem = history.data?.items.find((item) => item.job.id === selectedJobId) ?? null
-  const detail = useQuery(projectReviewJobQuery(projectId, selectedItem?.has_attempts ? selectedItem.job.id : null))
+  const detail = useQuery(projectReviewJobQuery(projectId, selectedItem && selectedItem.job.attempt_count > 0 ? selectedItem.job.id : null))
 
   useEffect(() => {
     setHistoryPage(1)
@@ -135,17 +135,20 @@ function historyLabel(item: PullRequestReviewHistoryItem) {
 function ReviewRecordContent({ projectId, item, detail, detailLoading, detailError, retryDetail }: { projectId: string; item: PullRequestReviewHistoryItem; detail?: ReviewJobDetail; detailLoading: boolean; detailError: unknown; retryDetail(): void }) {
   const [metadataOpen, setMetadataOpen] = useState(false)
   const job = item.job
+  const attempted = job.attempt_count > 0
+  const attemptsMissing = Boolean(attempted && detail && (detail.attempts?.length ?? 0) === 0)
   const usage = projectReviewUsage(detail?.attempts ?? [])
   return <div className="flex flex-col gap-5">
     <div className="flex flex-wrap items-center gap-2"><StatusBadge status={job.status} /><ReviewOutcome job={job} /><EnvironmentWarningBadge job={job} />{job.status === "retry_waiting" && <Badge variant="outline">Retry scheduled</Badge>}</div>
     <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-4"><Metric label="Attempts" value={`${job.attempt_count}/${job.max_attempts}`} /><Metric label="Created" value={formatReviewDate(job.created_at)} /><Metric label="Duration" value={formatReviewDuration(job.created_at, job.finished_at)} /><Metric label="Next attempt" value={job.next_attempt_at ? formatReviewDate(job.next_attempt_at) : "—"} /></dl>
-    {item.has_attempts && <ReviewUsageSummary usage={usage.total} active={reviewJobIsActive(job)} />}
-    {!item.has_attempts && <Alert><CircleAlert /><AlertTitle>此记录未启动 Agent 会话</AlertTitle><AlertDescription>{job.skip_reason ? reviewSkipReasonLabel(job.skip_reason) : job.reason || "The review ended before an execution attempt was created."}</AlertDescription></Alert>}
+    {attempted && !attemptsMissing && <ReviewUsageSummary usage={usage.total} active={reviewJobIsActive(job)} />}
+    {!attempted && <Alert><CircleAlert /><AlertTitle>此记录未启动 Agent 会话</AlertTitle><AlertDescription>{job.skip_reason ? reviewSkipReasonLabel(job.skip_reason) : job.reason || "The review ended before an execution attempt was created."}</AlertDescription></Alert>}
+    {attemptsMissing && <Alert variant="destructive"><CircleAlert /><AlertTitle>Review history is incomplete</AlertTitle><AlertDescription>This Job recorded {job.attempt_count} {job.attempt_count === 1 ? "attempt" : "attempts"}, but no retained Attempt data was found.</AlertDescription></Alert>}
     {job.failure && <Alert variant="destructive"><CircleAlert /><AlertTitle>{job.status === "retry_waiting" ? "Attempt failed; retry pending" : "Review failed"}</AlertTitle><AlertDescription><span className="block">{job.failure.message}</span><span className="mt-1 block text-xs opacity-80">{job.failure.category}{job.failure.code ? ` · ${job.failure.code}` : ""}{job.failure.http_status ? ` · HTTP ${job.failure.http_status}` : ""}</span></AlertDescription></Alert>}
     {job.environment_warning && <Alert className="border-amber-500/50 bg-amber-500/5 text-amber-950 dark:text-amber-100"><CircleAlert /><AlertTitle>Latest image refresh failed</AlertTitle><AlertDescription><span className="block">{job.environment_warning.message}</span><span className="mt-1 block text-xs opacity-80">{job.environment_warning.image} · cached {shortSha(job.environment_warning.cached_image_id)} · {formatReviewDate(job.environment_warning.observed_at)}</span></AlertDescription></Alert>}
     {job.submission_intent && !job.submission_receipt && <section className="rounded-lg border bg-muted/35 p-3"><h3 className="text-sm font-medium">GitHub submission pending</h3><p className="mt-1 text-xs text-muted-foreground">The server is reconciling one {job.submission_intent.event.replaceAll("_", " ")} review at head {shortSha(job.submission_intent.head_sha)} with {job.submission_intent.comment_count} inline comments.</p></section>}
     {job.submission_receipt && <section className="rounded-lg border bg-muted/35 p-3"><div className="flex items-center justify-between gap-3"><div><h3 className="text-sm font-medium">GitHub receipt</h3><p className="text-xs text-muted-foreground">Review #{job.submission_receipt.github_review_id} · {formatReviewDate(job.submission_receipt.submitted_at)}</p></div>{job.submission_receipt.html_url && <Button asChild variant="outline" size="sm"><a href={job.submission_receipt.html_url} target="_blank" rel="noreferrer"><ExternalLink /> Open</a></Button>}</div></section>}
-    {item.has_attempts && (detailLoading ? <LoadingState rows={4} /> : detailError ? <ErrorState error={detailError} retry={retryDetail} /> : detail ? <Attempts projectId={projectId} attempts={detail.attempts} usageByAttemptId={usage.attempts} /> : null)}
+    {attempted && (detailLoading ? <LoadingState rows={4} /> : detailError ? <ErrorState error={detailError} retry={retryDetail} /> : detail && !attemptsMissing ? <Attempts projectId={projectId} attempts={detail.attempts} usageByAttemptId={usage.attempts} /> : null)}
     <Collapsible open={metadataOpen} onOpenChange={setMetadataOpen} className="rounded-lg border"><CollapsibleTrigger asChild><Button variant="ghost" className="w-full justify-between rounded-lg px-3" aria-label={`${metadataOpen ? "Hide" : "Show"} technical details`}>Technical details<ChevronDown className={cn("size-4 transition-transform motion-reduce:transition-none", metadataOpen && "rotate-180")} /></Button></CollapsibleTrigger><CollapsibleContent className="border-t"><dl className="divide-y"><DetailRow label="Job" value={job.id} mono /><DetailRow label="Head SHA" value={job.head_sha} mono /><DetailRow label="Reviewer" value={job.reviewer_agent_id || "—"} mono /><DetailRow label="Source" value={job.source} /></dl></CollapsibleContent></Collapsible>
   </div>
 }

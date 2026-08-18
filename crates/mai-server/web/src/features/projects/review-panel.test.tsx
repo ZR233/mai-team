@@ -25,7 +25,7 @@ describe("pull request review pagination", () => {
       requested.push(path)
       const url = new URL(path, "http://test")
       if (url.pathname.endsWith("/pull-request-reviews/42/history")) return jsonResponse({
-        items: [{ job: job("job-42", 42, "succeeded", 1), has_attempts: false }],
+        items: [{ job: job("job-42", 42, "succeeded", 1) }],
         page: 1,
         page_size: 20,
         total_items: 1,
@@ -58,7 +58,7 @@ describe("pull request review pagination", () => {
       const path = String(input)
       if (path.endsWith("/lifecycle-status/refresh")) return jsonResponse({ checked: 0, newly_merged: 0, newly_closed: 0 })
       if (path.includes("/pull-request-reviews/42/history")) return jsonResponse({
-        items: [{ job: approvedJob("approved-job", 42), has_attempts: false }],
+        items: [{ job: approvedJob("approved-job", 42) }],
         page: 1,
         page_size: 20,
         total_items: 1,
@@ -86,7 +86,7 @@ describe("pull request review pagination", () => {
       const path = String(input)
       if (path.endsWith("/lifecycle-status/refresh")) return jsonResponse({ checked: 0, newly_merged: 0, newly_closed: 0 })
       if (path.includes("/pull-request-reviews/43/history")) return jsonResponse({
-        items: [{ job: approvedJob("closed-job", 43), has_attempts: false }],
+        items: [{ job: approvedJob("closed-job", 43) }],
         page: 1,
         page_size: 20,
         total_items: 1,
@@ -193,8 +193,8 @@ describe("pull request review history", () => {
       requested.push(path)
       if (path.includes("/pull-request-reviews/42/history")) return jsonResponse({
         items: [
-          { job: job("skipped-job", 42, "skipped", 0), has_attempts: false },
-          { job: job("executed-job", 42, "succeeded", 1), has_attempts: true },
+          { job: job("skipped-job", 42, "skipped", 0) },
+          { job: job("executed-job", 42, "succeeded", 1) },
         ],
         page: 1,
         page_size: 20,
@@ -233,7 +233,7 @@ describe("pull request review history", () => {
       const page = new URL(path, "http://test").searchParams.get("page")
       if (page === "1" && firstPageRequests++ === 0) return jsonResponse({ error: "temporary history failure" }, 500)
       const selected = page === "2" ? job("cancelled-job", 42, "cancelled") : job("latest-job", 42, "skipped")
-      return jsonResponse({ items: [{ job: selected, has_attempts: false }], page: Number(page), page_size: 20, total_items: 21, total_pages: 2 })
+      return jsonResponse({ items: [{ job: selected }], page: Number(page), page_size: 20, total_items: 21, total_pages: 2 })
     }))
     renderWithQuery(<ReviewJobDetails projectId="project-1" repository="owner/repo" review={review(42, job("latest-job", 42, "skipped"), 21)} onClose={() => undefined} onRereview={() => undefined} pending={false} />)
 
@@ -245,6 +245,30 @@ describe("pull request review history", () => {
     await userEvent.click(screen.getByRole("button", { name: "Next page" }))
     await waitFor(() => expect(screen.getByRole("combobox", { name: "Review history" })).toHaveTextContent("cancelled"))
     expect(screen.getByText("此记录未启动 Agent 会话")).toBeVisible()
+  })
+
+  it("reports retained attempt inconsistency instead of claiming the agent never started", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.includes("/pull-request-reviews/42/history")) return jsonResponse({
+        items: [{ job: job("incomplete-job", 42, "succeeded", 1) }],
+        page: 1,
+        page_size: 20,
+        total_items: 1,
+        total_pages: 1,
+      })
+      if (path.endsWith("/review-jobs/incomplete-job")) return jsonResponse({
+        ...job("incomplete-job", 42, "succeeded", 1),
+        attempts: [],
+      })
+      return jsonResponse({ error: `unexpected request ${path}` }, 404)
+    }))
+
+    renderWithQuery(<ReviewJobDetails projectId="project-1" repository="owner/repo" review={review(42, job("incomplete-job", 42, "succeeded", 1))} onClose={() => undefined} onRereview={() => undefined} pending={false} />)
+
+    expect(await screen.findByText("Review history is incomplete")).toBeVisible()
+    expect(screen.queryByText("此记录未启动 Agent 会话")).not.toBeInTheDocument()
+    expect(screen.queryByText("No attempt has started yet.")).not.toBeInTheDocument()
   })
 })
 
