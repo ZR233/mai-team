@@ -10,28 +10,34 @@ use super::storage::{load_job, open_review_job_connection, project_review_run_su
 use crate::{MaiStore, Result, StoreError, u64_to_i64};
 
 impl MaiStore {
-    pub async fn load_unfinished_active_project_review_attempts(
+    pub async fn load_expired_unfinished_active_project_review_attempts(
         &self,
+        recovered_at: DateTime<Utc>,
     ) -> Result<Vec<(ProjectReviewJobSummary, ProjectReviewRunSummary)>> {
-        self.load_unfinished_project_review_attempts(
+        self.load_expired_unfinished_project_review_attempts(
             "AND job.active_run_id = run.id AND job.status IN \
              ('preparing','running','submission_pending','reconciling')",
+            recovered_at,
         )
         .await
     }
 
-    pub async fn load_unfinished_terminal_project_review_attempts(
+    pub async fn load_expired_unfinished_terminal_project_review_attempts(
         &self,
+        recovered_at: DateTime<Utc>,
     ) -> Result<Vec<(ProjectReviewJobSummary, ProjectReviewRunSummary)>> {
-        self.load_unfinished_project_review_attempts(
-            "AND job.status IN ('succeeded','failed','cancelled','superseded','skipped')",
+        self.load_expired_unfinished_project_review_attempts(
+            "AND job.active_run_id = run.id AND job.status IN \
+             ('succeeded','failed','cancelled','superseded','skipped')",
+            recovered_at,
         )
         .await
     }
 
-    async fn load_unfinished_project_review_attempts(
+    async fn load_expired_unfinished_project_review_attempts(
         &self,
         scope_clause: &'static str,
+        recovered_at: DateTime<Utc>,
     ) -> Result<Vec<(ProjectReviewJobSummary, ProjectReviewRunSummary)>> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
@@ -44,11 +50,15 @@ impl MaiStore {
                      run.failure_json, run.input_tokens, run.cached_input_tokens, \
                      run.output_tokens, run.reasoning_output_tokens, run.total_tokens \
                      FROM project_review_runs run JOIN project_review_jobs job ON job.id = run.job_id \
-                     WHERE run.finished_at IS NULL {scope_clause} \
+                     WHERE run.finished_at IS NULL {scope_clause} AND ( \
+                     job.lease_expires_at IS NULL OR job.lease_expires_at <= ?1) \
                      ORDER BY run.started_at ASC, run.id ASC"
                 ))?;
                 statement
-                    .query_map([], project_review_run_summary_record)?
+                    .query_map(
+                        [recovered_at.to_rfc3339()],
+                        project_review_run_summary_record,
+                    )?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             };
             let mut attempts = Vec::with_capacity(runs.len());
@@ -56,14 +66,14 @@ impl MaiStore {
                 let run = run.into_summary()?;
                 let job_id = run.job_id.ok_or_else(|| {
                     StoreError::DataIntegrity(format!(
-                        "terminal review run {} has no owning job",
+                        "review run {} has no owning job",
                         run.id
                     ))
                 })?;
                 let job = load_job(&connection, job_id)?
                     .ok_or_else(|| {
                         StoreError::DataIntegrity(format!(
-                            "terminal review run {} references missing job {job_id}",
+                            "review run {} references missing job {job_id}",
                             run.id
                         ))
                     })?
@@ -117,7 +127,10 @@ impl MaiStore {
         })?
     }
 
-    pub async fn release_archived_terminal_project_review_ownership(&self) -> Result<usize> {
+    pub async fn release_expired_archived_terminal_project_review_ownership(
+        &self,
+        recovered_at: DateTime<Utc>,
+    ) -> Result<usize> {
         let path = self.path.clone();
         crate::sqlite_busy::retry_sqlite_busy(|| {
             let path = path.clone();
@@ -130,12 +143,13 @@ impl MaiStore {
                          WHERE job.status IN
                          ('succeeded','failed','cancelled','superseded','skipped')
                          AND job.active_run_id IS NOT NULL
+                         AND (job.lease_expires_at IS NULL OR job.lease_expires_at <= ?1)
                          AND EXISTS (
                              SELECT 1 FROM project_review_runs run
                              WHERE run.id = job.active_run_id AND run.job_id = job.id
                              AND run.finished_at IS NOT NULL
                          )",
-                        [],
+                        [recovered_at.to_rfc3339()],
                     )?)
                 })
                 .await

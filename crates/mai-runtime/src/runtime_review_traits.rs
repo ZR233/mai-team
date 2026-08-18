@@ -1189,16 +1189,8 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
             .await?)
     }
 
-    async fn recover_interrupted_project_review_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
-        Ok(self
-            .deps
-            .store
-            .recover_interrupted_project_review_jobs(now)
-            .await?)
-    }
-
-    async fn archive_interrupted_project_review_runs(&self, now: DateTime<Utc>) -> Result<usize> {
-        projects::review::runs::archive_interrupted_project_review_runs(
+    async fn archive_expired_project_review_runs(&self, now: DateTime<Utc>) -> Result<usize> {
+        projects::review::runs::archive_expired_project_review_runs(
             &self.deps.store,
             self.as_ref(),
             now,
@@ -1206,18 +1198,40 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
         .await
     }
 
-    async fn release_archived_terminal_project_review_ownership(&self) -> Result<usize> {
+    async fn release_expired_archived_terminal_project_review_ownership(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<usize> {
         Ok(self
             .deps
             .store
-            .release_archived_terminal_project_review_ownership()
+            .release_expired_archived_terminal_project_review_ownership(now)
             .await?)
     }
 
-    async fn recover_terminal_project_review_runs(&self, now: DateTime<Utc>) -> Result<usize> {
-        projects::review::runs::recover_terminal_project_review_runs(
+    async fn recover_expired_terminal_project_review_runs(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<usize> {
+        projects::review::runs::recover_expired_terminal_project_review_runs(
             &self.deps.store,
             self.as_ref(),
+            now,
+        )
+        .await
+    }
+
+    async fn finish_owned_terminal_project_review_run(
+        &self,
+        job: ProjectReviewJobSummary,
+        owner: String,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        projects::review::runs::finish_owned_terminal_project_review_run(
+            &self.deps.store,
+            self.as_ref(),
+            job,
+            owner,
             now,
         )
         .await

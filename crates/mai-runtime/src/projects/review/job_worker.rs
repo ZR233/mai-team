@@ -87,7 +87,11 @@ pub(super) async fn run_claimed_project_review_job(
         if current.active_run_id.is_some() {
             if let Err(error) = ops
                 .ops
-                .recover_terminal_project_review_runs(Utc::now())
+                .finish_owned_terminal_project_review_run(
+                    current.clone(),
+                    owner.clone(),
+                    Utc::now(),
+                )
                 .await
             {
                 tracing::error!(

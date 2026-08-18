@@ -224,46 +224,21 @@ async fn finish_project_review_run_at(
     Ok(())
 }
 
-pub(crate) async fn recover_terminal_project_review_runs(
+pub(crate) async fn recover_expired_terminal_project_review_runs(
     store: &MaiStore,
     snapshot_source: &impl ReviewRunSnapshotSource,
     recovered_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<usize> {
     let candidates = store
-        .load_unfinished_terminal_project_review_attempts()
+        .load_expired_unfinished_terminal_project_review_attempts(recovered_at)
         .await?;
     let recovered = candidates.len();
     for (job, run) in candidates {
-        let receipt = job.submission_receipt.as_ref();
-        let submitted =
-            job.status == mai_protocol::ProjectReviewJobStatus::Succeeded && receipt.is_some();
-        finish_project_review_run_at(
+        finish_terminal_project_review_run(
             store,
             snapshot_source,
-            FinishReviewRun {
-                run_id: run.id,
-                project_id: run.project_id,
-                reviewer_agent_id: run.reviewer_agent_id,
-                turn_id: run.turn_id,
-                status: if submitted {
-                    ProjectReviewRunStatus::Succeeded
-                } else {
-                    ProjectReviewRunStatus::Interrupted
-                },
-                outcome: submitted.then_some(ProjectReviewOutcome::ReviewSubmitted),
-                review_event: receipt.map(|receipt| receipt.event.clone()),
-                pr: run.pr,
-                summary_text: run.summary.or_else(|| {
-                    submitted.then(|| "GitHub review submission recorded.".to_string())
-                }),
-                error: (!submitted).then(|| {
-                    run.error.unwrap_or_else(|| {
-                        "review attempt completion was not persisted before server restart"
-                            .to_string()
-                    })
-                }),
-                failure: if submitted { None } else { run.failure },
-            },
+            &job,
+            run,
             job.finished_at.unwrap_or(recovered_at),
         )
         .await?;
@@ -271,13 +246,105 @@ pub(crate) async fn recover_terminal_project_review_runs(
     Ok(recovered)
 }
 
-pub(crate) async fn archive_interrupted_project_review_runs(
+pub(crate) async fn finish_owned_terminal_project_review_run(
+    store: &MaiStore,
+    snapshot_source: &impl ReviewRunSnapshotSource,
+    job: mai_protocol::ProjectReviewJobSummary,
+    owner: String,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    if !job.status.is_terminal()
+        || job.lease_owner.as_deref() != Some(owner.as_str())
+        || job
+            .lease_expires_at
+            .is_none_or(|lease_expires_at| lease_expires_at <= now)
+    {
+        return Err(RuntimeError::InvalidInput(format!(
+            "review job {} is not terminal with an unexpired lease owned by {owner}",
+            job.id
+        )));
+    }
+    let run_id = job.active_run_id.ok_or_else(|| {
+        RuntimeError::InvalidInput(format!(
+            "terminal review job {} has no active Run to finish",
+            job.id
+        ))
+    })?;
+    let run = store
+        .load_project_review_run(job.project_id, run_id)
+        .await?
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(format!(
+                "terminal review job {} references missing active Run {run_id}",
+                job.id
+            ))
+        })?
+        .summary;
+    if run.job_id != Some(job.id) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "terminal review job {} does not own active Run {run_id}",
+            job.id
+        )));
+    }
+    finish_terminal_project_review_run(
+        store,
+        snapshot_source,
+        &job,
+        run,
+        job.finished_at.unwrap_or(now),
+    )
+    .await
+}
+
+async fn finish_terminal_project_review_run(
+    store: &MaiStore,
+    snapshot_source: &impl ReviewRunSnapshotSource,
+    job: &mai_protocol::ProjectReviewJobSummary,
+    run: ProjectReviewRunSummary,
+    finished_at: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let receipt = job.submission_receipt.as_ref();
+    let submitted =
+        job.status == mai_protocol::ProjectReviewJobStatus::Succeeded && receipt.is_some();
+    finish_project_review_run_at(
+        store,
+        snapshot_source,
+        FinishReviewRun {
+            run_id: run.id,
+            project_id: run.project_id,
+            reviewer_agent_id: run.reviewer_agent_id,
+            turn_id: run.turn_id,
+            status: if submitted {
+                ProjectReviewRunStatus::Succeeded
+            } else {
+                ProjectReviewRunStatus::Interrupted
+            },
+            outcome: submitted.then_some(ProjectReviewOutcome::ReviewSubmitted),
+            review_event: receipt.map(|receipt| receipt.event.clone()),
+            pr: run.pr,
+            summary_text: run
+                .summary
+                .or_else(|| submitted.then(|| "GitHub review submission recorded.".to_string())),
+            error: (!submitted).then(|| {
+                run.error.unwrap_or_else(|| {
+                    "review attempt completion was not persisted before its lease expired"
+                        .to_string()
+                })
+            }),
+            failure: if submitted { None } else { run.failure },
+        },
+        finished_at,
+    )
+    .await
+}
+
+pub(crate) async fn archive_expired_project_review_runs(
     store: &MaiStore,
     snapshot_source: &impl ReviewRunSnapshotSource,
     recovered_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<usize> {
     let attempts = store
-        .load_unfinished_active_project_review_attempts()
+        .load_expired_unfinished_active_project_review_attempts(recovered_at)
         .await?;
     let archived = attempts.len();
     for (_job, run) in attempts {
@@ -295,7 +362,7 @@ pub(crate) async fn archive_interrupted_project_review_runs(
                 pr: run.pr,
                 summary_text: run.summary,
                 error: Some(run.error.unwrap_or_else(|| {
-                    "review attempt was interrupted by server recovery".to_string()
+                    "review attempt lease expired before completion".to_string()
                 })),
                 failure: run.failure,
             },
@@ -446,7 +513,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_archives_submitted_thread_before_releasing_job_ownership() {
+    async fn owner_archives_submitted_thread_before_releasing_job_ownership() {
         let (_directory, store) = test_store().await;
         let (job, run, history) = receipted_attempt(&store, 2026).await;
         assert_eq!(ProjectReviewJobStatus::Succeeded, job.status);
@@ -465,12 +532,15 @@ mod tests {
             },
         };
 
-        assert_eq!(
-            1,
-            recover_terminal_project_review_runs(&store, &source, Utc::now())
-                .await
-                .expect("recover submitted attempt")
-        );
+        finish_owned_terminal_project_review_run(
+            &store,
+            &source,
+            job.clone(),
+            job.lease_owner.clone().expect("lease owner"),
+            Utc::now(),
+        )
+        .await
+        .expect("finish owned submitted attempt");
         let archived = store
             .load_project_review_run(run.project_id, run.id)
             .await
@@ -495,11 +565,50 @@ mod tests {
         assert_eq!(None, completed_job.active_run_id);
         assert_eq!(None, completed_job.lease_owner);
         assert_eq!(None, completed_job.lease_expires_at);
+    }
+
+    #[tokio::test]
+    async fn terminal_recovery_waits_for_expiry_and_ignores_non_active_run() {
+        let (_directory, store) = test_store().await;
+        let (job, run, history) = receipted_attempt(&store, 2027).await;
+        let mut stray = store
+            .load_project_review_run(run.project_id, run.id)
+            .await
+            .expect("load active run")
+            .expect("active run");
+        stray.summary.id = Uuid::new_v4();
+        stray.summary.attempt_index += 1;
+        store
+            .save_project_review_run(&stray)
+            .await
+            .expect("save non-active unfinished run");
+        let source = FixedSnapshotSource {
+            snapshot: ReviewRunSnapshot {
+                token_usage: TokenUsage::default(),
+                history: Some(history),
+            },
+        };
+
         assert_eq!(
             0,
-            recover_terminal_project_review_runs(&store, &source, Utc::now())
+            recover_expired_terminal_project_review_runs(&store, &source, Utc::now())
                 .await
-                .expect("recovery is idempotent")
+                .expect("live terminal lease is retained")
+        );
+        let recovered_at = job.lease_expires_at.expect("lease expiry") + TimeDelta::seconds(1);
+        assert_eq!(
+            1,
+            recover_expired_terminal_project_review_runs(&store, &source, recovered_at)
+                .await
+                .expect("recover expired terminal Run")
+        );
+        assert_eq!(
+            stray,
+            store
+                .load_project_review_run(run.project_id, stray.summary.id)
+                .await
+                .expect("load non-active run")
+                .expect("non-active run")
         );
     }
 
@@ -511,7 +620,8 @@ mod tests {
             snapshot: ReviewRunSnapshot::default(),
         };
 
-        let error = recover_terminal_project_review_runs(&store, &source, Utc::now())
+        let recovered_at = job.lease_expires_at.expect("lease expiry") + TimeDelta::seconds(1);
+        let error = recover_expired_terminal_project_review_runs(&store, &source, recovered_at)
             .await
             .expect_err("missing canonical history must block cleanup");
         assert!(
@@ -536,7 +646,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_archives_active_attempt_before_job_and_resource_recovery() {
+    async fn recovery_waits_for_lease_expiry_before_archiving_active_attempt() {
         let (_directory, store) = test_store().await;
         let project_id = Uuid::new_v4();
         let job = new_project_review_job(NewProjectReviewJob {
@@ -590,7 +700,8 @@ mod tests {
             })
             .await
             .expect("record uncertain submission intent");
-        let recovered_at = started_at + TimeDelta::minutes(2);
+        let live_recovery_at = started_at + TimeDelta::minutes(2);
+        let recovered_at = started_at + TimeDelta::minutes(11);
         let history = ThreadTurnHistory {
             turn: Turn {
                 id: turn_id,
@@ -612,8 +723,22 @@ mod tests {
         };
 
         assert_eq!(
+            0,
+            archive_expired_project_review_runs(&store, &source, live_recovery_at)
+                .await
+                .expect("live lease keeps attempt active")
+        );
+        let live = store
+            .load_project_review_run(project_id, run_id)
+            .await
+            .expect("load live run")
+            .expect("live run");
+        assert_eq!(None, live.summary.finished_at);
+        assert_eq!(None, live.history);
+
+        assert_eq!(
             1,
-            archive_interrupted_project_review_runs(&store, &source, recovered_at)
+            archive_expired_project_review_runs(&store, &source, recovered_at)
                 .await
                 .expect("archive interrupted attempt")
         );
@@ -635,7 +760,7 @@ mod tests {
         assert_eq!(
             1,
             store
-                .recover_interrupted_project_review_jobs(recovered_at)
+                .recover_expired_project_review_jobs(recovered_at)
                 .await
                 .expect("recover interrupted job")
         );
@@ -680,8 +805,8 @@ mod tests {
             store
                 .claim_due_project_review_cleanup_task(
                     "cleanup-after-recovery".to_string(),
-                    recovered_at,
-                    recovered_at + TimeDelta::minutes(5),
+                    receipt_at,
+                    receipt_at + TimeDelta::minutes(5),
                 )
                 .await
                 .expect("cleanup claim")

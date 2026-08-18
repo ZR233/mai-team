@@ -2263,7 +2263,7 @@ async fn expired_review_job_recovers_without_losing_reviewer() {
 }
 
 #[tokio::test]
-async fn process_restart_recovers_live_lease_and_persists_reviewer_cleanup() {
+async fn recovery_preserves_live_lease_and_reviewer_ownership() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
     let reviewer_id = Uuid::new_v4();
@@ -2285,47 +2285,21 @@ async fn process_restart_recovers_live_lease_and_persists_reviewer_cleanup() {
             .await
             .expect("future lease is not expired")
     );
-    assert_eq!(
-        1,
-        store
-            .recover_interrupted_project_review_jobs(current_time)
-            .await
-            .expect("process restart owns every old lease")
-    );
-
-    let recovered = store
+    let preserved = store
         .load_project_review_job(project_id, job.id)
         .await
-        .expect("load recovered job")
-        .expect("recovered job");
+        .expect("load preserved job")
+        .expect("preserved job");
     let cleanup_tasks = store
         .load_project_review_cleanup_tasks(job.id)
         .await
         .expect("load cleanup tasks");
-    assert_eq!(ProjectReviewJobStatus::RetryWaiting, recovered.status);
-    assert_eq!(None, recovered.lease_owner);
-    assert_eq!(None, recovered.lease_expires_at);
-    assert_eq!(
-        vec![
-            ProjectReviewCleanupResourceKind::ReviewerAgent,
-            ProjectReviewCleanupResourceKind::ToolOutputNamespace,
-        ],
-        cleanup_tasks
-            .iter()
-            .map(|task| task.resource_kind)
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        vec![ProjectReviewCleanupTaskStatus::Pending; 2],
-        cleanup_tasks
-            .iter()
-            .map(|task| task.status)
-            .collect::<Vec<_>>()
-    );
+    assert_eq!(job, preserved);
+    assert_eq!(Vec::<ProjectReviewCleanupTask>::new(), cleanup_tasks);
 }
 
 #[tokio::test]
-async fn recovered_active_attempt_can_begin_the_next_attempt() {
+async fn expired_active_attempt_can_begin_the_next_attempt() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
     let job = test_review_job(project_id, 11, "head", None);
@@ -2356,13 +2330,13 @@ async fn recovered_active_attempt_can_begin_the_next_attempt() {
         .await
         .expect("begin first attempt");
 
-    let recovered_at = first_started_at + chrono::TimeDelta::seconds(1);
+    let recovered_at = first_started_at + chrono::TimeDelta::minutes(6);
     assert_eq!(
         1,
         store
-            .recover_interrupted_project_review_jobs(recovered_at)
+            .recover_expired_project_review_jobs(recovered_at)
             .await
-            .expect("recover interrupted attempt")
+            .expect("recover expired attempt")
     );
     let recovered = store
         .load_project_review_job(project_id, job_id)
@@ -2408,6 +2382,83 @@ async fn recovered_active_attempt_can_begin_the_next_attempt() {
             .into_iter()
             .map(|attempt| attempt.status)
             .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn expired_lease_recovery_interrupts_only_the_active_run() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let job = test_review_job(project_id, 12, "head", None);
+    let job_id = job.id;
+    store
+        .enqueue_project_review_job(job)
+        .await
+        .expect("enqueue job");
+    let started_at = Utc::now();
+    let lease_expires_at = started_at + chrono::TimeDelta::minutes(5);
+    store
+        .claim_due_project_review_job(
+            project_id,
+            "expired-owner".to_string(),
+            started_at,
+            lease_expires_at,
+        )
+        .await
+        .expect("claim attempt")
+        .expect("attempt due");
+    let active_run_id = Uuid::new_v4();
+    store
+        .begin_claimed_project_review_attempt(
+            job_id,
+            "expired-owner".to_string(),
+            active_run_id,
+            started_at,
+        )
+        .await
+        .expect("begin active attempt");
+    let active_before = store
+        .load_project_review_run(project_id, active_run_id)
+        .await
+        .expect("load active run")
+        .expect("active run");
+    let stray_run_id = Uuid::new_v4();
+    let mut stray_expected = active_before.clone();
+    stray_expected.summary.id = stray_run_id;
+    stray_expected.summary.attempt_index = 2;
+    store
+        .save_project_review_run(&stray_expected)
+        .await
+        .expect("save non-active unfinished run");
+
+    let recovered_at = lease_expires_at + chrono::TimeDelta::seconds(1);
+    assert_eq!(
+        1,
+        store
+            .recover_expired_project_review_jobs(recovered_at)
+            .await
+            .expect("recover expired ownership")
+    );
+    let mut active_expected = active_before;
+    active_expected.summary.status = ProjectReviewRunStatus::Interrupted;
+    active_expected.summary.finished_at = Some(recovered_at);
+    active_expected.summary.error =
+        Some("review attempt lease expired before completion".to_string());
+    assert_eq!(
+        active_expected,
+        store
+            .load_project_review_run(project_id, active_run_id)
+            .await
+            .expect("load interrupted active run")
+            .expect("interrupted active run")
+    );
+    assert_eq!(
+        stray_expected,
+        store
+            .load_project_review_run(project_id, stray_run_id)
+            .await
+            .expect("load preserved non-active run")
+            .expect("preserved non-active run")
     );
 }
 
@@ -2631,14 +2682,18 @@ async fn terminal_review_job_persists_idempotent_retryable_cleanup_tasks() {
     assert_eq!(
         1,
         store
-            .release_archived_terminal_project_review_ownership()
+            .release_expired_archived_terminal_project_review_ownership(
+                timestamp + chrono::TimeDelta::seconds(1),
+            )
             .await
             .expect("release archived ownership")
     );
     assert_eq!(
         0,
         store
-            .release_archived_terminal_project_review_ownership()
+            .release_expired_archived_terminal_project_review_ownership(
+                timestamp + chrono::TimeDelta::seconds(1),
+            )
             .await
             .expect("release is idempotent")
     );

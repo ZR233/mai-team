@@ -175,27 +175,31 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<usize>> + Send;
 
-    fn recover_interrupted_project_review_jobs(
+    /// 归档 lease 已失效且仍由非终态 Job 持有的 Run，再恢复 Job ownership。
+    fn archive_expired_project_review_runs(
         &self,
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<usize>> + Send;
 
-    /// 启动时先归档仍由非终态 Job 持有的 Run，确保清理 reviewer 前保留 Thread 历史。
-    fn archive_interrupted_project_review_runs(
+    /// 释放 lease 已失效的终态 Job 对已归档 Run 遗留的 ownership。
+    fn release_expired_archived_terminal_project_review_ownership(
         &self,
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<usize>> + Send;
 
-    /// 启动时释放终态 Job 对已归档 Run 遗留的 ownership，不触碰未完成 Run。
-    fn release_archived_terminal_project_review_ownership(
-        &self,
-    ) -> impl Future<Output = Result<usize>> + Send;
-
-    /// 启动时结束已终态 Job 遗留的非终态 Run，恢复跨表生命周期不变量。
-    fn recover_terminal_project_review_runs(
+    /// 结束 lease 已失效且 Job 已终态的 active Run，恢复跨表生命周期不变量。
+    fn recover_expired_terminal_project_review_runs(
         &self,
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<usize>> + Send;
+
+    /// 由仍持有有效 lease 的 worker 补完当前终态 Job 的 active Run 归档。
+    fn finish_owned_terminal_project_review_run(
+        &self,
+        job: ProjectReviewJobSummary,
+        owner: String,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<()>> + Send;
 
     fn cancel_active_project_review_jobs(
         &self,
@@ -236,72 +240,69 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
 
 pub(crate) async fn start_enabled_project_review_workers(ops: impl ProjectReviewWorkerOps) {
     let recovered_at = Utc::now();
-    match ops.recover_terminal_project_review_runs(recovered_at).await {
-        Ok(recovered) if recovered > 0 => {
-            tracing::warn!(
-                recovered,
-                "recovered unfinished review runs whose jobs were already terminal"
-            );
-        }
-        Ok(_) => {}
+    let recovery = match recover_expired_project_review_lifecycles(&ops, recovered_at).await {
+        Ok(recovery) => recovery,
         Err(error) => {
-            tracing::error!("failed to recover unfinished review runs for terminal jobs: {error}");
+            tracing::error!("failed to recover expired Review lifecycles: {error}");
             return;
         }
-    }
-    match ops
-        .archive_interrupted_project_review_runs(recovered_at)
-        .await
-    {
-        Ok(archived) if archived > 0 => {
-            tracing::warn!(
-                archived,
-                "archived review runs interrupted by server restart"
-            );
-        }
-        Ok(_) => {}
-        Err(error) => {
-            tracing::error!("failed to archive review runs interrupted by server restart: {error}");
-            return;
-        }
-    }
-    match ops
-        .release_archived_terminal_project_review_ownership()
-        .await
-    {
-        Ok(released) if released > 0 => {
-            tracing::warn!(
-                released,
-                "released stale terminal Review ownership after Run archive"
-            );
-        }
-        Ok(_) => {}
-        Err(error) => {
-            tracing::error!("failed to release archived terminal Review ownership: {error}");
-            return;
-        }
-    }
-    match ops
-        .recover_interrupted_project_review_jobs(recovered_at)
-        .await
-    {
-        Ok(recovered) if recovered > 0 => {
-            tracing::info!(
-                recovered,
-                "recovered review jobs interrupted by server restart"
-            );
-        }
-        Ok(_) => {}
-        Err(error) => {
-            tracing::error!("failed to recover review jobs interrupted by server restart: {error}");
-            return;
-        }
-    }
+    };
+    recovery.log();
     for project_id in ops.project_ids().await {
         if let Err(err) = start_project_review_loop_if_ready(ops.clone(), project_id).await {
             tracing::warn!(project_id = %project_id, "failed to start project review loop: {err}");
         }
     }
+}
+
+#[derive(Default)]
+struct ProjectReviewRecoverySummary {
+    terminal_runs: usize,
+    active_runs: usize,
+    terminal_ownership: usize,
+    jobs: usize,
+}
+
+impl ProjectReviewRecoverySummary {
+    fn log(&self) {
+        if self.terminal_runs > 0
+            || self.active_runs > 0
+            || self.terminal_ownership > 0
+            || self.jobs > 0
+        {
+            tracing::warn!(
+                terminal_runs = self.terminal_runs,
+                active_runs = self.active_runs,
+                terminal_ownership = self.terminal_ownership,
+                jobs = self.jobs,
+                "recovered expired Review lifecycles"
+            );
+        }
+    }
+}
+
+async fn recover_expired_project_review_lifecycles(
+    ops: &impl ProjectReviewWorkerOps,
+    recovered_at: DateTime<Utc>,
+) -> Result<ProjectReviewRecoverySummary> {
+    let terminal_runs = ops
+        .recover_expired_terminal_project_review_runs(recovered_at)
+        .await?;
+    let active_runs = ops
+        .archive_expired_project_review_runs(recovered_at)
+        .await?;
+    let terminal_ownership = ops
+        .release_expired_archived_terminal_project_review_ownership(recovered_at)
+        .await?;
+    let jobs = ops
+        .recover_expired_project_review_jobs(recovered_at)
+        .await?;
+    Ok(ProjectReviewRecoverySummary {
+        terminal_runs,
+        active_runs,
+        terminal_ownership,
+        jobs,
+    })
 }
 
 pub(crate) async fn start_project_review_loop_if_ready(
@@ -569,16 +570,15 @@ async fn run_project_review_pool_worker(
         }
 
         let claimed_at = Utc::now();
-        if let Err(err) = ops
-            .ops
-            .recover_expired_project_review_jobs(claimed_at)
-            .await
-        {
-            tracing::warn!(project_id = %ops.project_id, "failed to recover expired project review leases: {err}");
-            if !wait_or_cancel(&ops.cancellation_token, Duration::from_secs(1)).await {
-                break;
+        match recover_expired_project_review_lifecycles(&ops.ops, claimed_at).await {
+            Ok(recovery) => recovery.log(),
+            Err(err) => {
+                tracing::warn!(project_id = %ops.project_id, "failed to recover expired Review lifecycles: {err}");
+                if !wait_or_cancel(&ops.cancellation_token, Duration::from_secs(1)).await {
+                    break;
+                }
+                continue;
             }
-            continue;
         }
         let job = match ops
             .ops
@@ -1476,51 +1476,34 @@ mod tests {
             Ok(recovered)
         }
 
-        async fn recover_interrupted_project_review_jobs(
-            &self,
-            now: chrono::DateTime<chrono::Utc>,
-        ) -> crate::Result<usize> {
-            let mut jobs = self.review_jobs.lock().await;
-            let mut recovered = 0;
-            for job in jobs.iter_mut() {
-                if matches!(
-                    job.status,
-                    ProjectReviewJobStatus::Preparing
-                        | ProjectReviewJobStatus::Running
-                        | ProjectReviewJobStatus::SubmissionPending
-                        | ProjectReviewJobStatus::Reconciling
-                ) {
-                    job.status = if job.submission_intent.is_some() {
-                        ProjectReviewJobStatus::Reconciling
-                    } else {
-                        ProjectReviewJobStatus::RetryWaiting
-                    };
-                    job.next_attempt_at = Some(now);
-                    job.lease_owner = None;
-                    job.lease_expires_at = None;
-                    job.updated_at = now;
-                    recovered += 1;
-                }
-            }
-            Ok(recovered)
-        }
-
-        async fn archive_interrupted_project_review_runs(
+        async fn archive_expired_project_review_runs(
             &self,
             _now: chrono::DateTime<chrono::Utc>,
         ) -> crate::Result<usize> {
             Ok(0)
         }
 
-        async fn release_archived_terminal_project_review_ownership(&self) -> crate::Result<usize> {
-            Ok(0)
-        }
-
-        async fn recover_terminal_project_review_runs(
+        async fn release_expired_archived_terminal_project_review_ownership(
             &self,
             _now: chrono::DateTime<chrono::Utc>,
         ) -> crate::Result<usize> {
             Ok(0)
+        }
+
+        async fn recover_expired_terminal_project_review_runs(
+            &self,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> crate::Result<usize> {
+            Ok(0)
+        }
+
+        async fn finish_owned_terminal_project_review_run(
+            &self,
+            _job: ProjectReviewJobSummary,
+            _owner: String,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> crate::Result<()> {
+            Ok(())
         }
 
         async fn cancel_active_project_review_jobs(
