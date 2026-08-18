@@ -392,7 +392,7 @@ pub(crate) fn validate_project_reviewer_github_api_target(
         return Ok(());
     }
     let valid = is_base_repository_api_path(path, owner, repo)
-        || is_base_repository_scoped_search(method, path, owner, repo);
+        || is_base_repository_scoped_search(method, path, owner, repo)?;
     if !valid {
         return Err(RuntimeError::InvalidInput(format!(
             "reviewer GitHub API request must target the project base repository `{owner}/{repo}`"
@@ -412,32 +412,46 @@ fn is_base_repository_api_path(path: &str, owner: &str, repo: &str) -> bool {
         && decoded_path_segment(segments[3]).is_some_and(|value| value.eq_ignore_ascii_case(repo))
 }
 
-fn is_base_repository_scoped_search(method: &str, path: &str, owner: &str, repo: &str) -> bool {
+fn is_base_repository_scoped_search(
+    method: &str,
+    path: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<bool> {
     if !method.eq_ignore_ascii_case("GET") {
-        return false;
+        return Ok(false);
     }
     let Some((search_path, query_string)) = path.split_once('?') else {
-        return false;
+        return Ok(false);
     };
     if !matches!(
         search_path,
         "/search/issues" | "/search/code" | "/search/commits"
     ) {
-        return false;
+        return Ok(false);
     }
 
-    let mut search_queries = query_string.split('&').filter_map(|parameter| {
-        let (name, value) = parameter.split_once('=')?;
-        decoded_query_component(name)
-            .filter(|name| name == "q")
-            .and_then(|_| decoded_query_component(value))
-    });
-    let Some(search_query) = search_queries.next() else {
-        return false;
-    };
-    if search_queries.next().is_some() {
-        return false;
+    let mut search_queries = Vec::new();
+    for parameter in query_string.split('&') {
+        let Some((name, value)) = parameter.split_once('=') else {
+            continue;
+        };
+        if decoded_query_component(name).as_deref() != Some("q") {
+            continue;
+        }
+        if value.to_ascii_lowercase().contains("%2b") {
+            return Err(RuntimeError::InvalidInput(
+                "reviewer GitHub search query must use raw `+` or `%20` between terms; `%2B` is a literal plus and GitHub rejects it"
+                    .to_string(),
+            ));
+        }
+        if let Some(value) = decoded_query_component(value) {
+            search_queries.push(value);
+        }
     }
+    let [search_query] = search_queries.as_slice() else {
+        return Ok(false);
+    };
 
     let repository_qualifiers = search_query
         .split_whitespace()
@@ -447,8 +461,8 @@ fn is_base_repository_scoped_search(method: &str, path: &str, owner: &str, repo:
         })
         .collect::<Vec<_>>();
     let expected_repository = format!("{owner}/{repo}");
-    matches!(repository_qualifiers.as_slice(), [repository]
-        if repository.eq_ignore_ascii_case(&expected_repository))
+    Ok(matches!(repository_qualifiers.as_slice(), [repository]
+        if repository.eq_ignore_ascii_case(&expected_repository)))
 }
 
 fn decoded_query_component(value: &str) -> Option<String> {
@@ -556,6 +570,20 @@ mod tests {
             )
             .expect("repository-scoped search");
         }
+    }
+
+    #[test]
+    fn reviewer_searches_explain_percent_encoded_plus_separator() {
+        let error = validate_project_reviewer_github_api_target(
+            "GET",
+            "/search/issues?q=repo%3Arcore-os%2Ftgoskits%2Bis%3Apr%2Bis%3Aopen",
+            Some(&AgentRole::Reviewer),
+            "rcore-os",
+            "tgoskits",
+        )
+        .expect_err("percent-encoded plus is a literal plus in a GitHub search query");
+
+        assert!(error.to_string().contains("raw `+` or `%20`"));
     }
 
     #[test]

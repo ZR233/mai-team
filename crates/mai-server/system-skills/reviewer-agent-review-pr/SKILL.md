@@ -123,6 +123,11 @@ Fetch the target PR with visible Mai GitHub API tools. Use `github_api_request` 
 - `/repos/OWNER/REPO/commits/HEAD_SHA/check-runs`
 - `/repos/OWNER/REPO/commits/HEAD_SHA/status`
 
+如需做仓库内的 GitHub 搜索，可以使用 `/search/issues`、`/search/code` 或
+`/search/commits`，但 `q` 必须且只能包含一个目标仓库限定符。例如：
+`/search/issues?q=repo%3AOWNER%2FREPO+is%3Apr+is%3Aopen`。搜索词之间使用原始
+`+` 或 `%20` 分隔；禁止把分隔符写成 `%2B`，因为 GitHub 会把它解释成字面加号并拒绝查询。
+
 Do not scan for another PR, do not replace the target PR, and do not skip the target PR because of draft state, author identity, existing reviews, or CI status. Treat those facts as review context only.
 
 Practical note: many PRs expose `mergeable_state: "unknown"` even when `get_check_runs` is available. Do not infer passing CI from `mergeable_state == "unknown"`; rely on actual check runs when describing validation context.
