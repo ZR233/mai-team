@@ -2318,6 +2318,15 @@ async fn failed_missing_submission_receipt_recovers_once_for_reconciliation() {
             .expect("recovered job")
     );
 
+    assert_eq!(
+        0,
+        store
+            .recover_expired_project_review_jobs(
+                current_time + chrono::TimeDelta::milliseconds(500),
+            )
+            .await
+            .expect("queued reconciliation is not recovered again")
+    );
     let claimed_at = current_time + chrono::TimeDelta::seconds(1);
     let mut claimed = store
         .claim_due_project_review_job(

@@ -783,8 +783,10 @@ fn recover_jobs_on_path(path: &Path, now: DateTime<Utc>) -> Result<usize> {
          status = CASE WHEN submission_intent_json IS NULL THEN 'retry_waiting' ELSE 'reconciling' END, \
          next_attempt_at = ?1, updated_at = ?1, active_run_id = NULL, \
          lease_owner = NULL, lease_expires_at = NULL \
-         WHERE status IN ('preparing','running','submission_pending','reconciling') \
-         AND (lease_expires_at IS NULL OR lease_expires_at <= ?1)",
+         WHERE (status IN ('preparing','running','submission_pending') \
+             AND (lease_expires_at IS NULL OR lease_expires_at <= ?1)) \
+         OR (status = 'reconciling' AND lease_owner IS NOT NULL \
+             AND (lease_expires_at IS NULL OR lease_expires_at <= ?1))",
         params![now],
     )?;
     let ambiguous_submission_changed = transaction.execute(
