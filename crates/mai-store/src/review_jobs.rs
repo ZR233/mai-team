@@ -778,7 +778,7 @@ fn recover_jobs_on_path(path: &Path, now: DateTime<Utc>) -> Result<usize> {
          )",
         params![now],
     )?;
-    let changed = transaction.execute(
+    let expired_changed = transaction.execute(
         "UPDATE project_review_jobs SET \
          status = CASE WHEN submission_intent_json IS NULL THEN 'retry_waiting' ELSE 'reconciling' END, \
          next_attempt_at = ?1, updated_at = ?1, active_run_id = NULL, \
@@ -787,8 +787,18 @@ fn recover_jobs_on_path(path: &Path, now: DateTime<Utc>) -> Result<usize> {
          AND (lease_expires_at IS NULL OR lease_expires_at <= ?1)",
         params![now],
     )?;
+    let ambiguous_submission_changed = transaction.execute(
+        "UPDATE project_review_jobs SET status = 'reconciling', next_attempt_at = ?1, \
+         updated_at = ?1, finished_at = NULL, active_run_id = NULL, lease_owner = NULL, \
+         lease_expires_at = NULL, failure_json = NULL \
+         WHERE status = 'failed' AND submission_intent_json IS NOT NULL \
+         AND submission_receipt_json IS NULL \
+         AND CASE WHEN json_valid(failure_json) \
+             THEN json_extract(failure_json, '$.code') END = 'missing_submission_receipt'",
+        params![now],
+    )?;
     transaction.commit()?;
-    Ok(changed)
+    Ok(expired_changed + ambiguous_submission_changed)
 }
 
 fn record_submission_intent_on_path(

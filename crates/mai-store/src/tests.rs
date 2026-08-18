@@ -2,8 +2,9 @@ use super::*;
 use crate::schema::SETTING_SCHEMA_VERSION;
 use mai_protocol::{
     AgentMessageChannel, McpServerScope, McpServerTransport, ProjectCloneStatus,
-    ProjectReviewDecision, ProjectReviewEnvironmentWarning, ProjectReviewJobSource,
-    ProjectReviewJobStatus, ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus,
+    ProjectReviewDecision, ProjectReviewEnvironmentWarning, ProjectReviewFailure,
+    ProjectReviewFailureCategory, ProjectReviewJobSource, ProjectReviewJobStatus,
+    ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus,
     ProjectReviewSubmissionIntent, ProjectReviewSubmissionReceipt, ProjectStatus,
     ThreadContextDisposition, ThreadItem, ThreadItemContent, ThreadItemStatus, ThreadTurnHistory,
     Turn, TurnState,
@@ -2260,6 +2261,153 @@ async fn expired_review_job_recovers_without_losing_reviewer() {
     assert_eq!(ProjectReviewJobStatus::RetryWaiting, recovered.status);
     assert_eq!(Some(reviewer_id), recovered.reviewer_agent_id);
     assert!(recovered.next_attempt_at.is_some());
+}
+
+#[tokio::test]
+async fn failed_missing_submission_receipt_recovers_once_for_reconciliation() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let current_time = Utc::now();
+    let mut job = test_review_job(project_id, 91, "head", None);
+    job.status = ProjectReviewJobStatus::Failed;
+    job.attempt_count = 1;
+    job.next_attempt_at = None;
+    job.failure = Some(ProjectReviewFailure {
+        category: ProjectReviewFailureCategory::Validation,
+        code: Some("missing_submission_receipt".to_string()),
+        http_status: None,
+        message: "reviewer reported submission without a receipt".to_string(),
+        retry: pl_protocol::RetryDisposition::Permanent,
+    });
+    job.submission_intent = Some(ProjectReviewSubmissionIntent {
+        job_id: job.id,
+        head_sha: job.head_sha.clone(),
+        event: ProjectReviewDecision::Approve,
+        body_hash: "sha256:body".to_string(),
+        comment_count: 0,
+        created_at: current_time - chrono::TimeDelta::minutes(10),
+    });
+    job.updated_at = current_time - chrono::TimeDelta::minutes(9);
+    job.finished_at = Some(job.updated_at);
+    store
+        .save_project_review_job(job.clone())
+        .await
+        .expect("save legacy failed job");
+
+    assert_eq!(
+        1,
+        store
+            .recover_expired_project_review_jobs(current_time)
+            .await
+            .expect("recover ambiguous submission")
+    );
+    job.status = ProjectReviewJobStatus::Reconciling;
+    job.next_attempt_at = Some(current_time);
+    job.failure = None;
+    job.active_run_id = None;
+    job.lease_owner = None;
+    job.lease_expires_at = None;
+    job.updated_at = current_time;
+    job.finished_at = None;
+    assert_eq!(
+        job,
+        store
+            .load_project_review_job(project_id, job.id)
+            .await
+            .expect("load recovered job")
+            .expect("recovered job")
+    );
+
+    let claimed_at = current_time + chrono::TimeDelta::seconds(1);
+    let mut claimed = store
+        .claim_due_project_review_job(
+            project_id,
+            "reconciler".to_string(),
+            claimed_at,
+            claimed_at + chrono::TimeDelta::minutes(5),
+        )
+        .await
+        .expect("claim recovered reconciliation")
+        .expect("recovered reconciliation");
+    assert_eq!(ProjectReviewJobStatus::Reconciling, claimed.status);
+    claimed.status = ProjectReviewJobStatus::Failed;
+    claimed.next_attempt_at = None;
+    claimed.failure = Some(ProjectReviewFailure {
+        category: ProjectReviewFailureCategory::Github,
+        code: None,
+        http_status: None,
+        message: "reconciliation deadline elapsed".to_string(),
+        retry: pl_protocol::RetryDisposition::Permanent,
+    });
+    claimed.lease_owner = None;
+    claimed.lease_expires_at = None;
+    claimed.updated_at = claimed_at + chrono::TimeDelta::seconds(1);
+    claimed.finished_at = Some(claimed.updated_at);
+    assert!(
+        store
+            .save_claimed_project_review_job(claimed, "reconciler".to_string())
+            .await
+            .expect("persist terminal reconciliation failure")
+    );
+    assert_eq!(
+        0,
+        store
+            .recover_expired_project_review_jobs(claimed_at + chrono::TimeDelta::seconds(2))
+            .await
+            .expect("terminal reconciliation failure is not reopened")
+    );
+}
+
+#[tokio::test]
+async fn claimed_job_persists_reconciliation_and_releases_lease_atomically() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let mut job = test_review_job(project_id, 92, "head", None);
+    let current_time = job.updated_at + chrono::TimeDelta::seconds(1);
+    job.submission_intent = Some(ProjectReviewSubmissionIntent {
+        job_id: job.id,
+        head_sha: job.head_sha.clone(),
+        event: ProjectReviewDecision::Approve,
+        body_hash: "sha256:body".to_string(),
+        comment_count: 0,
+        created_at: current_time,
+    });
+    store
+        .save_project_review_job(job)
+        .await
+        .expect("save pending job");
+    let owner = "review-worker".to_string();
+    let mut claimed = store
+        .claim_due_project_review_job(
+            project_id,
+            owner.clone(),
+            current_time,
+            current_time + chrono::TimeDelta::minutes(5),
+        )
+        .await
+        .expect("claim pending job")
+        .expect("pending job");
+
+    claimed.status = ProjectReviewJobStatus::Reconciling;
+    claimed.next_attempt_at = Some(current_time + chrono::TimeDelta::seconds(10));
+    claimed.active_run_id = None;
+    claimed.lease_owner = None;
+    claimed.lease_expires_at = None;
+    claimed.updated_at = current_time + chrono::TimeDelta::seconds(1);
+    assert!(
+        store
+            .save_claimed_project_review_job(claimed.clone(), owner)
+            .await
+            .expect("persist reconciliation")
+    );
+    assert_eq!(
+        claimed,
+        store
+            .load_project_review_job(project_id, claimed.id)
+            .await
+            .expect("load reconciliation")
+            .expect("reconciliation")
+    );
 }
 
 #[tokio::test]

@@ -213,6 +213,23 @@ fn apply_review_cycle_result(
 ) -> (Option<ProjectReviewOutcome>, Option<String>) {
     let outcome = Some(result.outcome.clone());
     let summary = result.summary.clone();
+    if job.submission_intent.is_some() && job.submission_receipt.is_none() {
+        let error = result
+            .error
+            .clone()
+            .or_else(|| {
+                result
+                    .failure
+                    .as_ref()
+                    .map(|failure| failure.message.clone())
+            })
+            .unwrap_or_else(|| {
+                "GitHub review submission has no persisted receipt; reconciling the exact Job marker and head"
+                    .to_string()
+            });
+        begin_review_reconciliation(job, Some(error));
+        return (outcome, summary);
+    }
     match result.outcome {
         ProjectReviewOutcome::ReviewSubmitted if job.submission_receipt.is_some() => {
             super::job::succeed_job(job, Utc::now());
@@ -320,8 +337,20 @@ fn schedule_review_reconciliation(job: &mut ProjectReviewJobSummary, error: Opti
         );
         return;
     }
+    begin_review_reconciliation(job, error);
+}
+
+fn begin_review_reconciliation(job: &mut ProjectReviewJobSummary, error: Option<String>) {
+    let current_time = Utc::now();
+    let deadline = job
+        .submission_intent
+        .as_ref()
+        .map(|intent| intent.created_at + TimeDelta::minutes(5))
+        .unwrap_or(current_time);
+    let next_attempt_at = (current_time + TimeDelta::seconds(10)).min(deadline);
+    let retry_after_ms = (next_attempt_at - current_time).num_milliseconds().max(0) as u64;
     job.status = mai_protocol::ProjectReviewJobStatus::Reconciling;
-    job.next_attempt_at = Some((current_time + TimeDelta::seconds(10)).min(deadline));
+    job.next_attempt_at = Some(next_attempt_at);
     job.active_run_id = None;
     job.lease_owner = None;
     job.lease_expires_at = None;
@@ -333,7 +362,7 @@ fn schedule_review_reconciliation(job: &mut ProjectReviewJobSummary, error: Opti
             http_status: None,
             message: error,
             retry: pl_protocol::RetryDisposition::Retryable {
-                retry_after_ms: Some(10_000),
+                retry_after_ms: Some(retry_after_ms),
             },
         });
     }
@@ -723,7 +752,8 @@ mod tests {
     use std::time::Duration as StdDuration;
 
     use mai_protocol::{
-        ProjectReviewDecision, ProjectReviewJobStatus, ProjectReviewSubmissionReceipt,
+        ProjectReviewDecision, ProjectReviewJobStatus, ProjectReviewSubmissionIntent,
+        ProjectReviewSubmissionReceipt,
     };
     use pretty_assertions::assert_eq;
     use reqwest::StatusCode;
@@ -743,6 +773,62 @@ mod tests {
                 .as_ref()
                 .and_then(|failure| failure.code.as_deref())
         );
+    }
+
+    #[test]
+    fn unresolved_submission_intent_reconciles_instead_of_trusting_agent_outcome() {
+        let mut job = job_with_submission_intent();
+
+        apply_review_cycle_result(&mut job, submitted_result());
+
+        assert_eq!(ProjectReviewJobStatus::Reconciling, job.status);
+        assert_eq!(None, job.active_run_id);
+        assert_eq!(None, job.lease_owner);
+        assert_eq!(None, job.lease_expires_at);
+        assert!(job.next_attempt_at.is_some());
+        assert_eq!(
+            Some(pl_protocol::RetryDisposition::Retryable {
+                retry_after_ms: Some(10_000),
+            }),
+            job.failure.as_ref().map(|failure| failure.retry.clone())
+        );
+    }
+
+    #[test]
+    fn unresolved_submission_intent_reconciles_after_reported_failure() {
+        let mut job = job_with_submission_intent();
+        let mut result = submitted_result();
+        result.outcome = ProjectReviewOutcome::Failed;
+        result.review_event = None;
+        result.error = Some("sidecar timed out after sending the request".to_string());
+
+        apply_review_cycle_result(&mut job, result);
+
+        assert_eq!(ProjectReviewJobStatus::Reconciling, job.status);
+        assert_eq!(
+            Some((
+                "sidecar timed out after sending the request".to_string(),
+                pl_protocol::RetryDisposition::Retryable {
+                    retry_after_ms: Some(10_000),
+                },
+            )),
+            job.failure.map(|failure| (failure.message, failure.retry))
+        );
+    }
+
+    #[test]
+    fn expired_unresolved_submission_intent_still_gets_one_reconciliation_attempt() {
+        let mut job = job_with_submission_intent();
+        job.submission_intent
+            .as_mut()
+            .expect("submission intent")
+            .created_at = Utc::now() - chrono::TimeDelta::minutes(10);
+
+        apply_review_cycle_result(&mut job, submitted_result());
+
+        assert_eq!(ProjectReviewJobStatus::Reconciling, job.status);
+        assert_eq!(None, job.finished_at);
+        assert!(job.next_attempt_at.is_some_and(|next| next <= Utc::now()));
     }
 
     #[test]
@@ -864,6 +950,20 @@ mod tests {
             delivery_id: None,
             reason: "test".to_string(),
         })
+    }
+
+    fn job_with_submission_intent() -> ProjectReviewJobSummary {
+        let mut job = job();
+        job.status = ProjectReviewJobStatus::SubmissionPending;
+        job.submission_intent = Some(ProjectReviewSubmissionIntent {
+            job_id: job.id,
+            head_sha: job.head_sha.clone(),
+            event: ProjectReviewDecision::Approve,
+            body_hash: "sha256:body".to_string(),
+            comment_count: 0,
+            created_at: Utc::now(),
+        });
+        job
     }
 
     fn submitted_result() -> super::super::ProjectReviewCycleResult {

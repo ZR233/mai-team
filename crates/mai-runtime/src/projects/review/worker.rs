@@ -1451,7 +1451,7 @@ mod tests {
             let mut jobs = self.review_jobs.lock().await;
             let mut recovered = 0;
             for job in jobs.iter_mut() {
-                if matches!(
+                let expired_active_job = matches!(
                     job.status,
                     ProjectReviewJobStatus::Preparing
                         | ProjectReviewJobStatus::Running
@@ -1459,16 +1459,29 @@ mod tests {
                         | ProjectReviewJobStatus::Reconciling
                 ) && job
                     .lease_expires_at
-                    .is_none_or(|expires_at| expires_at <= now)
-                {
+                    .is_none_or(|expires_at| expires_at <= now);
+                let legacy_ambiguous_submission = job.status == ProjectReviewJobStatus::Failed
+                    && job.submission_intent.is_some()
+                    && job.submission_receipt.is_none()
+                    && job
+                        .failure
+                        .as_ref()
+                        .and_then(|failure| failure.code.as_deref())
+                        == Some("missing_submission_receipt");
+                if expired_active_job || legacy_ambiguous_submission {
                     job.status = if job.submission_intent.is_some() {
                         ProjectReviewJobStatus::Reconciling
                     } else {
                         ProjectReviewJobStatus::RetryWaiting
                     };
                     job.next_attempt_at = Some(now);
+                    job.active_run_id = None;
                     job.lease_owner = None;
                     job.lease_expires_at = None;
+                    if legacy_ambiguous_submission {
+                        job.failure = None;
+                        job.finished_at = None;
+                    }
                     job.updated_at = now;
                     recovered += 1;
                 }
