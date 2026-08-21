@@ -2,10 +2,10 @@ use mai_protocol::{ModelOutputItem, ModelResponse, TokenUsage};
 
 pub fn completion_response_usage(usage: &pl_model::TokenUsage) -> TokenUsage {
     let snapshot = pl_core::ModelTokenUsageSnapshot::from(usage);
-    token_usage_from_snapshot(&snapshot)
+    model_token_usage(&snapshot)
 }
 
-fn token_usage_from_snapshot(snapshot: &pl_core::ModelTokenUsageSnapshot) -> TokenUsage {
+pub fn model_token_usage(snapshot: &pl_core::ModelTokenUsageSnapshot) -> TokenUsage {
     TokenUsage {
         input_tokens: snapshot.input_tokens(),
         cached_input_tokens: snapshot.cached_input_tokens(),
@@ -47,7 +47,7 @@ pub fn completion_response_to_model_response(
     ModelResponse {
         id: snapshot.id().map(ToString::to_string),
         output,
-        usage: Some(token_usage_from_snapshot(snapshot.usage())),
+        usage: Some(model_token_usage(snapshot.usage())),
     }
 }
 

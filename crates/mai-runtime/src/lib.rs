@@ -26,7 +26,6 @@ mod facade;
 pub mod github;
 mod instructions;
 mod mcp;
-mod model_profile;
 mod model_projection;
 mod projects;
 mod runtime_agent_api;
@@ -66,8 +65,9 @@ use github::{
     DEFAULT_GITHUB_API_BASE_URL, DirectGithubAppBackend, GITHUB_HTTP_TIMEOUT_SECS, GithubAppBackend,
 };
 use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
-pub use model_profile::{core_model_turn_request, core_provider_for_selection};
-pub use model_projection::{completion_response_to_model_response, completion_response_usage};
+pub use model_projection::{
+    completion_response_to_model_response, completion_response_usage, model_token_usage,
+};
 use pl_core::{
     GIT_TOKEN_ENV, git_shell_credential_prelude, git_shell_retry_function, shell_quote_word,
 };
@@ -272,7 +272,7 @@ fn resolved_agent_model_preference(
 ) -> ResolvedAgentModelPreference {
     ResolvedAgentModelPreference {
         provider_id: selection.provider_id.to_string(),
-        provider_name: selection.provider_info.name,
+        provider_name: selection.endpoint.name,
         transport: selection.model.transport.clone(),
         model: selection.model.slug,
         model_name: selection.model.display_name,

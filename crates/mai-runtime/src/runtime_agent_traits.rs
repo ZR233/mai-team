@@ -56,7 +56,7 @@ impl agents::AgentDeleteOps for AgentRuntime {
         self.state.thread_subscriptions.invalidate(agent_id).await;
         match self
             .framework_handle()?
-            .close(agent_host::canonical_id(agent_id)?)
+            .retire(agent_host::canonical_id(agent_id)?)
             .await
         {
             Ok(_) => Ok(agents::CanonicalAgentClose::Closed),

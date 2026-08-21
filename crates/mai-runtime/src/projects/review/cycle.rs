@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::time::Duration;
 
 use mai_protocol::{AgentId, ProjectId, ProjectReviewRunDetail, ProjectReviewRunSummary, TurnId};
 #[cfg(test)]
@@ -18,6 +19,7 @@ use super::target::ProjectReviewRequest;
 use crate::{Result, RuntimeError};
 
 const REVIEWER_FINAL_JSON_REPAIR_PROMPT: &str = "The previous response did not include the required final JSON object, so the project review scheduler could not record the result. Continue from the existing review state. If the GitHub review has already been submitted, do not submit a duplicate review. If it has not been submitted yet, submit it now using the available GitHub API tool. Then reply with only one JSON object matching this schema exactly and no surrounding text: {\"outcome\":\"review_submitted|failed\",\"review_event\":\"approve|request_changes|comment\"|null,\"pr\":123|null,\"summary\":\"short result\",\"error\":null|\"failure reason\"}";
+const REVIEWER_FINAL_JSON_REPAIR_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReviewerProgress {
@@ -392,6 +394,21 @@ pub(crate) async fn parse_reviewer_final_response(
     reviewer_id: AgentId,
     cancellation_token: &CancellationToken,
 ) -> Result<ProjectReviewCycleResult> {
+    parse_reviewer_final_response_with_timeout(
+        ops,
+        reviewer_id,
+        cancellation_token,
+        REVIEWER_FINAL_JSON_REPAIR_TIMEOUT,
+    )
+    .await
+}
+
+async fn parse_reviewer_final_response_with_timeout(
+    ops: &impl ProjectReviewCycleOps,
+    reviewer_id: AgentId,
+    cancellation_token: &CancellationToken,
+    repair_timeout: Duration,
+) -> Result<ProjectReviewCycleResult> {
     let response = ops.reviewer_final_response(reviewer_id).await?;
     match super::parse_project_review_cycle_report(&response) {
         Ok(result) => Ok(result),
@@ -405,9 +422,20 @@ pub(crate) async fn parse_reviewer_final_response(
                 error = %first_err,
                 "project reviewer final JSON missing or invalid; requesting one repair turn"
             );
-            let wait_result = ops
-                .wait_agent_until_complete_with_cancel(reviewer_id, cancellation_token)
-                .await?;
+            let wait_result = match tokio::time::timeout(
+                repair_timeout,
+                ops.wait_agent_until_complete_with_cancel(reviewer_id, cancellation_token),
+            )
+            .await
+            {
+                Ok(wait_result) => wait_result?,
+                Err(_) => {
+                    ops.cancel_reviewer_turn(reviewer_id, turn_id).await?;
+                    return Ok(retryable_review_timeout_result(
+                        "reviewer final JSON repair exceeded the five-minute deadline",
+                    ));
+                }
+            };
             if last_turn_cancelled(&wait_result) && cancellation_token.is_cancelled() {
                 return Err(RuntimeError::TurnCancelled);
             }
@@ -417,6 +445,25 @@ pub(crate) async fn parse_reviewer_final_response(
             let repaired_response = ops.reviewer_final_response(reviewer_id).await?;
             super::parse_project_review_cycle_report(&repaired_response)
         }
+    }
+}
+
+pub(crate) fn retryable_review_timeout_result(message: &str) -> ProjectReviewCycleResult {
+    ProjectReviewCycleResult {
+        outcome: mai_protocol::ProjectReviewOutcome::Failed,
+        review_event: None,
+        pr: None,
+        summary: None,
+        error: Some(message.to_string()),
+        failure: Some(mai_protocol::ProjectReviewFailure {
+            category: mai_protocol::ProjectReviewFailureCategory::Timeout,
+            code: Some("review_watchdog_timeout".to_string()),
+            http_status: None,
+            message: message.to_string(),
+            retry: pl_protocol::RetryDisposition::Retryable {
+                retry_after_ms: None,
+            },
+        }),
     }
 }
 
@@ -449,9 +496,11 @@ mod tests {
         finished_runs: Arc<Mutex<Vec<FinishReviewRun>>>,
         run_summary: Arc<Mutex<Option<ProjectReviewRunSummary>>>,
         deleted_agents: Arc<Mutex<Vec<AgentId>>>,
+        cancelled_turns: Arc<Mutex<Vec<TurnId>>>,
         operations: Arc<Mutex<Vec<&'static str>>>,
         fail_running_state: bool,
         target_stale: bool,
+        block_wait: bool,
     }
 
     impl FakeCycleOps {
@@ -463,9 +512,11 @@ mod tests {
                 finished_runs: Arc::new(Mutex::new(Vec::new())),
                 run_summary: Arc::new(Mutex::new(None)),
                 deleted_agents: Arc::new(Mutex::new(Vec::new())),
+                cancelled_turns: Arc::new(Mutex::new(Vec::new())),
                 operations: Arc::new(Mutex::new(Vec::new())),
                 fail_running_state: false,
                 target_stale: false,
+                block_wait: false,
             }
         }
 
@@ -476,6 +527,11 @@ mod tests {
 
         fn with_stale_target(mut self) -> Self {
             self.target_stale = true;
+            self
+        }
+
+        fn with_blocked_wait(mut self) -> Self {
+            self.block_wait = true;
             self
         }
     }
@@ -587,6 +643,9 @@ mod tests {
             _agent_id: AgentId,
             _cancellation_token: &CancellationToken,
         ) -> Result<AgentWaitResult> {
+            if self.block_wait {
+                return std::future::pending().await;
+            }
             Ok(completed_wait_result())
         }
 
@@ -597,11 +656,8 @@ mod tests {
             })
         }
 
-        async fn cancel_reviewer_turn(
-            &self,
-            _reviewer_id: AgentId,
-            _turn_id: TurnId,
-        ) -> Result<()> {
+        async fn cancel_reviewer_turn(&self, _reviewer_id: AgentId, turn_id: TurnId) -> Result<()> {
+            self.cancelled_turns.lock().await.push(turn_id);
             Ok(())
         }
 
@@ -746,6 +802,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_json_repair_cancels_a_turn_that_exceeds_its_deadline() {
+        let project_id = Uuid::new_v4();
+        let reviewer_id = Uuid::new_v4();
+        let ops = FakeCycleOps::new(
+            project_id,
+            reviewer_id,
+            vec!["review completed without the required JSON".to_string()],
+        )
+        .with_blocked_wait();
+
+        let result = parse_reviewer_final_response_with_timeout(
+            &ops,
+            reviewer_id,
+            &CancellationToken::new(),
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect("repair timeout is a structured review result");
+
+        assert_eq!(ProjectReviewOutcome::Failed, result.outcome);
+        assert_eq!(
+            Some(mai_protocol::ProjectReviewFailureCategory::Timeout),
+            result
+                .failure
+                .as_ref()
+                .map(|failure| failure.category.clone())
+        );
+        assert!(
+            result
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.retry.is_retryable())
+        );
+        assert_eq!(1, ops.cancelled_turns.lock().await.len());
+    }
+
+    #[tokio::test]
     async fn stale_target_overrides_model_result_and_still_cleans_reviewer() {
         let project_id = Uuid::new_v4();
         let reviewer_id = Uuid::new_v4();
@@ -881,7 +974,7 @@ mod tests {
     }
 
     fn completed_wait_result() -> AgentWaitResult {
-        let agent_id = pl_core::AgentId::new("reviewer").expect("agent id");
+        let agent_id = pl_core::ThreadId::new("reviewer").expect("agent id");
         let turn = pl_core::AgentTurnOutcome {
             turn_id: pl_core::TurnId::new("turn").expect("turn id"),
             thread_id: agent_id.clone(),

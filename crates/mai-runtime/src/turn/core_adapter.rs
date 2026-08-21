@@ -4,9 +4,9 @@ use crate::state::AgentRecord;
 use crate::{AgentRuntime, Result};
 use mai_protocol::AgentId;
 use pl_core::{
-    AgentExecutionPolicy, AgentId as FrameworkAgentId, AgentRuntimeHandle, CoreRuntimeProfile,
-    NamespaceDescriptor, ToolEntry, ToolRegistry, ToolSourceId, ToolSourceMetadata, TurnEngine,
-    TurnEngineBuilder,
+    AgentExecutionPolicy, AgentRuntimeHandle, CoreRuntimeProfile, NamespaceDescriptor,
+    ThreadId as FrameworkThreadId, ToolEntry, ToolRegistry, ToolSourceId, ToolSourceMetadata,
+    TurnEngine, TurnEngineBuilder,
 };
 
 /// mai-team 产品动作工具的工具来源标识。
@@ -16,7 +16,7 @@ pub(crate) struct MaiFrameworkKernelBuildContext {
     pub(crate) runtime: Arc<AgentRuntime>,
     pub(crate) agent: Arc<AgentRecord>,
     pub(crate) agent_id: AgentId,
-    pub(crate) framework_agent_id: FrameworkAgentId,
+    pub(crate) framework_agent_id: FrameworkThreadId,
     pub(crate) framework_runtime: AgentRuntimeHandle,
     pub(crate) policy: AgentExecutionPolicy,
     pub(crate) mcp_shared_tools: Option<Arc<ToolRegistry>>,

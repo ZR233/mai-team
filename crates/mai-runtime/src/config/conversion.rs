@@ -166,7 +166,7 @@ pub fn resolve_provider_model(
         },
     );
     let route = scoped.resolve(&role).map_err(RuntimeError::Model)?;
-    if route.provider_info.bearer_token.is_none() {
+    if route.endpoint.bearer_token.is_none() {
         return Err(RuntimeError::InvalidInput(format!(
             "provider `{}` has no API key",
             route.provider_id
@@ -315,7 +315,7 @@ fn private_fields_mut(
 #[cfg(test)]
 mod tests {
     use pl_core::{ModelCatalogId, ProviderModelCatalogConfig};
-    use pl_model::{ModelInfo, ProviderInfo};
+    use pl_model::{ModelInfo, ModelTransportProfile, ProviderEndpoint};
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -375,10 +375,10 @@ mod tests {
     fn custom_provider_round_trips_without_projection() {
         let mut model = ModelInfo::fallback("custom-model");
         model.used_fallback = false;
-        let mut provider = ProviderConfig::from_provider_info(
-            ProviderInfo::responses_compatible("Custom", "https://example.test/v1", "custom-model"),
-            vec![model],
-        );
+        model.transport = ModelTransportProfile::responses_http();
+        let mut endpoint = ProviderEndpoint::openai(Some("https://example.test/v1".to_string()));
+        endpoint.name = "Custom".to_string();
+        let mut provider = ProviderConfig::from_explicit_models(endpoint, vec![model]);
         provider.bearer_token = Some("secret".to_string());
         let request = ProvidersConfigRequest {
             providers: vec![ApiProviderConfig {
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn public_projection_redacts_secrets_without_losing_model_values() {
         let mut provider = ProviderConfig::from_bundled_catalog(
-            ProviderInfo::openai(None),
+            ProviderEndpoint::openai(None),
             ModelCatalogId::new("openai").unwrap(),
             Vec::new(),
         );

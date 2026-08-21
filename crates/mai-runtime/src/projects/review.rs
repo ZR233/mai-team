@@ -1093,7 +1093,7 @@ mod tests {
         pl_core::AgentWaitResult {
             snapshot: pl_core::AgentSnapshot {
                 identity: pl_core::AgentIdentity {
-                    id: pl_core::AgentId::new("reviewer").expect("agent"),
+                    id: pl_core::ThreadId::new("reviewer").expect("agent"),
                     parent_id: None,
                     role: pl_core::AgentRoleId::new("reviewer").expect("role"),
                     depth: 0,

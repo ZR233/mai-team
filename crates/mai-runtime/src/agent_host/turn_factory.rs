@@ -2,12 +2,12 @@ use std::sync::{Arc, Weak};
 
 use mai_protocol::AgentId;
 use pl_core::{
-    AgentTurnFactory, AgentTurnPreparationContext, ContextCompactionConfig,
+    AgentTurnFactory, AgentTurnPreparationContext, AgentWorkspace, ContextCompactionConfig,
     ContextCompactionReplacement, CoreRuntimeProfile, PreparedAgentTurn, PreparedSessionRuntime,
     RecentInteractionTailConfig, TurnEngineBuilder, TurnOptions, TurnRequest,
     instruction::InstructionProfile,
 };
-use pl_model::{OpenAiCompactionMode, create_provider_with_catalog};
+use pl_model::OpenAiCompactionMode;
 use tokio::sync::RwLock;
 
 use crate::skills::{SkillInput, SkillSelection};
@@ -48,12 +48,7 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
             .resolve(&context.snapshot.identity.role)
             .map_err(RuntimeError::Model)?;
         let web_search = pl_core::plan_web_search(&config.models, &route, &config.web_search)?;
-        let provider = create_provider_with_catalog(route.provider_info, route.models)
-            .map_err(RuntimeError::Model)?;
-        let mut builder = TurnEngineBuilder::new(provider);
-        if let Some(effort) = route.effort {
-            builder = builder.with_effort(effort);
-        }
+        let builder = TurnEngineBuilder::from_route(&route).map_err(RuntimeError::Model)?;
 
         if let Err(error) = runtime.refresh_project_skills_for_agent(&agent).await {
             tracing::warn!(agent_id = %product_agent_id, "failed to refresh project skills: {error}");
@@ -106,7 +101,7 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
                         .into_iter()
                         .map(SkillSelection::from_mention)
                         .collect(),
-                    reserved_names: initial_visibility.to_btree_set(),
+                    reserved_names: initial_visibility.into_names(),
                 },
                 &skills_config,
             )?
@@ -157,15 +152,21 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
             instruction_profile = instruction_profile
                 .with_user_context_block("mai config user", config.instructions.user.clone());
         }
+        let workspace_root = if agent.summary.read().await.project_id.is_some() {
+            crate::projects::workspace::AGENT_WORKSPACE_REPO_PATH
+        } else {
+            "/workspace"
+        };
+        let mut profile = CoreRuntimeProfile::minimal()
+            .with_agent_workspace(AgentWorkspace::confined(
+                workspace_root,
+                pl_core::WorkspaceMutability::ReadWrite,
+            ))
+            .with_instruction_profile(instruction_profile)
+            .with_context_compaction(context_compaction());
         if let Some(workspace_instructions) = workspace_instructions {
-            instruction_profile =
-                instruction_profile.with_workspace_instructions(workspace_instructions);
+            profile = profile.with_workspace_instructions(workspace_instructions);
         }
-        let profile = CoreRuntimeProfile::host_provided(
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        )
-        .with_instruction_profile(instruction_profile)
-        .with_context_compaction(context_compaction());
         let mcp_shared_tools = if config.mcp.enabled {
             agent
                 .mcp
@@ -218,7 +219,7 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
 
 pub(crate) async fn product_agent(
     runtime: &AgentRuntime,
-    framework_id: &pl_core::AgentId,
+    framework_id: &pl_core::ThreadId,
 ) -> Result<(AgentId, Arc<AgentRecord>)> {
     let id = framework_id.as_str().parse::<AgentId>().map_err(|error| {
         RuntimeError::InvalidInput(format!(

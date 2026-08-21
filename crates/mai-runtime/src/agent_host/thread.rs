@@ -9,9 +9,9 @@ use pl_core::{ActiveKind, AgentActivityState, AgentLifecycleState, AgentSnapshot
 
 use crate::{Result, RuntimeError};
 
-/// 产品 AgentId 即 PL AgentId/ThreadId，边界只做非空校验。
-pub(crate) fn canonical_id(agent_id: mai_protocol::AgentId) -> Result<pl_core::AgentId> {
-    pl_core::AgentId::new(agent_id.to_string()).map_err(RuntimeError::Model)
+/// 产品 AgentId 即 PL ThreadId，边界只做非空校验。
+pub(crate) fn canonical_id(agent_id: mai_protocol::AgentId) -> Result<pl_core::ThreadId> {
+    pl_core::ThreadId::new(agent_id.to_string()).map_err(RuntimeError::Model)
 }
 
 /// 加载一个 Agent 唯一拥有的 canonical Thread document。

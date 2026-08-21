@@ -99,7 +99,7 @@ fn allowed_effects(role: &str) -> Vec<ToolEffect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pl_core::{AgentActivityState, AgentId, AgentIdentity, AgentLifecycleState};
+    use pl_core::{AgentActivityState, AgentIdentity, AgentLifecycleState, ThreadId};
 
     #[test]
     fn child_policy_has_no_spawn_or_close() {
@@ -164,8 +164,8 @@ mod tests {
     fn snapshot(parent: Option<&str>, role: &str) -> AgentSnapshot {
         AgentSnapshot {
             identity: AgentIdentity {
-                id: AgentId::new("agent").unwrap(),
-                parent_id: parent.map(|id| AgentId::new(id).unwrap()),
+                id: ThreadId::new("agent").unwrap(),
+                parent_id: parent.map(|id| ThreadId::new(id).unwrap()),
                 role: AgentRoleId::new(role).unwrap(),
                 depth: parent.is_some() as u32,
             },

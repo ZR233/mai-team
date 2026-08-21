@@ -61,8 +61,8 @@ fn last_turn(outcome: &AgentTurnOutcome) -> AgentLastTurn {
 mod tests {
     use mai_protocol::{AgentRuntimeActivity, AgentRuntimeLifecycle, AgentTurnOutcomeKind};
     use pl_core::{
-        AgentActivityState, AgentId, AgentIdentity, AgentLifecycleState, AgentRoleId,
-        AgentSnapshot, AgentTurnOutcome, ThreadId, TurnId, TurnOutcomeKind,
+        AgentActivityState, AgentIdentity, AgentLifecycleState, AgentRoleId, AgentSnapshot,
+        AgentTurnOutcome, ThreadId, TurnId, TurnOutcomeKind,
     };
 
     use super::runtime_state;
@@ -71,7 +71,7 @@ mod tests {
     fn maps_complete_runtime_snapshot_without_pl_types_leaking() {
         let snapshot = AgentSnapshot {
             identity: AgentIdentity {
-                id: AgentId::new("agent").unwrap(),
+                id: ThreadId::new("agent").unwrap(),
                 parent_id: None,
                 role: AgentRoleId::new("executor").unwrap(),
                 depth: 0,

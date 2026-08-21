@@ -191,5 +191,59 @@ async fn delete_thread_runtime_in_tx(
     .delete()
     .exec(&mut *tx)
     .await?;
+    Query::<List<ThreadSubmissionRecord>>::filter(
+        ThreadSubmissionRecord::fields()
+            .thread_id()
+            .eq(thread_id.to_string()),
+    )
+    .delete()
+    .exec(&mut *tx)
+    .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn deleting_thread_runtime_removes_durable_submissions() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = MaiStore::open_with_config_and_artifact_index_path(
+            directory.path().join("store.sqlite3"),
+            directory.path().join("config.toml"),
+            directory.path().join("artifacts"),
+        )
+        .await
+        .expect("open store");
+        let thread_id = "reviewer-thread";
+        let mut db = store.db.clone();
+        toasty::create!(ThreadSubmissionRecord {
+            id: format!("{thread_id}:1"),
+            thread_id: thread_id.to_string(),
+            ordinal: 1,
+            created_at: 1,
+            submission_json: "{}".to_string(),
+        })
+        .exec(&mut db)
+        .await
+        .expect("save submission");
+
+        let mut tx = db.transaction().await.expect("begin delete");
+        delete_thread_runtime_in_tx(&mut tx, thread_id)
+            .await
+            .expect("delete runtime");
+        tx.commit().await.expect("commit delete");
+
+        assert_eq!(
+            store
+                .list_thread_submissions(thread_id, 0, 20)
+                .await
+                .expect("list submissions")
+                .items,
+            Vec::new()
+        );
+    }
 }

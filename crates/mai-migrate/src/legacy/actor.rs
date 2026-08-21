@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
 use pl_core::{
-    ActiveKind, AgentActivityState, AgentId, AgentIdentity, AgentLifecycleState, AgentRoleId,
-    AgentSnapshot, AgentTurnOutcome, TurnOutcomeKind,
+    ActiveKind, AgentActivityState, AgentIdentity, AgentLifecycleState, AgentRoleId, AgentSnapshot,
+    AgentTurnOutcome, ThreadId, TurnOutcomeKind,
 };
 use pl_model::TokenUsage;
 use pl_protocol::AgentSessionSnapshot;
@@ -54,8 +54,8 @@ pub(super) fn actor_runtime(
     let document = ActorDocument {
         snapshot: AgentSnapshot {
             identity: AgentIdentity {
-                id: AgentId::new(agent.id.clone())?,
-                parent_id: agent.parent_id.clone().map(AgentId::new).transpose()?,
+                id: ThreadId::new(agent.id.clone())?,
+                parent_id: agent.parent_id.clone().map(ThreadId::new).transpose()?,
                 role: AgentRoleId::new(
                     agent
                         .role

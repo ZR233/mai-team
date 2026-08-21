@@ -11,6 +11,7 @@ use uuid::Uuid;
 use super::ProjectReviewCycleResult;
 use super::cycle::{
     ProjectReviewCycleOps, ReviewerProgress, last_turn_cancelled, parse_reviewer_final_response,
+    retryable_review_timeout_result,
 };
 use super::reviewer::PreparedProjectReviewer;
 use super::reviewer::PreparedProjectReviewerImage;
@@ -191,8 +192,9 @@ pub(crate) async fn run_project_review_job_attempt(
                 )
                 .await;
             }
-            let result =
-                retryable_timeout_result("review preparation made no progress for sixteen minutes");
+            let result = retryable_review_timeout_result(
+                "review preparation made no progress for sixteen minutes",
+            );
             finish_attempt(
                 ops,
                 &job,
@@ -383,7 +385,7 @@ async fn execute_turn(
     {
         ReviewerWait::Completed(wait_result) => *wait_result,
         ReviewerWait::TimedOut => {
-            return Ok(retryable_timeout_result(
+            return Ok(retryable_review_timeout_result(
                 "reviewer made no model, tool, or process progress before the running watchdog deadline",
             ));
         }
@@ -437,25 +439,6 @@ fn update_progress_deadline(
         *last_progress = tokio::time::Instant::now();
     }
     *progress = current;
-}
-
-fn retryable_timeout_result(message: &str) -> ProjectReviewCycleResult {
-    ProjectReviewCycleResult {
-        outcome: ProjectReviewOutcome::Failed,
-        review_event: None,
-        pr: None,
-        summary: None,
-        error: Some(message.to_string()),
-        failure: Some(mai_protocol::ProjectReviewFailure {
-            category: mai_protocol::ProjectReviewFailureCategory::Timeout,
-            code: Some("review_watchdog_timeout".to_string()),
-            http_status: None,
-            message: message.to_string(),
-            retry: pl_protocol::RetryDisposition::Retryable {
-                retry_after_ms: None,
-            },
-        }),
-    }
 }
 
 async fn validate_attempt_result(
@@ -576,7 +559,7 @@ mod tests {
 
     #[test]
     fn watchdog_timeout_is_a_structured_retryable_failure() {
-        let result = retryable_timeout_result("stalled");
+        let result = retryable_review_timeout_result("stalled");
 
         assert_eq!(ProjectReviewOutcome::Failed, result.outcome);
         assert_eq!(

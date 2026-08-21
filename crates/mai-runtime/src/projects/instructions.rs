@@ -42,7 +42,14 @@ pub(crate) fn detected_files_from_stdout(
 }
 
 pub(crate) fn load_workspace_instructions(stage_root: &Path) -> Result<String> {
-    pl_core::load_workspace_instructions(stage_root).map_err(|err| {
+    pl_core::load_workspace_instruction_documents(
+        stage_root,
+        stage_root,
+        pl_core::DEFAULT_PROJECT_DOC_MAX_BYTES,
+        &[],
+    )
+    .map(|instructions| instructions.content())
+    .map_err(|err| {
         RuntimeError::InvalidInput(format!(
             "project workspace instruction discovery failed: {err}"
         ))

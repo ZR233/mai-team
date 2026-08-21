@@ -63,7 +63,7 @@ pub(crate) async fn update_agent(
             return Err(RuntimeError::AgentBusy(agent_id));
         }
         summary.provider_id = provider_selection.provider_id.to_string();
-        summary.provider_name = provider_selection.provider_info.name.clone();
+        summary.provider_name = provider_selection.endpoint.name.clone();
         summary.model = provider_selection.model.slug.clone();
         summary.reasoning_effort = reasoning_effort;
         summary.updated_at = now();

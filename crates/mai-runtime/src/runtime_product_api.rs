@@ -106,16 +106,18 @@ impl AgentRuntime {
             .resolve_role_provider_selection(AgentRole::Planner, None, None)
             .await?;
         let instructions = "Generate a concise task title of 3-8 words that captures the essence of the user's request. Output only the title text, nothing else. Do not use quotes or punctuation at the end.";
-        let provider = model_profile::core_provider_for_selection(&selection)?;
+        let client = pl_core::ModelTurnClient::from_route(&selection)?;
+        let session =
+            pl_core::AgentSession::from_messages(vec![pl_core::user_text_message(message)]);
         let request =
-            model_profile::core_model_turn_request(&selection, None, instructions, Vec::new());
-        let title = pl_core::stream_history_completion_message_text(
-            provider,
-            vec![pl_core::user_text_message(message)],
-            request,
-            pl_core::CoreModelTurnOptions::default().with_cancellation(CancellationToken::new()),
-        )
-        .await?;
+            pl_core::ModelTurnRequest::from_route(&selection).with_instructions(instructions);
+        let title = client
+            .complete_text(
+                &session,
+                request,
+                pl_core::ModelTurnOptions::default().with_cancellation(CancellationToken::new()),
+            )
+            .await?;
         let title = title.trim().to_string();
         if title.is_empty() {
             return Ok("New Task".to_string());

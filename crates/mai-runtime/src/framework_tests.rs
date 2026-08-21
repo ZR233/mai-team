@@ -199,11 +199,12 @@ fn product_agent_id_is_submitted_as_the_canonical_thread_identity() {
 }
 
 #[test]
-fn framework_close_is_followed_by_product_record_purge() {
+fn framework_retirement_is_followed_by_product_record_purge() {
     let delete = include_str!("agents/delete.rs");
     let runtime_ports = include_str!("runtime_agent_traits.rs");
 
-    assert!(runtime_ports.contains(".close(agent_host::canonical_id(agent_id)?)"));
+    assert!(runtime_ports.contains(".retire(agent_host::canonical_id(agent_id)?)"));
+    assert!(!runtime_ports.contains(".close(agent_host::canonical_id(agent_id)?)"));
     assert!(runtime_ports.contains("AgentRuntimeError::NotFound"));
     assert!(delete.contains("CanonicalAgentClose::Closed => purge_agent_tree"));
     assert!(delete.contains("CanonicalAgentClose::Missing => rollback_unregistered_agent"));

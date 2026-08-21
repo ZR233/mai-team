@@ -8,7 +8,12 @@ fn mai_provider_boundaries_do_not_rebuild_pl_model_semantics() {
         .and_then(Path::parent)
         .expect("workspace root");
     let conversion = production_source(&root.join("crates/mai-runtime/src/config/conversion.rs"));
-    let profile = production_source(&root.join("crates/mai-runtime/src/model_profile.rs"));
+    assert!(
+        !root
+            .join("crates/mai-runtime/src/model_profile.rs")
+            .exists(),
+        "mai runtime 不应保留本地模型语义适配层"
+    );
     let provider_page = fs::read_to_string(
         root.join("crates/mai-server/web/src/features/providers/providers-page.tsx"),
     )
@@ -23,7 +28,7 @@ fn mai_provider_boundaries_do_not_rebuild_pl_model_semantics() {
         "ProviderWireProtocol",
     ] {
         assert!(
-            !conversion.contains(forbidden) && !profile.contains(forbidden),
+            !conversion.contains(forbidden),
             "mai runtime production source must not rebuild PL semantic `{forbidden}`"
         );
     }

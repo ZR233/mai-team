@@ -80,7 +80,7 @@ pub(crate) async fn create_agent_record(
         container_id: None,
         docker_image,
         provider_id: provider_selection.provider_id.to_string(),
-        provider_name: provider_selection.provider_info.name.clone(),
+        provider_name: provider_selection.endpoint.name.clone(),
         model: provider_selection.model.slug.clone(),
         reasoning_effort,
         created_at,

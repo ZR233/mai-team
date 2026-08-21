@@ -84,6 +84,7 @@ async fn project_runtime_event(
         AgentRuntimeEventKind::TurnStarted {
             turn_id,
             thread_id,
+            input: _,
             claimed_inputs: _,
             snapshot,
         } => {

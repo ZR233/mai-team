@@ -8,8 +8,8 @@ use pl_core::{
     builtin_provider_catalog,
 };
 use pl_model::{
-    ApplyPatchToolType, ModelInfo, ProviderConnectionMode, ProviderInfo, ProviderWireProtocol,
-    ToolWirePolicy,
+    ApplyPatchToolType, ModelInfo, ModelTransportProfile, ProviderConnectionMode, ProviderEndpoint,
+    ProviderWireProtocol, ToolWirePolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -284,12 +284,10 @@ async fn migrate_v1(documents: &ConfigDocumentStore) -> Result<MaiConfig> {
 }
 
 fn migrate_provider(id: &ProviderId, legacy: LegacyProviderConfig) -> Result<ProviderConfig> {
-    let info = ProviderInfo {
-        protocol: legacy.provider_kind.protocol(),
-        connection_mode: ProviderConnectionMode::Http,
+    let protocol = legacy.provider_kind.protocol();
+    let endpoint = ProviderEndpoint {
         name: legacy.name,
         base_url: legacy.base_url,
-        default_model: String::new(),
         bearer_token: legacy.bearer_token,
         http_headers: legacy.http_headers,
         tool_wire_policy: legacy.tool_wire_policy,
@@ -300,14 +298,12 @@ fn migrate_provider(id: &ProviderId, legacy: LegacyProviderConfig) -> Result<Pro
     let registry = builtin_provider_catalog();
     let preset = registry.presets.into_iter().find(|preset| {
         preset.id.as_str() == id.as_str()
-            || (preset
-                .provider
-                .to_provider_info(&preset.suggested_model)
-                .is_ok_and(|provider| provider.protocol == info.protocol)
-                && normalized_url(&preset.provider.base_url) == normalized_url(&info.base_url))
+            || (provider_transport(&preset.provider, &preset.suggested_model)
+                .is_ok_and(|transport| transport.protocol == protocol)
+                && normalized_url(&preset.provider.base_url) == normalized_url(&endpoint.base_url))
     });
     let Some(preset) = preset else {
-        let mut provider = ProviderConfig::from_explicit_models(info, legacy.models);
+        let mut provider = ProviderConfig::from_explicit_models(endpoint, legacy.models);
         provider.bearer_token_env = bearer_token_env;
         return Ok(provider);
     };
@@ -326,23 +322,19 @@ fn migrate_provider(id: &ProviderId, legacy: LegacyProviderConfig) -> Result<Pro
         .filter(|model| !bundled_slugs.contains(model.slug.as_str()))
         .collect::<Vec<_>>();
     let connection_mode =
-        if normalized_url(&preset.provider.base_url) == normalized_url(&info.base_url) {
-            preset
-                .provider
-                .to_provider_info(&preset.suggested_model)
-                .map_err(RuntimeError::Model)?
-                .connection_mode
+        if normalized_url(&preset.provider.base_url) == normalized_url(&endpoint.base_url) {
+            provider_transport(&preset.provider, &preset.suggested_model)?.default_connection_mode
         } else {
             ProviderConnectionMode::Http
         };
     let mut provider = preset.provider;
-    provider.name = info.name;
-    provider.base_url = info.base_url;
-    provider.bearer_token = info.bearer_token;
+    provider.name = endpoint.name;
+    provider.base_url = endpoint.base_url;
+    provider.bearer_token = endpoint.bearer_token;
     provider.bearer_token_env = bearer_token_env.or(provider.bearer_token_env);
-    provider.http_headers = info.http_headers;
-    provider.tool_wire_policy = info.tool_wire_policy;
-    provider.apply_patch_tool_type = info.apply_patch_tool_type;
+    provider.http_headers = endpoint.http_headers;
+    provider.tool_wire_policy = endpoint.tool_wire_policy;
+    provider.apply_patch_tool_type = endpoint.apply_patch_tool_type;
     if let ProviderModelCatalogConfig::Bundled {
         additional_models: configured,
         ..
@@ -413,13 +405,26 @@ fn migrated_preset_connection_mode(
             normalized_url(&candidate.provider.base_url) == normalized_url(base_url)
         })
         .and_then(|candidate| {
-            candidate
-                .provider
-                .to_provider_info(&candidate.suggested_model)
+            provider_transport(&candidate.provider, &candidate.suggested_model)
                 .ok()
-                .map(|provider| provider.connection_mode)
+                .map(|transport| transport.default_connection_mode)
         })
         .unwrap_or(ProviderConnectionMode::Http)
+}
+
+fn provider_transport(provider: &ProviderConfig, model: &str) -> Result<ModelTransportProfile> {
+    provider
+        .effective_models()
+        .map_err(RuntimeError::Model)?
+        .into_iter()
+        .find(|candidate| candidate.slug == model)
+        .map(|candidate| candidate.transport)
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(format!(
+                "provider `{}` is missing model `{model}`",
+                provider.name
+            ))
+        })
 }
 
 pub(super) fn set_supported_connection_mode(
@@ -469,10 +474,11 @@ mod tests {
     fn schema_four_capabilities_follow_preset_but_not_custom_provider() {
         let mut models = crate::MaiConfig::default().models;
         let custom_id = ProviderId::new("custom").unwrap();
-        let custom = ProviderConfig::from_explicit_models(
-            ProviderInfo::responses_compatible("Custom", "https://example.com/v1", "future-model"),
-            vec![ModelInfo::fallback("future-model")],
-        );
+        let mut endpoint = ProviderEndpoint::openai(Some("https://example.com/v1".to_string()));
+        endpoint.name = "Custom".to_string();
+        let mut model = ModelInfo::fallback("future-model");
+        model.transport = ModelTransportProfile::responses_http();
+        let custom = ProviderConfig::from_explicit_models(endpoint, vec![model]);
         models.providers.insert(custom_id.clone(), custom);
         for provider in models.providers.values_mut() {
             provider.capabilities = ProviderCapabilitySelection::PresetDefaults;
@@ -534,10 +540,10 @@ mod tests {
         let custom_id = ProviderId::new("custom").unwrap();
         let mut custom_model = ModelInfo::fallback("custom");
         custom_model.used_fallback = false;
-        let custom = ProviderConfig::from_explicit_models(
-            ProviderInfo::responses_compatible("Custom", "https://custom.example/v1", "custom"),
-            vec![custom_model],
-        );
+        custom_model.transport = ModelTransportProfile::responses_http();
+        let mut endpoint = ProviderEndpoint::openai(Some("https://custom.example/v1".to_string()));
+        endpoint.name = "Custom".to_string();
+        let custom = ProviderConfig::from_explicit_models(endpoint, vec![custom_model]);
         config
             .models
             .providers

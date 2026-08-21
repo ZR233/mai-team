@@ -220,11 +220,8 @@ impl SchemaSixProviderTransport {
                             "schema 6 配置引用未知 provider preset: {preset}"
                         ))
                     })?;
-                let protocol = entry
-                    .provider
-                    .to_provider_info(&entry.suggested_model)
-                    .map_err(RuntimeError::Model)?
-                    .protocol;
+                let protocol =
+                    super::provider_transport(&entry.provider, &entry.suggested_model)?.protocol;
                 Ok((Some(preset), protocol, connection_mode))
             }
         }

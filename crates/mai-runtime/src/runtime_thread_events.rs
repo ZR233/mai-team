@@ -328,8 +328,8 @@ mod tests {
         ThreadItemStatus, ThreadNotification, ThreadNotificationEnvelope, TokenUsage,
     };
     use pl_core::{
-        AgentActivityState, AgentId as CanonicalAgentId, AgentIdentity, AgentLifecycleState,
-        AgentRoleId, AgentSnapshot,
+        AgentActivityState, AgentIdentity, AgentLifecycleState, AgentRoleId, AgentSnapshot,
+        ThreadId as CanonicalThreadId,
     };
     use uuid::Uuid;
 
@@ -492,7 +492,7 @@ mod tests {
     fn snapshot(id: AgentId) -> AgentSnapshot {
         AgentSnapshot {
             identity: AgentIdentity {
-                id: CanonicalAgentId::new(id.to_string()).expect("canonical id"),
+                id: CanonicalThreadId::new(id.to_string()).expect("canonical id"),
                 parent_id: None,
                 role: AgentRoleId::new("executor").expect("role"),
                 depth: 0,
