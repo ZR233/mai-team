@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.15](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.14...mai-server-v0.1.15) - 2026-08-21
+
+### Added
+
+- 统一 Review 保留与 Timeline 投影
+- *(web)* group consecutive tool calls in chat timeline
+- *(review)* track pull request lifecycle states
+- track merged pull request reviews
+- *(review)* paginate pull request review history
+- show review token usage
+
+### Fixed
+
+- *(review)* bound repair turns and retire thread state
+- *(review)* clarify GitHub search query encoding
+- *(review)* reconcile ownership after restart
+- *(review)* make harness tool contracts unambiguous
+- *(web)* reconcile timeline controls with agent lifecycle
+- *(review)* refresh floating reviewer images
+- *(review)* handle completed workflow runs
+- *(review)* queue completed CI signals once per PR
+
+### Other
+
+- 直接组合 PL 模型配置
+- migrate runtime and review timeline to PL threads
+
 ## [0.1.14](https://github.com/ZR233/mai-team/compare/mai-server-v0.1.13...mai-server-v0.1.14) - 2026-07-23
 
 ### Added
