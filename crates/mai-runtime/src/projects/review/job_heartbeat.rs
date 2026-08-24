@@ -15,10 +15,10 @@ pub(super) async fn run_project_review_job_heartbeat(
     cancellation_token: CancellationToken,
     attempt_cancellation_token: CancellationToken,
 ) {
-    let delay = Duration::from_secs(super::job::REVIEW_JOB_HEARTBEAT_SECONDS);
+    let mut completed_heartbeats = 0;
     loop {
         tokio::select! {
-            _ = sleep(delay) => {
+            _ = sleep(heartbeat_delay(completed_heartbeats)) => {
                 let current_time = Utc::now();
                 let heartbeat = wait_heartbeat_operation(
                     &cancellation_token,
@@ -31,7 +31,9 @@ pub(super) async fn run_project_review_job_heartbeat(
                     REVIEW_JOB_HEARTBEAT_OPERATION_TIMEOUT,
                 ).await;
                 match heartbeat {
-                    HeartbeatOperation::Completed(Ok(true)) => {}
+                    HeartbeatOperation::Completed(Ok(true)) => {
+                        completed_heartbeats += 1;
+                    }
                     HeartbeatOperation::Completed(Ok(false)) => {
                         let current = wait_heartbeat_operation(
                             &cancellation_token,
@@ -40,6 +42,15 @@ pub(super) async fn run_project_review_job_heartbeat(
                         ).await;
                         match current {
                             HeartbeatOperation::Completed(current) => {
+                                if let Ok(Some(current)) = current.as_ref() {
+                                    tracing::warn!(
+                                        job_id = %job_id,
+                                        status = %current.status,
+                                        lease_owner = ?current.lease_owner,
+                                        lease_expires_at = ?current.lease_expires_at,
+                                        "review job heartbeat lost its lease"
+                                    );
+                                }
                                 if lease_loss_requires_attempt_cancellation(
                                     current.as_ref().ok().and_then(Option::as_ref),
                                 ) {
@@ -69,6 +80,14 @@ pub(super) async fn run_project_review_job_heartbeat(
             }
             _ = cancellation_token.cancelled() => break,
         }
+    }
+}
+
+fn heartbeat_delay(completed_heartbeats: u64) -> Duration {
+    if completed_heartbeats == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(super::job::REVIEW_JOB_HEARTBEAT_SECONDS)
     }
 }
 
@@ -120,6 +139,20 @@ mod tests {
             HeartbeatOperation::<()>::Cancelled,
             wait_heartbeat_operation(&cancelled, std::future::pending(), Duration::from_secs(1),)
                 .await
+        );
+    }
+
+    #[test]
+    fn heartbeat_renews_immediately_then_keeps_a_safe_steady_interval() {
+        assert_eq!(Duration::ZERO, heartbeat_delay(0));
+        assert_eq!(
+            Duration::from_secs(super::super::job::REVIEW_JOB_HEARTBEAT_SECONDS),
+            heartbeat_delay(1)
+        );
+        assert!(
+            super::super::job::REVIEW_JOB_HEARTBEAT_SECONDS
+                + REVIEW_JOB_HEARTBEAT_OPERATION_TIMEOUT.as_secs()
+                < super::super::job::REVIEW_JOB_LEASE_SECONDS as u64
         );
     }
 

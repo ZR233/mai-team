@@ -19,30 +19,6 @@ pub(super) async fn run_claimed_project_review_job(
     owner: String,
 ) -> bool {
     project_job_state_projection(ops, &job, None, None).await;
-    if job.status == mai_protocol::ProjectReviewJobStatus::Reconciling {
-        let heartbeat_cancel = CancellationToken::new();
-        let reconciliation_cancel = ops.cancellation_token.child_token();
-        let heartbeat = tokio::spawn(run_project_review_job_heartbeat(
-            ops.ops.clone(),
-            ops.project_id,
-            job.id,
-            owner.clone(),
-            heartbeat_cancel.clone(),
-            reconciliation_cancel.clone(),
-        ));
-        let result = tokio::select! {
-            result = run_claimed_project_review_reconciliation(ops, job, owner) => result,
-            _ = reconciliation_cancel.cancelled() => !ops.cancellation_token.is_cancelled(),
-        };
-        heartbeat_cancel.cancel();
-        let _ = heartbeat.await;
-        return result;
-    }
-    let job = match preflight_project_review_job(ops, job, &owner).await {
-        ProjectReviewPreflight::Continue(job) => *job,
-        ProjectReviewPreflight::Finished => return true,
-        ProjectReviewPreflight::Cancelled => return false,
-    };
     let heartbeat_cancel = CancellationToken::new();
     let attempt_cancel = ops.cancellation_token.child_token();
     let heartbeat = tokio::spawn(run_project_review_job_heartbeat(
@@ -53,6 +29,32 @@ pub(super) async fn run_claimed_project_review_job(
         heartbeat_cancel.clone(),
         attempt_cancel.clone(),
     ));
+    if job.status == mai_protocol::ProjectReviewJobStatus::Reconciling {
+        let result = tokio::select! {
+            result = run_claimed_project_review_reconciliation(ops, job, owner) => result,
+            _ = attempt_cancel.cancelled() => !ops.cancellation_token.is_cancelled(),
+        };
+        heartbeat_cancel.cancel();
+        let _ = heartbeat.await;
+        return result;
+    }
+    let preflight = tokio::select! {
+        preflight = preflight_project_review_job(ops, job, &owner) => preflight,
+        _ = attempt_cancel.cancelled() => ProjectReviewPreflight::Cancelled,
+    };
+    let job = match preflight {
+        ProjectReviewPreflight::Continue(job) => *job,
+        ProjectReviewPreflight::Finished => {
+            heartbeat_cancel.cancel();
+            let _ = heartbeat.await;
+            return true;
+        }
+        ProjectReviewPreflight::Cancelled => {
+            heartbeat_cancel.cancel();
+            let _ = heartbeat.await;
+            return false;
+        }
+    };
     let attempt = ops
         .ops
         .run_project_review_job_attempt(job.clone(), owner.clone(), attempt_cancel)
