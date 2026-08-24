@@ -16,6 +16,7 @@ pub(crate) mod cycle;
 pub(crate) mod eligibility;
 pub(crate) mod job;
 pub(crate) mod job_attempt;
+mod job_heartbeat;
 mod job_preflight;
 pub(crate) mod job_worker;
 pub(crate) mod pool;
@@ -323,17 +324,37 @@ pub(crate) fn project_review_cycle_result_for_wait_result(
             failure: None,
         });
     };
-    if last_turn.kind == pl_core::TurnOutcomeKind::Completed {
-        return None;
-    }
     let outcome_error = format!("reviewer turn ended with outcome {:?}", last_turn.kind);
+    let error = normalize_optional_text(last_turn.reason.clone()).unwrap_or(outcome_error);
+    let failure = match last_turn.kind {
+        pl_core::TurnOutcomeKind::Completed => return None,
+        pl_core::TurnOutcomeKind::BudgetLimited => Some(ProjectReviewFailure {
+            category: mai_protocol::ProjectReviewFailureCategory::Timeout,
+            code: Some("review_turn_budget_limited".to_string()),
+            http_status: None,
+            message: error.clone(),
+            retry: pl_protocol::RetryDisposition::Retryable {
+                retry_after_ms: None,
+            },
+        }),
+        pl_core::TurnOutcomeKind::Cancelled => Some(ProjectReviewFailure {
+            category: mai_protocol::ProjectReviewFailureCategory::Internal,
+            code: Some("review_turn_cancelled".to_string()),
+            http_status: None,
+            message: error.clone(),
+            retry: pl_protocol::RetryDisposition::Retryable {
+                retry_after_ms: None,
+            },
+        }),
+        pl_core::TurnOutcomeKind::Failed => last_turn.failure.clone().map(Into::into),
+    };
     Some(ProjectReviewCycleResult {
         outcome: ProjectReviewOutcome::Failed,
         review_event: None,
         pr: None,
         summary: Some("Review could not be completed.".to_string()),
-        error: Some(normalize_optional_text(last_turn.reason.clone()).unwrap_or(outcome_error)),
-        failure: last_turn.failure.clone().map(Into::into),
+        error: Some(error),
+        failure,
     })
 }
 
@@ -1064,6 +1085,54 @@ mod tests {
                     retry_after_ms: Some(30_000),
                 },
             })
+        );
+    }
+
+    #[test]
+    fn budget_limited_turn_is_a_structured_retryable_timeout() {
+        let wait_result = test_wait_result(
+            pl_core::TurnOutcomeKind::BudgetLimited,
+            Some("budget limited by wallClock budget"),
+        );
+
+        let result = project_review_cycle_result_for_wait_result(&wait_result)
+            .expect("budget-limited reviewer should continue in a later attempt");
+
+        assert_eq!(
+            Some(ProjectReviewFailure {
+                category: mai_protocol::ProjectReviewFailureCategory::Timeout,
+                code: Some("review_turn_budget_limited".to_string()),
+                http_status: None,
+                message: "budget limited by wallClock budget".to_string(),
+                retry: pl_protocol::RetryDisposition::Retryable {
+                    retry_after_ms: None,
+                },
+            }),
+            result.failure
+        );
+    }
+
+    #[test]
+    fn unexpected_cancelled_turn_is_a_structured_retryable_interruption() {
+        let wait_result = test_wait_result(
+            pl_core::TurnOutcomeKind::Cancelled,
+            Some("reviewer turn was cancelled"),
+        );
+
+        let result = project_review_cycle_result_for_wait_result(&wait_result)
+            .expect("an unexpected cancellation should continue in a later attempt");
+
+        assert_eq!(
+            Some(ProjectReviewFailure {
+                category: mai_protocol::ProjectReviewFailureCategory::Internal,
+                code: Some("review_turn_cancelled".to_string()),
+                http_status: None,
+                message: "reviewer turn was cancelled".to_string(),
+                retry: pl_protocol::RetryDisposition::Retryable {
+                    retry_after_ms: None,
+                },
+            }),
+            result.failure
         );
     }
 

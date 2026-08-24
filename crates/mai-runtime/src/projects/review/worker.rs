@@ -2458,6 +2458,12 @@ mod tests {
             summary.current_reviewer_agent_id = Some(reviewer_id);
         }
         ops.set_auto_reviewers(vec![reviewer, extra_reviewer]).await;
+        let kept_run = test_review_run(
+            project_id,
+            Some(reviewer_id),
+            None,
+            ProjectReviewRunStatus::Running,
+        );
         ops.set_review_runs(vec![
             test_review_run(
                 project_id,
@@ -2465,14 +2471,23 @@ mod tests {
                 None,
                 ProjectReviewRunStatus::Running,
             ),
-            test_review_run(
-                project_id,
-                Some(reviewer_id),
-                None,
-                ProjectReviewRunStatus::Running,
-            ),
+            kept_run.clone(),
         ])
         .await;
+        let mut job = crate::projects::review::job::new_project_review_job(
+            crate::projects::review::job::NewProjectReviewJob {
+                project_id,
+                pr: 42,
+                head_sha: "head-42".to_string(),
+                source: ProjectReviewJobSource::Automatic,
+                delivery_id: None,
+                reason: "runtime repair".to_string(),
+            },
+        );
+        job.status = ProjectReviewJobStatus::Running;
+        job.reviewer_agent_id = Some(reviewer_id);
+        job.active_run_id = Some(kept_run.id);
+        ops.review_jobs.lock().await.push(job);
 
         repair_project_review_singleton(&ops, project_id, 10, ProjectReviewRepairReason::Runtime)
             .await
@@ -2484,6 +2499,66 @@ mod tests {
         assert_eq!(ProjectReviewRunStatus::Cancelled, finished[0].status);
         assert_eq!(vec![extra_reviewer_id], *ops.deleted_agents.lock().await);
         assert_eq!(Vec::<ReviewStateSnapshot>::new(), *ops.states.lock().await);
+    }
+
+    #[tokio::test]
+    async fn startup_repair_preserves_job_owned_reviewer_for_continuation() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        let maintainer_agent_id = ops.project.summary.read().await.maintainer_agent_id;
+        let reviewer =
+            test_reviewer_agent(project_id, maintainer_agent_id, TestReviewerState::Running);
+        let reviewer_id = reviewer.id;
+        let turn_id = reviewer.state.active_turn().expect("reviewer turn");
+        let mut run = test_review_run(
+            project_id,
+            Some(reviewer_id),
+            Some(turn_id.clone()),
+            ProjectReviewRunStatus::Running,
+        );
+        let mut job = crate::projects::review::job::new_project_review_job(
+            crate::projects::review::job::NewProjectReviewJob {
+                project_id,
+                pr: 42,
+                head_sha: "head-42".to_string(),
+                source: ProjectReviewJobSource::Automatic,
+                delivery_id: None,
+                reason: "restart continuation".to_string(),
+            },
+        );
+        job.status = ProjectReviewJobStatus::Running;
+        job.reviewer_agent_id = Some(reviewer_id);
+        job.active_run_id = Some(run.id);
+        job.lease_owner = Some("stopped-instance".to_string());
+        job.lease_expires_at = Some(now() + chrono::TimeDelta::minutes(1));
+        run.job_id = Some(job.id);
+        {
+            let mut summary = ops.project.summary.write().await;
+            summary.review_status = ProjectReviewStatus::Running;
+            summary.current_reviewer_agent_id = Some(reviewer_id);
+        }
+        ops.set_auto_reviewers(vec![reviewer]).await;
+        ops.set_review_runs(vec![run]).await;
+        ops.review_jobs.lock().await.push(job.clone());
+
+        repair_project_review_singleton(&ops, project_id, 10, ProjectReviewRepairReason::Startup)
+            .await
+            .expect("startup repair");
+
+        assert_eq!(
+            vec![(reviewer_id, turn_id)],
+            *ops.cancelled_turns.lock().await
+        );
+        assert_eq!(Vec::<Uuid>::new(), *ops.deleted_agents.lock().await);
+        let finished = ops.finished_runs.lock().await.clone();
+        assert_eq!(1, finished.len());
+        assert_eq!(ProjectReviewRunStatus::Cancelled, finished[0].status);
+        assert_eq!(Some(reviewer_id), finished[0].reviewer_agent_id);
+        assert_eq!(
+            Some(reviewer_id),
+            ops.project.summary.read().await.current_reviewer_agent_id
+        );
+        assert_eq!(job, ops.review_jobs.lock().await[0]);
     }
 
     #[tokio::test]

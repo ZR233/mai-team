@@ -3,11 +3,12 @@ use mai_protocol::{
     ProjectReviewFailure, ProjectReviewFailureCategory, ProjectReviewJobSummary,
     ProjectReviewOutcome,
 };
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::RuntimeError;
 
+use super::job_heartbeat::run_project_review_job_heartbeat;
 use super::job_preflight::{ProjectReviewPreflight, preflight_project_review_job};
 use super::state::{ReviewStateUpdate, ReviewerAgentUpdate};
 use super::worker::{ProjectReviewTaskContext, ProjectReviewWorkerOps};
@@ -366,53 +367,6 @@ fn begin_review_reconciliation(job: &mut ProjectReviewJobSummary, error: Option<
             },
         });
     }
-}
-
-async fn run_project_review_job_heartbeat(
-    ops: impl ProjectReviewWorkerOps,
-    project_id: mai_protocol::ProjectId,
-    job_id: uuid::Uuid,
-    owner: String,
-    cancellation_token: CancellationToken,
-    attempt_cancellation_token: CancellationToken,
-) {
-    let delay = Duration::from_secs(super::job::REVIEW_JOB_HEARTBEAT_SECONDS);
-    loop {
-        tokio::select! {
-            _ = sleep(delay) => {
-                let current_time = Utc::now();
-                match ops.heartbeat_project_review_job(
-                    job_id,
-                    owner.clone(),
-                    current_time,
-                    current_time + TimeDelta::seconds(super::job::REVIEW_JOB_LEASE_SECONDS),
-                ).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let current = ops.load_project_review_job(project_id, job_id).await;
-                        if heartbeat_lease_loss_requires_attempt_cancellation(
-                            current.as_ref().ok().and_then(Option::as_ref),
-                        ) {
-                            attempt_cancellation_token.cancel();
-                        }
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::warn!(job_id = %job_id, "review job heartbeat failed: {error}");
-                        attempt_cancellation_token.cancel();
-                        break;
-                    }
-                }
-            }
-            _ = cancellation_token.cancelled() => break,
-        }
-    }
-}
-
-fn heartbeat_lease_loss_requires_attempt_cancellation(
-    current: Option<&ProjectReviewJobSummary>,
-) -> bool {
-    current.is_none_or(|job| job.submission_receipt.is_none())
 }
 
 async fn release_terminal_lease(
@@ -845,27 +799,6 @@ mod tests {
         apply_review_cycle_result(&mut job, submitted_result());
 
         assert_eq!(ProjectReviewJobStatus::Succeeded, job.status);
-    }
-
-    #[test]
-    fn heartbeat_does_not_cancel_turn_after_submission_receipt_is_persisted() {
-        let mut job = job();
-        assert!(heartbeat_lease_loss_requires_attempt_cancellation(Some(
-            &job
-        )));
-
-        job.submission_receipt = Some(ProjectReviewSubmissionReceipt {
-            github_review_id: 42,
-            event: ProjectReviewDecision::Approve,
-            head_sha: job.head_sha.clone(),
-            html_url: None,
-            submitted_at: Utc::now(),
-        });
-
-        assert!(!heartbeat_lease_loss_requires_attempt_cancellation(Some(
-            &job
-        )));
-        assert!(heartbeat_lease_loss_requires_attempt_cancellation(None));
     }
 
     #[test]

@@ -10,7 +10,8 @@ use uuid::Uuid;
 
 use super::ProjectReviewCycleResult;
 use super::cycle::{
-    ProjectReviewCycleOps, ReviewerProgress, last_turn_cancelled, parse_reviewer_final_response,
+    ProjectReviewCycleOps, REVIEWER_TURN_CANCEL_TIMEOUT, ReviewTimeoutKind, ReviewerProgress,
+    cancel_reviewer_turn_with_timeout, last_turn_cancelled, parse_reviewer_final_response,
     retryable_review_timeout_result,
 };
 use super::reviewer::PreparedProjectReviewer;
@@ -22,6 +23,8 @@ use crate::{Result, RuntimeError};
 const REVIEW_CONTINUATION_PROMPT: &str = "Continue the same pull request review after a retryable interruption. Keep using the existing session note as the append-only findings ledger. Re-check the fixed PR head before submission and do not repeat completed investigation unnecessarily. Treat a GitHub review as already submitted by this logical Job only when it targets the fixed head and contains the exact `mai-review-job:<current job UUID>` marker identified by your system prompt, or when this same Job's final submission call returned an ambiguous network result that you are actively reconciling. Existing reviews without that exact marker, including reviews from another Job or another head, are context only and do not fulfill this Job. Never return `review_submitted` unless this Job submitted the review or you confirmed its exact marker and head. Complete the review and return only the required final JSON object.";
 const REVIEW_PREPARING_TIMEOUT: Duration = Duration::from_secs(16 * 60);
 const REVIEW_RUNNING_WATCHDOG_POLL: Duration = Duration::from_secs(30);
+const REVIEW_RUNNING_DEADLINE: Duration =
+    Duration::from_millis(pl_core::DEFAULT_WALL_CLOCK_MS + 5 * 60 * 1_000);
 const REVIEW_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
 #[derive(Debug, PartialEq)]
@@ -192,9 +195,7 @@ pub(crate) async fn run_project_review_job_attempt(
                 )
                 .await;
             }
-            let result = retryable_review_timeout_result(
-                "review preparation made no progress for sixteen minutes",
-            );
+            let result = retryable_review_timeout_result(ReviewTimeoutKind::Preparation);
             finish_attempt(
                 ops,
                 &job,
@@ -375,21 +376,13 @@ async fn execute_turn(
     let turn_id = ops.start_reviewer_turn(reviewer_id, message).await?;
     ops.update_project_review_run_turn(job.project_id, run_id, reviewer_id, turn_id.clone())
         .await?;
-    let wait_result = match wait_reviewer_with_watchdog(
-        ops,
-        reviewer_id,
-        turn_id,
-        cancellation_token,
-    )
-    .await?
-    {
-        ReviewerWait::Completed(wait_result) => *wait_result,
-        ReviewerWait::TimedOut => {
-            return Ok(retryable_review_timeout_result(
-                "reviewer made no model, tool, or process progress before the running watchdog deadline",
-            ));
-        }
-    };
+    let wait_result =
+        match wait_reviewer_with_watchdog(ops, reviewer_id, turn_id, cancellation_token).await? {
+            ReviewerWait::Completed(wait_result) => *wait_result,
+            ReviewerWait::TimedOut(timeout_kind) => {
+                return Ok(retryable_review_timeout_result(timeout_kind));
+            }
+        };
     if last_turn_cancelled(&wait_result) && cancellation_token.is_cancelled() {
         return Err(RuntimeError::TurnCancelled);
     }
@@ -402,7 +395,7 @@ async fn execute_turn(
 
 enum ReviewerWait {
     Completed(Box<pl_core::AgentWaitResult>),
-    TimedOut,
+    TimedOut(ReviewTimeoutKind),
 }
 
 async fn wait_reviewer_with_watchdog(
@@ -411,19 +404,63 @@ async fn wait_reviewer_with_watchdog(
     turn_id: TurnId,
     cancellation_token: &CancellationToken,
 ) -> Result<ReviewerWait> {
-    let mut progress = ops.reviewer_progress(reviewer_id).await?;
+    let deadline = tokio::time::Instant::now() + REVIEW_RUNNING_DEADLINE;
+    let mut progress =
+        match tokio::time::timeout_at(deadline, ops.reviewer_progress(reviewer_id)).await {
+            Ok(progress) => progress?,
+            Err(_) => {
+                cancel_reviewer_turn_with_timeout(
+                    ops,
+                    reviewer_id,
+                    &turn_id,
+                    REVIEWER_TURN_CANCEL_TIMEOUT,
+                )
+                .await;
+                return Ok(ReviewerWait::TimedOut(ReviewTimeoutKind::RunningDeadline));
+            }
+        };
     let mut last_progress = tokio::time::Instant::now();
     let wait = ops.wait_agent_until_complete_with_cancel(reviewer_id, cancellation_token);
     tokio::pin!(wait);
+    let total_deadline = tokio::time::sleep_until(deadline);
+    tokio::pin!(total_deadline);
     loop {
         tokio::select! {
             result = &mut wait => return result.map(|wait_result| ReviewerWait::Completed(Box::new(wait_result))),
+            _ = &mut total_deadline => {
+                cancel_reviewer_turn_with_timeout(
+                    ops,
+                    reviewer_id,
+                    &turn_id,
+                    REVIEWER_TURN_CANCEL_TIMEOUT,
+                ).await;
+                return Ok(ReviewerWait::TimedOut(ReviewTimeoutKind::RunningDeadline));
+            }
             _ = tokio::time::sleep(REVIEW_RUNNING_WATCHDOG_POLL) => {
-                let current = ops.reviewer_progress(reviewer_id).await?;
+                let current = match tokio::time::timeout_at(
+                    deadline,
+                    ops.reviewer_progress(reviewer_id),
+                ).await {
+                    Ok(progress) => progress?,
+                    Err(_) => {
+                        cancel_reviewer_turn_with_timeout(
+                            ops,
+                            reviewer_id,
+                            &turn_id,
+                            REVIEWER_TURN_CANCEL_TIMEOUT,
+                        ).await;
+                        return Ok(ReviewerWait::TimedOut(ReviewTimeoutKind::RunningDeadline));
+                    }
+                };
                 update_progress_deadline(&mut progress, current, &mut last_progress);
                 if last_progress.elapsed() >= progress.inactivity_timeout {
-                    ops.cancel_reviewer_turn(reviewer_id, turn_id).await?;
-                    return Ok(ReviewerWait::TimedOut);
+                    cancel_reviewer_turn_with_timeout(
+                        ops,
+                        reviewer_id,
+                        &turn_id,
+                        REVIEWER_TURN_CANCEL_TIMEOUT,
+                    ).await;
+                    return Ok(ReviewerWait::TimedOut(ReviewTimeoutKind::RunningInactivity));
                 }
             }
         }
@@ -559,7 +596,7 @@ mod tests {
 
     #[test]
     fn watchdog_timeout_is_a_structured_retryable_failure() {
-        let result = retryable_review_timeout_result("stalled");
+        let result = retryable_review_timeout_result(ReviewTimeoutKind::RunningInactivity);
 
         assert_eq!(ProjectReviewOutcome::Failed, result.outcome);
         assert_eq!(

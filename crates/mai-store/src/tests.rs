@@ -1885,7 +1885,7 @@ async fn active_review_job_projection_prioritizes_execution_over_waiting() {
 }
 
 #[tokio::test]
-async fn delayed_review_retry_does_not_block_a_ready_queued_job() {
+async fn delayed_review_retry_reserves_the_project_reviewer_slot() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
     let current_time = Utc::now();
@@ -1916,9 +1916,34 @@ async fn delayed_review_retry_does_not_block_a_ready_queued_job() {
             current_time + chrono::TimeDelta::seconds(60),
         )
         .await
-        .expect("claim ready queued job")
-        .expect("queued job must not be blocked by retry backoff");
-    assert_eq!(queued_id, claimed.id);
+        .expect("check project reviewer reservation");
+    assert_eq!(None, claimed);
+
+    let retry_time = current_time + chrono::TimeDelta::minutes(2);
+    let claimed = store
+        .claim_due_project_review_job(
+            project_id,
+            "retry-owner".to_string(),
+            retry_time,
+            retry_time + chrono::TimeDelta::seconds(60),
+        )
+        .await
+        .expect("claim reserved retry")
+        .expect("reserved retry must resume when due");
+    assert_eq!(waiting.id, claimed.id);
+    assert_eq!(
+        Some(waiting.reviewer_agent_id.expect("reviewer")),
+        claimed.reviewer_agent_id
+    );
+    assert_eq!(
+        ProjectReviewJobStatus::Queued,
+        store
+            .load_project_review_job(project_id, queued_id)
+            .await
+            .expect("load queued job")
+            .expect("queued job")
+            .status
+    );
 }
 
 #[tokio::test]

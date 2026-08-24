@@ -31,6 +31,7 @@ use crate::config::RelayClientConfig;
 use crate::protocol;
 
 const RELAY_CONNECT_WAIT_SECS: u64 = 10;
+const RELAY_RECONNECT_MAX_SECS: u64 = RELAY_CONNECT_WAIT_SECS / 2;
 const RELAY_RPC_TIMEOUT_SECS: u64 = 30;
 
 pub struct RelayClient {
@@ -325,7 +326,7 @@ impl RelayClient {
                 _ = self.cancellation.cancelled() => break,
                 _ = sleep(delay) => {}
             }
-            delay = (delay * 2).min(Duration::from_secs(60));
+            delay = next_reconnect_delay(delay);
         }
         self.mark_disconnected(Some("relay connection stopped".to_string()))
             .await;
@@ -495,6 +496,10 @@ impl RelayClient {
     }
 }
 
+fn next_reconnect_delay(delay: Duration) -> Duration {
+    (delay * 2).min(Duration::from_secs(RELAY_RECONNECT_MAX_SECS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +512,28 @@ mod tests {
     use tokio_tungstenite::accept_async;
 
     struct DropSignal(Option<test_oneshot::Sender<()>>);
+
+    #[test]
+    fn reconnect_backoff_stays_inside_request_connection_wait() {
+        let mut delay = Duration::from_secs(1);
+        let mut observed = Vec::new();
+        for _ in 0..5 {
+            delay = next_reconnect_delay(delay);
+            observed.push(delay);
+        }
+
+        assert_eq!(
+            vec![
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            ],
+            observed
+        );
+        assert!(delay < Duration::from_secs(RELAY_CONNECT_WAIT_SECS));
+    }
 
     impl Drop for DropSignal {
         fn drop(&mut self) {

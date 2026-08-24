@@ -718,17 +718,26 @@ fn claim_due_job_on_path(
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let candidate_id = transaction
         .query_row(
-            "SELECT id FROM project_review_jobs WHERE project_id = ?1 \
-             AND status IN ('queued','retry_waiting','reconciling') \
-             AND (next_attempt_at IS NULL OR next_attempt_at <= ?2) \
-             AND (lease_expires_at IS NULL OR lease_expires_at <= ?2) \
+            "SELECT candidate.id FROM project_review_jobs AS candidate \
+             WHERE candidate.project_id = ?1 \
+             AND candidate.status IN ('queued','retry_waiting','reconciling') \
+             AND (candidate.next_attempt_at IS NULL OR candidate.next_attempt_at <= ?2) \
+             AND (candidate.lease_expires_at IS NULL OR candidate.lease_expires_at <= ?2) \
              AND NOT EXISTS (SELECT 1 FROM project_review_jobs AS active_lease \
                  WHERE active_lease.project_id = ?1 \
                  AND active_lease.lease_owner IS NOT NULL \
                  AND active_lease.lease_expires_at > ?2) \
-             ORDER BY CASE status \
+             AND NOT EXISTS (SELECT 1 FROM project_review_jobs AS reserved \
+                 WHERE reserved.project_id = candidate.project_id \
+                 AND reserved.id <> candidate.id \
+                 AND reserved.reviewer_agent_id IS NOT NULL \
+                 AND reserved.status IN ( \
+                     'preparing','running','retry_waiting','submission_pending','reconciling' \
+                 )) \
+             ORDER BY CASE candidate.status \
                  WHEN 'reconciling' THEN 0 ELSE 1 END, \
-                 COALESCE(next_attempt_at, created_at) ASC, created_at ASC, id ASC LIMIT 1",
+                 COALESCE(candidate.next_attempt_at, candidate.created_at) ASC, \
+                 candidate.created_at ASC, candidate.id ASC LIMIT 1",
             params![project_id.to_string(), now.to_rfc3339()],
             |row| row.get::<_, String>(0),
         )
