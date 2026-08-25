@@ -186,6 +186,25 @@ describe("pull request review pagination", () => {
 })
 
 describe("pull request review history", () => {
+  it("measures duration from the first running attempt instead of queue creation", async () => {
+    const executedJob = job("executed-job", 42, "succeeded", 1)
+    executedJob.created_at = "2026-08-11T09:00:00Z"
+    executedJob.finished_at = "2026-08-11T10:01:00Z"
+    const attempt = { id: "run-1", job_id: executedJob.id, attempt_index: 1, status: "completed", started_at: "2026-08-11T10:00:00Z", finished_at: executedJob.finished_at, summary: "Review completed" }
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.includes("/pull-request-reviews/42/history")) return jsonResponse({ items: [{ job: executedJob }], page: 1, page_size: 20, total_items: 1, total_pages: 1 })
+      if (path.endsWith("/review-jobs/executed-job")) return jsonResponse({ ...executedJob, attempts: [attempt] })
+      if (path.endsWith("/review-runs/run-1")) return jsonResponse({ ...attempt, history: null })
+      return jsonResponse({ error: `unexpected request ${path}` }, 404)
+    }))
+    renderWithQuery(<ReviewJobDetails projectId="project-1" repository="owner/repo" review={review(42, executedJob)} onClose={() => undefined} onRereview={() => undefined} pending={false} />)
+
+    const duration = await screen.findByText("Duration")
+    await waitFor(() => expect(duration.parentElement).toHaveTextContent("1m 0s"))
+    expect(duration.parentElement).not.toHaveTextContent("1h 1m")
+  })
+
   it("defaults to the latest job, avoids details without attempts, and restores executed history", async () => {
     const requested: string[] = []
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {

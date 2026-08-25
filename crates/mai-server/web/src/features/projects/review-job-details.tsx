@@ -137,10 +137,11 @@ function ReviewRecordContent({ projectId, item, detail, detailLoading, detailErr
   const job = item.job
   const attempted = job.attempt_count > 0
   const attemptsMissing = Boolean(attempted && detail && (detail.attempts?.length ?? 0) === 0)
+  const reviewStartedAt = detail?.attempts?.[0]?.started_at
   const usage = projectReviewUsage(detail?.attempts ?? [])
   return <div className="flex flex-col gap-5">
     <div className="flex flex-wrap items-center gap-2"><StatusBadge status={job.status} /><ReviewOutcome job={job} /><EnvironmentWarningBadge job={job} />{job.status === "retry_waiting" && <Badge variant="outline">Retry scheduled</Badge>}</div>
-    <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-4"><Metric label="Attempts" value={`${job.attempt_count}/${job.max_attempts}`} /><Metric label="Created" value={formatReviewDate(job.created_at)} /><Metric label="Duration" value={formatReviewDuration(job.created_at, job.finished_at)} /><Metric label="Next attempt" value={job.next_attempt_at ? formatReviewDate(job.next_attempt_at) : "—"} /></dl>
+    <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-4"><Metric label="Attempts" value={`${job.attempt_count}/${job.max_attempts}`} /><Metric label="Created" value={formatReviewDate(job.created_at)} /><Metric label="Duration" value={reviewStartedAt ? formatReviewDuration(reviewStartedAt, job.finished_at) : "—"} /><Metric label="Next attempt" value={job.next_attempt_at ? formatReviewDate(job.next_attempt_at) : "—"} /></dl>
     {attempted && !attemptsMissing && <ReviewUsageSummary usage={usage.total} active={reviewJobIsActive(job)} />}
     {!attempted && <Alert><CircleAlert /><AlertTitle>此记录未启动 Agent 会话</AlertTitle><AlertDescription>{job.skip_reason ? reviewSkipReasonLabel(job.skip_reason) : job.reason || "The review ended before an execution attempt was created."}</AlertDescription></Alert>}
     {attemptsMissing && <Alert variant="destructive"><CircleAlert /><AlertTitle>Review history is incomplete</AlertTitle><AlertDescription>This Job recorded {job.attempt_count} {job.attempt_count === 1 ? "attempt" : "attempts"}, but no retained Attempt data was found.</AlertDescription></Alert>}
