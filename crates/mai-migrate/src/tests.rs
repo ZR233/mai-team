@@ -116,6 +116,39 @@ fn nonterminal_review_or_lease_rejects_migration_before_archive_creation() {
 }
 
 #[test]
+fn terminal_review_job_stale_lease_is_cleared_by_schema32_transaction() {
+    let fixture = Fixture::new();
+    let connection = Connection::open(&fixture.path).expect("open fixture");
+    connection
+        .execute(
+            "UPDATE project_review_jobs
+             SET status = 'superseded',
+                 lease_owner = 'retired-server',
+                 lease_expires_at = '2026-08-26T00:00:00Z'",
+            [],
+        )
+        .expect("seed terminal stale lease");
+    drop(connection);
+
+    migrate_path(&fixture.path, &fixture.options()).expect("migrate terminal stale lease");
+
+    let connection = Connection::open(&fixture.path).expect("inspect migrated fixture");
+    let lease = connection
+        .query_row(
+            "SELECT lease_owner, lease_expires_at FROM project_review_jobs WHERE id = 'job-1'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .expect("read migrated lease");
+    assert_eq!(lease, (None, None));
+}
+
+#[test]
 fn backup_failure_aborts_without_touching_the_online_database() {
     let fixture = Fixture::new();
     fs::write(&fixture.archive_root, b"not a directory").expect("block archive root");

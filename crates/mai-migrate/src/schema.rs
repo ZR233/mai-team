@@ -74,15 +74,14 @@ pub(crate) fn validate_source(connection: &Connection) -> Result<()> {
 pub(crate) fn ensure_quiescent(connection: &Connection) -> Result<()> {
     let active_jobs: i64 = connection.query_row(
         "SELECT COUNT(*) FROM project_review_jobs
-         WHERE status IN (
-            'queued', 'preparing', 'running', 'retry_waiting',
-            'submission_pending', 'reconciling'
-         ) OR lease_owner IS NOT NULL OR lease_expires_at IS NOT NULL",
+         WHERE status NOT IN (
+            'succeeded', 'failed', 'cancelled', 'superseded', 'skipped'
+         )",
         [],
         |row| row.get(0),
     )?;
     if active_jobs != 0 {
-        bail!("存在 {active_jobs} 个非终态 Review Job 或未清空租约");
+        bail!("存在 {active_jobs} 个非终态 Review Job");
     }
     let active_runs: i64 = connection.query_row(
         "SELECT COUNT(*) FROM project_review_runs
@@ -146,6 +145,14 @@ pub(crate) fn install_v32(
              history_json = NULL
          WHERE history_json IS NOT NULL",
         params![archive.archive_id, archive.created_at],
+    )?;
+    // schema 31 的旧 worker 可能在 Job 已进入终态后遗留过期租约。终态本身不可再被
+    // worker claim，因此只在完整归档之后于同一 schema 32 事务中清理所有权残留。
+    transaction.execute(
+        "UPDATE project_review_jobs
+         SET lease_owner = NULL, lease_expires_at = NULL
+         WHERE status IN ('succeeded', 'failed', 'cancelled', 'superseded', 'skipped')",
+        [],
     )?;
     for table in RUNTIME_TABLES {
         transaction.execute(&format!("DELETE FROM {table}"), [])?;
@@ -214,6 +221,16 @@ pub(crate) fn validate_target(
     )?;
     if invalid_archives != 0 {
         bail!("有 {invalid_archives} 条 Review Timeline 归档标识不一致");
+    }
+    let terminal_job_leases: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM project_review_jobs
+         WHERE status IN ('succeeded', 'failed', 'cancelled', 'superseded', 'skipped')
+           AND (lease_owner IS NOT NULL OR lease_expires_at IS NOT NULL)",
+        [],
+        |row| row.get(0),
+    )?;
+    if terminal_job_leases != 0 {
+        bail!("schema {TARGET_SCHEMA} 中仍有 {terminal_job_leases} 个终态 Review Job 持有租约");
     }
     let legacy_documents: i64 = connection.query_row(
         "SELECT COUNT(*) FROM thread_runtime_documents
