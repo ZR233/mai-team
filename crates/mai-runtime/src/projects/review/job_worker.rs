@@ -557,6 +557,12 @@ fn model_runtime_failure(
             None,
             retryable_disposition(None),
         ),
+        pl_protocol::PureError::Protocol(_) => (
+            ProjectReviewFailureCategory::Protocol,
+            Some("model_protocol_error".to_string()),
+            None,
+            pl_protocol::RetryDisposition::Permanent,
+        ),
         pl_protocol::PureError::LlmError(_)
         | pl_protocol::PureError::ContextOverflow(_)
         | pl_protocol::PureError::ToolNotFound(_)
@@ -821,6 +827,25 @@ mod tests {
                 retry: pl_protocol::RetryDisposition::Retryable {
                     retry_after_ms: Some(12_000),
                 },
+            },
+            runtime_failure(&error)
+        );
+    }
+
+    #[test]
+    fn runtime_failure_preserves_model_protocol_category() {
+        let error = RuntimeError::Model(pl_protocol::PureError::Protocol(
+            "response.failed is missing error.message".to_string(),
+        ));
+
+        assert_eq!(
+            ProjectReviewFailure {
+                category: ProjectReviewFailureCategory::Protocol,
+                code: Some("model_protocol_error".to_string()),
+                http_status: None,
+                message: "model error: protocol error: response.failed is missing error.message"
+                    .to_string(),
+                retry: pl_protocol::RetryDisposition::Permanent,
             },
             runtime_failure(&error)
         );

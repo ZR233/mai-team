@@ -19,7 +19,7 @@ mod tests {
     #[test]
     fn pure_lang_dependencies_pin_the_verified_runtime_revision() {
         let manifest = include_str!("../../../../Cargo.toml");
-        let verified_revision = "989864ca7aba15c00352d9516ed83e02aee2f31a";
+        let verified_revision = "05a6a57dbcd80757372ba34fb7446b0edb9000aa";
         for package in ["pl-core", "pl-model", "pl-protocol", "pl-trace"] {
             let line = manifest
                 .lines()

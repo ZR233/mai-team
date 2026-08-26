@@ -23,10 +23,10 @@ ctrlc = { version = "3", features = ["termination"] }
 fnv = "1"
 percent-encoding = "2"
 pretty_assertions = "1"
-pl-core = { git = "https://github.com/ZR233/pure-lang.git", rev = "989864ca7aba15c00352d9516ed83e02aee2f31a", default-features = false }
-pl-model = { git = "https://github.com/ZR233/pure-lang.git", rev = "989864ca7aba15c00352d9516ed83e02aee2f31a" }
-pl-protocol = { git = "https://github.com/ZR233/pure-lang.git", rev = "989864ca7aba15c00352d9516ed83e02aee2f31a" }
-pl-trace = { git = "https://github.com/ZR233/pure-lang.git", rev = "989864ca7aba15c00352d9516ed83e02aee2f31a" }
+pl-core = { git = "https://github.com/ZR233/pure-lang.git", rev = "05a6a57dbcd80757372ba34fb7446b0edb9000aa", default-features = false }
+pl-model = { git = "https://github.com/ZR233/pure-lang.git", rev = "05a6a57dbcd80757372ba34fb7446b0edb9000aa" }
+pl-protocol = { git = "https://github.com/ZR233/pure-lang.git", rev = "05a6a57dbcd80757372ba34fb7446b0edb9000aa" }
+pl-trace = { git = "https://github.com/ZR233/pure-lang.git", rev = "05a6a57dbcd80757372ba34fb7446b0edb9000aa" }
 
 schemars = "1"
 shell-words = "1"

@@ -208,6 +208,7 @@ pub enum ProjectReviewFailureCategory {
     Github,
     Workspace,
     Validation,
+    Protocol,
     Timeout,
     Internal,
 }
@@ -243,6 +244,7 @@ impl From<pl_protocol::TurnFailure> for ProjectReviewFailure {
             pl_protocol::TurnFailureCategory::Validation => {
                 ProjectReviewFailureCategory::Validation
             }
+            pl_protocol::TurnFailureCategory::Protocol => ProjectReviewFailureCategory::Protocol,
             pl_protocol::TurnFailureCategory::Internal => ProjectReviewFailureCategory::Internal,
         };
         Self {
