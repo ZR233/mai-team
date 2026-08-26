@@ -1,14 +1,15 @@
 use mai_protocol::{
-    ThreadContextDisposition, ThreadNotificationEnvelope, ThreadSnapshot, ThreadTurnHistory,
-    ThreadTurnPage, Turn, TurnBillingRecord,
+    ThreadNotificationEnvelope, ThreadSnapshot, ThreadTurnHistory, ThreadTurnPage, Turn,
+    TurnBillingRecord,
 };
-use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::records::{
-    ThreadItemRecord, ThreadNotificationRecord, ThreadRuntimeDocumentRecord,
-    ThreadRuntimeEventRecord, ThreadRuntimeTraceRecord, ThreadSubmissionRecord, ThreadTurnRecord,
+    ThreadItemRecord, ThreadRuntimeDocumentRecord, ThreadSubmissionRecord, ThreadTurnRecord,
 };
 use crate::*;
+
+mod commit;
 
 /// 不依赖 pl-core 的 ThreadActor durable document。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,54 +118,28 @@ impl MaiStore {
         &self,
         document: ThreadRuntimeCommitDocument,
     ) -> Result<ThreadRuntimeCommitOutcome> {
-        crate::sqlite_busy::retry_sqlite_busy(|| async {
-            self.commit_thread_runtime_once(&document).await
+        let prepared = Arc::new(
+            tokio::task::spawn_blocking(move || commit::PreparedThreadCommit::try_new(document))
+                .await
+                .map_err(|error| {
+                    StoreError::InvalidConfig(format!(
+                        "Thread commit preparation task failed: {error}"
+                    ))
+                })??,
+        );
+        let path = self.path.clone();
+        crate::sqlite_busy::retry_sqlite_busy(|| {
+            let path = path.clone();
+            let prepared = Arc::clone(&prepared);
+            async move {
+                tokio::task::spawn_blocking(move || prepared.commit_on_path(&path))
+                    .await
+                    .map_err(|error| {
+                        StoreError::InvalidConfig(format!("Thread commit task failed: {error}"))
+                    })?
+            }
         })
         .await
-    }
-
-    async fn commit_thread_runtime_once(
-        &self,
-        document: &ThreadRuntimeCommitDocument,
-    ) -> Result<ThreadRuntimeCommitOutcome> {
-        let thread_id = document.runtime.thread_id.clone();
-        let mut db = self.db.clone();
-        let mut tx = db.transaction().await?;
-        let existing = Query::<List<ThreadRuntimeDocumentRecord>>::filter(
-            ThreadRuntimeDocumentRecord::fields()
-                .thread_id()
-                .eq(thread_id.clone()),
-        )
-        .exec(&mut tx)
-        .await?;
-        let actual_revision = existing.first().map(|record| i64_to_u64(record.revision));
-        if actual_revision != document.expected_revision {
-            return Ok(ThreadRuntimeCommitOutcome::RevisionConflict { actual_revision });
-        }
-
-        let mut runtime = document.runtime.clone();
-        if runtime.snapshot.is_none() {
-            runtime.snapshot = existing
-                .first()
-                .and_then(|record| record.snapshot_json.as_deref())
-                .map(serde_json::from_str)
-                .transpose()?;
-        }
-        upsert_runtime_document(&mut tx, &runtime, existing.first()).await?;
-        // projection snapshot 与 actor document 同属本次 CAS；其中同时包含 Item、
-        // Interaction 和 runtime overlay。没有 projection 变化时沿用上次 snapshot。
-        if let Some(snapshot) = &document.runtime.snapshot {
-            synchronize_thread_items(&mut tx, snapshot).await?;
-        }
-        if let Some(turn) = &document.turn {
-            upsert_thread_turn(&mut tx, turn).await?;
-        }
-        append_notifications(&mut tx, &document.notifications).await?;
-        append_runtime_events(&mut tx, &thread_id, &document.runtime_events).await?;
-        append_trace_events(&mut tx, &thread_id, &document.trace_events).await?;
-        append_submissions(&mut tx, &document.submissions).await?;
-        tx.commit().await?;
-        Ok(ThreadRuntimeCommitOutcome::Applied)
     }
 
     /// 按提交顺序分页读取一个 Thread 的 durable 阶段提交历史。
@@ -269,294 +244,6 @@ fn stored_runtime(row: ThreadRuntimeDocumentRecord) -> Result<StoredThreadRuntim
             .transpose()?,
         updated_at: row.updated_at,
     })
-}
-
-async fn upsert_runtime_document(
-    tx: &mut toasty::Transaction<'_>,
-    runtime: &StoredThreadRuntime,
-    existing: Option<&ThreadRuntimeDocumentRecord>,
-) -> Result<()> {
-    let revision = u64_to_i64(runtime.revision);
-    let document_json = serde_json::to_string(&runtime.document)?;
-    let snapshot_json = runtime
-        .snapshot
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()?;
-    if existing.is_some() {
-        ThreadRuntimeDocumentRecord::filter(
-            ThreadRuntimeDocumentRecord::fields()
-                .thread_id()
-                .eq(runtime.thread_id.clone()),
-        )
-        .update()
-        .revision(revision)
-        .document_json(document_json)
-        .snapshot_json(snapshot_json)
-        .updated_at(runtime.updated_at)
-        .exec(&mut *tx)
-        .await?;
-    } else {
-        toasty::create!(ThreadRuntimeDocumentRecord {
-            thread_id: runtime.thread_id.clone(),
-            revision,
-            document_json,
-            snapshot_json,
-            updated_at: runtime.updated_at,
-        })
-        .exec(&mut *tx)
-        .await?;
-    }
-    Ok(())
-}
-
-async fn synchronize_thread_items(
-    tx: &mut toasty::Transaction<'_>,
-    snapshot: &ThreadSnapshot,
-) -> Result<()> {
-    let existing = Query::<List<ThreadItemRecord>>::filter(
-        ThreadItemRecord::fields()
-            .thread_id()
-            .eq(snapshot.thread.id.clone()),
-    )
-    .exec(&mut *tx)
-    .await?;
-    let mut existing = existing
-        .into_iter()
-        .map(|record| (record.id.clone(), record))
-        .collect::<BTreeMap<_, _>>();
-    let mut seen = std::collections::BTreeSet::new();
-    for item in &snapshot.items {
-        if item.thread_id != snapshot.thread.id {
-            return Err(StoreError::InvalidConfig(format!(
-                "Thread Item {} belongs to {} instead of snapshot {}",
-                item.id, item.thread_id, snapshot.thread.id
-            )));
-        }
-        if !seen.insert(item.id.as_str()) {
-            return Err(StoreError::InvalidConfig(format!(
-                "Thread snapshot {} contains duplicate Item {}",
-                snapshot.thread.id, item.id
-            )));
-        }
-        let ordinal = u64_to_i64(item.ordinal);
-        let revision = u64_to_i64(item.revision);
-        let item_json = serde_json::to_string(item)?;
-        match existing.remove(&item.id) {
-            Some(record)
-                if record.thread_id == item.thread_id
-                    && record.turn_id == item.turn_id
-                    && record.ordinal == ordinal
-                    && record.revision == revision
-                    && record.item_json == item_json => {}
-            Some(_) => {
-                ThreadItemRecord::filter(ThreadItemRecord::fields().id().eq(item.id.clone()))
-                    .update()
-                    .thread_id(item.thread_id.clone())
-                    .turn_id(item.turn_id.clone())
-                    .ordinal(ordinal)
-                    .revision(revision)
-                    .item_json(item_json)
-                    .exec(&mut *tx)
-                    .await?;
-            }
-            None => {
-                toasty::create!(ThreadItemRecord {
-                    id: item.id.clone(),
-                    thread_id: item.thread_id.clone(),
-                    turn_id: item.turn_id.clone(),
-                    ordinal,
-                    revision,
-                    item_json,
-                })
-                .exec(&mut *tx)
-                .await?;
-            }
-        }
-    }
-    for item_id in existing.into_keys() {
-        Query::<List<ThreadItemRecord>>::filter(ThreadItemRecord::fields().id().eq(item_id))
-            .delete()
-            .exec(&mut *tx)
-            .await?;
-    }
-    Ok(())
-}
-
-async fn upsert_thread_turn(
-    tx: &mut toasty::Transaction<'_>,
-    update: &ThreadRuntimeTurnCommit,
-) -> Result<()> {
-    let existing = Query::<List<ThreadTurnRecord>>::filter(
-        ThreadTurnRecord::fields().id().eq(update.id.clone()),
-    )
-    .exec(&mut *tx)
-    .await?;
-    let previous = existing.first();
-    if previous.is_some_and(|record| record.thread_id != update.thread_id) {
-        return Err(StoreError::InvalidConfig(format!(
-            "Turn {} cannot move from another Thread to {}",
-            update.id, update.thread_id
-        )));
-    }
-    if let Some(turn) = &update.turn
-        && (turn.id != update.id || turn.thread_id != update.thread_id)
-    {
-        return Err(StoreError::InvalidConfig(format!(
-            "Turn commit {} has inconsistent Thread/Turn ownership",
-            update.id
-        )));
-    }
-    let turn_json = update
-        .turn
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()?
-        .or_else(|| previous.map(|record| record.turn_json.clone()))
-        .ok_or_else(|| {
-            StoreError::InvalidConfig(format!(
-                "Turn billing commit {} has no durable Turn",
-                update.id
-            ))
-        })?;
-    let model_json = update
-        .billing
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()?
-        .or_else(|| previous.and_then(|record| record.model_json.clone()));
-    let ordinal = existing
-        .first()
-        .map(|record| record.ordinal)
-        .or_else(|| {
-            update
-                .turn
-                .as_ref()
-                .map(|turn| turn.started_at().unwrap_or(turn.updated_at))
-        })
-        .ok_or_else(|| StoreError::InvalidConfig(format!("Turn {} lacks ordinal", update.id)))?;
-    if !existing.is_empty() {
-        Query::<List<ThreadTurnRecord>>::filter(
-            ThreadTurnRecord::fields().id().eq(update.id.clone()),
-        )
-        .delete()
-        .exec(&mut *tx)
-        .await?;
-    }
-    toasty::create!(ThreadTurnRecord {
-        id: update.id.clone(),
-        thread_id: update.thread_id.clone(),
-        ordinal,
-        turn_json,
-        model_json,
-        context_disposition: previous
-            .map(|record| record.context_disposition.clone())
-            .unwrap_or(serde_json::to_string(&ThreadContextDisposition::Active)?),
-    })
-    .exec(&mut *tx)
-    .await?;
-    Ok(())
-}
-
-async fn append_notifications(
-    tx: &mut toasty::Transaction<'_>,
-    notifications: &[ThreadNotificationEnvelope],
-) -> Result<()> {
-    for notification in notifications {
-        let id = format!("{}:{}", notification.thread_id, notification.revision);
-        Query::<List<ThreadNotificationRecord>>::filter(
-            ThreadNotificationRecord::fields().id().eq(id.clone()),
-        )
-        .delete()
-        .exec(&mut *tx)
-        .await?;
-        toasty::create!(ThreadNotificationRecord {
-            id,
-            thread_id: notification.thread_id.clone(),
-            revision: u64_to_i64(notification.revision),
-            emitted_at: notification.emitted_at,
-            notification_json: serde_json::to_string(notification)?,
-        })
-        .exec(&mut *tx)
-        .await?;
-    }
-    Ok(())
-}
-
-async fn append_runtime_events(
-    tx: &mut toasty::Transaction<'_>,
-    thread_id: &str,
-    events: &[StoredThreadRuntimeEvent],
-) -> Result<()> {
-    for event in events {
-        let id = format!("{thread_id}:{}", event.sequence);
-        Query::<List<ThreadRuntimeEventRecord>>::filter(
-            ThreadRuntimeEventRecord::fields().id().eq(id.clone()),
-        )
-        .delete()
-        .exec(&mut *tx)
-        .await?;
-        toasty::create!(ThreadRuntimeEventRecord {
-            id,
-            thread_id: thread_id.to_string(),
-            sequence: u64_to_i64(event.sequence),
-            created_at: event.created_at,
-            event_json: serde_json::to_string(&event.payload)?,
-        })
-        .exec(&mut *tx)
-        .await?;
-    }
-    Ok(())
-}
-
-async fn append_trace_events(
-    tx: &mut toasty::Transaction<'_>,
-    thread_id: &str,
-    events: &[StoredThreadTraceEvent],
-) -> Result<()> {
-    for event in events {
-        let id = format!("{thread_id}:{}", event.sequence);
-        Query::<List<ThreadRuntimeTraceRecord>>::filter(
-            ThreadRuntimeTraceRecord::fields().id().eq(id.clone()),
-        )
-        .delete()
-        .exec(&mut *tx)
-        .await?;
-        toasty::create!(ThreadRuntimeTraceRecord {
-            id,
-            thread_id: thread_id.to_string(),
-            sequence: u64_to_i64(event.sequence),
-            trace_json: serde_json::to_string(&event.payload)?,
-        })
-        .exec(&mut *tx)
-        .await?;
-    }
-    Ok(())
-}
-
-async fn append_submissions(
-    tx: &mut toasty::Transaction<'_>,
-    submissions: &[StoredThreadSubmission],
-) -> Result<()> {
-    for submission in submissions {
-        let id = format!("{}:{}", submission.thread_id, submission.ordinal);
-        Query::<List<ThreadSubmissionRecord>>::filter(
-            ThreadSubmissionRecord::fields().id().eq(id.clone()),
-        )
-        .delete()
-        .exec(&mut *tx)
-        .await?;
-        toasty::create!(ThreadSubmissionRecord {
-            id,
-            thread_id: submission.thread_id.clone(),
-            ordinal: u64_to_i64(submission.ordinal),
-            created_at: submission.created_at,
-            submission_json: serde_json::to_string(&submission.submission)?,
-        })
-        .exec(&mut *tx)
-        .await?;
-    }
-    Ok(())
 }
 
 fn parse_cursor(cursor: &str) -> Result<i64> {
@@ -811,6 +498,118 @@ mod tests {
                 .map(|(_, item_id)| item_id.as_str())
                 .collect::<std::collections::BTreeSet<_>>(),
             std::collections::BTreeSet::from(["item-b"]),
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_thread_facts_update_without_delete_churn() {
+        let (_directory, store) = test_store().await;
+        let connection = Connection::open(store.path()).expect("open audit connection");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE thread_fact_audit (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fact TEXT NOT NULL,
+                    operation TEXT NOT NULL
+                );
+                CREATE TRIGGER audit_runtime_event_insert AFTER INSERT ON thread_runtime_events
+                BEGIN INSERT INTO thread_fact_audit(fact, operation) VALUES ('event', 'insert'); END;
+                CREATE TRIGGER audit_runtime_event_update AFTER UPDATE ON thread_runtime_events
+                BEGIN INSERT INTO thread_fact_audit(fact, operation) VALUES ('event', 'update'); END;
+                CREATE TRIGGER audit_runtime_event_delete AFTER DELETE ON thread_runtime_events
+                BEGIN INSERT INTO thread_fact_audit(fact, operation) VALUES ('event', 'delete'); END;
+                CREATE TRIGGER audit_trace_insert AFTER INSERT ON thread_runtime_traces
+                BEGIN INSERT INTO thread_fact_audit(fact, operation) VALUES ('trace', 'insert'); END;
+                CREATE TRIGGER audit_trace_update AFTER UPDATE ON thread_runtime_traces
+                BEGIN INSERT INTO thread_fact_audit(fact, operation) VALUES ('trace', 'update'); END;
+                CREATE TRIGGER audit_trace_delete AFTER DELETE ON thread_runtime_traces
+                BEGIN INSERT INTO thread_fact_audit(fact, operation) VALUES ('trace', 'delete'); END;
+                CREATE TRIGGER audit_submission_insert AFTER INSERT ON thread_submissions
+                BEGIN INSERT INTO thread_fact_audit(fact, operation) VALUES ('submission', 'insert'); END;
+                CREATE TRIGGER audit_submission_update AFTER UPDATE ON thread_submissions
+                BEGIN INSERT INTO thread_fact_audit(fact, operation) VALUES ('submission', 'update'); END;
+                CREATE TRIGGER audit_submission_delete AFTER DELETE ON thread_submissions
+                BEGIN INSERT INTO thread_fact_audit(fact, operation) VALUES ('submission', 'delete'); END;
+                "#,
+            )
+            .expect("install fact audit triggers");
+
+        let mut initial = commit("thread-a", None, 1, None, None);
+        initial.runtime_events.push(StoredThreadRuntimeEvent {
+            sequence: 1,
+            created_at: 10,
+            payload: serde_json::json!({ "value": 1 }),
+        });
+        initial.trace_events.push(StoredThreadTraceEvent {
+            sequence: 1,
+            payload: serde_json::json!({ "value": 1 }),
+        });
+        initial.submissions.push(StoredThreadSubmission {
+            thread_id: "thread-a".to_string(),
+            ordinal: 1,
+            created_at: 10,
+            submission: serde_json::json!({ "value": 1 }),
+        });
+        assert_eq!(
+            store
+                .commit_thread_runtime(initial)
+                .await
+                .expect("initial facts"),
+            ThreadRuntimeCommitOutcome::Applied
+        );
+        let baseline: i64 = connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM thread_fact_audit",
+                [],
+                |row| row.get(0),
+            )
+            .expect("audit baseline");
+
+        let mut replay = commit("thread-a", Some(1), 2, None, None);
+        replay.runtime_events.push(StoredThreadRuntimeEvent {
+            sequence: 1,
+            created_at: 11,
+            payload: serde_json::json!({ "value": 2 }),
+        });
+        replay.trace_events.push(StoredThreadTraceEvent {
+            sequence: 1,
+            payload: serde_json::json!({ "value": 2 }),
+        });
+        replay.submissions.push(StoredThreadSubmission {
+            thread_id: "thread-a".to_string(),
+            ordinal: 1,
+            created_at: 11,
+            submission: serde_json::json!({ "value": 2 }),
+        });
+        assert_eq!(
+            store
+                .commit_thread_runtime(replay)
+                .await
+                .expect("replayed facts"),
+            ThreadRuntimeCommitOutcome::Applied
+        );
+
+        let mut statement = connection
+            .prepare(
+                "SELECT fact, operation FROM thread_fact_audit \
+                 WHERE sequence > ?1 ORDER BY sequence",
+            )
+            .expect("prepare audit query");
+        let writes = statement
+            .query_map([baseline], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query audit")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect audit rows");
+        assert_eq!(
+            writes,
+            vec![
+                ("event".to_string(), "update".to_string()),
+                ("trace".to_string(), "update".to_string()),
+                ("submission".to_string(), "update".to_string()),
+            ]
         );
     }
 

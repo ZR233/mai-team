@@ -57,6 +57,10 @@ SQLite CAS transaction。ThreadActor 先提交内存权威状态并发布规范�
 - `await_durable(thread, revision)` 精确等待指定 revision，不用“队列为空”代替；
 - Store 对 actor document 原位更新，对完整 Thread snapshot 只增删改真正变化的 Item，不允许每个
   流式 delta 全量删除并重建历史 Item；
+- Store 在事务外完成 JSON 编码与 ownership 校验，再由独立阻塞任务打开 SQLite
+  `IMMEDIATE` transaction；事务内复用 prepared statements 同步 UPSERT notification、runtime
+  event、trace 与 submission。canonical commit 不经过 Toasty 延迟事务，也不能在写锁内逐条
+  `await`，从而避免读后升级争用和大批流式事实占锁数分钟；
 - SQLite 临时 busy/locked 保留队首提交并自动重试；revision conflict、数据不变量或非瞬时 I/O
   失败固定为 writer 故障并传播给所有 barrier；
 - 关机先停止接收，再排空全部已接受提交；
