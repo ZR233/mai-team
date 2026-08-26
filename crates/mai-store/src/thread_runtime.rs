@@ -2,6 +2,7 @@ use mai_protocol::{
     ThreadContextDisposition, ThreadNotificationEnvelope, ThreadSnapshot, ThreadTurnHistory,
     ThreadTurnPage, Turn, TurnBillingRecord,
 };
+use std::collections::BTreeMap;
 
 use crate::records::{
     ThreadItemRecord, ThreadNotificationRecord, ThreadRuntimeDocumentRecord,
@@ -149,11 +150,11 @@ impl MaiStore {
                 .map(serde_json::from_str)
                 .transpose()?;
         }
-        replace_runtime_document(&mut tx, &runtime).await?;
+        upsert_runtime_document(&mut tx, &runtime, existing.first()).await?;
         // projection snapshot 与 actor document 同属本次 CAS；其中同时包含 Item、
         // Interaction 和 runtime overlay。没有 projection 变化时沿用上次 snapshot。
         if let Some(snapshot) = &document.runtime.snapshot {
-            replace_thread_items(&mut tx, snapshot).await?;
+            synchronize_thread_items(&mut tx, snapshot).await?;
         }
         if let Some(turn) = &document.turn {
             upsert_thread_turn(&mut tx, turn).await?;
@@ -270,57 +271,114 @@ fn stored_runtime(row: ThreadRuntimeDocumentRecord) -> Result<StoredThreadRuntim
     })
 }
 
-async fn replace_runtime_document(
+async fn upsert_runtime_document(
     tx: &mut toasty::Transaction<'_>,
     runtime: &StoredThreadRuntime,
+    existing: Option<&ThreadRuntimeDocumentRecord>,
 ) -> Result<()> {
-    Query::<List<ThreadRuntimeDocumentRecord>>::filter(
-        ThreadRuntimeDocumentRecord::fields()
-            .thread_id()
-            .eq(runtime.thread_id.clone()),
-    )
-    .delete()
-    .exec(&mut *tx)
-    .await?;
-    toasty::create!(ThreadRuntimeDocumentRecord {
-        thread_id: runtime.thread_id.clone(),
-        revision: u64_to_i64(runtime.revision),
-        document_json: serde_json::to_string(&runtime.document)?,
-        snapshot_json: runtime
-            .snapshot
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?,
-        updated_at: runtime.updated_at,
-    })
-    .exec(&mut *tx)
-    .await?;
+    let revision = u64_to_i64(runtime.revision);
+    let document_json = serde_json::to_string(&runtime.document)?;
+    let snapshot_json = runtime
+        .snapshot
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    if existing.is_some() {
+        ThreadRuntimeDocumentRecord::filter(
+            ThreadRuntimeDocumentRecord::fields()
+                .thread_id()
+                .eq(runtime.thread_id.clone()),
+        )
+        .update()
+        .revision(revision)
+        .document_json(document_json)
+        .snapshot_json(snapshot_json)
+        .updated_at(runtime.updated_at)
+        .exec(&mut *tx)
+        .await?;
+    } else {
+        toasty::create!(ThreadRuntimeDocumentRecord {
+            thread_id: runtime.thread_id.clone(),
+            revision,
+            document_json,
+            snapshot_json,
+            updated_at: runtime.updated_at,
+        })
+        .exec(&mut *tx)
+        .await?;
+    }
     Ok(())
 }
 
-async fn replace_thread_items(
+async fn synchronize_thread_items(
     tx: &mut toasty::Transaction<'_>,
     snapshot: &ThreadSnapshot,
 ) -> Result<()> {
-    Query::<List<ThreadItemRecord>>::filter(
+    let existing = Query::<List<ThreadItemRecord>>::filter(
         ThreadItemRecord::fields()
             .thread_id()
             .eq(snapshot.thread.id.clone()),
     )
-    .delete()
     .exec(&mut *tx)
     .await?;
+    let mut existing = existing
+        .into_iter()
+        .map(|record| (record.id.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = std::collections::BTreeSet::new();
     for item in &snapshot.items {
-        toasty::create!(ThreadItemRecord {
-            id: item.id.clone(),
-            thread_id: item.thread_id.clone(),
-            turn_id: item.turn_id.clone(),
-            ordinal: u64_to_i64(item.ordinal),
-            revision: u64_to_i64(item.revision),
-            item_json: serde_json::to_string(item)?,
-        })
-        .exec(&mut *tx)
-        .await?;
+        if item.thread_id != snapshot.thread.id {
+            return Err(StoreError::InvalidConfig(format!(
+                "Thread Item {} belongs to {} instead of snapshot {}",
+                item.id, item.thread_id, snapshot.thread.id
+            )));
+        }
+        if !seen.insert(item.id.as_str()) {
+            return Err(StoreError::InvalidConfig(format!(
+                "Thread snapshot {} contains duplicate Item {}",
+                snapshot.thread.id, item.id
+            )));
+        }
+        let ordinal = u64_to_i64(item.ordinal);
+        let revision = u64_to_i64(item.revision);
+        let item_json = serde_json::to_string(item)?;
+        match existing.remove(&item.id) {
+            Some(record)
+                if record.thread_id == item.thread_id
+                    && record.turn_id == item.turn_id
+                    && record.ordinal == ordinal
+                    && record.revision == revision
+                    && record.item_json == item_json => {}
+            Some(_) => {
+                ThreadItemRecord::filter(ThreadItemRecord::fields().id().eq(item.id.clone()))
+                    .update()
+                    .thread_id(item.thread_id.clone())
+                    .turn_id(item.turn_id.clone())
+                    .ordinal(ordinal)
+                    .revision(revision)
+                    .item_json(item_json)
+                    .exec(&mut *tx)
+                    .await?;
+            }
+            None => {
+                toasty::create!(ThreadItemRecord {
+                    id: item.id.clone(),
+                    thread_id: item.thread_id.clone(),
+                    turn_id: item.turn_id.clone(),
+                    ordinal,
+                    revision,
+                    item_json,
+                })
+                .exec(&mut *tx)
+                .await?;
+            }
+        }
+    }
+    for item_id in existing.into_keys() {
+        Query::<List<ThreadItemRecord>>::filter(ThreadItemRecord::fields().id().eq(item_id))
+            .delete()
+            .exec(&mut *tx)
+            .await?;
     }
     Ok(())
 }
@@ -514,6 +572,7 @@ mod tests {
     use mai_protocol::{ThreadAttachment, ThreadItem, ThreadSnapshot, Turn, TurnState};
     use pl_protocol::{CompletedTurnState, TurnCompletion};
     use pretty_assertions::assert_eq;
+    use rusqlite::Connection;
 
     use super::*;
 
@@ -664,6 +723,95 @@ mod tests {
         assert_eq!(beta.turns[0].turn.id, "turn-b");
         assert_eq!(alpha.turns[0].items[0].thread_id, "thread-a");
         assert_eq!(beta.turns[0].items[0].thread_id, "thread-b");
+    }
+
+    #[tokio::test]
+    async fn consecutive_snapshots_only_write_changed_items() {
+        let (_directory, store) = test_store().await;
+        let connection = Connection::open(store.path()).expect("open audit connection");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE thread_item_audit (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operation TEXT NOT NULL,
+                    item_id TEXT NOT NULL
+                );
+                CREATE TRIGGER audit_thread_item_insert
+                AFTER INSERT ON thread_items
+                BEGIN
+                    INSERT INTO thread_item_audit(operation, item_id)
+                    VALUES ('insert', NEW.id);
+                END;
+                CREATE TRIGGER audit_thread_item_delete
+                AFTER DELETE ON thread_items
+                BEGIN
+                    INSERT INTO thread_item_audit(operation, item_id)
+                    VALUES ('delete', OLD.id);
+                END;
+                CREATE TRIGGER audit_thread_item_update
+                AFTER UPDATE ON thread_items
+                BEGIN
+                    INSERT INTO thread_item_audit(operation, item_id)
+                    VALUES ('update', NEW.id);
+                END;
+                "#,
+            )
+            .expect("install item audit triggers");
+
+        let items = ["item-a", "item-b"].map(|id| {
+            ThreadItem::completed_user_message(
+                id.to_string(),
+                "thread-a".to_string(),
+                "turn-a".to_string(),
+                id.to_string(),
+                Vec::<ThreadAttachment>::new(),
+                10,
+            )
+        });
+        let mut first_snapshot = ThreadSnapshot::empty("thread-a");
+        first_snapshot.items.extend(items.clone());
+        store
+            .commit_thread_runtime(commit("thread-a", None, 1, None, Some(first_snapshot)))
+            .await
+            .expect("initial snapshot");
+        let baseline: i64 = connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM thread_item_audit",
+                [],
+                |row| row.get(0),
+            )
+            .expect("audit baseline");
+
+        let mut second_snapshot = ThreadSnapshot::empty("thread-a");
+        second_snapshot.items.extend(items);
+        second_snapshot.items[1].updated_at = 11;
+        store
+            .commit_thread_runtime(commit("thread-a", Some(1), 2, None, Some(second_snapshot)))
+            .await
+            .expect("updated snapshot");
+
+        let mut statement = connection
+            .prepare(
+                "SELECT operation, item_id FROM thread_item_audit \
+                 WHERE sequence > ?1 ORDER BY sequence",
+            )
+            .expect("prepare audit query");
+        let writes = statement
+            .query_map([baseline], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query audit")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect audit rows");
+        assert!(!writes.is_empty(), "changed item must be persisted");
+        assert_eq!(
+            writes
+                .iter()
+                .map(|(_, item_id)| item_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["item-b"]),
+        );
     }
 
     async fn test_store() -> (tempfile::TempDir, MaiStore) {

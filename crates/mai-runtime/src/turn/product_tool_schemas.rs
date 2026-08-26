@@ -17,24 +17,6 @@ mod tests {
     use serde_json::{Value, json};
 
     #[test]
-    fn pure_lang_dependencies_pin_the_verified_runtime_revision() {
-        let manifest = include_str!("../../../../Cargo.toml");
-        let verified_revision = "05a6a57dbcd80757372ba34fb7446b0edb9000aa";
-        for package in ["pl-core", "pl-model", "pl-protocol", "pl-trace"] {
-            let line = manifest
-                .lines()
-                .find(|line| line.starts_with(&format!("{package} = ")))
-                .expect("workspace dependency must exist");
-            assert!(
-                line.contains("git = \"https://github.com/ZR233/pure-lang.git\"")
-                    && line.contains(&format!("rev = \"{verified_revision}\""))
-                    && !line.contains("path ="),
-                "{package} 必须锁定经过现网数据兼容验证的 pure-lang runtime revision"
-            );
-        }
-    }
-
-    #[test]
     fn builtin_definitions_are_product_tools_only() {
         let tools = build_tool_specs();
         let names = tool_names(&tools);

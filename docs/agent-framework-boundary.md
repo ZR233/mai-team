@@ -46,13 +46,19 @@ v2 Thread 文档，首次访问会创建全新的 v2 初始状态；这不是旧
 
 `MaiAgentRepository` 是 PL `ThreadRepository` 的唯一实现。一次 `ThreadCommit` 将 actor document、
 mailbox、Turn、Item、Interaction、notification、trace、submission 和计费事实转换为一个
-SQLite CAS transaction。数据库提交成功前不得广播 authoritative notification。
+SQLite CAS transaction。ThreadActor 先提交内存权威状态并发布规范通知，repository 只接受同一
+事实进入进程内写后队列；SQLite 结果不反向控制已经发生的业务转换。
 
 写入由单一所有者的 FIFO writer 接受：
 
-- `commit` 只把完整 revision 加入有界队列；
+- `commit` 只把完整 revision 加入有界队列；严格连续且同属一个 owner、Turn 与 Item 的
+  `Coalescible` 提交只通过 PL `ThreadCommit::coalesce` 合并，全部 notification、trace 和最终
+  snapshot 都必须保留；
 - `await_durable(thread, revision)` 精确等待指定 revision，不用“队列为空”代替；
-- revision conflict 或 I/O 失败会固定为 writer 故障并传播给所有 barrier；
+- Store 对 actor document 原位更新，对完整 Thread snapshot 只增删改真正变化的 Item，不允许每个
+  流式 delta 全量删除并重建历史 Item；
+- SQLite 临时 busy/locked 保留队首提交并自动重试；revision conflict、数据不变量或非瞬时 I/O
+  失败固定为 writer 故障并传播给所有 barrier；
 - 关机先停止接收，再排空全部已接受提交；
 - 从 durable Thread 恢复时以其 revision 初始化 barrier 水位。
 

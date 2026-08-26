@@ -58,6 +58,7 @@ pub use review_jobs::{
     ProjectReviewJobEnqueueDisposition, ProjectReviewJobEnqueueResult,
     ProjectReviewReviewableJobEnqueueResult,
 };
+pub use sqlite_busy::is_retryable_sqlite_error;
 pub use store::MaiStore;
 pub use thread_runtime::{
     StoredThreadRuntime, StoredThreadRuntimeEvent, StoredThreadSubmission,

@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use mai_store::{
     MaiStore, StoredThreadRuntime, StoredThreadRuntimeEvent, StoredThreadSubmission,
     StoredThreadTraceEvent, ThreadRuntimeCommitDocument,
     ThreadRuntimeCommitOutcome as StoreCommitOutcome, ThreadRuntimeTurnCommit,
+    is_retryable_sqlite_error,
 };
 use pl_core::{
     AgentSession, AgentSnapshot, AgentSubmissionPage, AgentSubmissionRecord,
@@ -61,7 +63,7 @@ impl ThreadRepository for MaiAgentRepository {
         Ok(restored)
     }
     async fn commit(&self, commit: ThreadCommit) -> Result<()> {
-        self.writer.enqueue(commit_to_store(commit)?).await
+        self.writer.enqueue(commit).await
     }
 
     async fn await_durable(&self, thread_id: &ThreadId, revision: u64) -> Result<()> {
@@ -101,9 +103,7 @@ impl ThreadRepository for MaiAgentRepository {
 const MAX_PENDING_COMMITS: usize = 1024;
 
 struct QueuedCommit {
-    thread_id: String,
-    revision: u64,
-    document: ThreadRuntimeCommitDocument,
+    commit: Box<ThreadCommit>,
 }
 
 struct ThreadWriter {
@@ -144,9 +144,9 @@ impl ThreadWriter {
             .or_insert(revision);
     }
 
-    async fn enqueue(self: &Arc<Self>, document: ThreadRuntimeCommitDocument) -> Result<()> {
+    async fn enqueue(self: &Arc<Self>, commit: ThreadCommit) -> Result<()> {
         self.ensure_running()?;
-        let mut document = Some(document);
+        let mut commit = Some(Box::new(commit));
         loop {
             self.check_available()?;
             let progress = self.progress.notified();
@@ -155,12 +155,22 @@ impl ThreadWriter {
                     .queue
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let next = commit.take().expect("Thread commit present");
+                if let Some(previous) = queue.back_mut() {
+                    match previous.commit.coalesce(next) {
+                        Ok(()) => {
+                            drop(queue);
+                            self.work.notify_one();
+                            return Ok(());
+                        }
+                        Err(next) => commit = Some(next),
+                    }
+                } else {
+                    commit = Some(next);
+                }
                 if self.pending.load(Ordering::Acquire) < MAX_PENDING_COMMITS {
-                    let document = document.take().expect("Thread commit document present");
                     queue.push_back(QueuedCommit {
-                        thread_id: document.runtime.thread_id.clone(),
-                        revision: document.runtime.revision,
-                        document,
+                        commit: commit.take().expect("Thread commit present"),
                     });
                     self.pending.fetch_add(1, Ordering::AcqRel);
                     drop(queue);
@@ -252,13 +262,18 @@ impl ThreadWriter {
                 work.await;
                 continue;
             };
-            match self
-                .store
-                .commit_thread_runtime(commit.document.clone())
-                .await
-            {
+            let thread_id = commit.commit.agent_id.to_string();
+            let revision = commit.commit.facts.revision;
+            let document = match commit_to_store((*commit.commit).clone()) {
+                Ok(document) => document,
+                Err(error) => {
+                    self.requeue_failed(commit, error.to_string());
+                    return;
+                }
+            };
+            match self.store.commit_thread_runtime(document).await {
                 Ok(StoreCommitOutcome::Applied) => {
-                    self.advance_durable(&commit.thread_id, commit.revision);
+                    self.advance_durable(&thread_id, revision);
                     self.pending.fetch_sub(1, Ordering::AcqRel);
                     self.progress.notify_waiters();
                 }
@@ -270,6 +285,19 @@ impl ThreadWriter {
                         ),
                     );
                     return;
+                }
+                Err(error) if is_retryable_sqlite_error(&error) => {
+                    if self.stopping.load(Ordering::Acquire) {
+                        self.requeue_failed(commit, error.to_string());
+                        return;
+                    }
+                    self.requeue_retry(commit);
+                    tracing::warn!(
+                        thread_id,
+                        revision,
+                        "Thread writer 遇到临时 SQLite 锁，保留队首提交后重试"
+                    );
+                    tokio::time::sleep(Duration::from_millis(250)).await;
                 }
                 Err(error) => {
                     self.requeue_failed(commit, error.to_string());
@@ -291,15 +319,19 @@ impl ThreadWriter {
     }
 
     fn requeue_failed(&self, commit: QueuedCommit, error: String) {
-        self.queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push_front(commit);
+        self.requeue_retry(commit);
         *self
             .failure
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
         self.progress.notify_waiters();
+    }
+
+    fn requeue_retry(&self, commit: QueuedCommit) {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_front(commit);
     }
 
     fn check_available(&self) -> Result<()> {
@@ -480,7 +512,10 @@ fn json_error(error: serde_json::Error) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use pl_core::{AgentIdentity, AgentRoleId, AgentState};
+    use pl_core::{
+        AgentIdentity, AgentRoleId, AgentState, DurableCommitFacts, PersistenceClass,
+        ThreadMutation,
+    };
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -564,11 +599,11 @@ mod tests {
         let thread_id = ThreadId::new("thread-a").expect("thread id");
 
         writer
-            .enqueue(document("thread-a", None, 1))
+            .enqueue(commit("thread-a", None, 1, PersistenceClass::Standard))
             .await
             .expect("enqueue revision 1");
         writer
-            .enqueue(document("thread-a", Some(1), 2))
+            .enqueue(commit("thread-a", Some(1), 2, PersistenceClass::Standard))
             .await
             .expect("enqueue revision 2");
         writer
@@ -596,7 +631,7 @@ mod tests {
         let thread_id = ThreadId::new("thread-a").expect("thread id");
 
         writer
-            .enqueue(document("thread-a", None, 1))
+            .enqueue(commit("thread-a", None, 1, PersistenceClass::Standard))
             .await
             .expect("enqueue revision 1");
         writer
@@ -604,7 +639,7 @@ mod tests {
             .await
             .expect("revision 1 durable");
         writer
-            .enqueue(document("thread-a", None, 2))
+            .enqueue(commit("thread-a", None, 2, PersistenceClass::Standard))
             .await
             .expect("enqueue conflicting revision");
 
@@ -632,10 +667,11 @@ mod tests {
         let writer = Arc::new(ThreadWriter::new(store.clone()));
         for revision in 1..=16 {
             writer
-                .enqueue(document(
+                .enqueue(commit(
                     "thread-a",
                     (revision > 1).then_some(revision - 1),
                     revision,
+                    PersistenceClass::Standard,
                 ))
                 .await
                 .expect("enqueue sequential revision");
@@ -655,10 +691,52 @@ mod tests {
         );
         assert!(
             writer
-                .enqueue(document("thread-a", Some(16), 17))
+                .enqueue(commit("thread-a", Some(16), 17, PersistenceClass::Standard,))
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consecutive_streaming_commits_share_one_durable_write() {
+        let (_directory, store) = test_store().await;
+        let writer = Arc::new(ThreadWriter::new(store.clone()));
+        let thread_id = ThreadId::new("thread-stream").expect("thread id");
+
+        writer
+            .enqueue(commit(
+                "thread-stream",
+                None,
+                1,
+                PersistenceClass::Coalescible,
+            ))
+            .await
+            .expect("enqueue first stream commit");
+        writer
+            .enqueue(commit(
+                "thread-stream",
+                Some(1),
+                2,
+                PersistenceClass::Coalescible,
+            ))
+            .await
+            .expect("enqueue next stream commit");
+
+        assert_eq!(writer.pending.load(Ordering::Acquire), 1);
+        writer
+            .await_durable(&thread_id, 2)
+            .await
+            .expect("coalesced revision durable");
+        assert_eq!(
+            store
+                .load_thread_runtime("thread-stream")
+                .await
+                .expect("load runtime")
+                .expect("runtime")
+                .revision,
+            2
+        );
+        writer.shutdown().await.expect("shutdown");
     }
 
     async fn test_store() -> (tempfile::TempDir, Arc<MaiStore>) {
@@ -673,25 +751,40 @@ mod tests {
         (directory, Arc::new(store))
     }
 
-    fn document(
+    fn commit(
         thread_id: &str,
         expected_revision: Option<u64>,
         revision: u64,
-    ) -> ThreadRuntimeCommitDocument {
-        ThreadRuntimeCommitDocument {
-            expected_revision,
-            runtime: StoredThreadRuntime {
-                thread_id: thread_id.to_string(),
+        persistence: PersistenceClass,
+    ) -> ThreadCommit {
+        let thread_id = ThreadId::new(thread_id).expect("thread id");
+        let state = ThreadActorState {
+            snapshot: AgentSnapshot {
+                identity: AgentIdentity {
+                    id: thread_id.clone(),
+                    parent_id: None,
+                    role: AgentRoleId::new("executor").expect("role"),
+                    depth: 0,
+                },
+                state: AgentState::idle(),
+                pending_inputs: 0,
+                progress: None,
+                last_turn: None,
                 revision,
-                document: serde_json::json!({ "revision": revision }),
-                snapshot: None,
-                updated_at: revision as i64,
+                event_sequence: revision,
+                updated_at: i64::try_from(revision).expect("test revision fits i64"),
             },
-            turn: None,
-            notifications: Vec::new(),
-            runtime_events: Vec::new(),
-            trace_events: Vec::new(),
-            submissions: Vec::new(),
+            session: ThreadContextState::empty(),
+            pending_inputs: VecDeque::new(),
+            active_input: None,
+        };
+        ThreadCommit {
+            agent_id: thread_id,
+            persistence,
+            expected_revision,
+            facts: DurableCommitFacts::from_state(&state, Vec::new(), Vec::new(), None, None),
+            next_state: state,
+            mutation: ThreadMutation::SnapshotAndQueue,
         }
     }
 }

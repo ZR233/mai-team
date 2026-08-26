@@ -13,7 +13,9 @@ where
     loop {
         match operation().await {
             Ok(value) => return Ok(value),
-            Err(err) if sqlite_busy_error(&err) && tokio::time::Instant::now() < deadline => {
+            Err(err)
+                if is_retryable_sqlite_error(&err) && tokio::time::Instant::now() < deadline =>
+            {
                 tokio::time::sleep(Duration::from_millis(SQLITE_BUSY_RETRY_DELAY_MS)).await;
             }
             Err(err) => return Err(err),
@@ -21,7 +23,8 @@ where
     }
 }
 
-pub(crate) fn sqlite_busy_error(err: &StoreError) -> bool {
+/// 判断一次 Store 失败是否只由 SQLite writer 临时繁忙引起。
+pub fn is_retryable_sqlite_error(err: &StoreError) -> bool {
     match err {
         StoreError::Sqlite(err) => matches!(
             err.sqlite_error_code(),
