@@ -28,6 +28,10 @@ AgentSummary
 `AgentState`。mai 不再保存 lifecycle、activity、active/last turn 或 pending queue 的重复投影。
 API 和 Web 必须穷尽匹配 PL tagged state，不能从旧扁平字段推断。
 
+Review continuation 的 reviewer ownership 只来自非终态 Review Job 的 `reviewer_agent_id`。项目
+`current_reviewer_agent_id` 只是可重建投影；启动 singleton repair 必须保留仍存在且可运行的 Job
+owner，并把缺失或过期的项目投影校正回 Job，不能用投影否决 durable ownership。
+
 长期产品 Agent 身份先从产品表恢复，PL actor 按需驻留。首次读取、发送、取消、等待、订阅、
 Review 进度查询或删除前统一执行：
 

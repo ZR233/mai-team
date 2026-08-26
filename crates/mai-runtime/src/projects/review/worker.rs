@@ -2521,8 +2521,9 @@ mod tests {
             project_id,
             Some(reviewer_id),
             Some(turn_id.clone()),
-            ProjectReviewRunStatus::Running,
+            ProjectReviewRunStatus::Interrupted,
         );
+        run.finished_at = Some(now());
         let mut job = crate::projects::review::job::new_project_review_job(
             crate::projects::review::job::NewProjectReviewJob {
                 project_id,
@@ -2533,17 +2534,11 @@ mod tests {
                 reason: "restart continuation".to_string(),
             },
         );
-        job.status = ProjectReviewJobStatus::Running;
+        job.status = ProjectReviewJobStatus::RetryWaiting;
+        job.attempt_count = 1;
+        job.next_attempt_at = Some(now());
         job.reviewer_agent_id = Some(reviewer_id);
-        job.active_run_id = Some(run.id);
-        job.lease_owner = Some("stopped-instance".to_string());
-        job.lease_expires_at = Some(now() + chrono::TimeDelta::minutes(1));
         run.job_id = Some(job.id);
-        {
-            let mut summary = ops.project.summary.write().await;
-            summary.review_status = ProjectReviewStatus::Running;
-            summary.current_reviewer_agent_id = Some(reviewer_id);
-        }
         ops.set_auto_reviewers(vec![reviewer]).await;
         ops.set_review_runs(vec![run]).await;
         ops.review_jobs.lock().await.push(job.clone());
@@ -2558,13 +2553,10 @@ mod tests {
         );
         assert_eq!(Vec::<Uuid>::new(), *ops.deleted_agents.lock().await);
         let finished = ops.finished_runs.lock().await.clone();
-        assert_eq!(1, finished.len());
-        assert_eq!(ProjectReviewRunStatus::Cancelled, finished[0].status);
-        assert_eq!(Some(reviewer_id), finished[0].reviewer_agent_id);
-        assert_eq!(
-            Some(reviewer_id),
-            ops.project.summary.read().await.current_reviewer_agent_id
-        );
+        assert_eq!(0, finished.len());
+        let project = ops.project.summary.read().await.clone();
+        assert_eq!(Some(reviewer_id), project.current_reviewer_agent_id);
+        assert_eq!(ProjectReviewStatus::RetryWaiting, project.review_status);
         assert_eq!(job, ops.review_jobs.lock().await[0]);
     }
 

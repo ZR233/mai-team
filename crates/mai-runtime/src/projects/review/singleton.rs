@@ -6,7 +6,7 @@ use mai_protocol::{
 };
 
 use super::runs::FinishReviewRun;
-use super::state::ReviewStateUpdate;
+use super::state::{ReviewStateUpdate, ReviewerAgentUpdate};
 use super::worker::ProjectReviewWorkerOps;
 use crate::Result;
 
@@ -85,14 +85,46 @@ pub(crate) async fn repair_project_review_singleton<Ops: ProjectReviewWorkerOps>
         delete_project_reviewers(ops, project_id, reviewer_ids_to_delete).await?;
     let cancelled_turn_count =
         preserved_reviewer_cancelled_turn_count + deleted_reviewer_cancelled_turn_count;
-    if keep_reviewer_id.is_none() {
-        let status = if snapshot.summary.auto_review_enabled {
-            ProjectReviewStatus::Idle
-        } else {
-            ProjectReviewStatus::Disabled
-        };
-        ops.set_project_review_state(project_id, status, ReviewStateUpdate::default())
+    match keep_reviewer_id {
+        Some(reviewer_id) if snapshot.summary.current_reviewer_agent_id != Some(reviewer_id) => {
+            let active_job = snapshot
+                .active_job
+                .as_ref()
+                .expect("kept reviewer must belong to an active Job");
+            let reviewer_update = if snapshot.summary.current_reviewer_agent_id == Some(reviewer_id)
+            {
+                ReviewerAgentUpdate::Keep
+            } else {
+                ReviewerAgentUpdate::Set(reviewer_id)
+            };
+            ops.set_project_review_state(
+                project_id,
+                super::job::project_review_status_for_job(
+                    snapshot.summary.auto_review_enabled,
+                    Some(active_job),
+                ),
+                ReviewStateUpdate {
+                    current_reviewer_agent_id: reviewer_update,
+                    next_review_at: active_job.next_attempt_at,
+                    error: active_job
+                        .failure
+                        .as_ref()
+                        .map(|failure| failure.message.clone()),
+                    ..Default::default()
+                },
+            )
             .await?;
+        }
+        Some(_) => {}
+        None => {
+            let status = if snapshot.summary.auto_review_enabled {
+                ProjectReviewStatus::Idle
+            } else {
+                ProjectReviewStatus::Disabled
+            };
+            ops.set_project_review_state(project_id, status, ReviewStateUpdate::default())
+                .await?;
+        }
     }
 
     tracing::info!(
@@ -139,11 +171,8 @@ impl ProjectReviewSingletonSnapshot {
     }
 
     fn keep_consistent_reviewer(&self) -> Option<AgentId> {
-        let current_reviewer_id = self.summary.current_reviewer_agent_id?;
         let active_job = self.active_job.as_ref()?;
-        if active_job.reviewer_agent_id != Some(current_reviewer_id) {
-            return None;
-        }
+        let current_reviewer_id = active_job.reviewer_agent_id?;
         let reviewer = self
             .reviewers
             .iter()
