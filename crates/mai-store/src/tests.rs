@@ -1868,48 +1868,40 @@ async fn ci_pending_skip_rechecks_changed_delivery_and_allows_next_generation() 
 }
 
 #[tokio::test]
-async fn active_review_job_projection_prioritizes_execution_over_waiting() {
+async fn active_review_job_projection_does_not_hide_reviewer_owner() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
     let mut waiting = test_review_job(project_id, 41, "head-waiting", None);
     waiting.status = ProjectReviewJobStatus::RetryWaiting;
+    waiting.reviewer_agent_id = Some(Uuid::new_v4());
     waiting.next_attempt_at = Some(Utc::now() + chrono::TimeDelta::minutes(2));
     store
         .save_project_review_job(waiting.clone())
         .await
         .expect("save waiting job");
 
-    let mut running = test_review_job(project_id, 42, "head-running", None);
-    running.created_at += chrono::TimeDelta::seconds(1);
-    running.updated_at = running.created_at;
-    running.status = ProjectReviewJobStatus::Running;
-    running.reviewer_agent_id = Some(Uuid::new_v4());
+    let mut queued = test_review_job(project_id, 42, "head-queued", None);
+    queued.created_at += chrono::TimeDelta::seconds(1);
+    queued.updated_at = queued.created_at;
     store
-        .save_project_review_job(running.clone())
+        .save_project_review_job(queued.clone())
         .await
-        .expect("save running job");
+        .expect("save queued job");
 
     assert_eq!(
-        Some(running.id),
+        Some(queued.id),
         store
             .load_active_project_review_job(project_id)
             .await
             .expect("load active job")
             .map(|job| job.id)
     );
-
-    running.status = ProjectReviewJobStatus::Succeeded;
-    running.finished_at = Some(Utc::now());
-    store
-        .save_project_review_job(running)
-        .await
-        .expect("finish running job");
     assert_eq!(
         Some(waiting.id),
         store
-            .load_active_project_review_job(project_id)
+            .load_reviewer_owned_active_project_review_job(project_id)
             .await
-            .expect("load waiting job")
+            .expect("load reviewer owner")
             .map(|job| job.id)
     );
 }

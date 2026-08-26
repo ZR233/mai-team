@@ -147,6 +147,12 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         project_id: ProjectId,
     ) -> impl Future<Output = Result<Option<ProjectReviewJobSummary>>> + Send;
 
+    /// 返回持有 durable reviewer 所有权的非终态 Job，供 singleton 恢复使用。
+    fn load_reviewer_owned_active_project_review_job(
+        &self,
+        project_id: ProjectId,
+    ) -> impl Future<Output = Result<Option<ProjectReviewJobSummary>>> + Send;
+
     fn save_claimed_project_review_job(
         &self,
         job: ProjectReviewJobSummary,
@@ -1392,6 +1398,35 @@ mod tests {
                 .cloned())
         }
 
+        async fn load_reviewer_owned_active_project_review_job(
+            &self,
+            _project_id: Uuid,
+        ) -> crate::Result<Option<ProjectReviewJobSummary>> {
+            Ok(self
+                .review_jobs
+                .lock()
+                .await
+                .iter()
+                .filter(|job| !job.status.is_terminal() && job.reviewer_agent_id.is_some())
+                .min_by_key(|job| {
+                    let priority = match job.status {
+                        ProjectReviewJobStatus::Reconciling => 0,
+                        ProjectReviewJobStatus::SubmissionPending => 1,
+                        ProjectReviewJobStatus::Running => 2,
+                        ProjectReviewJobStatus::Preparing => 3,
+                        ProjectReviewJobStatus::Queued => 4,
+                        ProjectReviewJobStatus::RetryWaiting => 5,
+                        ProjectReviewJobStatus::Succeeded
+                        | ProjectReviewJobStatus::Failed
+                        | ProjectReviewJobStatus::Cancelled
+                        | ProjectReviewJobStatus::Superseded
+                        | ProjectReviewJobStatus::Skipped => 6,
+                    };
+                    (priority, job.created_at)
+                })
+                .cloned())
+        }
+
         async fn save_claimed_project_review_job(
             &self,
             job: ProjectReviewJobSummary,
@@ -2539,9 +2574,22 @@ mod tests {
         job.next_attempt_at = Some(now());
         job.reviewer_agent_id = Some(reviewer_id);
         run.job_id = Some(job.id);
+        let queued = crate::projects::review::job::new_project_review_job(
+            crate::projects::review::job::NewProjectReviewJob {
+                project_id,
+                pr: 43,
+                head_sha: "head-43".to_string(),
+                source: ProjectReviewJobSource::Automatic,
+                delivery_id: None,
+                reason: "queued after restart".to_string(),
+            },
+        );
         ops.set_auto_reviewers(vec![reviewer]).await;
         ops.set_review_runs(vec![run]).await;
-        ops.review_jobs.lock().await.push(job.clone());
+        ops.review_jobs
+            .lock()
+            .await
+            .extend([queued.clone(), job.clone()]);
 
         repair_project_review_singleton(&ops, project_id, 10, ProjectReviewRepairReason::Startup)
             .await
@@ -2557,7 +2605,7 @@ mod tests {
         let project = ops.project.summary.read().await.clone();
         assert_eq!(Some(reviewer_id), project.current_reviewer_agent_id);
         assert_eq!(ProjectReviewStatus::RetryWaiting, project.review_status);
-        assert_eq!(job, ops.review_jobs.lock().await[0]);
+        assert_eq!(vec![queued, job], *ops.review_jobs.lock().await);
     }
 
     #[tokio::test]

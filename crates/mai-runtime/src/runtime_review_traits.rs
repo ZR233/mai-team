@@ -1124,6 +1124,17 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
             .await?)
     }
 
+    async fn load_reviewer_owned_active_project_review_job(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Option<ProjectReviewJobSummary>> {
+        Ok(self
+            .deps
+            .store
+            .load_reviewer_owned_active_project_review_job(project_id)
+            .await?)
+    }
+
     async fn save_claimed_project_review_job(
         &self,
         job: ProjectReviewJobSummary,

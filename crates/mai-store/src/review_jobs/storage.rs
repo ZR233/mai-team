@@ -99,6 +99,35 @@ pub(super) fn load_first_active_job(
         .optional()?)
 }
 
+pub(super) fn load_first_reviewer_owned_active_job(
+    connection: &Connection,
+    project_id: ProjectId,
+) -> Result<Option<ProjectReviewJobRecord>> {
+    let placeholders = ACTIVE_JOB_STATUSES
+        .map(|status| format!("'{status}'"))
+        .join(",");
+    let sql = format!(
+        "SELECT {PROJECT_REVIEW_JOB_COLUMNS} FROM project_review_jobs \
+         WHERE project_id = ?1 AND reviewer_agent_id IS NOT NULL \
+             AND status IN ({placeholders}) \
+         ORDER BY CASE status \
+             WHEN 'reconciling' THEN 0 \
+             WHEN 'submission_pending' THEN 1 \
+             WHEN 'running' THEN 2 \
+             WHEN 'preparing' THEN 3 \
+             WHEN 'queued' THEN 4 \
+             WHEN 'retry_waiting' THEN 5 \
+             ELSE 6 END, created_at ASC LIMIT 1"
+    );
+    Ok(connection
+        .query_row(
+            &sql,
+            params![project_id.to_string()],
+            project_review_job_record,
+        )
+        .optional()?)
+}
+
 pub(super) fn project_review_job_record(row: &Row<'_>) -> rusqlite::Result<ProjectReviewJobRecord> {
     Ok(ProjectReviewJobRecord {
         id: row.get(0)?,

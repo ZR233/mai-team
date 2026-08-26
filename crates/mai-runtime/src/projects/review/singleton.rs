@@ -51,7 +51,7 @@ struct ProjectReviewSingletonSnapshot {
     summary: ProjectSummary,
     reviewers: Vec<AgentSummary>,
     active_runs: Vec<ProjectReviewRunSummary>,
-    active_job: Option<ProjectReviewJobSummary>,
+    reviewer_owned_job: Option<ProjectReviewJobSummary>,
 }
 
 pub(crate) async fn repair_project_review_singleton<Ops: ProjectReviewWorkerOps>(
@@ -87,8 +87,8 @@ pub(crate) async fn repair_project_review_singleton<Ops: ProjectReviewWorkerOps>
         preserved_reviewer_cancelled_turn_count + deleted_reviewer_cancelled_turn_count;
     match keep_reviewer_id {
         Some(reviewer_id) if snapshot.summary.current_reviewer_agent_id != Some(reviewer_id) => {
-            let active_job = snapshot
-                .active_job
+            let reviewer_owned_job = snapshot
+                .reviewer_owned_job
                 .as_ref()
                 .expect("kept reviewer must belong to an active Job");
             let reviewer_update = if snapshot.summary.current_reviewer_agent_id == Some(reviewer_id)
@@ -101,12 +101,12 @@ pub(crate) async fn repair_project_review_singleton<Ops: ProjectReviewWorkerOps>
                 project_id,
                 super::job::project_review_status_for_job(
                     snapshot.summary.auto_review_enabled,
-                    Some(active_job),
+                    Some(reviewer_owned_job),
                 ),
                 ReviewStateUpdate {
                     current_reviewer_agent_id: reviewer_update,
-                    next_review_at: active_job.next_attempt_at,
-                    error: active_job
+                    next_review_at: reviewer_owned_job.next_attempt_at,
+                    error: reviewer_owned_job
                         .failure
                         .as_ref()
                         .map(|failure| failure.message.clone()),
@@ -157,7 +157,9 @@ impl ProjectReviewSingletonSnapshot {
         let runs = ops
             .load_project_review_runs(project_id, 0, run_list_limit)
             .await?;
-        let active_job = ops.load_active_project_review_job(project_id).await?;
+        let reviewer_owned_job = ops
+            .load_reviewer_owned_active_project_review_job(project_id)
+            .await?;
         let active_runs = runs
             .into_iter()
             .filter(project_review_run_is_active)
@@ -166,13 +168,13 @@ impl ProjectReviewSingletonSnapshot {
             summary,
             reviewers,
             active_runs,
-            active_job,
+            reviewer_owned_job,
         })
     }
 
     fn keep_consistent_reviewer(&self) -> Option<AgentId> {
-        let active_job = self.active_job.as_ref()?;
-        let current_reviewer_id = active_job.reviewer_agent_id?;
+        let reviewer_owned_job = self.reviewer_owned_job.as_ref()?;
+        let current_reviewer_id = reviewer_owned_job.reviewer_agent_id?;
         let reviewer = self
             .reviewers
             .iter()

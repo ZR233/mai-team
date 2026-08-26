@@ -160,6 +160,25 @@ impl MaiStore {
         })?
     }
 
+    pub async fn load_reviewer_owned_active_project_review_job(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Option<ProjectReviewJobSummary>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = open_review_job_connection(&path)?;
+            load_first_reviewer_owned_active_job(&connection, project_id)?
+                .map(ProjectReviewJobRecord::into_summary)
+                .transpose()
+        })
+        .await
+        .map_err(|error| {
+            StoreError::InvalidConfig(format!(
+                "reviewer-owned active review job lookup task failed: {error}"
+            ))
+        })?
+    }
+
     pub async fn load_project_review_prs_for_head(
         &self,
         project_id: ProjectId,
