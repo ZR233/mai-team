@@ -2051,6 +2051,7 @@ dependencies = [
  "pl-protocol",
  "pretty_assertions",
  "reqwest",
+ "rusqlite",
  "rust-embed",
  "serde",
  "serde_json",

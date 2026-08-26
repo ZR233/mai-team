@@ -42,8 +42,8 @@ impl AgentRuntime {
     pub async fn get_agent(&self, agent_id: AgentId) -> Result<AgentDetail> {
         let agent = self.agent(agent_id).await?;
         let canonical_id = agent_host::canonical_id(agent_id)?;
-        let runtime = agent_host::load_runtime(&self.deps.store, &canonical_id).await?;
         let snapshot = self.ensure_framework_agent(agent_id).await?;
+        let runtime = agent_host::load_runtime(&self.deps.store, &canonical_id).await?;
         let mut summary = agent.summary.read().await.clone();
         summary.token_usage = agent_host::aggregate_usage(&runtime);
         Ok(AgentDetail {

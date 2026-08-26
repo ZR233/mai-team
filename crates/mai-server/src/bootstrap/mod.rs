@@ -209,11 +209,14 @@ mod tests {
     #[tokio::test]
     async fn startup_ensures_default_chat_environment_with_default_image() {
         let dir = tempdir().expect("tempdir");
+        let database_path = dir.path().join("runtime.sqlite3");
+        let config_path = dir.path().join("config.toml");
+        let artifact_index_path = dir.path().join("artifacts/index");
         let store = Arc::new(
             mai_store::MaiStore::open_with_config_and_artifact_index_path(
-                dir.path().join("runtime.sqlite3"),
-                dir.path().join("config.toml"),
-                dir.path().join("artifacts/index"),
+                database_path.clone(),
+                config_path.clone(),
+                artifact_index_path.clone(),
             )
             .await
             .expect("store"),
@@ -224,23 +227,7 @@ mod tests {
             .save(&mai_config)
             .await
             .expect("save config");
-        let runtime = mai_runtime::AgentRuntime::new(
-            DockerClient::new_with_binary("ubuntu:latest", fake_docker_path(&dir)),
-            Arc::clone(&store),
-            RuntimeConfig {
-                repo_root: dir.path().to_path_buf(),
-                projects_root: dir.path().join("projects"),
-                cache_root: dir.path().join("cache"),
-                artifact_files_root: dir.path().join("artifacts/files"),
-                sidecar_image: "sidecar:latest".to_string(),
-                github_api_base_url: None,
-                git_binary: None,
-                system_skills_root: None,
-                system_agents_root: None,
-            },
-        )
-        .await
-        .expect("runtime");
+        let runtime = test_runtime(&dir, Arc::clone(&store)).await;
 
         assert!(runtime.list_environments().await.is_empty());
 
@@ -262,6 +249,69 @@ mod tests {
             .await
             .expect("ensure chat environment again");
         assert_eq!(runtime.list_environments().await.len(), 1);
+
+        let original_environment_id = environments[0].id;
+        let original_root_agent_id = environments[0].root_agent_id;
+        runtime.shutdown().await.expect("shutdown first runtime");
+        drop(runtime);
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&database_path).expect("open runtime database");
+        connection
+            .execute_batch(
+                "DELETE FROM thread_submissions;
+                 DELETE FROM thread_notifications;
+                 DELETE FROM thread_runtime_traces;
+                 DELETE FROM thread_runtime_events;
+                 DELETE FROM thread_items;
+                 DELETE FROM thread_turns;
+                 DELETE FROM thread_runtime_documents;",
+            )
+            .expect("simulate schema32 framework reset");
+        drop(connection);
+
+        let store = Arc::new(
+            mai_store::MaiStore::open_with_config_and_artifact_index_path(
+                database_path,
+                config_path,
+                artifact_index_path,
+            )
+            .await
+            .expect("reopen migrated store"),
+        );
+        let runtime = test_runtime(&dir, store).await;
+
+        ensure_startup_chat_environment(&runtime)
+            .await
+            .expect("restore existing chat environment");
+        let restored = runtime.list_environments().await;
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, original_environment_id);
+        assert_eq!(restored[0].root_agent_id, original_root_agent_id);
+        runtime.shutdown().await.expect("shutdown restored runtime");
+    }
+
+    async fn test_runtime(
+        dir: &tempfile::TempDir,
+        store: Arc<mai_store::MaiStore>,
+    ) -> Arc<mai_runtime::AgentRuntime> {
+        mai_runtime::AgentRuntime::new(
+            DockerClient::new_with_binary("ubuntu:latest", fake_docker_path(dir)),
+            store,
+            RuntimeConfig {
+                repo_root: dir.path().to_path_buf(),
+                projects_root: dir.path().join("projects"),
+                cache_root: dir.path().join("cache"),
+                artifact_files_root: dir.path().join("artifacts/files"),
+                sidecar_image: "sidecar:latest".to_string(),
+                github_api_base_url: None,
+                git_binary: None,
+                system_skills_root: None,
+                system_agents_root: None,
+            },
+        )
+        .await
+        .expect("test runtime")
     }
 
     fn fake_docker_path(dir: &tempfile::TempDir) -> String {
