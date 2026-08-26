@@ -33,6 +33,8 @@ Review continuation 的 reviewer ownership 只来自非终态 Review Job 的 `re
 owner，并把缺失或过期的项目投影校正回 Job，不能用投影否决 durable ownership。普通“当前活动
 Job”查询按执行阶段选择前台 Job，只服务调度和产品投影；singleton 必须独立查询所有非终态且
 `reviewer_agent_id` 非空的 Job，不能让更靠前的无 owner queued Job 遮蔽 reviewer ownership。
+启动时 PL actor 采用懒恢复，因此 `runtime = None` 表示尚未驻留，不是 reviewer 已关闭；只要产品
+资源仍可用且 durable Job 持有 owner，singleton 就必须保留 reviewer，后续操作再触发原生恢复。
 
 长期产品 Agent 身份先从产品表恢复，PL actor 按需驻留。首次读取、发送、取消、等待、订阅、
 Review 进度查询或删除前统一执行：

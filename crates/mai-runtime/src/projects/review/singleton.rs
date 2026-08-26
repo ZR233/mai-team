@@ -344,5 +344,5 @@ fn project_reviewer_agent_can_continue(reviewer: &AgentSummary) -> bool {
     ) && reviewer
         .runtime
         .as_ref()
-        .is_some_and(|snapshot| snapshot.state.is_operational())
+        .is_none_or(|snapshot| snapshot.state.is_operational())
 }

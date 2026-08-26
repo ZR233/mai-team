@@ -2548,10 +2548,11 @@ mod tests {
         let project_id = Uuid::new_v4();
         let ops = FakeWorkerOps::new(project_id);
         let maintainer_agent_id = ops.project.summary.read().await.maintainer_agent_id;
-        let reviewer =
+        let mut reviewer =
             test_reviewer_agent(project_id, maintainer_agent_id, TestReviewerState::Running);
         let reviewer_id = reviewer.id;
         let turn_id = reviewer.active_turn().expect("reviewer turn");
+        reviewer.runtime = None;
         let mut run = test_review_run(
             project_id,
             Some(reviewer_id),
@@ -2596,7 +2597,7 @@ mod tests {
             .expect("startup repair");
 
         assert_eq!(
-            vec![(reviewer_id, turn_id)],
+            Vec::<(Uuid, TurnId)>::new(),
             *ops.cancelled_turns.lock().await
         );
         assert_eq!(Vec::<Uuid>::new(), *ops.deleted_agents.lock().await);
