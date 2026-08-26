@@ -1,385 +1,164 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, Read, Write};
+use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use pl_protocol::{
-    AgentMessageChannel, ThreadContextDisposition, ThreadItem, ThreadItemContent, ThreadItemStatus,
-    ThreadToolCall, ThreadTurnHistory, Turn, TurnState,
-};
-use serde_json::Value;
+use chrono::Utc;
+use rusqlite::Connection;
+use rusqlite::backup::Backup;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-mod context;
+use crate::{MigrationOptions, SOURCE_SCHEMA, TARGET_SCHEMA};
 
-#[derive(Debug, Clone)]
-pub(crate) struct ContextRow {
-    pub id: String,
-    pub position: i64,
-    pub value: Value,
+const DATABASE_FILE: &str = "mai-team-schema31.sqlite3";
+const MANIFEST_FILE: &str = "manifest.json";
+
+/// 不随在线数据库清理的 PL v1 完整归档清单。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveManifest {
+    pub archive_id: String,
+    pub created_at: String,
+    pub source_database: String,
+    pub archived_database: String,
+    pub database_sha256: String,
+    pub source_schema: String,
+    pub target_schema: String,
+    pub source_commit: String,
+    pub target_commit: String,
+    pub row_counts: BTreeMap<String, usize>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ReviewArchiveSource {
-    pub run_id: String,
-    pub reviewer_thread_id: Option<String>,
-    pub requested_turn_id: Option<String>,
-    pub status: String,
-    pub started_at: i64,
-    pub finished_at: Option<i64>,
-    pub messages_json: String,
-    pub events_json: String,
-}
-
-pub(crate) fn session_history(
-    thread_id: &str,
-    turn_id: &str,
-    created_at: i64,
-    updated_at: i64,
-    disposition: ThreadContextDisposition,
-    rows: &[ContextRow],
-) -> Result<Option<ThreadTurnHistory>> {
-    let items = context::context_items(thread_id, turn_id, updated_at, rows)?;
-    if items.is_empty() {
-        return Ok(None);
+pub(crate) fn create(
+    source_path: &Path,
+    source: &Connection,
+    options: &MigrationOptions,
+) -> Result<ArchiveManifest> {
+    let created_at = Utc::now();
+    let archive_id = format!("pl-v2-{}", created_at.format("%Y%m%dT%H%M%SZ"));
+    let directory = options.archive_root.join(&archive_id);
+    fs::create_dir_all(&options.archive_root)
+        .with_context(|| format!("无法创建框架归档根目录 {}", options.archive_root.display()))?;
+    if directory.exists() {
+        bail!("归档目录已存在，拒绝覆盖: {}", directory.display());
     }
-    Ok(Some(ThreadTurnHistory {
-        turn: Turn {
-            id: turn_id.to_string(),
-            thread_id: thread_id.to_string(),
-            state: TurnState::Completed,
-            failure: None,
-            started_at: Some(created_at),
-            updated_at,
-            completed_at: Some(updated_at),
-        },
-        items,
-        context_disposition: disposition,
-    }))
-}
+    fs::create_dir(&directory)
+        .with_context(|| format!("无法创建归档目录 {}", directory.display()))?;
+    protect_directory(&directory)?;
 
-pub(crate) fn review_history(source: &ReviewArchiveSource) -> Result<ThreadTurnHistory> {
-    let messages = serde_json::from_str::<Vec<Value>>(&source.messages_json)
-        .with_context(|| format!("review run {} 的 messages_json 非法", source.run_id))?;
-    let events = serde_json::from_str::<Vec<Value>>(&source.events_json)
-        .with_context(|| format!("review run {} 的 events_json 非法", source.run_id))?;
-    validate_event_sequences(&source.run_id, &events)?;
-    let turn_id = source
-        .requested_turn_id
-        .as_deref()
-        .map(str::to_string)
-        .or_else(|| event_turn_id(&events))
-        .unwrap_or_else(|| format!("review:{}", source.run_id));
-    let thread_id = source
-        .reviewer_thread_id
-        .as_deref()
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("archived-review:{}", source.run_id));
-    let mut items = latest_review_parts(&thread_id, &turn_id, &events)?;
-    if items.is_empty() {
-        items = archived_messages(&thread_id, &turn_id, &messages)?;
-    } else {
-        let mut user_items = archived_user_messages(&thread_id, &turn_id, &messages)?;
-        user_items.append(&mut items);
-        for (ordinal, item) in user_items.iter_mut().enumerate() {
-            item.ordinal = u64::try_from(ordinal)?;
-        }
-        items = user_items;
+    let database_path = directory.join(DATABASE_FILE);
+    let mut destination = Connection::open(&database_path)
+        .with_context(|| format!("无法创建归档数据库 {}", database_path.display()))?;
+    {
+        let backup = Backup::new(source, &mut destination)?;
+        backup.run_to_completion(256, Duration::from_millis(1), None)?;
     }
-    let completed_at = source.finished_at.unwrap_or(source.started_at);
-    Ok(ThreadTurnHistory {
-        turn: Turn {
-            id: turn_id,
-            thread_id,
-            state: review_turn_state(&source.status)?,
-            failure: None,
-            started_at: Some(source.started_at),
-            updated_at: completed_at,
-            completed_at: Some(completed_at),
-        },
-        items,
-        context_disposition: ThreadContextDisposition::RolledBack,
-    })
-}
+    drop(destination);
 
-fn latest_review_parts(
-    thread_id: &str,
-    turn_id: &str,
-    events: &[Value],
-) -> Result<Vec<ThreadItem>> {
-    let mut parts = BTreeMap::<String, Value>::new();
-    for event in events {
-        let kind = required_object(event, "kind")?;
-        if required_str(kind, "type")? != "partChanged" {
-            continue;
-        }
-        let part = required_object(kind, "part")?;
-        if required_str(part, "turnId")? != turn_id {
-            continue;
-        }
-        let id = required_str(part, "partId")?.to_string();
-        let revision = required_u64(part, "revision")?;
-        if let Some(previous) = parts.get(&id) {
-            let previous_revision = required_u64(previous, "revision")?;
-            if revision < previous_revision {
-                bail!("review part {id} revision 回退: {previous_revision} -> {revision}");
-            }
-        }
-        parts.insert(id, part.clone());
+    let archived = Connection::open(&database_path)?;
+    let integrity: String = archived.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        bail!("归档数据库完整性校验失败: {integrity}");
     }
-    let mut items = Vec::new();
-    for part in parts.into_values() {
-        if let Some(item) = review_part(thread_id, turn_id, &part)? {
-            items.push(item);
-        }
+    let archived_schema = crate::schema::schema_version(&archived)?;
+    if archived_schema != SOURCE_SCHEMA {
+        bail!("归档数据库 schema 应为 {SOURCE_SCHEMA}，实际为 {archived_schema}");
     }
-    items.sort_by_key(|item| item.ordinal);
-    Ok(items)
-}
+    let source_counts = row_counts(source)?;
+    let archived_counts = row_counts(&archived)?;
+    if archived_counts != source_counts {
+        bail!("归档数据库行数与源数据库不一致");
+    }
+    drop(archived);
 
-fn review_part(thread_id: &str, turn_id: &str, part: &Value) -> Result<Option<ThreadItem>> {
-    let content = required_object(part, "content")?;
-    let content = match required_str(content, "type")? {
-        "text" => {
-            let text = content
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            match required_str(content, "channel")? {
-                "user" => ThreadItemContent::UserMessage {
-                    text,
-                    attachments: Vec::new(),
-                },
-                "commentary" => ThreadItemContent::AgentMessage {
-                    channel: AgentMessageChannel::Commentary,
-                    text,
-                },
-                "final" => ThreadItemContent::AgentMessage {
-                    channel: AgentMessageChannel::Final,
-                    text,
-                },
-                other => bail!("未知 text channel `{other}`"),
-            }
-        }
-        "reasoning" => ThreadItemContent::Reasoning {
-            summary: Vec::new(),
-            content: content
-                .get("text")
-                .and_then(Value::as_str)
-                .map(|text| vec![text.to_string()])
-                .unwrap_or_default(),
-        },
-        "tool" => ThreadItemContent::ToolCall {
-            tool: serde_json::from_value(
-                content
-                    .get("tool")
-                    .cloned()
-                    .context("tool part 缺少 tool")?,
-            )?,
-        },
-        "inference" | "turn" => return Ok(None),
-        other => bail!("未知 review part content `{other}`"),
+    let database_sha256 = sha256(&database_path)?;
+    let manifest = ArchiveManifest {
+        archive_id,
+        created_at: created_at.to_rfc3339(),
+        source_database: source_path.display().to_string(),
+        archived_database: database_path.display().to_string(),
+        database_sha256,
+        source_schema: SOURCE_SCHEMA.to_string(),
+        target_schema: TARGET_SCHEMA.to_string(),
+        source_commit: required_commit("source_commit", &options.source_commit)?,
+        target_commit: required_commit("target_commit", &options.target_commit)?,
+        row_counts: source_counts,
     };
-    Ok(Some(ThreadItem {
-        id: required_str(part, "partId")?.to_string(),
-        thread_id: thread_id.to_string(),
-        turn_id: turn_id.to_string(),
-        ordinal: required_u64(part, "order")?,
-        revision: required_u64(part, "revision")?,
-        status: parse_item_status(required_str(part, "status")?)?,
-        created_at: required_i64(part, "createdAt")?,
-        updated_at: required_i64(part, "updatedAt")?,
-        completed_at: part.get("completedAt").and_then(Value::as_i64),
-        error: part
-            .get("error")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        content,
-        usage: None,
-    }))
+    write_manifest(&directory, &manifest)?;
+    Ok(manifest)
 }
 
-fn archived_messages(
-    thread_id: &str,
-    turn_id: &str,
-    messages: &[Value],
-) -> Result<Vec<ThreadItem>> {
-    let mut items = Vec::with_capacity(messages.len());
-    for (index, message) in messages.iter().enumerate() {
-        items.push(archived_message(thread_id, turn_id, message, index)?);
+fn required_commit(name: &str, value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("归档清单缺少 {name}");
     }
-    Ok(items)
+    Ok(value.to_string())
 }
 
-fn archived_user_messages(
-    thread_id: &str,
-    turn_id: &str,
-    messages: &[Value],
-) -> Result<Vec<ThreadItem>> {
-    messages
-        .iter()
-        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-        .enumerate()
-        .map(|(index, message)| archived_message(thread_id, turn_id, message, index))
-        .collect()
+fn row_counts(connection: &Connection) -> Result<BTreeMap<String, usize>> {
+    let mut statement = connection.prepare(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name",
+    )?;
+    let tables = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut counts = BTreeMap::new();
+    for table in tables {
+        let quoted = table.replace('"', "\"\"");
+        let count: i64 =
+            connection.query_row(&format!("SELECT COUNT(*) FROM \"{quoted}\""), [], |row| {
+                row.get(0)
+            })?;
+        counts.insert(table, usize::try_from(count)?);
+    }
+    Ok(counts)
 }
 
-fn archived_message(
-    thread_id: &str,
-    turn_id: &str,
-    message: &Value,
-    index: usize,
-) -> Result<ThreadItem> {
-    let text = required_str(message, "content")?.to_string();
-    let created_at =
-        chrono::DateTime::parse_from_rfc3339(required_str(message, "created_at")?)?.timestamp();
-    let content = match required_str(message, "role")? {
-        "user" => ThreadItemContent::UserMessage {
-            text,
-            attachments: Vec::new(),
-        },
-        "assistant" => ThreadItemContent::AgentMessage {
-            channel: AgentMessageChannel::Final,
-            text,
-        },
-        "system" => ThreadItemContent::AgentMessage {
-            channel: AgentMessageChannel::Commentary,
-            text,
-        },
-        "tool" => ThreadItemContent::ToolCall {
-            tool: ThreadToolCall {
-                tool_call_id: format!("review:{turn_id}:message:{index}"),
-                call_id: format!("review:{turn_id}:message:{index}"),
-                provider_item_id: None,
-                name: "archived_tool_output".to_string(),
-                arguments: String::new(),
-                result: Some(text),
-                output_artifacts: Vec::new(),
-                exit_code: None,
-                timed_out: false,
-                working_directory: None,
-                denial_reason: None,
-            },
-        },
-        other => bail!("未知 review message role `{other}`"),
-    };
-    Ok(item(
-        format!("review:{turn_id}:message:{index}"),
-        thread_id,
-        turn_id,
-        u64::try_from(index)?,
-        1,
-        created_at,
-        content,
-    ))
-}
-
-fn validate_event_sequences(run_id: &str, events: &[Value]) -> Result<()> {
-    let mut last = HashMap::<String, u64>::new();
-    for event in events {
-        let session_id = required_str(event, "sessionId")?;
-        let position = required_object(event, "position")?;
-        let sequence = required_u64(position, "sequence")?;
-        if let Some(previous) = last.insert(session_id.to_string(), sequence)
-            && sequence <= previous
-        {
-            bail!("review run {run_id} 的事件 sequence 未严格递增: {previous} -> {sequence}");
+fn sha256(path: &Path) -> Result<String> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
         }
+        hasher.update(&buffer[..read]);
     }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn write_manifest(directory: &Path, manifest: &ArchiveManifest) -> Result<()> {
+    let final_path = directory.join(MANIFEST_FILE);
+    let temporary_path = directory.join("manifest.json.tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary_path)?;
+    file.write_all(&serde_json::to_vec_pretty(manifest)?)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(&temporary_path, &final_path)?;
+    File::open(directory)?.sync_all()?;
     Ok(())
 }
 
-fn event_turn_id(events: &[Value]) -> Option<String> {
-    events.iter().find_map(|event| {
-        event
-            .get("turnId")
-            .or_else(|| event.get("kind")?.get("turn")?.get("id"))
-            .or_else(|| event.get("kind")?.get("part")?.get("turnId"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    })
+#[cfg(unix)]
+fn protect_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
 }
 
-fn review_turn_state(status: &str) -> Result<TurnState> {
-    Ok(match status {
-        "completed" | "succeeded" => TurnState::Completed,
-        "interrupted" | "cancelled" => TurnState::Interrupted {
-            reason: "历史 review 已中断".to_string(),
-        },
-        "failed" | "retryable_failed" | "permanent_failed" => TurnState::Failed {
-            reason: "历史 review 失败".to_string(),
-        },
-        other => bail!("未知历史 review 状态: {other}"),
-    })
-}
-
-fn parse_item_status(value: &str) -> Result<ThreadItemStatus> {
-    Ok(match value {
-        "started" => ThreadItemStatus::Started,
-        "streaming" => ThreadItemStatus::Streaming,
-        "awaitingApproval" | "awaiting_approval" => ThreadItemStatus::AwaitingApproval,
-        "approved" => ThreadItemStatus::Approved,
-        "denied" => ThreadItemStatus::Denied,
-        "running" => ThreadItemStatus::Running,
-        "completed" => ThreadItemStatus::Completed,
-        "failed" => ThreadItemStatus::Failed,
-        "interrupted" => ThreadItemStatus::Interrupted,
-        "budgetLimited" | "budget_limited" => ThreadItemStatus::BudgetLimited,
-        other => bail!("未知 Thread item 状态 `{other}`"),
-    })
-}
-
-fn item(
-    id: String,
-    thread_id: &str,
-    turn_id: &str,
-    ordinal: u64,
-    revision: u64,
-    timestamp: i64,
-    content: ThreadItemContent,
-) -> ThreadItem {
-    ThreadItem {
-        id,
-        thread_id: thread_id.to_string(),
-        turn_id: turn_id.to_string(),
-        ordinal,
-        revision,
-        status: ThreadItemStatus::Completed,
-        created_at: timestamp,
-        updated_at: timestamp,
-        completed_at: Some(timestamp),
-        error: None,
-        content,
-        usage: None,
-    }
-}
-
-fn next_ordinal(items: &[ThreadItem]) -> Result<u64> {
-    Ok(u64::try_from(items.len())?)
-}
-
-fn required_object<'a>(value: &'a Value, field: &str) -> Result<&'a Value> {
-    value
-        .get(field)
-        .filter(|value| value.is_object())
-        .with_context(|| format!("缺少对象字段 `{field}`"))
-}
-
-fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .with_context(|| format!("缺少字符串字段 `{field}`"))
-}
-
-fn required_u64(value: &Value, field: &str) -> Result<u64> {
-    value
-        .get(field)
-        .and_then(Value::as_u64)
-        .with_context(|| format!("缺少非负整数字段 `{field}`"))
-}
-
-fn required_i64(value: &Value, field: &str) -> Result<i64> {
-    value
-        .get(field)
-        .and_then(Value::as_i64)
-        .with_context(|| format!("缺少整数字段 `{field}`"))
+#[cfg(not(unix))]
+fn protect_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }

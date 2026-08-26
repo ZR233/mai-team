@@ -1,9 +1,7 @@
 import { expect, test, type Page, type Route } from "@playwright/test"
 
-test.beforeEach(async ({ page }, testInfo) => {
-  const updates = testInfo.title.includes("连续工具调用")
-    ? { "thread-a": groupedSnapshot() }
-    : { "thread-a": snapshotUpdate("thread-a", "Alpha message"), "thread-b": snapshotUpdate("thread-b", "Beta message") }
+test.beforeEach(async ({ page }) => {
+  const updates = { "thread-a": snapshotUpdate("thread-a", "Alpha message"), "thread-b": snapshotUpdate("thread-b", "Beta message") }
   await installThreadStreamFixture(page, updates)
   await installApiFixture(page)
 })
@@ -53,10 +51,13 @@ test("Thread 切换使用隔离 store，消息发送到目标 Thread", async ({ 
   await expect(page.getByText("Beta message")).toBeVisible()
   await expect(page.getByText("Alpha message")).toHaveCount(0)
 
+  await page.getByRole("button", { name: "Select skills" }).click()
+  await page.getByRole("menuitemcheckbox", { name: /project-review/ }).click()
+  await page.keyboard.press("Escape")
   await page.getByPlaceholder(/Send a command/).fill("Continue B")
   const request = page.waitForRequest((candidate) => candidate.url().endsWith("/threads/thread-b/messages") && candidate.method() === "POST")
   await page.getByRole("button", { name: /Send/ }).click()
-  expect((await request).postDataJSON()).toMatchObject({ message: "Continue B", skill_mentions: [] })
+  expect((await request).postDataJSON()).toMatchObject({ message: "Continue B", skill_mentions: ["project-review"] })
 })
 
 test("Thread timeline 在全部视口可用", async ({ page }) => {
@@ -64,33 +65,6 @@ test("Thread timeline 在全部视口可用", async ({ page }) => {
   await expect(page.getByText("Alpha message")).toBeVisible()
   await expect(page.locator("strong").filter({ hasText: "future-model" })).toBeVisible()
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true)
-})
-
-test("连续工具调用折叠为分组，思考默认收起", async ({ page }) => {
-  await page.goto("/chat/env-a")
-
-  // 连续工具调用合并为一个分组行，工具标题收起不可见。
-  await expect(page.getByText("Used 3 tools")).toBeVisible()
-  await expect(page.getByText("18s")).toBeVisible()
-  await expect(page.getByText("Run command")).toHaveCount(0)
-
-  // 展开分组后逐个工具可见，再展开单个工具显示命令与标准输出。
-  await page.getByRole("button", { name: "Expand Used 3 tools" }).click()
-  await expect(page.getByText("Run command")).toBeVisible()
-  await expect(page.getByText("Search files")).toBeVisible()
-  await page.getByRole("button", { name: "Expand Run command" }).click()
-  await expect(page.getByText("Command", { exact: true })).toBeVisible()
-  await expect(page.getByText("Standard output")).toBeVisible()
-  await expect(page.getByText("test passed")).toBeVisible()
-
-  // 完成的思考收起为一行时长摘要，点击展开显示内容。
-  await expect(page.getByText("Thought for 9s")).toBeVisible()
-  await page.getByRole("button", { name: "Expand reasoning" }).click()
-  await expect(page.getByText("需要先检查配置")).toBeVisible()
-
-  // 文字输出之后的单个工具渲染为紧凑行并带路径摘要。
-  await expect(page.getByText("Apply patch")).toBeVisible()
-  await expect(page.getByText("docs/web-workbench.md")).toBeVisible()
 })
 
 async function installApiFixture(page: Page) {
@@ -102,7 +76,11 @@ async function installApiFixture(page: Page) {
     if (path === "/environments/env-a") return json(route, environment("env-a", "Environment A", "thread-a"))
     if (path === "/environments/env-b") return json(route, environment("env-b", "Environment B", "thread-b"))
     if (path === "/providers") return json(route, providerFixture())
-    if (path === "/skills") return json(route, { skills: [], roots: [], errors: [] })
+    if (path === "/skills") return json(route, {
+      skills: [{ name: "project-review", description: "Review project changes", path: "/skills/project-review/SKILL.md", scope: "project", enabled: true }],
+      roots: ["/skills"],
+      errors: [],
+    })
     if (path.startsWith("/threads/") && path.endsWith("/messages") && request.method() === "POST") return json(route, { turn_id: "turn-next" })
     return route.continue()
   })
@@ -146,7 +124,17 @@ function environment(id: string, name: string, threadId: string) {
     id: threadId,
     name: `${name} Agent`,
     role: "planner",
-    state: { resource: "ready", runtime: { lifecycle: "active", activity: "idle", active_turn: null, pending_inputs: 0 } },
+    resource: { state: "ready", error: null },
+    runtime: {
+      identity: { id: threadId, parentId: null, role: "planner", depth: 0 },
+      state: { kind: "idle", data: null },
+      pendingInputs: 0,
+      progress: null,
+      lastTurn: null,
+      revision: 1,
+      eventSequence: 1,
+      updatedAt: 1,
+    },
     provider_id: "future-provider",
     provider_name: "Future Cloud",
     model: "future-model",
@@ -166,39 +154,6 @@ function snapshotUpdate(threadId: string, text: string) {
       revision: 1,
       thread: thread(threadId, threadId),
       items: [{ id: `${threadId}:item`, threadId, turnId: `${threadId}:turn`, ordinal: 0, revision: 0, status: "completed", createdAt: 1, updatedAt: 1, completedAt: 1, content: { type: "agentMessage", channel: "final", text } }],
-      interactions: [],
-      runtime: { threadId, usage: usageSnapshot(threadId), activeSkills: [], activeMcpServers: [], activeLspServers: [], updatedAt: 1 },
-    },
-  }
-}
-
-/** 覆盖分组场景：思考、三连工具调用、文字输出、单个工具调用。 */
-function groupedSnapshot() {
-  const threadId = "thread-a"
-  const turnId = "turn-grouped"
-  let ordinal = 0
-  const item = (content: unknown, status: string, createdAt: number, completedAt: number) => {
-    ordinal += 1
-    return { id: `${turnId}:item-${ordinal}`, threadId, turnId, ordinal, revision: 0, status, createdAt, updatedAt: completedAt, completedAt, content }
-  }
-  const tool = (name: string, argumentsJson: string | undefined, resultJson: string | undefined, createdAt: number, completedAt: number, extra: Record<string, unknown> = {}) =>
-    item({ type: "toolCall", tool: { toolCallId: `call-${name}`, name, arguments: argumentsJson, result: resultJson, timedOut: false, ...extra } }, "completed", createdAt, completedAt)
-
-  return {
-    type: "snapshot",
-    snapshot: {
-      schemaVersion: 1,
-      revision: 1,
-      thread: thread(threadId, threadId),
-      items: [
-        item({ type: "userMessage", text: "请检查 PR" }, "completed", 0, 1_000),
-        item({ type: "reasoning", summary: ["先看测试"], content: ["需要先检查配置"] }, "completed", 0, 9_000),
-        tool("exec", JSON.stringify({ command: "cargo test -p mai-server" }), JSON.stringify({ status: "exit", exitCode: 0, stdout: "test passed", stderr: "" }), 10_000, 16_000),
-        tool("read_file", JSON.stringify({ path: "README.md" }), undefined, 16_000, 22_000),
-        tool("search_files", JSON.stringify({ query: "timeline", path: "crates" }), undefined, 22_000, 28_000),
-        item({ type: "agentMessage", channel: "final", text: "工具运行完成，以下是结论。" }, "completed", 28_000, 29_000),
-        tool("apply_patch", JSON.stringify({ input: "*** Update File: docs/web-workbench.md" }), undefined, 29_000, 30_000),
-      ],
       interactions: [],
       runtime: { threadId, usage: usageSnapshot(threadId), activeSkills: [], activeMcpServers: [], activeLspServers: [], updatedAt: 1 },
     },

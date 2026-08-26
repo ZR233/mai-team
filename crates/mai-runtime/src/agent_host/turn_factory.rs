@@ -10,11 +10,8 @@ use pl_core::{
 use pl_model::OpenAiCompactionMode;
 use tokio::sync::RwLock;
 
-use crate::skills::{SkillInput, SkillSelection};
 use crate::state::AgentRecord;
-use crate::turn::core_adapter::{
-    MaiFrameworkKernelBuildContext, build_mai_turn_engine, mai_user_input_interaction_callback,
-};
+use crate::turn::core_adapter::{MaiFrameworkKernelBuildContext, build_mai_turn_engine};
 use crate::{AgentRuntime, MaiConfig, Result, RuntimeError};
 
 /// 由 MaiConfig 和产品资源为一次 PL turn 准备 kernel/policy。
@@ -48,17 +45,52 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
             .resolve(&context.snapshot.identity.role)
             .map_err(RuntimeError::Model)?;
         let web_search = pl_core::plan_web_search(&config.models, &route, &config.web_search)?;
-        let builder = TurnEngineBuilder::from_route(&route).map_err(RuntimeError::Model)?;
+        let exclusive_web_search =
+            web_search.visibility == pl_core::ToolVisibilityConstraint::Exclusive;
+        let mut builder = TurnEngineBuilder::from_route(&route).map_err(RuntimeError::Model)?;
+        let agent_tools = runtime.tool_sets.get(product_agent_id).await;
 
         if let Err(error) = runtime.refresh_project_skills_for_agent(&agent).await {
             tracing::warn!(agent_id = %product_agent_id, "failed to refresh project skills: {error}");
         }
-        let mut skills_config = runtime.deps.store.load_skills_config().await?;
-        apply_skill_policy(&mut skills_config, &config.skills);
-        let skills_manager = runtime.skills_manager_for_agent(&agent).await?;
-        let container_skill_paths = runtime
-            .sync_agent_skills_to_container(&agent, &skills_manager, &skills_config)
+        let skills_config = runtime.deps.store.load_skills_config().await?;
+        let skill_catalog_service = runtime.skill_catalog_for_agent(&agent).await?;
+        let project_skill_guard = runtime.project_skill_read_guard(&agent).await;
+        let skill_catalog = skill_catalog_service
+            .discover(
+                &skills_config,
+                &config.skills,
+                context.cancellation_token.clone(),
+            )
             .await?;
+        let mut skills_response =
+            skill_catalog_service.project(&skill_catalog, &skills_config, &config.skills);
+        if let Some(project_id) = agent.summary.read().await.project_id {
+            runtime
+                .apply_project_skill_source_paths_for_agent(
+                    &agent,
+                    project_id,
+                    &mut skills_response,
+                )
+                .await;
+        }
+        runtime
+            .sync_agent_skills_to_container(&agent, &skills_response)
+            .await?;
+        let skill_load = if config.skills.enabled && !exclusive_web_search {
+            skill_catalog
+                .load_user_invocations_with_selections(
+                    &context.input.payload.message,
+                    &skill_mentions(&context.input.payload.metadata),
+                    context.turn_id.as_str(),
+                    context.cancellation_token.clone(),
+                )
+                .await
+                .map_err(RuntimeError::Model)?
+        } else {
+            pl_core::skill::SkillUserInvocationLoad::default()
+        };
+        drop(project_skill_guard);
         let mcp_lease = runtime.prepare_agent_mcp_lease(&agent, &config).await?;
         let active_mcp_servers = mcp_lease
             .as_ref()
@@ -76,56 +108,13 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
             .map(|lease| lease.tools().iter().map(mcp_tool).collect::<Vec<_>>())
             .unwrap_or_default();
         let policy_context = super::MaiPolicyContext {
-            can_manage_agents: crate::turn::tool_visibility::can_manage_agents(
-                &runtime.state,
-                &agent,
-            )
-            .await,
+            can_manage_agents: super::policy::can_manage_agents(&runtime.state, &agent).await,
         };
         let configured_roles = config.models.routes.keys().cloned().collect::<Vec<_>>();
-        let mut initial_policy = super::compile_execution_policy(
-            &context.snapshot,
-            configured_roles.clone(),
-            crate::turn::tool_visibility::visible_tool_names(&agent, &mcp_tools).await,
-            policy_context,
-        );
-        initial_policy.visible_tools =
-            web_search.constrain_visibility(initial_policy.visible_tools);
-        let initial_visibility = initial_policy.visible_tools;
-        let skill_injections = {
-            let _guard = runtime.project_skill_read_guard(&agent).await;
-            skills_manager.build_injections_for_input(
-                SkillInput {
-                    text: Some(&context.input.payload.message),
-                    selections: skill_mentions(&context.input.payload.metadata)
-                        .into_iter()
-                        .map(SkillSelection::from_mention)
-                        .collect(),
-                    reserved_names: initial_visibility.into_names(),
-                },
-                &skills_config,
-            )?
-        };
-        let mut policy = super::compile_execution_policy(
-            &context.snapshot,
-            configured_roles,
-            crate::turn::tool_visibility::visible_tool_names(&agent, &mcp_tools).await,
-            policy_context,
-        );
-        policy.visible_tools = web_search.constrain_visibility(policy.visible_tools);
-        let generated_instructions = {
-            let _guard = runtime.project_skill_read_guard(&agent).await;
-            runtime
-                .build_instructions(
-                    &agent,
-                    &skills_manager,
-                    &skill_injections,
-                    &skills_config,
-                    &mcp_tools,
-                    &container_skill_paths,
-                )
-                .await?
-        };
+        let policy =
+            super::compile_execution_policy(&context.snapshot, configured_roles, policy_context);
+        let generated_instructions =
+            crate::instructions::build_instructions(agent.system_prompt.as_deref(), &mcp_tools);
         let workspace_instructions = runtime
             .project_review_workspace_instructions_for_agent(&agent)
             .await?;
@@ -134,7 +123,7 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
             .read()
             .await
             .as_deref()
-            .map(|context| super::review_manifest::section(context, &skill_injections))
+            .map(|context| super::review_manifest::section(context, &skill_load.activations))
             .transpose()?;
         let mut instruction_profile =
             InstructionProfile::new().with_developer_block("mai runtime", generated_instructions);
@@ -167,16 +156,29 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
         if let Some(workspace_instructions) = workspace_instructions {
             profile = profile.with_workspace_instructions(workspace_instructions);
         }
-        let mcp_shared_tools = if config.mcp.enabled {
-            agent
-                .mcp
-                .read()
-                .await
-                .as_ref()
-                .map(|runtime| runtime.shared_tools())
+        let engine_skill_catalog =
+            (config.skills.enabled && !exclusive_web_search).then(|| skill_catalog.clone());
+        if let Some(catalog) = &engine_skill_catalog {
+            builder = builder.with_skill_catalog(catalog.clone());
+        }
+        if config.mcp.enabled && !exclusive_web_search {
+            let refresh_agent = agent.clone();
+            builder =
+                builder.with_before_model_step(pl_core::BeforeModelStepHook::new(move |step| {
+                    let refresh_agent = refresh_agent.clone();
+                    async move {
+                        let tools = if let Some(runtime) = refresh_agent.mcp.read().await.clone() {
+                            runtime.handle().acquire_turn_lease().await?.agent_tools()
+                        } else {
+                            Vec::new()
+                        };
+                        step.agent_tools
+                            .install(pl_core::ToolGroupId::new("mcp"), tools)
+                    }
+                }));
         } else {
-            None
-        };
+            agent_tools.uninstall(&pl_core::ToolGroupId::new("mcp"));
+        }
         let mut engine = build_mai_turn_engine(
             builder,
             profile,
@@ -187,19 +189,25 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
                 framework_agent_id: context.snapshot.identity.id.clone(),
                 framework_runtime: context.runtime.clone(),
                 policy: policy.clone(),
-                mcp_shared_tools,
+                agent_tools,
+                skill_catalog: engine_skill_catalog,
+                exclusive_web_search,
             },
         )
         .await?;
         web_search.install(&mut engine, &config.web_search)?;
-        let request = TurnRequest::new(context.input.payload.message)
-            .with_turn_id(context.turn_id.to_string());
+        let mut request = TurnRequest::new(context.input.payload.message)
+            .with_turn_id(context.turn_id.to_string())
+            .with_skill_activations(skill_load.activations);
+        if let Some(instruction) = skill_load.instruction {
+            request = request.with_skill_invocation_instruction(instruction);
+        }
         let options = TurnOptions::default()
             // mai 的文件和进程工具都在 agent 容器内执行；产品级 effect policy
             // 已经完成授权，因此不能再按 server 主机路径触发人工审批。
             .with_permission_mode(pl_core::PermissionMode::FullAccess)
             .with_prompt_cache_namespace(context.thread_id.to_string())
-            .with_interaction_callback(mai_user_input_interaction_callback());
+            .with_user_input_end_turn();
         let mut session_runtime = PreparedSessionRuntime::new(route.model.slug.clone())
             .with_mcp_servers(active_mcp_servers);
         if let Some(context_window) = route.model.resolved_context_window() {
@@ -227,21 +235,6 @@ pub(crate) async fn product_agent(
         ))
     })?;
     runtime.agent(id).await.map(|agent| (id, agent))
-}
-
-fn apply_skill_policy(
-    skills: &mut mai_protocol::SkillsConfigRequest,
-    policy: &crate::config::MaiSkillsConfig,
-) {
-    for entry in &mut skills.config {
-        let disabled_by_name = entry
-            .name
-            .as_ref()
-            .is_some_and(|name| policy.disabled.iter().any(|disabled| disabled == name));
-        if !policy.enabled || disabled_by_name {
-            entry.enabled = false;
-        }
-    }
 }
 
 fn skill_mentions(metadata: &serde_json::Value) -> Vec<String> {

@@ -4,7 +4,7 @@ use std::time::Duration;
 use mai_protocol::{AgentId, ProjectId, ProjectReviewRunDetail, ProjectReviewRunSummary, TurnId};
 #[cfg(test)]
 use mai_protocol::{ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus, now};
-use pl_core::{AgentWaitResult, TurnOutcomeKind};
+use pl_core::AgentWaitResult;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -178,6 +178,9 @@ pub(crate) async fn run_project_review_once(
         error: None,
         failure: None,
         token_usage: Default::default(),
+        history_status: Default::default(),
+        history_archive_id: None,
+        history_archived_at: None,
     })
     .await?;
     if cancellation_token.is_cancelled() {
@@ -265,6 +268,9 @@ pub(crate) async fn run_project_review_once(
             error: None,
             failure: None,
             token_usage: Default::default(),
+            history_status: Default::default(),
+            history_archive_id: None,
+            history_archived_at: None,
         })
         .await
     {
@@ -570,7 +576,7 @@ pub(crate) fn last_turn_cancelled(wait_result: &AgentWaitResult) -> bool {
     wait_result
         .last_turn
         .as_ref()
-        .is_some_and(|turn| turn.kind == TurnOutcomeKind::Cancelled)
+        .is_some_and(|turn| matches!(turn.outcome, pl_protocol::TurnOutcome::Cancelled(_)))
 }
 
 #[cfg(test)]
@@ -579,8 +585,12 @@ mod tests {
 
     use chrono::Utc;
     use mai_protocol::{
-        AgentLastTurn, AgentResourceState, AgentRuntimeState, AgentState, AgentSummary,
-        AgentTurnOutcomeKind, ProjectCloneStatus, ProjectReviewDecision, ProjectStatus, TokenUsage,
+        AgentResourceSnapshot, AgentResourceState, AgentSummary, ProjectCloneStatus,
+        ProjectReviewDecision, ProjectStatus, TokenUsage,
+    };
+    use pl_protocol::{
+        AgentIdentity, AgentRoleId, AgentSnapshot, AgentState, AgentTurnOutcome, ThreadId,
+        TurnCompletion, TurnOutcome,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
@@ -757,7 +767,7 @@ mod tests {
 
         async fn reviewer_progress(&self, _reviewer_id: AgentId) -> Result<ReviewerProgress> {
             Ok(ReviewerProgress {
-                revision: self.reviewer.state.runtime.revision,
+                revision: self.reviewer.runtime.as_ref().expect("runtime").revision,
                 inactivity_timeout: std::time::Duration::from_secs(600),
             })
         }
@@ -828,7 +838,7 @@ mod tests {
             reviewer_id,
             vec![r#"{"outcome":"review_submitted","review_event":"approve","pr":726,"summary":"done","error":null}"#.to_string()],
         );
-        ops.reviewer.state.runtime.last_turn = None;
+        ops.reviewer.runtime.as_mut().expect("runtime").last_turn = None;
 
         let result =
             run_project_review_once(&ops, project_id, CancellationToken::new(), request(726))
@@ -1084,21 +1094,32 @@ mod tests {
             project_id: Some(project_id),
             role: Some(mai_protocol::AgentRole::Reviewer),
             name: "reviewer".to_string(),
-            state: AgentState {
-                resource: AgentResourceState::Ready,
-                runtime: AgentRuntimeState {
-                    last_turn: Some(AgentLastTurn {
-                        turn_id: Uuid::new_v4().to_string(),
-                        thread_id: reviewer_id.to_string(),
-                        outcome: AgentTurnOutcomeKind::Completed,
-                        reason: None,
-                        usage: TokenUsage::default(),
-                        finished_at: timestamp,
-                    }),
-                    ..AgentRuntimeState::default()
-                },
-                ..AgentState::default()
+            resource: AgentResourceSnapshot {
+                state: AgentResourceState::Ready,
+                error: None,
             },
+            runtime: Some(AgentSnapshot {
+                identity: AgentIdentity {
+                    id: ThreadId::new(reviewer_id.to_string()).expect("thread id"),
+                    parent_id: None,
+                    role: AgentRoleId::new("reviewer").expect("role"),
+                    depth: 0,
+                },
+                state: AgentState::idle(),
+                pending_inputs: 0,
+                progress: None,
+                last_turn: Some(AgentTurnOutcome {
+                    turn_id: pl_protocol::TurnId::new(Uuid::new_v4().to_string()).expect("turn id"),
+                    thread_id: ThreadId::new(reviewer_id.to_string()).expect("thread id"),
+                    outcome: TurnOutcome::completed(TurnCompletion::Normal),
+                    usage: TokenUsage::default(),
+                    started_at: None,
+                    finished_at: timestamp.timestamp_millis(),
+                }),
+                revision: 1,
+                event_sequence: 1,
+                updated_at: timestamp.timestamp_millis(),
+            }),
             container_id: Some("container".to_string()),
             docker_image: "ubuntu:latest".to_string(),
             provider_id: "mock".to_string(),
@@ -1113,16 +1134,12 @@ mod tests {
 
     fn completed_wait_result() -> AgentWaitResult {
         let agent_id = pl_core::ThreadId::new("reviewer").expect("agent id");
-        let turn = pl_core::AgentTurnOutcome {
+        let turn = AgentTurnOutcome {
             turn_id: pl_core::TurnId::new("turn").expect("turn id"),
             thread_id: agent_id.clone(),
-            kind: TurnOutcomeKind::Completed,
-            reason: None,
-            failure: None,
-            budget_limit: None,
-            rollover_compacted: false,
-            rollover_compaction_error: None,
+            outcome: TurnOutcome::completed(TurnCompletion::Normal),
             usage: pl_model::TokenUsage::default(),
+            started_at: None,
             finished_at: 1,
         };
         AgentWaitResult {
@@ -1133,9 +1150,7 @@ mod tests {
                     role: pl_core::AgentRoleId::new("reviewer").expect("role"),
                     depth: 0,
                 },
-                lifecycle: pl_core::AgentLifecycleState::Active,
-                activity: pl_core::AgentActivityState::Idle,
-                active_turn_id: None,
+                state: AgentState::idle(),
                 pending_inputs: 0,
                 progress: None,
                 last_turn: Some(turn.clone()),

@@ -1,5 +1,5 @@
 use crate::agents::profiles::AgentProfilesManager;
-use crate::skills::{SkillInjections, SkillsManager};
+use crate::skills::SkillCatalogService;
 use chrono::{DateTime, Utc};
 use mai_docker::{
     ContainerHandle, ContainerVolumeMount, DockerClient, SidecarParams, agent_workspace_volume,
@@ -53,7 +53,6 @@ mod thread_subscriptions;
 mod tools;
 mod turn;
 
-use agents::AgentResourceBroker;
 pub use config::{
     MAI_CONFIG_SCHEMA_VERSION, MaiConfig, MaiContainerConfig, MaiGithubConfig,
     MaiInstructionsConfig, MaiMcpConfig, MaiRetentionConfig, MaiReviewConfig, MaiSkillsConfig,
@@ -64,7 +63,7 @@ use events::{RECENT_EVENT_LIMIT, RuntimeEvents};
 use github::{
     DEFAULT_GITHUB_API_BASE_URL, DirectGithubAppBackend, GITHUB_HTTP_TIMEOUT_SECS, GithubAppBackend,
 };
-use instructions::{CONTAINER_SKILLS_ROOT, ContainerSkillPaths};
+use instructions::CONTAINER_SKILLS_ROOT;
 pub use model_projection::{
     completion_response_to_model_response, completion_response_usage, model_token_usage,
 };
@@ -170,8 +169,6 @@ pub enum RuntimeError {
     Model(#[from] pl_protocol::PureError),
     #[error("store error: {0}")]
     Store(#[from] mai_store::StoreError),
-    #[error("skill error: {0}")]
-    Skill(#[from] crate::skills::SkillError),
     #[error("invalid input: {0}")]
     InvalidInput(String),
     #[error("io error: {0}")]
@@ -219,6 +216,7 @@ pub struct AgentRuntime {
     github_get_cache: github::GithubGetCache,
     pull_request_state_refreshes: github::PullRequestStateRefreshCoordinator,
     workspace_manager: projects::workspace::LocalProjectWorkspaceManager,
+    tool_sets: turn::tool_sets::AgentToolSets,
 }
 
 struct ResolvedAgentModel {
@@ -355,4 +353,32 @@ fn runtime_sidecar_image(image: String) -> String {
 }
 
 #[cfg(test)]
-mod framework_tests;
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn startup_resume_only_selects_interrupted_project_clone_states() {
+        let cases = [
+            (ProjectStatus::Creating, ProjectCloneStatus::Pending, true),
+            (ProjectStatus::Creating, ProjectCloneStatus::Cloning, true),
+            (ProjectStatus::Creating, ProjectCloneStatus::Ready, true),
+            (ProjectStatus::Ready, ProjectCloneStatus::Ready, false),
+            (ProjectStatus::Creating, ProjectCloneStatus::Failed, false),
+        ];
+
+        assert_eq!(
+            cases
+                .iter()
+                .map(|(status, clone, _)| {
+                    project_workspace_creation_was_interrupted(status, clone)
+                })
+                .collect::<Vec<_>>(),
+            cases
+                .iter()
+                .map(|(_, _, expected)| *expected)
+                .collect::<Vec<_>>()
+        );
+    }
+}

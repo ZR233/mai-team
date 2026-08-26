@@ -41,7 +41,6 @@ impl From<mai_runtime::RuntimeError> for ApiError {
             Docker(_)
             | Model(_)
             | Store(_)
-            | Skill(_)
             | Io(_)
             | Http(_)
             | Jwt(_)

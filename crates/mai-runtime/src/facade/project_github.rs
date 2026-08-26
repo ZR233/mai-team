@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use crate::github::GitAccountToken;
 use crate::state::AgentRecord;
-use crate::turn::tool_output::ToolExecution;
 use crate::{AgentRuntime, Result, RuntimeError, github, projects, redact_secret, turn};
+use pl_core::ToolResult;
 
 const INVALID_INLINE_POSITION_CODE: &str = "invalid_inline_position";
 
@@ -54,7 +54,7 @@ impl AgentRuntime {
         &self,
         agent: &AgentRecord,
         request: &turn::product_tools::GithubApiRequest,
-    ) -> Result<ToolExecution> {
+    ) -> Result<ToolResult> {
         let method = github::normalize_github_api_method(request.method.as_str())?;
         let path = github::normalize_github_api_get_path(&request.path)?;
         let token = self
@@ -174,13 +174,13 @@ impl AgentRuntime {
                     ))
                 })?;
             if let Some(receipt) = existing.submission_receipt.clone() {
-                return Ok(ToolExecution::json(
-                    serde_json::to_value(receipt).map_err(|error| {
+                return Ok(ToolResult::json(serde_json::to_value(receipt).map_err(
+                    |error| {
                         RuntimeError::InvalidInput(format!(
                             "failed to serialize GitHub review receipt: {error}"
                         ))
-                    })?,
-                )?);
+                    },
+                )?)?);
             }
             let had_intent = existing.submission_intent.is_some();
             let body_only_fallback_allowed = review_body_only_fallback_is_allowed(
@@ -194,26 +194,26 @@ impl AgentRuntime {
                 .record_project_review_submission_intent(intent.clone())
                 .await?;
             if let Some(receipt) = job.submission_receipt {
-                return Ok(ToolExecution::json(
-                    serde_json::to_value(receipt).map_err(|error| {
+                return Ok(ToolResult::json(serde_json::to_value(receipt).map_err(
+                    |error| {
                         RuntimeError::InvalidInput(format!(
                             "failed to serialize GitHub review receipt: {error}"
                         ))
-                    })?,
-                )?);
+                    },
+                )?)?);
             }
             if had_intent
                 && let Some(receipt) = self
                     .reconcile_project_review_submission(&token, &project_summary, &intent)
                     .await?
             {
-                return Ok(ToolExecution::json(
-                    serde_json::to_value(receipt).map_err(|error| {
+                return Ok(ToolResult::json(serde_json::to_value(receipt).map_err(
+                    |error| {
                         RuntimeError::InvalidInput(format!(
                             "failed to serialize GitHub review receipt: {error}"
                         ))
-                    })?,
-                )?);
+                    },
+                )?)?);
             }
             if had_intent && !body_only_fallback_allowed {
                 self.deps
@@ -245,7 +245,7 @@ impl AgentRuntime {
                     &path,
                 )
                 .await?;
-            return Ok(ToolExecution::json(select_github_fields(
+            return Ok(ToolResult::json(select_github_fields(
                 value,
                 &request.fields,
             ))?);
@@ -321,7 +321,7 @@ impl AgentRuntime {
                 .record_project_review_submission_receipt(intent.job_id, receipt)
                 .await?;
         }
-        Ok(ToolExecution::success(output.stdout))
+        Ok(ToolResult::success(output.stdout))
     }
 
     pub(crate) async fn reconcile_project_review_submission(

@@ -1,5 +1,6 @@
-use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use mai_store::{
     MaiStore, StoredThreadRuntime, StoredThreadRuntimeEvent, StoredThreadSubmission,
@@ -9,11 +10,13 @@ use mai_store::{
 use pl_core::{
     AgentSession, AgentSnapshot, AgentSubmissionPage, AgentSubmissionRecord,
     DurableMailboxEnvelope, RestoredAgentRuntime, RestoredThreadSnapshot, ThreadActorState,
-    ThreadCommit, ThreadCommitOutcome, ThreadContextState, ThreadId, ThreadRepository,
+    ThreadCommit, ThreadContextState, ThreadId, ThreadRepository,
 };
 use pl_model::TokenUsage;
 use pl_protocol::{AgentSessionSnapshot, TurnBillingRecord};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 use crate::{Result, RuntimeError};
 
@@ -21,11 +24,19 @@ use crate::{Result, RuntimeError};
 #[derive(Clone)]
 pub(crate) struct MaiAgentRepository {
     store: Arc<MaiStore>,
+    writer: Arc<ThreadWriter>,
 }
 
 impl MaiAgentRepository {
     pub(crate) fn new(store: Arc<MaiStore>) -> Self {
-        Self { store }
+        Self {
+            writer: Arc::new(ThreadWriter::new(store.clone())),
+            store,
+        }
+    }
+
+    pub(crate) async fn shutdown(&self) -> Result<()> {
+        self.writer.shutdown().await
     }
 }
 
@@ -33,38 +44,32 @@ impl ThreadRepository for MaiAgentRepository {
     type Error = RuntimeError;
 
     async fn restore_runtime(&self) -> Result<Vec<RestoredAgentRuntime>> {
-        self.store
-            .load_thread_runtimes()
-            .await?
-            .into_iter()
-            .map(runtime_from_store)
-            .collect()
+        // mai 没有启动钉住集合；产品 Agent 身份先恢复，PL runtime 在首次访问时驻留。
+        Ok(Vec::new())
     }
 
     async fn restore_thread(&self, thread_id: &ThreadId) -> Result<Option<RestoredAgentRuntime>> {
-        self.store
+        let restored = self
+            .store
             .load_thread_runtime(&thread_id.to_string())
             .await?
             .map(runtime_from_store)
-            .transpose()
-    }
-    async fn commit(&self, commit: ThreadCommit) -> Result<ThreadCommitOutcome> {
-        let document = commit_to_store(commit)?;
-        match self.store.commit_thread_runtime(document).await? {
-            StoreCommitOutcome::Applied => Ok(ThreadCommitOutcome::Applied),
-            StoreCommitOutcome::RevisionConflict { actual_revision } => {
-                Ok(ThreadCommitOutcome::RevisionConflict { actual_revision })
-            }
+            .transpose()?;
+        if let Some(runtime) = &restored {
+            self.writer.seed(thread_id, runtime.state.snapshot.revision);
         }
+        Ok(restored)
+    }
+    async fn commit(&self, commit: ThreadCommit) -> Result<()> {
+        self.writer.enqueue(commit_to_store(commit)?).await
     }
 
-    /// mai-store 在 commit 事务返回前已完成同步落库，无 write-behind 积压。
-    async fn flush_pending(&self, _thread_id: Option<&ThreadId>) -> Result<()> {
-        Ok(())
+    async fn await_durable(&self, thread_id: &ThreadId, revision: u64) -> Result<()> {
+        self.writer.await_durable(thread_id, revision).await
     }
 
     fn pending_commit_count(&self) -> usize {
-        0
+        self.writer.pending.load(Ordering::Acquire)
     }
 
     async fn list_submissions(
@@ -93,6 +98,234 @@ impl ThreadRepository for MaiAgentRepository {
     }
 }
 
+const MAX_PENDING_COMMITS: usize = 1024;
+
+struct QueuedCommit {
+    thread_id: String,
+    revision: u64,
+    document: ThreadRuntimeCommitDocument,
+}
+
+struct ThreadWriter {
+    store: Arc<MaiStore>,
+    queue: Mutex<VecDeque<QueuedCommit>>,
+    durable: Mutex<HashMap<String, u64>>,
+    failure: Mutex<Option<String>>,
+    task: Mutex<Option<JoinHandle<()>>>,
+    work: Notify,
+    progress: Notify,
+    pending: AtomicUsize,
+    stopping: AtomicBool,
+}
+
+impl ThreadWriter {
+    fn new(store: Arc<MaiStore>) -> Self {
+        Self {
+            store,
+            queue: Mutex::new(VecDeque::new()),
+            durable: Mutex::new(HashMap::new()),
+            failure: Mutex::new(None),
+            task: Mutex::new(None),
+            work: Notify::new(),
+            progress: Notify::new(),
+            pending: AtomicUsize::new(0),
+            stopping: AtomicBool::new(false),
+        }
+    }
+
+    fn seed(&self, thread_id: &ThreadId, revision: u64) {
+        let mut durable = self
+            .durable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        durable
+            .entry(thread_id.to_string())
+            .and_modify(|current| *current = (*current).max(revision))
+            .or_insert(revision);
+    }
+
+    async fn enqueue(self: &Arc<Self>, document: ThreadRuntimeCommitDocument) -> Result<()> {
+        self.ensure_running()?;
+        let mut document = Some(document);
+        loop {
+            self.check_available()?;
+            let progress = self.progress.notified();
+            {
+                let mut queue = self
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if self.pending.load(Ordering::Acquire) < MAX_PENDING_COMMITS {
+                    let document = document.take().expect("Thread commit document present");
+                    queue.push_back(QueuedCommit {
+                        thread_id: document.runtime.thread_id.clone(),
+                        revision: document.runtime.revision,
+                        document,
+                    });
+                    self.pending.fetch_add(1, Ordering::AcqRel);
+                    drop(queue);
+                    self.work.notify_one();
+                    return Ok(());
+                }
+            }
+            progress.await;
+        }
+    }
+
+    async fn await_durable(self: &Arc<Self>, thread_id: &ThreadId, revision: u64) -> Result<()> {
+        loop {
+            if self.durable_revision(thread_id) >= revision {
+                return Ok(());
+            }
+            self.check_available()?;
+            self.ensure_running()?;
+            let progress = self.progress.notified();
+            if self.durable_revision(thread_id) >= revision {
+                return Ok(());
+            }
+            self.work.notify_one();
+            progress.await;
+        }
+    }
+
+    async fn shutdown(self: &Arc<Self>) -> Result<()> {
+        self.stopping.store(true, Ordering::Release);
+        self.ensure_task();
+        self.work.notify_waiters();
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            task.await.map_err(|error| {
+                RuntimeError::InvalidInput(format!("Thread writer task failed: {error}"))
+            })?;
+        }
+        self.check_failure()?;
+        if self.pending.load(Ordering::Acquire) != 0 {
+            return Err(RuntimeError::InvalidInput(
+                "Thread writer stopped before its queue drained".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn durable_revision(&self, thread_id: &ThreadId) -> u64 {
+        self.durable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(thread_id.as_str())
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn ensure_running(self: &Arc<Self>) -> Result<()> {
+        self.check_available()?;
+        self.ensure_task();
+        Ok(())
+    }
+
+    fn ensure_task(self: &Arc<Self>) {
+        let mut task = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if task.is_none() {
+            let writer = self.clone();
+            *task = Some(tokio::spawn(async move { writer.run().await }));
+        }
+    }
+
+    async fn run(self: Arc<Self>) {
+        loop {
+            let work = self.work.notified();
+            let commit = self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front();
+            let Some(commit) = commit else {
+                if self.stopping.load(Ordering::Acquire) {
+                    return;
+                }
+                work.await;
+                continue;
+            };
+            match self
+                .store
+                .commit_thread_runtime(commit.document.clone())
+                .await
+            {
+                Ok(StoreCommitOutcome::Applied) => {
+                    self.advance_durable(&commit.thread_id, commit.revision);
+                    self.pending.fetch_sub(1, Ordering::AcqRel);
+                    self.progress.notify_waiters();
+                }
+                Ok(StoreCommitOutcome::RevisionConflict { actual_revision }) => {
+                    self.requeue_failed(
+                        commit,
+                        format!(
+                            "Thread persistence revision conflict, durable revision is {actual_revision:?}"
+                        ),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    self.requeue_failed(commit, error.to_string());
+                    return;
+                }
+            }
+        }
+    }
+
+    fn advance_durable(&self, thread_id: &str, revision: u64) {
+        let mut durable = self
+            .durable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        durable
+            .entry(thread_id.to_string())
+            .and_modify(|current| *current = (*current).max(revision))
+            .or_insert(revision);
+    }
+
+    fn requeue_failed(&self, commit: QueuedCommit, error: String) {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_front(commit);
+        *self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+        self.progress.notify_waiters();
+    }
+
+    fn check_available(&self) -> Result<()> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(RuntimeError::InvalidInput(
+                "Thread writer is shutting down".to_string(),
+            ));
+        }
+        self.check_failure()
+    }
+
+    fn check_failure(&self) -> Result<()> {
+        if let Some(error) = self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return Err(RuntimeError::InvalidInput(format!(
+                "Thread writer is blocked: {error}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredThreadActorDocument {
@@ -117,7 +350,7 @@ struct StoredThreadContextDocument {
 fn commit_to_store(commit: ThreadCommit) -> Result<ThreadRuntimeCommitDocument> {
     let ThreadCommit {
         agent_id,
-        durability: _,
+        persistence: _,
         expected_revision,
         next_state,
         facts,
@@ -243,4 +476,222 @@ fn actor_document(state: &ThreadActorState) -> StoredThreadActorDocument {
 
 fn json_error(error: serde_json::Error) -> RuntimeError {
     RuntimeError::InvalidInput(format!("invalid Thread repository document: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use pl_core::{AgentIdentity, AgentRoleId, AgentState};
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn runtime_restore_is_empty_until_one_thread_is_requested() {
+        let (_directory, store) = test_store().await;
+        let thread_id = ThreadId::new("thread-lazy").expect("thread id");
+        let snapshot = AgentSnapshot {
+            identity: AgentIdentity {
+                id: thread_id.clone(),
+                parent_id: None,
+                role: AgentRoleId::new("executor").expect("role"),
+                depth: 0,
+            },
+            state: AgentState::idle(),
+            pending_inputs: 0,
+            progress: None,
+            last_turn: None,
+            revision: 7,
+            event_sequence: 11,
+            updated_at: 42,
+        };
+        let state = ThreadActorState {
+            snapshot: snapshot.clone(),
+            session: ThreadContextState::empty(),
+            pending_inputs: VecDeque::new(),
+            active_input: None,
+        };
+        assert_eq!(
+            store
+                .commit_thread_runtime(ThreadRuntimeCommitDocument {
+                    expected_revision: None,
+                    runtime: StoredThreadRuntime {
+                        thread_id: thread_id.to_string(),
+                        revision: snapshot.revision,
+                        document: serde_json::to_value(actor_document(&state))
+                            .expect("actor document"),
+                        snapshot: None,
+                        updated_at: snapshot.updated_at,
+                    },
+                    turn: None,
+                    notifications: Vec::new(),
+                    runtime_events: Vec::new(),
+                    trace_events: Vec::new(),
+                    submissions: Vec::new(),
+                })
+                .await
+                .expect("persist runtime"),
+            StoreCommitOutcome::Applied
+        );
+
+        let repository = MaiAgentRepository::new(store);
+        assert!(
+            repository
+                .restore_runtime()
+                .await
+                .expect("restore pinned runtime")
+                .is_empty()
+        );
+
+        let restored = repository
+            .restore_thread(&thread_id)
+            .await
+            .expect("restore one thread")
+            .expect("stored thread");
+        assert_eq!(restored.state.snapshot, snapshot);
+        assert!(restored.state.pending_inputs.is_empty());
+        assert!(restored.state.active_input.is_none());
+        repository
+            .await_durable(&thread_id, 7)
+            .await
+            .expect("restored revision seeds the exact barrier");
+        repository.shutdown().await.expect("shutdown repository");
+    }
+
+    #[tokio::test]
+    async fn exact_revision_barrier_waits_for_fifo_persistence() {
+        let (_directory, store) = test_store().await;
+        let writer = Arc::new(ThreadWriter::new(store.clone()));
+        let thread_id = ThreadId::new("thread-a").expect("thread id");
+
+        writer
+            .enqueue(document("thread-a", None, 1))
+            .await
+            .expect("enqueue revision 1");
+        writer
+            .enqueue(document("thread-a", Some(1), 2))
+            .await
+            .expect("enqueue revision 2");
+        writer
+            .await_durable(&thread_id, 2)
+            .await
+            .expect("revision 2 durable");
+
+        assert_eq!(writer.pending.load(Ordering::Acquire), 0);
+        assert_eq!(
+            store
+                .load_thread_runtime("thread-a")
+                .await
+                .expect("load runtime")
+                .expect("runtime")
+                .revision,
+            2
+        );
+        writer.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn revision_conflict_blocks_exact_barrier_without_losing_commit() {
+        let (_directory, store) = test_store().await;
+        let writer = Arc::new(ThreadWriter::new(store.clone()));
+        let thread_id = ThreadId::new("thread-a").expect("thread id");
+
+        writer
+            .enqueue(document("thread-a", None, 1))
+            .await
+            .expect("enqueue revision 1");
+        writer
+            .await_durable(&thread_id, 1)
+            .await
+            .expect("revision 1 durable");
+        writer
+            .enqueue(document("thread-a", None, 2))
+            .await
+            .expect("enqueue conflicting revision");
+
+        let error = writer
+            .await_durable(&thread_id, 2)
+            .await
+            .expect_err("conflict must fail the barrier");
+        assert!(error.to_string().contains("revision conflict"));
+        assert_eq!(writer.pending.load(Ordering::Acquire), 1);
+        assert_eq!(
+            store
+                .load_thread_runtime("thread-a")
+                .await
+                .expect("load runtime")
+                .expect("runtime")
+                .revision,
+            1
+        );
+        assert!(writer.shutdown().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_all_accepted_commits_and_rejects_new_work() {
+        let (_directory, store) = test_store().await;
+        let writer = Arc::new(ThreadWriter::new(store.clone()));
+        for revision in 1..=16 {
+            writer
+                .enqueue(document(
+                    "thread-a",
+                    (revision > 1).then_some(revision - 1),
+                    revision,
+                ))
+                .await
+                .expect("enqueue sequential revision");
+        }
+
+        writer.shutdown().await.expect("drain writer");
+
+        assert_eq!(writer.pending.load(Ordering::Acquire), 0);
+        assert_eq!(
+            store
+                .load_thread_runtime("thread-a")
+                .await
+                .expect("load runtime")
+                .expect("runtime")
+                .revision,
+            16
+        );
+        assert!(
+            writer
+                .enqueue(document("thread-a", Some(16), 17))
+                .await
+                .is_err()
+        );
+    }
+
+    async fn test_store() -> (tempfile::TempDir, Arc<MaiStore>) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = MaiStore::open_with_config_and_artifact_index_path(
+            directory.path().join("store.sqlite3"),
+            directory.path().join("config.toml"),
+            directory.path().join("artifacts"),
+        )
+        .await
+        .expect("open store");
+        (directory, Arc::new(store))
+    }
+
+    fn document(
+        thread_id: &str,
+        expected_revision: Option<u64>,
+        revision: u64,
+    ) -> ThreadRuntimeCommitDocument {
+        ThreadRuntimeCommitDocument {
+            expected_revision,
+            runtime: StoredThreadRuntime {
+                thread_id: thread_id.to_string(),
+                revision,
+                document: serde_json::json!({ "revision": revision }),
+                snapshot: None,
+                updated_at: revision as i64,
+            },
+            turn: None,
+            notifications: Vec::new(),
+            runtime_events: Vec::new(),
+            trace_events: Vec::new(),
+            submissions: Vec::new(),
+        }
+    }
 }

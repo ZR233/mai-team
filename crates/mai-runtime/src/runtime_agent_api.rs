@@ -1,6 +1,14 @@
 use super::*;
 
 impl AgentRuntime {
+    pub(crate) async fn await_agent_durable(&self, agent_id: AgentId, revision: u64) -> Result<()> {
+        let thread_id = agent_host::canonical_id(agent_id)?;
+        let framework = self.agent_framework.get().ok_or_else(|| {
+            RuntimeError::InvalidInput("agent framework is not started".to_string())
+        })?;
+        framework.host().await_durable(&thread_id, revision).await
+    }
+
     pub async fn update_agent(
         &self,
         agent_id: AgentId,
@@ -35,11 +43,7 @@ impl AgentRuntime {
         let agent = self.agent(agent_id).await?;
         let canonical_id = agent_host::canonical_id(agent_id)?;
         let runtime = agent_host::load_runtime(&self.deps.store, &canonical_id).await?;
-        let snapshot = self
-            .framework_handle()?
-            .snapshot(canonical_id)
-            .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        let snapshot = self.ensure_framework_agent(agent_id).await?;
         let mut summary = agent.summary.read().await.clone();
         summary.token_usage = agent_host::aggregate_usage(&runtime);
         Ok(AgentDetail {
@@ -87,10 +91,7 @@ impl AgentRuntime {
         let summary = agent.summary.read().await.clone();
         let thread_id = agent_host::canonical_id(agent_id)?;
         let framework = self.framework_handle()?;
-        let snapshot = framework
-            .snapshot(thread_id.clone())
-            .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        let snapshot = self.ensure_framework_agent(agent_id).await?;
         runtime_thread_events::ensure_live_message_target(&summary, &snapshot)?;
         let turn_id = framework
             .submit(
@@ -108,11 +109,8 @@ impl AgentRuntime {
         self.agent(agent_id).await?;
         let canonical_id = agent_host::canonical_id(agent_id)?;
         let handle = self.framework_handle()?;
-        let snapshot = handle
-            .snapshot(canonical_id.clone())
-            .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        if let Some(turn_id) = snapshot.active_turn_id {
+        let snapshot = self.ensure_framework_agent(agent_id).await?;
+        if let Some(turn_id) = snapshot.active_turn_id().cloned() {
             handle
                 .cancel_turn(canonical_id, turn_id)
                 .await
@@ -129,11 +127,8 @@ impl AgentRuntime {
         self.agent(agent_id).await?;
         let canonical_id = agent_host::canonical_id(agent_id)?;
         let handle = self.framework_handle()?;
-        let snapshot = handle
-            .snapshot(canonical_id.clone())
-            .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        let Some(active_turn_id) = snapshot.active_turn_id else {
+        let snapshot = self.ensure_framework_agent(agent_id).await?;
+        let Some(active_turn_id) = snapshot.active_turn_id().cloned() else {
             return Ok(());
         };
         if active_turn_id.as_str() != turn_id {
@@ -345,7 +340,7 @@ impl AgentRuntime {
         role: AgentRole,
         name: Option<String>,
     ) -> Result<AgentSummary> {
-        self.agent(parent_agent_id).await?;
+        self.ensure_framework_agent(parent_agent_id).await?;
         let parent_runtime_id = agent_host::canonical_id(parent_agent_id)?;
         let child_id = AgentId::new_v4();
         let thread_id = pl_core::ThreadId::new(child_id.to_string())?;
@@ -382,6 +377,7 @@ impl AgentRuntime {
     ) -> Result<AgentSummary> {
         let agent = self.agent(agent_id).await?;
         let canonical_id = agent_host::canonical_id(agent_id)?;
+        self.ensure_framework_agent(agent_id).await?;
         tokio::time::timeout(
             timeout,
             self.framework_handle()?.wait_until_idle(canonical_id),
@@ -400,6 +396,7 @@ impl AgentRuntime {
     ) -> Result<pl_core::AgentWaitResult> {
         self.agent(agent_id).await?;
         let canonical_id = agent_host::canonical_id(agent_id)?;
+        self.ensure_framework_agent(agent_id).await?;
         let handle = self.framework_handle()?;
         tokio::select! {
             result = handle.wait_until_idle(canonical_id) => {

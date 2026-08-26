@@ -10,12 +10,33 @@ export interface TokenUsage {
   total_tokens: number
 }
 
-export interface RuntimeState {
-  lifecycle: string
-  activity: string
-  active_turn?: string | null
-  pending_inputs?: number
-  last_turn?: { turn_id: Id; outcome: string; reason?: string | null } | null
+export type AgentRuntimeState =
+  | { kind: "idle"; data: null }
+  | { kind: "queued"; data: { turnId: Id } }
+  | { kind: "running"; data: { turnId: Id } }
+  | { kind: "waitingTool"; data: { turnId: Id } }
+  | { kind: "waitingInteraction"; data: { turnId: Id; interactionId: string } }
+  | { kind: "cancelling"; data: { turnId: Id } }
+  | { kind: "closing"; data: null }
+  | { kind: "closed"; data: null }
+  | {
+    kind: "faulted"
+    data: {
+      error: { code: string; message: string; retryable: boolean }
+      turnId?: Id | null
+      classification: "recoverableRuntime" | "recoverableProtocol" | "aggregateCorruption" | "legacyUnknown"
+    }
+  }
+
+export interface AgentRuntimeSnapshot {
+  identity: { id: Id; parentId?: Id | null; role: string; depth: number }
+  state: AgentRuntimeState
+  pendingInputs: number
+  progress?: Record<string, unknown> | null
+  lastTurn?: Record<string, unknown> | null
+  revision: number
+  eventSequence: number
+  updatedAt: number
 }
 
 export interface AgentSummary {
@@ -25,11 +46,11 @@ export interface AgentSummary {
   project_id?: Id | null
   role?: string | null
   name: string
-  state: {
-    resource: string
-    resource_error?: string | null
-    runtime?: RuntimeState | null
+  resource: {
+    state: "provisioning" | "ready" | "deleting" | "failed" | "deleted"
+    error?: string | null
   }
+  runtime?: AgentRuntimeSnapshot | null
   container_id?: string | null
   docker_image?: string
   provider_id: string
@@ -71,6 +92,7 @@ export interface ProjectSummary {
 
 export type ReviewRunOutcome = "review_submitted" | "no_eligible_pr" | "failed"
 export type ReviewDecision = "approve" | "request_changes" | "comment"
+export type ReviewHistoryStatus = "available" | "pl_v2_archived"
 
 export interface ReviewRunSummary {
   id: Id
@@ -87,6 +109,9 @@ export interface ReviewRunSummary {
   reviewer_agent_id?: string | null
   turn_id?: string | null
   token_usage?: TokenUsage
+  history_status: ReviewHistoryStatus
+  history_archive_id?: string | null
+  history_archived_at?: string | null
   [key: string]: unknown
 }
 

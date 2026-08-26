@@ -36,14 +36,3 @@ fn reasoning_effort_error(model: &ModelInfo, error: ModelParameterCandidateError
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn reasoning_effort_uses_pl_model_candidate_resolution() {
-        let source = include_str!("model.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap();
-        assert!(production.contains("resolve_candidate"));
-        assert!(!production.contains("reasoning.variants"));
-    }
-}

@@ -5,9 +5,9 @@ use std::sync::Arc;
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::{AbortHandle, Abortable};
 use mai_protocol::{
-    AgentId, AgentResourceState, AgentRuntimeLifecycle, AgentSummary, GitProvider,
-    ProjectCloneStatus, ProjectId, ProjectReviewJobSummary, ProjectReviewOutcome,
-    ProjectReviewRunStatus, ProjectReviewStatus, ProjectStatus, ProjectSummary, TurnId,
+    AgentId, AgentResourceState, AgentSummary, GitProvider, ProjectCloneStatus, ProjectId,
+    ProjectReviewJobSummary, ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus,
+    ProjectStatus, ProjectSummary, TurnId,
 };
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
@@ -856,9 +856,12 @@ async fn active_project_reviewer_ids(
 
 fn project_reviewer_agent_is_active(agent: &AgentSummary) -> bool {
     matches!(
-        agent.state.resource,
+        agent.resource.state,
         AgentResourceState::Provisioning | AgentResourceState::Ready
-    ) && agent.state.runtime.lifecycle == AgentRuntimeLifecycle::Active
+    ) && agent
+        .runtime
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.state.is_operational())
 }
 
 async fn wait_for_project_review_signal(
@@ -906,11 +909,15 @@ mod tests {
     use std::sync::Arc;
 
     use mai_protocol::{
-        AgentResourceState, AgentRole, AgentRuntimeActivity, AgentRuntimeState, AgentState,
-        ProjectCloneStatus, ProjectReviewDecision, ProjectReviewFailureCategory,
+        AgentResourceSnapshot, AgentResourceState, AgentRole, ProjectCloneStatus,
+        ProjectReviewDecision, ProjectReviewFailureCategory, ProjectReviewHistoryStatus,
         ProjectReviewJobSource, ProjectReviewJobStatus, ProjectReviewJobSummary,
         ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewStatus,
         ProjectStatus, ProjectSummary, TokenUsage, TurnId, now,
+    };
+    use pl_protocol::{
+        AgentIdentity, AgentRoleId, AgentSnapshot, AgentState, ClosedAgentState, RunningAgentState,
+        ThreadId, WaitingToolAgentState,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::{Mutex, Notify};
@@ -1621,7 +1628,7 @@ mod tests {
                 .await
                 .iter()
                 .find(|agent| agent.id == agent_id)
-                .and_then(|agent| agent.state.active_turn()))
+                .and_then(mai_protocol::AgentSummary::active_turn))
         }
 
         async fn cancel_agent_turn(&self, agent_id: Uuid, turn_id: TurnId) -> crate::Result<()> {
@@ -2347,7 +2354,7 @@ mod tests {
             TestReviewerState::WaitingTool,
         );
         let reviewer_id = reviewer.id;
-        let turn_id = reviewer.state.active_turn();
+        let turn_id = reviewer.active_turn();
         {
             let mut summary = ops.project.summary.write().await;
             summary.review_status = ProjectReviewStatus::Running;
@@ -2394,7 +2401,7 @@ mod tests {
         let reviewer =
             test_reviewer_agent(project_id, maintainer_agent_id, TestReviewerState::Deleting);
         let reviewer_id = reviewer.id;
-        let turn_id = reviewer.state.active_turn().expect("reviewer turn");
+        let turn_id = reviewer.active_turn().expect("reviewer turn");
         ops.set_auto_reviewers(vec![reviewer]).await;
         ops.set_review_runs(vec![test_review_run(
             project_id,
@@ -2509,7 +2516,7 @@ mod tests {
         let reviewer =
             test_reviewer_agent(project_id, maintainer_agent_id, TestReviewerState::Running);
         let reviewer_id = reviewer.id;
-        let turn_id = reviewer.state.active_turn().expect("reviewer turn");
+        let turn_id = reviewer.active_turn().expect("reviewer turn");
         let mut run = test_review_run(
             project_id,
             Some(reviewer_id),
@@ -2586,7 +2593,7 @@ mod tests {
         let reviewer =
             test_reviewer_agent(project_id, maintainer_agent_id, TestReviewerState::Running);
         let reviewer_id = reviewer.id;
-        let turn_id = reviewer.state.active_turn().expect("reviewer turn");
+        let turn_id = reviewer.active_turn().expect("reviewer turn");
         ops.set_auto_reviewers(vec![reviewer]).await;
 
         super::stop_project_review_loop(ops.clone(), project_id, 10).await;
@@ -2928,45 +2935,58 @@ mod tests {
         maintainer_agent_id: Uuid,
         test_state: TestReviewerState,
     ) -> mai_protocol::AgentSummary {
-        let turn_id = Uuid::new_v4().to_string();
-        let mut state = AgentState {
-            resource: AgentResourceState::Ready,
-            runtime: AgentRuntimeState {
-                activity: AgentRuntimeActivity::Running,
-                active_turn: Some(turn_id),
-                ..AgentRuntimeState::default()
-            },
-            ..AgentState::default()
+        let id = Uuid::new_v4();
+        let turn_id = pl_protocol::TurnId::new(Uuid::new_v4().to_string()).expect("turn id");
+        let mut resource = AgentResourceSnapshot {
+            state: AgentResourceState::Ready,
+            error: None,
         };
-        match test_state {
+        let runtime_state = match test_state {
             TestReviewerState::WaitingTool => {
-                state.runtime.activity = AgentRuntimeActivity::WaitingTool;
+                AgentState::WaitingTool(WaitingToolAgentState::new(turn_id.clone()))
             }
             TestReviewerState::Deleting => {
-                state.resource = AgentResourceState::Deleting;
+                resource.state = AgentResourceState::Deleting;
+                AgentState::Running(RunningAgentState::new(turn_id.clone()))
             }
-            TestReviewerState::Running => {}
+            TestReviewerState::Running => {
+                AgentState::Running(RunningAgentState::new(turn_id.clone()))
+            }
             TestReviewerState::Failed => {
-                state.resource = AgentResourceState::Failed;
-                state.resource_error = Some("reviewer failed".to_string());
-                state.runtime.activity = AgentRuntimeActivity::Idle;
-                state.runtime.active_turn = None;
+                resource.state = AgentResourceState::Failed;
+                resource.error = Some("reviewer failed".to_string());
+                AgentState::idle()
             }
             TestReviewerState::Deleted => {
-                state.resource = AgentResourceState::Deleted;
-                state.runtime.lifecycle = mai_protocol::AgentRuntimeLifecycle::Closed;
-                state.runtime.activity = AgentRuntimeActivity::Idle;
-                state.runtime.active_turn = None;
+                resource.state = AgentResourceState::Deleted;
+                AgentState::Closed(ClosedAgentState::new())
             }
-        }
+        };
         mai_protocol::AgentSummary {
-            id: Uuid::new_v4(),
+            id,
             parent_id: Some(maintainer_agent_id),
             task_id: None,
             project_id: Some(project_id),
             role: Some(AgentRole::Reviewer),
             name: "reviewer".to_string(),
-            state,
+            resource,
+            runtime: Some(AgentSnapshot {
+                identity: AgentIdentity {
+                    id: ThreadId::new(id.to_string()).expect("thread id"),
+                    parent_id: Some(
+                        ThreadId::new(maintainer_agent_id.to_string()).expect("parent id"),
+                    ),
+                    role: AgentRoleId::new("reviewer").expect("role"),
+                    depth: 1,
+                },
+                state: runtime_state,
+                pending_inputs: 0,
+                progress: None,
+                last_turn: None,
+                revision: 1,
+                event_sequence: 1,
+                updated_at: 1,
+            }),
             container_id: Some("container".to_string()),
             docker_image: "unused".to_string(),
             provider_id: "mock".to_string(),
@@ -3002,6 +3022,9 @@ mod tests {
             error: None,
             failure: None,
             token_usage: TokenUsage::default(),
+            history_status: ProjectReviewHistoryStatus::Available,
+            history_archive_id: None,
+            history_archived_at: None,
         }
     }
 }

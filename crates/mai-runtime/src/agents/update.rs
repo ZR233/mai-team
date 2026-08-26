@@ -31,7 +31,7 @@ pub(crate) async fn update_agent(
     let agent = ops.agent(agent_id).await?;
     let current = {
         let summary = agent.summary.read().await;
-        if !summary.state.can_reconfigure() {
+        if !summary.can_reconfigure() {
             return Err(RuntimeError::AgentBusy(agent_id));
         }
         summary.clone()
@@ -59,7 +59,7 @@ pub(crate) async fn update_agent(
     )?;
     let updated = {
         let mut summary = agent.summary.write().await;
-        if !summary.state.can_reconfigure() {
+        if !summary.can_reconfigure() {
             return Err(RuntimeError::AgentBusy(agent_id));
         }
         summary.provider_id = provider_selection.provider_id.to_string();

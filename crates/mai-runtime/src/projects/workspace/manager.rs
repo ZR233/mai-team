@@ -407,7 +407,7 @@ mod tests {
 
     use chrono::Utc;
     use mai_protocol::{
-        AgentResourceState, AgentState, AgentSummary, ProjectCloneStatus, ProjectStatus,
+        AgentResourceSnapshot, AgentResourceState, AgentSummary, ProjectCloneStatus, ProjectStatus,
         ProjectSummary,
     };
     use pretty_assertions::assert_eq;
@@ -675,7 +675,7 @@ mod tests {
         let agent_id = uuid::Uuid::new_v4();
         let project = test_project(project_id, agent_id);
         let mut live_agent = test_agent(agent_id, project_id);
-        live_agent.state.resource = AgentResourceState::Deleted;
+        live_agent.resource.state = AgentResourceState::Deleted;
         let legacy_worktrees = project_paths(dir.path(), project_id)
             .project_dir
             .join("worktrees");
@@ -805,10 +805,11 @@ mod tests {
             project_id: Some(project_id),
             parent_id: None,
             role: None,
-            state: AgentState {
-                resource: AgentResourceState::Ready,
-                ..AgentState::default()
+            resource: AgentResourceSnapshot {
+                state: AgentResourceState::Ready,
+                error: None,
             },
+            runtime: None,
             model: "model".to_string(),
             provider_id: "provider".to_string(),
             provider_name: "provider".to_string(),

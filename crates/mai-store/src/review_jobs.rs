@@ -921,7 +921,7 @@ fn record_submission_receipt_on_path(
     if existing.active_run_id.is_none() {
         let archived_run = transaction
             .query_row(
-                "SELECT id, reviewer_agent_id, turn_id, finished_at, history_json
+                "SELECT id, reviewer_agent_id, turn_id, finished_at, history_json, history_status
                  FROM project_review_runs WHERE job_id = ?1
                  ORDER BY attempt_index DESC, started_at DESC, id DESC LIMIT 1",
                 params![job_id.to_string()],
@@ -932,14 +932,25 @@ fn record_submission_receipt_on_path(
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
             .optional()?;
         match archived_run {
-            Some((run_id, reviewer_agent_id, turn_id, finished_at, history_json)) => {
+            Some((
+                run_id,
+                reviewer_agent_id,
+                turn_id,
+                finished_at,
+                history_json,
+                history_status,
+            )) => {
                 if finished_at.is_none()
-                    || (reviewer_agent_id.is_some() && turn_id.is_some() && history_json.is_none())
+                    || (reviewer_agent_id.is_some()
+                        && turn_id.is_some()
+                        && history_status == "available"
+                        && history_json.is_none())
                 {
                     return Err(StoreError::DataIntegrity(format!(
                         "review job {job_id} cannot reconcile receipt before Run {run_id} is archived"

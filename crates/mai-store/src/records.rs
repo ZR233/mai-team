@@ -140,6 +140,9 @@ pub(crate) struct ProjectReviewRunRecord {
     pub(crate) reasoning_output_tokens: i64,
     pub(crate) total_tokens: i64,
     pub(crate) history_json: Option<String>,
+    pub(crate) history_status: String,
+    pub(crate) history_archive_id: Option<String>,
+    pub(crate) history_archived_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +167,9 @@ pub(crate) struct ProjectReviewRunSummaryRecord {
     pub(crate) output_tokens: i64,
     pub(crate) reasoning_output_tokens: i64,
     pub(crate) total_tokens: i64,
+    pub(crate) history_status: String,
+    pub(crate) history_archive_id: Option<String>,
+    pub(crate) history_archived_at: Option<String>,
 }
 
 impl From<ProjectReviewRunRecord> for ProjectReviewRunSummaryRecord {
@@ -189,6 +195,9 @@ impl From<ProjectReviewRunRecord> for ProjectReviewRunSummaryRecord {
             output_tokens: record.output_tokens,
             reasoning_output_tokens: record.reasoning_output_tokens,
             total_tokens: record.total_tokens,
+            history_status: record.history_status,
+            history_archive_id: record.history_archive_id,
+            history_archived_at: record.history_archived_at,
         }
     }
 }
@@ -451,11 +460,11 @@ impl AgentRecordRow {
                 .transpose()?,
             role: self.role.as_deref().map(parse_store_enum).transpose()?,
             name: self.name,
-            state: mai_protocol::AgentState {
-                resource: parse_store_enum(&self.resource_state)?,
-                resource_error: self.resource_error,
-                runtime: mai_protocol::AgentRuntimeState::default(),
+            resource: mai_protocol::AgentResourceSnapshot {
+                state: parse_store_enum(&self.resource_state)?,
+                error: self.resource_error,
             },
+            runtime: None,
             container_id: self.container_id,
             docker_image: self.docker_image,
             provider_id: self.provider_id,
@@ -642,12 +651,20 @@ impl ProjectReviewRunSummaryRecord {
                 .map(serde_json::from_str)
                 .transpose()?,
             token_usage: TokenUsage {
-                input_tokens: i64_to_u64(self.input_tokens),
-                cached_input_tokens: i64_to_u64(self.cached_input_tokens),
-                output_tokens: i64_to_u64(self.output_tokens),
-                reasoning_output_tokens: i64_to_u64(self.reasoning_output_tokens),
+                prompt_tokens: i64_to_u64(self.input_tokens),
+                cached_prompt_tokens: i64_to_u64(self.cached_input_tokens),
+                cache_write_tokens: 0,
+                completion_tokens: i64_to_u64(self.output_tokens),
+                reasoning_tokens: i64_to_u64(self.reasoning_output_tokens),
                 total_tokens: i64_to_u64(self.total_tokens),
             },
+            history_status: parse_store_enum(&self.history_status)?,
+            history_archive_id: self.history_archive_id,
+            history_archived_at: self
+                .history_archived_at
+                .as_deref()
+                .map(parse_utc)
+                .transpose()?,
         })
     }
 }

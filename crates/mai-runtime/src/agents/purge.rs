@@ -73,7 +73,7 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::{DateTime, Utc};
-    use mai_protocol::{AgentState, TokenUsage};
+    use mai_protocol::{AgentResourceSnapshot, TokenUsage};
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
     use uuid::Uuid;
@@ -177,7 +177,8 @@ mod tests {
             project_id: None,
             role: None,
             name: "agent".to_string(),
-            state: AgentState::default(),
+            resource: AgentResourceSnapshot::default(),
+            runtime: None,
             container_id: None,
             docker_image: "unused".to_string(),
             provider_id: "mock".to_string(),

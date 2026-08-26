@@ -260,7 +260,7 @@ async fn set_resource_state(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use mai_protocol::{AgentState, TokenUsage};
+    use mai_protocol::{AgentResourceSnapshot, TokenUsage};
     use pretty_assertions::assert_eq;
     use tokio::sync::RwLock;
     use uuid::Uuid;
@@ -323,8 +323,8 @@ mod tests {
             change: AgentContainerStatusChange,
         ) -> Result<()> {
             let mut summary = agent.summary.write().await;
-            summary.state.resource = change.state;
-            summary.state.resource_error = change.error;
+            summary.resource.state = change.state;
+            summary.resource.error = change.error;
             Ok(())
         }
 
@@ -356,9 +356,9 @@ mod tests {
         assert!(agent.container.read().await.is_none());
         let summary = agent.summary.read().await.clone();
         assert_eq!(summary.container_id, None);
-        assert_eq!(summary.state.resource, AgentResourceState::Failed);
+        assert_eq!(summary.resource.state, AgentResourceState::Failed);
         assert_eq!(
-            summary.state.resource_error,
+            summary.resource.error,
             Some("invalid input: persist failed".to_string())
         );
     }
@@ -379,9 +379,9 @@ mod tests {
         assert!(agent.container.read().await.is_none());
         let summary = agent.summary.read().await.clone();
         assert_eq!(summary.container_id, None);
-        assert_eq!(summary.state.resource, AgentResourceState::Failed);
+        assert_eq!(summary.resource.state, AgentResourceState::Failed);
         assert_eq!(
-            summary.state.resource_error,
+            summary.resource.error,
             Some("invalid input: MCP config failed".to_string())
         );
     }
@@ -396,7 +396,8 @@ mod tests {
                 project_id: None,
                 role: None,
                 name: "agent".to_string(),
-                state: AgentState::default(),
+                resource: AgentResourceSnapshot::default(),
+                runtime: None,
                 container_id: None,
                 docker_image: "image".to_string(),
                 provider_id: "provider".to_string(),

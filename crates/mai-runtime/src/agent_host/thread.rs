@@ -1,11 +1,8 @@
 use std::sync::Arc;
 
-use mai_protocol::{
-    AgentMessageChannel, AgentSummary, Thread, ThreadItemContent, ThreadMode, ThreadStatus,
-    TokenUsage,
-};
+use mai_protocol::{AgentSummary, Thread, ThreadMode, ThreadStatus, ThreadTextChannel, TokenUsage};
 use mai_store::{MaiStore, StoredThreadRuntime};
-use pl_core::{ActiveKind, AgentActivityState, AgentLifecycleState, AgentSnapshot, ThreadId};
+use pl_core::{AgentSnapshot, AgentState, ThreadId};
 
 use crate::{Result, RuntimeError};
 
@@ -40,10 +37,11 @@ pub(crate) fn aggregate_usage(runtime: &StoredThreadRuntime) -> TokenUsage {
         return TokenUsage::default();
     };
     TokenUsage {
-        input_tokens: usage.prompt_tokens,
-        cached_input_tokens: usage.cached_prompt_tokens,
-        output_tokens: usage.completion_tokens,
-        reasoning_output_tokens: usage.reasoning_tokens,
+        prompt_tokens: usage.prompt_tokens,
+        cached_prompt_tokens: usage.cached_prompt_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        completion_tokens: usage.completion_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
         total_tokens: usage.total_tokens,
     }
 }
@@ -56,21 +54,9 @@ pub(crate) fn last_agent_response(runtime: &StoredThreadRuntime) -> Option<Strin
         .items
         .iter()
         .rev()
-        .find_map(|item| match &item.content {
-            ThreadItemContent::AgentMessage {
-                channel: AgentMessageChannel::Final,
-                text,
-            } => Some(text.clone()),
-            ThreadItemContent::UserMessage { .. }
-            | ThreadItemContent::AgentMessage {
-                channel: AgentMessageChannel::Commentary,
-                ..
-            }
-            | ThreadItemContent::Reasoning { .. }
-            | ThreadItemContent::Plan { .. }
-            | ThreadItemContent::ToolCall { .. }
-            | ThreadItemContent::File { .. }
-            | ThreadItemContent::ContextCompaction { .. } => None,
+        .find_map(|item| {
+            let text = item.text()?;
+            (text.channel() == ThreadTextChannel::Final).then(|| text.text().to_string())
         })
 }
 
@@ -98,23 +84,19 @@ pub(crate) fn thread_metadata(summary: &AgentSummary, snapshot: &AgentSnapshot) 
             .map(|role| role.to_string())
             .unwrap_or_default(),
         agent_path: summary.name.clone(),
-        status: match snapshot.lifecycle {
-            AgentLifecycleState::Closed => ThreadStatus::Closed,
-            AgentLifecycleState::Faulted => ThreadStatus::Failed,
-            AgentLifecycleState::Closing => ThreadStatus::Waiting,
-            AgentLifecycleState::Active => match snapshot.activity {
-                AgentActivityState::Idle => ThreadStatus::Idle,
-                AgentActivityState::Queued
-                | AgentActivityState::Active(ActiveKind::WaitingInteraction) => {
-                    ThreadStatus::Waiting
-                }
-                AgentActivityState::Active(ActiveKind::Running)
-                | AgentActivityState::Active(ActiveKind::WaitingTool) => ThreadStatus::Running,
-                AgentActivityState::Cancelling => ThreadStatus::Waiting,
-            },
+        status: match &snapshot.state {
+            AgentState::Idle(_) => ThreadStatus::Idle,
+            AgentState::Queued(_) => ThreadStatus::Queued,
+            AgentState::Running(_) => ThreadStatus::Running,
+            AgentState::WaitingTool(_) => ThreadStatus::WaitingTool,
+            AgentState::WaitingInteraction(_) => ThreadStatus::WaitingInteraction,
+            AgentState::Cancelling(_) => ThreadStatus::Cancelling,
+            AgentState::Closing(_) => ThreadStatus::Closing,
+            AgentState::Closed(_) => ThreadStatus::Closed,
+            AgentState::Faulted(_) => ThreadStatus::Faulted,
         },
         created_at: summary.created_at.timestamp(),
         updated_at: snapshot.updated_at,
-        archived: matches!(snapshot.lifecycle, AgentLifecycleState::Closed),
+        archived: matches!(snapshot.state, AgentState::Closed(_)),
     }
 }

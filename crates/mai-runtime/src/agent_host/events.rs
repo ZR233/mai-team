@@ -2,9 +2,9 @@ use std::sync::{Arc, Weak};
 
 use mai_protocol::MaiProductEventKind;
 use pl_core::{
-    AgentCommitObserver, AgentCommittedEvent, AgentLifecycleState, AgentRuntimeEventKind,
-    AgentSnapshot, TurnOutcomeKind,
+    AgentCommitObserver, AgentCommittedEvent, AgentRuntimeEventKind, AgentSnapshot, AgentState,
 };
+use pl_protocol::TurnOutcome;
 
 use crate::AgentRuntime;
 
@@ -104,11 +104,7 @@ async fn project_runtime_event(
             )
             .await;
         }
-        AgentRuntimeEventKind::TurnFinished {
-            outcome,
-            snapshot,
-            finalized_with_tool: _,
-        }
+        AgentRuntimeEventKind::TurnFinished { outcome, snapshot }
         | AgentRuntimeEventKind::RecoveryCancelledTurn { outcome, snapshot } => {
             let agent_id = persist_state(runtime, *snapshot).await?;
             super::trace_projection::record_agent_log(
@@ -117,15 +113,14 @@ async fn project_runtime_event(
                     agent_id,
                     thread_id: Some(outcome.thread_id.to_string()),
                     turn_id: Some(outcome.turn_id.to_string()),
-                    level: match outcome.kind {
-                        TurnOutcomeKind::Completed | TurnOutcomeKind::Cancelled => "info",
-                        TurnOutcomeKind::Failed | TurnOutcomeKind::BudgetLimited => "warn",
+                    level: match &outcome.outcome {
+                        TurnOutcome::Completed(_) | TurnOutcome::Cancelled(_) => "info",
+                        TurnOutcome::Failed(_) | TurnOutcome::BudgetLimited(_) => "warn",
                     },
                     category: "turn",
                     message: "turn completed",
                     details: serde_json::json!({
-                        "outcome": outcome.kind,
-                        "reason": outcome.reason,
+                        "outcome": outcome.outcome,
                         "revision": event.sequence,
                     }),
                     timestamp: event_time,
@@ -170,7 +165,7 @@ async fn project_runtime_event(
 /// 当前 Thread 的 UI 状态只由 PL subscription 驱动；产品事件仅用于 agent 资源、配置等
 /// 低频变化，避免每个 turn transition 都触发 AgentDetail 和项目/任务查询失效。
 async fn persist_state(
-    runtime: &Arc<AgentRuntime>,
+    runtime: &AgentRuntime,
     snapshot: AgentSnapshot,
 ) -> crate::Result<mai_protocol::AgentId> {
     let (agent_id, _) = project_state(runtime, snapshot).await?;
@@ -179,37 +174,40 @@ async fn persist_state(
 
 /// 启动恢复后以 PL snapshot 覆盖产品内存投影，不额外制造状态变更事件。
 pub(crate) async fn synchronize_runtime_state(
-    runtime: &Arc<AgentRuntime>,
+    runtime: &AgentRuntime,
     snapshot: AgentSnapshot,
 ) -> crate::Result<()> {
     project_state(runtime, snapshot).await.map(|_| ())
 }
 
 async fn project_state(
-    runtime: &Arc<AgentRuntime>,
+    runtime: &AgentRuntime,
     snapshot: AgentSnapshot,
 ) -> crate::Result<(mai_protocol::AgentId, mai_protocol::AgentSummary)> {
     let (agent_id, agent) =
         super::turn_factory::product_agent(runtime, &snapshot.identity.id).await?;
-    let canonical_id = super::canonical_id(agent_id)?;
-    let canonical = super::load_runtime(&runtime.deps.store, &canonical_id).await?;
     let mut current = agent.summary.write().await;
     let summary = {
         let mut summary = current.clone();
-        summary.state.runtime = super::runtime_state(&snapshot);
-        summary.token_usage = super::aggregate_usage(&canonical);
-        match snapshot.lifecycle {
-            AgentLifecycleState::Closing => {
-                summary.state.resource = mai_protocol::AgentResourceState::Deleting;
+        match &snapshot.state {
+            AgentState::Closing(_) => {
+                summary.resource.state = mai_protocol::AgentResourceState::Deleting;
             }
-            AgentLifecycleState::Closed => {
-                summary.state.resource = mai_protocol::AgentResourceState::Deleted;
-                summary.state.resource_error = None;
+            AgentState::Closed(_) => {
+                summary.resource.state = mai_protocol::AgentResourceState::Deleted;
+                summary.resource.error = None;
             }
-            AgentLifecycleState::Active | AgentLifecycleState::Faulted => {}
+            AgentState::Idle(_)
+            | AgentState::Queued(_)
+            | AgentState::Running(_)
+            | AgentState::WaitingTool(_)
+            | AgentState::WaitingInteraction(_)
+            | AgentState::Cancelling(_)
+            | AgentState::Faulted(_) => {}
         }
         summary.updated_at = chrono::DateTime::from_timestamp(snapshot.updated_at, 0)
             .unwrap_or_else(chrono::Utc::now);
+        summary.runtime = Some(snapshot);
         summary
     };
     runtime

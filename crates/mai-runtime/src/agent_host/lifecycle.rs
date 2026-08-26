@@ -185,7 +185,11 @@ impl AgentLifecycleAdapter for MaiAgentLifecycle {
         Ok(())
     }
 
-    async fn rollback_spawn(&self, lease: Self::SpawnLease) -> Result<()> {
+    async fn rollback_spawn(
+        &self,
+        lease: Self::SpawnLease,
+        _reason: pl_core::SpawnRollbackReason,
+    ) -> Result<()> {
         match lease.ownership {
             SpawnProductOwnership::Borrowed => return Ok(()),
             SpawnProductOwnership::CreatedHere => {}
@@ -214,6 +218,7 @@ impl AgentLifecycleAdapter for MaiAgentLifecycle {
         runtime
             .set_agent_resource_state(&agent, mai_protocol::AgentResourceState::Deleted, None)
             .await?;
+        runtime.tool_sets.remove(lease.product_agent_id).await;
         Ok(())
     }
 

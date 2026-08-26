@@ -147,16 +147,23 @@ impl MaiStore {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?,
-            input_tokens: u64_to_i64(run.summary.token_usage.input_tokens),
-            cached_input_tokens: u64_to_i64(run.summary.token_usage.cached_input_tokens),
-            output_tokens: u64_to_i64(run.summary.token_usage.output_tokens),
-            reasoning_output_tokens: u64_to_i64(run.summary.token_usage.reasoning_output_tokens),
+            input_tokens: u64_to_i64(run.summary.token_usage.prompt_tokens),
+            cached_input_tokens: u64_to_i64(run.summary.token_usage.cached_prompt_tokens),
+            output_tokens: u64_to_i64(run.summary.token_usage.completion_tokens),
+            reasoning_output_tokens: u64_to_i64(run.summary.token_usage.reasoning_tokens),
             total_tokens: u64_to_i64(run.summary.token_usage.total_tokens),
             history_json: run
                 .history
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?,
+            history_status: run.summary.history_status.to_string(),
+            history_archive_id: run.summary.history_archive_id.clone(),
+            history_archived_at: run
+                .summary
+                .history_archived_at
+                .as_ref()
+                .map(chrono::DateTime::to_rfc3339),
         })
         .exec(&mut tx)
         .await?;
@@ -180,7 +187,8 @@ impl MaiStore {
                     "SELECT id, project_id, job_id, attempt_index, reviewer_agent_id, turn_id, \
                      started_at, finished_at, status, outcome, review_event, pr, summary, error, \
                      failure_json, input_tokens, cached_input_tokens, output_tokens, \
-                     reasoning_output_tokens, total_tokens \
+                     reasoning_output_tokens, total_tokens, history_status, history_archive_id, \
+                     history_archived_at \
                      FROM project_review_runs WHERE project_id = ?1 AND started_at >= ?2 \
                      ORDER BY started_at DESC, id DESC LIMIT ?3 OFFSET ?4",
                 )?;
@@ -201,7 +209,8 @@ impl MaiStore {
                     "SELECT id, project_id, job_id, attempt_index, reviewer_agent_id, turn_id, \
                      started_at, finished_at, status, outcome, review_event, pr, summary, error, \
                      failure_json, input_tokens, cached_input_tokens, output_tokens, \
-                     reasoning_output_tokens, total_tokens \
+                     reasoning_output_tokens, total_tokens, history_status, history_archive_id, \
+                     history_archived_at \
                      FROM project_review_runs WHERE project_id = ?1 \
                      ORDER BY started_at DESC, id DESC LIMIT ?2 OFFSET ?3",
                 )?;

@@ -48,21 +48,15 @@ impl agents::AgentPurgeOps for AgentRuntime {
 }
 
 impl agents::AgentDeleteOps for AgentRuntime {
-    async fn close_canonical_agent(
-        &self,
-        agent_id: AgentId,
-    ) -> Result<agents::CanonicalAgentClose> {
-        self.agent(agent_id).await?;
+    async fn close_canonical_agent(&self, agent_id: AgentId) -> Result<()> {
+        self.ensure_framework_agent(agent_id).await?;
         self.state.thread_subscriptions.invalidate(agent_id).await;
         match self
             .framework_handle()?
             .retire(agent_host::canonical_id(agent_id)?)
             .await
         {
-            Ok(_) => Ok(agents::CanonicalAgentClose::Closed),
-            Err(pl_core::AgentRuntimeError::NotFound(_)) => {
-                Ok(agents::CanonicalAgentClose::Missing)
-            }
+            Ok(_) => Ok(()),
             Err(error) => Err(RuntimeError::InvalidInput(error.to_string())),
         }
     }
@@ -154,27 +148,6 @@ impl agents::AgentObservabilityOps for AgentRuntime {
         name: &str,
     ) -> PathBuf {
         AgentRuntime::tool_output_artifact_file_path(self, agent_id, call_id, artifact_id, name)
-    }
-}
-
-impl agents::AgentResourceBrokerOps for AgentRuntime {
-    fn project_skill_read_guard(
-        &self,
-        agent: &AgentRecord,
-    ) -> impl std::future::Future<Output = Option<tokio::sync::OwnedRwLockReadGuard<()>>> + Send
-    {
-        AgentRuntime::project_skill_read_guard(self, agent)
-    }
-
-    async fn skills_config(&self) -> Result<SkillsConfigRequest> {
-        Ok(self.deps.store.load_skills_config().await?)
-    }
-
-    fn skills_manager_for_agent(
-        &self,
-        agent: &AgentRecord,
-    ) -> impl std::future::Future<Output = Result<SkillsManager>> + Send {
-        AgentRuntime::skills_manager_for_agent(self, agent)
     }
 }
 

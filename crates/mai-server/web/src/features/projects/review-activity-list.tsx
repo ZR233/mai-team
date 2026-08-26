@@ -9,7 +9,9 @@ import type { ReviewActivity, ReviewConclusionView } from "./review-activity"
 
 export function ReviewActivityList({ activity }: { activity: ReviewActivity }) {
   return <div className="space-y-2.5">
-    {activity.items.length === 0
+    {activity.historyStatus === "pl_v2_archived"
+      ? <Alert><CircleAlert /><AlertTitle>PL v2 升级离线归档</AlertTitle><AlertDescription>此 Review 的旧 Timeline 已保存到部署归档，不再由当前服务在线读取。{activity.historyArchiveId && <> 归档标识：<code>{activity.historyArchiveId}</code></>}</AlertDescription></Alert>
+      : activity.items.length === 0
       ? <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">No review activity was archived.</p>
       : <TimelineEntriesView items={activity.items} />}
     <ReviewConclusion item={activity.conclusion} />

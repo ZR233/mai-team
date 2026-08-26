@@ -152,6 +152,9 @@ pub(crate) fn project_review_run_summary_record(
         output_tokens: row.get(17)?,
         reasoning_output_tokens: row.get(18)?,
         total_tokens: row.get(19)?,
+        history_status: row.get(20)?,
+        history_archive_id: row.get(21)?,
+        history_archived_at: row.get(22)?,
     })
 }
 

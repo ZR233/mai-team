@@ -2,9 +2,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use mai_protocol::{
-    AgentId, AgentModelPreference, AgentResourceState, AgentRole, AgentRuntimeLifecycle,
-    AgentSummary, CreateAgentRequest, ProjectId, ProjectReviewEnvironmentWarning, ProjectSummary,
-    TurnId,
+    AgentId, AgentModelPreference, AgentResourceState, AgentRole, AgentSummary, CreateAgentRequest,
+    ProjectId, ProjectReviewEnvironmentWarning, ProjectSummary, TurnId,
 };
 
 use crate::agents::ContainerSource;
@@ -253,8 +252,11 @@ async fn prepare_project_reviewer_inner(
 }
 
 fn project_reviewer_is_tombstone(reviewer: &AgentSummary) -> bool {
-    reviewer.state.resource == AgentResourceState::Deleted
-        || reviewer.state.runtime.lifecycle == AgentRuntimeLifecycle::Closed
+    reviewer.resource.state == AgentResourceState::Deleted
+        || reviewer
+            .runtime
+            .as_ref()
+            .is_some_and(|snapshot| matches!(snapshot.state, pl_protocol::AgentState::Closed(_)))
 }
 
 pub(crate) async fn reviewer_belongs_to_job(
@@ -418,9 +420,11 @@ mod tests {
     use std::sync::Arc;
 
     use mai_protocol::{
-        AgentModelPreference, AgentResourceState, AgentRuntimeLifecycle, AgentState,
-        ProjectCloneStatus, ProjectReviewOutcome, ProjectReviewStatus, ProjectStatus,
-        ProjectSummary, TokenUsage, now,
+        AgentModelPreference, AgentResourceSnapshot, AgentResourceState, ProjectCloneStatus,
+        ProjectReviewOutcome, ProjectReviewStatus, ProjectStatus, ProjectSummary, TokenUsage, now,
+    };
+    use pl_protocol::{
+        AgentIdentity, AgentRoleId, AgentSnapshot, AgentState, ClosedAgentState, ThreadId,
     };
     use serde_json::{Value, json};
     use tokio::sync::Mutex;
@@ -716,8 +720,9 @@ mod tests {
     async fn closed_reviewer_tombstone_is_removed_before_creating_replacement() {
         let mut ops = fake_reviewer_ops(PreparationFailure::Create);
         ops.reviewer_system_prompt = Some("stale reviewer".to_string());
-        ops.reviewer.state.resource = AgentResourceState::Deleted;
-        ops.reviewer.state.runtime.lifecycle = AgentRuntimeLifecycle::Closed;
+        ops.reviewer.resource.state = AgentResourceState::Deleted;
+        ops.reviewer.runtime.as_mut().expect("runtime").state =
+            AgentState::Closed(ClosedAgentState::new());
 
         let error = prepare_project_reviewer(
             &ops,
@@ -949,7 +954,25 @@ mod tests {
             project_id: Some(project_id),
             role: Some(role),
             name: role.to_string(),
-            state: AgentState::default(),
+            resource: AgentResourceSnapshot {
+                state: AgentResourceState::Ready,
+                error: None,
+            },
+            runtime: Some(AgentSnapshot {
+                identity: AgentIdentity {
+                    id: ThreadId::new(id.to_string()).expect("thread id"),
+                    parent_id: None,
+                    role: AgentRoleId::new(role.to_string()).expect("role"),
+                    depth: 0,
+                },
+                state: AgentState::idle(),
+                pending_inputs: 0,
+                progress: None,
+                last_turn: None,
+                revision: 1,
+                event_sequence: 1,
+                updated_at: timestamp.timestamp_millis(),
+            }),
             container_id: None,
             docker_image: "reviewer:latest".to_string(),
             provider_id: "provider".to_string(),

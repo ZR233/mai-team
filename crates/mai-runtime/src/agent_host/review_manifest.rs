@@ -1,7 +1,6 @@
 use serde::Serialize;
 
 use crate::projects::review::context::ProjectReviewContext;
-use crate::skills::SkillInjections;
 use crate::{Result, RuntimeError};
 
 #[derive(Serialize)]
@@ -35,7 +34,7 @@ struct RepositoryView<'a> {
 /// 将 review 准备阶段已经解析的事实固化为 PL pinned context。
 pub(super) fn section(
     context: &ProjectReviewContext,
-    skills: &SkillInjections,
+    skills: &[pl_core::SkillActivation],
 ) -> Result<pl_core::PinnedContextSection> {
     let manifest = ReviewManifest {
         pull_request: context.target.pr,
@@ -59,11 +58,7 @@ pub(super) fn section(
         changed_files_hash: &context.manifest.changed_files_hash,
         constraint_sources: &context.manifest.constraint_sources,
         discovered_skill_sources: &context.manifest.skill_sources,
-        activated_skills: skills
-            .items
-            .iter()
-            .map(|skill| skill.metadata.name.as_str())
-            .collect(),
+        activated_skills: skills.iter().map(|skill| skill.name.as_str()).collect(),
         github: &context.manifest.github,
         preflight: "GitHub review/check eligibility passed before this reviewer was prepared",
     };
@@ -121,7 +116,7 @@ mod tests {
             workspace_instructions: String::new(),
         });
 
-        let section = section(&context, &SkillInjections::default()).expect("manifest");
+        let section = section(&context, &[]).expect("manifest");
 
         assert_eq!(section.id.as_str(), pl_core::REVIEW_MANIFEST_SECTION_ID);
         assert!(section.content.contains("/project/repo"));

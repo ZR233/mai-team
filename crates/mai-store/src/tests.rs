@@ -1,14 +1,14 @@
 use super::*;
 use crate::schema::SETTING_SCHEMA_VERSION;
 use mai_protocol::{
-    AgentMessageChannel, McpServerScope, McpServerTransport, ProjectCloneStatus,
-    ProjectReviewDecision, ProjectReviewEnvironmentWarning, ProjectReviewFailure,
-    ProjectReviewFailureCategory, ProjectReviewJobSource, ProjectReviewJobStatus,
-    ProjectReviewOutcome, ProjectReviewRunStatus, ProjectReviewStatus,
-    ProjectReviewSubmissionIntent, ProjectReviewSubmissionReceipt, ProjectStatus,
-    ThreadContextDisposition, ThreadItem, ThreadItemContent, ThreadItemStatus, ThreadTurnHistory,
-    Turn, TurnState,
+    McpServerScope, McpServerTransport, ProjectCloneStatus, ProjectReviewDecision,
+    ProjectReviewEnvironmentWarning, ProjectReviewFailure, ProjectReviewFailureCategory,
+    ProjectReviewJobSource, ProjectReviewJobStatus, ProjectReviewOutcome, ProjectReviewRunStatus,
+    ProjectReviewStatus, ProjectReviewSubmissionIntent, ProjectReviewSubmissionReceipt,
+    ProjectStatus, ThreadContextDisposition, ThreadItem, ThreadItemState, ThreadTextChannel,
+    ThreadTurnHistory, Turn, TurnState,
 };
+use pl_protocol::{CompletedTurnState, ThreadContentLifecycle, ThreadTextItem, TurnCompletion};
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -58,6 +58,44 @@ fn test_project_summary(project_id: ProjectId, maintainer_agent_id: AgentId) -> 
         last_review_outcome: None,
         review_last_error: None,
     }
+}
+
+fn completed_turn(id: String, thread_id: String, started_at: i64, completed_at: i64) -> Turn {
+    Turn {
+        id,
+        thread_id,
+        revision: 1,
+        state: TurnState::Completed(CompletedTurnState::new(
+            Some(started_at),
+            completed_at,
+            TurnCompletion::Normal,
+        )),
+        updated_at: completed_at,
+    }
+}
+
+fn completed_final_item(
+    id: &str,
+    thread_id: String,
+    turn_id: String,
+    text: &str,
+    completed_at: i64,
+) -> ThreadItem {
+    ThreadItem::new(
+        id.to_string(),
+        thread_id,
+        turn_id,
+        0,
+        1,
+        completed_at,
+        completed_at,
+        ThreadItemState::Text(ThreadTextItem::new(
+            ThreadTextChannel::Final,
+            text.to_string(),
+            Vec::new(),
+            ThreadContentLifecycle::completed(completed_at),
+        )),
+    )
 }
 
 #[tokio::test]
@@ -557,40 +595,31 @@ async fn project_review_runs_round_trip_and_prune() {
                 error: None,
                 failure: None,
                 token_usage: TokenUsage {
-                    input_tokens: 100,
-                    cached_input_tokens: 60,
-                    output_tokens: 20,
-                    reasoning_output_tokens: 5,
+                    prompt_tokens: 100,
+                    cached_prompt_tokens: 60,
+                    cache_write_tokens: 0,
+                    completion_tokens: 20,
+                    reasoning_tokens: 5,
                     total_tokens: 120,
                 },
+                history_status: Default::default(),
+                history_archive_id: None,
+                history_archived_at: None,
             },
             history: Some(ThreadTurnHistory {
-                turn: Turn {
-                    id: turn_id.clone(),
-                    thread_id: reviewer_agent_id.to_string(),
-                    state: TurnState::Completed,
-                    failure: None,
-                    started_at: Some(started_at.timestamp_millis()),
-                    updated_at: finished_at.timestamp_millis(),
-                    completed_at: Some(finished_at.timestamp_millis()),
-                },
-                items: vec![ThreadItem {
-                    id: "item-1".to_string(),
-                    thread_id: reviewer_agent_id.to_string(),
-                    turn_id: turn_id.clone(),
-                    ordinal: 0,
-                    revision: 1,
-                    status: ThreadItemStatus::Completed,
-                    created_at: finished_at.timestamp_millis(),
-                    updated_at: finished_at.timestamp_millis(),
-                    completed_at: Some(finished_at.timestamp_millis()),
-                    error: None,
-                    content: ThreadItemContent::AgentMessage {
-                        channel: AgentMessageChannel::Final,
-                        text: "done".to_string(),
-                    },
-                    usage: None,
-                }],
+                turn: completed_turn(
+                    turn_id.clone(),
+                    reviewer_agent_id.to_string(),
+                    started_at.timestamp_millis(),
+                    finished_at.timestamp_millis(),
+                ),
+                items: vec![completed_final_item(
+                    "item-1",
+                    reviewer_agent_id.to_string(),
+                    turn_id.clone(),
+                    "done",
+                    finished_at.timestamp_millis(),
+                )],
                 context_disposition: ThreadContextDisposition::Active,
             }),
         })
@@ -608,10 +637,11 @@ async fn project_review_runs_round_trip_and_prune() {
     assert_eq!(
         runs[0].token_usage,
         TokenUsage {
-            input_tokens: 100,
-            cached_input_tokens: 60,
-            output_tokens: 20,
-            reasoning_output_tokens: 5,
+            prompt_tokens: 100,
+            cached_prompt_tokens: 60,
+            cache_write_tokens: 0,
+            completion_tokens: 20,
+            reasoning_tokens: 5,
             total_tokens: 120,
         }
     );
@@ -620,13 +650,11 @@ async fn project_review_runs_round_trip_and_prune() {
         .await
         .expect("detail")
         .expect("run exists");
-    assert_eq!(
-        detail.history.as_ref().expect("archived history").items[0].content,
-        ThreadItemContent::AgentMessage {
-            channel: AgentMessageChannel::Final,
-            text: "done".to_string(),
-        }
-    );
+    let text = detail.history.as_ref().expect("archived history").items[0]
+        .text()
+        .expect("final text item");
+    assert_eq!(text.channel(), ThreadTextChannel::Final);
+    assert_eq!(text.text(), "done");
 
     let connection = rusqlite::Connection::open(store.path()).expect("open sqlite");
     connection
@@ -703,6 +731,9 @@ async fn review_run_retention_removes_reference_to_missing_job() {
                 error: Some("missing job".to_string()),
                 failure: None,
                 token_usage: TokenUsage::default(),
+                history_status: Default::default(),
+                history_archive_id: None,
+                history_archived_at: None,
             },
             history: None,
         })
@@ -1084,6 +1115,9 @@ async fn delete_project_removes_review_runs() {
                 error: None,
                 failure: None,
                 token_usage: TokenUsage::default(),
+                history_status: Default::default(),
+                history_archive_id: None,
+                history_archived_at: None,
             },
             history: None,
         })
@@ -1143,11 +1177,7 @@ async fn skills_config_persists_in_settings() {
         .await
         .expect("open");
     let config = SkillsConfigRequest {
-        config: vec![mai_protocol::SkillConfigEntry {
-            name: Some("demo".to_string()),
-            path: None,
-            enabled: false,
-        }],
+        disabled: vec!["demo".to_string()],
     };
     store
         .save_skills_config(&config)
@@ -2069,6 +2099,9 @@ async fn review_attempt_start_atomically_increments_job_and_creates_run() {
             error: None,
             failure: None,
             token_usage: TokenUsage::default(),
+            history_status: Default::default(),
+            history_archive_id: None,
+            history_archived_at: None,
         }],
         store
             .load_project_review_job_attempts(job_id, 1)
@@ -2184,17 +2217,17 @@ async fn submitted_attempt_archives_run_before_releasing_job_ownership() {
             error: None,
             failure: None,
             token_usage: TokenUsage::default(),
+            history_status: Default::default(),
+            history_archive_id: None,
+            history_archived_at: None,
         },
         history: Some(ThreadTurnHistory {
-            turn: Turn {
-                id: turn_id,
-                thread_id: "reviewer-43".to_string(),
-                state: TurnState::Completed,
-                failure: None,
-                started_at: Some(started_at.timestamp_millis()),
-                updated_at: submitted_at.timestamp_millis(),
-                completed_at: Some(submitted_at.timestamp_millis()),
-            },
+            turn: completed_turn(
+                turn_id,
+                "reviewer-43".to_string(),
+                started_at.timestamp_millis(),
+                submitted_at.timestamp_millis(),
+            ),
             items: Vec::new(),
             context_disposition: ThreadContextDisposition::Active,
         }),
@@ -2815,6 +2848,9 @@ async fn terminal_review_job_persists_idempotent_retryable_cleanup_tasks() {
             error: None,
             failure: None,
             token_usage: TokenUsage::default(),
+            history_status: Default::default(),
+            history_archive_id: None,
+            history_archived_at: None,
         },
         history: None,
     };
@@ -2997,6 +3033,9 @@ async fn review_job_retention_preserves_active_and_leased_jobs() {
                 error: None,
                 failure: None,
                 token_usage: TokenUsage::default(),
+                history_status: Default::default(),
+                history_archive_id: None,
+                history_archived_at: None,
             },
             history: None,
         })
@@ -3207,6 +3246,9 @@ async fn pull_request_review_pages_aggregate_latest_jobs_and_preserve_attempt_hi
                 error: None,
                 failure: None,
                 token_usage: TokenUsage::default(),
+                history_status: Default::default(),
+                history_archive_id: None,
+                history_archived_at: None,
             },
             history: None,
         })

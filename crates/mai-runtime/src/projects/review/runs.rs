@@ -89,6 +89,9 @@ pub(crate) async fn record_project_review_startup_failure(
             error: Some(error),
             failure: None,
             token_usage: TokenUsage::default(),
+            history_status: Default::default(),
+            history_archive_id: None,
+            history_archived_at: None,
         },
         None,
     )
@@ -217,6 +220,9 @@ async fn finish_project_review_run_at(
                 error: request.error,
                 failure: request.failure,
                 token_usage: snapshot.token_usage,
+                history_status: existing.summary.history_status,
+                history_archive_id: existing.summary.history_archive_id,
+                history_archived_at: existing.summary.history_archived_at,
             },
             history: snapshot.history,
         })
@@ -381,6 +387,7 @@ mod tests {
         ProjectReviewSubmissionIntent, ProjectReviewSubmissionReceipt, ThreadContextDisposition,
         Turn, TurnState,
     };
+    use pl_protocol::{CompletedTurnState, TurnCompletion};
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
@@ -488,11 +495,13 @@ mod tests {
             turn: Turn {
                 id: turn_id,
                 thread_id: reviewer_agent_id.to_string(),
-                state: TurnState::Completed,
-                failure: None,
-                started_at: Some(started_at.timestamp_millis()),
+                revision: 0,
+                state: TurnState::Completed(CompletedTurnState::new(
+                    Some(started_at.timestamp_millis()),
+                    submitted_at.timestamp_millis(),
+                    TurnCompletion::Normal,
+                )),
                 updated_at: submitted_at.timestamp_millis(),
-                completed_at: Some(submitted_at.timestamp_millis()),
             },
             items: Vec::new(),
             context_disposition: ThreadContextDisposition::Active,
@@ -522,10 +531,11 @@ mod tests {
         let source = FixedSnapshotSource {
             snapshot: ReviewRunSnapshot {
                 token_usage: TokenUsage {
-                    input_tokens: 1,
-                    cached_input_tokens: 2,
-                    output_tokens: 3,
-                    reasoning_output_tokens: 4,
+                    prompt_tokens: 2,
+                    cached_prompt_tokens: 1,
+                    cache_write_tokens: 0,
+                    completion_tokens: 3,
+                    reasoning_tokens: 4,
                     total_tokens: 10,
                 },
                 history: Some(history.clone()),
@@ -706,11 +716,13 @@ mod tests {
             turn: Turn {
                 id: turn_id,
                 thread_id: reviewer_agent_id.to_string(),
-                state: TurnState::Completed,
-                failure: None,
-                started_at: Some(started_at.timestamp_millis()),
+                revision: 0,
+                state: TurnState::Completed(CompletedTurnState::new(
+                    Some(started_at.timestamp_millis()),
+                    recovered_at.timestamp_millis(),
+                    TurnCompletion::Normal,
+                )),
                 updated_at: recovered_at.timestamp_millis(),
-                completed_at: Some(recovered_at.timestamp_millis()),
             },
             items: Vec::new(),
             context_disposition: ThreadContextDisposition::Active,

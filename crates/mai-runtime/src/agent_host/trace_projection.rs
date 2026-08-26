@@ -3,7 +3,7 @@ use mai_protocol::{
     AgentId, AgentLogEntry, ThreadId, ToolOutputArtifactInfo, ToolTraceDetail, TurnId,
 };
 use pl_core::tool::output_format::projection::{
-    ToolLifecyclePhase, ToolLifecycleProjection, tool_lifecycle_projections,
+    ToolLifecycleProjection, ToolLifecycleState, tool_lifecycle_projections,
 };
 use pl_trace::TraceEvent;
 use serde_json::{Value, json};
@@ -31,20 +31,19 @@ pub(super) async fn project_trace_events(
     events: &[TraceEvent],
 ) {
     for projection in tool_lifecycle_projections(events, 500) {
-        match projection.phase() {
-            ToolLifecyclePhase::Started => {
+        match projection.state() {
+            ToolLifecycleState::Started(_) | ToolLifecycleState::Running(_) => {
                 project_tool_started(runtime, agent_id, &thread_id, &turn_id, &projection).await;
             }
-            ToolLifecyclePhase::Finished { success } => {
-                project_tool_completed(
-                    runtime,
-                    agent_id,
-                    &thread_id,
-                    &turn_id,
-                    &projection,
-                    *success,
-                )
-                .await;
+            ToolLifecycleState::Succeeded(_) => {
+                project_tool_completed(runtime, agent_id, &thread_id, &turn_id, &projection, true)
+                    .await;
+            }
+            ToolLifecycleState::Failed(_)
+            | ToolLifecycleState::Denied(_)
+            | ToolLifecycleState::Cancelled(_) => {
+                project_tool_completed(runtime, agent_id, &thread_id, &turn_id, &projection, false)
+                    .await;
             }
         }
     }
@@ -118,12 +117,12 @@ async fn project_tool_completed(
         call_id: projection.call_id().to_string(),
         tool_name: projection.tool_name().to_string(),
         arguments: projection.arguments().clone(),
-        output: projection.output().to_string(),
+        output: projection.output().unwrap_or_default().to_string(),
         success,
         duration_ms: projection.duration_ms(),
         started_at: Some(started_at),
         completed_at: Some(completed_at),
-        output_preview: projection.output_preview().to_string(),
+        output_preview: projection.output_preview().unwrap_or_default().to_string(),
         output_artifacts: projection.output_artifacts_as::<ToolOutputArtifactInfo>(),
     };
     if let Err(error) = runtime

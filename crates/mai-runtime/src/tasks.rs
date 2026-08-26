@@ -449,14 +449,14 @@ fn environment_summary_from_root(
         last_error: task
             .last_error
             .clone()
-            .or_else(|| root_agent.state.resource_error.clone())
+            .or_else(|| root_agent.resource.error.clone())
             .or_else(|| {
                 root_agent
-                    .state
                     .runtime
-                    .last_turn
                     .as_ref()
-                    .and_then(|turn| turn.reason.clone())
+                    .and_then(|snapshot| snapshot.last_turn.as_ref())
+                    .and_then(|turn| turn.outcome.failure())
+                    .map(|failure| failure.message.clone())
             }),
     }
 }

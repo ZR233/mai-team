@@ -48,7 +48,8 @@ impl MaiStore {
                      run.reviewer_agent_id, run.turn_id, run.started_at, run.finished_at, \
                      run.status, run.outcome, run.review_event, run.pr, run.summary, run.error, \
                      run.failure_json, run.input_tokens, run.cached_input_tokens, \
-                     run.output_tokens, run.reasoning_output_tokens, run.total_tokens \
+                     run.output_tokens, run.reasoning_output_tokens, run.total_tokens, \
+                     run.history_status, run.history_archive_id, run.history_archived_at \
                      FROM project_review_runs run JOIN project_review_jobs job ON job.id = run.job_id \
                      WHERE run.finished_at IS NULL {scope_clause} AND ( \
                      job.lease_expires_at IS NULL OR job.lease_expires_at <= ?1) \
@@ -102,7 +103,8 @@ impl MaiStore {
                 "SELECT id, project_id, job_id, attempt_index, reviewer_agent_id, turn_id, \
                  started_at, finished_at, status, outcome, review_event, pr, summary, error, \
                  failure_json, input_tokens, cached_input_tokens, output_tokens, \
-                 reasoning_output_tokens, total_tokens \
+                 reasoning_output_tokens, total_tokens, history_status, history_archive_id, \
+                 history_archived_at \
                  FROM project_review_runs WHERE job_id = ?1 ORDER BY attempt_index ASC, started_at ASC",
             )?;
             let rows = statement.query_map(
@@ -206,8 +208,9 @@ impl MaiStore {
                     id, project_id, job_id, attempt_index, reviewer_agent_id, turn_id,
                     started_at, finished_at, status, outcome, review_event, pr, summary, error,
                     failure_json, input_tokens, cached_input_tokens, output_tokens,
-                    reasoning_output_tokens, total_tokens, history_json
-                 ) VALUES (?1,?2,?3,?4,?5,NULL,?6,NULL,'syncing',NULL,NULL,?7,NULL,NULL,NULL,0,0,0,0,0,NULL)",
+                    reasoning_output_tokens, total_tokens, history_json, history_status,
+                    history_archive_id, history_archived_at
+                 ) VALUES (?1,?2,?3,?4,?5,NULL,?6,NULL,'syncing',NULL,NULL,?7,NULL,NULL,NULL,0,0,0,0,0,NULL,'available',NULL,NULL)",
                 params![
                     run_id.to_string(),
                     job.project_id.to_string(),
@@ -366,10 +369,10 @@ impl MaiStore {
                             run.summary.summary,
                             run.summary.error,
                             run.summary.failure.map(|failure| serde_json::to_string(&failure)).transpose()?,
-                            u64_to_i64(run.summary.token_usage.input_tokens),
-                            u64_to_i64(run.summary.token_usage.cached_input_tokens),
-                            u64_to_i64(run.summary.token_usage.output_tokens),
-                            u64_to_i64(run.summary.token_usage.reasoning_output_tokens),
+                            u64_to_i64(run.summary.token_usage.prompt_tokens),
+                            u64_to_i64(run.summary.token_usage.cached_prompt_tokens),
+                            u64_to_i64(run.summary.token_usage.completion_tokens),
+                            u64_to_i64(run.summary.token_usage.reasoning_tokens),
                             u64_to_i64(run.summary.token_usage.total_tokens),
                             run.history.map(|history| serde_json::to_string(&history)).transpose()?,
                             run.summary.id.to_string(),

@@ -7,10 +7,12 @@ use mai_docker::{DockerClient, SidecarParams, project_agent_workspace_volume};
 #[cfg(test)]
 use mai_protocol::ProjectSummary;
 use mai_protocol::{AgentId, ProjectId};
+#[cfg(test)]
+use pl_core::GitToolKind;
 use pl_core::{
     ExecutionBackend, ExecutionOutput, ExecutionRequest, GIT_TOKEN_ENV, GitCredential,
     GitCredentialProvider, GitCredentialRequest, GitPolicy, GitShellCommandRequest,
-    GitShellCredential, GitToolKind, GitWorkspaceConfig, git_shell_command,
+    GitShellCredential, GitWorkspaceConfig, git_shell_command,
 };
 #[cfg(test)]
 use serde_json::Value;
@@ -21,9 +23,9 @@ use tokio::process::Command;
 use crate::github::github_clone_url;
 use crate::projects;
 use crate::state::AgentRecord;
-#[cfg(test)]
-use crate::turn::tool_output::ToolExecution;
 use crate::{AgentRuntime, Result, RuntimeError};
+#[cfg(test)]
+use pl_core::ToolResult;
 
 #[cfg(test)]
 pub(crate) struct GitToolContext<'a> {
@@ -46,7 +48,7 @@ pub(crate) async fn execute_git_tool(
     context: GitToolContext<'_>,
     name: &str,
     arguments: Value,
-) -> Result<ToolExecution> {
+) -> Result<ToolResult> {
     let GitToolBackend::Host { projects_root, .. } = &context.backend;
     let clone =
         projects::workspace::agent_clone_path(projects_root, context.project.id, context.agent_id);
@@ -58,7 +60,7 @@ pub(crate) async fn execute_git_tool(
     let kind = GitToolKind::from_name(name)
         .ok_or_else(|| RuntimeError::InvalidInput(format!("unsupported git tool `{name}`")))?;
     let output = execute_git_tool_via_registry(&context, kind, arguments).await?;
-    Ok(ToolExecution::success(output))
+    Ok(ToolResult::success(output))
 }
 
 #[cfg(test)]
@@ -68,7 +70,6 @@ async fn execute_git_tool_via_registry(
     arguments: Value,
 ) -> Result<String> {
     let config = git_workspace_config(context);
-    let workspace_root = config.worktree.clone();
     let tool = pl_core::GitTool::new(
         kind,
         config,
@@ -80,26 +81,8 @@ async fn execute_git_tool_via_registry(
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
     let output = pl_core::Tool::execute(
         &tool,
-        pl_core::ToolInput {
-            arguments,
-            session_id: "mai-project-git".to_string(),
-            tool_id: kind.name().to_string(),
-            revision_base: 0,
-        },
-        pl_core::ToolContext {
-            event_tx,
-            options: pl_core::TurnOptions::default(),
-            workspace_access: pl_core::WorkspaceAccess::WorkspaceOnly,
-            workspace: pl_core::AgentWorkspace::local(workspace_root),
-            workspace_instructions: None,
-            instruction_snapshot: None,
-            provider_call_id: None,
-            active_subagent: None,
-            lsp_runtime: None,
-            parent_session: Arc::new(pl_core::AgentSession::new()),
-            working_set: pl_core::TurnWorkingSetHandle::default(),
-            tool_cache: pl_core::tool::cache::TurnToolCacheHandle::default(),
-        },
+        pl_core::ToolInput { arguments },
+        pl_core::ToolCallContext::new(pl_core::ToolCallIdentity::default(), event_tx),
     )
     .await
     .map_err(runtime_error_from_pure)?;
@@ -115,18 +98,11 @@ pub(crate) struct NativeGitToolRuntime {
 pub(crate) async fn native_git_tool_runtime(
     runtime: Arc<AgentRuntime>,
     agent: &AgentRecord,
-    visible_tool: impl Fn(&str) -> bool,
 ) -> Result<Option<NativeGitToolRuntime>> {
     let summary = agent.summary.read().await.clone();
     let Some(project_id) = summary.project_id else {
         return Ok(None);
     };
-    if !GitToolKind::all()
-        .iter()
-        .any(|kind| visible_tool(kind.name()))
-    {
-        return Ok(None);
-    }
     let project = runtime.project(project_id).await?;
     let project_summary = project.summary.read().await.clone();
     let workspace_volume =
@@ -391,83 +367,6 @@ mod tests {
     use super::*;
     use crate::projects::workspace;
 
-    #[test]
-    fn project_git_tool_uses_the_pl_core_typed_tool_contract() {
-        let source = include_str!("git.rs");
-        let start = source
-            .find("pub(crate) async fn execute_git_tool")
-            .expect("execute_git_tool");
-        let end = source
-            .find("pub(crate) struct NativeGitToolRuntime")
-            .expect("native git runtime");
-        let execute_path = &source[start..end];
-
-        assert!(
-            execute_path.contains("pl_core::GitTool::new"),
-            "project git tools must execute the PL typed GitTool"
-        );
-        assert!(
-            execute_path.contains("pl_core::Tool::execute"),
-            "project git tools must use the canonical Tool execution contract"
-        );
-        assert!(
-            !execute_path.contains("AgentKernel"),
-            "project git tool tests must not rebuild the removed kernel compatibility facade"
-        );
-        for forbidden in [
-            format!("{}{}", ".register", "(kernel.core_mut"),
-            "output.description".to_string(),
-        ] {
-            assert!(
-                !execute_path.contains(&forbidden),
-                "project git tools must not assemble `{forbidden}` locally"
-            );
-        }
-        assert!(
-            !source.contains(&format!("{}{}", "execute_pl_core", "_git_tool")),
-            "project git tools should not keep a direct GitTool execution helper"
-        );
-        assert!(
-            !source.contains(&format!("{}{}", "GitToolBackend::", "Sidecar")),
-            "sidecar git execution must use MaiGitExecutionBackend through the PL GitTool"
-        );
-    }
-
-    #[test]
-    fn git_backends_delegate_tool_error_shape_to_pl_core() {
-        let source = include_str!("git.rs");
-        let credential_impl = source_snippet(
-            source,
-            "impl GitCredentialProvider for MaiGitCredentialProvider",
-            "#[cfg(test)]\nstruct ProjectGitExecutionBackend",
-        );
-        let host_backend_impl = source_snippet(
-            source,
-            "impl ExecutionBackend for ProjectGitExecutionBackend",
-            "#[derive(Clone)]\npub(crate) struct MaiGitExecutionBackend",
-        );
-        let sidecar_backend_impl = source_snippet(
-            source,
-            "impl ExecutionBackend for MaiGitExecutionBackend",
-            "#[cfg(test)]\nasync fn run_host_git_request",
-        );
-
-        for snippet in [credential_impl, host_backend_impl, sidecar_backend_impl] {
-            assert!(
-                !snippet.contains(&format!("{}{}", "ToolExecution", "Failed")),
-                "git adapter 不应手动构造 pl-core 工具错误"
-            );
-            assert!(
-                !snippet.contains(&format!("{}{}", "Pure", "Error")),
-                "git adapter 不应依赖 pl 协议错误类型"
-            );
-            assert!(
-                !snippet.contains("pure_error_from_runtime"),
-                "git adapter 不应把 RuntimeError 包装回 pl 协议错误"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn git_status_runs_inside_agent_clone() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -524,7 +423,8 @@ mod tests {
         .await
         .expect("execute info");
 
-        let payload: Value = serde_json::from_str(&execution.output).expect("json payload");
+        let payload: Value =
+            serde_json::from_str(&execution.canonical_output()).expect("json payload");
         assert_eq!(payload["project_id"], json!(project_id));
         assert_eq!(
             payload["repo_cache"],
@@ -561,7 +461,8 @@ mod tests {
         .await
         .expect("execute workspace info");
 
-        let payload: Value = serde_json::from_str(&execution.output).expect("json payload");
+        let payload: Value =
+            serde_json::from_str(&execution.canonical_output()).expect("json payload");
         assert_eq!(payload["clone"], json!(clone_path));
     }
 
@@ -686,20 +587,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sidecar_git_command_delegates_to_pl_core_shell_helper() {
-        let source = include_str!("git.rs");
-        let production =
-            source_snippet(source, "async fn run_sidecar_git_output", "\n#[cfg(test)]");
-
-        assert!(production.contains("git_shell_command"));
-        assert!(production.contains("GitShellCommandRequest"));
-        assert!(!production.contains("fn git_askpass_script"));
-        assert!(!production.contains("sidecar_git_command_with_askpass"));
-        assert!(!production.contains("MAI_GITHUB_INSTALLATION_TOKEN"));
-        assert!(!production.contains("shell_words::quote"));
-    }
-
     #[tokio::test]
     async fn git_commit_and_push_disable_hooks() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -802,7 +689,8 @@ mod tests {
         .await
         .expect("sync default branch");
 
-        let payload: Value = serde_json::from_str(&execution.output).expect("sync payload");
+        let payload: Value =
+            serde_json::from_str(&execution.canonical_output()).expect("sync payload");
         assert_eq!(payload["preservedChanges"], json!(true));
         let git_log = read_git_log(dir.path());
         assert!(git_log.contains("stash push -u -m pl-core sync default branch"));
@@ -843,15 +731,6 @@ mod tests {
 
     fn fake_git_path(root: &Path) -> String {
         fake_git_path_with_status(root, "")
-    }
-
-    fn source_snippet<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-        let start = source.find(start).expect("snippet start");
-        let end = source[start..]
-            .find(end)
-            .map(|offset| start + offset)
-            .expect("snippet end");
-        &source[start..end]
     }
 
     fn fake_git_path_with_status(root: &Path, status_output: &str) -> String {

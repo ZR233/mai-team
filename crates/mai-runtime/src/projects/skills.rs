@@ -2,7 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::skills::SkillsManager;
+use crate::config::MaiSkillsConfig;
+use crate::skills::SkillCatalogService;
 use mai_protocol::{ProjectId, SkillScope, SkillsListResponse};
 use mai_store::MaiStore;
 use pl_core::shell_quote_word;
@@ -51,11 +52,14 @@ pub(crate) async fn list_from_cache(
     cache_root: &Path,
     lock: &Arc<RwLock<()>>,
     project_id: ProjectId,
+    policy: &MaiSkillsConfig,
 ) -> Result<SkillsListResponse> {
     let _guard = lock.read().await;
     let config = store.load_skills_config().await?;
-    let mut response =
-        SkillsManager::with_roots(roots_for_project(cache_root, project_id)).list(&config)?;
+    let project_cache = cache_dir(cache_root, project_id);
+    let catalog =
+        SkillCatalogService::with_roots(project_cache, roots_for_project(cache_root, project_id));
+    let mut response = catalog.list(&config, policy).await?;
     apply_project_source_paths(cache_root, project_id, &mut response);
     Ok(response)
 }

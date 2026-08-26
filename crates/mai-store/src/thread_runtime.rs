@@ -374,7 +374,7 @@ async fn upsert_thread_turn(
             update
                 .turn
                 .as_ref()
-                .map(|turn| turn.started_at.unwrap_or(turn.updated_at))
+                .map(|turn| turn.started_at().unwrap_or(turn.updated_at))
         })
         .ok_or_else(|| StoreError::InvalidConfig(format!("Turn {} lacks ordinal", update.id)))?;
     if !existing.is_empty() {
@@ -511,10 +511,8 @@ fn parse_cursor(cursor: &str) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use mai_protocol::{
-        ThreadAttachment, ThreadItem, ThreadItemContent, ThreadItemStatus, ThreadSnapshot, Turn,
-        TurnState,
-    };
+    use mai_protocol::{ThreadAttachment, ThreadItem, ThreadSnapshot, Turn, TurnState};
+    use pl_protocol::{CompletedTurnState, TurnCompletion};
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -635,23 +633,14 @@ mod tests {
         ] {
             let turn = turn(turn_id, thread_id, timestamp);
             let mut snapshot = ThreadSnapshot::empty(thread_id);
-            snapshot.items.push(ThreadItem {
-                id: format!("item-{thread_id}"),
-                thread_id: thread_id.to_string(),
-                turn_id: turn_id.to_string(),
-                ordinal: 0,
-                revision: 1,
-                status: ThreadItemStatus::Completed,
-                created_at: timestamp,
-                updated_at: timestamp,
-                completed_at: Some(timestamp),
-                error: None,
-                content: ThreadItemContent::UserMessage {
-                    text: text.to_string(),
-                    attachments: Vec::<ThreadAttachment>::new(),
-                },
-                usage: None,
-            });
+            snapshot.items.push(ThreadItem::completed_user_message(
+                format!("item-{thread_id}"),
+                thread_id.to_string(),
+                turn_id.to_string(),
+                text.to_string(),
+                Vec::<ThreadAttachment>::new(),
+                timestamp,
+            ));
             assert_eq!(
                 store
                     .commit_thread_runtime(commit(thread_id, None, 1, Some(turn), Some(snapshot),))
@@ -722,11 +711,13 @@ mod tests {
         Turn {
             id: id.to_string(),
             thread_id: thread_id.to_string(),
-            state: TurnState::Completed,
-            failure: None,
-            started_at: Some(timestamp),
+            revision: 1,
+            state: TurnState::Completed(CompletedTurnState::new(
+                Some(timestamp),
+                timestamp,
+                TurnCompletion::Normal,
+            )),
             updated_at: timestamp,
-            completed_at: Some(timestamp),
         }
     }
 }

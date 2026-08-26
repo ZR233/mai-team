@@ -109,6 +109,7 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
         );
     }
     ensure_startup_chat_environment(&runtime).await?;
+    let shutdown_runtime = Arc::clone(&runtime);
     let state = Arc::new(AppState {
         runtime,
         store,
@@ -119,8 +120,33 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
 
     println!("Open http://{addr}/");
     info!("mai-team listening on http://{addr}");
-    axum::serve(listener, app).await?;
+    let serve_result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+    shutdown_runtime.shutdown().await?;
+    serve_result?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result {
+                    tracing::error!("failed to listen for shutdown signal: {error}");
+                }
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::error!("failed to listen for shutdown signal: {error}");
+    }
 }
 
 async fn bind_server_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener> {

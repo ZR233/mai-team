@@ -177,6 +177,7 @@ const reviewRun = {
   started_at: "2026-08-11T10:00:00Z",
   finished_at: "2026-08-11T10:01:00Z",
   summary: "Review completed",
+  history_status: "available",
 }
 
 const projectSummary = {
@@ -193,7 +194,17 @@ function projectDetail() {
     id: "agent-1",
     name: "Maintainer",
     role: "planner",
-    state: { resource: "ready", runtime: { lifecycle: "active", activity: "idle", active_turn: null, pending_inputs: 0 } },
+    resource: { state: "ready", error: null },
+    runtime: {
+      identity: { id: "agent-1", parentId: null, role: "planner", depth: 0 },
+      state: { kind: "idle", data: null },
+      pendingInputs: 0,
+      progress: null,
+      lastTurn: null,
+      revision: 1,
+      eventSequence: 1,
+      updatedAt: 1,
+    },
     provider_id: "fixture",
     provider_name: "Fixture",
     model: "fixture-model",

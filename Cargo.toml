@@ -23,10 +23,10 @@ ctrlc = { version = "3", features = ["termination"] }
 fnv = "1"
 percent-encoding = "2"
 pretty_assertions = "1"
-pl-core = { git = "https://github.com/ZR233/pure-lang.git", rev = "efa318ad1469d5c0a615487d7ece38e6beb1b9d6", default-features = false }
-pl-model = { git = "https://github.com/ZR233/pure-lang.git", rev = "efa318ad1469d5c0a615487d7ece38e6beb1b9d6" }
-pl-protocol = { git = "https://github.com/ZR233/pure-lang.git", rev = "efa318ad1469d5c0a615487d7ece38e6beb1b9d6" }
-pl-trace = { git = "https://github.com/ZR233/pure-lang.git", rev = "efa318ad1469d5c0a615487d7ece38e6beb1b9d6" }
+pl-core = { git = "https://github.com/ZR233/pure-lang.git", rev = "df7018a0fa3cdd3814e9855100b76893aba92561", default-features = false }
+pl-model = { git = "https://github.com/ZR233/pure-lang.git", rev = "df7018a0fa3cdd3814e9855100b76893aba92561" }
+pl-protocol = { git = "https://github.com/ZR233/pure-lang.git", rev = "df7018a0fa3cdd3814e9855100b76893aba92561" }
+pl-trace = { git = "https://github.com/ZR233/pure-lang.git", rev = "df7018a0fa3cdd3814e9855100b76893aba92561" }
 
 schemars = "1"
 shell-words = "1"
@@ -39,17 +39,16 @@ clap = { version = "4.6.1", features = ["derive"] }
 dirs = "6"
 futures = "0.3"
 async-stream = "0.3"
-gray_matter = "0.3.2"
 http = "1"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 mime_guess = "2"
 reqwest = { version = "0.13", features = ["json", "rustls", "stream"], default-features = false }
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["backup", "bundled"] }
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde-saphyr = "0.0.26"
 serde_yaml = "0.9"
+sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }

@@ -97,9 +97,15 @@ Reviewer 是普通 project agent，但生命周期绑定 Job，而不是单次 R
 - 首次尝试创建 Reviewer、canonical Thread、精确 head 工作区和只读默认分支上下文。
 - Reviewer system prompt 带有不可变的 Job ID、PR 和 head marker。若服务在 Agent 已持久化、但 `reviewer_agent_id` 尚未回写 Job 的窄窗口重启，只能由 marker 完全匹配的同一 Job 认领；不同 head 或不同 generation 不得复用。
 - 可重试失败保留同一个 Reviewer、Thread 和会话笔记；下一次尝试启动新的 continuation turn，不重放失败 turn。
-- 重启后恢复持久化 `ThreadActorState`，并按 Job 固定的 head SHA 重建工作区和 Review 上下文。
+- 普通重启后，产品先恢复 Reviewer 身份；第一次查询进度或继续尝试时按 ID 惰性恢复持久化
+  `ThreadActorState`，并按 Job 固定的 head SHA 重建工作区和 Review 上下文。启动过程不全量驻留
+  所有 Agent。
 - Thread 丢失或损坏是永久失败，不以空 Thread 静默重审。
 - 只有 Job 进入 `Succeeded`、`Failed`、`Cancelled` 或 `Superseded` 后才删除 Reviewer、live Thread、上下文和工作区；终态清理也使用 marker 找回尚未写入 Job 的 Reviewer，timeline 只保留在 Run 的不可变 `ThreadTurnHistory` 归档中。
+
+PL v2 的 schema 31→32 升级是一次明确例外：部署窗口先正常取消并清理所有 Review Agent，完整
+v1 数据库离线归档，在线库不转换旧 Thread/Timeline。升级健康后按最新 PR head 为被取消目标建立
+新的 Review Job/Run，不能把旧 Review Thread 当作损坏数据恢复。
 
 ## 结构化错误与重试
 
@@ -140,6 +146,12 @@ GitHub 回执是成功的硬条件：已有回执时，即使最终模型 JSON �
 
 ## API 与展示
 
-列表和详情 API 以 Job 为主对象，详情按 `attempt_index` 展示各次 Run。Web 必须把 `RetryWaiting`、`Reconciling` 显示为活跃阶段，并展示结构化错误、下次重试时间、SubmissionIntent 和 GitHub receipt。Review Run detail 只返回业务结果和不可变 `ThreadTurnHistory`，不得重新订阅已经删除的 Reviewer Thread。
+列表和详情 API 以 Job 为主对象，详情按 `attempt_index` 展示各次 Run。Web 必须把
+`RetryWaiting`、`Reconciling` 显示为活跃阶段，并展示结构化错误、下次重试时间、
+SubmissionIntent 和 GitHub receipt。可用的 v2 Run detail 返回业务结果和不可变
+`ThreadTurnHistory`，不得重新订阅已经删除的 Reviewer Thread。
 
-历史 schema 迁移为每条旧 Run 创建一个对应 Job。历史终态不自动重放；部署时仍活跃的 Run 标为 `Interrupted`，其 Job 进入启动协调流程。
+schema 32 继续保留旧 Job/Run、intent、receipt、状态、用量和时间事实，但旧 Timeline 只存在于
+`framework-archives/pl-v2-<timestamp>/`。对应 Run 返回 `history_status = pl_v2_archived`、归档 ID
+和时间；Web 显示明确的离线归档说明，不发起旧 Thread 请求，不使用加载失败或损坏文案。旧终态
+不自动重放；迁移前受控取消的目标在新服务健康后按最新 head 重新入队。

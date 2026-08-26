@@ -1,9 +1,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use mai_protocol::{
-    AgentId, AgentRole, AgentSummary, AgentTurnOutcomeKind, TaskId, TaskStatus, TurnId,
-};
+use mai_protocol::{AgentId, AgentRole, AgentSummary, TaskId, TaskStatus, TurnId};
 
 use crate::state::RuntimeState;
 use crate::{Result, RuntimeError};
@@ -140,19 +138,12 @@ pub(crate) async fn run_task_workflow(
     Ok(())
 }
 
-fn failed_turn_outcome(summary: &AgentSummary) -> Option<AgentTurnOutcomeKind> {
+fn failed_turn_outcome(summary: &AgentSummary) -> Option<&pl_protocol::TurnOutcome> {
     summary
-        .state
         .runtime
+        .as_ref()?
         .last_turn
         .as_ref()
-        .map(|turn| turn.outcome)
-        .filter(|outcome| {
-            matches!(
-                outcome,
-                AgentTurnOutcomeKind::Failed
-                    | AgentTurnOutcomeKind::Cancelled
-                    | AgentTurnOutcomeKind::BudgetLimited
-            )
-        })
+        .map(|turn| &turn.outcome)
+        .filter(|outcome| !matches!(outcome, pl_protocol::TurnOutcome::Completed(_)))
 }

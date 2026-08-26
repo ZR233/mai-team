@@ -21,6 +21,7 @@ import { Input } from "@/components/ui/input"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { WorkspaceHeader } from "@/components/workspace-header"
+import { agentPresentationStatus } from "@/features/agents/agent-lifecycle"
 import { ThreadWorkspace } from "@/features/thread/thread-workspace"
 
 export default function TasksPage() {
@@ -87,7 +88,7 @@ function TaskWorkspace({ detail, selectAgent, refresh, onDeleted }: { detail: Ta
       {detail.plan.markdown && <CollapsibleContent className="max-h-72 overflow-auto border-t bg-background px-5 py-4"><Markdown>{detail.plan.markdown}</Markdown>{canApprove && <Alert className="mt-4"><Check /><AlertTitle>Plan ready for approval</AlertTitle><AlertDescription><div className="mt-3 flex flex-wrap items-center gap-2"><Button onClick={() => void action("plan:approve")}><Check data-icon="inline-start" /> Approve plan</Button><Input className="min-w-56 flex-1" value={feedback} onChange={(event) => setFeedback(event.target.value)} placeholder="Revision feedback" /><Button variant="outline" disabled={!feedback.trim()} onClick={() => void action("plan:request-revision", { feedback }).then(() => setFeedback(""))}>Request revision</Button></div></AlertDescription></Alert>}</CollapsibleContent>}
     </Collapsible>
     {detail.artifacts.length > 0 && <div className="flex shrink-0 gap-2 overflow-x-auto border-b px-4 py-2">{detail.artifacts.map((artifact) => <Button key={artifact.id} asChild variant="outline" size="sm"><a href={`/artifacts/${encodeURIComponent(artifact.id)}/download`} download><Download data-icon="inline-start" />{artifact.name}<span className="text-muted-foreground">{formatBytes(artifact.size_bytes)}</span></a></Button>)}</div>}
-    <div className="shrink-0 overflow-x-auto border-b bg-muted/20 p-2"><Tabs value={selected.id} onValueChange={selectAgent}><TabsList>{detail.agents.map((agent) => <TabsTrigger key={agent.id} value={agent.id} className="min-w-48 justify-start"><Bot data-icon="inline-start" /><span className="min-w-0 flex-1 text-left"><strong className="block truncate text-xs">{agent.name}</strong><small className="block truncate text-[11px] text-muted-foreground">{agent.role} · {agent.model}</small></span><StatusDot status={agent.state.runtime?.activity || agent.state.resource} /></TabsTrigger>)}</TabsList></Tabs></div>
+    <div className="shrink-0 overflow-x-auto border-b bg-muted/20 p-2"><Tabs value={selected.id} onValueChange={selectAgent}><TabsList>{detail.agents.map((agent) => <TabsTrigger key={agent.id} value={agent.id} className="min-w-48 justify-start"><Bot data-icon="inline-start" /><span className="min-w-0 flex-1 text-left"><strong className="block truncate text-xs">{agent.name}</strong><small className="block truncate text-[11px] text-muted-foreground">{agent.role} · {agent.model}</small></span><StatusDot status={agentPresentationStatus(agent)} /></TabsTrigger>)}</TabsList></Tabs></div>
     <ThreadWorkspace agent={selected} onAgentUpdated={refresh} onSend={(message, skillMentions) => api(`/threads/${encodeURIComponent(selected.thread.id)}/messages`, { method: "POST", ...jsonBody({ message, skill_mentions: skillMentions }) })} onStop={async (turnId) => { await api(`/agents/${selected.id}/turns/${turnId}/cancel`, { method: "POST" }) }} />
   </section>
 }

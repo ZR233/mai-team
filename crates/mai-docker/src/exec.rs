@@ -728,21 +728,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shell_command_helpers_delegate_to_pl_core() {
-        let source = include_str!("exec.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production section");
-
-        assert!(production.contains("shell_command_with_timeout"));
-        assert!(production.contains("ShellCommandTimeout"));
-        assert!(!production.contains("shell_words::quote"));
-        assert!(!production.contains("fn shell_command_with_optional_timeout"));
-        assert!(!production.contains("fn shell_quote"));
-    }
-
     #[tokio::test]
     async fn sidecar_shell_env_times_out_stuck_docker_process() {
         let script = fake_docker_script("exec sleep 30\n");

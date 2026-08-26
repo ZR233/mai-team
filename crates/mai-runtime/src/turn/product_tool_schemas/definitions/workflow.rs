@@ -1,7 +1,7 @@
 #[cfg(test)]
-use pl_core::FunctionToolDefinition;
+use pl_core::TypedTool;
 #[cfg(test)]
-use pl_model::ToolSchema;
+use pl_model::ToolSpec;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -79,7 +79,7 @@ pub(crate) enum ToolArtifactRange {
 }
 
 #[cfg(test)]
-pub(crate) fn definitions() -> Vec<ToolSchema> {
+pub(crate) fn definitions() -> Vec<ToolSpec> {
     vec![
         schema::<SaveTaskPlanInput>(TOOL_SAVE_TASK_PLAN, SAVE_TASK_PLAN_DESCRIPTION),
         schema::<SubmitReviewResultInput>(
@@ -92,13 +92,13 @@ pub(crate) fn definitions() -> Vec<ToolSchema> {
 }
 
 #[cfg(test)]
-fn schema<Input>(name: &str, description: &str) -> ToolSchema
+fn schema<Input>(name: &str, description: &str) -> ToolSpec
 where
     Input: JsonSchema,
 {
-    ToolSchema::function(
+    ToolSpec::function(
         name,
         description,
-        FunctionToolDefinition::<Input>::new(name, description).input_schema(),
+        TypedTool::<Input>::new(name, description).input_schema(),
     )
 }

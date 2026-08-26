@@ -2,7 +2,7 @@ pub(crate) mod github;
 pub(crate) mod review;
 pub(crate) mod workflow;
 
-pub(crate) use github::{GITHUB_API_REQUEST_DESCRIPTION, GithubApiRequest};
+pub(crate) use github::{GITHUB_API_REQUEST_DESCRIPTION, GithubApiRequest, GithubHttpMethod};
 #[cfg(test)]
 pub(crate) use review::QueueProjectReviewPr;
 pub(crate) use review::{QUEUE_PROJECT_REVIEW_PRS_DESCRIPTION, QueueProjectReviewPrsInput};
@@ -13,7 +13,7 @@ pub(crate) use workflow::{
 };
 
 #[cfg(test)]
-pub(crate) fn builtin_tool_schemas() -> Vec<pl_model::ToolSchema> {
+pub(crate) fn builtin_tool_specs() -> Vec<pl_model::ToolSpec> {
     let mut tools = Vec::new();
     tools.extend(workflow::definitions());
     tools.extend(github::definitions());

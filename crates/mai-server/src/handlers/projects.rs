@@ -246,7 +246,7 @@ mod tests {
     use chrono::Utc;
     use mai_docker::DockerClient;
     use mai_protocol::{
-        AgentResourceState, AgentRole, AgentState, ProjectCloneStatus, ProjectStatus,
+        AgentResourceSnapshot, AgentResourceState, AgentRole, ProjectCloneStatus, ProjectStatus,
     };
     use mai_runtime::{AgentRuntime, RuntimeConfig};
     use mai_store::MaiStore;
@@ -409,10 +409,11 @@ mod tests {
                     id: maintainer_id,
                     parent_id: None,
                     name: "Maintainer".to_string(),
-                    state: AgentState {
-                        resource: AgentResourceState::Ready,
-                        ..AgentState::default()
+                    resource: AgentResourceSnapshot {
+                        state: AgentResourceState::Ready,
+                        error: None,
                     },
+                    runtime: None,
                     task_id: None,
                     project_id: Some(project_id),
                     role: Some(AgentRole::Planner),

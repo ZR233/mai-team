@@ -1,37 +1,6 @@
 use super::*;
 
 impl AgentRuntime {
-    pub(super) async fn build_instructions(
-        &self,
-        agent: &AgentRecord,
-        skills_manager: &SkillsManager,
-        skill_injections: &SkillInjections,
-        skills_config: &SkillsConfigRequest,
-        mcp_tools: &[crate::mcp::McpTool],
-        container_skill_paths: &ContainerSkillPaths,
-    ) -> Result<String> {
-        let summary = agent.summary.read().await;
-        let project_id = summary.project_id;
-        let prefer_container_skill_paths = summary.role == Some(AgentRole::Reviewer);
-        drop(summary);
-        let skills_response = if let Some(project_id) = project_id {
-            let mut response = skills_manager.list(skills_config)?;
-            self.apply_project_skill_source_paths_for_agent(agent, project_id, &mut response)
-                .await;
-            response
-        } else {
-            skills_manager.list(skills_config)?
-        };
-        Ok(instructions::build_instructions(
-            agent.system_prompt.as_deref(),
-            skills_response,
-            skill_injections,
-            mcp_tools,
-            container_skill_paths,
-            prefer_container_skill_paths,
-        ))
-    }
-
     pub(super) async fn set_agent_resource_state(
         &self,
         agent: &Arc<AgentRecord>,
@@ -40,8 +9,7 @@ impl AgentRuntime {
     ) -> Result<()> {
         {
             let mut summary = agent.summary.write().await;
-            summary.state.resource = state;
-            summary.state.resource_error = error;
+            summary.resource = AgentResourceSnapshot { state, error };
             summary.updated_at = now();
         }
         self.persist_agent(agent).await?;
@@ -91,20 +59,30 @@ impl AgentRuntime {
         project_id: ProjectId,
     ) -> Result<SkillsListResponse> {
         let lock = self.project_skill_lock(project_id).await;
-        projects::skills::list_from_cache(&self.deps.store, &self.cache_root, &lock, project_id)
-            .await
+        let policy = self.mai_config.read().await.skills.clone();
+        projects::skills::list_from_cache(
+            &self.deps.store,
+            &self.cache_root,
+            &lock,
+            project_id,
+            &policy,
+        )
+        .await
     }
 
-    pub(super) fn skills_manager_with_project_roots(&self, project_id: ProjectId) -> SkillsManager {
+    pub(super) fn skill_catalog_with_project_roots(
+        &self,
+        project_id: ProjectId,
+    ) -> SkillCatalogService {
         self.deps
             .skills
             .clone_with_extra_roots(self.project_skill_roots(project_id))
     }
 
-    pub(super) async fn skills_manager_for_agent(
+    pub(super) async fn skill_catalog_for_agent(
         &self,
         agent: &AgentRecord,
-    ) -> Result<SkillsManager> {
+    ) -> Result<SkillCatalogService> {
         if let Some(context) = agent.review_context.read().await.as_ref() {
             return Ok(self
                 .deps
@@ -113,7 +91,7 @@ impl AgentRuntime {
         }
         let project_id = agent.summary.read().await.project_id;
         Ok(project_id
-            .map(|project_id| self.skills_manager_with_project_roots(project_id))
+            .map(|project_id| self.skill_catalog_with_project_roots(project_id))
             .unwrap_or_else(|| self.deps.skills.clone()))
     }
 
@@ -145,20 +123,13 @@ impl AgentRuntime {
     pub(super) async fn sync_agent_skills_to_container(
         &self,
         agent: &Arc<AgentRecord>,
-        skills_manager: &SkillsManager,
-        skills_config: &SkillsConfigRequest,
-    ) -> Result<ContainerSkillPaths> {
+        response: &SkillsListResponse,
+    ) -> Result<()> {
         let agent_id = agent.summary.read().await.id;
         let container_id = self.container_id(agent_id).await?;
-        let _project_skill_guard = self.project_skill_read_guard(agent).await;
-        let mut response = skills_manager.list(skills_config)?;
-        if let Some(project_id) = agent.summary.read().await.project_id {
-            self.apply_project_skill_source_paths_for_agent(agent, project_id, &mut response)
-                .await;
-        }
         let skills = response
             .skills
-            .into_iter()
+            .iter()
             .filter(|skill| {
                 skill.enabled
                     && matches!(skill.scope, SkillScope::System | SkillScope::Project)
@@ -166,7 +137,7 @@ impl AgentRuntime {
             })
             .collect::<Vec<_>>();
         if skills.is_empty() {
-            return Ok(ContainerSkillPaths::default());
+            return Ok(());
         }
 
         let cleanup = self
@@ -197,13 +168,12 @@ impl AgentRuntime {
             )));
         }
 
-        let mut mapped = HashMap::new();
         let mut copied_dirs = HashSet::new();
         for skill in skills {
             let Some(skill_dir) = skill.path.parent() else {
                 continue;
             };
-            let container_dir = instructions::container_skill_dir(&skill);
+            let container_dir = instructions::container_skill_dir(skill);
             if copied_dirs.insert(container_dir.clone()) {
                 self.deps
                     .docker
@@ -215,9 +185,8 @@ impl AgentRuntime {
                         ))
                     })?;
             }
-            mapped.insert(skill.path, container_dir.join("SKILL.md"));
         }
-        Ok(ContainerSkillPaths::from_paths(mapped))
+        Ok(())
     }
 
     pub(super) async fn refresh_project_skills_from_project_sidecar_if_ready(

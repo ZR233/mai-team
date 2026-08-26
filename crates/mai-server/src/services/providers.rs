@@ -483,10 +483,11 @@ mod tests {
         assert_eq!(
             response.usage.expect("usage"),
             TokenUsage {
-                input_tokens: 4,
-                cached_input_tokens: 3,
-                output_tokens: 2,
-                reasoning_output_tokens: 2,
+                prompt_tokens: 4,
+                cached_prompt_tokens: 3,
+                cache_write_tokens: 0,
+                completion_tokens: 2,
+                reasoning_tokens: 2,
                 total_tokens: 6,
             }
         );

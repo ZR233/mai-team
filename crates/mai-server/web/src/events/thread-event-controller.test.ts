@@ -35,6 +35,11 @@ class FakeEventSource {
   emit(type: "snapshot" | "notification", update: ThreadSubscriptionUpdate) {
     this.listeners.get(type)?.(new MessageEvent(type, { data: JSON.stringify(update) }))
   }
+
+  disconnectPermanently() {
+    this.readyState = FakeEventSource.CLOSED
+    this.onerror?.(new Event("error"))
+  }
 }
 
 describe("ThreadEventController", () => {
@@ -86,29 +91,7 @@ describe("ThreadEventController", () => {
     expect(FakeEventSource.instances[2].url).toBe("/threads/thread-a/events")
   })
 
-  it("通知先于 authoritative snapshot 时立即失效并重新订阅", () => {
-    vi.useFakeTimers()
-    const store = new ThreadStoreRegistry().get("thread-a")
-    const controller = new ThreadEventController(store)
-    controllers.push(controller)
-    controller.connect()
-    const source = FakeEventSource.instances[0]
-    source.emit("notification", {
-      type: "notification",
-      notification: {
-        threadId: "thread-a",
-        revision: 1,
-        emittedAt: 2,
-        notification: { type: "turnStarted", turn: turn("thread-a") },
-      },
-    })
-    expect(source.closed).toBe(true)
-    expect(store.getState().connectionMessage).toMatch(/before authoritative snapshot/)
-    vi.runAllTimers()
-    expect(FakeEventSource.instances[1].url).toBe("/threads/thread-a/events")
-  })
-
-  it("未知 subscription update 会关闭当前 generation", () => {
+  it("底层连接永久关闭时创建新的 EventSource generation", () => {
     vi.useFakeTimers()
     const store = new ThreadStoreRegistry().get("thread-a")
     const controller = new ThreadEventController(store)
@@ -116,11 +99,13 @@ describe("ThreadEventController", () => {
     controller.connect()
     const source = FakeEventSource.instances[0]
 
-    source.emit("notification", { type: "unknown" } as unknown as ThreadSubscriptionUpdate)
+    source.disconnectPermanently()
 
     expect(source.closed).toBe(true)
     expect(store.getState().connection).toBe("resyncing")
-    expect(store.getState().connectionMessage).toContain("Unknown Thread subscription update")
+    expect(store.getState().connectionMessage).toBe("Thread stream disconnected")
+    vi.runAllTimers()
+    expect(FakeEventSource.instances[1].url).toBe("/threads/thread-a/events")
   })
 
   it("Lagged 不进入 reducer，而是使 generation 失效", () => {

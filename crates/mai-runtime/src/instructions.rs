@@ -1,9 +1,7 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::mcp::McpTool;
-use crate::skills::{SkillInjections, render_available_response};
-use mai_protocol::{SkillScope, SkillsListResponse};
+use mai_protocol::SkillScope;
 
 pub(crate) const CONTAINER_SKILLS_ROOT: &str = "/tmp/.mai-team/skills";
 
@@ -16,7 +14,7 @@ General rules:
 - Keep the `exec` working directory inside the agent workspace. Read documented external read-only views with file tools, or reference their absolute paths only as command arguments.
 - Use `read_file`, `list_files`, and `apply_patch` for workspace files; use `exec` with grep or find for content search. Tool paths are relative to your workspace unless documented otherwise.
 - Use `spawn_agent`, `send_input`, `wait_agent`, `list_agents`, and `close_agent` for multi-agent collaboration.
-- Use `list_skill_resources` and `read_skill_resource` to browse and read enabled skills; `skill:///<name>` URIs address skill documents.
+- Use `skills_list` and `skill_view` to discover and read enabled Skills.
 - Use `list_mcp_resources` and `read_mcp_resource` to inspect MCP server resources when MCP servers are available.
 - Keep each child agent task concrete and bounded. Multiple agents can run in parallel.
 - Child agent model selection is controlled by Research Agent settings, falling back to the service default model when unset.
@@ -25,50 +23,11 @@ General rules:
 - Be concise with final answers and include important file paths or command outputs when they matter.
 "#;
 
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ContainerSkillPaths {
-    paths: HashMap<PathBuf, PathBuf>,
-}
-
-impl ContainerSkillPaths {
-    pub(crate) fn from_paths(paths: HashMap<PathBuf, PathBuf>) -> Self {
-        Self { paths }
-    }
-
-    fn get(&self, path: &Path) -> Option<&PathBuf> {
-        self.paths.get(path)
-    }
-}
-
-pub(crate) fn build_instructions(
-    system_prompt: Option<&str>,
-    mut skills_response: SkillsListResponse,
-    skill_injections: &SkillInjections,
-    mcp_tools: &[McpTool],
-    container_skill_paths: &ContainerSkillPaths,
-    prefer_container_skill_paths: bool,
-) -> String {
+pub(crate) fn build_instructions(system_prompt: Option<&str>, mcp_tools: &[McpTool]) -> String {
     let mut instructions = String::from(BASE_INSTRUCTIONS);
     if let Some(system_prompt) = system_prompt {
         instructions.push_str("\n\n## Agent System Prompt\n");
         instructions.push_str(system_prompt);
-    }
-    instructions.push_str("\n\n## Available Skills\n");
-    apply_container_skill_paths(
-        &mut skills_response,
-        container_skill_paths,
-        prefer_container_skill_paths,
-    );
-    instructions.push_str(&render_available_response(skills_response));
-    if !skill_injections.warnings.is_empty() {
-        instructions.push_str("\n\n## Skill Warnings\n");
-        for warning in &skill_injections.warnings {
-            instructions.push_str(&format!("\n- {warning}"));
-        }
-    }
-    if let Some(activated) = render_activated_skills(skill_injections, container_skill_paths) {
-        instructions.push_str("\n\n## Activated Skills\n");
-        instructions.push_str(&activated);
     }
     instructions.push_str("\n\n## MCP Tools\n");
     if mcp_tools.is_empty() {
@@ -84,26 +43,6 @@ pub(crate) fn build_instructions(
     instructions
 }
 
-fn render_activated_skills(
-    skill_injections: &SkillInjections,
-    container_skill_paths: &ContainerSkillPaths,
-) -> Option<String> {
-    if skill_injections.items.is_empty() {
-        return None;
-    }
-    let mut text = String::new();
-    for skill in &skill_injections.items {
-        let path = display_skill_path(&skill.metadata.path, container_skill_paths);
-        text.push_str(&format!(
-            "\n<skill>\n<name>{}</name>\n<path>{}</path>\n{}\n</skill>\n",
-            skill.metadata.name,
-            path.display(),
-            skill.contents
-        ));
-    }
-    Some(text)
-}
-
 pub(crate) fn container_skill_dir(skill: &mai_protocol::SkillMetadata) -> PathBuf {
     let scope = match skill.scope {
         SkillScope::System => "system",
@@ -114,27 +53,6 @@ pub(crate) fn container_skill_dir(skill: &mai_protocol::SkillMetadata) -> PathBu
     PathBuf::from(CONTAINER_SKILLS_ROOT)
         .join(scope)
         .join(safe_container_skill_segment(&skill.name))
-}
-
-fn apply_container_skill_paths(
-    response: &mut SkillsListResponse,
-    container_skill_paths: &ContainerSkillPaths,
-    overwrite_existing_source: bool,
-) {
-    for skill in &mut response.skills {
-        if (overwrite_existing_source || skill.source_path.is_none())
-            && let Some(container_path) = container_skill_paths.get(&skill.path)
-        {
-            skill.source_path = Some(container_path.clone());
-        }
-    }
-}
-
-fn display_skill_path(path: &Path, container_skill_paths: &ContainerSkillPaths) -> PathBuf {
-    container_skill_paths
-        .get(path)
-        .cloned()
-        .unwrap_or_else(|| path.to_path_buf())
 }
 
 fn safe_container_skill_segment(value: &str) -> String {
@@ -194,88 +112,13 @@ mod tests {
 
     #[test]
     fn base_instructions_precede_agent_specific_system_prompt() {
-        let instructions = build_instructions(
-            Some("CUSTOM_AGENT_RULE"),
-            SkillsListResponse {
-                roots: Vec::new(),
-                skills: Vec::new(),
-                errors: Vec::new(),
-            },
-            &SkillInjections::default(),
-            &[],
-            &ContainerSkillPaths::default(),
-            false,
-        );
+        let instructions = build_instructions(Some("CUSTOM_AGENT_RULE"), &[]);
 
         let base_rule = instructions.find("POSIX `sh`").expect("base shell rule");
         let custom_rule = instructions
             .find("CUSTOM_AGENT_RULE")
             .expect("custom agent rule");
         assert!(base_rule < custom_rule);
-    }
-
-    #[test]
-    fn activated_skills_wrap_loaded_skill_contents() {
-        let path = PathBuf::from("/tmp/demo/SKILL.md");
-        let fragment = render_activated_skills(
-            &SkillInjections {
-                items: vec![crate::skills::LoadedSkill {
-                    metadata: SkillMetadata {
-                        name: "demo".to_string(),
-                        description: "Demo skill".to_string(),
-                        short_description: None,
-                        path: path.clone(),
-                        source_path: None,
-                        scope: SkillScope::Repo,
-                        enabled: true,
-                        interface: None,
-                        dependencies: None,
-                        policy: None,
-                    },
-                    contents: "skill body".to_string(),
-                }],
-                warnings: Vec::new(),
-            },
-            &ContainerSkillPaths::default(),
-        )
-        .expect("fragment");
-        assert!(fragment.contains("<skill>"));
-        assert!(fragment.contains("<name>demo</name>"));
-        assert!(fragment.contains(path.to_string_lossy().as_ref()));
-        assert!(fragment.contains("skill body"));
-    }
-
-    #[test]
-    fn activated_skills_use_container_skill_path_when_synced() {
-        let path = PathBuf::from("/tmp/system/demo/SKILL.md");
-        let container_path = PathBuf::from("/tmp/.mai-team/skills/system/demo/SKILL.md");
-        let mut paths = HashMap::new();
-        paths.insert(path.clone(), container_path.clone());
-        let fragment = render_activated_skills(
-            &SkillInjections {
-                items: vec![crate::skills::LoadedSkill {
-                    metadata: SkillMetadata {
-                        name: "demo".to_string(),
-                        description: "Demo skill".to_string(),
-                        short_description: None,
-                        path: path.clone(),
-                        source_path: None,
-                        scope: SkillScope::System,
-                        enabled: true,
-                        interface: None,
-                        dependencies: None,
-                        policy: None,
-                    },
-                    contents: "skill body".to_string(),
-                }],
-                warnings: Vec::new(),
-            },
-            &ContainerSkillPaths::from_paths(paths),
-        )
-        .expect("fragment");
-
-        assert!(fragment.contains(container_path.to_string_lossy().as_ref()));
-        assert!(!fragment.contains(path.to_string_lossy().as_ref()));
     }
 
     #[test]

@@ -168,7 +168,6 @@ async fn project_still_ready(ops: &impl ProjectReviewWorkerOps, project_id: Proj
         | Err(RuntimeError::Docker(_))
         | Err(RuntimeError::Model(_))
         | Err(RuntimeError::Store(_))
-        | Err(RuntimeError::Skill(_))
         | Err(RuntimeError::InvalidInput(_))
         | Err(RuntimeError::Io(_))
         | Err(RuntimeError::Http(_))

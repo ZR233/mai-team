@@ -1,7 +1,6 @@
 mod events;
 mod lifecycle;
 mod policy;
-mod protocol;
 mod repository;
 mod review_manifest;
 mod thread;
@@ -18,7 +17,6 @@ use crate::{AgentRuntime, MaiConfig, RuntimeError};
 pub(crate) use events::{MaiAgentCommitObserver, synchronize_runtime_state};
 pub(crate) use lifecycle::MaiAgentLifecycle;
 pub(crate) use policy::{MaiPolicyContext, compile_execution_policy};
-pub(crate) use protocol::runtime_state;
 pub(crate) use repository::MaiAgentRepository;
 pub(crate) use thread::{
     aggregate_usage, canonical_id, last_agent_response, load_runtime, thread_metadata,
@@ -46,6 +44,25 @@ impl MaiAgentHost {
             lifecycle: MaiAgentLifecycle::new(runtime.clone()),
             observer: MaiAgentCommitObserver::new(runtime),
         }
+    }
+
+    pub(crate) async fn await_durable(
+        &self,
+        thread_id: &pl_core::ThreadId,
+        revision: u64,
+    ) -> crate::Result<()> {
+        pl_core::ThreadRepository::await_durable(&self.repository, thread_id, revision).await
+    }
+
+    pub(crate) async fn restore_thread(
+        &self,
+        thread_id: &pl_core::ThreadId,
+    ) -> crate::Result<Option<pl_core::RestoredAgentRuntime>> {
+        pl_core::ThreadRepository::restore_thread(&self.repository, thread_id).await
+    }
+
+    pub(crate) async fn shutdown_repository(&self) -> crate::Result<()> {
+        self.repository.shutdown().await
     }
 }
 

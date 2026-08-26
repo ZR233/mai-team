@@ -49,12 +49,7 @@ impl AgentRuntime {
             .guard(product_agent_id)
             .await
             .ok_or_else(|| RuntimeError::ThreadNotFound(thread_id.clone()))?;
-        let framework_id = pl_core::ThreadId::new(thread_id.clone())?;
-        let snapshot = self
-            .framework_handle()?
-            .snapshot(framework_id.clone())
-            .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        let snapshot = self.ensure_framework_agent(product_agent_id).await?;
         ensure_live_canonical_thread(&snapshot)?;
         let mut inner = self
             .framework_handle()?
@@ -80,11 +75,7 @@ impl AgentRuntime {
         let summary = agent.summary.read().await.clone();
         ensure_readable_product_thread(&summary)?;
         let framework_id = pl_core::ThreadId::new(thread_id)?;
-        let snapshot = self
-            .framework_handle()?
-            .snapshot(framework_id.clone())
-            .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        let snapshot = self.ensure_framework_agent(product_agent_id).await?;
         ensure_live_canonical_thread(&snapshot)?;
         let mut thread = self
             .framework_handle()?
@@ -285,7 +276,7 @@ fn invalid_thread_update<T>(message: impl Into<String>) -> Result<T> {
 }
 
 pub(crate) fn ensure_readable_product_thread(summary: &AgentSummary) -> Result<()> {
-    match summary.state.resource {
+    match summary.resource.state {
         AgentResourceState::Provisioning
         | AgentResourceState::Ready
         | AgentResourceState::Failed => Ok(()),
@@ -296,7 +287,7 @@ pub(crate) fn ensure_readable_product_thread(summary: &AgentSummary) -> Result<(
 }
 
 pub(crate) fn ensure_live_canonical_thread(snapshot: &pl_core::AgentSnapshot) -> Result<()> {
-    if snapshot.lifecycle != pl_core::AgentLifecycleState::Active {
+    if !snapshot.state.is_operational() {
         return Err(RuntimeError::ThreadNotFound(
             snapshot.identity.id.to_string(),
         ));
@@ -308,7 +299,7 @@ pub(crate) fn ensure_live_message_target(
     summary: &AgentSummary,
     snapshot: &pl_core::AgentSnapshot,
 ) -> Result<()> {
-    if summary.state.resource != AgentResourceState::Ready {
+    if summary.resource.state != AgentResourceState::Ready {
         return Err(RuntimeError::ThreadNotFound(summary.id.to_string()));
     }
     ensure_live_canonical_thread(snapshot)
@@ -324,13 +315,14 @@ fn parse_thread_agent_id(thread_id: &str) -> Result<AgentId> {
 mod tests {
     use chrono::Utc;
     use mai_protocol::{
-        AgentState, ThreadItem, ThreadItemContent, ThreadItemDelta, ThreadItemDeltaField,
-        ThreadItemStatus, ThreadNotification, ThreadNotificationEnvelope, TokenUsage,
+        AgentResourceSnapshot, ThreadItem, ThreadItemDelta, ThreadItemDeltaState,
+        ThreadNotification, ThreadNotificationEnvelope, TokenUsage,
     };
     use pl_core::{
-        AgentActivityState, AgentIdentity, AgentLifecycleState, AgentRoleId, AgentSnapshot,
+        AgentIdentity, AgentRoleId, AgentSnapshot, AgentState, ClosingAgentState,
         ThreadId as CanonicalThreadId,
     };
+    use pl_protocol::{ThreadContentLifecycle, ThreadItemState, ThreadTextChannel, ThreadTextItem};
     use uuid::Uuid;
 
     use super::*;
@@ -343,18 +335,18 @@ mod tests {
 
         assert!(ensure_readable_product_thread(&summary).is_ok());
         assert!(ensure_live_message_target(&summary, &snapshot).is_err());
-        summary.state.resource = AgentResourceState::Ready;
+        summary.resource.state = AgentResourceState::Ready;
         assert!(ensure_readable_product_thread(&summary).is_ok());
         assert!(ensure_live_message_target(&summary, &snapshot).is_ok());
-        summary.state.resource = AgentResourceState::Failed;
+        summary.resource.state = AgentResourceState::Failed;
         assert!(ensure_readable_product_thread(&summary).is_ok());
         assert!(ensure_live_message_target(&summary, &snapshot).is_err());
-        summary.state.resource = AgentResourceState::Deleting;
+        summary.resource.state = AgentResourceState::Deleting;
         assert!(ensure_readable_product_thread(&summary).is_err());
-        summary.state.resource = AgentResourceState::Deleted;
+        summary.resource.state = AgentResourceState::Deleted;
         assert!(ensure_readable_product_thread(&summary).is_err());
-        summary.state.resource = AgentResourceState::Ready;
-        snapshot.lifecycle = AgentLifecycleState::Closing;
+        summary.resource.state = AgentResourceState::Ready;
+        snapshot.state = AgentState::Closing(ClosingAgentState::new());
         assert!(ensure_live_message_target(&summary, &snapshot).is_err());
     }
 
@@ -421,9 +413,9 @@ mod tests {
                             delta: ThreadItemDelta {
                                 item_id: "item-a".to_string(),
                                 revision: 3,
-                                field: ThreadItemDeltaField::Text,
-                                delta: "gap".to_string(),
-                                chunk_index: None,
+                                delta: ThreadItemDeltaState::Text {
+                                    delta: "gap".to_string(),
+                                },
                             },
                         },
                     ),
@@ -448,23 +440,21 @@ mod tests {
     }
 
     fn item(revision: u64) -> ThreadItem {
-        ThreadItem {
-            id: "item-a".to_string(),
-            thread_id: "thread-a".to_string(),
-            turn_id: "turn-a".to_string(),
-            ordinal: 0,
+        ThreadItem::new(
+            "item-a".to_string(),
+            "thread-a".to_string(),
+            "turn-a".to_string(),
+            0,
             revision,
-            status: ThreadItemStatus::Streaming,
-            created_at: 1,
-            updated_at: 1,
-            completed_at: None,
-            error: None,
-            content: ThreadItemContent::AgentMessage {
-                channel: mai_protocol::AgentMessageChannel::Commentary,
-                text: String::new(),
-            },
-            usage: None,
-        }
+            1,
+            1,
+            ThreadItemState::Text(ThreadTextItem::new(
+                ThreadTextChannel::Commentary,
+                String::new(),
+                Vec::new(),
+                ThreadContentLifecycle::streaming(),
+            )),
+        )
     }
 
     fn summary(id: AgentId) -> AgentSummary {
@@ -476,7 +466,8 @@ mod tests {
             project_id: None,
             role: None,
             name: "thread".to_string(),
-            state: AgentState::default(),
+            resource: AgentResourceSnapshot::default(),
+            runtime: Some(snapshot(id)),
             container_id: None,
             docker_image: String::new(),
             provider_id: "test".to_string(),
@@ -497,9 +488,7 @@ mod tests {
                 role: AgentRoleId::new("executor").expect("role"),
                 depth: 0,
             },
-            lifecycle: AgentLifecycleState::Active,
-            activity: AgentActivityState::Idle,
-            active_turn_id: None,
+            state: AgentState::idle(),
             pending_inputs: 0,
             progress: None,
             last_turn: None,

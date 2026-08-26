@@ -14,7 +14,6 @@ mod observability;
 pub(crate) mod profiles;
 mod purge;
 mod recovery;
-mod resources;
 mod update;
 
 pub(crate) use container::{
@@ -24,9 +23,7 @@ pub(crate) use container::{
 pub(crate) use create::{
     AgentCreateOps, CreateAgentRecordContext, CreatedAgentRecord, create_agent_record,
 };
-pub(crate) use delete::{
-    AgentDeleteOps, CanonicalAgentClose, delete_agent, rollback_unregistered_agent,
-};
+pub(crate) use delete::{AgentDeleteOps, delete_agent, rollback_unregistered_agent};
 pub(crate) use files::{AgentFileOps, download_file_tar, upload_file};
 pub(crate) use model::normalize_reasoning_effort;
 pub(crate) use observability::{
@@ -37,7 +34,6 @@ pub(crate) use recovery::{
     AgentResourceRecoveryOps, AgentResourceRecoveryRequest, PreparedAgentWorkspace,
     agent_resource_recovery_retry_request, recover_agent_resources,
 };
-pub(crate) use resources::{AgentResourceBroker, AgentResourceBrokerOps, agent_resource_broker};
 pub(crate) use update::{AgentUpdateOps, update_agent};
 
 /// 关闭产品资源时所需的最小端口；framework 生命周期由 PL 独占。

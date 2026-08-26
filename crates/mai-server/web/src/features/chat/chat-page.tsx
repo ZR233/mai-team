@@ -44,7 +44,7 @@ export default function ChatPage() {
     id: environment.id,
     title: environment.name || environment.title || "Environment",
     subtitle: environment.root_agent?.model || "Docker workspace",
-    status: <StatusDot status={environment.status || environment.root_agent?.state?.resource} />,
+    status: <StatusDot status={environment.status || environment.root_agent?.resource.state} />,
     icon: <Boxes className="size-4" />,
   }))
 

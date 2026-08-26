@@ -344,11 +344,7 @@ impl projects::review::reviewer::ProjectReviewerAgentOps for Arc<AgentRuntime> {
     }
 
     async fn ensure_project_reviewer_thread(&self, agent_id: AgentId) -> Result<()> {
-        self.framework_handle()?
-            .snapshot(agent_host::canonical_id(agent_id)?)
-            .await
-            .map(|_| ())
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))
+        self.ensure_framework_agent(agent_id).await.map(|_| ())
     }
 
     async fn ensure_project_reviewer_container(
@@ -526,12 +522,7 @@ impl projects::review::cycle::ProjectReviewCycleOps for Arc<AgentRuntime> {
         &self,
         reviewer_id: AgentId,
     ) -> Result<projects::review::cycle::ReviewerProgress> {
-        AgentRuntime::agent(self.as_ref(), reviewer_id).await?;
-        let snapshot = self
-            .framework_handle()?
-            .snapshot(agent_host::canonical_id(reviewer_id)?)
-            .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        let snapshot = self.ensure_framework_agent(reviewer_id).await?;
         let inactivity_timeout = reviewer_inactivity_timeout(self, &snapshot)?;
         Ok(projects::review::cycle::ReviewerProgress {
             revision: snapshot.revision,
@@ -801,7 +792,7 @@ fn reviewer_inactivity_timeout(
     const RUNNING_INACTIVITY_SECS: u64 = 10 * 60;
     const TOOL_TIMEOUT_GRACE_SECS: u64 = 60;
     let mut timeout = std::time::Duration::from_secs(RUNNING_INACTIVITY_SECS);
-    if snapshot.activity != pl_core::AgentActivityState::Active(pl_core::ActiveKind::WaitingTool) {
+    if !matches!(snapshot.state, pl_protocol::AgentState::WaitingTool(_)) {
         return Ok(timeout);
     }
     let view = runtime
@@ -809,19 +800,18 @@ fn reviewer_inactivity_timeout(
         .thread_snapshot(&snapshot.identity.id)
         .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
     let declared_timeout = view.items.iter().rev().find_map(|item| {
+        let tool = item.tool()?;
         if !matches!(
-            item.status,
-            pl_protocol::ThreadItemStatus::Running
-                | pl_protocol::ThreadItemStatus::Approved
-                | pl_protocol::ThreadItemStatus::AwaitingApproval
+            tool.state(),
+            pl_protocol::ThreadToolState::Running(_)
+                | pl_protocol::ThreadToolState::Approved(_)
+                | pl_protocol::ThreadToolState::AwaitingApproval(_)
         ) {
             return None;
         }
-        let pl_protocol::ThreadItemContent::ToolCall { tool } = &item.content else {
-            return None;
-        };
-        (tool.name == pl_core::TOOL_EXEC)
-            .then(|| serde_json::from_str::<serde_json::Value>(&tool.arguments).ok())
+        let invocation = tool.invocation();
+        (invocation.name() == pl_core::TOOL_EXEC)
+            .then(|| serde_json::from_str::<serde_json::Value>(invocation.arguments()).ok())
             .flatten()
             .and_then(|arguments| {
                 arguments
@@ -1284,7 +1274,7 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
 
     async fn agent_current_turn(&self, agent_id: AgentId) -> Result<Option<TurnId>> {
         let agent = AgentRuntime::agent(self.as_ref(), agent_id).await?;
-        Ok(agent.summary.read().await.state.active_turn())
+        Ok(agent.summary.read().await.active_turn())
     }
 
     fn cancel_agent_turn(

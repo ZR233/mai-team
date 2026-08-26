@@ -57,7 +57,8 @@ impl AgentRuntime {
 
     pub async fn list_skills(&self) -> Result<SkillsListResponse> {
         let config = self.deps.store.load_skills_config().await?;
-        Ok(self.deps.skills.list(&config)?)
+        let policy = self.mai_config.read().await.skills.clone();
+        self.deps.skills.list(&config, &policy).await
     }
 
     pub async fn list_agent_profiles(&self) -> Result<AgentProfilesResponse> {
@@ -70,7 +71,8 @@ impl AgentRuntime {
     ) -> Result<SkillsListResponse> {
         let normalized = crate::skills::normalize_config(&request)?;
         self.deps.store.save_skills_config(&normalized).await?;
-        Ok(self.deps.skills.list(&normalized)?)
+        let policy = self.mai_config.read().await.skills.clone();
+        self.deps.skills.list(&normalized, &policy).await
     }
 
     pub async fn list_project_skills(&self, project_id: ProjectId) -> Result<SkillsListResponse> {

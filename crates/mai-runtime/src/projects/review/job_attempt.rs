@@ -271,6 +271,9 @@ pub(crate) async fn run_project_review_job_attempt(
         error: None,
         failure: None,
         token_usage: Default::default(),
+        history_status: Default::default(),
+        history_archive_id: None,
+        history_archived_at: None,
     })
     .await?;
 

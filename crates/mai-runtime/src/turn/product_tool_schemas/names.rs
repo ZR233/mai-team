@@ -4,5 +4,3 @@ pub const TOOL_SAVE_ARTIFACT: &str = "save_artifact";
 pub const TOOL_READ_TOOL_ARTIFACT: &str = "read_tool_artifact";
 pub const TOOL_GITHUB_API_REQUEST: &str = "github_api_request";
 pub const TOOL_QUEUE_PROJECT_REVIEW_PRS: &str = "queue_project_review_prs";
-pub const TOOL_LIST_SKILL_RESOURCES: &str = "list_skill_resources";
-pub const TOOL_READ_SKILL_RESOURCE: &str = "read_skill_resource";

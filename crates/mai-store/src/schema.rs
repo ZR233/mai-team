@@ -5,7 +5,7 @@ use std::time::Duration;
 use toasty_driver_sqlite::Sqlite;
 
 pub(crate) const SETTING_SCHEMA_VERSION: &str = "toasty_schema_version";
-pub(crate) const SCHEMA_VERSION: &str = "31";
+pub(crate) const SCHEMA_VERSION: &str = "32";
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const SQLITE_POOL_MAX_SIZE: usize = 4;
 const SQLITE_POOL_WAIT_TIMEOUT_SECS: u64 = 30;

@@ -500,7 +500,6 @@ pub(super) fn runtime_failure(error: &RuntimeError) -> ProjectReviewFailure {
         | RuntimeError::ThreadNotFound(_)
         | RuntimeError::ToolTraceNotFound { .. }
         | RuntimeError::TurnNotFound { .. }
-        | RuntimeError::Skill(_)
         | RuntimeError::InvalidInput(_)
         | RuntimeError::Io(_)
         | RuntimeError::Http(_)

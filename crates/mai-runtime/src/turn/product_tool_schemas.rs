@@ -2,13 +2,13 @@ pub(crate) mod definitions;
 mod names;
 
 #[cfg(test)]
-use pl_model::ToolSchema;
+use pl_model::ToolSpec;
 
 pub use names::*;
 
 #[cfg(test)]
-pub(crate) fn build_tool_schemas() -> Vec<ToolSchema> {
-    definitions::builtin_tool_schemas()
+pub(crate) fn build_tool_specs() -> Vec<ToolSpec> {
+    definitions::builtin_tool_specs()
 }
 
 #[cfg(test)]
@@ -17,37 +17,9 @@ mod tests {
     use serde_json::{Value, json};
 
     #[test]
-    fn product_tool_api_is_pl_schema_only() {
-        let api = include_str!("product_tool_schemas.rs");
-        let production = api.split("#[cfg(test)]").next().unwrap();
-        let names = include_str!("product_tool_schemas/names.rs");
-
-        let mcp_tool_type = format!("{}{}", "Mcp", "Tool");
-        assert!(
-            !production.contains(&mcp_tool_type),
-            "product_tool_schemas 只能暴露 mai-team 产品工具 schema，MCP schema 由 pl-core host MCP 工具包构造"
-        );
-        let mcp_visible_name = format!("{}{}", "model", "_name");
-        assert!(
-            !production.contains(&mcp_visible_name),
-            "product_tool_schemas 不应再拼装 MCP model tool 名称"
-        );
-        assert!(!production.contains(&format!("{}{}", "route", "_tool")));
-        assert!(!production.contains(&format!("{}{}", "Routed", "Tool")));
-        assert!(
-            !production.contains(&format!("{}{}", "Tool", "Definition")),
-            "product_tool_schemas 产品工具 schema 应直接使用 pl_model::ToolSchema"
-        );
-        assert!(
-            !names.contains("TOOL_GIT_SYNC_DEFAULT_BRANCH"),
-            "git_sync_default_branch is a pl-core shared git tool"
-        );
-    }
-
-    #[test]
     fn pure_lang_dependencies_pin_the_verified_runtime_revision() {
         let manifest = include_str!("../../../../Cargo.toml");
-        let verified_revision = "efa318ad1469d5c0a615487d7ece38e6beb1b9d6";
+        let verified_revision = "df7018a0fa3cdd3814e9855100b76893aba92561";
         for package in ["pl-core", "pl-model", "pl-protocol", "pl-trace"] {
             let line = manifest
                 .lines()
@@ -63,94 +35,31 @@ mod tests {
     }
 
     #[test]
-    fn pure_lang_shared_tools_use_unified_workspace_contract() {
-        let names = pl_core::shared_tool_names(
-            pl_core::SharedToolSchemaOptions::from_capabilities(
-                &pl_core::ToolCapabilityConfig::hosted_workspace(),
-            )
-            .with_plan_exit(false),
-        );
-
-        for name in [
-            pl_core::TOOL_EXEC,
-            pl_core::TOOL_WRITE_STDIN,
-            pl_core::WorkspaceFileToolKind::ReadFile.name(),
-            pl_core::WorkspaceFileToolKind::ListFiles.name(),
-            pl_core::WorkspaceFileToolKind::ApplyPatch.name(),
-            pl_core::TOOL_READ_SESSION_NOTE,
-            pl_core::TOOL_SEARCH_SESSION_NOTE,
-            pl_core::TOOL_WRITE_SESSION_NOTE,
-            pl_core::TOOL_APPLY_SESSION_NOTE_PATCH,
-        ] {
-            assert!(names.iter().any(|candidate| candidate == name), "{name}");
-        }
-        for legacy in [
-            "bash",
-            "container_exec",
-            "run_in_container",
-            "container_copy",
-            "search_files",
-        ] {
-            assert!(
-                !names.iter().any(|candidate| candidate == legacy),
-                "{legacy}"
-            );
-        }
-    }
-
-    #[test]
     fn builtin_definitions_are_product_tools_only() {
-        let tools = build_tool_schemas();
+        let tools = build_tool_specs();
         let names = tool_names(&tools);
 
-        assert!(names.contains(&TOOL_GITHUB_API_REQUEST));
-        assert!(names.contains(&TOOL_SAVE_ARTIFACT));
-        for legacy in [
-            pl_core::TOOL_EXEC,
-            pl_core::TOOL_WRITE_STDIN,
-            pl_core::WorkspaceFileToolKind::ReadFile.name(),
-            pl_core::WorkspaceFileToolKind::ListFiles.name(),
-            pl_core::WorkspaceFileToolKind::ApplyPatch.name(),
-            "spawn_agent",
-            "send_input",
-            "wait_agent",
-            "list_agents",
-            "close_agent",
-            "resume_agent",
-            "update_todo_list",
-            "request_user_input",
-            pl_core::TOOL_GIT_STATUS,
-            pl_core::TOOL_GIT_PUSH,
-            pl_core::TOOL_GIT_SYNC_DEFAULT_BRANCH,
-            // pl 的 MCP resource 工具由 MCP runtime 按需发布，不属于 mai 产品 schema。
-            "list_mcp_resources",
-            "list_mcp_resource_templates",
-            "read_mcp_resource",
-            "github_api_get",
-            "send_message",
-            "git_worktree_info",
-            "container_cp_upload",
-            "container_cp_download",
-            "bash",
-            "container_exec",
-            "run_in_container",
-            "container_copy",
-        ] {
-            assert!(
-                !names.contains(&legacy),
-                "{legacy} must be supplied by pl-core or removed"
-            );
-        }
+        assert_eq!(
+            names,
+            vec![
+                TOOL_SAVE_TASK_PLAN,
+                TOOL_SUBMIT_REVIEW_RESULT,
+                TOOL_SAVE_ARTIFACT,
+                TOOL_READ_TOOL_ARTIFACT,
+                TOOL_GITHUB_API_REQUEST,
+                TOOL_QUEUE_PROJECT_REVIEW_PRS,
+            ]
+        );
     }
 
     #[test]
     fn github_request_schema_covers_read_write_without_credentials() {
-        let tools = build_tool_schemas();
+        let tools = build_tool_specs();
         let request = tools
             .iter()
             .find(|tool| tool.name() == TOOL_GITHUB_API_REQUEST)
             .expect("github_api_request");
-        let ToolSchema::Function {
+        let ToolSpec::Function {
             description,
             input_schema,
             ..
@@ -183,12 +92,12 @@ mod tests {
 
     #[test]
     fn tool_artifact_schema_has_one_unambiguous_range_contract() {
-        let tools = build_tool_schemas();
+        let tools = build_tool_specs();
         let artifact = tools
             .iter()
             .find(|tool| tool.name() == TOOL_READ_TOOL_ARTIFACT)
             .expect("read_tool_artifact");
-        let ToolSchema::Function {
+        let ToolSpec::Function {
             description,
             input_schema,
             ..
@@ -225,12 +134,12 @@ mod tests {
 
     #[test]
     fn product_tool_schemas_use_codex_camel_case_fields() {
-        let tools = build_tool_schemas();
+        let tools = build_tool_specs();
         let queue = tools
             .iter()
             .find(|tool| tool.name() == TOOL_QUEUE_PROJECT_REVIEW_PRS)
             .expect("queue_project_review_prs");
-        let ToolSchema::Function { input_schema, .. } = queue else {
+        let ToolSpec::Function { input_schema, .. } = queue else {
             panic!("queue_project_review_prs must be a function tool");
         };
         let item_properties = input_schema
@@ -242,46 +151,7 @@ mod tests {
         assert!(!item_properties.contains_key("head_sha"));
     }
 
-    #[test]
-    fn product_tool_schemas_use_pl_core_typed_definitions() {
-        let definitions = [
-            include_str!("product_tool_schemas/definitions/workflow.rs"),
-            include_str!("product_tool_schemas/definitions/github.rs"),
-            include_str!("product_tool_schemas/definitions/review.rs"),
-        ]
-        .join("\n");
-
-        assert!(
-            definitions.contains("FunctionToolDefinition::<"),
-            "product_tool_schemas 产品工具 schema 应由 pl-core typed definition 派生"
-        );
-        assert!(
-            definitions.contains(".input_schema()"),
-            "typed definition 是 schema 的唯一事实源"
-        );
-        for forbidden in [
-            "ToolInputSchemaField",
-            "function_tool_schema(",
-            "crate::schema::object_schema",
-            "object_schema(vec!",
-            "\"properties\"",
-            "\"required\"",
-        ] {
-            assert!(
-                !definitions.contains(forbidden),
-                "product_tool_schemas 不应手写 JSON schema 片段 `{forbidden}`"
-            );
-        }
-    }
-
-    #[test]
-    fn product_tool_filtering_uses_pl_core_visibility_set() {
-        let tools = pl_core::ToolVisibilitySet::from_tool_names([TOOL_SAVE_ARTIFACT])
-            .filter_schemas(build_tool_schemas());
-        assert_eq!(tool_names(&tools), vec![TOOL_SAVE_ARTIFACT]);
-    }
-
-    fn tool_names(tools: &[ToolSchema]) -> Vec<&str> {
-        tools.iter().map(ToolSchema::name).collect()
+    fn tool_names(tools: &[ToolSpec]) -> Vec<&str> {
+        tools.iter().map(ToolSpec::name).collect()
     }
 }

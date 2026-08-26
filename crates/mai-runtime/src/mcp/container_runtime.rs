@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
 use mai_docker::DockerClient;
 use mai_protocol::{McpServerConfig, McpStartupStatus};
 use pl_core::{
     AgentModelConfig, BuiltinMcpServerState, EffectiveMcpServerConfig, McpAvailabilityKind,
-    McpConnector, McpResetScope, McpRuntime, McpRuntimeHandle, McpServerTransport, ToolRegistry,
+    McpConnector, McpResetScope, McpRuntime, McpRuntimeHandle, McpServerTransport,
 };
 use tokio::sync::RwLock;
 
@@ -22,12 +21,11 @@ pub(crate) struct ContainerMcpSettings {
 /// 单个 agent 容器对应的 PL MCP runtime 产品包装。
 ///
 /// PL 的 `McpConnector` 负责在宿主侧 spawn 进程与 rmcp 握手；stdio server 通过
-/// 改写为 `docker exec -i` 在 agent 专属 sidecar 内执行。工具按 generation 发布
-/// 到共享 `ToolRegistry`，由 turn engine 的共享注册表装配消费。
+/// 改写为 `docker exec -i` 在 agent 专属 sidecar 内执行。每次模型调用前由
+/// `McpTurnLease` 冻结本 generation 的工具集合。
 pub(crate) struct ContainerMcpRuntime {
     docker: DockerClient,
     sidecar_container_id: String,
-    shared_tools: Arc<ToolRegistry>,
     handle: McpRuntimeHandle,
     required_servers: RwLock<BTreeSet<String>>,
 }
@@ -47,12 +45,10 @@ impl ContainerMcpRuntime {
                 sidecar_image,
             )
             .await?;
-        let shared_tools = Arc::new(ToolRegistry::new());
-        let handle = McpRuntime::new(McpConnector::default(), Some(shared_tools.clone())).handle();
+        let handle = McpRuntime::new(McpConnector::default()).handle();
         let runtime = Self {
             docker,
             sidecar_container_id: sidecar.id,
-            shared_tools,
             handle,
             required_servers: RwLock::new(BTreeSet::new()),
         };
@@ -69,11 +65,6 @@ impl ContainerMcpRuntime {
             return Err(error);
         }
         Ok(runtime)
-    }
-
-    /// 与 MCP worker 共享的工具注册表；MCP 工具按 generation 发布于此。
-    pub(crate) fn shared_tools(&self) -> Arc<ToolRegistry> {
-        self.shared_tools.clone()
     }
 
     pub(crate) fn handle(&self) -> &McpRuntimeHandle {

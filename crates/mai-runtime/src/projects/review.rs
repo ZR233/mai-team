@@ -324,11 +324,17 @@ pub(crate) fn project_review_cycle_result_for_wait_result(
             failure: None,
         });
     };
-    let outcome_error = format!("reviewer turn ended with outcome {:?}", last_turn.kind);
-    let error = normalize_optional_text(last_turn.reason.clone()).unwrap_or(outcome_error);
-    let failure = match last_turn.kind {
-        pl_core::TurnOutcomeKind::Completed => return None,
-        pl_core::TurnOutcomeKind::BudgetLimited => Some(ProjectReviewFailure {
+    let error = match &last_turn.outcome {
+        pl_protocol::TurnOutcome::Completed(_) => return None,
+        pl_protocol::TurnOutcome::Cancelled(_) => "reviewer turn was cancelled".to_string(),
+        pl_protocol::TurnOutcome::Failed(outcome) => outcome.failure().message.clone(),
+        pl_protocol::TurnOutcome::BudgetLimited(outcome) => {
+            format!("budget limited by {} budget", outcome.limit().kind.as_str())
+        }
+    };
+    let failure = match &last_turn.outcome {
+        pl_protocol::TurnOutcome::Completed(_) => unreachable!("completed returned above"),
+        pl_protocol::TurnOutcome::BudgetLimited(_) => Some(ProjectReviewFailure {
             category: mai_protocol::ProjectReviewFailureCategory::Timeout,
             code: Some("review_turn_budget_limited".to_string()),
             http_status: None,
@@ -337,7 +343,7 @@ pub(crate) fn project_review_cycle_result_for_wait_result(
                 retry_after_ms: None,
             },
         }),
-        pl_core::TurnOutcomeKind::Cancelled => Some(ProjectReviewFailure {
+        pl_protocol::TurnOutcome::Cancelled(_) => Some(ProjectReviewFailure {
             category: mai_protocol::ProjectReviewFailureCategory::Internal,
             code: Some("review_turn_cancelled".to_string()),
             http_status: None,
@@ -346,7 +352,7 @@ pub(crate) fn project_review_cycle_result_for_wait_result(
                 retry_after_ms: None,
             },
         }),
-        pl_core::TurnOutcomeKind::Failed => last_turn.failure.clone().map(Into::into),
+        pl_protocol::TurnOutcome::Failed(outcome) => Some(outcome.failure().clone().into()),
     };
     Some(ProjectReviewCycleResult {
         outcome: ProjectReviewOutcome::Failed,
@@ -356,12 +362,6 @@ pub(crate) fn project_review_cycle_result_for_wait_result(
         error: Some(error),
         failure,
     })
-}
-
-fn normalize_optional_text(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 fn extract_json_object(text: &str) -> Option<&str> {
@@ -1030,10 +1030,12 @@ mod tests {
 
     #[test]
     fn failed_reviewer_turn_becomes_failure_result() {
-        let wait_result = test_wait_result(
-            pl_core::TurnOutcomeKind::Failed,
-            Some("container command timed out"),
-        );
+        let wait_result = test_wait_result(pl_protocol::TurnOutcome::failed(
+            pl_protocol::TurnFailure::permanent(
+                pl_protocol::TurnFailureCategory::Internal,
+                "container command timed out",
+            ),
+        ));
 
         let result = project_review_cycle_result_for_wait_result(&wait_result)
             .expect("failed reviewer should produce failed review result");
@@ -1059,17 +1061,7 @@ mod tests {
                 retry_after_ms: Some(30_000),
             },
         };
-        let mut wait_result = test_wait_result(
-            pl_core::TurnOutcomeKind::Failed,
-            Some("The server is overloaded"),
-        );
-        wait_result.last_turn.as_mut().expect("last turn").failure = Some(failure.clone());
-        wait_result
-            .snapshot
-            .last_turn
-            .as_mut()
-            .expect("snapshot last turn")
-            .failure = Some(failure);
+        let wait_result = test_wait_result(pl_protocol::TurnOutcome::failed(failure));
 
         let result = project_review_cycle_result_for_wait_result(&wait_result)
             .expect("failed reviewer should produce failed review result");
@@ -1090,10 +1082,13 @@ mod tests {
 
     #[test]
     fn budget_limited_turn_is_a_structured_retryable_timeout() {
-        let wait_result = test_wait_result(
-            pl_core::TurnOutcomeKind::BudgetLimited,
-            Some("budget limited by wallClock budget"),
-        );
+        let wait_result = test_wait_result(pl_protocol::TurnOutcome::budget_limited(
+            pl_protocol::BudgetLimitSnapshot {
+                kind: pl_protocol::BudgetLimitKind::WallClock,
+                usage: pl_protocol::BudgetUsage::default(),
+            },
+            pl_protocol::TurnRolloverOutcome::NotAttempted,
+        ));
 
         let result = project_review_cycle_result_for_wait_result(&wait_result)
             .expect("budget-limited reviewer should continue in a later attempt");
@@ -1114,10 +1109,9 @@ mod tests {
 
     #[test]
     fn unexpected_cancelled_turn_is_a_structured_retryable_interruption() {
-        let wait_result = test_wait_result(
-            pl_core::TurnOutcomeKind::Cancelled,
-            Some("reviewer turn was cancelled"),
-        );
+        let wait_result = test_wait_result(pl_protocol::TurnOutcome::cancelled(
+            pl_protocol::TurnCancellationCause::UserRequested,
+        ));
 
         let result = project_review_cycle_result_for_wait_result(&wait_result)
             .expect("an unexpected cancellation should continue in a later attempt");
@@ -1138,25 +1132,20 @@ mod tests {
 
     #[test]
     fn completed_reviewer_turn_does_not_skip_final_json_parsing() {
-        let wait_result = test_wait_result(pl_core::TurnOutcomeKind::Completed, None);
+        let wait_result = test_wait_result(pl_protocol::TurnOutcome::completed(
+            pl_protocol::TurnCompletion::Normal,
+        ));
 
         assert!(project_review_cycle_result_for_wait_result(&wait_result).is_none());
     }
 
-    fn test_wait_result(
-        kind: pl_core::TurnOutcomeKind,
-        reason: Option<&str>,
-    ) -> pl_core::AgentWaitResult {
+    fn test_wait_result(outcome: pl_protocol::TurnOutcome) -> pl_core::AgentWaitResult {
         let outcome = pl_core::AgentTurnOutcome {
             turn_id: pl_core::TurnId::new("turn").expect("turn"),
             thread_id: pl_core::ThreadId::new("reviewer").expect("thread"),
-            kind,
-            reason: reason.map(str::to_string),
-            failure: None,
-            budget_limit: None,
-            rollover_compacted: false,
-            rollover_compaction_error: None,
+            outcome,
             usage: pl_model::TokenUsage::default(),
+            started_at: None,
             finished_at: 1,
         };
         pl_core::AgentWaitResult {
@@ -1167,9 +1156,7 @@ mod tests {
                     role: pl_core::AgentRoleId::new("reviewer").expect("role"),
                     depth: 0,
                 },
-                lifecycle: pl_core::AgentLifecycleState::Active,
-                activity: pl_core::AgentActivityState::Idle,
-                active_turn_id: None,
+                state: pl_protocol::AgentState::idle(),
                 pending_inputs: 0,
                 progress: None,
                 last_turn: Some(outcome.clone()),

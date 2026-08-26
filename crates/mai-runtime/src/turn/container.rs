@@ -212,20 +212,3 @@ pub(super) fn artifact_records_from_descriptors(
 fn runtime_invalid_input(error: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::InvalidInput(error.to_string())
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn container_backend_delegates_tool_error_shape_to_pl_core() {
-        let source = include_str!("container.rs");
-
-        assert!(
-            !source.contains(&format!("{}{}", "ToolExecution", "Failed")),
-            "container backend adapter 不应手动构造 pl-core 工具错误"
-        );
-        assert!(
-            !source.contains(&format!("{}{}", "Pure", "Error")),
-            "container backend adapter 不应依赖 pl 协议错误类型"
-        );
-    }
-}

@@ -281,13 +281,14 @@ mod tests {
         fn new() -> Self {
             let directory = TempDir::new().expect("temporary directory");
             let binary = directory.path().join("docker");
+            let binary_staging = directory.path().join("docker.new");
             let current = directory.path().join("current");
             let desired = directory.path().join("desired");
             let fail_pull = directory.path().join("fail-pull");
             let pull_delay = directory.path().join("pull-delay");
             let calls = directory.path().join("calls");
             fs::write(
-                &binary,
+                &binary_staging,
                 format!(
                     "#!/bin/sh\n\
                      echo \"$*\" >> '{}'\n\
@@ -314,11 +315,12 @@ mod tests {
                 ),
             )
             .expect("write fake docker");
-            let mut permissions = fs::metadata(&binary)
+            let mut permissions = fs::metadata(&binary_staging)
                 .expect("fake docker metadata")
                 .permissions();
             permissions.set_mode(0o755);
-            fs::set_permissions(&binary, permissions).expect("make fake docker executable");
+            fs::set_permissions(&binary_staging, permissions).expect("make fake docker executable");
+            fs::rename(&binary_staging, &binary).expect("publish fake docker atomically");
             Self {
                 _directory: directory,
                 binary: binary.to_string_lossy().into_owned(),

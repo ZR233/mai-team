@@ -29,8 +29,8 @@ impl MaiStore {
             project_id: summary.project_id.map(|id| id.to_string()),
             role: summary.role.map(|r| r.to_string()),
             name: summary.name.clone(),
-            resource_state: summary.state.resource.to_string(),
-            resource_error: summary.state.resource_error.clone(),
+            resource_state: summary.resource.state.to_string(),
+            resource_error: summary.resource.error.clone(),
             container_id: summary.container_id.clone(),
             docker_image: summary.docker_image.clone(),
             provider_id: summary.provider_id.clone(),
@@ -90,13 +90,30 @@ impl MaiStore {
             if let Some(runtime) = self.load_thread_runtime(&summary.id.to_string()).await?
                 && let Some(usage) = runtime.snapshot.and_then(|snapshot| snapshot.runtime)
             {
-                summary.token_usage.add(&TokenUsage {
-                    input_tokens: usage.usage.prompt_tokens,
-                    cached_input_tokens: usage.usage.cached_prompt_tokens,
-                    output_tokens: usage.usage.completion_tokens,
-                    reasoning_output_tokens: usage.usage.reasoning_tokens,
-                    total_tokens: usage.usage.total_tokens,
-                });
+                summary.token_usage.prompt_tokens = summary
+                    .token_usage
+                    .prompt_tokens
+                    .saturating_add(usage.usage.prompt_tokens);
+                summary.token_usage.cached_prompt_tokens = summary
+                    .token_usage
+                    .cached_prompt_tokens
+                    .saturating_add(usage.usage.cached_prompt_tokens);
+                summary.token_usage.cache_write_tokens = summary
+                    .token_usage
+                    .cache_write_tokens
+                    .saturating_add(usage.usage.cache_write_tokens);
+                summary.token_usage.completion_tokens = summary
+                    .token_usage
+                    .completion_tokens
+                    .saturating_add(usage.usage.completion_tokens);
+                summary.token_usage.reasoning_tokens = summary
+                    .token_usage
+                    .reasoning_tokens
+                    .saturating_add(usage.usage.reasoning_tokens);
+                summary.token_usage.total_tokens = summary
+                    .token_usage
+                    .total_tokens
+                    .saturating_add(usage.usage.total_tokens);
             }
             agents.push(PersistedAgent {
                 summary,

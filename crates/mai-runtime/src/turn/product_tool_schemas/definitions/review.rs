@@ -1,7 +1,7 @@
 #[cfg(test)]
-use pl_core::FunctionToolDefinition;
+use pl_core::TypedTool;
 #[cfg(test)]
-use pl_model::ToolSchema;
+use pl_model::ToolSpec;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -32,11 +32,11 @@ pub(crate) struct QueueProjectReviewPr {
 }
 
 #[cfg(test)]
-pub(crate) fn definitions() -> Vec<ToolSchema> {
-    vec![ToolSchema::function(
+pub(crate) fn definitions() -> Vec<ToolSpec> {
+    vec![ToolSpec::function(
         TOOL_QUEUE_PROJECT_REVIEW_PRS,
         QUEUE_PROJECT_REVIEW_PRS_DESCRIPTION,
-        FunctionToolDefinition::<QueueProjectReviewPrsInput>::new(
+        TypedTool::<QueueProjectReviewPrsInput>::new(
             TOOL_QUEUE_PROJECT_REVIEW_PRS,
             QUEUE_PROJECT_REVIEW_PRS_DESCRIPTION,
         )

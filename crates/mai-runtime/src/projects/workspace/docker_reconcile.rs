@@ -351,13 +351,13 @@ fn project_workspace_should_exist(project: &ProjectSummary) -> bool {
 }
 
 fn agent_workspace_should_exist(agent: &AgentSummary) -> bool {
-    agent.state.resource != AgentResourceState::Deleted
+    agent.resource.state != AgentResourceState::Deleted
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mai_protocol::{AgentResourceState, AgentRole, AgentState, TokenUsage, now};
+    use mai_protocol::{AgentResourceSnapshot, AgentResourceState, AgentRole, TokenUsage, now};
     use pretty_assertions::assert_eq;
     use uuid::Uuid;
 
@@ -546,10 +546,11 @@ mod tests {
             project_id: Some(project_id),
             role: Some(AgentRole::Executor),
             name: "agent".to_string(),
-            state: AgentState {
-                resource: AgentResourceState::Ready,
-                ..AgentState::default()
+            resource: AgentResourceSnapshot {
+                state: AgentResourceState::Ready,
+                error: None,
             },
+            runtime: None,
             container_id: None,
             docker_image: "ubuntu:latest".to_string(),
             provider_id: "provider".to_string(),

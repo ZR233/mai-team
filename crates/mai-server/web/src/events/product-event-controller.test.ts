@@ -8,7 +8,7 @@ import { applyProductEvent } from "@/events/product-event-controller"
 const agent = {
   id: "agent-1",
   name: "Maintainer",
-  state: { resource: "ready" },
+  resource: { state: "ready", error: null },
   provider_id: "openai",
   provider_name: "OpenAI",
   model: "future-model",

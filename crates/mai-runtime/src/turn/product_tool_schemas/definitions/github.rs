@@ -1,7 +1,7 @@
 #[cfg(test)]
-use pl_core::FunctionToolDefinition;
+use pl_core::TypedTool;
 #[cfg(test)]
-use pl_model::ToolSchema;
+use pl_model::ToolSpec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -70,14 +70,11 @@ where
 }
 
 #[cfg(test)]
-pub(crate) fn definitions() -> Vec<ToolSchema> {
-    vec![ToolSchema::function(
+pub(crate) fn definitions() -> Vec<ToolSpec> {
+    vec![ToolSpec::function(
         TOOL_GITHUB_API_REQUEST,
         GITHUB_API_REQUEST_DESCRIPTION,
-        FunctionToolDefinition::<GithubApiRequest>::new(
-            TOOL_GITHUB_API_REQUEST,
-            GITHUB_API_REQUEST_DESCRIPTION,
-        )
-        .input_schema(),
+        TypedTool::<GithubApiRequest>::new(TOOL_GITHUB_API_REQUEST, GITHUB_API_REQUEST_DESCRIPTION)
+            .input_schema(),
     )]
 }

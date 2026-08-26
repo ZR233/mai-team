@@ -107,7 +107,7 @@ impl tasks::TaskLifecycleOps for Arc<AgentRuntime> {
 
     async fn agent_current_turn(&self, agent_id: AgentId) -> Result<Option<TurnId>> {
         let record = self.agent(agent_id).await?;
-        Ok(record.summary.read().await.state.active_turn())
+        Ok(record.summary.read().await.active_turn())
     }
 
     async fn delete_task_from_store(&self, task_id: TaskId) -> Result<()> {

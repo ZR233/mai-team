@@ -511,11 +511,4 @@ printf '{base_marker}%s\n' "$base_sha"
         projects::workspace::docker_reconcile::delete_project_volumes(&self.deps.docker, project_id)
             .await
     }
-
-    pub(super) async fn agent_resource_broker(
-        &self,
-        agent: &AgentRecord,
-    ) -> Result<AgentResourceBroker> {
-        agents::agent_resource_broker(self, agent).await
-    }
 }

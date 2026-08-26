@@ -28,10 +28,14 @@ export class ThreadEventController {
     source.onerror = () => {
       if (generation !== this.store.getState().generation) return
       const closed = source.readyState === EventSource.CLOSED
+      if (closed) {
+        this.resubscribe(generation, "Thread stream disconnected")
+        return
+      }
       this.store.getState().setConnection(
         generation,
-        closed ? "error" : "connecting",
-        closed ? "Thread stream disconnected" : "Reconnecting…",
+        "connecting",
+        "Reconnecting…",
       )
     }
   }

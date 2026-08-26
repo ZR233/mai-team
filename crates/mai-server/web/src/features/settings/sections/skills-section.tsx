@@ -18,7 +18,7 @@ import { SettingsBody, SettingsHeader, StickyActions } from "@/features/settings
 export function SkillsSection() {
   const queryClient = useQueryClient()
   const query = useQuery({ queryKey: queryKeys.skills, queryFn: () => api<SkillsResponse>("/skills") })
-  const initial = useMemo(() => Object.fromEntries((query.data?.skills ?? []).map((skill) => [skill.path, skill.enabled])), [query.data])
+  const initial = useMemo(() => Object.fromEntries((query.data?.skills ?? []).map((skill) => [skill.name, skill.enabled])), [query.data])
   const [enabled, setEnabled] = useState<Record<string, boolean>>({})
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState("")
@@ -29,7 +29,7 @@ export function SkillsSection() {
   const save = async () => {
     setSaving(true); setError("")
     try {
-      await api<SkillsResponse>("/skills/config", { method: "PUT", ...jsonBody({ config: (query.data?.skills ?? []).map((skill) => ({ name: skill.name, path: skill.path, enabled: enabled[skill.path] ?? false })) }) })
+      await api<SkillsResponse>("/skills/config", { method: "PUT", ...jsonBody({ disabled: (query.data?.skills ?? []).filter((skill) => !(enabled[skill.name] ?? false)).map((skill) => skill.name) }) })
       await queryClient.invalidateQueries({ queryKey: queryKeys.skills })
       toast.success("Skill configuration saved")
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)) } finally { setSaving(false) }
@@ -44,7 +44,7 @@ export function SkillsSection() {
       {!query.data?.skills.length ? <EmptyState title="No skills found" description="Reload after adding a skill to a configured discovery root." /> : <div className="divide-y rounded-lg border">
         {query.data?.skills.map((skill) => <div key={skill.path} className="flex items-start gap-3 px-4 py-3">
           <Avatar className="mt-0.5 size-8 rounded-md"><AvatarFallback className="rounded-md"><FolderSearch className="size-4" /></AvatarFallback></Avatar>
-          <Field orientation="horizontal"><FieldContent><FieldTitle>{skill.name} <Badge variant="outline">{skill.scope}</Badge></FieldTitle><FieldDescription>{skill.description}<code className="block truncate text-xs">{skill.path}</code></FieldDescription></FieldContent><Switch checked={enabled[skill.path] ?? false} onCheckedChange={(checked: boolean) => setEnabled({ ...enabled, [skill.path]: checked })} aria-label={`Enable ${skill.name}`} /></Field>
+          <Field orientation="horizontal"><FieldContent><FieldTitle>{skill.name} <Badge variant="outline">{skill.scope}</Badge></FieldTitle><FieldDescription>{skill.description}<code className="block truncate text-xs">{skill.path}</code></FieldDescription></FieldContent><Switch checked={enabled[skill.name] ?? false} onCheckedChange={(checked: boolean) => setEnabled({ ...enabled, [skill.name]: checked })} aria-label={`Enable ${skill.name}`} /></Field>
         </div>)}
       </div>}
     </SettingsBody>

@@ -2,16 +2,8 @@ use std::collections::BTreeSet;
 
 use pl_core::{
     AgentAccessPolicy, AgentExecutionPolicy, AgentRoleId, AgentSnapshot, AgentTargetSelector,
-    ToolEffect, ToolEffectSet, ToolVisibilitySet, TurnFinalizationPolicy,
+    ToolEffect, ToolEffectSet, TurnFinalizationPolicy,
 };
-
-const COLLABORATION_TOOLS: [&str; 5] = [
-    "spawn_agent",
-    "send_input",
-    "wait_agent",
-    "list_agents",
-    "close_agent",
-];
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MaiPolicyContext {
@@ -22,7 +14,6 @@ pub(crate) struct MaiPolicyContext {
 pub(crate) fn compile_execution_policy(
     snapshot: &AgentSnapshot,
     configured_roles: impl IntoIterator<Item = AgentRoleId>,
-    base_visibility: ToolVisibilitySet,
     context: MaiPolicyContext,
 ) -> AgentExecutionPolicy {
     let spawn_roles = if context.can_manage_agents {
@@ -40,14 +31,7 @@ pub(crate) fn compile_execution_policy(
             AgentTargetSelector::None
         },
     };
-    let mut visible_tools = base_visibility;
-    visible_tools.extend_tool_names(
-        COLLABORATION_TOOLS
-            .into_iter()
-            .filter(|name| collaboration_tool_visible(name, &collaboration)),
-    );
     AgentExecutionPolicy {
-        visible_tools,
         allowed_effects: ToolEffectSet::from_effects(allowed_effects(
             snapshot.identity.role.as_str(),
         )),
@@ -56,13 +40,22 @@ pub(crate) fn compile_execution_policy(
     }
 }
 
-fn collaboration_tool_visible(name: &str, policy: &AgentAccessPolicy) -> bool {
-    match name {
-        "spawn_agent" => !policy.spawn_roles.is_empty(),
-        "close_agent" => !matches!(policy.close_targets, AgentTargetSelector::None),
-        "send_input" | "wait_agent" | "list_agents" => true,
-        _ => false,
-    }
+pub(crate) async fn can_manage_agents(
+    state: &crate::state::RuntimeState,
+    agent: &crate::state::AgentRecord,
+) -> bool {
+    let summary = agent.summary.read().await.clone();
+    let is_project_maintainer = if let Some(project_id) = summary.project_id {
+        let project = state.projects.read().await.get(&project_id).cloned();
+        if let Some(project) = project {
+            project.summary.read().await.maintainer_agent_id == summary.id
+        } else {
+            false
+        }
+    } else {
+        summary.parent_id.is_none()
+    };
+    is_project_maintainer || summary.parent_id.is_none()
 }
 
 fn allowed_effects(role: &str) -> Vec<ToolEffect> {
@@ -99,7 +92,7 @@ fn allowed_effects(role: &str) -> Vec<ToolEffect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pl_core::{AgentActivityState, AgentIdentity, AgentLifecycleState, ThreadId};
+    use pl_core::{AgentIdentity, AgentState, ThreadId};
 
     #[test]
     fn child_policy_has_no_spawn_or_close() {
@@ -107,7 +100,6 @@ mod tests {
         let policy = compile_execution_policy(
             &snapshot,
             [AgentRoleId::new("executor").unwrap()],
-            ToolVisibilitySet::from_tool_names(["read_file"]),
             MaiPolicyContext {
                 can_manage_agents: false,
             },
@@ -118,7 +110,6 @@ mod tests {
             policy.collaboration.close_targets,
             AgentTargetSelector::None
         ));
-        assert!(policy.visible_tools.contains("send_input"));
     }
 
     #[test]
@@ -128,7 +119,6 @@ mod tests {
         let policy = compile_execution_policy(
             &snapshot,
             [executor.clone()],
-            ToolVisibilitySet::from_tool_names(["read_file"]),
             MaiPolicyContext {
                 can_manage_agents: true,
             },
@@ -139,8 +129,6 @@ mod tests {
             policy.collaboration.close_targets,
             AgentTargetSelector::Tree
         ));
-        assert!(policy.visible_tools.contains("spawn_agent"));
-        assert!(policy.visible_tools.contains("close_agent"));
     }
 
     #[test]
@@ -148,7 +136,6 @@ mod tests {
         let policy = compile_execution_policy(
             &snapshot(Some("maintainer"), "reviewer"),
             std::iter::empty(),
-            ToolVisibilitySet::from_tool_names(["read_file", "write_file", "exec"]),
             MaiPolicyContext {
                 can_manage_agents: false,
             },
@@ -169,9 +156,7 @@ mod tests {
                 role: AgentRoleId::new(role).unwrap(),
                 depth: parent.is_some() as u32,
             },
-            lifecycle: AgentLifecycleState::Active,
-            activity: AgentActivityState::Idle,
-            active_turn_id: None,
+            state: AgentState::idle(),
             pending_inputs: 0,
             progress: None,
             last_turn: None,

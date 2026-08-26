@@ -1,9 +1,8 @@
 use std::collections::HashSet;
 
 use mai_protocol::{
-    AgentId, AgentResourceState, AgentRuntimeLifecycle, AgentSummary, ProjectId,
-    ProjectReviewJobSummary, ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewStatus,
-    ProjectSummary,
+    AgentId, AgentResourceState, AgentSummary, ProjectId, ProjectReviewJobSummary,
+    ProjectReviewRunStatus, ProjectReviewRunSummary, ProjectReviewStatus, ProjectSummary,
 };
 
 use super::runs::FinishReviewRun;
@@ -309,7 +308,10 @@ fn reviewer_agent_should_be_deleted(
 
 fn project_reviewer_agent_can_continue(reviewer: &AgentSummary) -> bool {
     matches!(
-        reviewer.state.resource,
+        reviewer.resource.state,
         AgentResourceState::Provisioning | AgentResourceState::Ready
-    ) && reviewer.state.runtime.lifecycle == AgentRuntimeLifecycle::Active
+    ) && reviewer
+        .runtime
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.state.is_operational())
 }

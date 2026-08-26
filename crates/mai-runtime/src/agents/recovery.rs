@@ -212,10 +212,10 @@ pub(crate) async fn recover_agent_resources<O: AgentResourceRecoveryOps>(
 pub(crate) fn agent_resource_recovery_retry_request(
     agent: &AgentSummary,
 ) -> Option<AgentResourceRecoveryRequest> {
-    if agent.state.resource != AgentResourceState::Failed {
+    if agent.resource.state != AgentResourceState::Failed {
         return None;
     }
-    let error = agent.state.resource_error.as_deref()?.trim();
+    let error = agent.resource.error.as_deref()?.trim();
     let error = error.strip_prefix("invalid input: ").unwrap_or(error);
     if error.starts_with(CREATED_WORKSPACE_RECOVERY_FAILURE_PREFIX) {
         Some(AgentResourceRecoveryRequest::created_workspace(agent.id))
@@ -264,7 +264,7 @@ async fn rollback_agent_resource_recovery<O: AgentResourceRecoveryOps>(
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use mai_protocol::{AgentState, TokenUsage, now};
+    use mai_protocol::{AgentResourceSnapshot, TokenUsage, now};
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex;
     use uuid::Uuid;
@@ -397,8 +397,8 @@ mod tests {
     fn retry_request_preserves_workspace_ownership() {
         let agent_id = Uuid::new_v4();
         let mut summary = agent_summary(agent_id);
-        summary.state.resource = AgentResourceState::Failed;
-        summary.state.resource_error = Some(format!(
+        summary.resource.state = AgentResourceState::Failed;
+        summary.resource.error = Some(format!(
             "invalid input: {CREATED_WORKSPACE_RECOVERY_FAILURE_PREFIX}clone failed"
         ));
 
@@ -407,7 +407,7 @@ mod tests {
             Some(AgentResourceRecoveryRequest::created_workspace(agent_id))
         );
 
-        summary.state.resource_error = Some(format!(
+        summary.resource.error = Some(format!(
             "{BORROWED_WORKSPACE_RECOVERY_FAILURE_PREFIX}container failed"
         ));
         assert_eq!(
@@ -415,7 +415,7 @@ mod tests {
             Some(AgentResourceRecoveryRequest::borrowed_workspace(agent_id))
         );
 
-        summary.state.resource = AgentResourceState::Ready;
+        summary.resource.state = AgentResourceState::Ready;
         assert_eq!(agent_resource_recovery_retry_request(&summary), None);
     }
 
@@ -428,7 +428,8 @@ mod tests {
             project_id: Some(Uuid::new_v4()),
             role: None,
             name: "agent".to_string(),
-            state: AgentState::default(),
+            resource: AgentResourceSnapshot::default(),
+            runtime: None,
             container_id: None,
             docker_image: "image".to_string(),
             provider_id: "provider".to_string(),

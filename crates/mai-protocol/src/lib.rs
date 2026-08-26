@@ -7,22 +7,20 @@ use uuid::Uuid;
 
 mod agent_state;
 
-pub use agent_state::{
-    AgentLastTurn, AgentResourceState, AgentRuntimeActivity, AgentRuntimeLifecycle,
-    AgentRuntimeState, AgentState, AgentTurnOutcomeKind,
-};
+pub use agent_state::{AgentResourceSnapshot, AgentResourceState};
 pub use pl_protocol::{
-    AgentMessageChannel, CredentialDescriptorDto, ErrorSeverity, McpAvailabilityDescriptor,
+    AgentSnapshot, CredentialDescriptorDto, ErrorSeverity, McpAvailabilityDescriptor,
     McpHealthSnapshot, McpServerDescriptor, ModelCapabilitiesDto, ModelCatalogDescriptor,
     ModelDescriptor, ModelPricingDto, ModelReasoningDescriptor, PROVIDER_CATALOG_SCHEMA_VERSION,
     ProviderCatalogSnapshot, ProviderConnectionModeDescriptor, ProviderPresetDescriptor,
     ProviderServiceCapabilitiesDescriptor, THREAD_SCHEMA_VERSION, Thread, ThreadAttachment,
-    ThreadContextDisposition, ThreadItem, ThreadItemContent, ThreadItemDelta, ThreadItemDeltaField,
-    ThreadItemStatus, ThreadMode, ThreadNotification, ThreadNotificationEnvelope,
+    ThreadContextDisposition, ThreadItem, ThreadItemDelta, ThreadItemDeltaState, ThreadItemKind,
+    ThreadItemState, ThreadMode, ThreadNotification, ThreadNotificationEnvelope,
     ThreadRuntimeSnapshot, ThreadRuntimeUsage, ThreadSnapshot, ThreadStatus,
-    ThreadSubscriptionRequest, ThreadSubscriptionUpdate, ThreadToolCall, ThreadTurnHistory,
-    ThreadTurnPage, Turn, TurnBillingRecord, TurnPhase, TurnState,
-    WebSearchProviderCapabilitiesDescriptor, WebSearchResolutionDescriptor,
+    ThreadSubscriptionRequest, ThreadSubscriptionUpdate, ThreadTextChannel, ThreadToolItem,
+    ThreadToolOutput, ThreadToolState, ThreadTurnHistory, ThreadTurnPage, TokenUsage, Turn,
+    TurnBillingRecord, TurnPhase, TurnState, WebSearchProviderCapabilitiesDescriptor,
+    WebSearchResolutionDescriptor,
 };
 
 pub type AgentId = Uuid;
@@ -336,29 +334,6 @@ pub struct UserInputQuestion {
     pub options: Vec<UserInputOption>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct TokenUsage {
-    pub input_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub output_tokens: u64,
-    pub reasoning_output_tokens: u64,
-    pub total_tokens: u64,
-}
-
-impl TokenUsage {
-    pub fn add(&mut self, other: &TokenUsage) {
-        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
-        self.cached_input_tokens = self
-            .cached_input_tokens
-            .saturating_add(other.cached_input_tokens);
-        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
-        self.reasoning_output_tokens = self
-            .reasoning_output_tokens
-            .saturating_add(other.reasoning_output_tokens);
-        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSummary {
     pub id: AgentId,
@@ -370,7 +345,10 @@ pub struct AgentSummary {
     #[serde(default)]
     pub role: Option<AgentRole>,
     pub name: String,
-    pub state: AgentState,
+    pub resource: AgentResourceSnapshot,
+    /// PL v2 的原生执行快照；资源创建或销毁窗口中可以暂时不存在。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<AgentSnapshot>,
     pub container_id: Option<String>,
     #[serde(default)]
     pub docker_image: String,
@@ -382,6 +360,25 @@ pub struct AgentSummary {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub token_usage: TokenUsage,
+}
+
+impl AgentSummary {
+    /// 只有产品资源就绪且 PL actor 完全空闲时才允许修改执行配置。
+    pub fn can_reconfigure(&self) -> bool {
+        self.resource.state == AgentResourceState::Ready
+            && self
+                .runtime
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.state.is_idle() && snapshot.pending_inputs == 0)
+    }
+
+    /// 返回当前由 PL runtime 管理的活动 Turn。
+    pub fn active_turn(&self) -> Option<TurnId> {
+        self.runtime
+            .as_ref()?
+            .active_turn_id()
+            .map(|turn_id| turn_id.as_str().to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -575,6 +572,33 @@ pub struct ProjectReviewRunSummary {
     pub failure: Option<ProjectReviewFailure>,
     #[serde(default)]
     pub token_usage: TokenUsage,
+    #[serde(default)]
+    pub history_status: ProjectReviewHistoryStatus,
+    #[serde(default)]
+    pub history_archive_id: Option<String>,
+    #[serde(default)]
+    pub history_archived_at: Option<DateTime<Utc>>,
+}
+
+/// Review Timeline 在 PL v2 升级后的唯一可读性状态。
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    strum::Display,
+    strum::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ProjectReviewHistoryStatus {
+    #[default]
+    Available,
+    PlV2Archived,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -963,18 +987,10 @@ pub struct SkillsListResponse {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SkillsConfigRequest {
     #[serde(default)]
-    pub config: Vec<SkillConfigEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SkillConfigEntry {
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub path: Option<PathBuf>,
-    pub enabled: bool,
+    pub disabled: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -2486,6 +2502,21 @@ mod tests {
         assert_eq!(
             RelayEventKind::from_github_event("workflow_job").as_github_event(),
             "workflow_job"
+        );
+    }
+
+    #[test]
+    fn skills_config_accepts_only_the_native_name_set_shape() {
+        let current: SkillsConfigRequest = serde_json::from_value(json!({
+            "disabled": ["review"]
+        }))
+        .expect("current skills config");
+        assert_eq!(current.disabled, vec!["review"]);
+        assert!(
+            serde_json::from_value::<SkillsConfigRequest>(json!({
+                "config": [{"name": "review", "enabled": false}]
+            }))
+            .is_err()
         );
     }
 }

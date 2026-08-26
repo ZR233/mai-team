@@ -1,6 +1,18 @@
 use super::*;
 
 impl AgentRuntime {
+    /// 先停止全部 PL actor，再排空唯一 Thread 持久化写入器。
+    pub async fn shutdown(&self) -> Result<()> {
+        let Some(framework) = self.agent_framework.get() else {
+            return Ok(());
+        };
+        framework
+            .shutdown()
+            .await
+            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
+        framework.host().shutdown_repository().await
+    }
+
     pub async fn new(
         docker: DockerClient,
         store: Arc<MaiStore>,
@@ -15,7 +27,7 @@ impl AgentRuntime {
         config: RuntimeConfig,
         github_backend: Option<Arc<dyn GithubAppBackend>>,
     ) -> Result<Arc<Self>> {
-        let skills = SkillsManager::new_with_system_root(
+        let skills = SkillCatalogService::new_with_system_root(
             &config.repo_root,
             config.system_skills_root.as_ref(),
         );
@@ -137,6 +149,7 @@ impl AgentRuntime {
             github_get_cache: github::GithubGetCache::default(),
             pull_request_state_refreshes: github::PullRequestStateRefreshCoordinator::default(),
             workspace_manager,
+            tool_sets: turn::tool_sets::AgentToolSets::new(),
         });
         runtime.reconcile_project_workspaces().await?;
         runtime.restore_project_repositories().await;
@@ -163,12 +176,6 @@ impl AgentRuntime {
         runtime.agent_framework.set(framework).map_err(|_| {
             RuntimeError::InvalidInput("agent framework already started".to_string())
         })?;
-        runtime.bootstrap_framework_agents().await?;
-        runtime
-            .framework_handle()?
-            .start_restored_inputs()
-            .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
         runtime
             .cleanup_orphan_project_review_repository_views()
             .await;
@@ -200,79 +207,82 @@ impl AgentRuntime {
             .ok_or_else(|| RuntimeError::InvalidInput("agent framework is not started".to_string()))
     }
 
-    pub(super) async fn bootstrap_framework_agents(self: &Arc<Self>) -> Result<()> {
-        let handle = self.framework_handle()?;
-        let existing = handle
-            .list()
+    pub(super) async fn register_framework_agent(&self, product_agent_id: AgentId) -> Result<()> {
+        let agent = self.agent(product_agent_id).await?;
+        if let Some(parent_id) = agent.summary.read().await.parent_id {
+            self.ensure_framework_agent(parent_id).await?;
+        }
+        self.register_resident_framework_agent(product_agent_id)
             .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?
-            .into_iter()
-            .map(|snapshot| snapshot.identity.id)
-            .collect::<HashSet<_>>();
-        let records = self
-            .state
-            .agents
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut summaries = HashMap::new();
-        for agent in &records {
-            let summary = agent.summary.read().await.clone();
-            summaries.insert(summary.id, summary);
-        }
-        let mut registrations = Vec::new();
-        for agent in records {
-            let summary = agent.summary.read().await.clone();
-            let thread_id = pl_core::ThreadId::new(summary.id.to_string())?;
-            if existing.contains(&thread_id) {
-                continue;
-            }
-            let parent_id = summary
-                .parent_id
-                .map(|parent| pl_core::ThreadId::new(parent.to_string()))
-                .transpose()?;
-            let role = summary
-                .role
-                .map(|role| role.to_string())
-                .unwrap_or_else(|| "executor".to_string());
-            let identity = pl_core::AgentIdentity {
-                id: thread_id,
-                parent_id,
-                role: pl_core::AgentRoleId::new(role)?,
-                depth: framework_depth(summary.id, &summaries),
-            };
-            let mut registration = pl_core::AgentRegistration::new(identity);
-            registration.session = initial_thread_context(&summary);
-            registrations.push((framework_depth(summary.id, &summaries), registration));
-        }
-        registrations.sort_by_key(|(depth, _)| *depth);
-        for (_, registration) in registrations {
-            handle
-                .register(registration)
-                .await
-                .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        }
-        for snapshot in handle
-            .list()
-            .await
-            .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?
-        {
-            agent_host::synchronize_runtime_state(self, snapshot).await?;
-        }
-        Ok(())
+            .map(|_| ())
     }
 
-    pub(super) async fn register_framework_agent(&self, product_agent_id: AgentId) -> Result<()> {
+    /// 按产品父子图顺序惰性恢复一个 PL actor；没有 v2 document 的长期 Agent
+    /// 在首次访问时创建全新的原生初始运行态。
+    pub(super) async fn ensure_framework_agent(
+        &self,
+        product_agent_id: AgentId,
+    ) -> Result<pl_core::AgentSnapshot> {
+        let mut lineage = Vec::new();
+        let mut current = Some(product_agent_id);
+        while let Some(agent_id) = current {
+            let agent = self.agent(agent_id).await?;
+            let summary = agent.summary.read().await;
+            lineage.push(agent_id);
+            current = summary.parent_id;
+        }
+        lineage.reverse();
+
+        let framework = self.agent_framework.get().ok_or_else(|| {
+            RuntimeError::InvalidInput("agent framework is not started".to_string())
+        })?;
+        let handle = framework.handle();
+        let mut requested = None;
+        for agent_id in lineage {
+            let thread_id = agent_host::canonical_id(agent_id)?;
+            let (snapshot, restored) = match handle.snapshot(thread_id.clone()).await {
+                Ok(snapshot) => (snapshot, false),
+                Err(pl_core::AgentRuntimeError::NotFound(_)) => {
+                    match framework.host().restore_thread(&thread_id).await? {
+                        Some(restored) => (
+                            handle
+                                .restore_agent(restored)
+                                .await
+                                .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?,
+                            true,
+                        ),
+                        None => (
+                            self.register_resident_framework_agent(agent_id).await?,
+                            true,
+                        ),
+                    }
+                }
+                Err(error) => return Err(RuntimeError::InvalidInput(error.to_string())),
+            };
+            if restored {
+                agent_host::synchronize_runtime_state(self, snapshot.clone()).await?;
+            }
+            if agent_id == product_agent_id {
+                requested = Some(snapshot);
+            }
+        }
+        requested.ok_or_else(|| RuntimeError::AgentNotFound(product_agent_id))
+    }
+
+    async fn register_resident_framework_agent(
+        &self,
+        product_agent_id: AgentId,
+    ) -> Result<pl_core::AgentSnapshot> {
         let Some(framework) = self.agent_framework.get() else {
-            return Ok(());
+            return Err(RuntimeError::InvalidInput(
+                "agent framework is not started".to_string(),
+            ));
         };
         let handle = framework.handle();
         let agent = self.agent(product_agent_id).await?;
         let thread_id = pl_core::ThreadId::new(product_agent_id.to_string())?;
         match handle.snapshot(thread_id.clone()).await {
-            Ok(_) => return Ok(()),
+            Ok(snapshot) => return Ok(snapshot),
             Err(pl_core::AgentRuntimeError::NotFound(_)) => {}
             Err(error) => return Err(RuntimeError::InvalidInput(error.to_string())),
         }
@@ -297,7 +307,7 @@ impl AgentRuntime {
             summaries.insert(summary.id, summary);
         }
         let identity = pl_core::AgentIdentity {
-            id: thread_id,
+            id: thread_id.clone(),
             parent_id,
             role: pl_core::AgentRoleId::new(
                 summary
@@ -309,10 +319,14 @@ impl AgentRuntime {
         };
         let mut registration = pl_core::AgentRegistration::new(identity);
         registration.session = initial_thread_context(&summary);
-        handle
+        let snapshot = handle
             .register(registration)
             .await
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))?;
-        Ok(())
+        framework
+            .host()
+            .await_durable(&thread_id, snapshot.revision)
+            .await?;
+        Ok(snapshot)
     }
 }
