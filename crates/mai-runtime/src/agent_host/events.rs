@@ -186,9 +186,6 @@ async fn project_state(
 ) -> crate::Result<(mai_protocol::AgentId, mai_protocol::AgentSummary)> {
     let (agent_id, agent) =
         super::turn_factory::product_agent(runtime, &snapshot.identity.id).await?;
-    let thread_id = super::canonical_id(agent_id)?;
-    let durable_runtime = super::load_runtime(&runtime.deps.store, &thread_id).await?;
-    let token_usage = super::aggregate_usage(&durable_runtime);
     let mut current = agent.summary.write().await;
     let summary = {
         let mut summary = current.clone();
@@ -211,7 +208,6 @@ async fn project_state(
         summary.updated_at = chrono::DateTime::from_timestamp(snapshot.updated_at, 0)
             .unwrap_or_else(chrono::Utc::now);
         summary.runtime = Some(snapshot);
-        summary.token_usage = token_usage;
         summary
     };
     runtime
