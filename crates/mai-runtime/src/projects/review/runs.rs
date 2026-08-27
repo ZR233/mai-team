@@ -10,14 +10,15 @@ use uuid::Uuid;
 
 use crate::{Result, RuntimeError};
 
-/// Provides retained reviewer activity for review run snapshots without exposing
-/// the runtime's full agent and event internals to review persistence.
+/// 从 reviewer 唯一拥有的 canonical Thread 读取 Run 终态快照。
+///
+/// 实现必须读取已持久化的 Thread 文档，不能依赖异步产品投影或内存摘要。
 pub(crate) trait ReviewRunSnapshotSource: Send + Sync {
     fn snapshot(
         &self,
         reviewer_agent_id: AgentId,
         turn_id: Option<&str>,
-    ) -> impl Future<Output = ReviewRunSnapshot> + Send;
+    ) -> impl Future<Output = Result<ReviewRunSnapshot>> + Send;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -191,7 +192,7 @@ async fn finish_project_review_run_at(
     let snapshot = if let Some(reviewer_agent_id) = reviewer_agent_id {
         snapshot_source
             .snapshot(reviewer_agent_id, turn_id.as_deref())
-            .await
+            .await?
     } else {
         ReviewRunSnapshot::default()
     };
@@ -404,8 +405,8 @@ mod tests {
             &self,
             _reviewer_agent_id: AgentId,
             _turn_id: Option<&str>,
-        ) -> ReviewRunSnapshot {
-            self.snapshot.clone()
+        ) -> Result<ReviewRunSnapshot> {
+            Ok(self.snapshot.clone())
         }
     }
 

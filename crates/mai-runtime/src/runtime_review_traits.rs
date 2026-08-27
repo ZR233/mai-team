@@ -5,24 +5,24 @@ impl projects::review::runs::ReviewRunSnapshotSource for AgentRuntime {
         &self,
         reviewer_agent_id: AgentId,
         turn_id: Option<&str>,
-    ) -> projects::review::runs::ReviewRunSnapshot {
-        let token_usage = match self.agent(reviewer_agent_id).await {
-            Ok(agent) => agent.summary.read().await.token_usage.clone(),
-            Err(_) => Default::default(),
-        };
+    ) -> Result<projects::review::runs::ReviewRunSnapshot> {
+        let thread_id = agent_host::canonical_id(reviewer_agent_id)?;
+        let runtime = agent_host::load_runtime(&self.deps.store, &thread_id).await?;
+        let token_usage = agent_host::aggregate_usage(&runtime);
         let history = self
-            .thread_history(reviewer_agent_id)
+            .deps
+            .store
+            .list_thread_turns(thread_id.as_str(), None, 200)
             .await
-            .ok()
-            .and_then(|page| {
+            .map(|page| {
                 page.turns
                     .into_iter()
                     .find(|history| turn_id.is_none_or(|turn_id| history.turn.id == turn_id))
-            });
-        projects::review::runs::ReviewRunSnapshot {
+            })?;
+        Ok(projects::review::runs::ReviewRunSnapshot {
             token_usage,
             history,
-        }
+        })
     }
 }
 
@@ -417,6 +417,192 @@ impl projects::review::selector::ProjectReviewSelectorOps for Arc<AgentRuntime> 
         signals: Vec<ProjectReviewSignalInput>,
     ) -> impl std::future::Future<Output = Result<ProjectReviewQueueSummary>> + Send {
         AgentRuntime::enqueue_project_review_signals(self, project_id, signals, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use mai_store::{
+        StoredThreadRuntime, ThreadRuntimeCommitDocument, ThreadRuntimeCommitOutcome,
+        ThreadRuntimeTurnCommit,
+    };
+    use pl_protocol::{
+        CompletedTurnState, ThreadRuntimeSnapshot, ThreadRuntimeUsage, ThreadSnapshot, Turn,
+        TurnCompletion, TurnState,
+    };
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn review_snapshot_reads_usage_from_durable_thread() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            MaiStore::open_with_config_and_artifact_index_path(
+                directory.path().join("runtime.sqlite3"),
+                directory.path().join("config.toml"),
+                directory.path().join("artifacts/index"),
+            )
+            .await
+            .expect("open store"),
+        );
+        let reviewer_agent_id = Uuid::new_v4();
+        let now = Utc::now();
+        store
+            .save_agent(
+                &AgentSummary {
+                    id: reviewer_agent_id,
+                    parent_id: None,
+                    task_id: None,
+                    project_id: None,
+                    role: Some(AgentRole::Reviewer),
+                    name: "reviewer".to_string(),
+                    resource: AgentResourceSnapshot {
+                        state: AgentResourceState::Ready,
+                        error: None,
+                    },
+                    runtime: None,
+                    container_id: None,
+                    docker_image: "unused".to_string(),
+                    provider_id: "test".to_string(),
+                    provider_name: "Test".to_string(),
+                    model: "test-model".to_string(),
+                    reasoning_effort: None,
+                    created_at: now,
+                    updated_at: now,
+                    token_usage: TokenUsage::default(),
+                },
+                None,
+            )
+            .await
+            .expect("save reviewer");
+
+        let runtime = AgentRuntime::new(
+            DockerClient::new_with_binary("unused", fake_docker_path(&directory)),
+            Arc::clone(&store),
+            RuntimeConfig {
+                repo_root: directory.path().to_path_buf(),
+                projects_root: directory.path().join("projects"),
+                cache_root: directory.path().join("cache"),
+                artifact_files_root: directory.path().join("artifacts/files"),
+                sidecar_image: "unused".to_string(),
+                github_api_base_url: None,
+                git_binary: None,
+                system_skills_root: None,
+                system_agents_root: None,
+            },
+        )
+        .await
+        .expect("start runtime");
+
+        let thread_id = reviewer_agent_id.to_string();
+        let turn_id = "turn-review";
+        let expected_usage = TokenUsage {
+            prompt_tokens: 101,
+            cached_prompt_tokens: 23,
+            cache_write_tokens: 7,
+            completion_tokens: 31,
+            reasoning_tokens: 11,
+            total_tokens: 150,
+        };
+        let mut snapshot = ThreadSnapshot::empty(thread_id.clone());
+        snapshot.revision = 1;
+        snapshot.runtime = Some(ThreadRuntimeSnapshot {
+            thread_id: thread_id.clone(),
+            usage: ThreadRuntimeUsage {
+                model: "test-model".to_string(),
+                context_window: Some(200_000),
+                latest_context_tokens: 88,
+                prompt_tokens: expected_usage.prompt_tokens,
+                completion_tokens: expected_usage.completion_tokens,
+                cached_prompt_tokens: expected_usage.cached_prompt_tokens,
+                cache_write_tokens: expected_usage.cache_write_tokens,
+                cache_miss_tokens: 78,
+                reasoning_tokens: expected_usage.reasoning_tokens,
+                inference_count: 2,
+                total_tokens: expected_usage.total_tokens,
+                cache_hit_rate: Some(0.2),
+                estimated_costs: Vec::new(),
+                estimated_cache_savings: Vec::new(),
+                has_unpriced_usage: false,
+                prompt_generation: Some(1),
+                prompt_cache_policy: None,
+                prefix_changed_reason: None,
+                updated_at: 2,
+            },
+            todo: None,
+            active_skills: Vec::new(),
+            active_mcp_servers: Vec::new(),
+            active_lsp_servers: Vec::new(),
+            progress: None,
+            mcp_health: None,
+            updated_at: 2,
+        });
+        let turn = Turn {
+            id: turn_id.to_string(),
+            thread_id: thread_id.clone(),
+            revision: 1,
+            state: TurnState::Completed(CompletedTurnState::new(
+                Some(1),
+                2,
+                TurnCompletion::Normal,
+            )),
+            updated_at: 2,
+        };
+        assert_eq!(
+            store
+                .commit_thread_runtime(ThreadRuntimeCommitDocument {
+                    expected_revision: None,
+                    runtime: StoredThreadRuntime {
+                        thread_id: thread_id.clone(),
+                        revision: 1,
+                        document: serde_json::json!({ "revision": 1 }),
+                        snapshot: Some(snapshot),
+                        updated_at: 2,
+                    },
+                    turn: Some(ThreadRuntimeTurnCommit {
+                        id: turn.id.clone(),
+                        thread_id: thread_id.clone(),
+                        turn: Some(turn),
+                        billing: None,
+                    }),
+                    notifications: Vec::new(),
+                    runtime_events: Vec::new(),
+                    trace_events: Vec::new(),
+                    submissions: Vec::new(),
+                })
+                .await
+                .expect("commit canonical thread"),
+            ThreadRuntimeCommitOutcome::Applied
+        );
+
+        let captured = <AgentRuntime as projects::review::runs::ReviewRunSnapshotSource>::snapshot(
+            runtime.as_ref(),
+            reviewer_agent_id,
+            Some(turn_id),
+        )
+        .await
+        .expect("capture review snapshot");
+        assert_eq!(expected_usage, captured.token_usage);
+        assert_eq!(turn_id, captured.history.expect("turn history").turn.id);
+        runtime.shutdown().await.expect("shutdown runtime");
+    }
+
+    fn fake_docker_path(directory: &tempfile::TempDir) -> String {
+        let path = directory.path().join("fake-docker.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\ncase \"$1\" in\n  version) echo test-version ;;\n  *) exit 0 ;;\nesac\n",
+        )
+        .expect("write fake docker");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("fake docker metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod fake docker");
+        path.to_string_lossy().into_owned()
     }
 }
 

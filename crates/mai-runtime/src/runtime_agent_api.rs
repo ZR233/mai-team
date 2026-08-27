@@ -405,17 +405,4 @@ impl AgentRuntime {
             () = cancellation_token.cancelled() => Err(RuntimeError::TurnCancelled),
         }
     }
-
-    pub(super) async fn thread_history(
-        &self,
-        agent_id: AgentId,
-    ) -> Result<pl_protocol::ThreadTurnPage> {
-        self.agent(agent_id).await?;
-        let thread_id = agent_id.to_string();
-        Ok(self
-            .deps
-            .store
-            .list_thread_turns(&thread_id, None, 200)
-            .await?)
-    }
 }
