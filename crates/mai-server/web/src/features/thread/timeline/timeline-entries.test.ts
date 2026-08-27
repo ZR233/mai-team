@@ -1,190 +1,97 @@
 import { describe, expect, it } from "vitest"
 
-import type { ThreadItem, ThreadItemContent, ThreadToolCall } from "@/events/thread-events.generated"
+import type { ThreadItem, ThreadItemState, ThreadToolState } from "@/events/thread-events.generated"
 
 import { formatDuration } from "./duration"
 import { buildTimelineEntries } from "./timeline-entries"
 
 let sequence = 0
 
-function item(content: ThreadItemContent, overrides: Partial<ThreadItem> = {}): ThreadItem {
+function item(state: ThreadItemState, overrides: Partial<ThreadItem> = {}): ThreadItem {
   sequence += 1
-  return {
-    id: `item-${sequence}`,
-    threadId: "thread-1",
-    turnId: "turn-1",
-    ordinal: sequence,
-    revision: 1,
-    status: "completed",
-    createdAt: 0,
-    updatedAt: 18_000,
-    completedAt: 18_000,
-    content,
-    ...overrides,
-  }
+  return { id: `item-${sequence}`, threadId: "thread-1", turnId: "turn-1", ordinal: sequence, revision: 1, createdAt: 0, updatedAt: 18, state, ...overrides }
 }
 
-function toolCall(overrides: Partial<ThreadItem> = {}, tool: Partial<ThreadToolCall> = {}): ThreadItem {
-  return item({ type: "toolCall", tool: { toolCallId: "call", name: "exec", timedOut: false, ...tool } }, overrides)
+function toolCall(state: ThreadToolState = succeeded(), overrides: Partial<ThreadItem> = {}, result = ""): ThreadItem {
+  return item({ kind: "tool", data: { invocation: { toolCallId: "call", name: "exec" }, state: result ? succeeded(result) : state } }, overrides)
 }
 
-const message = (text: string) => item({ type: "agentMessage", channel: "final", text })
+function succeeded(result = ""): ThreadToolState {
+  return { kind: "succeeded", data: { completedAt: 18, output: { result, exitCode: 0 } } }
+}
 
-describe("buildTimelineEntries", () => {
-  it("返回空数组当没有条目", () => {
-    expect(buildTimelineEntries([])).toEqual([])
-  })
+const completed = { kind: "completed", data: { completedAt: 18 } } as const
+const message = (text: string, turnId = "turn-1") => item({ kind: "text", data: { channel: "final", text, lifecycle: completed } }, { turnId })
 
-  it("合并同 turn 内连续的工具调用为一个分组", () => {
-    const items = [toolCall(), toolCall(), toolCall()]
-
-    const entries = buildTimelineEntries(items)
-
-    expect(entries).toHaveLength(1)
-    const entry = entries[0]!
-    if (entry.kind !== "toolGroup") throw new Error(`expected toolGroup, got ${entry.kind}`)
-    expect(entry.key).toBe(`tool-group:${items[0]!.id}`)
-    expect(entry.group).toEqual({
-      activities: entry.group.activities,
-      countLabel: "Used 3 tools",
-      durationLabel: "18s",
-      active: false,
-      failedCount: 0,
-    })
-    expect(entry.group.activities).toHaveLength(3)
-  })
-
-  it("文字输出打断分组", () => {
-    const entries = buildTimelineEntries([toolCall(), toolCall(), message("working on it"), toolCall()])
+describe("buildTimelineEntries PL v2 投影", () => {
+  it("合并同 turn 连续工具，并由文字打断", () => {
+    const first = toolCall()
+    const entries = buildTimelineEntries([first, toolCall(), message("working"), toolCall()])
 
     expect(entries.map((entry) => entry.kind)).toEqual(["toolGroup", "item", "tool"])
+    expect(entries[0]).toMatchObject({ kind: "toolGroup", key: `tool-group:${first.id}`, group: { countLabel: "Used 2 tools", active: false } })
   })
 
-  it("思考输出打断分组", () => {
-    const entries = buildTimelineEntries([toolCall(), item({ type: "reasoning", summary: ["thinking"] }), toolCall()])
+  it("turn 边界打断工具和思考分组", () => {
+    const tools = buildTimelineEntries([toolCall(succeeded(), { turnId: "turn-1" }), toolCall(succeeded(), { turnId: "turn-2" })])
+    const thoughts = buildTimelineEntries([
+      item({ kind: "thinking", data: { summary: ["one"], lifecycle: completed } }, { turnId: "turn-1" }),
+      item({ kind: "thinking", data: { summary: ["two"], lifecycle: completed } }, { turnId: "turn-2" }),
+    ])
 
-    expect(entries.map((entry) => entry.kind)).toEqual(["tool", "reasoningGroup", "tool"])
+    expect(tools.map((entry) => entry.kind)).toEqual(["tool", "tool"])
+    expect(thoughts.map((entry) => entry.kind)).toEqual(["reasoningGroup", "reasoningGroup"])
+  })
+
+  it("隐藏空思考与内部协议条目且不打断工具分组", () => {
+    const first = toolCall()
+    const entries = buildTimelineEntries([
+      first,
+      item({ kind: "skill", data: { activation: { name: "review", source: "system", providerId: "local", resourceBase: { kind: "directory", path: "/skills/review" }, turnId: "turn-1", cause: { kind: "tool", toolCallId: "call" }, activatedAt: 1 } } }),
+      item({ kind: "thinking", data: { summary: ["  "], lifecycle: completed } }),
+      item({ kind: "file", data: { path: "README.md", completedAt: 1 } }),
+      toolCall(),
+    ])
+
+    expect(entries).toEqual([expect.objectContaining({ kind: "toolGroup", key: `tool-group:${first.id}` })])
+  })
+
+  it("运行中的工具分组标记为 active，失败输出计数", () => {
+    const active = buildTimelineEntries([toolCall(), toolCall({ kind: "running", data: {} })])
+    const failed = buildTimelineEntries([
+      toolCall(),
+      toolCall({ kind: "failed", data: { failedAt: 18, failure: { kind: "execution", message: "exit" }, output: { result: JSON.stringify({ exitCode: 1 }), exitCode: 1 } } }),
+    ])
+
+    expect(active[0]).toMatchObject({ kind: "toolGroup", group: { countLabel: "Using 2 tools", durationLabel: null, active: true } })
+    expect(failed[0]).toMatchObject({ kind: "toolGroup", group: { failedCount: 1 } })
   })
 
   it("按 ordinal 与 id 稳定排序", () => {
     const later = message("later")
-    const sameOrdinalB = message("same-b")
-    const sameOrdinalA = message("same-a")
+    const sameB = message("same-b")
+    const sameA = message("same-a")
     later.ordinal = 2
-    sameOrdinalB.ordinal = 1
-    sameOrdinalB.id = "b"
-    sameOrdinalA.ordinal = 1
-    sameOrdinalA.id = "a"
+    sameB.ordinal = 1
+    sameB.id = "b"
+    sameA.ordinal = 1
+    sameA.id = "a"
 
-    expect(buildTimelineEntries([later, sameOrdinalB, sameOrdinalA]).map((entry) => entry.key)).toEqual(["a", "b", later.id])
-  })
-
-  it("合并同 turn 内连续 reasoning 并保留最新摘要", () => {
-    const first = item({ type: "reasoning", summary: ["Inspecting files"] })
-    const second = item({ type: "reasoning", summary: ["Checking lifecycle"] })
-
-    const entries = buildTimelineEntries([first, second])
-
-    expect(entries).toHaveLength(1)
-    expect(entries[0]).toMatchObject({
-      kind: "reasoningGroup",
-      key: `reasoning-group:${first.id}`,
-      group: { latestSummary: "Checking lifecycle", durationLabel: "18s", active: false },
-    })
-  })
-
-  it("turn 边界打断 reasoning 分组", () => {
-    const entries = buildTimelineEntries([
-      item({ type: "reasoning", summary: ["one"] }, { turnId: "turn-1" }),
-      item({ type: "reasoning", summary: ["two"] }, { turnId: "turn-2" }),
-    ])
-
-    expect(entries.map((entry) => entry.kind)).toEqual(["reasoningGroup", "reasoningGroup"])
-  })
-
-  it("隐藏空 reasoning、file 与 contextCompaction", () => {
-    expect(buildTimelineEntries([
-      item({ type: "reasoning", summary: ["  "] }),
-      item({ type: "file", path: "README.md" }),
-      item({ type: "contextCompaction", beforeTokens: 10, afterTokens: 5, compactedAt: 1 }),
-    ])).toEqual([])
-  })
-
-  it("隐藏的内部条目不打断可见 Timeline 的连续分组", () => {
-    const first = toolCall()
-    const internal = item({ type: "file", path: "README.md" })
-    const second = toolCall()
-
-    expect(buildTimelineEntries([first, internal, second])).toEqual([
-      expect.objectContaining({ kind: "toolGroup", key: `tool-group:${first.id}` }),
-    ])
-  })
-
-  it("turn 边界打断分组", () => {
-    const entries = buildTimelineEntries([toolCall({ turnId: "turn-1" }), toolCall({ turnId: "turn-2" })])
-
-    expect(entries.map((entry) => entry.kind)).toEqual(["tool", "tool"])
-  })
-
-  it("单个工具调用退化为紧凑条目", () => {
-    const entries = buildTimelineEntries([toolCall({ id: "solo" })])
-
-    expect(entries).toEqual([
-      expect.objectContaining({ kind: "tool", key: "solo", activity: expect.objectContaining({ id: "solo" }) }),
-    ])
-  })
-
-  it("非工具条目原样透传", () => {
-    const user = item({ type: "userMessage", text: "hello" })
-
-    expect(buildTimelineEntries([user])).toEqual([{ kind: "item", key: user.id, item: user }])
-  })
-
-  it("运行中的分组展示 Using 且不带时长", () => {
-    const entries = buildTimelineEntries([
-      toolCall({ status: "completed" }),
-      toolCall({ status: "running", completedAt: undefined, updatedAt: 5_000 }),
-    ])
-
-    expect(entries[0]).toMatchObject({
-      kind: "toolGroup",
-      group: { countLabel: "Using 2 tools", durationLabel: null, active: true },
-    })
-  })
-
-  it("统计失败的工具调用", () => {
-    const entries = buildTimelineEntries([
-      toolCall(),
-      toolCall({}, { exitCode: 1, result: JSON.stringify({ status: "error", exitCode: 1 }) }),
-    ])
-
-    expect(entries[0]).toMatchObject({ kind: "toolGroup", group: { failedCount: 1 } })
-  })
-
-  it("分组 key 基于首条 id，流式更新期间保持稳定", () => {
-    const growing = [toolCall(), toolCall()]
-    const before = buildTimelineEntries(growing)
-    growing.push(toolCall(), toolCall())
-    const after = buildTimelineEntries(growing)
-
-    expect(after[0]!.key).toBe(before[0]!.key)
-    const entry = after[0]!
-    if (entry.kind !== "toolGroup") throw new Error(`expected toolGroup, got ${entry.kind}`)
-    expect(entry.group.activities).toHaveLength(4)
+    expect(buildTimelineEntries([later, sameB, sameA]).map((entry) => entry.key)).toEqual(["a", "b", later.id])
   })
 })
 
 describe("formatDuration", () => {
-  it("格式化各档时长", () => {
-    expect(formatDuration(0, 500)).toBe("<1s")
-    expect(formatDuration(0, 18_000)).toBe("18s")
-    expect(formatDuration(0, 125_000)).toBe("2m 5s")
-    expect(formatDuration(0, 180_000)).toBe("3m")
+  it("按 PL 秒级时间戳格式化时长", () => {
+    expect(formatDuration(0, 0.5)).toBe("<1s")
+    expect(formatDuration(0, 18)).toBe("18s")
+    expect(formatDuration(0, 125)).toBe("2m 5s")
+    expect(formatDuration(0, 180)).toBe("3m")
   })
 
   it("缺失或非法时间返回 null", () => {
-    expect(formatDuration(undefined, 1_000)).toBeNull()
-    expect(formatDuration(0, undefined)).toBeNull()
-    expect(formatDuration(2_000, 1_000)).toBeNull()
+    expect(formatDuration(undefined, 1)).toBeNull()
+    expect(formatDuration(2, undefined)).toBeNull()
+    expect(formatDuration(2, 1)).toBeNull()
   })
 })

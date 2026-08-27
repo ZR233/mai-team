@@ -150,18 +150,18 @@ function snapshotUpdate(threadId: string, text: string) {
   return {
     type: "snapshot",
     snapshot: {
-      schemaVersion: 1,
+      schemaVersion: 7,
       revision: 1,
       thread: thread(threadId, threadId),
-      items: [{ id: `${threadId}:item`, threadId, turnId: `${threadId}:turn`, ordinal: 0, revision: 0, status: "completed", createdAt: 1, updatedAt: 1, completedAt: 1, content: { type: "agentMessage", channel: "final", text } }],
+      items: [{ id: `${threadId}:item`, threadId, turnId: `${threadId}:turn`, ordinal: 0, revision: 0, createdAt: 1, updatedAt: 1, state: { kind: "text", data: { channel: "final", text, lifecycle: { kind: "completed", data: { completedAt: 1 } } } } }],
       interactions: [],
-      runtime: { threadId, usage: usageSnapshot(threadId), activeSkills: [], activeMcpServers: [], activeLspServers: [], updatedAt: 1 },
+      runtime: { threadId, usage: usageSnapshot(), activeSkills: [], activeMcpServers: [], activeLspServers: [], updatedAt: 1 },
     },
   }
 }
 
-function usageSnapshot(threadId: string) {
-  return { threadId, model: "future-model", latestContextTokens: 1200, promptTokens: 1200, completionTokens: 180, cachedPromptTokens: 400, cacheWriteTokens: 0, cacheMissTokens: 800, reasoningTokens: 80, inferenceCount: 1, totalTokens: 1380, hasUnpricedUsage: false, updatedAt: 1 }
+function usageSnapshot() {
+  return { model: "future-model", latestContextTokens: 1200, promptTokens: 1200, completionTokens: 180, cachedPromptTokens: 400, cacheWriteTokens: 0, cacheMissTokens: 800, reasoningTokens: 80, inferenceCount: 1, totalTokens: 1380, hasUnpricedUsage: false, updatedAt: 1 }
 }
 
 function thread(id: string, title: string) {

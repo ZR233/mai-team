@@ -16,8 +16,8 @@ describe("ThreadStoreRegistry", () => {
     a.getState().replace(generationA, snapshot("thread-a"))
     b.getState().replace(generationB, snapshot("thread-b"))
 
-    a.getState().apply(generationA, { threadId: "thread-a", revision: 1, emittedAt: 2, notification: { type: "turnStarted", turn: { id: "turn-a", threadId: "thread-a", state: { status: "queued" }, startedAt: null, updatedAt: 2, completedAt: null } } })
-    b.getState().apply(generationB, { threadId: "thread-b", revision: 1, emittedAt: 2, notification: { type: "turnStarted", turn: { id: "turn-b", threadId: "thread-b", state: { status: "queued" }, startedAt: null, updatedAt: 2, completedAt: null } } })
+    a.getState().apply(generationA, { threadId: "thread-a", revision: 1, emittedAt: 2, notification: { type: "turnStarted", turn: { id: "turn-a", threadId: "thread-a", revision: 0, state: { kind: "queued", data: { queuedAt: 2 } }, updatedAt: 2 } } })
+    b.getState().apply(generationB, { threadId: "thread-b", revision: 1, emittedAt: 2, notification: { type: "turnStarted", turn: { id: "turn-b", threadId: "thread-b", revision: 0, state: { kind: "queued", data: { queuedAt: 2 } }, updatedAt: 2 } } })
 
     expect(a.getState().snapshot?.activeTurn?.id).toBe("turn-a")
     expect(b.getState().snapshot?.activeTurn?.id).toBe("turn-b")
@@ -35,7 +35,7 @@ describe("ThreadStoreRegistry", () => {
 
 function snapshot(threadId: string, title = threadId): ThreadSnapshot {
   return {
-    schemaVersion: 1,
+    schemaVersion: 7,
     revision: 0,
     thread: { id: threadId, projectId: "", title, mode: "simple", rootThreadId: threadId, role: "planner", agentPath: "root", status: "idle", createdAt: 1, updatedAt: 1, archived: false },
     items: [],

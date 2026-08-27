@@ -29,7 +29,7 @@ export interface ToolActivityGroup {
   failedCount: number
 }
 
-export type ReasoningItem = ThreadItem & { content: Extract<ThreadItem["content"], { type: "reasoning" }> }
+export type ReasoningItem = ThreadItem & { state: Extract<ThreadItem["state"], { kind: "thinking" }> }
 
 export interface ReasoningActivityGroup {
   items: ReasoningItem[]
@@ -95,24 +95,27 @@ export function buildTimelineEntries(items: ThreadItem[]): TimelineEntry[] {
 }
 
 function isToolCallItem(item: ThreadItem): item is ToolCallItem {
-  return item.content.type === "toolCall"
+  return item.state.kind === "tool"
 }
 
 function isReasoningItem(item: ThreadItem): item is ReasoningItem {
-  return item.content.type === "reasoning"
+  return item.state.kind === "thinking"
 }
 
 function isVisibleItem(item: ThreadItem): boolean {
-  switch (item.content.type) {
+  switch (item.state.kind) {
+    case "agent":
+    case "turn":
+    case "inference":
+    case "skill":
     case "file":
     case "contextCompaction":
       return false
-    case "reasoning":
-      return [...(item.content.summary ?? []), ...(item.content.content ?? [])].some((part) => part.trim().length > 0)
-    case "userMessage":
-    case "agentMessage":
+    case "thinking":
+      return [...(item.state.data.summary ?? []), ...(item.state.data.content ?? [])].some((part) => part.trim().length > 0)
+    case "text":
     case "plan":
-    case "toolCall":
+    case "tool":
       return true
   }
 }
@@ -120,12 +123,12 @@ function isVisibleItem(item: ThreadItem): boolean {
 function buildReasoningActivityGroup(items: ReasoningItem[]): ReasoningActivityGroup {
   const active = items.some((item) => !isTerminalItem(item))
   const startedAt = Math.min(...items.map((item) => item.createdAt))
-  const endedAt = Math.max(...items.map((item) => item.completedAt ?? item.updatedAt))
+  const endedAt = Math.max(...items.map((item) => item.updatedAt))
   return {
     items: [...items],
     latestSummary: [...items]
       .reverse()
-      .flatMap((item) => [...(item.content.summary ?? [])].reverse())
+      .flatMap((item) => [...(item.state.data.summary ?? [])].reverse())
       .map((summary) => summary.trim())
       .find(Boolean) ?? null,
     durationLabel: active ? null : formatDuration(startedAt, endedAt),
@@ -133,21 +136,8 @@ function buildReasoningActivityGroup(items: ReasoningItem[]): ReasoningActivityG
   }
 }
 
-function isTerminalItem(item: ThreadItem): boolean {
-  switch (item.status) {
-    case "completed":
-    case "failed":
-    case "interrupted":
-    case "budgetLimited":
-    case "denied":
-      return true
-    case "started":
-    case "streaming":
-    case "awaitingApproval":
-    case "approved":
-    case "running":
-      return false
-  }
+function isTerminalItem(item: ReasoningItem): boolean {
+  return item.state.data.lifecycle.kind !== "streaming"
 }
 
 function buildToolActivityGroup(items: ToolCallItem[]): ToolActivityGroup {
@@ -168,6 +158,6 @@ function buildToolActivityGroup(items: ToolCallItem[]): ToolActivityGroup {
 
 function groupDuration(items: ToolCallItem[]): string | null {
   const startedAt = Math.min(...items.map((item) => item.createdAt))
-  const endedAt = Math.max(...items.map((item) => item.completedAt ?? item.updatedAt))
+  const endedAt = Math.max(...items.map((item) => item.updatedAt))
   return formatDuration(startedAt, endedAt)
 }

@@ -6,7 +6,7 @@
  * 视图组件只消费本模块产出的模型，不做业务推导。
  */
 
-import type { ThreadItem, ThreadItemContent } from "@/events/thread-events.generated"
+import type { ThreadItem, ThreadToolOutput } from "@/events/thread-events.generated"
 
 import { asRecord, humanize, inlinePreview, numberValue, parseToolText, stringValue, type ToolJsonRecord } from "./tool-json"
 import { buildToolInputSections, buildToolResultSections, type ToolSection } from "./tool-sections"
@@ -31,8 +31,8 @@ export interface ToolActivity {
   rawResult: string | null
 }
 
-/** content.type === "toolCall" 的 ThreadItem。 */
-export type ToolCallItem = ThreadItem & { content: Extract<ThreadItemContent, { type: "toolCall" }> }
+/** state.kind === "tool" 的 ThreadItem。 */
+export type ToolCallItem = ThreadItem & { state: Extract<ThreadItem["state"], { kind: "tool" }> }
 
 const TOOL_TITLES: Record<string, string> = {
   exec: "Run command",
@@ -50,19 +50,23 @@ const TOOL_TITLES: Record<string, string> = {
 }
 
 export function buildToolActivity(item: ToolCallItem): ToolActivity {
-  const tool = item.content.tool
-  const parsedArguments = parseToolText(tool.arguments)
-  const parsedResult = parseToolText(tool.result)
+  const tool = item.state.data
+  const output = toolOutput(tool.state)
+  const error = tool.state.kind === "failed" ? tool.state.data.failure.message : undefined
+  const denialReason = tool.state.kind === "denied" ? tool.state.data.reason : undefined
+  const resultText = output?.result ?? (tool.state.kind === "running" ? tool.state.data.streamedOutput : undefined)
+  const parsedArguments = parseToolText(tool.invocation.arguments)
+  const parsedResult = parseToolText(resultText)
   const argumentsRecord = asRecord(parsedArguments.value)
   const resultRecord = asRecord(parsedResult.value)
-  const name = inferToolName(tool.name, argumentsRecord, resultRecord)
+  const name = inferToolName(tool.invocation.name, argumentsRecord, resultRecord)
 
   const sections = [
     ...buildToolInputSections(name, parsedArguments),
     ...buildToolResultSections(name, parsedResult),
   ]
-  if (item.error) sections.push({ kind: "text", title: "Error", text: item.error })
-  if (tool.denialReason) sections.push({ kind: "text", title: "Denied", text: tool.denialReason })
+  if (error) sections.push({ kind: "text", title: "Error", text: error })
+  if (denialReason) sections.push({ kind: "text", title: "Denied", text: denialReason })
 
   return {
     id: item.id,
@@ -70,9 +74,9 @@ export function buildToolActivity(item: ToolCallItem): ToolActivity {
     summary: toolSummary(name, argumentsRecord, resultRecord, parsedArguments.text, parsedResult.text),
     outcome: toolOutcome(item, resultRecord),
     sections,
-    artifacts: artifactViews(tool.outputArtifacts),
-    rawArguments: parsedArguments.structured ? tool.arguments ?? null : null,
-    rawResult: parsedResult.structured ? tool.result ?? null : null,
+    artifacts: artifactViews(output?.outputArtifacts),
+    rawArguments: parsedArguments.structured ? tool.invocation.arguments ?? null : null,
+    rawResult: parsedResult.structured ? resultText ?? null : null,
   }
 }
 
@@ -82,14 +86,14 @@ export function isFailedOutcome(outcome: ToolOutcome): boolean {
 }
 
 function toolOutcome(item: ToolCallItem, result: ToolJsonRecord | null): ToolOutcome {
-  const tool = item.content.tool
-  if (item.error) return "failed"
-  if (tool.denialReason || item.status === "denied") return "denied"
-  if (tool.timedOut || result?.timedOut === true) return "timedOut"
-  const exitCode = tool.exitCode ?? numberValue(result?.exitCode)
+  const state = item.state.data.state
+  const output = toolOutput(state)
+  if (state.kind === "failed" && state.data.failure.kind === "timedOut") return "timedOut"
+  if (result?.timedOut === true) return "timedOut"
+  const exitCode = output?.exitCode ?? numberValue(result?.exitCode)
   if (exitCode !== undefined && exitCode !== 0) return "failed"
 
-  switch (item.status) {
+  switch (state.kind) {
     case "started":
     case "streaming":
     case "awaitingApproval":
@@ -97,12 +101,30 @@ function toolOutcome(item: ToolCallItem, result: ToolJsonRecord | null): ToolOut
     case "running":
       return "active"
     case "failed":
-    case "budgetLimited":
       return "failed"
-    case "interrupted":
+    case "denied":
+      return "denied"
+    case "cancelled":
       return "interrupted"
-    case "completed":
+    case "succeeded":
       return "completed"
+  }
+}
+
+function toolOutput(state: ToolCallItem["state"]["data"]["state"]): ThreadToolOutput | undefined {
+  switch (state.kind) {
+    case "succeeded":
+      return state.data.output
+    case "failed":
+      return state.data.output
+    case "started":
+    case "streaming":
+    case "awaitingApproval":
+    case "approved":
+    case "running":
+    case "denied":
+    case "cancelled":
+      return undefined
   }
 }
 

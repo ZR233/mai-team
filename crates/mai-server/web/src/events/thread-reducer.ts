@@ -1,7 +1,7 @@
 import type {
   ThreadItem,
-  ThreadItemContent,
   ThreadItemDelta,
+  ThreadItemState,
   ThreadNotificationEnvelope,
   ThreadSnapshot,
 } from "@/events/thread-events.generated"
@@ -92,41 +92,59 @@ function applyItemDelta(items: ThreadItem[], delta: ThreadItemDelta, emittedAt: 
     ...item,
     revision: delta.revision,
     updatedAt: emittedAt,
-    content: appendDelta(item.content, delta),
+    state: appendDelta(item.state, delta),
   }
   const next = [...items]
   next[index] = updated
   return next
 }
 
-function appendDelta(content: ThreadItemContent, delta: ThreadItemDelta): ThreadItemContent {
-  switch (delta.field) {
+function appendDelta(state: ThreadItemState, delta: ThreadItemDelta): ThreadItemState {
+  const change = delta.delta
+  switch (change.kind) {
     case "text":
-      if (content.type === "userMessage" || content.type === "agentMessage") return { ...content, text: (content.text ?? "") + delta.delta }
+      if (state.kind === "text") return { ...state, data: { ...state.data, text: state.data.text + change.data.delta } }
       break
-    case "reasoning.summary":
-      if (content.type === "reasoning") return { ...content, summary: appendChunk(content.summary, delta.delta) }
+    case "thinkingSummary":
+      if (state.kind === "thinking") return { ...state, data: { ...state.data, summary: appendChunk(state.data.summary, change.data.chunkIndex, change.data.delta) } }
       break
-    case "reasoning.content":
-      if (content.type === "reasoning") return { ...content, content: appendChunk(content.content, delta.delta) }
+    case "thinkingContent":
+      if (state.kind === "thinking") return { ...state, data: { ...state.data, content: appendChunk(state.data.content, change.data.chunkIndex, change.data.delta) } }
       break
-    case "planContent":
-      if (content.type === "plan") return { ...content, content: (content.content ?? "") + delta.delta }
+    case "plan":
+      if (state.kind === "plan") return { ...state, data: { ...state.data, content: state.data.content + change.data.delta } }
       break
-    case "tool.arguments":
-      if (content.type === "toolCall") return { ...content, tool: { ...content.tool, arguments: (content.tool.arguments ?? "") + delta.delta } }
+    case "toolArguments":
+      if (state.kind === "tool") {
+        return {
+          ...state,
+          data: {
+            invocation: { ...state.data.invocation, arguments: (state.data.invocation.arguments ?? "") + change.data.delta },
+            state: { kind: "streaming", data: null },
+          },
+        }
+      }
       break
-    case "tool.result":
-      if (content.type === "toolCall") return { ...content, tool: { ...content.tool, result: (content.tool.result ?? "") + delta.delta } }
+    case "toolResult":
+      if (state.kind === "tool" && state.data.state.kind === "running") {
+        return {
+          ...state,
+          data: {
+            ...state.data,
+            state: { kind: "running", data: { streamedOutput: (state.data.state.data.streamedOutput ?? "") + change.data.delta } },
+          },
+        }
+      }
       break
   }
-  throw new ThreadProjectionError(`Delta field ${delta.field} is invalid for Item content ${content.type}`)
+  throw new ThreadProjectionError(`Delta ${change.kind} is invalid for Item state ${state.kind}`)
 }
 
-function appendChunk(chunks: string[] | undefined, delta: string): string[] {
+function appendChunk(chunks: string[] | undefined, chunkIndex: number, delta: string): string[] {
   const next = [...(chunks ?? [])]
-  if (next.length === 0) next.push(delta)
-  else next[next.length - 1] += delta
+  if (chunkIndex > next.length) throw new ThreadProjectionError(`Delta skipped reasoning chunk ${next.length}`)
+  if (chunkIndex === next.length) next.push("")
+  next[chunkIndex] += delta
   return next
 }
 

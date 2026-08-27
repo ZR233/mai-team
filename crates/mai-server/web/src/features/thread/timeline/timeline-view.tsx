@@ -24,7 +24,7 @@ export function ThreadTimeline({ snapshot }: { snapshot: ThreadSnapshot | null }
 
 export function TimelineEntriesView({ items, activeTurn, progress }: { items: ThreadItem[]; activeTurn?: Turn; progress?: string }) {
   const entries = buildTimelineEntries(items)
-  const activity = activeTurn?.state.status === "inProgress" ? <ThreadActivityRow phase={activeTurn.state.phase} progress={progress} /> : null
+  const activity = activeTurn?.state.kind === "running" ? <ThreadActivityRow phase={activeTurn.state.data.phase} progress={progress} /> : null
   if (entries.length === 0 && !activity) return <p className="py-12 text-center text-sm text-muted-foreground">No Thread activity yet.</p>
   return <div className="space-y-3 py-5">{entries.map((entry) => <TimelineEntryView key={entry.key} entry={entry} />)}{activity}</div>
 }
@@ -43,20 +43,25 @@ function TimelineEntryView({ entry }: { entry: TimelineEntry }) {
 }
 
 function ThreadItemCard({ item }: { item: ThreadItem }) {
-  const content = item.content
-  switch (content.type) {
-    case "userMessage":
-      return <TimelineCard icon={User} label="User" status={item.status}><Markdown>{content.text ?? ""}</Markdown></TimelineCard>
-    case "agentMessage":
-      return content.channel === "final"
-        ? <TimelineCard icon={Bot} label="Final" status={item.status}><Markdown>{content.text ?? ""}</Markdown></TimelineCard>
-        : <CommentaryText text={content.text ?? ""} status={item.status} />
-    case "reasoning":
+  const state = item.state
+  switch (state.kind) {
+    case "text":
+      if (state.data.channel === "user") {
+        return <TimelineCard icon={User} label="User" status={state.data.lifecycle.kind}><Markdown>{state.data.text}</Markdown></TimelineCard>
+      }
+      return state.data.channel === "final"
+        ? <TimelineCard icon={Bot} label="Final" status={state.data.lifecycle.kind}><Markdown>{state.data.text}</Markdown></TimelineCard>
+        : <CommentaryText text={state.data.text} status={state.data.lifecycle.kind} />
+    case "thinking":
       return null
     case "plan":
-      return <article className="flex gap-3 rounded-md border-l-2 bg-muted/20 px-3 py-2.5"><ListChecks className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><div className="min-w-0 flex-1 space-y-1"><span className="text-xs font-medium text-muted-foreground">Plan</span><Markdown>{content.content ?? ""}</Markdown></div></article>
-    case "toolCall":
-      return <ToolActivityRow activity={buildToolActivity({ ...item, content })} />
+      return <article className="flex gap-3 rounded-md border-l-2 bg-muted/20 px-3 py-2.5"><ListChecks className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><div className="min-w-0 flex-1 space-y-1"><span className="text-xs font-medium text-muted-foreground">Plan</span><Markdown>{state.data.content}</Markdown></div></article>
+    case "tool":
+      return <ToolActivityRow activity={buildToolActivity({ ...item, state })} />
+    case "agent":
+    case "turn":
+    case "inference":
+    case "skill":
     case "file":
     case "contextCompaction":
       return null
@@ -67,7 +72,7 @@ function CommentaryText({ text, status }: { text: string; status: string }) {
   return <article className="flex gap-3 px-1 py-1.5"><Bot className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><div className="min-w-0 flex-1 space-y-1"><div className="flex items-center gap-2"><span className="text-xs font-medium text-muted-foreground">Commentary</span>{status !== "completed" && <Badge variant="secondary">{status}</Badge>}</div><Markdown>{text}</Markdown></div></article>
 }
 
-type ActivePhase = Extract<Turn["state"], { status: "inProgress" }>["phase"]
+type ActivePhase = Extract<Turn["state"], { kind: "running" }>["data"]["phase"]
 
 function ThreadActivityRow({ phase, progress }: { phase: ActivePhase; progress?: string }) {
   const label = activityLabel(phase)
@@ -81,7 +86,6 @@ function activityLabel(phase: ActivePhase): string {
     case "responding": return "Writing response"
     case "planning": return "Planning"
     case "runningTool": return "Running tools"
-    case "waitingInteraction": return "Waiting for input"
     case "persisting": return "Saving"
   }
 }

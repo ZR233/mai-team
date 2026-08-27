@@ -26,7 +26,7 @@ export function ReasoningEntry({ group }: { group: ReasoningActivityGroup }) {
     ? `${group.latestSummary}${group.durationLabel ? ` · ${group.durationLabel}` : ""}`
     : fallback
   const text = group.items
-    .flatMap((item) => [...(item.content.summary ?? []), ...(item.content.content ?? [])])
+    .flatMap((item) => [...(item.state.data.summary ?? []), ...(item.state.data.content ?? [])])
     .map((part) => part.trim())
     .filter(Boolean)
     .join("\n\n")

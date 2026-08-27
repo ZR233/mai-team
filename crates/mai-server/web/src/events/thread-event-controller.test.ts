@@ -190,7 +190,7 @@ describe("ThreadEventController", () => {
 
 function snapshot(threadId: string) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 7,
     revision: 0,
     thread: {
       id: threadId,
@@ -214,9 +214,8 @@ function turn(threadId: string) {
   return {
     id: `${threadId}:turn`,
     threadId,
-    state: { status: "queued" as const },
-    startedAt: null,
+    revision: 0,
+    state: { kind: "queued" as const, data: { queuedAt: 2 } },
     updatedAt: 2,
-    completedAt: null,
   }
 }

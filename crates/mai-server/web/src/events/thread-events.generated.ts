@@ -11,7 +11,7 @@ export interface Thread {
   parentThreadId?: ThreadId
   role: string
   agentPath: string
-  status: "idle" | "running" | "waiting" | "completed" | "failed" | "closed"
+  status: "idle" | "queued" | "running" | "waitingTool" | "waitingInteraction" | "cancelling" | "closing" | "closed" | "faulted"
   createdAt: number
   updatedAt: number
   archived: boolean
@@ -20,51 +20,46 @@ export interface Thread {
 export interface Turn {
   id: string
   threadId: ThreadId
+  revision: number
   state: TurnState
-  failure?: TurnFailure
-  startedAt: number | null
   updatedAt: number
-  completedAt: number | null
 }
 
 export type TurnState =
-  | { status: "queued" }
-  | { status: "inProgress"; phase: "preparing" | "thinking" | "responding" | "planning" | "runningTool" | "waitingInteraction" | "persisting" }
-  | { status: "completed" }
-  | { status: "failed"; reason: string }
-  | { status: "interrupted"; reason: string }
+  | { kind: "queued"; data: { queuedAt: number } }
+  | { kind: "running"; data: { startedAt: number; phase: TurnPhase } }
+  | { kind: "completed"; data: { startedAt: number | null; completedAt: number; completion: "normal" | "interactionRequested" } }
+  | { kind: "cancelled"; data: { startedAt: number | null; requestedAt: number; completedAt: number; cause: TurnCancellationCause } }
+  | { kind: "failed"; data: { startedAt: number | null; completedAt: number; failure: TurnFailure } }
+  | { kind: "budgetLimited"; data: { startedAt: number | null; completedAt: number; limit: BudgetLimitSnapshot; rollover: TurnRolloverOutcome } }
+
+export type TurnPhase = "preparing" | "thinking" | "responding" | "planning" | "runningTool" | "persisting"
+
+export type TurnCancellationCause =
+  | { kind: "userRequested" }
+  | { kind: "runtimeShutdown" }
+  | { kind: "agentClosed" }
+  | { kind: "recovery" }
+  | { kind: "coalesced"; data: { targetTurnId: string } }
+
+export type TurnRolloverOutcome =
+  | { kind: "notAttempted" }
+  | { kind: "succeeded" }
+  | { kind: "failed"; data: { error: string } }
+
+export interface BudgetLimitSnapshot {
+  kind: "modelStep" | "toolCall" | "wait" | "wallClock" | "agentCount" | "agentDepth" | "finalization"
+  usage: { modelSteps: number; toolCalls: number; waitCalls: number; elapsedMs: number }
+}
 
 export interface TurnFailure {
-  category: "provider" | "providerCapacity" | "tool" | "validation" | "internal"
+  category: "provider" | "providerCapacity" | "tool" | "validation" | "protocol" | "internal"
   providerKind?: "authentication" | "authorization" | "capacity" | "configuration" | "transport" | "protocol" | "unknown"
   code?: string
   httpStatus?: number
   message: string
   retry: { kind: "retryable"; retryAfterMs?: number } | { kind: "permanent" }
 }
-
-export interface ThreadToolCall {
-  toolCallId: string
-  callId?: string
-  providerItemId?: string
-  name: string
-  arguments?: string
-  result?: string
-  outputArtifacts?: unknown[]
-  exitCode?: number
-  timedOut: boolean
-  workingDirectory?: string
-  denialReason?: string
-}
-
-export type ThreadItemContent =
-  | { type: "userMessage"; text?: string; attachments?: ThreadAttachment[] }
-  | { type: "agentMessage"; channel: "commentary" | "final"; text?: string }
-  | { type: "reasoning"; summary?: string[]; content?: string[] }
-  | { type: "plan"; content?: string }
-  | { type: "toolCall"; tool: ThreadToolCall }
-  | { type: "file"; path: string; mediaType?: string }
-  | { type: "contextCompaction"; beforeTokens: number; afterTokens: number; compactedAt: number }
 
 export interface ThreadAttachment {
   id: string
@@ -76,19 +71,88 @@ export interface ThreadAttachment {
   dataUrl?: string
 }
 
+export type ThreadContentLifecycle =
+  | { kind: "streaming"; data: null }
+  | { kind: "completed"; data: { completedAt: number } }
+  | { kind: "failed"; data: { failedAt: number; error: string } }
+  | { kind: "cancelled"; data: { cancelledAt: number; reason: string } }
+
+export interface ThreadToolInvocation {
+  toolCallId: string
+  callId?: string
+  providerItemId?: string
+  name: string
+  arguments?: string
+  workingDirectory?: string
+}
+
+export interface ThreadToolOutput {
+  result: string
+  outputArtifacts?: unknown[]
+  exitCode?: number
+}
+
+export interface ThreadToolFailure {
+  kind: "execution" | "timedOut" | "budgetLimited"
+  message: string
+}
+
+export type ThreadToolState =
+  | { kind: "started"; data: null }
+  | { kind: "streaming"; data: null }
+  | { kind: "awaitingApproval"; data: null }
+  | { kind: "approved"; data: null }
+  | { kind: "running"; data: { streamedOutput?: string } }
+  | { kind: "succeeded"; data: { completedAt: number; output: ThreadToolOutput } }
+  | { kind: "failed"; data: { failedAt: number; failure: ThreadToolFailure; output?: ThreadToolOutput } }
+  | { kind: "denied"; data: { deniedAt: number; reason: string } }
+  | { kind: "cancelled"; data: { cancelledAt: number; reason: string } }
+
+export type ThreadAgentState =
+  | { kind: "queued"; data: null }
+  | { kind: "running"; data: null }
+  | { kind: "succeeded"; data: { completedAt: number; summary: string } }
+  | { kind: "denied"; data: { deniedAt: number; reason: string } }
+  | { kind: "cancelled"; data: { cancelledAt: number; reason: string } }
+  | { kind: "failed"; data: { failedAt: number; error: string } }
+
+export type ThreadInferenceState =
+  | { kind: "running"; data: null }
+  | { kind: "completed"; data: { completedAt: number; usage: TokenUsageSnapshot } }
+  | { kind: "failed"; data: { failedAt: number; error: string } }
+  | { kind: "cancelled"; data: { cancelledAt: number; reason: string } }
+
+export interface SkillActivation {
+  name: string
+  source: string
+  providerId: string
+  resourceBase: { kind: "directory"; path: string } | { kind: "url"; url: string } | { kind: "opaque"; description: string }
+  turnId: string
+  cause: { kind: "tool"; toolCallId: string } | { kind: "userGesture"; invocationId: string }
+  activatedAt: number
+}
+
+export type ThreadItemState =
+  | { kind: "text"; data: { channel: "user" | "commentary" | "final"; text: string; attachments?: ThreadAttachment[]; lifecycle: ThreadContentLifecycle } }
+  | { kind: "thinking"; data: { summary?: string[]; content?: string[]; lifecycle: ThreadContentLifecycle } }
+  | { kind: "tool"; data: { invocation: ThreadToolInvocation; state: ThreadToolState } }
+  | { kind: "agent"; data: { identity: { id: string; path: string; parentPath?: string; role: string; task: string; depth: number }; state: ThreadAgentState } }
+  | { kind: "turn"; data: { state: TurnState } }
+  | { kind: "inference"; data: { inferenceId: string; model: string; state: ThreadInferenceState } }
+  | { kind: "plan"; data: { content: string; lifecycle: ThreadContentLifecycle } }
+  | { kind: "skill"; data: { activation: SkillActivation } }
+  | { kind: "file"; data: { path: string; mediaType?: string; completedAt: number } }
+  | { kind: "contextCompaction"; data: { beforeTokens: number; afterTokens: number; compactedAt: number } }
+
 export interface ThreadItem {
   id: string
   threadId: ThreadId
   turnId: string
   ordinal: number
   revision: number
-  status: "started" | "streaming" | "awaitingApproval" | "approved" | "denied" | "running" | "completed" | "failed" | "interrupted" | "budgetLimited"
   createdAt: number
   updatedAt: number
-  completedAt?: number
-  error?: string
-  content: ThreadItemContent
-  usage?: TokenUsageSnapshot
+  state: ThreadItemState
 }
 
 export interface TokenUsageSnapshot {
@@ -105,9 +169,13 @@ export interface TokenUsageSnapshot {
 export interface ThreadItemDelta {
   itemId: string
   revision: number
-  field: "text" | "reasoning.summary" | "reasoning.content" | "planContent" | "tool.arguments" | "tool.result"
-  delta: string
-  chunkIndex?: number
+  delta:
+    | { kind: "text"; data: { delta: string } }
+    | { kind: "thinkingSummary"; data: { chunkIndex: number; delta: string } }
+    | { kind: "thinkingContent"; data: { chunkIndex: number; delta: string } }
+    | { kind: "plan"; data: { delta: string } }
+    | { kind: "toolArguments"; data: { delta: string } }
+    | { kind: "toolResult"; data: { delta: string } }
 }
 
 export interface ThreadRuntimeUsage {
@@ -171,7 +239,10 @@ export interface ThreadRuntimeSnapshot {
   activeMcpServers: string[]
   activeLspServers: string[]
   progress?: string
-  mcpHealth?: Record<string, unknown>
+  mcpHealth?: {
+    generation: number
+    servers: { server: { id: string; source: string; transport: string; endpoint: string; builtIn: boolean }; availability: string; message: string | null; lastCheckedAt: number | null; toolCount: number | null }[]
+  }
   updatedAt: number
 }
 
@@ -185,28 +256,26 @@ export interface ThreadSnapshot {
   runtime?: ThreadRuntimeSnapshot
 }
 
+type PendingInteractionState = { kind: "pending"; data: { operationId: string } }
+type CancelledInteractionState = { kind: "cancelled"; data: { operationId: string; cancelledAt: number; reason: string } }
+type ExpiredInteractionState = { kind: "expired"; data: { operationId: string; expiredAt: number } }
+type ResolvedUserInputState = { kind: "resolved"; data: { operationId: string; resolvedAt: number; answers: Record<string, { answers: string[] }> } }
+type ResolvedToolApprovalState = { kind: "resolved"; data: { operationId: string; resolvedAt: number; decision: "approved" | "denied"; reason: string | null } }
+type ResolvedPlanConfirmationState = { kind: "resolved"; data: { operationId: string; resolvedAt: number; decision: "confirm" | "revisePlan"; content: string | null; reason: string | null } }
+
+export type InteractionContent =
+  | { kind: "userInput"; data: { questions: UserQuestion[]; state: PendingInteractionState | ResolvedUserInputState | CancelledInteractionState | ExpiredInteractionState } }
+  | { kind: "toolApproval"; data: { request: { name: string; arguments: unknown; workingDirectory: string | null; parentAgentId: string | null }; state: PendingInteractionState | ResolvedToolApprovalState | CancelledInteractionState | ExpiredInteractionState } }
+  | { kind: "planConfirmation"; data: { planId: string; content: string; state: PendingInteractionState | ResolvedPlanConfirmationState | CancelledInteractionState | ExpiredInteractionState } }
+
 export interface InteractionRequest {
   interactionId: string
-  kind: "userInput" | "toolApproval" | "planConfirmation"
-  status: "pending" | "resolved" | "cancelled" | "expired"
-  scope: {
-    threadId: ThreadId
-    turnId: string
-    itemId?: string
-    toolId?: string
-    agentPath?: string
-  }
-  payload: InteractionPayload
+  scope: { threadId: ThreadId; turnId: string; itemId?: string; toolId?: string; agentPath?: string }
+  revision: number
+  content: InteractionContent
   createdAt: number
   updatedAt: number
-  resolvedAt?: number
-  resolution?: InteractionResolution
 }
-
-export type InteractionPayload =
-  | { type: "userInput"; questions: UserQuestion[] }
-  | { type: "toolApproval"; name: string; arguments: unknown; workingDirectory?: string; parentAgentId?: string }
-  | { type: "planConfirmation"; planId: string; content: string }
 
 export interface UserQuestion {
   id: string
@@ -216,11 +285,6 @@ export interface UserQuestion {
   isSecret: boolean
   options?: { label: string; description: string }[]
 }
-
-export type InteractionResolution =
-  | { type: "userInput"; answers: Record<string, { answers: string[] }> }
-  | { type: "toolApproval"; decision: "approved" | "denied"; reason?: string }
-  | { type: "planConfirmation"; decision: "implementFreshContext" | "continuePlanning" | "dismiss"; content?: string; reason?: string }
 
 export type ThreadNotification =
   | { type: "turnStarted"; turn: Turn }
