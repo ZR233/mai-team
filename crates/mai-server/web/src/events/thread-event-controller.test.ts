@@ -108,6 +108,40 @@ describe("ThreadEventController", () => {
     expect(FakeEventSource.instances[1].url).toBe("/threads/thread-a/events")
   })
 
+  it("永久关闭使用有界退避并在 authoritative snapshot 后重置", () => {
+    vi.useFakeTimers()
+    const store = new ThreadStoreRegistry().get("thread-a")
+    const controller = new ThreadEventController(store)
+    controllers.push(controller)
+    controller.connect()
+
+    FakeEventSource.instances[0].disconnectPermanently()
+    vi.advanceTimersByTime(499)
+    expect(FakeEventSource.instances).toHaveLength(1)
+    vi.advanceTimersByTime(1)
+    expect(FakeEventSource.instances).toHaveLength(2)
+
+    FakeEventSource.instances[1].emit("snapshot", {
+      type: "snapshot",
+      snapshot: snapshot("thread-a"),
+    })
+    FakeEventSource.instances[1].disconnectPermanently()
+    vi.advanceTimersByTime(499)
+    expect(FakeEventSource.instances).toHaveLength(2)
+    vi.advanceTimersByTime(1)
+
+    for (const delay of [1_000, 2_000, 4_000, 8_000, 10_000]) {
+      FakeEventSource.instances.at(-1)?.disconnectPermanently()
+      vi.advanceTimersByTime(delay)
+    }
+    FakeEventSource.instances.at(-1)?.disconnectPermanently()
+    vi.runAllTimers()
+
+    expect(FakeEventSource.instances).toHaveLength(8)
+    expect(store.getState().connection).toBe("error")
+    expect(store.getState().connectionMessage).toBe("Thread stream unavailable after repeated reconnect attempts")
+  })
+
   it("Lagged 不进入 reducer，而是使 generation 失效", () => {
     vi.useFakeTimers()
     const store = new ThreadStoreRegistry().get("thread-a")

@@ -1,10 +1,13 @@
 import type { ThreadSubscriptionUpdate } from "@/events/thread-events.generated"
 import { isItemDelta, type ThreadStore } from "@/events/thread-store"
 
+const reconnectDelays = [500, 1_000, 2_000, 4_000, 8_000, 10_000] as const
+
 export class ThreadEventController {
   private source: EventSource | null = null
   private animationFrame: number | null = null
   private reconnectTimer: number | null = null
+  private reconnectAttempt = 0
 
   constructor(private readonly store: ThreadStore) {}
 
@@ -59,6 +62,7 @@ export class ThreadEventController {
     switch (update.type) {
       case "snapshot":
         this.store.getState().replace(generation, update.snapshot)
+        this.reconnectAttempt = 0
         return
       case "notification":
         if (update.notification.notification.type === "lagged") {
@@ -93,12 +97,22 @@ export class ThreadEventController {
 
   private resubscribe(generation: number, message: string) {
     if (generation !== this.store.getState().generation) return
-    this.store.getState().invalidate(generation, message)
+    const nextGeneration = this.store.getState().invalidate(generation, message)
     this.disconnect()
+    if (this.reconnectAttempt >= reconnectDelays.length) {
+      this.store.getState().setConnection(
+        nextGeneration,
+        "error",
+        "Thread stream unavailable after repeated reconnect attempts",
+      )
+      return
+    }
+    const delay = reconnectDelays[this.reconnectAttempt]
+    this.reconnectAttempt += 1
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null
       this.connect()
-    }, 0)
+    }, delay)
   }
 }
 
