@@ -26,7 +26,7 @@ export function ReviewUsageSummary({ usage, active }: { usage: TokenUsage | null
     </CardHeader>
     <CardContent className="flex flex-col gap-4">
       <dl className="grid grid-cols-2 gap-3">
-        <UsageMetric label="Total tokens" value={formatCompactTokens(usage.total_tokens)} title={formatExactTokens(usage.total_tokens)} />
+        <UsageMetric label="Total tokens" value={formatCompactTokens(usage.totalTokens)} title={formatExactTokens(usage.totalTokens)} />
         <UsageMetric label="Cache hit" value={hitRateLabel} />
       </dl>
       <div className="flex flex-col gap-2">
@@ -43,10 +43,10 @@ export function ReviewUsageSummary({ usage, active }: { usage: TokenUsage | null
         />
       </div>
       <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs sm:grid-cols-4">
-        <UsageDetail label="Input" value={usage.input_tokens} />
-        <UsageDetail label="Cached input" value={usage.cached_input_tokens} />
-        <UsageDetail label="Output" value={usage.output_tokens} />
-        <UsageDetail label="Reasoning" value={usage.reasoning_output_tokens} />
+        <UsageDetail label="Input" value={usage.promptTokens} />
+        <UsageDetail label="Cached input" value={usage.cachedPromptTokens} />
+        <UsageDetail label="Output" value={usage.completionTokens} />
+        <UsageDetail label="Reasoning" value={usage.reasoningTokens} />
       </dl>
     </CardContent>
   </Card>
@@ -55,7 +55,7 @@ export function ReviewUsageSummary({ usage, active }: { usage: TokenUsage | null
 export function ReviewAttemptUsage({ usage }: { usage?: TokenUsage }) {
   if (!usage) return null
   return <span className="mt-1 flex flex-wrap items-center gap-x-1 text-xs text-muted-foreground">
-    <span title={formatExactTokens(usage.total_tokens)}>{formatCompactTokens(usage.total_tokens)} tokens</span>
+    <span title={formatExactTokens(usage.totalTokens)}>{formatCompactTokens(usage.totalTokens)} tokens</span>
     <span aria-hidden>·</span>
     <span>{formatCacheHitRate(cacheHitRate(usage))} cache</span>
   </span>

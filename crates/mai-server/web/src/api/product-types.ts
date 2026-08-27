@@ -3,11 +3,12 @@ export type Id = string
 import type { Thread, ThreadTurnHistory } from "@/events/thread-events.generated"
 
 export interface TokenUsage {
-  input_tokens: number
-  cached_input_tokens: number
-  output_tokens: number
-  reasoning_output_tokens: number
-  total_tokens: number
+  promptTokens: number
+  cachedPromptTokens: number
+  cacheWriteTokens: number
+  completionTokens: number
+  reasoningTokens: number
+  totalTokens: number
 }
 
 export type AgentRuntimeState =

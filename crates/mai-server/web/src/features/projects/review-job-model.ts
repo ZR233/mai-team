@@ -1,7 +1,7 @@
 import type { ReviewJobSummary, ReviewRunSummary, TokenUsage } from "@/api/product-types"
 
 const activeStatuses = new Set(["queued", "preparing", "running", "retry_waiting", "submission_pending", "reconciling"])
-const usageFields = ["input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens"] as const
+const usageFields = ["promptTokens", "cachedPromptTokens", "cacheWriteTokens", "completionTokens", "reasoningTokens", "totalTokens"] as const
 
 export interface ReviewUsageProjection {
   total: TokenUsage | null
@@ -63,8 +63,8 @@ export function projectReviewUsage(attempts: ReviewRunSummary[]): ReviewUsagePro
 }
 
 export function cacheHitRate(usage?: TokenUsage | null) {
-  if (!usage || usage.input_tokens <= 0) return null
-  return Math.min(100, Math.max(0, usage.cached_input_tokens / usage.input_tokens * 100))
+  if (!usage || usage.promptTokens <= 0) return null
+  return Math.min(100, Math.max(0, usage.cachedPromptTokens / usage.promptTokens * 100))
 }
 
 function compareAttempts(left: ReviewRunSummary, right: ReviewRunSummary) {
@@ -83,7 +83,7 @@ function normalizeTokenCount(value: number) {
 }
 
 function emptyUsage(): TokenUsage {
-  return { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 0 }
+  return { promptTokens: 0, cachedPromptTokens: 0, cacheWriteTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0 }
 }
 
 function usageIsEmpty(usage: TokenUsage) {

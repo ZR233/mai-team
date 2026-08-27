@@ -117,7 +117,7 @@ function json(route: Route, body: unknown) {
   return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) })
 }
 
-const usage = { input_tokens: 1200, cached_input_tokens: 400, output_tokens: 180, reasoning_output_tokens: 80, total_tokens: 1380 }
+const usage = { promptTokens: 1200, cachedPromptTokens: 400, cacheWriteTokens: 0, completionTokens: 180, reasoningTokens: 80, totalTokens: 1380 }
 
 function environment(id: string, name: string, threadId: string) {
   const agent = {

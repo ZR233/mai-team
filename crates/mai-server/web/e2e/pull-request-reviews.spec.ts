@@ -210,7 +210,7 @@ function projectDetail() {
     model: "fixture-model",
     created_at: "2026-08-11T00:00:00Z",
     updated_at: "2026-08-11T00:00:00Z",
-    token_usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 0 },
+    token_usage: { promptTokens: 0, cachedPromptTokens: 0, cacheWriteTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0 },
     thread: { id: "agent-1", projectId: "project-1", title: "Maintainer", mode: "simple", rootThreadId: "agent-1", role: "planner", agentPath: "root", status: "idle", createdAt: 1, updatedAt: 1, archived: false },
   }
   return { ...projectSummary, maintainer_agent: agent, agents: [agent], selected_agent_id: agent.id, selected_agent: agent, review_runs: [] }

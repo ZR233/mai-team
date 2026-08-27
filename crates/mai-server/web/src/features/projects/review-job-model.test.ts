@@ -109,10 +109,11 @@ function attempt(index: number, tokenUsage?: TokenUsage, reviewerAgentId = "revi
 
 function usage(input: number, cached: number, output: number, reasoning: number, total: number): TokenUsage {
   return {
-    input_tokens: input,
-    cached_input_tokens: cached,
-    output_tokens: output,
-    reasoning_output_tokens: reasoning,
-    total_tokens: total,
+    promptTokens: input,
+    cachedPromptTokens: cached,
+    cacheWriteTokens: 0,
+    completionTokens: output,
+    reasoningTokens: reasoning,
+    totalTokens: total,
   }
 }

@@ -15,11 +15,12 @@ const agent = {
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",
   token_usage: {
-    input_tokens: 0,
-    cached_input_tokens: 0,
-    output_tokens: 0,
-    reasoning_output_tokens: 0,
-    total_tokens: 0,
+    promptTokens: 0,
+    cachedPromptTokens: 0,
+    cacheWriteTokens: 0,
+    completionTokens: 0,
+    reasoningTokens: 0,
+    totalTokens: 0,
   },
 } satisfies AgentSummary
 

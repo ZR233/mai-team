@@ -6,11 +6,12 @@ import type { TokenUsage } from "@/api/product-types"
 import { ReviewAttemptUsage, ReviewUsageSummary } from "./review-usage-summary"
 
 const usage: TokenUsage = {
-  input_tokens: 1_200,
-  cached_input_tokens: 400,
-  output_tokens: 180,
-  reasoning_output_tokens: 80,
-  total_tokens: 1_380,
+  promptTokens: 1_200,
+  cachedPromptTokens: 400,
+  cacheWriteTokens: 0,
+  completionTokens: 180,
+  reasoningTokens: 80,
+  totalTokens: 1_380,
 }
 
 describe("review usage summary", () => {
@@ -40,7 +41,7 @@ describe("review usage summary", () => {
   })
 
   it("renders a compact per-attempt increment", () => {
-    render(<ReviewAttemptUsage usage={{ ...usage, input_tokens: 500, cached_input_tokens: 200, total_tokens: 600 }} />)
+    render(<ReviewAttemptUsage usage={{ ...usage, promptTokens: 500, cachedPromptTokens: 200, totalTokens: 600 }} />)
 
     expect(screen.getByText("600 tokens")).toHaveAttribute("title", "600 tokens")
     expect(screen.getByText("40% cache")).toBeVisible()
