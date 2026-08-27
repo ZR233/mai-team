@@ -12,7 +12,7 @@ use mai_protocol::{
 };
 
 use super::state::{ApiError, AppState};
-use crate::services::events::ThreadEventStreamService;
+use crate::services::events::{ThreadEventStreamService, stop_on_shutdown};
 
 const DEFAULT_TURN_PAGE_SIZE: usize = 50;
 const MAX_TURN_PAGE_SIZE: usize = 200;
@@ -71,5 +71,6 @@ pub(crate) async fn events(
     let stream = ThreadEventStreamService::new(Arc::clone(&state.runtime))
         .stream(thread_id)
         .await?;
+    let stream = stop_on_shutdown(stream, state.shutdown.clone());
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }

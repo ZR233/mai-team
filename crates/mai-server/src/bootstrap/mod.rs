@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use mai_docker::DockerClient;
 use mai_runtime::RuntimeConfig;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::config::{Cli, RelayMode, ServerConfig, ServerPaths, StdEnv};
@@ -110,10 +111,12 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     }
     ensure_startup_chat_environment(&runtime).await?;
     let shutdown_runtime = Arc::clone(&runtime);
+    let shutdown = CancellationToken::new();
     let state = Arc::new(AppState {
         runtime,
         store,
-        relay,
+        relay: Arc::clone(&relay),
+        shutdown: shutdown.clone(),
     });
 
     let app = router::create_router(state);
@@ -121,11 +124,20 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     println!("Open http://{addr}/");
     info!("mai-team listening on http://{addr}");
     let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(cancel_on_shutdown(shutdown))
         .await;
+    info!("HTTP connections drained");
+    relay.shutdown().await;
     shutdown_runtime.shutdown().await?;
+    info!("runtime shutdown drained");
     serve_result?;
     Ok(())
+}
+
+async fn cancel_on_shutdown(shutdown: CancellationToken) {
+    shutdown_signal().await;
+    info!("server shutdown signal received");
+    shutdown.cancel();
 }
 
 async fn shutdown_signal() {

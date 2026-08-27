@@ -391,6 +391,7 @@ mod tests {
                 runtime,
                 store,
                 relay,
+                shutdown: tokio_util::sync::CancellationToken::new(),
             }),
             dir,
         )

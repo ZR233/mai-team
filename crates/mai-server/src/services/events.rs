@@ -7,10 +7,16 @@ use futures::{Stream, StreamExt};
 use mai_protocol::{MaiProductEventEnvelope, ThreadSubscriptionUpdate};
 use tokio_stream::once;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_util::sync::CancellationToken;
 
 const SSE_REPLAY_LIMIT: usize = 1_000;
 
 pub(crate) type EventStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
+
+/// 让长连接流服从 server 唯一的关闭信号，避免 HTTP graceful shutdown 永久等待 SSE。
+pub(crate) fn stop_on_shutdown(stream: EventStream, shutdown: CancellationToken) -> EventStream {
+    Box::pin(stream.take_until(shutdown.cancelled_owned()))
+}
 
 pub(crate) struct ThreadEventStreamService {
     runtime: Arc<mai_runtime::AgentRuntime>,
@@ -141,6 +147,21 @@ mod tests {
     use super::*;
     use mai_protocol::{AgentId, MaiProductEventEnvelope, MaiProductEventKind, ProjectId, TaskId};
     use pretty_assertions::assert_eq;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn server_shutdown_ends_sse_without_a_new_event() {
+        let shutdown = CancellationToken::new();
+        let pending: EventStream = Box::pin(futures::stream::pending());
+        let mut stream = stop_on_shutdown(pending, shutdown.clone());
+
+        shutdown.cancel();
+
+        let item = tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .expect("shutdown must wake the pending SSE stream");
+        assert!(item.is_none());
+    }
 
     fn make_event(kind: MaiProductEventKind) -> MaiProductEventEnvelope {
         MaiProductEventEnvelope {

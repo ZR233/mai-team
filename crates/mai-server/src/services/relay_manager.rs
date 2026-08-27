@@ -82,6 +82,11 @@ impl RelayManager {
         self.relay.read().await.clone()
     }
 
+    pub(crate) async fn shutdown(&self) {
+        self.stop().await;
+        *self.runtime.write().await = None;
+    }
+
     async fn start(self: &Arc<Self>, config: RelayClientConfig) {
         self.stop().await;
         tracing::info!(url = %config.url, node_id = %config.node_id, "starting relay client");

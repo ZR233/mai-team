@@ -4,6 +4,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use mai_protocol::ErrorResponse;
+use tokio_util::sync::CancellationToken;
 
 use crate::services::relay_manager::RelayManager;
 
@@ -12,6 +13,7 @@ pub(crate) struct AppState {
     pub(crate) runtime: Arc<mai_runtime::AgentRuntime>,
     pub(crate) store: Arc<mai_store::MaiStore>,
     pub(crate) relay: Arc<RelayManager>,
+    pub(crate) shutdown: CancellationToken,
 }
 
 #[derive(Debug)]

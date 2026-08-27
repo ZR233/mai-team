@@ -7,7 +7,7 @@ use futures::Stream;
 use serde::Deserialize;
 
 use super::state::{ApiError, AppState};
-use crate::services::events::EventStreamService;
+use crate::services::events::{EventStreamService, stop_on_shutdown};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct EventsQuery {
@@ -24,6 +24,7 @@ pub(crate) async fn events(
     let stream = service
         .stream_after(last_event_id_from_request(query, &headers))
         .await?;
+    let stream = stop_on_shutdown(stream, state.shutdown.clone());
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
