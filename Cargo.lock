@@ -2014,6 +2014,7 @@ dependencies = [
  "pl-trace",
  "pretty_assertions",
  "reqwest",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",

@@ -7,6 +7,7 @@ use super::worker::ProjectReviewWorkerOps;
 
 const REVIEW_JOB_HEARTBEAT_OPERATION_TIMEOUT: Duration =
     Duration::from_secs(mai_store::REVIEW_JOB_SQLITE_BUSY_TIMEOUT_SECS + 5);
+const REVIEW_JOB_HEARTBEAT_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub(super) async fn run_project_review_job_heartbeat(
     ops: impl ProjectReviewWorkerOps,
@@ -67,18 +68,32 @@ pub(super) async fn run_project_review_job_heartbeat(
                         break;
                     }
                     HeartbeatOperation::Completed(Err(error)) => {
-                        tracing::warn!(job_id = %job_id, "review job heartbeat failed: {error}");
-                        attempt_cancellation_token.cancel();
-                        break;
+                        if heartbeat_error_requires_attempt_cancellation(&error) {
+                            tracing::warn!(job_id = %job_id, "review job heartbeat failed: {error}");
+                            attempt_cancellation_token.cancel();
+                            break;
+                        }
+                        tracing::warn!(
+                            job_id = %job_id,
+                            retry_delay_ms = REVIEW_JOB_HEARTBEAT_RETRY_DELAY.as_millis(),
+                            "review job heartbeat hit temporary SQLite contention; retrying"
+                        );
+                        completed_heartbeats = 0;
+                        if !wait_heartbeat_retry(&cancellation_token).await {
+                            break;
+                        }
                     }
                     HeartbeatOperation::TimedOut => {
                         tracing::warn!(
                             job_id = %job_id,
                             timeout_seconds = REVIEW_JOB_HEARTBEAT_OPERATION_TIMEOUT.as_secs(),
-                            "review job heartbeat operation timed out"
+                            retry_delay_ms = REVIEW_JOB_HEARTBEAT_RETRY_DELAY.as_millis(),
+                            "review job heartbeat operation timed out; retrying"
                         );
-                        attempt_cancellation_token.cancel();
-                        break;
+                        completed_heartbeats = 0;
+                        if !wait_heartbeat_retry(&cancellation_token).await {
+                            break;
+                        }
                     }
                     HeartbeatOperation::Cancelled => break,
                 }
@@ -119,8 +134,22 @@ async fn wait_heartbeat_operation<T>(
     }
 }
 
+async fn wait_heartbeat_retry(cancellation_token: &CancellationToken) -> bool {
+    tokio::select! {
+        _ = sleep(REVIEW_JOB_HEARTBEAT_RETRY_DELAY) => true,
+        _ = cancellation_token.cancelled() => false,
+    }
+}
+
 fn lease_loss_requires_attempt_cancellation(current: Option<&ProjectReviewJobSummary>) -> bool {
     current.is_none_or(|job| job.submission_receipt.is_none())
+}
+
+fn heartbeat_error_requires_attempt_cancellation(error: &crate::RuntimeError) -> bool {
+    if let crate::RuntimeError::Store(error) = error {
+        return !mai_store::is_retryable_sqlite_error(error);
+    }
+    true
 }
 
 #[cfg(test)]
@@ -160,7 +189,8 @@ mod tests {
         );
         assert!(
             super::super::job::REVIEW_JOB_HEARTBEAT_SECONDS
-                + REVIEW_JOB_HEARTBEAT_OPERATION_TIMEOUT.as_secs()
+                + 2 * (REVIEW_JOB_HEARTBEAT_OPERATION_TIMEOUT.as_secs()
+                    + REVIEW_JOB_HEARTBEAT_RETRY_DELAY.as_secs())
                 < super::super::job::REVIEW_JOB_LEASE_SECONDS as u64
         );
     }
@@ -188,5 +218,17 @@ mod tests {
 
         assert!(!lease_loss_requires_attempt_cancellation(Some(&job)));
         assert!(lease_loss_requires_attempt_cancellation(None));
+    }
+
+    #[test]
+    fn sqlite_busy_heartbeat_keeps_attempt_alive_for_retry() {
+        let error = crate::RuntimeError::Store(mai_store::StoreError::Sqlite(
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            ),
+        ));
+
+        assert!(!heartbeat_error_requires_attempt_cancellation(&error));
     }
 }

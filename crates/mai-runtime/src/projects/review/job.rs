@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 pub(crate) const MAX_REVIEW_JOB_ATTEMPTS: u32 = 5;
 pub(crate) const REVIEW_JOB_RETRY_WINDOW_MINUTES: i64 = 30;
-pub(crate) const REVIEW_JOB_LEASE_SECONDS: i64 = 60;
+pub(crate) const REVIEW_JOB_LEASE_SECONDS: i64 = 120;
 pub(crate) const REVIEW_JOB_HEARTBEAT_SECONDS: u64 = 15;
 const RETRY_DELAYS_SECONDS: [i64; 4] = [5, 30, 120, 300];
 
