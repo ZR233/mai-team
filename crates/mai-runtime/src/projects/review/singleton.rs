@@ -249,7 +249,7 @@ async fn cancel_project_review_runs<Ops: ProjectReviewWorkerOps>(
 ) -> Result<usize> {
     let mut cancelled_run_count = 0;
     for run in runs {
-        ops.finish_project_review_run(FinishReviewRun {
+        ops.finish_expired_project_review_run(FinishReviewRun {
             run_id: run.id,
             project_id,
             reviewer_agent_id: run.reviewer_agent_id,

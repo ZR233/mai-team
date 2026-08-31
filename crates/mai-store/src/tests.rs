@@ -2282,6 +2282,94 @@ async fn submitted_attempt_archives_run_before_releasing_job_ownership() {
 }
 
 #[tokio::test]
+async fn expired_recovery_archives_run_detached_by_failed_job_transition() {
+    let (_dir, store) = store().await;
+    let project_id = Uuid::new_v4();
+    let job = test_review_job(project_id, 44, "head", None);
+    let job_id = job.id;
+    store
+        .enqueue_project_review_job(job)
+        .await
+        .expect("enqueue job");
+    let started_at = Utc::now();
+    let owner = "worker".to_string();
+    store
+        .claim_due_project_review_job(
+            project_id,
+            owner.clone(),
+            started_at,
+            started_at + chrono::TimeDelta::minutes(1),
+        )
+        .await
+        .expect("claim")
+        .expect("claimed job");
+    let run_id = Uuid::new_v4();
+    let mut detached = store
+        .begin_claimed_project_review_attempt(job_id, owner.clone(), run_id, started_at)
+        .await
+        .expect("begin attempt");
+    detached.status = ProjectReviewJobStatus::RetryWaiting;
+    detached.next_attempt_at = Some(Utc::now() + chrono::TimeDelta::minutes(1));
+    detached.active_run_id = None;
+    assert!(
+        store
+            .save_claimed_project_review_job(detached, owner.clone())
+            .await
+            .expect("persist detached ownership")
+    );
+
+    let mut run = store
+        .load_project_review_run(project_id, run_id)
+        .await
+        .expect("load run")
+        .expect("run");
+    run.summary.finished_at = Some(Utc::now());
+    run.summary.status = ProjectReviewRunStatus::Interrupted;
+    run.summary.error = Some("review interrupted after persistence failure".to_string());
+    assert!(
+        store.finish_project_review_run(&run).await.is_err(),
+        "ordinary finalization must retain strict active ownership"
+    );
+    assert!(
+        store.finish_expired_project_review_run(&run).await.is_err(),
+        "recovery must not archive a detached Run while its lease is valid"
+    );
+    let mut expired = store
+        .load_project_review_job(project_id, job_id)
+        .await
+        .expect("load detached job")
+        .expect("detached job");
+    expired.lease_owner = None;
+    expired.lease_expires_at = None;
+    assert!(
+        store
+            .save_claimed_project_review_job(expired, owner)
+            .await
+            .expect("expire detached ownership")
+    );
+    store
+        .finish_expired_project_review_run(&run)
+        .await
+        .expect("expired recovery archives detached Run");
+
+    let archived = store
+        .load_project_review_run(project_id, run_id)
+        .await
+        .expect("reload run")
+        .expect("archived run");
+    assert_eq!(ProjectReviewRunStatus::Interrupted, archived.summary.status);
+    assert_eq!(Some(job_id), archived.summary.job_id);
+    assert!(archived.summary.finished_at.is_some());
+    let recovered_job = store
+        .load_project_review_job(project_id, job_id)
+        .await
+        .expect("reload job")
+        .expect("job");
+    assert_eq!(ProjectReviewJobStatus::RetryWaiting, recovered_job.status);
+    assert_eq!(None, recovered_job.active_run_id);
+}
+
+#[tokio::test]
 async fn expired_review_job_recovers_without_losing_reviewer() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();

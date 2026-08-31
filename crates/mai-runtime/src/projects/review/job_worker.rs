@@ -157,6 +157,17 @@ pub(super) async fn run_claimed_project_review_job(
 
     let (outcome, summary) = match attempt {
         Ok(result) => apply_review_cycle_result(&mut current, result),
+        Err(crate::RuntimeError::ProjectReviewRunFinalization { run_id, source }) => {
+            tracing::error!(
+                job_id = %current.id,
+                %run_id,
+                error = %source,
+                active_run_id = ?current.active_run_id,
+                "review Run finalization failed; preserving Job ownership for lease recovery"
+            );
+            project_job_state_projection(ops, &current, None, None).await;
+            return true;
+        }
         Err(crate::RuntimeError::TurnCancelled) => {
             apply_review_failure(
                 &mut current,
@@ -446,7 +457,9 @@ pub(super) fn runtime_failure(error: &RuntimeError) -> ProjectReviewFailure {
             ),
         },
         RuntimeError::Model(error) => model_runtime_failure(error),
-        RuntimeError::Store(_) | RuntimeError::PullRequestStateRefresh(_) => (
+        RuntimeError::Store(_)
+        | RuntimeError::ProjectReviewRunFinalization { .. }
+        | RuntimeError::PullRequestStateRefresh(_) => (
             ProjectReviewFailureCategory::Internal,
             Some("store_unavailable".to_string()),
             None,

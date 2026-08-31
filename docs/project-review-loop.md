@@ -88,6 +88,8 @@ server 启动时：
 - 已有 GitHub 回执的 Job 直接视为成功。
 - 有提交意图但无回执的 Job 进入 `Reconciling`。
 - 无提交副作用的过期 `Preparing`、`Running` Job 进入立即到期的 `RetryWaiting`，对应 Run 标为 `Interrupted`。
+- Run 归档失败属于持久化边界失败，worker 保留 Job 的 `active_run_id` 与租约，等待过期恢复先归档 Run，再转换 Job；不得把它当成普通 Review 失败提前清空 Run 所有权。
+- 对旧版本已经留下的“Job 无 `active_run_id`、Run 仍未结束”状态，仅在 Job 没有其他 active Run 且租约已失效时归档为 `Interrupted`；恢复不删除 attempt 记录，也不覆盖仍有效的执行者。
 - 尚未过期的租约继续等待，支持滚动部署时的跨实例排他。
 
 ## Reviewer 与 Thread 生命周期

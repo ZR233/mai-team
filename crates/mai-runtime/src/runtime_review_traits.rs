@@ -1137,9 +1137,13 @@ impl projects::review::worker::ProjectReviewWorkerOps for Arc<AgentRuntime> {
             .await?)
     }
 
-    async fn finish_project_review_run(&self, request: FinishReviewRun) -> Result<()> {
-        projects::review::runs::finish_project_review_run(&self.deps.store, self.as_ref(), request)
-            .await
+    async fn finish_expired_project_review_run(&self, request: FinishReviewRun) -> Result<()> {
+        projects::review::runs::finish_expired_project_review_run(
+            &self.deps.store,
+            self.as_ref(),
+            request,
+        )
+        .await
     }
 
     async fn cancel_active_project_review_runs(

@@ -43,6 +43,7 @@ impl From<mai_runtime::RuntimeError> for ApiError {
             Docker(_)
             | Model(_)
             | Store(_)
+            | ProjectReviewRunFinalization { .. }
             | Io(_)
             | Http(_)
             | Jwt(_)

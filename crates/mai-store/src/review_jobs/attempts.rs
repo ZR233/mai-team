@@ -9,6 +9,12 @@ use uuid::Uuid;
 use super::storage::{load_job, open_review_job_connection, project_review_run_summary_record};
 use crate::{MaiStore, Result, StoreError, u64_to_i64};
 
+#[derive(Clone, Copy)]
+enum ReviewRunFinalizationMode {
+    ActiveAttempt,
+    ExpiredRecovery,
+}
+
 impl MaiStore {
     pub async fn load_expired_unfinished_active_project_review_attempts(
         &self,
@@ -285,6 +291,26 @@ impl MaiStore {
     }
 
     pub async fn finish_project_review_run(&self, run: &ProjectReviewRunDetail) -> Result<()> {
+        self.finish_project_review_run_with_mode(run, ReviewRunFinalizationMode::ActiveAttempt)
+            .await
+    }
+
+    /// 归档已经失去 Job 指针且 lease 失效的遗留 Run。
+    ///
+    /// 该入口只用于启动恢复；若 Job 已指向另一个 Run 或仍持有有效 lease，操作会失败。
+    pub async fn finish_expired_project_review_run(
+        &self,
+        run: &ProjectReviewRunDetail,
+    ) -> Result<()> {
+        self.finish_project_review_run_with_mode(run, ReviewRunFinalizationMode::ExpiredRecovery)
+            .await
+    }
+
+    async fn finish_project_review_run_with_mode(
+        &self,
+        run: &ProjectReviewRunDetail,
+        mode: ReviewRunFinalizationMode,
+    ) -> Result<()> {
         let path = self.path.clone();
         crate::sqlite_busy::retry_sqlite_busy(|| {
             let path = path.clone();
@@ -340,13 +366,23 @@ impl MaiStore {
                                 ))
                             })?
                             .into_summary()?;
-                        if job.active_run_id != Some(run.summary.id) {
-                            return Err(StoreError::DataIntegrity(format!(
-                                "review job {job_id} owns run {:?}, not {}",
-                                job.active_run_id, run.summary.id
-                            )));
+                        let owns_run = job.active_run_id == Some(run.summary.id);
+                        if !owns_run {
+                            let detached_recovery_is_safe = matches!(
+                                mode,
+                                ReviewRunFinalizationMode::ExpiredRecovery
+                            ) && job.active_run_id.is_none()
+                                && job
+                                    .lease_expires_at
+                                    .is_none_or(|lease_expires_at| lease_expires_at <= finished_at);
+                            if !detached_recovery_is_safe {
+                                return Err(StoreError::DataIntegrity(format!(
+                                    "review job {job_id} owns run {:?}, not {}",
+                                    job.active_run_id, run.summary.id
+                                )));
+                            }
                         }
-                        job.status.is_terminal().then_some(job_id)
+                        (owns_run && job.status.is_terminal()).then_some(job_id)
                     } else {
                         None
                     };

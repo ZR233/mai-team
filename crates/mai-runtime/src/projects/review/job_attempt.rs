@@ -532,6 +532,22 @@ async fn finish_attempt(
     turn_id: Option<TurnId>,
     completion: AttemptCompletion,
 ) -> Result<()> {
+    finish_attempt_inner(ops, job, run_id, reviewer_agent_id, turn_id, completion)
+        .await
+        .map_err(|source| RuntimeError::ProjectReviewRunFinalization {
+            run_id,
+            source: Box::new(source),
+        })
+}
+
+async fn finish_attempt_inner(
+    ops: &impl ProjectReviewJobAttemptOps,
+    job: &ProjectReviewJobSummary,
+    run_id: Uuid,
+    reviewer_agent_id: Option<AgentId>,
+    turn_id: Option<TurnId>,
+    completion: AttemptCompletion,
+) -> Result<()> {
     let receipt = match ops.load_project_review_job(job.project_id, job.id).await {
         Ok(Some(current)) => current.submission_receipt,
         Ok(None) => {

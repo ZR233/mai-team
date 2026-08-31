@@ -114,7 +114,10 @@ impl PreparedThreadCommit {
     pub(super) fn commit_on_path(&self, path: &Path) -> Result<ThreadRuntimeCommitOutcome> {
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(THREAD_WRITER_BUSY_TIMEOUT)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Thread writer 是同一进程内的单一所有者。先用 deferred transaction 完成
+        // revision 与 Item 差异读取，到首次写入时再竞争 SQLite writer，避免大 Thread
+        // 的全量比较阶段长期占住全库唯一写锁。
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let existing = transaction
             .query_row(
                 "SELECT revision, snapshot_json FROM thread_runtime_documents WHERE thread_id = ?1",

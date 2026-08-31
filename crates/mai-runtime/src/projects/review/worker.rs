@@ -46,7 +46,7 @@ pub(crate) trait ProjectReviewWorkerOps: Clone + Send + Sync + 'static {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<mai_protocol::ProjectReviewRunSummary>>> + Send;
 
-    fn finish_project_review_run(
+    fn finish_expired_project_review_run(
         &self,
         request: FinishReviewRun,
     ) -> impl Future<Output = Result<()>> + Send;
@@ -975,6 +975,7 @@ mod tests {
         cache_ready_errors: Arc<Mutex<Vec<String>>>,
         reviewed_prs: Arc<Mutex<Vec<Option<u64>>>>,
         review_errors: Arc<Mutex<Vec<String>>>,
+        review_finalization_errors: Arc<Mutex<Vec<String>>>,
         auto_reviewers: Arc<Mutex<Vec<mai_protocol::AgentSummary>>>,
         review_runs: Arc<Mutex<Vec<ProjectReviewRunSummary>>>,
         review_jobs: Arc<Mutex<Vec<ProjectReviewJobSummary>>>,
@@ -1003,6 +1004,7 @@ mod tests {
                 cache_ready_errors: Arc::new(Mutex::new(Vec::new())),
                 reviewed_prs: Arc::new(Mutex::new(Vec::new())),
                 review_errors: Arc::new(Mutex::new(Vec::new())),
+                review_finalization_errors: Arc::new(Mutex::new(Vec::new())),
                 auto_reviewers: Arc::new(Mutex::new(Vec::new())),
                 review_runs: Arc::new(Mutex::new(Vec::new())),
                 review_jobs: Arc::new(Mutex::new(Vec::new())),
@@ -1024,6 +1026,13 @@ mod tests {
 
         async fn push_review_error(&self, error: impl Into<String>) {
             self.review_errors.lock().await.push(error.into());
+        }
+
+        async fn push_review_finalization_error(&self, error: impl Into<String>) {
+            self.review_finalization_errors
+                .lock()
+                .await
+                .push(error.into());
         }
 
         async fn push_cache_ready_error(&self, error: impl Into<String>) {
@@ -1064,7 +1073,10 @@ mod tests {
             Ok(self.review_runs.lock().await.clone())
         }
 
-        async fn finish_project_review_run(&self, request: FinishReviewRun) -> crate::Result<()> {
+        async fn finish_expired_project_review_run(
+            &self,
+            request: FinishReviewRun,
+        ) -> crate::Result<()> {
             self.finished_runs.lock().await.push(request);
             Ok(())
         }
@@ -1586,6 +1598,7 @@ mod tests {
         ) -> crate::Result<ProjectReviewCycleResult> {
             let job_id = job.id;
             let job_head = job.head_sha.clone();
+            let run_id = Uuid::new_v4();
             if let Some(stored) = self
                 .review_jobs
                 .lock()
@@ -1594,7 +1607,17 @@ mod tests {
                 .find(|stored| stored.id == job_id)
             {
                 stored.attempt_count += 1;
-                stored.active_run_id = Some(Uuid::new_v4());
+                stored.active_run_id = Some(run_id);
+            }
+            let finalization_error = {
+                let mut errors = self.review_finalization_errors.lock().await;
+                (!errors.is_empty()).then(|| errors.remove(0))
+            };
+            if let Some(error) = finalization_error {
+                return Err(crate::RuntimeError::ProjectReviewRunFinalization {
+                    run_id,
+                    source: Box::new(crate::RuntimeError::InvalidInput(error)),
+                });
             }
             let mut result = self
                 .run_project_review_once(
@@ -2146,6 +2169,48 @@ mod tests {
         assert_eq!(Some("delivery-2"), jobs[0].delivery_id.as_deref());
         assert_ne!(ProjectReviewJobStatus::Skipped, jobs[0].status);
         assert_eq!(1, jobs[0].attempt_count);
+    }
+
+    #[tokio::test]
+    async fn run_finalization_failure_preserves_job_run_ownership() {
+        let project_id = Uuid::new_v4();
+        let ops = FakeWorkerOps::new(project_id);
+        ops.push_review_finalization_error("database is locked")
+            .await;
+        let mut job = crate::projects::review::job::new_project_review_job(
+            crate::projects::review::job::NewProjectReviewJob {
+                project_id,
+                pr: 42,
+                head_sha: "head-42".to_string(),
+                source: ProjectReviewJobSource::Manual,
+                delivery_id: None,
+                reason: "run finalization fault injection".to_string(),
+            },
+        );
+        job.status = ProjectReviewJobStatus::Preparing;
+        job.lease_owner = Some("worker-1".to_string());
+        job.lease_expires_at = Some(now() + chrono::TimeDelta::minutes(1));
+        ops.review_jobs.lock().await.push(job.clone());
+        let context = ProjectReviewTaskContext {
+            ops: ops.clone(),
+            project_id,
+            cancellation_token: CancellationToken::new(),
+        };
+
+        assert!(
+            crate::projects::review::job_worker::run_claimed_project_review_job(
+                &context,
+                job,
+                "worker-1".to_string(),
+            )
+            .await
+        );
+
+        let jobs = ops.review_jobs.lock().await;
+        assert_eq!(ProjectReviewJobStatus::Preparing, jobs[0].status);
+        assert!(jobs[0].active_run_id.is_some());
+        assert_eq!(Some("worker-1"), jobs[0].lease_owner.as_deref());
+        assert!(jobs[0].failure.is_none());
     }
 
     #[tokio::test]

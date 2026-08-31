@@ -141,6 +141,12 @@ pub enum RuntimeError {
     ProjectReviewRunNotFound(Uuid),
     #[error("project review job not found: {0}")]
     ProjectReviewJobNotFound(Uuid),
+    #[error("project review run {run_id} finalization failed: {source}")]
+    ProjectReviewRunFinalization {
+        run_id: Uuid,
+        #[source]
+        source: Box<RuntimeError>,
+    },
     #[error("pull request #{pr} in project {project_id} is already {state}")]
     PullRequestNotOpen {
         project_id: ProjectId,

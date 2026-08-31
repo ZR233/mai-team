@@ -170,7 +170,35 @@ pub(crate) async fn finish_project_review_run(
     snapshot_source: &impl ReviewRunSnapshotSource,
     request: FinishReviewRun,
 ) -> Result<()> {
-    finish_project_review_run_at(store, snapshot_source, request, now()).await
+    finish_project_review_run_at(
+        store,
+        snapshot_source,
+        request,
+        now(),
+        ReviewRunFinalizationMode::ActiveAttempt,
+    )
+    .await
+}
+
+pub(crate) async fn finish_expired_project_review_run(
+    store: &MaiStore,
+    snapshot_source: &impl ReviewRunSnapshotSource,
+    request: FinishReviewRun,
+) -> Result<()> {
+    finish_project_review_run_at(
+        store,
+        snapshot_source,
+        request,
+        now(),
+        ReviewRunFinalizationMode::ExpiredRecovery,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ReviewRunFinalizationMode {
+    ActiveAttempt,
+    ExpiredRecovery,
 }
 
 async fn finish_project_review_run_at(
@@ -178,6 +206,7 @@ async fn finish_project_review_run_at(
     snapshot_source: &impl ReviewRunSnapshotSource,
     request: FinishReviewRun,
     finished_at: chrono::DateTime<chrono::Utc>,
+    mode: ReviewRunFinalizationMode,
 ) -> Result<()> {
     let Some(existing) = store
         .load_project_review_run(request.project_id, request.run_id)
@@ -190,44 +219,75 @@ async fn finish_project_review_run_at(
         .or(existing.summary.reviewer_agent_id);
     let turn_id = request.turn_id.or(existing.summary.turn_id);
     let snapshot = if let Some(reviewer_agent_id) = reviewer_agent_id {
-        snapshot_source
+        match snapshot_source
             .snapshot(reviewer_agent_id, turn_id.as_deref())
-            .await?
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) if matches!(mode, ReviewRunFinalizationMode::ExpiredRecovery) => {
+                tracing::warn!(
+                    %reviewer_agent_id,
+                    ?turn_id,
+                    %error,
+                    "expired Review Run recovery is continuing without canonical Thread snapshot"
+                );
+                ReviewRunSnapshot::default()
+            }
+            Err(error) => return Err(error),
+        }
     } else {
         ReviewRunSnapshot::default()
     };
     if reviewer_agent_id.is_some() && turn_id.is_some() && snapshot.history.is_none() {
-        return Err(RuntimeError::InvalidInput(format!(
-            "review run {} cannot finish without canonical Thread history",
-            request.run_id
-        )));
+        match mode {
+            ReviewRunFinalizationMode::ActiveAttempt => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "review run {} cannot finish without canonical Thread history",
+                    request.run_id
+                )));
+            }
+            ReviewRunFinalizationMode::ExpiredRecovery => {
+                tracing::warn!(
+                    run_id = %request.run_id,
+                    ?reviewer_agent_id,
+                    ?turn_id,
+                    "expired Review Run recovery has no canonical Thread history"
+                );
+            }
+        }
     }
-    store
-        .finish_project_review_run(&ProjectReviewRunDetail {
-            summary: ProjectReviewRunSummary {
-                id: request.run_id,
-                job_id: existing.summary.job_id,
-                attempt_index: existing.summary.attempt_index,
-                project_id: request.project_id,
-                reviewer_agent_id,
-                turn_id,
-                started_at: existing.summary.started_at,
-                finished_at: Some(finished_at),
-                status: request.status,
-                outcome: request.outcome,
-                review_event: request.review_event,
-                pr: request.pr.or(existing.summary.pr),
-                summary: request.summary_text,
-                error: request.error,
-                failure: request.failure,
-                token_usage: snapshot.token_usage,
-                history_status: existing.summary.history_status,
-                history_archive_id: existing.summary.history_archive_id,
-                history_archived_at: existing.summary.history_archived_at,
-            },
-            history: snapshot.history,
-        })
-        .await?;
+    let detail = ProjectReviewRunDetail {
+        summary: ProjectReviewRunSummary {
+            id: request.run_id,
+            job_id: existing.summary.job_id,
+            attempt_index: existing.summary.attempt_index,
+            project_id: request.project_id,
+            reviewer_agent_id,
+            turn_id,
+            started_at: existing.summary.started_at,
+            finished_at: Some(finished_at),
+            status: request.status,
+            outcome: request.outcome,
+            review_event: request.review_event,
+            pr: request.pr.or(existing.summary.pr),
+            summary: request.summary_text,
+            error: request.error,
+            failure: request.failure,
+            token_usage: snapshot.token_usage,
+            history_status: existing.summary.history_status,
+            history_archive_id: existing.summary.history_archive_id,
+            history_archived_at: existing.summary.history_archived_at,
+        },
+        history: snapshot.history,
+    };
+    match mode {
+        ReviewRunFinalizationMode::ActiveAttempt => {
+            store.finish_project_review_run(&detail).await?;
+        }
+        ReviewRunFinalizationMode::ExpiredRecovery => {
+            store.finish_expired_project_review_run(&detail).await?;
+        }
+    }
     Ok(())
 }
 
@@ -341,6 +401,7 @@ async fn finish_terminal_project_review_run(
             failure: if submitted { None } else { run.failure },
         },
         finished_at,
+        ReviewRunFinalizationMode::ActiveAttempt,
     )
     .await
 }
@@ -374,6 +435,7 @@ pub(crate) async fn archive_expired_project_review_runs(
                 failure: run.failure,
             },
             recovered_at,
+            ReviewRunFinalizationMode::ActiveAttempt,
         )
         .await?;
     }

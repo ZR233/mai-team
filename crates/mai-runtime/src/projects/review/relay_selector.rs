@@ -156,6 +156,7 @@ async fn project_still_ready(ops: &impl ProjectReviewWorkerOps, project_id: Proj
         | Err(RuntimeError::ProjectNotFound(_))
         | Err(RuntimeError::ProjectReviewRunNotFound(_))
         | Err(RuntimeError::ProjectReviewJobNotFound(_))
+        | Err(RuntimeError::ProjectReviewRunFinalization { .. })
         | Err(RuntimeError::PullRequestNotOpen { .. })
         | Err(RuntimeError::ThreadNotFound(_))
         | Err(RuntimeError::AgentBusy(_))
