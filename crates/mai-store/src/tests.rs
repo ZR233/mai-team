@@ -2788,6 +2788,26 @@ async fn submission_intent_is_idempotent_and_receipt_completes_job() {
         .expect("same logical body-only fallback");
     assert_eq!(Some(intent), pending.submission_intent);
 
+    let owner = "reconciliation-worker".to_string();
+    let mut reconciling = pending;
+    reconciling.status = ProjectReviewJobStatus::Reconciling;
+    reconciling.next_attempt_at = Some(created_at);
+    store
+        .save_project_review_job(reconciling)
+        .await
+        .expect("schedule reconciliation");
+    let claimed = store
+        .claim_due_project_review_job(
+            project_id,
+            owner.clone(),
+            created_at,
+            created_at + chrono::TimeDelta::minutes(1),
+        )
+        .await
+        .expect("claim reconciliation")
+        .expect("due reconciliation");
+    assert_eq!(Some(owner), claimed.lease_owner);
+
     let receipt = ProjectReviewSubmissionReceipt {
         github_review_id: 123,
         event: ProjectReviewDecision::RequestChanges,
@@ -2802,6 +2822,8 @@ async fn submission_intent_is_idempotent_and_receipt_completes_job() {
     assert_eq!(ProjectReviewJobStatus::Succeeded, completed.status);
     assert_eq!(Some(receipt), completed.submission_receipt);
     assert_eq!(None, completed.active_run_id);
+    assert_eq!(None, completed.lease_owner);
+    assert_eq!(None, completed.lease_expires_at);
     assert_eq!(None, completed.next_attempt_at);
     assert_eq!(None, completed.failure);
 }

@@ -72,7 +72,11 @@ pub(super) async fn run_project_review_job_heartbeat(
                         break;
                     }
                     HeartbeatOperation::TimedOut => {
-                        tracing::warn!(job_id = %job_id, "review job heartbeat exceeded ten seconds");
+                        tracing::warn!(
+                            job_id = %job_id,
+                            timeout_seconds = REVIEW_JOB_HEARTBEAT_OPERATION_TIMEOUT.as_secs(),
+                            "review job heartbeat operation timed out"
+                        );
                         attempt_cancellation_token.cancel();
                         break;
                     }

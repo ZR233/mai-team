@@ -1002,7 +1002,9 @@ fn record_submission_receipt_on_path(
     transaction.execute(
         "UPDATE project_review_jobs SET status = 'succeeded', submission_receipt_json = ?1, \
          finished_at = ?2, updated_at = ?2, next_attempt_at = NULL, \
-         failure_json = NULL, skip_reason = NULL \
+         failure_json = NULL, skip_reason = NULL, \
+         lease_owner = CASE WHEN active_run_id IS NULL THEN NULL ELSE lease_owner END, \
+         lease_expires_at = CASE WHEN active_run_id IS NULL THEN NULL ELSE lease_expires_at END \
          WHERE id = ?3",
         params![
             serde_json::to_string(&receipt)?,
