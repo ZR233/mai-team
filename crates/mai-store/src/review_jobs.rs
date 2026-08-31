@@ -355,10 +355,19 @@ impl MaiStore {
             let transaction =
                 connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let existing = load_job(&transaction, job.id)?
-                .ok_or_else(|| StoreError::InvalidConfig("review job not found".to_string()))?;
+                .ok_or_else(|| StoreError::InvalidConfig("review job not found".to_string()))?
+                .into_summary()?;
             if existing.lease_owner.as_deref() != Some(owner.as_str()) {
                 transaction.commit()?;
                 return Ok(false);
+            }
+            let mut job = job;
+            if job.lease_owner.as_deref() == Some(owner.as_str()) {
+                job.lease_expires_at = match (existing.lease_expires_at, job.lease_expires_at) {
+                    (Some(existing), Some(incoming)) => Some(existing.max(incoming)),
+                    (Some(existing), None) => Some(existing),
+                    (None, incoming) => incoming,
+                };
             }
             upsert_job(&transaction, &job)?;
             transaction.commit()?;

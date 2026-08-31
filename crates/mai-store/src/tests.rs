@@ -2020,8 +2020,10 @@ async fn webhook_delivery_is_idempotent_per_pull_request() {
 async fn concurrent_review_job_claim_has_one_winner() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
+    let job = test_review_job(project_id, 7, "head", None);
+    let job_id = job.id;
     store
-        .enqueue_project_review_job(test_review_job(project_id, 7, "head", None))
+        .enqueue_project_review_job(job)
         .await
         .expect("enqueue");
     let store = Arc::new(store);
@@ -2039,6 +2041,29 @@ async fn concurrent_review_job_claim_has_one_winner() {
     assert_eq!(1, winners.len());
     assert_eq!(0, winners[0].attempt_count);
     assert_eq!(ProjectReviewJobStatus::Preparing, winners[0].status);
+    let mut stale_claim = winners[0].clone();
+    let owner = stale_claim.lease_owner.clone().expect("winner owner");
+    let heartbeat_at = current_time + chrono::TimeDelta::seconds(15);
+    let extended_lease = lease + chrono::TimeDelta::minutes(1);
+    assert!(
+        store
+            .heartbeat_project_review_job(job_id, owner.clone(), heartbeat_at, extended_lease)
+            .await
+            .expect("extend lease")
+    );
+    stale_claim.updated_at = heartbeat_at + chrono::TimeDelta::seconds(1);
+    assert!(
+        store
+            .save_claimed_project_review_job(stale_claim, owner)
+            .await
+            .expect("save stale claimed snapshot")
+    );
+    let saved = store
+        .load_project_review_job(project_id, job_id)
+        .await
+        .expect("load saved job")
+        .expect("saved job");
+    assert_eq!(Some(extended_lease), saved.lease_expires_at);
 }
 
 #[tokio::test]
@@ -2597,7 +2622,8 @@ async fn recovery_preserves_live_lease_and_reviewer_ownership() {
 async fn expired_active_attempt_can_begin_the_next_attempt() {
     let (_dir, store) = store().await;
     let project_id = Uuid::new_v4();
-    let job = test_review_job(project_id, 11, "head", None);
+    let mut job = test_review_job(project_id, 11, "head", None);
+    job.max_attempts = 2;
     let job_id = job.id;
     store
         .enqueue_project_review_job(job)
@@ -2678,6 +2704,41 @@ async fn expired_active_attempt_can_begin_the_next_attempt() {
             .map(|attempt| attempt.status)
             .collect::<Vec<_>>()
     );
+    let final_recovery = second_started_at + chrono::TimeDelta::minutes(6);
+    assert_eq!(
+        1,
+        store
+            .recover_expired_project_review_jobs(final_recovery)
+            .await
+            .expect("recover final allowed attempt")
+    );
+    let final_owner = "final-worker".to_string();
+    store
+        .claim_due_project_review_job(
+            project_id,
+            final_owner.clone(),
+            final_recovery,
+            final_recovery + chrono::TimeDelta::minutes(1),
+        )
+        .await
+        .expect("claim recovered job")
+        .expect("recovered job due");
+    let error = store
+        .begin_claimed_project_review_attempt(job_id, final_owner, Uuid::new_v4(), final_recovery)
+        .await
+        .expect_err("attempt limit must be enforced at Run creation");
+    assert!(
+        error
+            .to_string()
+            .contains("reached its maximum of 2 attempts")
+    );
+    let preserved = store
+        .load_project_review_job(project_id, job_id)
+        .await
+        .expect("load limited job")
+        .expect("limited job");
+    assert_eq!(2, preserved.attempt_count);
+    assert_eq!(None, preserved.active_run_id);
 }
 
 #[tokio::test]

@@ -200,6 +200,12 @@ impl MaiStore {
                             "review job {job_id} is not an unstarted attempt owned by {owner}"
                         )));
                     }
+                    if job.attempt_count >= job.max_attempts {
+                        return Err(StoreError::InvalidConfig(format!(
+                            "review job {job_id} reached its maximum of {} attempts",
+                            job.max_attempts
+                        )));
+                    }
                     job.attempt_count = job.attempt_count.checked_add(1).ok_or_else(|| {
                         StoreError::DataIntegrity(format!(
                             "review job {job_id} attempt count overflow"
