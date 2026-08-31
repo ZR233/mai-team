@@ -16,6 +16,8 @@ pub enum DockerError {
     InvalidImage(String),
     #[error("invalid docker mount: {0}")]
     InvalidMount(String),
+    #[error("invalid workspace export: {0}")]
+    InvalidWorkspaceExport(String),
     #[error("docker command cancelled")]
     Cancelled,
 }

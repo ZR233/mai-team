@@ -437,7 +437,8 @@ pub(super) fn runtime_failure(error: &RuntimeError) -> ProjectReviewFailure {
             mai_docker::DockerError::Utf8(_)
             | mai_docker::DockerError::Json(_)
             | mai_docker::DockerError::InvalidImage(_)
-            | mai_docker::DockerError::InvalidMount(_) => (
+            | mai_docker::DockerError::InvalidMount(_)
+            | mai_docker::DockerError::InvalidWorkspaceExport(_) => (
                 ProjectReviewFailureCategory::Validation,
                 Some("invalid_workspace_configuration".to_string()),
                 None,

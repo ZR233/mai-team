@@ -2,8 +2,8 @@ use crate::agents::profiles::AgentProfilesManager;
 use crate::skills::SkillCatalogService;
 use chrono::{DateTime, Utc};
 use mai_docker::{
-    ContainerHandle, ContainerVolumeMount, DockerClient, SidecarParams, agent_workspace_volume,
-    project_agent_workspace_volume, project_cache_volume,
+    ContainerHandle, ContainerVolumeMount, DockerClient, SidecarParams, WorkspaceExportRequest,
+    agent_workspace_volume, project_agent_workspace_volume, project_cache_volume,
 };
 use mai_protocol::*;
 use mai_store::{AgentLogFilter, MaiStore, ToolTraceFilter};

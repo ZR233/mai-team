@@ -103,6 +103,12 @@ Reviewer 是普通 project agent，但生命周期绑定 Job，而不是单次 R
 - Thread 丢失或损坏是永久失败，不以空 Thread 静默重审。
 - 只有 Job 进入 `Succeeded`、`Failed`、`Cancelled` 或 `Superseded` 后才删除 Reviewer、live Thread、上下文和工作区；终态清理也使用 marker 找回尚未写入 Job 的 Reviewer，timeline 只保留在 Run 的不可变 `ThreadTurnHistory` 归档中。
 
+Review 上下文中的项目 Skill 从同一只读仓库快照生成。Mai 一次导出
+`.claude/skills`、`.agents/skills` 和 `skills` 的仓库相对布局，再将仓库内相对
+symlink 实体化为普通目录和文件；绝对、越界、悬空或循环链接立即失败。交给 PL 的
+每个 Skill 根都不含 symlink，根顺序与同名 Skill 选择继续由 PL 的原生 catalog
+规则负责，Mai 不建立第二套名称注册或运行时过滤逻辑。
+
 PL v2 的 schema 31→32 升级是一次明确例外：部署窗口先正常取消并清理所有 Review Agent，完整
 v1 数据库离线归档，在线库不转换旧 Thread/Timeline。升级健康后按最新 PR head 为被取消目标建立
 新的 Review Job/Run，不能把旧 Review Thread 当作损坏数据恢复。

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,8 +24,10 @@ const PROJECT_SKILL_CANDIDATE_DIRS: [(&str, &str); 3] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectSkillSourceDir {
     pub(crate) cache_name: String,
+    pub(crate) relative_path: String,
     pub(crate) container_path: String,
     pub(crate) host_path: Option<PathBuf>,
+    pub(crate) host_repository_root: Option<PathBuf>,
 }
 
 pub(crate) fn cache_dir(cache_root: &Path, project_id: ProjectId) -> PathBuf {
@@ -117,8 +120,10 @@ fn detected_dir_from_line(workspace_root: &str, line: &str) -> Result<ProjectSki
     }
     Ok(ProjectSkillSourceDir {
         cache_name: (*cache_name).to_string(),
+        relative_path: (*relative).to_string(),
         container_path: (*container_path).to_string(),
         host_path: None,
+        host_repository_root: None,
     })
 }
 
@@ -142,25 +147,119 @@ pub(crate) fn refresh_cache_dir(cache_dir: &Path, sources: &[ProjectSkillSourceD
         let host_source = project_source.host_path.as_ref().ok_or_else(|| {
             RuntimeError::InvalidInput("project host skill source path is missing".to_string())
         })?;
-        copy_dir_all(host_source, &target)?;
-        normalize_copied_dir(&target, &project_source.cache_name)?;
+        let host_repository_root =
+            project_source
+                .host_repository_root
+                .as_ref()
+                .ok_or_else(|| {
+                    RuntimeError::InvalidInput(
+                        "project host skill repository root is missing".to_string(),
+                    )
+                })?;
+        materialize_project_source(host_source, &target, host_repository_root)?;
     }
     Ok(())
 }
 
-fn copy_dir_all(source: &Path, target: &Path) -> Result<()> {
-    fs::create_dir_all(target)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let dest = target.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &dest)?;
-        } else if ty.is_file() {
-            fs::copy(entry.path(), dest)?;
-        }
+fn materialize_project_source(source: &Path, target: &Path, repository_root: &Path) -> Result<()> {
+    let repository_root = fs::canonicalize(repository_root).map_err(|error| {
+        RuntimeError::InvalidInput(format!(
+            "project skill repository root `{}` cannot be resolved: {error}",
+            repository_root.display()
+        ))
+    })?;
+    if !repository_root.is_dir() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "project skill repository root `{}` is not a directory",
+            repository_root.display()
+        )));
     }
-    Ok(())
+    copy_materialized_path(source, target, &repository_root, &mut HashSet::new())
+}
+
+fn copy_materialized_path(
+    source: &Path,
+    target: &Path,
+    repository_root: &Path,
+    active_directories: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(source).map_err(|error| {
+        RuntimeError::InvalidInput(format!(
+            "project skill path `{}` cannot be inspected: {error}",
+            source.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        let link_target = fs::read_link(source)?;
+        if link_target.is_absolute() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "project skill symlink `{}` must use a repository-relative target",
+                source.display()
+            )));
+        }
+        let resolved = fs::canonicalize(
+            source
+                .parent()
+                .unwrap_or(repository_root)
+                .join(&link_target),
+        )
+        .map_err(|error| {
+            RuntimeError::InvalidInput(format!(
+                "project skill symlink `{}` cannot resolve target `{}`: {error}",
+                source.display(),
+                link_target.display()
+            ))
+        })?;
+        ensure_project_path(&resolved, repository_root, source)?;
+        return copy_materialized_path(&resolved, target, repository_root, active_directories);
+    }
+
+    let resolved = fs::canonicalize(source).map_err(|error| {
+        RuntimeError::InvalidInput(format!(
+            "project skill path `{}` cannot be resolved: {error}",
+            source.display()
+        ))
+    })?;
+    ensure_project_path(&resolved, repository_root, source)?;
+    if metadata.is_dir() {
+        if !active_directories.insert(resolved.clone()) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "project skill symlink cycle reaches `{}`",
+                resolved.display()
+            )));
+        }
+        fs::create_dir_all(target)?;
+        for entry in fs::read_dir(&resolved)? {
+            let entry = entry?;
+            copy_materialized_path(
+                &entry.path(),
+                &target.join(entry.file_name()),
+                repository_root,
+                active_directories,
+            )?;
+        }
+        active_directories.remove(&resolved);
+        return Ok(());
+    }
+    if metadata.is_file() {
+        fs::copy(&resolved, target)?;
+        return Ok(());
+    }
+    Err(RuntimeError::InvalidInput(format!(
+        "project skill path `{}` is neither a file nor a directory",
+        source.display()
+    )))
+}
+
+fn ensure_project_path(resolved: &Path, repository_root: &Path, source: &Path) -> Result<()> {
+    if resolved.starts_with(repository_root) {
+        return Ok(());
+    }
+    Err(RuntimeError::InvalidInput(format!(
+        "project skill symlink `{}` resolves outside repository root `{}`",
+        source.display(),
+        repository_root.display()
+    )))
 }
 
 pub(crate) fn apply_project_source_paths(
@@ -201,20 +300,6 @@ pub(crate) fn apply_source_paths_with_workspace_root(
                 .then(|| PathBuf::from(workspace_root).join(relative))
         })
         .collect();
-}
-
-pub(crate) fn normalize_copied_dir(target: &Path, cache_name: &str) -> Result<()> {
-    let nested = target.join(cache_name);
-    if nested.is_dir() {
-        let temp = target.with_extension("tmp");
-        if temp.exists() {
-            fs::remove_dir_all(&temp)?;
-        }
-        fs::rename(&nested, &temp)?;
-        fs::remove_dir_all(target)?;
-        fs::rename(temp, target)?;
-    }
-    Ok(())
 }
 
 fn source_path(cache_dir: &Path, workspace_root: &str, path: &Path) -> Option<PathBuf> {
@@ -258,13 +343,17 @@ mod tests {
             vec![
                 ProjectSkillSourceDir {
                     cache_name: "claude".to_string(),
+                    relative_path: ".claude/skills".to_string(),
                     container_path: "/workspace/repo/.claude/skills".to_string(),
                     host_path: None,
+                    host_repository_root: None,
                 },
                 ProjectSkillSourceDir {
                     cache_name: "skills".to_string(),
+                    relative_path: "skills".to_string(),
                     container_path: "/workspace/repo/skills".to_string(),
                     host_path: None,
+                    host_repository_root: None,
                 },
             ]
         );
@@ -298,6 +387,78 @@ mod tests {
                 skills: Vec::new(),
                 errors: Vec::new(),
             }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materializes_project_internal_skill_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repository = temp.path().join("repository");
+        let agents_skill = repository.join(".agents/skills/arceos-test-adapter");
+        std::fs::create_dir_all(&agents_skill).expect("canonical skill directory");
+        std::fs::write(agents_skill.join("SKILL.md"), "# Test Adapter\n").expect("canonical skill");
+        let claude_skills = repository.join(".claude/skills");
+        std::fs::create_dir_all(&claude_skills).expect("claude skill directory");
+        symlink(
+            "../../.agents/skills/arceos-test-adapter",
+            claude_skills.join("arceos-test-adapter"),
+        )
+        .expect("project-internal skill symlink");
+
+        let cache = temp.path().join("cache");
+        refresh_cache_dir(
+            &cache,
+            &[ProjectSkillSourceDir {
+                cache_name: "claude".to_string(),
+                relative_path: ".claude/skills".to_string(),
+                container_path: "/workspace/repo/.claude/skills".to_string(),
+                host_path: Some(claude_skills),
+                host_repository_root: Some(repository),
+            }],
+        )
+        .expect("materialize skill cache");
+
+        assert_eq!(
+            std::fs::read_to_string(cache.join("claude/arceos-test-adapter/SKILL.md"))
+                .expect("materialized skill"),
+            "# Test Adapter\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_project_skill_symlink_outside_repository() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repository = temp.path().join("repository");
+        let claude_skills = repository.join(".claude/skills");
+        std::fs::create_dir_all(&claude_skills).expect("claude skill directory");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside directory");
+        std::fs::write(outside.join("SKILL.md"), "# Outside\n").expect("outside skill");
+        symlink("../../../outside", claude_skills.join("outside"))
+            .expect("out-of-repository symlink");
+
+        let error = refresh_cache_dir(
+            &temp.path().join("cache"),
+            &[ProjectSkillSourceDir {
+                cache_name: "claude".to_string(),
+                relative_path: ".claude/skills".to_string(),
+                container_path: "/workspace/repo/.claude/skills".to_string(),
+                host_path: Some(claude_skills),
+                host_repository_root: Some(repository),
+            }],
+        )
+        .expect_err("reject out-of-repository symlink");
+
+        assert!(
+            error
+                .to_string()
+                .contains("resolves outside repository root")
         );
     }
 }

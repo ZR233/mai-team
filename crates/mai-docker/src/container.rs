@@ -648,7 +648,7 @@ impl DockerClient {
         })
     }
 
-    async fn start_container(&self, container_id: &str) -> Result<()> {
+    pub(crate) async fn start_container(&self, container_id: &str) -> Result<()> {
         let output = Command::new(&self.binary)
             .args(["start", container_id])
             .output()

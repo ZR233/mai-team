@@ -327,30 +327,32 @@ impl AgentRuntime {
         }
 
         std::fs::create_dir_all(stage_root)?;
+        let repository_stage = stage_root.join("repository");
+        let _ = std::fs::remove_dir_all(&repository_stage);
+        let relative_paths = sources
+            .iter()
+            .map(|source| source.relative_path.clone())
+            .collect::<Vec<_>>();
+        let export_name = format!("mai-tool-skill-export-{project_id}-{}", Uuid::new_v4());
+        self.deps
+            .docker
+            .export_workspace_paths(&WorkspaceExportRequest {
+                name: &export_name,
+                image: &self.sidecar_image,
+                workspace_volume,
+                workspace_root,
+                relative_paths: &relative_paths,
+                host_path: &repository_stage,
+            })
+            .await
+            .map_err(|err| {
+                RuntimeError::InvalidInput(format!(
+                    "failed to export project skill sources from workspace volume: {err}"
+                ))
+            })?;
         for source in &mut sources {
-            let target = stage_root.join(&source.cache_name);
-            let _ = std::fs::remove_dir_all(&target);
-            let copy_name = format!(
-                "mai-tool-skill-copy-{project_id}-{}-{}",
-                source.cache_name,
-                Uuid::new_v4()
-            );
-            self.deps
-                .docker
-                .copy_from_workspace_volume_to_file(
-                    &copy_name,
-                    &self.sidecar_image,
-                    workspace_volume,
-                    &source.container_path,
-                    &target,
-                )
-                .await
-                .map_err(|err| {
-                    RuntimeError::InvalidInput(format!(
-                        "failed to copy project skill source from workspace volume: {err}"
-                    ))
-                })?;
-            source.host_path = Some(target);
+            source.host_path = Some(repository_stage.join(&source.relative_path));
+            source.host_repository_root = Some(repository_stage.clone());
         }
         Ok(sources)
     }

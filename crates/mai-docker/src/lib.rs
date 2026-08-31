@@ -14,6 +14,7 @@ mod selection;
 pub use args::ContainerCreateOptions;
 pub use client::DockerClient;
 pub use container::ContainerHandle;
+pub use copy::WorkspaceExportRequest;
 pub use error::{DockerError, Result};
 pub use exec::{CapturedExecOutput, ExecCaptureOptions, ExecOutput, SidecarParams};
 pub use image::ImageRefreshOutcome;
