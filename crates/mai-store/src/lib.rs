@@ -56,7 +56,7 @@ pub use review_ci_watches::ProjectReviewCiWatch;
 pub use review_jobs::{
     ProjectReviewCiPendingSkipResult, ProjectReviewCiWatchEnqueueResult,
     ProjectReviewJobEnqueueDisposition, ProjectReviewJobEnqueueResult,
-    ProjectReviewReviewableJobEnqueueResult,
+    ProjectReviewReviewableJobEnqueueResult, REVIEW_JOB_SQLITE_BUSY_TIMEOUT_SECS,
 };
 pub use sqlite_busy::is_retryable_sqlite_error;
 pub use store::MaiStore;

@@ -5,7 +5,6 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::records::{ProjectReviewJobRecord, ProjectReviewRunSummaryRecord};
 use crate::*;
 
-const REVIEW_JOB_SQLITE_BUSY_TIMEOUT_SECS: u64 = 30;
 pub(super) const PROJECT_REVIEW_JOB_COLUMNS: &str = "id, project_id, pr, head_sha, source, delivery_id, reason, status, \
      attempt_count, max_attempts, first_retryable_failure_at, next_attempt_at, \
      reviewer_agent_id, active_run_id, lease_owner, lease_expires_at, failure_json, \
@@ -189,6 +188,8 @@ pub(crate) fn project_review_run_summary_record(
 
 pub(crate) fn open_review_job_connection(path: &Path) -> Result<Connection> {
     let connection = Connection::open(path)?;
-    connection.busy_timeout(Duration::from_secs(REVIEW_JOB_SQLITE_BUSY_TIMEOUT_SECS))?;
+    connection.busy_timeout(Duration::from_secs(
+        super::REVIEW_JOB_SQLITE_BUSY_TIMEOUT_SECS,
+    ))?;
     Ok(connection)
 }

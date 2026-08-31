@@ -5,7 +5,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::worker::ProjectReviewWorkerOps;
 
-const REVIEW_JOB_HEARTBEAT_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+const REVIEW_JOB_HEARTBEAT_OPERATION_TIMEOUT: Duration =
+    Duration::from_secs(mai_store::REVIEW_JOB_SQLITE_BUSY_TIMEOUT_SECS + 5);
 
 pub(super) async fn run_project_review_job_heartbeat(
     ops: impl ProjectReviewWorkerOps,
@@ -148,6 +149,10 @@ mod tests {
         assert_eq!(
             Duration::from_secs(super::super::job::REVIEW_JOB_HEARTBEAT_SECONDS),
             heartbeat_delay(1)
+        );
+        assert!(
+            REVIEW_JOB_HEARTBEAT_OPERATION_TIMEOUT.as_secs()
+                > mai_store::REVIEW_JOB_SQLITE_BUSY_TIMEOUT_SECS
         );
         assert!(
             super::super::job::REVIEW_JOB_HEARTBEAT_SECONDS

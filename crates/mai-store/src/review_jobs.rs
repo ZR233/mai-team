@@ -14,6 +14,9 @@ pub(crate) mod storage;
 
 use storage::*;
 
+/// Review Job 独立 SQLite 写连接等待全库 writer 锁的最长秒数。
+pub const REVIEW_JOB_SQLITE_BUSY_TIMEOUT_SECS: u64 = 30;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectReviewJobEnqueueDisposition {
     Queued,
