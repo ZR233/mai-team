@@ -4,7 +4,7 @@ use mai_protocol::AgentId;
 use pl_core::{
     AgentTurnFactory, AgentTurnPreparationContext, AgentWorkspace, ContextCompactionConfig,
     ContextCompactionReplacement, CoreRuntimeProfile, PreparedAgentTurn, PreparedSessionRuntime,
-    RecentInteractionTailConfig, TurnEngineBuilder, TurnOptions, TurnRequest,
+    RecentInteractionTailConfig, TurnBudget, TurnEngineBuilder, TurnOptions, TurnRequest,
     instruction::InstructionProfile,
 };
 use pl_model::OpenAiCompactionMode;
@@ -253,6 +253,10 @@ impl AgentTurnFactory for MaiAgentTurnFactory {
         }
         let mut prepared = PreparedAgentTurn::new(engine, request, options, policy)
             .with_session_runtime(session_runtime);
+        if review_mode.is_some() {
+            prepared =
+                prepared.with_budget(TurnBudget::new(crate::projects::review::REVIEW_TURN_BUDGET));
+        }
         if let Some(review_manifest) = review_manifest {
             prepared = prepared.with_pinned_context(review_manifest);
         }

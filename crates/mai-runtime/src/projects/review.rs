@@ -9,6 +9,7 @@ use tokio::time::Duration;
 use crate::{Result, RuntimeError};
 
 pub(crate) mod backoff;
+mod budget;
 pub(crate) mod ci_watch;
 pub(crate) mod cleanup;
 pub(crate) mod context;
@@ -33,6 +34,8 @@ pub(crate) mod singleton;
 pub(crate) mod state;
 pub(crate) mod target;
 pub(crate) mod worker;
+
+pub(crate) use budget::{REVIEW_RUNNING_DEADLINE, REVIEW_TURN_BUDGET};
 
 #[cfg(test)]
 const PROJECT_REVIEW_IDLE_RETRY_SECS: u64 = 120;

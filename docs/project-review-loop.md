@@ -150,6 +150,13 @@ Job 因永久错误或重试窗口结束进入 `Failed` 后，后续 discovery �
 
 ## Watchdog
 
+- Review 模式在 Mai 产品层固定选择一小时的 PL Turn 活跃墙钟预算。Mai 通过 PL 面向宿主公开的
+  类型化预算能力传入这个产品决策；计时、`BudgetLimited` 结果、用量快照与上下文 rollover
+  仍完全由 PL 拥有，Mai 不复制第二套 Turn 预算状态机。普通会话不覆写预算，继续使用 PL 默认值。
+- `Running` 的绝对资源保护期限是一小时五分钟：前一小时对应 PL Turn 预算，额外五分钟只用于
+  等待 PL 提交终态、持久化 Run/Timeline、确认 GitHub 回执并清理 Reviewer。它不能作为另一个
+  模型执行预算，也不能早于 PL 的预算终态取消 Turn。即使 PL 后续调整 Rust 接口，面向宿主按
+  Turn 选择预算、并由 PL 统一产生预算终态的功能语义仍是 Review 生命周期所依赖的公共能力。
 - `Preparing` 最长 5 分钟。
 - `Running` 连续 10 分钟没有模型、工具或进程 revision 进展时取消 turn。
 - 活跃 `exec` 使用其 `timeoutSeconds + 60 秒` 与 10 分钟中的较大值。
